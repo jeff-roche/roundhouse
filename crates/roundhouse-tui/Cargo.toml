@@ -8,3 +8,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+roundhouse-proto = { path = "../roundhouse-proto" }
+schemars = { workspace = true }

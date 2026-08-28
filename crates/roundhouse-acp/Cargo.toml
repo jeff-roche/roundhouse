@@ -8,3 +8,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+roundhouse-core = { path = "../roundhouse-core" }
+roundhouse-proto = { path = "../roundhouse-proto" }

@@ -438,6 +438,10 @@ dependencies = [
 [[package]]
 name = "roundhouse-acp"
 version = "0.1.0"
+dependencies = [
+ "roundhouse-core",
+ "roundhouse-proto",
+]
 
 [[package]]
 name = "roundhouse-bus"
@@ -454,6 +458,8 @@ name = "roundhouse-cli"
 version = "0.1.0"
 dependencies = [
  "color-eyre",
+ "roundhouse-proto",
+ "roundhouse-tui",
 ]
 
 [[package]]
@@ -478,19 +484,50 @@ name = "roundhouse-daemon"
 version = "0.1.0"
 dependencies = [
  "color-eyre",
+ "roundhouse-acp",
+ "roundhouse-bus",
+ "roundhouse-core",
+ "roundhouse-engine",
+ "roundhouse-flow",
+ "roundhouse-mcp",
+ "roundhouse-policy",
+ "roundhouse-proto",
+ "roundhouse-provider",
+ "roundhouse-sandbox",
+ "roundhouse-sched",
+ "roundhouse-store",
+ "roundhouse-tools",
 ]
 
 [[package]]
 name = "roundhouse-engine"
 version = "0.1.0"
+dependencies = [
+ "roundhouse-bus",
+ "roundhouse-core",
+ "roundhouse-policy",
+ "roundhouse-provider",
+ "roundhouse-sandbox",
+ "roundhouse-store",
+]
 
 [[package]]
 name = "roundhouse-flow"
 version = "0.1.0"
+dependencies = [
+ "roundhouse-core",
+ "roundhouse-engine",
+ "roundhouse-store",
+]
 
 [[package]]
 name = "roundhouse-mcp"
 version = "0.1.0"
+dependencies = [
+ "roundhouse-core",
+ "roundhouse-policy",
+ "serde_json",
+]
 
 [[package]]
 name = "roundhouse-policy"
@@ -535,6 +572,11 @@ dependencies = [
 [[package]]
 name = "roundhouse-sched"
 version = "0.1.0"
+dependencies = [
+ "roundhouse-core",
+ "roundhouse-engine",
+ "roundhouse-store",
+]
 
 [[package]]
 name = "roundhouse-store"
@@ -551,14 +593,26 @@ dependencies = [
 [[package]]
 name = "roundhouse-tools"
 version = "0.1.0"
+dependencies = [
+ "roundhouse-core",
+ "roundhouse-policy",
+ "roundhouse-sandbox",
+]
 
 [[package]]
 name = "roundhouse-tui"
 version = "0.1.0"
+dependencies = [
+ "roundhouse-proto",
+ "schemars",
+]
 
 [[package]]
 name = "roundhouse-web"
 version = "0.1.0"
+dependencies = [
+ "roundhouse-proto",
+]
 
 [[package]]
 name = "rsqlite-vfs"
