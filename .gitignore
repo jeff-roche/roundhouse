@@ -1,0 +1,9 @@
+# Rust build artifacts (crates/xtask don't exist until Phase 0, but this
+# applies from the first `cargo build`)
+/target
+**/*.rs.bk
+
+# Editor/OS cruft
+.DS_Store
+.idea/
+*.swp
