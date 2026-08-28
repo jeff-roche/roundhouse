@@ -1,7 +1,8 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// §4.4 — who/what caused a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum Origin {
     User,
     Model,
@@ -13,7 +14,7 @@ pub enum Origin {
 
 /// §6.2 — `Policy::decide` returns one of these three, matched on typed,
 /// parsed parameters, never raw strings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum PolicyDecision {
     Allow,
     Ask,
@@ -33,18 +34,18 @@ pub enum PolicyDecision {
 /// intentional stylistic split, not an oversight — see the definitions of
 /// `ServerId`/`ProviderId` (Task 6) and `ModelId`/`ProviderId`/
 /// `ToolCallId`/`Signature` (Task 7) for the same rationale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RuleId(pub u64);
 
 /// §6.5 — the *achieved* isolation, written on every task row.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IsolationAttestation {
     pub tier: crate::tier::Tier,
     pub digest: String,
     pub net_enforced: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Progress {
     pub message: String,
     pub fraction: Option<f32>,
@@ -58,13 +59,13 @@ pub struct Progress {
 /// (an opaque isolation-environment handle returned by `Isolate::prepare`) —
 /// the two share a name because they're both "a handle" in their own
 /// domains, but callers needing both should refer to them by qualified path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum Handle {
     Pid(u32),
     Pty(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum SuspendReason {
     AwaitingApproval,
     AwaitingElicitation,
@@ -72,13 +73,13 @@ pub enum SuspendReason {
     AwaitingPeer { session: crate::ids::SessionId },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum TaskInput {
     Json(serde_json::Value),
     Text(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum TaskOutput {
     Json(serde_json::Value),
     Text(String),
@@ -98,13 +99,13 @@ pub enum TaskOutput {
 /// waiting side of a `message`/`agent` task). New categories are expected
 /// as later phases add executors; this list is the Phase 0 baseline, not a
 /// closed set.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TaskError {
     pub message: String,
     pub category: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum CancelReason {
     User,
     Timeout,
@@ -112,7 +113,7 @@ pub enum CancelReason {
     PolicyDeny,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum NoteLevel {
     Debug,
     Info,
@@ -128,7 +129,7 @@ pub enum NoteLevel {
 /// likewise derivable from the owning task's `TaskStarted`/terminal event
 /// timestamps rather than duplicated here. This comment exists so the
 /// omission reads as a documented decision, not a gap.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -137,7 +138,7 @@ pub struct Usage {
 
 /// §7 — inter-agent message envelope. Self-contained and serializable per
 /// §7.8's rule (`RemoteBus` frames this as CBOR unchanged).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Envelope {
     pub from: crate::address::Address,
     pub to: crate::address::Address,

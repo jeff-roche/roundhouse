@@ -7,6 +7,7 @@ use crate::task_meta::{
     Progress, RuleId, SuspendReason, TaskError, TaskInput, TaskOutput, Usage,
 };
 use crate::timestamp::Timestamp;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// §4.1 — the only thing ever written. Append-only. No UPDATE, no DELETE.
@@ -45,7 +46,7 @@ impl Event {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum EventPayload {
     // ── session lifecycle ─────────────────────────────────────────────
     SessionCreated { spec: Box<SessionSpec> },

@@ -1,18 +1,21 @@
 use crate::ids::SessionId;
 use bytes::Bytes;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// §4.1 — deliberately typed rather than `String`: a `shell` task streams
 /// stdout/stderr bytes, a `chat` task streams text/thinking/tool-call
 /// fragments, an `agent` task streams child-session progress.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum Delta {
     Text { text: String },
     /// Must round-trip verbatim — see §9.3 on thinking signatures.
     Thinking { text: String, signature: Option<String> },
     #[serde(with = "bytes_as_vec")]
+    #[schemars(with = "Vec<u8>")]
     Stdout { bytes: Bytes },
     #[serde(with = "bytes_as_vec")]
+    #[schemars(with = "Vec<u8>")]
     Stderr { bytes: Bytes },
     /// Partial JSON from a streaming tool call.
     ToolArgs { fragment: String },

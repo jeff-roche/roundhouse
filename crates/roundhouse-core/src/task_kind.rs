@@ -1,9 +1,10 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// §4.2 — core kinds are flat identifiers; plugin-provided kinds are
 /// namespaced `vendor:verb` so the enum stays closed for the core and open
 /// for extension.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum TaskKind {
     Chat,
     Infer,
