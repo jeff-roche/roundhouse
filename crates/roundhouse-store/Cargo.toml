@@ -8,3 +8,9 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+roundhouse-core = { path = "../roundhouse-core" }
+rusqlite = { workspace = true }
+rusqlite_migration = { workspace = true }
+deadpool-sqlite = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
