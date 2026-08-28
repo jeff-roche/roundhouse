@@ -6,9 +6,12 @@ use std::path::{Path, PathBuf};
 
 /// §4.5 — git-style sharded-by-prefix layout, avoiding one directory with
 /// millions of entries: the first two hex characters of the hash become a
-/// subdirectory.
+/// subdirectory. Safe to byte-slice at index 2 unconditionally because
+/// `Blake3Hash` is validated (exactly 64 lowercase ASCII hex characters,
+/// never `../` or a multi-byte UTF-8 prefix) at every construction and
+/// deserialization site — see `roundhouse_core::Blake3Hash`'s doc comment.
 fn blob_path(state_dir: &Path, hash: &Blake3Hash) -> PathBuf {
-    let hex = &hash.0;
+    let hex = hash.as_str();
     let shard = &hex[..hex.len().min(2)];
     state_dir.join("blobs").join(shard).join(hex)
 }
@@ -21,7 +24,8 @@ fn blob_path(state_dir: &Path, hash: &Blake3Hash) -> PathBuf {
 /// function only writes the filesystem side; `record_blob_write` (below)
 /// is the caller's separate step for the SQLite index and ref-count bump.
 pub fn write_blob(state_dir: &Path, bytes: &[u8], mime: Option<String>) -> io::Result<BlobRef> {
-    let hash = Blake3Hash(blake3::hash(bytes).to_hex().to_string());
+    let hash = Blake3Hash::from_hex(blake3::hash(bytes).to_hex().to_string())
+        .expect("blake3's own hex digest is always a valid 64-char lowercase hex string");
     let final_path = blob_path(state_dir, &hash);
     if !final_path.exists() {
         if let Some(parent) = final_path.parent() {
@@ -39,6 +43,20 @@ pub fn read_blob(state_dir: &Path, blob_ref: &BlobRef) -> io::Result<Vec<u8>> {
     fs::read(blob_path(state_dir, &blob_ref.hash))
 }
 
+/// A `record_blob_write` call was rejected before touching the index.
+#[derive(Debug, thiserror::Error)]
+pub enum RecordBlobError {
+    /// The caller supplied a `BlobRef` with no backing file at its
+    /// content-addressed path — i.e. something other than `write_blob`
+    /// produced this `BlobRef` (or `write_blob` was never called for it).
+    /// Indexing it anyway would let the `blobs` table diverge from what's
+    /// actually on disk, defeating `read_blob`/GC/quota accounting.
+    #[error("blob {hash} has no file at its content-addressed path under {state_dir}; call write_blob before record_blob_write")]
+    MissingFile { hash: Blake3Hash, state_dir: PathBuf },
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+}
+
 /// Inserts (first reference) or bumps `ref_count` on (subsequent
 /// references — including a duplicate write of identical content) the
 /// `blobs` row for `blob_ref`. **Must be called in the same transaction the
@@ -48,12 +66,29 @@ pub fn read_blob(state_dir: &Path, blob_ref: &BlobRef) -> io::Result<Vec<u8>> {
 /// call site into the real event-append transaction is Phase 1's
 /// `roundhouse-store` work (the same deferral Task 10's Interfaces note
 /// already states for the event-append path itself).
-pub fn record_blob_write(txn: &Transaction, blob_ref: &BlobRef, now: i64) -> rusqlite::Result<()> {
+///
+/// Rejects (`RecordBlobError::MissingFile`) a `blob_ref` whose file isn't
+/// actually present under `state_dir` — e.g. one that arrived via
+/// deserialized/persisted event data rather than a real `write_blob` call
+/// in this process — rather than indexing a row the filesystem can't back.
+pub fn record_blob_write(
+    txn: &Transaction,
+    state_dir: &Path,
+    blob_ref: &BlobRef,
+    now: i64,
+) -> Result<(), RecordBlobError> {
+    let path = blob_path(state_dir, &blob_ref.hash);
+    if fs::metadata(&path).is_err() {
+        return Err(RecordBlobError::MissingFile {
+            hash: blob_ref.hash.clone(),
+            state_dir: state_dir.to_path_buf(),
+        });
+    }
     txn.execute(
         "INSERT INTO blobs (hash, len, mime, created_at, last_referenced_at, ref_count) \
          VALUES (?1, ?2, ?3, ?4, ?4, 1) \
          ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1, last_referenced_at = ?4",
-        params![blob_ref.hash.0, blob_ref.len as i64, blob_ref.mime, now],
+        params![blob_ref.hash.as_str(), blob_ref.len as i64, blob_ref.mime, now],
     )?;
     Ok(())
 }
@@ -64,7 +99,7 @@ pub fn record_blob_write(txn: &Transaction, blob_ref: &BlobRef, now: i64) -> rus
 /// `gc_eligible_blobs`); actual deletion still waits out the grace period
 /// (§4.5) and is a later phase's daemon-scheduled job.
 pub fn decrement_ref_count(txn: &Transaction, hash: &Blake3Hash) -> rusqlite::Result<()> {
-    txn.execute("UPDATE blobs SET ref_count = MAX(ref_count - 1, 0) WHERE hash = ?1", params![hash.0])?;
+    txn.execute("UPDATE blobs SET ref_count = MAX(ref_count - 1, 0) WHERE hash = ?1", params![hash.as_str()])?;
     Ok(())
 }
 
@@ -79,7 +114,14 @@ pub fn gc_eligible_blobs(conn: &Connection, now: i64, grace_period_secs: i64) ->
     let mut stmt = conn.prepare("SELECT hash FROM blobs WHERE ref_count = 0 AND (?1 - last_referenced_at) >= ?2")?;
     let hashes = stmt
         .query_map(params![now, grace_period_secs], |row| row.get::<_, String>(0))?
-        .map(|r| r.map(Blake3Hash))
+        .map(|r| {
+            r.map(|s| {
+                Blake3Hash::from_hex(s).expect(
+                    "blobs.hash only ever contains previously-validated Blake3Hash values, \
+                     written exclusively by record_blob_write",
+                )
+            })
+        })
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(hashes)
 }

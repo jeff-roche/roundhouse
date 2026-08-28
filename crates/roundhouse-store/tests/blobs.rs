@@ -1,7 +1,7 @@
-use roundhouse_core::Blake3Hash;
+use roundhouse_core::{Blake3Hash, BlobRef};
 use roundhouse_store::blobs::{
     decrement_ref_count, gc_eligible_blobs, read_blob, record_blob_write, write_blob,
-    write_blob_with_quota, QuotaError,
+    write_blob_with_quota, QuotaError, RecordBlobError,
 };
 use roundhouse_store::{begin_immediate, migrations, open_memory_connection};
 
@@ -19,7 +19,7 @@ fn writing_identical_content_twice_produces_one_blob_with_ref_count_two() {
     let blob_a = write_blob(dir.path(), b"same content", Some("text/plain".into())).unwrap();
     {
         let txn = begin_immediate(&mut conn).unwrap();
-        record_blob_write(&txn, &blob_a, 1_000).unwrap();
+        record_blob_write(&txn, dir.path(), &blob_a, 1_000).unwrap();
         txn.commit().unwrap();
     }
 
@@ -27,12 +27,12 @@ fn writing_identical_content_twice_produces_one_blob_with_ref_count_two() {
     assert_eq!(blob_a.hash, blob_b.hash, "identical bytes must collide to the same content address");
     {
         let txn = begin_immediate(&mut conn).unwrap();
-        record_blob_write(&txn, &blob_b, 2_000).unwrap();
+        record_blob_write(&txn, dir.path(), &blob_b, 2_000).unwrap();
         txn.commit().unwrap();
     }
 
     let ref_count: i64 = conn
-        .query_row("SELECT ref_count FROM blobs WHERE hash = ?1", [&blob_a.hash.0], |row| row.get(0))
+        .query_row("SELECT ref_count FROM blobs WHERE hash = ?1", [blob_a.hash.as_str()], |row| row.get(0))
         .unwrap();
     assert_eq!(ref_count, 2, "two writes of the same content must bump ref_count to 2, not create two rows");
 
@@ -47,7 +47,7 @@ fn a_blob_with_zero_ref_count_past_the_grace_period_is_gc_eligible() {
     let blob = write_blob(dir.path(), b"orphaned", None).unwrap();
     {
         let txn = begin_immediate(&mut conn).unwrap();
-        record_blob_write(&txn, &blob, 1_000).unwrap();
+        record_blob_write(&txn, dir.path(), &blob, 1_000).unwrap();
         txn.commit().unwrap();
     }
     {
@@ -77,4 +77,25 @@ fn write_beyond_the_configured_quota_is_rejected() {
 
     // A write that fits within the remaining quota still succeeds.
     assert!(write_blob_with_quota(dir.path(), 100, 1_000, &[0u8; 200], None).is_ok());
+}
+
+#[test]
+fn record_blob_write_rejects_a_blob_ref_whose_file_is_missing_on_disk() {
+    // Security fix: record_blob_write must not trust a caller-supplied
+    // BlobRef that didn't come from a real write_blob call in this process
+    // (e.g. one reconstructed from persisted/external event data) — it
+    // must verify the content-addressed file actually exists before
+    // indexing it, or the `blobs` table can diverge from what's on disk.
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = seeded_conn();
+
+    let phantom_hash = "c".repeat(64);
+    let phantom = BlobRef { hash: Blake3Hash::from_hex(phantom_hash).unwrap(), len: 4, mime: None };
+
+    let txn = begin_immediate(&mut conn).unwrap();
+    let result = record_blob_write(&txn, dir.path(), &phantom, 1_000);
+    match result {
+        Err(RecordBlobError::MissingFile { hash, .. }) => assert_eq!(hash, phantom.hash),
+        other => panic!("expected RecordBlobError::MissingFile, got {other:?}"),
+    }
 }
