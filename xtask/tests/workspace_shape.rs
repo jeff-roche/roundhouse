@@ -20,6 +20,7 @@ const EXPECTED_MEMBERS: &[&str] = &[
     "crates/roundhouse-tui",
     "crates/roundhouse-cli",
     "crates/roundhouse-web",
+    "xtask",
 ];
 
 #[test]
