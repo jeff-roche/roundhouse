@@ -1,0 +1,15 @@
+[package]
+name = "roundhouse-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "round-daemon-internal"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+color-eyre = { workspace = true }

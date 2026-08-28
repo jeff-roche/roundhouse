@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/roundhouse-core",
+    "crates/roundhouse-proto",
+    "crates/roundhouse-store",
+    "crates/roundhouse-policy",
+    "crates/roundhouse-sandbox",
+    "crates/roundhouse-provider",
+    "crates/roundhouse-tools",
+    "crates/roundhouse-mcp",
+    "crates/roundhouse-acp",
+    "crates/roundhouse-bus",
+    "crates/roundhouse-engine",
+    "crates/roundhouse-config",
+    "crates/roundhouse-flow",
+    "crates/roundhouse-sched",
+    "crates/roundhouse-daemon",
+    "crates/roundhouse-tui",
+    "crates/roundhouse-cli",
+    "crates/roundhouse-web",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio-util = "0.7.19"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+deadpool-sqlite = "0.14"
+rusqlite_migration = "2.6"
+schemars = "1.2.2"
+thiserror = "2.0.20"
+color-eyre = "0.6.5"
+tracing = "0.1.44"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+
+[profile.release]
+panic = "unwind"
+
+[profile.dev]
+panic = "unwind"

@@ -1,0 +1,12 @@
+[package]
+name = "roundhouse-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints.rust]
+# Confined exception to the workspace-wide forbid: this crate needs raw
+# syscalls (Landlock, seccomp, bwrap exec) behind one module. See src/enforce/unsafe_ops.rs.
+unsafe_code = "deny"
+
+[dependencies]

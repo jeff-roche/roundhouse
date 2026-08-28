@@ -1,0 +1,15 @@
+[package]
+name = "roundhouse-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "round"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+color-eyre = { workspace = true }
