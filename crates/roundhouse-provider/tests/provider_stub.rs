@@ -90,10 +90,10 @@ fn tool_def_input_schema_is_generated_from_a_typed_params_struct() {
         "shell",
         "Run a shell command in the task's working directory",
     );
-    assert_eq!(tool.name, "shell");
+    assert_eq!(tool.name(), "shell");
 
     // Round-trips into a valid, usable serde_json::Value...
-    let schema_value: &serde_json::Value = &tool.input_schema;
+    let schema_value: &serde_json::Value = tool.input_schema();
     assert!(schema_value.is_object(), "input_schema must round-trip into a valid JSON Value");
 
     // ...and matches the expected shape for ShellToolParams specifically.

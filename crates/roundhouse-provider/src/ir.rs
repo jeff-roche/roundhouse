@@ -96,11 +96,30 @@ pub enum MessageRole {
     Assistant,
 }
 
+/// Fields are private: `tool_def_from_schema` (below) is the only
+/// sanctioned constructor (S-TOOL-9, §12.7) — see its doc comment for why.
+/// Read access is via the accessors below; there is deliberately no public
+/// way to construct or mutate a `ToolDef` with a hand-written
+/// `input_schema`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDef {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
+    name: String,
+    description: String,
+    input_schema: Value,
+}
+
+impl ToolDef {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn input_schema(&self) -> &Value {
+        &self.input_schema
+    }
 }
 
 /// S-TOOL-9 (§12.7) — Phase 0 contract: a tool's `input_schema` is always
