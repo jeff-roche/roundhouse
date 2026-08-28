@@ -10,3 +10,10 @@ license.workspace = true
 unsafe_code = "deny"
 
 [dependencies]
+roundhouse-core = { path = "../roundhouse-core" }
+async-trait = "0.1"
+tokio = { workspace = true }
+thiserror = "2.0"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
