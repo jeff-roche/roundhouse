@@ -19,6 +19,9 @@ CREATE TABLE events (
 
 CREATE INDEX events_task_id_idx ON events (task_id) WHERE task_id IS NOT NULL;
 
+-- S-LOG-2: events table is append-only by design (source of truth for
+-- the whole system). These triggers enforce immutability at the
+-- database level, not by application convention — do not drop them.
 CREATE TRIGGER events_no_update
 BEFORE UPDATE ON events
 BEGIN
