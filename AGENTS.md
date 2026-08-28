@@ -4,18 +4,17 @@ Guidance for coding agents working in this repository.
 
 ## Project status
 
-Pre-Phase 0: no Cargo workspace exists yet. `docs/architecture/` is the
-frozen design (committed, reference truth). `docs/superpowers/plans/`,
-`docs/audits/`, and `docs/scratch/` hold the phase-by-phase implementation
-plans, audit findings, and scratch notes — they exist locally but are
-gitignored, so don't expect them on a fresh clone. Phase 0
-(`docs/superpowers/plans/2026-08-27-phase0-contracts.md`) is what creates the
-workspace and the shared contracts every later phase depends on.
+Phase 0 implementation in progress: Task 1 (Cargo workspace skeleton) is complete;
+Tasks 2–14 remain. `docs/architecture/` is the frozen design (committed, reference
+truth). `docs/superpowers/plans/`, `docs/audits/`, and `docs/scratch/` hold the
+phase-by-phase implementation plans, audit findings, and scratch notes — they exist
+locally but are gitignored, so don't expect them on a fresh clone. Phase 0
+(`docs/superpowers/plans/2026-08-27-phase0-contracts.md`) creates the workspace
+and the shared contracts every later phase depends on.
 
 ## Commands
 
-Nothing builds yet. Once Phase 0 lands and the Cargo workspace exists, the
-standard commands apply:
+The Cargo workspace exists and builds as of Task 1. Standard commands now apply:
 
 - Build everything: `cargo build --workspace`
 - Test everything: `cargo test --workspace`
