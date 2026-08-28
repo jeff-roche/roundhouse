@@ -25,4 +25,5 @@ roundhouse-bus = { path = "../roundhouse-bus" }
 roundhouse-engine = { path = "../roundhouse-engine" }
 roundhouse-flow = { path = "../roundhouse-flow" }
 roundhouse-sched = { path = "../roundhouse-sched" }
+roundhouse-config = { path = "../roundhouse-config" }
 color-eyre = { workspace = true }

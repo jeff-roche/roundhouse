@@ -465,6 +465,11 @@ dependencies = [
 [[package]]
 name = "roundhouse-config"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "toml 0.8.23",
+]
 
 [[package]]
 name = "roundhouse-core"
@@ -486,6 +491,7 @@ dependencies = [
  "color-eyre",
  "roundhouse-acp",
  "roundhouse-bus",
+ "roundhouse-config",
  "roundhouse-core",
  "roundhouse-engine",
  "roundhouse-flow",
