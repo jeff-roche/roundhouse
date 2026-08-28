@@ -8,3 +8,9 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+roundhouse-core = { path = "../roundhouse-core" }
+async-trait = "0.1"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
