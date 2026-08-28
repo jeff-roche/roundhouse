@@ -61,6 +61,19 @@ CREATE VIRTUAL TABLE tasks_fts USING fts5(
 );
 "#;
 
+const MIGRATION_0002_BLOBS: &str = r#"
+CREATE TABLE blobs (
+    hash               TEXT    PRIMARY KEY,
+    len                INTEGER NOT NULL,
+    mime               TEXT,
+    created_at         INTEGER NOT NULL,
+    last_referenced_at INTEGER NOT NULL,
+    ref_count          INTEGER NOT NULL DEFAULT 0
+) STRICT;
+
+CREATE INDEX blobs_gc_eligible_idx ON blobs (ref_count, last_referenced_at) WHERE ref_count = 0;
+"#;
+
 pub fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(MIGRATION_0001_INITIAL_SCHEMA)])
+    Migrations::new(vec![M::up(MIGRATION_0001_INITIAL_SCHEMA), M::up(MIGRATION_0002_BLOBS)])
 }

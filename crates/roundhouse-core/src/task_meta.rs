@@ -77,12 +77,15 @@ pub enum SuspendReason {
 pub enum TaskInput {
     Json(serde_json::Value),
     Text(String),
+    /// §4.5 — payload routed to the blob store instead of inlined.
+    Blob(crate::blob::BlobRef),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum TaskOutput {
     Json(serde_json::Value),
     Text(String),
+    Blob(crate::blob::BlobRef),
 }
 
 /// `category` is a free-string tag rather than a closed enum (unlike

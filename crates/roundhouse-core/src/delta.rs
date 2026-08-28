@@ -21,6 +21,11 @@ pub enum Delta {
     ToolArgs { fragment: String },
     /// Pointer to a child session's event.
     Child { session: SessionId, seq: u64 },
+    /// §4.5 — a streamed chunk that crossed `BLOB_INLINE_THRESHOLD` (rare —
+    /// most deltas are small by nature, but e.g. a single oversized
+    /// `Stdout` chunk can still exceed it) and was routed to the blob store
+    /// instead of inlined in the event row.
+    Blob(crate::blob::BlobRef),
 }
 
 // serde has no built-in Bytes support without pulling in `serde_bytes`;

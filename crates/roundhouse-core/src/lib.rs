@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod address;
+mod blob;
 mod delta;
 mod error;
 mod event;
@@ -15,6 +16,7 @@ mod tier;
 mod timestamp;
 
 pub use address::Address;
+pub use blob::{Blake3Hash, BlobRef, BLOB_INLINE_THRESHOLD};
 pub use delta::Delta;
 pub use error::CoreError;
 pub use event::{Event, EventPayload};
