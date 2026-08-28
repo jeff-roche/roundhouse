@@ -1,0 +1,22 @@
+error: cannot construct `Event` with struct literal syntax due to private fields
+  --> tests/ui/event_literal_construction_fails.rs:7:18
+   |
+ 7 |     let _event = roundhouse_core::Event {
+   |                  ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: ...and other private field `_seal` that was not provided
+help: you might have meant to use the `new_sealed` associated function
+   |
+ 7 -     let _event = roundhouse_core::Event {
+ 8 -         session_id: roundhouse_core::SessionId::new(),
+ 9 -         seq: 1,
+10 -         ts: roundhouse_core::Timestamp::from_unix_nanos(0),
+11 -         task_id: None,
+12 -         payload: roundhouse_core::EventPayload::Note {
+13 -             level: roundhouse_core::NoteLevel::Info,
+14 -             text: "bypass attempt".into(),
+15 -         },
+16 -         schema_v: 1,
+17 -     };
+ 7 +     let _event = roundhouse_core::Event::new_sealed(_, _, _, _, _, _);
+   |

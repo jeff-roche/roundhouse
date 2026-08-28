@@ -5,10 +5,12 @@ mod delta;
 mod error;
 mod event;
 mod ids;
+mod seal;
 mod session;
 mod task;
 mod task_kind;
 mod task_meta;
+mod task_runner;
 mod tier;
 mod timestamp;
 
@@ -24,5 +26,6 @@ pub use task_meta::{
     CancelReason, Envelope, Handle, IsolationAttestation, NoteLevel, Origin, PolicyDecision,
     Progress, RuleId, SuspendReason, TaskError, TaskInput, TaskOutput, Usage,
 };
+pub use task_runner::TaskRunner;
 pub use tier::Tier;
 pub use timestamp::Timestamp;
