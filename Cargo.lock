@@ -344,6 +344,11 @@ version = "0.1.0"
 [[package]]
 name = "roundhouse-policy"
 version = "0.1.0"
+dependencies = [
+ "roundhouse-core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "roundhouse-proto"
