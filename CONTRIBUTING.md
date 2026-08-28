@@ -33,5 +33,5 @@ in the phase implementation plans.
 
 ## License
 
-By contributing, you agree that your contributions will be dual-licensed
-under the [MIT](LICENSE-MIT) and [Apache 2.0](LICENSE-APACHE) licenses.
+By contributing, you agree that your contributions will be licensed under
+the [MIT license](LICENSE).
