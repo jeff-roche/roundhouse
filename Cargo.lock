@@ -363,6 +363,13 @@ dependencies = [
 [[package]]
 name = "roundhouse-provider"
 version = "0.1.0"
+dependencies = [
+ "roundhouse-core",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "roundhouse-sandbox"
