@@ -1,0 +1,74 @@
+---
+source: crates/roundhouse-provider/tests/anthropic_messages_encode.rs
+expression: body
+---
+{
+  "max_tokens": 2048,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Edit main.rs",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "signature": "sig-abc123",
+          "thinking": "I should read the file first.",
+          "type": "thinking"
+        },
+        {
+          "id": "toolu_1",
+          "input": {
+            "path": "main.rs"
+          },
+          "name": "read",
+          "type": "tool_use"
+        }
+      ],
+      "role": "assistant"
+    }
+  ],
+  "model": "claude-sonnet-5",
+  "stream": true,
+  "system": [
+    {
+      "cache_control": {
+        "type": "ephemeral"
+      },
+      "text": "You are a careful coding agent.",
+      "type": "text"
+    }
+  ],
+  "thinking": {
+    "budget_tokens": 10000,
+    "type": "enabled"
+  },
+  "tool_choice": {
+    "type": "auto"
+  },
+  "tools": [
+    {
+      "description": "Read a file",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Test params struct for the \"read\" tool.",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "ReadParams",
+        "type": "object"
+      },
+      "name": "read"
+    }
+  ]
+}
