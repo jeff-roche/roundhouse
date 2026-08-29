@@ -26,7 +26,11 @@ fn task_input_output_and_delta_all_carry_a_blob_variant() {
     // after adapters and tools already assume inline payloads" is the cost
     // this task exists to avoid — so all three frozen types must have the
     // variant now, not just one of them.
-    let blob = BlobRef { hash: Blake3Hash::from_hex(TEST_HASH_2).unwrap(), len: 1_000_000, mime: None };
+    let blob = BlobRef {
+        hash: Blake3Hash::from_hex(TEST_HASH_2).unwrap(),
+        len: 1_000_000,
+        mime: None,
+    };
 
     match TaskInput::Blob(blob.clone()) {
         TaskInput::Blob(b) => assert_eq!(b, blob),
@@ -52,7 +56,10 @@ fn task_input_output_and_delta_all_carry_a_blob_variant() {
 #[test]
 fn blake3_hash_rejects_a_path_traversal_string_at_construction() {
     let result = Blake3Hash::from_hex("../../../etc/passwd");
-    assert!(result.is_err(), "a path-traversal string must never construct a Blake3Hash");
+    assert!(
+        result.is_err(),
+        "a path-traversal string must never construct a Blake3Hash"
+    );
 }
 
 #[test]
@@ -84,7 +91,10 @@ fn blake3_hash_rejects_a_string_starting_with_a_multi_byte_utf8_character() {
 fn blake3_hash_rejects_wrong_length_and_uppercase_strings() {
     assert!(Blake3Hash::from_hex("abc123").is_err(), "too short");
     assert!(Blake3Hash::from_hex("a".repeat(65)).is_err(), "too long");
-    assert!(Blake3Hash::from_hex("A".repeat(64)).is_err(), "uppercase hex is not accepted");
+    assert!(
+        Blake3Hash::from_hex("A".repeat(64)).is_err(),
+        "uppercase hex is not accepted"
+    );
 }
 
 #[test]

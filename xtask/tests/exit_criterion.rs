@@ -13,11 +13,17 @@ use std::process::Command;
 /// all targets, compiles. Only both together are the real exit criterion.
 #[test]
 fn downstream_crates_declare_required_dependency_edges() {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
 
     // (crate, required path-dependency edges per §5.2 / this task's brief)
     const REQUIRED_EDGES: &[(&str, &[&str])] = &[
-        ("roundhouse-tools", &["roundhouse-core", "roundhouse-sandbox", "roundhouse-policy"]),
+        (
+            "roundhouse-tools",
+            &["roundhouse-core", "roundhouse-sandbox", "roundhouse-policy"],
+        ),
         ("roundhouse-mcp", &["roundhouse-core", "roundhouse-policy"]),
         ("roundhouse-acp", &["roundhouse-core", "roundhouse-proto"]),
         (
@@ -31,8 +37,14 @@ fn downstream_crates_declare_required_dependency_edges() {
                 "roundhouse-bus",
             ],
         ),
-        ("roundhouse-flow", &["roundhouse-core", "roundhouse-engine", "roundhouse-store"]),
-        ("roundhouse-sched", &["roundhouse-core", "roundhouse-engine", "roundhouse-store"]),
+        (
+            "roundhouse-flow",
+            &["roundhouse-core", "roundhouse-engine", "roundhouse-store"],
+        ),
+        (
+            "roundhouse-sched",
+            &["roundhouse-core", "roundhouse-engine", "roundhouse-store"],
+        ),
         (
             "roundhouse-daemon",
             &[
@@ -63,8 +75,9 @@ fn downstream_crates_declare_required_dependency_edges() {
         let manifest_path = workspace_root.join("crates").join(krate).join("Cargo.toml");
         let manifest = fs::read_to_string(&manifest_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
-        let parsed: toml::Value =
-            manifest.parse().unwrap_or_else(|e| panic!("parse {}: {e}", manifest_path.display()));
+        let parsed: toml::Value = manifest
+            .parse()
+            .unwrap_or_else(|e| panic!("parse {}: {e}", manifest_path.display()));
         let deps_table = parsed
             .get("dependencies")
             .and_then(|d| d.as_table())
@@ -87,7 +100,9 @@ fn downstream_crates_declare_required_dependency_edges() {
 /// effect of other tests passing.
 #[test]
 fn cargo_check_workspace_succeeds() {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
     let status = Command::new("cargo")
         .arg("check")
         .arg("--workspace")
@@ -95,5 +110,8 @@ fn cargo_check_workspace_succeeds() {
         .current_dir(workspace_root)
         .status()
         .expect("cargo must be on PATH");
-    assert!(status.success(), "cargo check --workspace --all-targets must succeed (Phase 0 exit criterion, §13.2)");
+    assert!(
+        status.success(),
+        "cargo check --workspace --all-targets must succeed (Phase 0 exit criterion, §13.2)"
+    );
 }

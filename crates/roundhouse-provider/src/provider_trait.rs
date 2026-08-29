@@ -1,4 +1,7 @@
-use crate::ir::{Capabilities, ChatRequest, ChatStream, ModelId, ModelInfo, Plan, ProviderError, RequestCtx, TokenCount};
+use crate::ir::{
+    Capabilities, ChatRequest, ChatStream, ModelId, ModelInfo, Plan, ProviderError, RequestCtx,
+    TokenCount,
+};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -25,7 +28,10 @@ pub trait Provider: Send + Sync + 'static {
         ctx: &'a RequestCtx,
     ) -> BoxFut<'a, Result<TokenCount, ProviderError>>;
 
-    fn list_models<'a>(&'a self, _ctx: &'a RequestCtx) -> BoxFut<'a, Result<Vec<ModelInfo>, ProviderError>> {
+    fn list_models<'a>(
+        &'a self,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<Vec<ModelInfo>, ProviderError>> {
         Box::pin(async { Err(ProviderError::Unsupported("list_models".into())) })
     }
 }

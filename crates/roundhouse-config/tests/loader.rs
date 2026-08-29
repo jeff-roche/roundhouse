@@ -3,8 +3,10 @@ use std::fs;
 use std::path::PathBuf;
 
 fn temp_dir_for(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir()
-        .join(format!("roundhouse-config-test-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "roundhouse-config-test-{name}-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).expect("create temp test dir");
     dir
 }
@@ -51,8 +53,16 @@ fn nested_tables_deep_merge_rather_than_replace_wholesale() {
     let dir = temp_dir_for("deepmerge");
     let user_path = dir.join("user.toml");
     let project_path = dir.join("project.toml");
-    fs::write(&user_path, "[providers.anthropic]\nbase_url = \"https://api.anthropic.com\"\n").unwrap();
-    fs::write(&project_path, "[providers.anthropic]\ndefault_model = \"claude-opus\"\n").unwrap();
+    fs::write(
+        &user_path,
+        "[providers.anthropic]\nbase_url = \"https://api.anthropic.com\"\n",
+    )
+    .unwrap();
+    fs::write(
+        &project_path,
+        "[providers.anthropic]\ndefault_model = \"claude-opus\"\n",
+    )
+    .unwrap();
 
     let loaded = ConfigLoader::new()
         .with_layer(ConfigScope::UserGlobal, &user_path)
@@ -70,7 +80,10 @@ fn nested_tables_deep_merge_rather_than_replace_wholesale() {
         "Project layer must not wholesale-replace the [providers.anthropic] table — \
          base_url from UserGlobal must survive the merge"
     );
-    assert_eq!(anthropic.get("default_model").and_then(|v| v.as_str()), Some("claude-opus"));
+    assert_eq!(
+        anthropic.get("default_model").and_then(|v| v.as_str()),
+        Some("claude-opus")
+    );
 }
 
 #[test]
@@ -83,7 +96,10 @@ fn secret_ref_round_trips_through_toml_without_holding_material() {
     )
     .unwrap();
 
-    let loaded = ConfigLoader::new().with_layer(ConfigScope::UserGlobal, &path).load().expect("load succeeds");
+    let loaded = ConfigLoader::new()
+        .with_layer(ConfigScope::UserGlobal, &path)
+        .load()
+        .expect("load succeeds");
 
     let raw = loaded
         .get("providers")
@@ -94,6 +110,14 @@ fn secret_ref_round_trips_through_toml_without_holding_material() {
     // NOTE for whoever executes this task: confirm `toml::Value::try_into::<T>()` is
     // the correct conversion call for the pinned `toml` 0.8 — if the real API differs,
     // fix this call site only, the SecretRef type itself does not change.
-    let secret: SecretRef = raw.try_into().expect("api_key must deserialize into SecretRef");
-    assert_eq!(secret, SecretRef::Keyring { service: "roundhouse".into(), account: "anthropic".into() });
+    let secret: SecretRef = raw
+        .try_into()
+        .expect("api_key must deserialize into SecretRef");
+    assert_eq!(
+        secret,
+        SecretRef::Keyring {
+            service: "roundhouse".into(),
+            account: "anthropic".into()
+        }
+    );
 }

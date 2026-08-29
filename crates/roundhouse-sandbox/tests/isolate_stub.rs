@@ -11,19 +11,35 @@ impl Isolate for NoopIsolate {
     }
 
     async fn probe(&self) -> ProbeResult {
-        ProbeResult { achieved: Tier::None, degradations: vec![] }
+        ProbeResult {
+            achieved: Tier::None,
+            degradations: vec![],
+        }
     }
 
-    async fn prepare(&self, _spec: &roundhouse_core::SessionSpec) -> Result<Handle, IsolationError> {
+    async fn prepare(
+        &self,
+        _spec: &roundhouse_core::SessionSpec,
+    ) -> Result<Handle, IsolationError> {
         Ok(Handle { id: "noop".into() })
     }
 
-    async fn spawn(&self, _h: &Handle, _cmd: CommandSpec) -> Result<roundhouse_sandbox::Child, IsolationError> {
-        Err(IsolationError::Unsupported("NoopIsolate never actually spawns".into()))
+    async fn spawn(
+        &self,
+        _h: &Handle,
+        _cmd: CommandSpec,
+    ) -> Result<roundhouse_sandbox::Child, IsolationError> {
+        Err(IsolationError::Unsupported(
+            "NoopIsolate never actually spawns".into(),
+        ))
     }
 
     fn attest(&self, h: &Handle) -> Attestation {
-        Attestation { tier: Tier::None, digest: format!("noop:{}", h.id), net_enforced: false }
+        Attestation {
+            tier: Tier::None,
+            digest: format!("noop:{}", h.id),
+            net_enforced: false,
+        }
     }
 
     async fn teardown(&self, _h: Handle) -> Result<(), IsolationError> {

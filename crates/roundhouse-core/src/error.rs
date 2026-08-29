@@ -12,7 +12,10 @@ pub enum CoreError {
     UnknownSchemaVersion { found: u16, max_known: u16 },
 
     #[error("task {task} is not in a valid state for this transition: {reason}")]
-    InvalidTaskTransition { task: crate::ids::TaskId, reason: String },
+    InvalidTaskTransition {
+        task: crate::ids::TaskId,
+        reason: String,
+    },
 
     #[error("invalid task state string: {0:?}")]
     InvalidTaskState(String),

@@ -11,7 +11,10 @@ impl Policy for AlwaysAsk {
 
 #[test]
 fn task_params_shell_variant_carries_a_parsed_command() {
-    let params = TaskParams::Shell(ParsedCommand { program: "ls".into(), argv: vec!["-la".into()] });
+    let params = TaskParams::Shell(ParsedCommand {
+        program: "ls".into(),
+        argv: vec!["-la".into()],
+    });
     match params {
         TaskParams::Shell(cmd) => assert_eq!(cmd.program, "ls"),
         _ => panic!("wrong variant"),
@@ -35,7 +38,10 @@ fn task_params_fs_variant_carries_op_and_canonical_result() {
 fn policy_trait_is_object_safe_and_stubbable() {
     let policy: Box<dyn Policy> = Box::new(AlwaysAsk);
     let input = PolicyInput {
-        params: TaskParams::Shell(ParsedCommand { program: "git".into(), argv: vec!["status".into()] }),
+        params: TaskParams::Shell(ParsedCommand {
+            program: "git".into(),
+            argv: vec!["status".into()],
+        }),
         taint: roundhouse_policy::Taint::Trusted,
     };
     assert_eq!(policy.decide(&input), PolicyDecision::Ask);

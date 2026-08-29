@@ -3,7 +3,9 @@ use roundhouse_store::{migrations, open_memory_connection};
 #[test]
 fn migrations_create_events_tasks_and_fts_tables() {
     let mut conn = open_memory_connection();
-    migrations().to_latest(&mut conn).expect("migrations apply cleanly");
+    migrations()
+        .to_latest(&mut conn)
+        .expect("migrations apply cleanly");
 
     let table_names: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger')")
@@ -13,7 +15,13 @@ fn migrations_create_events_tasks_and_fts_tables() {
         .map(|r| r.unwrap())
         .collect();
 
-    for expected in ["events", "tasks", "tasks_fts", "events_no_update", "events_no_delete"] {
+    for expected in [
+        "events",
+        "tasks",
+        "tasks_fts",
+        "events_no_update",
+        "events_no_delete",
+    ] {
         assert!(
             table_names.iter().any(|n| n == expected),
             "expected {expected} to exist after migration, found {table_names:?}"
@@ -36,7 +44,10 @@ fn events_primary_key_is_session_id_and_seq() {
         "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params!["session-a", 1i64, 1i64, Option::<String>::None, "{}", 1i64],
     );
-    assert!(duplicate.is_err(), "duplicate (session_id, seq) must violate the primary key");
+    assert!(
+        duplicate.is_err(),
+        "duplicate (session_id, seq) must violate the primary key"
+    );
 }
 
 #[test]
@@ -51,14 +62,36 @@ fn tasks_state_column_rejects_unrecognized_values_and_accepts_known_ones() {
     let valid = conn.execute(
         "INSERT INTO tasks (task_id, session_id, kind, state, parent, created_seq, updated_seq) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params!["task-a", "session-a", "Shell", "Running", Option::<String>::None, 1i64, 1i64],
+        rusqlite::params![
+            "task-a",
+            "session-a",
+            "Shell",
+            "Running",
+            Option::<String>::None,
+            1i64,
+            1i64
+        ],
     );
-    assert!(valid.is_ok(), "a recognized TaskState discriminant must be accepted: {valid:?}");
+    assert!(
+        valid.is_ok(),
+        "a recognized TaskState discriminant must be accepted: {valid:?}"
+    );
 
     let invalid = conn.execute(
         "INSERT INTO tasks (task_id, session_id, kind, state, parent, created_seq, updated_seq) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params!["task-b", "session-a", "Shell", "bogus", Option::<String>::None, 1i64, 1i64],
+        rusqlite::params![
+            "task-b",
+            "session-a",
+            "Shell",
+            "bogus",
+            Option::<String>::None,
+            1i64,
+            1i64
+        ],
     );
-    assert!(invalid.is_err(), "an unrecognized state string must violate the CHECK constraint");
+    assert!(
+        invalid.is_err(),
+        "an unrecognized state string must violate the CHECK constraint"
+    );
 }

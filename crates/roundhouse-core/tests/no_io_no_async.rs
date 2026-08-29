@@ -21,8 +21,14 @@ fn source_tree_contains_no_io_or_async_keywords() {
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     for entry in walk(&src_dir) {
         let text = fs::read_to_string(&entry).unwrap();
-        assert!(!text.contains("std::fs"), "{entry:?} touches std::fs — core must have zero I/O");
-        assert!(!text.contains("std::net"), "{entry:?} touches std::net — core must have zero I/O");
+        assert!(
+            !text.contains("std::fs"),
+            "{entry:?} touches std::fs — core must have zero I/O"
+        );
+        assert!(
+            !text.contains("std::net"),
+            "{entry:?} touches std::net — core must have zero I/O"
+        );
         assert!(
             !text.contains("async fn") && !text.contains("async move") && !text.contains("async {"),
             "{entry:?} uses `async` — core must have zero async"

@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 /// `IsolationAttestation`, which is part of `EventPayload`, needs it and
 /// core has zero dependencies. `roundhouse-sandbox` re-exports this type
 /// rather than redefining it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 pub enum Tier {
     None,
     Worktree,

@@ -13,7 +13,9 @@ fn client_event_schema_emits_valid_json_schema_with_expected_properties() {
 
 #[test]
 fn client_request_round_trips_through_json() {
-    let req = ClientRequest::CreateSession { workspace_name: "demo".into() };
+    let req = ClientRequest::CreateSession {
+        workspace_name: "demo".into(),
+    };
     let json = serde_json::to_string(&req).unwrap();
     let back: ClientRequest = serde_json::from_str(&json).unwrap();
     match back {

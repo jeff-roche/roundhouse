@@ -35,7 +35,11 @@ pub fn write_blob(state_dir: &Path, bytes: &[u8], mime: Option<String>) -> io::R
         fs::write(&tmp_path, bytes)?;
         fs::rename(&tmp_path, &final_path)?;
     }
-    Ok(BlobRef { hash, len: bytes.len() as u64, mime })
+    Ok(BlobRef {
+        hash,
+        len: bytes.len() as u64,
+        mime,
+    })
 }
 
 /// Reads a blob's raw bytes back off disk.
@@ -52,7 +56,10 @@ pub enum RecordBlobError {
     /// Indexing it anyway would let the `blobs` table diverge from what's
     /// actually on disk, defeating `read_blob`/GC/quota accounting.
     #[error("blob {hash} has no file at its content-addressed path under {state_dir}; call write_blob before record_blob_write")]
-    MissingFile { hash: Blake3Hash, state_dir: PathBuf },
+    MissingFile {
+        hash: Blake3Hash,
+        state_dir: PathBuf,
+    },
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
 }
@@ -88,7 +95,12 @@ pub fn record_blob_write(
         "INSERT INTO blobs (hash, len, mime, created_at, last_referenced_at, ref_count) \
          VALUES (?1, ?2, ?3, ?4, ?4, 1) \
          ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1, last_referenced_at = ?4",
-        params![blob_ref.hash.as_str(), blob_ref.len as i64, blob_ref.mime, now],
+        params![
+            blob_ref.hash.as_str(),
+            blob_ref.len as i64,
+            blob_ref.mime,
+            now
+        ],
     )?;
     Ok(())
 }
@@ -99,7 +111,10 @@ pub fn record_blob_write(
 /// `gc_eligible_blobs`); actual deletion still waits out the grace period
 /// (§4.5) and is a later phase's daemon-scheduled job.
 pub fn decrement_ref_count(txn: &Transaction, hash: &Blake3Hash) -> rusqlite::Result<()> {
-    txn.execute("UPDATE blobs SET ref_count = MAX(ref_count - 1, 0) WHERE hash = ?1", params![hash.as_str()])?;
+    txn.execute(
+        "UPDATE blobs SET ref_count = MAX(ref_count - 1, 0) WHERE hash = ?1",
+        params![hash.as_str()],
+    )?;
     Ok(())
 }
 
@@ -110,10 +125,18 @@ pub fn decrement_ref_count(txn: &Transaction, hash: &Blake3Hash) -> rusqlite::Re
 /// task that calls this on a schedule, and the file deletion + `Note`-event
 /// logging §4.5 requires on top of it, are `roundhouse-daemon` work for a
 /// later phase — this task ships the pure query they'll call.
-pub fn gc_eligible_blobs(conn: &Connection, now: i64, grace_period_secs: i64) -> rusqlite::Result<Vec<Blake3Hash>> {
-    let mut stmt = conn.prepare("SELECT hash FROM blobs WHERE ref_count = 0 AND (?1 - last_referenced_at) >= ?2")?;
+pub fn gc_eligible_blobs(
+    conn: &Connection,
+    now: i64,
+    grace_period_secs: i64,
+) -> rusqlite::Result<Vec<Blake3Hash>> {
+    let mut stmt = conn.prepare(
+        "SELECT hash FROM blobs WHERE ref_count = 0 AND (?1 - last_referenced_at) >= ?2",
+    )?;
     let hashes = stmt
-        .query_map(params![now, grace_period_secs], |row| row.get::<_, String>(0))?
+        .query_map(params![now, grace_period_secs], |row| {
+            row.get::<_, String>(0)
+        })?
         .map(|r| {
             r.map(|s| {
                 Blake3Hash::from_hex(s).expect(
@@ -132,7 +155,11 @@ pub enum QuotaError {
         "writing {attempted_bytes} more bytes would exceed the workspace's {quota_bytes}-byte \
          blob quota (currently at {current_usage_bytes})"
     )]
-    WouldExceedQuota { current_usage_bytes: u64, attempted_bytes: u64, quota_bytes: u64 },
+    WouldExceedQuota {
+        current_usage_bytes: u64,
+        attempted_bytes: u64,
+        quota_bytes: u64,
+    },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -160,7 +187,11 @@ pub fn write_blob_with_quota(
 ) -> Result<BlobRef, QuotaError> {
     let attempted_bytes = bytes.len() as u64;
     if current_usage_bytes + attempted_bytes > quota_bytes {
-        return Err(QuotaError::WouldExceedQuota { current_usage_bytes, attempted_bytes, quota_bytes });
+        return Err(QuotaError::WouldExceedQuota {
+            current_usage_bytes,
+            attempted_bytes,
+            quota_bytes,
+        });
     }
     Ok(write_blob(state_dir, bytes, mime)?)
 }

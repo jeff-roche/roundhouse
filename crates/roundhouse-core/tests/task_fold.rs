@@ -14,9 +14,16 @@ fn fold_task_state_derives_each_state_from_a_realistic_event_sequence() {
             origin: Origin::Model,
             input: roundhouse_core::TaskInput::Text("ls".into()),
         },
-        EventPayload::TaskDecided { decision: PolicyDecision::Allow, rule: None },
+        EventPayload::TaskDecided {
+            decision: PolicyDecision::Allow,
+            rule: None,
+        },
         EventPayload::TaskStarted {
-            isolation: IsolationAttestation { tier: Tier::Worktree, digest: "d".into(), net_enforced: true },
+            isolation: IsolationAttestation {
+                tier: Tier::Worktree,
+                digest: "d".into(),
+                net_enforced: true,
+            },
             handle: None,
         },
         EventPayload::TaskCompleted {
@@ -24,7 +31,10 @@ fn fold_task_state_derives_each_state_from_a_realistic_event_sequence() {
             usage: roundhouse_core::Usage::default(),
         },
     ];
-    assert_eq!(roundhouse_core::fold_task_state(&happy_path), Some(TaskState::Completed));
+    assert_eq!(
+        roundhouse_core::fold_task_state(&happy_path),
+        Some(TaskState::Completed)
+    );
 
     // Created -> Decided -> Running -> Suspended (awaiting approval)
     let suspended_path = vec![
@@ -34,12 +44,21 @@ fn fold_task_state_derives_each_state_from_a_realistic_event_sequence() {
             origin: Origin::Model,
             input: roundhouse_core::TaskInput::Text("rm -rf /".into()),
         },
-        EventPayload::TaskDecided { decision: PolicyDecision::Ask, rule: None },
+        EventPayload::TaskDecided {
+            decision: PolicyDecision::Ask,
+            rule: None,
+        },
         EventPayload::TaskStarted {
-            isolation: IsolationAttestation { tier: Tier::Worktree, digest: "d".into(), net_enforced: true },
+            isolation: IsolationAttestation {
+                tier: Tier::Worktree,
+                digest: "d".into(),
+                net_enforced: true,
+            },
             handle: None,
         },
-        EventPayload::TaskSuspended { reason: SuspendReason::AwaitingApproval },
+        EventPayload::TaskSuspended {
+            reason: SuspendReason::AwaitingApproval,
+        },
     ];
     assert_eq!(
         roundhouse_core::fold_task_state(&suspended_path),
@@ -54,9 +73,15 @@ fn fold_task_state_derives_each_state_from_a_realistic_event_sequence() {
             origin: Origin::User,
             input: roundhouse_core::TaskInput::Text("sleep 100".into()),
         },
-        EventPayload::TaskCancelled { by: Origin::User, reason: CancelReason::User },
+        EventPayload::TaskCancelled {
+            by: Origin::User,
+            reason: CancelReason::User,
+        },
     ];
-    assert_eq!(roundhouse_core::fold_task_state(&cancelled_path), Some(TaskState::Cancelled));
+    assert_eq!(
+        roundhouse_core::fold_task_state(&cancelled_path),
+        Some(TaskState::Cancelled)
+    );
 
     // No task-lifecycle events at all: no state to derive.
     assert_eq!(roundhouse_core::fold_task_state(&[]), None);

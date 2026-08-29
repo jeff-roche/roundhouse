@@ -27,7 +27,10 @@ fn no_file_contains_raw_update_events_sql() {
         .into_iter()
         .filter(|(path, _)| !path.ends_with("roundhouse-store/tests/append_only.rs"))
         .collect();
-    assert!(violations.is_empty(), "raw UPDATE events found outside the trigger definition: {violations:?}");
+    assert!(
+        violations.is_empty(),
+        "raw UPDATE events found outside the trigger definition: {violations:?}"
+    );
 }
 
 #[test]
@@ -49,7 +52,10 @@ fn no_file_contains_raw_delete_from_events_sql() {
         .into_iter()
         .filter(|(path, _)| !path.ends_with("roundhouse-store/tests/append_only.rs"))
         .collect();
-    assert!(violations.is_empty(), "raw DELETE FROM events found outside the trigger definition: {violations:?}");
+    assert!(
+        violations.is_empty(),
+        "raw DELETE FROM events found outside the trigger definition: {violations:?}"
+    );
 }
 
 /// Positive test: verify the scanner actually DETECTS raw UPDATE events
@@ -60,14 +66,19 @@ fn scanner_detects_raw_update_events_when_present() {
     // Create a temporary test directory isolated from crates/ to avoid
     // interfering with other tests' scans of the live workspace.
     // Use std::env::temp_dir() so this never conflicts with production scanning.
-    let thread_id = format!("{:?}", std::thread::current().id()).replace("ThreadId(", "").replace(")", "");
+    let thread_id = format!("{:?}", std::thread::current().id())
+        .replace("ThreadId(", "")
+        .replace(")", "");
     let temp_root = std::env::temp_dir().join(format!("xtask_test_update_{}", thread_id));
     let _ = fs::remove_dir_all(&temp_root); // Clean up from any previous failed run
     fs::create_dir_all(&temp_root).expect("failed to create temp test directory");
 
     let test_file = temp_root.join("violation.rs");
-    fs::write(&test_file, "let sql = \"UPDATE events SET payload = 'tampered'\";")
-        .expect("failed to write temp test file");
+    fs::write(
+        &test_file,
+        "let sql = \"UPDATE events SET payload = 'tampered'\";",
+    )
+    .expect("failed to write temp test file");
 
     // Scan only the isolated temp directory (not the live workspace)
     let hits = scan_dir_for(&temp_root, |line| {
@@ -101,14 +112,19 @@ fn scanner_detects_raw_delete_events_when_present() {
     // Create a temporary test directory isolated from crates/ to avoid
     // interfering with other tests' scans of the live workspace.
     // Use std::env::temp_dir() so this never conflicts with production scanning.
-    let thread_id = format!("{:?}", std::thread::current().id()).replace("ThreadId(", "").replace(")", "");
+    let thread_id = format!("{:?}", std::thread::current().id())
+        .replace("ThreadId(", "")
+        .replace(")", "");
     let temp_root = std::env::temp_dir().join(format!("xtask_test_delete_{}", thread_id));
     let _ = fs::remove_dir_all(&temp_root); // Clean up from any previous failed run
     fs::create_dir_all(&temp_root).expect("failed to create temp test directory");
 
     let test_file = temp_root.join("violation.rs");
-    fs::write(&test_file, "let sql = \"DELETE FROM events WHERE session_id = 'x'\";")
-        .expect("failed to write temp test file");
+    fs::write(
+        &test_file,
+        "let sql = \"DELETE FROM events WHERE session_id = 'x'\";",
+    )
+    .expect("failed to write temp test file");
 
     // Scan only the isolated temp directory (not the live workspace)
     let hits = scan_dir_for(&temp_root, |line| {
