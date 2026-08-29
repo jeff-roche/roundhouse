@@ -1,6 +1,7 @@
 //! Cooperative cancellation (Phase 2, Task 3): a `SessionActor` tracks one
-//! session's `SessionState` and refuses admission of new, non-`finally:`
-//! tasks once that session has moved to `SessionState::Cancelling`.
+//! session's `SessionState` and, via an allowlist, refuses admission of new,
+//! non-`finally:` tasks once that session has left `Created`/`Running`
+//! (i.e. `Suspended`, `Cancelling`, or `Closed`).
 //!
 //! **Scope note — read before wiring this in anywhere:** this is a correct,
 //! fully unit-tested, standalone unit, *not* wired into any real dispatch
@@ -46,8 +47,12 @@ pub struct TaskCreateRequest {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdmitError {
-    #[error("session is Cancelling; only finally: steps are admitted")]
+    #[error("session is Cancelling; only a trusted finally: step is admitted")]
     SessionCancelling,
+    #[error("session is Suspended; only a trusted finally: step is admitted")]
+    SessionSuspended,
+    #[error("session is Closed; only a trusted finally: step is admitted")]
+    SessionClosed,
 }
 
 /// Tracks one session's `SessionState` and gates new-task admission on it.
@@ -89,38 +94,83 @@ impl SessionActor {
         self.state_tx.subscribe()
     }
 
-    /// Mint and append a `SessionStateChanged { state: Cancelling, .. }`
-    /// event through `runner` (the sole authority that may mint
-    /// session-lifecycle events — see `roundhouse_core::TaskRunner`'s doc
-    /// comment), then publish the new state to `state_tx` once the append
-    /// has durably succeeded. Publishing only after a successful append
-    /// means a caller who observes `state() == Cancelling` is guaranteed the
-    /// event is already in the log, not just in memory.
+    /// Flip the in-memory admission gate to `Cancelling`, then mint and
+    /// append a `SessionStateChanged { state: Cancelling, .. }` event
+    /// through `runner` (the sole authority that may mint session-lifecycle
+    /// events — see `roundhouse_core::TaskRunner`'s doc comment).
+    ///
+    /// **Fail-closed, not fail-open:** the gate (`state_tx`) is flipped
+    /// *before* the durable append is even attempted, not after. If the
+    /// append below fails (writer task shut down, pool exhaustion, a
+    /// non-busy sqlite error surviving the retry loop), `admit_task` is
+    /// already refusing new non-finally work by the time this function
+    /// returns `Err` — the error still propagates to the caller (so failed
+    /// persistence is loud, never silently swallowed), but a persistence
+    /// failure can never leave the gate open. The same ordering also closes
+    /// a narrower window that existed under the old (fail-open)
+    /// append-then-signal ordering: the append is a cross-task channel
+    /// round-trip plus a SQLite transaction (with possible busy-retry
+    /// backoff) that can take anywhere from microseconds to seconds, during
+    /// which a signal-after-append design would have let `admit_task` keep
+    /// admitting new work even on the eventual success path. Note this is
+    /// SQLite in WAL mode with `synchronous=NORMAL` (see `roundhouse_store::
+    /// open`'s doc comment) — not fsync'd on every write — so "appended"
+    /// here means "written to the write-ahead log," not "survives an
+    /// OS-level power loss"; it is not a claim of strict durability.
     pub async fn cancel(
         &self,
         runner: &TaskRunner,
         reason: CancelReason,
     ) -> Result<(), StoreError> {
+        self.state_tx.send_replace(SessionState::Cancelling);
+
         let event = runner.record_session_state_changed(
             self.session_id,
-            0,
+            0, // ignored — EventWriter::append assigns the real per-session seq
             now_ts(),
             SessionState::Cancelling,
+            // `CancelReason` has no `Display` impl and no established
+            // stringification convention exists elsewhere in this codebase
+            // for this free-text field, so its `Debug` rendering (e.g.
+            // "User") is used deliberately here — NOT a placeholder. This is
+            // distinct from `TaskCancelled.reason`, which stores the typed
+            // `CancelReason` itself rather than a string. Because this value
+            // is written into the append-only event log, renaming a
+            // `CancelReason` variant will silently change the text of
+            // already-persisted historical events' `reason` field.
             Some(format!("{reason:?}")),
             1,
         );
         self.writer.append(event).await?;
-        self.state_tx.send_replace(SessionState::Cancelling);
         Ok(())
     }
 
-    /// Refuse admission of new tasks once the session is `Cancelling`,
-    /// except `finally:` cleanup steps, which must still run to completion
-    /// (§8's cooperative-cancellation model).
+    /// Admit or refuse a new task, gated on the session's current state.
+    ///
+    /// Deliberately an **allowlist**, not a denylist: only `Created` and
+    /// `Running` admit an ordinary (non-finally-step) task. Every other
+    /// state — `Suspended`, `Cancelling`, `Closed`, and any variant added to
+    /// `SessionState` in the future — refuses one by default, so a new
+    /// variant this match doesn't yet know about fails closed rather than
+    /// silently admitting work into (for example) a terminated session.
+    ///
+    /// A `finally:` cleanup step is only honored as a trusted bypass of that
+    /// refusal when `req.origin == Origin::System` — `is_finally_step` is a
+    /// caller-asserted boolean with nothing else tying it to provenance, so
+    /// honoring it regardless of origin would make cancellation merely
+    /// advisory the moment any model-influenced caller sets it. A
+    /// `finally_step` claim from any other origin is evaluated as an
+    /// ordinary task for gating purposes — the bypass simply doesn't apply,
+    /// it is not a hard error.
     pub fn admit_task(&self, req: &TaskCreateRequest) -> Result<(), AdmitError> {
-        if self.state() == SessionState::Cancelling && !req.is_finally_step {
-            return Err(AdmitError::SessionCancelling);
+        let trusted_finally_step = req.is_finally_step && req.origin == Origin::System;
+
+        match self.state() {
+            SessionState::Created | SessionState::Running => Ok(()),
+            _ if trusted_finally_step => Ok(()),
+            SessionState::Cancelling => Err(AdmitError::SessionCancelling),
+            SessionState::Suspended => Err(AdmitError::SessionSuspended),
+            SessionState::Closed => Err(AdmitError::SessionClosed),
         }
-        Ok(())
     }
 }

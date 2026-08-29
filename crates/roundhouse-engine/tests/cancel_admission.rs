@@ -130,3 +130,107 @@ async fn cancel_persists_session_state_changed_event_to_the_store() {
         other => panic!("expected SessionStateChanged, got {other:?}"),
     }
 }
+
+/// Security-audit fix: `cancel()` must fail CLOSED, not open — the
+/// in-memory gate flips to `Cancelling` *before* the durable append is even
+/// attempted, so a failed (or merely slow) append can never leave
+/// `admit_task` still admitting new work. This is proven structurally, not
+/// by injecting a fake `StoreError`: `cancel`'s body calls
+/// `state_tx.send_replace` as its first statement, then `runner.record_session_state_changed`
+/// (pure, synchronous), and only then `.await`s the actual append — so a
+/// SINGLE manual `poll()` of the returned future executes every synchronous
+/// statement up to (but not including) that first real suspension point
+/// inside `writer.append` (the oneshot reply from the writer task, which
+/// genuinely cannot be ready on the first poll since the separate writer
+/// task hasn't run yet). If the future is still `Pending` after exactly one
+/// poll, `state()` reading `Cancelling` at that point proves the gate closed
+/// strictly before the append could possibly have completed — success,
+/// failure, or otherwise.
+#[tokio::test]
+async fn cancel_flips_the_admission_gate_before_the_append_can_possibly_complete() {
+    use std::future::Future;
+    use std::task::{Context, Poll};
+
+    let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Running).await;
+
+    let mut fut = Box::pin(actor.cancel(&RUNNER, CancelReason::User));
+
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let poll_result = fut.as_mut().poll(&mut cx);
+
+    assert_eq!(
+        actor.state(),
+        SessionState::Cancelling,
+        "the admission gate must already be closed after a single poll of cancel(), \
+         strictly before the durable append can have completed"
+    );
+
+    // Drive the future to completion so the test doesn't leave a half-driven
+    // append dangling against the shared writer task.
+    match poll_result {
+        Poll::Pending => fut.await.unwrap(),
+        Poll::Ready(result) => result.unwrap(),
+    }
+}
+
+/// Security-audit fix: `admit_task` is now an allowlist. A `Closed` session
+/// must refuse an ordinary task exactly like a `Cancelling` one — the old
+/// denylist (`if state == Cancelling`) let every other terminal/paused state
+/// admit anything, including a session rehydrated as already `Closed`.
+#[tokio::test]
+async fn closed_session_refuses_ordinary_tasks() {
+    let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Closed).await;
+
+    let normal = TaskCreateRequest {
+        kind: TaskKind::Shell,
+        origin: Origin::Model,
+        is_finally_step: false,
+    };
+    let err = actor.admit_task(&normal).unwrap_err();
+    assert!(matches!(err, AdmitError::SessionClosed));
+}
+
+/// Same allowlist fix, for `Suspended`.
+#[tokio::test]
+async fn suspended_session_refuses_ordinary_tasks() {
+    let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Suspended).await;
+
+    let normal = TaskCreateRequest {
+        kind: TaskKind::Shell,
+        origin: Origin::Model,
+        is_finally_step: false,
+    };
+    let err = actor.admit_task(&normal).unwrap_err();
+    assert!(matches!(err, AdmitError::SessionSuspended));
+}
+
+/// Security-audit fix: `is_finally_step: true` is only a trusted bypass when
+/// `origin == Origin::System` — a claimed finally-step from any other origin
+/// (e.g. `Origin::Model`) is evaluated as an ordinary task and refused just
+/// like one, even though the boolean itself is set.
+#[tokio::test]
+async fn finally_step_bypass_is_refused_unless_origin_is_system() {
+    let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Closed).await;
+
+    let untrusted_finally_step = TaskCreateRequest {
+        kind: TaskKind::Shell,
+        origin: Origin::Model,
+        is_finally_step: true,
+    };
+    let err = actor.admit_task(&untrusted_finally_step).unwrap_err();
+    assert!(
+        matches!(err, AdmitError::SessionClosed),
+        "a finally-step claim from a non-System origin must not bypass the gate"
+    );
+
+    let trusted_finally_step = TaskCreateRequest {
+        kind: TaskKind::Shell,
+        origin: Origin::System,
+        is_finally_step: true,
+    };
+    assert!(
+        actor.admit_task(&trusted_finally_step).is_ok(),
+        "a genuine (Origin::System) finally-step must still be admitted even when Closed"
+    );
+}
