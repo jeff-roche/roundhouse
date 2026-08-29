@@ -1,0 +1,33 @@
+---
+source: crates/roundhouse-provider/tests/openai_chat_encode.rs
+expression: body
+---
+{
+  "messages": [
+    {
+      "content": "What's the time?",
+      "role": "user"
+    },
+    {
+      "content": null,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{}",
+            "name": "get_time"
+          },
+          "id": "call_42",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "It is 3:45 PM",
+      "role": "tool",
+      "tool_call_id": "call_42"
+    }
+  ],
+  "model": "gpt-5.4",
+  "stream": true
+}

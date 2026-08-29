@@ -84,6 +84,7 @@ fn encode_message(msg: &Message) -> Vec<Value> {
                 tool_calls.push(json!({
                     "id": id,
                     "type": "function",
+                    // OpenAI requires tool arguments as a JSON string, not a nested object.
                     "function": { "name": name, "arguments": input.to_string() },
                 }));
             }
@@ -108,14 +109,19 @@ fn encode_message(msg: &Message) -> Vec<Value> {
     }
 
     let mut out = Vec::new();
-    if tool_calls.is_empty() {
-        out.push(json!({ "role": role, "content": text_parts.join("") }));
-    } else {
-        out.push(json!({
-            "role": role,
-            "content": if text_parts.is_empty() { Value::Null } else { json!(text_parts.join("")) },
-            "tool_calls": tool_calls,
-        }));
+    // Only push the primary role message if there's actual content (text or tool calls).
+    // For messages containing only ToolResult blocks, skip the primary message and let the
+    // tail_messages (role: "tool") carry the content instead.
+    if !text_parts.is_empty() || !tool_calls.is_empty() {
+        if tool_calls.is_empty() {
+            out.push(json!({ "role": role, "content": text_parts.join("") }));
+        } else {
+            out.push(json!({
+                "role": role,
+                "content": if text_parts.is_empty() { Value::Null } else { json!(text_parts.join("")) },
+                "tool_calls": tool_calls,
+            }));
+        }
     }
     out.extend(tail_messages);
     out
