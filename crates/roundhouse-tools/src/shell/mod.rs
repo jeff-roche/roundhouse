@@ -17,7 +17,7 @@ use tokio::process::Command;
 use crate::error::ToolError;
 
 pub use cancel::{
-    cancel_running_shell, spawn_cancellable, spawn_test, CancelError, ExitDisposition, ShellHandle,
+    cancel_running_shell, spawn_cancellable, CancelError, ExitDisposition, ShellHandle,
 };
 
 /// Output captured from a shell command execution.

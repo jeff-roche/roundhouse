@@ -2306,6 +2306,7 @@ dependencies = [
  "diffy",
  "glob",
  "libc",
+ "nix 0.31.3",
  "process-wrap",
  "roundhouse-core",
  "roundhouse-policy",

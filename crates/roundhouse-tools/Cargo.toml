@@ -22,5 +22,11 @@ process-wrap = { version = "10.0.0", default-features = false, features = [
     "process-group",
 ] }
 libc = "0.2.189"
+# Same version process-wrap itself pulls in (kept in step deliberately, to
+# avoid two copies of nix in the dependency tree) — used directly by this
+# crate for the signal-0 `killpg` liveness probe in `shell/cancel.rs`, since
+# process-wrap has no API of its own for "is this process group still
+# alive" (only for signalling/waiting on it).
+nix = { version = "0.31.1", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
