@@ -16,6 +16,7 @@
 mod cassette;
 mod ir;
 mod provider_trait;
+mod stream_event;
 mod transport;
 
 pub use cassette::CassetteTransport;
@@ -26,5 +27,7 @@ pub use ir::{
     RequestPolicy, ResponseFormat, ShellToolParams, Signature, SystemBlock, TokenCount,
     ToolCallId, ToolChoice, ToolDef, ToolResultPart,
 };
+pub use ir::MessageRole as Role; // compat alias — see stream_event module docs
 pub use provider_trait::{BoxFut, Provider};
+pub use stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 pub use transport::{HttpRequest, HttpResponseStream, HttpTransport, TransportError};
