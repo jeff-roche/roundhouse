@@ -26,3 +26,26 @@ fn quota_exhausted_is_never_retryable_by_classification() {
     let result = classify(&profile, 400, body, &HeaderMap::new());
     assert!(matches!(result, ProviderError::QuotaExhausted));
 }
+
+#[test]
+fn retry_after_header_is_parsed_on_default_429_path() {
+    let profile = ErrorProfile::empty();
+    let mut headers = HeaderMap::new();
+    headers.insert("retry-after", "30".parse().unwrap());
+    let result = classify(&profile, 429, b"{}", &headers);
+    match result {
+        ProviderError::RateLimited { retry_after } => {
+            assert_eq!(retry_after, Some(std::time::Duration::from_secs(30)));
+        }
+        other => panic!("expected RateLimited, got {other:?}"),
+    }
+}
+
+#[test]
+fn non_utf8_body_never_panics_and_falls_back_to_status_default() {
+    let profile = ErrorProfile::empty();
+    // Invalid UTF-8 and invalid JSON — must not panic in the error path.
+    let body: &[u8] = &[0xff, 0xfe, 0xfd, 0x00, 0x01];
+    let result = classify(&profile, 502, body, &HeaderMap::new());
+    assert!(matches!(result, ProviderError::Server { status: 502 }));
+}
