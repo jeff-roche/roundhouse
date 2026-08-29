@@ -6,8 +6,8 @@
 //! `roundhouse_core::task_runner` for why).
 
 use roundhouse_core::{
-    Handle, IsolationAttestation, Origin, SessionId, TaskId, TaskInput, TaskKind, TaskOutput,
-    TaskRunner, Tier, Timestamp, Usage,
+    Handle, IsolationAttestation, Origin, SessionId, TaskError, TaskId, TaskInput, TaskKind,
+    TaskOutput, TaskRunner, Tier, Timestamp, Usage,
 };
 use roundhouse_provider::{ChatRequest, ContentBlock, Provider, ProviderError, RequestCtx};
 use roundhouse_store::{EventWriter, StoreError};
@@ -40,6 +40,14 @@ pub enum AgentError {
 /// `runner` is the sole authority (`TaskRunner::bootstrap()`, called exactly
 /// once per process by `roundhouse-engine`) that can mint the `Event`s this
 /// function appends — see `roundhouse_core::TaskRunner`'s doc comment.
+///
+/// If `provider.stream_chat` fails, both tasks are recorded `TaskFailed`
+/// (innermost — `infer` — first, then `chat`) before the error is returned,
+/// rather than being left permanently `Running` in the append-only log: a
+/// task stuck in `Running` forever is indistinguishable from one genuinely
+/// still in flight, and `recover_interrupted_tasks` only runs at daemon
+/// restart (and would misattribute it as `CancelReason::DaemonRestart` even
+/// then) — it can't clean up a same-process provider error.
 pub async fn run_chat_turn(
     writer: &EventWriter,
     runner: &TaskRunner,
@@ -49,14 +57,37 @@ pub async fn run_chat_turn(
     request: ChatRequest,
 ) -> Result<Vec<ContentBlock>, AgentError> {
     let chat_task_id = TaskId::new();
-    append_created(writer, runner, session_id, chat_task_id, TaskKind::Chat, None).await?;
+    // The `chat` task is the user-facing turn; `Origin::User` reflects that.
+    append_created(writer, runner, session_id, chat_task_id, TaskKind::Chat, None, Origin::User).await?;
     append_started(writer, runner, session_id, chat_task_id).await?;
 
     let infer_task_id = TaskId::new();
-    append_created(writer, runner, session_id, infer_task_id, TaskKind::Infer, Some(chat_task_id)).await?;
+    // The `infer` task is the model actually generating a response;
+    // `Origin::Model` reflects that (distinct from the parent `chat` task's
+    // `Origin::User`).
+    append_created(
+        writer,
+        runner,
+        session_id,
+        infer_task_id,
+        TaskKind::Infer,
+        Some(chat_task_id),
+        Origin::Model,
+    )
+    .await?;
     append_started(writer, runner, session_id, infer_task_id).await?;
 
-    let stream = provider.stream_chat(&request, ctx).await?;
+    let stream = match provider.stream_chat(&request, ctx).await {
+        Ok(stream) => stream,
+        Err(provider_err) => {
+            let error = TaskError { message: provider_err.to_string(), category: "provider_error".into() };
+            // Innermost first: infer failed because of the provider, which is why
+            // the parent chat task fails too.
+            append_failed(writer, runner, session_id, infer_task_id, error.clone(), false).await?;
+            append_failed(writer, runner, session_id, chat_task_id, error, false).await?;
+            return Err(AgentError::Provider(provider_err));
+        }
+    };
     let blocks = fold_stream_to_blocks(stream).await;
 
     append_completed(writer, runner, session_id, infer_task_id).await?;
@@ -72,6 +103,7 @@ async fn append_created(
     task_id: TaskId,
     kind: TaskKind,
     parent: Option<TaskId>,
+    origin: Origin,
 ) -> Result<(), StoreError> {
     let event = runner.record_task_created(
         session_id,
@@ -80,7 +112,7 @@ async fn append_created(
         task_id,
         kind,
         parent,
-        Origin::Model,
+        origin,
         // TaskInput has no Default — construct explicitly.
         TaskInput::Text(String::new()),
         1,
@@ -127,6 +159,19 @@ async fn append_completed(
         Usage::default(),
         1,
     );
+    writer.append(event).await?;
+    Ok(())
+}
+
+async fn append_failed(
+    writer: &EventWriter,
+    runner: &TaskRunner,
+    session_id: SessionId,
+    task_id: TaskId,
+    error: TaskError,
+    retryable: bool,
+) -> Result<(), StoreError> {
+    let event = runner.record_task_failed(session_id, 0, now_ts(), task_id, error, retryable, 1);
     writer.append(event).await?;
     Ok(())
 }

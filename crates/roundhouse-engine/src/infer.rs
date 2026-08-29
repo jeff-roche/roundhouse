@@ -17,6 +17,22 @@ use std::collections::BTreeMap;
 /// echoed back verbatim on the next turn (e.g. Anthropic extended thinking) gets a
 /// real `ContentBlock::Thinking` with the signature intact, not a `Text` block with
 /// the signature silently dropped.
+///
+/// **Corrected 2026-08-28 (audit finding 1).** An earlier draft accumulated `Thinking`
+/// deltas into the *same* `text_by_index` map as plain `Text` deltas, and the final
+/// mapping had no `BlockKind::Thinking` arm at all — every non-tool-use block,
+/// including a genuine thinking block, fell through to a catch-all and was emitted as
+/// `ContentBlock::Text`, discarding the block's kind and silently dropping its
+/// signature. That is exactly §1.1 bug #1 ("bricked sessions on resume") reintroduced
+/// structurally: a provider that requires its own prior signed thinking block to be
+/// echoed back verbatim on the next turn (Anthropic extended thinking) would receive a
+/// plain `Text` block with no signature instead, and resuming the session would fail
+/// or be rejected by the provider. This function tracks thinking text and signature in
+/// their own map (`thinking_by_index`), keyed separately from plain text, and the
+/// final mapping below has an explicit `BlockKind::Thinking` arm — plus an exhaustive
+/// (not catch-all) `BlockKind::Text`/`None` arm, so a future `BlockKind` variant that
+/// isn't explicitly handled here fails to compile instead of silently falling through
+/// to `ContentBlock::Text` the same way.
 pub async fn fold_stream_to_blocks(mut stream: ChatStream) -> Vec<ContentBlock> {
     let mut text_by_index: BTreeMap<u32, String> = BTreeMap::new();
     let mut thinking_by_index: BTreeMap<u32, (String, Option<String>)> = BTreeMap::new();
@@ -65,19 +81,25 @@ pub async fn fold_stream_to_blocks(mut stream: ChatStream) -> Vec<ContentBlock> 
                 } else {
                     serde_json::from_str(&raw_args).unwrap_or(serde_json::Value::Null)
                 };
-                ContentBlock::ToolUse {
-                    id: ToolCallId(provider_id.unwrap_or_else(|| format!("synth_{index}"))),
-                    id_origin: IdOrigin::Provider,
-                    name,
-                    input,
-                    cache: None,
-                }
+                // A provider-issued id gets `IdOrigin::Provider`; a locally synthesized
+                // one (the provider never assigned a tool-call id) gets
+                // `IdOrigin::Synthesized`, so downstream consumers can tell the two
+                // apart instead of both being reported as provider-issued.
+                let (id, id_origin) = match provider_id {
+                    Some(p) => (ToolCallId(p), IdOrigin::Provider),
+                    None => (ToolCallId(format!("synth_{index}")), IdOrigin::Synthesized),
+                };
+                ContentBlock::ToolUse { id, id_origin, name, input, cache: None }
             }
             Some(BlockKind::Thinking) => {
                 let (text, signature) = thinking_by_index.remove(&index).unwrap_or_default();
                 ContentBlock::Thinking { text, signature: signature.map(Signature), redacted: false }
             }
-            _ => ContentBlock::Text {
+            // Exhaustive, not a catch-all: `BlockKind` isn't `#[non_exhaustive]` today,
+            // but a future variant added here must fail to compile instead of silently
+            // downgrading to `ContentBlock::Text` the way `Thinking` used to (see this
+            // function's doc comment, audit finding 1).
+            Some(BlockKind::Text) | None => ContentBlock::Text {
                 text: text_by_index.remove(&index).unwrap_or_default(),
                 cache: None,
                 citations: vec![],
