@@ -83,9 +83,17 @@ async fn main() -> color_eyre::Result<()> {
     // it is not logged, not echoed into the "demo session complete" line below,
     // and neither `RequestCtx` nor `HttpRequest` derives `Debug`, so no
     // formatter downstream can print it either (§9.9).
+    //
+    // An empty `ANTHROPIC_API_KEY=` counts as unset: it is what `unset` looks
+    // like to a half-written shell profile or a CI job with an unpopulated
+    // secret, and taking the live path with an empty credential would trade the
+    // working demo for a guaranteed 401.
     let (provider, request_ctx): (Arc<dyn Provider>, RequestCtx) =
-        match std::env::var("ANTHROPIC_API_KEY") {
-            Ok(api_key) => (
+        match std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty())
+        {
+            Some(api_key) => (
                 Arc::new(AnthropicMessagesProvider::new()),
                 RequestCtx {
                     trace_id: None,
@@ -93,7 +101,7 @@ async fn main() -> color_eyre::Result<()> {
                     api_key,
                 },
             ),
-            Err(_) => (
+            None => (
                 Arc::new(FakeEditProvider {
                     reply_text: "Edited the demo file.".into(),
                 }),

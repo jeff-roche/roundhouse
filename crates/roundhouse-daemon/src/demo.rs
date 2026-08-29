@@ -9,8 +9,8 @@ use roundhouse_core::{SessionId, TaskRunner};
 use roundhouse_engine::{assemble_context, run_chat_turn, AgentError};
 use roundhouse_provider::{
     BlockDelta, BlockKind, Capabilities, ChatRequest, ChatStream, ContentBlock, HttpRequest,
-    HttpResponseStream, HttpTransport, ModelId, ModelInfo, Plan, Provider, ProviderError,
-    RequestCtx, StreamEvent, TokenCount, TransportError,
+    HttpResponseStream, HttpTransport, Message, MessageRole, ModelId, ModelInfo, Plan, Provider,
+    ProviderError, RequestCtx, StreamEvent, TokenCount, TransportError,
 };
 use roundhouse_store::{open, spawn_writer, StoreError};
 use roundhouse_tools::{edit_file, ToolError};
@@ -181,7 +181,31 @@ pub async fn run_demo_session(
     let writer = spawn_writer(store).await;
 
     let session_id = SessionId::new();
-    let request = assemble_context("claude-sonnet-5", "You are careful.", &[], &[]);
+    // A real user turn, not an empty `messages` array. `FakeEditProvider`
+    // ignores the request entirely, so this made no difference while the demo
+    // was fake-only — but Anthropic's API rejects an empty `messages` array
+    // with a 400, so once `main.rs` started selecting the live provider on the
+    // presence of `ANTHROPIC_API_KEY`, an empty turn would have made the demo
+    // fail for every developer who happens to have that variable exported.
+    //
+    // Worded to match what the demo then actually does (`edit_file` replaces
+    // `cfg.find` with `cfg.replace`), so a live run's response is coherent with
+    // the edit the operator watches land, rather than a non sequitur.
+    let user_turn = [Message {
+        role: MessageRole::User,
+        content: vec![ContentBlock::Text {
+            text: format!(
+                "Please update the demo file at {}: replace the word \"{}\" with \"{}\". \
+                 Reply with one short sentence confirming the change.",
+                cfg.edit_target.display(),
+                cfg.find,
+                cfg.replace
+            ),
+            cache: None,
+            citations: vec![],
+        }],
+    }];
+    let request = assemble_context("claude-sonnet-5", "You are careful.", &[], &user_turn);
 
     let blocks = run_chat_turn(
         &writer,

@@ -176,9 +176,16 @@ async fn stream_chat_surfaces_non_2xx_status_as_a_provider_error() {
 
     let provider = AnthropicMessagesProvider::new();
     let result = provider.stream_chat(&sample_request(), &ctx).await;
+    // Pinned to the exact variant, like every other status in
+    // `stream_chat_classifies_error_statuses_by_disposition`: a bare
+    // `is_err()` would still pass if 401 silently changed disposition from
+    // fatal to retryable, which is the property that actually matters here.
     assert!(
-        result.is_err(),
-        "a 401 must surface as an error, never be decoded as if it were a successful stream"
+        matches!(
+            result,
+            Err(ProviderError::BadRequest { status: 401, .. })
+        ),
+        "a 401 must surface as a fatal BadRequest, never be decoded as if it were a successful stream"
     );
 }
 
@@ -286,6 +293,55 @@ async fn errors_never_contain_the_api_key_or_the_response_body() {
     assert!(
         !rendered.contains("echoed_key"),
         "an unredacted response body leaked into a ProviderError: {rendered}"
+    );
+}
+
+/// A transport that always fails, so the adapter's *other* error path — the one
+/// that wraps a `TransportError` rather than classifying a status — can be
+/// exercised.
+struct FailingTransport;
+
+impl HttpTransport for FailingTransport {
+    fn send<'a>(
+        &'a self,
+        _req: HttpRequest,
+    ) -> BoxFuture<'a, Result<HttpResponseStream, TransportError>> {
+        Box::pin(async {
+            Err(TransportError::Io(
+                "connection reset by peer while sending request".into(),
+            ))
+        })
+    }
+}
+
+/// The status-classification path is not the only way out of `stream_chat`; a
+/// transport failure produces `ProviderError::Transport(..)` from a
+/// `TransportError`'s `Display`. That wrapping must not become a leak either.
+///
+/// The complementary half of this — that `reqwest` itself never puts request
+/// headers into the `TransportError` in the first place — is pinned against the
+/// real client in `tests/reqwest_transport.rs`
+/// (`transport_errors_never_echo_the_request_headers`).
+#[tokio::test]
+async fn a_transport_failure_is_a_transport_error_that_omits_the_api_key() {
+    const KEY: &str = "sk-ant-super-secret-value";
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(FailingTransport),
+        api_key: KEY.into(),
+    };
+
+    let err = expect_err(
+        AnthropicMessagesProvider::new()
+            .stream_chat(&sample_request(), &ctx)
+            .await,
+    );
+
+    assert!(matches!(err, ProviderError::Transport(_)));
+    let rendered = format!("{err} / {err:?}");
+    assert!(
+        !rendered.contains(KEY),
+        "the API key leaked into a transport ProviderError: {rendered}"
     );
 }
 
