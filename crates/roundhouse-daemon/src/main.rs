@@ -70,6 +70,29 @@ async fn main() -> color_eyre::Result<()> {
     let edit_target = runtime_dir.join("demo-target.txt");
     write_demo_file(&edit_target).await?;
 
+    // Crash recovery (S-SESS-4): reclassify any task left in `Created`/`Decided`/
+    // `Running` state by a previous daemon process that died mid-run. Without this,
+    // a `round daemon` killed mid-session leaves those tasks stuck in the log forever
+    // — `roundhouse_store::recover_interrupted_tasks` is fully implemented and tested
+    // (`roundhouse-store/tests/recovery.rs`) but had no production caller before this.
+    // Runs once, here, between opening the store and starting the (possibly brand new)
+    // demo session — on a fresh `store_path` this is a no-op scan over zero rows.
+    let recovery_store = roundhouse_store::open(&store_path).await?;
+    let recovery_writer = roundhouse_store::spawn_writer(recovery_store).await;
+    let recovery_pool_for_scan = roundhouse_store::open(&store_path).await?;
+    let interrupted = roundhouse_store::recover_interrupted_tasks(
+        &recovery_pool_for_scan,
+        &recovery_writer,
+        &runner,
+    )
+    .await?;
+    if !interrupted.is_empty() {
+        println!(
+            "recovered {} task(s) interrupted by a previous daemon run",
+            interrupted.len()
+        );
+    }
+
     // The one switch between the hermetic demo and a real model call.
     //
     // Keyed on the *presence* of `ANTHROPIC_API_KEY` rather than on a flag, so
@@ -179,7 +202,10 @@ async fn main() -> color_eyre::Result<()> {
 ///    entries the attacker controls leaves a TOCTOU window in which they can
 ///    swap a symlink in between this check and the later open.
 fn prepare_runtime_dir(dir: &Path) -> std::io::Result<()> {
-    match std::fs::DirBuilder::new().mode(RUNTIME_DIR_MODE).create(dir) {
+    match std::fs::DirBuilder::new()
+        .mode(RUNTIME_DIR_MODE)
+        .create(dir)
+    {
         // Freshly created by us, so it is by construction a directory, 0700, and
         // ours — none of the checks below can fail.
         Ok(()) => Ok(()),
