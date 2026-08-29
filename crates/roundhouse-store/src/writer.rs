@@ -20,11 +20,23 @@ pub struct EventWriter {
     tx: mpsc::Sender<WriteCmd>,
 }
 
-/// Serialize an `EventPayload` to JSON. Returns `Err` if the payload
-/// contains non-finite floating-point values (NaN/Infinity), which JSON
-/// cannot represent. This is a non-retryable error and propagates immediately
-/// to the caller.
-pub fn serialize_payload(payload: &roundhouse_core::EventPayload) -> Result<String, serde_json::Error> {
+/// Serialize an `EventPayload` to JSON.
+///
+/// Does *not* return `Err` for non-finite floating-point values (NaN/Infinity):
+/// `serde_json` silently writes those as JSON `null` and returns `Ok` (verified
+/// empirically — `serde_json::to_string` never errors on a non-finite `f32`/`f64`,
+/// it only errors on genuinely non-serializable inputs, e.g. a map with
+/// non-string keys). So a non-finite value here is a lossy round-trip
+/// (`Some(NaN)` -> `null` -> `None` on replay), not a rejected write. This is
+/// benign in this codebase today because the only float field on any
+/// `EventPayload` variant is `Progress.fraction: Option<f32>`, where losing a
+/// NaN/Infinity to `None` is an acceptable degradation, not data corruption.
+/// The `Result` return type is kept for whatever `serde_json::to_string` *can*
+/// still fail on (and as a stable signature for callers), not because
+/// non-finite floats trigger it.
+pub fn serialize_payload(
+    payload: &roundhouse_core::EventPayload,
+) -> Result<String, serde_json::Error> {
     serde_json::to_string(payload)
 }
 
@@ -106,7 +118,14 @@ async fn append_one(store: &StorePool, event: Event) -> Result<u64, StoreError> 
                 tx.execute(
                     "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![session_id, next_seq, ts_nanos, task_id, payload_json, schema_v],
+                    rusqlite::params![
+                        session_id,
+                        next_seq,
+                        ts_nanos,
+                        task_id,
+                        payload_json,
+                        schema_v
+                    ],
                 )?;
                 tx.commit()?;
                 Ok(next_seq as u64)
