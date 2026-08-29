@@ -30,6 +30,13 @@ license = "MIT"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+[workspace.lints.clippy]
+# roundhouse-core's event-recording functions (record_task_decided et al.) take
+# one arg per event field on purpose, for now — splitting them into a params
+# struct is a deliberate future refactor, not something to do incidentally
+# while wiring up CI.
+too_many_arguments = "allow"
+
 [workspace.dependencies]
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tokio-util = "0.7.19"
