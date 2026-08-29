@@ -57,12 +57,18 @@ fn fold_task_state_derives_each_state_from_a_realistic_event_sequence() {
             handle: None,
         },
         EventPayload::TaskSuspended {
-            reason: SuspendReason::AwaitingApproval,
+            reason: SuspendReason::AwaitingApproval {
+                rule: None,
+                params_digest: [0u8; 32],
+            },
         },
     ];
     assert_eq!(
         roundhouse_core::fold_task_state(&suspended_path),
-        Some(TaskState::Suspended(SuspendReason::AwaitingApproval))
+        Some(TaskState::Suspended(SuspendReason::AwaitingApproval {
+            rule: None,
+            params_digest: [0u8; 32],
+        }))
     );
 
     // A cancelled task.

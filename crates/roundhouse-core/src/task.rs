@@ -63,7 +63,10 @@ impl TaskState {
             "Created" => Ok(TaskState::Created),
             "Decided" => Ok(TaskState::Decided),
             "Running" => Ok(TaskState::Running),
-            "Suspended" => Ok(TaskState::Suspended(SuspendReason::AwaitingApproval)),
+            "Suspended" => Ok(TaskState::Suspended(SuspendReason::AwaitingApproval {
+                rule: None,
+                params_digest: [0u8; 32],
+            })),
             "Completed" => Ok(TaskState::Completed),
             "Failed" => Ok(TaskState::Failed),
             "Cancelled" => Ok(TaskState::Cancelled),

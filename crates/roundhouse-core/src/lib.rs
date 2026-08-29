@@ -33,7 +33,7 @@ pub use delta::Delta;
 pub use error::CoreError;
 pub use event::{Event, EventFields, EventPayload};
 pub use ids::{SessionId, TaskId, TeamId, WorkspaceId};
-pub use session::{SessionOutcome, SessionPatch, SessionSpec, SessionState};
+pub use session::{OnDegrade, SessionOutcome, SessionPatch, SessionSpec, SessionState};
 pub use task::{fold_task_state, RedactedSpan, Task, TaskState};
 pub use task_kind::TaskKind;
 pub use task_meta::{

@@ -67,10 +67,25 @@ pub enum Handle {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum SuspendReason {
-    AwaitingApproval,
-    AwaitingElicitation,
+    /// `rule`/`params_digest` let an approval's grant record which rule was
+    /// matched and a digest of the exact params it was granted for (§6.2/
+    /// §6.4 grant-scope provenance).
+    AwaitingApproval {
+        rule: Option<RuleId>,
+        params_digest: [u8; 32],
+    },
+    /// `schema` carries the elicit JSON schema (§8).
+    AwaitingElicitation {
+        schema: serde_json::Value,
+    },
     AwaitingReply,
-    AwaitingPeer { session: crate::ids::SessionId },
+    AwaitingPeer {
+        session: crate::ids::SessionId,
+    },
+    /// §8.8-8.13 — a workflow step paused at a gate, named by `step_ref`.
+    WorkflowGate {
+        step_ref: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -127,6 +142,11 @@ pub enum NoteLevel {
     Info,
     Warn,
     Error,
+    /// §6.5/§6.7 — a startup/runtime isolation degradation (e.g. requested
+    /// tier unavailable, fell back to a weaker one). Distinct from an
+    /// ordinary `Warn`: this is a UI-surfaced concept the frozen spec calls
+    /// out by name, not just a log line.
+    Degradation,
 }
 
 /// §4.4 names `usage` as carrying "tokens, cost, wall time," but only token
