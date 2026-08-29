@@ -1,14 +1,13 @@
 use std::path::Path;
 
-use deadpool_sqlite::{Config, Pool, Runtime};
-use rusqlite_migration::{Migrations, M};
+use deadpool_sqlite::{Config, Hook, HookError, Pool, Runtime};
 
-pub static MIGRATIONS: once_cell::sync::Lazy<Migrations<'static>> =
-    once_cell::sync::Lazy::new(|| {
-        Migrations::new(vec![M::up(include_str!(
-            "../migrations/0001_events.sql"
-        ))])
-    });
+/// The migration harness for this crate's SQLite schema. Wraps Phase 0's complete
+/// migrations (events table with append-only triggers, tasks table, FTS5 index, and
+/// blobs table) in a lazy static for use with `deadpool_sqlite`'s connection pool.
+/// Initialize and run all migrations on first pool connection via `MIGRATIONS.to_latest()`.
+pub static MIGRATIONS: once_cell::sync::Lazy<rusqlite_migration::Migrations<'static>> =
+    once_cell::sync::Lazy::new(crate::migrations::migrations);
 
 /// One writer task, WAL, per §5.3. Phase 0 wires the pool configuration;
 /// the single-writer discipline itself (one dedicated task owning all
@@ -27,6 +26,12 @@ pub fn open_memory_connection() -> rusqlite::Connection {
     conn
 }
 
+/// Error type for connection pool and storage operations. Variants correspond to:
+/// - `Io`: filesystem errors (e.g., path doesn't exist or is unreadable)
+/// - `Sqlite`: SQLite connection or query errors
+/// - `Migration`: schema migration failures
+/// - `Pool`: deadpool connection pool exhaustion or shutdown
+/// - `Interact`: async executor (tokio) task panicked while interacting with the connection
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("io error: {0}")]
@@ -41,15 +46,37 @@ pub enum StoreError {
     Interact(String),
 }
 
+/// A WAL-mode SQLite connection pool. The `pool` field is public (not `pub(crate)`) because
+/// integration tests in the `tests/` directory (compiled as a separate crate) need direct access
+/// to call `.get().await` for connection acquisition. Each pooled connection is configured to
+/// use SQLite's Write-Ahead Logging (WAL) mode for improved concurrency and `synchronous=NORMAL`
+/// for reasonable durability-vs-performance trade-offs (via post_create hook).
 pub struct StorePool {
-    pub pool: deadpool_sqlite::Pool, // pub, not pub(crate): integration tests in tests/ (Tasks 1, 4) and recovery.rs both need direct access
+    pub pool: deadpool_sqlite::Pool,
 }
 
+/// Opens a WAL-mode SQLite connection pool at the given filesystem path. Applies all pending
+/// schema migrations on the first connection. Every pooled connection is configured with
+/// `journal_mode=WAL` and `synchronous=NORMAL` for balanced performance and durability.
+///
+/// # Errors
+/// Returns `StoreError::Io` if the path is invalid or inaccessible; `StoreError::Sqlite` if
+/// SQLite connection fails; `StoreError::Migration` if schema migrations fail to apply;
+/// `StoreError::Pool` if the connection pool creation or connection acquisition fails;
+/// `StoreError::Interact` if the async executor panics while setting up pragmas.
 pub async fn open(path: &Path) -> Result<StorePool, StoreError> {
     let cfg = Config::new(path.to_path_buf());
     let pool = cfg
-        .create_pool(Runtime::Tokio1)
-        .expect("deadpool-sqlite pool config is infallible for a plain path");
+        .builder(Runtime::Tokio1)
+        .expect("deadpool-sqlite config is infallible for a plain path")
+        .post_create(Hook::sync_fn(|conn, _metrics| {
+            conn.lock()
+                .map_err(|_| HookError::message("sync wrapper mutex poisoned"))?
+                .pragma_update(None, "synchronous", "NORMAL")
+                .map_err(HookError::Backend)
+        }))
+        .build()
+        .expect("pool builder config is valid");
 
     let conn = pool.get().await?;
     conn.interact(|c| {
