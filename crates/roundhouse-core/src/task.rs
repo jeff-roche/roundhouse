@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 /// only ever replaces `Created`/`Decided`/`Running` on an unclean shutdown;
 /// `Suspended*` tasks are re-armed through the attention-queue path
 /// instead, never wiped to `Interrupted`.
+///
+/// **This is now only half true of `fold_task_state` below** — Phase 1 added
+/// `roundhouse_store::fold_task`, a second, narrower fold that *does* derive
+/// `Interrupted` from a `TaskCancelled { reason: DaemonRestart }` event.
+/// `fold_task_state` here was not taught the same case (see the `TaskCancelled`
+/// arm below for the cross-reference); the two folds disagree on this one input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskState {
     Created,
@@ -120,6 +126,16 @@ pub fn fold_task_state(events: &[EventPayload]) -> Option<TaskState> {
             EventPayload::TaskResumed { .. } => Some(TaskState::Running),
             EventPayload::TaskCompleted { .. } => Some(TaskState::Completed),
             EventPayload::TaskFailed { .. } => Some(TaskState::Failed),
+            // NOTE (Phase 1 final review, I8): every `TaskCancelled` maps to
+            // `Cancelled` here, regardless of `reason`. `roundhouse_store::fold_task`
+            // (`crates/roundhouse-store/src/fold.rs`) disagrees: it special-cases
+            // `CancelReason::DaemonRestart` and maps *that* reason to
+            // `TaskState::Interrupted` instead. Both folds are exported from the
+            // workspace and both are named `Task`/`TaskState`, so the same event row
+            // yields two different answers depending on which fold you call. This is
+            // a known, deliberately-unreconciled divergence — see this fix's
+            // discussion in the Phase 1 final review report for why it wasn't
+            // resolved here (comment-only fix; behavior intentionally unchanged).
             EventPayload::TaskCancelled { .. } => Some(TaskState::Cancelled),
             _ => state,
         };

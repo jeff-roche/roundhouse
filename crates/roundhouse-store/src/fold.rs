@@ -61,13 +61,12 @@ pub fn fold_task<E: EventFields>(events: &[E]) -> Option<Task> {
 
     // Find the TaskCreated event — if missing, return None
     let created = sorted.iter().find_map(|e| match e.payload() {
-        EventPayload::TaskCreated { kind, parent, origin, .. } => Some((
-            e.task_id()?,
-            e.session_id(),
-            kind.clone(),
-            *parent,
-            origin.clone(),
-        )),
+        EventPayload::TaskCreated {
+            kind,
+            parent,
+            origin,
+            ..
+        } => Some((e.task_id()?, e.session_id(), kind.clone(), *parent, *origin)),
         _ => None,
     })?;
 
@@ -80,12 +79,21 @@ pub fn fold_task<E: EventFields>(events: &[E]) -> Option<Task> {
             EventPayload::TaskCreated { .. } => TaskState::Created,
             EventPayload::TaskDecided { .. } => TaskState::Decided,
             EventPayload::TaskStarted { .. } => TaskState::Running,
-            EventPayload::TaskDelta { .. } => state,   // deltas don't change state
+            EventPayload::TaskDelta { .. } => state, // deltas don't change state
             EventPayload::TaskProgress { .. } => state, // progress doesn't change state
             EventPayload::TaskSuspended { .. } => TaskState::Suspended,
             EventPayload::TaskResumed { .. } => TaskState::Running,
             EventPayload::TaskCompleted { .. } => TaskState::Completed,
             EventPayload::TaskFailed { .. } => TaskState::Failed,
+            // NOTE (Phase 1 final review, I8): this special-cases
+            // `CancelReason::DaemonRestart` into `Interrupted`. `roundhouse_core::
+            // fold_task_state` (`crates/roundhouse-core/src/task.rs`) does not — it
+            // maps every `TaskCancelled` to `Cancelled` regardless of `reason`. Both
+            // folds are exported from the workspace and both are named
+            // `Task`/`TaskState`, so the same event row yields two different answers
+            // depending on which fold you call. Deliberately left unreconciled here
+            // (comment-only fix; behavior intentionally unchanged) — see the Phase 1
+            // final review report.
             EventPayload::TaskCancelled { reason, .. } => match reason {
                 roundhouse_core::CancelReason::DaemonRestart => TaskState::Interrupted,
                 _ => TaskState::Cancelled,
@@ -95,5 +103,12 @@ pub fn fold_task<E: EventFields>(events: &[E]) -> Option<Task> {
         };
     }
 
-    Some(Task { id, session_id, kind, parent, state, origin })
+    Some(Task {
+        id,
+        session_id,
+        kind,
+        parent,
+        state,
+        origin,
+    })
 }
