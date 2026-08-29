@@ -1,12 +1,15 @@
 use serde_json::{json, Value};
 
-use crate::ir::{ChatRequest, ContentBlock, Message, MessageRole as Role, ReasoningIntent, ToolChoice, ToolDef};
+use crate::ir::{
+    ChatRequest, ContentBlock, Message, MessageRole as Role, ReasoningIntent, ToolChoice, ToolDef,
+};
 
 /// Encode a `ChatRequest` into the Anthropic Messages API `/v1/messages` request body format.
 ///
 /// The encoder handles all ContentBlock variants and respects cache breakpoints on both
 /// system blocks and message content blocks. Thinking blocks preserve their signatures
-/// when present. Reasoning budget tokens are computed from the ReasoningIntent level.
+/// when present. Reasoning depth is computed from the ReasoningIntent level and sent as
+/// `output_config.effort` (see `reasoning_effort`).
 pub fn encode_anthropic_messages(req: &ChatRequest) -> Value {
     let system: Vec<Value> = req
         .system
@@ -25,11 +28,7 @@ pub fn encode_anthropic_messages(req: &ChatRequest) -> Value {
     // `cache_control` — a bare-string `system` field wouldn't support breakpoints
     // on individual blocks.
 
-    let messages: Vec<Value> = req
-        .messages
-        .iter()
-        .filter_map(encode_message)
-        .collect();
+    let messages: Vec<Value> = req.messages.iter().filter_map(encode_message).collect();
 
     let mut body = json!({
         "model": req.model,
@@ -58,10 +57,12 @@ pub fn encode_anthropic_messages(req: &ChatRequest) -> Value {
     // None are equivalent for this codec's purposes.
     let intent = req.reasoning.intent.unwrap_or(ReasoningIntent::Off);
     if intent != ReasoningIntent::Off {
-        body["thinking"] = json!({
-            "type": "enabled",
-            "budget_tokens": reasoning_budget(intent),
-        });
+        // Current Anthropic models (including claude-sonnet-5) reject the older
+        // `{"type": "enabled", "budget_tokens": N}` shape with a 400 — `budget_tokens`
+        // has been removed from the API. The current shape is `{"type": "adaptive"}`,
+        // with depth controlled by `output_config.effort` instead.
+        body["thinking"] = json!({ "type": "adaptive" });
+        body["output_config"] = json!({ "effort": reasoning_effort(intent) });
     }
 
     body
@@ -88,19 +89,23 @@ fn encode_tool_choice(choice: &ToolChoice) -> Value {
     }
 }
 
-/// Map a ReasoningIntent to its Anthropic budget_tokens value.
+/// Map a ReasoningIntent to Anthropic's `output_config.effort` value.
 ///
-/// These values (Off→0, Low→4096, Medium→10_000, High→24_000, Max→32_000) are sourced
-/// from this plan's task brief for Phase 1, not independently verified against Anthropic's
-/// live documentation. Before Phase 1's real provider (Task 22) goes live against actual
-/// Anthropic traffic, these should be double-checked against the current API specification.
-fn reasoning_budget(intent: ReasoningIntent) -> u32 {
+/// Anthropic's current API controls adaptive-thinking depth via `output_config.effort`
+/// (accepted values: `low`/`medium`/`high`/`xhigh`/`max`), not the deprecated
+/// `thinking.budget_tokens`. `ReasoningIntent::Off` never reaches this function (callers
+/// only invoke it when `intent != Off`); the remaining four variants map directly onto
+/// their same-named effort strings, leaving `xhigh` unused since Phase 0's `ReasoningIntent`
+/// has no variant between `High` and `Max`. Verified against the current Anthropic API
+/// reference as of this fix (I3 in the Phase 1 final review) — double-check against live
+/// docs again before relying on this mapping long-term, since the API surface can change.
+fn reasoning_effort(intent: ReasoningIntent) -> &'static str {
     match intent {
-        ReasoningIntent::Off => 0,
-        ReasoningIntent::Low => 4096,
-        ReasoningIntent::Medium => 10_000,
-        ReasoningIntent::High => 24_000,
-        ReasoningIntent::Max => 32_000,
+        ReasoningIntent::Off => "low",
+        ReasoningIntent::Low => "low",
+        ReasoningIntent::Medium => "medium",
+        ReasoningIntent::High => "high",
+        ReasoningIntent::Max => "max",
     }
 }
 
@@ -143,15 +148,20 @@ fn encode_block(block: &ContentBlock) -> Option<Value> {
             }
             Some(v)
         }
-        ContentBlock::ToolUse { id, name, input, .. } => {
-            Some(json!({
-                "type": "tool_use",
-                "id": id,
-                "name": name,
-                "input": input
-            }))
-        }
-        ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => Some(json!({
+            "type": "tool_use",
+            "id": id,
+            "name": name,
+            "input": input
+        })),
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            ..
+        } => {
             // `content` is `Vec<ToolResultPart>` (Phase 0's real IR) — Anthropic's
             // tool_result content accepts an array of text blocks directly.
             let parts: Vec<Value> = content
@@ -165,7 +175,9 @@ fn encode_block(block: &ContentBlock) -> Option<Value> {
                 "is_error": is_error
             }))
         }
-        ContentBlock::Thinking { text, signature, .. } => {
+        ContentBlock::Thinking {
+            text, signature, ..
+        } => {
             let mut v = json!({ "type": "thinking", "thinking": text });
             if let Some(sig) = signature {
                 // The `signature` field is Anthropic's integrity mechanism for replayed thinking
@@ -178,6 +190,8 @@ fn encode_block(block: &ContentBlock) -> Option<Value> {
         }
         // Phase 1 scope: Image, Document, and Opaque blocks are not emitted to Anthropic.
         // A Phase 2 LossEvent should be generated on cross-provider handoff.
-        ContentBlock::Image { .. } | ContentBlock::Document { .. } | ContentBlock::Opaque { .. } => None,
+        ContentBlock::Image { .. }
+        | ContentBlock::Document { .. }
+        | ContentBlock::Opaque { .. } => None,
     }
 }
