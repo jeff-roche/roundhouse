@@ -12,6 +12,10 @@
 //! `00-overview.md` §3.1.
 #![forbid(unsafe_code)]
 
+mod context;
+
+pub use context::assemble_context;
+
 use roundhouse_bus::Bus;
 use roundhouse_core::TaskRunner;
 use roundhouse_provider::Provider;
