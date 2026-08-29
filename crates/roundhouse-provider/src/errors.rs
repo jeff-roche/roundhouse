@@ -13,6 +13,14 @@ use http::HeaderMap;
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Ceiling on a parsed `Retry-After` value. The header is attacker/provider
+/// controlled wire input; passing it through uncapped lets a hostile or
+/// buggy value (e.g. `u64::MAX` seconds) turn into an effectively-infinite
+/// wait, or overflow a later `Instant + retry_after` computation — a
+/// self-inflicted availability failure. Five minutes is generous for any
+/// legitimate rate-limit backoff while bounding the worst case.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProviderErrorKind {
     Overloaded,
@@ -40,8 +48,11 @@ impl ErrorProfile {
         code_table.insert("overloaded_error", ProviderErrorKind::Overloaded);
         Self {
             code_table,
+            // Anthropic's real, verbatim wording is "Your credit balance is
+            // too low to access the Anthropic API" — note "is too low", not
+            // "too low" alone.
             message_patterns: vec![(
-                regex::Regex::new("credit balance too low").unwrap(),
+                regex::Regex::new("credit balance is too low").unwrap(),
                 ProviderErrorKind::QuotaExhausted,
             )],
         }
@@ -67,12 +78,38 @@ pub fn classify(
         }
     }
 
-    let body_str = String::from_utf8_lossy(body);
+    // Match message patterns against the structured `/error/message` field
+    // when the body parsed as JSON, not the raw body: a provider that echoes
+    // request content back in a 400 (§9.9's explicit warning — e.g. a file
+    // the agent read, or fetched web content sitting in context) must not be
+    // able to steer classification by having a pattern string appear
+    // incidentally in that echoed content. Only fall back to the raw,
+    // lossy-decoded body when the response didn't parse as JSON at all (the
+    // HTML-error-page case), where there is no structured field to prefer.
+    let message_haystack: std::borrow::Cow<'_, str> = match &parsed {
+        Some(v) => match v.pointer("/error/message").and_then(|x| x.as_str()) {
+            Some(msg) => std::borrow::Cow::Borrowed(msg),
+            None => std::borrow::Cow::Owned(String::new()),
+        },
+        None => String::from_utf8_lossy(body),
+    };
     for (pattern, kind) in &profile.message_patterns {
-        if pattern.is_match(&body_str) {
+        if pattern.is_match(&message_haystack) {
             return kind_to_error(*kind, headers);
         }
     }
+
+    // No profile matched — this is a pure HTTP-status guess, not something
+    // the provider told us explicitly. Per this project's invariants, a
+    // degrade like this must be observable, not silent: e.g. OpenAI-family
+    // providers return HTTP 429 for `insufficient_quota` (a permanent
+    // billing failure, not a rate limit), which an empty/incomplete profile
+    // would otherwise silently misclassify as retryable.
+    tracing::debug!(
+        status,
+        "provider error classification fell through to HTTP-status default \
+         (no code-table or message-pattern match)"
+    );
 
     match status {
         429 => ProviderError::RateLimited {
@@ -80,13 +117,16 @@ pub fn classify(
         },
         400 => ProviderError::BadRequest {
             status,
-            body_snippet: body_str.chars().take(200).collect(),
+            // §9.9: no redaction pass exists yet, so the safe amount of
+            // unredacted provider body to persist is none — matches
+            // `anthropic_provider::classify_status`'s existing precedent.
+            body_snippet: String::new(),
         },
         404 => ProviderError::ModelNotFound,
         500..=599 => ProviderError::Server { status },
         _ => ProviderError::BadRequest {
             status,
-            body_snippet: body_str.chars().take(200).collect(),
+            body_snippet: String::new(),
         },
     }
 }
@@ -107,5 +147,5 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
+        .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER))
 }

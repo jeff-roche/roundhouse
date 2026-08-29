@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 schemars = { workspace = true }
 sse-stream = "0.2.5"
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
