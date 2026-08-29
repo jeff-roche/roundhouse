@@ -273,12 +273,23 @@ pub struct ModelInfo {
     pub context_window: Option<u64>,
 }
 
-/// Placeholder for the real streamed-event type (§9.3: "streaming is the
-/// only path"). Phase 1 replaces this with the actual
-/// `BlockStart`/`BlockDelta`/`BlockStop` stream; Phase 0 needs only a
-/// nameable return type for `Provider::stream_chat`'s signature.
-#[derive(Debug, Clone, Default)]
-pub struct ChatStream;
+/// The real streamed-event type (§9.3: "streaming is the only path — there
+/// is no non-streaming method"). Replaces Phase 0's Task 7 placeholder
+/// (`#[derive(Debug, Clone, Default)] pub struct ChatStream;`) in place, per
+/// that placeholder's own hand-off comment. A newtype (not a bare type
+/// alias) so `ChatStream` has exactly one name and one definition site
+/// across every codec's `stream_chat` impl.
+pub struct ChatStream(pub std::pin::Pin<Box<dyn futures::Stream<Item = crate::stream_event::StreamEvent> + Send>>);
+
+impl futures::Stream for ChatStream {
+    type Item = crate::stream_event::StreamEvent;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.0.as_mut().poll_next(cx)
+    }
+}
 
 /// Extended 2026-08-28 (audit follow-up, same class of fix as `RequestCtx`/
 /// `ChatStream` above): the original 3 variants were enough for the

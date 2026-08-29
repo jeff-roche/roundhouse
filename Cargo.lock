@@ -733,12 +733,20 @@ dependencies = [
 name = "roundhouse-engine"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "once_cell",
  "roundhouse-bus",
  "roundhouse-core",
  "roundhouse-policy",
  "roundhouse-provider",
  "roundhouse-sandbox",
  "roundhouse-store",
+ "schemars",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

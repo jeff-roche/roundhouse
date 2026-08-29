@@ -12,9 +12,13 @@
 //! `00-overview.md` §3.1.
 #![forbid(unsafe_code)]
 
+mod chat;
 mod context;
+mod infer;
 
+pub use chat::{run_chat_turn, AgentError};
 pub use context::assemble_context;
+pub use infer::fold_stream_to_blocks;
 
 use roundhouse_bus::Bus;
 use roundhouse_core::TaskRunner;
