@@ -101,7 +101,21 @@ pub enum MessageRole {
 /// Read access is via the accessors below; there is deliberately no public
 /// way to construct or mutate a `ToolDef` with a hand-written
 /// `input_schema`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Deliberately does **not** derive `Deserialize`, unlike this struct's
+/// sibling IR types: a derived impl lives inside `roundhouse-provider`
+/// itself, so it has ordinary same-module access to these private fields
+/// and would let `serde_json::from_str::<ToolDef>(..)` construct one with
+/// an arbitrary hand-written `input_schema` — private fields only block
+/// the `ToolDef { .. }` struct-literal from other crates, not trait-based
+/// deserialization. That would reopen exactly the schema/type-confusion
+/// gap S-TOOL-9 exists to close (see `Event`'s `Seal` doc comment in
+/// `roundhouse-core` for the same class of bypass, closed the same way).
+/// If a later phase needs to reconstruct a `ToolDef` from persisted or
+/// wire data, that should be a narrow, reviewed function that still routes
+/// through `tool_def_from_schema`-equivalent validation, not a blanket
+/// derive.
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolDef {
     name: String,
     description: String,
@@ -200,7 +214,12 @@ pub enum RequestPolicy {
 }
 
 /// §9.3 — the narrow waist request shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Does not derive `Deserialize`: it carries a `Vec<ToolDef>`, and
+/// `ToolDef` deliberately doesn't derive `Deserialize` either (see its doc
+/// comment) — a derived impl here would just push the same bypass down
+/// one field.
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
     pub model: ModelId,
     pub system: Vec<SystemBlock>,
