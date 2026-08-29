@@ -18,6 +18,10 @@ static BOOTSTRAPPED: AtomicBool = AtomicBool::new(false);
 /// `Event` for a task-lifecycle payload except through one of the
 /// `record_*` methods below, because `Event`'s constructor lives in this
 /// same crate and is not exposed (see `event.rs`'s `new_sealed`).
+/// `TaskRunner` is likewise the sole minter of session-lifecycle
+/// (`record_session_created`/`record_session_state_changed`/
+/// `record_session_closed`) and `Note` (`record_note`) events — not just
+/// task-lifecycle ones.
 ///
 /// `TaskRunner` itself has a `pub(crate)` constructor — it cannot be
 /// struct-literal-constructed from outside `roundhouse-core` either. The

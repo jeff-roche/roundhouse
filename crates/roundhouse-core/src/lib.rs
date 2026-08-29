@@ -8,8 +8,10 @@
 //! `TaskRunner` private-constructor pattern that structurally enforces
 //! S-LOG-1 (one `Task` record per action, no bypass — see `task_runner`'s
 //! module docs), and content-addressed blob types (`Blake3Hash`, `BlobRef`)
-//! for §4.5's retention contract. See
-//! `docs/architecture/01-data-model.md` and `02-system-architecture.md` §5.2.
+//! for §4.5's retention contract. `TaskRunner` is also the sole minter of
+//! session-lifecycle and `Note` events, not just task-lifecycle ones — see
+//! `task_runner`'s module docs. See `docs/architecture/01-data-model.md`
+//! and `02-system-architecture.md` §5.2.
 #![forbid(unsafe_code)]
 
 mod address;

@@ -1,9 +1,13 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Minimal Phase 0 shape — enough for `EventPayload` to compile and for
-/// `roundhouse-engine`/`roundhouse-sandbox` to grow real fields later
-/// without changing `EventPayload`'s variant shapes.
+/// Phase 0 gave this a minimal shape — just enough for `EventPayload` to
+/// compile, with real fields expected to land in downstream crates later
+/// without changing `EventPayload`'s variant shapes. Phase 2 instead grew
+/// `SessionSpec` itself, directly in `roundhouse-core`: `requested_tier`
+/// and `on_degrade` below are real isolation-tier fields the frozen spec
+/// (§6.5/§6.9) calls for on the spec itself, not something a downstream
+/// crate layered on top.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSpec {
     pub workspace: crate::ids::WorkspaceId,

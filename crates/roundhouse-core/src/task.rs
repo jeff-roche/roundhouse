@@ -53,11 +53,17 @@ impl TaskState {
     /// unrecognized state happens at *fold time* here (as well as at
     /// *insert time* via the SQL `CHECK`) — both legs enforce the same
     /// taxonomy so a hand-edited or corrupted row can't silently produce a
-    /// `Task` in a state that doesn't exist. Note this only reconstructs
-    /// the fieldless discriminant; a caller that needs a real
-    /// `Suspended(SuspendReason)` must fold it from the event log instead
-    /// (this function exists for validating/round-tripping the cache
-    /// column, not as a full inverse of `as_sql_str`).
+    /// `Task` in a state that doesn't exist. For `"Suspended"`, the
+    /// `AwaitingApproval { rule: None, params_digest: [0u8; 32] }` returned
+    /// is a placeholder sentinel, not a reconstruction of the real suspend
+    /// reason — the row's actual reason may have been `AwaitingElicitation`,
+    /// `AwaitingPeer`, or `WorkflowGate`, and even a real `AwaitingApproval`'s
+    /// real `rule`/`params_digest` are lost by this discriminant-only cache
+    /// column. Grant/approval-scoping logic (§6.2/§6.4) must never read
+    /// these placeholder fields as real data; a caller that needs the real
+    /// reason must fold it from the event log instead (this function exists
+    /// for validating/round-tripping the cache column, not as a full
+    /// inverse of `as_sql_str`).
     pub fn from_sql_str(s: &str) -> Result<TaskState, crate::error::CoreError> {
         match s {
             "Created" => Ok(TaskState::Created),
