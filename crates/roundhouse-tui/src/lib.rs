@@ -7,6 +7,12 @@
 //! `docs/architecture/02-system-architecture.md` §5.2 and `08-ui-design.md`.
 #![forbid(unsafe_code)]
 
+mod client;
+mod protocol;
+
+pub use client::{connect, DaemonClient};
+pub use protocol::{ServerMessage, TuiError};
+
 pub fn client_schema() -> schemars::Schema {
     roundhouse_proto::client_event_schema()
 }
