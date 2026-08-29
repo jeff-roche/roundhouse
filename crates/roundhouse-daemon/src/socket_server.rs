@@ -1,0 +1,81 @@
+//! The minimal real server half of Task 18's `DaemonClient`: one Unix socket,
+//! one attached client, NDJSON out.
+
+use roundhouse_tui::ServerMessage;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use tokio::io::AsyncWriteExt;
+use tokio::net::UnixListener;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+/// Binds a Unix socket, accepts exactly one connection, and forwards every
+/// `ServerMessage` sent on `rx` to it as one NDJSON line.
+///
+/// A production daemon serves many concurrent attached clients (§11.3); this
+/// phase's exit criterion only needs one, to prove the wire format round-trips
+/// end to end. `bind` runs synchronously *before* this function returns, so the
+/// socket exists and is listening the moment the caller gets the `JoinHandle`
+/// back — that ordering is load-bearing, since it's what lets a caller dial the
+/// socket immediately instead of sleeping and hoping.
+///
+/// The spawned task exits when `rx` closes, when the peer goes away, or when the
+/// accept fails; dropping the stream on the way out is what gives the client a
+/// clean EOF rather than a hang. Nothing here panics on a hostile or vanished
+/// peer: every write error ends the loop instead.
+///
+/// # Errors
+/// Returns the `bind` error if the path is already in use, unwritable, or too
+/// long for `sockaddr_un`, or the `set_permissions` error if the socket's mode
+/// can't be tightened.
+pub fn serve_ndjson(
+    socket_path: impl AsRef<Path>,
+    mut rx: mpsc::Receiver<ServerMessage>,
+) -> std::io::Result<JoinHandle<()>> {
+    let socket_path = socket_path.as_ref();
+    let listener = UnixListener::bind(socket_path)?;
+    // `bind` creates the socket with `0777 & ~umask`, which on a permissive
+    // umask is world-connectable. Tighten it to owner-only.
+    //
+    // There is an unavoidable window between `bind` and this call, and
+    // `set_permissions` *follows symlinks* — so if the socket path sits
+    // somewhere an attacker can write, they could replace it with a symlink in
+    // that window and have this line chmod an arbitrary file of their choosing
+    // to 0600. For the default path that is fully mitigated by the 0700 parent
+    // directory (nobody else can create anything in it, so there is nothing to
+    // swap). It is *not* mitigated for an operator-supplied `$ROUND_SOCKET`
+    // pointing at a shared directory — the parent directory is the real barrier
+    // here, and this chmod is only defense in depth behind it.
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+
+    Ok(tokio::spawn(async move {
+        // TODO(Phase 2): implement SO_PEERCRED peer-credential verification per
+        // docs/architecture/03-security-and-sandboxing.md §6.4 "Approvals" ("The
+        // Unix socket uses peer-credential checks (SO_PEERCRED)"). This demo server
+        // accepts any local connection with no authentication whatsoever — the
+        // 0600 socket mode and 0700 parent directory above are what currently
+        // stand in for it, and they are a filesystem-permission approximation,
+        // not the credential check the frozen contract requires.
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        while let Some(message) = rx.recv().await {
+            // `ServerMessage` is a plain serde enum, so this cannot fail in
+            // practice — but a serialization bug must drop one message, not take
+            // down the daemon's only client connection.
+            let line = match serde_json::to_string(&message) {
+                Ok(line) => line,
+                Err(err) => {
+                    tracing::warn!(error = %err, "dropping unserializable ServerMessage");
+                    continue;
+                }
+            };
+            if stream.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+            if stream.write_all(b"\n").await.is_err() {
+                break;
+            }
+        }
+    }))
+}

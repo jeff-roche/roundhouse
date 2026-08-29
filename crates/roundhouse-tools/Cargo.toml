@@ -8,6 +8,13 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+diffy = "0.5.1"
+glob = "0.3"
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-sandbox = { path = "../roundhouse-sandbox" }
 roundhouse-policy = { path = "../roundhouse-policy" }
+tokio = { version = "1.53", features = ["full"] }
+thiserror = "2.0.20"
+tempfile = "3"
+
+[dev-dependencies]

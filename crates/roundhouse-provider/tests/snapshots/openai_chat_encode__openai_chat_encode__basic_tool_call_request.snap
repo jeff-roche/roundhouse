@@ -1,0 +1,57 @@
+---
+source: crates/roundhouse-provider/tests/openai_chat_encode.rs
+expression: body
+---
+{
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "content": "You are a careful coding agent.",
+      "role": "system"
+    },
+    {
+      "content": "Read main.rs",
+      "role": "user"
+    },
+    {
+      "content": null,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"path\":\"main.rs\"}",
+            "name": "read"
+          },
+          "id": "call_1",
+          "type": "function"
+        }
+      ]
+    }
+  ],
+  "model": "gpt-5.4",
+  "stream": true,
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "function": {
+        "description": "Read a file",
+        "name": "read",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "description": "Test params struct for the \"read\" tool.",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "title": "ReadParams",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

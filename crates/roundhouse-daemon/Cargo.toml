@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "round-daemon-internal"
 path = "src/main.rs"
@@ -26,4 +29,16 @@ roundhouse-engine = { path = "../roundhouse-engine" }
 roundhouse-flow = { path = "../roundhouse-flow" }
 roundhouse-sched = { path = "../roundhouse-sched" }
 roundhouse-config = { path = "../roundhouse-config" }
+roundhouse-tui = { path = "../roundhouse-tui" }
 color-eyre = { workspace = true }
+# `fs`/`io-util` on top of the workspace feature set: the demo reads the edited
+# file back and the socket server writes NDJSON lines. Declared here rather than
+# relied on via cross-crate feature unification, which is not a guarantee.
+tokio = { workspace = true, features = ["fs", "io-util"] }
+futures = "0.3"
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

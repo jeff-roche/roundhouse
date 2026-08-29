@@ -4,16 +4,51 @@ Guidance for coding agents working in this repository.
 
 ## Project status
 
-Phase 0 is complete. All 14 tasks of `docs/superpowers/plans/2026-08-27-phase0-contracts.md`
-have landed: the 18-crate Cargo workspace exists with every downstream crate wired against
-Phase 0 stub traits, event-sourcing and S-LOG properties are enforced at the type and schema
-levels, layered config loading with `roundhouse-config` is real, and content-addressed blob
-storage (`BlobRef`, `blobs` table, `write_blob`/`read_blob`, GC eligibility, quota rejection)
-is wired into `roundhouse-core`/`roundhouse-store`. Phase 1 (the vertical slice) is next per
-`docs/superpowers/plans/2026-08-27-phase1-vertical-slice.md`. `docs/architecture/` is the
-frozen design (committed, reference truth). `docs/superpowers/plans/`, `docs/audits/`, and
-`docs/scratch/` hold the phase-by-phase implementation plans, audit findings, and scratch
-notes — they exist locally but are gitignored, so don't expect them on a fresh clone.
+Phase 0 and Phase 1 are both complete. Phase 0 landed all 14 tasks of
+`docs/superpowers/plans/2026-08-27-phase0-contracts.md`: the 18-crate Cargo workspace exists
+with every downstream crate wired against Phase 0 stub traits, event-sourcing and S-LOG
+properties are enforced at the type and schema levels, layered config loading with
+`roundhouse-config` is real, and content-addressed blob storage (`BlobRef`, `blobs` table,
+`write_blob`/`read_blob`, GC eligibility, quota rejection) is wired into
+`roundhouse-core`/`roundhouse-store`. Phase 1 landed all 22 tasks of
+`docs/superpowers/plans/2026-08-27-phase1-vertical-slice.md`: the full vertical slice now
+runs end to end — `roundhouse-cli`'s `round` TUI attaches over a Unix socket to
+`roundhouse-daemon`, whose `TaskRunner` (`roundhouse-core`) records every action as
+event-sourced `chat`/`infer` tasks folded by `roundhouse-store`, driven by
+`roundhouse-engine`'s `run_chat_turn`, dispatching to `roundhouse-tools`' executors
+(`read`/`write`/`edit`/`find`/`shell`), and backed by a real `Provider` implementation
+(`roundhouse-provider`'s `AnthropicMessagesProvider`) when `ANTHROPIC_API_KEY` is set.
+Phase 2 (robustness) is next per `docs/superpowers/plans/2026-08-27-phase2-robustness.md`.
+`docs/architecture/` is the frozen design (committed, reference truth).
+`docs/superpowers/plans/`, `docs/audits/`, and `docs/scratch/` hold the phase-by-phase
+implementation plans, audit findings, and scratch notes — they exist locally but are
+gitignored, so don't expect them on a fresh clone.
+
+### Running what Phase 1 built
+
+`roundhouse-daemon`'s binary (`round-daemon-internal`) runs one scripted demo session on
+startup — real event log, real `chat`→`infer` task tree, one scripted `edit_file` call —
+then serves the results to exactly one attached client over a Unix socket
+(`$ROUND_SOCKET`, default resolved by `roundhouse_tui::default_socket_path`). In one
+terminal:
+
+```
+cargo run -p roundhouse-daemon --bin round-daemon-internal
+```
+
+With no `ANTHROPIC_API_KEY` set (the default, and what CI relies on), it runs fully
+offline against `roundhouse_daemon::demo::FakeEditProvider` — zero outbound connections.
+Export a real `ANTHROPIC_API_KEY` first to exercise the live `AnthropicMessagesProvider`
+path instead. In a second terminal, attach with the TUI client to watch the session's
+task log stream in over the socket:
+
+```
+cargo run -p roundhouse-cli --bin round
+```
+
+See `crates/roundhouse-daemon/src/demo.rs` and `crates/roundhouse-daemon/src/main.rs` for
+the actual wiring, and `crates/roundhouse-daemon/tests/exit_criterion_demo.rs` for the
+scripted end-to-end test this exit criterion is pinned against.
 
 ## Commands
 

@@ -114,6 +114,11 @@ pub enum CancelReason {
     Timeout,
     SessionClosed,
     PolicyDeny,
+    /// Task was interrupted by crash recovery (daemon restart).
+    /// Distinct from `User` — allows callers to distinguish daemon-restart
+    /// cancellations from user-requested cancellations. Folds to `TaskState::Interrupted`
+    /// rather than `TaskState::Cancelled` for observability (S-SESS-4).
+    DaemonRestart,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -153,8 +158,12 @@ impl Envelope {
     #[doc(hidden)]
     pub fn default_for_test() -> Self {
         Envelope {
-            from: crate::address::Address::Human { session: crate::ids::SessionId::new() },
-            to: crate::address::Address::Human { session: crate::ids::SessionId::new() },
+            from: crate::address::Address::Human {
+                session: crate::ids::SessionId::new(),
+            },
+            to: crate::address::Address::Human {
+                session: crate::ids::SessionId::new(),
+            },
             body: TaskInput::Text(String::new()),
             expect_reply: false,
         }

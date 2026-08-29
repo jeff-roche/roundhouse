@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Bare-`pub` tuple id, deliberately unlike the four private-field core ids
 /// (`SessionId`/`TaskId`/`WorkspaceId`/`TeamId`) — see `RuleId`'s doc
@@ -56,9 +56,20 @@ pub struct ToolResultPart {
 /// content blocks: the only IR shape lossless for the hardest provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ContentBlock {
-    Text { text: String, cache: Option<CacheBreakpoint>, citations: Vec<Citation> },
-    Image { source: MediaSource, cache: Option<CacheBreakpoint> },
-    Document { source: MediaSource, title: Option<String>, cache: Option<CacheBreakpoint> },
+    Text {
+        text: String,
+        cache: Option<CacheBreakpoint>,
+        citations: Vec<Citation>,
+    },
+    Image {
+        source: MediaSource,
+        cache: Option<CacheBreakpoint>,
+    },
+    Document {
+        source: MediaSource,
+        title: Option<String>,
+        cache: Option<CacheBreakpoint>,
+    },
     ToolUse {
         id: ToolCallId,
         id_origin: IdOrigin,
@@ -72,10 +83,18 @@ pub enum ContentBlock {
         is_error: bool,
         cache: Option<CacheBreakpoint>,
     },
-    Thinking { text: String, signature: Option<Signature>, redacted: bool },
+    Thinking {
+        text: String,
+        signature: Option<Signature>,
+        redacted: bool,
+    },
     /// Round-trips verbatim to the SAME (provider, model); dropped with a
     /// LossEvent on cross-provider handoff.
-    Opaque { provider: ProviderId, kind: String, raw: Value },
+    Opaque {
+        provider: ProviderId,
+        kind: String,
+        raw: Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,8 +178,13 @@ pub fn tool_def_from_schema<T: schemars::JsonSchema>(
     description: impl Into<String>,
 ) -> ToolDef {
     let schema = schemars::schema_for!(T);
-    let input_schema = serde_json::to_value(&schema).expect("schemars::Schema always serializes to JSON");
-    ToolDef { name: name.into(), description: description.into(), input_schema }
+    let input_schema =
+        serde_json::to_value(&schema).expect("schemars::Schema always serializes to JSON");
+    ToolDef {
+        name: name.into(),
+        description: description.into(),
+        input_schema,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,9 +258,19 @@ pub struct ChatRequest {
     pub policy: RequestPolicy,
 }
 
-#[derive(Debug, Clone, Default)]
+use crate::transport::HttpTransport;
+
+/// Request context carrying the trace ID, HTTP transport, and API key.
+///
+/// Does not derive `Default` or `Debug` because `Arc<dyn HttpTransport>` does not implement
+/// either trait — a transport must be provided explicitly at construction.
 pub struct RequestCtx {
+    /// Optional trace ID for request tracing.
     pub trace_id: Option<String>,
+    /// HTTP transport implementation (may be real network or test cassette).
+    pub transport: std::sync::Arc<dyn HttpTransport>,
+    /// API key for the provider. Simplified for Phase 1; §9.9's `Secret<String>`/`CredentialProvider` lands in Phase 2.
+    pub api_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -263,12 +297,25 @@ pub struct ModelInfo {
     pub context_window: Option<u64>,
 }
 
-/// Placeholder for the real streamed-event type (§9.3: "streaming is the
-/// only path"). Phase 1 replaces this with the actual
-/// `BlockStart`/`BlockDelta`/`BlockStop` stream; Phase 0 needs only a
-/// nameable return type for `Provider::stream_chat`'s signature.
-#[derive(Debug, Clone, Default)]
-pub struct ChatStream;
+/// The real streamed-event type (§9.3: "streaming is the only path — there
+/// is no non-streaming method"). Replaces Phase 0's Task 7 placeholder
+/// (`#[derive(Debug, Clone, Default)] pub struct ChatStream;`) in place, per
+/// that placeholder's own hand-off comment. A newtype (not a bare type
+/// alias) so `ChatStream` has exactly one name and one definition site
+/// across every codec's `stream_chat` impl.
+pub struct ChatStream(
+    pub std::pin::Pin<Box<dyn futures::Stream<Item = crate::stream_event::StreamEvent> + Send>>,
+);
+
+impl futures::Stream for ChatStream {
+    type Item = crate::stream_event::StreamEvent;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.0.as_mut().poll_next(cx)
+    }
+}
 
 /// Extended 2026-08-28 (audit follow-up, same class of fix as `RequestCtx`/
 /// `ChatStream` above): the original 3 variants were enough for the
@@ -300,7 +347,9 @@ pub enum ProviderError {
     Overloaded,
     /// §9.8: "your request rate" — shed concurrency, then retry.
     #[error("rate limited (retry_after={retry_after:?})")]
-    RateLimited { retry_after: Option<std::time::Duration> },
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+    },
     /// §9.8: billing — fatal, never retry.
     #[error("quota exhausted")]
     QuotaExhausted,
