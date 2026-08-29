@@ -15,7 +15,7 @@ pub enum ToolError {
     /// Ambiguous match: multiple occurrences found when exactly one was expected.
     #[error("ambiguous match: {0} occurrences found, expected exactly 1")]
     AmbiguousMatch(usize),
-    /// Glob pattern error.
+    /// Glob pattern error, covering invalid glob syntax, non-UTF-8 patterns, path containment violations, and I/O errors during glob expansion.
     #[error("glob pattern error: {0}")]
     Glob(String),
 }
