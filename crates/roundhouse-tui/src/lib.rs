@@ -8,10 +8,14 @@
 #![forbid(unsafe_code)]
 
 mod client;
+mod dirty;
 mod protocol;
+mod render;
 
 pub use client::{connect, DaemonClient};
+pub use dirty::{DirtyFlags, Region};
 pub use protocol::{ServerMessage, TuiError};
+pub use render::render_tick;
 
 pub fn client_schema() -> schemars::Schema {
     roundhouse_proto::client_event_schema()
