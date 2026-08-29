@@ -27,7 +27,7 @@ pub use ir::{
     RequestPolicy, ResponseFormat, ShellToolParams, Signature, SystemBlock, TokenCount,
     ToolCallId, ToolChoice, ToolDef, ToolResultPart,
 };
-pub use ir::MessageRole as Role; // compat alias — see stream_event module docs
+pub use ir::MessageRole as Role; // temporary compat alias: rest of this plan's Track B/C/G task text says Role::User/Role::Assistant; a later phase should update those call sites to MessageRole directly and drop this alias
 pub use provider_trait::{BoxFut, Provider};
 pub use stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 pub use transport::{HttpRequest, HttpResponseStream, HttpTransport, TransportError};

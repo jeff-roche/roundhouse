@@ -35,11 +35,24 @@ pub enum BlockDelta {
 /// Streaming event representing a chunk of a provider's response stream.
 pub enum StreamEvent {
     /// Start of a new content block at the given index with the specified kind.
-    BlockStart { index: u32, kind: BlockKind },
+    BlockStart {
+        /// Index of the block in the normalized sequence.
+        index: u32,
+        /// Type and metadata of the block being started.
+        kind: BlockKind,
+    },
     /// Incremental delta for the block at the given index.
-    BlockDelta { index: u32, delta: BlockDelta },
+    BlockDelta {
+        /// Index of the block receiving this delta.
+        index: u32,
+        /// Incremental change to the block.
+        delta: BlockDelta,
+    },
     /// End of the block at the given index.
-    BlockStop { index: u32 },
+    BlockStop {
+        /// Index of the block that is complete.
+        index: u32,
+    },
     /// Token usage update (any or all fields may be present).
     UsageDelta {
         /// Input tokens consumed so far (if available).
