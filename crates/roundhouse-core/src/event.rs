@@ -44,31 +44,6 @@ impl Event {
     ) -> Self {
         Event { session_id, seq, ts, task_id, payload, schema_v, _seal: crate::seal::Seal::mint() }
     }
-
-    /// Reconstructs an `Event` from parts already durably written to the
-    /// append-only `events` table (S-LOG-2). This does NOT mint a new
-    /// lifecycle event and is not a general bypass of `TaskRunner`'s
-    /// minting authority (S-LOG-1) — every row this ever replays could
-    /// only have been written by a pool write that itself required an
-    /// `Event` value, which by induction could only have originated from
-    /// `TaskRunner` (or a prior call to this same function replaying that
-    /// same row). Gated behind the `replay` feature so it is not part of
-    /// this crate's default public surface — only a crate that explicitly
-    /// opts in (via `features = ["replay"]` on its `roundhouse-core`
-    /// dependency) gains this capability. Callers must only use this to
-    /// replay rows actually read back from the append-only event log,
-    /// never to synthesize new events from other input.
-    #[cfg(feature = "replay")]
-    pub fn from_persisted(
-        session_id: crate::ids::SessionId,
-        seq: u64,
-        ts: Timestamp,
-        task_id: Option<TaskId>,
-        payload: EventPayload,
-        schema_v: u16,
-    ) -> Self {
-        Event::new_sealed(session_id, seq, ts, task_id, payload, schema_v)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
