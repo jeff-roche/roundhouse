@@ -8,19 +8,33 @@ use serde::{Deserialize, Serialize};
 /// fragments, an `agent` task streams child-session progress.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum Delta {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// Must round-trip verbatim — see §9.3 on thinking signatures.
-    Thinking { text: String, signature: Option<String> },
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
     #[serde(with = "bytes_as_vec")]
     #[schemars(with = "Vec<u8>")]
-    Stdout { bytes: Bytes },
+    Stdout {
+        bytes: Bytes,
+    },
     #[serde(with = "bytes_as_vec")]
     #[schemars(with = "Vec<u8>")]
-    Stderr { bytes: Bytes },
+    Stderr {
+        bytes: Bytes,
+    },
     /// Partial JSON from a streaming tool call.
-    ToolArgs { fragment: String },
+    ToolArgs {
+        fragment: String,
+    },
     /// Pointer to a child session's event.
-    Child { session: SessionId, seq: u64 },
+    Child {
+        session: SessionId,
+        seq: u64,
+    },
     /// §4.5 — a streamed chunk that crossed `BLOB_INLINE_THRESHOLD` (rare —
     /// most deltas are small by nature, but e.g. a single oversized
     /// `Stdout` chunk can still exceed it) and was routed to the blob store

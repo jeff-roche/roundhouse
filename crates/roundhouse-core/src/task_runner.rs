@@ -63,7 +63,12 @@ impl TaskRunner {
             seq,
             ts,
             Some(task_id),
-            EventPayload::TaskCreated { kind, parent, origin, input },
+            EventPayload::TaskCreated {
+                kind,
+                parent,
+                origin,
+                input,
+            },
             schema_v,
         )
     }
@@ -118,7 +123,14 @@ impl TaskRunner {
         delta: DeltaAlias,
         schema_v: u16,
     ) -> Event {
-        Event::new_sealed(session_id, seq, ts, Some(task_id), EventPayload::TaskDelta { delta }, schema_v)
+        Event::new_sealed(
+            session_id,
+            seq,
+            ts,
+            Some(task_id),
+            EventPayload::TaskDelta { delta },
+            schema_v,
+        )
     }
 
     pub fn record_task_progress(
@@ -168,7 +180,14 @@ impl TaskRunner {
         by: Origin,
         schema_v: u16,
     ) -> Event {
-        Event::new_sealed(session_id, seq, ts, Some(task_id), EventPayload::TaskResumed { by }, schema_v)
+        Event::new_sealed(
+            session_id,
+            seq,
+            ts,
+            Some(task_id),
+            EventPayload::TaskResumed { by },
+            schema_v,
+        )
     }
 
     pub fn record_task_completed(

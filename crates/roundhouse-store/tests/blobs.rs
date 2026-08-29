@@ -24,7 +24,10 @@ fn writing_identical_content_twice_produces_one_blob_with_ref_count_two() {
     }
 
     let blob_b = write_blob(dir.path(), b"same content", Some("text/plain".into())).unwrap();
-    assert_eq!(blob_a.hash, blob_b.hash, "identical bytes must collide to the same content address");
+    assert_eq!(
+        blob_a.hash, blob_b.hash,
+        "identical bytes must collide to the same content address"
+    );
     {
         let txn = begin_immediate(&mut conn).unwrap();
         record_blob_write(&txn, dir.path(), &blob_b, 2_000).unwrap();
@@ -32,9 +35,16 @@ fn writing_identical_content_twice_produces_one_blob_with_ref_count_two() {
     }
 
     let ref_count: i64 = conn
-        .query_row("SELECT ref_count FROM blobs WHERE hash = ?1", [blob_a.hash.as_str()], |row| row.get(0))
+        .query_row(
+            "SELECT ref_count FROM blobs WHERE hash = ?1",
+            [blob_a.hash.as_str()],
+            |row| row.get(0),
+        )
         .unwrap();
-    assert_eq!(ref_count, 2, "two writes of the same content must bump ref_count to 2, not create two rows");
+    assert_eq!(
+        ref_count, 2,
+        "two writes of the same content must bump ref_count to 2, not create two rows"
+    );
 
     assert_eq!(read_blob(dir.path(), &blob_a).unwrap(), b"same content");
 }
@@ -58,11 +68,18 @@ fn a_blob_with_zero_ref_count_past_the_grace_period_is_gc_eligible() {
 
     let seven_days = 7 * 24 * 3600;
     let too_soon = gc_eligible_blobs(&conn, 1_000 + 60, seven_days).unwrap();
-    assert!(too_soon.is_empty(), "a blob still inside its grace period must not be GC-eligible yet");
+    assert!(
+        too_soon.is_empty(),
+        "a blob still inside its grace period must not be GC-eligible yet"
+    );
 
     let past_grace_period = 1_000 + seven_days + 60;
     let eligible = gc_eligible_blobs(&conn, past_grace_period, seven_days).unwrap();
-    assert_eq!(eligible, vec![blob.hash], "a ref_count==0 blob past the grace period must be GC-eligible");
+    assert_eq!(
+        eligible,
+        vec![blob.hash],
+        "a ref_count==0 blob past the grace period must be GC-eligible"
+    );
 }
 
 #[test]
@@ -71,7 +88,11 @@ fn write_beyond_the_configured_quota_is_rejected() {
 
     let result = write_blob_with_quota(dir.path(), 900, 1_000, &[0u8; 200], None);
     match result {
-        Err(QuotaError::WouldExceedQuota { current_usage_bytes: 900, attempted_bytes: 200, quota_bytes: 1_000 }) => {}
+        Err(QuotaError::WouldExceedQuota {
+            current_usage_bytes: 900,
+            attempted_bytes: 200,
+            quota_bytes: 1_000,
+        }) => {}
         other => panic!("expected WouldExceedQuota, got {other:?}"),
     }
 
@@ -90,7 +111,11 @@ fn record_blob_write_rejects_a_blob_ref_whose_file_is_missing_on_disk() {
     let mut conn = seeded_conn();
 
     let phantom_hash = "c".repeat(64);
-    let phantom = BlobRef { hash: Blake3Hash::from_hex(phantom_hash).unwrap(), len: 4, mime: None };
+    let phantom = BlobRef {
+        hash: Blake3Hash::from_hex(phantom_hash).unwrap(),
+        len: 4,
+        mime: None,
+    };
 
     let txn = begin_immediate(&mut conn).unwrap();
     let result = record_blob_write(&txn, dir.path(), &phantom, 1_000);

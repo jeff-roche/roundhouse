@@ -1,4 +1,4 @@
-use roundhouse_core::{Tier, TaskId};
+use roundhouse_core::{TaskId, Tier};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -51,11 +51,31 @@ pub struct ProviderId(pub String);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskParams {
     Shell(ParsedCommand),
-    Fs { op: FsOp, path: PathBuf, canonical: Result<PathBuf, PathErr> },
-    Http { method: Method, url: String, body_len: usize },
-    Mcp { server: ServerId, tool: String, args: serde_json::Value },
-    Git { subcommand: String, argv: Vec<String>, remote: Option<String> },
-    Agent { provider: ProviderId, model: String, tier_request: Tier },
+    Fs {
+        op: FsOp,
+        path: PathBuf,
+        canonical: Result<PathBuf, PathErr>,
+    },
+    Http {
+        method: Method,
+        url: String,
+        body_len: usize,
+    },
+    Mcp {
+        server: ServerId,
+        tool: String,
+        args: serde_json::Value,
+    },
+    Git {
+        subcommand: String,
+        argv: Vec<String>,
+        remote: Option<String>,
+    },
+    Agent {
+        provider: ProviderId,
+        model: String,
+        tier_request: Tier,
+    },
 }
 
 /// §6.8 — `PolicyInput.taint` gates autonomy for irreversible/exfiltrating

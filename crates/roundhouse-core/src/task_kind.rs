@@ -31,5 +31,8 @@ pub enum TaskKind {
     /// finding A2); this is the fix, not a later addition layered on top.
     Report,
     /// `vendor:verb` — plugin-provided task kinds.
-    Plugin { vendor: String, verb: String },
+    Plugin {
+        vendor: String,
+        verb: String,
+    },
 }

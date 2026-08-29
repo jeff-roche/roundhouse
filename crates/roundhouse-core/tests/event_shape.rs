@@ -28,22 +28,39 @@ fn task_kind_covers_core_flat_kinds_and_open_vendor_verb() {
     ];
     assert_eq!(core_kinds.len(), 20);
 
-    let plugin_kind = TaskKind::Plugin { vendor: "acme".into(), verb: "deploy".into() };
+    let plugin_kind = TaskKind::Plugin {
+        vendor: "acme".into(),
+        verb: "deploy".into(),
+    };
     match plugin_kind {
-        TaskKind::Plugin { vendor, verb } => assert_eq!((vendor.as_str(), verb.as_str()), ("acme", "deploy")),
+        TaskKind::Plugin { vendor, verb } => {
+            assert_eq!((vendor.as_str(), verb.as_str()), ("acme", "deploy"))
+        }
         _ => unreachable!(),
     }
 }
 
 #[test]
 fn delta_covers_all_streaming_shapes() {
-    let deltas = vec![
+    let deltas = [
         Delta::Text { text: "hi".into() },
-        Delta::Thinking { text: "reasoning".into(), signature: None },
-        Delta::Stdout { bytes: bytes::Bytes::from_static(b"out") },
-        Delta::Stderr { bytes: bytes::Bytes::from_static(b"err") },
-        Delta::ToolArgs { fragment: "{\"a\":".into() },
-        Delta::Child { session: roundhouse_core::SessionId::new(), seq: 1 },
+        Delta::Thinking {
+            text: "reasoning".into(),
+            signature: None,
+        },
+        Delta::Stdout {
+            bytes: bytes::Bytes::from_static(b"out"),
+        },
+        Delta::Stderr {
+            bytes: bytes::Bytes::from_static(b"err"),
+        },
+        Delta::ToolArgs {
+            fragment: "{\"a\":".into(),
+        },
+        Delta::Child {
+            session: roundhouse_core::SessionId::new(),
+            seq: 1,
+        },
     ];
     assert_eq!(deltas.len(), 6);
 }
@@ -55,7 +72,9 @@ fn delta_stdout_and_stderr_round_trip_bytes_through_json() {
     // stderr delta silently vanish on serialize (a default-valued unit, not
     // an error) with no test catching it. Both variants must round-trip
     // identically.
-    let stdout = Delta::Stdout { bytes: bytes::Bytes::from_static(b"stdout bytes") };
+    let stdout = Delta::Stdout {
+        bytes: bytes::Bytes::from_static(b"stdout bytes"),
+    };
     let stdout_json = serde_json::to_string(&stdout).unwrap();
     let stdout_back: Delta = serde_json::from_str(&stdout_json).unwrap();
     match stdout_back {
@@ -63,7 +82,9 @@ fn delta_stdout_and_stderr_round_trip_bytes_through_json() {
         other => panic!("expected Delta::Stdout to round-trip, got {other:?}"),
     }
 
-    let stderr = Delta::Stderr { bytes: bytes::Bytes::from_static(b"stderr bytes") };
+    let stderr = Delta::Stderr {
+        bytes: bytes::Bytes::from_static(b"stderr bytes"),
+    };
     let stderr_json = serde_json::to_string(&stderr).unwrap();
     let stderr_back: Delta = serde_json::from_str(&stderr_json).unwrap();
     match stderr_back {
@@ -81,7 +102,12 @@ fn event_payload_task_created_carries_kind_parent_origin_input() {
         input: TaskInput::Json(serde_json::json!({"argv": ["ls"]})),
     };
     match payload {
-        EventPayload::TaskCreated { kind: TaskKind::Shell, parent: None, origin: Origin::Model, .. } => {}
+        EventPayload::TaskCreated {
+            kind: TaskKind::Shell,
+            parent: None,
+            origin: Origin::Model,
+            ..
+        } => {}
         _ => panic!("TaskCreated did not match expected shape"),
     }
 }
@@ -90,8 +116,13 @@ fn event_payload_task_created_carries_kind_parent_origin_input() {
 fn note_and_message_are_cross_cutting_payloads() {
     let ts = Timestamp::from_unix_nanos(0);
     let _ = ts;
-    let _note = EventPayload::Note { level: NoteLevel::Info, text: "hello".into() };
-    let _msg = EventPayload::Message { envelope: Envelope::default_for_test() };
+    let _note = EventPayload::Note {
+        level: NoteLevel::Info,
+        text: "hello".into(),
+    };
+    let _msg = EventPayload::Message {
+        envelope: Envelope::default_for_test(),
+    };
 }
 
 #[test]
@@ -100,7 +131,11 @@ fn task_started_carries_an_optional_handle_for_long_running_tasks() {
 
     // A `shell` task that runs to completion: no handle needed.
     let short_lived = EventPayload::TaskStarted {
-        isolation: IsolationAttestation { tier: Tier::Worktree, digest: "d1".into(), net_enforced: true },
+        isolation: IsolationAttestation {
+            tier: Tier::Worktree,
+            digest: "d1".into(),
+            net_enforced: true,
+        },
         handle: None,
     };
     match short_lived {
@@ -110,11 +145,18 @@ fn task_started_carries_an_optional_handle_for_long_running_tasks() {
 
     // A `shell` task running `npm run dev` (§4.3): non-terminating, carries a handle.
     let long_running = EventPayload::TaskStarted {
-        isolation: IsolationAttestation { tier: Tier::Worktree, digest: "d2".into(), net_enforced: true },
+        isolation: IsolationAttestation {
+            tier: Tier::Worktree,
+            digest: "d2".into(),
+            net_enforced: true,
+        },
         handle: Some(Handle::Pid(12345)),
     };
     match long_running {
-        EventPayload::TaskStarted { handle: Some(Handle::Pid(12345)), .. } => {}
+        EventPayload::TaskStarted {
+            handle: Some(Handle::Pid(12345)),
+            ..
+        } => {}
         _ => panic!("expected Some(Handle::Pid(12345)) for a long-running task"),
     }
 }

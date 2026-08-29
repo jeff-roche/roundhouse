@@ -28,6 +28,12 @@ pub enum ClientRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[non_exhaustive]
 pub enum ClientEvent {
-    TaskEvent { session_id: SessionId, task_id: Option<TaskId>, payload: EventPayload },
-    Ack { api_version: ApiVersion },
+    TaskEvent {
+        session_id: SessionId,
+        task_id: Option<TaskId>,
+        payload: EventPayload,
+    },
+    Ack {
+        api_version: ApiVersion,
+    },
 }

@@ -5,9 +5,15 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file {path}: {source}")]
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("failed to parse config file {path}: {source}")]
-    Parse { path: PathBuf, source: toml::de::Error },
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -51,15 +57,22 @@ impl ConfigLoader {
             if !path.exists() {
                 continue;
             }
-            let text = std::fs::read_to_string(path)
-                .map_err(|source| ConfigError::Io { path: path.clone(), source })?;
-            let value: toml::Value =
-                text.parse().map_err(|source| ConfigError::Parse { path: path.clone(), source })?;
+            let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let value: toml::Value = text.parse().map_err(|source| ConfigError::Parse {
+                path: path.clone(),
+                source,
+            })?;
             merge_into(&mut merged, value);
             scopes_present.push(*scope);
         }
 
-        Ok(LoadedConfig { value: merged, scopes_present })
+        Ok(LoadedConfig {
+            value: merged,
+            scopes_present,
+        })
     }
 }
 
@@ -93,7 +106,10 @@ fn merge_into(base: &mut toml::Value, overlay: toml::Value) {
 pub fn default_layers(project_root: Option<&Path>) -> Vec<(ConfigScope, PathBuf)> {
     let mut layers = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
-        layers.push((ConfigScope::UserGlobal, PathBuf::from(home).join(".config/roundhouse/config.toml")));
+        layers.push((
+            ConfigScope::UserGlobal,
+            PathBuf::from(home).join(".config/roundhouse/config.toml"),
+        ));
     }
     if let Some(root) = project_root {
         layers.push((ConfigScope::Project, root.join(".roundhouse/config.toml")));

@@ -37,14 +37,19 @@ fn scanner_detects_event_new_sealed_calls_when_present() {
     // Create a temporary test directory isolated from crates/ to avoid
     // interfering with other tests' scans of the live workspace.
     // Use std::env::temp_dir() so this never conflicts with production scanning.
-    let thread_id = format!("{:?}", std::thread::current().id()).replace("ThreadId(", "").replace(")", "");
+    let thread_id = format!("{:?}", std::thread::current().id())
+        .replace("ThreadId(", "")
+        .replace(")", "");
     let temp_root = std::env::temp_dir().join(format!("xtask_test_bypass_{}", thread_id));
     let _ = fs::remove_dir_all(&temp_root); // Clean up from any previous failed run
     fs::create_dir_all(&temp_root).expect("failed to create temp test directory");
 
     let test_file = temp_root.join("unauthorized.rs");
-    fs::write(&test_file, "let event = Event::new_sealed(task_id, payload);")
-        .expect("failed to write temp test file");
+    fs::write(
+        &test_file,
+        "let event = Event::new_sealed(task_id, payload);",
+    )
+    .expect("failed to write temp test file");
 
     // Scan only the isolated temp directory (not the live workspace)
     let hits = scan_dir_for(&temp_root, |line| {
@@ -64,7 +69,8 @@ fn scanner_detects_event_new_sealed_calls_when_present() {
         "scanner should detect Event::new_sealed call in temporary test file"
     );
     assert!(
-        hits.iter().any(|(path, _)| path.ends_with("unauthorized.rs")),
+        hits.iter()
+            .any(|(path, _)| path.ends_with("unauthorized.rs")),
         "detected violation should include the temporary test file: {hits:?}"
     );
 }

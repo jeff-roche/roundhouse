@@ -25,7 +25,10 @@ const EXPECTED_MEMBERS: &[&str] = &[
 
 #[test]
 fn workspace_lists_all_eighteen_crates() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("read root Cargo.toml");
     let parsed: toml::Value = manifest.parse().expect("parse root Cargo.toml");
     let members = parsed["workspace"]["members"]
@@ -40,12 +43,19 @@ fn workspace_lists_all_eighteen_crates() {
             "workspace.members is missing {expected}"
         );
     }
-    assert_eq!(members.len(), EXPECTED_MEMBERS.len(), "unexpected extra/missing member");
+    assert_eq!(
+        members.len(),
+        EXPECTED_MEMBERS.len(),
+        "unexpected extra/missing member"
+    );
 }
 
 #[test]
 fn workspace_forbids_unsafe_code_by_default() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("read root Cargo.toml");
     let parsed: toml::Value = manifest.parse().expect("parse root Cargo.toml");
     assert_eq!(

@@ -30,7 +30,10 @@ impl Bus for NoopBus {
 async fn bus_trait_is_object_safe_and_resolves_a_direct_session_address() {
     let bus: Arc<dyn Bus> = Arc::new(NoopBus);
     let session = SessionId::new();
-    let resolved = bus.resolve(&Address::Session { id: session }).await.unwrap();
+    let resolved = bus
+        .resolve(&Address::Session { id: session })
+        .await
+        .unwrap();
     assert_eq!(resolved, vec![session]);
 }
 
@@ -39,5 +42,8 @@ async fn send_to_an_ended_session_returns_undeliverable_never_a_silent_drop() {
     let bus: Arc<dyn Bus> = Arc::new(NoopBus);
     let envelope = Envelope::default_for_test();
     let result = bus.send(envelope).await;
-    assert!(matches!(result, Err(BusError::Undeliverable(Undeliverable::Ended))));
+    assert!(matches!(
+        result,
+        Err(BusError::Undeliverable(Undeliverable::Ended))
+    ));
 }

@@ -38,7 +38,8 @@ impl Blake3Hash {
     pub fn from_hex(s: impl Into<String>) -> Result<Self, InvalidHashError> {
         let s = s.into();
         let is_valid = s.len() == BLAKE3_HEX_LEN
-            && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
         if is_valid {
             Ok(Blake3Hash(s))
         } else {

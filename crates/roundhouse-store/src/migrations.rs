@@ -75,5 +75,8 @@ CREATE INDEX blobs_gc_eligible_idx ON blobs (ref_count, last_referenced_at) WHER
 "#;
 
 pub fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(MIGRATION_0001_INITIAL_SCHEMA), M::up(MIGRATION_0002_BLOBS)])
+    Migrations::new(vec![
+        M::up(MIGRATION_0001_INITIAL_SCHEMA),
+        M::up(MIGRATION_0002_BLOBS),
+    ])
 }
