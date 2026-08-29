@@ -19,6 +19,7 @@
 mod anthropic_provider;
 mod cassette;
 pub mod codec;
+pub mod errors;
 mod ir;
 mod provider_trait;
 mod reqwest_transport;
