@@ -8,14 +8,18 @@
 #![forbid(unsafe_code)]
 
 mod client;
+mod coalesce;
 mod dirty;
 mod protocol;
 mod render;
+mod rope;
 
 pub use client::{connect, DaemonClient};
+pub use coalesce::{Coalescer, SessionSummary};
 pub use dirty::{DirtyFlags, Region};
 pub use protocol::{ServerMessage, TuiError};
 pub use render::render_tick;
+pub use rope::RopeStore;
 
 pub fn client_schema() -> schemars::Schema {
     roundhouse_proto::client_event_schema()
