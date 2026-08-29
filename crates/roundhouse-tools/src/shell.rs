@@ -26,7 +26,11 @@ pub struct ShellOutput {
 /// equivalent as discrete arguments, no argv element can ever be reinterpreted as shell
 /// syntax (`;`, `|`, `$()`, backticks, etc. are all inert, literal characters). There is
 /// no shell in the loop to perform reinterpretation.
-pub async fn run_shell(program: &str, argv: &[String], cwd: &Path) -> Result<ShellOutput, ToolError> {
+pub async fn run_shell(
+    program: &str,
+    argv: &[String],
+    cwd: &Path,
+) -> Result<ShellOutput, ToolError> {
     let output = Command::new(program)
         .args(argv)
         .current_dir(cwd)

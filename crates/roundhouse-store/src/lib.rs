@@ -12,6 +12,7 @@
 //! See `docs/architecture/01-data-model.md` and `02-system-architecture.md` §5.2.
 #![forbid(unsafe_code)]
 
+pub mod blobs;
 mod fold;
 mod migrations;
 mod pool;
@@ -19,7 +20,6 @@ mod recovery;
 mod replay;
 mod txn;
 mod writer;
-pub mod blobs;
 
 // Phase 0 exports
 pub use migrations::migrations;

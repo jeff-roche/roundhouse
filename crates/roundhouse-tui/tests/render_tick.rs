@@ -37,5 +37,8 @@ fn marking_a_region_dirty_draws_exactly_once_then_clears() {
 
     assert!(drew);
     assert_eq!(*draw_count.borrow(), 1);
-    assert!(!flags.any_dirty(), "flags must clear after a completed render");
+    assert!(
+        !flags.any_dirty(),
+        "flags must clear after a completed render"
+    );
 }

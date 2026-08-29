@@ -23,6 +23,9 @@ async fn attaches_and_decodes_one_ndjson_line() {
 
     assert_eq!(
         message,
-        Some(ServerMessage::TaskDelta { task_id: "t1".into(), text: "Hello".into() })
+        Some(ServerMessage::TaskDelta {
+            task_id: "t1".into(),
+            text: "Hello".into()
+        })
     );
 }

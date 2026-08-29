@@ -42,7 +42,15 @@ impl Event {
         payload: EventPayload,
         schema_v: u16,
     ) -> Self {
-        Event { session_id, seq, ts, task_id, payload, schema_v, _seal: crate::seal::Seal::mint() }
+        Event {
+            session_id,
+            seq,
+            ts,
+            task_id,
+            payload,
+            schema_v,
+            _seal: crate::seal::Seal::mint(),
+        }
     }
 }
 
@@ -89,34 +97,84 @@ impl EventFields for Event {
 /// `EventFields` and `roundhouse_store::StoredEvent` to match.
 #[allow(dead_code)]
 fn _event_shape_is_exhaustive(e: Event) {
-    let Event { session_id: _, seq: _, ts: _, task_id: _, payload: _, schema_v: _, _seal: _ } = e;
+    let Event {
+        session_id: _,
+        seq: _,
+        ts: _,
+        task_id: _,
+        payload: _,
+        schema_v: _,
+        _seal: _,
+    } = e;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum EventPayload {
     // ── session lifecycle ─────────────────────────────────────────────
-    SessionCreated { spec: Box<SessionSpec> },
-    SessionConfigured { patch: SessionPatch },
-    SessionStateChanged { state: SessionState, reason: Option<String> },
-    SessionClosed { outcome: SessionOutcome },
+    SessionCreated {
+        spec: Box<SessionSpec>,
+    },
+    SessionConfigured {
+        patch: SessionPatch,
+    },
+    SessionStateChanged {
+        state: SessionState,
+        reason: Option<String>,
+    },
+    SessionClosed {
+        outcome: SessionOutcome,
+    },
 
     // ── task lifecycle ────────────────────────────────────────────────
-    TaskCreated { kind: TaskKind, parent: Option<TaskId>, origin: Origin, input: TaskInput },
-    TaskDecided { decision: PolicyDecision, rule: Option<RuleId> },
+    TaskCreated {
+        kind: TaskKind,
+        parent: Option<TaskId>,
+        origin: Origin,
+        input: TaskInput,
+    },
+    TaskDecided {
+        decision: PolicyDecision,
+        rule: Option<RuleId>,
+    },
     /// `handle` is `Some` only for long-running/non-terminating tasks
     /// (§4.3 — e.g. `shell` running `npm run dev`): the pty/process id the
     /// engine needs for a `read_output`/`kill` affordance while the task
     /// stays `Running`. `None` for tasks that simply run to completion.
-    TaskStarted { isolation: IsolationAttestation, handle: Option<Handle> },
-    TaskDelta { delta: Delta },
-    TaskProgress { progress: Progress },
-    TaskSuspended { reason: SuspendReason },
-    TaskResumed { by: Origin },
-    TaskCompleted { output: TaskOutput, usage: Usage },
-    TaskFailed { error: TaskError, retryable: bool },
-    TaskCancelled { by: Origin, reason: CancelReason },
+    TaskStarted {
+        isolation: IsolationAttestation,
+        handle: Option<Handle>,
+    },
+    TaskDelta {
+        delta: Delta,
+    },
+    TaskProgress {
+        progress: Progress,
+    },
+    TaskSuspended {
+        reason: SuspendReason,
+    },
+    TaskResumed {
+        by: Origin,
+    },
+    TaskCompleted {
+        output: TaskOutput,
+        usage: Usage,
+    },
+    TaskFailed {
+        error: TaskError,
+        retryable: bool,
+    },
+    TaskCancelled {
+        by: Origin,
+        reason: CancelReason,
+    },
 
     // ── cross-cutting ─────────────────────────────────────────────────
-    Message { envelope: Envelope },
-    Note { level: NoteLevel, text: String },
+    Message {
+        envelope: Envelope,
+    },
+    Note {
+        level: NoteLevel,
+        text: String,
+    },
 }

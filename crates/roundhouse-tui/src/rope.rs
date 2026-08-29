@@ -15,14 +15,19 @@ pub struct RopeStore {
 impl RopeStore {
     /// Creates a new empty `RopeStore`.
     pub fn new() -> Self {
-        Self { ropes: HashMap::new() }
+        Self {
+            ropes: HashMap::new(),
+        }
     }
 
     /// Appends `text` to the rope for the given `task_id`.
     ///
     /// If no rope exists for this task yet, one is created.
     pub fn append_delta(&mut self, task_id: &str, text: &str) {
-        self.ropes.entry(task_id.to_string()).or_default().push_str(text);
+        self.ropes
+            .entry(task_id.to_string())
+            .or_default()
+            .push_str(text);
     }
 
     /// Retrieves the accumulated text for the given `task_id`, or `None` if not present.

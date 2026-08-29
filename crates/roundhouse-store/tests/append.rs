@@ -1,4 +1,4 @@
-use roundhouse_core::{SessionId, Timestamp, TaskId, TaskKind, Origin, TaskInput};
+use roundhouse_core::{Origin, SessionId, TaskId, TaskInput, TaskKind, Timestamp};
 use roundhouse_store::{open, spawn_writer};
 
 static RUNNER: once_cell::sync::Lazy<roundhouse_core::TaskRunner> =
@@ -31,7 +31,7 @@ async fn appends_two_events_with_monotonic_seq() {
         now_ts(),
         task_id_1,
         TaskKind::Shell,
-        None,   // parent
+        None, // parent
         Origin::Model,
         TaskInput::Text("test".into()),
         1, // schema_v
@@ -80,7 +80,9 @@ async fn append_retries_through_a_real_sqlite_busy_and_eventually_succeeds() {
     let blocker = std::thread::spawn(move || {
         let mut conn = rusqlite::Connection::open(&db_path_for_blocker).unwrap();
         conn.pragma_update(None, "busy_timeout", 0).unwrap(); // fail fast instead of blocking, so our writer's own retry loop is what's under test
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         locked_tx.send(()).unwrap(); // signal: the write lock is now held
         unblock_rx.recv().unwrap(); // hold it until the test tells us to release
         tx.commit().unwrap();
@@ -111,6 +113,9 @@ async fn append_retries_through_a_real_sqlite_busy_and_eventually_succeeds() {
     unblock_tx.send(()).unwrap();
     blocker.join().unwrap();
 
-    let seq = append_fut.await.unwrap().expect("retry loop must absorb SQLITE_BUSY, never surface it to the caller");
+    let seq = append_fut
+        .await
+        .unwrap()
+        .expect("retry loop must absorb SQLITE_BUSY, never surface it to the caller");
     assert_eq!(seq, 0);
 }

@@ -114,7 +114,9 @@ pub async fn decode_openai_chat_stream(
             done = true;
             break;
         }
-        let Ok(chunk) = serde_json::from_str::<Chunk>(data) else { continue };
+        let Ok(chunk) = serde_json::from_str::<Chunk>(data) else {
+            continue;
+        };
 
         for choice in &chunk.choices {
             for tc in &choice.delta.tool_calls {
@@ -124,7 +126,11 @@ pub async fn decode_openai_chat_stream(
                     events.push(StreamEvent::BlockStart {
                         index,
                         kind: BlockKind::ToolUse {
-                            name: tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default(),
+                            name: tc
+                                .function
+                                .as_ref()
+                                .and_then(|f| f.name.clone())
+                                .unwrap_or_default(),
                             provider_id: tc.id.clone(),
                         },
                     });

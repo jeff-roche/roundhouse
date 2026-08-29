@@ -52,7 +52,9 @@ pub async fn fold_stream_to_blocks(mut stream: ChatStream) -> Vec<ContentBlock> 
             }
             StreamEvent::BlockDelta { index, delta } => match delta {
                 BlockDelta::Text(t) => *text_by_index.entry(index).or_default() += &t,
-                BlockDelta::ToolArgsFragment(f) => *tool_args_by_index.entry(index).or_default() += &f,
+                BlockDelta::ToolArgsFragment(f) => {
+                    *tool_args_by_index.entry(index).or_default() += &f
+                }
                 BlockDelta::Thinking { text, signature } => {
                     let entry = thinking_by_index.entry(index).or_default();
                     entry.0 += &text;
@@ -89,11 +91,21 @@ pub async fn fold_stream_to_blocks(mut stream: ChatStream) -> Vec<ContentBlock> 
                     Some(p) => (ToolCallId(p), IdOrigin::Provider),
                     None => (ToolCallId(format!("synth_{index}")), IdOrigin::Synthesized),
                 };
-                ContentBlock::ToolUse { id, id_origin, name, input, cache: None }
+                ContentBlock::ToolUse {
+                    id,
+                    id_origin,
+                    name,
+                    input,
+                    cache: None,
+                }
             }
             Some(BlockKind::Thinking) => {
                 let (text, signature) = thinking_by_index.remove(&index).unwrap_or_default();
-                ContentBlock::Thinking { text, signature: signature.map(Signature), redacted: false }
+                ContentBlock::Thinking {
+                    text,
+                    signature: signature.map(Signature),
+                    redacted: false,
+                }
             }
             // Exhaustive, not a catch-all: `BlockKind` isn't `#[non_exhaustive]` today,
             // but a future variant added here must fail to compile instead of silently

@@ -58,7 +58,16 @@ pub async fn run_chat_turn(
 ) -> Result<Vec<ContentBlock>, AgentError> {
     let chat_task_id = TaskId::new();
     // The `chat` task is the user-facing turn; `Origin::User` reflects that.
-    append_created(writer, runner, session_id, chat_task_id, TaskKind::Chat, None, Origin::User).await?;
+    append_created(
+        writer,
+        runner,
+        session_id,
+        chat_task_id,
+        TaskKind::Chat,
+        None,
+        Origin::User,
+    )
+    .await?;
     append_started(writer, runner, session_id, chat_task_id).await?;
 
     let infer_task_id = TaskId::new();
@@ -80,10 +89,21 @@ pub async fn run_chat_turn(
     let stream = match provider.stream_chat(&request, ctx).await {
         Ok(stream) => stream,
         Err(provider_err) => {
-            let error = TaskError { message: provider_err.to_string(), category: "provider_error".into() };
+            let error = TaskError {
+                message: provider_err.to_string(),
+                category: "provider_error".into(),
+            };
             // Innermost first: infer failed because of the provider, which is why
             // the parent chat task fails too.
-            append_failed(writer, runner, session_id, infer_task_id, error.clone(), false).await?;
+            append_failed(
+                writer,
+                runner,
+                session_id,
+                infer_task_id,
+                error.clone(),
+                false,
+            )
+            .await?;
             append_failed(writer, runner, session_id, chat_task_id, error, false).await?;
             return Err(AgentError::Provider(provider_err));
         }
@@ -135,7 +155,11 @@ async fn append_started(
         // IsolationAttestation has no Default either — construct explicitly.
         // Phase 1's chat/infer tasks run in-process (no sandbox tier), so
         // `Tier::None`/no network enforcement is the accurate attestation here.
-        IsolationAttestation { tier: Tier::None, digest: String::new(), net_enforced: false },
+        IsolationAttestation {
+            tier: Tier::None,
+            digest: String::new(),
+            net_enforced: false,
+        },
         None::<Handle>,
         1,
     );

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Bare-`pub` tuple id, deliberately unlike the four private-field core ids
 /// (`SessionId`/`TaskId`/`WorkspaceId`/`TeamId`) — see `RuleId`'s doc
@@ -56,9 +56,20 @@ pub struct ToolResultPart {
 /// content blocks: the only IR shape lossless for the hardest provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ContentBlock {
-    Text { text: String, cache: Option<CacheBreakpoint>, citations: Vec<Citation> },
-    Image { source: MediaSource, cache: Option<CacheBreakpoint> },
-    Document { source: MediaSource, title: Option<String>, cache: Option<CacheBreakpoint> },
+    Text {
+        text: String,
+        cache: Option<CacheBreakpoint>,
+        citations: Vec<Citation>,
+    },
+    Image {
+        source: MediaSource,
+        cache: Option<CacheBreakpoint>,
+    },
+    Document {
+        source: MediaSource,
+        title: Option<String>,
+        cache: Option<CacheBreakpoint>,
+    },
     ToolUse {
         id: ToolCallId,
         id_origin: IdOrigin,
@@ -72,10 +83,18 @@ pub enum ContentBlock {
         is_error: bool,
         cache: Option<CacheBreakpoint>,
     },
-    Thinking { text: String, signature: Option<Signature>, redacted: bool },
+    Thinking {
+        text: String,
+        signature: Option<Signature>,
+        redacted: bool,
+    },
     /// Round-trips verbatim to the SAME (provider, model); dropped with a
     /// LossEvent on cross-provider handoff.
-    Opaque { provider: ProviderId, kind: String, raw: Value },
+    Opaque {
+        provider: ProviderId,
+        kind: String,
+        raw: Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,8 +178,13 @@ pub fn tool_def_from_schema<T: schemars::JsonSchema>(
     description: impl Into<String>,
 ) -> ToolDef {
     let schema = schemars::schema_for!(T);
-    let input_schema = serde_json::to_value(&schema).expect("schemars::Schema always serializes to JSON");
-    ToolDef { name: name.into(), description: description.into(), input_schema }
+    let input_schema =
+        serde_json::to_value(&schema).expect("schemars::Schema always serializes to JSON");
+    ToolDef {
+        name: name.into(),
+        description: description.into(),
+        input_schema,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,7 +303,9 @@ pub struct ModelInfo {
 /// that placeholder's own hand-off comment. A newtype (not a bare type
 /// alias) so `ChatStream` has exactly one name and one definition site
 /// across every codec's `stream_chat` impl.
-pub struct ChatStream(pub std::pin::Pin<Box<dyn futures::Stream<Item = crate::stream_event::StreamEvent> + Send>>);
+pub struct ChatStream(
+    pub std::pin::Pin<Box<dyn futures::Stream<Item = crate::stream_event::StreamEvent> + Send>>,
+);
 
 impl futures::Stream for ChatStream {
     type Item = crate::stream_event::StreamEvent;
@@ -321,7 +347,9 @@ pub enum ProviderError {
     Overloaded,
     /// §9.8: "your request rate" — shed concurrency, then retry.
     #[error("rate limited (retry_after={retry_after:?})")]
-    RateLimited { retry_after: Option<std::time::Duration> },
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+    },
     /// §9.8: billing — fatal, never retry.
     #[error("quota exhausted")]
     QuotaExhausted,

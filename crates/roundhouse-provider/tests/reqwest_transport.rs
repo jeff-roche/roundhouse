@@ -89,7 +89,10 @@ async fn a_refused_connection_is_an_error_not_a_panic() {
         })
         .await;
 
-    assert!(result.is_err(), "a refused connection must be a TransportError");
+    assert!(
+        result.is_err(),
+        "a refused connection must be a TransportError"
+    );
 }
 
 /// The transport must not follow redirects, because `reqwest`'s
@@ -142,8 +145,8 @@ async fn does_not_follow_redirects_so_the_api_key_cannot_be_forwarded() {
 
     // Nothing ever connected to the redirect target. `accept()` would complete
     // if it had; the timeout is what proves the absence.
-    let accepted = tokio::time::timeout(std::time::Duration::from_millis(250), attacker.accept())
-        .await;
+    let accepted =
+        tokio::time::timeout(std::time::Duration::from_millis(250), attacker.accept()).await;
     assert!(
         accepted.is_err(),
         "the redirect target received a connection — the API key was forwarded"
@@ -170,7 +173,10 @@ async fn the_production_constructor_refuses_plaintext_http() {
         })
         .await;
 
-    assert!(result.is_err(), "http:// must be refused by ReqwestTransport::new()");
+    assert!(
+        result.is_err(),
+        "http:// must be refused by ReqwestTransport::new()"
+    );
 
     let accepted =
         tokio::time::timeout(std::time::Duration::from_millis(250), listener.accept()).await;
@@ -252,5 +258,8 @@ async fn an_invalid_http_method_is_an_error_not_a_panic() {
         })
         .await;
 
-    assert!(result.is_err(), "an invalid method must be a TransportError");
+    assert!(
+        result.is_err(),
+        "an invalid method must be a TransportError"
+    );
 }

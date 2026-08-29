@@ -33,7 +33,10 @@ pub fn assemble_context(
         // yet implemented, Phase 2+] -> current turn (layer 6, least stable). Layer order
         // is the struct field order below; there is exactly one place in the codebase
         // that decides it.
-        system: vec![SystemBlock { text: system_prompt.to_string(), cache: Some(CacheBreakpoint) }],
+        system: vec![SystemBlock {
+            text: system_prompt.to_string(),
+            cache: Some(CacheBreakpoint),
+        }],
         tools: tools.to_vec(),
         messages: turn_messages.to_vec(),
         tool_choice: ToolChoice::Auto,

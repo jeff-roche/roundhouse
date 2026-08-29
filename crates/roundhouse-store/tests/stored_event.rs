@@ -17,7 +17,10 @@ fn sample_event() -> StoredEvent {
         seq: 7,
         ts: Timestamp::from_unix_nanos(1_234_567_890),
         task_id: None,
-        payload: EventPayload::Note { level: NoteLevel::Warn, text: "hello".to_string() },
+        payload: EventPayload::Note {
+            level: NoteLevel::Warn,
+            text: "hello".to_string(),
+        },
         schema_v: 1,
     }
 }
@@ -45,7 +48,10 @@ fn stored_event_round_trips_through_json() {
     assert_eq!(restored.schema_v, event.schema_v);
     match (&restored.payload, &event.payload) {
         (
-            EventPayload::Note { level: restored_level, text: restored_text },
+            EventPayload::Note {
+                level: restored_level,
+                text: restored_text,
+            },
             EventPayload::Note { level, text },
         ) => {
             assert_eq!(restored_level, level);

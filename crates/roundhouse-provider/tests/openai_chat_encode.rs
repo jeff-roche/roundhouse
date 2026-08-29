@@ -1,8 +1,8 @@
 use roundhouse_provider::codec::openai_chat::encode_openai_chat;
 use roundhouse_provider::{
-    ChatRequest, ContentBlock, IdOrigin, Message, ModelId, Params, ProviderExt, ReasoningRequest,
-    RequestPolicy, ResponseFormat, Role, SystemBlock, ToolCallId, ToolChoice, ToolResultPart,
-    tool_def_from_schema,
+    tool_def_from_schema, ChatRequest, ContentBlock, IdOrigin, Message, ModelId, Params,
+    ProviderExt, ReasoningRequest, RequestPolicy, ResponseFormat, Role, SystemBlock, ToolCallId,
+    ToolChoice, ToolResultPart,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -21,11 +21,18 @@ struct ReadParams {
 fn encodes_basic_tool_call_request() {
     let req = ChatRequest {
         model: ModelId("gpt-5.4".into()),
-        system: vec![SystemBlock { text: "You are a careful coding agent.".into(), cache: None }],
+        system: vec![SystemBlock {
+            text: "You are a careful coding agent.".into(),
+            cache: None,
+        }],
         messages: vec![
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::Text { text: "Read main.rs".into(), cache: None, citations: vec![] }],
+                content: vec![ContentBlock::Text {
+                    text: "Read main.rs".into(),
+                    cache: None,
+                    citations: vec![],
+                }],
             },
             Message {
                 role: Role::Assistant,
@@ -42,7 +49,12 @@ fn encodes_basic_tool_call_request() {
         tool_choice: ToolChoice::Auto,
         // Params.stop is Option<Vec<String>> (audit finding 5 — the frozen "every field
         // Option" rule) and the max-tokens field is named max_output_tokens.
-        params: Params { temperature: None, top_p: None, max_output_tokens: Some(1024), stop: None },
+        params: Params {
+            temperature: None,
+            top_p: None,
+            max_output_tokens: Some(1024),
+            stop: None,
+        },
         reasoning: ReasoningRequest::default(),
         // response_format/ext/extra/policy: unpopulated in Phase 1 (see Task 6's
         // deliberate-scoping note) — the type carries them since it's frozen/shared.
@@ -67,7 +79,11 @@ fn encodes_tool_result_only_message() {
         messages: vec![
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::Text { text: "What's the time?".into(), cache: None, citations: vec![] }],
+                content: vec![ContentBlock::Text {
+                    text: "What's the time?".into(),
+                    cache: None,
+                    citations: vec![],
+                }],
             },
             Message {
                 role: Role::Assistant,
@@ -83,7 +99,9 @@ fn encodes_tool_result_only_message() {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: ToolCallId("call_42".into()),
-                    content: vec![ToolResultPart { text: "It is 3:45 PM".into() }],
+                    content: vec![ToolResultPart {
+                        text: "It is 3:45 PM".into(),
+                    }],
                     is_error: false,
                     cache: None,
                 }],
@@ -91,7 +109,12 @@ fn encodes_tool_result_only_message() {
         ],
         tools: vec![],
         tool_choice: ToolChoice::None,
-        params: Params { temperature: None, top_p: None, max_output_tokens: None, stop: None },
+        params: Params {
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            stop: None,
+        },
         reasoning: ReasoningRequest::default(),
         response_format: ResponseFormat::default(),
         ext: ProviderExt::None,

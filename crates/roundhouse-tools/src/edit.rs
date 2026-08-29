@@ -26,11 +26,7 @@ pub struct EditOutcome {
 ///
 /// The actual write is atomic via `write_file` (Task 15), which uses temp+rename
 /// on the same filesystem.
-pub async fn edit_file(
-    path: &Path,
-    find: &str,
-    replace: &str,
-) -> Result<EditOutcome, ToolError> {
+pub async fn edit_file(path: &Path, find: &str, replace: &str) -> Result<EditOutcome, ToolError> {
     let original = tokio::fs::read_to_string(path).await?;
 
     // Count occurrences of the search text. Fail closed on 0 or 2+ matches

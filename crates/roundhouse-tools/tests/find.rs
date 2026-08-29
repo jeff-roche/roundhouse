@@ -13,7 +13,10 @@ fn finds_files_matching_glob_rooted_at_base_dir() {
 
     assert_eq!(
         matches,
-        vec![dir.path().join("src/lib.rs"), dir.path().join("src/main.rs")]
+        vec![
+            dir.path().join("src/lib.rs"),
+            dir.path().join("src/main.rs")
+        ]
     );
 }
 

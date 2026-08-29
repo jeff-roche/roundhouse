@@ -22,14 +22,15 @@ async fn replays_body_in_fixed_size_chunks() {
 
     assert_eq!(resp.status, 200);
 
-    let chunks: Vec<Vec<u8>> = resp
-        .body
-        .map(|c| c.unwrap().to_vec())
-        .collect()
-        .await;
+    let chunks: Vec<Vec<u8>> = resp.body.map(|c| c.unwrap().to_vec()).collect().await;
 
     assert_eq!(
         chunks,
-        vec![b"012".to_vec(), b"345".to_vec(), b"678".to_vec(), b"9".to_vec()]
+        vec![
+            b"012".to_vec(),
+            b"345".to_vec(),
+            b"678".to_vec(),
+            b"9".to_vec()
+        ]
     );
 }

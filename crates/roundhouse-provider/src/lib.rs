@@ -27,14 +27,14 @@ mod transport;
 
 pub use anthropic_provider::AnthropicMessagesProvider;
 pub use cassette::CassetteTransport;
+pub use ir::MessageRole as Role; // temporary compat alias: rest of this plan's Track B/C/G task text says Role::User/Role::Assistant; a later phase should update those call sites to MessageRole directly and drop this alias
 pub use ir::{
     tool_def_from_schema, CacheBreakpoint, Capabilities, ChatRequest, ChatStream, Citation,
     ContentBlock, IdOrigin, MediaSource, Message, MessageRole, ModelId, ModelInfo, Params, Plan,
     ProviderError, ProviderExt, ProviderId, ReasoningIntent, ReasoningRequest, RequestCtx,
-    RequestPolicy, ResponseFormat, ShellToolParams, Signature, SystemBlock, TokenCount,
-    ToolCallId, ToolChoice, ToolDef, ToolResultPart,
+    RequestPolicy, ResponseFormat, ShellToolParams, Signature, SystemBlock, TokenCount, ToolCallId,
+    ToolChoice, ToolDef, ToolResultPart,
 };
-pub use ir::MessageRole as Role; // temporary compat alias: rest of this plan's Track B/C/G task text says Role::User/Role::Assistant; a later phase should update those call sites to MessageRole directly and drop this alias
 pub use provider_trait::{BoxFut, Provider};
 pub use reqwest_transport::ReqwestTransport;
 pub use stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};

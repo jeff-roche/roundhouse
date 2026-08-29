@@ -150,10 +150,7 @@ async fn stream_chat_posts_the_encoded_body_to_the_messages_endpoint() {
     };
     assert_eq!(header("x-api-key").as_deref(), Some("test-key"));
     assert_eq!(header("anthropic-version").as_deref(), Some("2023-06-01"));
-    assert_eq!(
-        header("content-type").as_deref(),
-        Some("application/json")
-    );
+    assert_eq!(header("content-type").as_deref(), Some("application/json"));
 
     let body: serde_json::Value = serde_json::from_slice(&sent.body).expect("body must be JSON");
     assert_eq!(body["model"], "claude-sonnet-5");

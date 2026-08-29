@@ -80,7 +80,9 @@ fn encode_message(msg: &Message) -> Vec<Value> {
     for block in &msg.content {
         match block {
             ContentBlock::Text { text, .. } => text_parts.push(text.clone()),
-            ContentBlock::ToolUse { id, name, input, .. } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 tool_calls.push(json!({
                     "id": id,
                     "type": "function",
@@ -88,10 +90,18 @@ fn encode_message(msg: &Message) -> Vec<Value> {
                     "function": { "name": name, "arguments": input.to_string() },
                 }));
             }
-            ContentBlock::ToolResult { tool_use_id, content, .. } => {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
                 // `content` is `Vec<ToolResultPart>` (Phase 0's real IR); OpenAI's tool
                 // message content is a single string, so join the parts' text.
-                let joined = content.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("");
+                let joined = content
+                    .iter()
+                    .map(|p| p.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("");
                 tail_messages.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,

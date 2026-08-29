@@ -1,8 +1,10 @@
 use roundhouse_core::{
-    IsolationAttestation, Origin, SessionId, SuspendReason, TaskId, TaskInput,
-    TaskKind, Tier, Timestamp,
+    IsolationAttestation, Origin, SessionId, SuspendReason, TaskId, TaskInput, TaskKind, Tier,
+    Timestamp,
 };
-use roundhouse_store::{fold_task, open, recover_interrupted_tasks, spawn_writer, StoredEvent, TaskState};
+use roundhouse_store::{
+    fold_task, open, recover_interrupted_tasks, spawn_writer, StoredEvent, TaskState,
+};
 
 static RUNNER: once_cell::sync::Lazy<roundhouse_core::TaskRunner> =
     once_cell::sync::Lazy::new(roundhouse_core::TaskRunner::bootstrap);
@@ -62,9 +64,10 @@ async fn running_task_with_no_terminal_event_becomes_interrupted_on_recovery() {
     let reopened_writer = spawn_writer(reopened_store).await;
     let reopened_store_for_recovery = open(&dir_path).await.unwrap();
 
-    let interrupted = recover_interrupted_tasks(&reopened_store_for_recovery, &reopened_writer, &RUNNER)
-        .await
-        .unwrap();
+    let interrupted =
+        recover_interrupted_tasks(&reopened_store_for_recovery, &reopened_writer, &RUNNER)
+            .await
+            .unwrap();
 
     assert_eq!(interrupted, vec![task_id]);
 
@@ -82,7 +85,11 @@ async fn running_task_with_no_terminal_event_becomes_interrupted_on_recovery() {
         .await
         .unwrap();
 
-    assert_eq!(rows.len(), 3, "created + started + synthetic interrupt event");
+    assert_eq!(
+        rows.len(),
+        3,
+        "created + started + synthetic interrupt event"
+    );
 
     let stored_events: Vec<StoredEvent> = rows
         .iter()
@@ -161,11 +168,16 @@ async fn suspended_task_is_not_reclassified_as_interrupted_on_recovery() {
     let reopened_writer = spawn_writer(reopened_store).await;
     let reopened_store_for_recovery = open(&dir_path).await.unwrap();
 
-    let interrupted = recover_interrupted_tasks(&reopened_store_for_recovery, &reopened_writer, &RUNNER)
-        .await
-        .unwrap();
+    let interrupted =
+        recover_interrupted_tasks(&reopened_store_for_recovery, &reopened_writer, &RUNNER)
+            .await
+            .unwrap();
 
-    assert_eq!(interrupted, Vec::<TaskId>::new(), "a Suspended task must not be interrupted");
+    assert_eq!(
+        interrupted,
+        Vec::<TaskId>::new(),
+        "a Suspended task must not be interrupted"
+    );
 
     let conn = reopened_store_for_recovery.pool.get().await.unwrap();
     let rows: Vec<String> = conn
@@ -181,7 +193,11 @@ async fn suspended_task_is_not_reclassified_as_interrupted_on_recovery() {
         .await
         .unwrap();
 
-    assert_eq!(rows.len(), 3, "recovery must not append a synthetic event for a Suspended task");
+    assert_eq!(
+        rows.len(),
+        3,
+        "recovery must not append a synthetic event for a Suspended task"
+    );
 
     let stored_events: Vec<StoredEvent> = rows
         .iter()

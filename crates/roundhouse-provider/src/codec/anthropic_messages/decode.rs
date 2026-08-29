@@ -64,14 +64,19 @@ pub async fn decode_anthropic_messages_stream(
         // just skip and wait for the next frame (matches the OpenAI decoder's handling
         // of the same real `sse-stream` API shape).
         let Some(data) = frame.data else { continue };
-        let Ok(payload) = serde_json::from_str::<Value>(data.trim()) else { continue };
-        let Some(kind) = payload.get("type").and_then(Value::as_str) else { continue };
+        let Ok(payload) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        let Some(kind) = payload.get("type").and_then(Value::as_str) else {
+            continue;
+        };
 
         match kind {
             "message_start" => {
                 if let Some(usage) = payload.pointer("/message/usage") {
                     initial_input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
-                    initial_cache_read_tokens = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
+                    initial_cache_read_tokens =
+                        usage.get("cache_read_input_tokens").and_then(Value::as_u64);
                 }
             }
             "content_block_start" => {
@@ -83,30 +88,58 @@ pub async fn decode_anthropic_messages_stream(
                 let block_kind = match block_type {
                     "thinking" => BlockKind::Thinking,
                     "tool_use" => BlockKind::ToolUse {
-                        name: payload.pointer("/content_block/name").and_then(Value::as_str).unwrap_or_default().to_string(),
-                        provider_id: payload.pointer("/content_block/id").and_then(Value::as_str).map(str::to_string),
+                        name: payload
+                            .pointer("/content_block/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        provider_id: payload
+                            .pointer("/content_block/id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                     },
                     _ => BlockKind::Text,
                 };
-                events.push(StreamEvent::BlockStart { index, kind: block_kind });
+                events.push(StreamEvent::BlockStart {
+                    index,
+                    kind: block_kind,
+                });
             }
             "content_block_delta" => {
                 let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
-                let delta_type = payload.pointer("/delta/type").and_then(Value::as_str).unwrap_or("");
+                let delta_type = payload
+                    .pointer("/delta/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 let delta = match delta_type {
                     "text_delta" => Some(BlockDelta::Text(
-                        payload.pointer("/delta/text").and_then(Value::as_str).unwrap_or_default().to_string(),
+                        payload
+                            .pointer("/delta/text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
                     )),
                     "input_json_delta" => Some(BlockDelta::ToolArgsFragment(
-                        payload.pointer("/delta/partial_json").and_then(Value::as_str).unwrap_or_default().to_string(),
+                        payload
+                            .pointer("/delta/partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
                     )),
                     "thinking_delta" => Some(BlockDelta::Thinking {
-                        text: payload.pointer("/delta/thinking").and_then(Value::as_str).unwrap_or_default().to_string(),
+                        text: payload
+                            .pointer("/delta/thinking")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
                         signature: None,
                     }),
                     "signature_delta" => Some(BlockDelta::Thinking {
                         text: String::new(),
-                        signature: payload.pointer("/delta/signature").and_then(Value::as_str).map(str::to_string),
+                        signature: payload
+                            .pointer("/delta/signature")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
                     }),
                     _ => None,
                 };
@@ -119,11 +152,16 @@ pub async fn decode_anthropic_messages_stream(
                 events.push(StreamEvent::BlockStop { index });
             }
             "message_delta" => {
-                let output_tokens = payload.pointer("/usage/output_tokens").and_then(Value::as_u64);
+                let output_tokens = payload
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_u64);
                 // Only emit a combined UsageDelta if there's something to report — either
                 // half (message_start's input/cache figures, or this message_delta's
                 // output figure) may legitimately be absent on a malformed/partial stream.
-                if initial_input_tokens.is_some() || initial_cache_read_tokens.is_some() || output_tokens.is_some() {
+                if initial_input_tokens.is_some()
+                    || initial_cache_read_tokens.is_some()
+                    || output_tokens.is_some()
+                {
                     let input_tokens = initial_input_tokens.map(|input| {
                         normalize_anthropic_usage(input, initial_cache_read_tokens.unwrap_or(0))
                     });

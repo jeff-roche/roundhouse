@@ -1,6 +1,6 @@
 use roundhouse_core::{
-    EventPayload, IsolationAttestation, Origin, SessionId, TaskId, TaskInput, TaskKind,
-    TaskOutput, Tier, Timestamp,
+    EventPayload, IsolationAttestation, Origin, SessionId, TaskId, TaskInput, TaskKind, TaskOutput,
+    Tier, Timestamp,
 };
 use roundhouse_store::{fold_task, StoredEvent, TaskState};
 

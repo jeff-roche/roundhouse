@@ -82,7 +82,10 @@ pub struct DeltaKeyer {
 impl DeltaKeyer {
     /// Creates a new empty keyer.
     pub fn new() -> Self {
-        Self { next_index: 0, keys: HashMap::new() }
+        Self {
+            next_index: 0,
+            keys: HashMap::new(),
+        }
     }
 
     /// Maps a native key to a stable `u32` index.

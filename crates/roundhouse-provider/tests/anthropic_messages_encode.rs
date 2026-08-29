@@ -1,8 +1,8 @@
 use roundhouse_provider::codec::anthropic_messages::encode_anthropic_messages;
 use roundhouse_provider::{
-    CacheBreakpoint, ChatRequest, ContentBlock, IdOrigin, MediaSource, Message, ModelId, Params,
-    ProviderExt, ReasoningIntent, ReasoningRequest, RequestPolicy, ResponseFormat, Role, Signature,
-    SystemBlock, ToolCallId, ToolChoice, tool_def_from_schema,
+    tool_def_from_schema, CacheBreakpoint, ChatRequest, ContentBlock, IdOrigin, MediaSource,
+    Message, ModelId, Params, ProviderExt, ReasoningIntent, ReasoningRequest, RequestPolicy,
+    ResponseFormat, Role, Signature, SystemBlock, ToolCallId, ToolChoice,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -28,7 +28,11 @@ fn encodes_cache_breakpoint_and_thinking_block() {
         messages: vec![
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::Text { text: "Edit main.rs".into(), cache: None, citations: vec![] }],
+                content: vec![ContentBlock::Text {
+                    text: "Edit main.rs".into(),
+                    cache: None,
+                    citations: vec![],
+                }],
             },
             Message {
                 role: Role::Assistant,
@@ -50,8 +54,15 @@ fn encodes_cache_breakpoint_and_thinking_block() {
         ],
         tools: vec![tool_def_from_schema::<ReadParams>("read", "Read a file")],
         tool_choice: ToolChoice::Auto,
-        params: Params { temperature: None, top_p: None, max_output_tokens: Some(2048), stop: None },
-        reasoning: ReasoningRequest { intent: Some(ReasoningIntent::Medium) },
+        params: Params {
+            temperature: None,
+            top_p: None,
+            max_output_tokens: Some(2048),
+            stop: None,
+        },
+        reasoning: ReasoningRequest {
+            intent: Some(ReasoningIntent::Medium),
+        },
         response_format: ResponseFormat::default(),
         ext: ProviderExt::None,
         extra: BTreeMap::new(),
@@ -74,25 +85,39 @@ fn skips_messages_with_only_phase1_filtered_content() {
         messages: vec![
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::Text { text: "What's in the image?".into(), cache: None, citations: vec![] }],
+                content: vec![ContentBlock::Text {
+                    text: "What's in the image?".into(),
+                    cache: None,
+                    citations: vec![],
+                }],
             },
             Message {
                 role: Role::Assistant,
-                content: vec![
-                    ContentBlock::Image {
-                        source: MediaSource { mime_type: "image/png".into(), data: vec![0x89, 0x50, 0x4E, 0x47] },
-                        cache: None,
+                content: vec![ContentBlock::Image {
+                    source: MediaSource {
+                        mime_type: "image/png".into(),
+                        data: vec![0x89, 0x50, 0x4E, 0x47],
                     },
-                ],
+                    cache: None,
+                }],
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::Text { text: "OK, I see it.".into(), cache: None, citations: vec![] }],
+                content: vec![ContentBlock::Text {
+                    text: "OK, I see it.".into(),
+                    cache: None,
+                    citations: vec![],
+                }],
             },
         ],
         tools: vec![],
         tool_choice: ToolChoice::None,
-        params: Params { temperature: None, top_p: None, max_output_tokens: None, stop: None },
+        params: Params {
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            stop: None,
+        },
         reasoning: ReasoningRequest::default(),
         response_format: ResponseFormat::default(),
         ext: ProviderExt::None,
@@ -105,7 +130,11 @@ fn skips_messages_with_only_phase1_filtered_content() {
     // Verify that the assistant message with only Image content is skipped entirely,
     // so the messages array has exactly 2 entries (user → assistant → user), not 3.
     let messages = &body["messages"];
-    assert_eq!(messages.as_array().unwrap().len(), 2, "Expected 2 messages (assistant image-only message skipped)");
+    assert_eq!(
+        messages.as_array().unwrap().len(),
+        2,
+        "Expected 2 messages (assistant image-only message skipped)"
+    );
     assert_eq!(messages[0]["role"], "user");
     assert_eq!(messages[0]["content"][0]["text"], "What's in the image?");
     assert_eq!(messages[1]["role"], "user");

@@ -158,8 +158,12 @@ impl Envelope {
     #[doc(hidden)]
     pub fn default_for_test() -> Self {
         Envelope {
-            from: crate::address::Address::Human { session: crate::ids::SessionId::new() },
-            to: crate::address::Address::Human { session: crate::ids::SessionId::new() },
+            from: crate::address::Address::Human {
+                session: crate::ids::SessionId::new(),
+            },
+            to: crate::address::Address::Human {
+                session: crate::ids::SessionId::new(),
+            },
             body: TaskInput::Text(String::new()),
             expect_reply: false,
         }

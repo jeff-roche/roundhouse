@@ -143,7 +143,10 @@ impl Provider for AnthropicMessagesProvider {
                     // `Debug`, and neither does `RequestCtx`, so there is no
                     // formatter anywhere that can print it by accident.
                     ("x-api-key".to_string(), ctx.api_key.clone()),
-                    ("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
+                    (
+                        "anthropic-version".to_string(),
+                        ANTHROPIC_VERSION.to_string(),
+                    ),
                     ("content-type".to_string(), "application/json".to_string()),
                 ],
                 // `encode_anthropic_messages` returns a `serde_json::Value`,

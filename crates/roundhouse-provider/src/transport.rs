@@ -50,7 +50,7 @@ pub(crate) fn chunk_body(body: Vec<u8>, chunk_size: usize) -> Vec<Bytes> {
         return vec![Bytes::from(body)];
     }
     body.chunks(chunk_size)
-        .map(|c| Bytes::copy_from_slice(c))
+        .map(Bytes::copy_from_slice)
         .collect()
 }
 

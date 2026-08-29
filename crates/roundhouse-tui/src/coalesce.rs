@@ -34,7 +34,10 @@ pub struct Coalescer {
 impl Coalescer {
     /// Creates a new `Coalescer` with the given interval between emissions.
     pub fn new(interval: Duration) -> Self {
-        Self { interval, last_emitted: HashMap::new() }
+        Self {
+            interval,
+            last_emitted: HashMap::new(),
+        }
     }
 
     /// Offers a summary for potential emission.

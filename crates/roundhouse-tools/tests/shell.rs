@@ -3,7 +3,9 @@ use roundhouse_tools::{run_shell, ToolError};
 #[tokio::test]
 async fn runs_program_directly_and_captures_stdout() {
     let dir = tempfile::tempdir().unwrap();
-    tokio::fs::write(dir.path().join("hello.txt"), b"hello world").await.unwrap();
+    tokio::fs::write(dir.path().join("hello.txt"), b"hello world")
+        .await
+        .unwrap();
 
     let output = run_shell("cat", &["hello.txt".to_string()], dir.path())
         .await
