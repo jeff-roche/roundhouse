@@ -221,6 +221,14 @@ pub async fn run_demo_session(
     // returned `ContentBlock::ToolUse` blocks (Phase 2+ dispatch logic,
     // gated by `Policy::decide`) — this demo hard-codes the one tool call
     // to prove the wiring without that not-yet-built dispatcher.
+    //
+    // TODO(Phase 2): this call goes straight to `roundhouse_tools::edit_file` with
+    // nothing in front of it. Per `docs/architecture/03-security-and-sandboxing.md`
+    // §6.2, "Every task passes `Policy::decide` before execution" — every real tool
+    // dispatcher must call `roundhouse-policy` to gate the call (Allow/Ask/Deny) and
+    // `roundhouse-sandbox` to isolate it *before* an executor in `roundhouse-tools`
+    // ever runs, not just here but at every call site a future dispatcher adds. This
+    // demo is exempt only because its one tool call is hard-coded, not model-chosen.
     edit_file(&cfg.edit_target, &cfg.find, &cfg.replace).await?;
 
     for block in &blocks {
