@@ -197,3 +197,141 @@ async fn suspended_tasks_is_empty_when_nothing_is_suspended() {
     let suspended = suspended_tasks(&query_store).await.unwrap();
     assert!(suspended.is_empty());
 }
+
+/// Seeds a task suspended through the normal path (so its `tasks` row is
+/// otherwise entirely legitimate), then reaches around `suspended_tasks`
+/// through a raw connection to corrupt exactly one column —
+/// `suspend_reason_json` set to `NULL` — the state Task 0.5's own invariant
+/// says should never occur for a `state = 'Suspended'` row. This pins the
+/// fail-closed guard in place: `suspended_tasks` must return `Err`, not
+/// silently fall back to `TaskState::from_sql_str`'s placeholder
+/// `AwaitingApproval { rule: None, params_digest: [0u8; 32] }` — the exact
+/// fabricated-provenance failure mode the brief called out by name. Without
+/// this test, a future "simplification" of the `NULL` branch into a
+/// `.unwrap_or_else(...)` default would ship green.
+#[tokio::test]
+async fn suspended_tasks_errors_on_null_suspend_reason_json_instead_of_defaulting() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+
+    writer
+        .append(RUNNER.record_task_created(
+            session_id,
+            0,
+            now_ts(),
+            task_id,
+            TaskKind::Shell,
+            None,
+            Origin::Model,
+            TaskInput::Text("waiting on approval".into()),
+            1,
+        ))
+        .await
+        .unwrap();
+    writer
+        .append(RUNNER.record_task_suspended(
+            session_id,
+            0,
+            now_ts(),
+            task_id,
+            SuspendReason::AwaitingReply,
+            1,
+        ))
+        .await
+        .unwrap();
+
+    // Reach around the sanctioned writer path (the only way this column can
+    // legitimately go NULL on a `Suspended` row is a bug elsewhere, or —
+    // here — a deliberately corrupted row simulating one) via a raw
+    // connection to the same database file.
+    {
+        let task_id_str = task_id.to_string();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let rows_affected = conn
+            .execute(
+                "UPDATE tasks SET suspend_reason_json = NULL WHERE task_id = ?1",
+                [task_id_str],
+            )
+            .unwrap();
+        assert_eq!(
+            rows_affected, 1,
+            "the corrupting UPDATE must hit the seeded row"
+        );
+    }
+
+    let query_store = open(&db_path).await.unwrap();
+    let result = suspended_tasks(&query_store).await;
+    assert!(
+        result.is_err(),
+        "a NULL suspend_reason_json on a Suspended row must be a hard error, not a silent default"
+    );
+}
+
+/// Same fail-closed guard, other branch: `suspend_reason_json` holds text
+/// that is not a valid `SuspendReason` (a variant name that doesn't exist).
+/// `suspended_tasks` must return `Err` from the `serde_json::from_str`
+/// failure, not swallow it and fall back to a placeholder.
+#[tokio::test]
+async fn suspended_tasks_errors_on_unparseable_suspend_reason_json_instead_of_defaulting() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+
+    writer
+        .append(RUNNER.record_task_created(
+            session_id,
+            0,
+            now_ts(),
+            task_id,
+            TaskKind::Shell,
+            None,
+            Origin::Model,
+            TaskInput::Text("waiting on approval".into()),
+            1,
+        ))
+        .await
+        .unwrap();
+    writer
+        .append(RUNNER.record_task_suspended(
+            session_id,
+            0,
+            now_ts(),
+            task_id,
+            SuspendReason::AwaitingReply,
+            1,
+        ))
+        .await
+        .unwrap();
+
+    {
+        let task_id_str = task_id.to_string();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let rows_affected = conn
+            .execute(
+                "UPDATE tasks SET suspend_reason_json = '{\"NotAVariant\":{}}' WHERE task_id = ?1",
+                [task_id_str],
+            )
+            .unwrap();
+        assert_eq!(
+            rows_affected, 1,
+            "the corrupting UPDATE must hit the seeded row"
+        );
+    }
+
+    let query_store = open(&db_path).await.unwrap();
+    let result = suspended_tasks(&query_store).await;
+    assert!(
+        result.is_err(),
+        "unparseable suspend_reason_json on a Suspended row must be a hard error, not a \
+         silent default"
+    );
+}
