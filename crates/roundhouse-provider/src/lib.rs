@@ -13,9 +13,12 @@
 //! `06-provider-abstraction.md`.
 #![forbid(unsafe_code)]
 
+mod cassette;
 mod ir;
 mod provider_trait;
+mod transport;
 
+pub use cassette::CassetteTransport;
 pub use ir::{
     tool_def_from_schema, CacheBreakpoint, Capabilities, ChatRequest, ChatStream, Citation,
     ContentBlock, IdOrigin, MediaSource, Message, MessageRole, ModelId, ModelInfo, Params, Plan,
@@ -24,3 +27,4 @@ pub use ir::{
     ToolCallId, ToolChoice, ToolDef, ToolResultPart,
 };
 pub use provider_trait::{BoxFut, Provider};
+pub use transport::{HttpRequest, HttpResponseStream, HttpTransport, TransportError};

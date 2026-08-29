@@ -8,11 +8,13 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+bytes = "1"
+futures = "0.3"
 roundhouse-core = { path = "../roundhouse-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
-thiserror = { workspace = true }
+thiserror = "2.0.20"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { version = "1.53", features = ["full"] }

@@ -234,9 +234,13 @@ pub struct ChatRequest {
     pub policy: RequestPolicy,
 }
 
-#[derive(Debug, Clone, Default)]
+use crate::transport::HttpTransport;
+
+/// Request context carrying the trace ID, HTTP transport, and API key.
 pub struct RequestCtx {
     pub trace_id: Option<String>,
+    pub transport: std::sync::Arc<dyn HttpTransport>,
+    pub api_key: String, // simplified for Phase 1; §9.9's Secret<String>/CredentialProvider lands in Phase 2
 }
 
 #[derive(Debug, Clone)]

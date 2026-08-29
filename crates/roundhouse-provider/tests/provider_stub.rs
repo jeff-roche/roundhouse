@@ -1,6 +1,7 @@
+use futures::future::BoxFuture;
 use roundhouse_provider::{
-    Capabilities, ChatRequest, ChatStream, ContentBlock, ModelId, Plan, Provider, ProviderError,
-    RequestCtx, TokenCount,
+    Capabilities, ChatRequest, ChatStream, ContentBlock, HttpRequest, HttpResponseStream,
+    HttpTransport, ModelId, Plan, Provider, ProviderError, RequestCtx, TokenCount, TransportError,
 };
 use std::sync::Arc;
 
@@ -129,8 +130,22 @@ async fn list_models_defaults_to_unsupported() {
             Box::pin(async { todo!() })
         }
     }
+    struct UnusedTransport;
+    impl HttpTransport for UnusedTransport {
+        fn send<'a>(
+            &'a self,
+            _req: HttpRequest,
+        ) -> BoxFuture<'a, Result<HttpResponseStream, TransportError>> {
+            unreachable!("list_models is type-checked here, never polled")
+        }
+    }
+
     let provider = NoListModels;
-    let ctx = RequestCtx::default();
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(UnusedTransport),
+        api_key: String::new(),
+    };
     let result = provider.list_models(&ctx).await;
     assert!(
         matches!(result, Err(ProviderError::Unsupported(ref method)) if method == "list_models"),
