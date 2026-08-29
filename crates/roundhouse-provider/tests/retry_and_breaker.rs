@@ -3,6 +3,7 @@ use roundhouse_provider::retry::{
 };
 use roundhouse_provider::{ModelId, ProviderError, ProviderId};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[tokio::test(start_paused = true)]
@@ -354,7 +355,7 @@ async fn try_enter_half_open_trial_admits_exactly_one_caller() {
     assert_eq!(breaker.state(key.clone()), BreakerState::HalfOpen);
 
     let admitted = (0..5)
-        .filter(|_| breaker.try_enter_half_open_trial(key.clone()))
+        .filter(|_| breaker.try_enter_half_open_trial(key.clone()).is_some())
         .count();
     assert_eq!(
         admitted, 1,
@@ -378,7 +379,7 @@ async fn half_open_refuses_second_caller_while_a_trial_is_already_in_flight() {
 
     // Simulate a concurrent caller that already won the trial slot.
     assert!(
-        breaker.try_enter_half_open_trial(key.clone()),
+        breaker.try_enter_half_open_trial(key.clone()).is_some(),
         "test setup: the first caller should win the trial"
     );
 
@@ -592,14 +593,23 @@ async fn a_failed_half_open_trial_does_not_permanently_wedge_the_key() {
     );
 }
 
-// New finding 3 (Important regression): the trial holder re-checked/re-acquired the trial
-// slot on every loop iteration of its OWN call, so its own second attempt would see the
-// flag IT ITSELF set on the first iteration and reject itself -- discarding its own real
-// error (e.g. a genuine Timeout silently replaced by a generic breaker-rejection error) and
-// never actually retrying.
+// New finding 3 (Important regression, round 2): the trial holder re-checked/re-acquired
+// the trial slot on every loop iteration of its OWN call, so its own second attempt would
+// see the flag IT ITSELF set on the first iteration and reject itself -- discarding its own
+// real error (e.g. a genuine Timeout silently replaced by a generic breaker-rejection error).
+//
+// Round 3 superseded this test's original expectations: fixing round 3's finding 2 (ANY
+// failure during a held trial must reopen the breaker immediately, not just
+// is_breaker_trigger ones) means a held trial is now a strict one-shot probe --
+// retry_with_policy returns immediately on its first Ok/Err while holding one, rather than
+// looping internally. This still satisfies finding 3's core requirement (the trial holder
+// never re-checks/re-acquires the slot against itself, because it never reaches a later
+// loop iteration at all while holding a trial) while also fixing finding 2: the failure is
+// returned as this call's own real error (not masked by a self-rejection), AND the breaker
+// reopens immediately.
 
 #[tokio::test(start_paused = true)]
-async fn half_open_trial_holder_retries_within_its_own_call_without_self_rejecting() {
+async fn half_open_trial_failure_returns_the_real_error_immediately_without_self_rejecting() {
     let breaker = CircuitBreaker::new();
     let semaphore = AimdSemaphore::new();
     let key = (
@@ -615,28 +625,194 @@ async fn half_open_trial_holder_retries_within_its_own_call_without_self_rejecti
 
     let calls = AtomicU32::new(0);
     let result: Result<u32, ProviderError> =
-        retry_with_policy(key, &breaker, &semaphore, |attempt| {
-            let n = calls.fetch_add(1, Ordering::SeqCst);
-            async move {
-                if n == 0 {
-                    Err(ProviderError::Timeout) // not Fatal, not a breaker trigger: must retry
-                } else {
-                    Ok(attempt)
-                }
-            }
+        retry_with_policy(key.clone(), &breaker, &semaphore, |_attempt| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Err(ProviderError::Timeout) } // not Fatal, not a breaker trigger
         })
         .await;
 
-    assert_eq!(
-        result.unwrap(),
-        1,
-        "the trial holder's own second attempt must actually run and succeed, not be \
-         discarded by the call rejecting its own retry"
+    assert!(
+        matches!(result, Err(ProviderError::Timeout)),
+        "the trial's own real error ({:?}) must be returned directly -- not masked by a \
+         self-inflicted breaker-rejection from the call re-checking its own trial slot",
+        result
     );
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        2,
-        "must not re-check/re-acquire the trial slot on later iterations of its own loop -- \
-         the check-and-set happens once per retry_with_policy call"
+        1,
+        "a held trial is a one-shot probe: exactly one attempt, no further retries within \
+         the same call, regardless of error type"
     );
+    assert_eq!(
+        breaker.state(key),
+        BreakerState::Open,
+        "ANY failure during an active trial reopens the breaker immediately, even a \
+         non-is_breaker_trigger error like Timeout (finding 2, round 3)"
+    );
+}
+
+// New finding 1 (Critical regression, round 3): a bare bool flag can't distinguish "my
+// trial" from "a different, later trial" -- an ABA bug. Round 2's design let a stale guard
+// from an old trial clear a NEWER trial's slot out from under it, reopening the exact
+// thundering-herd hole this mechanism exists to close. None of the previous tests used
+// genuinely concurrent tokio tasks racing for the SAME key's trial slot -- that's exactly
+// why this bug wasn't caught by round 2's test suite. This test uses real spawned tasks and
+// a `Notify` to force genuine overlap: the winner blocks mid-`attempt` (deliberately, so it
+// cannot possibly resolve before the other racers have had a chance to run), while multiple
+// concurrent racers attempt the same key at the same time.
+
+#[tokio::test(start_paused = true)]
+async fn only_one_of_several_concurrent_callers_is_admitted_as_the_half_open_trial() {
+    let breaker = Arc::new(CircuitBreaker::new());
+    let semaphore = Arc::new(AimdSemaphore::new());
+    let key = (
+        ProviderId("anthropic".into()),
+        ModelId("claude-test".into()),
+    );
+
+    for _ in 0..5 {
+        breaker.record_failure(key.clone());
+    }
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(breaker.state(key.clone()), BreakerState::HalfOpen);
+
+    // The winner blocks here until explicitly released, guaranteeing every other
+    // concurrently-spawned racer gets a chance to run (and be refused) while the winner
+    // is still genuinely holding the trial -- not just sequentially, one after another.
+    let release = Arc::new(tokio::sync::Notify::new());
+    let admitted_into_attempt = Arc::new(AtomicU32::new(0));
+
+    const RACERS: usize = 6;
+    let mut handles = Vec::with_capacity(RACERS);
+    for _ in 0..RACERS {
+        let breaker = breaker.clone();
+        let semaphore = semaphore.clone();
+        let key = key.clone();
+        let release = release.clone();
+        let admitted_into_attempt = admitted_into_attempt.clone();
+        handles.push(tokio::spawn(async move {
+            retry_with_policy(key, &breaker, &semaphore, |_attempt| {
+                let release = release.clone();
+                let admitted_into_attempt = admitted_into_attempt.clone();
+                async move {
+                    admitted_into_attempt.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    Ok::<u32, ProviderError>(0)
+                }
+            })
+            .await
+        }));
+    }
+
+    // Let every spawned task run until it either blocks inside `attempt` (the winner) or
+    // returns having been refused (everyone else) -- paused-clock `yield_now` round-trips
+    // are enough to drain the whole batch on tokio's current-thread test executor since
+    // none of the refusal paths await anything.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        admitted_into_attempt.load(Ordering::SeqCst),
+        1,
+        "of {RACERS} genuinely concurrent callers racing for the same key's half-open \
+         trial, exactly one may be admitted into `attempt` at a time -- the rest must be \
+         refused outright without ever calling it"
+    );
+
+    // Release the winner and collect every racer's result.
+    release.notify_waiters();
+    let mut ok_count = 0;
+    let mut refused_count = 0;
+    for h in handles {
+        match h.await.unwrap() {
+            Ok(_) => ok_count += 1,
+            Err(_) => refused_count += 1,
+        }
+    }
+    assert_eq!(
+        ok_count, 1,
+        "exactly one racer wins and succeeds as the trial"
+    );
+    assert_eq!(
+        refused_count,
+        RACERS - 1,
+        "every other racer is refused, never silently admitted alongside the winner"
+    );
+    assert_eq!(
+        breaker.state(key),
+        BreakerState::Closed,
+        "the winning trial's success must fully close the breaker"
+    );
+}
+
+// Same ABA-prevention mechanism, exercised across TWO successive trial cycles: after the
+// first trial concludes (successfully) and the breaker later reopens and returns to
+// HalfOpen again, a fresh set of concurrent racers must again admit exactly one NEW winner
+// -- proving the generation/ticket correctly advances and a completed old trial can never
+// interfere with a later one, not just within a single cycle but across repeated cycles.
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_racing_admits_exactly_one_winner_on_each_successive_half_open_cycle() {
+    let breaker = Arc::new(CircuitBreaker::new());
+    let semaphore = Arc::new(AimdSemaphore::new());
+    let key = (ProviderId("openai".into()), ModelId("gpt-test".into()));
+
+    for cycle in 0..2 {
+        for _ in 0..5 {
+            breaker.record_failure(key.clone());
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(
+            breaker.state(key.clone()),
+            BreakerState::HalfOpen,
+            "cycle {cycle}: breaker must be half-open before this cycle's race"
+        );
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let admitted_into_attempt = Arc::new(AtomicU32::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let breaker = breaker.clone();
+            let semaphore = semaphore.clone();
+            let key = key.clone();
+            let release = release.clone();
+            let admitted_into_attempt = admitted_into_attempt.clone();
+            handles.push(tokio::spawn(async move {
+                retry_with_policy(key, &breaker, &semaphore, |_attempt| {
+                    let release = release.clone();
+                    let admitted_into_attempt = admitted_into_attempt.clone();
+                    async move {
+                        admitted_into_attempt.fetch_add(1, Ordering::SeqCst);
+                        release.notified().await;
+                        // Fail this cycle's trial so the breaker reopens and a further
+                        // cycle can be exercised the same way.
+                        Err::<u32, ProviderError>(ProviderError::Timeout)
+                    }
+                })
+                .await
+            }));
+        }
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            admitted_into_attempt.load(Ordering::SeqCst),
+            1,
+            "cycle {cycle}: exactly one of the concurrent racers may be admitted"
+        );
+
+        release.notify_waiters();
+        for h in handles {
+            let _ = h.await.unwrap();
+        }
+
+        assert_eq!(
+            breaker.state(key.clone()),
+            BreakerState::Open,
+            "cycle {cycle}: the failed trial must reopen the breaker so the next cycle \
+             starts from a clean, fully-open state"
+        );
+    }
 }
