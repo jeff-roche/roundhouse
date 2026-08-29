@@ -1,7 +1,9 @@
 use crate::event::EventPayload;
 use crate::ids::{SessionId, TaskId};
 use crate::task_kind::TaskKind;
-use crate::task_meta::{IsolationAttestation, Origin, PolicyDecision, SuspendReason, Usage};
+use crate::task_meta::{
+    CancelReason, IsolationAttestation, Origin, PolicyDecision, SuspendReason, Usage,
+};
 use serde::{Deserialize, Serialize};
 
 /// §4.1's fold states, named 1:1 with the task-lifecycle `EventPayload`
@@ -13,11 +15,13 @@ use serde::{Deserialize, Serialize};
 /// `Suspended*` tasks are re-armed through the attention-queue path
 /// instead, never wiped to `Interrupted`.
 ///
-/// **This is now only half true of `fold_task_state` below** — Phase 1 added
-/// `roundhouse_store::fold_task`, a second, narrower fold that *does* derive
-/// `Interrupted` from a `TaskCancelled { reason: DaemonRestart }` event.
-/// `fold_task_state` here was not taught the same case (see the `TaskCancelled`
-/// arm below for the cross-reference); the two folds disagree on this one input.
+/// Reconciled (Task 0.5) with `roundhouse_store::fold_task`, the second, narrower
+/// fold used by crash recovery: both folds now agree that a `TaskCancelled { reason:
+/// DaemonRestart }` event derives `Interrupted`, not `Cancelled` (see the
+/// `TaskCancelled` arm below). They remain two distinct types for other reasons
+/// (`fold_task` only needs enough state to drive Created/Decided/Running detection
+/// for recovery, and carries no `SuspendReason` detail) — this reconciliation is
+/// scoped to the one input they used to disagree on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskState {
     Created,
@@ -135,17 +139,15 @@ pub fn fold_task_state(events: &[EventPayload]) -> Option<TaskState> {
             EventPayload::TaskResumed { .. } => Some(TaskState::Running),
             EventPayload::TaskCompleted { .. } => Some(TaskState::Completed),
             EventPayload::TaskFailed { .. } => Some(TaskState::Failed),
-            // NOTE (Phase 1 final review, I8): every `TaskCancelled` maps to
-            // `Cancelled` here, regardless of `reason`. `roundhouse_store::fold_task`
-            // (`crates/roundhouse-store/src/fold.rs`) disagrees: it special-cases
-            // `CancelReason::DaemonRestart` and maps *that* reason to
-            // `TaskState::Interrupted` instead. Both folds are exported from the
-            // workspace and both are named `Task`/`TaskState`, so the same event row
-            // yields two different answers depending on which fold you call. This is
-            // a known, deliberately-unreconciled divergence — see this fix's
-            // discussion in the Phase 1 final review report for why it wasn't
-            // resolved here (comment-only fix; behavior intentionally unchanged).
-            EventPayload::TaskCancelled { .. } => Some(TaskState::Cancelled),
+            // Reconciled (Task 0.5): `roundhouse_store::fold_task`
+            // (`crates/roundhouse-store/src/fold.rs`) has always special-cased
+            // `CancelReason::DaemonRestart` -> `TaskState::Interrupted`; this arm now
+            // does the same, so the two folds agree on this input. Every other
+            // `CancelReason` still maps to plain `Cancelled`.
+            EventPayload::TaskCancelled { reason, .. } => Some(match reason {
+                CancelReason::DaemonRestart => TaskState::Interrupted,
+                _ => TaskState::Cancelled,
+            }),
             _ => state,
         };
     }

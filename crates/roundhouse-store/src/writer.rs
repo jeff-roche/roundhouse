@@ -100,6 +100,7 @@ async fn append_one(store: &StorePool, event: Event) -> Result<u64, StoreError> 
         let session_id = session_id.clone();
         let task_id = task_id.clone();
         let payload_json = payload_json.clone();
+        let payload = event.payload.clone();
 
         let write_result = conn
             .interact(move |c| -> Result<u64, rusqlite::Error> {
@@ -127,6 +128,19 @@ async fn append_one(store: &StorePool, event: Event) -> Result<u64, StoreError> 
                         schema_v
                     ],
                 )?;
+                // Same transaction as the events insert above (§6.10's pattern): a
+                // `tasks` row is never inconsistent with the event that produced it.
+                // Session-level events (`task_id: None`) have no `tasks` row to touch.
+                if let Some(task_id) = &task_id {
+                    crate::tasks_view::upsert_for_event(
+                        &tx,
+                        task_id,
+                        &session_id,
+                        next_seq,
+                        ts_nanos,
+                        &payload,
+                    )?;
+                }
                 tx.commit()?;
                 Ok(next_seq as u64)
             })

@@ -8,7 +8,11 @@ use roundhouse_core::{EventFields, EventPayload, Origin, SessionId, TaskId, Task
 /// Deliberately narrower than `roundhouse_core::TaskState` (which exists, but
 /// for Phase 0 contracts) — this local `TaskState` only needs to distinguish
 /// "has a terminal or `Suspended` event" from "still `Running`", for crash
-/// recovery purposes (Task 4). A later phase will reconcile the two into one.
+/// recovery purposes (Task 4). Task 0.5 reconciled the one input the two folds
+/// used to disagree on (`TaskCancelled { reason: DaemonRestart }` -> `Interrupted`
+/// — see the `TaskCancelled` arm in `fold_task` below); they remain two distinct
+/// types, since this one still only needs Created/Decided/Running detail for
+/// recovery and carries no `SuspendReason` detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     /// Task was created but not yet decided.
@@ -85,15 +89,13 @@ pub fn fold_task<E: EventFields>(events: &[E]) -> Option<Task> {
             EventPayload::TaskResumed { .. } => TaskState::Running,
             EventPayload::TaskCompleted { .. } => TaskState::Completed,
             EventPayload::TaskFailed { .. } => TaskState::Failed,
-            // NOTE (Phase 1 final review, I8): this special-cases
-            // `CancelReason::DaemonRestart` into `Interrupted`. `roundhouse_core::
-            // fold_task_state` (`crates/roundhouse-core/src/task.rs`) does not — it
-            // maps every `TaskCancelled` to `Cancelled` regardless of `reason`. Both
-            // folds are exported from the workspace and both are named
-            // `Task`/`TaskState`, so the same event row yields two different answers
-            // depending on which fold you call. Deliberately left unreconciled here
-            // (comment-only fix; behavior intentionally unchanged) — see the Phase 1
-            // final review report.
+            // Reconciled (Task 0.5): this special-cases `CancelReason::DaemonRestart`
+            // into `Interrupted`, and `roundhouse_core::fold_task_state`
+            // (`crates/roundhouse-core/src/task.rs`) now does the same, so the same
+            // event row yields the same answer from either fold on this input. The two
+            // folds remain distinct types otherwise (this one carries no
+            // `SuspendReason` detail — it only needs enough state for recovery's
+            // Created/Decided/Running detection).
             EventPayload::TaskCancelled { reason, .. } => match reason {
                 roundhouse_core::CancelReason::DaemonRestart => TaskState::Interrupted,
                 _ => TaskState::Cancelled,

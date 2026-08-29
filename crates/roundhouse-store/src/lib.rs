@@ -18,6 +18,7 @@ mod migrations;
 mod pool;
 mod recovery;
 mod replay;
+mod tasks_view;
 mod txn;
 mod writer;
 

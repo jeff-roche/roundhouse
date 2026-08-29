@@ -74,9 +74,21 @@ CREATE TABLE blobs (
 CREATE INDEX blobs_gc_eligible_idx ON blobs (ref_count, last_referenced_at) WHERE ref_count = 0;
 "#;
 
+/// Task 0.5: makes the `tasks` materialized-cache table live (see `tasks_view.rs`).
+/// Both columns are nullable with no `DEFAULT` — a non-suspended task has neither.
+/// `suspended_since` is the real event timestamp (unix nanos, matching `Timestamp`
+/// elsewhere), not a `seq`. `suspend_reason_json` is the `SuspendReason` serialized
+/// verbatim, since (per the `state` column's own comment) the `tasks` table is only a
+/// derived cache and the event log stays the source of truth for the full reason detail.
+const MIGRATION_0003_TASKS_SUSPEND_COLUMNS: &str = r#"
+ALTER TABLE tasks ADD COLUMN suspended_since INTEGER;
+ALTER TABLE tasks ADD COLUMN suspend_reason_json TEXT;
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_0001_INITIAL_SCHEMA),
         M::up(MIGRATION_0002_BLOBS),
+        M::up(MIGRATION_0003_TASKS_SUSPEND_COLUMNS),
     ])
 }
