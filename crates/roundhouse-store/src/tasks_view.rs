@@ -43,21 +43,31 @@ pub(crate) fn upsert_for_event(
         _ => (None, None),
     };
 
+    // `prepare_cached`, not `tx.execute` (which reparses/recompiles the SQL
+    // text from scratch on every call): this function runs once per
+    // task-lifecycle event, including once per member of a
+    // `writer::append_batch` batch — at crash-recovery scale (S-SESS-4's
+    // 500 sessions x 200 tasks) that is up to 100,000 calls in a single
+    // transaction, where re-parsing identical SQL text on every call was
+    // confirmed empirically (`tests/recovery_scale.rs`) to be the dominant
+    // cost. Both statements below are identical text on every call within a
+    // transaction, so SQLite's per-connection statement cache turns each
+    // repeat call into a cheap lookup-and-rebind instead of a fresh parse.
     if let EventPayload::TaskCreated { kind, parent, .. } = payload {
-        tx.execute(
+        let mut insert_task = tx.prepare_cached(
             "INSERT INTO tasks (task_id, session_id, kind, state, parent, created_seq, updated_seq, suspended_since, suspend_reason_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8)",
-            params![
-                task_id,
-                session_id,
-                task_kind_as_sql_str(kind),
-                state.as_sql_str(),
-                parent.map(|p| p.to_string()),
-                seq,
-                suspended_since,
-                suspend_reason_json
-            ],
         )?;
+        insert_task.execute(params![
+            task_id,
+            session_id,
+            task_kind_as_sql_str(kind),
+            state.as_sql_str(),
+            parent.map(|p| p.to_string()),
+            seq,
+            suspended_since,
+            suspend_reason_json
+        ])?;
     } else {
         // Security fix: a zero-row UPDATE (no `tasks` row exists for this task_id) used to
         // be silently swallowed — the event still committed to `events`, the caller got
@@ -68,16 +78,16 @@ pub(crate) fn upsert_for_event(
         // from being spuriously reachable on every legitimate upgrade of an existing
         // database — it seeds a `tasks` row for every task_id already in the event log
         // before this function is ever asked to UPDATE one.
-        let rows_affected = tx.execute(
+        let mut update_task = tx.prepare_cached(
             "UPDATE tasks SET state = ?1, updated_seq = ?2, suspended_since = ?3, suspend_reason_json = ?4 WHERE task_id = ?5",
-            params![
-                state.as_sql_str(),
-                seq,
-                suspended_since,
-                suspend_reason_json,
-                task_id
-            ],
         )?;
+        let rows_affected = update_task.execute(params![
+            state.as_sql_str(),
+            seq,
+            suspended_since,
+            suspend_reason_json,
+            task_id
+        ])?;
         if rows_affected == 0 {
             return Err(rusqlite::Error::StatementChangedRows(0));
         }

@@ -18,6 +18,7 @@ mod migrations;
 mod pool;
 mod recovery;
 mod replay;
+mod suspended;
 mod tasks_view;
 mod txn;
 mod writer;
@@ -38,6 +39,9 @@ pub use fold::{fold_task, Task, TaskState};
 
 // Task 4 exports
 pub use recovery::recover_interrupted_tasks;
+
+// Task 2 (Phase 2) exports: suspended-task enumeration
+pub use suspended::{suspended_tasks, SuspendedTask};
 
 // CQRS read-model exports (storage replay / fold)
 pub use replay::StoredEvent;
