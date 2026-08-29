@@ -11,6 +11,7 @@
 
 mod edit;
 mod error;
+mod find;
 mod read;
 mod shell;
 mod write;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 
 pub use edit::{edit_file, EditOutcome};
 pub use error::ToolError;
+pub use find::find_files;
 pub use read::read_file;
 pub use shell::{run_shell, ShellOutput};
 pub use write::write_file;

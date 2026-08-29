@@ -854,6 +854,7 @@ name = "roundhouse-tools"
 version = "0.1.0"
 dependencies = [
  "diffy",
+ "glob",
  "roundhouse-core",
  "roundhouse-policy",
  "roundhouse-sandbox",

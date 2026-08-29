@@ -15,4 +15,7 @@ pub enum ToolError {
     /// Ambiguous match: multiple occurrences found when exactly one was expected.
     #[error("ambiguous match: {0} occurrences found, expected exactly 1")]
     AmbiguousMatch(usize),
+    /// Glob pattern error.
+    #[error("glob pattern error: {0}")]
+    Glob(String),
 }
