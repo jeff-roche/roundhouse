@@ -21,7 +21,15 @@ pub fn encode_anthropic_messages(req: &ChatRequest) -> Value {
         })
         .collect();
 
-    let messages: Vec<Value> = req.messages.iter().map(encode_message).collect();
+    // `system` is always an array form (never a bare string) to enable per-block
+    // `cache_control` — a bare-string `system` field wouldn't support breakpoints
+    // on individual blocks.
+
+    let messages: Vec<Value> = req
+        .messages
+        .iter()
+        .filter_map(encode_message)
+        .collect();
 
     let mut body = json!({
         "model": req.model,
@@ -81,6 +89,11 @@ fn encode_tool_choice(choice: &ToolChoice) -> Value {
 }
 
 /// Map a ReasoningIntent to its Anthropic budget_tokens value.
+///
+/// These values (Off→0, Low→4096, Medium→10_000, High→24_000, Max→32_000) are sourced
+/// from this plan's task brief for Phase 1, not independently verified against Anthropic's
+/// live documentation. Before Phase 1's real provider (Task 22) goes live against actual
+/// Anthropic traffic, these should be double-checked against the current API specification.
 fn reasoning_budget(intent: ReasoningIntent) -> u32 {
     match intent {
         ReasoningIntent::Off => 0,
@@ -92,13 +105,22 @@ fn reasoning_budget(intent: ReasoningIntent) -> u32 {
 }
 
 /// Encode a message (conversation turn) for the Anthropic Messages API.
-fn encode_message(msg: &Message) -> Value {
+///
+/// Returns `None` if the message's content is entirely composed of blocks that are
+/// filtered out in Phase 1 scope (Image, Document, Opaque), resulting in an empty
+/// `content` array — Anthropic's API rejects empty content arrays. This prevents the
+/// same bug class as Task 7's ToolResult-only-message fix, but reached via block filtering
+/// rather than unconditional push.
+fn encode_message(msg: &Message) -> Option<Value> {
     let role = match msg.role {
         Role::User => "user",
         Role::Assistant => "assistant",
     };
     let content: Vec<Value> = msg.content.iter().filter_map(encode_block).collect();
-    json!({ "role": role, "content": content })
+    if content.is_empty() {
+        return None;
+    }
+    Some(json!({ "role": role, "content": content }))
 }
 
 /// Encode a ContentBlock to its Anthropic wire format.
@@ -146,6 +168,10 @@ fn encode_block(block: &ContentBlock) -> Option<Value> {
         ContentBlock::Thinking { text, signature, .. } => {
             let mut v = json!({ "type": "thinking", "thinking": text });
             if let Some(sig) = signature {
+                // The `signature` field is Anthropic's integrity mechanism for replayed thinking
+                // content — the signature must be preserved verbatim when a thinking block is
+                // sent back to Anthropic in a later turn, so Anthropic can verify the block
+                // wasn't tampered with.
                 v["signature"] = json!(sig);
             }
             Some(v)
