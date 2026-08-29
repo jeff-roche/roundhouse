@@ -4,16 +4,16 @@ Guidance for coding agents working in this repository.
 
 ## Project status
 
-Phase 0's exit criterion (Task 12) is now met: the full 18-crate workspace compiles
-with every downstream crate wired against the Phase 0 stub traits from Tasks 4–10.
-Tasks 13–14 remain as extensions beyond the core exit criterion: layered config
-loading (`roundhouse-config`) and content-addressed blob storage (added to
-`roundhouse-core`/`roundhouse-store`, not a separate crate). `docs/architecture/`
-is the frozen design (committed, reference truth). `docs/superpowers/plans/`,
-`docs/audits/`, and `docs/scratch/` hold the phase-by-phase implementation plans,
-audit findings, and scratch notes — they exist locally but are gitignored, so don't
-expect them on a fresh clone. Phase 0 (`docs/superpowers/plans/2026-08-27-phase0-contracts.md`)
-creates the workspace and the shared contracts every later phase depends on.
+Phase 0 is complete. All 14 tasks of `docs/superpowers/plans/2026-08-27-phase0-contracts.md`
+have landed: the 18-crate Cargo workspace exists with every downstream crate wired against
+Phase 0 stub traits, event-sourcing and S-LOG properties are enforced at the type and schema
+levels, layered config loading with `roundhouse-config` is real, and content-addressed blob
+storage (`BlobRef`, `blobs` table, `write_blob`/`read_blob`, GC eligibility, quota rejection)
+is wired into `roundhouse-core`/`roundhouse-store`. Phase 1 (the vertical slice) is next per
+`docs/superpowers/plans/2026-08-27-phase1-vertical-slice.md`. `docs/architecture/` is the
+frozen design (committed, reference truth). `docs/superpowers/plans/`, `docs/audits/`, and
+`docs/scratch/` hold the phase-by-phase implementation plans, audit findings, and scratch
+notes — they exist locally but are gitignored, so don't expect them on a fresh clone.
 
 ## Commands
 
