@@ -114,6 +114,10 @@ pub enum CancelReason {
     Timeout,
     SessionClosed,
     PolicyDeny,
+    /// Task was interrupted by crash recovery (daemon restart).
+    /// Distinct from `User` — allows callers to distinguish daemon-restart
+    /// cancellations from user-requested cancellations. Folds to `TaskState::Interrupted`
+    /// rather than `TaskState::Cancelled` for observability (S-SESS-4).
     DaemonRestart,
 }
 

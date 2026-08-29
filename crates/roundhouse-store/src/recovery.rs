@@ -18,6 +18,11 @@ use crate::{fold::fold_task, pool::StorePool, replay::StoredEvent, writer::Event
 /// event that folds to `TaskState::Interrupted`. `Suspended` tasks are left untouched.
 ///
 /// Returns the `TaskId`s of the tasks that were interrupted.
+///
+/// `runner` is the only sanctioned way to mint the synthetic `TaskCancelled` event.
+/// `TaskRunner::bootstrap()` can only be called once per process by roundhouse-engine
+/// at daemon startup — this function receives an already-bootstrapped instance rather
+/// than trying to obtain its own.
 pub async fn recover_interrupted_tasks(
     store: &StorePool,
     writer: &EventWriter,
@@ -48,23 +53,34 @@ pub async fn recover_interrupted_tasks(
         .map_err(|e| StoreError::Interact(e.to_string()))?;
 
     let rows: Vec<(String, i64, i64, Option<String>, String, i64)> = rows_result
-        .map_err(|e| StoreError::Sqlite(e))?;
+        .map_err(StoreError::Sqlite)?;
 
     let mut by_task: HashMap<TaskId, Vec<StoredEvent>> = HashMap::new();
     for (session_id, seq, ts_nanos, task_id_opt, payload, schema_v) in rows {
         let Some(task_id_str) = task_id_opt else { continue };
         let task_id = TaskId::from_uuid(
-            uuid::Uuid::parse_str(&task_id_str).expect("stored task_id is always valid UUID")
+            uuid::Uuid::parse_str(&task_id_str)
+                .map_err(|e| StoreError::Interact(format!("corrupt task_id in events table: {e}")))?
         );
+        let session_id_parsed = SessionId::from_uuid(
+            uuid::Uuid::parse_str(&session_id)
+                .map_err(|e| StoreError::Interact(format!("corrupt session_id in events table: {e}")))?
+        );
+        let seq_u64 = u64::try_from(seq)
+            .map_err(|e| StoreError::Interact(format!("corrupt seq in events table: {e}")))?;
+        let payload_parsed: roundhouse_core::EventPayload = serde_json::from_str(&payload)
+            .map_err(|e| StoreError::Interact(format!("corrupt payload in events table: {e}")))?;
+        let schema_v_u16 = u16::try_from(schema_v)
+            .map_err(|e| StoreError::Interact(format!("corrupt schema_v in events table: {e}")))?;
+
+        // StoredEvent is the read-model DTO for replayed events already on disk (see replay.rs).
         let event = StoredEvent {
-            session_id: SessionId::from_uuid(
-                uuid::Uuid::parse_str(&session_id).expect("stored session_id is always valid UUID")
-            ),
-            seq: seq as u64,
+            session_id: session_id_parsed,
+            seq: seq_u64,
             ts: Timestamp::from_unix_nanos(ts_nanos),
             task_id: Some(task_id),
-            payload: serde_json::from_str(&payload).expect("stored payload is always valid JSON"),
-            schema_v: schema_v as u16,
+            payload: payload_parsed,
+            schema_v: schema_v_u16,
         };
         by_task.entry(task_id).or_default().push(event);
     }

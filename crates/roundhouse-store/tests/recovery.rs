@@ -1,5 +1,5 @@
 use roundhouse_core::{
-    CancelReason, IsolationAttestation, Origin, SessionId, SuspendReason, TaskId, TaskInput,
+    IsolationAttestation, Origin, SessionId, SuspendReason, TaskId, TaskInput,
     TaskKind, Tier, Timestamp,
 };
 use roundhouse_store::{fold_task, open, recover_interrupted_tasks, spawn_writer, StoredEvent, TaskState};
