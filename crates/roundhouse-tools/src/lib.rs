@@ -9,9 +9,15 @@
 //! `10-implementation-phasing.md` §13.2 (Phase 1 executor list).
 #![forbid(unsafe_code)]
 
+mod error;
+mod shell;
+
 use roundhouse_policy::{ParsedCommand, TaskParams};
 use roundhouse_sandbox::Isolate;
 use std::sync::Arc;
+
+pub use error::ToolError;
+pub use shell::{run_shell, ShellOutput};
 
 /// Proves roundhouse-tools compiles against both stub traits it will
 /// implement executors on top of in Phase 1 (§13.2: shell/read/write/
