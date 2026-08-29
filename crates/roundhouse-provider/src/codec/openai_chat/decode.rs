@@ -104,6 +104,10 @@ pub async fn decode_openai_chat_stream(
 
     while let Some(frame) = sse.next().await {
         let Ok(frame) = frame else { continue };
+        // SSE keep-alive/comment frames (e.g. a bare `:` comment line, used by some
+        // proxies/backends to hold the connection open) legitimately carry no `data`
+        // field at all. That's not an error condition — just skip and wait for the
+        // next frame.
         let Some(data) = frame.data else { continue };
         let data = data.trim();
         if data == "[DONE]" {
@@ -128,6 +132,15 @@ pub async fn decode_openai_chat_stream(
                 if let Some(function) = &tc.function {
                     if let Some(args) = &function.arguments {
                         if !args.is_empty() {
+                            // §9.3 normative rule: tool-argument JSON fragments are
+                            // concatenated as raw, opaque strings here — never parsed
+                            // as JSON mid-stream. A single fragment (e.g. `{"path":`)
+                            // is not valid JSON on its own; only the full string,
+                            // concatenated across every `BlockDelta` for this index up
+                            // to `BlockStop`, is guaranteed to parse. Parsing eagerly
+                            // per-fragment would fail on most chunks and gains nothing,
+                            // since the arguments aren't needed until the tool call is
+                            // dispatched at `BlockStop`.
                             events.push(StreamEvent::BlockDelta {
                                 index,
                                 delta: BlockDelta::ToolArgsFragment(args.clone()),
