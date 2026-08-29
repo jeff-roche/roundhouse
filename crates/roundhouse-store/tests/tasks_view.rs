@@ -1,6 +1,6 @@
 use roundhouse_core::{
-    Delta, NoteLevel, Origin, Progress, RuleId, SessionId, SuspendReason, TaskId, TaskInput,
-    TaskKind, Timestamp,
+    Delta, EventPayload, NoteLevel, Origin, Progress, RuleId, SessionId, SuspendReason, TaskId,
+    TaskInput, TaskKind, Timestamp,
 };
 use roundhouse_store::{open, spawn_writer, StorePool};
 
@@ -386,5 +386,167 @@ async fn task_delta_progress_and_note_events_do_not_touch_the_tasks_row() {
     assert_eq!(
         row_after.suspend_reason_json,
         row_before.suspend_reason_json
+    );
+}
+
+/// Security fix (post-review): a state-changing event whose `task_id` has no existing
+/// `tasks` row (the `UPDATE` branch of `upsert_for_event` matches zero rows) must be a
+/// hard, loud error — not a silent no-op. Before the fix, `tx.execute(...)`'s
+/// rows-affected count was discarded and `Ok(())` returned unconditionally, so the event
+/// would commit to `events` while the `tasks` cache silently failed to reflect it.
+#[tokio::test]
+async fn a_state_changing_event_for_an_unknown_task_id_is_a_hard_error_not_a_silent_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let session_id = SessionId::new();
+    let task_id = TaskId::new(); // never created — no `tasks` row exists for it
+
+    let result = writer
+        .append(RUNNER.record_task_started(
+            session_id,
+            0,
+            now_ts(),
+            task_id,
+            roundhouse_core::IsolationAttestation {
+                tier: roundhouse_core::Tier::None,
+                digest: "test".into(),
+                net_enforced: false,
+            },
+            None,
+            1,
+        ))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a state-changing event for a task_id with no existing tasks row must be a hard \
+         error, not silently Ok — got {result:?}"
+    );
+}
+
+/// Security fix (post-review): reproduces the audit's exact scenario. Migration 0003 only
+/// adds columns — it never backfills `tasks` rows for tasks that already existed in the
+/// event log before this migration ran. Combined with the hard-error fix above, every
+/// subsequent lifecycle event for such a pre-existing task would otherwise become a hard
+/// failure (not just a silent gap) unless something backfills it first. `open()` now runs
+/// that backfill automatically, right after migrations apply.
+#[tokio::test]
+async fn reopening_the_store_backfills_a_tasks_row_for_a_task_that_predates_this_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+
+    // First open: applies migrations (including migration 0003's new columns). The
+    // backfill this fix adds also runs here, but is a no-op — no events exist yet.
+    open(&db_path).await.unwrap();
+
+    // Seed events directly against the `events` table via a raw connection, bypassing
+    // `tasks_view`/`writer.rs` entirely — simulating a task that was created and
+    // suspended before `roundhouse_store::open()` ever ran a backfill pass (i.e. every
+    // task in every database this daemon has ever written to before this fix).
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let reason = SuspendReason::AwaitingApproval {
+        rule: Some(RuleId(7)),
+        params_digest: [9u8; 32],
+    };
+    {
+        let seed_conn = rusqlite::Connection::open(&db_path).unwrap();
+        let seeded_events = [
+            (
+                0i64,
+                1_000i64,
+                serde_json::to_string(&EventPayload::TaskCreated {
+                    kind: TaskKind::Shell,
+                    parent: None,
+                    origin: Origin::Model,
+                    input: TaskInput::Text("rm -rf /tmp/scratch".into()),
+                })
+                .unwrap(),
+            ),
+            (
+                1i64,
+                2_000i64,
+                serde_json::to_string(&EventPayload::TaskStarted {
+                    isolation: roundhouse_core::IsolationAttestation {
+                        tier: roundhouse_core::Tier::None,
+                        digest: "d".into(),
+                        net_enforced: false,
+                    },
+                    handle: None,
+                })
+                .unwrap(),
+            ),
+            (
+                2i64,
+                3_000i64,
+                serde_json::to_string(&EventPayload::TaskSuspended {
+                    reason: reason.clone(),
+                })
+                .unwrap(),
+            ),
+        ];
+        for (seq, ts, payload) in seeded_events {
+            seed_conn
+                .execute(
+                    "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        session_id.to_string(),
+                        seq,
+                        ts,
+                        task_id.to_string(),
+                        payload,
+                        1i64
+                    ],
+                )
+                .unwrap();
+        }
+
+        // Sanity check, on the same raw connection, before any backfill-triggering
+        // open(): the seeded task genuinely has no tasks row yet.
+        let exists_before: i64 = seed_conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists_before, 0,
+            "sanity check: the seeded task must have no tasks row before backfill runs"
+        );
+    }
+
+    // Simulate a fresh daemon process reopening the same database — this is where the
+    // fix's backfill runs (inside open(), right after migrations apply).
+    let reopened_store = open(&db_path).await.unwrap();
+    let row = fetch_tasks_row(&reopened_store, task_id).await;
+
+    assert_eq!(row.session_id, session_id.to_string());
+    assert_eq!(row.kind, "Shell");
+    assert_eq!(row.state, "Suspended");
+    assert_eq!(row.parent, None);
+    assert_eq!(row.created_seq, 0);
+    assert_eq!(
+        row.updated_seq, 2,
+        "updated_seq must be the seq of the event that produced the current state \
+         (TaskSuspended), matching the live path's semantics"
+    );
+    assert_eq!(
+        row.suspended_since,
+        Some(3_000),
+        "backfilled suspended_since must be the real TaskSuspended event's own timestamp"
+    );
+    let stored_reason: SuspendReason = serde_json::from_str(
+        &row.suspend_reason_json
+            .expect("backfilled suspend_reason_json must be set"),
+    )
+    .expect("suspend_reason_json must deserialize back into a SuspendReason");
+    assert_eq!(
+        stored_reason, reason,
+        "backfill must recover the real SuspendReason, not a placeholder"
     );
 }

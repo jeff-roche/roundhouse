@@ -97,6 +97,11 @@ pub async fn open(path: &Path) -> Result<StorePool, StoreError> {
         c.pragma_update(None, "synchronous", "NORMAL")?;
         c.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
         MIGRATIONS.to_latest(c)?;
+        // Security fix (Task 0.5 follow-up): backfill `tasks` rows for any task_id
+        // already in the event log but missing from `tasks` — e.g. every task that
+        // existed before migration 0003 first ran on this database. Idempotent and
+        // cheap once complete; see `tasks_view::backfill_tasks_table`'s doc comment.
+        crate::tasks_view::backfill_tasks_table(c)?;
         Ok::<_, StoreError>(())
     })
     .await

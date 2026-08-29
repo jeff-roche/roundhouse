@@ -59,7 +59,16 @@ pub(crate) fn upsert_for_event(
             ],
         )?;
     } else {
-        tx.execute(
+        // Security fix: a zero-row UPDATE (no `tasks` row exists for this task_id) used to
+        // be silently swallowed — the event still committed to `events`, the caller got
+        // `Ok`, and the derived `tasks` cache silently failed to reflect the change. Per
+        // this project's fail-closed invariant, that is a bug in itself: check the
+        // rows-affected count and turn a zero-row match into a hard error instead of a
+        // silent no-op. `backfill_tasks_table` (called from `open()`) is what keeps this
+        // from being spuriously reachable on every legitimate upgrade of an existing
+        // database — it seeds a `tasks` row for every task_id already in the event log
+        // before this function is ever asked to UPDATE one.
+        let rows_affected = tx.execute(
             "UPDATE tasks SET state = ?1, updated_seq = ?2, suspended_since = ?3, suspend_reason_json = ?4 WHERE task_id = ?5",
             params![
                 state.as_sql_str(),
@@ -69,8 +78,155 @@ pub(crate) fn upsert_for_event(
                 task_id
             ],
         )?;
+        if rows_affected == 0 {
+            return Err(rusqlite::Error::StatementChangedRows(0));
+        }
     }
     Ok(())
+}
+
+/// One raw `events` row read back for backfill purposes:
+/// `(session_id, seq, ts_nanos, task_id, payload_json)`. `task_id` is a plain `String`
+/// (not `Option`) here because the query that produces these rows already filters
+/// `task_id IS NOT NULL`.
+type BackfillRow = (String, i64, i64, String, String);
+
+/// A `task_id`'s events, ordered by `seq`, plus the `session_id` they share (every event
+/// bearing one `task_id` belongs to the same session).
+struct TaskHistory {
+    session_id: String,
+    events: Vec<(i64, i64, EventPayload)>, // (seq, ts_nanos, payload), in seq order
+}
+
+/// Security fix: one-time reconciliation run automatically by `open()`, right after
+/// migrations apply. Migration 0003 only adds the `suspended_since`/`suspend_reason_json`
+/// columns — it does not backfill `tasks` rows for tasks that already existed in the event
+/// log before this migration ran (there were none in Task 0.5's own tests, since the table
+/// was previously dead, but every real database this daemon has ever written a task to has
+/// them). Without this, every subsequent lifecycle event for such a pre-existing task would
+/// hit `upsert_for_event`'s `UPDATE` branch and match zero rows — now a hard error (see
+/// above), where it used to be a silent gap. Worse, a task already `Suspended` at the time
+/// of the upgrade would never get an `INSERT` either (`recovery.rs` deliberately skips
+/// `Suspended` tasks) and so could never appear in `tasks` at all.
+///
+/// Scans the full event log grouped by `task_id` — the same full-scan-and-group technique
+/// `recovery.rs` already uses for its own purposes — folds each task's current state via
+/// `roundhouse_core::fold_task_state` (the same function `upsert_for_event` calls
+/// per-event), and inserts a `tasks` row for every `task_id` missing one, including the
+/// real `SuspendReason` (not a placeholder) for anything currently suspended. Already-
+/// present `task_id`s are left untouched (`INSERT OR IGNORE`), so this is idempotent and
+/// safe to run on every `open()`, not just the first post-migration one — the query itself
+/// is scoped to only `task_id`s missing from `tasks`, so once the backfill is complete a
+/// later call is a cheap, empty-result query rather than a full parse-and-fold pass.
+///
+/// Runs in its own transaction (all-or-nothing): if it fails partway, nothing changes, and
+/// since it is idempotent, the next `open()` call retries the same missing `task_id`s.
+pub(crate) fn backfill_tasks_table(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+
+    let mut stmt = tx.prepare(
+        "SELECT session_id, seq, ts, task_id, payload FROM events \
+         WHERE task_id IS NOT NULL AND task_id NOT IN (SELECT task_id FROM tasks) \
+         ORDER BY task_id, seq",
+    )?;
+    let mapped = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let rows: Vec<BackfillRow> = mapped.collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+
+    if rows.is_empty() {
+        return Ok(()); // Every live task_id already has a tasks row — nothing to backfill.
+    }
+
+    let mut by_task: std::collections::HashMap<String, TaskHistory> =
+        std::collections::HashMap::new();
+    for (session_id, seq, ts_nanos, task_id, payload_json) in rows {
+        let payload: EventPayload = serde_json::from_str(&payload_json)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        by_task
+            .entry(task_id)
+            .or_insert_with(|| TaskHistory {
+                session_id,
+                events: Vec::new(),
+            })
+            .events
+            .push((seq, ts_nanos, payload));
+    }
+
+    for (task_id, history) in &by_task {
+        // Fold one event at a time (rather than calling fold_task_state once on the whole
+        // slice) so we can also track which event's seq/ts_nanos produced the final state —
+        // exactly the (seq, ts_nanos) upsert_for_event would have used had it processed
+        // this event live. `fold_task_state` only ever changes `state` on the exact same
+        // match arms this loop checks, so the final `state` here is identical to calling
+        // it once on the whole slice.
+        let mut state: Option<TaskState> = None;
+        let mut created_seq: Option<i64> = None;
+        let mut kind: Option<roundhouse_core::TaskKind> = None;
+        let mut parent: Option<String> = None;
+        let mut last_state_seq: i64 = 0;
+        let mut last_state_ts: i64 = 0;
+
+        for (seq, ts_nanos, payload) in &history.events {
+            if let EventPayload::TaskCreated {
+                kind: k, parent: p, ..
+            } = payload
+            {
+                created_seq = Some(*seq);
+                kind = Some(k.clone());
+                parent = p.map(|id| id.to_string());
+            }
+            if let Some(new_state) = roundhouse_core::fold_task_state(std::slice::from_ref(payload))
+            {
+                state = Some(new_state);
+                last_state_seq = *seq;
+                last_state_ts = *ts_nanos;
+            }
+        }
+
+        // Defensive: a task_id with no TaskCreated event (corrupt/partial history) has
+        // nothing well-formed to backfill — skip it rather than insert a bogus row, same
+        // posture as fold_task's own `?` early-return for a missing TaskCreated.
+        let (Some(state), Some(created_seq), Some(kind)) = (state, created_seq, kind) else {
+            continue;
+        };
+
+        let (suspended_since, suspend_reason_json) = match &state {
+            TaskState::Suspended(reason) => (
+                Some(last_state_ts),
+                Some(
+                    serde_json::to_string(reason)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                ),
+            ),
+            _ => (None, None),
+        };
+
+        tx.execute(
+            "INSERT OR IGNORE INTO tasks (task_id, session_id, kind, state, parent, created_seq, updated_seq, suspended_since, suspend_reason_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                task_id,
+                history.session_id,
+                task_kind_as_sql_str(&kind),
+                state.as_sql_str(),
+                parent,
+                created_seq,
+                last_state_seq,
+                suspended_since,
+                suspend_reason_json
+            ],
+        )?;
+    }
+
+    tx.commit()
 }
 
 /// `TaskKind`'s SQL-text representation for the `tasks.kind` column. `TaskKind` has no

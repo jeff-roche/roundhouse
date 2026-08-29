@@ -80,6 +80,11 @@ CREATE INDEX blobs_gc_eligible_idx ON blobs (ref_count, last_referenced_at) WHER
 /// elsewhere), not a `seq`. `suspend_reason_json` is the `SuspendReason` serialized
 /// verbatim, since (per the `state` column's own comment) the `tasks` table is only a
 /// derived cache and the event log stays the source of truth for the full reason detail.
+/// This migration only adds columns — it does not, and structurally cannot (a
+/// `rusqlite_migration::M::up` is a fixed SQL string, not application logic), backfill
+/// `tasks` rows for tasks that already existed in the event log before it ran. That
+/// backfill is `tasks_view::backfill_tasks_table`, run automatically by `open()` right
+/// after migrations apply (security fix, Task 0.5 follow-up).
 const MIGRATION_0003_TASKS_SUSPEND_COLUMNS: &str = r#"
 ALTER TABLE tasks ADD COLUMN suspended_since INTEGER;
 ALTER TABLE tasks ADD COLUMN suspend_reason_json TEXT;
