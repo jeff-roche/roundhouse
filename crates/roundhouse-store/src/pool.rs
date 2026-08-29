@@ -57,7 +57,8 @@ pub struct StorePool {
 
 /// Opens a WAL-mode SQLite connection pool at the given filesystem path. Applies all pending
 /// schema migrations on the first connection. Every pooled connection is configured with
-/// `journal_mode=WAL` and `synchronous=NORMAL` for balanced performance and durability.
+/// `journal_mode=WAL`, `synchronous=NORMAL`, and `busy_timeout=5000ms` for balanced
+/// performance, durability, and `SQLITE_BUSY` tolerance on the read path.
 ///
 /// # Errors
 /// Returns `StoreError::Io` if the path is invalid or inaccessible; `StoreError::Sqlite` if
@@ -70,9 +71,21 @@ pub async fn open(path: &Path) -> Result<StorePool, StoreError> {
         .builder(Runtime::Tokio1)
         .expect("deadpool-sqlite config is infallible for a plain path")
         .post_create(Hook::sync_fn(|conn, _metrics| {
-            conn.lock()
-                .map_err(|_| HookError::message("sync wrapper mutex poisoned"))?
-                .pragma_update(None, "synchronous", "NORMAL")
+            let conn = conn
+                .lock()
+                .map_err(|_| HookError::message("sync wrapper mutex poisoned"))?;
+            conn.pragma_update(None, "synchronous", "NORMAL")
+                .map_err(HookError::Backend)?;
+            // Every pooled connection gets its own `busy_timeout` (SQLite pragmas are
+            // per-connection, not per-database): without it, a connection that hits
+            // `SQLITE_BUSY` (another connection holding the write lock) fails
+            // immediately instead of retrying internally for a bounded window. The
+            // writer task already has its own hand-rolled retry loop around
+            // `SQLITE_BUSY` (see `writer.rs`'s append retry), but read-only callers —
+            // e.g. `recovery.rs`'s scan — go straight through a pooled connection with
+            // no such loop, so without this pragma they surface `SQLITE_BUSY` as a
+            // hard error on any contention with the writer.
+            conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)
                 .map_err(HookError::Backend)
         }))
         .build()
@@ -82,6 +95,7 @@ pub async fn open(path: &Path) -> Result<StorePool, StoreError> {
     conn.interact(|c| {
         c.pragma_update(None, "journal_mode", "WAL")?;
         c.pragma_update(None, "synchronous", "NORMAL")?;
+        c.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
         MIGRATIONS.to_latest(c)?;
         Ok::<_, StoreError>(())
     })
@@ -90,3 +104,9 @@ pub async fn open(path: &Path) -> Result<StorePool, StoreError> {
 
     Ok(StorePool { pool })
 }
+
+/// How long a connection blocks retrying internally on `SQLITE_BUSY` before
+/// giving up and returning the error to the caller. A few seconds is enough to
+/// ride out the single writer task's normal append latency without either
+/// masking a genuinely stuck lock or making a contended read hang unreasonably.
+const BUSY_TIMEOUT_MS: u32 = 5_000;
