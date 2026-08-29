@@ -2,9 +2,12 @@ use roundhouse_core::{Origin, SessionId, TaskId, TaskInput, TaskKind, TaskRunner
 
 #[test]
 fn bootstrap_produces_a_working_runner_that_records_task_created() {
-    // NOTE: this test and the one below run in separate processes (cargo test
-    // does that per-#[test] by default is false — see Step 3 for how this is
-    // made safe with #[test] `#[ignore]`-free single-process ordering).
+    // The second-call-panics half of S-LOG-1 (BOOTSTRAPPED is a process-wide
+    // static, so it can't be tested from a second #[test] fn in *this* file
+    // without racing this one) lives in its own file,
+    // `task_runner_bootstrap_second_call_panics.rs` — each file under
+    // `tests/` compiles to its own process, giving it a fresh, unbootstrapped
+    // static to call `bootstrap()` twice against, in order, within one test.
     let runner = TaskRunner::bootstrap();
     let event = runner.record_task_created(
         SessionId::new(),
