@@ -7,6 +7,13 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Enables `Event::from_persisted`, a constructor reserved for reconstructing
+# `Event`s from rows already durably written to the append-only `events`
+# table (S-LOG-2 replay), not for minting new events (see event.rs). Only
+# `roundhouse-store` (and equivalents) should opt into this.
+replay = []
+
 [dev-dependencies]
 serde_json = { workspace = true }
 trybuild = "1"
@@ -18,3 +25,8 @@ thiserror = { workspace = true }
 bytes = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true, features = ["uuid1", "bytes1"] }
+
+[[test]]
+name = "replay_feature"
+path = "tests/replay_feature.rs"
+required-features = ["replay"]
