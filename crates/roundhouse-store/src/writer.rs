@@ -12,15 +12,32 @@ pub(crate) enum WriteCmd {
     },
 }
 
+/// A handle to the single-writer event-append task. Cloneable; multiple
+/// callers can share the same `EventWriter` and append events concurrently
+/// — all appends are serialized by the writer task, not the client.
 #[derive(Clone)]
 pub struct EventWriter {
     tx: mpsc::Sender<WriteCmd>,
 }
 
-pub fn serialize_payload(payload: &roundhouse_core::EventPayload) -> String {
-    serde_json::to_string(payload).expect("EventPayload must always serialize")
+/// Serialize an `EventPayload` to JSON. Returns `Err` if the payload
+/// contains non-finite floating-point values (NaN/Infinity), which JSON
+/// cannot represent. This is a non-retryable error and propagates immediately
+/// to the caller.
+pub fn serialize_payload(payload: &roundhouse_core::EventPayload) -> Result<String, serde_json::Error> {
+    serde_json::to_string(payload)
 }
 
+/// Spawn a dedicated async task that owns the event-append write transaction
+/// and channel-receives `Append` commands from multiple callers. Returns an
+/// `EventWriter` handle for sending append requests. The writer task runs until
+/// the last `EventWriter` handle is dropped (the channel closes).
+///
+/// **Why a channel-actor pattern:** One dedicated task owns all writes serially.
+/// Callers send append commands through the channel and await replies, rather than
+/// each caller attempting to acquire its own DB connection and racing for the write lock.
+/// This enforces single-writer discipline structurally (S-LOG-4/5) and makes the retry loop
+/// recoverable from transient `SQLITE_BUSY` — the writer task survives client failures.
 pub async fn spawn_writer(store: StorePool) -> EventWriter {
     let (tx, mut rx) = mpsc::channel::<WriteCmd>(1024);
 
@@ -43,6 +60,9 @@ pub async fn spawn_writer(store: StorePool) -> EventWriter {
 /// competing `BEGIN IMMEDIATE`, or — in WAL mode — a reader whose snapshot predates a
 /// concurrent commit) is retried transparently; every other `rusqlite::Error` propagates
 /// immediately, unretried.
+///
+/// Backoff: 5ms initial, doubles on each retry attempt (5, 10, 20, 40, 80, 160, 320, 640ms).
+/// With 8 max retries, worst-case total wait is ~1.3s before giving up and surfacing the error.
 const MAX_BUSY_RETRIES: u32 = 8;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
 
@@ -53,9 +73,10 @@ fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
     )
 }
 
-async fn append_one(store: &StorePool, mut event: Event) -> Result<u64, StoreError> {
+async fn append_one(store: &StorePool, event: Event) -> Result<u64, StoreError> {
     let conn = store.pool.get().await?;
-    let payload_json = serialize_payload(&event.payload);
+    let payload_json =
+        serialize_payload(&event.payload).map_err(|e| StoreError::Interact(e.to_string()))?;
     let session_id = event.session_id.to_string();
     let task_id = event.task_id.map(|t| t.to_string());
     let ts_nanos = event.ts.as_unix_nanos();
@@ -70,6 +91,12 @@ async fn append_one(store: &StorePool, mut event: Event) -> Result<u64, StoreErr
 
         let write_result = conn
             .interact(move |c| -> Result<u64, rusqlite::Error> {
+                // BEGIN IMMEDIATE: acquire the write lock immediately rather than deferring it.
+                // This enforces single-writer discipline: a writer holds the lock for its entire
+                // transaction, so no two writers can execute concurrently. Deferred transactions
+                // would allow multiple writers to run in parallel and race to the lock at commit
+                // time, which would be both unfair to clients and incompatible with S-LOG-4/5's
+                // retry guarantees.
                 let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let next_seq: i64 = tx.query_row(
                     "SELECT COALESCE(MAX(seq), -1) + 1 FROM events WHERE session_id = ?1",
@@ -97,11 +124,16 @@ async fn append_one(store: &StorePool, mut event: Event) -> Result<u64, StoreErr
         }
     };
 
-    event.seq = seq;
     Ok(seq)
 }
 
 impl EventWriter {
+    /// Append an event to the log. The event's `seq` field is ignored (the writer
+    /// assigns a monotonic sequence number per session). Returns the assigned `seq`,
+    /// or an error if serialization, database locking, or the writer task fails.
+    ///
+    /// The `SQLITE_BUSY` retries (S-LOG-4/5) are transparent to the caller — the
+    /// function blocks internally until the lock is acquired or max retries are exceeded.
     pub async fn append(&self, event: Event) -> Result<u64, StoreError> {
         let (reply, rx) = oneshot::channel();
         self.tx

@@ -102,7 +102,8 @@ async fn append_retries_through_a_real_sqlite_busy_and_eventually_succeeds() {
         1,
     );
 
-    let append_fut = writer.append(event);
+    let writer_clone = writer.clone();
+    let append_fut = tokio::spawn(async move { writer_clone.append(event).await });
 
     // Release the competing write lock shortly after the writer's first BEGIN IMMEDIATE
     // attempt has had a chance to collide with it and start backing off.
@@ -110,6 +111,6 @@ async fn append_retries_through_a_real_sqlite_busy_and_eventually_succeeds() {
     unblock_tx.send(()).unwrap();
     blocker.join().unwrap();
 
-    let seq = append_fut.await.expect("retry loop must absorb SQLITE_BUSY, never surface it to the caller");
+    let seq = append_fut.await.unwrap().expect("retry loop must absorb SQLITE_BUSY, never surface it to the caller");
     assert_eq!(seq, 0);
 }
