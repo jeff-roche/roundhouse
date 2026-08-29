@@ -331,10 +331,12 @@ async fn empty_chain_returns_model_not_found() {
     )
     .await;
 
-    assert!(
-        matches!(result, Err(ProviderError::ModelNotFound)),
-        "exhausted chain with no steps must return ModelNotFound"
-    );
+    let failure = match result {
+        Err(f) => f,
+        Ok(_) => panic!("empty chain must fail"),
+    };
+    assert!(matches!(failure.last_err, ProviderError::ModelNotFound));
+    assert_eq!(failure.events.len(), 0);
 }
 
 #[tokio::test]
@@ -370,8 +372,17 @@ async fn all_steps_fail_returns_last_error() {
     )
     .await;
 
+    let failure = match result {
+        Err(f) => f,
+        Ok(_) => panic!("all steps must fail"),
+    };
     assert!(
-        matches!(result, Err(ProviderError::Server { status: 500 })),
+        matches!(failure.last_err, ProviderError::Server { status: 500 }),
         "exhausted chain must surface the last real provider error"
+    );
+    assert_eq!(
+        failure.events.len(),
+        2,
+        "one TaskFailed event must be returned per attempted step"
     );
 }

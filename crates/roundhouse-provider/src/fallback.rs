@@ -1,12 +1,13 @@
 //! §9.7/§9.8's provider fallback chain with honest per-attempt cost accounting.
 //!
 //! Fixes audit finding 11: a provider bills every attempt it actually processes,
-//! not only the successful one. `ProviderError::ModelNotFound` is the only
-//! failure disposition that is genuinely free — the provider rejected the request
-//! before starting work. Every other failure means the provider received and
-//! began processing the request, so we bill its input tokens via
-//! `Provider::count_tokens` and fold that cost into the running total rather than
-//! silently dropping it.
+//! not only the successful one. `ProviderError::ModelNotFound` and
+//! `ProviderError::Unsupported` (circuit-breaker rejection when the breaker is
+//! open or a half-open trial is already in flight) are the only failure
+//! dispositions that are genuinely free — the provider never received the
+//! request. Every other failure means the provider received and began processing
+//! the request, so we bill its input tokens via `Provider::count_tokens` and fold
+//! that cost into the running total rather than silently dropping it.
 //!
 //! The winning attempt's stream is fully consumed and buffered so that usage can
 //! be read from the provider's own `StreamEvent::UsageDelta` events; the buffered
@@ -55,6 +56,14 @@ pub struct FallbackOutcome {
     pub events: Vec<Event>,
 }
 
+/// The fallback chain was exhausted without a successful attempt. Carries the
+/// last provider error and the events minted for every attempted step.
+#[derive(Debug)]
+pub struct FallbackFailure {
+    pub last_err: ProviderError,
+    pub events: Vec<Event>,
+}
+
 /// Try each `(provider, model)` step in `chain` in order, retrying each step
 /// under the provided `CircuitBreaker`/`AimdSemaphore` policy, until one
 /// succeeds. Returns the winning stream (buffered and replayed), the summed cost
@@ -73,7 +82,7 @@ pub async fn infer_with_fallback(
     runner: &TaskRunner,
     session_id: SessionId,
     task_id: TaskId,
-) -> Result<FallbackOutcome, ProviderError> {
+) -> Result<FallbackOutcome, FallbackFailure> {
     let mut total_known_pico_usd: u64 = 0;
     let mut any_cost_unknown = false;
 
@@ -137,6 +146,20 @@ pub async fn infer_with_fallback(
                 last_err = ProviderError::ModelNotFound;
                 continue;
             }
+            Err(e @ ProviderError::Unsupported(_)) => {
+                // Circuit-breaker rejection: the request never reached the
+                // provider, so billing would fabricate a cost. Do not call
+                // count_tokens.
+                let error = TaskError {
+                    message: format!("{}/{}: breaker rejected request", provider_id.0, model_id.0),
+                    category: "provider_error".into(),
+                };
+                let event =
+                    runner.record_task_failed(session_id, 0, now_ts(), task_id, error, false, 1);
+                events.push(event);
+                last_err = e;
+                continue;
+            }
             Err(e) => {
                 // The provider accepted and started processing the request but
                 // ultimately failed. Bill the input tokens we sent it.
@@ -171,7 +194,7 @@ pub async fn infer_with_fallback(
         }
     }
 
-    Err(last_err)
+    Err(FallbackFailure { last_err, events })
 }
 
 fn accumulate(total: &mut u64, unknown: &mut bool, c: Cost) {
