@@ -1,4 +1,4 @@
-use roundhouse_proto::{client_event_schema, ApiVersion, ClientEvent, ClientRequest};
+use roundhouse_proto::{client_event_schema, ApiVersion, ClientRequest};
 
 #[test]
 fn client_event_schema_emits_valid_json_schema_with_expected_properties() {

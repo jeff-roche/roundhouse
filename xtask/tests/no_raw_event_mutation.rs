@@ -15,17 +15,17 @@ fn no_file_contains_raw_update_events_sql() {
             None
         }
     });
-    // The trigger definitions in migrations.rs legitimately mention
-    // "BEFORE UPDATE ON events" — allow-list that one file, fail on any
-    // other occurrence. Also allow-list append_only.rs (Task 10's test)
-    // which deliberately contains UPDATE against events to prove the trigger
-    // blocks it.
+    // Allow-list append_only.rs (Task 10's test), which deliberately
+    // contains a raw UPDATE against events to prove the trigger blocks it.
+    // migrations.rs is NOT allow-listed here (and doesn't need to be): its
+    // trigger definitions read "BEFORE UPDATE ON events", which never
+    // matches the "UPDATE EVENTS" substring this scan looks for — an
+    // earlier draft of this test allow-listed it anyway, based on a comment
+    // that assumed a match that never actually happens; removed rather than
+    // left as dead, misleading configuration.
     let violations: Vec<_> = hits
         .into_iter()
-        .filter(|(path, _)| {
-            !path.ends_with("roundhouse-store/src/migrations.rs")
-                && !path.ends_with("roundhouse-store/tests/append_only.rs")
-        })
+        .filter(|(path, _)| !path.ends_with("roundhouse-store/tests/append_only.rs"))
         .collect();
     assert!(violations.is_empty(), "raw UPDATE events found outside the trigger definition: {violations:?}");
 }
@@ -40,16 +40,14 @@ fn no_file_contains_raw_delete_from_events_sql() {
             None
         }
     });
-    // The trigger definitions in migrations.rs legitimately mention the
-    // DELETE trigger — allow-list that one file, fail on any other.
-    // Also allow-list append_only.rs (Task 10's test) which deliberately
-    // contains DELETE against events to prove the trigger blocks it.
+    // Allow-list append_only.rs (Task 10's test), which deliberately
+    // contains a raw DELETE against events to prove the trigger blocks it.
+    // migrations.rs is NOT allow-listed here for the same reason given in
+    // `no_file_contains_raw_update_events_sql` above: its trigger reads
+    // "BEFORE DELETE ON events", which never matches "DELETE FROM EVENTS".
     let violations: Vec<_> = hits
         .into_iter()
-        .filter(|(path, _)| {
-            !path.ends_with("roundhouse-store/src/migrations.rs")
-                && !path.ends_with("roundhouse-store/tests/append_only.rs")
-        })
+        .filter(|(path, _)| !path.ends_with("roundhouse-store/tests/append_only.rs"))
         .collect();
     assert!(violations.is_empty(), "raw DELETE FROM events found outside the trigger definition: {violations:?}");
 }
