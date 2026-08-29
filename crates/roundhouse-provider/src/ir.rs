@@ -7,12 +7,12 @@ use std::collections::BTreeMap;
 /// comment in `roundhouse-core/src/task_meta.rs` for the rationale: this
 /// names an externally-sourced value (a provider's model name string), not
 /// an identity this system mints and must guard against collision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelId(pub String);
 
 /// See `ModelId`'s doc comment above (same rationale — a vendor name, not a
 /// minted identity).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProviderId(pub String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

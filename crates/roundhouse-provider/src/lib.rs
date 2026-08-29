@@ -23,6 +23,7 @@ pub mod errors;
 mod ir;
 mod provider_trait;
 mod reqwest_transport;
+pub mod retry;
 mod stream_event;
 mod transport;
 
