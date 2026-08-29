@@ -9,6 +9,7 @@
 
 mod client;
 mod coalesce;
+mod dashboard;
 mod dirty;
 mod protocol;
 mod render;
@@ -16,6 +17,7 @@ mod rope;
 
 pub use client::{connect, DaemonClient};
 pub use coalesce::{Coalescer, SessionSummary};
+pub use dashboard::Dashboard;
 pub use dirty::{DirtyFlags, Region};
 pub use protocol::{ServerMessage, TuiError};
 pub use render::render_tick;

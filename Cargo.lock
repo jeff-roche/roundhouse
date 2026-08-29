@@ -1530,8 +1530,11 @@ name = "roundhouse-cli"
 version = "0.1.0"
 dependencies = [
  "color-eyre",
+ "crossterm",
+ "ratatui",
  "roundhouse-proto",
  "roundhouse-tui",
+ "tokio",
 ]
 
 [[package]]
@@ -1561,6 +1564,7 @@ name = "roundhouse-daemon"
 version = "0.1.0"
 dependencies = [
  "color-eyre",
+ "futures",
  "roundhouse-acp",
  "roundhouse-bus",
  "roundhouse-config",
@@ -1575,6 +1579,12 @@ dependencies = [
  "roundhouse-sched",
  "roundhouse-store",
  "roundhouse-tools",
+ "roundhouse-tui",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

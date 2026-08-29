@@ -15,3 +15,9 @@ workspace = true
 roundhouse-proto = { path = "../roundhouse-proto" }
 roundhouse-tui = { path = "../roundhouse-tui" }
 color-eyre = { workspace = true }
+tokio = { workspace = true }
+# Same pins as `roundhouse-tui`'s own manifest (Task 19) — this crate constructs
+# the real `CrosstermBackend` the dashboard draws into, so the two must agree on
+# the `ratatui`/`crossterm` versions or the backend types won't be the same type.
+ratatui = { version = "0.30.2", features = ["layout-cache"] }
+crossterm = "0.29"
