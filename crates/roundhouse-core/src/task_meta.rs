@@ -114,6 +114,7 @@ pub enum CancelReason {
     Timeout,
     SessionClosed,
     PolicyDeny,
+    DaemonRestart,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -86,7 +86,10 @@ pub fn fold_task<E: EventFields>(events: &[E]) -> Option<Task> {
             EventPayload::TaskResumed { .. } => TaskState::Running,
             EventPayload::TaskCompleted { .. } => TaskState::Completed,
             EventPayload::TaskFailed { .. } => TaskState::Failed,
-            EventPayload::TaskCancelled { .. } => TaskState::Cancelled,
+            EventPayload::TaskCancelled { reason, .. } => match reason {
+                roundhouse_core::CancelReason::DaemonRestart => TaskState::Interrupted,
+                _ => TaskState::Cancelled,
+            },
             // Session-level and message/note events don't affect task state
             _ => state,
         };

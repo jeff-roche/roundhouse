@@ -15,6 +15,7 @@
 mod fold;
 mod migrations;
 mod pool;
+mod recovery;
 mod replay;
 mod txn;
 mod writer;
@@ -33,6 +34,9 @@ pub use writer::{serialize_payload, spawn_writer, EventWriter};
 
 // Task 3 exports
 pub use fold::{fold_task, Task, TaskState};
+
+// Task 4 exports
+pub use recovery::recover_interrupted_tasks;
 
 // CQRS read-model exports (storage replay / fold)
 pub use replay::StoredEvent;
