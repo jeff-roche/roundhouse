@@ -237,10 +237,16 @@ pub struct ChatRequest {
 use crate::transport::HttpTransport;
 
 /// Request context carrying the trace ID, HTTP transport, and API key.
+///
+/// Does not derive `Default` or `Debug` because `Arc<dyn HttpTransport>` does not implement
+/// either trait — a transport must be provided explicitly at construction.
 pub struct RequestCtx {
+    /// Optional trace ID for request tracing.
     pub trace_id: Option<String>,
+    /// HTTP transport implementation (may be real network or test cassette).
     pub transport: std::sync::Arc<dyn HttpTransport>,
-    pub api_key: String, // simplified for Phase 1; §9.9's Secret<String>/CredentialProvider lands in Phase 2
+    /// API key for the provider. Simplified for Phase 1; §9.9's `Secret<String>`/`CredentialProvider` lands in Phase 2.
+    pub api_key: String,
 }
 
 #[derive(Debug, Clone)]

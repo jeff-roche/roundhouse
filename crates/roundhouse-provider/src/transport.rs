@@ -5,16 +5,23 @@ use std::pin::Pin;
 
 /// HTTP request to be sent via `HttpTransport`.
 pub struct HttpRequest {
+    /// HTTP method (e.g., "GET", "POST").
     pub method: String,
+    /// Request URL.
     pub url: String,
+    /// Request headers as key-value pairs.
     pub headers: Vec<(String, String)>,
+    /// Request body bytes.
     pub body: Vec<u8>,
 }
 
 /// HTTP response body streamed via `futures::Stream`.
 pub struct HttpResponseStream {
+    /// HTTP status code.
     pub status: u16,
+    /// Response headers as key-value pairs.
     pub headers: Vec<(String, String)>,
+    /// Response body streamed in chunks.
     pub body: Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>>,
 }
 
