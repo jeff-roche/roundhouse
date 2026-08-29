@@ -12,6 +12,7 @@
 //! See `docs/architecture/01-data-model.md` and `02-system-architecture.md` §5.2.
 #![forbid(unsafe_code)]
 
+mod fold;
 mod migrations;
 mod pool;
 mod replay;
@@ -29,6 +30,9 @@ pub use pool::{open, StoreError, StorePool, MIGRATIONS};
 
 // Task 2 exports
 pub use writer::{serialize_payload, spawn_writer, EventWriter};
+
+// Task 3 exports
+pub use fold::{fold_task, Task, TaskState};
 
 // CQRS read-model exports (storage replay / fold)
 pub use replay::StoredEvent;
