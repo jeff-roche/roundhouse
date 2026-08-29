@@ -21,9 +21,13 @@ async fn main() -> color_eyre::Result<()> {
     // for anything beyond proving the wire-schema call site exists.
     let _schema = roundhouse_tui::client_schema();
 
+    // Resolved through `roundhouse-tui` rather than computed here: the daemon
+    // resolves the same default from the same function, which is what keeps the
+    // two sides from drifting onto different paths (§5.2 forbids this crate from
+    // depending on `roundhouse-daemon`, so the daemon can't own the constant).
     let socket_path = std::env::var_os("ROUND_SOCKET")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("round-demo.sock"));
+        .unwrap_or_else(roundhouse_tui::default_socket_path);
 
     let mut client = roundhouse_tui::connect(&socket_path)
         .await
@@ -56,18 +60,29 @@ async fn main() -> color_eyre::Result<()> {
 /// only writer on this socket, so a line that won't parse means the two sides
 /// disagree about the wire format, and continuing would render a silently
 /// incomplete session.
-async fn run_attach_loop<B: ratatui::backend::Backend>(
+///
+/// A failed draw is likewise an error, not something to ignore: with stdout
+/// closed (`round | head -1`) or the terminal gone, every subsequent frame would
+/// fail too, so exiting is the only sensible response.
+async fn run_attach_loop<B>(
     client: &mut roundhouse_tui::DaemonClient,
     terminal: &mut Terminal<B>,
     dashboard: &mut Dashboard,
-) -> color_eyre::Result<()> {
+) -> color_eyre::Result<()>
+where
+    B: ratatui::backend::Backend,
+    // `Backend::Error` is only bounded by `core::error::Error` upstream; eyre
+    // needs the extra three bounds to absorb it. `CrosstermBackend`'s
+    // `io::Error` satisfies them.
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     while let Some(message) = client
         .recv()
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?
     {
         dashboard.apply(message);
-        dashboard.tick(terminal);
+        dashboard.tick(terminal)?;
     }
     Ok(())
 }

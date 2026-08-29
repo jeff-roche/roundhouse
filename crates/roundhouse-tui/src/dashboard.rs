@@ -34,6 +34,12 @@ pub struct Dashboard {
     /// The most recent summary that survived coalescing, or `None` before the
     /// first one arrives.
     summary: Option<SessionSummary>,
+    /// The newest summary the `Coalescer` has so far refused, held for re-offer
+    /// on a later tick. `Coalescer`'s contract is "the caller holds the latest
+    /// summary and re-offers it on its own tick" — dropping a refused summary
+    /// outright would mean that if nothing else ever arrives for that session,
+    /// the status pane shows stale state forever.
+    pending_summary: Option<SessionSummary>,
 }
 
 impl Dashboard {
@@ -48,14 +54,18 @@ impl Dashboard {
             coalescer: Coalescer::new(Duration::from_millis(250)),
             last_task_id: None,
             summary: None,
+            pending_summary: None,
         }
     }
 
     /// Applies one incoming `ServerMessage`, updating state and marking the affected
     /// region dirty. `SessionSummary` updates go through the `Coalescer`, so a
-    /// fast-updating session doesn't redraw its status line faster than 4Hz; a summary
-    /// that gets coalesced away deliberately marks nothing dirty, which is the whole
-    /// point — the next one that survives carries the newer state anyway.
+    /// fast-updating session doesn't redraw its status line faster than 4Hz.
+    ///
+    /// A summary the `Coalescer` refuses is *retained*, not dropped: it becomes
+    /// `pending_summary` and is re-offered by [`Dashboard::tick`]. Dropping it
+    /// would leave the status pane permanently stale whenever the refused summary
+    /// happened to be the last one a session ever sent.
     ///
     /// Takes the message by value: the rope and summary want owned `String`s, so
     /// borrowing here would only force the caller's copy to be cloned instead.
@@ -76,24 +86,60 @@ impl Dashboard {
                     running_tasks,
                     blocked,
                 };
-                if let Some(summary) = self.coalescer.offer(summary, Instant::now()) {
-                    self.summary = Some(summary);
+                // Clone only to keep a copy for the refusal path; `offer` consumes
+                // its argument.
+                if let Some(accepted) = self.coalescer.offer(summary.clone(), Instant::now()) {
+                    self.summary = Some(accepted);
+                    // Anything still pending is older than what was just accepted.
+                    self.pending_summary = None;
                     self.flags.mark(Region::Status);
+                } else {
+                    // Newest refused summary wins: an older pending one is strictly
+                    // less current, so replacing it loses nothing.
+                    self.pending_summary = Some(summary);
                 }
             }
         }
     }
 
+    /// Re-offers the newest refused summary, if any, promoting it once the
+    /// `Coalescer`'s interval has elapsed.
+    ///
+    /// Called from [`Dashboard::tick`] rather than from a separate periodic timer:
+    /// `tick` already runs after every applied message, which is exactly the
+    /// "caller re-offers on its own tick" cadence `Coalescer` documents, and it
+    /// keeps `Dashboard` free of any clock of its own.
+    fn flush_pending_summary(&mut self) {
+        let Some(pending) = self.pending_summary.take() else {
+            return;
+        };
+        if let Some(accepted) = self.coalescer.offer(pending.clone(), Instant::now()) {
+            self.summary = Some(accepted);
+            self.flags.mark(Region::Status);
+        } else {
+            // Still inside the interval — put it back and try again next tick.
+            self.pending_summary = Some(pending);
+        }
+    }
+
     /// Runs one real render tick — the same `render_tick` Task 19 already unit-tests
     /// with `TestBackend`, now driven by this dashboard's real accumulated state
-    /// instead of a synthetic draw closure. Returns `true` if a frame was drawn.
+    /// instead of a synthetic draw closure. Returns `Ok(true)` if a frame was drawn,
+    /// `Ok(false)` if nothing was dirty.
     ///
     /// Field-destructures `self` rather than reaching through `self.` inside the draw
     /// closure: `render_tick` already holds `&mut self.flags` for the duration of the
     /// call, so a closure that also captured `self` would be a second, overlapping
     /// borrow. Destructuring first splits the borrow into disjoint per-field borrows,
     /// which the borrow checker accepts.
-    pub fn tick<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> bool {
+    ///
+    /// # Errors
+    /// Propagates a backend write/flush failure from `render_tick` — see its doc
+    /// comment for why that is a real, reachable condition on a live terminal,
+    /// and why the error type is `B::Error` rather than `io::Error`.
+    pub fn tick<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<bool, B::Error> {
+        // Before drawing: a summary the coalescer refused earlier may be due now.
+        self.flush_pending_summary();
         let Dashboard {
             flags,
             ropes,

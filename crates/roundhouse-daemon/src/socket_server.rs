@@ -2,6 +2,7 @@
 //! one attached client, NDJSON out.
 
 use roundhouse_tui::ServerMessage;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
@@ -25,13 +26,29 @@ use tokio::task::JoinHandle;
 ///
 /// # Errors
 /// Returns the `bind` error if the path is already in use, unwritable, or too
-/// long for `sockaddr_un`.
+/// long for `sockaddr_un`, or the `set_permissions` error if the socket's mode
+/// can't be tightened.
 pub fn serve_ndjson(
     socket_path: impl AsRef<Path>,
     mut rx: mpsc::Receiver<ServerMessage>,
 ) -> std::io::Result<JoinHandle<()>> {
+    let socket_path = socket_path.as_ref();
     let listener = UnixListener::bind(socket_path)?;
+    // `bind` creates the socket with `0777 & ~umask`, which on a permissive
+    // umask is world-connectable. Tighten it to owner-only. Defense in depth
+    // on top of the 0700 parent directory the daemon puts this in: the
+    // directory is the real barrier, since there is an unavoidable window
+    // between `bind` and this call.
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+
     Ok(tokio::spawn(async move {
+        // TODO(Phase 2): implement SO_PEERCRED peer-credential verification per
+        // docs/architecture/03-security-and-sandboxing.md §6.2 ("The Unix socket
+        // uses peer-credential checks (SO_PEERCRED)"). This Phase 1 demo server
+        // accepts any local connection with no authentication whatsoever — the
+        // 0600 socket mode and 0700 parent directory above are what currently
+        // stand in for it, and they are a filesystem-permission approximation,
+        // not the credential check the frozen contract requires.
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };

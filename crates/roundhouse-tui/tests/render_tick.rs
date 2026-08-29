@@ -10,9 +10,13 @@ fn idle_tick_with_nothing_dirty_never_draws() {
     let mut flags = DirtyFlags::new();
     let draw_count = RefCell::new(0);
 
+    // `TestBackend` writes into an in-memory buffer, so the `io::Result` here
+    // genuinely cannot be `Err` — unwrapping is safe in a way it is not for the
+    // real `CrosstermBackend` the CLI drives.
     let drew = render_tick(&mut terminal, &mut flags, |_frame, _flags| {
         *draw_count.borrow_mut() += 1;
-    });
+    })
+    .unwrap();
 
     assert!(!drew);
     assert_eq!(*draw_count.borrow(), 0);
@@ -28,7 +32,8 @@ fn marking_a_region_dirty_draws_exactly_once_then_clears() {
 
     let drew = render_tick(&mut terminal, &mut flags, |_frame, _flags| {
         *draw_count.borrow_mut() += 1;
-    });
+    })
+    .unwrap();
 
     assert!(drew);
     assert_eq!(*draw_count.borrow(), 1);
