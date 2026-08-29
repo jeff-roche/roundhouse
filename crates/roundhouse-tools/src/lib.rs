@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod read;
 mod shell;
 
 use roundhouse_policy::{ParsedCommand, TaskParams};
@@ -17,6 +18,7 @@ use roundhouse_sandbox::Isolate;
 use std::sync::Arc;
 
 pub use error::ToolError;
+pub use read::read_file;
 pub use shell::{run_shell, ShellOutput};
 
 /// Proves roundhouse-tools compiles against both stub traits it will
