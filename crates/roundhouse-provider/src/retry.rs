@@ -43,8 +43,10 @@ struct BreakerEntry {
     opened_at: Option<Instant>,
     // Set by `try_enter_half_open_trial` for the one caller admitted while
     // `HalfOpen`; read by that same method to refuse every other concurrent
-    // caller, and cleared on the trial's completion (by `record_success` on
-    // success, or by `record_failure` re-opening the breaker on failure).
+    // caller. Cleared by `record_success`/`record_failure` when either fires
+    // for this key, and — unconditionally, on every exit path, so it can
+    // never leak — by the `HalfOpenTrial` RAII guard `retry_with_policy`
+    // holds for the lifetime of the call that won the trial.
     half_open_trial_in_flight: bool,
 }
 
@@ -151,6 +153,48 @@ impl CircuitBreaker {
             false
         }
     }
+
+    /// Releases a claimed half-open trial slot. Idempotent — safe to call
+    /// even if `record_success`/`record_failure` already cleared the flag
+    /// through the breaker's normal state transition (setting `false` to
+    /// `false` again is a no-op). Called by `HalfOpenTrial`'s `Drop` impl so
+    /// a trial slot can never leak past the `retry_with_policy` call that
+    /// claimed it, regardless of which exit path that call takes (post-review
+    /// fix, 2026-08-29 — see `HalfOpenTrial`'s doc comment for the bug this
+    /// closes).
+    fn clear_half_open_trial(&self, key: BreakerKey) {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(entry) = entries.get_mut(&key) {
+            entry.half_open_trial_in_flight = false;
+        }
+    }
+}
+
+/// RAII guard for a claimed half-open trial slot, held by `retry_with_policy`
+/// for the lifetime of the call that won it via `try_enter_half_open_trial`.
+///
+/// Before this existed, only `record_success`/`record_failure` ever cleared
+/// `half_open_trial_in_flight` — but `retry_with_policy`'s `Fatal` arm and
+/// `RetryWithBackoff` arm (and, by construction, a dropped/cancelled
+/// `attempt` future or a panic inside one) called neither. A single
+/// `Timeout`/`BadRequest`/etc. during a trial would leak the flag
+/// permanently: `opened_at` never clears without `record_success`, so
+/// `state()` reports `HalfOpen` forever and `try_enter_half_open_trial`
+/// refuses every subsequent caller forever — a permanent per-key denial of
+/// service, strictly worse than the thundering-herd bug this mechanism
+/// exists to prevent. Wrapping the claimed slot in this guard means its
+/// `Drop` impl clears the flag on *every* exit path — success, any
+/// disposition, an early return, a cancelled future, or a panicking
+/// `attempt` closure — with no way to forget.
+struct HalfOpenTrial<'a> {
+    breaker: &'a CircuitBreaker,
+    key: BreakerKey,
+}
+
+impl Drop for HalfOpenTrial<'_> {
+    fn drop(&mut self) {
+        self.breaker.clear_half_open_trial(self.key.clone());
+    }
 }
 
 /// §9.8's disposition table, made an explicit type so the retry loop below cannot
@@ -213,6 +257,49 @@ pub fn disposition(e: &ProviderError) -> Disposition {
         ProviderError::Unsupported(_) | ProviderError::StreamInterrupted { .. } => {
             Disposition::Fatal
         }
+    }
+}
+
+/// Whether an error should count toward the circuit breaker's failure
+/// threshold — a decision §9.8 makes independently of `disposition()`'s
+/// "should this shed concurrency" decision, and one this function keeps
+/// structurally separate on purpose (post-review fix, 2026-08-29): an
+/// earlier version derived "call `record_failure`" from *which disposition
+/// arm* an error routed through, which conflated the two questions and
+/// regressed both directions at once — `Overloaded`/`Server{..}` (moved
+/// off the shedding arm by finding 1's fix) silently stopped tripping the
+/// breaker at all, its exact spec-mandated trigger, while `RateLimited`
+/// (moved *onto* a shedding arm) started tripping it for a condition §9.8
+/// never lists as a breaker trigger. Checking the concrete `ProviderError`
+/// variant here, called independently of `disposition()`, makes it
+/// impossible for a future change to the shed routing to silently change
+/// the breaker-trigger set again.
+///
+/// Only `Overloaded`/`Server{..}` trigger it, matching §9.8's literal
+/// "overloaded/5xx" breaker-open language. `RateLimited` never does — rate
+/// limiting isn't a breaker trigger per spec, even though it does shed
+/// concurrency. `Timeout`/`Transport` also don't: §9.8's retry-disposition
+/// row bundles "5xx/timeout" together, but the breaker-open wording only
+/// says "overloaded/5xx" — lacking stronger evidence that a timeout should
+/// count the same as a 5xx for breaker purposes, this leans conservative
+/// and excludes it (a network hiccup on our end/in transit isn't
+/// necessarily evidence the *provider* is unhealthy the way a 5xx is).
+///
+/// Deliberately an exhaustive `match`, not a `matches!` with an implicit
+/// "else false" — mirroring `disposition()`'s own structure above, so a
+/// future new `ProviderError` variant forces a compile error here instead
+/// of silently defaulting to "not a breaker trigger."
+fn is_breaker_trigger(e: &ProviderError) -> bool {
+    match e {
+        ProviderError::Overloaded | ProviderError::Server { .. } => true,
+        ProviderError::RateLimited { .. }
+        | ProviderError::Timeout
+        | ProviderError::Transport(_)
+        | ProviderError::QuotaExhausted
+        | ProviderError::BadRequest { .. }
+        | ProviderError::ModelNotFound
+        | ProviderError::Unsupported(_)
+        | ProviderError::StreamInterrupted { .. } => false,
     }
 }
 
@@ -341,17 +428,24 @@ impl AimdSemaphore {
     /// as those permits are returned. `current_limit` always reflects the
     /// intended ceiling; the real semaphore catches up as outstanding
     /// permits come back.
+    ///
+    /// Deferred debt is computed from `forget_permits`'s own return value
+    /// (the actual number it forgot), not from a separately-read
+    /// `available_permits()` beforehand (post-review fix, 2026-08-29): those
+    /// were two non-atomic reads of the same counter, so a concurrent
+    /// `acquire` landing in the gap between them could grab a permit this
+    /// call had already counted as "available to forget," making
+    /// `forget_permits` forget fewer than `want_to_forget` while the stale
+    /// `available` count silently ate the difference instead of it becoming
+    /// debt — the same class of lost-shed bug this whole debt mechanism
+    /// exists to close, just narrowed to a smaller window.
     pub fn shed(&self, key: &BreakerKey) {
         let mut entries = self.entries.lock().unwrap();
         let entry = entries.entry(key.clone()).or_insert_with(AimdEntry::new);
         let new_limit = (entry.current_limit / 2).max(MIN_PERMITS);
         let want_to_forget = entry.current_limit.saturating_sub(new_limit);
-        let available = entry.state.semaphore.available_permits();
-        let forget_now = want_to_forget.min(available);
-        if forget_now > 0 {
-            entry.state.semaphore.forget_permits(forget_now);
-        }
-        let deferred = want_to_forget - forget_now;
+        let forgotten = entry.state.semaphore.forget_permits(want_to_forget);
+        let deferred = want_to_forget - forgotten;
         if deferred > 0 {
             *entry.state.debt.lock().unwrap() += deferred;
         }
@@ -449,28 +543,46 @@ where
 {
     const MAX_ATTEMPTS: u32 = 5;
     let mut last_err: Option<ProviderError> = None;
+    // Set once, the first time this call observes `HalfOpen` and wins the
+    // trial slot; `Some` for every remaining iteration of *this* call's own
+    // loop after that. Declared outside the loop and dropped only when this
+    // function returns (any exit path — success, `Fatal`, exhaustion,
+    // cancellation, panic), so the slot it holds can never leak (finding 2)
+    // and this call never re-checks/re-acquires it against itself on a later
+    // iteration (finding 3 — without this, a call's own second attempt would
+    // see the flag it itself set and reject its own retry).
+    let mut trial: Option<HalfOpenTrial<'_>> = None;
     for n in 0..MAX_ATTEMPTS {
-        match breaker.state(key.clone()) {
-            BreakerState::Open => {
-                tracing::warn!(
-                    provider = %key.0 .0,
-                    model = %key.1 .0,
-                    "refusing attempt: circuit breaker open"
-                );
-                return Err(breaker_rejection(&key, "breaker open"));
-            }
-            BreakerState::HalfOpen => {
-                if !breaker.try_enter_half_open_trial(key.clone()) {
+        if trial.is_none() {
+            match breaker.state(key.clone()) {
+                BreakerState::Open => {
                     tracing::warn!(
                         provider = %key.0 .0,
                         model = %key.1 .0,
-                        "refusing attempt: half-open trial already in flight"
+                        "refusing attempt: circuit breaker open"
                     );
-                    return Err(breaker_rejection(&key, "half-open trial already in flight"));
+                    return Err(breaker_rejection(&key, "breaker open"));
                 }
+                BreakerState::HalfOpen => {
+                    if breaker.try_enter_half_open_trial(key.clone()) {
+                        trial = Some(HalfOpenTrial {
+                            breaker,
+                            key: key.clone(),
+                        });
+                    } else {
+                        tracing::warn!(
+                            provider = %key.0 .0,
+                            model = %key.1 .0,
+                            "refusing attempt: half-open trial already in flight"
+                        );
+                        return Err(breaker_rejection(&key, "half-open trial already in flight"));
+                    }
+                }
+                BreakerState::Closed => {}
             }
-            BreakerState::Closed => {}
         }
+        // else: this call already won the trial slot on an earlier iteration
+        // of its own loop — proceed without re-checking breaker state at all.
 
         let _permit = semaphore.acquire(&key).await;
         let result = attempt(n).await;
@@ -484,13 +596,26 @@ where
             }
             Err(e) => {
                 last_err = Some(e.clone());
+                // Finding 1 (post-review): "should this trip the breaker" and "should
+                // this shed concurrency" are independent §9.8 decisions — checked here
+                // via the concrete error variant, not derived from which `Disposition`
+                // arm below happens to run, so they can't get re-coupled by a future
+                // change to the shed routing.
+                if is_breaker_trigger(&e) {
+                    breaker.record_failure(key.clone());
+                    tracing::warn!(
+                        provider = %key.0 .0,
+                        model = %key.1 .0,
+                        "breaker failure recorded (overloaded/5xx)"
+                    );
+                }
                 match disposition(&e) {
                     // Fixes finding 8: Fatal returns immediately, no second `attempt` call.
                     Disposition::Fatal => return Err(e),
                     Disposition::RetryAfter => {
                         // Finding 1: RateLimited always means "your rate," regardless of
-                        // whether the provider gave an exact retry-after value — shed here too.
-                        breaker.record_failure(key.clone());
+                        // whether the provider gave an exact retry-after value — shed here
+                        // too (but does NOT trip the breaker — see is_breaker_trigger above).
                         semaphore.shed(&key);
                         tracing::warn!(
                             provider = %key.0 .0,
@@ -521,7 +646,8 @@ where
                         sleep(Duration::from_millis(100 * 2u64.pow(n)) + jitter()).await;
                     }
                     Disposition::ShedAndRetry => {
-                        breaker.record_failure(key.clone());
+                        // Finding 1: sheds, but does NOT trip the breaker (RateLimited{None}
+                        // is not a breaker trigger — see is_breaker_trigger above).
                         semaphore.shed(&key);
                         tracing::warn!(
                             provider = %key.0 .0,

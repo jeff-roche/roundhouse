@@ -451,3 +451,192 @@ async fn retry_after_arm_stops_at_max_attempts_and_caps_each_sleep() {
         "each Retry-After sleep must be clamped at the sleep site too, not obeyed uncapped"
     );
 }
+
+// ---------------------------------------------------------------------
+// Round-2 post-review fix round (2026-08-29): the round-1 fix (commit
+// 7147c6b) introduced 2 new Critical regressions and 1 new Important
+// regression while fixing the round-1 findings. Regression tests below.
+// ---------------------------------------------------------------------
+
+// New finding 1 (Critical regression): moving Overloaded/Server off the
+// shedding arm (round-1 finding 1's fix) accidentally also moved them off
+// the only code path that called breaker.record_failure, so the breaker
+// could no longer trip on its spec-mandated "overloaded/5xx" trigger at
+// all -- while RateLimited (moved onto a shedding arm) started tripping it
+// for a condition §9.8 never lists as a breaker trigger.
+
+#[tokio::test(start_paused = true)]
+async fn breaker_trips_on_five_consecutive_overloaded_even_though_overloaded_does_not_shed() {
+    let breaker = CircuitBreaker::new();
+    let semaphore = AimdSemaphore::new();
+    let key = (
+        ProviderId("anthropic".into()),
+        ModelId("claude-test".into()),
+    );
+
+    let result: Result<u32, ProviderError> =
+        retry_with_policy(key.clone(), &breaker, &semaphore, |_attempt| async move {
+            Err(ProviderError::Overloaded)
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        breaker.state(key),
+        BreakerState::Open,
+        "5 consecutive Overloaded is §9.8's literal breaker-open trigger — it must trip the \
+         breaker even though Overloaded (correctly, per round-1's finding 1) no longer sheds \
+         concurrency; 'does this shed' and 'does this trip the breaker' are independent \
+         decisions"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn breaker_trips_on_five_consecutive_server_errors() {
+    let breaker = CircuitBreaker::new();
+    let semaphore = AimdSemaphore::new();
+    let key = (ProviderId("openai".into()), ModelId("gpt-test".into()));
+
+    let result: Result<u32, ProviderError> =
+        retry_with_policy(key.clone(), &breaker, &semaphore, |_attempt| async move {
+            Err(ProviderError::Server { status: 503 })
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        breaker.state(key),
+        BreakerState::Open,
+        "5 consecutive Server{{503}} must trip the breaker per §9.8's 'overloaded/5xx' trigger"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn breaker_does_not_trip_on_five_consecutive_rate_limited() {
+    let breaker = CircuitBreaker::new();
+    let semaphore = AimdSemaphore::new();
+    let key = (
+        ProviderId("anthropic".into()),
+        ModelId("claude-test".into()),
+    );
+
+    let result: Result<u32, ProviderError> =
+        retry_with_policy(key.clone(), &breaker, &semaphore, |_attempt| async move {
+            Err(ProviderError::RateLimited { retry_after: None })
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        breaker.state(key),
+        BreakerState::Closed,
+        "RateLimited is not a §9.8 breaker trigger — even 5 consecutive rate-limits inside a \
+         single call must not trip the breaker, even though (correctly) they do shed \
+         concurrency"
+    );
+}
+
+// New finding 2 (Critical regression): try_enter_half_open_trial's flag was only ever
+// cleared by record_success/record_failure -- but the Fatal and RetryWithBackoff exit
+// arms called neither, so a single Timeout/BadRequest/etc. during a trial wedged that
+// key's half-open slot permanently (state() reports HalfOpen forever, every subsequent
+// caller refused forever, attempt never invoked again for that key).
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_half_open_trial_does_not_permanently_wedge_the_key() {
+    let breaker = CircuitBreaker::new();
+    let semaphore = AimdSemaphore::new();
+    let key = (ProviderId("openai".into()), ModelId("gpt-test".into()));
+
+    for _ in 0..5 {
+        breaker.record_failure(key.clone());
+    }
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(breaker.state(key.clone()), BreakerState::HalfOpen);
+
+    // The trial fails with Timeout -- NOT a breaker trigger (is_breaker_trigger), so
+    // record_failure never runs for it. Before this fix, nothing else ever cleared
+    // half_open_trial_in_flight on this exit path, and the key would be wedged forever.
+    let trial_result: Result<u32, ProviderError> =
+        retry_with_policy(key.clone(), &breaker, &semaphore, |_attempt| async move {
+            Err(ProviderError::Timeout)
+        })
+        .await;
+    assert!(
+        trial_result.is_err(),
+        "test setup: the trial must actually fail"
+    );
+
+    // Simulate a long time passing (well past any plausible re-open window) and then a
+    // fresh, independent, unrelated call for the same key -- it must be allowed to
+    // attempt, not permanently rejected as Fatal by a leaked trial flag.
+    tokio::time::advance(Duration::from_secs(3600)).await;
+
+    let calls = AtomicU32::new(0);
+    let result: Result<u32, ProviderError> =
+        retry_with_policy(key, &breaker, &semaphore, |attempt| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(attempt) }
+        })
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "a single failed half-open trial must not permanently wedge this (provider, model) \
+         key: {:?}",
+        result
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) > 0,
+        "the subsequent call must actually invoke `attempt`, not get silently rejected forever"
+    );
+}
+
+// New finding 3 (Important regression): the trial holder re-checked/re-acquired the trial
+// slot on every loop iteration of its OWN call, so its own second attempt would see the
+// flag IT ITSELF set on the first iteration and reject itself -- discarding its own real
+// error (e.g. a genuine Timeout silently replaced by a generic breaker-rejection error) and
+// never actually retrying.
+
+#[tokio::test(start_paused = true)]
+async fn half_open_trial_holder_retries_within_its_own_call_without_self_rejecting() {
+    let breaker = CircuitBreaker::new();
+    let semaphore = AimdSemaphore::new();
+    let key = (
+        ProviderId("anthropic".into()),
+        ModelId("claude-test".into()),
+    );
+
+    for _ in 0..5 {
+        breaker.record_failure(key.clone());
+    }
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(breaker.state(key.clone()), BreakerState::HalfOpen);
+
+    let calls = AtomicU32::new(0);
+    let result: Result<u32, ProviderError> =
+        retry_with_policy(key, &breaker, &semaphore, |attempt| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err(ProviderError::Timeout) // not Fatal, not a breaker trigger: must retry
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await;
+
+    assert_eq!(
+        result.unwrap(),
+        1,
+        "the trial holder's own second attempt must actually run and succeed, not be \
+         discarded by the call rejecting its own retry"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "must not re-check/re-acquire the trial slot on later iterations of its own loop -- \
+         the check-and-set happens once per retry_with_policy call"
+    );
+}
