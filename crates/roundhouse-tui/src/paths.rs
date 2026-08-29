@@ -6,10 +6,18 @@ use std::path::PathBuf;
 /// socket, the event log, and (in Phase 1) the demo's scratch file.
 ///
 /// Lives in `roundhouse-tui` because it is the only crate *both* binaries
-/// depend on. §5.2 forbids `roundhouse-cli` from depending on
-/// `roundhouse-daemon`, so the daemon can't own a location the client must also
-/// resolve, and duplicating the rule in two binaries would let the two sides
-/// drift apart silently — the client would dial a socket the daemon never bound.
+/// depend on, so the daemon can't own a location the client must also resolve.
+/// Duplicating the rule in two binaries would let the two sides drift apart
+/// silently — the client would dial a socket the daemon never bound.
+///
+/// To be precise about the constraint, since it is easy to misattribute: §5.2's
+/// dependency table does list `daemon` among `roundhouse-cli`'s dependencies.
+/// What actually rules the edge out is the enforced baseline in
+/// `xtask/tests/exit_criterion.rs`, which deliberately omits `roundhouse-daemon`
+/// from `roundhouse-cli`'s required edges (Phase 0's resolved ambiguity, and the
+/// reason `roundhouse-cli`'s own crate docs say `round daemon` is invoked as a
+/// subprocess rather than linked). Adding the edge would contradict that
+/// baseline, so the shared location goes here instead.
 ///
 /// Prefers `$XDG_RUNTIME_DIR`, which the OS already provides as a `0700`
 /// directory owned by the invoking user — exactly the private-directory

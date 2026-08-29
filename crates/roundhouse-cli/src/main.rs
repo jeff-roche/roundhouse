@@ -23,8 +23,10 @@ async fn main() -> color_eyre::Result<()> {
 
     // Resolved through `roundhouse-tui` rather than computed here: the daemon
     // resolves the same default from the same function, which is what keeps the
-    // two sides from drifting onto different paths (§5.2 forbids this crate from
-    // depending on `roundhouse-daemon`, so the daemon can't own the constant).
+    // two sides from drifting onto different paths. It lives in the shared crate
+    // because this crate does not link `roundhouse-daemon` — per the enforced
+    // baseline in `xtask/tests/exit_criterion.rs`, not per §5.2, whose table does
+    // list that edge (see `roundhouse_tui::default_runtime_dir`).
     let socket_path = std::env::var_os("ROUND_SOCKET")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(roundhouse_tui::default_socket_path);

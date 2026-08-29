@@ -15,7 +15,7 @@ use roundhouse_daemon::demo::{run_demo_session, DemoConfig, FakeEditProvider, No
 use roundhouse_daemon::socket_server::serve_ndjson;
 use roundhouse_provider::RequestCtx;
 use std::io::ErrorKind;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -111,27 +111,38 @@ async fn main() -> color_eyre::Result<()> {
     // Unlink on the way out: a bound Unix socket outlives the process that
     // created it, and a leftover one makes the next run's `bind` fail with
     // `EADDRINUSE` (and looks, to a client, like a daemon that never answers).
-    let _ = std::fs::remove_file(&socket_path);
+    //
+    // Goes through the same guarded helper as startup, so this can never delete
+    // something that isn't a socket — the path could have been replaced while
+    // the daemon ran. Failure is ignored rather than propagated: the run
+    // succeeded, and `remove_stale_socket` at the next startup is self-healing.
+    let _ = remove_stale_socket(&socket_path);
     Ok(())
 }
 
 /// Creates the daemon's runtime directory `0700`, or accepts an existing one
-/// only if it is still a real, owner-only directory.
+/// only if it is still a real, owner-only directory belonging to this user.
 ///
-/// Uses `symlink_metadata`, which does *not* follow symlinks, so a pre-planted
-/// `runtime_dir -> /somewhere/else` is rejected here instead of being silently
-/// accepted as "a directory". The mode check rejects a directory some other user
-/// left group- or world-writable, which would otherwise still allow the symlink
-/// pre-plant this whole function exists to stop.
+/// All three checks run against the *same* `symlink_metadata` result, so there
+/// is no window between them. `symlink_metadata` does not follow symlinks, so a
+/// pre-planted `runtime_dir -> /somewhere/else` is rejected here rather than
+/// silently accepted as "a directory".
 ///
-/// Deliberately does not verify the owning uid: reading the current process's
-/// uid needs a `getuid()` call, and this crate is `#![forbid(unsafe_code)]` with
-/// no `libc`/`rustix` dependency. The gap is small — a `0700` directory owned by
-/// *another* user is one this process cannot traverse at all, so every
-/// subsequent open fails with `EACCES`. That degrades the attack to denial of
-/// service rather than a clobber, which is the property that matters here.
+/// The three refusals, and why each is load-bearing:
+/// 1. **Not a directory** — catches the symlink pre-plant directly.
+/// 2. **Mode != 0700** — catches a directory left group- or world-writable, which
+///    would let anyone drop a symlink *inside* it for the daemon to open.
+/// 3. **Owned by another uid** — catches a `0700` directory the attacker owns.
+///    Mode alone is not enough: running as root (or with `CAP_DAC_OVERRIDE`)
+///    traverses a foreign `0700` directory freely, and SQLite opens `store_path`
+///    with `O_CREAT` *following symlinks*, so an attacker-owned directory is a
+///    root-clobber primitive. Even unprivileged, accepting a directory whose
+///    entries the attacker controls leaves a TOCTOU window in which they can
+///    swap a symlink in between this check and the later open.
 fn prepare_runtime_dir(dir: &Path) -> std::io::Result<()> {
     match std::fs::DirBuilder::new().mode(RUNTIME_DIR_MODE).create(dir) {
+        // Freshly created by us, so it is by construction a directory, 0700, and
+        // ours — none of the checks below can fail.
         Ok(()) => Ok(()),
         Err(err) if err.kind() == ErrorKind::AlreadyExists => {
             let meta = std::fs::symlink_metadata(dir)?;
@@ -155,10 +166,64 @@ fn prepare_runtime_dir(dir: &Path) -> std::io::Result<()> {
                     ),
                 ));
             }
+            check_owned_by_current_user(dir, &meta)?;
             Ok(())
         }
         Err(err) => Err(err),
     }
+}
+
+/// Rejects a runtime directory owned by anyone but the current user.
+///
+/// Linux-only, because the uid is read from `/proc/self` — `std::fs::metadata`
+/// on it reports the current process's own uid, which is the whole trick that
+/// makes this dependency-free (`getuid()` itself would mean taking on `libc` or
+/// `rustix`). Failing to read `/proc` is treated as a hard error, not as a pass:
+/// an ownership check that silently no-ops when it can't run isn't a check.
+///
+/// **`metadata`, never `symlink_metadata`, on this one path.** `/proc/self` is a
+/// *symlink* to `/proc/<pid>`, and like every `/proc` symlink it is itself owned
+/// by `root:root` — so `symlink_metadata` here would report uid 0 for every
+/// process and make this check reject every directory (or, worse, pass when
+/// running as root). Following it reaches the real `/proc/<pid>` directory,
+/// whose owner is this process's uid. This is the one place in this file where
+/// following a symlink is the correct behavior; every other call deliberately
+/// uses `symlink_metadata` for the opposite reason.
+#[cfg(target_os = "linux")]
+fn check_owned_by_current_user(dir: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    let current_uid = std::fs::metadata("/proc/self")
+        .map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!("cannot read /proc/self to determine this process's uid: {err}"),
+            )
+        })?
+        .uid();
+    let owner_uid = meta.uid();
+    if owner_uid != current_uid {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{} is owned by uid {owner_uid}, not this process's uid {current_uid}; \
+                 refusing to write runtime state into another user's directory",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Non-Linux fallback: no `/proc`, and reading the uid otherwise would mean
+/// adding `libc`/`rustix` for one syscall.
+///
+/// The gap is narrow in practice on the platform that matters here: macOS gives
+/// each user a private, per-user `$TMPDIR` (`/var/folders/...`, mode `0700`), so
+/// the shared-directory pre-plant this check defends against does not arise on
+/// the fallback path there the way it does under a world-writable `/tmp`. Linux —
+/// where `temp_dir()` really is the shared `/tmp` — gets the real check above.
+#[cfg(not(target_os = "linux"))]
+fn check_owned_by_current_user(_dir: &Path, _meta: &std::fs::Metadata) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Removes a leftover socket from a previous run, and *only* a socket.

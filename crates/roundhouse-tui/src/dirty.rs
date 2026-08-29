@@ -19,7 +19,7 @@ pub enum Region {
 ///
 /// A region is marked dirty when its state changes. `render_tick` checks
 /// if any region is dirty; if so, it draws a frame and clears all dirty flags.
-/// If nothing is dirty, `render_tick` returns `false` without drawing.
+/// If nothing is dirty, `render_tick` returns `Ok(false)` without drawing.
 pub struct DirtyFlags {
     set: HashSet<Region>,
 }

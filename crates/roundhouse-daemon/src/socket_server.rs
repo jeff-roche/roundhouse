@@ -35,16 +35,23 @@ pub fn serve_ndjson(
     let socket_path = socket_path.as_ref();
     let listener = UnixListener::bind(socket_path)?;
     // `bind` creates the socket with `0777 & ~umask`, which on a permissive
-    // umask is world-connectable. Tighten it to owner-only. Defense in depth
-    // on top of the 0700 parent directory the daemon puts this in: the
-    // directory is the real barrier, since there is an unavoidable window
-    // between `bind` and this call.
+    // umask is world-connectable. Tighten it to owner-only.
+    //
+    // There is an unavoidable window between `bind` and this call, and
+    // `set_permissions` *follows symlinks* — so if the socket path sits
+    // somewhere an attacker can write, they could replace it with a symlink in
+    // that window and have this line chmod an arbitrary file of their choosing
+    // to 0600. For the default path that is fully mitigated by the 0700 parent
+    // directory (nobody else can create anything in it, so there is nothing to
+    // swap). It is *not* mitigated for an operator-supplied `$ROUND_SOCKET`
+    // pointing at a shared directory — the parent directory is the real barrier
+    // here, and this chmod is only defense in depth behind it.
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
 
     Ok(tokio::spawn(async move {
         // TODO(Phase 2): implement SO_PEERCRED peer-credential verification per
-        // docs/architecture/03-security-and-sandboxing.md §6.2 ("The Unix socket
-        // uses peer-credential checks (SO_PEERCRED)"). This Phase 1 demo server
+        // docs/architecture/03-security-and-sandboxing.md §6.4 "Approvals" ("The
+        // Unix socket uses peer-credential checks (SO_PEERCRED)"). This demo server
         // accepts any local connection with no authentication whatsoever — the
         // 0600 socket mode and 0700 parent directory above are what currently
         // stand in for it, and they are a filesystem-permission approximation,
