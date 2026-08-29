@@ -1,3 +1,12 @@
+//! Task executors: shell, filesystem (read/edit/find), http, web, git, and
+//! memory — the code that actually performs an action once `roundhouse-policy`
+//! has allowed it and `roundhouse-sandbox` has isolated it.
+//!
+//! Phase 0 only proves this crate compiles against the `roundhouse-policy`
+//! and `roundhouse-sandbox` stub traits it will build real executors on top
+//! of; no executor exists yet. See
+//! `docs/architecture/02-system-architecture.md` §5.2 and
+//! `10-implementation-phasing.md` §13.2 (Phase 1 executor list).
 #![forbid(unsafe_code)]
 
 use roundhouse_policy::{ParsedCommand, TaskParams};
