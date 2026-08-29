@@ -16,6 +16,7 @@ mod migrations;
 mod pool;
 mod replay;
 mod txn;
+mod writer;
 pub mod blobs;
 
 // Phase 0 exports
@@ -25,6 +26,9 @@ pub use txn::begin_immediate;
 
 // Task 1 exports
 pub use pool::{open, StoreError, StorePool, MIGRATIONS};
+
+// Task 2 exports
+pub use writer::{serialize_payload, spawn_writer, EventWriter};
 
 // CQRS read-model exports (storage replay / fold)
 pub use replay::StoredEvent;
