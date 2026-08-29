@@ -18,6 +18,12 @@ pub struct EditOutcome {
 /// byte-for-byte unchanged. This design prevents silent corruption from ambiguous
 /// matches or accidental no-ops.
 ///
+/// This is especially important because this tool is eventually driven by LLM
+/// tool-call output, which may be mistaken or adversarial. Silently editing the
+/// wrong occurrence (or guessing) on ambiguous input would be a real data-corruption
+/// risk on a user's actual files. The strict refuse-to-guess posture is non-negotiable,
+/// not just a nice-to-have.
+///
 /// The actual write is atomic via `write_file` (Task 15), which uses temp+rename
 /// on the same filesystem.
 pub async fn edit_file(
