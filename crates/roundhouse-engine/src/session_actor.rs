@@ -16,9 +16,15 @@
 //! specifically to thread multiple Phase 2 policy/admission mechanisms into
 //! real call sites; cancellation admission-refusal fits the same umbrella.
 //! Don't assume more integration happened here than did.
+//!
+//! Phase 2, Task 4 adds [`SessionActor::run_finally_steps`] to this same
+//! file (not a separate `cancel.rs` — this module is `SessionActor`'s home).
+//! It reuses `admit_task` for real, but same as above, still doesn't reach
+//! into a real dispatch chokepoint for *executing* a step — that's injected
+//! by the caller, for the same "Task 25 doesn't exist yet" reason.
 
 use roundhouse_core::{
-    CancelReason, Origin, SessionId, SessionState, TaskKind, TaskRunner, Timestamp,
+    CancelReason, Origin, SessionId, SessionState, TaskInput, TaskKind, TaskRunner, Timestamp,
 };
 use roundhouse_store::{EventWriter, StoreError};
 
@@ -173,4 +179,60 @@ impl SessionActor {
             SessionState::Closed => Err(AdmitError::SessionClosed),
         }
     }
+
+    /// Runs each `finally:` step in order, even while this session is
+    /// `Cancelling` (or `Suspended`/`Closed`) — `admit_task` (above)
+    /// special-cases `is_finally_step: true` + `Origin::System` precisely so
+    /// this path is legal, and every step here is admitted through that
+    /// real check, not a bypass around it.
+    ///
+    /// `execute` is injected rather than hardcoded against a real dispatch
+    /// chokepoint: as of this task, `roundhouse-engine` still has no unified
+    /// task-execution entry point (see this module's doc comment — the same
+    /// gap Task 3 already documented and worked around). Inventing a fake
+    /// one here (e.g. a `TaskRunner::execute`/`executor_for` pair that
+    /// doesn't exist anywhere in this codebase) would paper over that gap
+    /// instead of leaving it honestly for the later integration task that
+    /// owns wiring a real executor in ("Task 25" in the Phase 2 plan).
+    ///
+    /// Stops at the first step whose admission or execution fails — later
+    /// steps are never attempted once an earlier one has failed, so a
+    /// partially-run `finally:` sequence is always reported as an error
+    /// rather than silently treated as complete.
+    pub async fn run_finally_steps<F, Fut>(
+        &self,
+        steps: Vec<FinallySpec>,
+        execute: F,
+    ) -> Result<(), FinallyStepError>
+    where
+        F: Fn(FinallySpec) -> Fut,
+        Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    {
+        for step in steps {
+            let req = TaskCreateRequest {
+                kind: step.kind.clone(),
+                origin: Origin::System,
+                is_finally_step: true,
+            };
+            self.admit_task(&req)?;
+            execute(step).await.map_err(FinallyStepError::Execute)?;
+        }
+        Ok(())
+    }
+}
+
+/// One `finally:`/cleanup step to be run by [`SessionActor::run_finally_steps`].
+#[derive(Debug, Clone)]
+pub struct FinallySpec {
+    pub kind: TaskKind,
+    pub input: TaskInput,
+}
+
+/// Failure modes for [`SessionActor::run_finally_steps`].
+#[derive(Debug, thiserror::Error)]
+pub enum FinallyStepError {
+    #[error("finally step refused by admission gate: {0}")]
+    Admit(#[from] AdmitError),
+    #[error("finally step execution failed: {0}")]
+    Execute(Box<dyn std::error::Error + Send + Sync>),
 }

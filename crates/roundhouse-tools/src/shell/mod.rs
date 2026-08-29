@@ -1,10 +1,24 @@
 //! Shell executor: direct exec without shell interpretation.
+//!
+//! This module has two execution modes:
+//! - [`run_shell`] (below, Phase 1): "run to completion" — waits for the
+//!   full `tokio::process::Command::output()` and cannot be cancelled
+//!   mid-flight. Still the executor used by the demo/simple tool-call path.
+//! - [`cancel`] (Phase 2, Task 4): cancellable execution via `process-wrap`,
+//!   for callers that need to SIGTERM-then-SIGKILL a still-running shell
+//!   task (and its whole process group, not just the direct child).
+
+mod cancel;
 
 use std::path::Path;
 
 use tokio::process::Command;
 
 use crate::error::ToolError;
+
+pub use cancel::{
+    cancel_running_shell, spawn_cancellable, spawn_test, CancelError, ExitDisposition, ShellHandle,
+};
 
 /// Output captured from a shell command execution.
 #[derive(Debug)]
