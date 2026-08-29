@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 mod cassette;
+pub mod codec;
 mod ir;
 mod provider_trait;
 mod stream_event;
