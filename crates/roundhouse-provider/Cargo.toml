@@ -20,6 +20,9 @@ serde_json = { workspace = true }
 schemars = { workspace = true }
 sse-stream = "0.2.5"
 thiserror = { workspace = true }
+# Real (not dev-only) dependency: `src/retry.rs` uses `tokio::sync::Semaphore`
+# and `tokio::time::sleep`/`Instant` as production code (the retry/circuit-
+# breaker/AIMD-concurrency machinery), not just in tests.
 tokio = { workspace = true }
 tracing = { workspace = true }
 

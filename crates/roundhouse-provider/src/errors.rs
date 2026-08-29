@@ -19,7 +19,13 @@ use std::time::Duration;
 /// wait, or overflow a later `Instant + retry_after` computation — a
 /// self-inflicted availability failure. Five minutes is generous for any
 /// legitimate rate-limit backoff while bounding the worst case.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+/// `pub(crate)`, not private: `crate::retry`'s `retry_with_policy` sleeps a
+/// caller-supplied `RateLimited { retry_after }` duration directly (a future
+/// caller could construct `ProviderError::RateLimited` by hand, bypassing
+/// `parse_retry_after` below entirely), so the sleep site clamps against this
+/// same ceiling belt-and-braces — sharing the constant instead of duplicating
+/// the magic number keeps the two caps from drifting apart.
+pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProviderErrorKind {
