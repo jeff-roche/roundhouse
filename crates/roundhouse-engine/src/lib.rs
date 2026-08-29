@@ -20,10 +20,12 @@
 mod chat;
 mod context;
 mod infer;
+mod session_actor;
 
 pub use chat::{run_chat_turn, AgentError};
 pub use context::assemble_context;
 pub use infer::fold_stream_to_blocks;
+pub use session_actor::{AdmitError, SessionActor, TaskCreateRequest};
 
 use roundhouse_bus::Bus;
 use roundhouse_core::TaskRunner;
