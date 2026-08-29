@@ -18,12 +18,13 @@ use roundhouse_tui::ServerMessage;
 use tokio::sync::mpsc;
 
 /// Stand-in for a real concrete `Provider`. Track B's Tasks 7-10 built only
-/// the pure `encode`/`decode` codec functions, not a struct bridging them
-/// to a live `HttpTransport` — that wiring doesn't exist yet anywhere in
-/// this plan (see `docs/architecture/README.md`'s "Known gaps" list, and
-/// Track G, which makes it real). This fake proves the daemon/engine/tools/tui
-/// wiring end to end without a live network call or a real API key, so the exit
-/// criterion stays runnable offline and in CI.
+/// the pure `encode`/`decode` codec functions; Track G's Task 22 added the
+/// struct that bridges them to a live `HttpTransport`
+/// (`roundhouse_provider::AnthropicMessagesProvider`), which `main.rs` now
+/// selects whenever `ANTHROPIC_API_KEY` is set. This fake remains the default
+/// because it proves the daemon/engine/tools/tui wiring end to end without a
+/// live network call, a real API key, or a bill — so the exit criterion stays
+/// runnable offline and in CI, and every test in this crate is hermetic.
 pub struct FakeEditProvider {
     /// The single text block this provider "generates", emitted as one delta.
     pub reply_text: String,

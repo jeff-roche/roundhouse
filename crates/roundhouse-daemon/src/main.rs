@@ -13,7 +13,7 @@
 use roundhouse_core::TaskRunner;
 use roundhouse_daemon::demo::{run_demo_session, DemoConfig, FakeEditProvider, NoopTransport};
 use roundhouse_daemon::socket_server::serve_ndjson;
-use roundhouse_provider::RequestCtx;
+use roundhouse_provider::{AnthropicMessagesProvider, Provider, RequestCtx, ReqwestTransport};
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -37,8 +37,9 @@ async fn main() -> color_eyre::Result<()> {
 
     // Phase 0 proves the dependency graph compiles; this proves the five
     // vertical-slice crates run together. This binary runs exactly one scripted
-    // demo session against a fake provider; see `demo::FakeEditProvider`'s doc
-    // comment for why a real one doesn't exist yet.
+    // demo session — against `demo::FakeEditProvider` by default, and against
+    // the real `AnthropicMessagesProvider` when `ANTHROPIC_API_KEY` is set (see
+    // the provider selection below).
     //
     // `TaskRunner::bootstrap()` is called here, at the daemon's actual startup
     // site, which is exactly the contract its doc comment states ("called
@@ -69,6 +70,41 @@ async fn main() -> color_eyre::Result<()> {
     let edit_target = runtime_dir.join("demo-target.txt");
     write_demo_file(&edit_target).await?;
 
+    // The one switch between the hermetic demo and a real model call.
+    //
+    // Keyed on the *presence* of `ANTHROPIC_API_KEY` rather than on a flag, so
+    // the no-key path is the default: with no key set this binary opens zero
+    // outbound connections, matching §12.5's "zero outbound connections before
+    // first session creation" budget, and the exit-criterion demo stays runnable
+    // offline and in CI. Only an operator who has deliberately exported a key
+    // gets a live, billable request.
+    //
+    // The key is moved straight into `RequestCtx` and never touched again here:
+    // it is not logged, not echoed into the "demo session complete" line below,
+    // and neither `RequestCtx` nor `HttpRequest` derives `Debug`, so no
+    // formatter downstream can print it either (§9.9).
+    let (provider, request_ctx): (Arc<dyn Provider>, RequestCtx) =
+        match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(api_key) => (
+                Arc::new(AnthropicMessagesProvider::new()),
+                RequestCtx {
+                    trace_id: None,
+                    transport: Arc::new(ReqwestTransport::new()),
+                    api_key,
+                },
+            ),
+            Err(_) => (
+                Arc::new(FakeEditProvider {
+                    reply_text: "Edited the demo file.".into(),
+                }),
+                RequestCtx {
+                    trace_id: None,
+                    transport: Arc::new(NoopTransport),
+                    api_key: "demo".into(),
+                },
+            ),
+        };
+
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let server = serve_ndjson(&socket_path, rx)?;
 
@@ -77,18 +113,13 @@ async fn main() -> color_eyre::Result<()> {
         edit_target,
         find: "old".into(),
         replace: "new".into(),
-        provider: Arc::new(FakeEditProvider {
-            reply_text: "Edited the demo file.".into(),
-        }),
-        request_ctx: RequestCtx {
-            trace_id: None,
-            transport: Arc::new(NoopTransport),
-            api_key: "demo".into(),
-        },
+        provider,
+        request_ctx,
     };
 
-    // Runs to completion immediately (the fake provider never touches the
-    // network); the two resulting messages sit buffered in the channel
+    // With the fake provider this runs to completion immediately (it never
+    // touches the network); with the real one it takes as long as one Anthropic
+    // turn. Either way the two resulting messages sit buffered in the channel
     // until a `round` client connects and drains them below.
     let outcome = run_demo_session(cfg, &runner, tx)
         .await
