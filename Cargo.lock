@@ -847,6 +847,9 @@ dependencies = [
  "roundhouse-core",
  "roundhouse-policy",
  "roundhouse-sandbox",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

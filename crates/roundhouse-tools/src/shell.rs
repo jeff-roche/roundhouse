@@ -7,6 +7,7 @@ use tokio::process::Command;
 use crate::error::ToolError;
 
 /// Output captured from a shell command execution.
+#[derive(Debug)]
 pub struct ShellOutput {
     /// Standard output bytes.
     pub stdout: Vec<u8>,
@@ -19,6 +20,12 @@ pub struct ShellOutput {
 /// Runs `program` with `argv` via a direct exec — never through a shell interpreter.
 /// Pipeline/redirection/interpreter classification (§6.3) is Phase 2's brush-parser work;
 /// this executor is the bottom half only, given an already-resolved argv.
+///
+/// This direct-exec approach structurally eliminates a whole class of command-injection
+/// vulnerabilities: since `program` and `argv` go straight to the OS-level `execve()`
+/// equivalent as discrete arguments, no argv element can ever be reinterpreted as shell
+/// syntax (`;`, `|`, `$()`, backticks, etc. are all inert, literal characters). There is
+/// no shell in the loop to perform reinterpretation.
 pub async fn run_shell(program: &str, argv: &[String], cwd: &Path) -> Result<ShellOutput, ToolError> {
     let output = Command::new(program)
         .args(argv)
