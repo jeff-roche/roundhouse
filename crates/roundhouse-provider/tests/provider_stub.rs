@@ -104,8 +104,8 @@ fn tool_def_input_schema_is_generated_from_a_typed_params_struct() {
     assert!(props.get("cwd").is_some(), "expected `cwd` in ShellToolParams' generated schema");
 }
 
-#[test]
-fn list_models_defaults_to_unsupported() {
+#[tokio::test]
+async fn list_models_defaults_to_unsupported() {
     struct NoListModels;
     impl Provider for NoListModels {
         fn capabilities(&self, _model: &ModelId) -> Capabilities {
@@ -131,6 +131,9 @@ fn list_models_defaults_to_unsupported() {
     }
     let provider = NoListModels;
     let ctx = RequestCtx::default();
-    let fut = provider.list_models(&ctx);
-    drop(fut); // default impl exists and type-checks; not polled in Phase 0
+    let result = provider.list_models(&ctx).await;
+    assert!(
+        matches!(result, Err(ProviderError::Unsupported(ref method)) if method == "list_models"),
+        "expected Err(ProviderError::Unsupported(\"list_models\")), got {result:?}"
+    );
 }
