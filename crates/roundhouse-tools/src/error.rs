@@ -9,4 +9,10 @@ pub enum ToolError {
     /// Process spawn failed.
     #[error("process spawn failed: {0}")]
     Spawn(String),
+    /// No match found for the given search text.
+    #[error("no match found for the given search text")]
+    NoMatch,
+    /// Ambiguous match: multiple occurrences found when exactly one was expected.
+    #[error("ambiguous match: {0} occurrences found, expected exactly 1")]
+    AmbiguousMatch(usize),
 }

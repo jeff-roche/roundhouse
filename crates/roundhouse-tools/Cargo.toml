@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+diffy = "0.5.1"
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-sandbox = { path = "../roundhouse-sandbox" }
 roundhouse-policy = { path = "../roundhouse-policy" }

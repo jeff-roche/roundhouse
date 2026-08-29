@@ -9,6 +9,7 @@
 //! `10-implementation-phasing.md` §13.2 (Phase 1 executor list).
 #![forbid(unsafe_code)]
 
+mod edit;
 mod error;
 mod read;
 mod shell;
@@ -18,6 +19,7 @@ use roundhouse_policy::{ParsedCommand, TaskParams};
 use roundhouse_sandbox::Isolate;
 use std::sync::Arc;
 
+pub use edit::{edit_file, EditOutcome};
 pub use error::ToolError;
 pub use read::read_file;
 pub use shell::{run_shell, ShellOutput};
