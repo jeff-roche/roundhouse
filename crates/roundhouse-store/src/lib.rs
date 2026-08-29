@@ -14,6 +14,7 @@
 
 mod migrations;
 mod pool;
+mod replay;
 mod txn;
 pub mod blobs;
 
@@ -24,3 +25,7 @@ pub use txn::begin_immediate;
 
 // Task 1 exports
 pub use pool::{open, StoreError, StorePool, MIGRATIONS};
+
+// CQRS read-model exports (storage replay / fold)
+pub use replay::StoredEvent;
+pub use roundhouse_core::EventFields;

@@ -31,7 +31,7 @@ pub use address::Address;
 pub use blob::{Blake3Hash, BlobRef, BLOB_INLINE_THRESHOLD};
 pub use delta::Delta;
 pub use error::CoreError;
-pub use event::{Event, EventPayload};
+pub use event::{Event, EventFields, EventPayload};
 pub use ids::{SessionId, TaskId, TeamId, WorkspaceId};
 pub use session::{SessionOutcome, SessionPatch, SessionSpec, SessionState};
 pub use task::{fold_task_state, RedactedSpan, Task, TaskState};
