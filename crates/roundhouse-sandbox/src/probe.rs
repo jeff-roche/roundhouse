@@ -20,6 +20,28 @@
 //! that child, reports the outcome back over a pipe, and the child exits immediately —
 //! any Tokio blocking-pool worker thread that runs the parent-side logic is left
 //! completely unaffected and reusable.
+//!
+//! **Why fork() and not just a direct call — the deadlock hazard this design exists to
+//! avoid, and why it isn't fully eliminated either.** `fork()` in an already-multithreaded
+//! process (which every Tokio program is) duplicates only the calling thread; every other
+//! thread simply ceases to exist in the child, *including any thread that happened to be
+//! holding a lock at the exact instant of the fork* (a malloc arena lock is the classic
+//! example, but it applies to any mutex/lock the C or Rust runtime takes internally). That
+//! lock is inherited in the child in its locked state, with no thread left alive that will
+//! ever unlock it — so the first time the child's own code tries to take that same lock
+//! (e.g. the next heap allocation), it deadlocks forever. Doing the *absolute minimum*
+//! amount of work in the child before exiting (see `forked_probe::run`'s child branch)
+//! narrows the window in which this can bite, but does not close it: the probe bodies
+//! below still allocate (building a `Ruleset`/`SeccompFilter`, `String` formatting, the
+//! pipe write) between `fork()` and `_exit()`, so a forked child can, in principle, still
+//! wedge on an inherited-locked allocator. The `libc::alarm()` call in `forked_probe::run`
+//! is the actual backstop for that residual risk: it does not prevent the deadlock, but it
+//! guarantees the child is killed by the kernel (`SIGALRM`) within a bounded time either
+//! way, so the parent's `read_to_end` can never block forever even if the mitigation above
+//! fails. Do not "simplify" this back to a direct `spawn_blocking` call without preserving
+//! that guarantee — a direct call permanently and irreversibly restricts whatever Tokio
+//! blocking-pool thread happens to run it, and that thread is reused by unrelated work for
+//! the rest of the process's life.
 #![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -103,6 +125,15 @@ mod forked_probe {
     use std::io::{Read, Write};
     use std::os::unix::io::FromRawFd;
 
+    /// Seconds a forked probe child is allowed to run before the kernel kills it with
+    /// `SIGALRM`. This is the backstop for the residual fork-in-a-multithreaded-process
+    /// deadlock risk documented on this module's doc comment: if the child ever does
+    /// wedge (e.g. on an allocator lock inherited in a locked state), this guarantees
+    /// the parent's blocking `read_to_end` below is unblocked by the pipe closing when
+    /// the kernel reaps the child, rather than hanging forever. A few seconds is far
+    /// more than any of these probes' real work needs.
+    const CHILD_TIMEOUT_SECS: u32 = 5;
+
     /// Runs `body` inside a forked child process and returns the `MechanismStatus` it
     /// reports, communicated back over a pipe as a one-byte tag (0 = Available,
     /// 1 = Degraded, 2 = Unavailable) followed by the UTF-8 `reason` bytes.
@@ -110,33 +141,53 @@ mod forked_probe {
     /// This exists so that Landlock's `restrict_self()` and an installed seccomp
     /// filter — both irreversible for the calling thread/process — are only ever
     /// applied to a throwaway child that exits immediately afterward, never to a
-    /// thread the Tokio runtime intends to reuse.
-    pub(super) fn run(mechanism: &str, body: impl FnOnce() -> MechanismStatus) -> MechanismStatus {
+    /// thread the Tokio runtime intends to reuse. See this module's top doc comment
+    /// for the full deadlock-hazard rationale and why `CHILD_TIMEOUT_SECS` exists.
+    /// Opens a close-on-exec pipe, returning `(read_fd, write_fd)`.
+    ///
+    /// `O_CLOEXEC` is set so that any `exec`-based subprocess spawned elsewhere in
+    /// this process (e.g. a concurrent `probe_bwrap`, or an unrelated agent shell
+    /// tool) during the window these fds are open never inherits either end — an
+    /// inherited write end would keep this pipe open (and `run`'s `read_to_end`
+    /// blocked) until that unrelated process *also* exits, not just our own forked
+    /// child. Split out from `run` so its exact fd-creation behavior (in
+    /// particular, that `FD_CLOEXEC` really ends up set) is directly unit-testable
+    /// without needing to race a real subprocess spawn against the fd-open window.
+    pub(super) fn open_cloexec_pipe() -> Result<(i32, i32), String> {
         let mut fds = [-1i32; 2];
         // SAFETY: `fds` is a valid `&mut [c_int; 2]` (correct size/alignment for two
-        // ints), exactly what POSIX `pipe(2)` requires as its out-parameter. The
+        // ints), exactly what POSIX `pipe2(2)` requires as its out-parameter. The
         // return value is checked before either fd is used.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return MechanismStatus::Unavailable {
-                reason: format!(
-                    "{mechanism} probe: pipe() failed: {}",
-                    std::io::Error::last_os_error()
-                ),
-            };
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(format!(
+                "pipe2() failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
-        let (read_fd, write_fd) = (fds[0], fds[1]);
+        Ok((fds[0], fds[1]))
+    }
+
+    pub(super) fn run(mechanism: &str, body: impl FnOnce() -> MechanismStatus) -> MechanismStatus {
+        let (read_fd, write_fd) = match open_cloexec_pipe() {
+            Ok(fds) => fds,
+            Err(reason) => {
+                return MechanismStatus::Unavailable {
+                    reason: format!("{mechanism} probe: {reason}"),
+                }
+            }
+        };
 
         // SAFETY: `fork()` duplicates the calling process. The child branch below
         // touches only process-local state (its own copy of `body`, the pipe fds,
         // and libc calls), never reaches back into the parent's Rust call stack
-        // past this function, and terminates via `_exit` without unwinding or
-        // running the parent's destructors. This is the one place in the workspace
-        // that needs a raw `fork()`: it's how Landlock/seccomp's irreversible
-        // enforcement is confined to a throwaway process instead of poisoning a
-        // shared thread.
+        // past this function, and terminates via `_exit` (on every path, including
+        // a caught panic — see below) without unwinding into or running the
+        // parent's destructors. This is the one place in the workspace that needs
+        // a raw `fork()`: it's how Landlock/seccomp's irreversible enforcement is
+        // confined to a throwaway process instead of poisoning a shared thread.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            // SAFETY: closing the two fds this function itself just opened via `pipe()`.
+            // SAFETY: closing the two fds this function itself just opened via `pipe2()`.
             unsafe {
                 libc::close(read_fd);
                 libc::close(write_fd);
@@ -151,11 +202,52 @@ mod forked_probe {
 
         if pid == 0 {
             // Child process: run the probe body, report the result over the pipe,
-            // and exit without ever returning to the caller's stack frame.
+            // and exit without ever returning to the caller's stack frame. Nothing
+            // below may return normally past this `if` block — every path must
+            // reach `libc::_exit` directly.
             // SAFETY: `read_fd` is unused in the child; closing our copy of it does
             // not affect the parent's copy.
             unsafe { libc::close(read_fd) };
-            let status = body();
+            // SAFETY: `alarm()` is async-signal-safe and takes no pointers; this
+            // arms a `SIGALRM` that fires if this child is still alive after
+            // `CHILD_TIMEOUT_SECS`, killing it with the default disposition (since
+            // this process never installs a `SIGALRM` handler) so a wedged child
+            // (e.g. deadlocked on an allocator lock inherited from `fork()`, per
+            // this module's doc comment) can never hang the parent's read forever.
+            unsafe { libc::alarm(CHILD_TIMEOUT_SECS) };
+
+            // Replace the default panic hook with a no-op for the remainder of this
+            // child's life: the default hook formats and prints a
+            // location/backtrace message — which itself allocates and can take
+            // locks — before unwinding ever reaches the `catch_unwind` below. A
+            // no-op hook narrows the window in which a panic's own handling could
+            // trigger the same inherited-lock deadlock this fork-based design
+            // exists to avoid. This is ordinary safe `std` API, not part of the
+            // unsafe surface below.
+            std::panic::set_hook(Box::new(|_| {}));
+
+            // Guard `body()` with `catch_unwind`: under `panic = "unwind"` (this
+            // workspace's default profile), an uncaught panic here would unwind
+            // *past* the `_exit` call below. Because this runs inside
+            // `tokio::task::spawn_blocking`, that unwind is caught by Tokio's own
+            // blocking-pool worker machinery in this copy-on-write child, which
+            // then returns to its idle loop instead of exiting — leaving a live
+            // orphaned process that never closes its copy of `write_fd`, which in
+            // turn hangs the parent's `read_to_end` forever. Catching the panic
+            // here and always falling through to `_exit` closes that hole
+            // regardless of what `body` does.
+            let status = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+                .unwrap_or_else(|payload| {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    MechanismStatus::Unavailable {
+                        reason: format!("{mechanism} probe body panicked: {msg}"),
+                    }
+                });
+
             let (tag, reason): (u8, &str) = match &status {
                 MechanismStatus::Available => (0, ""),
                 MechanismStatus::Degraded { reason } => (1, reason.as_str()),
@@ -164,16 +256,17 @@ mod forked_probe {
             let mut payload = Vec::with_capacity(1 + reason.len());
             payload.push(tag);
             payload.extend_from_slice(reason.as_bytes());
-            // SAFETY: `write_fd` is a valid, owned fd returned by `pipe()` above;
+            // SAFETY: `write_fd` is a valid, owned fd returned by `pipe2()` above;
             // `File::from_raw_fd` takes ownership of it, so it is closed exactly
             // once when `file` drops a few lines down.
             let mut file = unsafe { std::fs::File::from_raw_fd(write_fd) };
             let _ = file.write_all(&payload);
             drop(file);
-            // SAFETY: terminates only this forked child immediately after reporting
-            // its result. Uses `_exit` (not `std::process::exit`/a normal return) so
-            // no `Drop` impls or atexit handlers that logically belong to the parent
-            // process run a second time in this copy-on-write child.
+            // SAFETY: terminates only this forked child, on every path (normal
+            // completion or caught panic) above. Uses `_exit` (not
+            // `std::process::exit`/a normal return) so no `Drop` impls or atexit
+            // handlers that logically belong to the parent process run a second
+            // time in this copy-on-write child.
             unsafe { libc::_exit(0) };
         }
 
@@ -184,30 +277,39 @@ mod forked_probe {
         unsafe { libc::close(write_fd) };
         let mut buf = Vec::new();
         {
-            // SAFETY: `read_fd` is a valid, owned fd returned by `pipe()` above;
+            // SAFETY: `read_fd` is a valid, owned fd returned by `pipe2()` above;
             // `File::from_raw_fd` takes ownership, closed when `file` drops at the
             // end of this block.
             let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
             let _ = file.read_to_end(&mut buf);
         }
         let mut wait_status: i32 = 0;
-        // SAFETY: `pid` is the child this function just forked (no other code can
-        // have reaped it), and `&mut wait_status` is a valid out-pointer sized for
-        // a C `int`, exactly what `waitpid(2)` requires.
-        let waited = unsafe { libc::waitpid(pid, &mut wait_status, 0) };
-        if waited < 0 {
+        let waited = loop {
+            // SAFETY: `pid` is the child this function just forked (no other code
+            // can have reaped it), and `&mut wait_status` is a valid out-pointer
+            // sized for a C `int`, exactly what `waitpid(2)` requires. Retried on
+            // `EINTR` specifically (an interrupting signal delivered to this
+            // process, unrelated to the child's own exit) so a spurious signal
+            // doesn't turn an already-successful probe into a false `Unavailable`.
+            let rc = unsafe { libc::waitpid(pid, &mut wait_status, 0) };
+            if rc >= 0 {
+                break rc;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             return MechanismStatus::Unavailable {
-                reason: format!(
-                    "{mechanism} probe: waitpid() failed: {}",
-                    std::io::Error::last_os_error()
-                ),
+                reason: format!("{mechanism} probe: waitpid() failed: {err}"),
             };
-        }
+        };
+        debug_assert_eq!(waited, pid);
         if buf.is_empty() {
             // The child died before writing anything (e.g. crashed, or was killed
-            // outright by the very mechanism being probed instead of returning an
-            // error to it). Report that fact explicitly rather than silently
-            // treating it as Unavailable-with-no-explanation.
+            // outright — including by our own `CHILD_TIMEOUT_SECS` alarm, or by the
+            // very mechanism being probed — instead of returning an error to it).
+            // Report that fact explicitly rather than silently treating it as
+            // Unavailable-with-no-explanation.
             return MechanismStatus::Unavailable {
                 reason: format!(
                     "{mechanism} probe: child produced no report (raw wait status {wait_status:#x})"
@@ -398,6 +500,17 @@ fn seccomp_probe_body() -> MechanismStatus {
     // Every syscall not named below stays Allow (the child needs to keep running:
     // heap allocation, the pipe write, `_exit`, etc.); `getppid` alone is denied and
     // made to return EPERM.
+    //
+    // Deliberately NOT an empty map: this plan's own brief document shows
+    // `SeccompFilter::new(...)` called with an empty rules map and
+    // `mismatch_action = SeccompAction::Allow`. Since `mismatch_action` is what
+    // applies to every syscall *not* present in the map, an empty map there means
+    // literally every syscall falls through to Allow — a filter that installs
+    // successfully but denies nothing at all, silently defeating this entire probe
+    // (it would report `Available` having verified nothing). The map below must
+    // contain at least one real syscall paired with a real deny action for this
+    // probe to mean anything; do not "simplify" this back toward the brief's shown
+    // empty-map snippet.
     let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
     rules.insert(libc::SYS_getppid, Vec::new());
 
@@ -513,5 +626,119 @@ pub async fn probe_cached(cache_dir: &Path) -> MechanismProbeReport {
         bwrap: probe_bwrap(Path::new("/usr/libexec/roundhouse/bwrap")).await,
         seccomp: probe_seccomp().await,
         seatbelt: probe_seatbelt().await,
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// Internal regression tests for `forked_probe::run` itself (needs crate-internal
+// access to the private `forked_probe` module, so this lives here rather than in
+// `tests/probe.rs`).
+// ---------------------------------------------------------------------------------
+
+#[cfg(all(test, target_os = "linux"))]
+mod forked_probe_regression_tests {
+    use super::*;
+
+    /// Fix-round-1 regression test for the security auditor's reproduced finding:
+    /// a panic inside a forked probe body, invoked through `spawn_blocking` (the
+    /// exact call pattern `probe_landlock`/`probe_seccomp` use), must not hang the
+    /// parent forever. Before the fix, the panic unwound past `libc::_exit()`,
+    /// Tokio's blocking-pool worker machinery caught the unwind inside the
+    /// copy-on-write child and returned it to its idle loop instead of exiting, the
+    /// child never closed its copy of the pipe's write end, and the parent's
+    /// `read_to_end` blocked forever waiting for an EOF that would never come.
+    ///
+    /// This test itself is wrapped in a bounded `tokio::time::timeout` specifically
+    /// so that a regression here fails the test suite loudly and fast instead of
+    /// silently hanging CI forever — the exact failure mode this test exists to
+    /// catch would otherwise manifest as an unexplained CI timeout with no signal
+    /// pointing at this code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_probe_body_does_not_hang_the_parent() {
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::task::spawn_blocking(|| {
+                forked_probe::run("panic-regression", || {
+                    panic!("deliberate panic to reproduce the security auditor's hang scenario")
+                })
+            }),
+        )
+        .await;
+
+        let join_result = outcome.expect(
+            "forked_probe::run must return within the timeout; a hang here means the \
+             panic-hang regression (fix-round-1 finding 1) has come back",
+        );
+        let status =
+            join_result.expect("the spawn_blocking task itself must not panic or be cancelled");
+
+        match status {
+            MechanismStatus::Unavailable { reason } => {
+                assert!(
+                    reason.contains("panicked"),
+                    "reason should explain that the probe body panicked: {reason}"
+                );
+            }
+            other => panic!("expected Unavailable from a panicking probe body, got {other:?}"),
+        }
+    }
+
+    /// Fix-round-1 regression test for the security auditor's second reproduced
+    /// finding: the probe pipe must be opened `O_CLOEXEC` so an unrelated
+    /// subprocess spawned elsewhere in the daemon during the fd-open window never
+    /// inherits it (an inherited write end would keep the parent's `read_to_end`
+    /// blocked until that unrelated process also exits, not just our own forked
+    /// child).
+    ///
+    /// A timing-based test that races a real subprocess spawn against
+    /// `forked_probe::run`'s fd-open window would reproduce the auditor's exact
+    /// scenario, but is inherently racy/flaky in CI (the window is microseconds
+    /// wide). This test instead asserts the one fact that actually matters and is
+    /// fully deterministic: immediately after `open_cloexec_pipe()` returns, both
+    /// fds really do have `FD_CLOEXEC` set, checked via `fcntl(F_GETFD)` — the
+    /// same kernel-level property that determines whether `exec` in any other
+    /// thread of this process would inherit them. This is what plain `pipe()`
+    /// (the pre-fix call) would have failed, and what `pipe2(..., O_CLOEXEC)`
+    /// guarantees.
+    #[test]
+    fn probe_pipe_fds_are_close_on_exec() {
+        let (read_fd, write_fd) = forked_probe::open_cloexec_pipe().expect("pipe2 must succeed");
+        for fd in [read_fd, write_fd] {
+            // SAFETY: `fd` is one of the two fds `open_cloexec_pipe()` just
+            // returned, still open and owned by this test; `F_GETFD` takes no
+            // pointer arguments and only reads the fd's flags.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(
+                flags >= 0,
+                "fcntl(F_GETFD) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_ne!(
+                flags & libc::FD_CLOEXEC,
+                0,
+                "fd {fd} is missing FD_CLOEXEC — an exec'd subprocess elsewhere in this \
+                 process could inherit it and wedge forked_probe::run's read_to_end"
+            );
+            // SAFETY: closing fds this test itself opened via open_cloexec_pipe().
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// A well-behaved (non-panicking) body still round-trips correctly through the
+    /// same forked-child harness — establishes that the panic guard and alarm added
+    /// in fix-round-1 didn't break the ordinary success path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_normal_probe_body_still_reports_available() {
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::task::spawn_blocking(|| {
+                forked_probe::run("normal-regression", || MechanismStatus::Available)
+            }),
+        )
+        .await
+        .expect("must not hang")
+        .expect("spawn_blocking must not panic");
+
+        assert_eq!(status, MechanismStatus::Available);
     }
 }

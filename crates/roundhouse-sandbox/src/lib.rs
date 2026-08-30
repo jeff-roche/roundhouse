@@ -12,11 +12,11 @@
 //! `03-security-and-sandboxing.md` (S-ISO-1/2).
 
 // NOTE: unsafe_code is `deny`, not `forbid`, at the crate level — see
-// Cargo.toml. The only module permitted to use it is a future
-// `enforce::unsafe_ops` (Phase 2 work: raw Landlock/seccomp/bwrap-exec
-// syscalls), which will locally re-enable it with
-// `#[allow(unsafe_code)]` on that module alone. Phase 0 contains no
-// unsafe code anywhere in this crate yet.
+// Cargo.toml. The only module permitted to use it is `probe` (Phase 2:
+// raw fork/pipe/waitpid/syscall calls needed to run the real
+// Landlock/seccomp enforcement probes in a throwaway forked child — see
+// `src/probe.rs`'s module doc comment), which locally re-enables it with
+// `#![allow(unsafe_code)]` on that module alone.
 #![deny(unsafe_code)]
 
 mod isolate_trait;

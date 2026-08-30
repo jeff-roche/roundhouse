@@ -6,7 +6,8 @@ license.workspace = true
 
 [lints.rust]
 # Confined exception to the workspace-wide forbid: this crate needs raw
-# syscalls (Landlock, seccomp, bwrap exec) behind one module. See src/enforce/unsafe_ops.rs.
+# syscalls (fork/pipe/waitpid, plus one raw seccomp-verification syscall)
+# behind one module. See src/probe.rs.
 unsafe_code = "deny"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -21,4 +22,4 @@ tokio = { workspace = true, features = ["process", "rt"] }
 thiserror = "2.0"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
