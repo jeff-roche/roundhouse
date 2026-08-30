@@ -2558,12 +2558,15 @@ name = "roundhouse-sandbox"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
+ "dashmap",
  "landlock",
  "libc",
  "roundhouse-core",
  "seccompiler",
  "thiserror 2.0.20",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

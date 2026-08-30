@@ -20,6 +20,9 @@ roundhouse-core = { path = "../roundhouse-core" }
 async-trait = "0.1"
 tokio = { workspace = true, features = ["process", "rt"] }
 thiserror = "2.0"
+dashmap = "6"
+blake3 = "1"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

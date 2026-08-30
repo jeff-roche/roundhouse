@@ -19,6 +19,8 @@
 // `#![allow(unsafe_code)]` on that module alone.
 #![deny(unsafe_code)]
 
+pub mod bwrap;
+pub mod isolate;
 mod isolate_trait;
 pub mod probe; // the only module permitted unsafe_code — see probe.rs's module-level allow
 mod types;
