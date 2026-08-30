@@ -66,7 +66,15 @@ pub enum Predicate {
         op: FsOp,
         path: PathBuf,
     },
-    // Shell { .. } added by Task 14, matched against a single already-resolved node
+    /// Matched against a single already-resolved `(program, argv)` pipeline
+    /// node (Task 13's `decide_pipeline` builds exactly one `TaskParams::Shell`
+    /// per node) — never against a whole AST, so there is nothing here for a
+    /// predicate to misresolve back to a different node (audit finding 1).
+    Shell {
+        program: String,
+        matcher: ArgMatcher,
+        allow_interpreter: bool,
+    },
     Http {
         method: Option<Method>,
         url_prefix: String,
@@ -86,7 +94,33 @@ pub enum Predicate {
     },
 }
 
+/// How a `Predicate::Shell`'s argv is matched against `TaskParams::Shell`'s
+/// resolved argv. `Glob` stores raw patterns (compiled lazily at match time,
+/// not eagerly) — see the `Predicate::matches` `Shell` arm for why an
+/// invalid pattern must not panic.
+#[derive(Debug, Clone)]
+pub enum ArgMatcher {
+    Exact(Vec<String>),
+    ArgvPrefix(Vec<String>),
+    Glob(Vec<String>),
+}
+
 impl Predicate {
+    /// A bare program-name match: any argv is accepted (empty required prefix).
+    pub fn program(p: &str) -> Self {
+        Predicate::Shell {
+            program: p.to_string(),
+            matcher: ArgMatcher::ArgvPrefix(vec![]),
+            allow_interpreter: false,
+        }
+    }
+    pub fn argv_prefix(program: &str, prefix: &[&str]) -> Self {
+        Predicate::Shell {
+            program: program.to_string(),
+            matcher: ArgMatcher::ArgvPrefix(prefix.iter().map(|s| s.to_string()).collect()),
+            allow_interpreter: false,
+        }
+    }
     pub fn fs_write_prefix(p: &str) -> Self {
         Predicate::FsPrefix {
             op: FsOp::Write,
@@ -186,6 +220,44 @@ impl Predicate {
             ) => (subcommand == sc && argv.starts_with(argv_prefix))
                 .then(|| (subcommand.len(), 1 + argv_prefix.len())),
             (
+                Predicate::Shell {
+                    program,
+                    matcher,
+                    allow_interpreter,
+                },
+                TaskParams::Shell(cmd),
+            ) => {
+                if cmd.program != *program {
+                    return None;
+                }
+                // Interpreter programs force fall-through to no-match (-> Ask
+                // upstream) regardless of argv, unless the rule opted out
+                // (§6.3 step 6) — we do not analyse an interpreter's payload.
+                if crate::shell::interpreter::is_interpreter(program) && !allow_interpreter {
+                    return None;
+                }
+                let matched = match matcher {
+                    ArgMatcher::Exact(v) => &cmd.argv == v,
+                    ArgMatcher::ArgvPrefix(prefix) => cmd.argv.starts_with(prefix),
+                    ArgMatcher::Glob(patterns) => patterns.iter().enumerate().all(|(i, pat)| {
+                        // A pattern that fails to compile can never wrongly grant
+                        // Allow — treat it as "does not match" rather than
+                        // panicking the whole evaluation (ruling 5).
+                        globset::Glob::new(pat)
+                            .ok()
+                            .map(|g| g.compile_matcher())
+                            .zip(cmd.argv.get(i))
+                            .is_some_and(|(m, a)| m.is_match(a))
+                    }),
+                };
+                let bound = 1 + match matcher {
+                    ArgMatcher::Exact(v) => v.len(),
+                    ArgMatcher::ArgvPrefix(prefix) => prefix.len(),
+                    ArgMatcher::Glob(patterns) => patterns.len(),
+                };
+                matched.then_some((program.len(), bound))
+            }
+            (
                 Predicate::Agent {
                     provider,
                     model,
@@ -237,6 +309,25 @@ impl CompiledRule {
             file_order: 0,
             id: RuleId("test".into()),
         }
+    }
+
+    /// Test-only sugar for a `Predicate::Shell` rule with an explicit
+    /// `allow_interpreter` flag (bare program name, any argv).
+    pub fn test_new_with_interpreter_flag(
+        scope: Scope,
+        outcome: Outcome,
+        program: &str,
+        allow_interpreter: bool,
+    ) -> Self {
+        Self::test_new(
+            scope,
+            outcome,
+            Predicate::Shell {
+                program: program.to_string(),
+                matcher: ArgMatcher::ArgvPrefix(vec![]),
+                allow_interpreter,
+            },
+        )
     }
 }
 

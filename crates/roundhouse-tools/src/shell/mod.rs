@@ -59,3 +59,21 @@ pub async fn run_shell(
         exit_code: output.status.code(),
     })
 }
+
+/// §6.3 step 8: execve a single already-resolved pipeline node directly —
+/// a thin wrapper over [`run_shell`], not a parallel executor. No shell is
+/// ever started, so aliases don't exist and there is no `sh -c` layer for an
+/// argument to escape through; `run_shell` already provides that property,
+/// this just gives Task 13/14's `ResolvedNode` a matching entry point.
+///
+/// `node.redirections` is intentionally unused here: wiring redirection
+/// targets to real file descriptors is out of scope for this task (it
+/// belongs to the later task-admission integration point) — the redirection
+/// *decision* (whether the target is allowed) is already handled upstream by
+/// `roundhouse_policy::shell::pipeline::decide_pipeline`.
+pub async fn execve_node(
+    node: &roundhouse_policy::shell::pipeline::ResolvedNode,
+    cwd: &Path,
+) -> Result<ShellOutput, ToolError> {
+    run_shell(&node.resolved_program, &node.argv, cwd).await
+}

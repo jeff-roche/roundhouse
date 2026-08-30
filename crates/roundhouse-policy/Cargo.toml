@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 brush-parser = "0.4"
+globset = "0.4"
 roundhouse-core = { path = "../roundhouse-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }

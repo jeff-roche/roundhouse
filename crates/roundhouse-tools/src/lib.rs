@@ -31,8 +31,8 @@ pub use error::ToolError;
 pub use find::find_files;
 pub use read::read_file;
 pub use shell::{
-    cancel_running_shell, run_shell, spawn_cancellable, CancelError, ExitDisposition, ShellHandle,
-    ShellOutput,
+    cancel_running_shell, execve_node, run_shell, spawn_cancellable, CancelError, ExitDisposition,
+    ShellHandle, ShellOutput,
 };
 pub use write::write_file;
 

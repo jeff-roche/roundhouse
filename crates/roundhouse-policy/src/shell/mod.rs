@@ -5,6 +5,8 @@
 //! any per-node policy matching happens.
 
 pub mod classify;
+pub mod interpreter;
 pub mod opaque;
+pub mod pipeline;
 
 pub use classify::ParsedShellAst;
