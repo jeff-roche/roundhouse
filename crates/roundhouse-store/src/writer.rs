@@ -185,11 +185,25 @@ async fn append_one(
                     // existing match arms — it runs here instead, unconditionally
                     // alongside the `upsert_for_event` call, in the same transaction as
                     // the events insert.
+                    //
+                    // Fix round 1, item 4: same fail-closed discipline as
+                    // `tasks_view::upsert_for_event`'s own `UPDATE` branch (which already
+                    // turns a zero-row match into a hard error, not a silent no-op, per
+                    // Task 0.5's security fix). A `TaskDelta`/`Note`/`TaskFailed` event
+                    // with a `task_id` that has no corresponding `tasks` row (e.g. arriving
+                    // before that task's `TaskCreated`, or a corrupt/partial history) would
+                    // otherwise silently drop its redaction count — the event still
+                    // commits, correctly redacted, but the audit-visible count for that
+                    // task simply vanishes. That's exactly the class of bug this crate's
+                    // own precedent exists to prevent.
                     if redactions > 0 {
-                        tx.execute(
+                        let rows_affected = tx.execute(
                             "UPDATE tasks SET redactions = redactions + ?1 WHERE task_id = ?2",
                             rusqlite::params![redactions, task_id],
                         )?;
+                        if rows_affected == 0 {
+                            return Err(rusqlite::Error::StatementChangedRows(0));
+                        }
                     }
                 }
                 tx.commit()?;
@@ -357,12 +371,18 @@ async fn append_batch(
                             &item.payload,
                         )?;
                         // Same gotcha as append_one (Ruling 5): can't shoehorn this into
-                        // upsert_for_event's early-return for TaskDelta/Note payloads.
+                        // upsert_for_event's early-return for TaskDelta/Note payloads. Same
+                        // fail-closed fix as append_one (fix round 1, item 4): a zero-row
+                        // match means this batch member's task_id has no tasks row yet —
+                        // hard error rather than silently dropping the redaction count.
                         if item.redactions > 0 {
-                            tx.execute(
+                            let rows_affected = tx.execute(
                                 "UPDATE tasks SET redactions = redactions + ?1 WHERE task_id = ?2",
                                 rusqlite::params![item.redactions, task_id],
                             )?;
+                            if rows_affected == 0 {
+                                return Err(rusqlite::Error::StatementChangedRows(0));
+                            }
                         }
                     }
 

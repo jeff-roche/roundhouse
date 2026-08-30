@@ -240,3 +240,85 @@ async fn outbound_payload_with_no_secret_is_none_and_never_blocks() {
         .unwrap();
     assert_eq!(disposition, None);
 }
+
+// ---------------------------------------------------------------------------------------
+// Fix Round 1 regressions
+// ---------------------------------------------------------------------------------------
+
+/// Fix round 1, item 2: an empty-string secret value must never reach the Aho-Corasick
+/// automaton — an empty pattern matches at every position, which (pre-fix) mangled
+/// unrelated legitimate text and produced a wildly inflated match count. Pre-fix, this test
+/// fails: `redact("key=sk-live-abc123!")` returns a mangled string with `count` far above 1
+/// (an empty pattern matches at every one of the ~20 byte-positions in the input).
+#[test]
+fn empty_string_secret_value_is_filtered_and_never_mangles_output() {
+    let redactor = Redactor::build(&["".to_string(), "sk-live-abc123".to_string()]);
+    let (redacted, count) = redactor.redact("key=sk-live-abc123!");
+    assert_eq!(
+        redacted, "key=[REDACTED]!",
+        "an empty pattern must never reach the automaton — output must be a clean, single \
+         substitution of the real secret, not mangled by matching at every position"
+    );
+    assert_eq!(
+        count, 1,
+        "only the genuine non-empty pattern match counts — the empty string must contribute \
+         nothing"
+    );
+}
+
+/// Fix round 1, item 3: with a shorter secret value that is a prefix of a longer one (e.g.
+/// stale + rotated key sharing a prefix), the automaton must redact the FULL longer match,
+/// not stop at the shorter prefix and leave the longer secret's distinguishing suffix
+/// exposed. Pre-fix (default `LeftmostFirst`/standard match semantics), this test fails:
+/// redacting `"key=sk-live-abc123!"` against `["sk-live", "sk-live-abc123"]` produces
+/// `"key=[REDACTED]-abc123!"` — the shorter pattern wins and `-abc123` leaks in the clear.
+#[test]
+fn longer_secret_value_wins_over_a_shorter_prefix_shadowing_pattern() {
+    let redactor = Redactor::build(&["sk-live".to_string(), "sk-live-abc123".to_string()]);
+    let (redacted, count) = redactor.redact("key=sk-live-abc123!");
+    assert_eq!(
+        redacted, "key=[REDACTED]!",
+        "the longer, more specific secret value must be the one that wins at this position \
+         — no residual suffix of the real secret may remain in the output"
+    );
+    assert_eq!(count, 1);
+}
+
+/// Fix round 1, item 4: a `TaskDelta` (or `Note`/`TaskFailed`) event whose `task_id` has no
+/// corresponding `tasks` row (no `TaskCreated` was ever appended for it) must fail loudly,
+/// matching `tasks_view::upsert_for_event`'s own established zero-row-match hard-error
+/// convention, rather than silently dropping the redaction count for a task row that will
+/// never exist. Pre-fix, this `append` call succeeds (the payload is correctly redacted and
+/// committed) but the redaction count for this nonexistent task simply vanishes with no
+/// error and no trace; post-fix it must return `Err`.
+#[tokio::test]
+async fn task_delta_with_no_prior_task_created_row_hard_errors_instead_of_silently_dropping_the_count(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+    writer.set_redactor(Redactor::build(&["sk-live-abc123".to_string()]));
+
+    let session_id = SessionId::new();
+    // Deliberately skip create_task: this task_id has no tasks row.
+    let orphan_task_id = TaskId::new();
+
+    let result = writer
+        .append(RUNNER.record_task_delta(
+            session_id,
+            0,
+            now_ts(),
+            orphan_task_id,
+            Delta::Text {
+                text: "leak: sk-live-abc123".into(),
+            },
+            1,
+        ))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a TaskDelta with a redaction match but no corresponding tasks row must hard-error, \
+         not silently commit while dropping the redaction count"
+    );
+}

@@ -1,12 +1,19 @@
 //! Aho-Corasick redaction at the persistence boundary (§6.7): a live secret value, once
-//! it appears anywhere in an event payload, must never physically reach the SQLite
-//! `events.payload` column. Redaction runs inside `writer::append_one`/`append_batch`,
-//! BEFORE `serialize_payload` — the stored row is always the already-redacted form, never
-//! the original.
+//! it appears in one of the `EventPayload` fields `Redactor::redact_event_payload` actually
+//! covers (see that method's doc comment for the exact list and, just as importantly, what
+//! is NOT yet covered), must never physically reach the SQLite `events.payload` column.
+//! Redaction runs inside `writer::append_one`/`append_batch`, BEFORE `serialize_payload` —
+//! the stored row is always the already-redacted form, never the original.
 //!
 //! `EventWriter` holds a hot-swappable `Redactor` (`arc_swap::ArcSwap`, see `writer.rs`)
 //! so the live secret-value list can be updated without restarting the writer task or
 //! interrupting in-flight appends.
+//!
+//! This module also has a second, structurally different mechanism living alongside the
+//! persistence-boundary pass: `Redactor::scan_outbound`/`SecretLeakDisposition`, which
+//! never mutate a payload — they inspect an outbound provider payload and return a
+//! policy-style `Ask`/`Deny` disposition. See `scan_outbound`'s own doc comment for its
+//! (currently unwired) integration status.
 
 use roundhouse_core::{
     Delta, EventPayload, NoteLevel, SessionId, TaskError, TaskId, TaskRunner, Timestamp,
@@ -23,20 +30,51 @@ const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
 /// from *where* they're called (`writer::append_one`/`append_batch`, before
 /// `serialize_payload`), not from anything in this type.
 ///
-/// Lossy against transformed secrets (base64-encoded, chunk-split across multiple
-/// deltas, etc.) — a documented gap, not a silent one (§6.7): this is an exact-substring
-/// match over known live values, not a semantic secret detector.
+/// Two known, tracked gaps in what's actually implemented, vs. §6.7's frozen description:
+///
+/// - **Lossy against transformed secrets** (base64-encoded, chunk-split across multiple
+///   deltas, etc.) — this is an exact-substring match over known live values, not a
+///   semantic secret detector.
+/// - **Literal-value matching only.** §6.7 describes the automaton as running "over live
+///   secret values PLUS high-confidence patterns" (e.g. regex-shaped detection of
+///   API-key-looking strings that were never registered as a known live value). Only the
+///   literal-value half is implemented here — there is no pattern-based/heuristic
+///   detection anywhere in this type. A string that looks exactly like a secret but was
+///   never passed to `build` will not be redacted.
+///
+/// Neither gap is silent — both are documented here rather than fixed by this task; closing
+/// them is real follow-up work, not something this type quietly claims to already do.
 pub struct Redactor {
     automaton: aho_corasick::AhoCorasick,
 }
 
 impl Redactor {
-    /// Built over live secret values. An empty slice produces a automaton that matches
-    /// nothing — the safe default `spawn_writer` installs before any real secret value is
-    /// known (see `writer.rs`), so redaction is always "on" (just a no-op) rather than
-    /// absent until explicitly configured.
+    /// Built over live secret values. An empty slice (or a slice containing only
+    /// empty-string values, which are filtered out before reaching the automaton — see
+    /// below) produces an automaton that matches nothing — the safe default `spawn_writer`
+    /// installs before any real secret value is known (see `writer.rs`), so redaction is
+    /// always "on" (just a no-op) rather than absent until explicitly configured.
+    ///
+    /// Uses `MatchKind::LeftmostLongest` (not Aho-Corasick's default
+    /// `LeftmostFirst`/standard semantics): with the default, two patterns where one is a
+    /// prefix of the other (e.g. an old and new secret value that happen to share a
+    /// prefix, plausible after a key rotation) can match the SHORTER pattern first and
+    /// leave the longer secret's distinguishing suffix fully exposed in the output.
+    /// Leftmost-longest always prefers the longest match starting at a given position,
+    /// closing that gap.
+    ///
+    /// Empty-string values are filtered out before construction: an empty pattern matches
+    /// at every position in the input, which degrades `redact` pathologically (observed:
+    /// ~20x output amplification and near-total mangling of unrelated text on realistic
+    /// input) rather than simply being a harmless no-op match. A secret value that
+    /// resolves to an empty string is a plausible real input (e.g. an unset env var), so
+    /// this is filtered defensively rather than assumed never to happen.
     pub fn build(secret_values: &[String]) -> Self {
-        let automaton = aho_corasick::AhoCorasick::new(secret_values).expect("valid patterns");
+        let patterns: Vec<&String> = secret_values.iter().filter(|s| !s.is_empty()).collect();
+        let automaton = aho_corasick::AhoCorasickBuilder::new()
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            .build(patterns)
+            .expect("valid patterns");
         Self { automaton }
     }
 
@@ -57,12 +95,25 @@ impl Redactor {
         (out, count)
     }
 
-    /// Recurses into every string-carrying `EventPayload` field a live secret value could
-    /// realistically land in: `TaskDelta{delta: Delta::Text}` (streamed model/tool
-    /// output), `Note` text, and `TaskFailed.error.message` (an error message that quotes
-    /// back part of the failing input, e.g. a shell command). Every other variant passes
-    /// through unredacted (redaction count 0) — matches the brief's own scope, not
-    /// expanded speculatively.
+    /// Covers exactly three fields today: `TaskDelta{delta: Delta::Text}` (streamed
+    /// model/tool text output), `Note.text`, and `TaskFailed.error.message` (an error
+    /// message that quotes back part of the failing input, e.g. a shell command).
+    ///
+    /// **Known, tracked gap — NOT a safety property, just an honest inventory of what's
+    /// unprotected today:** every other `EventPayload` field that can carry free text
+    /// passes through completely unredacted (redaction count 0), including
+    /// `TaskCreated.input` (a task's actual prompt/command, when `TaskInput::Text`),
+    /// `TaskCompleted.output` (a task's actual output, same shape), `Delta::Thinking.text`,
+    /// `Delta::ToolArgs.fragment`, `Delta::Stdout`/`Delta::Stderr` (raw byte arrays —
+    /// substring text-matching doesn't apply to them the same way and would need a
+    /// different approach), `TaskFailed.error.category`, `Message{envelope}`,
+    /// `SessionStateChanged.reason`, `TaskSuspended.reason`, and `SessionCreated.spec`. A
+    /// live secret in any of those fields reaches the append-only log unredacted and
+    /// permanently, the moment something actually writes real (non-empty, non-placeholder)
+    /// text into them. Not exploitable in the shipped daemon today only because current
+    /// production code doesn't yet emit real text into most of these fields — expanding
+    /// coverage to close this gap is real follow-up work, not something this method's
+    /// current match arms claim to already handle.
     pub fn redact_event_payload(&self, payload: EventPayload) -> (EventPayload, u32) {
         match payload {
             EventPayload::TaskDelta {
@@ -133,6 +184,19 @@ impl Redactor {
             return Ok(None);
         }
 
+        let disposition = if hardened {
+            SecretLeakDisposition::Deny
+        } else {
+            SecretLeakDisposition::Ask
+        };
+        // Wording must stay accurate for both dispositions: `Deny` genuinely blocks the
+        // send, but `Ask` does not — it routes to a human-approval flow, it does not stop
+        // the request outright. Claiming "blocked" in the `Ask` case would misdescribe
+        // what actually happens in this durably persisted, UI-visible event.
+        let disposition_text = match disposition {
+            SecretLeakDisposition::Deny => "blocked (denied under --profile hardened)",
+            SecretLeakDisposition::Ask => "held pending human approval before sending",
+        };
         let event = runner.record_note(
             session_id,
             0, // placeholder seq — EventWriter::append assigns the real one
@@ -141,17 +205,13 @@ impl Redactor {
             NoteLevel::Warn,
             format!(
                 "SecretLeak: outbound payload to provider matched {count} known secret \
-                 value(s); blocked pending review"
+                 value(s); {disposition_text}"
             ),
             1, // schema_v
         );
         writer.append(event).await?;
 
-        Ok(Some(if hardened {
-            SecretLeakDisposition::Deny
-        } else {
-            SecretLeakDisposition::Ask
-        }))
+        Ok(Some(disposition))
     }
 }
 
