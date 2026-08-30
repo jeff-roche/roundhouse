@@ -13,53 +13,96 @@ use brush_parser::{Parser, ParserOptions};
 /// Byte-size cap on the raw shell command string (and on individual word strings).
 const MAX_INPUT_BYTES: usize = 64 * 1024;
 
-/// Maximum nesting depth of shell openers (`(`, backtick, `${`) accepted by the
-/// pre-parser guard. Chosen to block the exponential backtracking and stack-overflow
-/// blowups observed in `brush-parser` 0.4.0 while leaving realistic agent commands alone.
-const MAX_NESTING_DEPTH: usize = 16;
+/// Structural complexity budget for the pre-parser guard: total count of every
+/// grammar-recursing opener (`(`, backtick, `${`, bare `{`, `[[`) plus the whole-word
+/// keywords `case`, `if`, `then`, `while`, `until`, `for`, `select`, `coproc`,
+/// `function`. The budget is deliberately grammar-wide and over-counts (e.g., `echo`
+/// containing the substring `for` would contribute +1 — accepted fail-closed cost).
+///
+/// Cap 16 is chosen to block the smallest observed crash payload (25 nested `case`
+/// clauses, ~500 bytes) and the 1000/1500/2000-deep compound-command probes while
+/// leaving normal arithmetic such as `(( i = i + 1 ))` (2 openers) well within budget.
+const MAX_STRUCTURAL_BUDGET: usize = 16;
 
-/// Cheap pre-parser guard: rejects inputs that are too large or too deeply nested.
-/// Over-limit inputs are treated as parse failures and hard-denied.
+/// Cheap pre-parser guard: rejects inputs that are too large or exceed the structural
+/// complexity budget. Over-limit inputs are treated as parse failures and hard-denied.
 fn input_guard(raw: &str) -> Result<(), OpaqueReason> {
     if raw.len() > MAX_INPUT_BYTES {
         return Err(OpaqueReason::ParseError);
     }
-    if nesting_depth(raw) > MAX_NESTING_DEPTH {
+    if structural_budget(raw) > MAX_STRUCTURAL_BUDGET {
         return Err(OpaqueReason::ParseError);
     }
     Ok(())
 }
 
-/// Scans `raw` for the maximum nesting depth of `(`, backtick, and `${` openers.
-///
-/// This scan is deliberately **quote-naive**: any quote-tracking state machine that
-/// differs from `brush-parser`'s own lexer can be desynced to bypass the guard, as
-/// demonstrated by probes such as `'\n` + 30×`(` or `echo \'${`×2000. Counting every
-/// opener unconditionally is fail-closed: paren/backtick-heavy quoted literals may
-/// be denied as over-cap, but availability is the only cost, while correctness
-/// (no parser hang/abort) is preserved.
-fn nesting_depth(raw: &str) -> usize {
-    let mut depth = 0usize;
-    let mut max_depth = 0usize;
-    let mut chars = raw.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '(' | '`' => {
-                depth += 1;
-                max_depth = max_depth.max(depth);
+/// Quote-naive count of all grammar-recursing openers/keywords in `raw`. Counting
+/// every occurrence unconditionally (rather than net depth or quote-aware depth) is
+/// fail-closed: any per-construct whack-a-mole against a recursive-descent grammar
+/// is exactly how the earlier rounds were bypassed.
+fn structural_budget(raw: &str) -> usize {
+    let mut budget = 0usize;
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'`' => {
+                budget += 1;
+                i += 1;
             }
-            ')' => {
-                depth = depth.saturating_sub(1);
+            b'[' if i + 1 < bytes.len() && bytes[i + 1] == b'[' => {
+                budget += 1;
+                i += 2;
             }
-            '$' if chars.peek() == Some(&'{') => {
-                depth += 1;
-                max_depth = max_depth.max(depth);
-                chars.next(); // consume the '{' that belongs to `${`
+            b'{' => {
+                // Do not double-count the `{` in a `${` opener; that is counted below.
+                if i == 0 || bytes[i - 1] != b'$' {
+                    budget += 1;
+                }
+                i += 1;
             }
-            _ => {}
+            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'{' => {
+                budget += 1;
+                i += 2;
+            }
+            _ => {
+                if let Some(len) = keyword_match(bytes, i) {
+                    budget += 1;
+                    i += len;
+                } else {
+                    i += 1;
+                }
+            }
         }
     }
-    max_depth
+    budget
+}
+
+const KEYWORDS: &[&str] = &[
+    "case", "if", "then", "while", "until", "for", "select", "coproc", "function",
+];
+
+fn keyword_match(bytes: &[u8], start: usize) -> Option<usize> {
+    for kw in KEYWORDS {
+        let kw_bytes = kw.as_bytes();
+        let end = start + kw_bytes.len();
+        if end > bytes.len() {
+            continue;
+        }
+        if &bytes[start..end] != kw_bytes {
+            continue;
+        }
+        let prev_ok = start == 0 || !is_identifier_byte(bytes[start - 1]);
+        let next_ok = end == bytes.len() || !is_identifier_byte(bytes[end]);
+        if prev_ok && next_ok {
+            return Some(kw_bytes.len());
+        }
+    }
+    None
+}
+
+fn is_identifier_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// The full parsed pipeline AST — internal to the shell module. Deliberately not named

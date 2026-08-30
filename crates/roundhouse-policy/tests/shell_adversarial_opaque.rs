@@ -84,6 +84,14 @@ fn adversarial_table() {
         "single-quoted substitution-looking text is a literal, not opaque"
     );
 
+    assert!(
+        matches!(
+            classify_shell("(( i = i + 1 ))", &env),
+            ShellClassification::Program(_)
+        ),
+        "plain arithmetic with no substitution is not opaque"
+    );
+
     let Classification::Program(cmd) = parse_command("git status") else {
         panic!("git status should parse")
     };
@@ -112,7 +120,7 @@ fn adversarial_table() {
         ShellClassification::HardDeny(hint) => {
             assert_eq!(hint.error, "unparseable_shell_command");
         }
-        _ => panic!("40-deep nesting must be rejected by the pre-parser depth guard"),
+        _ => panic!("40-deep nesting must be rejected by the structural-budget guard"),
     }
 }
 
@@ -159,6 +167,65 @@ fn parser_resource_guard_blocks_quote_desync_bypass_probes() {
                 );
             }
             _ => panic!("{label} must be hard-denied by the pre-parser guard"),
+        }
+    }
+}
+
+#[test]
+fn structural_budget_blocks_recursive_compound_command_probes() {
+    use std::time::{Duration, Instant};
+
+    let env = SessionEnv::default();
+    let budget = Duration::from_millis(500);
+
+    let probes = [
+        (
+            format!("{}a{}", "{".repeat(1000), "; }".repeat(1000)),
+            "nested brace-group probe",
+        ),
+        (
+            format!(
+                "{}echo ok{}",
+                "case x in a) ".repeat(25),
+                ";; esac".repeat(25)
+            ),
+            "nested case-clause probe",
+        ),
+        (
+            format!(
+                "{}echo ok{}",
+                "if a; then ".repeat(2000),
+                "; fi".repeat(2000)
+            ),
+            "nested if probe",
+        ),
+        (
+            format!(
+                "{}echo ok{}",
+                "while a; do ".repeat(1500),
+                "; done".repeat(1500)
+            ),
+            "nested while probe",
+        ),
+    ];
+
+    for (cmd, label) in probes {
+        let start = Instant::now();
+        let result = classify_shell(&cmd, &env);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < budget,
+            "{label} must be rejected by the guard within {budget:?}, took {elapsed:?}"
+        );
+        match result {
+            ShellClassification::HardDeny(hint) => {
+                assert_eq!(
+                    hint.error, "unparseable_shell_command",
+                    "{label} must be classified as parse failure"
+                );
+            }
+            _ => panic!("{label} must be hard-denied by the structural-budget guard"),
         }
     }
 }
