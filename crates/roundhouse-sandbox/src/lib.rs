@@ -20,6 +20,7 @@
 #![deny(unsafe_code)]
 
 mod isolate_trait;
+pub mod probe; // the only module permitted unsafe_code — see probe.rs's module-level allow
 mod types;
 
 pub use isolate_trait::Isolate;

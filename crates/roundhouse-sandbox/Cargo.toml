@@ -9,10 +9,15 @@ license.workspace = true
 # syscalls (Landlock, seccomp, bwrap exec) behind one module. See src/enforce/unsafe_ops.rs.
 unsafe_code = "deny"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "=0.4.7"
+seccompiler = "=0.5.0"
+libc = "0.2"
+
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
 async-trait = "0.1"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process", "rt"] }
 thiserror = "2.0"
 
 [dev-dependencies]
