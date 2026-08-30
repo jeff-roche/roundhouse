@@ -44,12 +44,21 @@ pub enum CompactError {
     /// The provider failed to produce a summary.
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
+    /// The compacted context would exceed the target budget.
+    #[error("compaction exceeded target budget: {actual} > {budget}")]
+    BudgetExceeded { budget: u64, actual: u64 },
+    /// A committed context state could not be materialized.
+    #[error("compacted state disappeared")]
+    StateLost,
 }
 
 /// Executes a compaction: sends the summarizable conversation history to the
-/// provider, folds the streamed text into a summary, commits a new context
-/// state that preserves pinned memory verbatim, and rejects the result if it
-/// exceeds the target budget.
+/// provider, folds the streamed text into a summary, and commits a new context
+/// state that preserves pinned memory verbatim.
+///
+/// The candidate compaction is validated against the target budget **before**
+/// any state is mutated, so an over-budget summary leaves the caller's original
+/// conversation history intact.
 pub async fn execute_compact(
     provider: &dyn Provider,
     ctx: &RequestCtx,
@@ -67,18 +76,20 @@ pub async fn execute_compact(
     let summary = fold_stream_text(&mut stream)
         .await
         .map_err(CompactError::Provider)?;
-    let new_context_state = working.commit_compaction(&summary, pinned, input.target_budget);
 
-    let rendered = working
-        .materialize(new_context_state)
-        .expect("state was just created by commit_compaction");
-    if rendered.token_count() > input.target_budget.0 {
-        return Err(CompactError::Provider(ProviderError::Unsupported(format!(
-            "compaction exceeded target budget: {} > {}",
-            rendered.token_count(),
-            input.target_budget.0
-        ))));
+    // Reject over-budget compactions before touching WorkingContext state.
+    let actual = WorkingContext::candidate_token_count(&summary, &pinned);
+    if actual > input.target_budget.0 {
+        return Err(CompactError::BudgetExceeded {
+            budget: input.target_budget.0,
+            actual,
+        });
     }
+
+    let new_context_state = working.commit_compaction(&summary, pinned, input.target_budget);
+    let _rendered = working
+        .materialize(new_context_state)
+        .ok_or(CompactError::StateLost)?;
 
     Ok(CompactOutput {
         new_context_state,

@@ -57,6 +57,21 @@ fn heuristic_token_count(text: &str) -> u64 {
     (text.len() as u64).div_ceil(4)
 }
 
+/// Shared helper: renders summary + pinned memory into the same textual format
+/// used by `materialize`. Kept as a pure function so callers can compute the
+/// token count of a candidate compaction before mutating any state.
+fn render_state_text(summary: &str, pinned: &[String]) -> String {
+    let mut text = String::new();
+    text.push_str("[summary]\n");
+    text.push_str(summary);
+    text.push_str("\n\n[pinned memory]\n");
+    for line in pinned {
+        text.push_str(line);
+        text.push('\n');
+    }
+    text
+}
+
 #[derive(Debug)]
 struct ContextState {
     id: ContextStateId,
@@ -96,6 +111,11 @@ impl WorkingContext {
     pub fn split_pinned(&self) -> (Vec<Message>, Vec<String>) {
         let inner = self.inner.lock().unwrap();
         (inner.turns.clone(), inner.pinned.clone())
+    }
+
+    /// Computes the token count of a candidate compaction without mutating state.
+    pub fn candidate_token_count(summary: &str, pinned: &[String]) -> u64 {
+        heuristic_token_count(&render_state_text(summary, pinned))
     }
 
     /// Records a new compacted context state from the provider-generated summary
@@ -139,17 +159,13 @@ impl WorkingContext {
     /// Materializes a previously committed context state, if it exists.
     pub fn materialize(&self, id: ContextStateId) -> Option<Rendered> {
         let inner = self.inner.lock().unwrap();
-        inner.states.iter().find(|s| s.id == id).map(|state| {
-            let mut text = String::new();
-            text.push_str("[summary]\n");
-            text.push_str(&state.summary);
-            text.push_str("\n\n[pinned memory]\n");
-            for line in &state.pinned {
-                text.push_str(line);
-                text.push('\n');
-            }
-            Rendered { text }
-        })
+        inner
+            .states
+            .iter()
+            .find(|s| s.id == id)
+            .map(|state| Rendered {
+                text: render_state_text(&state.summary, &state.pinned),
+            })
     }
 }
 
@@ -193,5 +209,18 @@ mod tests {
         let (summarizable, pinned) = ctx.split_pinned();
         assert_eq!(summarizable.len(), 1);
         assert_eq!(pinned, vec!["pin".to_string()]);
+    }
+
+    #[test]
+    fn candidate_token_count_matches_materialized_state() {
+        let summary = "short summary";
+        let pinned = vec!["line one".to_string(), "line two".to_string()];
+        let ctx = WorkingContext::new(vec![], vec![]);
+        let id = ctx.commit_compaction(summary, pinned.clone(), TokenBudget(1_000));
+        let rendered = ctx.materialize(id).unwrap();
+        assert_eq!(
+            WorkingContext::candidate_token_count(summary, &pinned),
+            rendered.token_count()
+        );
     }
 }

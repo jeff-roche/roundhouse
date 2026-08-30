@@ -1,4 +1,4 @@
-use roundhouse_engine::compact::{execute_compact, CompactInput, CompactStrategy};
+use roundhouse_engine::compact::{execute_compact, CompactError, CompactInput, CompactStrategy};
 use roundhouse_engine::test_support::{
     fake_provider_streaming, fake_provider_summarizing_to, sample_ctx,
     working_context_with_turns_and_pinned_memory,
@@ -118,9 +118,9 @@ async fn stream_without_message_stop_is_interrupted() {
     .unwrap_err();
 
     match err {
-        roundhouse_engine::compact::CompactError::Provider(ProviderError::StreamInterrupted {
-            partial,
-        }) => assert_eq!(partial, "partial text"),
+        CompactError::Provider(ProviderError::StreamInterrupted { partial }) => {
+            assert_eq!(partial, "partial text")
+        }
         other => panic!("expected StreamInterrupted, got {other:?}"),
     }
 }
@@ -152,9 +152,7 @@ async fn stream_with_no_text_is_interrupted() {
     assert!(
         matches!(
             err,
-            roundhouse_engine::compact::CompactError::Provider(
-                ProviderError::StreamInterrupted { .. }
-            )
+            CompactError::Provider(ProviderError::StreamInterrupted { .. })
         ),
         "expected StreamInterrupted for empty stream, got {err:?}"
     );
@@ -179,12 +177,52 @@ async fn over_budget_summary_is_rejected() {
     .unwrap_err();
 
     match err {
-        roundhouse_engine::compact::CompactError::Provider(ProviderError::Unsupported(msg)) => {
+        CompactError::BudgetExceeded { budget, actual } => {
+            assert_eq!(budget, 5);
             assert!(
-                msg.contains("compaction exceeded target budget"),
-                "unexpected unsupported message: {msg}"
+                actual > 5,
+                "actual token count {actual} should exceed budget"
             );
         }
-        other => panic!("expected Unsupported budget error, got {other:?}"),
+        other => panic!("expected BudgetExceeded, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn over_budget_compaction_leaves_original_turns_intact() {
+    let working = working_context_with_turns_and_pinned_memory(5, "PINNED: keep");
+    let provider = fake_provider_summarizing_to("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    let err = execute_compact(
+        &provider,
+        &sample_ctx(),
+        &working,
+        CompactInput {
+            strategy: CompactStrategy::SummarizeAll,
+            target_budget: TokenBudget(5),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            CompactError::BudgetExceeded {
+                budget: 5,
+                actual: _,
+            }
+        ),
+        "expected BudgetExceeded, got {err:?}"
+    );
+
+    // The original conversation history must survive the rejected compaction.
+    let (turns, pinned) = working.split_pinned();
+    assert_eq!(turns.len(), 10, "all 5 user/assistant pairs preserved");
+    assert_eq!(pinned, vec!["PINNED: keep".to_string()]);
+    let rendered = format!("{:?}", turns);
+    assert!(
+        rendered.contains("user turn 0"),
+        "pre-compaction history text still present"
+    );
 }
