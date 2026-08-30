@@ -45,6 +45,20 @@ fn adversarial_table() {
         ("eval $x", "eval"),
         (". /etc/profile", "source dot-form"),
         ("sleep 1 &", "backgrounding"),
+        ("echo \"$(id)\"", "double-quoted command substitution"),
+        (
+            "echo `whoami`",
+            "double-quoted backtick command substitution",
+        ),
+        (
+            "echo ${X:-$(id)}",
+            "parameter default with command substitution",
+        ),
+        (
+            "echo $(( 1 + $(id) ))",
+            "arithmetic expansion with command substitution",
+        ),
+        ("cat <<< \"$(id)\"", "here-string with command substitution"),
     ];
     for (cmd, label) in deny_cases {
         assert!(
@@ -62,6 +76,14 @@ fn adversarial_table() {
         "missing variable expands to empty, not opaque"
     );
 
+    assert!(
+        matches!(
+            classify_shell("echo '$(id)'", &env),
+            ShellClassification::Program(_)
+        ),
+        "single-quoted substitution-looking text is a literal, not opaque"
+    );
+
     let Classification::Program(cmd) = parse_command("git status") else {
         panic!("git status should parse")
     };
@@ -75,4 +97,21 @@ fn adversarial_table() {
         ),
         "explicitly empty variable is not opaque"
     );
+
+    // Pre-parser resource guards: fail-closed on oversized or deeply nested input.
+    let huge = "a".repeat(100 * 1024);
+    match classify_shell(&huge, &env) {
+        ShellClassification::HardDeny(hint) => {
+            assert_eq!(hint.error, "unparseable_shell_command");
+        }
+        _ => panic!("100KB input must be rejected by the pre-parser size guard"),
+    }
+
+    let deep = "(".repeat(40);
+    match classify_shell(&deep, &env) {
+        ShellClassification::HardDeny(hint) => {
+            assert_eq!(hint.error, "unparseable_shell_command");
+        }
+        _ => panic!("40-deep nesting must be rejected by the pre-parser depth guard"),
+    }
 }

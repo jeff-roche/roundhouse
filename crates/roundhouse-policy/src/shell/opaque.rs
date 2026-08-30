@@ -2,8 +2,8 @@ use brush_parser::ast;
 use brush_parser::ast::SourceLocation;
 
 use super::classify::{
-    parse_command, resolve_variable_expansions, Classification, OpaqueReason, ParsedShellAst,
-    SessionEnv,
+    parse_command, parse_word_pieces, piece_is_opaque, resolve_variable_expansions, Classification,
+    OpaqueReason, ParsedShellAst, SessionEnv,
 };
 
 /// An opaque construct found in the shell AST, with its source span when available.
@@ -26,9 +26,10 @@ pub enum ShellClassification {
     HardDeny(RestructureHint),
 }
 
-/// Walks the AST looking for any node this design treats as irreducibly opaque:
-/// CommandSubstitution, ProcessSubstitution, Eval, Source, HereDoc, Backgrounding.
-/// These are found *after* VariableExpansion resolution so a plain `$VAR` never lands here.
+/// Walks the AST looking for any source-level node this design treats as irreducibly
+/// opaque: CommandSubstitution, ProcessSubstitution, Eval, Source, HereDoc, Backgrounding.
+/// Intended to be invoked *before* VariableExpansion resolution so quoted literals such
+/// as `'$(id)'` are not misclassified after quote stripping.
 pub fn find_opaque_nodes(program: &ast::Program) -> Vec<OpaqueNode> {
     let mut found = Vec::new();
     find_opaque_in_program(program, &mut found);
@@ -47,8 +48,10 @@ pub fn classify_shell(raw: &str, env: &SessionEnv) -> ShellClassification {
         Classification::Program(cmd) => cmd,
     };
 
-    resolve_variable_expansions(&mut cmd.program_ast, env);
-
+    // Detect source-level opaque constructs BEFORE expanding plain variables. Expanded
+    // env values are DATA under the execve-no-shell model; the original source tokens
+    // (quotes, substitutions, etc.) are what make a construct opaque. Scanning pre-
+    // expansion prevents quote-stripping false positives such as `echo '$(id)'`.
     let opaque = find_opaque_nodes(&cmd.program_ast);
     if !opaque.is_empty() {
         return ShellClassification::HardDeny(RestructureHint {
@@ -59,6 +62,8 @@ pub fn classify_shell(raw: &str, env: &SessionEnv) -> ShellClassification {
                 .into(),
         });
     }
+
+    resolve_variable_expansions(&mut cmd.program_ast, env);
 
     ShellClassification::Program(cmd)
 }
@@ -272,24 +277,20 @@ fn find_opaque_in_extended_test_expr(expr: &ast::ExtendedTestExpr, found: &mut V
         }
     }
 }
-
 fn find_opaque_in_word(word: &ast::Word, found: &mut Vec<OpaqueNode>) {
-    let pieces =
-        match brush_parser::word::parse(&word.value, &brush_parser::ParserOptions::default()) {
-            Ok(pieces) => pieces,
-            Err(_) => return,
-        };
-    for piece in pieces {
-        if matches!(
-            piece.piece,
-            brush_parser::word::WordPiece::CommandSubstitution(_)
-                | brush_parser::word::WordPiece::BackquotedCommandSubstitution(_)
-        ) {
-            found.push(OpaqueNode {
-                reason: OpaqueReason::CommandSubstitution,
-                span: (piece.start_index, piece.end_index),
-            });
+    match parse_word_pieces(&word.value) {
+        Ok(pieces) => {
+            if let Some(piece) = pieces.iter().find(|p| piece_is_opaque(&p.piece)) {
+                found.push(OpaqueNode {
+                    reason: OpaqueReason::CommandSubstitution,
+                    span: (piece.start_index, piece.end_index),
+                });
+            }
         }
+        Err(_) => found.push(OpaqueNode {
+            reason: OpaqueReason::ParseError,
+            span: (0, 0),
+        }),
     }
 }
 

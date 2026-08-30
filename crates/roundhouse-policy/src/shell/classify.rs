@@ -7,8 +7,65 @@ use brush_parser::ast::{
     FunctionDefinition, IoFileRedirectTarget, IoRedirect, Pipeline, Program, RedirectList,
     SimpleCommand, Word,
 };
-use brush_parser::word::{Parameter, ParameterExpr, WordPiece};
+use brush_parser::word::{Parameter, ParameterExpr, WordPiece, WordPieceWithSource};
 use brush_parser::{Parser, ParserOptions};
+
+/// Byte-size cap on the raw shell command string (and on individual word strings).
+const MAX_INPUT_BYTES: usize = 64 * 1024;
+
+/// Maximum nesting depth of shell openers (`(`, backtick, `${`) accepted by the
+/// pre-parser guard. Chosen to block the exponential backtracking and stack-overflow
+/// blowups observed in `brush-parser` 0.4.0 while leaving realistic agent commands alone.
+const MAX_NESTING_DEPTH: usize = 16;
+
+/// Cheap pre-parser guard: rejects inputs that are too large or too deeply nested.
+/// Over-limit inputs are treated as parse failures and hard-denied.
+fn input_guard(raw: &str) -> Result<(), OpaqueReason> {
+    if raw.len() > MAX_INPUT_BYTES {
+        return Err(OpaqueReason::ParseError);
+    }
+    if nesting_depth(raw) > MAX_NESTING_DEPTH {
+        return Err(OpaqueReason::ParseError);
+    }
+    Ok(())
+}
+
+/// Scans `raw` for unclosed `(`/backtick/`${` depth. Single-quoted regions are skipped
+/// because their contents are literal and cannot drive parser nesting.
+fn nesting_depth(raw: &str) -> usize {
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+    let mut in_single_quote = false;
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if in_single_quote {
+            if ch == '\'' {
+                in_single_quote = false;
+            }
+            continue;
+        }
+        if ch == '\'' {
+            in_single_quote = true;
+            continue;
+        }
+        match ch {
+            '(' | '`' => {
+                depth += 1;
+                max_depth = max_depth.max(depth);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+            }
+            '$' if chars.peek() == Some(&'{') => {
+                depth += 1;
+                max_depth = max_depth.max(depth);
+                chars.next(); // consume the '{' that belongs to `${`
+            }
+            _ => {}
+        }
+    }
+    max_depth
+}
 
 /// The full parsed pipeline AST — internal to the shell module. Deliberately not named
 /// `ParsedCommand`: Phase 0 already froze that name for the simple `{program, argv}`
@@ -34,12 +91,7 @@ impl ParsedShellAst {
     /// backtick form). Used after `resolve_variable_expansions` to confirm that step 2
     /// left opaque constructs untouched for step 3 to hard-deny.
     pub fn contains_unresolved_command_substitution(&self) -> bool {
-        any_word_piece(&self.program_ast, |piece| {
-            matches!(
-                piece,
-                WordPiece::CommandSubstitution(_) | WordPiece::BackquotedCommandSubstitution(_)
-            )
-        })
+        any_word_piece(&self.program_ast, piece_is_opaque)
     }
 }
 
@@ -62,6 +114,9 @@ pub enum Classification {
 /// Parse a shell command string. Parse failures are returned as
 /// `Classification::Opaque(OpaqueReason::ParseError)` rather than panicking.
 pub fn parse_command(raw: &str) -> Classification {
+    if let Err(reason) = input_guard(raw) {
+        return Classification::Opaque(reason);
+    }
     let options = ParserOptions::default();
     let reader = Cursor::new(raw);
     let mut parser = Parser::new(reader, &options);
@@ -97,6 +152,53 @@ impl SessionEnv {
 /// expression is left exactly as-is so that `find_opaque_nodes` can hard-deny it.
 pub fn resolve_variable_expansions(ast: &mut Program, env: &SessionEnv) {
     expand_in_program(ast, env);
+}
+
+// ---------------------------------------------------------------------------
+// Word-level parsing helpers (used by expansion and opaque detection)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn parse_word_pieces(word: &str) -> Result<Vec<WordPieceWithSource>, OpaqueReason> {
+    input_guard(word)?;
+    brush_parser::word::parse(word, &ParserOptions::default()).map_err(|_| OpaqueReason::ParseError)
+}
+
+/// True if the parsed word piece (recursively) contains any source-level opaque
+/// construct: command substitution (including backticks inside double quotes),
+/// arithmetic expansion embedding a substitution, or any non-plain parameter expansion.
+pub(crate) fn piece_is_opaque(piece: &WordPiece) -> bool {
+    match piece {
+        WordPiece::CommandSubstitution(_) | WordPiece::BackquotedCommandSubstitution(_) => true,
+        WordPiece::DoubleQuotedSequence(inner) | WordPiece::GettextDoubleQuotedSequence(inner) => {
+            inner.iter().any(|p| piece_is_opaque(&p.piece))
+        }
+        WordPiece::ArithmeticExpression(expr) => raw_string_has_command_substitution(&expr.value),
+        WordPiece::ParameterExpansion(expr) => parameter_expr_is_opaque(expr),
+        _ => false,
+    }
+}
+
+fn parameter_expr_is_opaque(expr: &ParameterExpr) -> bool {
+    !matches!(
+        expr,
+        ParameterExpr::Parameter {
+            parameter: Parameter::Named(_),
+            indirect: false,
+        }
+    )
+}
+
+fn raw_string_has_command_substitution(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'`' && (i == 0 || bytes[i - 1] != b'\\') {
+            return true;
+        }
+        if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +404,7 @@ fn expand_in_extended_test_expr(expr: &mut ExtendedTestExpr, env: &SessionEnv) {
 }
 
 fn expand_word(word: &mut Word, env: &SessionEnv) {
-    let pieces = match brush_parser::word::parse(&word.value, &ParserOptions::default()) {
+    let pieces = match parse_word_pieces(&word.value) {
         Ok(pieces) => pieces,
         Err(_) => return,
     };
@@ -656,9 +758,9 @@ fn extended_test_expr_matches(
 }
 
 fn word_matches(word: &Word, predicate: &impl Fn(&WordPiece) -> bool) -> bool {
-    match brush_parser::word::parse(&word.value, &ParserOptions::default()) {
+    match parse_word_pieces(&word.value) {
         Ok(pieces) => pieces.iter().any(|p| piece_matches(&p.piece, predicate)),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -666,8 +768,10 @@ fn piece_matches(piece: &WordPiece, predicate: &impl Fn(&WordPiece) -> bool) -> 
     if predicate(piece) {
         return true;
     }
-    if let WordPiece::DoubleQuotedSequence(inner) = piece {
-        return inner.iter().any(|p| piece_matches(&p.piece, predicate));
+    match piece {
+        WordPiece::DoubleQuotedSequence(inner) | WordPiece::GettextDoubleQuotedSequence(inner) => {
+            inner.iter().any(|p| piece_matches(&p.piece, predicate))
+        }
+        _ => false,
     }
-    false
 }
