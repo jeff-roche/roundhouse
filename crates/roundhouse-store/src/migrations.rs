@@ -90,10 +90,23 @@ ALTER TABLE tasks ADD COLUMN suspended_since INTEGER;
 ALTER TABLE tasks ADD COLUMN suspend_reason_json TEXT;
 "#;
 
+/// Task 19: redaction at the persistence boundary. `redactions` is a per-task counter,
+/// summed across every event folded into the task (see `writer::append_one`/
+/// `append_batch`, which `UPDATE tasks SET redactions = redactions + ?1` alongside the
+/// existing `tasks_view::upsert_for_event` call, in the same transaction as the events
+/// insert) — 0 is the diagnostic signal that redaction found nothing for this task, not
+/// an error, and must stay visible per-task rather than only existing transiently in
+/// memory. `NOT NULL DEFAULT 0` so every pre-existing row (and every new
+/// `TaskCreated`-triggered insert) starts at a well-defined zero.
+const MIGRATION_0004_TASKS_REDACTIONS_COLUMN: &str = r#"
+ALTER TABLE tasks ADD COLUMN redactions INTEGER NOT NULL DEFAULT 0;
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_0001_INITIAL_SCHEMA),
         M::up(MIGRATION_0002_BLOBS),
         M::up(MIGRATION_0003_TASKS_SUSPEND_COLUMNS),
+        M::up(MIGRATION_0004_TASKS_REDACTIONS_COLUMN),
     ])
 }

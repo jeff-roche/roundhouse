@@ -17,6 +17,7 @@ mod fold;
 mod migrations;
 mod pool;
 mod recovery;
+pub mod redact;
 mod replay;
 mod session_events;
 mod suspended;

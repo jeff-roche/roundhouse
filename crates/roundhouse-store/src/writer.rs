@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use roundhouse_core::{Event, EventPayload};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::redact::Redactor;
 use crate::{pool::StorePool, StoreError};
 
 pub(crate) enum WriteCmd {
@@ -20,9 +23,17 @@ pub(crate) enum WriteCmd {
 /// A handle to the single-writer event-append task. Cloneable; multiple
 /// callers can share the same `EventWriter` and append events concurrently
 /// — all appends are serialized by the writer task, not the client.
+///
+/// `redactor` (Task 19, §6.7) is consulted on every append, before
+/// `serialize_payload` — a live secret value must never physically reach the
+/// `events.payload` column. It's an `Arc<ArcSwap<Redactor>>`, shared with the
+/// spawned writer task's own closure (see `spawn_writer`), so `set_redactor`
+/// hot-swaps the live secret-value list for every future append without
+/// restarting the writer task or interrupting in-flight ones.
 #[derive(Clone)]
 pub struct EventWriter {
     tx: mpsc::Sender<WriteCmd>,
+    redactor: Arc<ArcSwap<Redactor>>,
 }
 
 /// Serialize an `EventPayload` to JSON.
@@ -57,23 +68,31 @@ pub fn serialize_payload(
 /// recoverable from transient `SQLITE_BUSY` — the writer task survives client failures.
 pub async fn spawn_writer(store: StorePool) -> EventWriter {
     let (tx, mut rx) = mpsc::channel::<WriteCmd>(1024);
+    // Empty-pattern automaton by default: matches nothing, so every append is a genuine
+    // no-op redaction pass until a real secret-value list is installed via
+    // `EventWriter::set_redactor` — redaction is always structurally "on" (Ruling 2),
+    // never simply absent because nobody configured it yet.
+    let redactor = Arc::new(ArcSwap::from_pointee(Redactor::build(&[])));
+    let redactor_for_task = Arc::clone(&redactor);
 
     tokio::spawn(async move {
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 WriteCmd::Append { event, reply } => {
-                    let result = append_one(&store, event).await;
+                    let redactor = redactor_for_task.load_full();
+                    let result = append_one(&store, event, &redactor).await;
                     let _ = reply.send(result);
                 }
                 WriteCmd::AppendBatch { events, reply } => {
-                    let result = append_batch(&store, events).await;
+                    let redactor = redactor_for_task.load_full();
+                    let result = append_batch(&store, events, &redactor).await;
                     let _ = reply.send(result);
                 }
             }
         }
     });
 
-    EventWriter { tx }
+    EventWriter { tx, redactor }
 }
 
 /// S-LOG-4/5: bounded exponential backoff around the single-writer transaction. A
@@ -94,14 +113,24 @@ fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
     )
 }
 
-async fn append_one(store: &StorePool, event: Event) -> Result<u64, StoreError> {
+async fn append_one(
+    store: &StorePool,
+    event: Event,
+    redactor: &Redactor,
+) -> Result<u64, StoreError> {
     let conn = store.pool.get().await?;
-    let payload_json =
-        serialize_payload(&event.payload).map_err(|e| StoreError::Interact(e.to_string()))?;
     let session_id = event.session_id.to_string();
     let task_id = event.task_id.map(|t| t.to_string());
     let ts_nanos = event.ts.as_unix_nanos();
     let schema_v = event.schema_v;
+
+    // Redaction runs BEFORE serialization (§6.7, Task 19 addendum Ruling 1): the stored
+    // row is always the already-redacted `EventPayload`, never the original. Run once,
+    // outside the retry loop below — redaction is deterministic, so a `SQLITE_BUSY` retry
+    // reuses the same redacted payload rather than redacting again.
+    let (payload, redactions) = redactor.redact_event_payload(event.payload);
+    let payload_json =
+        serialize_payload(&payload).map_err(|e| StoreError::Interact(e.to_string()))?;
 
     let mut attempt: u32 = 0;
     let seq = loop {
@@ -109,7 +138,7 @@ async fn append_one(store: &StorePool, event: Event) -> Result<u64, StoreError> 
         let session_id = session_id.clone();
         let task_id = task_id.clone();
         let payload_json = payload_json.clone();
-        let payload = event.payload.clone();
+        let payload = payload.clone();
 
         let write_result = conn
             .interact(move |c| -> Result<u64, rusqlite::Error> {
@@ -149,6 +178,19 @@ async fn append_one(store: &StorePool, event: Event) -> Result<u64, StoreError> 
                         ts_nanos,
                         &payload,
                     )?;
+                    // Task 19 addendum Ruling 5's gotcha: `upsert_for_event` early-returns
+                    // (via `fold_task_state` returning `None`) for exactly the payload
+                    // kinds redactable text lives in (`TaskDelta`/`Note`), so the
+                    // redaction-count accumulation cannot live inside that function's
+                    // existing match arms — it runs here instead, unconditionally
+                    // alongside the `upsert_for_event` call, in the same transaction as
+                    // the events insert.
+                    if redactions > 0 {
+                        tx.execute(
+                            "UPDATE tasks SET redactions = redactions + ?1 WHERE task_id = ?2",
+                            rusqlite::params![redactions, task_id],
+                        )?;
+                    }
                 }
                 tx.commit()?;
                 Ok(next_seq as u64)
@@ -180,6 +222,9 @@ struct PreparedEvent {
     payload_json: String,
     payload: EventPayload,
     schema_v: u16,
+    /// Redaction count for this member's payload (Task 19, §6.7) — computed once here,
+    /// alongside serialization, from the already-redacted `payload` above.
+    redactions: u32,
 }
 
 /// Batched counterpart to `append_one`: applies every event in `events` inside
@@ -204,7 +249,11 @@ struct PreparedEvent {
 ///
 /// Same `SQLITE_BUSY`-retrying pattern as `append_one`: on a busy collision,
 /// the ENTIRE batch is retried from scratch, not resumed partway.
-async fn append_batch(store: &StorePool, events: Vec<Event>) -> Result<Vec<u64>, StoreError> {
+async fn append_batch(
+    store: &StorePool,
+    events: Vec<Event>,
+    redactor: &Redactor,
+) -> Result<Vec<u64>, StoreError> {
     if events.is_empty() {
         return Ok(Vec::new());
     }
@@ -225,15 +274,19 @@ async fn append_batch(store: &StorePool, events: Vec<Event>) -> Result<Vec<u64>,
         events
             .iter()
             .map(|event| {
-                let payload_json = serialize_payload(&event.payload)
-                    .map_err(|e| StoreError::Interact(e.to_string()))?;
+                // Same redact-before-serialize ordering as append_one (§6.7, Ruling 1):
+                // the stored row is always the redacted form.
+                let (payload, redactions) = redactor.redact_event_payload(event.payload.clone());
+                let payload_json =
+                    serialize_payload(&payload).map_err(|e| StoreError::Interact(e.to_string()))?;
                 Ok(PreparedEvent {
                     session_id: event.session_id.to_string(),
                     task_id: event.task_id.map(|t| t.to_string()),
                     ts_nanos: event.ts.as_unix_nanos(),
                     payload_json,
-                    payload: event.payload.clone(),
+                    payload,
                     schema_v: event.schema_v,
+                    redactions,
                 })
             })
             .collect::<Result<Vec<_>, StoreError>>()?,
@@ -303,6 +356,14 @@ async fn append_batch(store: &StorePool, events: Vec<Event>) -> Result<Vec<u64>,
                             item.ts_nanos,
                             &item.payload,
                         )?;
+                        // Same gotcha as append_one (Ruling 5): can't shoehorn this into
+                        // upsert_for_event's early-return for TaskDelta/Note payloads.
+                        if item.redactions > 0 {
+                            tx.execute(
+                                "UPDATE tasks SET redactions = redactions + ?1 WHERE task_id = ?2",
+                                rusqlite::params![item.redactions, task_id],
+                            )?;
+                        }
                     }
 
                     next_seq_by_session.insert(item.session_id.clone(), next_seq + 1);
@@ -329,6 +390,14 @@ async fn append_batch(store: &StorePool, events: Vec<Event>) -> Result<Vec<u64>,
 }
 
 impl EventWriter {
+    /// Hot-swaps the redactor consulted on every future `append`/`append_batch` call
+    /// (Task 19, §6.7). Does not affect already-committed rows, only writes from this
+    /// point forward. Safe to call concurrently with in-flight appends — `ArcSwap::store`
+    /// is a single atomic pointer swap.
+    pub fn set_redactor(&self, r: Redactor) {
+        self.redactor.store(Arc::new(r));
+    }
+
     /// Append an event to the log. The event's `seq` field is ignored (the writer
     /// assigns a monotonic sequence number per session). Returns the assigned `seq`,
     /// or an error if serialization, database locking, or the writer task fails.
