@@ -11,6 +11,7 @@
 
 pub mod engine;
 pub mod sealed;
+pub mod shell;
 
 mod policy_trait;
 mod task_params;
