@@ -1,6 +1,7 @@
 use crate::{FsOp, Method, PolicyInput, ProviderId, ServerId, TaskParams};
 use roundhouse_core::{PolicyDecision, Tier};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Scope {
@@ -198,6 +199,7 @@ impl CompiledRule {
 pub struct PolicyEngine {
     rules: Vec<CompiledRule>,
     unsealed: bool,
+    sealed_ctx_provider: Arc<dyn Fn() -> crate::sealed::SealedContext + Send + Sync>,
 }
 
 impl PolicyEngine {
@@ -205,6 +207,7 @@ impl PolicyEngine {
         Self {
             rules,
             unsealed: false,
+            sealed_ctx_provider: Arc::new(crate::sealed::default_context),
         }
     }
 
@@ -214,6 +217,40 @@ impl PolicyEngine {
     pub fn with_unsealed(mut self, unsealed: bool) -> Self {
         self.unsealed = unsealed;
         self
+    }
+
+    /// The daemon is the only place that knows the live state dir, daemon
+    /// binary path, resolved MCP servers, and current attestation, so it
+    /// supplies this provider at construction. Unit tests get the safe default
+    /// from [`from_rules`](Self::from_rules).
+    pub fn with_sealed_ctx_provider(
+        mut self,
+        provider: Arc<dyn Fn() -> crate::sealed::SealedContext + Send + Sync>,
+    ) -> Self {
+        self.sealed_ctx_provider = provider;
+        self
+    }
+
+    pub fn sealed_ctx(&self) -> crate::sealed::SealedContext {
+        (self.sealed_ctx_provider)()
+    }
+
+    /// Sealed rules are matched first and are compiled in, not config. The only
+    /// documented escape is `round daemon --unsealed`, which must be recorded on
+    /// every task in the session once `TaskSecurity`/attestation lands
+    /// (Tasks 17/25), never silent.
+    pub fn decide_sealed(&self, params: &TaskParams, unsealed: bool, ctx: &crate::sealed::SealedContext) -> Decision {
+        if !unsealed {
+            for rule in crate::sealed::sealed_rules() {
+                if (rule.matches)(params, ctx) {
+                    return Decision {
+                        outcome: Outcome::Deny,
+                        rule: Some(RuleId(rule.id.to_string())),
+                    };
+                }
+            }
+        }
+        self.decide(params)
     }
 
     /// A path that fails to canonicalise is Deny, never Ask — a human cannot
@@ -266,9 +303,9 @@ impl PolicyEngine {
 
     /// Unattended runs default DenyAll (§6.4): an unmatched task is Deny, not
     /// the interactive default of Ask, because there is no human to answer the
-    /// Ask.
+    /// Ask. The sealed floor is still applied first.
     pub fn decide_unattended(&self, params: &TaskParams) -> Decision {
-        let d = self.decide(params);
+        let d = self.decide_sealed(params, self.unsealed, &self.sealed_ctx());
         if d.rule.is_none() && d.outcome == Outcome::Ask {
             Decision {
                 outcome: Outcome::Deny,
@@ -285,11 +322,10 @@ impl PolicyEngine {
 /// `Box<dyn Policy>` everywhere `roundhouse-tools`/`roundhouse-engine` already
 /// hold that trait object (Phase 0 Task 6).
 ///
-/// Routes through plain `decide()` for now; Task 10 edits this one line to
-/// route through `decide_sealed()` once the sealed floor exists, so the sealed
-/// floor is never bypassable through the trait-object call path either.
+/// Routes through `decide_sealed()` so the sealed floor is never bypassable
+/// through the trait-object call path either.
 impl crate::Policy for PolicyEngine {
     fn decide(&self, input: &PolicyInput) -> PolicyDecision {
-        self.decide(&input.params).outcome.into()
+        self.decide_sealed(&input.params, self.unsealed, &self.sealed_ctx()).outcome.into()
     }
 }

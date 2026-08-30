@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod engine;
+pub mod sealed;
 
 mod policy_trait;
 mod task_params;
