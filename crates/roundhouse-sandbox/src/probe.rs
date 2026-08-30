@@ -81,10 +81,21 @@ pub struct MechanismProbeReport {
 
 impl MechanismProbeReport {
     /// The achieved tier is the strongest tier this host's mechanisms actually
-    /// support: `Sandbox` needs Landlock *and* bwrap both truly `Available`; any
-    /// `Degraded`/`Unavailable` mechanism is recorded as a degradation, never
-    /// silently dropped (§6.5 rule 1's "Landlock BestEffort is where fail-open
-    /// hides").
+    /// support: `Sandbox` needs bwrap *and* (Landlock *or* Seatbelt) truly
+    /// `Available`; any `Degraded`/`Unavailable` mechanism is recorded as a
+    /// degradation, never silently dropped (§6.5 rule 1's "Landlock BestEffort is
+    /// where fail-open hides").
+    ///
+    /// Fix-round-1 finding 4: this used to consider only `(landlock, bwrap)`,
+    /// completely ignoring Seatbelt, while `isolate::BwrapLandlockIsolate::
+    /// achieved_tier()` correctly used a 3-way `bwrap && (landlock || seatbelt)` OR.
+    /// The two disagreeing (a Seatbelt-only host had `probe()` report `Tier::None`
+    /// while `prepare()` granted `Tier::Sandbox`) was a real internal
+    /// self-contradiction — a caller checking `probe()` before deciding whether to
+    /// even try `prepare()` got the wrong answer. This is now the single source of
+    /// truth for the fold: `achieved_tier()` calls this function and reads
+    /// `.achieved` rather than duplicating the logic, so the two structurally
+    /// cannot disagree again.
     pub fn to_probe_result(&self) -> ProbeResult {
         let mut degradations = Vec::new();
         for (name, status) in [
@@ -103,10 +114,15 @@ impl MechanismProbeReport {
                 MechanismStatus::Available => {}
             }
         }
-        let achieved = match (&self.landlock, &self.bwrap) {
-            (MechanismStatus::Available, MechanismStatus::Available) => Tier::Sandbox,
-            (_, MechanismStatus::Available) | (MechanismStatus::Available, _) => Tier::Worktree,
-            _ => Tier::None,
+        let bwrap_ok = matches!(self.bwrap, MechanismStatus::Available);
+        let landlock_ok = matches!(self.landlock, MechanismStatus::Available);
+        let seatbelt_ok = matches!(self.seatbelt, MechanismStatus::Available);
+        let achieved = if bwrap_ok && (landlock_ok || seatbelt_ok) {
+            Tier::Sandbox
+        } else if bwrap_ok || landlock_ok || seatbelt_ok {
+            Tier::Worktree
+        } else {
+            Tier::None
         };
         ProbeResult {
             achieved,
@@ -561,6 +577,73 @@ fn seccomp_probe_body() -> MechanismStatus {
             ),
         }
     }
+}
+
+/// Compiles a real, working seccomp-BPF program for use on the actual `Isolate::spawn`
+/// path (`isolate.rs`/`bwrap.rs`), not the throwaway probe verification above.
+///
+/// Fix-round-1 finding 1: before this, `Tier::Sandbox` was attested even though
+/// nothing anywhere actually installed a Landlock ruleset or seccomp filter on the
+/// real spawned child — `restrict_self()`/`apply_filter()` only ever ran inside this
+/// module's throwaway probe bodies. This function closes that gap for seccomp: it
+/// compiles a real filter, and `bwrap.rs::spawn_under_bwrap` passes the compiled
+/// program to bwrap's native `--seccomp FD` flag so it is genuinely applied to the
+/// process bwrap execs, not merely probed as theoretically available.
+///
+/// Deliberately denies `ptrace(2)`, not `getppid` (which `seccomp_probe_body` above
+/// denies, for that function's own, different purpose — a trivial, side-effect-free
+/// syscall convenient to test in a throwaway forked child via a raw verification
+/// syscall). `ptrace` is a real, security-meaningful syscall to restrict here: it is
+/// the classic sandbox-escape/process-injection primitive (attaching to or tracing
+/// another process), and none of this crate's actual sandboxed tool workloads
+/// (`read`/`write`/`edit`/`find`/`shell`) have any legitimate reason to call it. This
+/// is deliberately NOT a production-grade syscall allowlist/denylist — establishing
+/// that genuine seccomp-BPF enforcement infrastructure is real and wired end-to-end
+/// (compiled filter → real fd → bwrap → the actual exec'd child, empirically verified
+/// against real bwrap 0.12.0 in fix-round-1: `ptrace(PTRACE_TRACEME, ...)` returns
+/// `-1`/`EPERM` inside the sandbox, `0` outside it) is this round's scope; a full
+/// syscall policy is tracked separately.
+#[cfg(target_os = "linux")]
+pub(crate) fn compile_baseline_seccomp_bpf() -> Result<Vec<u8>, String> {
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
+    use std::convert::TryInto;
+
+    let arch = std::env::consts::ARCH.try_into().map_err(|e| {
+        format!(
+            "unsupported seccomp target arch {:?}: {e}",
+            std::env::consts::ARCH
+        )
+    })?;
+
+    let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
+    rules.insert(libc::SYS_ptrace, Vec::new());
+
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        arch,
+    )
+    .map_err(|e| format!("SeccompFilter::new failed: {e}"))?;
+
+    let bpf: BpfProgram = filter
+        .try_into()
+        .map_err(|e| format!("compiling seccomp filter to BPF failed: {e}"))?;
+
+    // The kernel's `struct sock_filter` is `{ u16 code; u8 jt; u8 jf; u32 k }` — 8
+    // bytes, naturally aligned, no padding — and `seccompiler::backend::bpf::sock_filter`
+    // has the identical `#[repr(C)]` layout, but this serializes field-by-field
+    // instead of an `unsafe` transmute/byte-cast: this crate forbids new `unsafe`
+    // outside `probe.rs`'s existing forked-probe machinery, and this function's
+    // output feeds the real spawn path in `bwrap.rs`, not just another forked probe.
+    let mut bytes = Vec::with_capacity(bpf.len() * 8);
+    for insn in &bpf {
+        bytes.extend_from_slice(&insn.code.to_ne_bytes());
+        bytes.push(insn.jt);
+        bytes.push(insn.jf);
+        bytes.extend_from_slice(&insn.k.to_ne_bytes());
+    }
+    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------------

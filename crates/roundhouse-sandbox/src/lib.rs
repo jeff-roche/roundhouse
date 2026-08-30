@@ -2,12 +2,20 @@
 //! in — from no isolation up through containers — chosen and attested to
 //! independently of which executor or provider is running the task.
 //!
-//! Phase 0 ships only the `Isolate` trait signature and its supporting data
+//! Phase 0 shipped only the `Isolate` trait signature and its supporting data
 //! types (`Tier` — re-exported from `roundhouse-core`, since `Tier` had to
 //! move there so `EventPayload::TaskStarted` could reference it without
 //! `roundhouse-core` depending on this crate — `Attestation`, `CommandSpec`,
-//! `ProbeResult`). The *behavioral* half (probing real syscalls, refusing to
-//! start below the requested tier) is Phase 2 work. See
+//! `ProbeResult`). The *behavioral* half is now substantially built by Phase 2
+//! (`probe` module: real syscall probes per mechanism; `isolate`/`bwrap`
+//! modules: `BwrapLandlockIsolate`, a real `Isolate` impl that fails closed —
+//! errors rather than warns — when the achieved tier is below what a session
+//! requested, and that genuinely applies bwrap namespace isolation and, on
+//! Linux when probed available, a real seccomp-BPF filter to every spawned
+//! child). It is not yet complete: real per-process Landlock enforcement on
+//! the spawned child (as opposed to Landlock's own probe, which is real) is a
+//! tracked follow-up — see `isolate::BwrapLandlockIsolate::achieved_tier`'s doc
+//! comment for exactly what each mechanism does and doesn't enforce today. See
 //! `docs/architecture/02-system-architecture.md` §5.2 and
 //! `03-security-and-sandboxing.md` (S-ISO-1/2).
 
