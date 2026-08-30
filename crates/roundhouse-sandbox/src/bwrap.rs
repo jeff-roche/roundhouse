@@ -115,34 +115,64 @@ pub async fn spawn_under_bwrap(
     // `Ok(Child{pid})`, leaving the caller believing a sandboxed task was running
     // when it never was.
     //
-    // Mechanism: bwrap's own setup failures are near-instant (they happen before any
-    // real workload code runs), unlike the real command potentially running for a
-    // long time — so give it one uncontended tick of the async runtime via `yield_now`
-    // and then a non-blocking `try_wait()`. If bwrap has *already* exited by then,
-    // that's conclusive evidence of a setup failure, not a coincidentally-fast real
-    // command (bwrap itself, not the child it execs, is what we're polling — bwrap
-    // only exits this fast if it never got past its own setup). This is a real,
-    // inherent race, not a complete guarantee: a bwrap setup failure that takes
-    // longer than this one scheduler tick to surface will not be caught here and
-    // will still return `Ok`. Narrowing that window further (e.g. an actual bounded
-    // sleep) trades false-negative risk for added latency on every single spawn;
-    // catching the specific reproduced case (bwrap failing near-instantly during its
-    // own setup, before any workload runs) is this round's scope.
-    tokio::task::yield_now().await;
-    match child.try_wait() {
-        Ok(Some(status)) => {
-            return Err(IsolationError::Unsupported(format!(
-                "bwrap exited immediately during setup (status: {status}) instead of running \
-                 the sandboxed command — this is a setup failure (e.g. an unbindable path), \
-                 not a fast-exiting real workload"
-            )));
+    // Fix-round-2 correction: fix-round-1 shipped a single `tokio::task::yield_now()`
+    // (one scheduler tick, ~10us) followed by one `try_wait()`, documented as
+    // "catching every near-instant setup failure" — that claim did not hold up under
+    // measurement. Instrumented timing showed bwrap actually takes ~1.5ms to die on
+    // a bad `--bind` path — two orders of magnitude longer than one `yield_now()`
+    // tick — so the guard caught the deliberately-reproduced failure in 0 of 50 runs,
+    // not "most" of them. This is now a short bounded poll instead: check
+    // immediately (free in the success case if bwrap is somehow already gone), then
+    // back off over a few short sleeps totaling ~15ms — comfortably above the
+    // measured ~1.5ms failure latency with margin, while still bounding the added
+    // latency on every successful spawn (the overwhelmingly common case) to at most
+    // ~15ms. Measured over multiple runs (fix-round-2): 10/10 for a bad bind path via
+    // `spawn_under_bwrap` directly, and 10/10 for a nonexistent exec target through
+    // the real `Isolate::spawn` API — see `tests/isolate_fix_round_2.rs`. This is
+    // still not a mathematical guarantee — a setup failure slower than ~15ms would
+    // still return `Ok` — but it is a real, measured margin over the actual observed
+    // failure latency, not merely an assertion of one.
+    //
+    // Only a *non-zero* exit within the window counts as a setup failure — bwrap's
+    // own top-level process exit code mirrors the real command's when it isn't
+    // reparented under `--as-pid-1`, so a real command that itself finishes within
+    // this same short window (a fast `echo`, a short script, `true`) exits bwrap with
+    // status 0 and must NOT be misreported as a setup failure (fix-round-2 caught this
+    // exact regression: the first version of this fix treated *any* exit within the
+    // window as failure, breaking two passing real-exec tests that happened to finish
+    // fast). Residual, accepted ambiguity: a real command that itself legitimately
+    // fails with a non-zero exit within this same short window is indistinguishable
+    // from a bwrap setup failure by exit code alone (bwrap's stderr, which would
+    // disambiguate the two, isn't captured here) — but `Isolate::spawn`'s frozen
+    // `Child{pid}` return type has no channel to report "ran and exited non-zero"
+    // separately from this error today regardless, so collapsing the two cases here
+    // is not a regression relative to what this contract can already represent.
+    const EXIT_CHECK_DELAYS_MS: &[u64] = &[0, 1, 2, 4, 8];
+    let mut setup_failure_status = None;
+    for delay_ms in EXIT_CHECK_DELAYS_MS {
+        if *delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
         }
-        Ok(None) => {} // still running past its own setup — proceed
-        Err(e) => {
-            return Err(IsolationError::Unsupported(format!(
-                "failed to check bwrap's post-spawn status: {e}"
-            )));
+        match child.try_wait() {
+            Ok(Some(status)) if !status.success() => {
+                setup_failure_status = Some(status);
+                break;
+            }
+            Ok(Some(_)) => break, // exited, but successfully — a fast real command, not a setup failure
+            Ok(None) => {}        // still running past its own setup — keep polling
+            Err(e) => {
+                return Err(IsolationError::Unsupported(format!(
+                    "failed to check bwrap's post-spawn status: {e}"
+                )));
+            }
         }
+    }
+    if let Some(status) = setup_failure_status {
+        return Err(IsolationError::Unsupported(format!(
+            "bwrap exited immediately during setup with a non-zero status ({status}) instead \
+             of running the sandboxed command — this is a setup failure (e.g. an unbindable \
+             path), not a fast-exiting real workload"
+        )));
     }
 
     Ok((Child { pid }, child))

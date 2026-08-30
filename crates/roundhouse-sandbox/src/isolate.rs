@@ -104,24 +104,42 @@ impl BwrapLandlockIsolate {
     }
 
     /// Compiles the real seccomp-BPF program to apply on the real spawn path when the
-    /// host's seccomp probe reported `Available` — `None` on hosts where seccomp
+    /// host's seccomp probe reported `Available` — `Ok(None)` on hosts where seccomp
     /// isn't real (not Linux, or the probe reported `Degraded`/`Unavailable`), so
     /// `spawn_under_bwrap` is never asked to pass a filter that was never actually
     /// verified. See `probe::compile_baseline_seccomp_bpf`'s doc comment for what the
     /// compiled filter actually restricts.
+    ///
+    /// Fix-round-2 bug fix: this used to discard a compile failure with `.ok()`,
+    /// which meant that if compilation ever failed (e.g. an unsupported target arch,
+    /// or any other real failure), `spawn()` would proceed with **no filter applied
+    /// at all** while the probe still reported seccomp `Available` and `attest()`
+    /// still claimed `Tier::Sandbox` as if the filter had actually been built —
+    /// exactly the "fail-open hides" pattern this whole module exists to prevent,
+    /// newly introduced by fix-round-1's own fix for that same pattern. Now returns
+    /// `Result` and propagates the failure as a real `IsolationError` so `spawn()`
+    /// fails closed instead of silently spawning under a weaker-than-attested tier.
     #[cfg(target_os = "linux")]
-    fn seccomp_bpf_for_spawn(&self) -> Option<Vec<u8>> {
+    fn seccomp_bpf_for_spawn(&self) -> Result<Option<Vec<u8>>, IsolationError> {
         use crate::probe::MechanismStatus;
         if matches!(self.probe_report.seccomp, MechanismStatus::Available) {
-            crate::probe::compile_baseline_seccomp_bpf().ok()
+            crate::probe::compile_baseline_seccomp_bpf()
+                .map(Some)
+                .map_err(|e| {
+                    IsolationError::Unsupported(format!(
+                        "seccomp probed Available but compiling the real enforcement filter \
+                         failed ({e}) — refusing to spawn with Tier::Sandbox attested but no \
+                         seccomp filter actually applied"
+                    ))
+                })
         } else {
-            None
+            Ok(None)
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn seccomp_bpf_for_spawn(&self) -> Option<Vec<u8>> {
-        None
+    fn seccomp_bpf_for_spawn(&self) -> Result<Option<Vec<u8>>, IsolationError> {
+        Ok(None)
     }
 }
 
@@ -189,7 +207,7 @@ impl Isolate for BwrapLandlockIsolate {
                 "spawn requires a real working directory to sandbox into".into(),
             )
         })?;
-        let seccomp_bpf = self.seccomp_bpf_for_spawn();
+        let seccomp_bpf = self.seccomp_bpf_for_spawn()?;
         let (child, live_handle) =
             crate::bwrap::spawn_under_bwrap(&self.bwrap_path, &workspace_root, cmd, seccomp_bpf)
                 .await?;
@@ -202,6 +220,18 @@ impl Isolate for BwrapLandlockIsolate {
 
     /// Written on every task row, not once per session — tiers can change mid-session
     /// (§6.5 rule 4).
+    ///
+    /// **Read this before trusting `Attestation.tier == Sandbox` as a complete
+    /// security boundary:** as of fix-round-1, bwrap, seccomp (when the probe reported
+    /// `Available`), and Seatbelt are all genuinely enforced on the real spawned
+    /// child — but **Landlock is not**. `restrict_self()` runs only inside
+    /// `probe.rs`'s throwaway probe child, never on the process bwrap actually execs
+    /// (bwrap has no native Landlock flag, unlike its native `--seccomp FD`). So a
+    /// `Tier::Sandbox` attestation reached via `achieved_tier()`'s OR because Landlock
+    /// probed `Available` — rather than because Seatbelt or seccomp did — is really
+    /// only bwrap namespace isolation, nothing more, despite the tier claiming
+    /// `Sandbox`. See `achieved_tier()`'s doc comment for the full per-mechanism
+    /// breakdown and the tracked follow-up (a pre-exec wrapper) that would close this.
     fn attest(&self, h: &Handle) -> Attestation {
         let meta = self.handles.get(&h.id);
         let (tier, bwrap_pid) = meta
