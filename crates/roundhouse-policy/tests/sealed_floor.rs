@@ -1,7 +1,7 @@
-use roundhouse_core::Tier;
+use roundhouse_core::{PolicyDecision, Tier};
 use roundhouse_policy::engine::{CompiledRule, Outcome, PolicyEngine, Predicate, Scope};
 use roundhouse_policy::sealed::{home_dir, SealedContext};
-use roundhouse_policy::{FsOp, ServerId, TaskParams};
+use roundhouse_policy::{FsOp, ParsedCommand, Policy, PolicyInput, ServerId, Taint, TaskParams};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -146,4 +146,97 @@ fn ssh_write_sibling_prefix_does_not_seal_match() {
         Outcome::Ask,
         "a sibling prefix like ~/.sshfoo must not match the .ssh sealed rule"
     );
+}
+
+#[test]
+fn trait_object_applies_sealed_floor_to_ssh_write() {
+    let home = home_dir().expect("HOME must be set for this test");
+    let policy: Box<dyn Policy> = Box::new(PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::fs_write_prefix(home.join(".ssh").to_str().unwrap()),
+    )]));
+    let input = PolicyInput {
+        params: TaskParams::Fs {
+            op: FsOp::Write,
+            path: PathBuf::from("~/.ssh/authorized_keys"),
+            canonical: Ok(home.join(".ssh/authorized_keys")),
+        },
+        taint: Taint::Trusted,
+    };
+    assert_eq!(policy.decide(&input), PolicyDecision::Deny);
+}
+
+#[test]
+fn trait_object_allows_workspace_write_with_default_context() {
+    let policy: Box<dyn Policy> = Box::new(PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::fs_write_prefix("/workspace"),
+    )]));
+    let input = PolicyInput {
+        params: TaskParams::Fs {
+            op: FsOp::Write,
+            path: PathBuf::from("/workspace/x"),
+            canonical: Ok(PathBuf::from("/workspace/x")),
+        },
+        taint: Taint::Trusted,
+    };
+    assert_eq!(
+        policy.decide(&input),
+        PolicyDecision::Allow,
+        "default empty state_dir must not seal-match an ordinary workspace path"
+    );
+}
+
+#[test]
+fn trait_object_seal_denies_mcp_with_empty_resolved_set() {
+    let policy: Box<dyn Policy> = Box::new(PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::mcp(ServerId("filesystem".into()), None),
+    )]));
+    let input = PolicyInput {
+        params: TaskParams::Mcp {
+            server: ServerId("filesystem".into()),
+            tool: "read_file".into(),
+            args: serde_json::json!({}),
+        },
+        taint: Taint::Trusted,
+    };
+    assert_eq!(
+        policy.decide(&input),
+        PolicyDecision::Deny,
+        "default empty resolved_mcp_servers must fail-closed for MCP"
+    );
+}
+
+#[test]
+fn edit_on_authorized_keys_is_sealed_despite_allow_rule() {
+    let home = home_dir().expect("HOME must be set for this test");
+    let params = TaskParams::Fs {
+        op: FsOp::Edit,
+        path: PathBuf::from("~/.ssh/authorized_keys"),
+        canonical: Ok(home.join(".ssh/authorized_keys")),
+    };
+    let policy = PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::fs_edit_prefix(home.join(".ssh").to_str().unwrap()),
+    )]);
+    let decision = policy.decide_sealed(&params, false, &ctx());
+    assert_eq!(decision.outcome, Outcome::Deny);
+    assert_eq!(decision.rule.unwrap().0, "sealed:ssh-write");
+}
+
+#[test]
+fn priv_escalation_program_matches_absolute_path() {
+    let params = TaskParams::Shell(ParsedCommand {
+        program: "/usr/bin/sudo".into(),
+        argv: vec!["whoami".into()],
+    });
+    let policy = PolicyEngine::from_rules(vec![]);
+    let decision = policy.decide_sealed(&params, false, &ctx());
+    assert_eq!(decision.outcome, Outcome::Deny);
+    assert_eq!(decision.rule.unwrap().0, "sealed:priv-escalation-program");
 }

@@ -58,12 +58,27 @@ pub struct Decision {
 /// gets a matcher here.
 #[derive(Debug, Clone)]
 pub enum Predicate {
-    FsPrefix { op: FsOp, prefix: PathBuf },
-    FsExact { op: FsOp, path: PathBuf },
+    FsPrefix {
+        op: FsOp,
+        prefix: PathBuf,
+    },
+    FsExact {
+        op: FsOp,
+        path: PathBuf,
+    },
     // Shell { .. } added by Task 14, matched against a single already-resolved node
-    Http { method: Option<Method>, url_prefix: String },
-    Mcp { server: ServerId, tool: Option<String> },
-    Git { subcommand: String, argv_prefix: Vec<String> },
+    Http {
+        method: Option<Method>,
+        url_prefix: String,
+    },
+    Mcp {
+        server: ServerId,
+        tool: Option<String>,
+    },
+    Git {
+        subcommand: String,
+        argv_prefix: Vec<String>,
+    },
     Agent {
         provider: Option<ProviderId>,
         model: Option<String>,
@@ -122,14 +137,25 @@ impl Predicate {
     fn matches(&self, params: &TaskParams) -> Option<(usize, usize)> {
         // returns (literal_prefix_len, bound_predicate_count) on match
         match (self, params) {
-            (Predicate::FsExact { op: pop, path: ppath }, TaskParams::Fs { op, canonical: Ok(c), .. })
-                if matches_op(pop, op) && c == ppath =>
-            {
-                Some((ppath.to_string_lossy().len(), 2))
-            }
-            (Predicate::FsPrefix { op: pop, prefix }, TaskParams::Fs { op, canonical: Ok(c), .. })
-                if matches_op(pop, op) && c.starts_with(prefix) =>
-            {
+            (
+                Predicate::FsExact {
+                    op: pop,
+                    path: ppath,
+                },
+                TaskParams::Fs {
+                    op,
+                    canonical: Ok(c),
+                    ..
+                },
+            ) if matches_op(pop, op) && c == ppath => Some((ppath.to_string_lossy().len(), 2)),
+            (
+                Predicate::FsPrefix { op: pop, prefix },
+                TaskParams::Fs {
+                    op,
+                    canonical: Ok(c),
+                    ..
+                },
+            ) if matches_op(pop, op) && c.starts_with(prefix) => {
                 Some((prefix.to_string_lossy().len(), 1))
             }
             (Predicate::Http { method, url_prefix }, TaskParams::Http { method: m, url, .. }) => {
@@ -137,16 +163,34 @@ impl Predicate {
                 (method_ok && url.starts_with(url_prefix.as_str()))
                     .then(|| (url_prefix.len(), if method.is_some() { 2 } else { 1 }))
             }
-            (Predicate::Mcp { server, tool }, TaskParams::Mcp { server: s, tool: t, .. }) => {
+            (
+                Predicate::Mcp { server, tool },
+                TaskParams::Mcp {
+                    server: s, tool: t, ..
+                },
+            ) => {
                 let tool_ok = tool.as_ref().map(|x| x == t).unwrap_or(true);
-                (server == s && tool_ok).then(|| (server.0.len(), if tool.is_some() { 2 } else { 1 }))
-            }
-            (Predicate::Git { subcommand, argv_prefix }, TaskParams::Git { subcommand: sc, argv, .. }) => {
-                (subcommand == sc && argv.starts_with(argv_prefix))
-                    .then(|| (subcommand.len(), 1 + argv_prefix.len()))
+                (server == s && tool_ok)
+                    .then(|| (server.0.len(), if tool.is_some() { 2 } else { 1 }))
             }
             (
-                Predicate::Agent { provider, model, max_tier },
+                Predicate::Git {
+                    subcommand,
+                    argv_prefix,
+                },
+                TaskParams::Git {
+                    subcommand: sc,
+                    argv,
+                    ..
+                },
+            ) => (subcommand == sc && argv.starts_with(argv_prefix))
+                .then(|| (subcommand.len(), 1 + argv_prefix.len())),
+            (
+                Predicate::Agent {
+                    provider,
+                    model,
+                    max_tier,
+                },
                 TaskParams::Agent {
                     provider: p,
                     model: m,
@@ -160,7 +204,7 @@ impl Predicate {
                     .filter(|b| **b)
                     .count()
                     + 1;
-                (provider_ok && model_ok && *tier_request <= *max_tier).then(|| (0, bound))
+                (provider_ok && model_ok && *tier_request <= *max_tier).then_some((0, bound))
             }
             _ => None,
         }
@@ -239,7 +283,12 @@ impl PolicyEngine {
     /// documented escape is `round daemon --unsealed`, which must be recorded on
     /// every task in the session once `TaskSecurity`/attestation lands
     /// (Tasks 17/25), never silent.
-    pub fn decide_sealed(&self, params: &TaskParams, unsealed: bool, ctx: &crate::sealed::SealedContext) -> Decision {
+    pub fn decide_sealed(
+        &self,
+        params: &TaskParams,
+        unsealed: bool,
+        ctx: &crate::sealed::SealedContext,
+    ) -> Decision {
         if !unsealed {
             for rule in crate::sealed::sealed_rules() {
                 if (rule.matches)(params, ctx) {
@@ -256,7 +305,10 @@ impl PolicyEngine {
     /// A path that fails to canonicalise is Deny, never Ask — a human cannot
     /// evaluate a dangling symlink or a TOCTOU race (§6.2).
     pub fn decide(&self, params: &TaskParams) -> Decision {
-        if let TaskParams::Fs { canonical: Err(_), .. } = params {
+        if let TaskParams::Fs {
+            canonical: Err(_), ..
+        } = params
+        {
             return Decision {
                 outcome: Outcome::Deny,
                 rule: None,
@@ -326,6 +378,8 @@ impl PolicyEngine {
 /// through the trait-object call path either.
 impl crate::Policy for PolicyEngine {
     fn decide(&self, input: &PolicyInput) -> PolicyDecision {
-        self.decide_sealed(&input.params, self.unsealed, &self.sealed_ctx()).outcome.into()
+        self.decide_sealed(&input.params, self.unsealed, &self.sealed_ctx())
+            .outcome
+            .into()
     }
 }

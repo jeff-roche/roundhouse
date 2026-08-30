@@ -1,7 +1,7 @@
 use crate::{FsOp, TaskParams};
 use roundhouse_core::Tier;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A compiled-in rule on the sealed floor. Sealed rules are matched before any
 /// config-derived rule and cannot be overridden by them. The one documented
@@ -35,10 +35,11 @@ pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Safe default for unit tests that do not exercise sealed rules. A
-/// non-existent/empty `state_dir` and `daemon_binary` cannot `starts_with` match
-/// any real path, `resolved_mcp_servers` is empty (fail-closed for MCP), and
-/// both tiers are `None` so a tier shortfall can never fire.
+/// Safe default for unit tests that do not exercise sealed rules. The
+/// state-dir and daemon-binary matchers explicitly reject empty paths (so the
+/// default empty `PathBuf`s never match), `resolved_mcp_servers` is empty
+/// (fail-closed for MCP), and both tiers are `None` so a tier shortfall can
+/// never fire.
 pub fn default_context() -> SealedContext {
     SealedContext {
         state_dir: PathBuf::new(),
@@ -102,13 +103,16 @@ pub fn sealed_rules() -> &'static [SealedRule] {
 
 fn sealed_write_under(params: &TaskParams, suffix: &str) -> bool {
     let TaskParams::Fs {
-        op: FsOp::Write,
+        op,
         canonical: Ok(c),
         ..
     } = params
     else {
         return false;
     };
+    if !matches!(op, FsOp::Write | FsOp::Edit) {
+        return false;
+    }
     let Some(home) = home_dir() else { return false };
     c.starts_with(home.join(suffix))
 }
@@ -117,14 +121,20 @@ fn sealed_write_under(params: &TaskParams, suffix: &str) -> bool {
 /// version of this rule set omitted it, which would have let an agent overwrite
 /// the very store its own audit trail lives in.
 fn sealed_state_dir_write(params: &TaskParams, ctx: &SealedContext) -> bool {
+    if ctx.state_dir.as_os_str().is_empty() {
+        return false;
+    }
     let TaskParams::Fs {
-        op: FsOp::Write,
+        op,
         canonical: Ok(c),
         ..
     } = params
     else {
         return false;
     };
+    if !matches!(op, FsOp::Write | FsOp::Edit) {
+        return false;
+    }
     c.starts_with(&ctx.state_dir)
 }
 
@@ -132,14 +142,20 @@ fn sealed_state_dir_write(params: &TaskParams, ctx: &SealedContext) -> bool {
 /// of the running daemon is exactly the kind of escalation the sealed floor
 /// exists to block.
 fn sealed_daemon_binary_write(params: &TaskParams, ctx: &SealedContext) -> bool {
+    if ctx.daemon_binary.as_os_str().is_empty() {
+        return false;
+    }
     let TaskParams::Fs {
-        op: FsOp::Write,
+        op,
         canonical: Ok(c),
         ..
     } = params
     else {
         return false;
     };
+    if !matches!(op, FsOp::Write | FsOp::Edit) {
+        return false;
+    }
     c == &ctx.daemon_binary
 }
 
@@ -150,7 +166,12 @@ fn sealed_program(params: &TaskParams) -> bool {
     let TaskParams::Shell(cmd) = params else {
         return false;
     };
-    SEALED_PROGRAMS.contains(&cmd.program.as_str())
+    let program = cmd.program.as_str();
+    SEALED_PROGRAMS.contains(&program)
+        || Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| SEALED_PROGRAMS.contains(&name))
 }
 
 /// §6.2's sealed floor: "MCP tools on unresolved servers." A server that never
