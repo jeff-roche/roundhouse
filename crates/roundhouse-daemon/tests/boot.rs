@@ -11,6 +11,7 @@ use roundhouse_core::{
     TaskRunner, Tier, Timestamp,
 };
 use roundhouse_daemon::boot::run_boot_sequence;
+use roundhouse_policy::registry::ApprovalRegistry;
 use roundhouse_store::{open, spawn_writer};
 
 fn now_ts() -> Timestamp {
@@ -101,8 +102,9 @@ async fn run_boot_sequence_reports_both_interrupted_and_suspended_tasks() {
     let reopened_store = open(&db_path).await.unwrap();
     let reopened_writer = spawn_writer(reopened_store).await;
     let store_for_boot = open(&db_path).await.unwrap();
+    let registry = ApprovalRegistry::new();
 
-    let report = run_boot_sequence(&store_for_boot, &reopened_writer, &runner)
+    let report = run_boot_sequence(&store_for_boot, &reopened_writer, &runner, &registry)
         .await
         .unwrap();
 
@@ -111,4 +113,10 @@ async fn run_boot_sequence_reports_both_interrupted_and_suspended_tasks() {
     assert_eq!(report.suspended[0].task_id, suspended_task);
     assert_eq!(report.suspended[0].session_id, session_id);
     assert_eq!(report.suspended[0].reason, SuspendReason::AwaitingReply);
+
+    // This task's reason is AwaitingReply, not AwaitingApproval, so it must
+    // NOT be re-armed into the approval registry (that registry only tracks
+    // AwaitingApproval — other suspend kinds re-arm through their own
+    // subsystems).
+    assert!(registry.list().is_empty());
 }

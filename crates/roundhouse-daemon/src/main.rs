@@ -84,8 +84,14 @@ async fn main() -> color_eyre::Result<()> {
     let recovery_store = roundhouse_store::open(&store_path).await?;
     let recovery_writer = roundhouse_store::spawn_writer(recovery_store).await;
     let recovery_pool_for_scan = roundhouse_store::open(&store_path).await?;
-    let boot_report =
-        boot::run_boot_sequence(&recovery_pool_for_scan, &recovery_writer, &runner).await?;
+    let approval_registry = roundhouse_policy::registry::ApprovalRegistry::new();
+    let boot_report = boot::run_boot_sequence(
+        &recovery_pool_for_scan,
+        &recovery_writer,
+        &runner,
+        &approval_registry,
+    )
+    .await?;
     if !boot_report.interrupted.is_empty() || !boot_report.suspended.is_empty() {
         println!(
             "boot recovery: {} task(s) interrupted, {} task(s) still suspended from a previous daemon run",

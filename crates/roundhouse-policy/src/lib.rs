@@ -9,7 +9,9 @@
 //! `docs/architecture/02-system-architecture.md` §5.2 and §6 (policy/config).
 #![forbid(unsafe_code)]
 
+pub mod approval;
 pub mod engine;
+pub mod registry;
 pub mod sealed;
 pub mod shell;
 
