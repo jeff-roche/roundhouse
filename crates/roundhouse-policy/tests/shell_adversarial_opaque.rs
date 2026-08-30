@@ -115,3 +115,50 @@ fn adversarial_table() {
         _ => panic!("40-deep nesting must be rejected by the pre-parser depth guard"),
     }
 }
+
+#[test]
+fn parser_resource_guard_blocks_quote_desync_bypass_probes() {
+    use std::time::{Duration, Instant};
+
+    let env = SessionEnv::default();
+    let budget = Duration::from_millis(500);
+
+    let probes = [
+        (
+            format!("'\n{}", "(".repeat(30)),
+            "newline-desync paren probe",
+        ),
+        (
+            format!("\\'{}", "(".repeat(30)),
+            "escaped-quote paren probe",
+        ),
+        (
+            format!("\"'\"\n{}id{}", "$(".repeat(2000), ")".repeat(2000)),
+            "double-quote/newline command-substitution probe",
+        ),
+        (
+            "echo \\'${".repeat(2000),
+            "escaped-quote parameter-expansion probe",
+        ),
+    ];
+
+    for (cmd, label) in probes {
+        let start = Instant::now();
+        let result = classify_shell(&cmd, &env);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < budget,
+            "{label} must be rejected by the guard within {budget:?}, took {elapsed:?}"
+        );
+        match result {
+            ShellClassification::HardDeny(hint) => {
+                assert_eq!(
+                    hint.error, "unparseable_shell_command",
+                    "{label} must be classified as parse failure"
+                );
+            }
+            _ => panic!("{label} must be hard-denied by the pre-parser guard"),
+        }
+    }
+}

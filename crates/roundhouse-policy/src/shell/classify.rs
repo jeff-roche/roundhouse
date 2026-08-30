@@ -30,24 +30,19 @@ fn input_guard(raw: &str) -> Result<(), OpaqueReason> {
     Ok(())
 }
 
-/// Scans `raw` for unclosed `(`/backtick/`${` depth. Single-quoted regions are skipped
-/// because their contents are literal and cannot drive parser nesting.
+/// Scans `raw` for the maximum nesting depth of `(`, backtick, and `${` openers.
+///
+/// This scan is deliberately **quote-naive**: any quote-tracking state machine that
+/// differs from `brush-parser`'s own lexer can be desynced to bypass the guard, as
+/// demonstrated by probes such as `'\n` + 30×`(` or `echo \'${`×2000. Counting every
+/// opener unconditionally is fail-closed: paren/backtick-heavy quoted literals may
+/// be denied as over-cap, but availability is the only cost, while correctness
+/// (no parser hang/abort) is preserved.
 fn nesting_depth(raw: &str) -> usize {
     let mut depth = 0usize;
     let mut max_depth = 0usize;
-    let mut in_single_quote = false;
     let mut chars = raw.chars().peekable();
     while let Some(ch) = chars.next() {
-        if in_single_quote {
-            if ch == '\'' {
-                in_single_quote = false;
-            }
-            continue;
-        }
-        if ch == '\'' {
-            in_single_quote = true;
-            continue;
-        }
         match ch {
             '(' | '`' => {
                 depth += 1;
