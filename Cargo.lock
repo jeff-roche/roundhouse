@@ -3088,6 +3088,7 @@ dependencies = [
  "deadpool-sqlite",
  "once_cell",
  "roundhouse-core",
+ "roundhouse-provider",
  "rusqlite",
  "rusqlite_migration",
  "serde",

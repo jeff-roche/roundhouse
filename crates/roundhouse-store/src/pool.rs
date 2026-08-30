@@ -32,6 +32,9 @@ pub fn open_memory_connection() -> rusqlite::Connection {
 /// - `Migration`: schema migration failures
 /// - `Pool`: deadpool connection pool exhaustion or shutdown
 /// - `Interact`: async executor (tokio) task panicked while interacting with the connection
+/// - `NotFound`: a genuine domain-level lookup failure (e.g. no `TaskCompleted` event found
+///   for a task) — distinct from `Interact`, which this crate's convention reserves for
+///   interact-closure/panic failures specifically, not ordinary "no such row" outcomes.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("io error: {0}")]
@@ -44,6 +47,8 @@ pub enum StoreError {
     Pool(#[from] deadpool_sqlite::PoolError),
     #[error("interact error: {0}")]
     Interact(String),
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 /// A WAL-mode SQLite connection pool. The `pool` field is public (not `pub(crate)`) because

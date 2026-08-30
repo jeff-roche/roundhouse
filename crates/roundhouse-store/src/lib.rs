@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod blobs;
+pub mod cost;
 mod fold;
 mod migrations;
 mod pool;
