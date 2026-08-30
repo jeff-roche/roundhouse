@@ -2,8 +2,9 @@ use brush_parser::ast;
 use brush_parser::ast::SourceLocation;
 
 use super::classify::{
-    parse_command, parse_word_pieces, piece_is_opaque, resolve_variable_expansions, Classification,
-    OpaqueReason, ParsedShellAst, SessionEnv,
+    check_input_guard, parse_command, parse_word_pieces, piece_is_opaque,
+    resolve_variable_expansions, with_parse_stack, Classification, GuardRejection, OpaqueReason,
+    ParsedShellAst, SessionEnv, MAX_INPUT_BYTES,
 };
 
 /// An opaque construct found in the shell AST, with its source span when available.
@@ -30,20 +31,77 @@ pub enum ShellClassification {
 /// opaque: CommandSubstitution, ProcessSubstitution, Eval, Source, HereDoc, Backgrounding.
 /// Intended to be invoked *before* VariableExpansion resolution so quoted literals such
 /// as `'$(id)'` are not misclassified after quote stripping.
+///
+/// The walk recurses in lockstep with the AST's nesting, so it runs on the dedicated
+/// bounded parse stack (see `classify::with_parse_stack`). A failure to get onto that
+/// stack fails closed: the caller sees at least one `ParseError` node.
 pub fn find_opaque_nodes(program: &ast::Program) -> Vec<OpaqueNode> {
-    let mut found = Vec::new();
-    find_opaque_in_program(program, &mut found);
-    found
+    with_parse_stack(|| {
+        let mut found = Vec::new();
+        find_opaque_in_program(program, &mut found);
+        found
+    })
+    .unwrap_or_else(|_| {
+        vec![OpaqueNode {
+            reason: OpaqueReason::ParseError,
+            span: (0, 0),
+        }]
+    })
 }
 
+fn parse_failure_hint() -> RestructureHint {
+    RestructureHint {
+        error: "unparseable_shell_command",
+        rule: "sealed:shell-parse-failure",
+        hint:
+            "The command could not be parsed as shell syntax. Restructure as a plain argv command."
+                .into(),
+    }
+}
+
+/// Honest hints for the cheap pre-parser guard. These inputs were *not* necessarily
+/// unparseable — they were refused before the parser ever saw them — so telling the model
+/// "could not be parsed" would send it chasing a syntax error that isn't there. The
+/// machine-readable `error`/`rule` codes stay identical to the parse-failure case.
+fn guard_rejection_hint(rejection: GuardRejection) -> RestructureHint {
+    let hint = match rejection {
+        GuardRejection::TooLarge => format!(
+            "The command is longer than the {MAX_INPUT_BYTES}-byte limit the shell \
+             classifier will inspect. Split it into smaller commands."
+        ),
+        GuardRejection::TooComplex => "The command contains too many shell grouping \
+             constructs (parentheses, braces, backticks, or compound-command keywords) \
+             for the classifier to inspect. Restructure it as one or more plain argv \
+             commands."
+            .to_string(),
+    };
+    RestructureHint {
+        error: "unparseable_shell_command",
+        rule: "sealed:shell-parse-failure",
+        hint,
+    }
+}
+
+/// Classify an untrusted shell command string.
+///
+/// The entire body — parse, opaque-node walk, and expansion walk — runs on a dedicated
+/// thread with an explicitly sized stack, so that no input within `MAX_INPUT_BYTES` can
+/// drive `brush-parser`'s (or this module's) recursion into an uncatchable stack-overflow
+/// abort. See `classify::PARSE_STACK_BYTES` for the calibration.
 pub fn classify_shell(raw: &str, env: &SessionEnv) -> ShellClassification {
+    if let Err(rejection) = check_input_guard(raw) {
+        return ShellClassification::HardDeny(guard_rejection_hint(rejection));
+    }
+    match with_parse_stack(|| classify_shell_inner(raw, env)) {
+        Ok(classification) => classification,
+        Err(_) => ShellClassification::HardDeny(parse_failure_hint()),
+    }
+}
+
+fn classify_shell_inner(raw: &str, env: &SessionEnv) -> ShellClassification {
     let mut cmd = match parse_command(raw) {
         Classification::Opaque(_) => {
-            return ShellClassification::HardDeny(RestructureHint {
-                error: "unparseable_shell_command",
-                rule: "sealed:shell-parse-failure",
-                hint: "The command could not be parsed as shell syntax. Restructure as a plain argv command.".into(),
-            });
+            return ShellClassification::HardDeny(parse_failure_hint());
         }
         Classification::Program(cmd) => cmd,
     };

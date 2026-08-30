@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -11,7 +12,57 @@ use brush_parser::word::{Parameter, ParameterExpr, WordPiece, WordPieceWithSourc
 use brush_parser::{Parser, ParserOptions};
 
 /// Byte-size cap on the raw shell command string (and on individual word strings).
-const MAX_INPUT_BYTES: usize = 64 * 1024;
+///
+/// 4 KiB. This is the *load-bearing* half of the stack-exhaustion bound: together with
+/// [`PARSE_STACK_BYTES`] it fixes a hard ceiling on how much stack any attacker-controlled
+/// input can drive `brush-parser` (and this module's own recursive AST walkers) to
+/// consume. See [`PARSE_STACK_BYTES`] for the calibration.
+///
+/// 4 KiB is far above any legitimate agent-emitted command line; over-cap inputs fail
+/// closed (hard-deny with a "restructure this" hint), so the cost of the lower cap is
+/// availability for pathological commands, never a missed dangerous classification.
+pub(crate) const MAX_INPUT_BYTES: usize = 4 * 1024;
+
+/// Stack reserved for the dedicated thread that every untrusted parse and every
+/// recursive walk over an untrusted AST runs on.
+///
+/// **Why a thread at all.** `brush-parser` is a recursive-descent (PEG) parser with no
+/// internal recursion limit, and this module's own AST walkers recurse in lockstep with
+/// it. A stack overflow in Rust is an *uncatchable* `SIGABRT` — not a panic, not
+/// recoverable with `catch_unwind` — so the only way to keep model-controlled shell
+/// syntax from killing the daemon is to make overflow unreachable. Three prior rounds
+/// tried to do that by enumerating the grammar's recursion points in a pre-parser guard;
+/// each enumeration turned out to be incomplete (the most recent gap: the extended-test
+/// `!` prefix operator, `peg.rs:215`, which recurses once per token and is not an opener
+/// any character-counting guard sees). This constant bounds the *resource* instead of the
+/// grammar, so it holds for recursion points nobody has found yet.
+///
+/// **Calibration** (all figures measured on this crate's `dev` profile, which has larger
+/// frames than `release`, i.e. the conservative direction; see the fix-round-4 section of
+/// `task-11-12-report.md` for the raw probe output):
+///
+/// | construct                       | stack/level | input bytes/level | stack per input byte |
+/// |---------------------------------|-------------|-------------------|----------------------|
+/// | `[[ ! ! … x ]]` (uncounted)     | 9,473 B     | 2                 | **4,737 B**          |
+/// | `echo $( $( … id ) )`           | 12,710 B    | 3                 | 4,237 B              |
+/// | `echo ${ ${ … X } }`            | 11,397 B    | 3                 | 3,799 B              |
+/// | `{ { … a; }; }`                 | 17,331 B    | 5                 | 3,466 B              |
+/// | `while a; do … done`            | 17,848 B    | 18                | 992 B                |
+/// | `if a; then … fi`               | 17,772 B    | 15                | 1,185 B              |
+/// | `(( ( ( … ) ) ))`               | 708 B       | 2                 | 354 B                |
+///
+/// 256 MiB / 4 KiB = 65,536 bytes of stack tolerated per byte of input. That is **13.8x**
+/// the densest construct measured, and still **3.7x** the deliberately paranoid bound of
+/// "some undiscovered construct recurses once per *single* input byte at the largest
+/// per-level frame ever measured here (17,848 B)" — which would need 15,050 bytes of
+/// input to overflow, well past the 4 KiB cap. Empirically, the worst known payload
+/// (`[[ ! ! … x ]]`) only overflows 256 MiB at 56,679 input bytes.
+///
+/// **Why this is cheap.** A thread stack is `mmap`ed lazily: only pages actually touched
+/// are faulted in. Measured spawn+join cost is ~50 µs and peak RSS is unchanged whether
+/// the stack size is 1 MiB or 256 MiB (2.7–2.8 MiB VmHWM over 2,000 iterations either
+/// way).
+const PARSE_STACK_BYTES: usize = 256 * 1024 * 1024;
 
 /// Structural complexity budget for the pre-parser guard: total count of every
 /// grammar-recursing opener (`(`, backtick, `${`, bare `{`, `[[`) plus the whole-word
@@ -22,18 +73,79 @@ const MAX_INPUT_BYTES: usize = 64 * 1024;
 /// Cap 16 is chosen to block the smallest observed crash payload (25 nested `case`
 /// clauses, ~500 bytes) and the 1000/1500/2000-deep compound-command probes while
 /// leaving normal arithmetic such as `(( i = i + 1 ))` (2 openers) well within budget.
+///
+/// Because the metric is a total *occurrence count* rather than a nesting depth, a flat
+/// but bracket-heavy one-liner (a long `awk`/`jq` program, say) can exceed it even though
+/// it would have parsed fine. That is an accepted fail-closed cost, and the rejection is
+/// reported with its own hint (see [`GuardRejection`]) rather than being mislabelled a
+/// parse failure.
 const MAX_STRUCTURAL_BUDGET: usize = 16;
 
+/// Why the cheap pre-parser guard rejected an input. Kept separate from
+/// [`OpaqueReason`] (whose variants are frozen by the module contract) purely so callers
+/// can render an honest hint: a budget rejection is *not* a parse failure, and saying so
+/// would mislead a model that emitted a perfectly valid but paren-heavy one-liner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuardRejection {
+    TooLarge,
+    TooComplex,
+}
+
 /// Cheap pre-parser guard: rejects inputs that are too large or exceed the structural
-/// complexity budget. Over-limit inputs are treated as parse failures and hard-denied.
-fn input_guard(raw: &str) -> Result<(), OpaqueReason> {
+/// complexity budget. Over-limit inputs are hard-denied.
+///
+/// This is a *first-pass filter*, not the stack-exhaustion backstop — that role belongs
+/// to [`PARSE_STACK_BYTES`]. It is kept because it is essentially free and because it
+/// still cheaply blocks the exponential-backtracking (CPU, not stack) blowups documented
+/// in earlier rounds, e.g. 25 nested `case` clauses in 502 bytes.
+pub(crate) fn check_input_guard(raw: &str) -> Result<(), GuardRejection> {
     if raw.len() > MAX_INPUT_BYTES {
-        return Err(OpaqueReason::ParseError);
+        return Err(GuardRejection::TooLarge);
     }
     if structural_budget(raw) > MAX_STRUCTURAL_BUDGET {
-        return Err(OpaqueReason::ParseError);
+        return Err(GuardRejection::TooComplex);
     }
     Ok(())
+}
+
+fn input_guard(raw: &str) -> Result<(), OpaqueReason> {
+    check_input_guard(raw).map_err(|_| OpaqueReason::ParseError)
+}
+
+thread_local! {
+    /// True while the current thread *is* a parse-stack thread, so nested calls through
+    /// the module's public entry points reuse the existing big stack instead of spawning
+    /// another one.
+    static ON_PARSE_STACK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `f` on a dedicated thread with [`PARSE_STACK_BYTES`] of stack and joins it.
+///
+/// Every code path in this module that parses untrusted shell text or recurses over an
+/// untrusted AST goes through here. Re-entrant: if the caller is already on a parse-stack
+/// thread, `f` runs inline.
+///
+/// Returns `Err(OpaqueReason::ParseError)` if the thread could not be spawned or if `f`
+/// panicked — both fail closed into a hard-deny.
+pub(crate) fn with_parse_stack<T, F>(f: F) -> Result<T, OpaqueReason>
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    if ON_PARSE_STACK.with(Cell::get) {
+        return Ok(f());
+    }
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("rh-shell-classify".to_string())
+            .stack_size(PARSE_STACK_BYTES)
+            .spawn_scoped(scope, || {
+                ON_PARSE_STACK.with(|flag| flag.set(true));
+                f()
+            })
+            .map_err(|_| OpaqueReason::ParseError)?;
+        handle.join().map_err(|_| OpaqueReason::ParseError)
+    })
 }
 
 /// Quote-naive count of all grammar-recursing openers/keywords in `raw`. Counting
@@ -55,10 +167,9 @@ fn structural_budget(raw: &str) -> usize {
                 i += 2;
             }
             b'{' => {
-                // Do not double-count the `{` in a `${` opener; that is counted below.
-                if i == 0 || bytes[i - 1] != b'$' {
-                    budget += 1;
-                }
+                // Always a bare brace: the `$` arm below consumes `${` as a single
+                // two-byte unit, so the `{` of a `${` opener is never visited here.
+                budget += 1;
                 i += 1;
             }
             b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'{' => {
@@ -129,7 +240,8 @@ impl ParsedShellAst {
     /// backtick form). Used after `resolve_variable_expansions` to confirm that step 2
     /// left opaque constructs untouched for step 3 to hard-deny.
     pub fn contains_unresolved_command_substitution(&self) -> bool {
-        any_word_piece(&self.program_ast, piece_is_opaque)
+        // Recursive walk over untrusted AST → bounded stack; fail closed on any error.
+        with_parse_stack(|| any_word_piece(&self.program_ast, piece_is_opaque)).unwrap_or(true)
     }
 }
 
@@ -151,10 +263,20 @@ pub enum Classification {
 
 /// Parse a shell command string. Parse failures are returned as
 /// `Classification::Opaque(OpaqueReason::ParseError)` rather than panicking.
+///
+/// The parse itself runs on a dedicated [`PARSE_STACK_BYTES`] stack, so no input within
+/// [`MAX_INPUT_BYTES`] can drive `brush-parser`'s recursion into a stack overflow.
 pub fn parse_command(raw: &str) -> Classification {
     if let Err(reason) = input_guard(raw) {
         return Classification::Opaque(reason);
     }
+    match with_parse_stack(|| parse_command_inner(raw)) {
+        Ok(classification) => classification,
+        Err(reason) => Classification::Opaque(reason),
+    }
+}
+
+fn parse_command_inner(raw: &str) -> Classification {
     let options = ParserOptions::default();
     let reader = Cursor::new(raw);
     let mut parser = Parser::new(reader, &options);
@@ -188,8 +310,11 @@ impl SessionEnv {
 /// `env`. Missing variables expand to the empty string. Any word containing a command
 /// substitution, process substitution, arithmetic expansion, or non-plain parameter
 /// expression is left exactly as-is so that `find_opaque_nodes` can hard-deny it.
+///
+/// The walk recurses in lockstep with the AST's nesting, so it runs on the same
+/// dedicated [`PARSE_STACK_BYTES`] stack the parse used.
 pub fn resolve_variable_expansions(ast: &mut Program, env: &SessionEnv) {
-    expand_in_program(ast, env);
+    let _ = with_parse_stack(|| expand_in_program(ast, env));
 }
 
 // ---------------------------------------------------------------------------
