@@ -102,6 +102,15 @@ pub enum Predicate {
 pub enum ArgMatcher {
     Exact(Vec<String>),
     ArgvPrefix(Vec<String>),
+    /// Positional glob matching: pattern index `i` is checked ONLY against
+    /// `argv[i]` — pattern 0 against `argv[0]`, pattern 1 against `argv[1]`,
+    /// and so on. This is NOT "any pattern matches any arg": a pattern with
+    /// no corresponding argv slot (argv shorter than the pattern list) fails
+    /// to match that position, and an argv slot with no corresponding
+    /// pattern is simply unconstrained (not checked at all — only the first
+    /// `patterns.len()` argv positions are constrained). E.g.
+    /// `Glob(vec!["*.rs".into()])` matches `["a.rs"]` and `["a.rs", "extra"]`
+    /// but not `["subdir", "a.rs"]`.
     Glob(Vec<String>),
 }
 
@@ -114,6 +123,8 @@ impl Predicate {
             allow_interpreter: false,
         }
     }
+    /// A program match requiring `argv` to start with `prefix` (in order,
+    /// from position 0).
     pub fn argv_prefix(program: &str, prefix: &[&str]) -> Self {
         Predicate::Shell {
             program: program.to_string(),
@@ -168,7 +179,13 @@ impl Predicate {
         }
     }
 
-    fn matches(&self, params: &TaskParams) -> Option<(usize, usize)> {
+    /// `outcome` is the *rule's own* outcome this predicate is attached to —
+    /// needed only by the `Shell` arm's interpreter gate (see its comment):
+    /// an interpreter program must force a bare `Allow` rule to fall through
+    /// to no-match, but must NOT do the same to an explicit `Deny` rule,
+    /// which is at least as restrictive as the default `Ask` a suppressed
+    /// match would otherwise fall back to.
+    fn matches(&self, params: &TaskParams, outcome: Outcome) -> Option<(usize, usize)> {
         // returns (literal_prefix_len, bound_predicate_count) on match
         match (self, params) {
             (
@@ -230,10 +247,17 @@ impl Predicate {
                 if cmd.program != *program {
                     return None;
                 }
-                // Interpreter programs force fall-through to no-match (-> Ask
-                // upstream) regardless of argv, unless the rule opted out
-                // (§6.3 step 6) — we do not analyse an interpreter's payload.
-                if crate::shell::interpreter::is_interpreter(program) && !allow_interpreter {
+                // Interpreter programs force a bare Allow rule to fall
+                // through to no-match (-> Ask upstream) regardless of argv,
+                // unless the rule opted out (§6.3 step 6) — we do not
+                // analyse an interpreter's payload. This must NOT also
+                // suppress a Deny-scoped rule: an operator-authored
+                // `Deny python` has to still produce Deny, not get weakened
+                // to the Ask default by falling through here (Important 4).
+                if crate::shell::interpreter::is_interpreter(program)
+                    && !allow_interpreter
+                    && outcome == Outcome::Allow
+                {
                     return None;
                 }
                 let matched = match matcher {
@@ -409,7 +433,11 @@ impl PolicyEngine {
         let mut matches: Vec<(&CompiledRule, usize, usize)> = self
             .rules
             .iter()
-            .filter_map(|r| r.predicate.matches(params).map(|(lp, bp)| (r, lp, bp)))
+            .filter_map(|r| {
+                r.predicate
+                    .matches(params, r.outcome)
+                    .map(|(lp, bp)| (r, lp, bp))
+            })
             .collect();
 
         if matches.iter().any(|(r, _, _)| r.outcome == Outcome::Deny) {

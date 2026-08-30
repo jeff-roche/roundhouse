@@ -21,9 +21,13 @@ use crate::shell::classify::{with_parse_stack, ParsedShellAst, SessionEnv};
 use crate::shell::opaque::{classify_shell, ShellClassification};
 use crate::{FsOp, ParsedCommand, PathErr, TaskParams};
 
-/// A single filesystem-write target produced by a shell redirection (`>`,
-/// `>>`, `&>`, ...) — evaluated as its own synthetic `Fs` write task, never
-/// folded into the program/argv match (§6.3 step 5).
+/// A single filesystem target produced by a shell redirection (`<`, `>`,
+/// `>>`, `&>`, `>&file`, ...) — evaluated as its own synthetic `Fs` task,
+/// never folded into the program/argv match (§6.3 step 5). `op` reflects the
+/// redirection's real direction: `FsOp::Read` for input-style redirects
+/// (`<`), `FsOp::Write` for every output-style form (`>`, `>>`, `<>`,
+/// `>|`, `&>`, `&>>`, and word-form `>&file`/`<&file` duplications that
+/// resolve to a path rather than a bare fd number).
 #[derive(Debug, Clone)]
 pub struct Redirection {
     pub op: FsOp,
@@ -189,24 +193,95 @@ fn attach_command_level_redirects(rl: &ast::RedirectList, out: &mut Vec<Resolved
     }
 }
 
-/// Only `Filename` targets produce a synthetic write task (task-13/14
-/// addendum ruling 1): heredocs, fd duplication, and process substitution
-/// don't write to a filesystem path, and `classify_shell` already treats
+/// Extracts every filesystem-path-shaped redirect target as a [`Redirection`]
+/// with the correct read/write direction. Heredocs and process substitution
+/// don't write to a filesystem path (and `classify_shell` already treats
 /// process substitution/heredocs as opaque upstream, so those forms should
-/// never actually reach here — but this must not panic or misresolve if one
-/// does.
+/// never actually reach here) — but this must not panic or misresolve if one
+/// does; unrecognized shapes are simply skipped.
+///
+/// Three real `IoRedirect`/`IoFileRedirectTarget` shapes produce a
+/// filesystem path (task-13/14 fix-round-1 Critical 2 / Important 5 — the
+/// original version only handled the first of these, silently dropping the
+/// other two, which let `&>`/`&>>`/`>&file` bypass every write-path policy
+/// rule entirely):
+///
+/// - `File(_, kind, Filename(w))` — the ordinary `<`/`>`/`>>`/`<>`/`>|` forms.
+///   `kind` distinguishes direction: `Read` -> `FsOp::Read`, everything else
+///   (`Write`/`Append`/`ReadAndWrite`/`Clobber`) -> `FsOp::Write` (each of
+///   those can write to the target, so failing closed to `Write` is correct
+///   even for `ReadAndWrite`'s `<>` form).
+/// - `File(_, kind, Duplicate(w))` — the word-form `<&word` / `>&word`
+///   duplications. Per brush-parser's own doc comment, after expansion `w`
+///   "could be a filename, a file descriptor, or a file descriptor and a
+///   \"-\" to indicate requested closure" — only treat it as a filesystem
+///   write/read when it's actually path-shaped (`duplicate_target_is_path`),
+///   never for a bare fd number or `-`, which are not filesystem paths at
+///   all.
+/// - `OutputAndError(w, _append)` — the `&>`/`&>>` "both stdout and stderr"
+///   form. Always a write.
 fn collect_redirect(r: &ast::IoRedirect, redirections: &mut Vec<Redirection>) {
-    if let ast::IoRedirect::File(_, _, ast::IoFileRedirectTarget::Filename(w)) = r {
-        redirections.push(Redirection {
-            op: FsOp::Write,
-            path: PathBuf::from(&w.value),
-        });
+    match r {
+        ast::IoRedirect::File(_, kind, ast::IoFileRedirectTarget::Filename(w)) => {
+            redirections.push(Redirection {
+                op: fs_op_for_kind(kind),
+                path: PathBuf::from(&w.value),
+            });
+        }
+        ast::IoRedirect::File(_, kind, ast::IoFileRedirectTarget::Duplicate(w)) => {
+            if duplicate_target_is_path(&w.value) {
+                redirections.push(Redirection {
+                    op: fs_op_for_kind(kind),
+                    path: PathBuf::from(&w.value),
+                });
+            }
+        }
+        ast::IoRedirect::OutputAndError(w, _append) => {
+            redirections.push(Redirection {
+                op: FsOp::Write,
+                path: PathBuf::from(&w.value),
+            });
+        }
+        ast::IoRedirect::HereDocument(..) | ast::IoRedirect::HereString(..) => {}
+        ast::IoRedirect::File(_, _, ast::IoFileRedirectTarget::Fd(_))
+        | ast::IoRedirect::File(_, _, ast::IoFileRedirectTarget::ProcessSubstitution(_, _)) => {}
     }
+}
+
+/// Maps a real `IoFileRedirectKind` to the `FsOp` it actually performs on its
+/// target path. `Read` is the only input-style kind; every other kind can
+/// write to (or truncate/create) the target.
+fn fs_op_for_kind(kind: &ast::IoFileRedirectKind) -> FsOp {
+    match kind {
+        ast::IoFileRedirectKind::Read | ast::IoFileRedirectKind::DuplicateInput => FsOp::Read,
+        ast::IoFileRedirectKind::Write
+        | ast::IoFileRedirectKind::Append
+        | ast::IoFileRedirectKind::ReadAndWrite
+        | ast::IoFileRedirectKind::Clobber
+        | ast::IoFileRedirectKind::DuplicateOutput => FsOp::Write,
+    }
+}
+
+/// A `Duplicate` redirect target (`<&word` / `>&word`) is only a filesystem
+/// path when, after expansion, it isn't a bare fd number or the `-`
+/// (close-fd) sentinel — matching brush-parser's own doc comment on
+/// `IoFileRedirectTarget::Duplicate`.
+fn duplicate_target_is_path(word_value: &str) -> bool {
+    !word_value.is_empty() && word_value != "-" && !word_value.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn walk_compound_command(cmd: &ast::CompoundCommand, out: &mut Vec<ResolvedNode>) {
     match cmd {
-        ast::CompoundCommand::Arithmetic(_) | ast::CompoundCommand::ArithmeticForClause(_) => {}
+        // Arithmetic expressions (`(( ... ))`) contain no executable
+        // commands. `ArithmeticForClauseCommand` (`for ((init;cond;incr))`)
+        // is different — it has its own `body: DoGroupCommand`, exactly
+        // like `ForClause`/`WhileClause`, and MUST be walked the same way:
+        // fix-round-1 Critical 1 found that leaving this a no-op let a
+        // `rm -rf` inside a C-style for-loop body reach exec with zero
+        // policy evaluation at all (an unwalked node never becomes a
+        // `ResolvedNode`, so it's simply invisible to `decide_pipeline`).
+        ast::CompoundCommand::Arithmetic(_) => {}
+        ast::CompoundCommand::ArithmeticForClause(c) => walk_do_group(&c.body, out),
         ast::CompoundCommand::BraceGroup(g) => walk_compound_list(&g.list, out),
         ast::CompoundCommand::Subshell(s) => walk_compound_list(&s.list, out),
         ast::CompoundCommand::ForClause(c) => walk_do_group(&c.body, out),

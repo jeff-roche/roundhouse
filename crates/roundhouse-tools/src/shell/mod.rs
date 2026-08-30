@@ -1,12 +1,17 @@
 //! Shell executor: direct exec without shell interpretation.
 //!
-//! This module has two execution modes:
+//! This module has three execution modes:
 //! - [`run_shell`] (below, Phase 1): "run to completion" — waits for the
 //!   full `tokio::process::Command::output()` and cannot be cancelled
 //!   mid-flight. Still the executor used by the demo/simple tool-call path.
 //! - [`cancel`] (Phase 2, Task 4): cancellable execution via `process-wrap`,
 //!   for callers that need to SIGTERM-then-SIGKILL a still-running shell
 //!   task (and its whole process group, not just the direct child).
+//! - [`execve_node`] (Phase 2, Task 13/14): the intended entry point for the
+//!   policy-decided pipeline path — takes a
+//!   `roundhouse_policy::shell::pipeline::ResolvedNode` (one already-parsed,
+//!   already-policy-checked pipeline node) instead of a raw `program`/`argv`
+//!   pair, and delegates straight to `run_shell`.
 
 mod cancel;
 
@@ -32,8 +37,11 @@ pub struct ShellOutput {
 }
 
 /// Runs `program` with `argv` via a direct exec — never through a shell interpreter.
-/// Pipeline/redirection/interpreter classification (§6.3) is Phase 2's brush-parser work;
-/// this executor is the bottom half only, given an already-resolved argv.
+/// Pipeline/redirection/interpreter classification (§6.3) is implemented by
+/// `roundhouse-policy`'s `shell::pipeline`/`shell::interpreter` modules
+/// (`resolve_nodes`, `decide_pipeline`, `is_interpreter`); this executor is the
+/// bottom half only, given an already-resolved argv. [`execve_node`] (below) is
+/// the entry point that takes a `ResolvedNode` straight from that classification.
 ///
 /// This direct-exec approach structurally eliminates a whole class of command-injection
 /// vulnerabilities: since `program` and `argv` go straight to the OS-level `execve()`
