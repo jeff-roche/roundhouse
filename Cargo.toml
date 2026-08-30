@@ -5,6 +5,7 @@ members = [
     "crates/roundhouse-proto",
     "crates/roundhouse-store",
     "crates/roundhouse-policy",
+    "crates/roundhouse-secrets",
     "crates/roundhouse-sandbox",
     "crates/roundhouse-provider",
     "crates/roundhouse-tools",

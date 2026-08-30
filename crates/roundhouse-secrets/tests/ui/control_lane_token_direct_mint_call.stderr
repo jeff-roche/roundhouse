@@ -1,0 +1,10 @@
+error[E0624]: associated function `mint_within_control_lane` is private
+ --> tests/ui/control_lane_token_direct_mint_call.rs:6:31
+  |
+6 |     let _ = ControlLaneToken::mint_within_control_lane();
+  |                               ^^^^^^^^^^^^^^^^^^^^^^^^ private associated function
+  |
+ ::: src/secret.rs
+  |
+  |     pub(crate) fn mint_within_control_lane() -> Self {
+  |     ------------------------------------------------ private associated function defined here

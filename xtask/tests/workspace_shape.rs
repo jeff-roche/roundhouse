@@ -6,6 +6,7 @@ const EXPECTED_MEMBERS: &[&str] = &[
     "crates/roundhouse-proto",
     "crates/roundhouse-store",
     "crates/roundhouse-policy",
+    "crates/roundhouse-secrets",
     "crates/roundhouse-sandbox",
     "crates/roundhouse-provider",
     "crates/roundhouse-tools",
@@ -24,7 +25,7 @@ const EXPECTED_MEMBERS: &[&str] = &[
 ];
 
 #[test]
-fn workspace_lists_all_eighteen_crates() {
+fn workspace_lists_all_expected_crates() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()

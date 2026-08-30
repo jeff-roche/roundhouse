@@ -18,6 +18,7 @@ mod migrations;
 mod pool;
 mod recovery;
 mod replay;
+mod session_events;
 mod suspended;
 mod tasks_view;
 mod txn;
@@ -42,6 +43,10 @@ pub use recovery::recover_interrupted_tasks;
 
 // Task 2 (Phase 2) exports: suspended-task enumeration
 pub use suspended::{suspended_tasks, SuspendedTask};
+
+// Task 18 (Phase 2) exports: session-scoped event reads (used by
+// roundhouse-secrets' keyring-fallback Degradation visibility test).
+pub use session_events::session_events;
 
 // CQRS read-model exports (storage replay / fold)
 pub use replay::StoredEvent;
