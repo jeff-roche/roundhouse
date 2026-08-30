@@ -75,12 +75,15 @@ async fn main() -> color_eyre::Result<()> {
     // `Running` state by a previous daemon process that died mid-run, and
     // enumerate tasks left `Suspended` (e.g. mid-approval) so they are at least
     // visible again after a restart. Without the first half, a `round daemon`
-    // killed mid-session leaves those tasks stuck in the log forever. See
-    // `roundhouse_daemon::boot` for exactly what this does and does not do —
-    // re-arming suspended approvals for live resolution is Task 15's job, not
-    // this one's. Runs once, here, between opening the store and starting the
-    // (possibly brand new) demo session — on a fresh `store_path` this is a
-    // cheap no-op scan over an empty `tasks` table.
+    // killed mid-session leaves those tasks stuck in the log forever. Task 15
+    // added the `ApprovalRegistry` constructed just below and threaded it
+    // through `run_boot_sequence` — this is the actual re-arm site: every
+    // persisted `Suspended{AwaitingApproval}` task gets registered live here,
+    // so a restarted daemon's registry isn't empty even though the approvals
+    // were always correctly sitting in the database. See `roundhouse_daemon::boot`
+    // for the re-arm loop itself. Runs once, here, between opening the store
+    // and starting the (possibly brand new) demo session — on a fresh
+    // `store_path` this is a cheap no-op scan over an empty `tasks` table.
     let recovery_store = roundhouse_store::open(&store_path).await?;
     let recovery_writer = roundhouse_store::spawn_writer(recovery_store).await;
     let recovery_pool_for_scan = roundhouse_store::open(&store_path).await?;

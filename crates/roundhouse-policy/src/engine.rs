@@ -39,7 +39,12 @@ impl From<Outcome> for PolicyDecision {
 /// `CompiledRule` is compiled from config, stable across reloads for the same
 /// rule text) that this plan does not specify — the same "materialized schema
 /// is Phase 0/1's responsibility" caveat this plan's own self-review already
-/// makes for the `tasks` cache table applies here too. Everywhere below that
+/// makes for the `tasks` cache table applies here too. `approval::
+/// core_rule_id_from_policy_rule_id` (Task 15) closes *part* of this gap with
+/// a one-way blake3-hash truncation used only when minting a persisted
+/// `SuspendReason::AwaitingApproval` event — it is explicitly a lossy
+/// stopgap, not the real bidirectional interning table this comment
+/// describes; that table is still unbuilt. Everywhere below that
 /// constructs a real `EventPayload` (Tasks 1, 2, 15, 21), the `Option<RuleId>`
 /// written is the frozen `core::RuleId(u64)`; everywhere else (`Decision`,
 /// `CompiledRule`, audit/debug output) it is this string type.
@@ -78,6 +83,16 @@ pub enum Predicate {
     Http {
         method: Option<Method>,
         url_prefix: String,
+        /// When `true`, `url` must equal `url_prefix` exactly rather than
+        /// merely start with it. Added for Task 15's `synthesize_grant`
+        /// (security fix round 1, finding 1): a plain `starts_with` match
+        /// let an approved URL like `https://api.example.com/v1/status` also
+        /// silently cover `.../v1/status?exfil=...` or
+        /// `.../v1/statusSECRET` — a human approving one exact call must not
+        /// grant a family of calls. Every non-grant caller (config-authored
+        /// rules via `Predicate::http_prefix`) sets this `false`, preserving
+        /// prefix semantics for everyone except grants.
+        exact: bool,
     },
     Mcp {
         server: ServerId,
@@ -86,6 +101,16 @@ pub enum Predicate {
     Git {
         subcommand: String,
         argv_prefix: Vec<String>,
+        /// When `true`, `argv` must equal `argv_prefix` exactly rather than
+        /// merely start with it. Added for Task 15's `synthesize_grant`
+        /// (security fix round 1, finding 2): a plain `starts_with` match
+        /// let an approved `git push origin main` also silently cover
+        /// `git push origin main --force` (or any other appended args) —
+        /// a human approving one exact invocation must not grant a family
+        /// of invocations. Every non-grant caller (config-authored rules via
+        /// `Predicate::git`) sets this `false`, preserving prefix semantics
+        /// for everyone except grants.
+        exact: bool,
     },
     Agent {
         provider: Option<ProviderId>,
@@ -160,6 +185,7 @@ impl Predicate {
         Predicate::Http {
             method,
             url_prefix: url_prefix.to_string(),
+            exact: false,
         }
     }
     pub fn mcp(server: ServerId, tool: Option<String>) -> Self {
@@ -169,6 +195,7 @@ impl Predicate {
         Predicate::Git {
             subcommand: subcommand.to_string(),
             argv_prefix: argv_prefix.iter().map(|s| s.to_string()).collect(),
+            exact: false,
         }
     }
     pub fn agent(provider: Option<ProviderId>, model: Option<String>, max_tier: Tier) -> Self {
@@ -209,9 +236,21 @@ impl Predicate {
             ) if matches_op(pop, op) && c.starts_with(prefix) => {
                 Some((prefix.to_string_lossy().len(), 1))
             }
-            (Predicate::Http { method, url_prefix }, TaskParams::Http { method: m, url, .. }) => {
+            (
+                Predicate::Http {
+                    method,
+                    url_prefix,
+                    exact,
+                },
+                TaskParams::Http { method: m, url, .. },
+            ) => {
                 let method_ok = method.as_ref().map(|x| method_eq(x, m)).unwrap_or(true);
-                (method_ok && url.starts_with(url_prefix.as_str()))
+                let url_ok = if *exact {
+                    url == url_prefix
+                } else {
+                    url.starts_with(url_prefix.as_str())
+                };
+                (method_ok && url_ok)
                     .then(|| (url_prefix.len(), if method.is_some() { 2 } else { 1 }))
             }
             (
@@ -228,14 +267,21 @@ impl Predicate {
                 Predicate::Git {
                     subcommand,
                     argv_prefix,
+                    exact,
                 },
                 TaskParams::Git {
                     subcommand: sc,
                     argv,
                     ..
                 },
-            ) => (subcommand == sc && argv.starts_with(argv_prefix))
-                .then(|| (subcommand.len(), 1 + argv_prefix.len())),
+            ) => {
+                let argv_ok = if *exact {
+                    argv == argv_prefix
+                } else {
+                    argv.starts_with(argv_prefix)
+                };
+                (subcommand == sc && argv_ok).then(|| (subcommand.len(), 1 + argv_prefix.len()))
+            }
             (
                 Predicate::Shell {
                     program,
