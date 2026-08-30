@@ -2,8 +2,7 @@
 //!
 //! Drives a summarization provider call over the summarizable portion of a
 //! `WorkingContext`, folds the streamed text response into a summary, and
-//! commits the result as a new `ContextStateId` while preserving pinned memory
-//! verbatim.
+//! commits a new context state that preserves pinned memory verbatim.
 
 use futures::StreamExt;
 use roundhouse_provider::{
@@ -48,8 +47,9 @@ pub enum CompactError {
 }
 
 /// Executes a compaction: sends the summarizable conversation history to the
-/// provider, folds the streamed text into a summary, and commits a new context
-/// state that preserves pinned memory verbatim.
+/// provider, folds the streamed text into a summary, commits a new context
+/// state that preserves pinned memory verbatim, and rejects the result if it
+/// exceeds the target budget.
 pub async fn execute_compact(
     provider: &dyn Provider,
     ctx: &RequestCtx,
@@ -64,8 +64,21 @@ pub async fn execute_compact(
         .await
         .map_err(CompactError::Provider)?;
 
-    let summary = fold_stream_text(&mut stream).await;
+    let summary = fold_stream_text(&mut stream)
+        .await
+        .map_err(CompactError::Provider)?;
     let new_context_state = working.commit_compaction(&summary, pinned, input.target_budget);
+
+    let rendered = working
+        .materialize(new_context_state)
+        .expect("state was just created by commit_compaction");
+    if rendered.token_count() > input.target_budget.0 {
+        return Err(CompactError::Provider(ProviderError::Unsupported(format!(
+            "compaction exceeded target budget: {} > {}",
+            rendered.token_count(),
+            input.target_budget.0
+        ))));
+    }
 
     Ok(CompactOutput {
         new_context_state,
@@ -106,17 +119,30 @@ fn build_summarization_request(
 
 /// Folds a `ChatStream` into a single owned `String` from `BlockDelta::Text`
 /// events, terminating at `MessageStop`.
-async fn fold_stream_text(stream: &mut ChatStream) -> String {
+///
+/// Returns `Ok(summary)` only if `MessageStop` was observed and the folded text
+/// is non-empty. Otherwise returns `Err(ProviderError::StreamInterrupted)` with
+/// the partial text seen so far.
+async fn fold_stream_text(stream: &mut ChatStream) -> Result<String, ProviderError> {
     let mut text = String::new();
+    let mut saw_message_stop = false;
     while let Some(event) = stream.0.next().await {
         match event {
             StreamEvent::BlockDelta {
                 delta: BlockDelta::Text(t),
                 ..
             } => text.push_str(&t),
-            StreamEvent::MessageStop => break,
+            StreamEvent::MessageStop => {
+                saw_message_stop = true;
+                break;
+            }
             _ => {}
         }
     }
-    text
+
+    if saw_message_stop && !text.is_empty() {
+        Ok(text)
+    } else {
+        Err(ProviderError::StreamInterrupted { partial: text })
+    }
 }

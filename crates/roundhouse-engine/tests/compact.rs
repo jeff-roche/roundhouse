@@ -1,8 +1,10 @@
 use roundhouse_engine::compact::{execute_compact, CompactInput, CompactStrategy};
 use roundhouse_engine::test_support::{
-    fake_provider_summarizing_to, sample_ctx, working_context_with_turns_and_pinned_memory,
+    fake_provider_streaming, fake_provider_summarizing_to, sample_ctx,
+    working_context_with_turns_and_pinned_memory,
 };
 use roundhouse_engine::TokenBudget;
+use roundhouse_provider::{BlockDelta, BlockKind, ProviderError, StreamEvent};
 
 #[tokio::test]
 async fn compaction_respects_budget_and_preserves_pinned_memory_verbatim() {
@@ -23,7 +25,9 @@ async fn compaction_respects_budget_and_preserves_pinned_memory_verbatim() {
     .unwrap();
 
     assert_eq!(output.summary, "condensed summary of 50 turns");
-    let new_ctx = working.materialize(output.new_context_state);
+    let new_ctx = working
+        .materialize(output.new_context_state)
+        .expect("state exists");
     assert!(
         new_ctx.token_count() <= 2_000,
         "compacted context must fit target budget"
@@ -54,7 +58,7 @@ async fn summarize_all_uses_same_flow() {
     .unwrap();
 
     assert_eq!(output.summary, "all turns summary");
-    let new_ctx = working.materialize(output.new_context_state);
+    let new_ctx = working.materialize(output.new_context_state).unwrap();
     assert!(new_ctx.render().contains("PINNED: keep"));
 }
 
@@ -84,4 +88,103 @@ async fn provider_request_excludes_pinned_memory() {
         !req_json.contains(pinned),
         "pinned memory must not appear in the summarization request"
     );
+}
+
+#[tokio::test]
+async fn stream_without_message_stop_is_interrupted() {
+    let working = working_context_with_turns_and_pinned_memory(3, "PINNED: keep");
+    let provider = fake_provider_streaming(vec![
+        StreamEvent::BlockStart {
+            index: 0,
+            kind: BlockKind::Text,
+        },
+        StreamEvent::BlockDelta {
+            index: 0,
+            delta: BlockDelta::Text("partial text".into()),
+        },
+        StreamEvent::BlockStop { index: 0 },
+    ]);
+
+    let err = execute_compact(
+        &provider,
+        &sample_ctx(),
+        &working,
+        CompactInput {
+            strategy: CompactStrategy::SummarizeAll,
+            target_budget: TokenBudget(1_000),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        roundhouse_engine::compact::CompactError::Provider(ProviderError::StreamInterrupted {
+            partial,
+        }) => assert_eq!(partial, "partial text"),
+        other => panic!("expected StreamInterrupted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stream_with_no_text_is_interrupted() {
+    let working = working_context_with_turns_and_pinned_memory(3, "PINNED: keep");
+    let provider = fake_provider_streaming(vec![
+        StreamEvent::BlockStart {
+            index: 0,
+            kind: BlockKind::Text,
+        },
+        StreamEvent::BlockStop { index: 0 },
+        StreamEvent::MessageStop,
+    ]);
+
+    let err = execute_compact(
+        &provider,
+        &sample_ctx(),
+        &working,
+        CompactInput {
+            strategy: CompactStrategy::SummarizeAll,
+            target_budget: TokenBudget(1_000),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            roundhouse_engine::compact::CompactError::Provider(
+                ProviderError::StreamInterrupted { .. }
+            )
+        ),
+        "expected StreamInterrupted for empty stream, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn over_budget_summary_is_rejected() {
+    let working = working_context_with_turns_and_pinned_memory(3, "PINNED: keep");
+    // 40 bytes of summary + rendering overhead easily exceeds a budget of 5 tokens.
+    let provider = fake_provider_summarizing_to("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    let err = execute_compact(
+        &provider,
+        &sample_ctx(),
+        &working,
+        CompactInput {
+            strategy: CompactStrategy::SummarizeAll,
+            target_budget: TokenBudget(5),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    match err {
+        roundhouse_engine::compact::CompactError::Provider(ProviderError::Unsupported(msg)) => {
+            assert!(
+                msg.contains("compaction exceeded target budget"),
+                "unexpected unsupported message: {msg}"
+            );
+        }
+        other => panic!("expected Unsupported budget error, got {other:?}"),
+    }
 }

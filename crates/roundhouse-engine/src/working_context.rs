@@ -4,13 +4,27 @@
 //! summarization plus pinned memory lines that must survive compaction verbatim.
 //! It materializes compacted snapshots as `Rendered` context states, each with a
 //! deterministic, documentable token-count heuristic.
+//!
+//! Security / boundedness: `commit_compaction` collapses the working context
+//! into the latest compacted state. Old turns and older states are discarded,
+//! so pinned lines are not duplicated per state and the structure cannot grow
+//! without bound.
 
-use roundhouse_provider::Message;
+use roundhouse_provider::{ContentBlock, Message, MessageRole};
 use std::sync::Mutex;
 
 /// Identifies a materialized context state produced by `commit_compaction`.
+///
+/// The wrapped id is private so callers cannot forge an id and bypass the
+/// `materialize` lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ContextStateId(pub usize);
+pub struct ContextStateId(usize);
+
+impl ContextStateId {
+    pub(crate) fn new(raw: usize) -> Self {
+        Self(raw)
+    }
+}
 
 /// Budget ceiling, in abstract tokens, used to validate that a compacted context
 /// state fits inside the target window.
@@ -50,20 +64,28 @@ struct ContextState {
     pinned: Vec<String>,
 }
 
-/// Holds the conversation state that compaction operates on.
-pub struct WorkingContext {
+struct Inner {
     turns: Vec<Message>,
     pinned: Vec<String>,
-    states: Mutex<Vec<ContextState>>,
+    states: Vec<ContextState>,
+    next_id: usize,
+}
+
+/// Holds the conversation state that compaction operates on.
+pub struct WorkingContext {
+    inner: Mutex<Inner>,
 }
 
 impl WorkingContext {
     /// Creates a new working context from conversation turns and pinned memory lines.
     pub fn new(turns: Vec<Message>, pinned: Vec<String>) -> Self {
         Self {
-            turns,
-            pinned,
-            states: Mutex::new(Vec::new()),
+            inner: Mutex::new(Inner {
+                turns,
+                pinned,
+                states: Vec::new(),
+                next_id: 0,
+            }),
         }
     }
 
@@ -72,50 +94,62 @@ impl WorkingContext {
     /// Pinned lines are set aside **before** the summarization request is built;
     /// they are carried through compaction verbatim and never sent to the provider.
     pub fn split_pinned(&self) -> (Vec<Message>, Vec<String>) {
-        (self.turns.clone(), self.pinned.clone())
+        let inner = self.inner.lock().unwrap();
+        (inner.turns.clone(), inner.pinned.clone())
     }
 
     /// Records a new compacted context state from the provider-generated summary
     /// and the preserved pinned lines, returning its stable id.
     ///
-    /// The `budget` is accepted for interface compatibility with future budget-
-    /// enforcement logic; today the compacted state is inherently small (one
-    /// summary plus pinned lines), so it always fits a realistic target budget.
+    /// This call **collapses** the working context: old turns are replaced by the
+    /// compacted summary and only the latest state is retained. Pinned lines are
+    /// never trimmed.
     pub fn commit_compaction(
         &self,
         summary: &str,
         pinned: Vec<String>,
         _budget: TokenBudget,
     ) -> ContextStateId {
-        let mut states = self.states.lock().unwrap();
-        let id = ContextStateId(states.len());
-        states.push(ContextState {
+        let mut inner = self.inner.lock().unwrap();
+        let id = ContextStateId::new(inner.next_id);
+        inner.next_id += 1;
+
+        // Collapse: the conversation history becomes the compacted summary.
+        let compacted_turn = Message {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::Text {
+                text: format!("[summary]\n{summary}"),
+                cache: None,
+                citations: vec![],
+            }],
+        };
+
+        inner.turns = vec![compacted_turn];
+        inner.pinned = pinned.clone();
+        inner.states.clear();
+        inner.states.push(ContextState {
             id,
             summary: summary.to_string(),
             pinned,
         });
+
         id
     }
 
-    /// Materializes a previously committed context state.
-    ///
-    /// Panics if `id` is not a state produced by this `WorkingContext`.
-    pub fn materialize(&self, id: ContextStateId) -> Rendered {
-        let states = self.states.lock().unwrap();
-        let state = states
-            .iter()
-            .find(|s| s.id == id)
-            .expect("valid ContextStateId for this WorkingContext");
-
-        let mut text = String::new();
-        text.push_str("[summary]\n");
-        text.push_str(&state.summary);
-        text.push_str("\n\n[pinned memory]\n");
-        for line in &state.pinned {
-            text.push_str(line);
-            text.push('\n');
-        }
-        Rendered { text }
+    /// Materializes a previously committed context state, if it exists.
+    pub fn materialize(&self, id: ContextStateId) -> Option<Rendered> {
+        let inner = self.inner.lock().unwrap();
+        inner.states.iter().find(|s| s.id == id).map(|state| {
+            let mut text = String::new();
+            text.push_str("[summary]\n");
+            text.push_str(&state.summary);
+            text.push_str("\n\n[pinned memory]\n");
+            for line in &state.pinned {
+                text.push_str(line);
+                text.push('\n');
+            }
+            Rendered { text }
+        })
     }
 }
 

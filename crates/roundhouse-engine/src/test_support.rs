@@ -68,6 +68,17 @@ pub fn fake_provider_summarizing_to(summary: &str) -> FakeProvider {
     FakeProvider {
         summary: summary.to_string(),
         last_request: Arc::new(Mutex::new(None)),
+        events: Arc::new(Mutex::new(None)),
+    }
+}
+
+/// Returns a fake provider that captures the last summarization request and
+/// emits the provided stream events.
+pub fn fake_provider_streaming(events: Vec<StreamEvent>) -> FakeProvider {
+    FakeProvider {
+        summary: String::new(),
+        last_request: Arc::new(Mutex::new(None)),
+        events: Arc::new(Mutex::new(Some(events))),
     }
 }
 
@@ -75,6 +86,7 @@ pub fn fake_provider_summarizing_to(summary: &str) -> FakeProvider {
 pub struct FakeProvider {
     summary: String,
     last_request: Arc<Mutex<Option<ChatRequest>>>,
+    events: Arc<Mutex<Option<Vec<StreamEvent>>>>,
 }
 
 impl FakeProvider {
@@ -101,20 +113,24 @@ impl Provider for FakeProvider {
         _ctx: &'a RequestCtx,
     ) -> roundhouse_provider::BoxFut<'a, Result<ChatStream, ProviderError>> {
         *self.last_request.lock().unwrap() = Some(req.clone());
+
+        let events = self.events.lock().unwrap().take();
         let summary = self.summary.clone();
         Box::pin(async move {
-            let events = vec![
-                StreamEvent::BlockStart {
-                    index: 0,
-                    kind: BlockKind::Text,
-                },
-                StreamEvent::BlockDelta {
-                    index: 0,
-                    delta: BlockDelta::Text(summary),
-                },
-                StreamEvent::BlockStop { index: 0 },
-                StreamEvent::MessageStop,
-            ];
+            let events = events.unwrap_or_else(|| {
+                vec![
+                    StreamEvent::BlockStart {
+                        index: 0,
+                        kind: BlockKind::Text,
+                    },
+                    StreamEvent::BlockDelta {
+                        index: 0,
+                        delta: BlockDelta::Text(summary),
+                    },
+                    StreamEvent::BlockStop { index: 0 },
+                    StreamEvent::MessageStop,
+                ]
+            });
             Ok(ChatStream(Box::pin(stream::iter(events))))
         })
     }
