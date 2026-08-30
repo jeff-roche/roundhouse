@@ -1,6 +1,14 @@
 use std::fs;
 use std::path::Path;
 
+// This is a frozen-shape guard: its entire purpose is catching
+// UNAUTHORIZED changes to the workspace's crate list, so an edit to this
+// list is itself something that should draw attention, not slip through
+// quietly. `crates/roundhouse-secrets` below is a deliberate, authorized
+// addition (Task 18) — it's now an official row in the architecture doc's
+// crate table (`docs/architecture/02-system-architecture.md` §5.2), not an
+// accidental extra member. Any other change to this list should be treated
+// with the same scrutiny this comment is calling out for that one.
 const EXPECTED_MEMBERS: &[&str] = &[
     "crates/roundhouse-core",
     "crates/roundhouse-proto",

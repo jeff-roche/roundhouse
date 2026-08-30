@@ -8,18 +8,33 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+roundhouse-config = { path = "../roundhouse-config" }
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-store = { path = "../roundhouse-store" }
-serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 secrecy = "0.10.3"
-zeroize = "1.9"
-keyring = "4.1.6"
+# Exact-pinned, not a caret requirement: this crate's `KeyringBackend` DI
+# seam (resolve.rs) was designed against 4.1.6-specific internal behavior
+# — `keyring::Entry::new` installs a real, process-global credential
+# backend on first use via an internal `LazyLock`, with no parameter or
+# hook to override it for a test, which is exactly why the seam exists at
+# all. A future version bump should re-verify that behavior still holds
+# (diffed byte-identical against 4.2.0 at the time this was written) rather
+# than assuming it, given there's no test that would catch a change to it.
+keyring = "=4.1.6"
 toml = "0.8"
+# Safe (non-`unsafe`) access to `getuid()`, used by resolve.rs's
+# TOCTOU-safe/owner-checked file permission read to compare a secrets
+# file's owner uid against the current process's — std has no safe way to
+# do this without an external crate.
+rustix = { version = "1.1", features = ["process"] }
 
 [dev-dependencies]
 tempfile = "3"
 once_cell = "1"
 trybuild = "1"
+tokio = { workspace = true }
+# Only needed by tests/ui/secret_serde_serialize.rs's trybuild compile-fail
+# case (proving `Secret` has no reachable `Serialize` impl) — no production
+# code in this crate uses serde/serde_json.
+serde_json = { workspace = true }

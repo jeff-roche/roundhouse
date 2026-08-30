@@ -1,0 +1,8 @@
+error: lifetime may not live long enough
+  --> tests/ui/bridge_closure_cannot_smuggle_exposed_str.rs:13:75
+   |
+13 |     let leaked: &str = expose_secret_for_provider_call(&secret, |exposed| exposed);
+   |                                                                  -------- ^^^^^^^ returning this value requires that `'1` must outlive `'2`
+   |                                                                  |      |
+   |                                                                  |      return type of closure is &'2 str
+   |                                                                  has type `&'1 str`
