@@ -8,16 +8,76 @@
 
 use std::sync::{Arc, Mutex};
 
-use roundhouse_core::{Origin, SessionId, SessionState, TaskInput, TaskKind};
+use roundhouse_core::{
+    OnDegrade, Origin, SessionId, SessionSpec, SessionState, TaskInput, TaskKind, Tier,
+};
 use roundhouse_engine::{FinallySpec, FinallyStepError, SessionActor, TaskCreateRequest};
+use roundhouse_policy::engine::{
+    CompiledRule, Outcome as PolicyOutcome, PolicyEngine, Predicate, Scope,
+};
+use roundhouse_policy::{ParsedCommand, TaskParams};
+use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
+use roundhouse_sandbox::probe::{MechanismProbeReport, MechanismStatus};
+use roundhouse_sandbox::Isolate;
 use roundhouse_store::{open, spawn_writer};
+
+/// `TaskRunner::bootstrap()` panics on a second call per-process — one
+/// shared `&'static TaskRunner` for all tests here, matching
+/// `cancel_admission.rs`.
+static RUNNER: once_cell::sync::Lazy<roundhouse_core::TaskRunner> =
+    once_cell::sync::Lazy::new(roundhouse_core::TaskRunner::bootstrap);
+
+/// Permissive `TaskParams` for a finally-step/ordinary shell request — see
+/// `cancel_admission.rs`'s identically-purposed helper for why this file's
+/// pre-existing `SessionState`-gate tests use a placeholder that Task 25's
+/// new policy gate always `Outcome::Allow`s.
+fn permissive_params() -> TaskParams {
+    TaskParams::Shell(ParsedCommand {
+        program: "true".to_string(),
+        argv: vec![],
+    })
+}
 
 async fn spawn_test_actor(initial_state: SessionState) -> (SessionActor, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("events.db");
     let store = open(&db_path).await.unwrap();
     let writer = spawn_writer(store).await;
-    let actor = SessionActor::new(SessionId::new(), writer, initial_state);
+
+    // See `cancel_admission.rs`'s identical helper for why a single
+    // permissive rule (rather than zero rules) is needed here: with zero
+    // rules, `PolicyEngine::decide`'s unmatched-task default is `Ask`, not
+    // `Allow`.
+    let policy = Arc::new(PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Builtin,
+        PolicyOutcome::Allow,
+        Predicate::program("true"),
+    )]));
+    let isolate: Arc<dyn Isolate> = Arc::new(BwrapLandlockIsolate::test_with_probe(
+        MechanismProbeReport {
+            landlock: MechanismStatus::Available,
+            bwrap: MechanismStatus::Available,
+            seccomp: MechanismStatus::Available,
+            seatbelt: MechanismStatus::Unavailable {
+                reason: "n/a".into(),
+            },
+        },
+    ));
+    let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+    let handle = isolate.prepare(&spec).await.unwrap();
+    let actor = SessionActor::new(
+        SessionId::new(),
+        writer,
+        initial_state,
+        &RUNNER,
+        policy,
+        false,
+        std::path::PathBuf::new(),
+        std::path::PathBuf::new(),
+        isolate,
+        handle,
+        spec,
+    );
     (actor, dir)
 }
 
@@ -25,6 +85,7 @@ fn spec(kind: TaskKind) -> FinallySpec {
     FinallySpec {
         kind,
         input: TaskInput::Text(String::new()),
+        params: permissive_params(),
     }
 }
 
@@ -74,6 +135,7 @@ async fn finally_steps_still_run_when_the_session_would_refuse_an_ordinary_task(
             kind: TaskKind::Shell,
             origin: Origin::Model,
             is_finally_step: false,
+            params: permissive_params(),
         };
         assert!(
             actor.admit_task(&ordinary).is_err(),

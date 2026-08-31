@@ -45,7 +45,7 @@ agent team** — one crate, one owner, one test suite, minimal shared mutable su
 | `roundhouse-mcp` | MCP host (rmcp) | core, policy |
 | `roundhouse-acp` | ACP client + ACP server (agent-client-protocol) | core, proto |
 | `roundhouse-bus` | Inter-agent messaging + teams | core, store |
-| `roundhouse-engine` | Agent loop, session actor, supervision, context mgmt | most of the above |
+| `roundhouse-engine` | Agent loop, session actor, supervision, context mgmt | most of the above, plus net (Task 25: session creation registers the session's egress allowlist with the real `LoopbackProxy` at the same call site it decides isolation tier, so `SessionActor`'s home module depends on `roundhouse-net` directly rather than only transitively) |
 | `roundhouse-config` | Layered config loading (builtin/user/project/workspace scopes per §6.2's precedence ranking), `SecretRef` types | core |
 | `roundhouse-secrets` | Secret *material* handling: `CredentialProvider` implementations (§9.9), keyring/file-fallback resolution, the `Secret<T>`/`expose_for_request` type-level guarantee (§6.7), outbound redaction. Split out from `roundhouse-config` (which only ever holds `SecretRef` pointers, never material) because material-handling has a materially different trust boundary and a much smaller expose-site surface to audit. | core, config |
 | `roundhouse-flow` | Workflow definition + durable execution | core, engine, store |
@@ -102,6 +102,16 @@ except `roundhouse-sandbox` (which needs it, and confines it to one module).
 > Fix: `NetworkMechanism`/`net_enforced_for` now live in `roundhouse-core` instead,
 > which both `roundhouse-sandbox` and `roundhouse-net` already depended on, so no
 > `roundhouse-sandbox` row change was needed after all.)
+>
+> **A second new dependency edge added the same way (Task 25, Phase 2):** wiring the
+> sealed floor, isolation-shortfall recording, and the network-policy proxy into the
+> real task-admission path (the audit's "built in isolation, never wired" recurring
+> finding) required `roundhouse-engine`'s `session_actor.rs` to call
+> `roundhouse_net::proxy::LoopbackProxy::register_session` directly at session-creation
+> time — the same call site that already decides a session's isolation tier and builds
+> its `SealedContext`. That row above is amended in place (replacing the previous vague
+> "most of the above" with an explicit call-out of `net`) rather than inventing a
+> separate crate to host `create_session_with_egress`.
 
 ### 5.3 Verified dependency baseline
 

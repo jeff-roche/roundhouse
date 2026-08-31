@@ -2966,6 +2966,7 @@ dependencies = [
  "once_cell",
  "roundhouse-bus",
  "roundhouse-core",
+ "roundhouse-net",
  "roundhouse-policy",
  "roundhouse-provider",
  "roundhouse-sandbox",

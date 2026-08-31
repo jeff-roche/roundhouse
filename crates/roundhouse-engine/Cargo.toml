@@ -11,6 +11,7 @@ workspace = true
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-store = { path = "../roundhouse-store" }
 roundhouse-policy = { path = "../roundhouse-policy" }
+roundhouse-net = { path = "../roundhouse-net" }
 roundhouse-sandbox = { path = "../roundhouse-sandbox" }
 roundhouse-provider = { path = "../roundhouse-provider" }
 roundhouse-bus = { path = "../roundhouse-bus" }

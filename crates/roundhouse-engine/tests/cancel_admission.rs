@@ -5,9 +5,20 @@
 //! task deliberately does NOT wire `admit_task` into any real dispatch
 //! chokepoint (there isn't one yet).
 
-use roundhouse_core::{CancelReason, EventPayload, Origin, SessionId, SessionState, TaskKind};
+use roundhouse_core::{
+    CancelReason, EventPayload, OnDegrade, Origin, SessionId, SessionSpec, SessionState, Tier,
+    TaskKind,
+};
 use roundhouse_engine::{AdmitError, SessionActor, TaskCreateRequest};
+use roundhouse_policy::engine::{
+    CompiledRule, Outcome as PolicyOutcome, PolicyEngine, Predicate, Scope,
+};
+use roundhouse_policy::{ParsedCommand, TaskParams};
+use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
+use roundhouse_sandbox::probe::{MechanismProbeReport, MechanismStatus};
+use roundhouse_sandbox::Isolate;
 use roundhouse_store::{open, spawn_writer};
+use std::sync::Arc;
 
 /// `TaskRunner::bootstrap()` panics on a second call per-process, and every
 /// test in this binary shares one process — one shared `&'static TaskRunner`
@@ -15,9 +26,34 @@ use roundhouse_store::{open, spawn_writer};
 static RUNNER: once_cell::sync::Lazy<roundhouse_core::TaskRunner> =
     once_cell::sync::Lazy::new(roundhouse_core::TaskRunner::bootstrap);
 
+/// A `TaskCreateRequest` with an inert `TaskParams::Shell` — permissive
+/// against the sealed floor (no sealed-program name, no fs path at all), so
+/// tests that only care about the `SessionState` admission gate (Task 3/4's
+/// original scope) aren't incidentally tripped up by Task 25's new policy
+/// gate.
+fn permissive_request(kind: TaskKind, origin: Origin, is_finally_step: bool) -> TaskCreateRequest {
+    TaskCreateRequest {
+        kind,
+        origin,
+        is_finally_step,
+        params: TaskParams::Shell(ParsedCommand {
+            program: "true".to_string(),
+            argv: vec![],
+        }),
+    }
+}
+
 /// Spins up a fresh on-disk store + writer for one test, returning the
 /// `SessionActor` under test plus the DB path so the test can open a second,
 /// independent connection to verify what actually landed in the log.
+///
+/// Task 25 grew `SessionActor::new`'s signature to carry the policy engine,
+/// sealed-floor inputs, and isolation handle it now needs for the real
+/// `admit_task` policy gate — every field here is a permissive placeholder
+/// (zero config rules, an always-Available probe, an empty `Tier::Sandbox`
+/// session spec) so this file's existing `SessionState`-gate tests keep
+/// exercising exactly what they exercised before, with the new policy gate
+/// staying out of their way (`Outcome::Allow` for every `permissive_request`).
 async fn spawn_test_actor(
     initial_state: SessionState,
 ) -> (
@@ -32,7 +68,41 @@ async fn spawn_test_actor(
     let writer = spawn_writer(store).await;
 
     let session_id = SessionId::new();
-    let actor = SessionActor::new(session_id, writer, initial_state);
+    // A single config rule allowing exactly the `TaskParams::Shell` program
+    // `permissive_request`/`spec` construct ("true", no argv) — with zero
+    // rules, `PolicyEngine::decide`'s unmatched-task default is `Ask` (§6.4:
+    // the *interactive* default, not `Allow`), which would spuriously trip
+    // this file's `SessionState`-gate tests via Task 25's new policy gate.
+    let policy = Arc::new(PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Builtin,
+        PolicyOutcome::Allow,
+        Predicate::program("true"),
+    )]));
+    let isolate: Arc<dyn Isolate> = Arc::new(BwrapLandlockIsolate::test_with_probe(
+        MechanismProbeReport {
+            landlock: MechanismStatus::Available,
+            bwrap: MechanismStatus::Available,
+            seccomp: MechanismStatus::Available,
+            seatbelt: MechanismStatus::Unavailable {
+                reason: "n/a".into(),
+            },
+        },
+    ));
+    let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+    let handle = isolate.prepare(&spec).await.unwrap();
+    let actor = SessionActor::new(
+        session_id,
+        writer,
+        initial_state,
+        &RUNNER,
+        policy,
+        false,
+        std::path::PathBuf::new(),
+        std::path::PathBuf::new(),
+        isolate,
+        handle,
+        spec,
+    );
 
     (actor, session_id, db_path, dir)
 }
@@ -43,19 +113,11 @@ async fn cancelling_session_refuses_new_non_finally_tasks() {
 
     actor.cancel(&RUNNER, CancelReason::User).await.unwrap();
 
-    let normal = TaskCreateRequest {
-        kind: TaskKind::Shell,
-        origin: Origin::Model,
-        is_finally_step: false,
-    };
+    let normal = permissive_request(TaskKind::Shell, Origin::Model, false);
     let err = actor.admit_task(&normal).unwrap_err();
     assert!(matches!(err, AdmitError::SessionCancelling));
 
-    let finally_step = TaskCreateRequest {
-        kind: TaskKind::Shell,
-        origin: Origin::System,
-        is_finally_step: true,
-    };
+    let finally_step = permissive_request(TaskKind::Shell, Origin::System, true);
     assert!(
         actor.admit_task(&finally_step).is_ok(),
         "finally steps must still be admitted while Cancelling"
@@ -66,21 +128,13 @@ async fn cancelling_session_refuses_new_non_finally_tasks() {
 async fn admit_task_allows_everything_before_cancel_is_called() {
     let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Running).await;
 
-    let normal = TaskCreateRequest {
-        kind: TaskKind::Shell,
-        origin: Origin::Model,
-        is_finally_step: false,
-    };
+    let normal = permissive_request(TaskKind::Shell, Origin::Model, false);
     assert!(
         actor.admit_task(&normal).is_ok(),
         "a session that hasn't been cancelled must admit ordinary tasks"
     );
 
-    let finally_step = TaskCreateRequest {
-        kind: TaskKind::Shell,
-        origin: Origin::System,
-        is_finally_step: true,
-    };
+    let finally_step = permissive_request(TaskKind::Shell, Origin::System, true);
     assert!(actor.admit_task(&finally_step).is_ok());
 }
 
@@ -182,11 +236,7 @@ async fn cancel_flips_the_admission_gate_before_the_append_can_possibly_complete
 async fn closed_session_refuses_ordinary_tasks() {
     let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Closed).await;
 
-    let normal = TaskCreateRequest {
-        kind: TaskKind::Shell,
-        origin: Origin::Model,
-        is_finally_step: false,
-    };
+    let normal = permissive_request(TaskKind::Shell, Origin::Model, false);
     let err = actor.admit_task(&normal).unwrap_err();
     assert!(matches!(err, AdmitError::SessionClosed));
 }
@@ -196,11 +246,7 @@ async fn closed_session_refuses_ordinary_tasks() {
 async fn suspended_session_refuses_ordinary_tasks() {
     let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Suspended).await;
 
-    let normal = TaskCreateRequest {
-        kind: TaskKind::Shell,
-        origin: Origin::Model,
-        is_finally_step: false,
-    };
+    let normal = permissive_request(TaskKind::Shell, Origin::Model, false);
     let err = actor.admit_task(&normal).unwrap_err();
     assert!(matches!(err, AdmitError::SessionSuspended));
 }
@@ -213,22 +259,14 @@ async fn suspended_session_refuses_ordinary_tasks() {
 async fn finally_step_bypass_is_refused_unless_origin_is_system() {
     let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Closed).await;
 
-    let untrusted_finally_step = TaskCreateRequest {
-        kind: TaskKind::Shell,
-        origin: Origin::Model,
-        is_finally_step: true,
-    };
+    let untrusted_finally_step = permissive_request(TaskKind::Shell, Origin::Model, true);
     let err = actor.admit_task(&untrusted_finally_step).unwrap_err();
     assert!(
         matches!(err, AdmitError::SessionClosed),
         "a finally-step claim from a non-System origin must not bypass the gate"
     );
 
-    let trusted_finally_step = TaskCreateRequest {
-        kind: TaskKind::Shell,
-        origin: Origin::System,
-        is_finally_step: true,
-    };
+    let trusted_finally_step = permissive_request(TaskKind::Shell, Origin::System, true);
     assert!(
         actor.admit_task(&trusted_finally_step).is_ok(),
         "a genuine (Origin::System) finally-step must still be admitted even when Closed"

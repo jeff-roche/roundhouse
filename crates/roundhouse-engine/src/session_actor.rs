@@ -22,11 +22,32 @@
 //! It reuses `admit_task` for real, but same as above, still doesn't reach
 //! into a real dispatch chokepoint for *executing* a step — that's injected
 //! by the caller, for the same "Task 25 doesn't exist yet" reason.
+//!
+//! Phase 2, Task 25 is the integration task named throughout this file's
+//! comments above: it wires `PolicyEngine::decide_sealed` (via a live
+//! [`roundhouse_policy::sealed::SealedContext`] built from this session's
+//! own isolation attestation and MCP registry) into `admit_task` as a
+//! second gate after the `SessionState` allowlist, adds
+//! [`create_session_isolation`] as the real, inline fix for the
+//! isolation-shortfall `Degradation`-recording gap, and adds
+//! [`create_session_with_egress`] to register a session's egress allowlist
+//! with a real `roundhouse_net::proxy::LoopbackProxy` at the same
+//! session-creation call site.
 
 use roundhouse_core::{
-    CancelReason, Origin, SessionId, SessionState, TaskInput, TaskKind, TaskRunner, Timestamp,
+    CancelReason, NoteLevel, Origin, SessionId, SessionSpec, SessionState, TaskInput, TaskKind,
+    TaskRunner, Timestamp,
 };
+use roundhouse_net::policy::EgressPolicy;
+use roundhouse_net::proxy::{LoopbackProxy, ProxyHandle, ProxyNotServingError};
+use roundhouse_policy::engine::{Outcome, PolicyEngine, RuleId};
+use roundhouse_policy::sealed::SealedContext;
+use roundhouse_policy::TaskParams;
+use roundhouse_sandbox::{Handle, Isolate, IsolationError};
 use roundhouse_store::{EventWriter, StoreError};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 /// `Timestamp` has no `now()` — read the wall clock ourselves and convert.
 /// Matches the identical helper in `chat.rs`/`roundhouse-store/tests/recovery.rs`.
@@ -49,6 +70,11 @@ pub struct TaskCreateRequest {
     /// session is `Cancelling` — that's the entire point of admission
     /// refusal being scoped to *new*, non-cleanup work.
     pub is_finally_step: bool,
+    /// Task 25 — the typed, parsed params `PolicyEngine::decide_sealed`
+    /// judges this task against. Nothing carried policy-relevant params
+    /// before this task; every real caller must now supply the real,
+    /// already-parsed `TaskParams` for the task it is asking to admit.
+    pub params: TaskParams,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +85,19 @@ pub enum AdmitError {
     SessionSuspended,
     #[error("session is Closed; only a trusted finally: step is admitted")]
     SessionClosed,
+    /// Task 25: the sealed floor or a configured policy rule denied this
+    /// task. `roundhouse_policy::engine::RuleId` — deliberately NOT
+    /// `roundhouse_core`'s `RuleId(u64)`, a different type of the same name
+    /// (see `roundhouse_policy::engine::RuleId`'s own doc comment).
+    #[error("denied by sealed floor or configured policy: {0:?}")]
+    Denied(Option<RuleId>),
+    /// Task 25: `PolicyEngine::decide_sealed` returned `Outcome::Ask` — this
+    /// task requires human approval before it may proceed. No approval
+    /// workflow is wired to this call site yet (that's Task 15's
+    /// `approval` module, consumed by a later integration); for now this
+    /// variant simply refuses admission the same as `Denied`.
+    #[error("requires human approval before this task can proceed")]
+    RequiresApproval,
 }
 
 /// Tracks one session's `SessionState` and gates new-task admission on it.
@@ -74,15 +113,80 @@ pub struct SessionActor {
     session_id: SessionId,
     writer: EventWriter,
     state_tx: tokio::sync::watch::Sender<SessionState>,
+    /// Task 25 — the shared, process-wide `TaskRunner` this actor mints new
+    /// events through for policy/admission-adjacent bookkeeping. `cancel()`'s
+    /// existing `runner: &TaskRunner` *parameter* is untouched by this field;
+    /// they're separate, deliberately (see `cancel`'s call sites, which keep
+    /// passing their own `&TaskRunner` exactly as before).
+    runner: &'static TaskRunner,
+    policy: Arc<PolicyEngine>,
+    /// Mirrors the daemon's `--unsealed` flag (§6.2's one documented sealed-
+    /// floor escape), threaded in at construction — never toggled per-task.
+    unsealed: bool,
+    state_dir: PathBuf,
+    daemon_binary: PathBuf,
+    /// Populated by the MCP host (Phase 3) as servers complete their
+    /// handshake; read here, never written from this module in this task's
+    /// scope — Phase 3 is a hard prerequisite for this ever containing
+    /// anything real. `ServerId` (`roundhouse_policy`) has no `Hash`
+    /// derive, which is why `SealedContext` itself already stores raw
+    /// `String` server names rather than `ServerId`.
+    mcp_resolved: Arc<RwLock<HashSet<String>>>,
+    isolate: Arc<dyn Isolate>,
+    handle: Handle,
+    session_spec: SessionSpec,
 }
 
 impl SessionActor {
-    pub fn new(session_id: SessionId, writer: EventWriter, initial_state: SessionState) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_id: SessionId,
+        writer: EventWriter,
+        initial_state: SessionState,
+        runner: &'static TaskRunner,
+        policy: Arc<PolicyEngine>,
+        unsealed: bool,
+        state_dir: PathBuf,
+        daemon_binary: PathBuf,
+        isolate: Arc<dyn Isolate>,
+        handle: Handle,
+        session_spec: SessionSpec,
+    ) -> Self {
         let (state_tx, _rx) = tokio::sync::watch::channel(initial_state);
         SessionActor {
             session_id,
             writer,
             state_tx,
+            runner,
+            policy,
+            unsealed,
+            state_dir,
+            daemon_binary,
+            mcp_resolved: Arc::new(RwLock::new(HashSet::new())),
+            isolate,
+            handle,
+            session_spec,
+        }
+    }
+
+    /// Builds the live `SealedContext` this session's tasks are judged
+    /// against — the exact wiring finding 3's `sealed_tier_shortfall` check
+    /// needed and never had before this task: reads the CURRENT isolation
+    /// attestation (re-read every call, since §6.5 rule 4 says the achieved
+    /// tier can change mid-session) and the MCP registry's currently-
+    /// resolved servers, not a snapshot taken once at session start.
+    fn sealed_context(&self) -> SealedContext {
+        let attestation = self.isolate.attest(&self.handle);
+        SealedContext {
+            state_dir: self.state_dir.clone(),
+            daemon_binary: self.daemon_binary.clone(),
+            resolved_mcp_servers: self
+                .mcp_resolved
+                .read()
+                .expect("mcp_resolved lock poisoned")
+                .clone(),
+            requested_tier: self.session_spec.requested_tier,
+            attested_tier: attestation.tier,
         }
     }
 
@@ -98,6 +202,15 @@ impl SessionActor {
     /// its future consumers are.
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<SessionState> {
         self.state_tx.subscribe()
+    }
+
+    /// The shared, process-wide `TaskRunner` this actor was constructed
+    /// with — exposed so a later caller (e.g. a real task-execution
+    /// dispatch chokepoint) can mint further session-scoped events through
+    /// the same authority `admit_task`'s own bookkeeping uses, without
+    /// needing its own separate `&'static TaskRunner` threaded in.
+    pub fn runner(&self) -> &'static TaskRunner {
+        self.runner
     }
 
     /// Flip the in-memory admission gate to `Cancelling`, then mint and
@@ -168,15 +281,32 @@ impl SessionActor {
     /// `finally_step` claim from any other origin is evaluated as an
     /// ordinary task for gating purposes — the bypass simply doesn't apply,
     /// it is not a hard error.
+    ///
+    /// Task 25: once the `SessionState` gate above admits the task (an
+    /// ordinary admit or a trusted finally-step bypass — this gate's own
+    /// logic is unchanged from Task 3/4), a *second*, later gate now
+    /// actually calls `PolicyEngine::decide_sealed` — §6.2: "Every task
+    /// passes Policy::decide before execution." This is the real call site
+    /// every task goes through before `TaskRunner::execute`, not a unit
+    /// test against `PolicyEngine::decide`/`decide_sealed` in isolation
+    /// (Tasks 9/10 already cover that).
     pub fn admit_task(&self, req: &TaskCreateRequest) -> Result<(), AdmitError> {
         let trusted_finally_step = req.is_finally_step && req.origin == Origin::System;
 
         match self.state() {
-            SessionState::Created | SessionState::Running => Ok(()),
-            _ if trusted_finally_step => Ok(()),
-            SessionState::Cancelling => Err(AdmitError::SessionCancelling),
-            SessionState::Suspended => Err(AdmitError::SessionSuspended),
-            SessionState::Closed => Err(AdmitError::SessionClosed),
+            SessionState::Created | SessionState::Running => {}
+            _ if trusted_finally_step => {}
+            SessionState::Cancelling => return Err(AdmitError::SessionCancelling),
+            SessionState::Suspended => return Err(AdmitError::SessionSuspended),
+            SessionState::Closed => return Err(AdmitError::SessionClosed),
+        }
+
+        let ctx = self.sealed_context();
+        let decision = self.policy.decide_sealed(&req.params, self.unsealed, &ctx);
+        match decision.outcome {
+            Outcome::Deny => Err(AdmitError::Denied(decision.rule)),
+            Outcome::Ask => Err(AdmitError::RequiresApproval),
+            Outcome::Allow => Ok(()),
         }
     }
 
@@ -213,6 +343,7 @@ impl SessionActor {
                 kind: step.kind.clone(),
                 origin: Origin::System,
                 is_finally_step: true,
+                params: step.params.clone(),
             };
             self.admit_task(&req)?;
             execute(step).await.map_err(FinallyStepError::Execute)?;
@@ -226,6 +357,16 @@ impl SessionActor {
 pub struct FinallySpec {
     pub kind: TaskKind,
     pub input: TaskInput,
+    /// Task 25: `admit_task` now always consults `PolicyEngine::decide_sealed`,
+    /// which needs a real `TaskParams` for every `TaskCreateRequest` it
+    /// builds — `FinallySpec` didn't carry one before this task. Added here
+    /// (rather than synthesizing a permissive default inside
+    /// `run_finally_steps`) so a `finally:` step's own policy-relevant
+    /// params are exactly what gets judged — a synthesized placeholder
+    /// would either be spuriously permissive (bypassing the sealed floor
+    /// for a step that should be caught by it) or spuriously restrictive,
+    /// neither of which is honest about what the step actually does.
+    pub params: TaskParams,
 }
 
 /// Failure modes for [`SessionActor::run_finally_steps`].
@@ -235,4 +376,89 @@ pub enum FinallyStepError {
     Admit(#[from] AdmitError),
     #[error("finally step execution failed: {0}")]
     Execute(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Task 25 — the real, inline fix for audit finding 11's deferred
+/// downgrade-recording. Uses only the frozen `Isolate::probe`/`ProbeResult
+/// { achieved, degradations }` contract — no downcast from the generic
+/// `dyn Isolate` the engine actually holds, so this works identically for
+/// every `Isolate` implementation, not just `BwrapLandlockIsolate`.
+///
+/// A free function, not a method: `SessionActor` doesn't exist yet at
+/// session-creation time — this function's whole point is to build the
+/// `Handle` that later goes INTO a `SessionActor`.
+///
+/// Follows the exact real pattern this same file's `cancel()` uses: mint an
+/// `Event` via `TaskRunner::record_note`, append it via `EventWriter`,
+/// deliberately best-effort (`let _ =`) on the append so a failed Degradation
+/// note can never abort session creation — matching the brief's own
+/// "regardless of whether prepare() below ends up erring" framing.
+pub async fn create_session_isolation(
+    writer: &EventWriter,
+    runner: &TaskRunner,
+    session_id: SessionId,
+    isolate: &dyn Isolate,
+    spec: &SessionSpec,
+) -> Result<Handle, IsolationError> {
+    let probe = isolate.probe().await;
+    if probe.achieved < spec.requested_tier {
+        // §6.5 rule 3: a downgrade requires SessionSpec.on_degrade, set by
+        // the human at creation, and must be RECORDED — regardless of
+        // whether prepare() below ends up erring (on_degrade=Refuse) or
+        // succeeding at the lower tier (on_degrade=AllowDownTo). Recorded
+        // here, unconditionally, before prepare() runs.
+        let event = runner.record_note(
+            session_id,
+            0, // ignored — EventWriter::append assigns the real per-session seq
+            now_ts(),
+            None,
+            NoteLevel::Degradation,
+            format!(
+                "isolation shortfall: requested {:?}, only {:?} achievable on this host ({})",
+                spec.requested_tier,
+                probe.achieved,
+                probe.degradations.join("; "),
+            ),
+            1,
+        );
+        let _ = writer.append(event).await;
+    }
+    isolate.prepare(spec).await
+}
+
+/// Task 25 — the single real call site both `SealedContext` construction
+/// (via a later `SessionActor::new`) and the network-policy proxy hang off
+/// of: a session's isolation handle and its egress allowlist are decided
+/// together, once, here, at session creation.
+///
+/// Deliberately does NOT call `proxy.serve()` itself: `LoopbackProxy` binds
+/// exactly one listener for its whole lifetime and panics if `serve()` is
+/// called a second time (see `LoopbackProxy::serve`'s doc comment) — in the
+/// real daemon `serve()` runs once at daemon boot, well before any session
+/// (and therefore any call to this function) exists. The caller is
+/// responsible for having already `serve()`d `proxy` exactly once.
+pub async fn create_session_with_egress(
+    writer: &EventWriter,
+    runner: &TaskRunner,
+    session_id: SessionId,
+    isolate: &dyn Isolate,
+    spec: &SessionSpec,
+    proxy: &Arc<LoopbackProxy>,
+    egress_policy: EgressPolicy,
+) -> Result<(Handle, ProxyHandle), CreateSessionError> {
+    let handle = create_session_isolation(writer, runner, session_id, isolate, spec).await?;
+    let proxy_handle = proxy.register_session(session_id, egress_policy)?;
+    Ok((handle, proxy_handle))
+}
+
+/// Task 25's own design call (flagged as such by the addendum): a small
+/// error enum wrapping both failure modes `create_session_with_egress` can
+/// hit, so it has one coherent `Result` error type instead of forcing every
+/// caller to match on an ad hoc combination.
+#[derive(Debug, thiserror::Error)]
+pub enum CreateSessionError {
+    #[error(transparent)]
+    Isolation(#[from] IsolationError),
+    #[error(transparent)]
+    ProxyNotServing(#[from] ProxyNotServingError),
 }

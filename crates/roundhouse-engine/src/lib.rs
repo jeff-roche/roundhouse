@@ -31,7 +31,8 @@ pub use compact::{execute_compact, CompactError, CompactInput, CompactOutput, Co
 pub use context::assemble_context;
 pub use infer::fold_stream_to_blocks;
 pub use session_actor::{
-    AdmitError, FinallySpec, FinallyStepError, SessionActor, TaskCreateRequest,
+    create_session_isolation, create_session_with_egress, AdmitError, CreateSessionError,
+    FinallySpec, FinallyStepError, SessionActor, TaskCreateRequest,
 };
 pub use working_context::{ContextStateId, TokenBudget, WorkingContext};
 
