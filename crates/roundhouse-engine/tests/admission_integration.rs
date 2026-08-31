@@ -426,3 +426,152 @@ async fn admitting_a_task_with_the_sealed_floor_disabled_records_a_real_never_si
          never silent, per sealed.rs/engine.rs's own pre-existing doc contract"
     );
 }
+
+#[tokio::test]
+async fn a_dead_or_unrecognized_handle_fails_closed_instead_of_permanently_disabling_the_tier_shortfall_rule(
+) {
+    // Security-review fix-round-2 regression test. Fix-round-1's original
+    // `effective_tier = isolate.attest(&handle).tier` collapsed to
+    // `Tier::None` for any handle `BwrapLandlockIsolate::attest` doesn't
+    // recognize (a dead handle, a handle from a different `Isolate`
+    // instance, or — the realistic future case — a session rehydrated
+    // after a daemon restart, since the handle map is purely in-memory).
+    // That made BOTH sides of `sealed_tier_shortfall`'s comparison collapse
+    // to `Tier::None` (`attested_tier == requested_tier == None`),
+    // PERMANENTLY disabling the rule instead of denying — a real fail-open,
+    // in the opposite direction from the original nullity finding 6
+    // reported. `effective_tier` is now derived from `on_degrade` alone,
+    // never from a live `attest()` read, so a genuinely-unknown handle's
+    // real `Tier::None` attestation now correctly fails CLOSED instead.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let isolate: Arc<dyn Isolate> = Arc::new(available_isolate());
+    // Deliberately never `prepare()`d on this isolate instance — an id its
+    // internal handle map has never seen, so `attest()` takes its
+    // `Tier::None` "no live handle" branch.
+    let dead_handle = roundhouse_sandbox::Handle {
+        id: "dead-handle-never-prepared".to_string(),
+    };
+    assert_eq!(
+        isolate.attest(&dead_handle).tier,
+        Tier::None,
+        "test setup bug: this handle must be genuinely unrecognized by the isolate"
+    );
+
+    let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::AllowDownTo(Tier::Worktree));
+    let policy = Arc::new(PolicyEngine::from_rules(vec![
+        roundhouse_policy::engine::CompiledRule::test_new(
+            roundhouse_policy::engine::Scope::Builtin,
+            roundhouse_policy::engine::Outcome::Allow,
+            roundhouse_policy::engine::Predicate::program("true"),
+        ),
+    ]));
+
+    let actor = SessionActor::new(
+        SessionId::new(),
+        writer,
+        SessionState::Running,
+        &RUNNER,
+        policy,
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        isolate,
+        dead_handle,
+        spec,
+    );
+
+    let task = TaskCreateRequest {
+        kind: TaskKind::Shell,
+        origin: Origin::Model,
+        is_finally_step: false,
+        params: TaskParams::Shell(roundhouse_policy::ParsedCommand {
+            program: "true".to_string(),
+            argv: vec![],
+        }),
+    };
+
+    let err = actor.admit_task(&task).await.unwrap_err();
+    assert!(
+        matches!(err, AdmitError::Denied(_)),
+        "a dead/unrecognized handle's genuinely-unknown live attestation must fail admission \
+         closed via sealed:tier-shortfall, not silently allow everything forever — got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn unsealed_audit_note_accurately_reflects_a_denied_outcome_not_admitted() {
+    // Security-review fix-round-2 regression test: reproduced with
+    // fix-round-1's code, `unsealed=true` + a config rule that ends up
+    // denying the task still persisted a note reading "task admitted with
+    // the sealed floor DISABLED" — actively misleading, worse than no note
+    // at all. The note is now recorded AFTER the decision, describing the
+    // real outcome.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let session_id = SessionId::new();
+    let policy = Arc::new(
+        PolicyEngine::from_rules(vec![roundhouse_policy::engine::CompiledRule::test_new(
+            roundhouse_policy::engine::Scope::Builtin,
+            roundhouse_policy::engine::Outcome::Deny,
+            roundhouse_policy::engine::Predicate::program("rm"),
+        )])
+        .with_unsealed(true),
+    );
+    let isolate: Arc<dyn Isolate> = Arc::new(available_isolate());
+    let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+    let handle = isolate.prepare(&spec).await.unwrap();
+
+    let actor = SessionActor::new(
+        session_id,
+        writer,
+        SessionState::Running,
+        &RUNNER,
+        policy,
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        isolate,
+        handle,
+        spec,
+    );
+
+    let task = TaskCreateRequest {
+        kind: TaskKind::Shell,
+        origin: Origin::Model,
+        is_finally_step: false,
+        params: TaskParams::Shell(roundhouse_policy::ParsedCommand {
+            program: "rm".to_string(),
+            argv: vec![],
+        }),
+    };
+    let err = actor.admit_task(&task).await.unwrap_err();
+    assert!(
+        matches!(err, AdmitError::Denied(_)),
+        "test setup bug: this task must actually be denied by the config rule — got {err:?}"
+    );
+
+    let store2 = open(&db_path).await.unwrap();
+    let events = session_events(&store2, session_id).await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::Note { level: NoteLevel::Warn, text }
+                if text.contains("outcome=Deny")
+        )),
+        "the unsealed-admission audit note for a DENIED task must say so, not claim the task \
+         was admitted"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::Note { level: NoteLevel::Warn, text }
+                if text.contains("admitted")
+        )),
+        "no unsealed-admission note may claim this denied task was 'admitted'"
+    );
+}

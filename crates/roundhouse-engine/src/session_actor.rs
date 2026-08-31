@@ -35,8 +35,8 @@
 //! session-creation call site.
 
 use roundhouse_core::{
-    CancelReason, NoteLevel, Origin, SessionId, SessionSpec, SessionState, TaskInput, TaskKind,
-    TaskRunner, Tier, Timestamp,
+    CancelReason, NoteLevel, OnDegrade, Origin, SessionId, SessionSpec, SessionState, TaskInput,
+    TaskKind, TaskRunner, Tier, Timestamp,
 };
 use roundhouse_net::policy::EgressPolicy;
 use roundhouse_net::proxy::{LoopbackProxy, ProxyHandle, ProxyNotServingError};
@@ -123,6 +123,21 @@ pub enum AdmitError {
     /// variant simply refuses admission the same as `Denied`.
     #[error("requires human approval before this task can proceed")]
     RequiresApproval,
+    /// Task 25 fix-round-2 (security review): if the sealed-floor-disabled
+    /// audit note (see `admit_task`'s doc comment) fails to durably
+    /// append, admission fails CLOSED rather than silently proceeding with
+    /// the sealed floor disabled and no audit trail — mirroring `cancel()`'s
+    /// own fail-loud posture elsewhere in this file (propagated via `?`,
+    /// never `let _ =`). Fix-round-1's version of this note used `let _ =`
+    /// on the append and proceeded regardless — a real, reproduced
+    /// "tries to be loud, then is silent anyway on the one path where
+    /// loudness actually mattered" gap; this variant is what a caller now
+    /// sees instead of that silent fallthrough.
+    #[error(
+        "failed to durably record the sealed-floor-disabled audit note; refusing admission \
+         rather than proceeding without an audit trail: {0}"
+    )]
+    UnsealedAuditFailed(#[from] StoreError),
 }
 
 /// Tracks one session's `SessionState` and gates new-task admission on it.
@@ -173,19 +188,36 @@ pub struct SessionActor {
     isolate: Arc<dyn Isolate>,
     handle: Handle,
     session_spec: SessionSpec,
-    /// Task 25 fix-round-1 (security review): the tier this session's
-    /// `handle` actually settled at, captured once at construction via
-    /// `isolate.attest(&handle).tier` — mirrors `Isolate::prepare`'s own
-    /// internal `achieved.min(requested)` decision. `sealed_context()`
-    /// compares the CURRENT live attestation against THIS, not
-    /// `session_spec.requested_tier` directly: a session created with
-    /// `OnDegrade::AllowDownTo` that genuinely (and human-acceptedly)
+    /// The tier this session is actually ENTITLED to run at, derived from
+    /// what the human's `on_degrade` setting authorized — `requested_tier`
+    /// itself for `OnDegrade::Refuse` (nothing lower was ever accepted), or
+    /// the accepted floor for `OnDegrade::AllowDownTo(floor)`.
+    /// `sealed_context()` compares the CURRENT live attestation against
+    /// THIS, not `session_spec.requested_tier` directly: a session created
+    /// with `OnDegrade::AllowDownTo` that genuinely (and human-acceptedly)
     /// settles for a lower tier must not have `sealed_tier_shortfall` fire
     /// on every single task for the rest of its life just because the
     /// ORIGINAL ask never changes. A later, real mid-session degradation
     /// (attested tier dropping below `effective_tier`) still correctly
     /// fires the rule — only the one-time, accepted-at-creation gap is
     /// excused.
+    ///
+    /// **Task 25 fix-round-2 (security review):** deliberately NOT derived
+    /// from `isolate.attest(&handle).tier` (fix-round-1's original
+    /// approach) — `BwrapLandlockIsolate::attest` returns `Tier::None` for
+    /// any handle not currently in its in-memory handle map (a dead handle,
+    /// a handle from a different `Isolate` instance, or a session
+    /// rehydrated after a daemon restart, since the handle map is purely
+    /// in-memory), which made `effective_tier` silently collapse to `None`
+    /// and PERMANENTLY disable `sealed:tier-shortfall` for that session's
+    /// whole life — a genuine fail-open regression, reproduced by security
+    /// review, in the opposite direction from finding 6's original bug.
+    /// Deriving from `on_degrade` instead never depends on a live
+    /// attestation succeeding: `Isolate::prepare` already enforces
+    /// `achieved >= floor` before a `Handle` is ever returned (§6.5 rule
+    /// 2), so on the happy path this agrees with what `attest()` would
+    /// report anyway — it just doesn't fail open when attestation can't
+    /// find the handle.
     effective_tier: Tier,
 }
 
@@ -227,7 +259,10 @@ impl SessionActor {
              sealed:daemon-binary-write rule"
         );
         let (state_tx, _rx) = tokio::sync::watch::channel(initial_state);
-        let effective_tier = isolate.attest(&handle).tier;
+        let effective_tier = match session_spec.on_degrade {
+            OnDegrade::Refuse => session_spec.requested_tier,
+            OnDegrade::AllowDownTo(floor) => floor,
+        };
         SessionActor {
             session_id,
             writer,
@@ -392,12 +427,22 @@ impl SessionActor {
     /// Now `async`, as of Task 25 fix-round-1: whenever `self.policy.
     /// unsealed()` is true (§6.2's one documented sealed-floor escape,
     /// `round daemon --unsealed`), a `Note` is durably recorded for THIS
-    /// task before the policy decision runs — `sealed.rs`'s and `engine.
-    /// rs`'s own pre-existing doc comments already committed to "`--unsealed`
-    /// ... must be recorded per-task ... never silent"; this is that
-    /// recording, finally real. Best-effort (`let _ =`) on the append, same
-    /// as `create_session_isolation`'s Degradation note below: a failed
-    /// audit-note append must never itself block or unblock admission.
+    /// task — `sealed.rs`'s and `engine.rs`'s own pre-existing doc comments
+    /// already committed to "`--unsealed` ... must be recorded per-task ...
+    /// never silent"; this is that recording, finally real. As of
+    /// fix-round-2, the note is recorded AFTER the policy decision is known
+    /// (describing the real `Allow`/`Ask`/`Deny` outcome, not
+    /// unconditionally "admitted" — an earlier version recorded before the
+    /// decision and always said "admitted," which was actively misleading
+    /// whenever the decision then turned out to be `Ask`/`Deny`), and a
+    /// failed append fails admission CLOSED via `AdmitError::
+    /// UnsealedAuditFailed` rather than silently proceeding — an earlier
+    /// version used `let _ =` on this specific append and proceeded
+    /// regardless, which was its own "tries to be loud, then is silent
+    /// anyway" gap. This is a different posture from
+    /// `create_session_isolation`'s Degradation note (still best-effort,
+    /// by design — see that function's own doc comment for why session
+    /// *creation* deliberately doesn't fail closed on that append).
     ///
     /// # Security invariant on `req.params`
     /// For `TaskParams::Fs`, `req.params`'s `canonical` field MUST be a
@@ -439,7 +484,27 @@ impl SessionActor {
         }
 
         let unsealed = self.policy.unsealed();
+        let ctx = self.sealed_context();
+        let decision = self.policy.decide_sealed(&req.params, unsealed, &ctx);
+
+        // Task 25 fix-round-2 (security review): recorded AFTER the
+        // decision is known, and describing the REAL outcome — fix-round-1
+        // recorded this note before `decide_sealed` ran and unconditionally
+        // said "task admitted," which was actively misleading whenever the
+        // decision then turned out to be Ask/Deny (an audit trail claiming
+        // a denied task was admitted is worse than no note at all). The
+        // append is also no longer best-effort: `?` propagates a failed
+        // append as `AdmitError::UnsealedAuditFailed`, failing admission
+        // CLOSED rather than silently proceeding with the sealed floor
+        // disabled and no durable record of it — satisfying "must be
+        // recorded ... never silent" for real, not just "tries to record,
+        // then is silent anyway if that fails."
         if unsealed {
+            let outcome_str = match decision.outcome {
+                Outcome::Allow => "Allow",
+                Outcome::Ask => "Ask",
+                Outcome::Deny => "Deny",
+            };
             let event = self.runner.record_note(
                 self.session_id,
                 0, // ignored — EventWriter::append assigns the real per-session seq
@@ -447,17 +512,18 @@ impl SessionActor {
                 None,
                 NoteLevel::Warn,
                 format!(
-                    "task admitted with the sealed floor DISABLED (--unsealed): kind={:?} \
-                     origin={:?}",
+                    "task evaluated with the sealed floor DISABLED (--unsealed): kind={:?} \
+                     origin={:?} outcome={outcome_str}",
                     req.kind, req.origin,
                 ),
                 1,
             );
-            let _ = self.writer.append(event).await;
+            self.writer
+                .append(event)
+                .await
+                .map_err(AdmitError::UnsealedAuditFailed)?;
         }
 
-        let ctx = self.sealed_context();
-        let decision = self.policy.decide_sealed(&req.params, unsealed, &ctx);
         match decision.outcome {
             Outcome::Deny => Err(AdmitError::Denied(decision.rule)),
             Outcome::Ask => Err(AdmitError::RequiresApproval),
@@ -561,12 +627,19 @@ pub enum FinallyStepError {
 /// Degradation note (false positive, driven by a stale/mismatched `probe()`
 /// read), and a custom `Isolate` whose `probe()` over-reports produced ZERO
 /// degradation notes for a real downgrade (false negative). `prepare()` is
-/// now called FIRST; the note (if any) is recorded from its real,
-/// handle-attested outcome afterward — "regardless of whether `prepare()`
-/// erred" no longer applies verbatim, since a `Refuse`-degraded `prepare()`
-/// error means no handle (and therefore nothing to attest or record) was
-/// ever created at all; that is the honest outcome for that case, not a
-/// regression.
+/// now called FIRST; the note is recorded from its real, handle-attested
+/// outcome afterward on the success path. **Fix-round-2:** the
+/// `OnDegrade::Refuse` error path (`prepare()` returning
+/// `IsolationError::DegradedBelowRequested`, meaning no `Handle` was ever
+/// created at all) ALSO records a Degradation note — sourced from
+/// `isolate.probe()` for best-effort diagnostic detail, since there is no
+/// handle to attest against there and none of finding 2's mismatch hazard
+/// applies to a case where no decision is being made from the probe read (a
+/// shortfall in that path is already, independently established by the
+/// `DegradedBelowRequested` variant itself). Fix-round-1 had left this
+/// specific path recording nothing, a real regression versus the original
+/// (pre-fix-round-1) code, which recorded unconditionally before `prepare()`
+/// ran.
 ///
 /// Follows the exact real pattern this same file's `cancel()` uses for the
 /// append itself: mint an `Event` via `TaskRunner::record_note`, append it
@@ -579,28 +652,67 @@ pub async fn create_session_isolation(
     isolate: &dyn Isolate,
     spec: &SessionSpec,
 ) -> Result<Handle, IsolationError> {
-    let handle = isolate.prepare(spec).await?;
-    let achieved = isolate.attest(&handle).tier;
-    if achieved < spec.requested_tier {
-        // §6.5 rule 3: a downgrade requires SessionSpec.on_degrade, set by
-        // the human at creation, and must be RECORDED. Driven by the real,
-        // handle-attested `achieved` tier above, not an independent probe.
-        let event = runner.record_note(
-            session_id,
-            0, // ignored — EventWriter::append assigns the real per-session seq
-            now_ts(),
-            None,
-            NoteLevel::Degradation,
-            format!(
-                "isolation shortfall: requested {:?}, this session's handle actually achieved \
-                 {:?}",
-                spec.requested_tier, achieved,
-            ),
-            1,
-        );
-        let _ = writer.append(event).await;
+    match isolate.prepare(spec).await {
+        Ok(handle) => {
+            let achieved = isolate.attest(&handle).tier;
+            if achieved < spec.requested_tier {
+                // §6.5 rule 3: a downgrade requires SessionSpec.on_degrade,
+                // set by the human at creation, and must be RECORDED.
+                // Driven by the real, handle-attested `achieved` tier
+                // above, not an independent probe.
+                let event = runner.record_note(
+                    session_id,
+                    0, // ignored — EventWriter::append assigns the real per-session seq
+                    now_ts(),
+                    None,
+                    NoteLevel::Degradation,
+                    format!(
+                        "isolation shortfall: requested {:?}, this session's handle actually \
+                         achieved {:?}",
+                        spec.requested_tier, achieved,
+                    ),
+                    1,
+                );
+                let _ = writer.append(event).await;
+            }
+            Ok(handle)
+        }
+        // Task 25 fix-round-2 (optional, folded in): `OnDegrade::Refuse`
+        // means `prepare()` errors instead of returning a `Handle` — with
+        // fix-round-1's prepare-then-note reordering (the fix for finding
+        // 2), that left this specific path recording nothing at all, a
+        // real audit-trail gap versus the original (pre-fix-round-1)
+        // behavior, which recorded unconditionally before `prepare()` ran.
+        // Safe to record here from `isolate.probe()`: finding 2's
+        // attest()-vs-probe() mismatch hazard was about a DECISION (whether
+        // a shortfall exists / what tier to claim was achieved) disagreeing
+        // with the real, handle-attested outcome — here there is no handle
+        // to disagree with at all (`prepare()` already errored), so
+        // `probe()`'s read is used purely as best-effort diagnostic color
+        // for a shortfall the `DegradedBelowRequested` error variant has
+        // already, independently established occurred.
+        Err(e @ IsolationError::DegradedBelowRequested) => {
+            let probe = isolate.probe().await;
+            let event = runner.record_note(
+                session_id,
+                0,
+                now_ts(),
+                None,
+                NoteLevel::Degradation,
+                format!(
+                    "isolation shortfall: requested {:?}, only {:?} achievable on this host \
+                     ({}) — session refused to start (OnDegrade::Refuse)",
+                    spec.requested_tier,
+                    probe.achieved,
+                    probe.degradations.join("; "),
+                ),
+                1,
+            );
+            let _ = writer.append(event).await;
+            Err(e)
+        }
+        Err(e) => Err(e),
     }
-    Ok(handle)
 }
 
 /// Task 25 — the single real call site both `SealedContext` construction
