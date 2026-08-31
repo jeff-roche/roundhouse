@@ -65,6 +65,145 @@ fn workspace_lists_all_expected_crates() {
     );
 }
 
+/// The expected internal (`roundhouse-*`) dependency edges for each real
+/// workspace crate, matching `docs/architecture/02-system-architecture.md`
+/// §5.2's crate-dependency table as corrected by the final Phase 2
+/// whole-branch-review cleanup. This is a deliberate, hardcoded mirror of
+/// that table — not derived from it — so a future edit to either the table
+/// or a crate's real `Cargo.toml` dependencies that isn't also reflected
+/// here fails this test loudly, the way doc drift like the one this test
+/// was added to catch should have been caught before it could land.
+///
+/// `xtask` itself and `roundhouse-core` (no internal deps) are omitted —
+/// `roundhouse-core`'s empty edge set is still checked via `expect(&[])`
+/// falling out of `.unwrap_or(&[])` below for any crate not listed here
+/// with a nonempty real dependency set, so leaving it out is fine, but it's
+/// listed explicitly for clarity.
+const EXPECTED_EDGES: &[(&str, &[&str])] = &[
+    ("roundhouse-core", &[]),
+    ("roundhouse-proto", &["roundhouse-core"]),
+    (
+        "roundhouse-store",
+        &["roundhouse-core", "roundhouse-provider"],
+    ),
+    ("roundhouse-policy", &["roundhouse-core", "roundhouse-store"]),
+    ("roundhouse-sandbox", &["roundhouse-core"]),
+    ("roundhouse-provider", &["roundhouse-core"]),
+    (
+        "roundhouse-tools",
+        &[
+            "roundhouse-core",
+            "roundhouse-sandbox",
+            "roundhouse-policy",
+            "roundhouse-net",
+        ],
+    ),
+    ("roundhouse-mcp", &["roundhouse-core", "roundhouse-policy"]),
+    ("roundhouse-acp", &["roundhouse-core", "roundhouse-proto"]),
+    ("roundhouse-bus", &["roundhouse-core"]),
+    (
+        "roundhouse-engine",
+        &[
+            "roundhouse-core",
+            "roundhouse-store",
+            "roundhouse-policy",
+            "roundhouse-net",
+            "roundhouse-sandbox",
+            "roundhouse-provider",
+            "roundhouse-bus",
+        ],
+    ),
+    ("roundhouse-config", &[]),
+    (
+        "roundhouse-secrets",
+        &["roundhouse-config", "roundhouse-core", "roundhouse-store"],
+    ),
+    (
+        "roundhouse-flow",
+        &["roundhouse-core", "roundhouse-engine", "roundhouse-store"],
+    ),
+    (
+        "roundhouse-sched",
+        &["roundhouse-core", "roundhouse-engine", "roundhouse-store"],
+    ),
+    (
+        "roundhouse-daemon",
+        &[
+            "roundhouse-core",
+            "roundhouse-proto",
+            "roundhouse-store",
+            "roundhouse-policy",
+            "roundhouse-sandbox",
+            "roundhouse-provider",
+            "roundhouse-tools",
+            "roundhouse-mcp",
+            "roundhouse-acp",
+            "roundhouse-bus",
+            "roundhouse-engine",
+            "roundhouse-flow",
+            "roundhouse-sched",
+            "roundhouse-config",
+            "roundhouse-tui",
+        ],
+    ),
+    ("roundhouse-tui", &["roundhouse-proto"]),
+    ("roundhouse-cli", &["roundhouse-proto", "roundhouse-tui"]),
+    ("roundhouse-web", &["roundhouse-proto"]),
+    ("roundhouse-net", &["roundhouse-core", "roundhouse-store"]),
+];
+
+/// Reads `path`'s `[dependencies]` table and returns the sorted names of
+/// every `roundhouse-*` dependency it declares. A straightforward
+/// TOML-parsing check, consistent with `workspace_lists_all_expected_crates`
+/// above, rather than anything fancier — this only needs to catch drift
+/// between the architecture doc's dependency table and each crate's real
+/// `Cargo.toml`, not model Cargo's full dependency resolution.
+fn real_internal_deps(manifest_path: &Path) -> Vec<String> {
+    let manifest = fs::read_to_string(manifest_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
+    let parsed: toml::Value = manifest
+        .parse()
+        .unwrap_or_else(|e| panic!("parse {}: {e}", manifest_path.display()));
+    let mut deps: Vec<String> = parsed
+        .get("dependencies")
+        .and_then(|d| d.as_table())
+        .map(|table| {
+            table
+                .keys()
+                .filter(|name| name.starts_with("roundhouse-"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    deps.sort();
+    deps
+}
+
+#[test]
+fn crate_dependency_edges_match_the_architecture_doc() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    for (crate_name, expected_edges) in EXPECTED_EDGES {
+        let manifest_path = root
+            .join("crates")
+            .join(crate_name)
+            .join("Cargo.toml");
+        let mut expected: Vec<String> = expected_edges.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        let actual = real_internal_deps(&manifest_path);
+        assert_eq!(
+            actual, expected,
+            "{crate_name}'s real Cargo.toml roundhouse-* dependencies {actual:?} do not \
+             match the expected edges {expected:?} (kept in sync with \
+             docs/architecture/02-system-architecture.md §5.2 — update EXPECTED_EDGES here \
+             AND that table together, never one without the other)"
+        );
+    }
+}
+
 #[test]
 fn workspace_forbids_unsafe_code_by_default() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
