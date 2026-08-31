@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use roundhouse_core::{
-    EventPayload, NoteLevel, OnDegrade, Origin, SessionId, SessionSpec, SessionState, Tier,
-    TaskKind,
+    EventPayload, NoteLevel, OnDegrade, Origin, SessionId, SessionSpec, SessionState, TaskKind,
+    Tier,
 };
 use roundhouse_engine::{
     create_session_isolation, create_session_with_egress, AdmitError, SessionActor,

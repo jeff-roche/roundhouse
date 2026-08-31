@@ -35,7 +35,10 @@ pub enum NetworkMechanism {
 /// §6.6's honesty table as one pure, directly-tested function: `Netns` and
 /// `Bubblewrap` are real network enforcement; `LandlockPortOnly` and `None` are not.
 pub fn net_enforced_for(mechanism: NetworkMechanism) -> bool {
-    matches!(mechanism, NetworkMechanism::Netns | NetworkMechanism::Bubblewrap)
+    matches!(
+        mechanism,
+        NetworkMechanism::Netns | NetworkMechanism::Bubblewrap
+    )
 }
 
 #[cfg(test)]

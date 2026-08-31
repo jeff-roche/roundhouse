@@ -1,4 +1,4 @@
-use roundhouse_policy::engine::{CompiledRule, Outcome, Predicate, PolicyEngine, Scope};
+use roundhouse_policy::engine::{CompiledRule, Outcome, PolicyEngine, Predicate, Scope};
 use roundhouse_policy::trust::{apply_project_scope_trust, record_explicit_trust, TrustStore};
 use roundhouse_policy::{ParsedCommand, TaskParams};
 use std::path::PathBuf;
@@ -95,7 +95,8 @@ fn narrowing_the_policy_file_is_accepted_automatically_no_human_needed() {
     // The agent (or a human) removes the `curl` rule — this only narrows, so it applies
     // immediately with no separate trust step, and becomes the new trusted baseline.
     let narrowed_text = "allow git status";
-    let effective = apply_project_scope_trust(&repo_root, narrowed_text, vec![allow_rule("git")], &store);
+    let effective =
+        apply_project_scope_trust(&repo_root, narrowed_text, vec![allow_rule("git")], &store);
     assert_eq!(
         effective.len(),
         1,
@@ -126,7 +127,10 @@ fn explicit_trust_update_unlocks_the_wider_rules() {
 
     let effective = apply_project_scope_trust(&repo_root, widened_text, widened_rules, &store);
     assert_eq!(
-        effective.iter().filter(|r| r.outcome == Outcome::Allow).count(),
+        effective
+            .iter()
+            .filter(|r| r.outcome == Outcome::Allow)
+            .count(),
         2,
         "after an explicit trust update, the previously-refused wider rule now applies"
     );
@@ -174,7 +178,11 @@ fn a_corrupt_trust_record_is_not_silently_clobbered_and_stays_fail_closed() {
     let path = state_dir
         .path()
         .join("workspaces")
-        .join(blake3::hash(repo_root.to_string_lossy().as_bytes()).to_hex().as_str())
+        .join(
+            blake3::hash(repo_root.to_string_lossy().as_bytes())
+                .to_hex()
+                .as_str(),
+        )
         .join("policy_trust.toml");
     std::fs::write(&path, b"this is not valid toml {{{").unwrap();
 
@@ -222,7 +230,9 @@ fn removing_a_trusted_deny_rule_widens_the_real_effective_decision_and_is_fully_
     // Sanity: the real PolicyEngine actually denies this before the attack — Deny always
     // wins over a matching Allow in `PolicyEngine::decide`, regardless of order.
     assert_eq!(
-        PolicyEngine::from_rules(baseline_rules).decide(&force_push_params()).outcome,
+        PolicyEngine::from_rules(baseline_rules)
+            .decide(&force_push_params())
+            .outcome,
         Outcome::Deny
     );
 
@@ -230,7 +240,8 @@ fn removing_a_trusted_deny_rule_widens_the_real_effective_decision_and_is_fully_
     // appears at all, and the surviving `Allow git` rule is unchanged.
     let deny_removed_text = "allow git";
     let deny_removed_rules = vec![allow_rule("git")];
-    let effective = apply_project_scope_trust(&repo_root, deny_removed_text, deny_removed_rules, &store);
+    let effective =
+        apply_project_scope_trust(&repo_root, deny_removed_text, deny_removed_rules, &store);
 
     assert!(
         !effective.iter().any(|r| r.outcome == Outcome::Allow),
@@ -343,7 +354,9 @@ fn reordering_two_tied_specificity_rules_flips_the_real_decision_and_is_gated() 
         argv: vec![],
     });
     assert_eq!(
-        PolicyEngine::from_rules(ask_first_rules).decide(&bare_git).outcome,
+        PolicyEngine::from_rules(ask_first_rules)
+            .decide(&bare_git)
+            .outcome,
         Outcome::Ask,
         "sanity: with `ask git` listed first, the real PolicyEngine decides Ask on a tie"
     );
@@ -360,7 +373,9 @@ fn reordering_two_tied_specificity_rules_flips_the_real_decision_and_is_gated() 
     // its own, so this test isn't vacuous (i.e. it isn't accidentally passing because the
     // swap never mattered to `PolicyEngine::decide` in the first place).
     assert_eq!(
-        PolicyEngine::from_rules(swapped_rules.clone()).decide(&bare_git).outcome,
+        PolicyEngine::from_rules(swapped_rules.clone())
+            .decide(&bare_git)
+            .outcome,
         Outcome::Allow,
         "sanity: with the lines swapped and NO trust gate involved, the real PolicyEngine \
          really does flip to Allow on the same tie — proving the gate below is doing real \
@@ -402,7 +417,8 @@ fn reordering_via_the_file_order_field_alone_is_gated_even_when_vec_position_is_
     let repo_root = PathBuf::from("/repos/example");
     let store = TrustStore::new(state_dir.path().to_path_buf());
 
-    let mut ask_rule = CompiledRule::test_new(Scope::Project, Outcome::Ask, Predicate::program("git"));
+    let mut ask_rule =
+        CompiledRule::test_new(Scope::Project, Outcome::Ask, Predicate::program("git"));
     let mut allow_git = allow_rule("git");
     ask_rule.file_order = 0;
     allow_git.file_order = 1;
@@ -417,7 +433,9 @@ fn reordering_via_the_file_order_field_alone_is_gated_even_when_vec_position_is_
         argv: vec![],
     });
     assert_eq!(
-        PolicyEngine::from_rules(baseline_rules).decide(&bare_git).outcome,
+        PolicyEngine::from_rules(baseline_rules)
+            .decide(&bare_git)
+            .outcome,
         Outcome::Ask
     );
 
@@ -431,15 +449,20 @@ fn reordering_via_the_file_order_field_alone_is_gated_even_when_vec_position_is_
     let attacked_rules = vec![swapped_ask, swapped_allow]; // same Vec order as baseline_rules
 
     assert_eq!(
-        PolicyEngine::from_rules(attacked_rules.clone()).decide(&bare_git).outcome,
+        PolicyEngine::from_rules(attacked_rules.clone())
+            .decide(&bare_git)
+            .outcome,
         Outcome::Allow,
         "sanity: file_order alone (not Vec position) really does flip the real decision"
     );
 
-    let effective = apply_project_scope_trust(&repo_root, "allow git\nask git", attacked_rules, &store);
+    let effective =
+        apply_project_scope_trust(&repo_root, "allow git\nask git", attacked_rules, &store);
 
     assert!(
-        effective.iter().all(|r| r.outcome != Outcome::Allow && r.outcome != Outcome::Ask),
+        effective
+            .iter()
+            .all(|r| r.outcome != Outcome::Allow && r.outcome != Outcome::Ask),
         "a file_order-only reorder (identical Vec position) must be caught exactly like a \
          Vec-position reorder — the trust gate must key its ordering on file_order, not on \
          incidental Vec iteration order"

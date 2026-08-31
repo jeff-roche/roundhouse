@@ -6,8 +6,8 @@
 //! chokepoint (there isn't one yet).
 
 use roundhouse_core::{
-    CancelReason, EventPayload, OnDegrade, Origin, SessionId, SessionSpec, SessionState, Tier,
-    TaskKind,
+    CancelReason, EventPayload, OnDegrade, Origin, SessionId, SessionSpec, SessionState, TaskKind,
+    Tier,
 };
 use roundhouse_engine::{AdmitError, SessionActor, TaskCreateRequest};
 use roundhouse_policy::engine::{

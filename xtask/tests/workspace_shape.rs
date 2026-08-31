@@ -86,7 +86,10 @@ const EXPECTED_EDGES: &[(&str, &[&str])] = &[
         "roundhouse-store",
         &["roundhouse-core", "roundhouse-provider"],
     ),
-    ("roundhouse-policy", &["roundhouse-core", "roundhouse-store"]),
+    (
+        "roundhouse-policy",
+        &["roundhouse-core", "roundhouse-store"],
+    ),
     ("roundhouse-sandbox", &["roundhouse-core"]),
     ("roundhouse-provider", &["roundhouse-core"]),
     (
@@ -187,10 +190,7 @@ fn crate_dependency_edges_match_the_architecture_doc() {
         .to_path_buf();
 
     for (crate_name, expected_edges) in EXPECTED_EDGES {
-        let manifest_path = root
-            .join("crates")
-            .join(crate_name)
-            .join("Cargo.toml");
+        let manifest_path = root.join("crates").join(crate_name).join("Cargo.toml");
         let mut expected: Vec<String> = expected_edges.iter().map(|s| s.to_string()).collect();
         expected.sort();
         let actual = real_internal_deps(&manifest_path);

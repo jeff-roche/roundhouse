@@ -219,7 +219,9 @@ fn signature_sequence(rules: &[CompiledRule]) -> Vec<String> {
         rules.iter().filter(|r| r.scope == Scope::Project).collect();
     project_rules.sort_by_key(|r| r.file_order);
     debug_assert!(
-        project_rules.windows(2).all(|w| w[0].file_order <= w[1].file_order),
+        project_rules
+            .windows(2)
+            .all(|w| w[0].file_order <= w[1].file_order),
         "trust::signature_sequence: rules must come out sorted by file_order — the exact \
          field PolicyEngine::decide's tie-break reads — after the sort_by_key above; a \
          violation here means the sort was changed or bypassed, silently reintroducing the \
