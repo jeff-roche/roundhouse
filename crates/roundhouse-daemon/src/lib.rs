@@ -9,5 +9,6 @@
 //! startup shell over it. See `docs/architecture/02-system-architecture.md` §5.2.
 #![forbid(unsafe_code)]
 
+pub mod boot;
 pub mod demo;
 pub mod socket_server;

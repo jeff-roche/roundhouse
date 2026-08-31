@@ -32,6 +32,16 @@ pub fn open_memory_connection() -> rusqlite::Connection {
 /// - `Migration`: schema migration failures
 /// - `Pool`: deadpool connection pool exhaustion or shutdown
 /// - `Interact`: async executor (tokio) task panicked while interacting with the connection
+/// - `NotFound`: a genuine domain-level lookup failure (e.g. no `TaskCompleted` event found
+///   for a task) — distinct from `Interact`, which this crate's convention reserves for
+///   interact-closure/panic failures specifically, not ordinary "no such row" outcomes.
+/// - `Unattributable`: a completed task's `TaskOutput` exists but doesn't carry the
+///   provider/model attribution `cost.rs`'s cost view needs (e.g. a chat task's
+///   `TaskOutput::Text(String::new())`, per `roundhouse-engine`'s `chat.rs`). Deliberately
+///   distinct from `NotFound`: this is the *expected*, common case for most completed
+///   tasks in a real session, not a data-consistency error — callers that need to treat
+///   it as non-fatal (`cost::session_cost_rollup`) match on this variant specifically
+///   rather than on `NotFound`.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("io error: {0}")]
@@ -44,6 +54,10 @@ pub enum StoreError {
     Pool(#[from] deadpool_sqlite::PoolError),
     #[error("interact error: {0}")]
     Interact(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("unattributable: {0}")]
+    Unattributable(String),
 }
 
 /// A WAL-mode SQLite connection pool. The `pool` field is public (not `pub(crate)`) because
@@ -97,6 +111,11 @@ pub async fn open(path: &Path) -> Result<StorePool, StoreError> {
         c.pragma_update(None, "synchronous", "NORMAL")?;
         c.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
         MIGRATIONS.to_latest(c)?;
+        // Security fix (Task 0.5 follow-up): backfill `tasks` rows for any task_id
+        // already in the event log but missing from `tasks` — e.g. every task that
+        // existed before migration 0003 first ran on this database. Idempotent and
+        // cheap once complete; see `tasks_view::backfill_tasks_table`'s doc comment.
+        crate::tasks_view::backfill_tasks_table(c)?;
         Ok::<_, StoreError>(())
     })
     .await

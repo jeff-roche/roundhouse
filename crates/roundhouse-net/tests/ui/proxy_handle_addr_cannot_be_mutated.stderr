@@ -1,0 +1,5 @@
+error[E0616]: field `addr` of struct `ProxyHandle` is private
+  --> tests/ui/proxy_handle_addr_cannot_be_mutated.rs:20:12
+   |
+20 |     handle.addr = rogue;
+   |            ^^^^ private field

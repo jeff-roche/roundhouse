@@ -18,12 +18,25 @@
 #![forbid(unsafe_code)]
 
 mod chat;
+pub mod compact;
 mod context;
 mod infer;
+mod session_actor;
+mod working_context;
 
 pub use chat::{run_chat_turn, AgentError};
+// `compact` is `pub mod` so tests can use the path `roundhouse_engine::compact::*`.
+// Re-export the common items at crate root for convenience.
+pub use compact::{execute_compact, CompactError, CompactInput, CompactOutput, CompactStrategy};
 pub use context::assemble_context;
 pub use infer::fold_stream_to_blocks;
+pub use session_actor::{
+    create_session_isolation, create_session_with_egress, AdmitError, CreateSessionError,
+    FinallySpec, FinallyStepError, SessionActor, TaskCreateRequest,
+};
+pub use working_context::{ContextStateId, TokenBudget, WorkingContext};
+
+pub mod test_support;
 
 use roundhouse_bus::Bus;
 use roundhouse_core::TaskRunner;

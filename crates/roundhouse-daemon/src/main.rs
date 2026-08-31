@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 use roundhouse_core::TaskRunner;
+use roundhouse_daemon::boot;
 use roundhouse_daemon::demo::{run_demo_session, DemoConfig, FakeEditProvider, NoopTransport};
 use roundhouse_daemon::socket_server::serve_ndjson;
 use roundhouse_provider::{AnthropicMessagesProvider, Provider, RequestCtx, ReqwestTransport};
@@ -70,26 +71,35 @@ async fn main() -> color_eyre::Result<()> {
     let edit_target = runtime_dir.join("demo-target.txt");
     write_demo_file(&edit_target).await?;
 
-    // Crash recovery (S-SESS-4): reclassify any task left in `Created`/`Decided`/
-    // `Running` state by a previous daemon process that died mid-run. Without this,
-    // a `round daemon` killed mid-session leaves those tasks stuck in the log forever
-    // — `roundhouse_store::recover_interrupted_tasks` is fully implemented and tested
-    // (`roundhouse-store/tests/recovery.rs`) but had no production caller before this.
-    // Runs once, here, between opening the store and starting the (possibly brand new)
-    // demo session — on a fresh `store_path` this is a no-op scan over zero rows.
+    // Boot sequence (S-SESS-4): reclassify any task left in `Created`/`Decided`/
+    // `Running` state by a previous daemon process that died mid-run, and
+    // enumerate tasks left `Suspended` (e.g. mid-approval) so they are at least
+    // visible again after a restart. Without the first half, a `round daemon`
+    // killed mid-session leaves those tasks stuck in the log forever. Task 15
+    // added the `ApprovalRegistry` constructed just below and threaded it
+    // through `run_boot_sequence` — this is the actual re-arm site: every
+    // persisted `Suspended{AwaitingApproval}` task gets registered live here,
+    // so a restarted daemon's registry isn't empty even though the approvals
+    // were always correctly sitting in the database. See `roundhouse_daemon::boot`
+    // for the re-arm loop itself. Runs once, here, between opening the store
+    // and starting the (possibly brand new) demo session — on a fresh
+    // `store_path` this is a cheap no-op scan over an empty `tasks` table.
     let recovery_store = roundhouse_store::open(&store_path).await?;
     let recovery_writer = roundhouse_store::spawn_writer(recovery_store).await;
     let recovery_pool_for_scan = roundhouse_store::open(&store_path).await?;
-    let interrupted = roundhouse_store::recover_interrupted_tasks(
+    let approval_registry = roundhouse_policy::registry::ApprovalRegistry::new();
+    let boot_report = boot::run_boot_sequence(
         &recovery_pool_for_scan,
         &recovery_writer,
         &runner,
+        &approval_registry,
     )
     .await?;
-    if !interrupted.is_empty() {
+    if !boot_report.interrupted.is_empty() || !boot_report.suspended.is_empty() {
         println!(
-            "recovered {} task(s) interrupted by a previous daemon run",
-            interrupted.len()
+            "boot recovery: {} task(s) interrupted, {} task(s) still suspended from a previous daemon run",
+            boot_report.interrupted.len(),
+            boot_report.suspended.len()
         );
     }
 

@@ -18,6 +18,7 @@
 mod edit;
 mod error;
 mod find;
+pub mod http;
 mod read;
 mod shell;
 mod write;
@@ -30,7 +31,10 @@ pub use edit::{edit_file, EditOutcome};
 pub use error::ToolError;
 pub use find::find_files;
 pub use read::read_file;
-pub use shell::{run_shell, ShellOutput};
+pub use shell::{
+    cancel_running_shell, execve_node, run_shell, spawn_cancellable, CancelError, ExitDisposition,
+    ShellHandle, ShellOutput,
+};
 pub use write::write_file;
 
 /// Proves roundhouse-tools compiles against both stub traits it will

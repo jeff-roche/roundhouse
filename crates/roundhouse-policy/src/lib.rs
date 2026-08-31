@@ -9,9 +9,19 @@
 //! `docs/architecture/02-system-architecture.md` §5.2 and §6 (policy/config).
 #![forbid(unsafe_code)]
 
+pub mod approval;
+pub mod engine;
+pub mod registry;
+pub mod sealed;
+pub mod shell;
+pub mod trust;
+
 mod policy_trait;
 mod task_params;
 
+pub use engine::{
+    ArgMatcher, CompiledRule, Decision, Outcome, PolicyEngine, Predicate, RuleId, Scope,
+};
 pub use policy_trait::Policy;
 pub use task_params::{
     FsOp, Method, ParsedCommand, PathErr, PolicyInput, ProviderId, ServerId, Taint, TaskParams,

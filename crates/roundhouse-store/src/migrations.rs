@@ -74,9 +74,53 @@ CREATE TABLE blobs (
 CREATE INDEX blobs_gc_eligible_idx ON blobs (ref_count, last_referenced_at) WHERE ref_count = 0;
 "#;
 
+/// Task 0.5: makes the `tasks` materialized-cache table live (see `tasks_view.rs`).
+/// Both columns are nullable with no `DEFAULT` — a non-suspended task has neither.
+/// `suspended_since` is the real event timestamp (unix nanos, matching `Timestamp`
+/// elsewhere), not a `seq`. `suspend_reason_json` is the `SuspendReason` serialized
+/// verbatim, since (per the `state` column's own comment) the `tasks` table is only a
+/// derived cache and the event log stays the source of truth for the full reason detail.
+/// This migration only adds columns — it does not, and structurally cannot (a
+/// `rusqlite_migration::M::up` is a fixed SQL string, not application logic), backfill
+/// `tasks` rows for tasks that already existed in the event log before it ran. That
+/// backfill is `tasks_view::backfill_tasks_table`, run automatically by `open()` right
+/// after migrations apply (security fix, Task 0.5 follow-up).
+const MIGRATION_0003_TASKS_SUSPEND_COLUMNS: &str = r#"
+ALTER TABLE tasks ADD COLUMN suspended_since INTEGER;
+ALTER TABLE tasks ADD COLUMN suspend_reason_json TEXT;
+"#;
+
+/// Task 19: redaction at the persistence boundary. `redactions` is a per-task counter,
+/// summed across every event folded into the task (see `writer::append_one`/
+/// `append_batch`, which `UPDATE tasks SET redactions = redactions + ?1` alongside the
+/// existing `tasks_view::upsert_for_event` call, in the same transaction as the events
+/// insert) — 0 is the diagnostic signal that redaction found nothing for this task, not
+/// an error, and must stay visible per-task rather than only existing transiently in
+/// memory. `NOT NULL DEFAULT 0` so every pre-existing row (and every new
+/// `TaskCreated`-triggered insert) starts at a well-defined zero.
+const MIGRATION_0004_TASKS_REDACTIONS_COLUMN: &str = r#"
+ALTER TABLE tasks ADD COLUMN redactions INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// Task 21 (S-OBS-4): the "blocked-anywhere" query's index. Matches
+/// `suspended_tasks`'s (`suspended.rs`) real predicate exactly — the `tasks` table
+/// has only one generic `state = 'Suspended'` value for every suspend reason, so
+/// a partial index on that single value is what makes `attention::blocked_anywhere`
+/// a fast index range scan instead of a full-table scan at 10,000-session scale.
+/// Ordered by `suspended_since` to match the query's own `ORDER BY suspended_since
+/// ASC` (oldest-blocked-first).
+const MIGRATION_0005_ATTENTION_INDEX: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_tasks_suspended
+    ON tasks(state, suspended_since)
+    WHERE state = 'Suspended';
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_0001_INITIAL_SCHEMA),
         M::up(MIGRATION_0002_BLOBS),
+        M::up(MIGRATION_0003_TASKS_SUSPEND_COLUMNS),
+        M::up(MIGRATION_0004_TASKS_REDACTIONS_COLUMN),
+        M::up(MIGRATION_0005_ATTENTION_INDEX),
     ])
 }

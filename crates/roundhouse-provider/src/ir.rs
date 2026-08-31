@@ -7,12 +7,19 @@ use std::collections::BTreeMap;
 /// comment in `roundhouse-core/src/task_meta.rs` for the rationale: this
 /// names an externally-sourced value (a provider's model name string), not
 /// an identity this system mints and must guard against collision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Derives `Hash` (added 2026-08-29, Task 6) because `crate::retry` keys a
+/// `HashMap<(ProviderId, ModelId), _>` — its `CircuitBreaker` and
+/// `AimdSemaphore` are indexed per `(provider, model)` pair. Both wrap a
+/// single `String`, which is already `Hash`, so this is additive and
+/// doesn't change either type's external behavior — but removing it would
+/// break `roundhouse_provider::retry`'s compile.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelId(pub String);
 
 /// See `ModelId`'s doc comment above (same rationale — a vendor name, not a
-/// minted identity).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// minted identity — and the same reason for deriving `Hash`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProviderId(pub String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

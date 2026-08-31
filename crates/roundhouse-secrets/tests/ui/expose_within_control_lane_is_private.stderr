@@ -1,0 +1,10 @@
+error[E0624]: method `expose_within_control_lane` is private
+ --> tests/ui/expose_within_control_lane_is_private.rs:9:15
+  |
+9 |     let _ = s.expose_within_control_lane(|x| x.to_string());
+  |               ^^^^^^^^^^^^^^^^^^^^^^^^^^ private method
+  |
+ ::: src/secret.rs
+  |
+  |     pub(crate) fn expose_within_control_lane<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+  |     ---------------------------------------------------------------------------------- private method defined here

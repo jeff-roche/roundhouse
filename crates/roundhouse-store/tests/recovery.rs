@@ -156,7 +156,10 @@ async fn suspended_task_is_not_reclassified_as_interrupted_on_recovery() {
         0,
         now_ts(),
         task_id,
-        SuspendReason::AwaitingApproval,
+        SuspendReason::AwaitingApproval {
+            rule: None,
+            params_digest: [0u8; 32],
+        },
         1,
     );
 

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Deterministic stand-in for a broken `bwrap` binary: ignores whatever args it's
+# given (probe_bwrap always calls it with --ro-bind / / -- /bin/true) and always
+# exits nonzero, so tests/probe.rs can exercise probe_bwrap's real-exit-status
+# surfacing path without depending on real bwrap being installed on this machine.
+echo "bwrap-that-fails: simulated bwrap failure" >&2
+exit 7

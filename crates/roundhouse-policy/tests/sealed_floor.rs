@@ -1,0 +1,269 @@
+use roundhouse_core::{PolicyDecision, Tier};
+use roundhouse_policy::engine::{CompiledRule, Outcome, PolicyEngine, Predicate, Scope};
+use roundhouse_policy::sealed::{home_dir, SealedContext};
+use roundhouse_policy::{FsOp, ParsedCommand, Policy, PolicyInput, ServerId, Taint, TaskParams};
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+fn ctx() -> SealedContext {
+    SealedContext {
+        state_dir: PathBuf::from("/tmp/roundhouse-test-state"),
+        daemon_binary: PathBuf::from("/usr/libexec/roundhouse/round-daemon"),
+        resolved_mcp_servers: HashSet::new(),
+        requested_tier: Tier::Sandbox,
+        attested_tier: Tier::Sandbox,
+        home: home_dir(),
+    }
+}
+
+#[test]
+fn sealed_floor_denies_ssh_write_even_with_an_explicit_config_allow_rule() {
+    let home = home_dir().expect("HOME must be set for this test");
+    let params = TaskParams::Fs {
+        op: FsOp::Write,
+        path: PathBuf::from("~/.ssh/authorized_keys"),
+        canonical: Ok(home.join(".ssh/authorized_keys")),
+    };
+    // an agent-writable config file explicitly allows this — sealed floor must still win
+    let policy = PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::fs_write_prefix(home.join(".ssh").to_str().unwrap()),
+    )]);
+
+    let decision = policy.decide_sealed(&params, /* unsealed */ false, &ctx());
+    assert_eq!(decision.outcome, Outcome::Deny);
+    assert_eq!(decision.rule.unwrap().0, "sealed:ssh-write");
+}
+
+#[test]
+fn unsealed_flag_falls_through_to_config_and_is_recorded() {
+    let home = home_dir().expect("HOME must be set for this test");
+    let params = TaskParams::Fs {
+        op: FsOp::Write,
+        path: PathBuf::from("~/.ssh/authorized_keys"),
+        canonical: Ok(home.join(".ssh/authorized_keys")),
+    };
+    let policy = PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::fs_write_prefix(home.join(".ssh").to_str().unwrap()),
+    )]);
+
+    let decision = policy.decide_sealed(&params, /* unsealed */ true, &ctx());
+    assert_eq!(
+        decision.outcome,
+        Outcome::Allow,
+        "--unsealed is the one documented escape (§6.2)"
+    );
+}
+
+#[test]
+fn state_dir_write_is_sealed() {
+    let c = ctx();
+    let params = TaskParams::Fs {
+        op: FsOp::Write,
+        path: c.state_dir.join("store.db"),
+        canonical: Ok(c.state_dir.join("store.db")),
+    };
+    let policy = PolicyEngine::from_rules(vec![]);
+    assert_eq!(
+        policy.decide_sealed(&params, false, &c).outcome,
+        Outcome::Deny,
+        "§6.2 lists the state dir on the sealed floor, not just dotfiles"
+    );
+}
+
+#[test]
+fn daemon_binary_write_is_sealed() {
+    let c = ctx();
+    let params = TaskParams::Fs {
+        op: FsOp::Write,
+        path: c.daemon_binary.clone(),
+        canonical: Ok(c.daemon_binary.clone()),
+    };
+    let policy = PolicyEngine::from_rules(vec![]);
+    assert_eq!(
+        policy.decide_sealed(&params, false, &c).outcome,
+        Outcome::Deny,
+        "§6.2 lists the daemon binary on the sealed floor"
+    );
+}
+
+#[test]
+fn mcp_tool_on_an_unresolved_server_is_sealed_denied() {
+    let c = ctx(); // resolved_mcp_servers is empty
+    let params = TaskParams::Mcp {
+        server: ServerId("never-connected".into()),
+        tool: "read_file".into(),
+        args: serde_json::json!({}),
+    };
+    let policy = PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::mcp(ServerId("never-connected".into()), None),
+    )]);
+    assert_eq!(
+        policy.decide_sealed(&params, false, &c).outcome,
+        Outcome::Deny,
+        "§6.2: MCP tools on unresolved servers are sealed, even with an explicit allow rule"
+    );
+}
+
+#[test]
+fn tier_shortfall_seals_every_task_kind_not_just_agent() {
+    let mut c = ctx();
+    c.requested_tier = Tier::Sandbox;
+    c.attested_tier = Tier::Worktree; // the sandbox degraded mid-session
+    let params = TaskParams::Fs {
+        op: FsOp::Read,
+        path: PathBuf::from("/workspace/x"),
+        canonical: Ok(PathBuf::from("/workspace/x")),
+    };
+    let policy = PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::fs_write_prefix("/workspace"),
+    )]);
+    assert_eq!(
+        policy.decide_sealed(&params, false, &c).outcome,
+        Outcome::Deny,
+        "attested_tier < requested_tier seals EVERY task in the session, not only Agent spawns (previous stub was hardcoded to Agent-only and `&& false`)"
+    );
+}
+
+#[test]
+fn ssh_write_sibling_prefix_does_not_seal_match() {
+    let home = home_dir().expect("HOME must be set for this test");
+    let params = TaskParams::Fs {
+        op: FsOp::Write,
+        path: home.join(".sshfoo/authorized_keys"),
+        canonical: Ok(home.join(".sshfoo/authorized_keys")),
+    };
+    let policy = PolicyEngine::from_rules(vec![]);
+    let decision = policy.decide_sealed(&params, false, &ctx());
+    assert_eq!(
+        decision.outcome,
+        Outcome::Ask,
+        "a sibling prefix like ~/.sshfoo must not match the .ssh sealed rule"
+    );
+}
+
+#[test]
+fn trait_object_applies_sealed_floor_to_ssh_write() {
+    let home = home_dir().expect("HOME must be set for this test");
+    let policy: Box<dyn Policy> = Box::new(PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::fs_write_prefix(home.join(".ssh").to_str().unwrap()),
+    )]));
+    let input = PolicyInput {
+        params: TaskParams::Fs {
+            op: FsOp::Write,
+            path: PathBuf::from("~/.ssh/authorized_keys"),
+            canonical: Ok(home.join(".ssh/authorized_keys")),
+        },
+        taint: Taint::Trusted,
+    };
+    assert_eq!(policy.decide(&input), PolicyDecision::Deny);
+}
+
+#[test]
+fn trait_object_allows_workspace_write_with_default_context() {
+    let policy: Box<dyn Policy> = Box::new(PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::fs_write_prefix("/workspace"),
+    )]));
+    let input = PolicyInput {
+        params: TaskParams::Fs {
+            op: FsOp::Write,
+            path: PathBuf::from("/workspace/x"),
+            canonical: Ok(PathBuf::from("/workspace/x")),
+        },
+        taint: Taint::Trusted,
+    };
+    assert_eq!(
+        policy.decide(&input),
+        PolicyDecision::Allow,
+        "default empty state_dir must not seal-match an ordinary workspace path"
+    );
+}
+
+#[test]
+fn trait_object_seal_denies_mcp_with_empty_resolved_set() {
+    let policy: Box<dyn Policy> = Box::new(PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::mcp(ServerId("filesystem".into()), None),
+    )]));
+    let input = PolicyInput {
+        params: TaskParams::Mcp {
+            server: ServerId("filesystem".into()),
+            tool: "read_file".into(),
+            args: serde_json::json!({}),
+        },
+        taint: Taint::Trusted,
+    };
+    assert_eq!(
+        policy.decide(&input),
+        PolicyDecision::Deny,
+        "default empty resolved_mcp_servers must fail-closed for MCP"
+    );
+}
+
+#[test]
+fn edit_on_authorized_keys_is_sealed_despite_allow_rule() {
+    let home = home_dir().expect("HOME must be set for this test");
+    let params = TaskParams::Fs {
+        op: FsOp::Edit,
+        path: PathBuf::from("~/.ssh/authorized_keys"),
+        canonical: Ok(home.join(".ssh/authorized_keys")),
+    };
+    let policy = PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::fs_edit_prefix(home.join(".ssh").to_str().unwrap()),
+    )]);
+    let decision = policy.decide_sealed(&params, false, &ctx());
+    assert_eq!(decision.outcome, Outcome::Deny);
+    assert_eq!(decision.rule.unwrap().0, "sealed:ssh-write");
+}
+
+#[test]
+fn dotfile_write_is_sealed_denied_when_home_is_unset_fail_closed() {
+    // `home: None` models a session constructed with HOME genuinely unset
+    // (normal under systemd or a minimal container). The rule must fail
+    // CLOSED here — deny — not silently allow the write through because it
+    // has no `home` to compare against.
+    let mut c = ctx();
+    c.home = None;
+    let params = TaskParams::Fs {
+        op: FsOp::Write,
+        path: PathBuf::from("/some/arbitrary/path/not/under/any/home"),
+        canonical: Ok(PathBuf::from("/some/arbitrary/path/not/under/any/home")),
+    };
+    let policy = PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::fs_write_prefix("/some/arbitrary/path/not/under/any/home"),
+    )]);
+    let decision = policy.decide_sealed(&params, false, &c);
+    assert_eq!(
+        decision.outcome,
+        Outcome::Deny,
+        "HOME unset must fail closed (deny writes) rather than silently disarm dotfile protection"
+    );
+}
+
+#[test]
+fn priv_escalation_program_matches_absolute_path() {
+    let params = TaskParams::Shell(ParsedCommand {
+        program: "/usr/bin/sudo".into(),
+        argv: vec!["whoami".into()],
+    });
+    let policy = PolicyEngine::from_rules(vec![]);
+    let decision = policy.decide_sealed(&params, false, &ctx());
+    assert_eq!(decision.outcome, Outcome::Deny);
+    assert_eq!(decision.rule.unwrap().0, "sealed:priv-escalation-program");
+}

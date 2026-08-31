@@ -1,0 +1,277 @@
+//! Task 3: cooperative-cancellation admission refusal.
+//!
+//! `SessionActor` is a standalone, fully unit-tested unit — see its doc
+//! comment in `crates/roundhouse-engine/src/session_actor.rs` for why this
+//! task deliberately does NOT wire `admit_task` into any real dispatch
+//! chokepoint (there isn't one yet).
+
+use roundhouse_core::{
+    CancelReason, EventPayload, OnDegrade, Origin, SessionId, SessionSpec, SessionState, TaskKind,
+    Tier,
+};
+use roundhouse_engine::{AdmitError, SessionActor, TaskCreateRequest};
+use roundhouse_policy::engine::{
+    CompiledRule, Outcome as PolicyOutcome, PolicyEngine, Predicate, Scope,
+};
+use roundhouse_policy::{ParsedCommand, TaskParams};
+use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
+use roundhouse_sandbox::probe::{MechanismProbeReport, MechanismStatus};
+use roundhouse_sandbox::Isolate;
+use roundhouse_store::{open, spawn_writer};
+use std::sync::Arc;
+
+/// `TaskRunner::bootstrap()` panics on a second call per-process, and every
+/// test in this binary shares one process — one shared `&'static TaskRunner`
+/// for all tests here, matching `crates/roundhouse-store/tests/recovery.rs`.
+static RUNNER: once_cell::sync::Lazy<roundhouse_core::TaskRunner> =
+    once_cell::sync::Lazy::new(roundhouse_core::TaskRunner::bootstrap);
+
+/// A `TaskCreateRequest` with an inert `TaskParams::Shell` — permissive
+/// against the sealed floor (no sealed-program name, no fs path at all), so
+/// tests that only care about the `SessionState` admission gate (Task 3/4's
+/// original scope) aren't incidentally tripped up by Task 25's new policy
+/// gate.
+fn permissive_request(kind: TaskKind, origin: Origin, is_finally_step: bool) -> TaskCreateRequest {
+    TaskCreateRequest {
+        kind,
+        origin,
+        is_finally_step,
+        params: TaskParams::Shell(ParsedCommand {
+            program: "true".to_string(),
+            argv: vec![],
+        }),
+    }
+}
+
+/// Spins up a fresh on-disk store + writer for one test, returning the
+/// `SessionActor` under test plus the DB path so the test can open a second,
+/// independent connection to verify what actually landed in the log.
+///
+/// Task 25 grew `SessionActor::new`'s signature to carry the policy engine,
+/// sealed-floor inputs, and isolation handle it now needs for the real
+/// `admit_task` policy gate — every field here is a permissive placeholder
+/// (zero config rules, an always-Available probe, an empty `Tier::Sandbox`
+/// session spec) so this file's existing `SessionState`-gate tests keep
+/// exercising exactly what they exercised before, with the new policy gate
+/// staying out of their way (`Outcome::Allow` for every `permissive_request`).
+async fn spawn_test_actor(
+    initial_state: SessionState,
+) -> (
+    SessionActor,
+    SessionId,
+    std::path::PathBuf,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let session_id = SessionId::new();
+    // A single config rule allowing exactly the `TaskParams::Shell` program
+    // `permissive_request`/`spec` construct ("true", no argv) — with zero
+    // rules, `PolicyEngine::decide`'s unmatched-task default is `Ask` (§6.4:
+    // the *interactive* default, not `Allow`), which would spuriously trip
+    // this file's `SessionState`-gate tests via Task 25's new policy gate.
+    let policy = Arc::new(PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Builtin,
+        PolicyOutcome::Allow,
+        Predicate::program("true"),
+    )]));
+    let isolate: Arc<dyn Isolate> = Arc::new(BwrapLandlockIsolate::test_with_probe(
+        MechanismProbeReport {
+            landlock: MechanismStatus::Available,
+            bwrap: MechanismStatus::Available,
+            seccomp: MechanismStatus::Available,
+            seatbelt: MechanismStatus::Unavailable {
+                reason: "n/a".into(),
+            },
+        },
+    ));
+    let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+    let handle = isolate.prepare(&spec).await.unwrap();
+    // `SessionActor::new` fail-closed asserts these are absolute, non-empty
+    // paths (an empty path would silently disable the real
+    // sealed:state-dir-write/sealed:daemon-binary-write rules) — real
+    // absolute placeholders under the test's own tempdir, not `PathBuf::new()`.
+    let actor = SessionActor::new(
+        session_id,
+        writer,
+        initial_state,
+        &RUNNER,
+        policy,
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        isolate,
+        handle,
+        spec,
+    );
+
+    (actor, session_id, db_path, dir)
+}
+
+#[tokio::test]
+async fn cancelling_session_refuses_new_non_finally_tasks() {
+    let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Running).await;
+
+    actor.cancel(&RUNNER, CancelReason::User).await.unwrap();
+
+    let normal = permissive_request(TaskKind::Shell, Origin::Model, false);
+    let err = actor.admit_task(&normal).await.unwrap_err();
+    assert!(matches!(err, AdmitError::SessionCancelling));
+
+    let finally_step = permissive_request(TaskKind::Shell, Origin::System, true);
+    assert!(
+        actor.admit_task(&finally_step).await.is_ok(),
+        "finally steps must still be admitted while Cancelling"
+    );
+}
+
+#[tokio::test]
+async fn admit_task_allows_everything_before_cancel_is_called() {
+    let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Running).await;
+
+    let normal = permissive_request(TaskKind::Shell, Origin::Model, false);
+    assert!(
+        actor.admit_task(&normal).await.is_ok(),
+        "a session that hasn't been cancelled must admit ordinary tasks"
+    );
+
+    let finally_step = permissive_request(TaskKind::Shell, Origin::System, true);
+    assert!(actor.admit_task(&finally_step).await.is_ok());
+}
+
+#[tokio::test]
+async fn cancel_transitions_state_to_cancelling() {
+    let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Running).await;
+
+    assert_eq!(actor.state(), SessionState::Running);
+
+    actor.cancel(&RUNNER, CancelReason::User).await.unwrap();
+
+    assert_eq!(actor.state(), SessionState::Cancelling);
+}
+
+#[tokio::test]
+async fn cancel_persists_session_state_changed_event_to_the_store() {
+    let (actor, session_id, db_path, _dir) = spawn_test_actor(SessionState::Running).await;
+
+    actor.cancel(&RUNNER, CancelReason::User).await.unwrap();
+
+    // Open an independent connection to the same on-disk DB to verify the
+    // event actually landed — not just that in-memory state changed. This
+    // would catch a bug where `state_tx.send_replace` runs but
+    // `writer.append` silently failed or was skipped.
+    let query_store = open(&db_path).await.unwrap();
+    let conn = query_store.pool.get().await.unwrap();
+    let rows: Vec<String> = conn
+        .interact(move |c| {
+            let mut stmt = c
+                .prepare("SELECT payload FROM events WHERE session_id = ?1 ORDER BY seq")
+                .unwrap();
+            stmt.query_map([session_id.to_string()], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1, "cancel() must append exactly one event");
+
+    let payload: EventPayload = serde_json::from_str(&rows[0]).unwrap();
+    match payload {
+        EventPayload::SessionStateChanged { state, .. } => {
+            assert_eq!(state, SessionState::Cancelling);
+        }
+        other => panic!("expected SessionStateChanged, got {other:?}"),
+    }
+}
+
+/// Security-audit fix: `cancel()` must fail CLOSED, not open — the
+/// in-memory gate flips to `Cancelling` *before* the durable append is even
+/// attempted, so a failed (or merely slow) append can never leave
+/// `admit_task` still admitting new work. This is proven structurally, not
+/// by injecting a fake `StoreError`: `cancel`'s body calls
+/// `state_tx.send_replace` as its first statement, then `runner.record_session_state_changed`
+/// (pure, synchronous), and only then `.await`s the actual append — so a
+/// SINGLE manual `poll()` of the returned future executes every synchronous
+/// statement up to (but not including) that first real suspension point
+/// inside `writer.append` (the oneshot reply from the writer task, which
+/// genuinely cannot be ready on the first poll since the separate writer
+/// task hasn't run yet). If the future is still `Pending` after exactly one
+/// poll, `state()` reading `Cancelling` at that point proves the gate closed
+/// strictly before the append could possibly have completed — success,
+/// failure, or otherwise.
+#[tokio::test]
+async fn cancel_flips_the_admission_gate_before_the_append_can_possibly_complete() {
+    use std::future::Future;
+    use std::task::{Context, Poll};
+
+    let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Running).await;
+
+    let mut fut = Box::pin(actor.cancel(&RUNNER, CancelReason::User));
+
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let poll_result = fut.as_mut().poll(&mut cx);
+
+    assert_eq!(
+        actor.state(),
+        SessionState::Cancelling,
+        "the admission gate must already be closed after a single poll of cancel(), \
+         strictly before the durable append can have completed"
+    );
+
+    // Drive the future to completion so the test doesn't leave a half-driven
+    // append dangling against the shared writer task.
+    match poll_result {
+        Poll::Pending => fut.await.unwrap(),
+        Poll::Ready(result) => result.unwrap(),
+    }
+}
+
+/// Security-audit fix: `admit_task` is now an allowlist. A `Closed` session
+/// must refuse an ordinary task exactly like a `Cancelling` one — the old
+/// denylist (`if state == Cancelling`) let every other terminal/paused state
+/// admit anything, including a session rehydrated as already `Closed`.
+#[tokio::test]
+async fn closed_session_refuses_ordinary_tasks() {
+    let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Closed).await;
+
+    let normal = permissive_request(TaskKind::Shell, Origin::Model, false);
+    let err = actor.admit_task(&normal).await.unwrap_err();
+    assert!(matches!(err, AdmitError::SessionClosed));
+}
+
+/// Same allowlist fix, for `Suspended`.
+#[tokio::test]
+async fn suspended_session_refuses_ordinary_tasks() {
+    let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Suspended).await;
+
+    let normal = permissive_request(TaskKind::Shell, Origin::Model, false);
+    let err = actor.admit_task(&normal).await.unwrap_err();
+    assert!(matches!(err, AdmitError::SessionSuspended));
+}
+
+/// Security-audit fix: `is_finally_step: true` is only a trusted bypass when
+/// `origin == Origin::System` — a claimed finally-step from any other origin
+/// (e.g. `Origin::Model`) is evaluated as an ordinary task and refused just
+/// like one, even though the boolean itself is set.
+#[tokio::test]
+async fn finally_step_bypass_is_refused_unless_origin_is_system() {
+    let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Closed).await;
+
+    let untrusted_finally_step = permissive_request(TaskKind::Shell, Origin::Model, true);
+    let err = actor.admit_task(&untrusted_finally_step).await.unwrap_err();
+    assert!(
+        matches!(err, AdmitError::SessionClosed),
+        "a finally-step claim from a non-System origin must not bypass the gate"
+    );
+
+    let trusted_finally_step = permissive_request(TaskKind::Shell, Origin::System, true);
+    assert!(
+        actor.admit_task(&trusted_finally_step).await.is_ok(),
+        "a genuine (Origin::System) finally-step must still be admitted even when Closed"
+    );
+}

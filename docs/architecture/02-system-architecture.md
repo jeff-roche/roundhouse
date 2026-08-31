@@ -36,24 +36,24 @@ agent team** — one crate, one owner, one test suite, minimal shared mutable su
 |---|---|---|
 | `roundhouse-core` | Domain types: `Event`, `Task`, `Session`, ids, errors. **No I/O.** | — |
 | `roundhouse-proto` | Client↔daemon wire types + JSON Schema emission; versioned | `roundhouse-core` |
-| `roundhouse-store` | SQLite event log, materialised views, FTS5, migrations | `roundhouse-core` |
-| `roundhouse-policy` | Permission rule language + evaluation engine | `roundhouse-core` |
+| `roundhouse-store` | SQLite event log, materialised views, FTS5, migrations | core, provider (Task 20: the cost-attribution derived view needs `Cost`/`PricingLookup`/`ModelId`/`ProviderId` from `roundhouse-provider::{fallback, ir}` — a deliberate, tracked deviation from this table's original `core`-only row, landed here; see `crates/roundhouse-store/Cargo.toml`'s own comment on the edge) |
+| `roundhouse-policy` | Permission rule language + evaluation engine | core, store (Task 15: the project-scope trust ledger persists through `roundhouse-store`) |
 | `roundhouse-sandbox` | Isolation tiers behind one trait | `roundhouse-core` |
 | `roundhouse-provider` | Provider trait + adapters, capability registry | `roundhouse-core` |
-| `roundhouse-conformance` | The reusable conformance-suite library §9.10 specifies (`roundhouse_conformance::run::<Adapter>()`) — golden-snapshot harness, cassette replay, the generic param-mask property test. Pulled out of `roundhouse-provider` into its own crate so provider-adapter crates (and any future out-of-tree adapter) can depend on the test harness without depending on the adapters it tests. | core, provider (dev-dependency of provider's own adapter tests) |
-| `roundhouse-tools` | Task executors (shell/fs/http/web/git/memory) | core, sandbox, policy |
+| `roundhouse-tools` | Task executors (shell/fs/http/web/git/memory) | core, sandbox, policy, net (Task 24: the `http` executor is constructible only from a `roundhouse-net::ProxyHandle`, so `http` traffic is structurally forced through `LoopbackProxy`'s egress allowlist/metadata-IP hard-deny rather than reaching the network directly) |
 | `roundhouse-mcp` | MCP host (rmcp) | core, policy |
 | `roundhouse-acp` | ACP client + ACP server (agent-client-protocol) | core, proto |
-| `roundhouse-bus` | Inter-agent messaging + teams | core, store |
-| `roundhouse-engine` | Agent loop, session actor, supervision, context mgmt | most of the above |
-| `roundhouse-config` | Layered config loading (builtin/user/project/workspace scopes per §6.2's precedence ranking), `SecretRef` types | core |
-| `roundhouse-secrets` | Secret *material* handling: `CredentialProvider` implementations (§9.9), keyring/file-fallback resolution, the `Secret<T>`/`expose_for_request` type-level guarantee (§6.7), outbound redaction. Split out from `roundhouse-config` (which only ever holds `SecretRef` pointers, never material) because material-handling has a materially different trust boundary and a much smaller expose-site surface to audit. | core, config |
+| `roundhouse-bus` | Inter-agent messaging + teams | `roundhouse-core` |
+| `roundhouse-engine` | Agent loop, session actor, supervision, context mgmt | most of the above, plus net (Task 25: session creation registers the session's egress allowlist with the real `LoopbackProxy` at the same call site it decides isolation tier, so `SessionActor`'s home module depends on `roundhouse-net` directly rather than only transitively) |
+| `roundhouse-config` | Layered config loading (builtin/user/project/workspace scopes per §6.2's precedence ranking), `SecretRef` types | — (no internal `roundhouse-*` dependency) |
+| `roundhouse-secrets` | Secret *material* handling: `CredentialProvider` implementations (§9.9), keyring/file-fallback resolution, the `Secret`/`expose_within_control_lane` closure-scoped type-level guarantee (§6.7; see `roundhouse-secrets/src/secret.rs`'s module doc comment for why this replaced an earlier, defeatable `ControlLaneToken` capability-type design), outbound redaction. Split out from `roundhouse-config` (which only ever holds `SecretRef` pointers, never material) because material-handling has a materially different trust boundary and a much smaller expose-site surface to audit. | core, config, store (Task 18: keyring/file-fallback resolution persists the fallback `Degradation` through `roundhouse-store`) |
 | `roundhouse-flow` | Workflow definition + durable execution | core, engine, store |
 | `roundhouse-sched` | Triggers and scheduling | core, engine, store |
-| `roundhouse-daemon` | Daemon: wiring, API server, lifecycle — runs as `round daemon` | all |
+| `roundhouse-daemon` | Daemon: wiring, API server, lifecycle — runs as `round daemon` | core, proto, store, policy, sandbox, provider, tools, mcp, acp, bus, engine, flow, sched, config, tui — no direct `roundhouse-net` edge of its own (reached transitively through `engine`/`tools`, both of which depend on it directly per their own rows above); no `roundhouse-secrets` edge either, direct or transitive — `roundhouse-secrets` is not yet a dependency of anything in the workspace, i.e. genuinely unwired as of this writing |
 | `roundhouse-tui` | ratatui client | proto |
-| `roundhouse-cli` | The `round` binary: TUI attach, headless/one-shot runs, and `round daemon` | proto, daemon, tui |
+| `roundhouse-cli` | The `round` binary: TUI attach, headless/one-shot runs, and `round daemon` | proto, tui (not `daemon` — `round daemon` is spawned as a separate process/binary, not linked in) |
 | `roundhouse-web` | axum API + embedded web client assets | proto |
+| `roundhouse-net` | The daemon-owned network egress boundary (§6.6, one of the design's "exactly two real boundaries," §6.1): the two-lane model (`Lane::Control`/`Lane::Agent`), the `HostPattern`/`EgressPolicy` allowlist matcher, `ConnectFilter`'s metadata-IP hard-deny, and the per-session `LoopbackProxy` (a loopback HTTP CONNECT proxy with bearer-token session disambiguation) that the agent lane exits through exclusively. | core, store |
 
 **Non-negotiable rules:** `roundhouse-core` has no async and no I/O; no *library* crate
 (i.e. none of the rows above `roundhouse-daemon` in this table) depends on
@@ -72,13 +72,51 @@ except `roundhouse-sandbox` (which needs it, and confines it to one module).
 > plan or doc elsewhere still using the old names, treat it as a typo for the name
 > given here, not as a second crate.
 >
-> **Two more crates added during later phase planning (2026-08-28), same pattern:**
+> **One more crate added during later phase planning (2026-08-28), same pattern:**
 > Phase 2 needed a home for secret *material* handling distinct from `roundhouse-config`'s
-> `SecretRef` pointers — `roundhouse-secrets` is now this table's own row. Phase 6 needed
-> the conformance suite (§9.10) usable as a dependency of provider-adapter tests without
-> depending on the adapters themselves — `roundhouse-conformance` is now this table's own
-> row. Both were previously created ad hoc by their phase plans without a matching row
-> here; this table is still the single source of truth, now including them.
+> `SecretRef` pointers — `roundhouse-secrets` is now this table's own row. It was
+> previously created ad hoc by its phase plan without a matching row here; this table is
+> still the single source of truth, now including it.
+>
+> **Correction (final Phase 2 whole-branch-review cleanup):** an earlier version of this
+> table also carried a `roundhouse-conformance` row (Phase 6's planned conformance-suite
+> library, §9.10). That crate does not exist in the workspace as of this writing — Phase 6
+> is still ahead per `docs/architecture/10-implementation-phasing.md`, and no
+> `crates/roundhouse-conformance` directory or workspace member was ever created. The row
+> was premature and has been removed; re-add it here, following this same pattern, once
+> Phase 6 actually creates the crate.
+>
+> **A third crate added the same way (Task 23, Phase 2):** §6.6's loopback-proxy network
+> boundary had no implementing crate anywhere in the plan before Task 23 — a full-text
+> search across every prior phase plan turned up no `loopback proxy`/`agent lane`/
+> `control lane`/CONNECT vocabulary at all. `roundhouse-net` is now this table's own row,
+> same pattern as the two above: built ad hoc by its phase task without a matching row
+> here until now.
+>
+> **One new dependency edge added the same way (Task 24, Phase 2):** closing the audit
+> finding that `Attestation.net_enforced` was attested but never honestly computed or
+> enforced required one real, deliberate edge onto `roundhouse-net` that this table
+> didn't declare before now: `roundhouse-tools` (so the new `http` task executor can
+> only ever be constructed from a real `roundhouse-net::ProxyHandle`, forcing `http`
+> traffic through `LoopbackProxy`). That row above is amended in place rather than
+> duplicating the proxy-routing logic in the downstream crate. (An initial version of
+> this task also added `roundhouse-sandbox -> roundhouse-net` so `attest()` could call
+> the mechanism-honesty table — a security-review finding on that same round caught
+> that this needlessly pulled `roundhouse-net`'s `roundhouse-store`/SQLite dependency
+> into `roundhouse-sandbox`, the workspace's smallest and most tightly audited crate.
+> Fix: `NetworkMechanism`/`net_enforced_for` now live in `roundhouse-core` instead,
+> which both `roundhouse-sandbox` and `roundhouse-net` already depended on, so no
+> `roundhouse-sandbox` row change was needed after all.)
+>
+> **A second new dependency edge added the same way (Task 25, Phase 2):** wiring the
+> sealed floor, isolation-shortfall recording, and the network-policy proxy into the
+> real task-admission path (the audit's "built in isolation, never wired" recurring
+> finding) required `roundhouse-engine`'s `session_actor.rs` to call
+> `roundhouse_net::proxy::LoopbackProxy::register_session` directly at session-creation
+> time — the same call site that already decides a session's isolation tier and builds
+> its `SealedContext`. That row above is amended in place (replacing the previous vague
+> "most of the above" with an explicit call-out of `net`) rather than inventing a
+> separate crate to host `create_session_with_egress`.
 
 ### 5.3 Verified dependency baseline
 

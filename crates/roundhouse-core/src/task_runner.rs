@@ -1,10 +1,11 @@
 use crate::delta::Delta as DeltaAlias;
 use crate::event::{Event, EventPayload};
 use crate::ids::{SessionId, TaskId};
+use crate::session::{SessionOutcome, SessionSpec, SessionState};
 use crate::task_kind::TaskKind;
 use crate::task_meta::{
-    CancelReason, Handle, IsolationAttestation, Origin, PolicyDecision, Progress, RuleId,
-    SuspendReason, TaskError, TaskInput, TaskOutput, Usage,
+    CancelReason, Handle, IsolationAttestation, NoteLevel, Origin, PolicyDecision, Progress,
+    RuleId, SuspendReason, TaskError, TaskInput, TaskOutput, Usage,
 };
 use crate::timestamp::Timestamp;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,10 @@ static BOOTSTRAPPED: AtomicBool = AtomicBool::new(false);
 /// `Event` for a task-lifecycle payload except through one of the
 /// `record_*` methods below, because `Event`'s constructor lives in this
 /// same crate and is not exposed (see `event.rs`'s `new_sealed`).
+/// `TaskRunner` is likewise the sole minter of session-lifecycle
+/// (`record_session_created`/`record_session_state_changed`/
+/// `record_session_closed`) and `Note` (`record_note`) events — not just
+/// task-lifecycle ones.
 ///
 /// `TaskRunner` itself has a `pub(crate)` constructor — it cannot be
 /// struct-literal-constructed from outside `roundhouse-core` either. The
@@ -246,6 +251,81 @@ impl TaskRunner {
             ts,
             Some(task_id),
             EventPayload::TaskCancelled { by, reason },
+            schema_v,
+        )
+    }
+
+    pub fn record_session_created(
+        &self,
+        session_id: SessionId,
+        seq: u64,
+        ts: Timestamp,
+        spec: Box<SessionSpec>,
+        schema_v: u16,
+    ) -> Event {
+        Event::new_sealed(
+            session_id,
+            seq,
+            ts,
+            None,
+            EventPayload::SessionCreated { spec },
+            schema_v,
+        )
+    }
+
+    pub fn record_session_state_changed(
+        &self,
+        session_id: SessionId,
+        seq: u64,
+        ts: Timestamp,
+        state: SessionState,
+        reason: Option<String>,
+        schema_v: u16,
+    ) -> Event {
+        Event::new_sealed(
+            session_id,
+            seq,
+            ts,
+            None,
+            EventPayload::SessionStateChanged { state, reason },
+            schema_v,
+        )
+    }
+
+    pub fn record_session_closed(
+        &self,
+        session_id: SessionId,
+        seq: u64,
+        ts: Timestamp,
+        outcome: SessionOutcome,
+        schema_v: u16,
+    ) -> Event {
+        Event::new_sealed(
+            session_id,
+            seq,
+            ts,
+            None,
+            EventPayload::SessionClosed { outcome },
+            schema_v,
+        )
+    }
+
+    pub fn record_note(
+        &self,
+        session_id: SessionId,
+        seq: u64,
+        ts: Timestamp,
+        task_id: Option<TaskId>,
+        level: NoteLevel,
+        text: String,
+        schema_v: u16,
+    ) -> Event {
+        Event::new_sealed(
+            session_id,
+            seq,
+            ts,
+            task_id,
+            EventPayload::Note { level, text },
             schema_v,
         )
     }

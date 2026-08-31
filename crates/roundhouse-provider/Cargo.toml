@@ -10,6 +10,9 @@ workspace = true
 [dependencies]
 bytes = { workspace = true }
 futures = "0.3"
+http = "1.5.0"
+regex = "1.13.1"
+rand = "0.9"
 reqwest = { version = "0.13.4", features = ["stream"] }
 roundhouse-core = { path = "../roundhouse-core" }
 serde = { workspace = true }
@@ -17,7 +20,12 @@ serde_json = { workspace = true }
 schemars = { workspace = true }
 sse-stream = "0.2.5"
 thiserror = { workspace = true }
+# Real (not dev-only) dependency: `src/retry.rs` uses `tokio::sync::Semaphore`
+# and `tokio::time::sleep`/`Instant` as production code (the retry/circuit-
+# breaker/AIMD-concurrency machinery), not just in tests.
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
-tokio = { version = "1.53", features = ["full"] }
+tokio = { version = "1.53", features = ["full", "test-util"] }

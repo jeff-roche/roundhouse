@@ -9,6 +9,18 @@ workspace = true
 
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
+# Deliberate, tracked deviation from the frozen crate dependency table
+# (`docs/architecture/02-system-architecture.md` §5.2, which lists this crate's only
+# allowed dependency as `roundhouse-core`): Task 20 (Phase 2, cost-attribution derived
+# view) genuinely needs `Cost`/`PricingLookup`/`ModelId`/`ProviderId` from
+# `roundhouse-provider::{fallback, ir}` and cannot be built without this edge. Relocating
+# those types down into `roundhouse-core` was considered and rejected — they are used
+# pervasively throughout `roundhouse-provider`'s own internals (`ChatRequest`,
+# `FallbackChain`, circuit-breaker keying), so moving them would be a much larger,
+# higher-blast-radius refactor than this task's scope. Confirmed no dependency cycle:
+# `roundhouse-provider` depends only on `roundhouse-core`. See `crates/roundhouse-store/
+# src/cost.rs` and this task's report for the full ruling.
+roundhouse-provider = { path = "../roundhouse-provider" }
 rusqlite = { workspace = true }
 rusqlite_migration = { workspace = true }
 deadpool-sqlite = { workspace = true }
@@ -20,6 +32,8 @@ blake3 = "1"
 once_cell = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1.53", features = ["sync", "time"] }
+aho-corasick = "1"
+arc-swap = "1"
 
 [dev-dependencies]
 tempfile = "3"

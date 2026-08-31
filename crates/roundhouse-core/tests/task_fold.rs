@@ -57,12 +57,18 @@ fn fold_task_state_derives_each_state_from_a_realistic_event_sequence() {
             handle: None,
         },
         EventPayload::TaskSuspended {
-            reason: SuspendReason::AwaitingApproval,
+            reason: SuspendReason::AwaitingApproval {
+                rule: None,
+                params_digest: [0u8; 32],
+            },
         },
     ];
     assert_eq!(
         roundhouse_core::fold_task_state(&suspended_path),
-        Some(TaskState::Suspended(SuspendReason::AwaitingApproval))
+        Some(TaskState::Suspended(SuspendReason::AwaitingApproval {
+            rule: None,
+            params_digest: [0u8; 32],
+        }))
     );
 
     // A cancelled task.
@@ -85,6 +91,56 @@ fn fold_task_state_derives_each_state_from_a_realistic_event_sequence() {
 
     // No task-lifecycle events at all: no state to derive.
     assert_eq!(roundhouse_core::fold_task_state(&[]), None);
+}
+
+#[test]
+fn fold_task_state_maps_daemon_restart_cancellation_to_interrupted() {
+    // Reconciliation fix: `roundhouse_store::fold::fold_task` (the narrower, local fold
+    // used by crash recovery) has always special-cased `CancelReason::DaemonRestart` ->
+    // `TaskState::Interrupted`. `fold_task_state` here used to map every `TaskCancelled`
+    // to `Cancelled` regardless of reason, disagreeing with that other fold on this one
+    // input. Both folds must now agree here.
+    let daemon_restart_path = vec![
+        EventPayload::TaskCreated {
+            kind: TaskKind::Shell,
+            parent: None,
+            origin: Origin::Model,
+            input: roundhouse_core::TaskInput::Text("sleep 100".into()),
+        },
+        EventPayload::TaskCancelled {
+            by: Origin::System,
+            reason: CancelReason::DaemonRestart,
+        },
+    ];
+    assert_eq!(
+        roundhouse_core::fold_task_state(&daemon_restart_path),
+        Some(TaskState::Interrupted)
+    );
+
+    // Every other CancelReason must still map to plain Cancelled.
+    for reason in [
+        CancelReason::User,
+        CancelReason::Timeout,
+        CancelReason::SessionClosed,
+        CancelReason::PolicyDeny,
+    ] {
+        let path = vec![
+            EventPayload::TaskCreated {
+                kind: TaskKind::Shell,
+                parent: None,
+                origin: Origin::Model,
+                input: roundhouse_core::TaskInput::Text("sleep 100".into()),
+            },
+            EventPayload::TaskCancelled {
+                by: Origin::User,
+                reason,
+            },
+        ];
+        assert_eq!(
+            roundhouse_core::fold_task_state(&path),
+            Some(TaskState::Cancelled)
+        );
+    }
 }
 
 #[test]
