@@ -78,7 +78,8 @@ The Cargo workspace exists and builds as of Task 1. Standard commands now apply:
   `events` table physically rejects `UPDATE`/`DELETE`, and a source scan
   fails the build on any raw SQL string that tries. See
   [`docs/architecture/01-data-model.md`](docs/architecture/01-data-model.md).
-- **18-crate Cargo workspace**, with crate boundaries doubling as
+- **20-crate Cargo workspace** (18 at Phase 0 completion; Phase 2 added
+  `roundhouse-secrets` and `roundhouse-net`), with crate boundaries doubling as
   agent work-assignment boundaries — one crate, one owner, minimal shared
   mutable state.
   [`docs/architecture/02-system-architecture.md`](docs/architecture/02-system-architecture.md)

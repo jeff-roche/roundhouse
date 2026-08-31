@@ -64,7 +64,9 @@ in these docs already; unresolved ones are listed here so they aren't lost befor
 human implementer starts Phase 0.
 
 **Resolved in these docs:**
-- **Crate naming.** §5.2's workspace table (18 crates) is now stated as the single
+- **Crate naming.** §5.2's workspace table (18 crates at the time this note was written,
+  pre-Phase-0; 20 as of the Phase 2 whole-branch-review cleanup, which added
+  `roundhouse-secrets` and `roundhouse-net`) is now stated as the single
   source of truth. `roundhouse-agent`/`roundhouse-session` (used loosely elsewhere in
   the original draft) both name `roundhouse-engine`. `roundhouse-config` was a genuine
   gap — the design referenced `S-CFG-1`/`S-CFG-5` (layered config, API versioning) as

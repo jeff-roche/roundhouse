@@ -303,10 +303,16 @@ their snippets are `Trust::Untrusted`; fetching a result page is a separate `htt
 
 OS keyring first; `~/.config/roundhouse/secrets.toml` mode 0600 as fallback — and **the
 fallback is recorded as a startup `Degradation` visible in the UI**, not a log line.
-Config holds `SecretRef`, never material. `Secret(secrecy::SecretString)` has no `Debug`/
-`Display`/`Serialize`, and `expose_for_request` requires a `ControlLaneToken` that is
-unconstructable outside the daemon's provider/MCP modules — a type-level guarantee that
-secrets cannot reach the executor.
+Config holds `SecretRef`, never material. `Secret` (`roundhouse-secrets`, wrapping
+`secrecy::SecretString`) has no `Debug`/`Display`/`Serialize` anywhere reachable, and the
+only way to read the material out is `Secret::expose_within_control_lane` — `pub(crate)`,
+so reachable only via this crate's two bridge modules (`provider_bridge`, `mcp_bridge`),
+and even then only for the duration of a caller-supplied closure, never as a returned
+free-standing value — a type-level guarantee that secrets cannot reach the executor. (An
+earlier draft gated exposure behind a `ControlLaneToken` capability type instead; that
+was replaced because an *owned* token handed back to any caller could be stashed and
+reused arbitrarily later — see `roundhouse-secrets/src/secret.rs`'s module doc comment
+for the full design history.)
 
 Provider calls never leave the daemon, so no key enters a child environment. MCP stdio
 servers are spawned **by the daemon, outside the session's namespace**; the agent talks to
