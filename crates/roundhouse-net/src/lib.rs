@@ -17,8 +17,10 @@
 //! test exercises it from the real task-admission path.
 #![forbid(unsafe_code)]
 
+pub mod enforcement;
 pub mod policy;
 pub mod proxy;
 
+pub use enforcement::{net_enforced_for, NetworkMechanism};
 pub use policy::{ConnectFilter, EgressDecision, EgressPolicy, HostPattern, Lane, METADATA_IP};
-pub use proxy::{LoopbackProxy, SessionEgressContext};
+pub use proxy::{LoopbackProxy, ProxyHandle, SessionEgressContext};

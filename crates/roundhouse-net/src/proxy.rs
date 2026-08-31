@@ -39,6 +39,16 @@ pub struct SessionEgressContext {
     pub policy: EgressPolicy,
 }
 
+/// A session's registered bearer token, bundled with the proxy's bound address —
+/// everything an `http`-task executor needs to route exclusively through
+/// [`LoopbackProxy`] and nothing more. The only way to construct
+/// `roundhouse_tools::http::HttpTaskExecutor` is from one of these (Task 24), so an
+/// `http` task cannot be executed without going through this proxy.
+pub struct ProxyHandle {
+    pub token: String,
+    pub addr: SocketAddr,
+}
+
 /// Hard cap on the total bytes read for one CONNECT preamble (request line
 /// and headers, combined). Security-review finding: an unbounded
 /// `read_line` into a `String` with no terminator let a single connection
@@ -122,12 +132,22 @@ impl LoopbackProxy {
 
     /// Called once per session at spawn time, before the agent lane's proxy
     /// env vars (`HTTPS_PROXY`/`https_proxy`) are set in the sandboxed
-    /// process's environment. Returns the session's bearer token.
-    pub fn register_session(&self, session_id: SessionId, policy: EgressPolicy) -> String {
+    /// process's environment. `addr` is the proxy's own bound address (from
+    /// [`Self::serve`], which in the real daemon runs once at boot before any
+    /// session registers, so a concrete address is always available here).
+    /// Returns a [`ProxyHandle`] bundling the session's bearer token with that
+    /// address — enough, and only enough, for `roundhouse-tools`' `http`
+    /// executor to route exclusively through this proxy.
+    pub fn register_session(
+        &self,
+        session_id: SessionId,
+        policy: EgressPolicy,
+        addr: SocketAddr,
+    ) -> ProxyHandle {
         let token = format!("rh-{}", uuid::Uuid::new_v4());
         self.sessions
             .insert(token.clone(), SessionEgressContext { session_id, policy });
-        token
+        ProxyHandle { token, addr }
     }
 
     pub fn deregister_session(&self, token: &str) {

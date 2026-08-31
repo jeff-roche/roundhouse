@@ -38,10 +38,10 @@ agent team** — one crate, one owner, one test suite, minimal shared mutable su
 | `roundhouse-proto` | Client↔daemon wire types + JSON Schema emission; versioned | `roundhouse-core` |
 | `roundhouse-store` | SQLite event log, materialised views, FTS5, migrations | `roundhouse-core` |
 | `roundhouse-policy` | Permission rule language + evaluation engine | `roundhouse-core` |
-| `roundhouse-sandbox` | Isolation tiers behind one trait | `roundhouse-core` |
+| `roundhouse-sandbox` | Isolation tiers behind one trait | core, net (Task 24: `attest()` computes `Attestation.net_enforced` from `roundhouse-net::enforcement`'s honesty table — which mechanism actually achieved a tier, not `Tier` alone — so this needed a real dependency edge, not a duplicated table) |
 | `roundhouse-provider` | Provider trait + adapters, capability registry | `roundhouse-core` |
 | `roundhouse-conformance` | The reusable conformance-suite library §9.10 specifies (`roundhouse_conformance::run::<Adapter>()`) — golden-snapshot harness, cassette replay, the generic param-mask property test. Pulled out of `roundhouse-provider` into its own crate so provider-adapter crates (and any future out-of-tree adapter) can depend on the test harness without depending on the adapters it tests. | core, provider (dev-dependency of provider's own adapter tests) |
-| `roundhouse-tools` | Task executors (shell/fs/http/web/git/memory) | core, sandbox, policy |
+| `roundhouse-tools` | Task executors (shell/fs/http/web/git/memory) | core, sandbox, policy, net (Task 24: the `http` executor is constructible only from a `roundhouse-net::ProxyHandle`, so `http` traffic is structurally forced through `LoopbackProxy`'s egress allowlist/metadata-IP hard-deny rather than reaching the network directly) |
 | `roundhouse-mcp` | MCP host (rmcp) | core, policy |
 | `roundhouse-acp` | ACP client + ACP server (agent-client-protocol) | core, proto |
 | `roundhouse-bus` | Inter-agent messaging + teams | core, store |
@@ -87,6 +87,16 @@ except `roundhouse-sandbox` (which needs it, and confines it to one module).
 > `control lane`/CONNECT vocabulary at all. `roundhouse-net` is now this table's own row,
 > same pattern as the two above: built ad hoc by its phase task without a matching row
 > here until now.
+>
+> **Two new dependency edges added the same way (Task 24, Phase 2):** closing the audit
+> finding that `Attestation.net_enforced` was attested but never honestly computed or
+> enforced required two real, deliberate edges onto `roundhouse-net` that this table
+> didn't declare before now: `roundhouse-sandbox` (so `attest()` can compute
+> `net_enforced` from `roundhouse-net::enforcement`'s mechanism table instead of `Tier`
+> alone) and `roundhouse-tools` (so the new `http` task executor can only ever be
+> constructed from a real `roundhouse-net::ProxyHandle`, forcing `http` traffic through
+> `LoopbackProxy`). Both rows above are amended in place rather than duplicating the
+> honesty table or the proxy-routing logic in either downstream crate.
 
 ### 5.3 Verified dependency baseline
 

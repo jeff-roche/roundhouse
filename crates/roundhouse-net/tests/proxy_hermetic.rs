@@ -135,8 +135,9 @@ async fn allowed_host_gets_200_and_a_real_tunnel() {
     let policy = EgressPolicy {
         allowed_hosts: vec![HostPattern::exact("127.0.0.1")],
     };
-    let token = proxy.register_session(SessionId::new(), policy);
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let token = handle.token.clone();
 
     let (status, mut sock) = send_connect(proxy_addr, &token, &target).await;
     assert_eq!(
@@ -158,8 +159,9 @@ async fn non_allowlisted_host_gets_403_and_a_recorded_deny() {
     let policy = EgressPolicy {
         allowed_hosts: vec![HostPattern::exact("crates.io")],
     };
-    let token = proxy.register_session(session_id, policy);
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(session_id, policy, proxy_addr);
+    let token = handle.token.clone();
 
     let (status, _sock) = send_connect(proxy_addr, &token, "evil.example:443").await;
     assert_eq!(status, 403);
@@ -192,8 +194,9 @@ async fn metadata_ip_is_denied_even_with_an_allow_all_policy() {
     let policy = EgressPolicy {
         allowed_hosts: vec![HostPattern::wildcard_suffix("")],
     };
-    let token = proxy.register_session(SessionId::new(), policy);
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let token = handle.token.clone();
 
     let (status, _sock) = send_connect(proxy_addr, &token, &format!("{METADATA_IP}:80")).await;
     assert_eq!(
@@ -222,8 +225,9 @@ async fn evil_crates_io_is_not_matched_by_exact_crates_io_allowlist_entry() {
     let policy = EgressPolicy {
         allowed_hosts: vec![HostPattern::exact("crates.io")],
     };
-    let token = proxy.register_session(SessionId::new(), policy);
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let token = handle.token.clone();
 
     let (status, _sock) = send_connect(proxy_addr, &token, "evil-crates.io:443").await;
     assert_eq!(
@@ -239,8 +243,9 @@ async fn evilexample_com_is_not_matched_by_wildcard_example_com_allowlist_entry(
     let policy = EgressPolicy {
         allowed_hosts: vec![HostPattern::wildcard_suffix("example.com")],
     };
-    let token = proxy.register_session(SessionId::new(), policy);
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let token = handle.token.clone();
 
     let (status, _sock) = send_connect(proxy_addr, &token, "evilexample.com:443").await;
     assert_eq!(
@@ -270,8 +275,9 @@ async fn nine_alternate_encodings_of_the_metadata_ip_are_all_denied() {
     let policy = EgressPolicy {
         allowed_hosts: vec![HostPattern::wildcard_suffix("")],
     };
-    let token = proxy.register_session(SessionId::new(), policy);
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let token = handle.token.clone();
 
     let encodings = [
         "169.254.169.254.:80",         // trailing dot — DNS root-anchored form
@@ -316,8 +322,9 @@ async fn wildcard_allowlisted_host_resolving_to_a_loopback_address_is_denied() {
     let policy = EgressPolicy {
         allowed_hosts: vec![HostPattern::wildcard_suffix("")],
     };
-    let token = proxy.register_session(SessionId::new(), policy);
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let token = handle.token.clone();
 
     let (status, _sock) = send_connect(proxy_addr, &token, &target).await;
     assert_eq!(
@@ -401,8 +408,9 @@ async fn idle_tunnel_with_no_bytes_flowing_is_closed_after_the_idle_timeout() {
     let policy = EgressPolicy {
         allowed_hosts: vec![HostPattern::exact("127.0.0.1")],
     };
-    let token = proxy.register_session(SessionId::new(), policy);
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let token = handle.token.clone();
 
     let (status, mut sock) = send_connect(proxy_addr, &token, &target).await;
     assert_eq!(status, 200);
@@ -432,8 +440,9 @@ async fn control_characters_in_a_denied_target_are_sanitized_in_the_recorded_eve
     let policy = EgressPolicy {
         allowed_hosts: vec![HostPattern::exact("crates.io")],
     };
-    let token = proxy.register_session(session_id, policy);
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(session_id, policy, proxy_addr);
+    let token = handle.token.clone();
 
     // A CONNECT target embedding an ANSI escape byte and a BEL, with no
     // other visible characters between them and the surrounding text —
@@ -500,8 +509,9 @@ async fn unspecified_address_bypasses_are_all_denied_under_allow_all_policy() {
     let policy = EgressPolicy {
         allowed_hosts: vec![HostPattern::wildcard_suffix("")],
     };
-    let token = proxy.register_session(SessionId::new(), policy);
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let token = handle.token.clone();
 
     let encodings = ["0.0.0.0:80", "0:80", "0x0:80", "[::ffff:0.0.0.0]:80"];
     for target in encodings {
@@ -530,8 +540,9 @@ async fn exact_matched_hostname_resolving_to_loopback_is_denied_unlike_an_exact_
     let policy = EgressPolicy {
         allowed_hosts: vec![HostPattern::exact("localhost")],
     };
-    let token = proxy.register_session(SessionId::new(), policy);
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let token = handle.token.clone();
 
     let (status, _sock) = send_connect(proxy_addr, &token, "localhost:80").await;
     assert_eq!(
@@ -558,8 +569,9 @@ async fn half_close_after_write_still_receives_the_full_response() {
     let policy = EgressPolicy {
         allowed_hosts: vec![HostPattern::exact("127.0.0.1")],
     };
-    let token = proxy.register_session(SessionId::new(), policy);
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let token = handle.token.clone();
 
     let (status, mut sock) = send_connect(proxy_addr, &token, &target).await;
     assert_eq!(status, 200);

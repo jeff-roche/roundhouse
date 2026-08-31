@@ -7,6 +7,7 @@ use crate::probe::MechanismProbeReport;
 use crate::{Attestation, Child, CommandSpec, Handle, Isolate, IsolationError};
 use dashmap::DashMap;
 use roundhouse_core::{OnDegrade, SessionSpec, Tier};
+use roundhouse_net::enforcement::{net_enforced_for, NetworkMechanism};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -240,6 +241,24 @@ impl Isolate for BwrapLandlockIsolate {
         let digest = blake3::hash(format!("{}:{tier:?}:{bwrap_pid:?}", h.id).as_bytes())
             .to_hex()
             .to_string();
+
+        // §6.6's honesty table, driven by which mechanism actually achieved this
+        // handle's tier — not by `Tier` alone. This struct's `achieved_tier()` folds
+        // `bwrap && (landlock || seatbelt)` into `Tier::Sandbox` (bwrap is mandatory to
+        // reach it here; there is no live "Landlock achieved Sandbox without bwrap"
+        // path in this implementation today), and never produces `Tier::Container`/
+        // `Tier::Remote` (no netns/remote executor exists yet), so mapping tier to
+        // mechanism directly is a behavior-preserving refactor of the previous
+        // `matches!(tier, Sandbox | Container | Remote)` line — it now flows through
+        // one directly-tested, doc-table-matching pure function instead, so a future
+        // isolate impl that CAN distinguish a Landlock-only Sandbox has a mechanism to
+        // plug into rather than another ad hoc match arm.
+        let mechanism = match tier {
+            Tier::Sandbox => NetworkMechanism::Bubblewrap,
+            Tier::Container | Tier::Remote => NetworkMechanism::Netns, // unreachable today, forward-safe
+            Tier::None | Tier::Worktree => NetworkMechanism::None,
+        };
+
         Attestation {
             tier,
             digest,
@@ -250,7 +269,7 @@ impl Isolate for BwrapLandlockIsolate {
             // the sandbox at all), but it is not backed by the bound loopback-proxy
             // enforcement §6.6 actually calls for — do not read this field as "a real
             // proxy is enforcing policy," only as "network is currently fully cut."
-            net_enforced: matches!(tier, Tier::Sandbox | Tier::Container | Tier::Remote),
+            net_enforced: net_enforced_for(mechanism),
         }
     }
 

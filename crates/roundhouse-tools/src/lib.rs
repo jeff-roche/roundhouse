@@ -18,6 +18,7 @@
 mod edit;
 mod error;
 mod find;
+pub mod http;
 mod read;
 mod shell;
 mod write;
