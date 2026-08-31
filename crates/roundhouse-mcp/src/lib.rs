@@ -16,6 +16,9 @@ pub mod transport;
 pub mod wire;
 
 #[cfg(test)]
+pub mod testing;
+
+#[cfg(test)]
 mod smoke {
     #[test]
     fn crate_links_and_forbids_unsafe() {
