@@ -185,7 +185,7 @@ async fn pricing_landing_later_makes_a_historical_task_backfillable_without_muta
         PriceEntry {
             input_pico_usd_per_token: 3_000_000,
             output_pico_usd_per_token: 15_000_000,
-            cache_write_pico_usd_per_token: None,
+            cache_read_pico_usd_per_token: None,
         },
     );
     let later_snapshot = PricingSnapshot {
@@ -301,7 +301,7 @@ async fn session_cost_rollup_sums_known_costs_and_counts_unknowns() {
         PriceEntry {
             input_pico_usd_per_token: 1_000,
             output_pico_usd_per_token: 2_000,
-            cache_write_pico_usd_per_token: None,
+            cache_read_pico_usd_per_token: None,
         },
     );
     let snapshot = PricingSnapshot {
@@ -315,4 +315,285 @@ async fn session_cost_rollup_sums_known_costs_and_counts_unknowns() {
 
     assert_eq!(rollup.known_pico_usd, 10 * 1_000 + 5 * 2_000);
     assert_eq!(rollup.unknown_task_count, 1);
+    assert_eq!(rollup.unattributable_task_count, 0);
+}
+
+/// Fix round 1, item 1: the security review reproduced this directly — a session
+/// containing a real chat-shaped completed task (`TaskOutput::Text(String::new())`,
+/// byte-identical to what `roundhouse-engine`'s `chat.rs::append_completed` actually
+/// produces) used to abort `session_cost_rollup` for the ENTIRE session on the first
+/// such task, because `task_cost_view`'s `Err` was propagated unconditionally out of the
+/// loop. Chat-shaped completed tasks are the NORMAL case in a real session, not an
+/// anomaly, so this must not fail the whole rollup — it must be counted as
+/// `unattributable_task_count` and the rollup must still succeed, correctly reflecting
+/// the properly-priced task alongside it.
+#[tokio::test]
+async fn session_cost_rollup_tolerates_a_real_chat_shaped_completed_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let session_id = SessionId::new();
+    let priced_task = TaskId::new();
+    let chat_task = TaskId::new();
+
+    seed_completed_task(
+        &writer,
+        session_id,
+        priced_task,
+        "anthropic",
+        "priced-model",
+        Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+        },
+    )
+    .await;
+
+    // A real chat task, completed exactly the way
+    // `roundhouse-engine/src/chat.rs`'s `append_completed` actually does it: `TaskKind::Chat`,
+    // `TaskOutput::Text(String::new())`, `Usage::default()`.
+    writer
+        .append(RUNNER.record_task_created(
+            session_id,
+            0,
+            now_ts(),
+            chat_task,
+            TaskKind::Chat,
+            None,
+            Origin::User,
+            TaskInput::Text("hello".into()),
+            1,
+        ))
+        .await
+        .unwrap();
+    writer
+        .append(RUNNER.record_task_completed(
+            session_id,
+            0,
+            now_ts(),
+            chat_task,
+            TaskOutput::Text(String::new()),
+            Usage::default(),
+            1,
+        ))
+        .await
+        .unwrap();
+
+    let query_store: StorePool = open(&db_path).await.unwrap();
+    let mut table = HashMap::new();
+    table.insert(
+        (
+            ProviderId("anthropic".to_string()),
+            ModelId("priced-model".to_string()),
+        ),
+        PriceEntry {
+            input_pico_usd_per_token: 1_000,
+            output_pico_usd_per_token: 2_000,
+            cache_read_pico_usd_per_token: None,
+        },
+    );
+    let snapshot = PricingSnapshot {
+        id: PricingSnapshotId(1),
+        table,
+    };
+
+    let rollup = roundhouse_store::cost::session_cost_rollup(&query_store, session_id, &snapshot)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "session_cost_rollup must not fail the whole session over one chat-shaped \
+                 completed task, got Err: {e}"
+            )
+        });
+
+    assert_eq!(
+        rollup.known_pico_usd,
+        10 * 1_000 + 5 * 2_000,
+        "the properly-priced task's cost must still be reflected correctly"
+    );
+    assert_eq!(rollup.unknown_task_count, 0);
+    assert_eq!(
+        rollup.unattributable_task_count, 1,
+        "the chat-shaped task must be counted as unattributable, not silently dropped \
+         and not treated as a pricing-coverage gap"
+    );
+}
+
+/// Fix round 1, item 2: `Usage::cache_read_tokens` is a real, billed token class (for
+/// the Anthropic provider this repo ships) and must actually be priced when a
+/// `PriceEntry` supplies a rate for it — the security review reproduced 1,000,000
+/// cache-read tokens against a fully-populated `PriceEntry` silently returning
+/// `Cost::Known(0)` under the pre-fix code.
+#[tokio::test]
+async fn cache_read_tokens_are_priced_when_a_rate_is_supplied() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+
+    seed_completed_task(
+        &writer,
+        session_id,
+        task_id,
+        "anthropic",
+        "cache-heavy-model",
+        Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 1_000_000,
+        },
+    )
+    .await;
+
+    let query_store: StorePool = open(&db_path).await.unwrap();
+    let mut table = HashMap::new();
+    table.insert(
+        (
+            ProviderId("anthropic".to_string()),
+            ModelId("cache-heavy-model".to_string()),
+        ),
+        PriceEntry {
+            input_pico_usd_per_token: 3_000_000,
+            output_pico_usd_per_token: 15_000_000,
+            cache_read_pico_usd_per_token: Some(300_000),
+        },
+    );
+    let snapshot = PricingSnapshot {
+        id: PricingSnapshotId(1),
+        table,
+    };
+
+    let (_, cost) = task_cost_view(&query_store, task_id, &snapshot)
+        .await
+        .unwrap();
+
+    match cost {
+        Cost::Known(pico) => assert_eq!(
+            pico,
+            1_000_000 * 300_000,
+            "cache-read tokens must actually be priced, not silently treated as free"
+        ),
+        Cost::Unknown => panic!("a fully-populated PriceEntry must yield Cost::Known"),
+    }
+}
+
+/// Companion to the above: a nonzero `cache_read_tokens` count against a `PriceEntry`
+/// that has NO cache-read rate must fall back to `Cost::Unknown`, not silently price
+/// those tokens at zero — the same fail-closed discipline `cost_for` already applies to
+/// an entirely-missing `PriceEntry`.
+#[tokio::test]
+async fn cache_read_tokens_with_no_price_entry_yields_unknown_not_silent_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+
+    seed_completed_task(
+        &writer,
+        session_id,
+        task_id,
+        "anthropic",
+        "cache-heavy-model",
+        Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 1_000_000,
+        },
+    )
+    .await;
+
+    let query_store: StorePool = open(&db_path).await.unwrap();
+    let mut table = HashMap::new();
+    table.insert(
+        (
+            ProviderId("anthropic".to_string()),
+            ModelId("cache-heavy-model".to_string()),
+        ),
+        PriceEntry {
+            input_pico_usd_per_token: 3_000_000,
+            output_pico_usd_per_token: 15_000_000,
+            cache_read_pico_usd_per_token: None, // no cache-read rate supplied
+        },
+    );
+    let snapshot = PricingSnapshot {
+        id: PricingSnapshotId(1),
+        table,
+    };
+
+    let (_, cost) = task_cost_view(&query_store, task_id, &snapshot)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(cost, Cost::Unknown),
+        "cache-read tokens with no known rate must yield Cost::Unknown, never a cost \
+         figure that silently excludes them"
+    );
+}
+
+/// Fix round 1, item 3: the price table is fully caller-supplied and unvalidated, so a
+/// mis-scaled `PriceEntry` combined with ordinary token counts must not panic (debug
+/// builds) or silently wrap into a fabricated number (release builds — this workspace
+/// doesn't enable `overflow-checks` in its release profile). `cost_for` must fold any
+/// overflow to `Cost::Unknown` instead.
+#[tokio::test]
+async fn overflowing_price_arithmetic_yields_unknown_instead_of_panicking_or_wrapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+
+    seed_completed_task(
+        &writer,
+        session_id,
+        task_id,
+        "anthropic",
+        "overflow-model",
+        Usage {
+            input_tokens: u64::MAX,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+        },
+    )
+    .await;
+
+    let query_store: StorePool = open(&db_path).await.unwrap();
+    let mut table = HashMap::new();
+    table.insert(
+        (
+            ProviderId("anthropic".to_string()),
+            ModelId("overflow-model".to_string()),
+        ),
+        PriceEntry {
+            // u64::MAX * 2 overflows u64 — this must not panic.
+            input_pico_usd_per_token: 2,
+            output_pico_usd_per_token: 0,
+            cache_read_pico_usd_per_token: None,
+        },
+    );
+    let snapshot = PricingSnapshot {
+        id: PricingSnapshotId(1),
+        table,
+    };
+
+    let (_, cost) = task_cost_view(&query_store, task_id, &snapshot)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(cost, Cost::Unknown),
+        "overflowing price arithmetic must fold to Cost::Unknown, never panic or wrap"
+    );
 }

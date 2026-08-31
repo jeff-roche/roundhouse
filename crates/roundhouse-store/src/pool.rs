@@ -35,6 +35,13 @@ pub fn open_memory_connection() -> rusqlite::Connection {
 /// - `NotFound`: a genuine domain-level lookup failure (e.g. no `TaskCompleted` event found
 ///   for a task) — distinct from `Interact`, which this crate's convention reserves for
 ///   interact-closure/panic failures specifically, not ordinary "no such row" outcomes.
+/// - `Unattributable`: a completed task's `TaskOutput` exists but doesn't carry the
+///   provider/model attribution `cost.rs`'s cost view needs (e.g. a chat task's
+///   `TaskOutput::Text(String::new())`, per `roundhouse-engine`'s `chat.rs`). Deliberately
+///   distinct from `NotFound`: this is the *expected*, common case for most completed
+///   tasks in a real session, not a data-consistency error — callers that need to treat
+///   it as non-fatal (`cost::session_cost_rollup`) match on this variant specifically
+///   rather than on `NotFound`.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("io error: {0}")]
@@ -49,6 +56,8 @@ pub enum StoreError {
     Interact(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("unattributable: {0}")]
+    Unattributable(String),
 }
 
 /// A WAL-mode SQLite connection pool. The `pool` field is public (not `pub(crate)`) because
