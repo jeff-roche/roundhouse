@@ -16,13 +16,13 @@ seccompiler = "=0.5.0"
 libc = "0.2"
 
 # Task 24: `isolate.rs`'s `attest()` computes `net_enforced` from
-# `roundhouse-net::enforcement`'s honesty table (mechanism -> bool), not from `Tier`
-# alone, so this crate can attest honestly rather than just claiming an isolation
-# mechanism achieved network enforcement. `roundhouse-net` depends only on `core` and
-# `store`, so this new edge introduces no cycle.
+# `roundhouse-core::{NetworkMechanism, net_enforced_for}`'s honesty table (mechanism
+# -> bool), not from `Tier` alone, so this crate can attest honestly rather than
+# just claiming an isolation mechanism achieved network enforcement. This lives in
+# `roundhouse-core` (not `roundhouse-net`, fix-round-1 security-review finding) so no
+# new dependency edge was needed — `roundhouse-core` was already a dependency here.
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
-roundhouse-net = { path = "../roundhouse-net" }
 async-trait = "0.1"
 tokio = { workspace = true, features = ["process", "rt"] }
 thiserror = "2.0"

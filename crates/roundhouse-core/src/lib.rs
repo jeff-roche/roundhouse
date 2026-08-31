@@ -17,6 +17,7 @@
 mod address;
 mod blob;
 mod delta;
+mod enforcement;
 mod error;
 mod event;
 mod ids;
@@ -32,6 +33,7 @@ mod timestamp;
 pub use address::Address;
 pub use blob::{Blake3Hash, BlobRef, BLOB_INLINE_THRESHOLD};
 pub use delta::Delta;
+pub use enforcement::{net_enforced_for, NetworkMechanism};
 pub use error::CoreError;
 pub use event::{Event, EventFields, EventPayload};
 pub use ids::{SessionId, TaskId, TeamId, WorkspaceId};

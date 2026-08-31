@@ -44,9 +44,34 @@ pub struct SessionEgressContext {
 /// [`LoopbackProxy`] and nothing more. The only way to construct
 /// `roundhouse_tools::http::HttpTaskExecutor` is from one of these (Task 24), so an
 /// `http` task cannot be executed without going through this proxy.
+///
+/// **Security-review finding (fix-round-1):** the fields here used to be `pub`,
+/// which made the "only constructor is `via_proxy`" guarantee fake — any crate could
+/// forge a `ProxyHandle` pointing at an arbitrary address, or mutate a legitimately
+/// registered one's `addr` after the fact, bypassing every allowlist/metadata-IP
+/// check `LoopbackProxy` exists to enforce. This is the exact defect class
+/// `roundhouse-secrets`'s `Secret`/`expose_within_control_lane` redesign
+/// (`crates/roundhouse-secrets/src/secret.rs`) was built to close: an owned, freely
+/// constructible value is not a capability. Fields are now private; only
+/// [`LoopbackProxy::register_session`] (same crate) can build one, and outside
+/// crates get read-only access via [`Self::token`]/[`Self::addr`].
 pub struct ProxyHandle {
-    pub token: String,
-    pub addr: SocketAddr,
+    token: String,
+    addr: SocketAddr,
+}
+
+impl ProxyHandle {
+    /// The session's bearer token, presented as `Proxy-Authorization: Bearer
+    /// <token>` on every CONNECT this session's traffic makes.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// The loopback proxy's bound address — where an `http`-task executor must
+    /// point its HTTP client's proxy configuration.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
 }
 
 /// Hard cap on the total bytes read for one CONNECT preamble (request line

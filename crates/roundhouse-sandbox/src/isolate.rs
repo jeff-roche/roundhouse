@@ -6,8 +6,7 @@
 use crate::probe::MechanismProbeReport;
 use crate::{Attestation, Child, CommandSpec, Handle, Isolate, IsolationError};
 use dashmap::DashMap;
-use roundhouse_core::{OnDegrade, SessionSpec, Tier};
-use roundhouse_net::enforcement::{net_enforced_for, NetworkMechanism};
+use roundhouse_core::{net_enforced_for, NetworkMechanism, OnDegrade, SessionSpec, Tier};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -242,19 +241,26 @@ impl Isolate for BwrapLandlockIsolate {
             .to_hex()
             .to_string();
 
-        // §6.6's honesty table, driven by which mechanism actually achieved this
-        // handle's tier — not by `Tier` alone. This struct's `achieved_tier()` folds
-        // `bwrap && (landlock || seatbelt)` into `Tier::Sandbox` (bwrap is mandatory to
-        // reach it here; there is no live "Landlock achieved Sandbox without bwrap"
-        // path in this implementation today), and never produces `Tier::Container`/
-        // `Tier::Remote` (no netns/remote executor exists yet), so mapping tier to
-        // mechanism directly is a behavior-preserving refactor of the previous
-        // `matches!(tier, Sandbox | Container | Remote)` line — it now flows through
-        // one directly-tested, doc-table-matching pure function instead, so a future
-        // isolate impl that CAN distinguish a Landlock-only Sandbox has a mechanism to
-        // plug into rather than another ad hoc match arm.
+        // §6.6's honesty table, driven by which mechanism actually achieved THIS
+        // HANDLE's network posture — not by `Tier` alone. `tier` is set once at
+        // `prepare()` time and reflects the *probed capability* of the host, not
+        // whether bwrap has actually run for this handle: a handle that was
+        // `prepare()`d but never `spawn()`ed, or whose `spawn()` failed (missing
+        // bwrap binary etc.), still carries `Tier::Sandbox` with `bwrap_pid: None`.
+        // Security-review finding (fix-round-1): mapping tier alone to a mechanism
+        // made `net_enforced` definitionally identical to the old
+        // `matches!(tier, Sandbox | Container | Remote)` line for exactly that
+        // reason — a rename, not an honesty fix. `bwrap_pid.is_some()` is this
+        // struct's own record of whether bwrap demonstrably ran (set only in
+        // `spawn()`, on a real child), so gate the `Sandbox` arm on it: no live
+        // bwrap process for this handle means no real Bubblewrap network
+        // enforcement to attest to, regardless of what tier was declared/probed.
+        // `Container`/`Remote` are unreachable in this implementation today (no
+        // netns/remote executor exists yet), so their mapping is moot for now and
+        // left as `Netns`/true per the doc table.
         let mechanism = match tier {
-            Tier::Sandbox => NetworkMechanism::Bubblewrap,
+            Tier::Sandbox if bwrap_pid.is_some() => NetworkMechanism::Bubblewrap,
+            Tier::Sandbox => NetworkMechanism::None, // prepared but never spawned, or spawn failed
             Tier::Container | Tier::Remote => NetworkMechanism::Netns, // unreachable today, forward-safe
             Tier::None | Tier::Worktree => NetworkMechanism::None,
         };

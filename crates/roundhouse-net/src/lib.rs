@@ -17,10 +17,16 @@
 //! test exercises it from the real task-admission path.
 #![forbid(unsafe_code)]
 
-pub mod enforcement;
 pub mod policy;
 pub mod proxy;
 
-pub use enforcement::{net_enforced_for, NetworkMechanism};
+// Security-review finding (fix-round-1): `NetworkMechanism`/`net_enforced_for` used
+// to live in this crate's own `enforcement` module, which forced
+// `roundhouse-sandbox` (the smallest, most tightly audited crate in the workspace)
+// to pull in this crate's `roundhouse-store` dependency (SQLite/`libsqlite3-sys`)
+// just to call a pure, three-branch `matches!`. Moved to `roundhouse-core`, which
+// every consumer of this table already depends on; re-exported here so existing
+// `roundhouse_net::{net_enforced_for, NetworkMechanism}` call sites keep working.
 pub use policy::{ConnectFilter, EgressDecision, EgressPolicy, HostPattern, Lane, METADATA_IP};
 pub use proxy::{LoopbackProxy, ProxyHandle, SessionEgressContext};
+pub use roundhouse_core::{net_enforced_for, NetworkMechanism};

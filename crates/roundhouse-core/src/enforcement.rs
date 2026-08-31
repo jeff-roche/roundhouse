@@ -3,6 +3,17 @@
 //! never the `Tier` alone — a `Tier::Sandbox` reached via Landlock only (bwrap
 //! unavailable) must not report the same `net_enforced` as one reached via a real
 //! Bubblewrap netns.
+//!
+//! Lives in `roundhouse-core` (Task 24 fix-round-1; originally placed in
+//! `roundhouse-net`) rather than in `roundhouse-net` or `roundhouse-sandbox`: both of
+//! those crates need it (`roundhouse-sandbox`'s `attest()` to compute
+//! `net_enforced`, `roundhouse-net` to re-export it for `roundhouse-tools` and other
+//! consumers), and both already depend on `roundhouse-core` for the `Tier` type this
+//! table maps from. Putting it in `roundhouse-net` instead would have forced
+//! `roundhouse-sandbox` — the one crate in this workspace with the smallest,
+//! `#![forbid(unsafe_code)]`-audited surface — to pull in `roundhouse-net`'s own
+//! `roundhouse-store` dependency (SQLite/`libsqlite3-sys`) just to call a pure,
+//! three-branch `matches!`. This module has zero dependencies of its own.
 
 /// Which real isolation mechanism produced a task's current tier. See
 /// `docs/architecture/03-security-and-sandboxing.md` §6.6 for the source table this
