@@ -26,6 +26,31 @@
 //! module's contribution is the narrow-vs-widen decision logic and safe-by-construction
 //! storage semantics (fail-closed on corruption, atomic writes); it is not, by itself, a
 //! complete trust boundary.
+//!
+//! **What "safe narrowing" means here, precisely** (security review round 2 corrected an
+//! earlier, too-permissive definition): `PolicyEngine::decide` picks a winning rule by
+//! scope, then specificity, then — when those tie — by relative file order (see
+//! `engine.rs::decide`'s sort). That means the *set* of rule signatures being unchanged is
+//! NOT sufficient evidence of safety: reordering two rules that tie in specificity can
+//! flip which one wins with zero signature-level change at all, and a trusted `Deny`/`Ask`
+//! rule quietly disappearing (or being rewritten to a less restrictive outcome on the same
+//! predicate) removes a constraint on whatever broader `Allow` rule used to be shadowed by
+//! it. Rather than special-case each such shape, this module treats anything that isn't
+//! *exactly* "the current file's Project-scope rules are the trusted baseline's rules with
+//! zero or more `Allow` rules removed and zero or more new non-`Allow` rules added, with
+//! every retained rule's relative order preserved" as an undifferentiated widening event,
+//! and fails closed on it: every Project-scope `Allow` rule is dropped for that call, the
+//! same fail-closed treatment first-use and a corrupt record already get. The only softer
+//! case is a brand-new `Allow` rule appearing with nothing else disturbed, where the
+//! previously-trusted `Allow` rules can safely keep applying (see `Widening::Additive`
+//! below) — everything else nukes every Project-scope `Allow` rule until a human calls
+//! `record_explicit_trust` again. There is deliberately no "trusted hash matches current
+//! hash, apply verbatim" shortcut anywhere in this module: that exact shortcut was the
+//! root cause of a prior Critical finding (a file trusted-at-hash `H` with an empty
+//! trusted-signature set self-granted on the very next call, since the shortcut never
+//! consulted the signature set at all). `trusted_policy_hash` is retained purely as
+//! human-auditable metadata (which exact file content was last trusted) — it plays no
+//! role in the authorization decision itself, which is entirely signature-and-order based.
 
 use crate::engine::{CompiledRule, Outcome, Scope};
 use std::collections::HashSet;
@@ -34,9 +59,10 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrustRecord {
     pub trusted_policy_hash: String,
-    /// Signatures of every Project-scope rule (Allow *and* Deny/Ask) present in the file
-    /// at the time trust was last established or auto-advanced. Tagged so `Allow` and
-    /// non-`Allow` signatures can be told apart on load — see `signature_string`.
+    /// Every Project-scope rule's signature (`Allow`, `Ask`, *and* `Deny` alike — see
+    /// `signature_string`), in the exact order they appeared in the trusted file. Order
+    /// is significant and preserved deliberately: see the module doc comment on why a
+    /// pure reorder of tied-specificity rules must be detectable from this alone.
     pub trusted_rule_signatures: Vec<String>,
 }
 
@@ -143,39 +169,99 @@ impl TrustStore {
     }
 }
 
-/// A signature stable enough to detect a genuinely new/changed Project-scope rule —
-/// tagged with whether it's an `Allow` rule or not, so widening (a new `Allow` appearing,
-/// *or* a previously-trusted `Deny`/`Ask` disappearing) can be told apart from narrowing
-/// (an `Allow` disappearing, or a new `Deny`/`Ask` appearing) using simple set membership.
-/// Not a general rule-equality algebra; good enough to answer "did this specific rule
-/// exist in the last-trusted file."
+fn tag_for(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Allow => "ALLOW",
+        Outcome::Ask => "ASK",
+        Outcome::Deny => "DENY",
+    }
+}
+
+/// A signature stable enough to detect a genuinely new/changed/reordered Project-scope
+/// rule: the real outcome (`Allow`/`Ask`/`Deny`, not collapsed into a generic
+/// non-`Allow` bucket — a `Deny` rewritten to an `Ask` on the identical predicate must
+/// produce a DIFFERENT signature, not the same one) plus a `Debug` rendering of the
+/// predicate. Not a general rule-equality algebra; good enough to answer "did this exact
+/// (outcome, predicate) pair exist in the last-trusted file, and where."
 fn signature_string(rule: &CompiledRule) -> Option<String> {
     if rule.scope != Scope::Project {
         return None;
     }
-    let tag = if rule.outcome == Outcome::Allow {
-        "ALLOW"
-    } else {
-        "OTHER"
-    };
-    Some(format!("{tag}:{:?}", rule.predicate))
+    Some(format!("{}:{:?}", tag_for(rule.outcome), rule.predicate))
 }
 
 fn is_allow_signature(sig: &str) -> bool {
     sig.starts_with("ALLOW:")
 }
 
+/// How the current file's Project-scope rule signatures compare to the trusted baseline.
+#[derive(Debug, PartialEq, Eq)]
+enum Widening {
+    /// Nothing widened: every signature disappearance was an `Allow` (safe to drop), no
+    /// trusted `Ask`/`Deny` signature disappeared or got replaced, no new `Allow`
+    /// signature appeared, and every retained signature's relative order is unchanged.
+    None,
+    /// Only new `Allow` signature(s) appeared; nothing else about the trusted baseline
+    /// was disturbed. Safe to keep applying every previously-trusted `Allow` rule and
+    /// refuse only the new one(s).
+    Additive,
+    /// Something beyond "a brand-new `Allow` rule appeared" changed: a trusted
+    /// `Ask`/`Deny` signature disappeared (whether removed outright or replaced by a
+    /// less restrictive outcome on the same predicate), or the relative order of
+    /// signatures retained in both the trusted baseline and the current file changed.
+    /// Either can flip `PolicyEngine::decide`'s real output for an action nothing here
+    /// individually "added" — fails closed exactly like first-use/corrupt-record: every
+    /// Project-scope `Allow` rule is dropped, not just the ones that look new.
+    Structural,
+}
+
+fn classify(trusted_seq: &[String], current_seq: &[String]) -> Widening {
+    let trusted_set: HashSet<&str> = trusted_seq.iter().map(String::as_str).collect();
+    let current_set: HashSet<&str> = current_seq.iter().map(String::as_str).collect();
+
+    // A trusted restriction (Ask/Deny) that is no longer present at all — whether the
+    // line was deleted outright, or rewritten to a different (less restrictive)
+    // outcome on the same predicate, either way the OLD signature string vanishes from
+    // the current set.
+    let restriction_disappeared = trusted_seq
+        .iter()
+        .any(|s| !is_allow_signature(s) && !current_set.contains(s.as_str()));
+
+    // Relative order of every signature retained in BOTH files, compared as a sequence.
+    // A pure reorder changes nothing about set membership but changes this.
+    let filtered_trusted_order: Vec<&str> = trusted_seq
+        .iter()
+        .map(String::as_str)
+        .filter(|s| current_set.contains(s))
+        .collect();
+    let filtered_current_order: Vec<&str> = current_seq
+        .iter()
+        .map(String::as_str)
+        .filter(|s| trusted_set.contains(s))
+        .collect();
+    let reordered = filtered_trusted_order != filtered_current_order;
+
+    if restriction_disappeared || reordered {
+        return Widening::Structural;
+    }
+
+    let new_allow_appeared = current_seq
+        .iter()
+        .any(|s| is_allow_signature(s) && !trusted_set.contains(s.as_str()));
+
+    if new_allow_appeared {
+        Widening::Additive
+    } else {
+        Widening::None
+    }
+}
+
 /// The precedence rule, made real: `Project` scope may narrow, never widen, unless a
 /// human has recorded a trust decision at this exact `(repo_root, blake3(policy_file))`
 /// pair. Returns the rule set that is actually safe to compile into the `PolicyEngine` —
 /// which may be strictly narrower than what the (agent-writable) file itself authors.
-///
-/// Widening covers two symmetric cases, both gated identically: a new `Allow` rule
-/// appearing that was never previously trusted, or a previously-trusted `Deny`/`Ask` rule
-/// disappearing (removing a restriction is exactly as much a widening as adding a new
-/// permission). Either one refuses every `Allow` rule that isn't in the last-trusted set
-/// and leaves the trusted baseline exactly where it was — repeated calls on the same
-/// untrusted-and-widened file keep refusing until a human calls `record_explicit_trust`.
+/// See the module doc comment for the precise, conservative definition of "safe
+/// narrowing" this function fails closed against anything short of.
 pub fn apply_project_scope_trust(
     repo_root: &Path,
     policy_file_contents: &str,
@@ -185,10 +271,6 @@ pub fn apply_project_scope_trust(
     let current_hash = blake3::hash(policy_file_contents.as_bytes())
         .to_hex()
         .to_string();
-    let current_sigs: HashSet<String> = parsed_project_rules
-        .iter()
-        .filter_map(signature_string)
-        .collect();
 
     match trust_store.load(repo_root) {
         Err(_) => {
@@ -206,10 +288,10 @@ pub fn apply_project_scope_trust(
             // applied to the whole file). Auto-record trust at THIS hash with an EMPTY
             // trusted-signature set, so a later addition of any Allow rule is detected as
             // new and stays refused too, until a human explicitly trusts it. Every later
-            // call against this same unchanged hash falls into the `Some(record)` arm
-            // below and re-evaluates against that (initially empty) trusted set — it does
-            // NOT take a "hash matches, apply verbatim" shortcut, which is what let a
-            // first-use Allow rule silently self-grant on the very next call.
+            // call re-evaluates against that (initially empty) trusted set via the same
+            // `classify` logic below — there is no "hash matches, apply verbatim"
+            // shortcut anywhere, which is what let a first-use Allow rule silently
+            // self-grant on the very next call in an earlier version of this function.
             let _ = trust_store.save(
                 repo_root,
                 &TrustRecord {
@@ -223,61 +305,75 @@ pub fn apply_project_scope_trust(
                 .collect()
         }
         Ok(Some(record)) => {
-            let trusted: HashSet<&str> = record
-                .trusted_rule_signatures
+            let trusted_seq = &record.trusted_rule_signatures;
+            let current_seq: Vec<String> = parsed_project_rules
                 .iter()
-                .map(|s| s.as_str())
+                .filter_map(signature_string)
                 .collect();
 
-            let new_allow_appeared = current_sigs
-                .iter()
-                .any(|s| is_allow_signature(s) && !trusted.contains(s.as_str()));
-            let restriction_disappeared = trusted
-                .iter()
-                .any(|s| !is_allow_signature(s) && !current_sigs.contains(*s));
-            let widened = new_allow_appeared || restriction_disappeared;
-
-            if widened {
-                // Refuse anything not already trusted: keep only previously-trusted
-                // Allow rules, plus every Deny/Ask rule the current file still has (a
-                // *new* Deny/Ask only narrows further and is always safe to keep). Do
-                // NOT save — the trusted baseline stays exactly where it was, so this
-                // file keeps being flagged as widened on every subsequent call until a
-                // human calls `record_explicit_trust`.
-                parsed_project_rules
-                    .into_iter()
-                    .filter(|r| {
-                        if r.scope == Scope::Project && r.outcome == Outcome::Allow {
-                            signature_string(r)
-                                .map(|s| trusted.contains(s.as_str()))
-                                .unwrap_or(false)
-                        } else {
-                            true
-                        }
-                    })
-                    .collect()
-            } else {
-                // Pure narrowing (or no change at all) — auto-advance the trusted
-                // baseline to the current file, no human action required.
-                let _ = trust_store.save(
-                    repo_root,
-                    &TrustRecord {
-                        trusted_policy_hash: current_hash,
-                        trusted_rule_signatures: current_sigs.into_iter().collect(),
-                    },
-                );
-                parsed_project_rules
+            match classify(trusted_seq, &current_seq) {
+                Widening::Structural => {
+                    // Fails closed exactly like first-use/corrupt-record: drop EVERY
+                    // Project-scope Allow rule, including ones that were previously
+                    // trusted — a disappearing restriction or a reorder can make an
+                    // already-trusted Allow rule cover ground it never used to. Do NOT
+                    // save — the trusted baseline stays exactly where it was, so this
+                    // file keeps being flagged as widened on every subsequent call
+                    // until a human calls `record_explicit_trust`.
+                    parsed_project_rules
+                        .into_iter()
+                        .filter(|r| !(r.scope == Scope::Project && r.outcome == Outcome::Allow))
+                        .collect()
+                }
+                Widening::Additive => {
+                    // Only a brand-new Allow rule appeared; nothing else about the
+                    // trusted baseline was disturbed. Safe to keep every
+                    // previously-trusted Allow rule (and every current Deny/Ask rule —
+                    // new restrictions only narrow further); refuse just the new
+                    // Allow(s). Do NOT save, for the same reason as above.
+                    let trusted_allow: HashSet<&str> = trusted_seq
+                        .iter()
+                        .filter(|s| is_allow_signature(s))
+                        .map(|s| s.as_str())
+                        .collect();
+                    parsed_project_rules
+                        .into_iter()
+                        .filter(|r| {
+                            if r.scope == Scope::Project && r.outcome == Outcome::Allow {
+                                signature_string(r)
+                                    .map(|s| trusted_allow.contains(s.as_str()))
+                                    .unwrap_or(false)
+                            } else {
+                                true
+                            }
+                        })
+                        .collect()
+                }
+                Widening::None => {
+                    // Provably safe narrowing (or literally no change): auto-advance
+                    // the trusted baseline to the current file, no human action
+                    // required.
+                    let _ = trust_store.save(
+                        repo_root,
+                        &TrustRecord {
+                            trusted_policy_hash: current_hash,
+                            trusted_rule_signatures: current_seq,
+                        },
+                    );
+                    parsed_project_rules
+                }
             }
         }
     }
 }
 
 /// The human-facing escape hatch (`round policy trust`, or equivalent) — explicitly
-/// trusts the CURRENT file's exact content and full Project-scope rule set (`Allow` and
-/// `Deny`/`Ask` alike), unlocking whatever it widened. Never called automatically except
-/// by `apply_project_scope_trust`'s own narrowing-auto-advance path above. Overwrites any
-/// existing record unconditionally — including a corrupt one — since this is the human
-/// resolving exactly the ambiguity `apply_project_scope_trust` fails closed on.
+/// trusts the CURRENT file's exact content and full Project-scope rule sequence (`Allow`
+/// and `Deny`/`Ask` alike, in file order), unlocking whatever it widened. Never called
+/// automatically except by `apply_project_scope_trust`'s own narrowing-auto-advance path
+/// above. Overwrites any existing record unconditionally — including a corrupt one —
+/// since this is the human resolving exactly the ambiguity `apply_project_scope_trust`
+/// fails closed on.
 pub fn record_explicit_trust(
     repo_root: &Path,
     policy_file_contents: &str,

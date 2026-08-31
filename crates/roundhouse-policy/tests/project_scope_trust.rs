@@ -1,5 +1,6 @@
-use roundhouse_policy::engine::{CompiledRule, Outcome, Predicate, Scope};
+use roundhouse_policy::engine::{CompiledRule, Outcome, Predicate, PolicyEngine, Scope};
 use roundhouse_policy::trust::{apply_project_scope_trust, record_explicit_trust, TrustStore};
+use roundhouse_policy::{ParsedCommand, TaskParams};
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -8,6 +9,17 @@ fn allow_rule(program: &str) -> CompiledRule {
 }
 fn deny_rule(program: &str) -> CompiledRule {
     CompiledRule::test_new(Scope::Project, Outcome::Deny, Predicate::program(program))
+}
+
+fn force_push_predicate() -> Predicate {
+    Predicate::argv_prefix("git", &["push", "--force"])
+}
+
+fn force_push_params() -> TaskParams {
+    TaskParams::Shell(ParsedCommand {
+        program: "git".to_string(),
+        argv: vec!["push".to_string(), "--force".to_string()],
+    })
 }
 
 #[test]
@@ -192,44 +204,156 @@ fn a_corrupt_trust_record_is_not_silently_clobbered_and_stays_fail_closed() {
 }
 
 #[test]
-fn removing_a_trusted_deny_rule_is_a_widening_and_is_gated_like_any_other() {
+fn removing_a_trusted_deny_rule_widens_the_real_effective_decision_and_is_fully_gated() {
     let state_dir = TempDir::new().unwrap();
     let repo_root = PathBuf::from("/repos/example");
     let store = TrustStore::new(state_dir.path().to_path_buf());
 
-    // Baseline: `git` is trusted-Allow, constrained by a trusted Deny on `curl`.
-    let baseline_text = "allow git status\ndeny curl";
-    let baseline_rules = vec![allow_rule("git"), deny_rule("curl")];
+    // Baseline: `git` is broadly trusted-Allow (any argv), constrained by a trusted Deny
+    // on the specific `git push --force` invocation.
+    let baseline_text = "allow git\ndeny git push --force";
+    let baseline_rules = vec![
+        allow_rule("git"),
+        CompiledRule::test_new(Scope::Project, Outcome::Deny, force_push_predicate()),
+    ];
     record_explicit_trust(&repo_root, baseline_text, &baseline_rules, &store).unwrap();
     let baseline_record = store.load(&repo_root).unwrap().unwrap();
 
-    // The agent removes only the `deny curl` line — no new Allow rule appears at all.
-    let deny_removed_text = "allow git status";
+    // Sanity: the real PolicyEngine actually denies this before the attack — Deny always
+    // wins over a matching Allow in `PolicyEngine::decide`, regardless of order.
+    assert_eq!(
+        PolicyEngine::from_rules(baseline_rules).decide(&force_push_params()).outcome,
+        Outcome::Deny
+    );
+
+    // The agent removes only the `deny git push --force` line — no new Allow rule
+    // appears at all, and the surviving `Allow git` rule is unchanged.
+    let deny_removed_text = "allow git";
     let deny_removed_rules = vec![allow_rule("git")];
     let effective = apply_project_scope_trust(&repo_root, deny_removed_text, deny_removed_rules, &store);
 
-    let allowed_programs: Vec<_> = effective
-        .iter()
-        .filter(|r| r.outcome == Outcome::Allow)
-        .filter_map(|r| match &r.predicate {
-            Predicate::Shell { program, .. } => Some(program.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        allowed_programs,
-        vec!["git".to_string()],
-        "removing a trusted Deny must not itself grant any new Allow rule"
+    assert!(
+        !effective.iter().any(|r| r.outcome == Outcome::Allow),
+        "a disappearing trusted restriction must drop ALL Project-scope Allow rules, not \
+         just refuse newly-added ones — the surviving broad `Allow git` rule could still \
+         cover the action the deleted Deny used to block"
     );
 
-    // The real check: this must NOT have been treated as pure narrowing. The trusted
-    // baseline must stay exactly where it was (the deny-removed file's hash must NOT
-    // become the new trusted hash) so this keeps being flagged as widened until a human
-    // explicitly re-trusts it.
+    // The real check the earlier (round-1) version of this test missed: verify the
+    // ACTUAL effective decision through the real PolicyEngine, not just rule counts.
+    let real_decision = PolicyEngine::from_rules(effective).decide(&force_push_params());
+    assert_ne!(
+        real_decision.outcome,
+        Outcome::Allow,
+        "the real PolicyEngine::decide must not grant `git push --force` just because the \
+         Deny rule that used to block it was quietly deleted from the file"
+    );
+
+    // The trusted baseline must stay exactly where it was, so this keeps being flagged as
+    // widened on every subsequent call until a human explicitly re-trusts it.
     let record_after = store.load(&repo_root).unwrap().unwrap();
     assert_eq!(
         record_after.trusted_policy_hash, baseline_record.trusted_policy_hash,
         "removing a trusted Deny rule must NOT auto-advance the trusted hash — it widens \
          effective permissions and requires an explicit human trust decision"
+    );
+}
+
+#[test]
+fn rewriting_a_trusted_deny_as_ask_on_the_same_predicate_is_widening_and_is_gated() {
+    let state_dir = TempDir::new().unwrap();
+    let repo_root = PathBuf::from("/repos/example");
+    let store = TrustStore::new(state_dir.path().to_path_buf());
+
+    let baseline_text = "allow git\ndeny git push --force";
+    let baseline_rules = vec![
+        allow_rule("git"),
+        CompiledRule::test_new(Scope::Project, Outcome::Deny, force_push_predicate()),
+    ];
+    record_explicit_trust(&repo_root, baseline_text, &baseline_rules, &store).unwrap();
+    let baseline_record = store.load(&repo_root).unwrap().unwrap();
+
+    // The agent rewrites the SAME predicate's outcome from Deny to Ask — a hard refusal
+    // becomes a prompt a human or automation could accept. The signature set the naive
+    // "collapse every non-Allow outcome into one tag" scheme used is bit-for-bit
+    // unchanged; only the real outcome differs.
+    let rewritten_text = "allow git\nask git push --force";
+    let rewritten_rules = vec![
+        allow_rule("git"),
+        CompiledRule::test_new(Scope::Project, Outcome::Ask, force_push_predicate()),
+    ];
+    let effective = apply_project_scope_trust(&repo_root, rewritten_text, rewritten_rules, &store);
+
+    assert!(
+        !effective.iter().any(|r| r.outcome == Outcome::Allow),
+        "loosening a trusted Deny to Ask on the same predicate must be gated exactly like \
+         any other widening — an absolute refusal becoming a user-approvable prompt is a \
+         real widening"
+    );
+
+    let record_after = store.load(&repo_root).unwrap().unwrap();
+    assert_eq!(
+        record_after.trusted_policy_hash, baseline_record.trusted_policy_hash,
+        "a Deny-to-Ask rewrite on a trusted predicate must NOT auto-advance the trusted \
+         hash — this must keep being flagged until a human explicitly re-trusts it"
+    );
+}
+
+#[test]
+fn reordering_two_tied_specificity_rules_flips_the_real_decision_and_is_gated() {
+    let state_dir = TempDir::new().unwrap();
+    let repo_root = PathBuf::from("/repos/example");
+    let store = TrustStore::new(state_dir.path().to_path_buf());
+
+    // Two rules with the IDENTICAL predicate (bare `git`, any argv). Neither Allow nor
+    // Ask ever hard-wins over the other in `PolicyEngine::decide` (only Deny does) — a
+    // tie on scope/specificity is broken purely by relative order (a stable sort over
+    // the rules as given). Baseline: `ask git` listed before `allow git`, so it decides
+    // Ask.
+    let ask_first_text = "ask git\nallow git";
+    let ask_first_rules = vec![
+        CompiledRule::test_new(Scope::Project, Outcome::Ask, Predicate::program("git")),
+        allow_rule("git"),
+    ];
+    record_explicit_trust(&repo_root, ask_first_text, &ask_first_rules, &store).unwrap();
+    let baseline_record = store.load(&repo_root).unwrap().unwrap();
+
+    let bare_git = TaskParams::Shell(ParsedCommand {
+        program: "git".to_string(),
+        argv: vec![],
+    });
+    assert_eq!(
+        PolicyEngine::from_rules(ask_first_rules).decide(&bare_git).outcome,
+        Outcome::Ask,
+        "sanity: with `ask git` listed first, the real PolicyEngine decides Ask on a tie"
+    );
+
+    // The agent swaps the two lines — same set of rules, same signatures, only the
+    // relative order changed.
+    let swapped_text = "allow git\nask git";
+    let swapped_rules = vec![
+        allow_rule("git"),
+        CompiledRule::test_new(Scope::Project, Outcome::Ask, Predicate::program("git")),
+    ];
+    let effective = apply_project_scope_trust(&repo_root, swapped_text, swapped_rules, &store);
+
+    assert!(
+        !effective.iter().any(|r| r.outcome == Outcome::Allow),
+        "a pure reorder of tied-specificity rules must be gated as widening — order alone \
+         can flip PolicyEngine::decide's outcome even though the signature SET is identical"
+    );
+
+    let real_decision = PolicyEngine::from_rules(effective).decide(&bare_git);
+    assert_ne!(
+        real_decision.outcome,
+        Outcome::Allow,
+        "the real PolicyEngine::decide must not grant a bare `git` invocation just because \
+         the trusted `ask git`/`allow git` lines were swapped"
+    );
+
+    let record_after = store.load(&repo_root).unwrap().unwrap();
+    assert_eq!(
+        record_after.trusted_policy_hash, baseline_record.trusted_policy_hash,
+        "a reorder-only change must NOT auto-advance the trusted hash"
     );
 }
