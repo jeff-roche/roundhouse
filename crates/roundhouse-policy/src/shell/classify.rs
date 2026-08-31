@@ -828,6 +828,13 @@ fn expand_piece(piece: &WordPiece, env: &SessionEnv, out: &mut String) {
 /// so every reachable arm here mirrors an accepted variant; the wildcard arm is a
 /// defensive no-op (never a panic) in case that invariant is ever violated by future
 /// changes, rather than a silently-guessed resolution.
+///
+/// Known pre-existing divergence from real bash (not something this function can
+/// correct): `brush-parser` collapses runs of whitespace inside a `${...}` payload, so
+/// e.g. `${X:-a  b}` resolves here to `"a b"` where bash keeps `"a  b"`. This predates
+/// task-22.5 but is newly *reachable* now that these forms are accepted (fix round 1,
+/// Minor finding — not fixed, since the collapsing happens upstream in `brush-parser`'s
+/// own tokenizer, outside this module's control).
 fn expand_parameter_expr(expr: &ParameterExpr, env: &SessionEnv, out: &mut String) {
     match expr {
         ParameterExpr::Parameter {
