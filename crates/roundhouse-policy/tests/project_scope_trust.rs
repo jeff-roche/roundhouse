@@ -290,6 +290,26 @@ fn rewriting_a_trusted_deny_as_ask_on_the_same_predicate_is_widening_and_is_gate
          any other widening — an absolute refusal becoming a user-approvable prompt is a \
          real widening"
     );
+    assert!(
+        !effective.iter().any(|r| r.outcome == Outcome::Ask),
+        "the widened Ask rule itself must also be dropped, not just Allow rules — a live \
+         Ask rule would still MATCH `git push --force`, which is exactly what the next \
+         assertion below proves matters"
+    );
+
+    // The real check the earlier version of this test missed: an Ask rule that survives
+    // and still matches is not neutralized by unattended mode's no-human-to-ask
+    // downgrade, because that downgrade only fires when NO rule matched at all
+    // (`decide_unattended`'s `d.rule.is_none()` check) — a live, matching Ask rule left
+    // in place would leave `git push --force` at Ask even unattended, never a real Deny.
+    let real_decision = PolicyEngine::from_rules(effective).decide_unattended(&force_push_params());
+    assert_eq!(
+        real_decision.outcome,
+        Outcome::Deny,
+        "with no live Project-scope rule left to match `git push --force`, unattended \
+         mode's no-human-to-ask downgrade must produce a real Deny — this only holds if \
+         the widened Ask rule was dropped alongside Allow, not left in place still matching"
+    );
 
     let record_after = store.load(&repo_root).unwrap().unwrap();
     assert_eq!(
@@ -335,6 +355,18 @@ fn reordering_two_tied_specificity_rules_flips_the_real_decision_and_is_gated() 
         allow_rule("git"),
         CompiledRule::test_new(Scope::Project, Outcome::Ask, Predicate::program("git")),
     ];
+
+    // The ungated counterfactual: prove the reorder really does flip the real decision on
+    // its own, so this test isn't vacuous (i.e. it isn't accidentally passing because the
+    // swap never mattered to `PolicyEngine::decide` in the first place).
+    assert_eq!(
+        PolicyEngine::from_rules(swapped_rules.clone()).decide(&bare_git).outcome,
+        Outcome::Allow,
+        "sanity: with the lines swapped and NO trust gate involved, the real PolicyEngine \
+         really does flip to Allow on the same tie — proving the gate below is doing real \
+         work, not passing vacuously"
+    );
+
     let effective = apply_project_scope_trust(&repo_root, swapped_text, swapped_rules, &store);
 
     assert!(
@@ -355,5 +387,67 @@ fn reordering_two_tied_specificity_rules_flips_the_real_decision_and_is_gated() 
     assert_eq!(
         record_after.trusted_policy_hash, baseline_record.trusted_policy_hash,
         "a reorder-only change must NOT auto-advance the trusted hash"
+    );
+}
+
+#[test]
+fn reordering_via_the_file_order_field_alone_is_gated_even_when_vec_position_is_unchanged() {
+    // The mechanical twin of the previous test, targeting the actual bug the security
+    // review's round-3 finding named: PolicyEngine::decide's real tie-break key is each
+    // rule's `file_order` FIELD, never the `Vec`'s iteration order. This test keeps the
+    // `Vec` in byte-identical order throughout and only swaps `file_order` values, to
+    // prove the trust gate reads the field the real engine reads, not incidental Vec
+    // position.
+    let state_dir = TempDir::new().unwrap();
+    let repo_root = PathBuf::from("/repos/example");
+    let store = TrustStore::new(state_dir.path().to_path_buf());
+
+    let mut ask_rule = CompiledRule::test_new(Scope::Project, Outcome::Ask, Predicate::program("git"));
+    let mut allow_git = allow_rule("git");
+    ask_rule.file_order = 0;
+    allow_git.file_order = 1;
+    // Vec position: [ask_rule, allow_git] — same as the file_order order, so this
+    // baseline is unambiguous either way.
+    let baseline_rules = vec![ask_rule.clone(), allow_git.clone()];
+    record_explicit_trust(&repo_root, "ask git\nallow git", &baseline_rules, &store).unwrap();
+    let baseline_record = store.load(&repo_root).unwrap().unwrap();
+
+    let bare_git = TaskParams::Shell(ParsedCommand {
+        program: "git".to_string(),
+        argv: vec![],
+    });
+    assert_eq!(
+        PolicyEngine::from_rules(baseline_rules).decide(&bare_git).outcome,
+        Outcome::Ask
+    );
+
+    // The attack: swap the FIELD values, not the Vec positions. The Vec still iterates
+    // [ask_rule, allow_git] in that exact order — byte-identical to the baseline — but
+    // `allow_git` now carries the lower `file_order`, so it wins the real tie-break.
+    let mut swapped_ask = ask_rule;
+    let mut swapped_allow = allow_git;
+    swapped_ask.file_order = 1;
+    swapped_allow.file_order = 0;
+    let attacked_rules = vec![swapped_ask, swapped_allow]; // same Vec order as baseline_rules
+
+    assert_eq!(
+        PolicyEngine::from_rules(attacked_rules.clone()).decide(&bare_git).outcome,
+        Outcome::Allow,
+        "sanity: file_order alone (not Vec position) really does flip the real decision"
+    );
+
+    let effective = apply_project_scope_trust(&repo_root, "allow git\nask git", attacked_rules, &store);
+
+    assert!(
+        effective.iter().all(|r| r.outcome != Outcome::Allow && r.outcome != Outcome::Ask),
+        "a file_order-only reorder (identical Vec position) must be caught exactly like a \
+         Vec-position reorder — the trust gate must key its ordering on file_order, not on \
+         incidental Vec iteration order"
+    );
+
+    let record_after = store.load(&repo_root).unwrap().unwrap();
+    assert_eq!(
+        record_after.trusted_policy_hash, baseline_record.trusted_policy_hash,
+        "a file_order-only reorder must NOT auto-advance the trusted hash"
     );
 }

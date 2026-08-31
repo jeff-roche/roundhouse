@@ -51,6 +51,16 @@
 //! consulted the signature set at all). `trusted_policy_hash` is retained purely as
 //! human-auditable metadata (which exact file content was last trusted) — it plays no
 //! role in the authorization decision itself, which is entirely signature-and-order based.
+//!
+//! "Order," precisely: `PolicyEngine::decide`'s tie-break reads each `CompiledRule`'s
+//! `file_order` FIELD, not whatever position a caller's `Vec` happens to iterate rules
+//! in — so `signature_sequence` (below) always sorts by `file_order` before building the
+//! sequence `classify` compares, regardless of the order `parsed_project_rules` arrives
+//! in. Nothing currently in this codebase sets a non-zero `file_order` (the real
+//! `.roundhouse/policy.toml` parser/compiler this module isn't wired into yet doesn't
+//! exist), so today `Vec` order and `file_order` order coincide by construction; this
+//! sort is what keeps that true once a real caller exists that might filter, group, or
+//! recollect rules before calling this module.
 
 use crate::engine::{CompiledRule, Outcome, Scope};
 use std::collections::HashSet;
@@ -194,6 +204,33 @@ fn is_allow_signature(sig: &str) -> bool {
     sig.starts_with("ALLOW:")
 }
 
+/// Builds the ordered Project-scope signature sequence `classify`'s order check relies
+/// on — critically, ordered by each rule's `file_order` FIELD, not by the position the
+/// caller happened to put it at in the `Vec`. `PolicyEngine::decide` (`engine.rs:520`)
+/// breaks specificity ties by `file_order`, never by however a caller iterated/filtered/
+/// recollected its rules on the way here — so this function's entire "detect a pure
+/// reorder" guarantee is meaningless unless the sequence it builds reflects `file_order`,
+/// not incidental `Vec` order. `file_order` is deliberately excluded from the signature
+/// *string* itself (only used to sort): baking the numeric value in would treat a
+/// legitimate narrowing edit — which renumbers every rule after the deleted one — as a
+/// wholesale signature change instead of the safe removal it actually is.
+fn signature_sequence(rules: &[CompiledRule]) -> Vec<String> {
+    let mut project_rules: Vec<&CompiledRule> =
+        rules.iter().filter(|r| r.scope == Scope::Project).collect();
+    project_rules.sort_by_key(|r| r.file_order);
+    debug_assert!(
+        project_rules.windows(2).all(|w| w[0].file_order <= w[1].file_order),
+        "trust::signature_sequence: rules must come out sorted by file_order — the exact \
+         field PolicyEngine::decide's tie-break reads — after the sort_by_key above; a \
+         violation here means the sort was changed or bypassed, silently reintroducing the \
+         reorder-widening bug this ordering exists to catch"
+    );
+    project_rules
+        .into_iter()
+        .map(|r| signature_string(r).expect("already filtered to Scope::Project above"))
+        .collect()
+}
+
 /// How the current file's Project-scope rule signatures compare to the trusted baseline.
 #[derive(Debug, PartialEq, Eq)]
 enum Widening {
@@ -211,7 +248,11 @@ enum Widening {
     /// signatures retained in both the trusted baseline and the current file changed.
     /// Either can flip `PolicyEngine::decide`'s real output for an action nothing here
     /// individually "added" — fails closed exactly like first-use/corrupt-record: every
-    /// Project-scope `Allow` rule is dropped, not just the ones that look new.
+    /// Project-scope `Allow` *and* `Ask` rule is dropped (only `Deny` survives), not just
+    /// the ones that look new. `Ask` has to go too, not just `Allow`: a Deny-to-Ask
+    /// rewrite on the same predicate leaves a live, matching `Ask` rule in place, which
+    /// would otherwise stop `decide_unattended`'s no-human-to-ask downgrade from ever
+    /// reinstating a real `Deny`.
     Structural,
 }
 
@@ -306,23 +347,27 @@ pub fn apply_project_scope_trust(
         }
         Ok(Some(record)) => {
             let trusted_seq = &record.trusted_rule_signatures;
-            let current_seq: Vec<String> = parsed_project_rules
-                .iter()
-                .filter_map(signature_string)
-                .collect();
+            let current_seq: Vec<String> = signature_sequence(&parsed_project_rules);
 
             match classify(trusted_seq, &current_seq) {
                 Widening::Structural => {
-                    // Fails closed exactly like first-use/corrupt-record: drop EVERY
-                    // Project-scope Allow rule, including ones that were previously
-                    // trusted — a disappearing restriction or a reorder can make an
-                    // already-trusted Allow rule cover ground it never used to. Do NOT
+                    // Fails closed exactly like first-use/corrupt-record — and stricter:
+                    // drop EVERY Project-scope Allow *and* Ask rule, keeping only Deny.
+                    // Allow must go for the usual reason (a disappearing restriction or
+                    // reorder can make an already-trusted Allow rule cover ground it
+                    // never used to). Ask must go too: when the widening is a Deny
+                    // rewritten to an Ask on the same predicate, that Ask rule DOES
+                    // match, so leaving it in place would mean even
+                    // `decide_unattended`'s no-human-to-ask-so-Deny downgrade never
+                    // kicks in (it only downgrades an unmatched Ask, not one produced by
+                    // a live rule) — nothing legitimate is lost by dropping it, since a
+                    // Structurally-widened file is already fully distrusted. Do NOT
                     // save — the trusted baseline stays exactly where it was, so this
                     // file keeps being flagged as widened on every subsequent call
                     // until a human calls `record_explicit_trust`.
                     parsed_project_rules
                         .into_iter()
-                        .filter(|r| !(r.scope == Scope::Project && r.outcome == Outcome::Allow))
+                        .filter(|r| !(r.scope == Scope::Project && r.outcome != Outcome::Deny))
                         .collect()
                 }
                 Widening::Additive => {
@@ -383,10 +428,7 @@ pub fn record_explicit_trust(
     let hash = blake3::hash(policy_file_contents.as_bytes())
         .to_hex()
         .to_string();
-    let sigs = parsed_project_rules
-        .iter()
-        .filter_map(signature_string)
-        .collect();
+    let sigs = signature_sequence(parsed_project_rules);
     trust_store.save(
         repo_root,
         &TrustRecord {
