@@ -2986,6 +2986,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "roundhouse-net"
+version = "0.1.0"
+dependencies = [
+ "dashmap",
+ "once_cell",
+ "roundhouse-core",
+ "roundhouse-store",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "roundhouse-policy"
 version = "0.1.0"
 dependencies = [

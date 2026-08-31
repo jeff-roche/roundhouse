@@ -29,6 +29,12 @@ const EXPECTED_MEMBERS: &[&str] = &[
     "crates/roundhouse-tui",
     "crates/roundhouse-cli",
     "crates/roundhouse-web",
+    // `crates/roundhouse-net` below is a deliberate, authorized addition
+    // (Task 23, Phase 2) — the daemon-owned network egress boundary (§6.6),
+    // now an official row in the architecture doc's crate table
+    // (`docs/architecture/02-system-architecture.md` §5.2), not an
+    // accidental extra member.
+    "crates/roundhouse-net",
     "xtask",
 ];
 

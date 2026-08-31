@@ -54,6 +54,7 @@ agent team** — one crate, one owner, one test suite, minimal shared mutable su
 | `roundhouse-tui` | ratatui client | proto |
 | `roundhouse-cli` | The `round` binary: TUI attach, headless/one-shot runs, and `round daemon` | proto, daemon, tui |
 | `roundhouse-web` | axum API + embedded web client assets | proto |
+| `roundhouse-net` | The daemon-owned network egress boundary (§6.6, one of the design's "exactly two real boundaries," §6.1): the two-lane model (`Lane::Control`/`Lane::Agent`), the `HostPattern`/`EgressPolicy` allowlist matcher, `ConnectFilter`'s metadata-IP hard-deny, and the per-session `LoopbackProxy` (a loopback HTTP CONNECT proxy with bearer-token session disambiguation) that the agent lane exits through exclusively. | core, store |
 
 **Non-negotiable rules:** `roundhouse-core` has no async and no I/O; no *library* crate
 (i.e. none of the rows above `roundhouse-daemon` in this table) depends on
@@ -79,6 +80,13 @@ except `roundhouse-sandbox` (which needs it, and confines it to one module).
 > depending on the adapters themselves — `roundhouse-conformance` is now this table's own
 > row. Both were previously created ad hoc by their phase plans without a matching row
 > here; this table is still the single source of truth, now including them.
+>
+> **A third crate added the same way (Task 23, Phase 2):** §6.6's loopback-proxy network
+> boundary had no implementing crate anywhere in the plan before Task 23 — a full-text
+> search across every prior phase plan turned up no `loopback proxy`/`agent lane`/
+> `control lane`/CONNECT vocabulary at all. `roundhouse-net` is now this table's own row,
+> same pattern as the two above: built ad hoc by its phase task without a matching row
+> here until now.
 
 ### 5.3 Verified dependency baseline
 
