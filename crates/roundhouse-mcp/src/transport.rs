@@ -2,6 +2,8 @@
 use crate::wire::{DiscoverResult, McpError, McpResult, ToolCallRequest};
 use async_trait::async_trait;
 
+pub mod stdio;
+
 #[async_trait]
 pub trait McpTransport: Send + Sync {
     async fn discover(&self) -> Result<DiscoverResult, McpError>;
