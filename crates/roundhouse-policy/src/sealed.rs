@@ -26,10 +26,25 @@ pub struct SealedContext {
     pub resolved_mcp_servers: HashSet<String>,
     pub requested_tier: Tier,
     pub attested_tier: Tier,
+    /// The session's `HOME` value, snapshotted ONCE at `SessionActor::new`
+    /// time (see that constructor's own doc comment) rather than read live
+    /// at decision time. `None` means `HOME` was genuinely unset when the
+    /// session was constructed — a real, unremarkable state under systemd or
+    /// a minimal container, NOT a signal that dotfile protection should be
+    /// skipped. `sealed_write_under` must treat `None` as a fail-CLOSED
+    /// match (deny), never as "rule doesn't apply" — a prior version of this
+    /// context had no `home` field at all and read `std::env::var_os("HOME")`
+    /// live inside the matcher, which silently disarmed the entire
+    /// dotfile-write sealed floor whenever `HOME` was unset.
+    pub home: Option<PathBuf>,
 }
 
 /// A tiny home-dir helper matching `roundhouse-config/src/loader.rs` — no `dirs`
-/// crate dependency is introduced.
+/// crate dependency is introduced. Retained as a standalone helper for tests
+/// (and `SessionActor::new`'s one real snapshot site) to build real
+/// `$HOME`-relative paths; the sealed dotfile rule itself no longer calls
+/// this live — it consults `SealedContext::home`, snapshotted once at
+/// session construction, instead (see that field's doc comment for why).
 #[doc(hidden)]
 pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
@@ -39,7 +54,12 @@ pub fn home_dir() -> Option<PathBuf> {
 /// state-dir and daemon-binary matchers explicitly reject empty paths (so the
 /// default empty `PathBuf`s never match), `resolved_mcp_servers` is empty
 /// (fail-closed for MCP), and both tiers are `None` so a tier shortfall can
-/// never fire.
+/// never fire. `home` is the process's real `$HOME` (falling back to a
+/// placeholder if genuinely unset) so existing tests that build real
+/// `$HOME`-relative paths via `home_dir()` and then exercise the dotfile
+/// rules through this default context keep their old (pre-fail-closed)
+/// behavior; tests that want to prove the new fail-closed `None` path
+/// construct their own context with `home: None` explicitly.
 pub fn default_context() -> SealedContext {
     SealedContext {
         state_dir: PathBuf::new(),
@@ -47,6 +67,7 @@ pub fn default_context() -> SealedContext {
         resolved_mcp_servers: HashSet::new(),
         requested_tier: Tier::None,
         attested_tier: Tier::None,
+        home: home_dir().or_else(|| Some(PathBuf::from("/home/test-user"))),
     }
 }
 
@@ -64,19 +85,19 @@ pub fn sealed_rules() -> &'static [SealedRule] {
     &[
         SealedRule {
             id: "sealed:ssh-write",
-            matches: |p, _| sealed_write_under(p, ".ssh"),
+            matches: |p, ctx| sealed_write_under(p, ctx, ".ssh"),
         },
         SealedRule {
             id: "sealed:gnupg-write",
-            matches: |p, _| sealed_write_under(p, ".gnupg"),
+            matches: |p, ctx| sealed_write_under(p, ctx, ".gnupg"),
         },
         SealedRule {
             id: "sealed:aws-write",
-            matches: |p, _| sealed_write_under(p, ".aws"),
+            matches: |p, ctx| sealed_write_under(p, ctx, ".aws"),
         },
         SealedRule {
             id: "sealed:roundhouse-config-write",
-            matches: |p, _| sealed_write_under(p, ".config/roundhouse"),
+            matches: |p, ctx| sealed_write_under(p, ctx, ".config/roundhouse"),
         },
         SealedRule {
             id: "sealed:state-dir-write",
@@ -101,7 +122,15 @@ pub fn sealed_rules() -> &'static [SealedRule] {
     ]
 }
 
-fn sealed_write_under(params: &TaskParams, suffix: &str) -> bool {
+/// **Fail-closed on missing `HOME`:** if `ctx.home` is `None` (the session
+/// snapshotted a genuinely-unset `HOME` at construction), this returns
+/// `true` — the rule MATCHES (deny) any fs write/edit — rather than `false`
+/// ("rule doesn't apply", i.e. allow). A prior version of this function read
+/// `std::env::var_os("HOME")` live and returned `false` when it was unset,
+/// which silently disarmed every dotfile-protection sealed rule whenever
+/// `HOME` was missing (entirely normal under systemd or a minimal
+/// container) — exactly backwards for a security floor.
+fn sealed_write_under(params: &TaskParams, ctx: &SealedContext, suffix: &str) -> bool {
     let TaskParams::Fs {
         op,
         canonical: Ok(c),
@@ -113,7 +142,11 @@ fn sealed_write_under(params: &TaskParams, suffix: &str) -> bool {
     if !matches!(op, FsOp::Write | FsOp::Edit) {
         return false;
     }
-    let Some(home) = home_dir() else { return false };
+    let Some(home) = ctx.home.as_ref() else {
+        // HOME is genuinely unset: fail closed by treating every write/edit
+        // as a match, rather than silently allowing it through.
+        return true;
+    };
     c.starts_with(home.join(suffix))
 }
 

@@ -178,6 +178,20 @@ pub struct SessionActor {
     /// Same absolute/non-empty invariant as `state_dir`, for the same
     /// reason (`sealed_daemon_binary_write`'s empty-path guard).
     daemon_binary: PathBuf,
+    /// The process's `HOME` value, snapshotted ONCE here at construction
+    /// time (not read live at task-admission time) and threaded verbatim
+    /// into every `SealedContext` this session builds. `None` means `HOME`
+    /// was genuinely unset when this `SessionActor` was constructed — a
+    /// real, unremarkable state under systemd or a minimal container.
+    /// `roundhouse_policy::sealed::sealed_write_under` treats `SealedContext
+    /// { home: None, .. }` as a fail-CLOSED match (deny) for dotfile writes,
+    /// never as "rule doesn't apply" — see that function's doc comment. A
+    /// prior version of the sealed dotfile rules read
+    /// `std::env::var_os("HOME")` live and fail-OPEN when unset, which
+    /// silently disarmed the entire dotfile-protection sealed floor; taking
+    /// one snapshot here, at the same place `state_dir`/`daemon_binary` are
+    /// already validated, closes that gap.
+    home: Option<PathBuf>,
     /// Populated by the MCP host (Phase 3) as servers complete their
     /// handshake; read here, never written from this module in this task's
     /// scope — Phase 3 is a hard prerequisite for this ever containing
@@ -263,6 +277,10 @@ impl SessionActor {
             OnDegrade::Refuse => session_spec.requested_tier,
             OnDegrade::AllowDownTo(floor) => floor,
         };
+        // Snapshot HOME once, here, alongside state_dir/daemon_binary's own
+        // construction-time validation — never read live at decision time
+        // (see the `home` field's doc comment for why that matters).
+        let home = roundhouse_policy::sealed::home_dir();
         SessionActor {
             session_id,
             writer,
@@ -271,6 +289,7 @@ impl SessionActor {
             policy,
             state_dir,
             daemon_binary,
+            home,
             mcp_resolved: Arc::new(RwLock::new(HashSet::new())),
             isolate,
             handle,
@@ -311,6 +330,7 @@ impl SessionActor {
                 .unwrap_or_default(),
             requested_tier: self.effective_tier,
             attested_tier: attestation.tier,
+            home: self.home.clone(),
         }
     }
 

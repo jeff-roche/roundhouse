@@ -204,11 +204,19 @@ fn accumulate(total: &mut u64, unknown: &mut bool, c: Cost) {
     }
 }
 
+/// If ANY attempt in the fallback/retry chain had unknown pricing, the
+/// total must be reported as `Cost::Unknown`, full stop — never a partial
+/// `Cost::Known` sum of just the attempts that happened to have pricing.
+/// A prior version of this function reported `Cost::Known(total_known_pico_usd)`
+/// whenever that partial sum was nonzero, silently dropping the fact that
+/// the total was actually incomplete/unreliable whenever `any_cost_unknown`
+/// was `true` — the same class of cost-attribution honesty bug Task 20's
+/// cost-tracking design exists to prevent in `roundhouse-store`.
 fn finalize(total_known_pico_usd: u64, any_cost_unknown: bool) -> Cost {
-    if total_known_pico_usd > 0 || !any_cost_unknown {
-        Cost::Known(total_known_pico_usd)
-    } else {
+    if any_cost_unknown {
         Cost::Unknown
+    } else {
+        Cost::Known(total_known_pico_usd)
     }
 }
 

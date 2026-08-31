@@ -14,6 +14,7 @@ fn ctx() -> SealedContext {
         resolved_mcp_servers: HashSet::new(),
         requested_tier: Tier::Sandbox,
         attested_tier: Tier::Sandbox,
+        home: Some(PathBuf::from("/tmp/home")),
     }
 }
 

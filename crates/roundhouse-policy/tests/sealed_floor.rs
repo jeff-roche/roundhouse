@@ -12,6 +12,7 @@ fn ctx() -> SealedContext {
         resolved_mcp_servers: HashSet::new(),
         requested_tier: Tier::Sandbox,
         attested_tier: Tier::Sandbox,
+        home: home_dir(),
     }
 }
 
@@ -227,6 +228,32 @@ fn edit_on_authorized_keys_is_sealed_despite_allow_rule() {
     let decision = policy.decide_sealed(&params, false, &ctx());
     assert_eq!(decision.outcome, Outcome::Deny);
     assert_eq!(decision.rule.unwrap().0, "sealed:ssh-write");
+}
+
+#[test]
+fn dotfile_write_is_sealed_denied_when_home_is_unset_fail_closed() {
+    // `home: None` models a session constructed with HOME genuinely unset
+    // (normal under systemd or a minimal container). The rule must fail
+    // CLOSED here — deny — not silently allow the write through because it
+    // has no `home` to compare against.
+    let mut c = ctx();
+    c.home = None;
+    let params = TaskParams::Fs {
+        op: FsOp::Write,
+        path: PathBuf::from("/some/arbitrary/path/not/under/any/home"),
+        canonical: Ok(PathBuf::from("/some/arbitrary/path/not/under/any/home")),
+    };
+    let policy = PolicyEngine::from_rules(vec![CompiledRule::test_new(
+        Scope::Project,
+        Outcome::Allow,
+        Predicate::fs_write_prefix("/some/arbitrary/path/not/under/any/home"),
+    )]);
+    let decision = policy.decide_sealed(&params, false, &c);
+    assert_eq!(
+        decision.outcome,
+        Outcome::Deny,
+        "HOME unset must fail closed (deny writes) rather than silently disarm dotfile protection"
+    );
 }
 
 #[test]

@@ -75,6 +75,22 @@ impl PricingLookup for AlwaysUnknownPricing {
     }
 }
 
+/// Reports a known cost for the "flaky" provider (the failed first attempt)
+/// and an unknown cost for the "backup" provider (the eventual winner) — a
+/// mixed chain where SOME attempts had real pricing and at least one did
+/// not.
+struct MixedPricing;
+
+impl PricingLookup for MixedPricing {
+    fn cost_for(&self, usage: &Usage, p: &ProviderId, _m: &ModelId) -> Cost {
+        if p.0 == "flaky" {
+            Cost::Known(usage.input_tokens + usage.output_tokens)
+        } else {
+            Cost::Unknown
+        }
+    }
+}
+
 struct ModelNotFoundProvider;
 
 impl Provider for ModelNotFoundProvider {
@@ -309,6 +325,58 @@ async fn a_billed_failed_attempt_sums_into_the_returned_total_cost() {
     assert_eq!(completed_usage.input_tokens, 100);
     assert_eq!(completed_usage.output_tokens, 50);
     assert_eq!(completed_usage.cache_read_tokens, 0);
+}
+
+#[tokio::test]
+async fn mixed_known_and_unknown_costs_in_chain_report_unknown_total() {
+    // Regression test for the final whole-branch-review cleanup: `finalize`
+    // used to report `Cost::Known(partial_sum)` whenever the partial sum of
+    // KNOWN-cost attempts was nonzero, even if another attempt in the same
+    // chain had genuinely unknown pricing — silently dropping the fact that
+    // the total was incomplete. The correct behavior is that ANY unknown
+    // attempt makes the whole chain's total `Cost::Unknown`, regardless of
+    // what the known attempts summed to.
+    let runner = RUNNER.get_or_init(TaskRunner::bootstrap);
+    let chain = FallbackChain {
+        steps: vec![
+            (ProviderId("flaky".into()), ModelId("test".into())),
+            (ProviderId("backup".into()), ModelId("test".into())),
+        ],
+    };
+    let mut providers: HashMap<ProviderId, Arc<dyn Provider>> = HashMap::new();
+    providers.insert(
+        ProviderId("flaky".into()),
+        Arc::new(ServerErrorAfterAcceptingProvider { count: 40 }),
+    );
+    providers.insert(
+        ProviderId("backup".into()),
+        Arc::new(EchoProvider {
+            input: 100,
+            output: 50,
+        }),
+    );
+
+    let outcome = infer_with_fallback(
+        &chain,
+        &dummy_request(),
+        &dummy_ctx(),
+        &providers,
+        &CircuitBreaker::new(),
+        &AimdSemaphore::new(),
+        &MixedPricing,
+        runner,
+        SessionId::new(),
+        TaskId::new(),
+    )
+    .await
+    .expect("fallback should succeed on second step");
+
+    assert!(
+        matches!(outcome.cost, Cost::Unknown),
+        "flaky attempt had known cost (40) but backup (the winner) had unknown pricing — \
+         the total must be Cost::Unknown, not a fabricated Cost::Known(40) that silently \
+         drops the winner's unknown pricing"
+    );
 }
 
 #[tokio::test]
