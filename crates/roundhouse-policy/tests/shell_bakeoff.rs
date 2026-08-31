@@ -1,43 +1,41 @@
 // crates/roundhouse-policy/tests/shell_bakeoff.rs
 //
 // ============================================================================
-// KNOWN RED: `brush_parser_false_opaque_rate_is_within_the_15_percent_gate`
-// below is CURRENTLY, GENUINELY, KNOWINGLY FAILING as of this file's authorship
-// (commit d05b292 and this follow-up). This is a tracked, decision-pending
-// state per §6.12 — not an accidental regression, not flaky, and not a bug in
-// this test file or the corpus. Measured real rate: ~18.8% (12/64 `ShouldParse`
-// entries wrongly HardDeny'd), over the 15% threshold.
+// FIXED by task-22.5 (see `.superpowers/sdd/2026-08-27-phase2-robustness/
+// task-22.5-report.md`): this gate previously, genuinely failed at ~18.8%
+// (12/64 `ShouldParse` entries wrongly HardDeny'd), over the 15% threshold.
 //
 // ROOT CAUSE (confirmed by security review): this codebase's own
 // `parameter_expr_is_opaque` function in
-// `crates/roundhouse-policy/src/shell/classify.rs` is deliberately
-// over-conservative — it blanket-denies any non-plain `${...}` parameter
+// `crates/roundhouse-policy/src/shell/classify.rs` was deliberately
+// over-conservative — it blanket-denied any non-plain `${...}` parameter
 // expansion form (array indexing, `${var:-default}`-style defaults,
 // `${var#prefix}`/`${var%%suffix}` stripping, etc.) regardless of whether the
-// expansion's payload actually contains anything dangerous. This is NOT a
+// expansion's payload actually contained anything dangerous. This was NOT a
 // `brush-parser` parsing limitation: brush-parser successfully parses all of
 // these into complete, structured AST data; the classifier's own
-// post-parse policy just refuses to treat that structured data as safe.
+// post-parse policy simply refused to treat that structured data as safe.
 //
-// Consequently, §6.12's literal "switch to `yash-syntax`" remedy (see the
-// assertion message below, which still states that rule verbatim because it
-// is §6.12's locked text) does NOT apply to this specific failure and must
-// NOT be triggered off of this gate's current result — switching parsers
-// would not move this number at all. `yash-syntax` is a stricter POSIX
-// parser with fewer bash extensions than `brush-parser`, so it would do
-// *worse* on these constructs, not better.
+// §6.12's literal "switch to `yash-syntax`" remedy (see the assertion
+// message below, which still states that rule verbatim because it is
+// §6.12's locked text) did NOT apply to this specific failure — switching
+// parsers would not have moved this number at all. `yash-syntax` is a
+// stricter POSIX parser with fewer bash extensions than `brush-parser`, so
+// it would have done *worse* on these constructs, not better.
 //
-// The real fix — narrowing the classifier's over-conservative
-// parameter-expansion handling, which must be done carefully since a naive
-// "just scan the payload for `$(`/backtick" approach was already proven
-// unsafe by security review — is being tracked separately as "the
-// shell-classifier parameter-expansion follow-up" (no permanent task number
-// yet in the plan document).
+// task-22.5 narrowed `parameter_expr_is_opaque` to an allowlist (gated on
+// `indirect: false` AND every payload string being `$`-free — NOT a deny-scan
+// for `$(`/backtick, which was separately proven unsafe against real bash)
+// and widened `is_expandable_piece`/`expand_piece` in lockstep. Measured
+// resulting rate: 10.9% (7/64), comfortably under the 15% gate. The 7
+// remaining false-Opaque entries are legitimately, honestly opaque given this
+// codebase's current `SessionEnv` model: array-indexed/all-indices parameter
+// forms (no array model, and array expansion produces multiple argv words),
+// positional parameters (`$1`, no positional context at classify time), and
+// one entry with a real `$(true)` command substitution.
 //
 // The corpus and the 15% threshold must NEVER be weakened to force this test
-// to pass. If you are reading this because the test is red: that is
-// expected and correct right now. The fix is narrowing the classifier, not
-// adjusting the gate.
+// to pass.
 // ============================================================================
 mod fixtures {
     pub mod shell_bakeoff_corpus;
@@ -77,14 +75,14 @@ fn brush_parser_false_opaque_rate_is_within_the_15_percent_gate() {
 
     let rate = false_opaque_count as f64 / should_parse.len() as f64;
 
-    // KNOWN RED (see the module-level comment at the top of this file for full
-    // detail): this assertion is currently, genuinely failing at ~18.8% (12/64).
-    // Root cause is this crate's own over-conservative `parameter_expr_is_opaque`
-    // in `shell/classify.rs`, NOT a `brush-parser` gap — the "switch to
-    // yash-syntax" remedy the message below states (§6.12's locked text) does
-    // NOT apply to this failure and must not be triggered off of it. Do not
-    // weaken the corpus or the 0.15 threshold to force a pass; the real fix is
-    // the tracked shell-classifier parameter-expansion follow-up.
+    // Fixed by task-22.5 (see the module-level comment at the top of this file):
+    // measured real rate is now 10.9% (7/64), comfortably under the 15% gate.
+    // If this assertion goes red again, the "switch to yash-syntax" remedy the
+    // message below states (§6.12's locked text) very likely does NOT apply —
+    // check `crates/roundhouse-policy/src/shell/classify.rs`'s
+    // `parameter_expr_is_allowlisted`/`is_expandable_piece`/`expand_piece` for a
+    // regression first, the same way task-22.5's own investigation did. Do not
+    // weaken the corpus or the 0.15 threshold to force a pass.
     assert!(
         rate <= 0.15,
         "brush-parser's false-Opaque rate against this corpus is {:.1}% (over the 15% \

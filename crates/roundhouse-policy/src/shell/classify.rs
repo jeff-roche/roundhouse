@@ -8,7 +8,9 @@ use brush_parser::ast::{
     FunctionDefinition, IoFileRedirectTarget, IoRedirect, Pipeline, Program, RedirectList,
     SimpleCommand, Word,
 };
-use brush_parser::word::{Parameter, ParameterExpr, WordPiece, WordPieceWithSource};
+use brush_parser::word::{
+    Parameter, ParameterExpr, ParameterTestType, WordPiece, WordPieceWithSource,
+};
 use brush_parser::{Parser, ParserOptions};
 
 /// Byte-size cap on the raw shell command string (and on individual word strings).
@@ -342,13 +344,116 @@ pub(crate) fn piece_is_opaque(piece: &WordPiece) -> bool {
 }
 
 fn parameter_expr_is_opaque(expr: &ParameterExpr) -> bool {
-    !matches!(
-        expr,
+    !parameter_expr_is_allowlisted(expr)
+}
+
+/// The shared opaque-check/expand-resolution predicate (task-22.5). This crate's own
+/// `parameter_expr_is_opaque` (used by `piece_is_opaque`, the hard-deny path) and
+/// `is_expandable_piece`/`expand_piece` (the argv-resolution path) MUST stay in exact
+/// lockstep: a form accepted here without a matching resolution arm in
+/// `expand_parameter_expr` would let unexpanded `${...}` text reach argv verbatim (a
+/// correctness *and* policy-fidelity regression — see the module-level task-22.5 brief).
+///
+/// **Design: allowlist, not deny-scan.** Denies by default; a form is accepted only when
+/// BOTH of the following hold:
+/// - `indirect: false` — an indirect reference (`${!x}`) computes its target name at
+///   runtime, so it can never be statically resolved here and must stay denied.
+/// - every payload string the variant carries (default/alternative value, pattern, ...)
+///   is `None` or contains **no `$` byte at all** — not just no `$(`. Banning any bare
+///   `$`, not only `$(`/backtick, is load-bearing: a payload-text deny-scan for just
+///   `$(`/backtick was adversarially proven unsafe by security review against real bash
+///   5.3.15 — `${x@P}` (`Transform{op: PromptExpand}`) has an EMPTY payload but performs
+///   command substitution on the variable's OWN VALUE during prompt expansion, and
+///   `${arr[$(id)]}`/`${x:$z:2}` hide injection one level of indirection behind an
+///   arithmetic-context payload (array subscript / substring offset) that a same-string
+///   scan never inspects. Rejecting every bare `$` closes all three: `${x@P}` is simply
+///   not in this allowlist at all (`Transform` is never accepted, regardless of payload),
+///   and any pattern/offset containing a `$` (which an injection payload always does, to
+///   reference the smuggled variable) disqualifies the whole expression.
+///
+/// Every accepted variant is additionally restricted to `Parameter::Named(_)` — never
+/// `Positional`/`Special` (no positional/special context exists at classify time) or
+/// `NamedWithIndex`/`NamedWithAllIndices` (no array model in `SessionEnv`, and array
+/// forms expand to MULTIPLE argv words, which this module's one-word-in/one-word-out
+/// `expand_word` cannot represent). Leaving those denied is intentional, not a gap: the
+/// bake-off gate's target is a false-Opaque rate comfortably under 15%, not 0%.
+fn parameter_expr_is_allowlisted(expr: &ParameterExpr) -> bool {
+    match expr {
         ParameterExpr::Parameter {
-            parameter: Parameter::Named(_),
+            parameter,
             indirect: false,
+        } => is_plain_named(parameter),
+        ParameterExpr::ParameterLength {
+            parameter,
+            indirect: false,
+        } => is_plain_named(parameter),
+        ParameterExpr::UseDefaultValues {
+            parameter,
+            indirect: false,
+            default_value,
+            ..
+        } => is_plain_named(parameter) && is_dollar_free(default_value),
+        ParameterExpr::AssignDefaultValues {
+            parameter,
+            indirect: false,
+            default_value,
+            ..
+        } => is_plain_named(parameter) && is_dollar_free(default_value),
+        ParameterExpr::UseAlternativeValue {
+            parameter,
+            indirect: false,
+            alternative_value,
+            ..
+        } => is_plain_named(parameter) && is_dollar_free(alternative_value),
+        ParameterExpr::RemoveSmallestPrefixPattern {
+            parameter,
+            indirect: false,
+            pattern,
         }
-    )
+        | ParameterExpr::RemoveLargestPrefixPattern {
+            parameter,
+            indirect: false,
+            pattern,
+        }
+        | ParameterExpr::RemoveSmallestSuffixPattern {
+            parameter,
+            indirect: false,
+            pattern,
+        }
+        | ParameterExpr::RemoveLargestSuffixPattern {
+            parameter,
+            indirect: false,
+            pattern,
+        } => is_plain_named(parameter) && is_dollar_free(pattern),
+        // Deliberately NOT accepted, even though `indirect: false` alone wouldn't be
+        // unsafe for some of these:
+        // - `IndicateErrorIfNullOrUnset` (`${var:?msg}`): `error_message` carries no
+        //   execution semantics, so it's plausibly safe under the same `$`-ban gating —
+        //   but this classifier has no error-propagation model to correctly represent
+        //   "fail the task if var is unset/null" during resolution, and the bake-off
+        //   corpus doesn't need it to clear the gate. Left denied rather than guessed at.
+        // - `Transform` (covers `${x@P}`, `${x@Q}`, etc.): never accepted regardless of
+        //   payload — this is bypass #1 above; `${x@P}`'s danger lives entirely in the
+        //   variable's own value, not in any string this expression carries.
+        // - Every other transform/case-conversion/substring/replace variant not listed
+        //   above (`UppercaseFirstChar`, `UppercasePattern`, `LowercaseFirstChar`,
+        //   `LowercasePattern`, `ReplaceSubstring`, `Substring`): not reasoned about:
+        //   `Substring`'s `offset`/`length` are arithmetic-expression payloads (bypass
+        //   #3's exact shape), so it's excluded outright.
+        // - `Parameter::Positional`/`Special`/`NamedWithIndex`/`NamedWithAllIndices` for
+        //   any of the variants above: excluded by `is_plain_named`, per the doc comment.
+        _ => false,
+    }
+}
+
+fn is_plain_named(parameter: &Parameter) -> bool {
+    matches!(parameter, Parameter::Named(_))
+}
+
+/// True if `payload` is absent, or present and contains no `$` byte at all. See
+/// [`parameter_expr_is_allowlisted`] for why the ban is on any bare `$`, not just `$(`.
+fn is_dollar_free(payload: &Option<String>) -> bool {
+    payload.as_deref().is_none_or(|s| !s.contains('$'))
 }
 
 fn raw_string_has_command_substitution(s: &str) -> bool {
@@ -583,16 +688,18 @@ fn expand_word(word: &mut Word, env: &SessionEnv) {
     word.value = expanded;
 }
 
+/// MUST accept exactly the `ParameterExpr` forms `parameter_expr_is_allowlisted` accepts
+/// (task-22.5 lockstep requirement) — this is what makes a non-opaque `${...}` form
+/// actually reach argv resolved, instead of being denied at `piece_is_opaque` but then
+/// falling through `expand_word`'s "any non-expandable piece bails the whole word"
+/// short-circuit and reaching argv as unexpanded literal `${...}` text.
 fn is_expandable_piece(piece: &WordPiece) -> bool {
     match piece {
         WordPiece::Text(_)
         | WordPiece::SingleQuotedText(_)
         | WordPiece::AnsiCQuotedText(_)
         | WordPiece::EscapeSequence(_) => true,
-        WordPiece::ParameterExpansion(ParameterExpr::Parameter {
-            parameter: Parameter::Named(_),
-            indirect: false,
-        }) => true,
+        WordPiece::ParameterExpansion(expr) => parameter_expr_is_allowlisted(expr),
         WordPiece::DoubleQuotedSequence(inner) => {
             inner.iter().all(|p| is_quoted_expandable(&p.piece))
         }
@@ -601,15 +708,11 @@ fn is_expandable_piece(piece: &WordPiece) -> bool {
 }
 
 fn is_quoted_expandable(piece: &WordPiece) -> bool {
-    matches!(
-        piece,
-        WordPiece::Text(_)
-            | WordPiece::EscapeSequence(_)
-            | WordPiece::ParameterExpansion(ParameterExpr::Parameter {
-                parameter: Parameter::Named(_),
-                indirect: false,
-            })
-    )
+    match piece {
+        WordPiece::Text(_) | WordPiece::EscapeSequence(_) => true,
+        WordPiece::ParameterExpansion(expr) => parameter_expr_is_allowlisted(expr),
+        _ => false,
+    }
 }
 
 fn expand_piece(piece: &WordPiece, env: &SessionEnv, out: &mut String) {
@@ -618,10 +721,7 @@ fn expand_piece(piece: &WordPiece, env: &SessionEnv, out: &mut String) {
             out.push_str(s)
         }
         WordPiece::EscapeSequence(s) => out.push_str(unescape(s).as_str()),
-        WordPiece::ParameterExpansion(ParameterExpr::Parameter {
-            parameter: Parameter::Named(name),
-            indirect: false,
-        }) => out.push_str(env.get(name).unwrap_or("")),
+        WordPiece::ParameterExpansion(expr) => expand_parameter_expr(expr, env, out),
         WordPiece::DoubleQuotedSequence(inner) => {
             for p in inner {
                 expand_piece(&p.piece, env, out);
@@ -629,6 +729,198 @@ fn expand_piece(piece: &WordPiece, env: &SessionEnv, out: &mut String) {
         }
         _ => {}
     }
+}
+
+/// Resolves every `ParameterExpr` variant `parameter_expr_is_allowlisted` accepts. Only
+/// ever invoked on pieces that already passed `is_expandable_piece` (i.e. the allowlist),
+/// so every reachable arm here mirrors an accepted variant; the wildcard arm is a
+/// defensive no-op (never a panic) in case that invariant is ever violated by future
+/// changes, rather than a silently-guessed resolution.
+fn expand_parameter_expr(expr: &ParameterExpr, env: &SessionEnv, out: &mut String) {
+    match expr {
+        ParameterExpr::Parameter {
+            parameter: Parameter::Named(name),
+            indirect: false,
+        } => out.push_str(env.get(name).unwrap_or("")),
+        ParameterExpr::ParameterLength {
+            parameter: Parameter::Named(name),
+            indirect: false,
+        } => {
+            let len = env.get(name).unwrap_or("").chars().count();
+            out.push_str(&len.to_string());
+        }
+        ParameterExpr::UseDefaultValues {
+            parameter: Parameter::Named(name),
+            indirect: false,
+            test_type,
+            default_value,
+        } => match resolve_if_set(env, name, test_type) {
+            Some(v) => out.push_str(v),
+            None => out.push_str(default_value.as_deref().unwrap_or("")),
+        },
+        ParameterExpr::AssignDefaultValues {
+            parameter: Parameter::Named(name),
+            indirect: false,
+            test_type,
+            default_value,
+        } => {
+            // Real bash also assigns the default back into the variable; this
+            // classifier resolves a read-only `SessionEnv` snapshot purely to decide
+            // what text reaches argv, so the assignment side-effect is intentionally
+            // not modeled (see task-22.5-brief.md Step 3).
+            match resolve_if_set(env, name, test_type) {
+                Some(v) => out.push_str(v),
+                None => out.push_str(default_value.as_deref().unwrap_or("")),
+            }
+        }
+        ParameterExpr::UseAlternativeValue {
+            parameter: Parameter::Named(name),
+            indirect: false,
+            test_type,
+            alternative_value,
+        } => {
+            if resolve_if_set(env, name, test_type).is_some() {
+                out.push_str(alternative_value.as_deref().unwrap_or(""));
+            }
+        }
+        ParameterExpr::RemoveSmallestPrefixPattern {
+            parameter: Parameter::Named(name),
+            indirect: false,
+            pattern,
+        } => out.push_str(&strip_prefix_pattern(
+            env.get(name).unwrap_or(""),
+            pattern.as_deref().unwrap_or(""),
+            true,
+        )),
+        ParameterExpr::RemoveLargestPrefixPattern {
+            parameter: Parameter::Named(name),
+            indirect: false,
+            pattern,
+        } => out.push_str(&strip_prefix_pattern(
+            env.get(name).unwrap_or(""),
+            pattern.as_deref().unwrap_or(""),
+            false,
+        )),
+        ParameterExpr::RemoveSmallestSuffixPattern {
+            parameter: Parameter::Named(name),
+            indirect: false,
+            pattern,
+        } => out.push_str(&strip_suffix_pattern(
+            env.get(name).unwrap_or(""),
+            pattern.as_deref().unwrap_or(""),
+            true,
+        )),
+        ParameterExpr::RemoveLargestSuffixPattern {
+            parameter: Parameter::Named(name),
+            indirect: false,
+            pattern,
+        } => out.push_str(&strip_suffix_pattern(
+            env.get(name).unwrap_or(""),
+            pattern.as_deref().unwrap_or(""),
+            false,
+        )),
+        _ => {}
+    }
+}
+
+/// Resolves `name` against `test_type`'s "is this considered set" rule and returns
+/// `Some(value)` when it counts as set, `None` otherwise:
+/// - `ParameterTestType::UnsetOrNull` (the `:`-prefixed test forms, e.g. `${var:-d}`):
+///   a present-but-empty variable counts the same as unset.
+/// - `ParameterTestType::Unset` (the bare forms, e.g. `${var-d}`): only a genuinely
+///   absent variable counts as unset; present-and-empty resolves to the empty value.
+fn resolve_if_set<'a>(
+    env: &'a SessionEnv,
+    name: &str,
+    test_type: &ParameterTestType,
+) -> Option<&'a str> {
+    match env.get(name) {
+        Some(v) if matches!(test_type, ParameterTestType::UnsetOrNull) && v.is_empty() => None,
+        Some(v) => Some(v),
+        None => None,
+    }
+}
+
+/// Safety cap on the value length this module will attempt glob-anchored prefix/suffix
+/// stripping against. The matching loop below is O(n) glob-match attempts each
+/// proportional to the candidate substring's length, i.e. worst-case O(n^2) in the
+/// resolved value's length; `SessionEnv` values come from this codebase's own tool
+/// executors, not raw untrusted shell text, but this cap keeps the classifier's own CPU
+/// bound honest regardless of what ends up populating `SessionEnv` in the future. Values
+/// over the cap are returned unmodified (fail-safe: no stripping, not a panic or a hang).
+const MAX_GLOB_STRIP_INPUT_BYTES: usize = 64 * 1024;
+
+/// Implements `${var#pattern}` (`smallest = true`) / `${var##pattern}`
+/// (`smallest = false`): removes the shortest (or longest) prefix of `value` that
+/// glob-matches `pattern` in full, per bash's prefix-removal semantics. Returns `value`
+/// unmodified if no prefix matches, or if `pattern` fails to compile as a glob (a
+/// correctness fallback, not a security-relevant one: `pattern` is already guaranteed
+/// `$`-free by the allowlist gate).
+fn strip_prefix_pattern(value: &str, pattern: &str, smallest: bool) -> String {
+    if value.len() > MAX_GLOB_STRIP_INPUT_BYTES {
+        return value.to_string();
+    }
+    let Some(matcher) = compile_glob(pattern) else {
+        return value.to_string();
+    };
+    let boundaries = char_boundaries(value);
+    let found = if smallest {
+        boundaries.iter().find(|&&b| matcher.is_match(&value[..b]))
+    } else {
+        boundaries
+            .iter()
+            .rev()
+            .find(|&&b| matcher.is_match(&value[..b]))
+    };
+    match found {
+        Some(&b) => value[b..].to_string(),
+        None => value.to_string(),
+    }
+}
+
+/// Implements `${var%pattern}` (`smallest = true`) / `${var%%pattern}`
+/// (`smallest = false`): removes the shortest (or longest) suffix of `value` that
+/// glob-matches `pattern` in full. See [`strip_prefix_pattern`] for the shared
+/// fallback/caps rationale.
+fn strip_suffix_pattern(value: &str, pattern: &str, smallest: bool) -> String {
+    if value.len() > MAX_GLOB_STRIP_INPUT_BYTES {
+        return value.to_string();
+    }
+    let Some(matcher) = compile_glob(pattern) else {
+        return value.to_string();
+    };
+    let boundaries = char_boundaries(value);
+    // Suffix length is `value.len() - b`. Smallest suffix ⇒ largest `b` first
+    // (descending); largest suffix ⇒ smallest `b` first (ascending).
+    let found = if smallest {
+        boundaries
+            .iter()
+            .rev()
+            .find(|&&b| matcher.is_match(&value[b..]))
+    } else {
+        boundaries.iter().find(|&&b| matcher.is_match(&value[b..]))
+    };
+    match found {
+        Some(&b) => value[..b].to_string(),
+        None => value.to_string(),
+    }
+}
+
+fn compile_glob(pattern: &str) -> Option<globset::GlobMatcher> {
+    globset::Glob::new(pattern)
+        .ok()
+        .map(|g| g.compile_matcher())
+}
+
+/// Every valid UTF-8 byte-index boundary in `value`, ascending, including both `0` and
+/// `value.len()` — the full candidate-split-point list for prefix/suffix pattern
+/// matching.
+fn char_boundaries(value: &str) -> Vec<usize> {
+    value
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(value.len()))
+        .collect()
 }
 
 fn unescape(s: &str) -> String {
