@@ -101,6 +101,8 @@ pub enum McpError {
     Protocol(String),
     #[error("mcp server process exited before responding")]
     ServerExited,
+    #[error("mcp request timed out after {after:?}")]
+    Timeout { after: std::time::Duration },
 }
 
 #[cfg(test)]
