@@ -3,28 +3,28 @@
 //! non-`finally:` tasks once that session has left `Created`/`Running`
 //! (i.e. `Suspended`, `Cancelling`, or `Closed`).
 //!
-//! **Scope note — read before wiring this in anywhere:** this is a correct,
-//! fully unit-tested, standalone unit, *not* wired into any real dispatch
-//! chokepoint. As of this task, `roundhouse-engine` has no unified
-//! task-execution entry point — the only real driver is
-//! [`crate::run_chat_turn`] in `chat.rs`, and tool executors are invoked ad
-//! hoc from `roundhouse-daemon`'s demo wiring with no policy/sandbox gate in
-//! front of the real executors yet. Threading `admit_task` in front of those
-//! real call sites (chat turns, tool calls) is deferred to a later
-//! integration task ("Task 25" — "Integration — wire the sealed floor and
-//! network policy into the real task-admission path"), which already exists
-//! specifically to thread multiple Phase 2 policy/admission mechanisms into
-//! real call sites; cancellation admission-refusal fits the same umbrella.
-//! Don't assume more integration happened here than did.
+//! **Scope note — read before wiring this in anywhere:** `admit_task` (this
+//! module) is real and fully wired to `PolicyEngine::decide_sealed` (Phase 2,
+//! Task 25), but is **still not called from any real dispatch chokepoint**
+//! as of this task. `roundhouse-engine` still has no unified task-execution
+//! entry point — the only real driver is [`crate::run_chat_turn`] in
+//! `chat.rs`, and tool executors are invoked ad hoc from
+//! `roundhouse-daemon`'s demo wiring with no admission gate in front of the
+//! real executors yet. Threading `admit_task` in front of those real call
+//! sites (chat turns, tool calls) remains open, deferred to a further,
+//! not-yet-numbered integration task. Don't assume more integration happened
+//! here than did: Task 25 wired real policy/isolation/egress mechanisms
+//! *into* `admit_task`/session creation; it did not wire `admit_task` *into*
+//! a real dispatch chokepoint.
 //!
 //! Phase 2, Task 4 adds [`SessionActor::run_finally_steps`] to this same
 //! file (not a separate `cancel.rs` — this module is `SessionActor`'s home).
 //! It reuses `admit_task` for real, but same as above, still doesn't reach
 //! into a real dispatch chokepoint for *executing* a step — that's injected
-//! by the caller, for the same "Task 25 doesn't exist yet" reason.
+//! by the caller, for the same "no unified task-execution entry point yet"
+//! reason above.
 //!
-//! Phase 2, Task 25 is the integration task named throughout this file's
-//! comments above: it wires `PolicyEngine::decide_sealed` (via a live
+//! Phase 2, Task 25 wires `PolicyEngine::decide_sealed` (via a live
 //! [`roundhouse_policy::sealed::SealedContext`] built from this session's
 //! own isolation attestation and MCP registry) into `admit_task` as a
 //! second gate after the `SessionState` allowlist, adds
@@ -36,7 +36,7 @@
 
 use roundhouse_core::{
     CancelReason, NoteLevel, Origin, SessionId, SessionSpec, SessionState, TaskInput, TaskKind,
-    TaskRunner, Timestamp,
+    TaskRunner, Tier, Timestamp,
 };
 use roundhouse_net::policy::EgressPolicy;
 use roundhouse_net::proxy::{LoopbackProxy, ProxyHandle, ProxyNotServingError};
@@ -74,6 +74,31 @@ pub struct TaskCreateRequest {
     /// judges this task against. Nothing carried policy-relevant params
     /// before this task; every real caller must now supply the real,
     /// already-parsed `TaskParams` for the task it is asking to admit.
+    ///
+    /// **SECURITY INVARIANT (Task 25 fix-round-1, security review):** for
+    /// `TaskParams::Fs`, `canonical` MUST be the result of a genuine,
+    /// symlink-followed filesystem resolution (e.g. `std::fs::
+    /// canonicalize`) of the real path this task will touch — never merely
+    /// the path string as received from wherever this request originated.
+    /// The sealed floor's own path matchers (`sealed_write_under`,
+    /// `sealed_state_dir_write`, `sealed_daemon_binary_write`) trust
+    /// `canonical` completely and have no independent way to detect an
+    /// unresolved value; a well-formed-looking `Ok(path)` that is
+    /// technically absolute but still points at, or through, an
+    /// unfollowed live symlink is a real, reproducible fail-open bypass of
+    /// every sealed rule that matches on `canonical` (confirmed: writing
+    /// through a symlink pointing at `~/.ssh/authorized_keys`, submitted
+    /// with `canonical: Ok(<the symlink's own path>)` rather than its
+    /// resolved target, is admitted). `SessionActor::admit_task` performs
+    /// exactly one cheap, no-I/O partial guard (rejecting a non-absolute
+    /// `Ok(path)` outright) — it cannot and does not perform real
+    /// canonicalization itself (this is policy-adjacent code that
+    /// deliberately does no I/O). Real, symlink-resolving canonicalization
+    /// before this field is ever populated is a hard prerequisite for
+    /// whoever wires `TaskCreateRequest` construction into a real tool
+    /// executor next; that wiring does not exist anywhere in this codebase
+    /// yet (see this module's own doc comment on `admit_task` still not
+    /// being called from a real dispatch chokepoint).
     pub params: TaskParams,
 }
 
@@ -102,28 +127,41 @@ pub enum AdmitError {
 
 /// Tracks one session's `SessionState` and gates new-task admission on it.
 ///
-/// Deliberately does not hold a `TaskRunner` field: `TaskRunner` is not
-/// `Clone` and is meant to be a single process-wide singleton obtained once
-/// via `TaskRunner::bootstrap()`. Wiring a shared `TaskRunner` into every
-/// `SessionActor` instance is real production-wiring work left to Task 25;
-/// for now `cancel` takes `runner: &TaskRunner` as a parameter, matching the
-/// existing convention elsewhere in this codebase (e.g.
-/// `recover_interrupted_tasks(store, writer, runner)`).
+/// Does not hold its own copy of `TaskRunner` semantics beyond the `runner`
+/// field below: `TaskRunner` is not `Clone` and is meant to be a single
+/// process-wide singleton obtained once via `TaskRunner::bootstrap()` — see
+/// the `runner` field's own doc comment for how this actor holds one.
 pub struct SessionActor {
     session_id: SessionId,
     writer: EventWriter,
     state_tx: tokio::sync::watch::Sender<SessionState>,
-    /// Task 25 — the shared, process-wide `TaskRunner` this actor mints new
-    /// events through for policy/admission-adjacent bookkeeping. `cancel()`'s
-    /// existing `runner: &TaskRunner` *parameter* is untouched by this field;
-    /// they're separate, deliberately (see `cancel`'s call sites, which keep
-    /// passing their own `&TaskRunner` exactly as before).
+    /// The shared, process-wide `TaskRunner` this actor mints new events
+    /// through for policy/admission-adjacent bookkeeping (Task 25).
+    /// `TaskRunner` is not `Clone` and is meant to be a single process-wide
+    /// singleton obtained once via `TaskRunner::bootstrap()` — this field
+    /// holds a `'static` reference to that one singleton, not an owned
+    /// copy. `cancel()`'s existing `runner: &TaskRunner` *parameter* is
+    /// untouched by this field; they're separate, deliberately (see
+    /// `cancel`'s call sites, which keep passing their own `&TaskRunner`
+    /// exactly as before).
     runner: &'static TaskRunner,
+    /// Task 25 fix-round-1 (security review): this is now the ONLY place
+    /// `admit_task` reads whether the sealed floor is disabled —
+    /// `self.policy.unsealed()`, never a separate actor-local copy. An
+    /// earlier version of this struct held its own `unsealed: bool` field,
+    /// independently settable from the `PolicyEngine` it wrapped; that let
+    /// a `PolicyEngine::with_unsealed(false)` have its sealed floor
+    /// disabled anyway because `admit_task` consulted the actor's own,
+    /// unrelated flag. There must be exactly one source of truth for this.
     policy: Arc<PolicyEngine>,
-    /// Mirrors the daemon's `--unsealed` flag (§6.2's one documented sealed-
-    /// floor escape), threaded in at construction — never toggled per-task.
-    unsealed: bool,
+    /// Absolute, non-empty by construction (`SessionActor::new` asserts
+    /// this) — an empty or relative `state_dir` silently disables
+    /// `sealed_state_dir_write` (see that rule's own empty-path guard,
+    /// intended only for `roundhouse_policy::sealed::default_context`'s
+    /// unit-test placeholder, never for a real session).
     state_dir: PathBuf,
+    /// Same absolute/non-empty invariant as `state_dir`, for the same
+    /// reason (`sealed_daemon_binary_write`'s empty-path guard).
     daemon_binary: PathBuf,
     /// Populated by the MCP host (Phase 3) as servers complete their
     /// handshake; read here, never written from this module in this task's
@@ -135,9 +173,35 @@ pub struct SessionActor {
     isolate: Arc<dyn Isolate>,
     handle: Handle,
     session_spec: SessionSpec,
+    /// Task 25 fix-round-1 (security review): the tier this session's
+    /// `handle` actually settled at, captured once at construction via
+    /// `isolate.attest(&handle).tier` — mirrors `Isolate::prepare`'s own
+    /// internal `achieved.min(requested)` decision. `sealed_context()`
+    /// compares the CURRENT live attestation against THIS, not
+    /// `session_spec.requested_tier` directly: a session created with
+    /// `OnDegrade::AllowDownTo` that genuinely (and human-acceptedly)
+    /// settles for a lower tier must not have `sealed_tier_shortfall` fire
+    /// on every single task for the rest of its life just because the
+    /// ORIGINAL ask never changes. A later, real mid-session degradation
+    /// (attested tier dropping below `effective_tier`) still correctly
+    /// fires the rule — only the one-time, accepted-at-creation gap is
+    /// excused.
+    effective_tier: Tier,
 }
 
 impl SessionActor {
+    /// # Panics
+    /// Panics if `state_dir` or `daemon_binary` is not an absolute,
+    /// non-empty path. This is a fail-closed construction-time invariant,
+    /// not a soft validation: `roundhouse_policy::sealed::
+    /// sealed_state_dir_write`/`sealed_daemon_binary_write` both silently
+    /// no-op when their respective `SealedContext` field is empty (a guard
+    /// meant only for `sealed::default_context`'s unit-test placeholder) —
+    /// constructing a real `SessionActor` with an empty or relative path
+    /// here would silently disable two of the sealed floor's compiled-in
+    /// rules for this session's entire lifetime, with nothing downstream
+    /// able to detect it. Panicking here, at construction, is deliberately
+    /// louder than that.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionId,
@@ -145,47 +209,72 @@ impl SessionActor {
         initial_state: SessionState,
         runner: &'static TaskRunner,
         policy: Arc<PolicyEngine>,
-        unsealed: bool,
         state_dir: PathBuf,
         daemon_binary: PathBuf,
         isolate: Arc<dyn Isolate>,
         handle: Handle,
         session_spec: SessionSpec,
     ) -> Self {
+        assert!(
+            state_dir.is_absolute(),
+            "SessionActor::new: state_dir must be a non-empty, absolute path (got {state_dir:?}) \
+             — an empty/relative path silently disables the real sealed:state-dir-write rule"
+        );
+        assert!(
+            daemon_binary.is_absolute(),
+            "SessionActor::new: daemon_binary must be a non-empty, absolute path (got \
+             {daemon_binary:?}) — an empty/relative path silently disables the real \
+             sealed:daemon-binary-write rule"
+        );
         let (state_tx, _rx) = tokio::sync::watch::channel(initial_state);
+        let effective_tier = isolate.attest(&handle).tier;
         SessionActor {
             session_id,
             writer,
             state_tx,
             runner,
             policy,
-            unsealed,
             state_dir,
             daemon_binary,
             mcp_resolved: Arc::new(RwLock::new(HashSet::new())),
             isolate,
             handle,
             session_spec,
+            effective_tier,
         }
     }
 
     /// Builds the live `SealedContext` this session's tasks are judged
     /// against — the exact wiring finding 3's `sealed_tier_shortfall` check
-    /// needed and never had before this task: reads the CURRENT isolation
+    /// needed and never had before Task 25: reads the CURRENT isolation
     /// attestation (re-read every call, since §6.5 rule 4 says the achieved
     /// tier can change mid-session) and the MCP registry's currently-
     /// resolved servers, not a snapshot taken once at session start.
+    ///
+    /// `requested_tier` here is `self.effective_tier` (the tier accepted at
+    /// construction), not `self.session_spec.requested_tier` — see
+    /// `effective_tier`'s own doc comment for why comparing against the
+    /// stale original ask would make a legitimately-downgraded session deny
+    /// every task for the rest of its life.
     fn sealed_context(&self) -> SealedContext {
         let attestation = self.isolate.attest(&self.handle);
         SealedContext {
             state_dir: self.state_dir.clone(),
             daemon_binary: self.daemon_binary.clone(),
+            // Task 25 fix-round-1 (security review): a poisoned lock reads
+            // as an empty resolved-server set (fail-closed — an empty set
+            // makes every `TaskParams::Mcp` sealed-deny, never
+            // spuriously-allow) rather than panicking. `mcp_resolved` is
+            // write-only from Phase 3 code that doesn't exist yet in this
+            // task's scope, but treating a future writer's panic as a
+            // reason to also crash every *reader* of this session would be
+            // a real, avoidable DoS surface once Phase 3 lands.
             resolved_mcp_servers: self
                 .mcp_resolved
                 .read()
-                .expect("mcp_resolved lock poisoned")
-                .clone(),
-            requested_tier: self.session_spec.requested_tier,
+                .map(|guard| guard.clone())
+                .unwrap_or_default(),
+            requested_tier: self.effective_tier,
             attested_tier: attestation.tier,
         }
     }
@@ -211,6 +300,15 @@ impl SessionActor {
     /// needing its own separate `&'static TaskRunner` threaded in.
     pub fn runner(&self) -> &'static TaskRunner {
         self.runner
+    }
+
+    /// The original `SessionSpec` this session was created with — kept for
+    /// observability/debugging (e.g. surfacing the ORIGINAL ask alongside
+    /// `effective_tier`, the tier actually accepted). `sealed_context()`
+    /// deliberately does NOT read `requested_tier` off of this — see
+    /// `effective_tier`'s own doc comment for why.
+    pub fn session_spec(&self) -> &SessionSpec {
+        &self.session_spec
     }
 
     /// Flip the in-memory admission gate to `Cancelling`, then mint and
@@ -290,7 +388,25 @@ impl SessionActor {
     /// every task goes through before `TaskRunner::execute`, not a unit
     /// test against `PolicyEngine::decide`/`decide_sealed` in isolation
     /// (Tasks 9/10 already cover that).
-    pub fn admit_task(&self, req: &TaskCreateRequest) -> Result<(), AdmitError> {
+    ///
+    /// Now `async`, as of Task 25 fix-round-1: whenever `self.policy.
+    /// unsealed()` is true (§6.2's one documented sealed-floor escape,
+    /// `round daemon --unsealed`), a `Note` is durably recorded for THIS
+    /// task before the policy decision runs — `sealed.rs`'s and `engine.
+    /// rs`'s own pre-existing doc comments already committed to "`--unsealed`
+    /// ... must be recorded per-task ... never silent"; this is that
+    /// recording, finally real. Best-effort (`let _ =`) on the append, same
+    /// as `create_session_isolation`'s Degradation note below: a failed
+    /// audit-note append must never itself block or unblock admission.
+    ///
+    /// # Security invariant on `req.params`
+    /// For `TaskParams::Fs`, `req.params`'s `canonical` field MUST be a
+    /// genuinely resolved (symlink-followed, e.g. via `std::fs::
+    /// canonicalize`) absolute path, not merely whatever path string the
+    /// caller happened to receive — see [`TaskCreateRequest::params`]'s own
+    /// doc comment for the full rationale and this function's one cheap,
+    /// no-I/O partial guard (rejecting a non-absolute `Ok(path)` outright).
+    pub async fn admit_task(&self, req: &TaskCreateRequest) -> Result<(), AdmitError> {
         let trusted_finally_step = req.is_finally_step && req.origin == Origin::System;
 
         match self.state() {
@@ -301,8 +417,47 @@ impl SessionActor {
             SessionState::Closed => return Err(AdmitError::SessionClosed),
         }
 
+        // Cheap, no-I/O partial guard against the class of bug (not the
+        // full attack) flagged by security review: a `canonical: Ok(path)`
+        // that isn't even absolute is definitely not a real, resolved
+        // canonical path (`std::fs::canonicalize` always returns an
+        // absolute path), so it can never legitimately pass the sealed
+        // floor's path-prefix matchers. This does NOT defend against a
+        // caller supplying an absolute-but-unresolved path (e.g. the
+        // symlink's own path rather than its resolved target) — that
+        // requires real filesystem I/O this policy-adjacent, otherwise
+        // I/O-free function deliberately does not perform; real
+        // canonicalization is the caller's hard responsibility (see
+        // `TaskCreateRequest::params`'s doc comment).
+        if let TaskParams::Fs {
+            canonical: Ok(p), ..
+        } = &req.params
+        {
+            if !p.is_absolute() {
+                return Err(AdmitError::Denied(None));
+            }
+        }
+
+        let unsealed = self.policy.unsealed();
+        if unsealed {
+            let event = self.runner.record_note(
+                self.session_id,
+                0, // ignored — EventWriter::append assigns the real per-session seq
+                now_ts(),
+                None,
+                NoteLevel::Warn,
+                format!(
+                    "task admitted with the sealed floor DISABLED (--unsealed): kind={:?} \
+                     origin={:?}",
+                    req.kind, req.origin,
+                ),
+                1,
+            );
+            let _ = self.writer.append(event).await;
+        }
+
         let ctx = self.sealed_context();
-        let decision = self.policy.decide_sealed(&req.params, self.unsealed, &ctx);
+        let decision = self.policy.decide_sealed(&req.params, unsealed, &ctx);
         match decision.outcome {
             Outcome::Deny => Err(AdmitError::Denied(decision.rule)),
             Outcome::Ask => Err(AdmitError::RequiresApproval),
@@ -317,13 +472,16 @@ impl SessionActor {
     /// real check, not a bypass around it.
     ///
     /// `execute` is injected rather than hardcoded against a real dispatch
-    /// chokepoint: as of this task, `roundhouse-engine` still has no unified
-    /// task-execution entry point (see this module's doc comment — the same
-    /// gap Task 3 already documented and worked around). Inventing a fake
-    /// one here (e.g. a `TaskRunner::execute`/`executor_for` pair that
-    /// doesn't exist anywhere in this codebase) would paper over that gap
-    /// instead of leaving it honestly for the later integration task that
-    /// owns wiring a real executor in ("Task 25" in the Phase 2 plan).
+    /// chokepoint: `roundhouse-engine` still has no unified task-execution
+    /// entry point (see this module's doc comment — the same gap Task 3
+    /// already documented and worked around, and which Task 25 did not
+    /// close either — Task 25 wired real policy/isolation/egress mechanisms
+    /// into `admit_task` and session creation, not `admit_task` into a real
+    /// dispatch chokepoint). Inventing a fake one here (e.g. a
+    /// `TaskRunner::execute`/`executor_for` pair that doesn't exist anywhere
+    /// in this codebase) would paper over that gap instead of leaving it
+    /// honestly for the further, not-yet-numbered integration task that
+    /// owns wiring a real executor in.
     ///
     /// Stops at the first step whose admission or execution fails — later
     /// steps are never attempted once an earlier one has failed, so a
@@ -345,7 +503,7 @@ impl SessionActor {
                 is_finally_step: true,
                 params: step.params.clone(),
             };
-            self.admit_task(&req)?;
+            self.admit_task(&req).await?;
             execute(step).await.map_err(FinallyStepError::Execute)?;
         }
         Ok(())
@@ -379,20 +537,41 @@ pub enum FinallyStepError {
 }
 
 /// Task 25 — the real, inline fix for audit finding 11's deferred
-/// downgrade-recording. Uses only the frozen `Isolate::probe`/`ProbeResult
-/// { achieved, degradations }` contract — no downcast from the generic
-/// `dyn Isolate` the engine actually holds, so this works identically for
-/// every `Isolate` implementation, not just `BwrapLandlockIsolate`.
+/// downgrade-recording.
 ///
 /// A free function, not a method: `SessionActor` doesn't exist yet at
 /// session-creation time — this function's whole point is to build the
 /// `Handle` that later goes INTO a `SessionActor`.
 ///
-/// Follows the exact real pattern this same file's `cancel()` uses: mint an
-/// `Event` via `TaskRunner::record_note`, append it via `EventWriter`,
-/// deliberately best-effort (`let _ =`) on the append so a failed Degradation
-/// note can never abort session creation — matching the brief's own
-/// "regardless of whether prepare() below ends up erring" framing.
+/// **Task 25 fix-round-1 (security review):** the shortfall decision is
+/// driven by `isolate.attest(&handle).tier` — the REAL tier the returned
+/// handle actually settled at — never by an independent `isolate.probe()`
+/// call. An earlier version of this function compared `isolate.probe().
+/// await.achieved` against `spec.requested_tier` before calling `prepare()`;
+/// that is unsound for two reasons proven by security review: (1)
+/// `Isolate::probe()`'s real implementation (`BwrapLandlockIsolate::probe`)
+/// re-probes the actual live host from scratch via `probe_cached`, wholly
+/// ignoring any probe result a test double was constructed with — so even
+/// `test_with_probe`'s injected report was silently bypassed by that
+/// `probe()` call, while `prepare()`/`attest()` correctly used it; and (2)
+/// even for a real host, nothing guarantees `probe()`'s live re-read agrees
+/// with what `prepare()` — called moments later — actually decided for
+/// this specific handle. Both directions were reproduced: a session that
+/// genuinely achieved full `Sandbox` tier got a spurious permanent
+/// Degradation note (false positive, driven by a stale/mismatched `probe()`
+/// read), and a custom `Isolate` whose `probe()` over-reports produced ZERO
+/// degradation notes for a real downgrade (false negative). `prepare()` is
+/// now called FIRST; the note (if any) is recorded from its real,
+/// handle-attested outcome afterward — "regardless of whether `prepare()`
+/// erred" no longer applies verbatim, since a `Refuse`-degraded `prepare()`
+/// error means no handle (and therefore nothing to attest or record) was
+/// ever created at all; that is the honest outcome for that case, not a
+/// regression.
+///
+/// Follows the exact real pattern this same file's `cancel()` uses for the
+/// append itself: mint an `Event` via `TaskRunner::record_note`, append it
+/// via `EventWriter`, deliberately best-effort (`let _ =`) on the append so
+/// a failed Degradation-note append can never fail session creation itself.
 pub async fn create_session_isolation(
     writer: &EventWriter,
     runner: &TaskRunner,
@@ -400,13 +579,12 @@ pub async fn create_session_isolation(
     isolate: &dyn Isolate,
     spec: &SessionSpec,
 ) -> Result<Handle, IsolationError> {
-    let probe = isolate.probe().await;
-    if probe.achieved < spec.requested_tier {
+    let handle = isolate.prepare(spec).await?;
+    let achieved = isolate.attest(&handle).tier;
+    if achieved < spec.requested_tier {
         // §6.5 rule 3: a downgrade requires SessionSpec.on_degrade, set by
-        // the human at creation, and must be RECORDED — regardless of
-        // whether prepare() below ends up erring (on_degrade=Refuse) or
-        // succeeding at the lower tier (on_degrade=AllowDownTo). Recorded
-        // here, unconditionally, before prepare() runs.
+        // the human at creation, and must be RECORDED. Driven by the real,
+        // handle-attested `achieved` tier above, not an independent probe.
         let event = runner.record_note(
             session_id,
             0, // ignored — EventWriter::append assigns the real per-session seq
@@ -414,16 +592,15 @@ pub async fn create_session_isolation(
             None,
             NoteLevel::Degradation,
             format!(
-                "isolation shortfall: requested {:?}, only {:?} achievable on this host ({})",
-                spec.requested_tier,
-                probe.achieved,
-                probe.degradations.join("; "),
+                "isolation shortfall: requested {:?}, this session's handle actually achieved \
+                 {:?}",
+                spec.requested_tier, achieved,
             ),
             1,
         );
         let _ = writer.append(event).await;
     }
-    isolate.prepare(spec).await
+    Ok(handle)
 }
 
 /// Task 25 — the single real call site both `SealedContext` construction
@@ -437,6 +614,11 @@ pub async fn create_session_isolation(
 /// real daemon `serve()` runs once at daemon boot, well before any session
 /// (and therefore any call to this function) exists. The caller is
 /// responsible for having already `serve()`d `proxy` exactly once.
+///
+/// If isolation succeeds but registering the session with `proxy` fails
+/// (`ProxyNotServingError`), the isolation handle that was just created is
+/// torn down (best-effort) before returning the error, rather than leaked
+/// in the isolate's internal handle map.
 pub async fn create_session_with_egress(
     writer: &EventWriter,
     runner: &TaskRunner,
@@ -447,8 +629,13 @@ pub async fn create_session_with_egress(
     egress_policy: EgressPolicy,
 ) -> Result<(Handle, ProxyHandle), CreateSessionError> {
     let handle = create_session_isolation(writer, runner, session_id, isolate, spec).await?;
-    let proxy_handle = proxy.register_session(session_id, egress_policy)?;
-    Ok((handle, proxy_handle))
+    match proxy.register_session(session_id, egress_policy) {
+        Ok(proxy_handle) => Ok((handle, proxy_handle)),
+        Err(e) => {
+            let _ = isolate.teardown(handle).await;
+            Err(CreateSessionError::from(e))
+        }
+    }
 }
 
 /// Task 25's own design call (flagged as such by the addendum): a small

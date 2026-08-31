@@ -69,9 +69,8 @@ async fn admit_task_denies_a_sealed_write_through_the_real_admission_path() {
         SessionState::Running,
         &RUNNER,
         policy,
-        false, // unsealed
-        std::path::PathBuf::new(),
-        std::path::PathBuf::new(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
         isolate,
         handle,
         spec,
@@ -96,10 +95,83 @@ async fn admit_task_denies_a_sealed_write_through_the_real_admission_path() {
         },
     };
 
-    let err = actor.admit_task(&write_ssh).unwrap_err();
+    let err = actor.admit_task(&write_ssh).await.unwrap_err();
     assert!(
         matches!(err, AdmitError::Denied(_)),
         "the sealed floor must fire from the real admission path, with zero config rules involved"
+    );
+}
+
+#[tokio::test]
+async fn admit_task_denies_writes_under_the_real_state_dir_and_daemon_binary() {
+    // Security-review fix-round-1: `sealed_state_dir_write`/
+    // `sealed_daemon_binary_write` both silently no-op when `SealedContext`'s
+    // `state_dir`/`daemon_binary` are empty — a guard meant only for
+    // `sealed::default_context`'s unit-test placeholder. `SessionActor::new`
+    // now fail-closed asserts both are real, absolute, non-empty paths; this
+    // test proves the two rules those paths exist to drive actually fire
+    // through the real `admit_task` path, with real non-empty paths, not
+    // `PathBuf::new()` — closing the exact regression security review
+    // reproduced (an empty-context write to the daemon's own state dir was
+    // silently `Ok(())` instead of `Denied(sealed:state-dir-write)`).
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let state_dir = dir.path().join("state");
+    let daemon_binary = dir.path().join("bin/round-daemon-internal");
+
+    let policy = Arc::new(PolicyEngine::from_rules(vec![]));
+    let isolate: Arc<dyn Isolate> = Arc::new(available_isolate());
+    let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+    let handle = isolate.prepare(&spec).await.unwrap();
+
+    let actor = SessionActor::new(
+        SessionId::new(),
+        writer,
+        SessionState::Running,
+        &RUNNER,
+        policy,
+        state_dir.clone(),
+        daemon_binary.clone(),
+        isolate,
+        handle,
+        spec,
+    );
+
+    let write_state_dir = TaskCreateRequest {
+        kind: TaskKind::Write,
+        origin: Origin::Model,
+        is_finally_step: false,
+        params: TaskParams::Fs {
+            op: FsOp::Write,
+            path: state_dir.join("events.db"),
+            canonical: Ok(state_dir.join("events.db")),
+        },
+    };
+    let err = actor.admit_task(&write_state_dir).await.unwrap_err();
+    assert!(
+        matches!(err, AdmitError::Denied(_)),
+        "a write under the session's real state_dir must be denied by sealed:state-dir-write \
+         through the real admission path — got {err:?}"
+    );
+
+    let write_daemon_binary = TaskCreateRequest {
+        kind: TaskKind::Write,
+        origin: Origin::Model,
+        is_finally_step: false,
+        params: TaskParams::Fs {
+            op: FsOp::Write,
+            path: daemon_binary.clone(),
+            canonical: Ok(daemon_binary.clone()),
+        },
+    };
+    let err = actor.admit_task(&write_daemon_binary).await.unwrap_err();
+    assert!(
+        matches!(err, AdmitError::Denied(_)),
+        "a write to the session's real daemon_binary must be denied by \
+         sealed:daemon-binary-write through the real admission path — got {err:?}"
     );
 }
 
@@ -211,5 +283,146 @@ async fn session_creation_registers_egress_with_the_real_loopback_proxy() {
         attestation.tier,
         Tier::Sandbox,
         "the isolation handle session creation produced must reflect the achieved tier"
+    );
+}
+
+#[tokio::test]
+async fn a_legitimately_downgraded_session_does_not_deny_every_subsequent_task() {
+    // Security-review fix-round-1: `sealed_context()` used to compare the
+    // live attestation against `session_spec.requested_tier` directly — the
+    // ORIGINAL ask, which never changes even after a human explicitly
+    // accepted a downgrade via `OnDegrade::AllowDownTo`. That made
+    // `sealed_tier_shortfall` fire on every single task for the rest of a
+    // legitimately-downgraded session's life, making `on_degrade`
+    // functionally meaningless. `sealed_context()` now compares against
+    // `SessionActor::effective_tier` (the tier the handle actually settled
+    // at, captured once at construction) instead — this test proves an
+    // ordinary, otherwise-allowed task is admitted on such a session.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    // Achieves only Worktree tier (bwrap available, landlock degraded,
+    // seatbelt unavailable) — a real, human-accepted downgrade from the
+    // Sandbox tier this session asks for.
+    let isolate: Arc<dyn Isolate> = Arc::new(BwrapLandlockIsolate::test_with_probe(
+        MechanismProbeReport {
+            landlock: MechanismStatus::Degraded {
+                reason: "BestEffort: missing TruncateFs".into(),
+            },
+            bwrap: MechanismStatus::Available,
+            seccomp: MechanismStatus::Available,
+            seatbelt: MechanismStatus::Unavailable {
+                reason: "not macOS".into(),
+            },
+        },
+    ));
+    let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::AllowDownTo(Tier::Worktree));
+    let handle = isolate.prepare(&spec).await.unwrap();
+    assert_eq!(
+        isolate.attest(&handle).tier,
+        Tier::Worktree,
+        "test setup bug: this isolate/spec combination must actually downgrade to Worktree"
+    );
+
+    let policy = Arc::new(roundhouse_policy::engine::PolicyEngine::from_rules(vec![
+        roundhouse_policy::engine::CompiledRule::test_new(
+            roundhouse_policy::engine::Scope::Builtin,
+            roundhouse_policy::engine::Outcome::Allow,
+            roundhouse_policy::engine::Predicate::program("true"),
+        ),
+    ]));
+
+    let actor = SessionActor::new(
+        SessionId::new(),
+        writer,
+        SessionState::Running,
+        &RUNNER,
+        policy,
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        isolate,
+        handle,
+        spec,
+    );
+
+    let ordinary = TaskCreateRequest {
+        kind: TaskKind::Shell,
+        origin: Origin::Model,
+        is_finally_step: false,
+        params: TaskParams::Shell(roundhouse_policy::ParsedCommand {
+            program: "true".to_string(),
+            argv: vec![],
+        }),
+    };
+
+    // Ask twice: the fix must hold for more than just the first task on
+    // this session — a stale one-time comparison would only happen to pass
+    // once by accident.
+    actor
+        .admit_task(&ordinary)
+        .await
+        .expect("an otherwise-allowed task on a legitimately-downgraded session must be admitted");
+    actor
+        .admit_task(&ordinary)
+        .await
+        .expect("the fix must hold for every subsequent task, not just the first one");
+}
+
+#[tokio::test]
+async fn admitting_a_task_with_the_sealed_floor_disabled_records_a_real_never_silent_note() {
+    // Security-review fix-round-1: `sealed.rs`/`engine.rs` both already
+    // carried a pre-existing doc-comment contract that `--unsealed` "must
+    // be recorded per-task ... never silent" once Tasks 17/25 landed. Task
+    // 25 landed and recorded nothing until this fix. `SessionActor` no
+    // longer holds its own independent `unsealed` bool — `admit_task` reads
+    // `self.policy.unsealed()`, the single source of truth — and records a
+    // `Note` for every task admitted while that flag is set.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let session_id = SessionId::new();
+    let policy = Arc::new(PolicyEngine::from_rules(vec![]).with_unsealed(true));
+    let isolate: Arc<dyn Isolate> = Arc::new(available_isolate());
+    let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+    let handle = isolate.prepare(&spec).await.unwrap();
+
+    let actor = SessionActor::new(
+        session_id,
+        writer,
+        SessionState::Running,
+        &RUNNER,
+        policy,
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        isolate,
+        handle,
+        spec,
+    );
+
+    let task = TaskCreateRequest {
+        kind: TaskKind::Shell,
+        origin: Origin::Model,
+        is_finally_step: false,
+        params: TaskParams::Shell(roundhouse_policy::ParsedCommand {
+            program: "whatever".to_string(),
+            argv: vec![],
+        }),
+    };
+    let _ = actor.admit_task(&task).await; // outcome doesn't matter — the Note must be recorded regardless
+
+    let store2 = open(&db_path).await.unwrap();
+    let events = session_events(&store2, session_id).await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::Note { level: NoteLevel::Warn, text }
+                if text.contains("sealed floor") && text.contains("--unsealed")
+        )),
+        "admitting a task with the sealed floor disabled must durably record a Note — \
+         never silent, per sealed.rs/engine.rs's own pre-existing doc contract"
     );
 }

@@ -424,6 +424,20 @@ impl PolicyEngine {
         self
     }
 
+    /// Task 25 fix-round-1 (security review): the single source of truth for
+    /// whether the sealed floor is disabled for this engine. Before this
+    /// accessor existed, `SessionActor` held its own independent `unsealed`
+    /// bool, settable to a different value than the one this `PolicyEngine`
+    /// was actually constructed with — a caller could construct a
+    /// `PolicyEngine::with_unsealed(false)` whose sealed floor still got
+    /// disabled anyway because whatever *called* `decide_sealed` consulted
+    /// its own, unrelated flag instead of this one. Every caller of
+    /// `decide_sealed` outside this impl block must read `unsealed` from
+    /// here, never maintain a parallel copy.
+    pub fn unsealed(&self) -> bool {
+        self.unsealed
+    }
+
     /// The daemon is the only place that knows the live state dir, daemon
     /// binary path, resolved MCP servers, and current attestation, so it
     /// supplies this provider at construction. Unit tests get the safe default

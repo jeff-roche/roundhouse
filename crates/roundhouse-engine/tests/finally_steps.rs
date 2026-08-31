@@ -65,15 +65,16 @@ async fn spawn_test_actor(initial_state: SessionState) -> (SessionActor, tempfil
     ));
     let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
     let handle = isolate.prepare(&spec).await.unwrap();
+    // `SessionActor::new` fail-closed asserts these are absolute, non-empty
+    // paths — see `cancel_admission.rs`'s identical helper for why.
     let actor = SessionActor::new(
         SessionId::new(),
         writer,
         initial_state,
         &RUNNER,
         policy,
-        false,
-        std::path::PathBuf::new(),
-        std::path::PathBuf::new(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
         isolate,
         handle,
         spec,
@@ -138,7 +139,7 @@ async fn finally_steps_still_run_when_the_session_would_refuse_an_ordinary_task(
             params: permissive_params(),
         };
         assert!(
-            actor.admit_task(&ordinary).is_err(),
+            actor.admit_task(&ordinary).await.is_err(),
             "test setup bug: {state:?} should refuse ordinary tasks"
         );
 

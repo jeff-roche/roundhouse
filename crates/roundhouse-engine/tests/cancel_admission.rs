@@ -90,15 +90,18 @@ async fn spawn_test_actor(
     ));
     let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
     let handle = isolate.prepare(&spec).await.unwrap();
+    // `SessionActor::new` fail-closed asserts these are absolute, non-empty
+    // paths (an empty path would silently disable the real
+    // sealed:state-dir-write/sealed:daemon-binary-write rules) — real
+    // absolute placeholders under the test's own tempdir, not `PathBuf::new()`.
     let actor = SessionActor::new(
         session_id,
         writer,
         initial_state,
         &RUNNER,
         policy,
-        false,
-        std::path::PathBuf::new(),
-        std::path::PathBuf::new(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
         isolate,
         handle,
         spec,
@@ -114,12 +117,12 @@ async fn cancelling_session_refuses_new_non_finally_tasks() {
     actor.cancel(&RUNNER, CancelReason::User).await.unwrap();
 
     let normal = permissive_request(TaskKind::Shell, Origin::Model, false);
-    let err = actor.admit_task(&normal).unwrap_err();
+    let err = actor.admit_task(&normal).await.unwrap_err();
     assert!(matches!(err, AdmitError::SessionCancelling));
 
     let finally_step = permissive_request(TaskKind::Shell, Origin::System, true);
     assert!(
-        actor.admit_task(&finally_step).is_ok(),
+        actor.admit_task(&finally_step).await.is_ok(),
         "finally steps must still be admitted while Cancelling"
     );
 }
@@ -130,12 +133,12 @@ async fn admit_task_allows_everything_before_cancel_is_called() {
 
     let normal = permissive_request(TaskKind::Shell, Origin::Model, false);
     assert!(
-        actor.admit_task(&normal).is_ok(),
+        actor.admit_task(&normal).await.is_ok(),
         "a session that hasn't been cancelled must admit ordinary tasks"
     );
 
     let finally_step = permissive_request(TaskKind::Shell, Origin::System, true);
-    assert!(actor.admit_task(&finally_step).is_ok());
+    assert!(actor.admit_task(&finally_step).await.is_ok());
 }
 
 #[tokio::test]
@@ -237,7 +240,7 @@ async fn closed_session_refuses_ordinary_tasks() {
     let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Closed).await;
 
     let normal = permissive_request(TaskKind::Shell, Origin::Model, false);
-    let err = actor.admit_task(&normal).unwrap_err();
+    let err = actor.admit_task(&normal).await.unwrap_err();
     assert!(matches!(err, AdmitError::SessionClosed));
 }
 
@@ -247,7 +250,7 @@ async fn suspended_session_refuses_ordinary_tasks() {
     let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Suspended).await;
 
     let normal = permissive_request(TaskKind::Shell, Origin::Model, false);
-    let err = actor.admit_task(&normal).unwrap_err();
+    let err = actor.admit_task(&normal).await.unwrap_err();
     assert!(matches!(err, AdmitError::SessionSuspended));
 }
 
@@ -260,7 +263,7 @@ async fn finally_step_bypass_is_refused_unless_origin_is_system() {
     let (actor, _session_id, _db_path, _dir) = spawn_test_actor(SessionState::Closed).await;
 
     let untrusted_finally_step = permissive_request(TaskKind::Shell, Origin::Model, true);
-    let err = actor.admit_task(&untrusted_finally_step).unwrap_err();
+    let err = actor.admit_task(&untrusted_finally_step).await.unwrap_err();
     assert!(
         matches!(err, AdmitError::SessionClosed),
         "a finally-step claim from a non-System origin must not bypass the gate"
@@ -268,7 +271,7 @@ async fn finally_step_bypass_is_refused_unless_origin_is_system() {
 
     let trusted_finally_step = permissive_request(TaskKind::Shell, Origin::System, true);
     assert!(
-        actor.admit_task(&trusted_finally_step).is_ok(),
+        actor.admit_task(&trusted_finally_step).await.is_ok(),
         "a genuine (Origin::System) finally-step must still be admitted even when Closed"
     );
 }
