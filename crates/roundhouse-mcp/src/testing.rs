@@ -107,7 +107,7 @@ mod tests {
             })
             .await
             .unwrap();
-        matches!(r1.result_type, McpResultType::Ok);
+        assert!(matches!(r1.result_type, McpResultType::Ok));
         assert!(matches!(&r1.content[0], McpContentBlock::Text { text } if text == "first"));
 
         let r2 = fake
