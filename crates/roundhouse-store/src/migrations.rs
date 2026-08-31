@@ -102,11 +102,25 @@ const MIGRATION_0004_TASKS_REDACTIONS_COLUMN: &str = r#"
 ALTER TABLE tasks ADD COLUMN redactions INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// Task 21 (S-OBS-4): the "blocked-anywhere" query's index. Matches
+/// `suspended_tasks`'s (`suspended.rs`) real predicate exactly — the `tasks` table
+/// has only one generic `state = 'Suspended'` value for every suspend reason, so
+/// a partial index on that single value is what makes `attention::blocked_anywhere`
+/// a fast index range scan instead of a full-table scan at 10,000-session scale.
+/// Ordered by `suspended_since` to match the query's own `ORDER BY suspended_since
+/// ASC` (oldest-blocked-first).
+const MIGRATION_0005_ATTENTION_INDEX: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_tasks_suspended
+    ON tasks(state, suspended_since)
+    WHERE state = 'Suspended';
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_0001_INITIAL_SCHEMA),
         M::up(MIGRATION_0002_BLOBS),
         M::up(MIGRATION_0003_TASKS_SUSPEND_COLUMNS),
         M::up(MIGRATION_0004_TASKS_REDACTIONS_COLUMN),
+        M::up(MIGRATION_0005_ATTENTION_INDEX),
     ])
 }

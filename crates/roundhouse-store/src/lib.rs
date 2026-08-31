@@ -12,6 +12,7 @@
 //! See `docs/architecture/01-data-model.md` and `02-system-architecture.md` §5.2.
 #![forbid(unsafe_code)]
 
+pub mod attention;
 pub mod blobs;
 pub mod cost;
 mod fold;
@@ -45,6 +46,9 @@ pub use recovery::recover_interrupted_tasks;
 
 // Task 2 (Phase 2) exports: suspended-task enumeration
 pub use suspended::{suspended_tasks, SuspendedTask};
+
+// Task 21 (Phase 2) exports: the blocked-anywhere query (S-OBS-4)
+pub use attention::{blocked_anywhere, BlockedTask};
 
 // Task 18 (Phase 2) exports: session-scoped event reads (used by
 // roundhouse-secrets' keyring-fallback Degradation visibility test).
