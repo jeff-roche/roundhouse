@@ -41,7 +41,7 @@ agent team** — one crate, one owner, one test suite, minimal shared mutable su
 | `roundhouse-sandbox` | Isolation tiers behind one trait | `roundhouse-core` |
 | `roundhouse-provider` | Provider trait + adapters, capability registry | `roundhouse-core` |
 | `roundhouse-tools` | Task executors (shell/fs/http/web/git/memory) | core, sandbox, policy, net (Task 24: the `http` executor is constructible only from a `roundhouse-net::ProxyHandle`, so `http` traffic is structurally forced through `LoopbackProxy`'s egress allowlist/metadata-IP hard-deny rather than reaching the network directly) |
-| `roundhouse-mcp` | MCP host (rmcp) | core, policy |
+| `roundhouse-mcp` | MCP host (rmcp) | core, policy, provider (Task 1, Phase 3: `ContentBlock`/`MediaSource` live in `roundhouse-provider`, not `roundhouse-core`) |
 | `roundhouse-acp` | ACP client + ACP server (agent-client-protocol) | core, proto |
 | `roundhouse-bus` | Inter-agent messaging + teams | `roundhouse-core` |
 | `roundhouse-engine` | Agent loop, session actor, supervision, context mgmt | most of the above, plus net (Task 25: session creation registers the session's egress allowlist with the real `LoopbackProxy` at the same call site it decides isolation tier, so `SessionActor`'s home module depends on `roundhouse-net` directly rather than only transitively) |

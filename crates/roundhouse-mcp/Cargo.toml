@@ -7,7 +7,32 @@ license.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "fake-mcp-stdio-server"
+path = "src/bin/fake_mcp_stdio_server.rs"
+
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-policy = { path = "../roundhouse-policy" }
+# Task 1 plan correction (2026-08-28): `ContentBlock`/`MediaSource` live in
+# `roundhouse-provider` (src/ir.rs), not `roundhouse-core`, so this crate
+# takes the provider edge too.
+roundhouse-provider = { path = "../roundhouse-provider" }
+tokio = { workspace = true, features = ["process", "io-util", "io-std", "fs"] }
+tokio-util = { workspace = true }
+process-wrap = { version = "10.0.0", features = ["tokio1"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+blake3 = "1"
+rmcp = "3.1.4"
+# Reconciled 2026-08-28: decode_content (Task 8) base64-decodes MCP Image
+# content into Phase 0's real `MediaSource { mime_type, data: Vec<u8> }`
+# shape rather than storing an encoded string, so this crate needs a real
+# decoder rather than relying on one of its other dependencies transitively.
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
