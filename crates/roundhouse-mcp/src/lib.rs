@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod namespace;
 pub mod transport;
 pub mod wire;
 
