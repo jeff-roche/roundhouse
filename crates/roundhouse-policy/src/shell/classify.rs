@@ -359,17 +359,12 @@ fn parameter_expr_is_opaque(expr: &ParameterExpr) -> bool {
 /// - `indirect: false` — an indirect reference (`${!x}`) computes its target name at
 ///   runtime, so it can never be statically resolved here and must stay denied.
 /// - every payload string the variant carries (default/alternative value, pattern, ...)
-///   is `None` or contains **no `$` byte at all** — not just no `$(`. Banning any bare
-///   `$`, not only `$(`/backtick, is load-bearing: a payload-text deny-scan for just
-///   `$(`/backtick was adversarially proven unsafe by security review against real bash
-///   5.3.15 — `${x@P}` (`Transform{op: PromptExpand}`) has an EMPTY payload but performs
-///   command substitution on the variable's OWN VALUE during prompt expansion, and
-///   `${arr[$(id)]}`/`${x:$z:2}` hide injection one level of indirection behind an
-///   arithmetic-context payload (array subscript / substring offset) that a same-string
-///   scan never inspects. Rejecting every bare `$` closes all three: `${x@P}` is simply
-///   not in this allowlist at all (`Transform` is never accepted, regardless of payload),
-///   and any pattern/offset containing a `$` (which an injection payload always does, to
-///   reference the smuggled variable) disqualifies the whole expression.
+///   is `None` or passes [`is_safe_literal_payload`] — no `$`, no backtick, no `~`. See
+///   that function's doc comment for why all three are banned (task-22.5 fix round 1
+///   closed a real command-injection regression here: an earlier version of this gate
+///   banned only `$`, and `brush-parser` stores these payloads as RAW STRINGS — never
+///   nested `WordPiece`s — so a bare backtick inside `${X:-\`cmd\`}` was invisible to
+///   both `find_opaque_nodes` and the `$`-only check, and DID execute).
 ///
 /// Every accepted variant is additionally restricted to `Parameter::Named(_)` — never
 /// `Positional`/`Special` (no positional/special context exists at classify time) or
@@ -377,6 +372,14 @@ fn parameter_expr_is_opaque(expr: &ParameterExpr) -> bool {
 /// forms expand to MULTIPLE argv words, which this module's one-word-in/one-word-out
 /// `expand_word` cannot represent). Leaving those denied is intentional, not a gap: the
 /// bake-off gate's target is a false-Opaque rate comfortably under 15%, not 0%.
+///
+/// The four prefix/suffix pattern-stripping variants additionally require
+/// [`prefix_suffix_pattern_is_safe`] — a pattern must be in the verified-safe glob
+/// subset AND compile successfully via `globset`, or the whole expression is denied
+/// (fail closed on either a pattern outside the verified subset or a compile failure —
+/// task-22.5 fix round 1: previously a compile failure silently fell back to "no
+/// stripping" at *resolve* time, which is a resolved-value divergence from real bash,
+/// i.e. security-relevant in this module, not a mere correctness nit).
 fn parameter_expr_is_allowlisted(expr: &ParameterExpr) -> bool {
     match expr {
         ParameterExpr::Parameter {
@@ -390,21 +393,21 @@ fn parameter_expr_is_allowlisted(expr: &ParameterExpr) -> bool {
         ParameterExpr::UseDefaultValues {
             parameter,
             indirect: false,
+            test_type: _,
             default_value,
-            ..
-        } => is_plain_named(parameter) && is_dollar_free(default_value),
+        } => is_plain_named(parameter) && is_safe_literal_payload(default_value),
         ParameterExpr::AssignDefaultValues {
             parameter,
             indirect: false,
+            test_type: _,
             default_value,
-            ..
-        } => is_plain_named(parameter) && is_dollar_free(default_value),
+        } => is_plain_named(parameter) && is_safe_literal_payload(default_value),
         ParameterExpr::UseAlternativeValue {
             parameter,
             indirect: false,
+            test_type: _,
             alternative_value,
-            ..
-        } => is_plain_named(parameter) && is_dollar_free(alternative_value),
+        } => is_plain_named(parameter) && is_safe_literal_payload(alternative_value),
         ParameterExpr::RemoveSmallestPrefixPattern {
             parameter,
             indirect: false,
@@ -424,17 +427,22 @@ fn parameter_expr_is_allowlisted(expr: &ParameterExpr) -> bool {
             parameter,
             indirect: false,
             pattern,
-        } => is_plain_named(parameter) && is_dollar_free(pattern),
+        } => {
+            is_plain_named(parameter)
+                && is_safe_literal_payload(pattern)
+                && prefix_suffix_pattern_is_safe(pattern)
+        }
         // Deliberately NOT accepted, even though `indirect: false` alone wouldn't be
         // unsafe for some of these:
         // - `IndicateErrorIfNullOrUnset` (`${var:?msg}`): `error_message` carries no
-        //   execution semantics, so it's plausibly safe under the same `$`-ban gating —
-        //   but this classifier has no error-propagation model to correctly represent
+        //   execution semantics, so it's plausibly safe under the same gating — but
+        //   this classifier has no error-propagation model to correctly represent
         //   "fail the task if var is unset/null" during resolution, and the bake-off
         //   corpus doesn't need it to clear the gate. Left denied rather than guessed at.
         // - `Transform` (covers `${x@P}`, `${x@Q}`, etc.): never accepted regardless of
-        //   payload — this is bypass #1 above; `${x@P}`'s danger lives entirely in the
-        //   variable's own value, not in any string this expression carries.
+        //   payload — this is bypass #1 from the original brief; `${x@P}`'s danger
+        //   lives entirely in the variable's own value, not in any string this
+        //   expression carries.
         // - Every other transform/case-conversion/substring/replace variant not listed
         //   above (`UppercaseFirstChar`, `UppercasePattern`, `LowercaseFirstChar`,
         //   `LowercasePattern`, `ReplaceSubstring`, `Substring`): not reasoned about:
@@ -450,10 +458,94 @@ fn is_plain_named(parameter: &Parameter) -> bool {
     matches!(parameter, Parameter::Named(_))
 }
 
-/// True if `payload` is absent, or present and contains no `$` byte at all. See
-/// [`parameter_expr_is_allowlisted`] for why the ban is on any bare `$`, not just `$(`.
-fn is_dollar_free(payload: &Option<String>) -> bool {
-    payload.as_deref().is_none_or(|s| !s.contains('$'))
+/// True if `payload` is absent, or present and safe to treat as an inert literal for
+/// policy-matching purposes: contains no `$` (any expansion form, not just `$(`), no
+/// backtick (command substitution — deliberately checked as a blunt unconditional
+/// substring ban, NOT the escape-aware `raw_string_has_command_substitution` used
+/// elsewhere in this module for arithmetic expressions; escape-awareness only ever
+/// *weakens* a check by carving out exceptions, and this module's standing rule is
+/// "when in doubt, deny" — see task-22.5 fix round 1's Critical finding), and no `~`
+/// (tilde expansion: real bash expands a leading `~` to a real home-directory path in
+/// this position, but this classifier has no such model and would otherwise resolve the
+/// literal text `~/...`, which a path-shaped policy rule could be fooled by — task-22.5
+/// fix round 1 Important finding #1).
+fn is_safe_literal_payload(payload: &Option<String>) -> bool {
+    payload.as_deref().is_none_or(is_safe_literal_str)
+}
+
+fn is_safe_literal_str(s: &str) -> bool {
+    !s.contains('$') && !s.contains('`') && !s.contains('~')
+}
+
+/// True if `pattern` (a `${var#pattern}`-family payload) is `None`, or present and BOTH
+/// in the verified-safe glob subset ([`is_verified_safe_glob_pattern`]) AND compiles
+/// successfully via `globset::Glob`. Both conditions are checked at *classify* time
+/// (not just resolve time) so a pattern this module can't confidently resolve correctly
+/// denies the whole expression rather than silently falling back to a different
+/// resolved value than real bash would produce (task-22.5 fix round 1, Important #2).
+fn prefix_suffix_pattern_is_safe(pattern: &Option<String>) -> bool {
+    match pattern.as_deref() {
+        None => true,
+        Some(p) => is_verified_safe_glob_pattern(p) && compile_glob(p).is_some(),
+    }
+}
+
+/// True only for patterns in the glob subset this module has actually checked matches
+/// bash's own prefix/suffix pattern-matching semantics: literal characters, `*`, `?`,
+/// and simple (non-nested, single-`]`-terminated) bracket character classes, optionally
+/// negated with a leading `!` or `^`. Rejects everything else, in particular:
+/// - `**` (task-22.5 fix round 1, Important #3): `globset` gives `**` special
+///   "match across path components" semantics that were adversarially confirmed to
+///   diverge from bash's own glob matcher in BOTH directions on `${f#**/}`/`${f##**/}`
+///   — under-stripping in one direction, over-stripping in the other. Not "fixable" by
+///   a tweak; the safe move is to not accept `**` into the verified subset at all.
+/// - `{`/`}` (brace alternation) and `\` (escape sequences, since `globset`'s default
+///   `backslash_escape` is platform-dependent and this module hasn't verified its
+///   semantics against bash here): neither has been checked against bash, so neither is
+///   accepted — narrow the accepted pattern language to what's actually verified
+///   correct, and deny the rest, rather than trying to faithfully support the full bash
+///   glob dialect.
+fn is_verified_safe_glob_pattern(pattern: &str) -> bool {
+    if pattern.contains("**") {
+        return false;
+    }
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'*' | b'?' => i += 1,
+            b'[' => {
+                let mut j = i + 1;
+                if j < bytes.len() && (bytes[j] == b'!' || bytes[j] == b'^') {
+                    j += 1;
+                }
+                // A `]` immediately after `[` (or `[!`/`[^`) is a literal `]`, per the
+                // usual glob/POSIX bracket-expression convention.
+                if j < bytes.len() && bytes[j] == b']' {
+                    j += 1;
+                }
+                let body_start = j;
+                let mut closed = false;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'[' => return false, // nested bracket: outside the verified subset
+                        b']' => {
+                            closed = true;
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                if !closed || j == body_start {
+                    return false;
+                }
+                i = j + 1;
+            }
+            b'{' | b'}' | b'\\' => return false,
+            _ => i += 1,
+        }
+    }
+    true
 }
 
 fn raw_string_has_command_substitution(s: &str) -> bool {
@@ -845,17 +937,41 @@ fn resolve_if_set<'a>(
 /// stripping against. The matching loop below is O(n) glob-match attempts each
 /// proportional to the candidate substring's length, i.e. worst-case O(n^2) in the
 /// resolved value's length; `SessionEnv` values come from this codebase's own tool
-/// executors, not raw untrusted shell text, but this cap keeps the classifier's own CPU
-/// bound honest regardless of what ends up populating `SessionEnv` in the future. Values
-/// over the cap are returned unmodified (fail-safe: no stripping, not a panic or a hang).
-const MAX_GLOB_STRIP_INPUT_BYTES: usize = 64 * 1024;
+/// executors, not raw untrusted shell text today, but this cap keeps the classifier's
+/// own CPU bound honest regardless of what ends up populating `SessionEnv` in the
+/// future. Values over the cap are returned unmodified (fail-safe: no stripping, not a
+/// panic or a hang — see the arithmetic-cost note above [`strip_prefix_pattern`]/
+/// [`strip_suffix_pattern`] for why unlike a glob-compile failure this one stays a
+/// correctness-only fallback, not a security-relevant one).
+///
+/// **Calibration** (task-22.5 fix round 1, Important #4): a single 289-byte command with
+/// `structural_budget`'s maximum 15 permitted `${...}` expansions, each stripping
+/// against a large `SessionEnv` value, was adversarially measured to cost 34.09s of
+/// classifier CPU under the previous 64 KiB cap while still classifying as an allowed
+/// `Program` — a real, large hole in this module's otherwise strict resource-bound
+/// discipline (`MAX_INPUT_BYTES`, `PARSE_STACK_BYTES`, `MAX_STRUCTURAL_BUDGET`). Measured
+/// directly against this crate's own `dev` profile (this module's established
+/// conservative-direction calibration baseline, per [`PARSE_STACK_BYTES`]'s own note):
+/// a single worst-case (always-scans-to-the-end, never-matches pattern) call costs
+/// ~0.3–0.7ms at 256–512 bytes; 15 such calls back-to-back (`structural_budget`'s cap)
+/// cost ~4.6ms at 256 bytes. 256 bytes keeps the worst case for an entire command,
+/// across every expansion the structural budget allows, in the low single-digit
+/// milliseconds even on the slower `dev` profile.
+const MAX_GLOB_STRIP_INPUT_BYTES: usize = 256;
 
 /// Implements `${var#pattern}` (`smallest = true`) / `${var##pattern}`
 /// (`smallest = false`): removes the shortest (or longest) prefix of `value` that
 /// glob-matches `pattern` in full, per bash's prefix-removal semantics. Returns `value`
-/// unmodified if no prefix matches, or if `pattern` fails to compile as a glob (a
-/// correctness fallback, not a security-relevant one: `pattern` is already guaranteed
-/// `$`-free by the allowlist gate).
+/// unmodified if no prefix matches. `pattern` failing to compile as a glob is only
+/// reachable here as a defensive no-op (never a panic), exactly like
+/// `expand_parameter_expr`'s own wildcard arm: [`prefix_suffix_pattern_is_safe`] already
+/// requires a successful compile at *classify* time, so this function is only ever
+/// invoked (via `is_expandable_piece`/`expand_piece`'s shared allowlist gate) with a
+/// pattern already proven to compile. Task-22.5 fix round 1, Important #2 moved the
+/// real fail-closed decision to *classify* time specifically because a resolve-time
+/// silent fallback to unmodified text on compile failure was itself a real
+/// bash-divergence bug — this classifier's belief about the resolved value is exactly
+/// what policy matching operates on.
 fn strip_prefix_pattern(value: &str, pattern: &str, smallest: bool) -> String {
     if value.len() > MAX_GLOB_STRIP_INPUT_BYTES {
         return value.to_string();
