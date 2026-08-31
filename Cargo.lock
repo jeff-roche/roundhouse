@@ -2995,6 +2995,7 @@ dependencies = [
  "roundhouse-store",
  "tempfile",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
