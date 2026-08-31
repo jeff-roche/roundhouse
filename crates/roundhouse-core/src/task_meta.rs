@@ -12,6 +12,30 @@ pub enum Origin {
     Client,
 }
 
+/// §6.8 — exactly two trust levels, no "semi-trusted." Untrusted covers
+/// model output, MCP results **and tool descriptions**, fetched web/http
+/// content, peer-agent messages, ACP external agent claims, and project
+/// config until trusted. Deliberately minimal, matching this file's other
+/// small enums (`Origin`/`PolicyDecision`): the trust model's power is in
+/// where these values flow (`PolicyInput.taint`, content-block provenance),
+/// not in more variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum Trust {
+    Trusted,
+    Untrusted,
+}
+
+/// §6.8 — "every content block carries `Provenance { origin, trust, task }`":
+/// who/what produced a block (`origin`, same vocabulary as a task's cause),
+/// its trust level (`trust`), and the task that generated it (`task`).
+/// Carried on task rows and MCP tool definitions from Phase 3 onward.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Provenance {
+    pub origin: Origin,
+    pub trust: Trust,
+    pub task: crate::ids::TaskId,
+}
+
 /// §6.2 — `Policy::decide` returns one of these three, matched on typed,
 /// parsed parameters, never raw strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -42,7 +42,7 @@ pub use task::{fold_task_state, RedactedSpan, Task, TaskState};
 pub use task_kind::TaskKind;
 pub use task_meta::{
     CancelReason, Envelope, Handle, IsolationAttestation, NoteLevel, Origin, PolicyDecision,
-    Progress, RuleId, SuspendReason, TaskError, TaskInput, TaskOutput, Usage,
+    Progress, Provenance, RuleId, SuspendReason, TaskError, TaskInput, TaskOutput, Trust, Usage,
 };
 pub use task_runner::TaskRunner;
 pub use tier::Tier;
