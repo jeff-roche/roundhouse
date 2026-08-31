@@ -14,6 +14,7 @@ pub mod engine;
 pub mod registry;
 pub mod sealed;
 pub mod shell;
+pub mod trust;
 
 mod policy_trait;
 mod task_params;
