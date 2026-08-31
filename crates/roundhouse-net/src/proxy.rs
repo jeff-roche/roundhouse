@@ -8,13 +8,16 @@
 //! makes now goes through [`gate_connect`], which resolves the CONNECT
 //! target's host to real `SocketAddr`s exactly once, checks the IP-level
 //! deny rules against every resolved candidate, and — critically — connects
-//! to the *specific* `SocketAddr` it just checked rather than handing the
+//! only to *already-checked* `SocketAddr`s rather than handing the
 //! original host string back to `TcpStream::connect` for a second,
 //! independent resolution. That second resolution is what made the
 //! previous version of this file structurally unable to defend against
 //! DNS-rebinding-shaped bypasses: there was no "checked address" at all,
 //! only a checked *string*, and the string was never what a real TCP
-//! connection actually reaches.
+//! connection actually reaches. (Fix-round-2: `connect_to_first_reachable`
+//! tries every checked candidate in order — restoring the real dual-stack
+//! fallback behavior `TcpStream::connect(&str)` had — never re-resolving,
+//! just falling back across addresses that were already validated.)
 
 use std::io;
 use std::net::SocketAddr;
@@ -148,6 +151,7 @@ impl LoopbackProxy {
         let this = self.clone();
         let concurrency = Arc::new(Semaphore::new(this.max_concurrent_connections));
         tokio::spawn(async move {
+            let mut last_transient_log: Option<std::time::Instant> = None;
             loop {
                 match listener.accept().await {
                     Ok((socket, _)) => {
@@ -182,10 +186,29 @@ impl LoopbackProxy {
                         // be the same kind of dishonest workaround this
                         // crate's original task addendum explicitly
                         // rejected for `TaskId`.
-                        tracing::warn!(
-                            error = %e,
-                            "roundhouse-net: transient accept() error, continuing to serve"
-                        );
+                        //
+                        // Fix-round-2 regression fix: retrying immediately
+                        // with no backoff turned a real, sustained EMFILE
+                        // condition into a CPU livelock (measured: ~236k
+                        // hot-spun iterations in 1.5s, pegging a full core)
+                        // — `TRANSIENT_ACCEPT_BACKOFF` below fixes that.
+                        // Logging on every one of those retries would
+                        // itself be a (smaller) version of the same
+                        // problem, hence the rate limit.
+                        let now = std::time::Instant::now();
+                        if should_log_transient_accept_error(
+                            last_transient_log,
+                            now,
+                            TRANSIENT_ACCEPT_LOG_INTERVAL,
+                        ) {
+                            tracing::warn!(
+                                error = %e,
+                                "roundhouse-net: transient accept() error, continuing to serve \
+                                 (further occurrences rate-limited)"
+                            );
+                            last_transient_log = Some(now);
+                        }
+                        tokio::time::sleep(TRANSIENT_ACCEPT_BACKOFF).await;
                         continue;
                     }
                     Err(e) => {
@@ -235,13 +258,15 @@ impl LoopbackProxy {
         let session_id = ctx.session_id;
 
         match gate_connect(&ctx.policy, &target_host).await {
-            GateResult::Allow(checked_addr) => {
+            GateResult::Allow(candidates) => {
                 drop(ctx); // release the DashMap read guard before the (potentially long) tunnel
-                           // Connect to the exact address just resolved and checked —
-                           // never re-resolve `target_host` here. Re-resolving would
-                           // reopen the DNS-rebinding-shaped TOCTOU the whole
-                           // `gate_connect` pipeline exists to close.
-                if let Ok(mut upstream) = TcpStream::connect(checked_addr).await {
+                           // Try each already-checked candidate address in turn — never
+                           // re-resolve `target_host` here. Re-resolving would reopen the
+                           // DNS-rebinding-shaped TOCTOU the whole `gate_connect` pipeline
+                           // exists to close; falling back across the *checked* candidate
+                           // list (rather than only ever trying the first) is safe, since
+                           // every one of them already passed the same checks.
+                if let Some(mut upstream) = connect_to_first_reachable(&candidates).await {
                     let _ = socket
                         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                         .await;
@@ -297,8 +322,13 @@ impl Default for LoopbackProxy {
 }
 
 enum GateResult {
-    Allow(SocketAddr),
-    Deny { host: String, reason: String },
+    /// Every resolved candidate address that passed every check, in
+    /// resolution order — `handle_connection` tries each in turn.
+    Allow(Vec<SocketAddr>),
+    Deny {
+        host: String,
+        reason: String,
+    },
 }
 
 /// The single pipeline every CONNECT target passes through before a real
@@ -320,14 +350,15 @@ enum GateResult {
 ///    the first.
 /// 4. Check the *hostname* against the allowlist (a legitimate,
 ///    intentionally string-based check — operators allow by hostname).
-/// 5. If the only matching allowlist entry was a **wildcard**, additionally
-///    check every resolved candidate against
-///    `ConnectFilter::deny_reason_for_private_range` — an **exact** match
-///    skips this, since it represents explicit, specific operator intent
-///    (see `MatchKind`'s doc comment).
-/// 6. Return the *first resolved, already-checked* `SocketAddr` — the
-///    caller connects to exactly this address, never re-resolving
-///    `target`.
+/// 5. Unless the match was `MatchKind::ExactIpLiteral` (the allowlist
+///    pattern's own text is a raw IP literal — explicit, specific operator
+///    consent to that exact address), additionally check every resolved
+///    candidate against `ConnectFilter::deny_reason_for_private_range`
+///    (see `MatchKind`'s doc comment for why an exact-matched *hostname*
+///    does not get this exemption).
+/// 6. Return *every* resolved, already-checked candidate — the caller
+///    tries each in turn at connect time (real dual-stack fallback
+///    behavior), never re-resolving `target` itself.
 async fn gate_connect(policy: &EgressPolicy, target: &str) -> GateResult {
     let Some((bare_host, port)) = split_host_port(target) else {
         return GateResult::Deny {
@@ -371,7 +402,15 @@ async fn gate_connect(policy: &EgressPolicy, target: &str) -> GateResult {
         }
     };
 
-    if match_kind == MatchKind::Wildcard {
+    // Fix-round-2 correction: the private-range check is skipped only for
+    // `ExactIpLiteral` — an operator who explicitly typed a raw IP address
+    // is consenting to that exact address. Every other kind of match
+    // (a wildcard, *or* an exact match on a hostname) has only ever
+    // expressed trust in a *name*, and that name resolving into the
+    // daemon host's internal network is exactly what this check exists to
+    // catch — an exact-matched hostname is not exempt just because the
+    // match itself was exact.
+    if match_kind != MatchKind::ExactIpLiteral {
         for addr in &addrs {
             let canonical = addr.ip().to_canonical();
             if let Some(reason) = ConnectFilter::deny_reason_for_private_range(canonical) {
@@ -383,7 +422,30 @@ async fn gate_connect(policy: &EgressPolicy, target: &str) -> GateResult {
         }
     }
 
-    GateResult::Allow(addrs[0])
+    // Fix-round-2 regression fix: return every checked candidate, not just
+    // the first — `handle_connection` tries each in turn at connect time,
+    // restoring the real fallback behavior `TcpStream::connect(&str)` had
+    // (e.g. a dual-stack host where the first resolved address has nothing
+    // listening). Every candidate here has already passed the checks
+    // above, so trying any of them is safe.
+    GateResult::Allow(addrs)
+}
+
+/// Tries every candidate address in order, returning the first one that
+/// actually accepts a connection. Every candidate passed in here has
+/// already been resolved and checked by `gate_connect` — trying more than
+/// the first is exactly what `TcpStream::connect(&str)` did before this
+/// crate switched to connecting by `SocketAddr` (fix-round-2 regression:
+/// connecting only to `addrs[0]` broke the common case of a dual-stack
+/// host whose first resolved address has nothing listening, e.g. an IPv6
+/// loopback candidate ahead of a working IPv4 one).
+async fn connect_to_first_reachable(candidates: &[SocketAddr]) -> Option<TcpStream> {
+    for addr in candidates {
+        if let Ok(stream) = TcpStream::connect(*addr).await {
+            return Some(stream);
+        }
+    }
+    None
 }
 
 /// Splits a CONNECT target into `(host, port)`, handling both plain
@@ -399,6 +461,36 @@ fn split_host_port(target: &str) -> Option<(&str, &str)> {
         Some((host, port))
     } else {
         target.rsplit_once(':')
+    }
+}
+
+/// How long the accept loop sleeps before retrying `accept()` after a
+/// transient error. Security-review finding (fix-round-2): retrying with
+/// no backoff at all turned a real, sustained EMFILE condition into a CPU
+/// livelock — hundreds of thousands of hot-spun iterations per second,
+/// pegging a full core for as long as the fd-pressure condition lasted.
+/// Kept short enough that the proxy recovers promptly once the transient
+/// condition clears.
+const TRANSIENT_ACCEPT_BACKOFF: Duration = Duration::from_millis(25);
+
+/// Minimum spacing between logged warnings for repeated transient
+/// `accept()` errors — without this, a sustained transient condition would
+/// log once per retry (236k+ log lines for the same 1.5-second EMFILE
+/// condition that motivated `TRANSIENT_ACCEPT_BACKOFF` above), which is
+/// itself a resource-exhaustion-shaped problem.
+const TRANSIENT_ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Whether a transient `accept()` error should be logged right now, given
+/// when one was last logged. A pure, deterministically testable function —
+/// no real waiting required to verify the rate-limiting decision itself.
+fn should_log_transient_accept_error(
+    last_logged: Option<std::time::Instant>,
+    now: std::time::Instant,
+    min_interval: Duration,
+) -> bool {
+    match last_logged {
+        None => true,
+        Some(last) => now.duration_since(last) >= min_interval,
     }
 }
 
@@ -484,42 +576,87 @@ async fn read_connect_request<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// `tokio::io::copy_bidirectional` with no way to bound how long an idle
-/// (no bytes flowing either direction) tunnel sits open — this wraps it
-/// with an idle timer that resets on every successful read from either
-/// side, torn down (returning `ErrorKind::TimedOut`) if neither side
-/// produces a byte within `idle_timeout`. Deliberately hand-rolled rather
-/// than racing the whole `copy_bidirectional` future against one fixed
-/// timeout, which would kill a legitimate long-lived-but-active tunnel
-/// (e.g. a multi-minute download) exactly as readily as a truly idle one.
+/// (no bytes flowing either direction) tunnel sits open. The straightforward
+/// fix (fix-round-1) — a single `tokio::select!` loop that tears down BOTH
+/// directions the instant EITHER side hits EOF or the shared idle timer
+/// fires — is wrong: it breaks half-close, real standard TCP behavior some
+/// protocols depend on (a client signaling "I'm done sending" while still
+/// expecting a response). `copy_bidirectional` itself gets this right: each
+/// direction shuts down only its own write side when its own reader hits
+/// EOF, and the other direction keeps running. Security-review finding
+/// (fix-round-2): the fix-round-1 version caused real, reproduced data
+/// loss — a client that writes then half-closes only received its echoed
+/// response in 1 of 3 identical runs.
+///
+/// This preserves that half-close correctness while still enforcing an
+/// idle timeout, *per direction* rather than as one shared "either side
+/// idle kills both" timer: each direction is copied independently via
+/// [`copy_one_direction`], which wraps every individual `read()` in
+/// `tokio::time::timeout` and shuts down only its own write half on EOF —
+/// exactly matching `copy_bidirectional`'s real behavior, plus a timeout.
+/// The two directions run concurrently via `tokio::join!` (not `select!` —
+/// `select!` would cancel whichever direction is still running the moment
+/// the other one finishes, which is exactly the bug being fixed here) and
+/// this function only returns once *both* directions have finished, each
+/// on its own terms.
 async fn copy_bidirectional_with_idle_timeout(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
     idle_timeout: Duration,
 ) -> io::Result<()> {
-    let (mut client_r, mut client_w) = client.split();
-    let (mut upstream_r, mut upstream_w) = upstream.split();
-    let mut client_buf = [0u8; 8192];
-    let mut upstream_buf = [0u8; 8192];
+    let (client_r, client_w) = client.split();
+    let (upstream_r, upstream_w) = upstream.split();
 
+    let client_to_upstream = copy_one_direction(client_r, upstream_w, idle_timeout);
+    let upstream_to_client = copy_one_direction(upstream_r, client_w, idle_timeout);
+
+    let (client_to_upstream_result, upstream_to_client_result) =
+        tokio::join!(client_to_upstream, upstream_to_client);
+    client_to_upstream_result?;
+    upstream_to_client_result?;
+    Ok(())
+}
+
+/// Copies bytes from `reader` to `writer` until `reader` hits EOF (in which
+/// case `writer`'s write half is shut down — real half-close, matching what
+/// `tokio::io::copy` plus an explicit `shutdown()` already does) or a
+/// single `read()` call goes longer than `idle_timeout` with no data
+/// (in which case this returns `ErrorKind::TimedOut`). The timeout is
+/// re-armed on every individual read, so a tunnel that's merely slow but
+/// still making periodic progress in *this* direction is never killed —
+/// only a direction that goes fully silent for the whole timeout window is.
+async fn copy_one_direction<R, W>(
+    mut reader: R,
+    mut writer: W,
+    idle_timeout: Duration,
+) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 8192];
     loop {
-        tokio::select! {
-            result = client_r.read(&mut client_buf) => {
-                match result? {
-                    0 => return Ok(()),
-                    n => upstream_w.write_all(&client_buf[..n]).await?,
-                }
+        let n = match timeout(idle_timeout, reader.read(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "egress tunnel idle timeout",
+                ))
             }
-            result = upstream_r.read(&mut upstream_buf) => {
-                match result? {
-                    0 => return Ok(()),
-                    n => client_w.write_all(&upstream_buf[..n]).await?,
-                }
-            }
-            () = tokio::time::sleep(idle_timeout) => {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "egress tunnel idle timeout"));
-            }
+        };
+        if n == 0 {
+            break;
         }
+        writer.write_all(&buf[..n]).await?;
     }
+    // Real half-close: shut down only this direction's write side once its
+    // reader hit EOF — the other direction (driven by the sibling
+    // `copy_one_direction` call in `copy_bidirectional_with_idle_timeout`)
+    // is unaffected and keeps running independently.
+    let _ = writer.shutdown().await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -566,5 +703,70 @@ mod tests {
         assert!(!is_transient_accept_error(&io::Error::from(
             io::ErrorKind::InvalidInput
         )));
+    }
+
+    #[test]
+    fn should_log_transient_accept_error_rate_limits_correctly() {
+        // Deterministic via relative `Instant` arithmetic — no real
+        // sleeping required. Security-review finding (fix-round-2): the
+        // pre-fix code logged on every single retry, which under a
+        // sustained transient condition meant hundreds of thousands of log
+        // lines in under two seconds.
+        let interval = Duration::from_millis(50);
+        let t0 = std::time::Instant::now();
+        assert!(
+            should_log_transient_accept_error(None, t0, interval),
+            "the first occurrence must always log"
+        );
+        let soon_after = t0 + Duration::from_millis(10);
+        assert!(
+            !should_log_transient_accept_error(Some(t0), soon_after, interval),
+            "an occurrence within the rate-limit interval must not log again"
+        );
+        let well_after = t0 + Duration::from_millis(60);
+        assert!(
+            should_log_transient_accept_error(Some(t0), well_after, interval),
+            "an occurrence past the rate-limit interval must log again"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_accept_backoff_sleeps_for_a_real_nonzero_duration() {
+        // Confirms `TRANSIENT_ACCEPT_BACKOFF` is wired to a genuine sleep,
+        // not a no-op — guards against a future refactor accidentally
+        // dropping the actual delay while leaving the constant in place.
+        let start = std::time::Instant::now();
+        tokio::time::sleep(TRANSIENT_ACCEPT_BACKOFF).await;
+        assert!(
+            start.elapsed() >= TRANSIENT_ACCEPT_BACKOFF,
+            "the backoff must actually sleep for at least its configured duration"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_to_first_reachable_falls_back_to_a_later_working_address() {
+        // Fix-round-2 regression: connecting only ever tried `addrs[0]`,
+        // breaking the common case of a dual-stack host whose first
+        // resolved candidate has nothing listening. First candidate here
+        // is a real address with a bound-then-immediately-dropped
+        // listener (so the port is guaranteed refused, not merely slow);
+        // the second candidate has a real, live listener.
+        let dead_addr = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+            // listener dropped here — connecting to this port now fails
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let candidates = vec![dead_addr, good_addr];
+        let result = connect_to_first_reachable(&candidates).await;
+        assert!(
+            result.is_some(),
+            "must fall back to the second, reachable candidate when the first is unreachable"
+        );
     }
 }

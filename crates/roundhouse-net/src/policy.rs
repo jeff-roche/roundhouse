@@ -32,6 +32,7 @@
 //! TOCTOU the string-only design had no defense against at all).
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::str::FromStr;
 
 /// §6.6's two physically separated lanes. The control lane (provider APIs,
 /// `web` search backends, ACP transports, telemetry) is the daemon's own;
@@ -54,19 +55,33 @@ pub(crate) fn normalize_host(host: &str) -> String {
     host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
 }
 
-/// Whether a host matched an allowlist entry via an **exact** pattern or a
-/// **wildcard-suffix** one. `proxy.rs`'s `gate_connect` uses this
-/// distinction to decide whether to additionally deny a private/loopback/
-/// link-local resolved address: an exact entry (e.g. an operator literally
-/// allowlisting `"127.0.0.1"`) is explicit, deliberate operator intent and
-/// is trusted as-is; a wildcard entry (e.g. `"*.example.com"`) only ever
-/// expresses trust in a *hostname*, and a hostname unexpectedly resolving
-/// into the daemon host's internal network (accidentally, or via a
-/// DNS-rebinding-shaped record change) is exactly the shape of bug/attack
-/// this distinction exists to catch.
+/// Whether, and how, a host matched an allowlist entry. `proxy.rs`'s
+/// `gate_connect` uses this to decide whether to additionally deny a
+/// private/loopback/link-local resolved address:
+///
+/// - `ExactIpLiteral` — the matching pattern's own text parses as a raw
+///   `IpAddr` (e.g. `exact("127.0.0.1")`). An operator who explicitly typed
+///   a literal IP address is consenting to *that specific address*, full
+///   stop — this is the only case the private-range check does not
+///   second-guess.
+/// - `ExactHostname` — the matching pattern's text does *not* parse as an
+///   `IpAddr` (e.g. `exact("internal.example.com")`), even though the
+///   match itself was exact. **Fix-round-2 correction:** an earlier version
+///   of this distinction exempted every exact match, including hostnames —
+///   but an operator typing a *name* is consenting to that name, not to
+///   whatever address it happens to resolve to now or after a later DNS
+///   change. Only a literal-IP exact match is exempt; an exact-matched
+///   hostname is treated the same as a wildcard for the private-range
+///   check.
+/// - `Wildcard` — matched via a `*.`-suffix pattern. Only ever expresses
+///   trust in a *hostname*, and a hostname unexpectedly resolving into the
+///   daemon host's internal network (accidentally, or via a
+///   DNS-rebinding-shaped record change) is exactly the shape of bug/attack
+///   this distinction exists to catch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MatchKind {
-    Exact,
+    ExactIpLiteral,
+    ExactHostname,
     Wildcard,
 }
 
@@ -115,7 +130,13 @@ impl HostPattern {
     pub(crate) fn match_kind(&self, host: &str) -> Option<MatchKind> {
         let host = normalize_host(host);
         match &self.0 {
-            HostPatternKind::Exact(exact) => (host == *exact).then_some(MatchKind::Exact),
+            HostPatternKind::Exact(exact) => (host == *exact).then(|| {
+                if IpAddr::from_str(exact).is_ok() {
+                    MatchKind::ExactIpLiteral
+                } else {
+                    MatchKind::ExactHostname
+                }
+            }),
             HostPatternKind::WildcardSuffix(suffix) => {
                 let matched =
                     host == *suffix || host.ends_with(&format!(".{suffix}")) || suffix.is_empty();
@@ -136,20 +157,28 @@ impl EgressPolicy {
         self.allowed_hosts.iter().any(|p| p.matches(host))
     }
 
-    /// Prefers `MatchKind::Exact` if *any* pattern matches exactly, even if
-    /// a wildcard pattern also matches the same host — an explicit exact
-    /// entry is always at least as trusted as a wildcard one covering the
+    /// Returns the highest-trust `MatchKind` among every pattern that
+    /// matches `host`, in priority order `ExactIpLiteral` >
+    /// `ExactHostname` > `Wildcard` — an explicit exact-IP-literal entry is
+    /// always at least as trusted as any other kind of match covering the
     /// same host, never less.
     pub(crate) fn match_kind(&self, host: &str) -> Option<MatchKind> {
-        let mut wildcard_matched = false;
+        let mut best: Option<MatchKind> = None;
         for pattern in &self.allowed_hosts {
-            match pattern.match_kind(host) {
-                Some(MatchKind::Exact) => return Some(MatchKind::Exact),
-                Some(MatchKind::Wildcard) => wildcard_matched = true,
-                None => {}
-            }
+            let Some(kind) = pattern.match_kind(host) else {
+                continue;
+            };
+            best = Some(match (best, kind) {
+                (Some(MatchKind::ExactIpLiteral), _) | (_, MatchKind::ExactIpLiteral) => {
+                    MatchKind::ExactIpLiteral
+                }
+                (Some(MatchKind::ExactHostname), _) | (_, MatchKind::ExactHostname) => {
+                    MatchKind::ExactHostname
+                }
+                _ => MatchKind::Wildcard,
+            });
         }
-        wildcard_matched.then_some(MatchKind::Wildcard)
+        best
     }
 }
 
@@ -203,28 +232,42 @@ impl ConnectFilter {
         }
     }
 
-    /// Denies loopback/private/link-local ranges. Only consulted by
-    /// `proxy.rs`'s `gate_connect` when the matching allowlist entry was a
-    /// **wildcard**, not an exact host — an operator who explicitly
-    /// allowlists `"127.0.0.1"` (or any other specific host) by its exact
-    /// name has given deliberate, specific consent that this check does
-    /// not second-guess; a broad `"*.example.com"`-shaped entry has only
-    /// ever expressed trust in a *hostname*, and that hostname resolving
-    /// into the daemon host's own internal network is exactly the
-    /// SSRF/DNS-rebinding shape this exists to catch. `ip` must already be
-    /// canonicalized by the caller, same as
-    /// [`Self::deny_reason_for_metadata_ip`].
+    /// Denies unspecified/loopback/private/link-local ranges. Only
+    /// consulted by `proxy.rs`'s `gate_connect` when the matching allowlist
+    /// entry's `MatchKind` is not `ExactIpLiteral` — an operator who
+    /// explicitly typed a literal IP address (e.g. `exact("127.0.0.1")`)
+    /// has given deliberate, specific consent to that exact address, which
+    /// this check does not second-guess; anything else (a hostname, even
+    /// via an exact match, or a wildcard) has only ever expressed trust in
+    /// a *name*, and that name resolving into the daemon host's own
+    /// internal network is exactly the SSRF/DNS-rebinding shape this
+    /// exists to catch. `ip` must already be canonicalized by the caller,
+    /// same as [`Self::deny_reason_for_metadata_ip`].
+    ///
+    /// **Fix-round-2 addition:** `is_unspecified()` — on Linux, connecting
+    /// to the unspecified address (`0.0.0.0`, or any of its equivalent
+    /// spellings: `0`, `0x0`, decimal/octal/hex forms, or the
+    /// IPv4-mapped-IPv6 `::ffff:0.0.0.0`) actually connects to
+    /// `127.0.0.1` — a real, live bypass the original loopback/private/
+    /// link-local checks alone did not catch, confirmed by an
+    /// end-to-end byte-tunnel reproduction against all four listed
+    /// spellings.
     pub fn deny_reason_for_private_range(ip: IpAddr) -> Option<String> {
         let denied = match ip {
-            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+            IpAddr::V4(v4) => {
+                v4.is_unspecified() || v4.is_loopback() || v4.is_private() || v4.is_link_local()
+            }
             IpAddr::V6(v6) => {
-                v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
+                v6.is_unspecified()
+                    || v6.is_loopback()
+                    || v6.is_unique_local()
+                    || v6.is_unicast_link_local()
             }
         };
         denied.then(|| {
             format!(
-                "{ip} is in a private/loopback/link-local range, only reachable via an \
-                 explicit exact-host allowlist entry, not a wildcard match"
+                "{ip} is unspecified/loopback/private/link-local, only reachable via an \
+                 allowlist entry that is itself an exact, literal IP address"
             )
         })
     }
@@ -254,9 +297,25 @@ mod tests {
         // Fix-round-1 regression: `exact("*.foo")` must not be silently
         // reinterpreted as a wildcard pattern.
         let pattern = HostPattern::exact("*.foo");
-        assert_eq!(pattern.match_kind("*.foo"), Some(MatchKind::Exact));
+        assert_eq!(pattern.match_kind("*.foo"), Some(MatchKind::ExactHostname));
         assert_eq!(pattern.match_kind("bar.foo"), None);
         assert_eq!(pattern.match_kind("foo"), None);
+    }
+
+    #[test]
+    fn exact_pattern_distinguishes_ip_literal_from_hostname() {
+        assert_eq!(
+            HostPattern::exact("127.0.0.1").match_kind("127.0.0.1"),
+            Some(MatchKind::ExactIpLiteral)
+        );
+        assert_eq!(
+            HostPattern::exact("::1").match_kind("::1"),
+            Some(MatchKind::ExactIpLiteral)
+        );
+        assert_eq!(
+            HostPattern::exact("internal.example.com").match_kind("internal.example.com"),
+            Some(MatchKind::ExactHostname)
+        );
     }
 
     #[test]
@@ -299,12 +358,33 @@ mod tests {
                 HostPattern::exact("api.example.com"),
             ],
         };
-        assert_eq!(policy.match_kind("api.example.com"), Some(MatchKind::Exact));
+        assert_eq!(
+            policy.match_kind("api.example.com"),
+            Some(MatchKind::ExactHostname)
+        );
         assert_eq!(
             policy.match_kind("other.example.com"),
             Some(MatchKind::Wildcard)
         );
         assert_eq!(policy.match_kind("unrelated.example"), None);
+    }
+
+    #[test]
+    fn egress_policy_match_kind_prefers_exact_ip_literal_over_everything() {
+        let policy = EgressPolicy {
+            allowed_hosts: vec![
+                HostPattern::wildcard_suffix(""),
+                HostPattern::exact("127.0.0.1"),
+            ],
+        };
+        assert_eq!(
+            policy.match_kind("127.0.0.1"),
+            Some(MatchKind::ExactIpLiteral)
+        );
+        assert_eq!(
+            policy.match_kind("other.example"),
+            Some(MatchKind::Wildcard)
+        );
     }
 
     #[test]
@@ -332,5 +412,31 @@ mod tests {
             ConnectFilter::deny_reason_for_private_range("93.184.216.34".parse().unwrap())
                 .is_none()
         );
+    }
+
+    /// Fix-round-2 Critical: on Linux, connecting to the unspecified
+    /// address (in any of its equivalent spellings — `0.0.0.0`, `0`,
+    /// `0x0`, and the IPv4-mapped-IPv6 `::ffff:0.0.0.0`) actually connects
+    /// to `127.0.0.1` — a live bypass the re-review confirmed with a real,
+    /// byte-tunnel-verified connection through the proxy under a wildcard
+    /// allow-all policy. Every one of those textual spellings resolves
+    /// (via `tokio::net::lookup_host`, per `proxy.rs`'s
+    /// `nine_alternate_encodings...`-style resolution) to one of the two
+    /// canonical `IpAddr` values this test checks directly — this is the
+    /// pure decision-logic test; `tests/proxy_hermetic.rs` has the
+    /// end-to-end wire-level regression test using the literal alternate
+    /// spellings.
+    #[test]
+    fn deny_reason_for_private_range_covers_unspecified_address_in_every_spelling() {
+        // `0.0.0.0`, `0`, and `0x0` all resolve to this canonical IPv4
+        // value.
+        assert!(ConnectFilter::deny_reason_for_private_range("0.0.0.0".parse().unwrap()).is_some());
+        // `[::ffff:0.0.0.0]`, canonicalized (as every caller in this crate
+        // is required to do before calling this function), collapses to
+        // the same IPv4 value above.
+        let mapped: IpAddr = "::ffff:0.0.0.0".parse().unwrap();
+        assert!(ConnectFilter::deny_reason_for_private_range(mapped.to_canonical()).is_some());
+        // The plain IPv6 unspecified address.
+        assert!(ConnectFilter::deny_reason_for_private_range("::".parse().unwrap()).is_some());
     }
 }

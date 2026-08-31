@@ -9,7 +9,15 @@
 //! TOCTOU) and its four Important findings (unbounded CONNECT-preamble
 //! read; no handshake/idle timeouts or connection cap; accept-loop death on
 //! transient errors; unsanitized attacker-controlled text landing in a
-//! durable event).
+//! durable event) — plus fix-round-2 regression tests for a live
+//! completion gap in the fix-round-1 private-range check (the unspecified
+//! address, `0.0.0.0` and its equivalent spellings, actually connects to
+//! `127.0.0.1` on Linux) and a residual hole in the exact-match exemption
+//! (an exact-matched *hostname*, as opposed to an exact-matched raw IP
+//! literal, was still exempted from the private-range check) plus the two
+//! Important regressions fix-round-1 itself introduced (half-close broken
+//! by the idle-timeout replacement; only the first resolved address ever
+//! tried at connect time).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,6 +76,25 @@ async fn spawn_silent_upstream() -> std::net::SocketAddr {
             let mut sock = sock;
             let mut buf = [0u8; 1];
             let _ = sock.read(&mut buf).await;
+        }
+    });
+    addr
+}
+
+/// A hermetic upstream that reads until its peer half-closes (EOF), then
+/// echoes back everything it read, then drops (closing its own write side
+/// too). Used to prove half-close survives the proxy: a client that writes
+/// then shuts down its write half must still receive this full response —
+/// which requires the proxy's client->upstream direction finishing (on
+/// EOF) to not also tear down the upstream->client direction.
+async fn spawn_echo_after_eof_upstream() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut received = Vec::new();
+            let _ = sock.read_to_end(&mut received).await;
+            let _ = sock.write_all(&received).await;
         }
     });
     addr
@@ -451,3 +478,131 @@ async fn control_characters_in_a_denied_target_are_sanitized_in_the_recorded_eve
         "the recorded event text must never contain raw control characters, got: {note_text:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Fix-round-2 regression tests: a live completion gap in the round-1
+// private-range check (Critical), a residual hole in the exact-match
+// exemption (Critical), and the two Important regressions round 1 itself
+// introduced (half-close breakage, single-address connect).
+// ---------------------------------------------------------------------
+
+/// Critical (completion): on Linux, connecting to the unspecified address
+/// actually connects to `127.0.0.1` — the re-review reproduced a real,
+/// byte-tunnel-confirmed working connection through the proxy, under the
+/// exact wildcard allow-all policy `wildcard_allowlisted_host_resolving_to_
+/// a_loopback_address_is_denied` above claims to protect, using every one
+/// of these four spellings. `deny_reason_for_private_range` gained an
+/// `is_unspecified()` check to close this.
+#[tokio::test]
+async fn unspecified_address_bypasses_are_all_denied_under_allow_all_policy() {
+    let (_dir, _db_path, writer) = fresh_writer().await;
+    let proxy = Arc::new(LoopbackProxy::new());
+    let policy = EgressPolicy {
+        allowed_hosts: vec![HostPattern::wildcard_suffix("")],
+    };
+    let token = proxy.register_session(SessionId::new(), policy);
+    let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+
+    let encodings = ["0.0.0.0:80", "0:80", "0x0:80", "[::ffff:0.0.0.0]:80"];
+    for target in encodings {
+        let (status, _sock) = send_connect(proxy_addr, &token, target).await;
+        assert_eq!(
+            status, 403,
+            "unspecified-address spelling `{target}` must be denied — on Linux it connects to 127.0.0.1"
+        );
+    }
+}
+
+/// Critical (completion): the exact-match exemption from the private-range
+/// check must only apply when the matching allowlist PATTERN ITSELF is a
+/// raw IP literal — not merely "the match was exact." An operator typing
+/// `exact("localhost")` is consenting to a NAME, not to whatever address
+/// that name resolves to. `localhost` resolves (in this environment,
+/// confirmed via `getent hosts localhost`) to `::1`, a loopback address —
+/// so an exact-matched hostname allowlist entry must still be denied here,
+/// while an exact-matched raw IP literal (the crate's own hermetic test
+/// design, `allowed_host_gets_200_and_a_real_tunnel` above) continues to
+/// work.
+#[tokio::test]
+async fn exact_matched_hostname_resolving_to_loopback_is_denied_unlike_an_exact_ip_literal() {
+    let (_dir, _db_path, writer) = fresh_writer().await;
+    let proxy = Arc::new(LoopbackProxy::new());
+    let policy = EgressPolicy {
+        allowed_hosts: vec![HostPattern::exact("localhost")],
+    };
+    let token = proxy.register_session(SessionId::new(), policy);
+    let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+
+    let (status, _sock) = send_connect(proxy_addr, &token, "localhost:80").await;
+    assert_eq!(
+        status, 403,
+        "an exact-matched hostname (not a raw IP literal) resolving to a loopback address must be denied"
+    );
+}
+
+/// Important (fix-round-1 regression): the fix-round-1 idle-timeout
+/// replacement tore down BOTH tunnel directions the instant EITHER side
+/// hit EOF, breaking half-close — real, standard TCP behavior some
+/// protocols depend on. The re-review reproduced actual data loss: a
+/// client that writes then shuts down its write half only received the
+/// echoed response in 1 of 3 identical runs. This drives that exact
+/// sequence — write, shutdown, read — and requires the full response to
+/// arrive every time.
+#[tokio::test]
+async fn half_close_after_write_still_receives_the_full_response() {
+    let (_dir, _db_path, writer) = fresh_writer().await;
+    let upstream_addr = spawn_echo_after_eof_upstream().await;
+    let target = format!("127.0.0.1:{}", upstream_addr.port());
+
+    let proxy = Arc::new(LoopbackProxy::new());
+    let policy = EgressPolicy {
+        allowed_hosts: vec![HostPattern::exact("127.0.0.1")],
+    };
+    let token = proxy.register_session(SessionId::new(), policy);
+    let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+
+    let (status, mut sock) = send_connect(proxy_addr, &token, &target).await;
+    assert_eq!(status, 200);
+
+    let payload = b"half-close-regression-test-payload";
+    sock.write_all(payload).await.unwrap();
+    // Signal "I'm done sending" while still expecting a response — real
+    // half-close. The pre-fix (fix-round-1) tunnel implementation tore
+    // down the upstream->client direction as soon as this direction's EOF
+    // was observed, non-deterministically losing the response.
+    sock.shutdown().await.unwrap();
+
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut response))
+        .await
+        .expect("must not hang waiting for the response")
+        .unwrap();
+    assert_eq!(
+        response, payload,
+        "a client that shuts down its write half after sending must still receive the full echoed response"
+    );
+}
+
+// Important (fix-round-1 regression): connecting only ever tried the first
+// resolved candidate address. The re-review reproduced a genuine
+// regression with `exact("localhost")` allowlisted and an echo server
+// bound only on `127.0.0.1`: `lookup_host("localhost")` returns the IPv6
+// loopback candidate first (confirmed via a standalone check against this
+// environment: `[::1]`, then `127.0.0.1`), nothing listens there, and —
+// with no fallback — every CONNECT spuriously 502'd even though the
+// working `127.0.0.1` candidate was right there in the already-checked
+// list.
+//
+// The deterministic, environment-independent regression test for this
+// finding is `connect_to_first_reachable_falls_back_to_a_later_working_
+// address` in `crates/roundhouse-net/src/proxy.rs`'s own unit test module:
+// it constructs exactly the "first candidate unreachable, second candidate
+// reachable" shape directly (a dropped-listener dead port, then a live
+// one) rather than depending on a specific real hostname's DNS resolution
+// order, which the test binary running in a different environment (or a
+// future change to this host's `/etc/hosts`/nsswitch config) could not
+// otherwise guarantee. `exact_matched_hostname_resolving_to_loopback_is_
+// denied_unlike_an_exact_ip_literal` above also confirms, through the real
+// wire protocol, that `exact("localhost")` now correctly reaches the
+// private-range deny path at all (which is what made the original
+// 502-not-403 regression observable in the first place).
