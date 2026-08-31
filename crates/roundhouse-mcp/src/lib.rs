@@ -11,6 +11,8 @@
 //! `07-protocols-acp-mcp.md`.
 #![forbid(unsafe_code)]
 
+pub mod config;
+
 #[cfg(test)]
 mod smoke {
     #[test]
