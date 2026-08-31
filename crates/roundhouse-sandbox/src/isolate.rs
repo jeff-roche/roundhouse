@@ -13,6 +13,13 @@ use std::sync::Mutex;
 pub(crate) struct HandleMeta {
     pub tier: Tier,
     pub bwrap_pid: Option<u32>,
+    /// `true` only if bwrap's own `--info-fd` mechanism confirmed namespace/mount
+    /// setup actually completed for this handle's spawned process (fix-round-2
+    /// security-review finding: `bwrap_pid.is_some()` alone only proves fork/exec of
+    /// the bwrap binary succeeded, not that its `unshare(2)` calls did — see
+    /// `bwrap::spawn_under_bwrap`'s doc comment for the full rationale). `attest()`
+    /// keys `net_enforced` off this, not `bwrap_pid.is_some()`.
+    pub bwrap_namespace_confirmed: bool,
     /// Kept alive here (not dropped) so tokio can still reap the process; a bare `pid:
     /// u32` on the frozen `Child` type has nowhere else for the live handle to live.
     pub child_handle: Option<tokio::process::Child>,
@@ -179,6 +186,7 @@ impl Isolate for BwrapLandlockIsolate {
             HandleMeta {
                 tier,
                 bwrap_pid: None,
+                bwrap_namespace_confirmed: false,
                 child_handle: None,
             },
         );
@@ -208,11 +216,12 @@ impl Isolate for BwrapLandlockIsolate {
             )
         })?;
         let seccomp_bpf = self.seccomp_bpf_for_spawn()?;
-        let (child, live_handle) =
+        let (child, live_handle, namespace_confirmed) =
             crate::bwrap::spawn_under_bwrap(&self.bwrap_path, &workspace_root, cmd, seccomp_bpf)
                 .await?;
         if let Some(mut meta) = self.handles.get_mut(&h.id) {
             meta.bwrap_pid = Some(child.pid);
+            meta.bwrap_namespace_confirmed = namespace_confirmed;
             meta.child_handle = Some(live_handle); // keeps tokio able to reap the process
         }
         Ok(child)
@@ -233,10 +242,34 @@ impl Isolate for BwrapLandlockIsolate {
     /// `Sandbox`. See `achieved_tier()`'s doc comment for the full per-mechanism
     /// breakdown and the tracked follow-up (a pre-exec wrapper) that would close this.
     fn attest(&self, h: &Handle) -> Attestation {
-        let meta = self.handles.get(&h.id);
-        let (tier, bwrap_pid) = meta
-            .map(|m| (m.tier, m.bwrap_pid))
-            .unwrap_or((Tier::None, None));
+        // Mutable borrow (not just `get`): fix-round-2 security-review finding —
+        // attestation must reflect whether the sandboxed child is *still actually
+        // running* at the moment this specific `attest()` call happens, not just
+        // whatever was true when `spawn()` returned. A task row written after the
+        // child has already exited (on its own, not via `teardown()`, which would
+        // have removed this handle from `self.handles` entirely) must not keep
+        // claiming live network enforcement that no longer exists. `try_wait()` is a
+        // cheap, non-blocking, synchronous liveness check — `Ok(None)` means still
+        // running, anything else (exited, or no live handle to check at all) means
+        // there is nothing left to attest enforcement for.
+        let mut meta = self.handles.get_mut(&h.id);
+        let (tier, bwrap_pid, bwrap_namespace_confirmed, still_running) =
+            if let Some(m) = meta.as_mut() {
+                let still_running = match m.child_handle.as_mut() {
+                    Some(child) => matches!(child.try_wait(), Ok(None)),
+                    None => false, // never spawned (prepare()-only handle) — nothing to be running
+                };
+                (
+                    m.tier,
+                    m.bwrap_pid,
+                    m.bwrap_namespace_confirmed,
+                    still_running,
+                )
+            } else {
+                (Tier::None, None, false, false)
+            };
+        drop(meta); // release the DashMap shard lock before the rest of this synchronous call
+
         let digest = blake3::hash(format!("{}:{tier:?}:{bwrap_pid:?}", h.id).as_bytes())
             .to_hex()
             .to_string();
@@ -250,17 +283,24 @@ impl Isolate for BwrapLandlockIsolate {
         // Security-review finding (fix-round-1): mapping tier alone to a mechanism
         // made `net_enforced` definitionally identical to the old
         // `matches!(tier, Sandbox | Container | Remote)` line for exactly that
-        // reason — a rename, not an honesty fix. `bwrap_pid.is_some()` is this
-        // struct's own record of whether bwrap demonstrably ran (set only in
-        // `spawn()`, on a real child), so gate the `Sandbox` arm on it: no live
-        // bwrap process for this handle means no real Bubblewrap network
-        // enforcement to attest to, regardless of what tier was declared/probed.
-        // `Container`/`Remote` are unreachable in this implementation today (no
-        // netns/remote executor exists yet), so their mapping is moot for now and
-        // left as `Netns`/true per the doc table.
+        // reason — a rename, not an honesty fix.
+        //
+        // Security-review finding (fix-round-2): gating on bare `bwrap_pid.is_some()`
+        // only proved a fork/exec succeeded, not that bwrap's own namespace setup
+        // did — a bwrap process that starts and immediately fails with "Creating new
+        // namespace failed: Operation not permitted" still set `bwrap_pid` before
+        // dying. Gate on `bwrap_namespace_confirmed` instead — set only when
+        // `bwrap::spawn_under_bwrap`'s `--info-fd` wiring got a real confirmation
+        // that setup completed (see that function's doc comment) — and additionally
+        // on `still_running`, so a since-exited child no longer attests to
+        // enforcement it no longer provides. `Container`/`Remote` are unreachable in
+        // this implementation today (no netns/remote executor exists yet), so their
+        // mapping is moot for now and left as `Netns`/true per the doc table.
         let mechanism = match tier {
-            Tier::Sandbox if bwrap_pid.is_some() => NetworkMechanism::Bubblewrap,
-            Tier::Sandbox => NetworkMechanism::None, // prepared but never spawned, or spawn failed
+            Tier::Sandbox if bwrap_namespace_confirmed && still_running => {
+                NetworkMechanism::Bubblewrap
+            }
+            Tier::Sandbox => NetworkMechanism::None, // never spawned, spawn failed, or since exited
             Tier::Container | Tier::Remote => NetworkMechanism::Netns, // unreachable today, forward-safe
             Tier::None | Tier::Worktree => NetworkMechanism::None,
         };

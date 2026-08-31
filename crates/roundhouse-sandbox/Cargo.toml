@@ -24,11 +24,23 @@ libc = "0.2"
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
 async-trait = "0.1"
-tokio = { workspace = true, features = ["process", "rt"] }
+tokio = { workspace = true, features = ["process", "rt", "net", "time", "io-util"] }
 thiserror = "2.0"
 dashmap = "6"
 blake3 = "1"
 uuid = { version = "1", features = ["v4"] }
+# Task 24 fix-round-2 (security-review finding): `bwrap.rs::spawn_under_bwrap` wires
+# up bwrap's own `--info-fd` mechanism as a real, synchronous confirmation that
+# namespace setup actually completed (not just that fork/exec succeeded) — the
+# authoritative signal `isolate.rs::attest()` needs to compute `net_enforced`
+# honestly rather than assuming a spawned bwrap process's namespace came up.
+# `command-fds`'s own unsafe `pre_exec` internals are unrelated to this crate's own
+# `unsafe_code = "deny"` lint (that only governs code written in this crate) — same
+# posture as `landlock`/`seccompiler` above, both of which also wrap raw syscalls
+# internally. The `tokio` feature flag switches its `CommandFdExt` impl to target
+# `tokio::process::Command` (what `spawn_under_bwrap` already uses) instead of
+# `std::process::Command`.
+command-fds = { version = "0.3", features = ["tokio"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

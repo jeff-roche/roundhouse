@@ -38,10 +38,11 @@ async fn http_task_execution_only_ever_reaches_an_allowlisted_host_through_the_p
         allowed_hosts: vec![HostPattern::exact("example.invalid")],
     };
     let session_id = SessionId::new();
-    let addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    // register_session now takes the proxy's bound address too (this task's edit to
-    // Task 23's signature) and returns a ProxyHandle bundling both.
-    let handle = proxy.register_session(session_id, policy, addr);
+    // register_session (fix-round-2) reads the proxy's own bound address, set by
+    // serve() below, rather than trusting a caller-supplied one — so serve() must
+    // run first, and register_session can now fail if it hasn't.
+    proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(session_id, policy).unwrap();
 
     // Constructing the executor is only possible with a ProxyHandle — there is no
     // other public constructor, so an http task literally cannot bypass the proxy
@@ -86,10 +87,21 @@ async fn http_task_execution_actually_tunnels_an_allowlisted_request_through_the
     // handshake — but that failure has a distinct shape from a proxy-level deny, which
     // is exactly what this test uses to prove the tunnel was actually established
     // rather than the request being rejected before ever reaching the upstream.
+    //
+    // Fix-round-2 finding (N3): asserting only on the *shape* of the resulting error
+    // (e.g. "doesn't mention TunnelUnsuccessful") is too weak — a dead proxy address
+    // produces a `ConnectionRefused` error that also doesn't mention that string, so
+    // that assertion alone can't tell "reached the upstream through a real tunnel"
+    // apart from "never reached any proxy at all". Have the upstream signal on a
+    // channel the moment it actually accepts a connection, and assert on that
+    // positive signal directly — the real proof the tunnel was established — in
+    // addition to the error-shape check.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
+            let _ = accepted_tx.send(());
             use tokio::io::AsyncWriteExt;
             // A real TCP accept happened, but no TLS ServerHello is ever sent —
             // reqwest's TLS handshake fails to parse whatever bytes (if any) show up.
@@ -101,8 +113,8 @@ async fn http_task_execution_actually_tunnels_an_allowlisted_request_through_the
     let policy = EgressPolicy {
         allowed_hosts: vec![HostPattern::exact("127.0.0.1")],
     };
-    let addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    let handle = proxy.register_session(SessionId::new(), policy, addr);
+    proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(SessionId::new(), policy).unwrap();
 
     let executor = HttpTaskExecutor::via_proxy(&handle);
     let url = format!("https://127.0.0.1:{}/", upstream_addr.port());
@@ -111,14 +123,22 @@ async fn http_task_execution_actually_tunnels_an_allowlisted_request_through_the
         .await
         .expect_err("the hermetic upstream never speaks TLS, so this must fail");
 
+    // The positive signal: the hermetic upstream itself confirms a real TCP
+    // connection reached it — this cannot be produced by a denied request (which
+    // never leaves the proxy) or a dead/misconfigured proxy address (which never
+    // reaches the upstream at all).
+    tokio::time::timeout(std::time::Duration::from_secs(2), accepted_rx)
+        .await
+        .expect("timed out waiting for the hermetic upstream to accept a connection")
+        .expect("the accept-signal sender was dropped without sending");
+
     // A denied request fails with `TunnelUnsuccessful` (the CONNECT itself was
     // rejected by the proxy with a non-200 status) — verified directly against this
     // proxy in the sibling deny-path test above. A failure at the TLS layer, after a
     // real 200 Connection Established tunnel, looks different: reqwest/hyper report it
     // as a connect-phase error whose *source* is a TLS parse failure, not a tunnel
-    // rejection. Asserting the debug text does NOT mention `TunnelUnsuccessful` proves
-    // this request got past the proxy's allowlist check and into a real tunnel to the
-    // upstream, rather than being denied or never reaching any proxy at all.
+    // rejection. This is a secondary corroborating check now that the positive signal
+    // above is the real proof.
     let debug = format!("{err:?}");
     assert!(
         !debug.contains("TunnelUnsuccessful"),

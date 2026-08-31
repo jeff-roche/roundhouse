@@ -46,12 +46,20 @@ impl HttpTaskExecutor {
             .expect("proxy URL is always well-formed — built from a real SocketAddr")
             .custom_http_auth(
                 reqwest::header::HeaderValue::from_str(&auth_header)
-                    // Genuinely unreachable, not just unlikely: `ProxyHandle`'s only
-                    // constructor is `LoopbackProxy::register_session` (fix-round-1
-                    // made its fields private, see `roundhouse-net`'s
-                    // `tests/compile_fail.rs`), which always mints the token as
-                    // `format!("rh-{}", Uuid::new_v4())` — never attacker-influenced,
-                    // never containing CRLF or other invalid header bytes.
+                    // Genuinely unreachable, not just unlikely — but not because
+                    // construction is "gated" in some general sense (fix-round-2
+                    // finding N4: an earlier version of this comment claimed that,
+                    // which was false — private fields alone don't stop *minting* a
+                    // handle through the public `register_session` API; see
+                    // `roundhouse-net::proxy`'s fix-round-2 notes on `ProxyHandle`
+                    // for the real minting fix). The actual reason this is
+                    // unreachable: every `ProxyHandle` that exists, forged or not,
+                    // carries a `token` that only ever came from
+                    // `LoopbackProxy::register_session`'s own
+                    // `format!("rh-{}", Uuid::new_v4())` — there is no code path,
+                    // gated or not, that lets a caller supply the token string
+                    // itself, so it can never contain CRLF or other invalid header
+                    // bytes regardless of how the handle was obtained.
                     .expect("a session bearer token is always a valid header value"),
             );
         let client = reqwest::Client::builder()

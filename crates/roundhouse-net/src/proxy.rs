@@ -55,6 +55,18 @@ pub struct SessionEgressContext {
 /// constructible value is not a capability. Fields are now private; only
 /// [`LoopbackProxy::register_session`] (same crate) can build one, and outside
 /// crates get read-only access via [`Self::token`]/[`Self::addr`].
+///
+/// **Security-review finding (fix-round-2):** private fields alone stopped *forging*
+/// a handle from raw parts and *mutating* one after the fact, but not *minting* —
+/// `register_session` used to accept a caller-supplied `addr: SocketAddr` with no
+/// check that it was this proxy's own bound address, so any crate could still get a
+/// fully legitimate, unforged `ProxyHandle` pointing at an arbitrary rogue address,
+/// even on a `LoopbackProxy` that was never `serve()`d at all — reaching the exact
+/// same "metadata IP reachable, zero enforcement, zero audit trail" outcome Task 23
+/// exists to prevent. `register_session` no longer takes an `addr` parameter at
+/// all: it reads [`LoopbackProxy`]'s own recorded bound address (set exactly once,
+/// by [`LoopbackProxy::serve`]) and fails closed with [`ProxyNotServingError`] if
+/// this instance has never actually served.
 pub struct ProxyHandle {
     token: String,
     addr: SocketAddr,
@@ -73,6 +85,26 @@ impl ProxyHandle {
         self.addr
     }
 }
+
+/// Returned by [`LoopbackProxy::register_session`] when called on a proxy instance
+/// that has never had [`LoopbackProxy::serve`] bind a real address — minting a
+/// [`ProxyHandle`] with no real bound listener behind it would be a silent,
+/// structurally undetectable way to route traffic around every check this proxy
+/// exists to run (fix-round-2 security-review finding; see [`ProxyHandle`]'s docs).
+#[derive(Debug)]
+pub struct ProxyNotServingError;
+
+impl std::fmt::Display for ProxyNotServingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "LoopbackProxy::register_session called before serve() bound a real \
+             address on this instance"
+        )
+    }
+}
+
+impl std::error::Error for ProxyNotServingError {}
 
 /// Hard cap on the total bytes read for one CONNECT preamble (request line
 /// and headers, combined). Security-review finding: an unbounded
@@ -127,6 +159,14 @@ pub struct LoopbackProxy {
     handshake_timeout: Duration,
     idle_timeout: Duration,
     max_concurrent_connections: usize,
+    /// This instance's own bound address, set exactly once by [`Self::serve`].
+    /// Fix-round-2 security-review finding: `register_session` used to accept a
+    /// caller-supplied `addr` with no check against anything this proxy actually
+    /// bound, letting any crate mint a fully legitimate `ProxyHandle` pointing
+    /// wherever it wanted — even on a proxy that was never served at all. Reading
+    /// the address back from here instead means a handle can only ever point at a
+    /// real listener this specific instance is actually running.
+    bound_addr: std::sync::OnceLock<SocketAddr>,
 }
 
 impl LoopbackProxy {
@@ -152,27 +192,31 @@ impl LoopbackProxy {
             handshake_timeout,
             idle_timeout,
             max_concurrent_connections,
+            bound_addr: std::sync::OnceLock::new(),
         }
     }
 
     /// Called once per session at spawn time, before the agent lane's proxy
     /// env vars (`HTTPS_PROXY`/`https_proxy`) are set in the sandboxed
-    /// process's environment. `addr` is the proxy's own bound address (from
-    /// [`Self::serve`], which in the real daemon runs once at boot before any
-    /// session registers, so a concrete address is always available here).
-    /// Returns a [`ProxyHandle`] bundling the session's bearer token with that
-    /// address — enough, and only enough, for `roundhouse-tools`' `http`
+    /// process's environment. Returns a [`ProxyHandle`] bundling the session's
+    /// bearer token with this proxy's own bound address (recorded by
+    /// [`Self::serve`]) — enough, and only enough, for `roundhouse-tools`' `http`
     /// executor to route exclusively through this proxy.
+    ///
+    /// Fails with [`ProxyNotServingError`] if this `LoopbackProxy` instance has
+    /// never actually bound a listener via [`Self::serve`] — see [`ProxyHandle`]'s
+    /// docs for why silently minting a handle in that case would be a real,
+    /// structural bypass rather than a hypothetical one.
     pub fn register_session(
         &self,
         session_id: SessionId,
         policy: EgressPolicy,
-        addr: SocketAddr,
-    ) -> ProxyHandle {
+    ) -> Result<ProxyHandle, ProxyNotServingError> {
+        let addr = *self.bound_addr.get().ok_or(ProxyNotServingError)?;
         let token = format!("rh-{}", uuid::Uuid::new_v4());
         self.sessions
             .insert(token.clone(), SessionEgressContext { session_id, policy });
-        ProxyHandle { token, addr }
+        Ok(ProxyHandle { token, addr })
     }
 
     pub fn deregister_session(&self, token: &str) {
@@ -186,6 +230,15 @@ impl LoopbackProxy {
     /// per-connection handler it spawns must be able to outlive the
     /// caller's stack frame. `writer` is cheap to clone (an `mpsc::Sender`
     /// internally), so one handle is cloned per accepted connection.
+    ///
+    /// Records the bound address on `self` (fix-round-2) before returning, so
+    /// every [`Self::register_session`] call afterward hands back a
+    /// [`ProxyHandle`] pointing at this real, live listener — never a
+    /// caller-supplied address this instance never actually bound. Calling
+    /// `serve()` a second time on the same instance panics: this proxy design
+    /// is one bound listener per instance for its whole lifetime (§6.6's "one
+    /// accepting listener with per-session token disambiguation"), so a second
+    /// call is a real caller bug, not a case to silently paper over.
     pub async fn serve(
         self: Arc<Self>,
         runner: &'static TaskRunner,
@@ -193,6 +246,9 @@ impl LoopbackProxy {
     ) -> io::Result<SocketAddr> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
+        self.bound_addr
+            .set(addr)
+            .expect("LoopbackProxy::serve() called more than once on the same instance");
         let this = self.clone();
         let concurrency = Arc::new(Semaphore::new(this.max_concurrent_connections));
         tokio::spawn(async move {

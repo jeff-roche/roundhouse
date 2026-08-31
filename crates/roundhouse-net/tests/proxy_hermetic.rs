@@ -136,7 +136,7 @@ async fn allowed_host_gets_200_and_a_real_tunnel() {
         allowed_hosts: vec![HostPattern::exact("127.0.0.1")],
     };
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let handle = proxy.register_session(SessionId::new(), policy).unwrap();
     let token = handle.token().to_string();
 
     let (status, mut sock) = send_connect(proxy_addr, &token, &target).await;
@@ -160,7 +160,7 @@ async fn non_allowlisted_host_gets_403_and_a_recorded_deny() {
         allowed_hosts: vec![HostPattern::exact("crates.io")],
     };
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    let handle = proxy.register_session(session_id, policy, proxy_addr);
+    let handle = proxy.register_session(session_id, policy).unwrap();
     let token = handle.token().to_string();
 
     let (status, _sock) = send_connect(proxy_addr, &token, "evil.example:443").await;
@@ -195,7 +195,7 @@ async fn metadata_ip_is_denied_even_with_an_allow_all_policy() {
         allowed_hosts: vec![HostPattern::wildcard_suffix("")],
     };
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let handle = proxy.register_session(SessionId::new(), policy).unwrap();
     let token = handle.token().to_string();
 
     let (status, _sock) = send_connect(proxy_addr, &token, &format!("{METADATA_IP}:80")).await;
@@ -218,6 +218,46 @@ async fn unknown_bearer_token_is_rejected_before_any_allowlist_check() {
     );
 }
 
+/// Fix-round-2 security-review finding: `register_session` used to accept a
+/// caller-supplied `addr` with no check against anything this proxy actually bound,
+/// so any crate could mint a fully legitimate `ProxyHandle` pointing at a rogue
+/// address on a `LoopbackProxy` that was never even `serve()`d — zero allowlist
+/// check, zero metadata-IP hard-deny, zero audit trail, and no served proxy anywhere
+/// in the path. `register_session` no longer takes an `addr` parameter at all: it
+/// reads this proxy's own recorded bound address, set exactly once by `serve()`, and
+/// must fail closed — not silently mint a dangling handle — when called before
+/// `serve()` has ever run.
+#[tokio::test]
+async fn register_session_before_serve_fails_closed_instead_of_minting_a_dangling_handle() {
+    let proxy = LoopbackProxy::new();
+    let policy = EgressPolicy {
+        allowed_hosts: vec![HostPattern::wildcard_suffix("")],
+    };
+    let result = proxy.register_session(SessionId::new(), policy);
+    assert!(
+        result.is_err(),
+        "register_session on a never-served proxy must fail, not mint a ProxyHandle \
+         with no real listener behind it"
+    );
+}
+
+#[tokio::test]
+async fn registered_handle_addr_is_exactly_this_instances_own_bound_address() {
+    let (_dir, _db_path, writer) = fresh_writer().await;
+    let proxy = Arc::new(LoopbackProxy::new());
+    let policy = EgressPolicy {
+        allowed_hosts: vec![HostPattern::wildcard_suffix("")],
+    };
+    let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
+    let handle = proxy.register_session(SessionId::new(), policy).unwrap();
+    assert_eq!(
+        handle.addr(),
+        proxy_addr,
+        "a ProxyHandle must point at exactly the address this proxy instance itself \
+         bound in serve() — never anything else"
+    );
+}
+
 #[tokio::test]
 async fn evil_crates_io_is_not_matched_by_exact_crates_io_allowlist_entry() {
     let (_dir, _db_path, writer) = fresh_writer().await;
@@ -226,7 +266,7 @@ async fn evil_crates_io_is_not_matched_by_exact_crates_io_allowlist_entry() {
         allowed_hosts: vec![HostPattern::exact("crates.io")],
     };
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let handle = proxy.register_session(SessionId::new(), policy).unwrap();
     let token = handle.token().to_string();
 
     let (status, _sock) = send_connect(proxy_addr, &token, "evil-crates.io:443").await;
@@ -244,7 +284,7 @@ async fn evilexample_com_is_not_matched_by_wildcard_example_com_allowlist_entry(
         allowed_hosts: vec![HostPattern::wildcard_suffix("example.com")],
     };
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let handle = proxy.register_session(SessionId::new(), policy).unwrap();
     let token = handle.token().to_string();
 
     let (status, _sock) = send_connect(proxy_addr, &token, "evilexample.com:443").await;
@@ -276,7 +316,7 @@ async fn nine_alternate_encodings_of_the_metadata_ip_are_all_denied() {
         allowed_hosts: vec![HostPattern::wildcard_suffix("")],
     };
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let handle = proxy.register_session(SessionId::new(), policy).unwrap();
     let token = handle.token().to_string();
 
     let encodings = [
@@ -323,7 +363,7 @@ async fn wildcard_allowlisted_host_resolving_to_a_loopback_address_is_denied() {
         allowed_hosts: vec![HostPattern::wildcard_suffix("")],
     };
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let handle = proxy.register_session(SessionId::new(), policy).unwrap();
     let token = handle.token().to_string();
 
     let (status, _sock) = send_connect(proxy_addr, &token, &target).await;
@@ -409,7 +449,7 @@ async fn idle_tunnel_with_no_bytes_flowing_is_closed_after_the_idle_timeout() {
         allowed_hosts: vec![HostPattern::exact("127.0.0.1")],
     };
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let handle = proxy.register_session(SessionId::new(), policy).unwrap();
     let token = handle.token().to_string();
 
     let (status, mut sock) = send_connect(proxy_addr, &token, &target).await;
@@ -441,7 +481,7 @@ async fn control_characters_in_a_denied_target_are_sanitized_in_the_recorded_eve
         allowed_hosts: vec![HostPattern::exact("crates.io")],
     };
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    let handle = proxy.register_session(session_id, policy, proxy_addr);
+    let handle = proxy.register_session(session_id, policy).unwrap();
     let token = handle.token().to_string();
 
     // A CONNECT target embedding an ANSI escape byte and a BEL, with no
@@ -510,7 +550,7 @@ async fn unspecified_address_bypasses_are_all_denied_under_allow_all_policy() {
         allowed_hosts: vec![HostPattern::wildcard_suffix("")],
     };
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let handle = proxy.register_session(SessionId::new(), policy).unwrap();
     let token = handle.token().to_string();
 
     let encodings = ["0.0.0.0:80", "0:80", "0x0:80", "[::ffff:0.0.0.0]:80"];
@@ -541,7 +581,7 @@ async fn exact_matched_hostname_resolving_to_loopback_is_denied_unlike_an_exact_
         allowed_hosts: vec![HostPattern::exact("localhost")],
     };
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let handle = proxy.register_session(SessionId::new(), policy).unwrap();
     let token = handle.token().to_string();
 
     let (status, _sock) = send_connect(proxy_addr, &token, "localhost:80").await;
@@ -570,7 +610,7 @@ async fn half_close_after_write_still_receives_the_full_response() {
         allowed_hosts: vec![HostPattern::exact("127.0.0.1")],
     };
     let proxy_addr = proxy.clone().serve(&RUNNER, writer).await.unwrap();
-    let handle = proxy.register_session(SessionId::new(), policy, proxy_addr);
+    let handle = proxy.register_session(SessionId::new(), policy).unwrap();
     let token = handle.token().to_string();
 
     let (status, mut sock) = send_connect(proxy_addr, &token, &target).await;
