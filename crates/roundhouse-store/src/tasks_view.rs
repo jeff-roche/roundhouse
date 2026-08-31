@@ -248,11 +248,19 @@ pub(crate) fn backfill_tasks_table(conn: &mut rusqlite::Connection) -> rusqlite:
 /// already-precedented choice: every flat variant (`Chat`, `Shell`, `Read`, ...) Debug-
 /// formats to just its bare name. The one rough edge is `Plugin { vendor, verb }`, whose
 /// `Debug` output is `Plugin { vendor: "x", verb: "y" }` rather than the doc-commented
-/// `vendor:verb` convention — no code parses `tasks.kind` back into a `TaskKind` today
-/// (this column is a discriminant-only cache per the `state` column's own precedent), so
-/// this is an acceptable minimal choice now; a real `TaskKind::as_sql_str`/`from_sql_str`
-/// pair (with a clean `vendor:verb` encoding for `Plugin`) is future work for whenever a
-/// reader needs to parse this column back, not before.
+/// `vendor:verb` convention — this was an acceptable minimal choice at the time because no
+/// code parsed `tasks.kind` back into a `TaskKind` (this column was a discriminant-only
+/// cache per the `state` column's own precedent). That reader has since arrived: Task 21's
+/// `attention::parse_task_kind` (`roundhouse-store/src/attention.rs`) is the first real
+/// consumer that parses this column back, including a hand-rolled decoder for exactly this
+/// `Plugin { vendor: "..", verb: ".." }` `Debug` shape — see that module's doc comment for
+/// the resulting implicit, untyped cross-crate contract this now creates (this function is
+/// the writer half of it; `parse_task_kind` is the reader half, and the two must be kept in
+/// lockstep manually, since nothing here pins the format at compile time). A real
+/// `TaskKind::as_sql_str`/`from_sql_str` pair (with a clean `vendor:verb` encoding for
+/// `Plugin`) remains a reasonable future refactor if a second crate ever needs the same
+/// read capability, so both readers share one source of truth instead of each hand-rolling
+/// a parser against `Debug`'s output — not required now that there is exactly one reader.
 fn task_kind_as_sql_str(kind: &roundhouse_core::TaskKind) -> String {
     format!("{kind:?}")
 }

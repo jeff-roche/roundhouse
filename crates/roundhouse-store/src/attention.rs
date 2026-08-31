@@ -18,8 +18,34 @@
 //! `parse_task_kind`, below) and `tasks.suspended_since` — `suspended_tasks` never
 //! needed either. `tasks.kind` is written as `TaskKind`'s `Debug` representation
 //! (`tasks_view::task_kind_as_sql_str`), and — per that function's own doc comment —
-//! no code has ever needed to parse it back until now; `parse_task_kind` is that
+//! no code had ever needed to parse it back until now; `parse_task_kind` is that
 //! first real reader.
+//!
+//! **This is a fragile, implicit, untyped cross-crate contract, not a compiler-
+//! enforced one** — the same category of risk `cost.rs`'s
+//! `provider_and_model_from_output` doc comment calls out for its own analogous
+//! situation, stated here with the same explicitness: `#[derive(Debug)]`'s output
+//! format is not a stable, guaranteed serialization format. There is nothing tying
+//! `task_kind_as_sql_str` (the writer, in `tasks_view.rs`) to `parse_task_kind`
+//! (the reader, below) at compile time — a future Rust toolchain change to how
+//! `derive(Debug)` formats struct variants, or someone adding/renaming a field on
+//! `TaskKind::Plugin`, would silently desync them, and the failure mode would only
+//! surface at runtime (as `parse_task_kind` returning `None` for a value it used
+//! to parse, or worse, if the new shape happened to still parse, as a wrong
+//! result). Anyone touching `TaskKind`'s definition or `task_kind_as_sql_str`
+//! needs to know `parse_task_kind` depends on the exact current shape.
+//!
+//! A hand-rolled parser (rather than a real `Display`/`FromStr` round-trip pair
+//! added to `TaskKind` itself, in `roundhouse-core`) was a deliberate, narrower
+//! scope call for this task specifically — it keeps the change contained to this
+//! one reader in `roundhouse-store` rather than touching the shared core type and
+//! its writer. It is not the only reasonable design, and it is not necessarily the
+//! permanent one: if a second crate ever needs to read `tasks.kind` back into a
+//! `TaskKind`, that is the point to reconsider a real `Display`/`FromStr` pair on
+//! `TaskKind` (with an explicit `vendor:verb` encoding for `Plugin`, as
+//! `tasks_view.rs`'s own doc comment already speculates) so both crates share one
+//! source of truth instead of each hand-rolling their own parser against
+//! `Debug`'s output.
 
 use roundhouse_core::{SessionId, SuspendReason, TaskId, TaskKind, Timestamp};
 
@@ -188,10 +214,28 @@ fn parse_plugin_task_kind(s: &str) -> Option<TaskKind> {
 }
 
 /// Parses one `Debug`-quoted Rust string literal (e.g. `"foo\"bar"`) from the
-/// start of `s`, returning the unescaped value and the remaining tail. Handles
-/// the escape sequences Rust's `Debug` impl for `str`/`String` actually emits
-/// (`\"`, `\\`, `\n`, `\r`, `\t`) — sufficient for `vendor`/`verb` values, which
-/// are plugin-supplied identifiers, not arbitrary binary data.
+/// start of `s`, returning the unescaped value and the remaining tail.
+///
+/// Handles every escape form Rust's `Debug` impl for `char`/`str`/`String` can
+/// emit: `\"`, `\\`, `\n`, `\r`, `\t`, `\0` (NUL), and `\u{XXXX}` (emitted for
+/// any other non-printable/control/grapheme-extending codepoint — see
+/// `char::escape_debug`, which is what the derived `Debug` for `String` fields
+/// uses under the hood). Fail-closed on anything else: an escape letter this
+/// function does not specifically recognize returns `None` (the whole string
+/// is rejected as unparseable) rather than being pushed through as a literal
+/// character. That fallback-rejects-instead-of-guesses behavior is a
+/// deliberate fix for a real bug this function used to have: an earlier
+/// version's fallback arm stripped the backslash and kept the escape letter
+/// itself (`other => out.push(other)`), which silently produced a WRONG
+/// decoded value instead of failing — concretely, `"\u{7}"` (one BEL control
+/// character) and `"u{7}"` (four literal ASCII characters) both decoded to
+/// the same four-character string `u{7}`, a genuine identity collision
+/// between two different `TaskKind::Plugin` values. With every escape form
+/// `Debug` can actually emit now handled explicitly, this function's
+/// "reject anything unrecognized" fallback is unreachable for any real
+/// `Debug`-formatted `String` field — it exists purely as the fail-closed
+/// backstop for corrupted/hand-edited `tasks.kind` data, matching this
+/// crate's established convention.
 fn parse_debug_quoted_string(s: &str) -> Option<(String, &str)> {
     let s = s.strip_prefix('"')?;
     let mut out = String::new();
@@ -207,11 +251,164 @@ fn parse_debug_quoted_string(s: &str) -> Option<(String, &str)> {
                     'n' => out.push('\n'),
                     'r' => out.push('\r'),
                     't' => out.push('\t'),
-                    other => out.push(other),
+                    '0' => out.push('\0'),
+                    'u' => {
+                        let (_, open_brace) = chars.next()?;
+                        if open_brace != '{' {
+                            return None;
+                        }
+                        let mut hex = String::new();
+                        loop {
+                            let (_, hc) = chars.next()?;
+                            if hc == '}' {
+                                break;
+                            }
+                            hex.push(hc);
+                        }
+                        let code = u32::from_str_radix(&hex, 16).ok()?;
+                        let decoded = char::from_u32(code)?;
+                        out.push(decoded);
+                    }
+                    // Fail closed: any other escape letter is not one Rust's
+                    // Debug impl actually emits — reject rather than guess.
+                    _ => return None,
                 }
             }
             other => out.push(other),
         }
     }
     None // unterminated string literal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fix-round-1 regression test, matching the security auditor's exact
+    /// reproduction shape: two DIFFERENT `TaskKind::Plugin` values — one whose
+    /// `vendor` is a single real BEL control character (`\u{7}`, which Rust's
+    /// `Debug` for `str` renders as the four-character escape sequence
+    /// `\u{7}`), the other whose `vendor` is the literal four-character string
+    /// `u{7}` — must parse to two DIFFERENT, correct results now, not collide.
+    /// Before the fix, the old fallback (`other => out.push(other)`) stripped
+    /// the backslash off `\u{7}` and pushed `u` through literally, so both
+    /// inputs decoded to the same wrong string `u{7}`.
+    #[test]
+    fn plugin_vendor_with_real_control_char_and_literal_escape_text_do_not_collide() {
+        let real_control_char = TaskKind::Plugin {
+            vendor: "\u{7}".into(), // one real BEL character
+            verb: "v".into(),
+        };
+        let literal_escape_text = TaskKind::Plugin {
+            vendor: "u{7}".into(), // four literal ASCII characters
+            verb: "v".into(),
+        };
+
+        // Confirm the premise: these are genuinely different TaskKind values,
+        // and Rust's Debug format for them is genuinely different text too
+        // (the whole bug was that two different Debug outputs decoded to the
+        // same wrong TaskKind).
+        assert_ne!(real_control_char, literal_escape_text);
+        let real_debug = format!("{real_control_char:?}");
+        let literal_debug = format!("{literal_escape_text:?}");
+        assert_ne!(real_debug, literal_debug);
+
+        let parsed_real = parse_task_kind(&real_debug);
+        let parsed_literal = parse_task_kind(&literal_debug);
+
+        assert_eq!(
+            parsed_real,
+            Some(real_control_char),
+            "a real BEL control character in vendor must round-trip exactly"
+        );
+        assert_eq!(
+            parsed_literal,
+            Some(literal_escape_text),
+            "the literal four-character text \"u{{7}}\" in vendor must round-trip exactly"
+        );
+        assert_ne!(
+            parsed_real, parsed_literal,
+            "two different Plugin values must never parse to the same result"
+        );
+    }
+
+    /// `\0` (NUL) must decode to an actual NUL character, not be rejected or
+    /// mangled.
+    #[test]
+    fn plugin_vendor_with_nul_round_trips() {
+        let kind = TaskKind::Plugin {
+            vendor: "a\0b".into(),
+            verb: "v".into(),
+        };
+        let debug = format!("{kind:?}");
+        assert_eq!(parse_task_kind(&debug), Some(kind));
+    }
+
+    /// A multi-byte non-ASCII `\u{...}` escape (not just a single-digit one)
+    /// must also decode correctly — exercises the hex-digit accumulation loop
+    /// with more than one digit.
+    #[test]
+    fn plugin_vendor_with_multi_digit_unicode_escape_round_trips() {
+        let kind = TaskKind::Plugin {
+            vendor: "\u{1F600}".into(), // an emoji: a real, multi-hex-digit codepoint
+            verb: "v".into(),
+        };
+        let debug = format!("{kind:?}");
+        assert_eq!(parse_task_kind(&debug), Some(kind));
+    }
+
+    /// A genuinely unrecognized escape sequence — one Rust's own `Debug` impl
+    /// never actually emits — must be rejected (`None`), not silently mangled
+    /// into some plausible-looking wrong value. Hand-constructed directly
+    /// (rather than via a real `TaskKind`) since `Debug` itself won't produce
+    /// this shape; this pins the fail-closed backstop for corrupted/hand-
+    /// edited `tasks.kind` data.
+    #[test]
+    fn unrecognized_escape_sequence_is_rejected_not_mangled() {
+        let corrupt = r#"Plugin { vendor: "\q", verb: "v" }"#;
+        assert_eq!(
+            parse_task_kind(corrupt),
+            None,
+            "an escape sequence Debug never emits must be rejected, not silently decoded"
+        );
+    }
+
+    /// A malformed `\u{...}` escape (missing the closing brace) must also be
+    /// rejected, not panic or hang.
+    #[test]
+    fn malformed_unicode_escape_is_rejected_not_panicking() {
+        let corrupt = r#"Plugin { vendor: "\u{41", verb: "v" }"#;
+        assert_eq!(parse_task_kind(corrupt), None);
+    }
+
+    /// Every flat unit variant must still parse correctly after the fix —
+    /// pins the non-Plugin path, which the fix did not touch.
+    #[test]
+    fn unit_variants_round_trip() {
+        for kind in [
+            TaskKind::Chat,
+            TaskKind::Infer,
+            TaskKind::Shell,
+            TaskKind::Read,
+            TaskKind::Write,
+            TaskKind::Edit,
+            TaskKind::Find,
+            TaskKind::Http,
+            TaskKind::Web,
+            TaskKind::Mcp,
+            TaskKind::Git,
+            TaskKind::Memory,
+            TaskKind::Agent,
+            TaskKind::Message,
+            TaskKind::Compact,
+            TaskKind::Checkpoint,
+            TaskKind::Plan,
+            TaskKind::Elicit,
+            TaskKind::Flow,
+            TaskKind::Report,
+        ] {
+            let debug = format!("{kind:?}");
+            assert_eq!(parse_task_kind(&debug), Some(kind));
+        }
+    }
 }

@@ -122,6 +122,82 @@ async fn finds_approvals_elicits_and_workflow_gates_across_every_session() {
     assert_eq!(approval_task.session_id, s1);
 }
 
+/// Fix-round-1 regression test: end-to-end, through the real public API against a
+/// real database, two DIFFERENT `TaskKind::Plugin` values whose `vendor`s differ
+/// only by a Debug escape sequence (one a real control character, one the literal
+/// escaped text) must come back as two DIFFERENT, correct `kind`s — not collide,
+/// and not silently mangle either one. This is the security auditor's exact
+/// reproduction shape (a real BEL character `vendor: "\u{7}"` vs. the literal
+/// four-character `vendor: "u{7}"`), run through `seed_suspended` (real
+/// `TaskRunner`/`EventWriter` writes, so `tasks.kind` is genuinely
+/// Debug-formatted by the real write path) and `blocked_anywhere` (the real read
+/// path), not just the parser unit tests in `attention.rs`.
+#[tokio::test]
+async fn plugin_vendor_with_control_char_and_literal_escape_text_do_not_collide_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let s_control = SessionId::new();
+    let t_control = TaskId::new();
+    seed_suspended(
+        &writer,
+        s_control,
+        t_control,
+        TaskKind::Plugin {
+            vendor: "\u{7}".into(), // one real BEL control character
+            verb: "v".into(),
+        },
+        SuspendReason::AwaitingReply,
+    )
+    .await;
+
+    let s_literal = SessionId::new();
+    let t_literal = TaskId::new();
+    seed_suspended(
+        &writer,
+        s_literal,
+        t_literal,
+        TaskKind::Plugin {
+            vendor: "u{7}".into(), // four literal ASCII characters
+            verb: "v".into(),
+        },
+        SuspendReason::AwaitingReply,
+    )
+    .await;
+
+    let query_store = open(&db_path).await.unwrap();
+    let blocked = blocked_anywhere(&query_store).await.unwrap();
+
+    let control_task = blocked
+        .iter()
+        .find(|b| b.task_id == t_control)
+        .expect("control-char-vendor task must be found");
+    let literal_task = blocked
+        .iter()
+        .find(|b| b.task_id == t_literal)
+        .expect("literal-escape-text-vendor task must be found");
+
+    assert_eq!(
+        control_task.kind,
+        TaskKind::Plugin {
+            vendor: "\u{7}".into(),
+            verb: "v".into(),
+        },
+        "the real control character must round-trip exactly, not collide with the literal text"
+    );
+    assert_eq!(
+        literal_task.kind,
+        TaskKind::Plugin {
+            vendor: "u{7}".into(),
+            verb: "v".into(),
+        },
+        "the literal escaped text must round-trip exactly, not collide with the control character"
+    );
+    assert_ne!(control_task.kind, literal_task.kind);
+}
+
 #[tokio::test]
 async fn excludes_non_suspended_tasks() {
     let dir = tempfile::tempdir().unwrap();
