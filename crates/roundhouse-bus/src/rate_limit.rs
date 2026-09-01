@@ -63,6 +63,13 @@ impl RateLimiter {
     }
 }
 
+impl Default for RateLimiter {
+    /// §7.7 default: 20/min, burst 10.
+    fn default() -> Self {
+        Self::new(20, 10)
+    }
+}
+
 /// §7.7: "Repetition damper — ≥3 sends with identical (to, subject) and no state
 /// change between refuses the 4th. Cheap livelock kill."
 pub struct RepetitionDamper {
