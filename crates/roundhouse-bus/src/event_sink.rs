@@ -25,6 +25,13 @@ pub trait EventSink: Send + Sync {
     /// message has actually been enqueued, so a bounce leaves the key unrecorded and a
     /// subsequent redelivery is still accepted.
     fn record_inbound(&self, session: SessionId, msg_id: MessageId);
+
+    /// §7.1: "delivery appends [a `message` task] to the recipient's log." This records
+    /// the outbound side of that append — the sender's event-sourced record that a
+    /// message task was created. Called by `message_send` after each successful
+    /// `bus.send`, so the outbound task is durably recorded rather than living only in
+    /// the mailbox.
+    fn record_outbound(&self, session: SessionId, msg_id: MessageId);
 }
 
 /// Test double. A real `SqliteEventSink` (roundhouse-store, `INSERT ... ON CONFLICT
@@ -32,12 +39,14 @@ pub trait EventSink: Send + Sync {
 /// daemon-assembly layer, not in this crate.
 pub struct InMemoryEventSink {
     seen: Mutex<HashSet<(SessionId, MessageId)>>,
+    outbound: Mutex<HashSet<(SessionId, MessageId)>>,
 }
 
 impl InMemoryEventSink {
     pub fn new() -> Self {
         Self {
             seen: Mutex::new(HashSet::new()),
+            outbound: Mutex::new(HashSet::new()),
         }
     }
 
@@ -63,6 +72,10 @@ impl EventSink for InMemoryEventSink {
 
     fn record_inbound(&self, session: SessionId, msg_id: MessageId) {
         self.seen.lock().unwrap().insert((session, msg_id));
+    }
+
+    fn record_outbound(&self, session: SessionId, msg_id: MessageId) {
+        self.outbound.lock().unwrap().insert((session, msg_id));
     }
 }
 

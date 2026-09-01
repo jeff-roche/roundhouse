@@ -186,6 +186,7 @@ impl MessageWaitExecutor {
 
         let deadline = expect.deadline.map(unix_millis_to_instant);
         let mut replies = Vec::new();
+        let mut counted_ids = HashSet::new();
         let timed_out = loop {
             if let Some(deadline) = deadline {
                 if tokio::time::Instant::now() >= deadline {
@@ -209,9 +210,11 @@ impl MessageWaitExecutor {
                         if expected_sender.get(&reply_to_id) == Some(&envelope.from)
                             || envelope.provenance.origin == Origin::User
                         {
-                            replies.push(envelope);
-                            if replies.len() as u32 >= needed {
-                                break false;
+                            if counted_ids.insert(reply_to_id) {
+                                replies.push(envelope);
+                                if replies.len() as u32 >= needed {
+                                    break false;
+                                }
                             }
                         } else {
                             // Reply from the wrong sender — re-queue it rather than
@@ -482,6 +485,7 @@ mod tests {
 
     async fn three_member_team_with_registered_mailboxes() -> (
         Arc<dyn roundhouse_bus::Bus>,
+        Arc<dyn roundhouse_bus::event_sink::EventSink>,
         roundhouse_core::TeamId,
         WorkspaceId,
         SessionId,
@@ -512,16 +516,19 @@ mod tests {
             .await
             .unwrap();
         let bus: Arc<dyn roundhouse_bus::Bus> = Arc::new(local.with_teams(teams));
-        (bus, team, ws, asker, lead, m2, m3)
+        let sink: Arc<dyn roundhouse_bus::event_sink::EventSink> =
+            Arc::new(roundhouse_bus::event_sink::InMemoryEventSink::new());
+        (bus, sink, team, ws, asker, lead, m2, m3)
     }
 
     #[tokio::test]
     async fn fan_out_to_team_address_delivers_one_message_task_per_member() {
-        let (bus, team, ws, asker, lead, m2, m3) =
+        let (bus, sink, team, ws, asker, lead, m2, m3) =
             three_member_team_with_registered_mailboxes().await;
 
         let sent = crate::tools::message_send::message_send(
             bus.as_ref(),
+            &sink,
             ws,
             asker,
             Address::Team { team },
@@ -549,11 +556,12 @@ mod tests {
 
     #[tokio::test]
     async fn quorum_all_unblocks_only_once_every_fanout_recipient_has_replied() {
-        let (bus, team, ws, asker, lead, m2, m3) =
+        let (bus, sink, team, ws, asker, lead, m2, m3) =
             three_member_team_with_registered_mailboxes().await;
 
         let sent = crate::tools::message_send::message_send(
             bus.as_ref(),
+            &sink,
             ws,
             asker,
             Address::Team { team },
@@ -614,11 +622,12 @@ mod tests {
 
     #[tokio::test]
     async fn quorum_all_times_out_when_not_every_fanout_recipient_has_replied() {
-        let (bus, team, ws, asker, lead, m2, _m3) =
+        let (bus, sink, team, ws, asker, lead, m2, _m3) =
             three_member_team_with_registered_mailboxes().await;
 
         let sent = crate::tools::message_send::message_send(
             bus.as_ref(),
+            &sink,
             ws,
             asker,
             Address::Team { team },
@@ -686,11 +695,12 @@ mod tests {
 
     #[tokio::test]
     async fn quorum_all_rejects_forged_replies_from_single_sender() {
-        let (bus, team, ws, asker, lead, _m2, _m3) =
+        let (bus, sink, team, ws, asker, lead, _m2, _m3) =
             three_member_team_with_registered_mailboxes().await;
 
         let sent = crate::tools::message_send::message_send(
             bus.as_ref(),
+            &sink,
             ws,
             asker,
             Address::Team { team },

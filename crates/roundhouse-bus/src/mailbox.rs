@@ -38,6 +38,16 @@ impl Mailbox {
         Ok(())
     }
 
+    pub fn push_front(&mut self, session: SessionId, envelope: Envelope) -> Result<(), BusError> {
+        if let MailboxKind::Bounded(capacity) = self.kind {
+            if self.queue.len() >= capacity {
+                return Err(BusError::MailboxFull { session, capacity });
+            }
+        }
+        self.queue.push_front(envelope);
+        Ok(())
+    }
+
     pub fn pop_front(&mut self) -> Option<Envelope> {
         self.queue.pop_front()
     }

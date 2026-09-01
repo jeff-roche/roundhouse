@@ -3,6 +3,7 @@
 //! `expect_reply`, have it reply, resolve the wait, and confirm the wait-graph's
 //! synchronous deadlock refusal works end to end.
 
+use roundhouse_bus::event_sink::InMemoryEventSink;
 use roundhouse_bus::local_bus::LocalBus;
 use roundhouse_bus::mailbox::MailboxKind;
 use roundhouse_bus::teams::TeamRegistry;
@@ -25,6 +26,7 @@ impl SpawnPolicyScope for AllowAll {
 #[tokio::test]
 async fn parent_spawns_child_sends_request_child_replies_parent_wait_resolves() {
     let bus: Arc<dyn roundhouse_bus::Bus> = Arc::new(LocalBus::new());
+    let sink: Arc<dyn roundhouse_bus::event_sink::EventSink> = Arc::new(InMemoryEventSink::new());
     let teams = TeamRegistry::new();
     let ws = WorkspaceId::new();
 
@@ -66,6 +68,7 @@ async fn parent_spawns_child_sends_request_child_replies_parent_wait_resolves() 
     // here there's exactly one, `Address::Session` being point-to-point.
     let sent = message_send(
         bus.as_ref(),
+        &sink,
         ws,
         parent,
         Address::Session { id: child },

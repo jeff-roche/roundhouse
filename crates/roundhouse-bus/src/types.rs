@@ -63,6 +63,17 @@ pub struct Envelope {
     pub provenance: Provenance,
 }
 
+impl Envelope {
+    pub fn to_core_envelope(&self) -> roundhouse_core::Envelope {
+        roundhouse_core::Envelope {
+            from: Address::Session { id: self.from },
+            to: self.to_requested.clone(),
+            body: roundhouse_core::TaskInput::Text(self.body.clone()),
+            expect_reply: self.expect_reply.is_some(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Undeliverable {
     Ended { session: SessionId },

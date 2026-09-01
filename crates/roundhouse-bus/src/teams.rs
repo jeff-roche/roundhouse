@@ -147,7 +147,7 @@ impl TeamRegistry {
             .store
             .memberships
             .get(&team)
-            .map(|m| m.len() as u32)
+            .map(|m| m.iter().filter(|mem| !mem.ended).count() as u32)
             .unwrap_or(0);
         check_team_size(current + 1)?;
         self.store.save_membership(&Membership {

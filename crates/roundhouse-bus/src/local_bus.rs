@@ -202,18 +202,14 @@ impl LocalBus {
                     session: to,
                 }))?;
 
-        // Idempotency: check *before* the push (cheap read) so a duplicate redelivery
-        // is short-circuited and never enqueued twice — but record only *after* a
-        // successful push, so a `MailboxFull` bounce leaves the key unrecorded and a
-        // later retry is accepted rather than false-acked.
+        let mut guard = mailbox.lock().expect("mailbox mutex poisoned");
+
         if self.sink.is_duplicate(to, msg_id) {
             tracing::debug!(?to, msg_id = ?msg_id, "duplicate inbound message, dropped as idempotent redelivery");
             return Ok(());
         }
 
-        let mut guard = mailbox.lock().expect("mailbox mutex poisoned");
-        guard.push(to, envelope)?; // MailboxFull propagates — sink NOT yet recorded
-
+        guard.push(to, envelope)?;
         self.sink.record_inbound(to, msg_id);
         Ok(())
     }
@@ -253,7 +249,7 @@ impl LocalBus {
                     session: to,
                 }))?;
         let mut guard = mailbox.lock().expect("mailbox mutex poisoned");
-        guard.push(to, envelope)
+        guard.push_front(to, envelope)
     }
 }
 

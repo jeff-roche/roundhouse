@@ -1,10 +1,12 @@
 //! `message_send` tool executor (Task 13).
 
+use roundhouse_bus::event_sink::EventSink;
 use roundhouse_bus::types::{
     Address, ArtifactRef, BusError, Envelope, ExpectReply, MessageId, Provenance, Trust,
 };
 use roundhouse_bus::Bus;
 use roundhouse_core::{Origin, SessionId, WorkspaceId};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// What `message_send` hands back: every recipient this send actually resolved to (one
@@ -30,6 +32,7 @@ pub struct SendOutcome {
 /// `Bus` itself (`LocalBus::send`, Task 12), not duplicated here.
 pub async fn message_send(
     bus: &dyn Bus,
+    sink: &Arc<dyn EventSink>,
     workspace: WorkspaceId,
     from: SessionId,
     to: Address,
@@ -55,9 +58,6 @@ pub async fn message_send(
             expect_reply: expect_reply.clone(),
             in_reply_to: None,
             ttl_hops,
-            // §6.8: "every peer message is Trust::Untrusted regardless of how it's
-            // phrased" — this is the provenance the *recipient* will see on the
-            // inbound copy.
             provenance: Provenance {
                 origin: Origin::Peer,
                 trust: Trust::Untrusted,
@@ -65,6 +65,7 @@ pub async fn message_send(
             },
         };
         bus.send(envelope).await?;
+        sink.record_outbound(from, id);
         message_ids.push(id);
     }
 
