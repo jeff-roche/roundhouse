@@ -183,6 +183,10 @@ impl TeamRegistry {
         false
     }
 
+    pub fn team(&self, team: TeamId) -> Option<Team> {
+        self.store.teams.get(&team).map(|t| t.clone())
+    }
+
     pub fn state(&self, team: TeamId) -> Option<TeamState> {
         self.store.teams.get(&team).map(|t| t.state)
     }
