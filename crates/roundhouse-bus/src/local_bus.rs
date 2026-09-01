@@ -210,6 +210,35 @@ impl LocalBus {
         let mut guard = mailbox.lock().expect("mailbox mutex poisoned");
         Ok(guard.pop_front())
     }
+
+    /// Re-queue an envelope that was popped from a mailbox but not consumed (e.g. a
+    /// non-matching reply during a quorum wait). Unlike `send`, this does not run the
+    /// idempotency sink, ttl_hops decrement, rate cap, or repetition damper — the
+    /// envelope is already in flight and was merely parked in the wrong place, so
+    /// re-applying those checks would silently drop it (the sink would reject it as a
+    /// duplicate). Pushes directly back to the mailbox (or a human's notification feed).
+    pub async fn requeue(&self, envelope: Envelope) -> Result<(), BusError> {
+        let to = envelope.to;
+        if self.human_sessions.contains(&to) {
+            self.human_notifications.push(
+                to,
+                HumanNotification {
+                    from: envelope.from,
+                    envelope,
+                    ts_unix_ms: current_unix_millis(),
+                },
+            );
+            return Ok(());
+        }
+        let mailbox =
+            self.mailboxes
+                .get(&to)
+                .ok_or(BusError::Undeliverable(Undeliverable::Ended {
+                    session: to,
+                }))?;
+        let mut guard = mailbox.lock().expect("mailbox mutex poisoned");
+        guard.push(to, envelope)
+    }
 }
 
 #[async_trait]
@@ -259,6 +288,10 @@ impl Bus for LocalBus {
         addr: &Address,
     ) -> Result<Vec<SessionId>, BusError> {
         LocalBus::resolve_recipients(self, workspace, addr).await
+    }
+
+    async fn requeue(&self, envelope: Envelope) -> Result<(), BusError> {
+        LocalBus::requeue(self, envelope).await
     }
 }
 

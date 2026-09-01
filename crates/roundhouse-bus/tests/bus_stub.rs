@@ -61,6 +61,10 @@ impl Bus for NoopBus {
     ) -> Result<Vec<SessionId>, BusError> {
         Ok(vec![self.resolve_address(workspace, addr).await?])
     }
+
+    async fn requeue(&self, _envelope: Envelope) -> Result<(), BusError> {
+        Ok(())
+    }
 }
 
 #[tokio::test]

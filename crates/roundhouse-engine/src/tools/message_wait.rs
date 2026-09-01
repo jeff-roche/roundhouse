@@ -138,6 +138,17 @@ impl MessageWaitExecutor {
             Quorum::AtLeast(n) => n,
         };
 
+        // Which sender is expected to answer each outbound `MessageId`: a fan-out
+        // send mints one id per recipient, so a reply counts toward quorum only if
+        // it comes from the recipient that specific message was addressed to — a
+        // forged reply from some other member (or a single member answering for the
+        // whole team) must not satisfy `Quorum::All`.
+        let expected_sender: HashMap<MessageId, SessionId> = sent_ids
+            .iter()
+            .copied()
+            .zip(targets.iter().copied())
+            .collect();
+
         let deadline = expect.deadline.map(unix_millis_to_instant);
         let mut replies = Vec::new();
         let timed_out = loop {
@@ -146,26 +157,38 @@ impl MessageWaitExecutor {
                     break true;
                 }
             }
-            match self.bus.poll(session).await? {
-                Some(envelope)
+            match self.bus.poll(session).await {
+                Ok(Some(envelope))
                     if envelope
                         .in_reply_to
                         .map(|id| sent_ids.contains(&id))
                         .unwrap_or(false) =>
                 {
-                    replies.push(envelope);
-                    if replies.len() as u32 >= needed {
-                        break false;
+                    if let Some(reply_to_id) = envelope.in_reply_to {
+                        if expected_sender.get(&reply_to_id) == Some(&envelope.from) {
+                            replies.push(envelope);
+                            if replies.len() as u32 >= needed {
+                                break false;
+                            }
+                        } else {
+                            // Reply from the wrong sender — re-queue it rather than
+                            // dropping it (it may still be a legitimate reply to
+                            // some *other* wait on the same session), and sleep so a
+                            // mailbox holding only non-matching messages can't
+                            // busy-spin.
+                            let _ = self.bus.requeue(envelope).await;
+                            tokio::time::sleep(WAIT_POLL_INTERVAL).await;
+                        }
                     }
                 }
-                Some(_other) => {
-                    // An unrelated inbound message arrived while parked; it is not part
-                    // of this wait's quorum. §7.6: it still renders at its own next
-                    // turn boundary as an ordinary system-framed injection (Task 14) —
-                    // `poll` already removed it from the mailbox, and handing it to
-                    // that injection path is the caller's job, not this executor's.
+                Ok(Some(other)) => {
+                    // A non-matching message (not an `in_reply_to` one of our sent
+                    // ids) arrived while parked — re-queue so it isn't lost, then
+                    // sleep to avoid busy-spin.
+                    let _ = self.bus.requeue(other).await;
+                    tokio::time::sleep(WAIT_POLL_INTERVAL).await;
                 }
-                None => {
+                Ok(None) => {
                     let sleep_for = match deadline {
                         Some(d) => d
                             .saturating_duration_since(tokio::time::Instant::now())
@@ -173,6 +196,23 @@ impl MessageWaitExecutor {
                         None => WAIT_POLL_INTERVAL,
                     };
                     tokio::time::sleep(sleep_for).await;
+                }
+                Err(e) => {
+                    // A poll error is a hard exit, not a retry: clear the wait-graph
+                    // edge and the pending-reply entry, resume the task with a
+                    // `poll_failed` error frame, and propagate. Without this cleanup
+                    // the edge would linger (a later wait would report a phantom
+                    // deadlock) and `pending` would leak a stale entry.
+                    let _ = self.bus.clear_wait(session).await;
+                    self.pending
+                        .lock()
+                        .expect("pending-reply mutex poisoned")
+                        .remove(&task.id());
+                    let _ = task.resume(
+                        Origin::System,
+                        serde_json::json!({ "error": "poll_failed" }),
+                    );
+                    return Err(e);
                 }
             }
         };
@@ -591,5 +631,68 @@ mod tests {
 
         assert!(outcome.timed_out);
         assert_eq!(outcome.replies.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn quorum_all_rejects_forged_replies_from_single_sender() {
+        let (bus, team, ws, asker, lead, _m2, _m3) =
+            three_member_team_with_registered_mailboxes().await;
+
+        let sent = crate::tools::message_send::message_send(
+            bus.as_ref(),
+            ws,
+            asker,
+            Address::Team { team },
+            "status?".into(),
+            "all good?".into(),
+            vec![],
+            Some(ExpectReply {
+                quorum: Quorum::All,
+                deadline: None,
+            }),
+            8,
+        )
+        .await
+        .unwrap();
+
+        // Only lead replies, but sends 3 replies with different in_reply_to values
+        // (forging the other members' responses)
+        for &msg_id in &sent.message_ids {
+            bus.send(reply_envelope(lead, asker, msg_id, "yes"))
+                .await
+                .unwrap();
+        }
+
+        let deadline_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 200;
+        let task = Arc::new(FakeTaskHandle {
+            id: TaskId::new(),
+            session: asker,
+            suspended: Mutex::new(None),
+            resumed: Mutex::new(None),
+            cancelled: Mutex::new(None),
+        });
+        let executor = MessageWaitExecutor::new(bus.clone());
+        let outcome = executor
+            .wait(
+                task,
+                asker,
+                sent.recipients.clone(),
+                sent.message_ids.clone(),
+                ExpectReply {
+                    quorum: Quorum::All,
+                    deadline: Some(deadline_ms),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Only 1 of 3 accepted (from lead for lead's message_id); the other 2 are
+        // rejected because lead != expected sender for those message_ids.
+        assert!(outcome.timed_out);
+        assert_eq!(outcome.replies.len(), 1);
     }
 }

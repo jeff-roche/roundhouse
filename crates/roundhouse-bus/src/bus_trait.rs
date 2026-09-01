@@ -32,4 +32,8 @@ pub trait Bus: Send + Sync {
         workspace: WorkspaceId,
         addr: &Address,
     ) -> Result<Vec<SessionId>, BusError>;
+    /// Re-queue an envelope that was popped from a mailbox but not consumed
+    /// (e.g. a non-matching reply during a quorum wait). Bypasses idempotency,
+    /// ttl_hops, rate cap, and repetition damper — pushes directly to the mailbox.
+    async fn requeue(&self, envelope: Envelope) -> Result<(), BusError>;
 }
