@@ -58,3 +58,4 @@ panic = "unwind"
 
 [profile.dev]
 panic = "unwind"
+debug = "line-tables-only"

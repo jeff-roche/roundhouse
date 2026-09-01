@@ -101,7 +101,19 @@ const EXPECTED_EDGES: &[(&str, &[&str])] = &[
             "roundhouse-net",
         ],
     ),
-    ("roundhouse-mcp", &["roundhouse-core", "roundhouse-policy"]),
+    // `roundhouse-provider` below is a deliberate, authorized addition
+    // (Task 1, Phase 3; plan correction dated 2026-08-28) — `ContentBlock`/
+    // `MediaSource` live in `roundhouse-provider` (src/ir.rs), not
+    // `roundhouse-core`, and the doc table row was updated in the same
+    // commit per this test's keep-both-in-sync rule.
+    (
+        "roundhouse-mcp",
+        &[
+            "roundhouse-core",
+            "roundhouse-policy",
+            "roundhouse-provider",
+        ],
+    ),
     ("roundhouse-acp", &["roundhouse-core", "roundhouse-proto"]),
     ("roundhouse-bus", &["roundhouse-core"]),
     (

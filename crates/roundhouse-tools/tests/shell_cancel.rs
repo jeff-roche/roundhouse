@@ -59,13 +59,36 @@ async fn sigterm_then_sigkill_on_unresponsive_process() {
 async fn sigterm_is_sufficient_for_a_cooperative_process() {
     // `sleep` has no SIGTERM handler, so the default disposition (terminate)
     // applies and the process should exit well within the grace period.
-    let mut handle = spawn_sh("sleep 30").await.unwrap();
+    //
+    // Spawned DIRECTLY (`sleep 30`, not `sh -c "sleep 30"`): the point of
+    // this test is the SIGTERM-sufficient verdict, and that verdict is
+    // only deterministic when the group contains exactly the one
+    // cooperative process. Via a shell, whether the group holds one
+    // process (`sh` exec-replaces itself with `sleep`, as dash does for a
+    // lone simple command) or two (a shell that forks `sleep`) is a
+    // property of the host's `/bin/sh`, not of this crate — and in the
+    // two-process shape the outer `sh` dies on the group-wide SIGTERM
+    // without ever reaping `sleep`, so `sleep` briefly answers the
+    // `killpg(pgid, 0)` probe as a zombie-orphan and the confirmation
+    // loop correctly escalates to SIGKILL, reporting `Killed`. That is
+    // the same honest-but-slower race documented on
+    // `cancel_kills_the_whole_process_group_not_just_the_direct_child`
+    // below (which is why *that* test tolerates either disposition); this
+    // test exists to pin the `Terminated` verdict, so it removes the
+    // shell fork from the picture instead of tolerating the flake.
+    let mut handle = spawn_cancellable("sleep", &["30".to_string()], Path::new("."))
+        .await
+        .unwrap();
 
     let disposition = cancel_running_shell(&mut handle, Duration::from_millis(500))
         .await
         .unwrap();
 
-    assert_eq!(disposition, ExitDisposition::Terminated);
+    assert_eq!(
+        disposition,
+        ExitDisposition::Terminated,
+        "a lone cooperative process must be terminable by SIGTERM alone"
+    );
 }
 
 #[tokio::test]
