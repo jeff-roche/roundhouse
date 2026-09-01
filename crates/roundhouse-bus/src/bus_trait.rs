@@ -36,4 +36,16 @@ pub trait Bus: Send + Sync {
     /// (e.g. a non-matching reply during a quorum wait). Bypasses idempotency,
     /// ttl_hops, rate cap, and repetition damper — pushes directly to the mailbox.
     async fn requeue(&self, envelope: Envelope) -> Result<(), BusError>;
+    /// Registers `(workspace, name) -> session` in the daemon-side handle
+    /// registry (§7.2) — the missing half of `resolve_address`'s
+    /// `Address::Handle` support. `roundhouse-sched`'s `Message` trigger
+    /// binding is the first real caller; nothing in Phase 4 needed this
+    /// because its scope only covered point-to-point session sends.
+    async fn register_handle(
+        &self,
+        workspace: WorkspaceId,
+        name: String,
+        session: SessionId,
+    ) -> Result<(), BusError>;
+    async fn unregister_handle(&self, workspace: WorkspaceId, name: &str) -> Result<(), BusError>;
 }

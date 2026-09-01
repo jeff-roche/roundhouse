@@ -325,6 +325,21 @@ impl Bus for LocalBus {
     async fn requeue(&self, envelope: Envelope) -> Result<(), BusError> {
         LocalBus::requeue(self, envelope).await
     }
+
+    async fn register_handle(
+        &self,
+        workspace: WorkspaceId,
+        name: String,
+        session: SessionId,
+    ) -> Result<(), BusError> {
+        self.handles.register(workspace, name, session);
+        Ok(())
+    }
+
+    async fn unregister_handle(&self, workspace: WorkspaceId, name: &str) -> Result<(), BusError> {
+        self.handles.unregister(workspace, name);
+        Ok(())
+    }
 }
 
 impl Default for LocalBus {
