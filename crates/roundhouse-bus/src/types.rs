@@ -102,6 +102,8 @@ pub enum BusError {
     TeamSizeLimitExceeded { count: u32, max: u32 },
     #[error("team {team:?} is draining and refuses new members/sends")]
     TeamDraining { team: TeamId },
+    #[error("session {caller:?} is not authorized to close team {team:?}")]
+    NotAuthorized { team: TeamId, caller: SessionId },
     #[error("session {session:?} is a human and can never join a team roster (§7.2)")]
     HumanCannotJoinTeam { session: SessionId },
 }

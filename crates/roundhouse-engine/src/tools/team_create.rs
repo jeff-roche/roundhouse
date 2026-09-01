@@ -29,8 +29,8 @@ pub fn team_create(
 /// member has ended, not by this call directly.
 ///
 /// Authorization: the caller must be the team's creator or hold the "lead" role on the
-/// roster. Any other session gets `TeamDraining` (we have no dedicated `NotAuthorized`
-/// variant yet), and a missing team is reported as `UnknownHandle` (no `TeamNotFound`).
+/// roster. Any other session gets `NotAuthorized`, and a missing team is reported as
+/// `UnknownHandle` (no `TeamNotFound`).
 pub fn team_close(
     registry: &TeamRegistry,
     team: TeamId,
@@ -52,7 +52,7 @@ pub fn team_close(
             .unwrap_or(false);
 
     if !authorized {
-        return Err(BusError::TeamDraining { team });
+        return Err(BusError::NotAuthorized { team, caller });
     }
 
     registry.begin_draining(team)

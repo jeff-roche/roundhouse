@@ -57,7 +57,8 @@ mod tests {
         let err = team_close(&registry, team_id, worker).unwrap_err();
         assert!(matches!(
             err,
-            roundhouse_bus::types::BusError::TeamDraining { .. }
+            roundhouse_bus::types::BusError::NotAuthorized { team, caller }
+                if team == team_id && caller == worker
         ));
         assert_eq!(registry.state(team_id).unwrap(), TeamState::Active);
     }
