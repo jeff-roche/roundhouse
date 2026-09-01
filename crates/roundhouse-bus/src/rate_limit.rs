@@ -1,8 +1,8 @@
-use crate::types::{BusError, Envelope};
+use crate::types::BusError;
 use roundhouse_core::SessionId;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Per-session token bucket. §7.7: "Message rate cap — token bucket per session
 /// (default 20/min, burst 10) plus a global cap; exceeding returns Refused, never
@@ -63,88 +63,58 @@ impl RateLimiter {
     }
 }
 
-/// Per-recipient subject tracker. §7.7: "Repetition damper — a send with the same
-/// (to, subject) within the window is refused." This is the cheap livelock kill:
-/// an agent that loops `message` to the same recipient with an unchanging subject
-/// is stopped at the second send, not after burning a full relay cycle.
+/// §7.7: "Repetition damper — ≥3 sends with identical (to, subject) and no state
+/// change between refuses the 4th. Cheap livelock kill."
 pub struct RepetitionDamper {
-    window: Duration,
-    last_seen: Mutex<HashMap<(SessionId, String), Instant>>,
+    counts: HashMap<(SessionId, String), u32>,
 }
 
 impl RepetitionDamper {
-    pub fn new(window: Duration) -> Self {
+    pub fn new() -> Self {
         Self {
-            window,
-            last_seen: Mutex::new(HashMap::new()),
+            counts: HashMap::new(),
         }
     }
 
-    /// Refuses with `BusError::Repetitive` if `(to, subject)` was last seen within
-    /// `window`. Records the current `now` as the last-seen timestamp otherwise.
-    /// Stale entries (older than `window`) are lazily evicted on each check.
-    pub fn check(&self, to: SessionId, subject: &str, now: Instant) -> Result<(), BusError> {
-        let mut last_seen = self
-            .last_seen
-            .lock()
-            .expect("repetition damper mutex poisoned");
-
-        // Lazy eviction: drop every pair whose last sighting is outside the window.
-        last_seen.retain(|_, seen| now.duration_since(*seen) < self.window);
-
+    pub fn check_and_record(&mut self, to: SessionId, subject: &str) -> Result<(), BusError> {
         let key = (to, subject.to_string());
-        if last_seen.contains_key(&key) {
+        let count = self.counts.entry(key).or_insert(0);
+        if *count >= 3 {
             return Err(BusError::Repetitive {
                 to,
                 subject: subject.to_string(),
             });
         }
-
-        last_seen.insert(key, now);
+        *count += 1;
         Ok(())
+    }
+
+    /// Called by the caller whenever it can observe that something changed as a
+    /// result of a send (e.g. the recipient's state moved, or a reply carried new
+    /// information) — resets the streak for that `(to, subject)`.
+    pub fn note_state_change(&mut self, to: SessionId, subject: &str) {
+        self.counts.remove(&(to, subject.to_string()));
     }
 }
 
-/// §7.7: "ttl_hops (default 8) decremented per relay." Decrements the envelope's
-/// remaining hop count in place; refuses synchronously once it reaches zero so an
-/// envelope can never circulate forever.
-pub fn decrement_ttl(envelope: &mut Envelope) -> Result<(), BusError> {
-    if envelope.ttl_hops == 0 {
-        return Err(BusError::TtlExpired);
+impl Default for RepetitionDamper {
+    fn default() -> Self {
+        Self::new()
     }
-    envelope.ttl_hops -= 1;
-    Ok(())
+}
+
+/// §7.7: "ttl_hops (default 8) decremented per relay." Decrements the remaining hop
+/// count; refuses synchronously once it reaches zero so an envelope can never
+/// circulate forever.
+pub fn decrement_ttl(current: u8) -> Result<u8, BusError> {
+    current.checked_sub(1).ok_or(BusError::TtlExpired)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Address, Envelope, MessageId, Provenance, Trust};
-    use roundhouse_core::{Origin, SessionId};
+    use roundhouse_core::SessionId;
     use std::time::{Duration, Instant};
-    use uuid::Uuid;
-
-    fn envelope_with_ttl(ttl_hops: u8) -> Envelope {
-        Envelope {
-            id: MessageId(Uuid::new_v4()),
-            from: SessionId::new(),
-            to: SessionId::new(),
-            to_requested: Address::Session {
-                id: SessionId::new(),
-            },
-            subject: "ping".into(),
-            body: "hi".into(),
-            attachments: vec![],
-            expect_reply: None,
-            in_reply_to: None,
-            ttl_hops,
-            provenance: Provenance {
-                origin: Origin::Peer,
-                trust: Trust::Untrusted,
-                task: None,
-            },
-        }
-    }
 
     #[test]
     fn token_bucket_allows_burst_then_throttles() {
@@ -175,59 +145,32 @@ mod tests {
     }
 
     #[test]
-    fn repetition_damper_rejects_same_subject_within_window() {
-        let damper = RepetitionDamper::new(Duration::from_secs(10));
+    fn repetition_damper_refuses_the_fourth_identical_send() {
+        let mut damper = RepetitionDamper::new();
         let to = SessionId::new();
-        let subject = "status-check";
-        let t0 = Instant::now();
-
-        assert!(damper.check(to, subject, t0).is_ok());
-        let err = damper
-            .check(to, subject, t0 + Duration::from_secs(5))
-            .unwrap_err();
-        assert!(
-            matches!(err, BusError::Repetitive { to: t, subject: s } if t == to && s == "status-check")
-        );
+        let subject = "status-check".to_string();
+        assert!(damper.check_and_record(to, &subject).is_ok());
+        assert!(damper.check_and_record(to, &subject).is_ok());
+        assert!(damper.check_and_record(to, &subject).is_ok());
+        assert!(damper.check_and_record(to, &subject).is_err());
     }
 
     #[test]
-    fn repetition_damper_allows_different_subjects() {
-        let damper = RepetitionDamper::new(Duration::from_secs(10));
+    fn repetition_damper_resets_on_state_change() {
+        let mut damper = RepetitionDamper::new();
         let to = SessionId::new();
-        let t0 = Instant::now();
-
-        assert!(damper.check(to, "one", t0).is_ok());
-        assert!(damper.check(to, "two", t0).is_ok());
+        let subject = "status-check".to_string();
+        damper.check_and_record(to, &subject).unwrap();
+        damper.check_and_record(to, &subject).unwrap();
+        damper.note_state_change(to, &subject);
+        damper.check_and_record(to, &subject).unwrap();
+        damper.check_and_record(to, &subject).unwrap();
+        assert!(damper.check_and_record(to, &subject).is_ok());
     }
 
     #[test]
-    fn repetition_damper_allows_after_window_expires() {
-        let damper = RepetitionDamper::new(Duration::from_secs(10));
-        let to = SessionId::new();
-        let subject = "status-check";
-        let t0 = Instant::now();
-
-        assert!(damper.check(to, subject, t0).is_ok());
-        assert!(damper
-            .check(to, subject, t0 + Duration::from_secs(11))
-            .is_ok());
-    }
-
-    #[test]
-    fn ttl_hops_zero_is_refused_synchronously() {
-        let mut env = envelope_with_ttl(0);
-        assert!(matches!(decrement_ttl(&mut env), Err(BusError::TtlExpired)));
-    }
-
-    #[test]
-    fn ttl_hops_decrements_on_each_hop() {
-        let mut env = envelope_with_ttl(3);
-        assert!(decrement_ttl(&mut env).is_ok());
-        assert_eq!(env.ttl_hops, 2);
-        assert!(decrement_ttl(&mut env).is_ok());
-        assert_eq!(env.ttl_hops, 1);
-        assert!(decrement_ttl(&mut env).is_ok());
-        assert_eq!(env.ttl_hops, 0);
-        assert!(matches!(decrement_ttl(&mut env), Err(BusError::TtlExpired)));
+    fn ttl_hops_decrements_and_expires_at_zero() {
+        assert_eq!(decrement_ttl(1).unwrap(), 0);
+        assert!(decrement_ttl(0).is_err());
     }
 }
