@@ -36,6 +36,10 @@ cron = "=0.15.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Task 3 (scheduler): only `tokio::time::Instant` is used, for a monotonic
+# clock reading that is immune to wall-clock adjustments. No async runtime
+# is spun up by this crate, so only the `time` feature is enabled.
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
