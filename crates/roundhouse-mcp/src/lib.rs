@@ -1,7 +1,10 @@
-//! The MCP host: connects to Model Context Protocol servers (via `rmcp`)
-//! and exposes their tools to the rest of the system as ordinary
+//! The MCP host: connects to Model Context Protocol servers and exposes
+//! their tools to the rest of the system as ordinary
 //! `TaskParams`/policy-gated actions, so an MCP tool call is subject to the
-//! same permission and event-sourcing rules as any built-in executor.
+//! same permission and event-sourcing rules as any built-in executor. The
+//! current stdio adapter (`transport/stdio.rs`) hand-rolls
+//! newline-delimited JSON-RPC framing; the future `rmcp` reconciliation is
+//! isolated to that one file.
 //!
 //! Task 1 (Phase 3) scaffolds the crate: the workspace wiring, the
 //! dependency set later tasks build on, and a placeholder

@@ -57,7 +57,7 @@ pub enum McpResultType {
 pub struct McpResult {
     pub result_type: McpResultType,
     /// Raw `CallToolResult.content` blocks, still in MCP's wire shape —
-    /// decoding into `roundhouse_core::ContentBlock` happens in `executor.rs`.
+    /// decoding into `roundhouse_provider::ContentBlock` happens in `executor.rs`.
     pub content: Vec<McpContentBlock>,
     pub is_error: bool,
 }
