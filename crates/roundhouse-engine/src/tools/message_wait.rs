@@ -83,10 +83,19 @@ impl MessageWaitExecutor {
     /// and exits exactly the way a deadline would have, `timed_out: true`. A safe
     /// no-op if `task_id` has no live wait (nothing to release).
     pub fn mark_released(&self, task_id: TaskId) {
-        self.released
+        // Only insert if there's a live wait for this task — a release on a
+        // non-waiting task is a safe no-op, not a deferred trigger.
+        if self
+            .pending
             .lock()
-            .expect("released-set mutex poisoned")
-            .insert(task_id);
+            .expect("pending-reply mutex poisoned")
+            .contains_key(&task_id)
+        {
+            self.released
+                .lock()
+                .expect("released-set mutex poisoned")
+                .insert(task_id);
+        }
     }
 
     fn take_released(&self, task_id: TaskId) -> bool {
@@ -144,6 +153,10 @@ impl MessageWaitExecutor {
                 .lock()
                 .expect("pending-reply mutex poisoned")
                 .remove(&task.id());
+            self.released
+                .lock()
+                .expect("released-set mutex poisoned")
+                .remove(&task.id());
             let _ = self.bus.clear_wait(session).await;
             return Err(BusError::Undeliverable(
                 roundhouse_bus::types::Undeliverable::Ended { session },
@@ -193,7 +206,9 @@ impl MessageWaitExecutor {
                         .unwrap_or(false) =>
                 {
                     if let Some(reply_to_id) = envelope.in_reply_to {
-                        if expected_sender.get(&reply_to_id) == Some(&envelope.from) {
+                        if expected_sender.get(&reply_to_id) == Some(&envelope.from)
+                            || envelope.provenance.origin == Origin::User
+                        {
                             replies.push(envelope);
                             if replies.len() as u32 >= needed {
                                 break false;
@@ -236,6 +251,10 @@ impl MessageWaitExecutor {
                         .lock()
                         .expect("pending-reply mutex poisoned")
                         .remove(&task.id());
+                    self.released
+                        .lock()
+                        .expect("released-set mutex poisoned")
+                        .remove(&task.id());
                     let _ = task.resume(
                         Origin::System,
                         serde_json::json!({ "error": "poll_failed" }),
@@ -252,6 +271,10 @@ impl MessageWaitExecutor {
         self.pending
             .lock()
             .expect("pending-reply mutex poisoned")
+            .remove(&task.id());
+        self.released
+            .lock()
+            .expect("released-set mutex poisoned")
             .remove(&task.id());
 
         let outcome = WaitOutcome { replies, timed_out };

@@ -157,6 +157,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn answer_as_peer_resolves_a_live_wait_on_an_agent_peer() {
+        let bus: Arc<dyn roundhouse_bus::Bus> = Arc::new(LocalBus::new());
+        let waiter = SessionId::new();
+        let peer = SessionId::new();
+        let human = SessionId::new();
+        bus.register_mailbox(waiter, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+        bus.register_mailbox(peer, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        let task = Arc::new(FakeTaskHandle {
+            id: TaskId::new(),
+            session: waiter,
+            cancelled: Mutex::new(None),
+        });
+        let executor = Arc::new(crate::tools::message_wait::MessageWaitExecutor::new(
+            bus.clone(),
+        ));
+        let sent_id = MessageId(Uuid::new_v4());
+
+        let wait_handle = {
+            let executor = executor.clone();
+            let task: Arc<dyn crate::tools::message_wait::TaskHandle> = task;
+            tokio::spawn(async move {
+                executor
+                    .wait(
+                        task,
+                        waiter,
+                        vec![peer],
+                        vec![sent_id],
+                        ExpectReply {
+                            quorum: Quorum::Any,
+                            deadline: None,
+                        },
+                    )
+                    .await
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        answer_as_peer(
+            bus.as_ref(),
+            waiter,
+            sent_id,
+            "human override".into(),
+            human,
+        )
+        .await
+        .unwrap();
+
+        let outcome = wait_handle.await.unwrap().unwrap();
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.replies.len(), 1);
+        assert_eq!(outcome.replies[0].body, "human override");
+        assert_eq!(outcome.replies[0].provenance.origin, Origin::User);
+    }
+
+    #[tokio::test]
     async fn release_unblocks_a_live_parked_wait_as_timed_out() {
         let bus: Arc<dyn roundhouse_bus::Bus> = Arc::new(LocalBus::new());
         let a = SessionId::new();
