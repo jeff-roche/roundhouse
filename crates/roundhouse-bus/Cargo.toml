@@ -9,8 +9,15 @@ workspace = true
 
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
+roundhouse-store = { path = "../roundhouse-store" }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+dashmap = "6"
 async-trait = "0.1"
+smallvec = "1.13"
 thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

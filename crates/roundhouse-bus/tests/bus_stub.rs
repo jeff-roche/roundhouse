@@ -11,11 +11,15 @@ impl Bus for NoopBus {
     }
 
     async fn send(&self, _envelope: Envelope) -> Result<(), BusError> {
-        Err(BusError::Undeliverable(Undeliverable::Ended))
+        Err(BusError::Undeliverable(Undeliverable::Ended {
+            session: SessionId::new(),
+        }))
     }
 
     async fn wait(&self, _session: SessionId) -> Result<Envelope, BusError> {
-        Err(BusError::Timeout)
+        Err(BusError::Undeliverable(Undeliverable::Ended {
+            session: _session,
+        }))
     }
 
     async fn resolve(&self, address: &Address) -> Result<Vec<SessionId>, BusError> {
@@ -44,6 +48,6 @@ async fn send_to_an_ended_session_returns_undeliverable_never_a_silent_drop() {
     let result = bus.send(envelope).await;
     assert!(matches!(
         result,
-        Err(BusError::Undeliverable(Undeliverable::Ended))
+        Err(BusError::Undeliverable(Undeliverable::Ended { .. }))
     ));
 }

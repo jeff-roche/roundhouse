@@ -2988,9 +2988,15 @@ name = "roundhouse-bus"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dashmap",
  "roundhouse-core",
+ "roundhouse-store",
+ "serde",
+ "smallvec",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
