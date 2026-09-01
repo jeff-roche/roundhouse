@@ -1,6 +1,6 @@
 use crate::handle_registry::HandleRegistry;
 use crate::mailbox::{Mailbox, MailboxKind};
-use crate::types::BusError;
+use crate::types::{BusError, Envelope, Undeliverable};
 use crate::wait_graph::WaitGraph;
 use dashmap::DashMap;
 use roundhouse_core::SessionId;
@@ -46,6 +46,32 @@ impl LocalBus {
     pub fn has_mailbox(&self, session: SessionId) -> bool {
         self.mailboxes.contains_key(&session)
     }
+
+    /// §7.4: "FIFO per (sender, recipient) pair." A per-recipient VecDeque already
+    /// gives FIFO for everything landing in that mailbox; because sends from a given
+    /// sender are pushed in the order `send` is awaited (single mailbox lock per push),
+    /// each (sender, recipient) sub-sequence within that queue is preserved without
+    /// needing a separate index.
+    pub async fn send(&self, envelope: Envelope) -> Result<(), BusError> {
+        let to = envelope.to;
+        let mailbox =
+            self.mailboxes
+                .get(&to)
+                .ok_or(BusError::Undeliverable(Undeliverable::Ended {
+                    session: to,
+                }))?;
+        let mut guard = mailbox.lock().expect("mailbox mutex poisoned");
+        guard.push(to, envelope)
+    }
+
+    pub async fn poll(&self, session: SessionId) -> Result<Option<Envelope>, BusError> {
+        let mailbox = self
+            .mailboxes
+            .get(&session)
+            .ok_or(BusError::Undeliverable(Undeliverable::Ended { session }))?;
+        let mut guard = mailbox.lock().expect("mailbox mutex poisoned");
+        Ok(guard.pop_front())
+    }
 }
 
 impl Default for LocalBus {
@@ -82,5 +108,75 @@ mod tests {
             .unwrap();
         bus.deregister_mailbox(sid).await.unwrap();
         assert!(!bus.has_mailbox(sid));
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+    use crate::mailbox::MailboxKind;
+    use crate::types::{Address, Envelope, MessageId, Provenance, Trust};
+    use roundhouse_core::{Origin, SessionId};
+    use uuid::Uuid;
+
+    fn envelope(from: SessionId, to: SessionId, seq: u8) -> Envelope {
+        Envelope {
+            id: MessageId(Uuid::new_v4()),
+            from,
+            to,
+            to_requested: Address::Session { id: to },
+            subject: "s".into(),
+            body: format!("msg-{seq}"),
+            attachments: vec![],
+            expect_reply: None,
+            in_reply_to: None,
+            ttl_hops: 8,
+            provenance: Provenance {
+                origin: Origin::Peer,
+                trust: Trust::Untrusted,
+                task: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn fifo_ordering_is_per_sender_recipient_pair_not_global() {
+        let bus = LocalBus::new();
+        let a = SessionId::new();
+        let b = SessionId::new();
+        bus.register_mailbox(a, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+        bus.register_mailbox(b, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        // Interleave two independent pairs: A->B and B->A.
+        bus.send(envelope(a, b, 1)).await.unwrap();
+        bus.send(envelope(b, a, 1)).await.unwrap();
+        bus.send(envelope(a, b, 2)).await.unwrap();
+        bus.send(envelope(b, a, 2)).await.unwrap();
+
+        let b1 = bus.poll(b).await.unwrap().unwrap();
+        let b2 = bus.poll(b).await.unwrap().unwrap();
+        assert_eq!(b1.body, "msg-1");
+        assert_eq!(b2.body, "msg-2");
+
+        let a1 = bus.poll(a).await.unwrap().unwrap();
+        let a2 = bus.poll(a).await.unwrap().unwrap();
+        assert_eq!(a1.body, "msg-1");
+        assert_eq!(a2.body, "msg-2");
+    }
+
+    #[tokio::test]
+    async fn send_to_ended_session_is_synchronously_undeliverable() {
+        let bus = LocalBus::new();
+        let from = SessionId::new();
+        let ended = SessionId::new(); // never registered = tombstoned/ended
+        let err = bus.send(envelope(from, ended, 1)).await.unwrap_err();
+        assert!(matches!(
+            err,
+            crate::types::BusError::Undeliverable(crate::types::Undeliverable::Ended { .. })
+        ));
     }
 }
