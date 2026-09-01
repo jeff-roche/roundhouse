@@ -3064,6 +3064,7 @@ dependencies = [
 name = "roundhouse-engine"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures",
  "once_cell",
  "roundhouse-bus",
@@ -3078,6 +3079,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

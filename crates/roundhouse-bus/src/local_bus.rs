@@ -112,11 +112,18 @@ impl LocalBus {
                         workspace,
                         name: "<unknown team>".into(),
                     })?;
-                Ok(roster
+                let recipients: Vec<SessionId> = roster
                     .into_iter()
                     .filter(|m| !m.ended)
                     .map(|m| m.session)
-                    .collect())
+                    .collect();
+                if recipients.is_empty() {
+                    return Err(BusError::NoLiveRecipients {
+                        team: *team,
+                        role: None,
+                    });
+                }
+                Ok(recipients)
             }
             Address::Role { team, role } => {
                 if let Some(state) = self.teams.state(*team) {
@@ -131,11 +138,18 @@ impl LocalBus {
                         workspace,
                         name: "<unknown team>".into(),
                     })?;
-                Ok(roster
+                let recipients: Vec<SessionId> = roster
                     .into_iter()
                     .filter(|m| !m.ended && &m.role == role)
                     .map(|m| m.session)
-                    .collect())
+                    .collect();
+                if recipients.is_empty() {
+                    return Err(BusError::NoLiveRecipients {
+                        team: *team,
+                        role: Some(role.clone()),
+                    });
+                }
+                Ok(recipients)
             }
             other => self
                 .handles
@@ -228,7 +242,13 @@ impl LocalBus {
     /// idempotency sink, ttl_hops decrement, rate cap, or repetition damper — the
     /// envelope is already in flight and was merely parked in the wrong place, so
     /// re-applying those checks would silently drop it (the sink would reject it as a
-    /// duplicate). Pushes directly back to the mailbox (or a human's notification feed).
+    /// duplicate). Pushes to the *back* of the mailbox, not the front: `poll` always
+    /// pops from the front, so a front-push would hand the exact same envelope right
+    /// back to the next `poll` — if it's still non-matching there, the caller re-queues
+    /// it to the front again, forever, and never reaches anything queued behind it. A
+    /// back-push instead rotates the mailbox one message per poll/requeue cycle, so
+    /// every message — including the one actually being waited for — eventually
+    /// reaches the front.
     pub async fn requeue(&self, envelope: Envelope) -> Result<(), BusError> {
         let to = envelope.to;
         if self.human_sessions.contains(&to) {
@@ -249,7 +269,7 @@ impl LocalBus {
                     session: to,
                 }))?;
         let mut guard = mailbox.lock().expect("mailbox mutex poisoned");
-        guard.push_front(to, envelope)
+        guard.push(to, envelope)
     }
 }
 
@@ -661,6 +681,61 @@ mod send_wiring_tests {
             .await
             .unwrap();
         assert_eq!(recipients, vec![worker]);
+    }
+
+    #[tokio::test]
+    async fn resolve_recipients_refuses_a_team_address_with_zero_live_members() {
+        // Regression test: a team whose only member has ended used to resolve to
+        // `Ok(vec![])` — `message_send` would then "succeed" with nobody actually
+        // sent to, and a caller doing `message_wait(Quorum::All)` on that empty send
+        // registers no wait-graph edges (nothing to catch it) and hangs forever with
+        // no explicit deadline.
+        let bus = LocalBus::new();
+        let ws = WorkspaceId::new();
+        let lead = SessionId::new();
+        let teams = Arc::new(TeamRegistry::new());
+        let team = teams
+            .create_team(ws, "t".into(), "c".into(), lead, "lead".into())
+            .unwrap();
+        teams.mark_member_ended(team, lead).unwrap();
+        let bus = bus.with_teams(teams);
+
+        let err = bus
+            .resolve_recipients(ws, &Address::Team { team })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::types::BusError::NoLiveRecipients { team: t, role: None } if t == team
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_recipients_refuses_a_role_address_with_no_matching_members() {
+        let bus = LocalBus::new();
+        let ws = WorkspaceId::new();
+        let lead = SessionId::new();
+        let teams = Arc::new(TeamRegistry::new());
+        let team = teams
+            .create_team(ws, "t".into(), "c".into(), lead, "lead".into())
+            .unwrap();
+        let bus = bus.with_teams(teams);
+
+        let err = bus
+            .resolve_recipients(
+                ws,
+                &Address::Role {
+                    team,
+                    role: "reviewer".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::types::BusError::NoLiveRecipients { team: t, role: Some(r) }
+                if t == team && r == "reviewer"
+        ));
     }
 
     #[tokio::test]

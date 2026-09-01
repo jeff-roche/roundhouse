@@ -117,6 +117,13 @@ pub enum BusError {
     NotAuthorized { team: TeamId, caller: SessionId },
     #[error("session {session:?} is a human and can never join a team roster (§7.2)")]
     HumanCannotJoinTeam { session: SessionId },
+    /// A `Team`/`Role` address resolved to zero live recipients (every member has
+    /// ended, or none holds the requested role). Returning `Ok(vec![])` here instead
+    /// would let `message_send` "succeed" with nothing sent, and a caller doing
+    /// `message_wait(Quorum::All)` on that empty send registers no wait-graph edges
+    /// and has no deadlock detector to ever catch the resulting hang.
+    #[error("address for team {team:?} (role {role:?}) resolved to zero live recipients")]
+    NoLiveRecipients { team: TeamId, role: Option<String> },
 }
 
 #[cfg(test)]

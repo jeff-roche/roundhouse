@@ -20,7 +20,7 @@ mod tests {
             .create_team(ws, "t".into(), "c".into(), creator, "lead".into())
             .unwrap();
 
-        team_close(&registry, team_id, creator).unwrap();
+        team_close(&registry, ws, team_id, creator).unwrap();
         assert_eq!(registry.state(team_id).unwrap(), TeamState::Draining);
     }
 
@@ -38,7 +38,7 @@ mod tests {
             .join(team_id, other_lead, Some("lead".into()))
             .unwrap();
 
-        team_close(&registry, team_id, other_lead).unwrap();
+        team_close(&registry, ws, team_id, other_lead).unwrap();
         assert_eq!(registry.state(team_id).unwrap(), TeamState::Draining);
     }
 
@@ -54,7 +54,7 @@ mod tests {
         let worker = SessionId::new();
         registry.join(team_id, worker, None).unwrap();
 
-        let err = team_close(&registry, team_id, worker).unwrap_err();
+        let err = team_close(&registry, ws, team_id, worker).unwrap_err();
         assert!(matches!(
             err,
             roundhouse_bus::types::BusError::NotAuthorized { team, caller }
@@ -64,14 +64,16 @@ mod tests {
     }
 
     #[test]
-    fn closing_unknown_team_returns_unknown_handle() {
+    fn closing_unknown_team_returns_unknown_handle_with_the_callers_real_workspace() {
         let registry = TeamRegistry::new();
+        let ws = WorkspaceId::new();
         let caller = SessionId::new();
 
-        let err = team_close(&registry, TeamId::new(), caller).unwrap_err();
+        let err = team_close(&registry, ws, TeamId::new(), caller).unwrap_err();
         assert!(matches!(
             err,
-            roundhouse_bus::types::BusError::UnknownHandle { .. }
+            roundhouse_bus::types::BusError::UnknownHandle { workspace, .. }
+                if workspace == ws
         ));
     }
 }

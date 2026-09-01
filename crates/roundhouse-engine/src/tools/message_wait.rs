@@ -124,16 +124,12 @@ impl MessageWaitExecutor {
         sent_ids: Vec<MessageId>,
         expect: ExpectReply,
     ) -> Result<WaitOutcome, BusError> {
-        for &target in &targets {
-            if let Err(e) = self.bus.register_wait(session, target).await {
-                // Roll back before propagating — a partially-registered wait must not
-                // linger in the graph. `clear_wait` removes every edge registered
-                // under `session` in one call, so this is a full rollback, not partial.
-                let _ = self.bus.clear_wait(session).await;
-                return Err(e);
-            }
-        }
-
+        // Inserted *before* the `register_wait` loop's await points (below) —
+        // `mark_released`'s "is this task actually waiting" check reads `pending`, so
+        // if the insert happened after those awaits, a break-glass `release` landing
+        // in that window would see no entry, treat itself as a no-op, and be lost for
+        // good (this executor's own `wait` is the only place that ever re-checks
+        // `released` for this task id). Populating `pending` first closes that window.
         self.pending
             .lock()
             .expect("pending-reply mutex poisoned")
@@ -145,6 +141,23 @@ impl MessageWaitExecutor {
                     quorum: expect.quorum,
                 },
             );
+
+        for &target in &targets {
+            if let Err(e) = self.bus.register_wait(session, target).await {
+                // Roll back before propagating — a partially-registered wait must not
+                // linger in the graph, and `pending`/`released` must not leak either.
+                let _ = self.bus.clear_wait(session).await;
+                self.pending
+                    .lock()
+                    .expect("pending-reply mutex poisoned")
+                    .remove(&task.id());
+                self.released
+                    .lock()
+                    .expect("released-set mutex poisoned")
+                    .remove(&task.id());
+                return Err(e);
+            }
+        }
 
         // §4.1: no payload on `AwaitingReply` — message_id/quorum/targets live in
         // `self.pending` (above), not in this enum variant.
@@ -222,7 +235,9 @@ impl MessageWaitExecutor {
                             // some *other* wait on the same session), and sleep so a
                             // mailbox holding only non-matching messages can't
                             // busy-spin.
-                            let _ = self.bus.requeue(envelope).await;
+                            if let Err(e) = self.bus.requeue(envelope).await {
+                                tracing::error!(?session, error = ?e, "requeue of non-matching reply failed, message dropped");
+                            }
                             tokio::time::sleep(WAIT_POLL_INTERVAL).await;
                         }
                     }
@@ -231,7 +246,9 @@ impl MessageWaitExecutor {
                     // A non-matching message (not an `in_reply_to` one of our sent
                     // ids) arrived while parked — re-queue so it isn't lost, then
                     // sleep to avoid busy-spin.
-                    let _ = self.bus.requeue(other).await;
+                    if let Err(e) = self.bus.requeue(other).await {
+                        tracing::error!(?session, error = ?e, "requeue of non-matching message failed, message dropped");
+                    }
                     tokio::time::sleep(WAIT_POLL_INTERVAL).await;
                 }
                 Ok(None) => {
@@ -314,6 +331,63 @@ mod tests {
     use roundhouse_core::{Origin, SessionId, TaskId, WorkspaceId};
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
+
+    /// Test-only `Bus` decorator that yields to the scheduler inside `register_wait`,
+    /// standing in for tokio's cooperative-budget preemption (which can suspend a
+    /// task mid-`.await` even when nothing genuinely blocks) so a single-threaded test
+    /// can deterministically land in the exact window a break-glass `release` needs to
+    /// race against.
+    struct YieldBeforeRegisterWait {
+        inner: Arc<dyn roundhouse_bus::Bus>,
+    }
+
+    #[async_trait::async_trait]
+    impl roundhouse_bus::Bus for YieldBeforeRegisterWait {
+        async fn send(&self, envelope: Envelope) -> Result<(), BusError> {
+            self.inner.send(envelope).await
+        }
+        async fn poll(&self, session: SessionId) -> Result<Option<Envelope>, BusError> {
+            self.inner.poll(session).await
+        }
+        async fn register_mailbox(
+            &self,
+            session: SessionId,
+            kind: MailboxKind,
+        ) -> Result<(), BusError> {
+            self.inner.register_mailbox(session, kind).await
+        }
+        async fn deregister_mailbox(&self, session: SessionId) -> Result<(), BusError> {
+            self.inner.deregister_mailbox(session).await
+        }
+        async fn register_wait(
+            &self,
+            waiter: SessionId,
+            target: SessionId,
+        ) -> Result<(), BusError> {
+            tokio::task::yield_now().await;
+            self.inner.register_wait(waiter, target).await
+        }
+        async fn clear_wait(&self, waiter: SessionId) -> Result<(), BusError> {
+            self.inner.clear_wait(waiter).await
+        }
+        async fn resolve_address(
+            &self,
+            workspace: WorkspaceId,
+            addr: &Address,
+        ) -> Result<SessionId, BusError> {
+            self.inner.resolve_address(workspace, addr).await
+        }
+        async fn resolve_recipients(
+            &self,
+            workspace: WorkspaceId,
+            addr: &Address,
+        ) -> Result<Vec<SessionId>, BusError> {
+            self.inner.resolve_recipients(workspace, addr).await
+        }
+        async fn requeue(&self, envelope: Envelope) -> Result<(), BusError> {
+            self.inner.requeue(envelope).await
+        }
+    }
 
     struct FakeTaskHandle {
         id: TaskId,
@@ -419,6 +493,139 @@ mod tests {
         // §7.6: a reply arriving while parked renders as the tool_result of the pending
         // call — the resume path carries the reply payload, not a synthetic user turn.
         assert!(task.resumed.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_non_matching_message_ahead_of_the_real_reply_does_not_starve_the_wait() {
+        // Regression test: `requeue` used to push back to the *front* of the mailbox,
+        // so a non-matching message sitting ahead of the real reply got popped and
+        // immediately re-queued to the same front position, forever — the real reply
+        // behind it was never reached and the wait hung. `requeue` now pushes to the
+        // back, so the mailbox rotates and the reply is eventually polled.
+        let bus: Arc<dyn roundhouse_bus::Bus> = Arc::new(LocalBus::new());
+        let waiter = SessionId::new();
+        let stranger = SessionId::new();
+        let peer = SessionId::new();
+        bus.register_mailbox(waiter, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+        bus.register_mailbox(stranger, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+        bus.register_mailbox(peer, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        let sent_id = MessageId(Uuid::new_v4());
+        // An unrelated message lands ahead of the real reply in waiter's mailbox.
+        bus.send(reply_envelope(
+            stranger,
+            waiter,
+            MessageId(Uuid::new_v4()),
+            "not for you",
+        ))
+        .await
+        .unwrap();
+        bus.send(reply_envelope(peer, waiter, sent_id, "42"))
+            .await
+            .unwrap();
+
+        let task = Arc::new(FakeTaskHandle {
+            id: TaskId::new(),
+            session: waiter,
+            suspended: Mutex::new(None),
+            resumed: Mutex::new(None),
+            cancelled: Mutex::new(None),
+        });
+
+        let executor = MessageWaitExecutor::new(bus.clone());
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            executor.wait(
+                task,
+                waiter,
+                vec![peer],
+                vec![sent_id],
+                ExpectReply {
+                    quorum: Quorum::Any,
+                    deadline: None,
+                },
+            ),
+        )
+        .await
+        .expect("wait must not hang behind a non-matching message")
+        .unwrap();
+
+        assert_eq!(outcome.replies.len(), 1);
+        assert_eq!(outcome.replies[0].body, "42");
+        assert!(!outcome.timed_out);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_racing_the_register_wait_await_point_is_not_dropped() {
+        // Regression test: `mark_released` only recorded a release if `pending`
+        // already had an entry for the task, but `pending` used to be populated
+        // *after* the `register_wait` loop's await points. A break-glass `release`
+        // landing in that window saw no `pending` entry, treated itself as a safe
+        // no-op, and was lost — the wait then had no deadline and hung forever.
+        // `pending` is now populated before any await in `wait`, closing the window;
+        // this test uses a `Bus` that deliberately yields inside `register_wait` to
+        // land exactly there.
+        let local = LocalBus::new();
+        let waiter = SessionId::new();
+        let peer = SessionId::new();
+        local
+            .register_mailbox(waiter, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+        local
+            .register_mailbox(peer, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+        let bus: Arc<dyn roundhouse_bus::Bus> = Arc::new(YieldBeforeRegisterWait {
+            inner: Arc::new(local),
+        });
+
+        let task_id = TaskId::new();
+        let task = Arc::new(FakeTaskHandle {
+            id: task_id,
+            session: waiter,
+            suspended: Mutex::new(None),
+            resumed: Mutex::new(None),
+            cancelled: Mutex::new(None),
+        });
+        let executor = Arc::new(MessageWaitExecutor::new(bus.clone()));
+
+        let wait_handle = {
+            let executor = executor.clone();
+            tokio::spawn(async move {
+                executor
+                    .wait(
+                        task,
+                        waiter,
+                        vec![peer],
+                        vec![MessageId(Uuid::new_v4())],
+                        ExpectReply {
+                            quorum: Quorum::Any,
+                            deadline: None,
+                        },
+                    )
+                    .await
+            })
+        };
+
+        // Let the spawned wait run up to (and yield inside) `register_wait`, then
+        // release it — on a current-thread runtime this reliably lands in that exact
+        // window, before the (pre-fix) `pending` insert would have happened.
+        tokio::task::yield_now().await;
+        executor.mark_released(task_id);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), wait_handle)
+            .await
+            .expect("release must not be dropped — the wait must not hang")
+            .unwrap()
+            .unwrap();
+        assert!(outcome.timed_out);
     }
 
     #[tokio::test]

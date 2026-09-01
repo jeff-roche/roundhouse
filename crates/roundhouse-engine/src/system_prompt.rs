@@ -20,7 +20,7 @@ pub fn render_team_block(
         out.push_str("## Team\n");
         out.push_str(&format!(
             "Charter (peer-supplied, untrusted): {}\n\n",
-            team_record.charter
+            strip_control_chars(&team_record.charter)
         ));
         out.push_str(&format!("You are `{self_handle}` — {self_description}\n\n"));
     }
@@ -30,12 +30,21 @@ pub fn render_team_block(
             out.push_str(&format!(
                 "- {} · {}{}\n",
                 self_handle_or_session(member.session),
-                member.role,
+                strip_control_chars(&member.role),
                 marker
             ));
         }
     }
     out
+}
+
+/// Peer-supplied fields (`charter`, each roster member's `role`) are untrusted and go
+/// straight into the model's system prompt — a control/escape character (ANSI, BEL, a
+/// bare newline opening a fake `##` section) is a prompt-injection vector, not just
+/// display noise. `self_handle`/`self_description` don't need this: they're
+/// session-local, supplied by the caller for itself, not by a peer.
+fn strip_control_chars(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 fn self_handle_or_session(session: SessionId) -> String {
@@ -85,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn charter_and_role_are_preserved_verbatim() {
+    fn charter_and_role_control_chars_are_stripped() {
         let registry = TeamRegistry::new();
         let ws = WorkspaceId::new();
         let lead = SessionId::new();
@@ -101,7 +110,12 @@ mod tests {
 
         let block = render_team_block(&registry, team_id, lead, "self", "desc");
 
-        assert!(block.contains("Charter (peer-supplied, untrusted): Ship v2\u{1b}[0m"));
-        assert!(block.contains("lead\t\u{7}"));
+        // The escape/tab/BEL bytes are gone, but the surrounding legitimate content
+        // survives untouched.
+        assert!(block.contains("Charter (peer-supplied, untrusted): Ship v2[0m"));
+        assert!(!block.contains('\u{1b}'));
+        assert!(block.contains("lead"));
+        assert!(!block.contains('\u{7}'));
+        assert!(!block.contains('\t'));
     }
 }

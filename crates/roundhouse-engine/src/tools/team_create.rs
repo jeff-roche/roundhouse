@@ -30,28 +30,23 @@ pub fn team_create(
 ///
 /// Authorization: the caller must be the team's creator or hold the "lead" role on the
 /// roster. Any other session gets `NotAuthorized`, and a missing team is reported as
-/// `UnknownHandle` (no `TeamNotFound`).
+/// `UnknownHandle` (no `TeamNotFound`) — `workspace` is the caller's own workspace
+/// (mirrors `Bus::resolve_recipients`'s parameter of the same name), not something
+/// derived from the team, since a missing team has none to derive.
 pub fn team_close(
     registry: &TeamRegistry,
+    workspace: WorkspaceId,
     team: TeamId,
     caller: SessionId,
 ) -> Result<(), BusError> {
-    let team_record = registry.team(team).ok_or_else(|| BusError::UnknownHandle {
-        workspace: WorkspaceId::new(),
-        name: "<unknown team>".into(),
-    })?;
+    if registry.team(team).is_none() {
+        return Err(BusError::UnknownHandle {
+            workspace,
+            name: "<unknown team>".into(),
+        });
+    }
 
-    let authorized = team_record.created_by == caller
-        || registry
-            .roster(team)
-            .map(|roster| {
-                roster
-                    .iter()
-                    .any(|m| m.session == caller && m.role == "lead")
-            })
-            .unwrap_or(false);
-
-    if !authorized {
+    if !registry.is_lead(team, caller) {
         return Err(BusError::NotAuthorized { team, caller });
     }
 

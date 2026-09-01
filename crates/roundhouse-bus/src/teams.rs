@@ -187,6 +187,24 @@ impl TeamRegistry {
         self.store.teams.get(&team).map(|t| t.clone())
     }
 
+    /// A session holds "lead" authority over `team` iff it created the team or holds
+    /// the "lead" role on the roster — the single predicate `team_close` (authorization
+    /// to close) and `agent_spawn` (authorization to mint a child with role "lead")
+    /// both need, kept in one place so the rule can't drift between the two call sites.
+    pub fn is_lead(&self, team: TeamId, session: SessionId) -> bool {
+        self.team(team)
+            .map(|t| t.created_by == session)
+            .unwrap_or(false)
+            || self
+                .roster(team)
+                .map(|roster| {
+                    roster
+                        .iter()
+                        .any(|m| m.session == session && m.role == "lead")
+                })
+                .unwrap_or(false)
+    }
+
     pub fn state(&self, team: TeamId) -> Option<TeamState> {
         self.store.teams.get(&team).map(|t| t.state)
     }

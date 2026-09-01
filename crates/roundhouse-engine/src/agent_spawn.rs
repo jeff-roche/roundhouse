@@ -154,25 +154,11 @@ pub fn agent_spawn(
         }
 
         if let Some(ref requested_role) = input.role {
-            if requested_role == "lead" {
-                let parent_is_lead = teams
-                    .team(team)
-                    .map(|t| t.created_by == input.parent)
-                    .unwrap_or(false)
-                    || teams
-                        .roster(team)
-                        .map(|roster| {
-                            roster
-                                .iter()
-                                .any(|m| m.session == input.parent && m.role == "lead")
-                        })
-                        .unwrap_or(false);
-                if !parent_is_lead {
-                    return Err(SpawnError::Bus(BusError::NotAuthorized {
-                        team,
-                        caller: input.parent,
-                    }));
-                }
+            if requested_role == "lead" && !teams.is_lead(team, input.parent) {
+                return Err(SpawnError::Bus(BusError::NotAuthorized {
+                    team,
+                    caller: input.parent,
+                }));
             }
         }
     }
