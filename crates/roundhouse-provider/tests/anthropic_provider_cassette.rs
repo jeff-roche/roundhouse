@@ -102,6 +102,7 @@ async fn stream_chat_encodes_the_request_and_decodes_a_real_shaped_sse_response(
         trace_id: None,
         transport,
         api_key: "test-key".into(),
+        credentials: None,
     };
 
     let provider = AnthropicMessagesProvider::new();
@@ -130,6 +131,7 @@ async fn stream_chat_posts_the_encoded_body_to_the_messages_endpoint() {
         trace_id: None,
         transport: transport.clone(),
         api_key: "test-key".into(),
+        credentials: None,
     };
 
     let provider = AnthropicMessagesProvider::new();
@@ -169,6 +171,7 @@ async fn stream_chat_surfaces_non_2xx_status_as_a_provider_error() {
         trace_id: None,
         transport,
         api_key: "bad-key".into(),
+        credentials: None,
     };
 
     let provider = AnthropicMessagesProvider::new();
@@ -203,6 +206,7 @@ async fn stream_chat_rejects_a_3xx_rather_than_decoding_an_empty_stream() {
         trace_id: None,
         transport,
         api_key: "test-key".into(),
+        credentials: None,
     };
 
     let provider = AnthropicMessagesProvider::new();
@@ -228,6 +232,7 @@ async fn stream_chat_classifies_error_statuses_by_disposition() {
             trace_id: None,
             transport,
             api_key: "test-key".into(),
+            credentials: None,
         };
         expect_err(
             AnthropicMessagesProvider::new()
@@ -274,6 +279,7 @@ async fn errors_never_contain_the_api_key_or_the_response_body() {
         trace_id: None,
         transport,
         api_key: KEY.into(),
+        credentials: None,
     };
 
     let err = expect_err(
@@ -326,6 +332,7 @@ async fn a_transport_failure_is_a_transport_error_that_omits_the_api_key() {
         trace_id: None,
         transport: Arc::new(FailingTransport),
         api_key: KEY.into(),
+        credentials: None,
     };
 
     let err = expect_err(
@@ -357,6 +364,7 @@ async fn count_tokens_is_unsupported_rather_than_silently_wrong() {
         trace_id: None,
         transport,
         api_key: "test-key".into(),
+        credentials: None,
     };
 
     let result = AnthropicMessagesProvider::new()

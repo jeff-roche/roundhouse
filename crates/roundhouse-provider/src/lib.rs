@@ -17,8 +17,10 @@
 #![forbid(unsafe_code)]
 
 mod anthropic_provider;
+pub mod audit;
 mod cassette;
 pub mod codec;
+pub mod credential;
 pub mod errors;
 pub mod fallback;
 mod ir;

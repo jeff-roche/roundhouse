@@ -25,7 +25,24 @@ thiserror = { workspace = true }
 # breaker/AIMD-concurrency machinery), not just in tests.
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Used by `credential::base_url::resolve_base_url` and
+# `credential::host_only::record_base_url_override` (§9.9) to parse/derive a
+# host from a base-URL string. Already present transitively via `reqwest`;
+# declared explicitly since this crate's own public API returns `url::Url`.
+url = "2.5"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
 tokio = { version = "1.53", features = ["full", "test-util"] }
+# Dev-dependency only, per the Phase 6 Task 2 ruling: `roundhouse-secrets`
+# holds the six concrete `CredentialProvider` implementations (bearer,
+# header-key, OAuth refresh, Azure Entra, exec-command, SigV4) per the
+# frozen crate table (`docs/architecture/02-system-architecture.md` §5.2),
+# which this crate's own tests construct to exercise `ctx.credentials`
+# end-to-end. `roundhouse-provider` cannot take this as a normal dependency
+# — `roundhouse-secrets -> roundhouse-store -> roundhouse-provider` already
+# exists, so that would be a cycle. A dev-dependency cycle is legal in
+# Cargo (dev-deps are excluded from the normal build graph); do not move
+# this out of `[dev-dependencies]`.
+roundhouse-secrets = { path = "../roundhouse-secrets" }
+walkdir = "2.5"

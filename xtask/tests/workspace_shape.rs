@@ -129,9 +129,20 @@ const EXPECTED_EDGES: &[(&str, &[&str])] = &[
         ],
     ),
     ("roundhouse-config", &[]),
+    // `roundhouse-provider` below is a deliberate, authorized addition
+    // (Phase 6 Task 2) — the six concrete `CredentialProvider`
+    // implementations (§9.9) live here and implement
+    // `roundhouse_provider::credential::CredentialProvider` directly;
+    // acyclic because this crate already reaches `roundhouse-provider`
+    // transitively through the `roundhouse-store` edge below.
     (
         "roundhouse-secrets",
-        &["roundhouse-config", "roundhouse-core", "roundhouse-store"],
+        &[
+            "roundhouse-config",
+            "roundhouse-core",
+            "roundhouse-provider",
+            "roundhouse-store",
+        ],
     ),
     (
         "roundhouse-flow",

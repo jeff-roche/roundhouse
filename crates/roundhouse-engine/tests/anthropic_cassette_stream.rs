@@ -62,6 +62,7 @@ async fn anthropic_thinking_cassette_folds_to_a_thinking_block_with_signature_in
         trace_id: None,
         transport,
         api_key: "test-key".into(),
+        credentials: None,
     };
 
     let provider = AnthropicMessagesProvider::new();

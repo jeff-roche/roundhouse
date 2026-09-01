@@ -184,6 +184,7 @@ async fn list_models_defaults_to_unsupported() {
         trace_id: None,
         transport: Arc::new(UnusedTransport),
         api_key: String::new(),
+        credentials: None,
     };
     let result = provider.list_models(&ctx).await;
     assert!(

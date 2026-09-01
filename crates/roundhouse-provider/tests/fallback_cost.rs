@@ -30,6 +30,7 @@ fn dummy_ctx() -> RequestCtx {
         trace_id: None,
         transport: Arc::new(NoopTransport),
         api_key: String::new(),
+        credentials: None,
     }
 }
 
