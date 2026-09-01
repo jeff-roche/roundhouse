@@ -17,6 +17,8 @@
 //! `00-overview.md` §3.1.
 #![forbid(unsafe_code)]
 
+pub mod agent_spawn;
+
 mod chat;
 pub mod compact;
 mod context;
