@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bus_trait;
+pub mod event_sink;
 pub mod handle_registry;
 pub mod human_notifications;
 pub mod local_bus;

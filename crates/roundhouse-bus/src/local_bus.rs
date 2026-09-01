@@ -1,10 +1,11 @@
+use crate::event_sink::{EventSink, InMemoryEventSink};
 use crate::handle_registry::HandleRegistry;
 use crate::mailbox::{Mailbox, MailboxKind};
 use crate::types::{BusError, Envelope, Undeliverable};
 use crate::wait_graph::WaitGraph;
 use dashmap::DashMap;
 use roundhouse_core::SessionId;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// §7.8: "A routed mpsc registry (LocalBus with DashMap of mailboxes, handles, teams,
 /// plus the wait graph and the shared DB writer)."
@@ -16,6 +17,7 @@ pub struct LocalBus {
     pub(crate) handles: HandleRegistry,
     #[allow(dead_code)]
     pub(crate) wait_graph: Mutex<WaitGraph>,
+    pub(crate) sink: Arc<dyn EventSink>,
 }
 
 impl LocalBus {
@@ -24,7 +26,13 @@ impl LocalBus {
             mailboxes: DashMap::new(),
             handles: HandleRegistry::new(),
             wait_graph: Mutex::new(WaitGraph::new()),
+            sink: Arc::new(InMemoryEventSink::new()),
         }
+    }
+
+    pub fn with_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.sink = sink;
+        self
     }
 
     pub async fn register_mailbox(
@@ -60,6 +68,14 @@ impl LocalBus {
                 .ok_or(BusError::Undeliverable(Undeliverable::Ended {
                     session: to,
                 }))?;
+
+        // Idempotency check happens before the mailbox push: a duplicate redelivery is
+        // recorded as a no-op observation, not a second queued item.
+        if !self.sink.record_inbound(to, envelope.id) {
+            tracing::debug!(?to, msg_id = ?envelope.id, "duplicate inbound message, dropped as idempotent redelivery");
+            return Ok(());
+        }
+
         let mut guard = mailbox.lock().expect("mailbox mutex poisoned");
         guard.push(to, envelope)
     }
