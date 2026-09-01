@@ -129,6 +129,17 @@ fn is_ambiguous_local_detects_the_fold_and_rejects_unambiguous_times() {
         .and_hms_opt(12, 0, 0)
         .unwrap();
     assert!(!is_ambiguous_local(tz, ordinary));
+
+    // review round 2: a GAP instant (2026-03-08T02:30:00 local does not
+    // exist — spring-forward, `LocalResult::None`) must NOT be reported as
+    // ambiguous. `None` (no valid mapping) and `Ambiguous` (two valid
+    // mappings) are opposite conditions; a broadened match or a
+    // defensive-but-wrong `None => true` would conflate them.
+    let gap = chrono::NaiveDate::from_ymd_opt(2026, 3, 8)
+        .unwrap()
+        .and_hms_opt(2, 30, 0)
+        .unwrap();
+    assert!(!is_ambiguous_local(tz, gap));
 }
 
 #[test]
