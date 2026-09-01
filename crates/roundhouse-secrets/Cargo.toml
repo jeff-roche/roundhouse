@@ -29,6 +29,20 @@ roundhouse-store = { path = "../roundhouse-store" }
 roundhouse-provider = { path = "../roundhouse-provider" }
 thiserror = { workspace = true }
 secrecy = "0.10.3"
+# `credential::exec_command::ExecCommandCredential` (spawns a helper process)
+# and `credential::oauth_refresh::OAuthRefreshCredential` (its single-flight
+# cache mutex) use `tokio::process`/`tokio::sync::Mutex` as production code,
+# not just in tests. `process` isn't in the workspace default feature set, so
+# it's added here on top of the shared `workspace = true` features.
+tokio = { workspace = true, features = ["process"] }
+# `credential::oauth_refresh::OAuthRefreshCredential::apply` collects the
+# token endpoint's streamed `HttpResponseStream` body before parsing it as
+# JSON.
+futures = "0.3"
+# `credential::oauth_refresh`'s `OAuthTokenResponse` and the client-credentials
+# request body it builds.
+serde = { workspace = true }
+serde_json = { workspace = true }
 # SigV4 signing math (`credential::sigv4::sign`, §9.9).
 hmac = "0.12"
 sha2 = "0.10"
@@ -61,13 +75,12 @@ rustix = { version = "1.1", features = ["process"] }
 tempfile = "3"
 once_cell = "1"
 trybuild = "1"
-tokio = { workspace = true }
-futures = "0.3"
+# `tests/credential_test.rs`'s fake `HttpTransport`s build `HttpResponseStream`
+# bodies directly. `tokio`'s `macros`/`rt-multi-thread` features (needed for
+# `#[tokio::test]`) are already pulled in via `[dependencies]`'s
+# `workspace = true`.
+bytes = { workspace = true }
 # `credential`'s own ratchet test (Phase 6 Task 2) walks `src/credential/` and
 # asserts exact `expose_secret_for_provider_call(` call-site counts and the
 # absence of raw-exposure patterns.
 walkdir = "2.5"
-# Only needed by tests/ui/secret_serde_serialize.rs's trybuild compile-fail
-# case (proving `Secret` has no reachable `Serialize` impl) — no production
-# code in this crate uses serde/serde_json.
-serde_json = { workspace = true }

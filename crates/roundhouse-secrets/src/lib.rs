@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod credential;
 pub mod resolve;
 pub mod secret;
 

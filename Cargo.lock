@@ -3223,6 +3223,7 @@ dependencies = [
 name = "roundhouse-secrets"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "futures",
  "hex",
@@ -3235,6 +3236,7 @@ dependencies = [
  "roundhouse-store",
  "rustix",
  "secrecy",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
