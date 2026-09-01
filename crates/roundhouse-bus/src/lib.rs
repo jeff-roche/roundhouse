@@ -10,6 +10,7 @@ pub mod local_bus;
 pub mod mailbox;
 pub mod rate_limit;
 pub mod restart;
+pub mod spawn_tree;
 pub mod teams;
 pub mod types;
 pub mod wait_graph;

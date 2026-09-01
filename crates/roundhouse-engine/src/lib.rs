@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_spawn;
+pub mod break_glass;
 
 mod chat;
 pub mod compact;

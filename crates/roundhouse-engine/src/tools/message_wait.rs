@@ -3,7 +3,7 @@
 use roundhouse_bus::types::{BusError, Envelope, ExpectReply, MessageId, Quorum};
 use roundhouse_bus::Bus;
 use roundhouse_core::{Origin, SessionId, SuspendReason, TaskId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,6 +64,9 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub struct MessageWaitExecutor {
     bus: Arc<dyn Bus>,
     pending: Mutex<HashMap<TaskId, PendingReply>>,
+    /// Populated by the free function `release` (`break_glass.rs`) — checked
+    /// alongside the deadline each poll iteration in `wait`, below.
+    released: Mutex<HashSet<TaskId>>,
 }
 
 impl MessageWaitExecutor {
@@ -71,7 +74,26 @@ impl MessageWaitExecutor {
         Self {
             bus,
             pending: Mutex::new(HashMap::new()),
+            released: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// §7.7: human break-glass "release (unblock as TimedOut)." Marks `task_id`
+    /// released; the live `wait` loop for it (if any) notices on its next iteration
+    /// and exits exactly the way a deadline would have, `timed_out: true`. A safe
+    /// no-op if `task_id` has no live wait (nothing to release).
+    pub fn mark_released(&self, task_id: TaskId) {
+        self.released
+            .lock()
+            .expect("released-set mutex poisoned")
+            .insert(task_id);
+    }
+
+    fn take_released(&self, task_id: TaskId) -> bool {
+        self.released
+            .lock()
+            .expect("released-set mutex poisoned")
+            .remove(&task_id)
     }
 
     /// `targets` are the resolved recipients of the `message_send` this wait blocks on
@@ -156,6 +178,12 @@ impl MessageWaitExecutor {
                 if tokio::time::Instant::now() >= deadline {
                     break true;
                 }
+            }
+            // Added by Task 18: a human `release` call marks this task's id released;
+            // notice it here, on the same cadence as the deadline check above, and
+            // exit exactly the way a deadline would have.
+            if self.take_released(task.id()) {
+                break true;
             }
             match self.bus.poll(session).await {
                 Ok(Some(envelope))
