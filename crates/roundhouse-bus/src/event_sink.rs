@@ -4,14 +4,27 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 /// The append-only write path §7.1 requires: "delivery appends [a `message` task] to
-/// the recipient's log." `roundhouse-bus` depends on `roundhouse-store` (§5.2) for the
-/// real implementation; this trait is the seam that keeps `roundhouse-bus` testable
-/// without a real SQLite file, mirroring §9.10's `HttpTransport` seam pattern.
+/// the recipient's log." The real implementation lives in `roundhouse-store` (§5.2)
+/// and is wired at the daemon-assembly layer; this trait is the seam that keeps
+/// `roundhouse-bus` testable without a real SQLite file, mirroring §9.10's
+/// `HttpTransport` seam pattern.
+///
+/// §7.4's idempotency contract is split into two operations deliberately:
+/// [`is_duplicate`](Self::is_duplicate) is a pure read used to short-circuit a
+/// redelivery *before* it is enqueued, while [`record_inbound`](Self::record_inbound)
+/// must be called only *after* the message is actually enqueued — so a failed push
+/// (e.g. `MailboxFull`) never burns the idempotency key and a later retry isn't
+/// false-acked.
 pub trait EventSink: Send + Sync {
-    /// Returns `true` if this is the first time `(session, msg_id)` has been recorded —
-    /// i.e. the UNIQUE(session_id, inbound_msg_id) constraint from §7.4 would have
-    /// accepted the insert. Returns `false` on a duplicate.
-    fn record_inbound(&self, session: SessionId, msg_id: MessageId) -> bool;
+    /// Returns `true` if `(session, msg_id)` has already been recorded — i.e. the
+    /// UNIQUE(session_id, inbound_msg_id) constraint from §7.4 would reject the insert.
+    /// Pure read; does not mutate.
+    fn is_duplicate(&self, session: SessionId, msg_id: MessageId) -> bool;
+
+    /// Records `(session, msg_id)` as delivered. Callers must only invoke this after the
+    /// message has actually been enqueued, so a bounce leaves the key unrecorded and a
+    /// subsequent redelivery is still accepted.
+    fn record_inbound(&self, session: SessionId, msg_id: MessageId);
 }
 
 /// Test double. A real `SqliteEventSink` (roundhouse-store, `INSERT ... ON CONFLICT
@@ -44,8 +57,12 @@ impl Default for InMemoryEventSink {
 }
 
 impl EventSink for InMemoryEventSink {
-    fn record_inbound(&self, session: SessionId, msg_id: MessageId) -> bool {
-        self.seen.lock().unwrap().insert((session, msg_id))
+    fn is_duplicate(&self, session: SessionId, msg_id: MessageId) -> bool {
+        self.seen.lock().unwrap().contains(&(session, msg_id))
+    }
+
+    fn record_inbound(&self, session: SessionId, msg_id: MessageId) {
+        self.seen.lock().unwrap().insert((session, msg_id));
     }
 }
 
@@ -99,8 +116,38 @@ mod tests {
         bus.send(envelope(msg_id, a, b)).await.unwrap();
 
         // §7.4: "the recipient's log has UNIQUE(session_id, inbound_msg_id), so
-        // redelivery is idempotent." The mailbox may see it twice; the persisted,
-        // observable inbound event count must be exactly one.
+        // redelivery is idempotent." The duplicate is short-circuited *before* the
+        // mailbox push (the `is_duplicate` read), so it is never enqueued twice and
+        // the persisted, observable inbound event count is exactly one.
         assert_eq!(sink.inbound_count(b, msg_id), 1);
+    }
+
+    #[tokio::test]
+    async fn mailbox_full_bounce_does_not_burn_the_idempotency_key() {
+        let sink = Arc::new(InMemoryEventSink::new());
+        let bus = LocalBus::new().with_sink(sink.clone());
+        let from = SessionId::new();
+        let to = SessionId::new();
+        bus.register_mailbox(to, MailboxKind::Bounded(1))
+            .await
+            .unwrap();
+
+        // Fill the single-slot mailbox so the next push bounces.
+        bus.send(envelope(Uuid::new_v4(), from, to)).await.unwrap();
+
+        // One fixed id for the message we'll bounce and then retry.
+        let msg_id = Uuid::new_v4();
+        let bounced = envelope(msg_id, from, to);
+
+        // Mailbox is full: push fails, and the idempotency key must NOT be recorded —
+        // otherwise a retry of this same id would be false-acked as a duplicate.
+        let err = bus.send(bounced.clone()).await.unwrap_err();
+        assert!(matches!(err, crate::types::BusError::MailboxFull { .. }));
+        assert_eq!(sink.inbound_count(to, msg_id), 0);
+
+        // Drain the slot, then the same id must deliver — proving the key was never burned.
+        assert!(bus.poll(to).await.unwrap().is_some());
+        bus.send(bounced).await.unwrap();
+        assert_eq!(sink.inbound_count(to, msg_id), 1);
     }
 }

@@ -1,3 +1,9 @@
+//! Inter-agent messaging, teams, and break-glass operations.
+//!
+//! Implements the routed registry (`Bus`) that session runtimes use to address
+//! each other, the `LocalBus` concrete implementation with bounded mailboxes,
+//! wait-graph deadlock refusal, rate limiting, and team management per
+//! `docs/architecture/04-messaging-and-teams.md` §7.
 #![forbid(unsafe_code)]
 
 pub mod artifact_grant;

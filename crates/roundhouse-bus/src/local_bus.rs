@@ -4,7 +4,7 @@ use crate::handle_registry::HandleRegistry;
 use crate::human_notifications::{HumanNotification, HumanNotificationRegistry};
 use crate::mailbox::{Mailbox, MailboxKind};
 use crate::rate_limit::{decrement_ttl, RateLimiter, RepetitionDamper};
-use crate::teams::TeamRegistry;
+use crate::teams::{TeamRegistry, TeamState};
 use crate::types::{Address, BusError, Envelope, Undeliverable};
 use crate::wait_graph::WaitGraph;
 use async_trait::async_trait;
@@ -100,6 +100,11 @@ impl LocalBus {
     ) -> Result<Vec<SessionId>, BusError> {
         match addr {
             Address::Team { team } => {
+                if let Some(state) = self.teams.state(*team) {
+                    if state == TeamState::Draining || state == TeamState::Closed {
+                        return Err(BusError::TeamDraining { team: *team });
+                    }
+                }
                 let roster = self
                     .teams
                     .roster(*team)
@@ -114,6 +119,11 @@ impl LocalBus {
                     .collect())
             }
             Address::Role { team, role } => {
+                if let Some(state) = self.teams.state(*team) {
+                    if state == TeamState::Draining || state == TeamState::Closed {
+                        return Err(BusError::TeamDraining { team: *team });
+                    }
+                }
                 let roster = self
                     .teams
                     .roster(*team)
@@ -153,6 +163,7 @@ impl LocalBus {
     /// lookup, since a human session never has one.
     pub async fn send(&self, envelope: Envelope) -> Result<(), BusError> {
         let to = envelope.to;
+        let msg_id = envelope.id;
 
         let ttl_hops = decrement_ttl(envelope.ttl_hops)?;
         self.rate_limiter
@@ -191,15 +202,20 @@ impl LocalBus {
                     session: to,
                 }))?;
 
-        // Idempotency check happens before the mailbox push: a duplicate redelivery is
-        // recorded as a no-op observation, not a second queued item.
-        if !self.sink.record_inbound(to, envelope.id) {
-            tracing::debug!(?to, msg_id = ?envelope.id, "duplicate inbound message, dropped as idempotent redelivery");
+        // Idempotency: check *before* the push (cheap read) so a duplicate redelivery
+        // is short-circuited and never enqueued twice — but record only *after* a
+        // successful push, so a `MailboxFull` bounce leaves the key unrecorded and a
+        // later retry is accepted rather than false-acked.
+        if self.sink.is_duplicate(to, msg_id) {
+            tracing::debug!(?to, msg_id = ?msg_id, "duplicate inbound message, dropped as idempotent redelivery");
             return Ok(());
         }
 
         let mut guard = mailbox.lock().expect("mailbox mutex poisoned");
-        guard.push(to, envelope)
+        guard.push(to, envelope)?; // MailboxFull propagates — sink NOT yet recorded
+
+        self.sink.record_inbound(to, msg_id);
+        Ok(())
     }
 
     pub async fn poll(&self, session: SessionId) -> Result<Option<Envelope>, BusError> {
@@ -649,5 +665,52 @@ mod send_wiring_tests {
             .await
             .unwrap();
         assert_eq!(recipients, vec![worker]);
+    }
+
+    #[tokio::test]
+    async fn resolve_recipients_refuses_a_draining_or_closed_team() {
+        let bus = LocalBus::new();
+        let ws = WorkspaceId::new();
+        let lead = SessionId::new();
+        let teams = Arc::new(TeamRegistry::new());
+        let team = teams
+            .create_team(ws, "t".into(), "c".into(), lead, "lead".into())
+            .unwrap();
+        let bus = bus.with_teams(teams.clone());
+
+        // Active: resolves.
+        assert!(bus
+            .resolve_recipients(ws, &Address::Team { team })
+            .await
+            .is_ok());
+
+        teams.begin_draining(team).unwrap();
+        let err = bus
+            .resolve_recipients(ws, &Address::Team { team })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::TeamDraining { .. }));
+
+        // Role addresses are refused the same way.
+        let err = bus
+            .resolve_recipients(
+                ws,
+                &Address::Role {
+                    team,
+                    role: "lead".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::TeamDraining { .. }));
+
+        // Closed teams (reaper path) too.
+        teams.mark_member_ended(team, lead).unwrap();
+        teams.reap_ended();
+        let err = bus
+            .resolve_recipients(ws, &Address::Team { team })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::TeamDraining { .. }));
     }
 }

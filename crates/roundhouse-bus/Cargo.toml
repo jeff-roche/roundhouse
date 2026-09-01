@@ -9,7 +9,6 @@ workspace = true
 
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
-roundhouse-store = { path = "../roundhouse-store" }
 tokio = { workspace = true, features = ["sync", "time", "rt"] }
 dashmap = "6"
 async-trait = "0.1"
