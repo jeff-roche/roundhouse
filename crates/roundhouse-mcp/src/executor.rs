@@ -53,6 +53,22 @@ pub enum TaskInput {
         tool: String,
         args: serde_json::Value,
     },
+    /// finding 3 (Task 8b): the input of the REAL `elicit`-kind child task
+    /// an `input_required` MCP result is normalised into — the thing that
+    /// makes every elicitation enumerable via the same query path as any
+    /// other suspended task (S-OBS-4). `schema`/`question` carry what the
+    /// server asked for; `mcp_resume_context` carries the opaque serialized
+    /// [`McpRetryState`] the parent `mcp` task needs in order to resume.
+    /// The engine's job (outside this crate) is to read that context back
+    /// off the completed elicit task's own `TaskInput` and hand it to
+    /// `execute` again as `ResumptionInput::ElicitationAnswers` — exactly
+    /// how MCP's own opaque `requestState` round-trips (§10.1). `None`
+    /// there means a plain non-MCP elicitation with nothing to resume.
+    Elicit {
+        schema: Option<serde_json::Value>,
+        question: Option<String>,
+        mcp_resume_context: Option<serde_json::Value>,
+    },
 }
 
 /// See [`TaskInput`]'s reconciliation note: the MCP result shape
@@ -90,6 +106,51 @@ pub struct McpRetryState {
     pub args: serde_json::Value,
     pub request_state: crate::wire::RequestState,
     pub round: u8,
+}
+
+/// The MRTR retry loop's hard bound (§10.1). §7.7 bounds every other
+/// retry/relay loop in the design with a hop-style counter — `ttl_hops`
+/// defaults to 8 for inter-agent message relaying, where each hop is a
+/// cheap, fully-automated forward with no human in the loop. MRTR's loop is
+/// structurally the same shape (bounded retries around a request, refuse
+/// rather than loop forever), but each round blocks on a *synchronous human
+/// response* — an `elicit` task — so a round costs minutes of a person's
+/// attention, not a network hop. Five rounds keeps the same "bounded, not
+/// infinite" guarantee while sizing the bound to that cost profile: enough
+/// for a realistic multi-step elicitation ("pick an account" → "confirm
+/// scope" → "enter a one-time code"), small enough that a bugged or
+/// malicious server cannot demand input indefinitely. Exceeding the cap
+/// fails the task loudly (non-retryable `Failed`) rather than silently
+/// dropping the loop — §6's "fail-open is the actual bug".
+pub const MRTR_ROUND_CAP: u8 = 5;
+
+/// finding 6: an elicitation answers payload that isn't a non-empty JSON
+/// object of `{id: value}` pairs is a rejected, structured error surfaced
+/// as an audited non-retryable `Failed` — never a silently-empty
+/// `Vec<InputResponse>` sent on to the transport as a no-answer retry.
+#[derive(Debug, thiserror::Error)]
+#[error("elicitation answer was not a non-empty JSON object of {{id: value}} pairs: {0}")]
+pub struct MalformedAnswerError(String);
+
+/// finding 6: `flatten_answers` fails CLOSED on anything that isn't a
+/// non-empty JSON object of `{id: value}` pairs, instead of silently
+/// returning an empty `Vec<InputResponse>`.
+fn flatten_answers(
+    answers: &serde_json::Value,
+) -> Result<Vec<crate::wire::InputResponse>, MalformedAnswerError> {
+    match answers.as_object() {
+        Some(map) if !map.is_empty() => Ok(map
+            .iter()
+            .map(|(k, v)| crate::wire::InputResponse {
+                id: k.clone(),
+                value: v.clone(),
+            })
+            .collect()),
+        Some(_) => Err(MalformedAnswerError("answers object was empty".into())),
+        None => Err(MalformedAnswerError(format!(
+            "expected a JSON object, got: {answers}"
+        ))),
+    }
 }
 
 /// The outcome of one `TaskExecutor::execute` call, shaped to lift
@@ -334,49 +395,110 @@ fn params_digest(params: &TaskParams) -> [u8; 32] {
 
 #[async_trait]
 impl TaskExecutor for McpExecutor {
+    /// One code path per case: `(Mcp, None)` is the initial dispatch,
+    /// `(anything, Some(ElicitationAnswers))` is the MRTR retry, and every
+    /// other combination fails closed. Both live paths pass the §6.2 policy
+    /// gate (finding 2: every dispatch passes policy, not just the first).
     async fn execute(
         &self,
         ctx: &TaskCtx,
         input: &TaskInput,
         resume: Option<ResumptionInput>,
     ) -> ExecutorOutcome {
-        let (server, tool, args) = match (input, resume) {
+        match (input, resume) {
             (TaskInput::Mcp { server, tool, args }, None) => {
-                (server.clone(), tool.clone(), args.clone())
-            }
-            _ => {
-                return ExecutorOutcome::Failed {
-                    error: TaskError {
-                        message: "resume path not wired until Task 8b".into(),
-                        category: "executor_error".into(),
-                    },
-                    retryable: false,
+                // finding 5: fail closed on an unresolvable namespaced name —
+                // never forward an arbitrary string to the transport as if it
+                // were already an original tool name.
+                let original_tool = match self.namespace.resolve(tool) {
+                    Some((_, original)) => original.to_string(),
+                    None => {
+                        return ExecutorOutcome::Failed {
+                            error: TaskError {
+                                message: format!(
+                                    "unknown namespaced tool '{tool}' — refusing to forward an unresolved name to the transport"
+                                ),
+                                category: "executor_error".into(),
+                            },
+                            retryable: false,
+                        }
+                    }
+                };
+                if let Err(outcome) = self.gate(ctx, server, &original_tool, args).await {
+                    return outcome;
                 }
+                // The initial dispatch is round 0; an `input_required` answer
+                // suspends the task at round 1.
+                self.dispatch(ctx, server.clone(), original_tool, args.clone(), None, 0)
+                    .await
             }
-        };
-
-        // finding 5: fail closed on an unresolvable namespaced name — never
-        // forward an arbitrary string to the transport as if it were
-        // already an original tool name.
-        let original_tool = match self.namespace.resolve(&tool) {
-            Some((_, original)) => original.to_string(),
-            None => {
-                return ExecutorOutcome::Failed {
-                    error: TaskError {
-                        message: format!(
-                            "unknown namespaced tool '{tool}' — refusing to forward an unresolved name to the transport"
-                        ),
-                        category: "executor_error".into(),
-                    },
-                    retryable: false,
+            (_, Some(ResumptionInput::ElicitationAnswers { state, answers })) => {
+                // The MRTR loop is bounded: a state already at the cap is
+                // refused before anything else runs.
+                if state.round >= MRTR_ROUND_CAP {
+                    return ExecutorOutcome::Failed {
+                        error: TaskError {
+                            message: format!("MRTR round cap ({MRTR_ROUND_CAP}) exceeded"),
+                            category: "executor_error".into(),
+                        },
+                        retryable: false,
+                    };
                 }
+                // finding 6: reject a malformed answer instead of silently
+                // treating it as "no answers."
+                let input_responses = match flatten_answers(&answers) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return ExecutorOutcome::Failed {
+                            error: TaskError {
+                                message: format!("rejected malformed elicitation answer: {e}"),
+                                category: "executor_error".into(),
+                            },
+                            retryable: false,
+                        }
+                    }
+                };
+                // finding 2: gate the retry too — every dispatch passes
+                // policy, not just the first one.
+                if let Err(outcome) = self
+                    .gate(ctx, &state.server, &state.tool, &state.args)
+                    .await
+                {
+                    return outcome;
+                }
+                // MRTR retries the ORIGINAL request; the fresh answers ride
+                // along as input_responses (see `ToolCallRequest`), the
+                // original tool/args/server are unchanged from the first
+                // call. `state.tool` is already the original (non-namespaced)
+                // name — it was resolved before the first dispatch and stored.
+                self.retry(ctx, state, input_responses).await
             }
-        };
-
-        if let Err(outcome) = self.gate(ctx, &server, &original_tool, &args).await {
-            return outcome;
+            _ => ExecutorOutcome::Failed {
+                error: TaskError {
+                    message: "unsupported (input, resume) combination".into(),
+                    category: "executor_error".into(),
+                },
+                retryable: false,
+            },
         }
+    }
+}
 
+impl McpExecutor {
+    /// Issues one `tools/call` against `server` and folds the transport
+    /// result into an outcome. Called with `request_state: None, round: 0`
+    /// for the initial dispatch (`retry` owns the MRTR re-issue); the
+    /// request_state/round parameters are what an `input_required` result
+    /// turns into a resume via [`Self::suspend_for_elicitation`].
+    async fn dispatch(
+        &self,
+        ctx: &TaskCtx,
+        server: ServerId,
+        original_tool: String,
+        args: serde_json::Value,
+        request_state: Option<crate::wire::RequestState>,
+        round: u8,
+    ) -> ExecutorOutcome {
         let key = server.0.clone();
         let transport = match self.connections.get(&key) {
             Some(t) => t,
@@ -393,18 +515,18 @@ impl TaskExecutor for McpExecutor {
                 }
             }
         };
-
         let jsonrpc_id = self
             .id_gens
             .get(&key)
             .map(|g| g.next())
             .unwrap_or(JsonRpcId(0));
+
         let result = transport
             .call_tool(ToolCallRequest {
                 jsonrpc_id,
-                tool: original_tool,
-                args,
-                request_state: None,
+                tool: original_tool.clone(),
+                args: args.clone(),
+                request_state,
                 input_responses: vec![],
             })
             .await;
@@ -428,15 +550,176 @@ impl TaskExecutor for McpExecutor {
                     // all-zero value.
                     usage: Usage::default(),
                 },
-                McpResultType::InputRequired { .. } => ExecutorOutcome::Failed {
+                McpResultType::InputRequired {
+                    input_requests,
+                    request_state,
+                } => {
+                    self.suspend_for_elicitation(
+                        ctx,
+                        server,
+                        original_tool,
+                        args,
+                        input_requests,
+                        request_state,
+                        round + 1,
+                    )
+                    .await
+                }
+            },
+        }
+    }
+
+    /// Re-issues the ORIGINAL request (§10.1's MRTR retry): same server,
+    /// same tool, same args — a NEW jsonrpc id, the server's opaque
+    /// `request_state` echoed verbatim, and the fresh elicitation answers
+    /// riding along as `input_responses`.
+    async fn retry(
+        &self,
+        ctx: &TaskCtx,
+        state: McpRetryState,
+        input_responses: Vec<crate::wire::InputResponse>,
+    ) -> ExecutorOutcome {
+        let key = state.server.0.clone();
+        let transport = match self.connections.get(&key) {
+            Some(t) => t,
+            None => {
+                return ExecutorOutcome::Failed {
                     error: TaskError {
-                        message: "input_required not handled until Task 8b".into(),
+                        message: format!("no connection for server {:?}", state.server.0),
                         category: "executor_error".into(),
                     },
                     retryable: false,
+                }
+            }
+        };
+        let jsonrpc_id = self
+            .id_gens
+            .get(&key)
+            .map(|g| g.next())
+            .unwrap_or(JsonRpcId(0));
+
+        let result = transport
+            .call_tool(ToolCallRequest {
+                jsonrpc_id, // NEW id per §10.1's MRTR requirement
+                tool: state.tool.clone(),
+                args: state.args.clone(),
+                request_state: Some(state.request_state.clone()), // echoed verbatim
+                input_responses,
+            })
+            .await;
+
+        match result {
+            Err(e) => ExecutorOutcome::Failed {
+                error: TaskError {
+                    message: e.to_string(),
+                    category: "executor_error".into(),
                 },
+                retryable: true,
+            },
+            Ok(r) => match r.result_type {
+                McpResultType::Ok => ExecutorOutcome::Completed {
+                    output: TaskOutput::Mcp {
+                        content: Self::decode_content(r.content, ctx.task),
+                        is_error: r.is_error,
+                    },
+                    usage: Usage::default(),
+                },
+                McpResultType::InputRequired {
+                    input_requests,
+                    request_state,
+                } => {
+                    self.suspend_for_elicitation(
+                        ctx,
+                        state.server,
+                        state.tool,
+                        state.args,
+                        input_requests,
+                        request_state,
+                        state.round + 1,
+                    )
+                    .await
+                }
             },
         }
+    }
+
+    /// finding 3: normalises an MRTR `input_required` result into a REAL
+    /// `elicit`-kind child task (never a bespoke payload riding on
+    /// `SuspendReason`, which has no room for one — see the reconciliation
+    /// note on [`TaskInput`]: the real Phase 0 variant carries only a
+    /// `schema`), then suspends the PARENT `mcp` task on the real
+    /// `SuspendReason::AwaitingElicitation`. This is what makes the
+    /// elicitation enumerable via the same query path as any other
+    /// suspended task (S-OBS-4). The opaque [`McpRetryState`] the parent
+    /// needs to resume rides on the child task's `TaskInput::Elicit`
+    /// `mcp_resume_context` — the engine reads it back off the completed
+    /// elicit task and passes it in as `ResumptionInput::ElicitationAnswers`
+    /// (§10.1, exactly how MCP's own opaque `requestState` round-trips).
+    async fn suspend_for_elicitation(
+        &self,
+        ctx: &TaskCtx,
+        server: ServerId,
+        tool: String,
+        args: serde_json::Value,
+        input_requests: Vec<crate::wire::InputRequest>,
+        request_state: crate::wire::RequestState,
+        round: u8,
+    ) -> ExecutorOutcome {
+        // Belt-and-braces bound (the resume path checks `state.round >= cap`
+        // before ever getting here): refuse rather than suspend past the cap.
+        if round > MRTR_ROUND_CAP {
+            return ExecutorOutcome::Failed {
+                error: TaskError {
+                    message: format!("MRTR round cap ({MRTR_ROUND_CAP}) exceeded"),
+                    category: "executor_error".into(),
+                },
+                retryable: false,
+            };
+        }
+        let resume_state = McpRetryState {
+            server,
+            tool,
+            args,
+            request_state,
+            round,
+        };
+        let question = input_requests
+            .iter()
+            .map(|r| r.prompt.clone())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let schema = input_requests.iter().find_map(|r| r.schema.clone());
+        let elicit_input = TaskInput::Elicit {
+            schema: schema.clone(),
+            question: Some(question),
+            mcp_resume_context: Some(
+                serde_json::to_value(&resume_state).expect("McpRetryState always serializes"),
+            ),
+        };
+
+        self.task_spawner
+            .spawn_task(
+                ctx.session,
+                Some(ctx.task),
+                TaskKind::Elicit,
+                Origin::System,
+                elicit_input,
+            )
+            .await;
+        // The real Phase 0 `SuspendReason::AwaitingElicitation` carries the
+        // elicit JSON schema (§8). When the server supplied none, the
+        // unconstrained empty schema `{}` is recorded — `Value::Null` would
+        // fabricate a distinguishable "no schema" marker the variant has no
+        // way to represent, and an empty object is the JSON-Schema-idiomatic
+        // "anything allowed".
+        let reason = SuspendReason::AwaitingElicitation {
+            schema: schema.unwrap_or(serde_json::json!({})),
+        };
+        self.task_spawner
+            .suspend_task(ctx.task, reason.clone())
+            .await;
+
+        ExecutorOutcome::Suspended { reason }
     }
 }
 
@@ -444,7 +727,7 @@ impl TaskExecutor for McpExecutor {
 mod tests {
     use super::*;
     use crate::testing::{FakeMcpTransport, ScriptedResponse};
-    use crate::wire::McpToolDef;
+    use crate::wire::{InputRequest, McpToolDef, RequestState};
     use std::sync::Mutex;
 
     /// Test double for `Policy` (Phase 2's real sealed floor is not built
@@ -667,6 +950,350 @@ mod tests {
         assert!(
             fake.calls.lock().unwrap().is_empty(),
             "the transport must never see an unresolved tool name"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_required_constructs_a_real_elicit_task_and_suspends_the_parent() {
+        let (executor, fake, spawner) = setup(vec![ScriptedResponse::InputRequired {
+            input_requests: vec![InputRequest {
+                id: "acct".into(),
+                prompt: "which account?".into(),
+                schema: None,
+            }],
+            request_state: RequestState("opaque-blob-1".into()),
+        }]);
+
+        let task_id = TaskId::new();
+        let ctx = ctx(task_id);
+        let namespaced = executor.namespace.tools()[0].namespaced_name.clone();
+        let input = TaskInput::Mcp {
+            server: ServerId("github".into()),
+            tool: namespaced,
+            args: serde_json::json!({}),
+        };
+
+        let outcome = executor.execute(&ctx, &input, None).await;
+        assert!(
+            matches!(
+                outcome,
+                ExecutorOutcome::Suspended {
+                    reason: SuspendReason::AwaitingElicitation { .. }
+                }
+            ),
+            "expected the parent `mcp` task suspended on AwaitingElicitation, got {outcome:?}"
+        );
+        assert_eq!(fake.calls.lock().unwrap().len(), 1);
+
+        // finding 3: a REAL elicit-kind child task was constructed, not just
+        // an in-memory suspension with nowhere to enumerate it (S-OBS-4).
+        // Guards are scoped (not `drop`ped) so no MutexGuard is even in
+        // scope across the awaits below.
+        let resume_state = {
+            let created = spawner.created.lock().unwrap();
+            assert_eq!(created.len(), 1);
+            assert!(matches!(created[0].0, TaskKind::Elicit));
+            let resume_state = match &created[0].1 {
+                TaskInput::Elicit {
+                    schema: _,
+                    question,
+                    mcp_resume_context,
+                } => {
+                    assert!(question.as_deref().unwrap().contains("which account?"));
+                    let ctx_val = mcp_resume_context
+                        .clone()
+                        .expect("resume context must be attached");
+                    serde_json::from_value::<McpRetryState>(ctx_val)
+                        .expect("resume context must deserialize back into McpRetryState")
+                }
+                other => panic!("expected TaskInput::Elicit, got {other:?}"),
+            };
+            assert_eq!(resume_state.round, 1);
+            assert_eq!(
+                resume_state.request_state,
+                RequestState("opaque-blob-1".into())
+            );
+            resume_state
+        };
+
+        // finding 3: the PARENT task is the one suspended, via TaskSpawner.
+        {
+            let suspended = spawner.suspended.lock().unwrap();
+            assert_eq!(suspended.len(), 1);
+            assert_eq!(suspended[0].0, task_id);
+            assert!(matches!(
+                suspended[0].1,
+                SuspendReason::AwaitingElicitation { .. }
+            ));
+        }
+
+        // Human answers the elicit task; the engine calls execute() again on
+        // the PARENT with the resume payload it read back off the elicit
+        // task's own TaskInput.
+        let outcome2 = executor
+            .execute(
+                &ctx,
+                &input,
+                Some(ResumptionInput::ElicitationAnswers {
+                    state: resume_state,
+                    answers: serde_json::json!({"acct": "personal"}),
+                }),
+            )
+            .await;
+        // setup()'s script only had one scripted response, so the retry hits
+        // "script exhausted" — proving the retry actually re-invoked
+        // call_tool with a NEW jsonrpc id and the echoed request_state,
+        // which is exactly what this test exists to check.
+        assert!(matches!(
+            outcome2,
+            ExecutorOutcome::Failed {
+                retryable: true,
+                ..
+            }
+        ));
+        // The fake records every call, so the §10.1 MRTR requirements the
+        // comment above claims are asserted directly: the retry is a SECOND
+        // transport call, carrying a NEW jsonrpc id and the ORIGINAL
+        // request_state echoed verbatim.
+        {
+            let calls = fake.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2, "the retry must re-invoke call_tool");
+            assert_ne!(
+                calls[1].jsonrpc_id, calls[0].jsonrpc_id,
+                "MRTR: a NEW id per retry (§10.1)"
+            );
+            assert_eq!(
+                calls[1].request_state,
+                Some(RequestState("opaque-blob-1".into())),
+                "MRTR: the server's request_state echoed verbatim on retry (§10.1)"
+            );
+            assert_eq!(
+                calls[1].tool, "search",
+                "MRTR retries the ORIGINAL (non-namespaced) request"
+            );
+            assert_eq!(calls[1].input_responses.len(), 1);
+            assert_eq!(calls[1].input_responses[0].id, "acct");
+        }
+        // finding 2: the retry passed the policy gate too (initial Allow +
+        // retry Allow = two audited decisions).
+        assert_eq!(
+            spawner.decisions.lock().unwrap().len(),
+            2,
+            "finding 2: every dispatch passes policy, retries included"
+        );
+    }
+
+    #[tokio::test]
+    async fn round_cap_fails_loudly_instead_of_looping_forever() {
+        let script = (0..10)
+            .map(|_| ScriptedResponse::InputRequired {
+                input_requests: vec![InputRequest {
+                    id: "x".into(),
+                    prompt: "again?".into(),
+                    schema: None,
+                }],
+                request_state: RequestState("blob".into()),
+            })
+            .collect();
+        let (executor, _fake, spawner) = setup(script);
+
+        let ctx = ctx(TaskId::new());
+        let namespaced = executor.namespace.tools()[0].namespaced_name.clone();
+        let input = TaskInput::Mcp {
+            server: ServerId("github".into()),
+            tool: namespaced.clone(),
+            args: serde_json::json!({}),
+        };
+
+        let mut outcome = executor.execute(&ctx, &input, None).await;
+        for round in 1..=super::MRTR_ROUND_CAP {
+            let state = if matches!(outcome, ExecutorOutcome::Suspended { .. }) {
+                let ctx_val = spawner.created.lock().unwrap().last().unwrap().1.clone();
+                match ctx_val {
+                    TaskInput::Elicit {
+                        mcp_resume_context: Some(v),
+                        ..
+                    } => serde_json::from_value::<McpRetryState>(v).unwrap(),
+                    other => panic!(
+                        "round {round}: expected TaskInput::Elicit with a resume context, got {other:?}"
+                    ),
+                }
+            } else if round == super::MRTR_ROUND_CAP {
+                assert!(matches!(outcome, ExecutorOutcome::Failed { .. }));
+                break;
+            } else {
+                panic!("round {round}: expected Suspended, got {outcome:?}");
+            };
+            outcome = executor
+                .execute(
+                    &ctx,
+                    &input,
+                    Some(ResumptionInput::ElicitationAnswers {
+                        state,
+                        answers: serde_json::json!({"x": "ok"}),
+                    }),
+                )
+                .await;
+        }
+
+        assert!(
+            matches!(
+                outcome,
+                ExecutorOutcome::Failed {
+                    retryable: false,
+                    ..
+                }
+            ),
+            "expected a hard failure once MRTR_ROUND_CAP is exceeded, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_elicitation_answer_is_rejected_not_silently_dropped() {
+        // finding 6: `flatten_answers` used to return an empty Vec for any
+        // non-object answers payload — a silent fail-open. It must now fail
+        // closed with a structured, audited error instead.
+        let (executor, fake, _spawner) = setup(vec![ScriptedResponse::InputRequired {
+            input_requests: vec![InputRequest {
+                id: "acct".into(),
+                prompt: "which account?".into(),
+                schema: None,
+            }],
+            request_state: RequestState("opaque-blob-1".into()),
+        }]);
+        let ctx = ctx(TaskId::new());
+        let namespaced = executor.namespace.tools()[0].namespaced_name.clone();
+        let input = TaskInput::Mcp {
+            server: ServerId("github".into()),
+            tool: namespaced,
+            args: serde_json::json!({}),
+        };
+
+        let outcome = executor.execute(&ctx, &input, None).await;
+        let state = McpRetryState {
+            server: ServerId("github".into()),
+            tool: "search".into(),
+            args: serde_json::json!({}),
+            request_state: RequestState("opaque-blob-1".into()),
+            round: 1,
+        };
+        let _ = outcome; // only used to drive the transport once above
+
+        let malformed = executor
+            .execute(
+                &ctx,
+                &input,
+                Some(ResumptionInput::ElicitationAnswers {
+                    state: state.clone(),
+                    answers: serde_json::json!("not an object"),
+                }),
+            )
+            .await;
+        match malformed {
+            ExecutorOutcome::Failed { error, retryable } => {
+                assert!(
+                    !retryable,
+                    "a malformed answer must be rejected, not silently treated as empty"
+                );
+                assert!(
+                    error
+                        .message
+                        .contains("rejected malformed elicitation answer"),
+                    "message was: {}",
+                    error.message
+                );
+            }
+            other => panic!("expected a hard rejection, got {other:?}"),
+        }
+        // Only the ONE call from the initial dispatch above — the malformed
+        // retry must never reach the transport at all.
+        assert_eq!(fake.calls.lock().unwrap().len(), 1);
+
+        // The strict half of the same rule: an EMPTY answers object is also
+        // rejected, never flattened into a silent no-answer retry.
+        let empty = executor
+            .execute(
+                &ctx,
+                &input,
+                Some(ResumptionInput::ElicitationAnswers {
+                    state,
+                    answers: serde_json::json!({}),
+                }),
+            )
+            .await;
+        assert!(
+            matches!(
+                empty,
+                ExecutorOutcome::Failed {
+                    retryable: false,
+                    ..
+                }
+            ),
+            "an empty answers object must also be rejected, got {empty:?}"
+        );
+        assert_eq!(
+            fake.calls.lock().unwrap().len(),
+            1,
+            "neither malformed retry may reach the transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_repasses_policy_gate_so_a_denied_retry_never_reaches_the_transport() {
+        // finding 2: every dispatch passes policy — the FIRST call went out
+        // under an allowing policy, but by the time the human answers the
+        // elicit task, the policy denies. The retry must be refused by the
+        // gate itself, never forwarded to the transport.
+        let (executor, fake, spawner) =
+            setup_with_policy(vec![], Arc::new(FixedPolicy::deny_all()));
+        let ctx = ctx(TaskId::new());
+        let namespaced = executor.namespace.tools()[0].namespaced_name.clone();
+        let input = TaskInput::Mcp {
+            server: ServerId("github".into()),
+            tool: namespaced,
+            args: serde_json::json!({}),
+        };
+
+        // The engine would hand back the McpRetryState it read off the
+        // completed elicit task; here it is hand-constructed with the same
+        // fields the executor would have serialized.
+        let state = McpRetryState {
+            server: ServerId("github".into()),
+            tool: "search".into(),
+            args: serde_json::json!({}),
+            request_state: RequestState("opaque-blob-1".into()),
+            round: 1,
+        };
+        let outcome = executor
+            .execute(
+                &ctx,
+                &input,
+                Some(ResumptionInput::ElicitationAnswers {
+                    state,
+                    answers: serde_json::json!({"acct": "personal"}),
+                }),
+            )
+            .await;
+        match outcome {
+            ExecutorOutcome::Failed { error, retryable } => {
+                assert!(!retryable);
+                assert!(
+                    error.message.contains("denied by policy"),
+                    "message was: {}",
+                    error.message
+                );
+                assert_eq!(error.category, "policy_denied");
+            }
+            other => panic!("expected the gate to refuse the retry, got {other:?}"),
+        }
+        assert!(
+            fake.calls.lock().unwrap().is_empty(),
+            "a denied retry must never reach the transport"
+        );
+        assert_eq!(
+            spawner.decisions.lock().unwrap().len(),
+            1,
+            "the retry's gate decision must be audited"
         );
     }
 }
