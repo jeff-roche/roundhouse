@@ -6,21 +6,25 @@
 //! Phase 1 built the real chat turn: [`run_chat_turn`] drives a `chat`→`infer`
 //! task pair against a `&dyn Provider`, records every step through a
 //! `TaskRunner`, and folds the provider's stream into `ContentBlock`s via
-//! [`fold_stream_to_blocks`]. `EngineHandles::bootstrap` below is Phase 0
-//! scaffolding proving this crate compiles against every trait it will hold a
-//! handle to; it is *not* what `roundhouse-daemon` actually calls today —
-//! `main.rs` calls `TaskRunner::bootstrap()` directly at its own startup site
-//! instead, since `EngineHandles::bootstrap` also demands an `Arc<dyn Bus>`
-//! and no concrete `Bus` implementation exists yet. Full session
-//! actor/supervision beyond one scripted chat turn is Phase 2+ work. See
+//! [`fold_stream_to_blocks`]. Phase 2 hardened the session actor
+//! ([`SessionActor`]) with fail-closed admission, sandbox isolation, and egress
+//! boundaries. Phase 4 added sub-agent spawning ([`agent_spawn`]) and
+//! break-glass operations ([`break_glass`]), driven over a real
+//! `roundhouse-bus` `LocalBus` — so `EngineHandles::bootstrap` below is the
+//! Phase 0 compile-proof scaffolding it always was, not what
+//! `roundhouse-daemon` calls at startup today. See
 //! `docs/architecture/02-system-architecture.md` §5.2 and
 //! `00-overview.md` §3.1.
 #![forbid(unsafe_code)]
+
+pub mod agent_spawn;
+pub mod break_glass;
 
 mod chat;
 pub mod compact;
 mod context;
 mod infer;
+pub mod message_render;
 mod session_actor;
 mod working_context;
 
@@ -36,7 +40,9 @@ pub use session_actor::{
 };
 pub use working_context::{ContextStateId, TokenBudget, WorkingContext};
 
+pub mod system_prompt;
 pub mod test_support;
+pub mod tools;
 
 use roundhouse_bus::Bus;
 use roundhouse_core::TaskRunner;
