@@ -137,9 +137,20 @@ const EXPECTED_EDGES: &[(&str, &[&str])] = &[
         "roundhouse-flow",
         &["roundhouse-core", "roundhouse-engine", "roundhouse-store"],
     ),
+    // `roundhouse-bus` below is a deliberate, authorized addition (Task 1,
+    // Phase 5, Subsystem A): a `Message` trigger's `Binding` doubles as the
+    // addressable recipient for a bus mailbox, and Task 4's
+    // `bind_message_trigger`/`poll_message_trigger` call the `Bus` trait
+    // directly — the doc table row was updated in the same commit per this
+    // test's keep-both-in-sync rule.
     (
         "roundhouse-sched",
-        &["roundhouse-core", "roundhouse-engine", "roundhouse-store"],
+        &[
+            "roundhouse-core",
+            "roundhouse-engine",
+            "roundhouse-store",
+            "roundhouse-bus",
+        ],
     ),
     (
         "roundhouse-daemon",

@@ -11,3 +11,20 @@ workspace = true
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-engine = { path = "../roundhouse-engine" }
 roundhouse-store = { path = "../roundhouse-store" }
+# Deliberate, tracked deviation from the frozen crate dependency table
+# (`docs/architecture/02-system-architecture.md` §5.2, which lists this crate's
+# dependencies as `core, engine, store`): Task 4 (Subsystem A, `trigger_event`
+# persistence + dedupe) mints a `Message`-trigger `Binding`'s own id as the
+# `SessionId` under which the daemon-side bus registers a mailbox
+# (`bind_message_trigger`/`poll_message_trigger`), which requires calling the
+# `Bus` trait directly. Confirmed no dependency cycle: `roundhouse-bus`
+# depends only on `roundhouse-core`. See `docs/architecture/02-system-architecture.md`
+# §5.2's `roundhouse-sched` row for the matching table update.
+roundhouse-bus = { path = "../roundhouse-bus" }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

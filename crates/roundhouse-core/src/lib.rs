@@ -36,7 +36,7 @@ pub use delta::Delta;
 pub use enforcement::{net_enforced_for, NetworkMechanism};
 pub use error::CoreError;
 pub use event::{Event, EventFields, EventPayload};
-pub use ids::{SessionId, TaskId, TeamId, WorkspaceId};
+pub use ids::{BindingId, JobId, SessionId, TaskId, TeamId, WorkspaceId};
 pub use session::{OnDegrade, SessionOutcome, SessionPatch, SessionSpec, SessionState};
 pub use task::{fold_task_state, RedactedSpan, Task, TaskState};
 pub use task_kind::TaskKind;
