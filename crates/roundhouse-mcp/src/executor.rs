@@ -428,9 +428,18 @@ impl TaskExecutor for McpExecutor {
                     return outcome;
                 }
                 // The initial dispatch is round 0; an `input_required` answer
-                // suspends the task at round 1.
-                self.dispatch(ctx, server.clone(), original_tool, args.clone(), None, 0)
-                    .await
+                // suspends the task at round 1. Neither the server's
+                // `request_state` nor any elicitation answers exist yet.
+                self.dispatch(
+                    ctx,
+                    server.clone(),
+                    original_tool,
+                    args.clone(),
+                    None,
+                    vec![],
+                    0,
+                )
+                .await
             }
             (_, Some(ResumptionInput::ElicitationAnswers { state, answers })) => {
                 // The MRTR loop is bounded: a state already at the cap is
@@ -471,7 +480,16 @@ impl TaskExecutor for McpExecutor {
                 // original tool/args/server are unchanged from the first
                 // call. `state.tool` is already the original (non-namespaced)
                 // name — it was resolved before the first dispatch and stored.
-                self.retry(ctx, state, input_responses).await
+                self.dispatch(
+                    ctx,
+                    state.server,
+                    state.tool,
+                    state.args,
+                    Some(state.request_state),
+                    input_responses,
+                    state.round,
+                )
+                .await
             }
             _ => ExecutorOutcome::Failed {
                 error: TaskError {
@@ -485,18 +503,31 @@ impl TaskExecutor for McpExecutor {
 }
 
 impl McpExecutor {
-    /// Issues one `tools/call` against `server` and folds the transport
-    /// result into an outcome. Called with `request_state: None, round: 0`
-    /// for the initial dispatch (`retry` owns the MRTR re-issue); the
-    /// request_state/round parameters are what an `input_required` result
-    /// turns into a resume via [`Self::suspend_for_elicitation`].
+    /// THE one request/result path — both `execute` arms are it, differing
+    /// only in the request payload. Looks up the connection for `server`,
+    /// mints a fresh per-connection jsonrpc id (§10.1: a NEW id per call,
+    /// MRTR retries included), issues the `tools/call`, and folds the
+    /// transport result into an outcome: decode → `Completed` with
+    /// untrusted provenance and all-zero `Usage`; transport error →
+    /// retryable `Failed`; `InputRequired` →
+    /// [`Self::suspend_for_elicitation`] at `round + 1` — the MRTR loop's
+    /// only way forward.
+    ///
+    /// The initial dispatch passes `request_state: None`,
+    /// `input_responses: vec![]`, `round: 0`. The MRTR retry (the
+    /// `ResumptionInput::ElicitationAnswers` arm) re-issues the ORIGINAL
+    /// request — same server/tool/args, `tool` already the original
+    /// (non-namespaced) name — with the server's opaque `request_state`
+    /// echoed verbatim and the fresh elicitation answers riding along as
+    /// `input_responses` (§10.1).
     async fn dispatch(
         &self,
         ctx: &TaskCtx,
         server: ServerId,
-        original_tool: String,
+        tool: String,
         args: serde_json::Value,
         request_state: Option<crate::wire::RequestState>,
+        input_responses: Vec<crate::wire::InputResponse>,
         round: u8,
     ) -> ExecutorOutcome {
         let key = server.0.clone();
@@ -505,6 +536,10 @@ impl McpExecutor {
             None => {
                 return ExecutorOutcome::Failed {
                     error: TaskError {
+                        // `connections` is built once in `new` and never
+                        // mutated, so a missing key always means the server
+                        // was never spawned — accurate on the initial path
+                        // and on a (practically unreachable) retry alike.
                         message: format!(
                             "no connection for server {:?} (policy allowed it, but it was never spawned)",
                             server.0
@@ -512,7 +547,7 @@ impl McpExecutor {
                         category: "executor_error".into(),
                     },
                     retryable: false,
-                }
+                };
             }
         };
         let jsonrpc_id = self
@@ -524,10 +559,10 @@ impl McpExecutor {
         let result = transport
             .call_tool(ToolCallRequest {
                 jsonrpc_id,
-                tool: original_tool.clone(),
+                tool: tool.clone(),
                 args: args.clone(),
                 request_state,
-                input_responses: vec![],
+                input_responses,
             })
             .await;
 
@@ -557,85 +592,11 @@ impl McpExecutor {
                     self.suspend_for_elicitation(
                         ctx,
                         server,
-                        original_tool,
+                        tool,
                         args,
                         input_requests,
                         request_state,
                         round + 1,
-                    )
-                    .await
-                }
-            },
-        }
-    }
-
-    /// Re-issues the ORIGINAL request (§10.1's MRTR retry): same server,
-    /// same tool, same args — a NEW jsonrpc id, the server's opaque
-    /// `request_state` echoed verbatim, and the fresh elicitation answers
-    /// riding along as `input_responses`.
-    async fn retry(
-        &self,
-        ctx: &TaskCtx,
-        state: McpRetryState,
-        input_responses: Vec<crate::wire::InputResponse>,
-    ) -> ExecutorOutcome {
-        let key = state.server.0.clone();
-        let transport = match self.connections.get(&key) {
-            Some(t) => t,
-            None => {
-                return ExecutorOutcome::Failed {
-                    error: TaskError {
-                        message: format!("no connection for server {:?}", state.server.0),
-                        category: "executor_error".into(),
-                    },
-                    retryable: false,
-                }
-            }
-        };
-        let jsonrpc_id = self
-            .id_gens
-            .get(&key)
-            .map(|g| g.next())
-            .unwrap_or(JsonRpcId(0));
-
-        let result = transport
-            .call_tool(ToolCallRequest {
-                jsonrpc_id, // NEW id per §10.1's MRTR requirement
-                tool: state.tool.clone(),
-                args: state.args.clone(),
-                request_state: Some(state.request_state.clone()), // echoed verbatim
-                input_responses,
-            })
-            .await;
-
-        match result {
-            Err(e) => ExecutorOutcome::Failed {
-                error: TaskError {
-                    message: e.to_string(),
-                    category: "executor_error".into(),
-                },
-                retryable: true,
-            },
-            Ok(r) => match r.result_type {
-                McpResultType::Ok => ExecutorOutcome::Completed {
-                    output: TaskOutput::Mcp {
-                        content: Self::decode_content(r.content, ctx.task),
-                        is_error: r.is_error,
-                    },
-                    usage: Usage::default(),
-                },
-                McpResultType::InputRequired {
-                    input_requests,
-                    request_state,
-                } => {
-                    self.suspend_for_elicitation(
-                        ctx,
-                        state.server,
-                        state.tool,
-                        state.args,
-                        input_requests,
-                        request_state,
-                        state.round + 1,
                     )
                     .await
                 }
