@@ -1,4 +1,4 @@
-use roundhouse_core::{SessionId, TaskId, WorkspaceId};
+use roundhouse_core::{SessionId, TaskId, TeamId, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -100,6 +100,10 @@ pub enum BusError {
     FanOutLimitExceeded { count: u32, max: u32 },
     #[error("team size limit exceeded: {count} > {max}")]
     TeamSizeLimitExceeded { count: u32, max: u32 },
+    #[error("team {team:?} is draining and refuses new members/sends")]
+    TeamDraining { team: TeamId },
+    #[error("session {session:?} is a human and can never join a team roster (§7.2)")]
+    HumanCannotJoinTeam { session: SessionId },
 }
 
 #[cfg(test)]
