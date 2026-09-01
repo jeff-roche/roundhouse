@@ -113,10 +113,69 @@ pub fn agent_spawn(
         });
     }
 
-    // §7.7 depth/fan-out limits, evaluated before any side effect.
-    let child_depth = input.parent_depth + 1;
+    // §7.7 depth/fan-out limits, evaluated before any side effect. `checked_add`
+    // (not `+`) so a maxed-out parent depth/fan-out can't wrap around in a release
+    // build and silently grant the child a smaller, "valid-looking" value.
+    let child_depth = input.parent_depth.checked_add(1).ok_or({
+        SpawnError::Bus(BusError::DepthLimitExceeded {
+            depth: 255,
+            max: roundhouse_bus::limits::MAX_DEPTH,
+        })
+    })?;
     check_depth(child_depth)?;
-    check_fan_out(input.parent_direct_children + 1)?;
+    let child_fan_out = input.parent_direct_children.checked_add(1).ok_or({
+        SpawnError::Bus(BusError::FanOutLimitExceeded {
+            count: u32::MAX,
+            max: roundhouse_bus::limits::MAX_FAN_OUT,
+        })
+    })?;
+    check_fan_out(child_fan_out)?;
+
+    // §7.5: "agent_spawn auto-joins the child to the parent's team as `worker`
+    // unless overridden." Two fences run before any budget transfer or roster
+    // mutation, in this order:
+    //
+    //   1. Membership — the parent must already be a current (non-ended) member of
+    //      the team the child is asked to join, so a child can't reach a team its
+    //      parent couldn't.
+    //   2. Role clamping — requesting "lead" requires the parent to be the team's
+    //      creator or to already hold "lead", so a worker parent can't mint a child
+    //      with team-close authority the parent itself never had.
+    if let Some(team) = input.team {
+        let parent_is_member = teams
+            .roster(team)
+            .map(|roster| roster.iter().any(|m| m.session == input.parent && !m.ended))
+            .unwrap_or(false);
+        if !parent_is_member {
+            return Err(SpawnError::Bus(BusError::NotAuthorized {
+                team,
+                caller: input.parent,
+            }));
+        }
+
+        if let Some(ref requested_role) = input.role {
+            if requested_role == "lead" {
+                let parent_is_lead = teams
+                    .team(team)
+                    .map(|t| t.created_by == input.parent)
+                    .unwrap_or(false)
+                    || teams
+                        .roster(team)
+                        .map(|roster| {
+                            roster
+                                .iter()
+                                .any(|m| m.session == input.parent && m.role == "lead")
+                        })
+                        .unwrap_or(false);
+                if !parent_is_lead {
+                    return Err(SpawnError::Bus(BusError::NotAuthorized {
+                        team,
+                        caller: input.parent,
+                    }));
+                }
+            }
+        }
+    }
 
     // §7.7: "Budget inheritance is a transfer, not a grant ... moves tokens from the
     // parent's remaining budget into the child's."
@@ -376,5 +435,108 @@ mod tests {
             err,
             SpawnError::Bus(roundhouse_bus::types::BusError::DepthLimitExceeded { .. })
         ));
+    }
+
+    #[test]
+    fn spawn_beyond_fan_out_limit_is_refused() {
+        let registry = TeamRegistry::new();
+        let ws = WorkspaceId::new();
+        let parent_session = SessionId::new();
+        let team = registry
+            .create_team(ws, "t".into(), "c".into(), parent_session, "lead".into())
+            .unwrap();
+        let mut parent_budget = Budget {
+            remaining_tokens: 1000,
+        };
+
+        let input = AgentSpawnInput {
+            workspace: ws,
+            parent: parent_session,
+            parent_depth: 0,
+            parent_direct_children: 8, // would become 9 > MAX_FAN_OUT(8)
+            team: Some(team),
+            role: None,
+            provider: "anthropic".to_string(),
+            budget_tokens: 10,
+            parent_taint: TaintSet { tainted: false },
+        };
+
+        let err =
+            agent_spawn(&registry, &AllowAnthropicOnly, &mut parent_budget, input).unwrap_err();
+        assert!(matches!(
+            err,
+            SpawnError::Bus(roundhouse_bus::types::BusError::FanOutLimitExceeded { .. })
+        ));
+        assert_eq!(parent_budget.remaining_tokens, 1000); // refused before any transfer
+    }
+
+    #[test]
+    fn worker_parent_cannot_spawn_a_lead_child() {
+        let registry = TeamRegistry::new();
+        let ws = WorkspaceId::new();
+        let creator = SessionId::new();
+        let team = registry
+            .create_team(ws, "t".into(), "c".into(), creator, "lead".into())
+            .unwrap();
+
+        let worker = SessionId::new();
+        registry.join(team, worker, None).unwrap(); // auto-joins as "worker"
+
+        let mut parent_budget = Budget {
+            remaining_tokens: 1000,
+        };
+        let input = AgentSpawnInput {
+            workspace: ws,
+            parent: worker,
+            parent_depth: 0,
+            parent_direct_children: 0,
+            team: Some(team),
+            role: Some("lead".to_string()), // escalation: worker can't mint a lead child
+            provider: "anthropic".to_string(),
+            budget_tokens: 10,
+            parent_taint: TaintSet { tainted: false },
+        };
+
+        let err =
+            agent_spawn(&registry, &AllowAnthropicOnly, &mut parent_budget, input).unwrap_err();
+        assert!(matches!(
+            err,
+            SpawnError::Bus(roundhouse_bus::types::BusError::NotAuthorized { .. })
+        ));
+        assert_eq!(parent_budget.remaining_tokens, 1000); // refused before any transfer
+    }
+
+    #[test]
+    fn non_member_parent_cannot_spawn_into_a_team() {
+        let registry = TeamRegistry::new();
+        let ws = WorkspaceId::new();
+        let creator = SessionId::new();
+        let team = registry
+            .create_team(ws, "t".into(), "c".into(), creator, "lead".into())
+            .unwrap();
+
+        let stranger = SessionId::new(); // not on the roster
+        let mut parent_budget = Budget {
+            remaining_tokens: 1000,
+        };
+        let input = AgentSpawnInput {
+            workspace: ws,
+            parent: stranger,
+            parent_depth: 0,
+            parent_direct_children: 0,
+            team: Some(team),
+            role: None,
+            provider: "anthropic".to_string(),
+            budget_tokens: 10,
+            parent_taint: TaintSet { tainted: false },
+        };
+
+        let err =
+            agent_spawn(&registry, &AllowAnthropicOnly, &mut parent_budget, input).unwrap_err();
+        assert!(matches!(
+            err,
+            SpawnError::Bus(roundhouse_bus::types::BusError::NotAuthorized { .. })
+        ));
+        assert_eq!(parent_budget.remaining_tokens, 1000); // refused before any transfer
     }
 }
