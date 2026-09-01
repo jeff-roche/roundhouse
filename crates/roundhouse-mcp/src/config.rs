@@ -17,7 +17,7 @@ pub enum McpTransportKind {
         /// (§6.7: MCP stdio servers are spawned by the daemon outside the
         /// session's namespace; nothing here is session-derived.)
         env: Vec<(String, String)>,
-        /// §6.5 hardened profile: "MCP servers pinned by binary hash."
+        /// §6.9 hardened profile: "MCP servers pinned by binary hash."
         /// Hex-encoded blake3 digest of the `command` binary's bytes,
         /// verified at spawn time (`StdioMcpTransport::spawn`, Task 6)
         /// before the process is ever started. `None` outside

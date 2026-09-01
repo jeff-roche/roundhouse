@@ -11,7 +11,7 @@
 //! and `cfg(test)` items never cross that boundary. This file defines its
 //! own tiny `AllowAllPolicy`/`NoopTaskSpawner` doubles (the same
 //! self-contained-test-double pattern Task 10's `tests/untrusted_boundary.rs`
-//! uses).
+//! will use).
 //!
 //! Reconciled shapes (per the plan preamble's assumed-shape rule): the
 //! brief sketched `TaskInput`/`TaskOutput`/`ContentBlock` as
