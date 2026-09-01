@@ -255,6 +255,17 @@ impl McpExecutor {
         }
     }
 
+    /// Test/integration convenience: look up the namespaced name for a
+    /// known original tool name. Production callers already have the
+    /// namespaced name from whatever presented the tool list to the model.
+    pub fn namespace_tool_name(&self, original_name: &str) -> Option<String> {
+        self.namespace
+            .tools()
+            .iter()
+            .find(|t| t.original_name == original_name)
+            .map(|t| t.namespaced_name.clone())
+    }
+
     /// finding 2: the §6.2 policy gate every dispatch (initial call AND
     /// every MRTR retry, Task 8b) passes through before touching a
     /// transport. Returns `Ok(())` only on `PolicyDecision::Allow`.
