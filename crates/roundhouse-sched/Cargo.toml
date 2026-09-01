@@ -22,9 +22,20 @@ roundhouse-store = { path = "../roundhouse-store" }
 # §5.2's `roundhouse-sched` row for the matching table update.
 roundhouse-bus = { path = "../roundhouse-bus" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
-chrono-tz = { version = "0.10", features = ["serde"] }
+# Pinned exact per §5.3's "never track to latest" discipline. `chrono-tz`
+# isn't in §5.3's table (trigger scheduling is new this Phase); pinned to
+# 0.10.4 rather than a bare "0.10" range. Task 1 originally added this as a
+# soft "0.10" requirement — 0.10.4 is what that already resolves and locks
+# to on this branch, so tightening to it here (rather than to some other
+# 0.10.x) changes no behavior, only the pin discipline.
+chrono-tz = { version = "=0.10.4", features = ["serde"] }
+# Pinned exact per §5.3's discipline (also not in that table for the same
+# reason as chrono-tz above). See `src/cron.rs` for the real (verified
+# against the crate source) `Schedule::after`/`upcoming` API this task uses.
+cron = "=0.15.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

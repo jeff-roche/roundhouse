@@ -10,6 +10,7 @@
 //! `05-scheduling-and-workflows.md`.
 #![forbid(unsafe_code)]
 
+pub mod cron;
 pub mod trigger;
 
 pub fn schema_version_floor() -> u16 {
