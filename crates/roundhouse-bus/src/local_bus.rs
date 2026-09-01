@@ -1,9 +1,10 @@
 use crate::event_sink::{EventSink, InMemoryEventSink};
 use crate::handle_registry::HandleRegistry;
+use crate::human_notifications::{HumanNotification, HumanNotificationRegistry};
 use crate::mailbox::{Mailbox, MailboxKind};
 use crate::types::{BusError, Envelope, Undeliverable};
 use crate::wait_graph::WaitGraph;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use roundhouse_core::SessionId;
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +19,8 @@ pub struct LocalBus {
     #[allow(dead_code)]
     pub(crate) wait_graph: Mutex<WaitGraph>,
     pub(crate) sink: Arc<dyn EventSink>,
+    pub(crate) human_sessions: DashSet<SessionId>,
+    pub(crate) human_notifications: HumanNotificationRegistry,
 }
 
 impl LocalBus {
@@ -27,7 +30,24 @@ impl LocalBus {
             handles: HandleRegistry::new(),
             wait_graph: Mutex::new(WaitGraph::new()),
             sink: Arc::new(InMemoryEventSink::new()),
+            human_sessions: DashSet::new(),
+            human_notifications: HumanNotificationRegistry::new(),
         }
+    }
+
+    /// Marks `session` as a human recipient: it never gets a `Mailbox` — `send`
+    /// (below) routes anything addressed to it into `human_notifications` instead.
+    /// Distinct from `register_mailbox` on purpose (§7.2's split delivery mechanism).
+    pub fn register_human(&self, session: SessionId) {
+        self.human_sessions.insert(session);
+    }
+
+    pub fn list_human_notifications(&self, session: SessionId) -> Vec<HumanNotification> {
+        self.human_notifications.list(session)
+    }
+
+    pub fn drain_human_notifications(&self, session: SessionId) -> Vec<HumanNotification> {
+        self.human_notifications.drain(session)
     }
 
     pub fn with_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
@@ -62,6 +82,23 @@ impl LocalBus {
     /// needing a separate index.
     pub async fn send(&self, envelope: Envelope) -> Result<(), BusError> {
         let to = envelope.to;
+
+        // §7.2: human recipients bypass the ordinary mailbox path entirely — no
+        // capacity check, no idempotency/redelivery bookkeeping (a UI notification
+        // feed has no "effectively-once observation" contract the way a Task-injected
+        // reply does), just a durable, listable/drainable notification.
+        if self.human_sessions.contains(&to) {
+            self.human_notifications.push(
+                to,
+                HumanNotification {
+                    from: envelope.from,
+                    envelope,
+                    ts_unix_ms: current_unix_millis(),
+                },
+            );
+            return Ok(());
+        }
+
         let mailbox =
             self.mailboxes
                 .get(&to)
@@ -94,6 +131,13 @@ impl Default for LocalBus {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn current_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -194,5 +238,97 @@ mod send_tests {
             err,
             crate::types::BusError::Undeliverable(crate::types::Undeliverable::Ended { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod backpressure_tests {
+    use super::*;
+    use crate::mailbox::MailboxKind;
+    use crate::types::{Address, Envelope, MessageId, Provenance, Trust};
+    use roundhouse_core::{Origin, SessionId};
+    use uuid::Uuid;
+
+    fn envelope(from: SessionId, to: SessionId, subject: &str) -> Envelope {
+        Envelope {
+            id: MessageId(Uuid::new_v4()),
+            from,
+            to,
+            to_requested: Address::Session { id: to },
+            subject: subject.into(),
+            body: "x".into(),
+            attachments: vec![],
+            expect_reply: None,
+            in_reply_to: None,
+            ttl_hops: 8,
+            provenance: Provenance {
+                origin: Origin::Peer,
+                trust: Trust::Untrusted,
+                task: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_rejects_the_send_and_never_drops_the_oldest() {
+        let bus = LocalBus::new();
+        let from = SessionId::new();
+        let to = SessionId::new();
+        bus.register_mailbox(to, MailboxKind::Bounded(2))
+            .await
+            .unwrap();
+
+        bus.send(envelope(from, to, "s")).await.unwrap();
+        bus.send(envelope(from, to, "s")).await.unwrap();
+        let err = bus.send(envelope(from, to, "s")).await.unwrap_err();
+        assert!(matches!(
+            err,
+            crate::types::BusError::MailboxFull { capacity: 2, .. }
+        ));
+
+        // The two original messages are both still there — nothing was evicted.
+        assert!(bus.poll(to).await.unwrap().is_some());
+        assert!(bus.poll(to).await.unwrap().is_some());
+        assert!(bus.poll(to).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn human_recipients_never_get_an_ordinary_mailbox_or_a_capacity_limit() {
+        let bus = LocalBus::new();
+        let from = SessionId::new();
+        let human = SessionId::new();
+        bus.register_human(human);
+
+        // A distinct subject per iteration: this test is only about the human path
+        // itself, so it deliberately avoids tripping the repetition damper Task 12
+        // later wires into `send` for real (keyed on `(to, subject)`, §7.7).
+        for i in 0..(crate::mailbox::DEFAULT_MAILBOX_CAPACITY * 4) {
+            bus.send(envelope(from, human, &format!("s{i}")))
+                .await
+                .unwrap();
+        }
+
+        // §7.2: "never blocked by policy" — there is no capacity concept to violate
+        // because a human recipient never gets an ordinary `Mailbox` in the first
+        // place, not because its `Mailbox` happens to be `Unbounded`.
+        assert!(!bus.has_mailbox(human));
+        assert_eq!(
+            bus.list_human_notifications(human).len(),
+            crate::mailbox::DEFAULT_MAILBOX_CAPACITY * 4
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_human_notifications_removes_them() {
+        let bus = LocalBus::new();
+        let from = SessionId::new();
+        let human = SessionId::new();
+        bus.register_human(human);
+        bus.send(envelope(from, human, "heads up")).await.unwrap();
+
+        let drained = bus.drain_human_notifications(human);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].from, from);
+        assert!(bus.list_human_notifications(human).is_empty());
     }
 }
