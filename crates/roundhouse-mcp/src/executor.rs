@@ -198,7 +198,11 @@ pub trait TaskExecutor: Send + Sync {
 /// in-process recording fake, the same pattern `FakeMcpTransport` (Task 5)
 /// already establishes for `McpTransport`. Task 8 only exercises
 /// `record_decision`; Task 8b's MRTR loop adds the `spawn_task`/
-/// `suspend_task` callers.
+/// `suspend_task` callers; Task 11's `McpHost::start` adds the
+/// `record_terminal` caller — the discovery task it mints through
+/// `spawn_task` gets exactly one terminal record the moment discovery
+/// resolves, so a minted task is never left permanently in-flight
+/// (S-LOG-1: a task record exists only as a complete lifecycle).
 #[async_trait]
 pub trait TaskSpawner: Send + Sync {
     /// Creates and records a new task (a real `TaskCreated` event),
@@ -219,6 +223,41 @@ pub trait TaskSpawner: Send + Sync {
     /// `Policy::decide` wiring (§6.2: every decision is logged, not just
     /// acted on).
     async fn record_decision(&self, task: TaskId, decision: PolicyDecision);
+
+    /// Records the terminal `TaskCompleted`/`TaskFailed` event for a task
+    /// previously minted by [`TaskSpawner::spawn_task`]. Every minted task
+    /// gets exactly one terminal record — S-LOG-1's lifecycle rule means a
+    /// task creation is never left dangling without its terminal event.
+    ///
+    /// Reconciliation (same rule as the methods above): the real core
+    /// calls (`TaskRunner::record_task_completed`/
+    /// `record_task_failed`) additionally need a session id, the
+    /// append-only `seq`, a timestamp, and `schema_v` — store/engine-owned
+    /// state this crate has no business holding — so this seam carries
+    /// only the task id and the terminal payload ([`TerminalOutcome`]),
+    /// which the engine implementation maps 1:1 onto those two calls.
+    async fn record_terminal(&self, task: TaskId, outcome: TerminalOutcome);
+}
+
+/// The terminal outcome of a task, shaped to lift 1:1 onto the real core
+/// task-lifecycle events: `Completed` carries exactly what
+/// `roundhouse_core::TaskRunner::record_task_completed` folds into a
+/// `TaskCompleted` event (a core [`roundhouse_core::TaskOutput`] plus
+/// [`Usage`]), `Failed` exactly what `record_task_failed` folds into a
+/// `TaskFailed` event (a [`TaskError`] plus its `retryable` flag).
+/// (Core's `TaskOutput` is referenced by its full path here — this
+/// module's own `TaskOutput` above is the executor's MCP result shape,
+/// not the event-payload shape.)
+#[derive(Debug, Clone)]
+pub enum TerminalOutcome {
+    Completed {
+        output: roundhouse_core::TaskOutput,
+        usage: Usage,
+    },
+    Failed {
+        error: TaskError,
+        retryable: bool,
+    },
 }
 
 pub struct McpExecutor {
@@ -732,13 +771,15 @@ mod tests {
     }
 
     /// Test double for `TaskSpawner`. Records every spawned/suspended/
-    /// decided call so tests can assert the elicit-task-construction and
-    /// audit-trail wiring (findings 3, 4, 2) actually happened.
+    /// decided/terminal call so tests can assert the elicit-task-
+    /// construction and audit-trail wiring (findings 3, 4, 2) actually
+    /// happened.
     #[derive(Default)]
     struct RecordingTaskSpawner {
         created: Mutex<Vec<(TaskKind, TaskInput)>>,
         suspended: Mutex<Vec<(TaskId, SuspendReason)>>,
         decisions: Mutex<Vec<(TaskId, PolicyDecision)>>,
+        terminal: Mutex<Vec<(TaskId, TerminalOutcome)>>,
     }
     #[async_trait]
     impl TaskSpawner for RecordingTaskSpawner {
@@ -758,6 +799,9 @@ mod tests {
         }
         async fn record_decision(&self, task: TaskId, decision: PolicyDecision) {
             self.decisions.lock().unwrap().push((task, decision));
+        }
+        async fn record_terminal(&self, task: TaskId, outcome: TerminalOutcome) {
+            self.terminal.lock().unwrap().push((task, outcome));
         }
     }
 
@@ -861,6 +905,16 @@ mod tests {
             spawner.decisions.lock().unwrap()[0].1,
             PolicyDecision::Allow
         ));
+        // The executor itself never records terminal state: it RETURNS
+        // `ExecutorOutcome` and the ENGINE folds that into the
+        // `TaskCompleted`/`TaskFailed` events. The one `record_terminal`
+        // caller inside this crate is `McpHost::start`'s discovery task
+        // (Task 11) — a dispatch-driven task's terminal record is not the
+        // executor's to write.
+        assert!(
+            spawner.terminal.lock().unwrap().is_empty(),
+            "the executor must not record terminal state for dispatched tasks"
+        );
     }
 
     #[tokio::test]

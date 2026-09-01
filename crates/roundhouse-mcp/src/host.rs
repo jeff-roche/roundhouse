@@ -1,11 +1,11 @@
 // crates/roundhouse-mcp/src/host.rs
 use crate::config::McpServerConfig;
-use crate::executor::{McpExecutor, TaskInput, TaskSpawner};
+use crate::executor::{McpExecutor, TaskInput, TaskSpawner, TerminalOutcome};
 use crate::namespace::{NamespaceCollisionError, ToolNamespace};
 use crate::transport::stdio::StdioMcpTransport;
 use crate::transport::McpTransport;
 use crate::wire::McpError;
-use roundhouse_core::{Origin, SessionId, TaskKind};
+use roundhouse_core::{Origin, SessionId, TaskError, TaskKind, Usage};
 use roundhouse_policy::{Policy, ServerId};
 use std::sync::Arc;
 
@@ -74,6 +74,15 @@ impl McpHost {
     /// field should draw from. Consumed by `roundhouse-daemon` (out of this
     /// phase's crate boundary, same as `roundhouse-engine`'s real
     /// `TaskSpawner` implementation).
+    ///
+    /// The minted discovery task's lifecycle is CLOSED here, not left to
+    /// the caller: the moment discovery resolves, its terminal record goes
+    /// out through `TaskSpawner::record_terminal` — `Completed` (with the
+    /// discovered protocol version and tool names as the task output) on
+    /// success, `Failed` (the transport error, non-retryable: startup fails
+    /// closed and nothing re-runs this task in-process) on failure. A task
+    /// minted through the real creation authority must never be left
+    /// permanently in-flight — S-LOG-1's lifecycle rule.
     pub async fn start(
         configs: Vec<McpServerConfig>,
         session: SessionId,
@@ -115,13 +124,57 @@ impl McpHost {
                 )
                 .await;
 
-            let result = transport
-                .discover()
-                .await
-                .map_err(|source| McpHostError::Discover {
-                    server: config.id.0.clone(),
-                    source,
-                })?;
+            // Task 11 fix (review finding 1): the discovery task minted
+            // above must never be left permanently in-flight. Whichever way
+            // discovery resolves, its terminal record goes out through
+            // `record_terminal` before anything else happens — `Completed`
+            // with the discovered protocol version and tool names as the
+            // task output, or `Failed` with the transport error (non-
+            // retryable: `start` fails closed, so nothing re-runs this task
+            // in-process). The terminal payload is exactly what core's
+            // `record_task_completed`/`record_task_failed` fold into the
+            // `TaskCompleted`/`TaskFailed` events; session/seq/timestamp/
+            // `schema_v` stay engine-side, same as every other seam call.
+            let result = match transport.discover().await {
+                Ok(result) => {
+                    let tool_names: Vec<String> =
+                        result.tools.iter().map(|t| t.name.clone()).collect();
+                    let output = roundhouse_core::TaskOutput::Json(serde_json::json!({
+                        "protocol_version": result.protocol_version.clone(),
+                        "tools": tool_names,
+                    }));
+                    task_spawner
+                        .record_terminal(
+                            discovery_task,
+                            TerminalOutcome::Completed {
+                                output,
+                                usage: Usage::default(),
+                            },
+                        )
+                        .await;
+                    result
+                }
+                Err(source) => {
+                    task_spawner
+                        .record_terminal(
+                            discovery_task,
+                            TerminalOutcome::Failed {
+                                error: TaskError {
+                                    message: source.to_string(),
+                                    // Same category the executor assigns to
+                                    // transport-level failures.
+                                    category: "executor_error".into(),
+                                },
+                                retryable: false,
+                            },
+                        )
+                        .await;
+                    return Err(McpHostError::Discover {
+                        server: config.id.0.clone(),
+                        source,
+                    });
+                }
+            };
             discovered.push((config.id.clone(), discovery_task, result));
             connections.push((
                 config.id.clone(),

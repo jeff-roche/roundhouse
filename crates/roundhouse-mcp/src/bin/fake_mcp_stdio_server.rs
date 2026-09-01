@@ -14,6 +14,12 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
 fn main() {
+    // Task 11 fix (finding 2 review coverage): `bad-schema` argv mode makes
+    // the server announce a tool whose `inputSchema` is a non-object string
+    // — the malformed discovery shape `McpHost::start` must fail closed on
+    // without echoing the payload. Default (no-arg) behavior is unchanged;
+    // every other test spawns this binary with no args.
+    let bad_schema = std::env::args().any(|arg| arg == "bad-schema");
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     // Opaque server-side booking state (§10.1): the real server would seal
@@ -35,6 +41,19 @@ fn main() {
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
 
         let response = match method {
+            // bad-schema mode: the marker string rides as the tool's whole
+            // `inputSchema` value. If the host's fail-closed path ever
+            // echoes the schema payload through its error, the host test's
+            // no-leak assertion catches it.
+            "server/discover" if bad_schema => json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {
+                    "protocolVersion": "2026-07-28",
+                    "tools": [
+                        {"name": "bad_schema", "description": "announces a non-object input schema", "inputSchema": "__UNTRUSTED_SCHEMA_PAYLOAD__"}
+                    ]
+                }
+            }),
             "server/discover" => json!({
                 "jsonrpc": "2.0", "id": id,
                 "result": {

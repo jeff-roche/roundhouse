@@ -26,7 +26,7 @@ use roundhouse_core::{Origin, PolicyDecision, SessionId, SuspendReason, TaskId, 
 use roundhouse_mcp::config::{McpServerConfig, McpTransportKind};
 use roundhouse_mcp::executor::{
     ExecutorOutcome, McpExecutor, McpRetryState, ResumptionInput, TaskCtx, TaskExecutor, TaskInput,
-    TaskOutput, TaskSpawner,
+    TaskOutput, TaskSpawner, TerminalOutcome,
 };
 use roundhouse_mcp::namespace::ToolNamespace;
 use roundhouse_mcp::transport::stdio::StdioMcpTransport;
@@ -58,6 +58,7 @@ impl TaskSpawner for NoopTaskSpawner {
     }
     async fn suspend_task(&self, _task: TaskId, _reason: SuspendReason) {}
     async fn record_decision(&self, _task: TaskId, _decision: PolicyDecision) {}
+    async fn record_terminal(&self, _task: TaskId, _outcome: TerminalOutcome) {}
 }
 
 #[tokio::test]
