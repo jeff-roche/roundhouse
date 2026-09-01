@@ -640,10 +640,25 @@ mod tests {
         // the captured pgid is the pid `/proc` can confirm the exec target
         // for.
         let pid = u32::try_from(transport.pgid.as_raw()).expect("pgid fits u32");
-        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+        let expected = std::fs::canonicalize(&resolved).unwrap();
+        // `spawn()` returning doesn't guarantee the child has reached its
+        // `execve` yet — under CI's CPU contention, `/proc/{pid}/exe` can
+        // still read back this test binary's own path (the pre-exec
+        // image) for a moment. Same bounded-reprobe idiom as
+        // `KILL_CONFIRM_ATTEMPTS`/`KILL_CONFIRM_INTERVAL` below: poll
+        // instead of asserting on a single synchronous read.
+        let mut exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+        for attempt in 0..KILL_CONFIRM_ATTEMPTS {
+            if exe == expected {
+                break;
+            }
+            if attempt + 1 < KILL_CONFIRM_ATTEMPTS {
+                tokio::time::sleep(KILL_CONFIRM_INTERVAL).await;
+                exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+            }
+        }
         assert_eq!(
-            exe,
-            std::fs::canonicalize(&resolved).unwrap(),
+            exe, expected,
             "pinned spawn must exec the exact binary whose bytes were hashed"
         );
 
