@@ -123,37 +123,38 @@ fn request_ctx_credentials_field_defaults_to_none_for_existing_call_sites() {
 fn base_url_resolution_order_is_override_then_env_then_profile_default() {
     // §9.9: explicit override -> ROUNDHOUSE_<PROVIDER>_BASE_URL env -> profile default.
     std::env::remove_var("ROUNDHOUSE_TESTPROV_BASE_URL");
-    assert_eq!(
-        roundhouse_provider::credential::resolve_base_url(
-            "testprov",
-            "https://default.example.com",
-            None
-        )
-        .unwrap()
-        .as_str(),
-        "https://default.example.com/",
-    );
+    let (url, _recorded) = roundhouse_provider::credential::resolve_base_url(
+        "testprov",
+        "https://default.example.com",
+        None,
+    )
+    .unwrap();
+    assert_eq!(url.as_str(), "https://default.example.com/");
+
     std::env::set_var("ROUNDHOUSE_TESTPROV_BASE_URL", "https://env.example.com");
+    let (url, _recorded) = roundhouse_provider::credential::resolve_base_url(
+        "testprov",
+        "https://default.example.com",
+        None,
+    )
+    .unwrap();
+    assert_eq!(url.as_str(), "https://env.example.com/");
+
+    let (url, recorded) = roundhouse_provider::credential::resolve_base_url(
+        "testprov",
+        "https://default.example.com",
+        Some("https://override.example.com/v1?api_key=sk-should-never-appear"),
+    )
+    .unwrap();
     assert_eq!(
-        roundhouse_provider::credential::resolve_base_url(
-            "testprov",
-            "https://default.example.com",
-            None
-        )
-        .unwrap()
-        .as_str(),
-        "https://env.example.com/",
+        url.as_str(),
+        "https://override.example.com/v1?api_key=sk-should-never-appear",
     );
-    assert_eq!(
-        roundhouse_provider::credential::resolve_base_url(
-            "testprov",
-            "https://default.example.com",
-            Some("https://override.example.com")
-        )
-        .unwrap()
-        .as_str(),
-        "https://override.example.com/",
-    );
+    // A6: `resolve_base_url` and the host-only recording are structurally
+    // inseparable — a caller cannot get the full URL (query string and all)
+    // without also getting the safe-to-persist host-only form.
+    assert_eq!(recorded, "override.example.com");
+
     std::env::remove_var("ROUNDHOUSE_TESTPROV_BASE_URL");
 }
 
@@ -187,5 +188,28 @@ fn provider_src_never_touches_secret_material_directly() {
     assert!(
         expose_hits.is_empty(),
         "roundhouse-provider/src must never reference secret exposure, found in: {expose_hits:?}"
+    );
+}
+
+#[test]
+fn provider_manifest_never_depends_on_secrecy() {
+    // A10: a source-text scan for `secrecy::` is defeated by `use secrecy as
+    // s;` — an aliased import never spells that substring anywhere. The
+    // manifest check above's text scan can't be renamed around: if
+    // `secrecy` isn't a declared dependency at all, no code in this crate
+    // can reference it under any alias.
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    let declares_secrecy = manifest.lines().any(|line| {
+        let key = line
+            .trim_start()
+            .split(|c: char| c == '=' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        key == "secrecy"
+    });
+    assert!(
+        !declares_secrecy,
+        "roundhouse-provider's Cargo.toml must never declare a `secrecy` dependency"
     );
 }

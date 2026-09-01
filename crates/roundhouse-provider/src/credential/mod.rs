@@ -43,6 +43,15 @@ use crate::transport::{HttpRequest, HttpTransport, TransportError};
 pub struct CredentialCtx<'a> {
     pub provider_id: &'a str,
     pub transport: &'a dyn HttpTransport,
+    /// The clock a credential uses for token-expiry decisions (skew checks
+    /// against a cached token's `expires_at`). **Strictly per-request**:
+    /// build a fresh `CredentialCtx` (and read `Instant::now()` into this
+    /// field) immediately before each `apply` call. A `CredentialCtx` built
+    /// once and reused across many requests — e.g. one per session instead
+    /// of one per request — makes a cached token's expiry check compare
+    /// against a clock that never advances, so a credential like
+    /// `OAuthRefreshCredential` would treat its cached token as eternally
+    /// fresh no matter how much real wall-clock time has actually passed.
     pub now: std::time::Instant,
 }
 
@@ -73,6 +82,16 @@ pub enum CredentialError {
 /// concrete `CredentialProvider` it was given: every provider adapter calls
 /// `ctx.credentials.apply(&mut req, &cred_ctx)` exactly once and gets
 /// bearer, header-key, OAuth, Entra, exec-command, or SigV4 handling alike.
+///
+/// **Idempotency contract:** `apply` may be called more than once on the
+/// same `HttpRequest` — retrying a request (`crate::retry`) re-applies the
+/// same credential to the same request object rather than building a fresh
+/// one. Implementations MUST make repeat application safe: at minimum, this
+/// means removing any header(s) a previous `apply` call on this credential
+/// set before setting them again, so retried requests never accumulate
+/// duplicate `Authorization`/custom-header values (and, for SigV4
+/// specifically, so a stale `authorization`/`x-amz-*` header from a prior
+/// signing pass never folds into the next canonical-request hash).
 pub trait CredentialProvider: Send + Sync + 'static {
     fn apply<'a>(
         &'a self,

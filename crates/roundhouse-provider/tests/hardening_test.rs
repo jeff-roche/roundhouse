@@ -70,3 +70,43 @@ fn error_body_redaction_catches_api_keys_bearer_tokens_and_jwts() {
         "non-secret content must survive redaction"
     );
 }
+
+#[test]
+fn error_body_redaction_catches_a_jwt_whose_payload_segment_does_not_start_with_eyj() {
+    // A9: only a JWT's header segment is guaranteed to start `eyJ`; the
+    // payload segment's leading bytes depend on its own first claim and are
+    // not. This payload segment ("eyIxMjM0NTY3ODkwIn0" decodes to something
+    // whose base64 does not happen to start `eyJ`) would have been missed by
+    // a pattern requiring both segments to start `eyJ`.
+    let body = r#"{"auth":"Bearer eyJhbGciOiJIUzI1NiJ9.c3ViOjEyMzQ1Njc4OTA.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"}"#;
+    let redacted = redact_error_body(body);
+    assert!(
+        !redacted.contains("c3ViOjEyMzQ1Njc4OTA"),
+        "JWT payload segment must be redacted even when it doesn't itself start `eyJ`: {redacted}"
+    );
+}
+
+#[test]
+fn error_body_redaction_catches_aws_and_google_key_shapes_and_labeled_secrets() {
+    // A9: the earlier version of this redactor covered only sk-/pk-/rk-
+    // prefixed keys, bearer tokens, and JWTs — missing most of what the six
+    // credential mechanisms this phase built actually carry.
+    let body = r#"{"error":"bad request","access_key_id":"AKIAABCDEFGHIJKLMNOP","google_key":"AIzaSyD-1234567890abcdefghijklmnopqrstu","client_secret":"Tn8Q~1a2B3c4D5e6F7g8H9i0Jk"}"#;
+    let redacted = redact_error_body(body);
+    assert!(
+        !redacted.contains("AKIAABCDEFGHIJKLMNOP"),
+        "AWS access key ID must be redacted: {redacted}"
+    );
+    assert!(
+        !redacted.contains("AIzaSyD-1234567890abcdefghijklmnopqrstu"),
+        "Google API key must be redacted: {redacted}"
+    );
+    assert!(
+        !redacted.contains("Tn8Q~1a2B3c4D5e6F7g8H9i0Jk"),
+        "labeled client_secret value must be redacted: {redacted}"
+    );
+    assert!(
+        redacted.contains("bad request"),
+        "non-secret content must survive redaction"
+    );
+}
