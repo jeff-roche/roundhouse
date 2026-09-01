@@ -149,6 +149,31 @@ pub struct ToolDef {
 }
 
 impl ToolDef {
+    /// S-TOOL-9's boundary case (Phase 3): the narrow, reviewed construction
+    /// path for *wire-sourced* tool definitions. An MCP server's
+    /// `server/discover` response carries `inputSchema` JSON authored by the
+    /// remote server — there is no Rust params struct to hand
+    /// [`tool_def_from_schema`], and the schema is untrusted content by
+    /// construction (§6.8 names tool descriptions untrusted; the schema
+    /// rides alongside them). Taking the schema as a [`serde_json::Map`]
+    /// makes a non-object schema unrepresentable at the type level — the
+    /// same root-shape guarantee `schemars` gives [`tool_def_from_schema`] —
+    /// so a caller holding a raw wire `Value` must fail closed on the
+    /// non-object case itself (roundhouse-mcp's `McpHost::start` does, with
+    /// a named error). Nothing here certifies the schema's *content*;
+    /// untrusted-provenance handling remains the caller's job.
+    pub fn from_wire_parts(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: serde_json::Map<String, Value>,
+    ) -> Self {
+        ToolDef {
+            name: name.into(),
+            description: description.into(),
+            input_schema: Value::Object(input_schema),
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }

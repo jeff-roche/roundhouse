@@ -13,6 +13,7 @@
 
 pub mod config;
 pub mod executor;
+pub mod host;
 pub mod namespace;
 pub mod transport;
 pub mod wire;
