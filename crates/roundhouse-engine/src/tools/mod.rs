@@ -6,3 +6,4 @@
 
 pub mod message_send;
 pub mod message_wait;
+pub mod peers;
