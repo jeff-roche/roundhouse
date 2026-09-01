@@ -115,6 +115,31 @@ CREATE INDEX IF NOT EXISTS idx_tasks_suspended
     WHERE state = 'Suspended';
 "#;
 
+/// Phase 5, Subsystem A, Task 4 (scheduling): durable record of one trigger
+/// firing, keyed for dedupe by `(binding_id, idempotency_key)`. Ruling P4
+/// requires this table live in the real store's migration list — a
+/// per-crate `roundhouse-sched/migrations/*.sql` file would never reach the
+/// daemon's actual database. The `UNIQUE INDEX` is the real enforcement
+/// mechanism for "exactly one run per scheduled occurrence, even under
+/// crash-and-retry": `roundhouse_sched::store::record_trigger_event` relies
+/// on this constraint via `INSERT ... ON CONFLICT DO NOTHING`, not a
+/// check-then-insert in application code (which would race under concurrent
+/// callers).
+const MIGRATION_0006_TRIGGER_EVENT: &str = r#"
+CREATE TABLE trigger_event (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    binding_id      TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    scheduled_for   TEXT NOT NULL,   -- RFC3339 UTC
+    fired_at        TEXT NOT NULL,   -- RFC3339 UTC
+    is_catch_up     INTEGER NOT NULL,
+    session_id      TEXT
+) STRICT;
+
+CREATE UNIQUE INDEX trigger_event_dedupe
+    ON trigger_event(binding_id, idempotency_key);
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_0001_INITIAL_SCHEMA),
@@ -122,5 +147,6 @@ pub fn migrations() -> Migrations<'static> {
         M::up(MIGRATION_0003_TASKS_SUSPEND_COLUMNS),
         M::up(MIGRATION_0004_TASKS_REDACTIONS_COLUMN),
         M::up(MIGRATION_0005_ATTENTION_INDEX),
+        M::up(MIGRATION_0006_TRIGGER_EVENT),
     ])
 }

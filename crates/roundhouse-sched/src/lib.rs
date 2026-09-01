@@ -11,7 +11,9 @@
 #![forbid(unsafe_code)]
 
 pub mod cron;
+pub mod message_trigger;
 pub mod scheduler;
+pub mod store;
 pub mod trigger;
 
 pub fn schema_version_floor() -> u16 {

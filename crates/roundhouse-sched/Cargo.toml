@@ -33,6 +33,10 @@ chrono-tz = { version = "=0.10.4", features = ["serde"] }
 # reason as chrono-tz above). See `src/cron.rs` for the real (verified
 # against the crate source) `Schedule::after`/`upcoming` API this task uses.
 cron = "=0.15.0"
+# Task 4 (`store.rs`): `record_trigger_event` writes directly against a
+# `rusqlite::Connection` via `roundhouse_store::begin_immediate` (Ruling
+# P4). Same workspace-pinned version `roundhouse-store` already uses.
+rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -43,3 +47,9 @@ tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# Task 4's message-trigger tests are `#[tokio::test]`s exercising the real
+# `LocalBus`; "time" alone (the sole normal-dependency feature above) has no
+# executor. `LocalBus` is already reachable through the `[dependencies]`
+# entry Task 1 added, so no extra dev-dependency is needed for it.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1", features = ["v4", "serde"] }
