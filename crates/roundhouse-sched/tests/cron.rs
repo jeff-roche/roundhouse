@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use chrono_tz::Tz;
-use roundhouse_sched::cron::next_fire_after;
+use roundhouse_sched::cron::{fire_all_ambiguous, is_ambiguous_local, next_fire_after};
 use roundhouse_sched::trigger::{DstAmbiguous, DstGap};
 use std::time::Duration;
 
@@ -57,6 +57,78 @@ fn fall_back_ambiguous_hour_fires_second_occurrence_when_configured() {
     )
     .expect("computes next fire");
     assert_eq!(next, Utc.with_ymd_and_hms(2026, 11, 1, 6, 30, 0).unwrap());
+}
+
+#[test]
+fn fall_back_ambiguous_hour_next_fire_after_both_resolves_to_first_occurrence() {
+    // review round 1, item 1: no test ever passed DstAmbiguous::Both to
+    // next_fire_after, leaving the `Both => first` arm unexercised. Same
+    // real 2026-11-01 fold as the other ambiguous tests: `Both` must
+    // resolve `next_fire_after`'s single-instant return to the first
+    // (EDT/UTC-4) occurrence, 05:30 UTC — the real double-fire is
+    // `fire_all_ambiguous`, covered separately below.
+    let tz = Tz::America__New_York;
+    let after = Utc.with_ymd_and_hms(2026, 11, 1, 4, 0, 0).unwrap();
+    let next = next_fire_after(
+        "30 1 * * *",
+        tz,
+        after,
+        &DstGap::FireAtGapEnd,
+        &DstAmbiguous::Both,
+        Duration::ZERO,
+    )
+    .expect("computes next fire");
+    assert_eq!(next, Utc.with_ymd_and_hms(2026, 11, 1, 5, 30, 0).unwrap());
+}
+
+#[test]
+fn fire_all_ambiguous_returns_both_real_instants_of_the_fold() {
+    // review round 1, item 1: fire_all_ambiguous had zero test coverage. A
+    // typo swapping first/second, or returning the same instant twice,
+    // would have gone undetected. Assert both full UTC instants (not
+    // formatted "HH:MM" strings) against the real 2026-11-01
+    // America/New_York fold: 01:30 local occurs once at EDT (UTC-4, i.e.
+    // 05:30 UTC) and once at EST (UTC-5, i.e. 06:30 UTC).
+    let tz = Tz::America__New_York;
+    let after = Utc.with_ymd_and_hms(2026, 11, 1, 4, 0, 0).unwrap();
+    let instants = fire_all_ambiguous("30 1 * * *", tz, after).expect("finds the fold");
+    assert_eq!(
+        instants,
+        vec![
+            Utc.with_ymd_and_hms(2026, 11, 1, 5, 30, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 11, 1, 6, 30, 0).unwrap(),
+        ]
+    );
+}
+
+#[test]
+fn fire_all_ambiguous_is_empty_when_the_schedule_never_hits_a_fold() {
+    // A schedule that never lands on the ambiguous local hour at all (here,
+    // noon, nowhere near either 2026 DST transition) must not fabricate an
+    // ambiguous pair.
+    let tz = Tz::America__New_York;
+    let after = Utc.with_ymd_and_hms(2026, 11, 1, 4, 0, 0).unwrap();
+    let instants = fire_all_ambiguous("0 12 * * *", tz, after).expect("computes fine");
+    assert!(instants.is_empty());
+}
+
+#[test]
+fn is_ambiguous_local_detects_the_fold_and_rejects_unambiguous_times() {
+    let tz = Tz::America__New_York;
+    // 2026-11-01T01:30:00 local occurs twice (the fold this file tests
+    // elsewhere).
+    let folded = chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+        .unwrap()
+        .and_hms_opt(1, 30, 0)
+        .unwrap();
+    assert!(is_ambiguous_local(tz, folded));
+
+    // An ordinary, unambiguous wall-clock time on the same day is not.
+    let ordinary = chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap();
+    assert!(!is_ambiguous_local(tz, ordinary));
 }
 
 #[test]

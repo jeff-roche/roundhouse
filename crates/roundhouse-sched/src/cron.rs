@@ -5,10 +5,9 @@
 //! (Task 1) and is in turn consumed by the scheduler heap (Task 3) and
 //! catch-up (Task 4). See `docs/architecture/05-scheduling-and-workflows.md`.
 use crate::trigger::{DstAmbiguous, DstGap};
-use chrono::{DateTime, LocalResult, TimeZone, Utc};
+use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
-use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::time::Duration;
 use thiserror::Error;
@@ -47,6 +46,15 @@ fn naive_candidates(
 /// the binding's declared DST policy and applying a deterministic jitter
 /// offset. `expr` is a standard 5-field cron expression (`min hour dom
 /// month dow`) evaluated against wall-clock time in `tz`.
+///
+/// **Contract for `DstAmbiguous::Both` (Ruling P16):** this function's
+/// return type is a single `DateTime<Utc>`, so it cannot express "fires
+/// twice." When `dst_ambiguous` is `Both`, the value returned here is only
+/// the first of the two occurrences — a caller whose binding policy is
+/// `Both` MUST call [`fire_all_ambiguous`] instead (or in addition) to get
+/// both fire instants; otherwise the second occurrence is silently dropped.
+/// Use [`is_ambiguous_local`] to detect, ahead of time, whether the next
+/// occurrence for a given wall-clock candidate falls in a fold at all.
 pub fn next_fire_after(
     expr: &str,
     tz: Tz,
@@ -66,11 +74,12 @@ pub fn next_fire_after(
                 let chosen = match dst_ambiguous {
                     DstAmbiguous::First => first,
                     DstAmbiguous::Second => second,
-                    // `Both` is admission-time fan-out: the caller (scheduler
-                    // admission, Task 3) fires the binding twice via
-                    // `fire_all_ambiguous`. For the single-instant contract
-                    // of `next_fire_after`, the first occurrence is the
-                    // correct "next" instant.
+                    // `Both` is admission-time fan-out (see this function's
+                    // doc comment, Ruling P16): the caller MUST use
+                    // `fire_all_ambiguous` to get the real double-fire. This
+                    // arm exists only so `next_fire_after` still returns
+                    // *a* valid instant (the first occurrence) rather than
+                    // panicking or erroring when called with `Both`.
                     DstAmbiguous::Both => first,
                 };
                 Some(chosen.with_timezone(&Utc))
@@ -103,26 +112,66 @@ pub fn next_fire_after(
     Err(CronError::Exhausted(expr.to_string()))
 }
 
-/// A deterministic offset in `[0, jitter)`, derived from a hash of the
-/// un-jittered candidate instant. Deterministic on purpose: recomputing the
-/// same binding from the same base instant (e.g. after Task 3's
-/// drift-triggered recompute) must land on the *same* jittered fire time,
-/// not re-roll a new one every recompute — otherwise "when will this
-/// actually fire" has no stable answer.
+/// FNV-1a (64-bit), a fixed, publicly-documented, non-cryptographic hash
+/// algorithm (see the FNV spec, `isthe.com/chongo/tech/comp/fnv/`) — chosen
+/// over `std::collections::hash_map::DefaultHasher` specifically because
+/// `DefaultHasher`'s own documentation disclaims algorithm stability across
+/// standard-library releases. `deterministic_jitter` below needs a hash
+/// whose bit pattern is fixed by *this crate's own code*, not by whichever
+/// toolchain built it, so that a daemon rebuilt on a newer Rust never
+/// silently shifts every binding's fire instant.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// A deterministic offset in `[0, jitter)`, derived from a fixed-algorithm
+/// hash ([`fnv1a64`]) of the un-jittered candidate instant's nanosecond
+/// timestamp. Deterministic on purpose: recomputing the same binding from
+/// the same base instant (e.g. after Task 3's drift-triggered recompute)
+/// must land on the *same* jittered fire time, not re-roll a new one every
+/// recompute — otherwise "when will this actually fire" has no stable
+/// answer. Pinned to `fnv1a64` rather than `DefaultHasher` so that answer
+/// is also stable across Rust toolchain/std upgrades, not just within one
+/// compiled binary.
 fn deterministic_jitter(base: DateTime<Utc>, jitter: Duration) -> Duration {
     let jitter_nanos = jitter.as_nanos();
     if jitter_nanos == 0 {
         return Duration::ZERO;
     }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    base.timestamp_nanos_opt().unwrap_or(0).hash(&mut hasher);
-    let offset_nanos = (hasher.finish() as u128) % jitter_nanos;
+    let nanos = base.timestamp_nanos_opt().unwrap_or(0);
+    let hash = fnv1a64(&nanos.to_le_bytes());
+    let offset_nanos = (hash as u128) % jitter_nanos;
     Duration::from_nanos(offset_nanos as u64)
 }
 
-/// For `DstAmbiguous::Both`, the caller (scheduler admission, Task 3) fires
-/// the binding twice for the one ambiguous wall-clock instant: once at each
-/// UTC instant the doubled local hour actually corresponds to.
+/// Reports whether the given wall-clock instant `naive`, interpreted in
+/// `tz`, falls in a DST fold — i.e. whether it is one of the doubled local
+/// times that occurs during a fall-back transition. Lets a caller (Task 3's
+/// scheduler admission) check a candidate ahead of time to decide whether
+/// [`fire_all_ambiguous`] needs to be consulted for a `DstAmbiguous::Both`
+/// binding, without having to pattern-match `chrono`'s `LocalResult`
+/// itself.
+pub fn is_ambiguous_local(tz: Tz, naive: NaiveDateTime) -> bool {
+    matches!(tz.from_local_datetime(&naive), LocalResult::Ambiguous(_, _))
+}
+
+/// The real double-fire entry point for `DstAmbiguous::Both` (Ruling P16):
+/// finds the next wall-clock candidate (strictly after `after`) that falls
+/// in a DST fold for `tz`, and returns **both** UTC instants the doubled
+/// local time actually corresponds to — first the earlier-offset (e.g.
+/// daylight-time) occurrence, then the later-offset (standard-time) one.
+/// Returns an empty `Vec` if no ambiguous occurrence exists within the
+/// search window (most schedules never hit a fold at all). A caller whose
+/// binding policy is `Both` MUST call this function to get the real
+/// double-fire semantics — [`next_fire_after`] alone only ever returns the
+/// first occurrence for an ambiguous candidate.
 pub fn fire_all_ambiguous(
     expr: &str,
     tz: Tz,
@@ -137,4 +186,46 @@ pub fn fire_all_ambiguous(
         }
     }
     Ok(vec![])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FNV-1a's own published test vector: the hash of the empty byte
+    /// string is defined to be the offset basis itself. Verifies `fnv1a64`
+    /// against the algorithm's spec, independent of anything in this crate.
+    #[test]
+    fn fnv1a64_matches_the_published_empty_input_test_vector() {
+        assert_eq!(fnv1a64(&[]), 0xcbf29ce484222325);
+    }
+
+    /// A second published FNV-1a (64-bit) test vector, for the single byte
+    /// 'a' (0x61): offset_basis XOR 0x61, then multiplied by the FNV prime.
+    #[test]
+    fn fnv1a64_matches_the_published_single_byte_test_vector() {
+        assert_eq!(fnv1a64(b"a"), 0xaf63dc4c8601ec8c);
+    }
+
+    /// Pins `deterministic_jitter`'s output for a known input to a
+    /// hard-coded value, so a future accidental change to the hash
+    /// algorithm or the offset formula is caught by the suite rather than
+    /// silently shifting every binding's fire instant.
+    #[test]
+    fn deterministic_jitter_is_pinned_for_a_known_input() {
+        let base = Utc.with_ymd_and_hms(2026, 1, 1, 2, 0, 0).unwrap();
+        let jitter = Duration::from_secs(300);
+        let offset = deterministic_jitter(base, jitter);
+        assert!(offset < jitter, "offset must stay within [0, jitter)");
+        // Computed once from the fixed fnv1a64 algorithm above and pinned
+        // here; a change to either the hash or the modulo/scale formula
+        // must be a deliberate, reviewed edit to this constant.
+        assert_eq!(offset, Duration::from_nanos(223_571_448_879));
+    }
+
+    #[test]
+    fn deterministic_jitter_is_zero_when_jitter_window_is_zero() {
+        let base = Utc.with_ymd_and_hms(2026, 1, 1, 2, 0, 0).unwrap();
+        assert_eq!(deterministic_jitter(base, Duration::ZERO), Duration::ZERO);
+    }
 }
