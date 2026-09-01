@@ -71,7 +71,7 @@ const DRIFT_THRESHOLD: Duration = Duration::from_secs(2);
 /// `binding_id` — most obviously the two instants of a `DstAmbiguous::Both`
 /// fold (Ruling P16), which are pushed as two independent entries for the
 /// same binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 struct HeapEntry {
     fire_at: DateTime<Utc>,
     binding_id: BindingId,
@@ -82,6 +82,19 @@ struct HeapEntry {
     /// fold is never double-scheduled by both of its own instants firing.
     advances_schedule: bool,
 }
+
+// `PartialEq`/`Eq` are implemented explicitly (rather than derived) to key
+// only on `(fire_at, binding_id)` — the same fields `Ord` compares — so
+// `Ord::cmp` returning `Equal` and `PartialEq::eq` returning `true` agree.
+// A derived `PartialEq` would also compare `advances_schedule`, which would
+// let two entries be `Ord`-equal (same heap position) yet `PartialEq`-unequal.
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.fire_at == other.fire_at && self.binding_id == other.binding_id
+    }
+}
+
+impl Eq for HeapEntry {}
 
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
