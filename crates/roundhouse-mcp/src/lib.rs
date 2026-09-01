@@ -12,6 +12,13 @@
 //! task adds a module declared here. See
 //! `docs/architecture/02-system-architecture.md` §5.2 and
 //! `07-protocols-acp-mcp.md`.
+//!
+//! ⚠️ KNOWN GAP (Phase 3 review, 2026-09-01): the host seam is complete and
+//! tested (`host::McpHost::{start,shutdown}`, `executor::McpExecutor`), but
+//! `roundhouse-daemon` does not call into it yet — MCP servers are not
+//! spawned by a real daemon boot until the engine-side production
+//! `TaskSpawner` lands. Do not describe Phase 3 MCP as runtime-live before
+//! that wiring exists.
 #![forbid(unsafe_code)]
 
 pub mod config;

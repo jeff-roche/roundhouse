@@ -305,6 +305,34 @@ impl McpExecutor {
             .map(|t| t.namespaced_name.clone())
     }
 
+    /// Shut down every server connection (Phase 3 review fix: this is the
+    /// only production path that reaches `McpTransport::shutdown` — the
+    /// executor owns the last `Arc`s, and without a `&self` teardown
+    /// reachable through them every MCP child process was orphaned at
+    /// daemon shutdown). Best-effort with a loud tail: EVERY connection is
+    /// attempted even if one fails to confirm down (one wedged server must
+    /// not keep the others' processes alive), and the first error is
+    /// returned so a partial teardown is reported, not laundered into
+    /// `Ok(())`. `McpHost::shutdown` delegates here; the daemon boot wiring
+    /// is a separately-tracked Phase 3 gap (see the KNOWN GAP note in
+    /// `host.rs`).
+    pub async fn shutdown(&self) -> Result<(), crate::wire::McpError> {
+        let mut first_err = None;
+        for (server, transport) in &self.connections {
+            if let Err(e) = transport.shutdown().await {
+                tracing::warn!(
+                    server,
+                    error = %e,
+                    "MCP transport shutdown could not be confirmed"
+                );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
     /// finding 2: the §6.2 policy gate every dispatch (initial call AND
     /// every MRTR retry, Task 8b) passes through before touching a
     /// transport. Returns `Ok(())` only on `PolicyDecision::Allow`.
@@ -1320,6 +1348,65 @@ mod tests {
             spawner.decisions.lock().unwrap().len(),
             1,
             "the retry's gate decision must be audited"
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_shutdown_reaches_every_connection() {
+        // Phase 3 review fix (Critical): `shutdown()` must be reachable
+        // through the executor's `Arc<dyn McpTransport>` map — the only
+        // production holder of live transports — and it must attempt ALL
+        // of them, not stop at the first.
+        let fake_a = Arc::new(FakeMcpTransport::new(
+            vec![McpToolDef {
+                name: "search".into(),
+                description: "search things".into(),
+                input_schema: serde_json::json!({}),
+            }],
+            vec![],
+        ));
+        let fake_b = Arc::new(FakeMcpTransport::new(
+            vec![McpToolDef {
+                name: "search".into(),
+                description: "search other things".into(),
+                input_schema: serde_json::json!({}),
+            }],
+            vec![],
+        ));
+        let server_a = ServerId("github".into());
+        let server_b = ServerId("gitlab".into());
+        let connections: Vec<(ServerId, Arc<dyn McpTransport>)> = vec![
+            (server_a.clone(), fake_a.clone() as Arc<dyn McpTransport>),
+            (server_b.clone(), fake_b.clone() as Arc<dyn McpTransport>),
+        ];
+        let disc = |name: &str| crate::wire::DiscoverResult {
+            protocol_version: "2026-07-28".into(),
+            tools: vec![McpToolDef {
+                name: "search".into(),
+                description: name.into(),
+                input_schema: serde_json::json!({}),
+            }],
+        };
+        let ns = ToolNamespace::build(&[
+            (server_a, TaskId::new(), disc("search things")),
+            (server_b, TaskId::new(), disc("search other things")),
+        ])
+        .unwrap();
+        let executor = McpExecutor::new(
+            connections,
+            ns,
+            Arc::new(FixedPolicy::allow_all()),
+            Arc::new(RecordingTaskSpawner::default()),
+        );
+
+        executor.shutdown().await.unwrap();
+        assert_eq!(
+            fake_a.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fake_b.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
     }
 }

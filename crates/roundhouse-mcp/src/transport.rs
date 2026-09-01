@@ -13,9 +13,7 @@ pub mod stdio;
 /// `McpError::ServerExited` instead of a hang. Everything a server sends
 /// back — tool names, descriptions, content — is untrusted input (§6.8);
 /// callers decode and gate it. Used through `Arc<dyn McpTransport>` in
-/// production and `Box<dyn McpTransport>` in tests; `shutdown` consumes
-/// the boxed implementation so the connection's resources (child process,
-/// pipes, reader task) are released explicitly rather than leaked.
+/// production and `Box<dyn McpTransport>` in tests.
 #[async_trait]
 pub trait McpTransport: Send + Sync {
     /// Ask the connected server what it offers: the wire protocol version
@@ -34,11 +32,24 @@ pub trait McpTransport: Send + Sync {
     /// the parent), or an error.
     async fn call_tool(&self, req: ToolCallRequest) -> Result<McpResult, McpError>;
 
-    /// End the session. Consumes the boxed transport so the connection's
-    /// resources are released deterministically (close the child's stdin,
-    /// stop the reader task, wait for exit) rather than on an incidental
-    /// drop of a shared handle.
-    async fn shutdown(self: Box<Self>) -> Result<(), McpError>;
+    /// End the session: close the child's stdin, stop the reader task,
+    /// and CONFIRM the server process (and its whole process group, for
+    /// the stdio transport) is gone before returning `Ok`.
+    ///
+    /// Takes `&self`, not `Box<Self>` (Phase 3 review fix, 2026-09-01):
+    /// production holds transports as `Arc<dyn McpTransport>`, and
+    /// `Arc<dyn Trait>` cannot be downcast to `Box<Self>` — a
+    /// `self: Box<Self>` shutdown was structurally unreachable from the
+    /// one place that owns live connections (`McpExecutor`), so daemon
+    /// shutdown silently orphaned every MCP child process. Reaching the
+    /// teardown through a shared handle requires shared-receiver dispatch;
+    /// implementations must therefore be idempotent (`StdioMcpTransport`
+    /// takes its child/reader/stdin out of interior state — a second call
+    /// is a no-op `Ok`), and callers must not rely on a drop to shut the
+    /// connection down. Explicit `shutdown()` remains the ONLY sanctioned
+    /// teardown; the stdio transport's kill-on-drop is a backstop for
+    /// paths that can't await, not a substitute.
+    async fn shutdown(&self) -> Result<(), McpError>;
 }
 
 #[cfg(test)]
@@ -73,7 +84,7 @@ mod tests {
             })
         }
 
-        async fn shutdown(self: Box<Self>) -> Result<(), McpError> {
+        async fn shutdown(&self) -> Result<(), McpError> {
             Ok(())
         }
     }

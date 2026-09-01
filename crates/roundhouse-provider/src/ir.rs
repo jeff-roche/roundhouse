@@ -146,6 +146,15 @@ pub struct ToolDef {
     name: String,
     description: String,
     input_schema: Value,
+    /// `#[serde(skip)]`: this is Roundhouse-internal taint metadata, never
+    /// part of a provider's tool-list payload (the Anthropic/OpenAI wire
+    /// shapes this `Serialize` derives for have no such field). `Some` only
+    /// for wire-sourced definitions built through [`ToolDef::from_wire_parts`]
+    /// — see the field doc on why the `Provenance` rides on the def itself.
+    /// `None` means repo-authored: `tool_def_from_schema`'s typed,
+    /// `schemars`-generated local tools.
+    #[serde(skip)]
+    provenance: Option<roundhouse_core::Provenance>,
 }
 
 impl ToolDef {
@@ -160,17 +169,31 @@ impl ToolDef {
     /// same root-shape guarantee `schemars` gives [`tool_def_from_schema`] —
     /// so a caller holding a raw wire `Value` must fail closed on the
     /// non-object case itself (roundhouse-mcp's `McpHost::start` does, with
-    /// a named error). Nothing here certifies the schema's *content*;
-    /// untrusted-provenance handling remains the caller's job.
+    /// a named error).
+    ///
+    /// `provenance` is a *required* argument, not an `Option`, and not
+    /// defaulted (Phase 3 review fix, 2026-09-01): the architecture's §6.8
+    /// mitigation — a session that reads untrusted content has its standing
+    /// permissions downgraded to `Ask` — is engine logic that only ever
+    /// holds the model-facing `Vec<ToolDef>`, so the `Untrusted` flag has to
+    /// be readable from the definition itself. A constructor that let a
+    /// wire-sourced def be built *without* provenance would recreate exactly
+    /// the gap the flag exists to close; there is no honest provenance value
+    /// to default to, so the caller must name the one it has (roundhouse-mcp
+    /// stamps `Trust::Untrusted` + the discovery task's id). Nothing here
+    /// certifies the schema's *content*; handling that provenance remains
+    /// the engine's job.
     pub fn from_wire_parts(
         name: impl Into<String>,
         description: impl Into<String>,
         input_schema: serde_json::Map<String, Value>,
+        provenance: roundhouse_core::Provenance,
     ) -> Self {
         ToolDef {
             name: name.into(),
             description: description.into(),
             input_schema: Value::Object(input_schema),
+            provenance: Some(provenance),
         }
     }
 
@@ -184,6 +207,15 @@ impl ToolDef {
 
     pub fn input_schema(&self) -> &Value {
         &self.input_schema
+    }
+
+    /// The taint metadata for wire-sourced definitions
+    /// ([`Self::from_wire_parts`]); `None` for repo-authored
+    /// [`tool_def_from_schema`] tools. Engine trust-mitigation logic reads
+    /// the flag here — see [`Self::from_wire_parts`]'s note on why
+    /// provenance rides on the tool list itself.
+    pub fn provenance(&self) -> Option<&roundhouse_core::Provenance> {
+        self.provenance.as_ref()
     }
 }
 
@@ -216,6 +248,7 @@ pub fn tool_def_from_schema<T: schemars::JsonSchema>(
         name: name.into(),
         description: description.into(),
         input_schema,
+        provenance: None,
     }
 }
 

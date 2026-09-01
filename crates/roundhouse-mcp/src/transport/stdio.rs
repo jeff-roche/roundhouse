@@ -16,11 +16,15 @@ use crate::wire::{
     DiscoverResult, McpError, McpResult, McpResultType, McpToolDef, ToolCallRequest,
 };
 use async_trait::async_trait;
-use process_wrap::tokio::{ChildWrapper, ProcessGroup};
+use nix::errno::Errno;
+use nix::sys::signal::killpg;
+use nix::unistd::Pid;
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop, ProcessGroup};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{oneshot, Mutex};
 
@@ -30,12 +34,41 @@ use tokio::sync::{oneshot, Mutex};
 /// and marks the connection dead so future requests fail fast.
 type PendingMap = Arc<Mutex<Option<HashMap<u64, oneshot::Sender<Value>>>>>;
 
+/// How long [`StdioMcpTransport::shutdown`] gives a well-behaved server to
+/// exit on its own after stdin EOF, before escalating to a group-wide
+/// SIGKILL.
+const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bounded re-probes of group liveness after a SIGKILL, mirroring
+/// `roundhouse-tools`' `shell/cancel.rs`: SIGKILL can't be ignored, so the
+/// kernel finishes within microseconds-to-milliseconds; the retries are
+/// headroom for scheduling and reaping, not an expectation of a real fight.
+const KILL_CONFIRM_ATTEMPTS: u32 = 25;
+const KILL_CONFIRM_INTERVAL: Duration = Duration::from_millis(20);
+
+/// A live connection to one stdio MCP server child process.
+///
+/// The killable pieces (`child`, `stdin`, `reader_task`) sit in
+/// take-once interior state, not bare fields, because
+/// [`McpTransport::shutdown`] takes `&self` — production holds this type
+/// as `Arc<dyn McpTransport>` and must be able to reach teardown through
+/// the shared handle (see the trait method's doc). `shutdown` takes them
+/// out, which makes it idempotent: the second call finds `child` already
+/// `None` and returns `Ok(())` without touching anything.
 #[derive(Debug)]
 pub struct StdioMcpTransport {
-    child: Box<dyn ChildWrapper>,
-    stdin: Arc<Mutex<tokio::process::ChildStdin>>,
+    child: Mutex<Option<Box<dyn ChildWrapper>>>,
+    stdin: Mutex<Option<tokio::process::ChildStdin>>,
+    reader_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Process group id, captured once at spawn: under
+    /// `ProcessGroup::leader()`'s `setpgid(0, 0)` the leader's own pid IS
+    /// the pgid, and — unlike anything derived from the leader's
+    /// child-state — it stays the right thing to probe even after the
+    /// leader exits and any grandchild has been reparented away from us
+    /// (the exact hole `roundhouse-tools/src/shell/cancel.rs`'s module doc
+    /// documents, where `wait()` resolving is not proof the group is
+    /// empty).
+    pgid: Pid,
     pending: PendingMap,
-    reader_task: tokio::task::JoinHandle<()>,
     next_id: std::sync::atomic::AtomicU64,
 }
 
@@ -135,10 +168,28 @@ impl StdioMcpTransport {
         };
         let cmd = build_command(&exec, args, env);
 
-        let mut child = process_wrap::tokio::CommandWrap::from(cmd)
+        // `KillOnDrop` (setting tokio's `kill_on_drop(true)` — SIGKILL to
+        // the direct child if the `Child` is ever dropped unawaited) is
+        // the LAST-RESORT backstop for paths that cannot await a
+        // `shutdown()`: a `spawn` that fails after the process started, or
+        // an `Arc` whose final handle is dropped without teardown. It is
+        // NOT the sanctioned teardown path — the direct-child-only kill
+        // doesn't confirm the group, so `McpExecutor::shutdown` /
+        // `McpHost::shutdown` (which reach the `shutdown()` below through
+        // the shared handle) remain the real lifecycle. Same wrapping
+        // order `roundhouse-tools`' `spawn_cancellable` uses.
+        let mut child = CommandWrap::from(cmd)
+            .wrap(KillOnDrop)
             .wrap(ProcessGroup::leader())
             .spawn()
             .map_err(|e| McpError::Io(e.to_string()))?;
+
+        let pid = child
+            .id()
+            .ok_or_else(|| McpError::Io("spawned MCP server has no pid".into()))?;
+        // Safe under `ProcessGroup::leader()`: `setpgid(0, 0)` makes the
+        // leader's own pid the process group id.
+        let pgid = Pid::from_raw(pid as i32);
 
         let stdin = child
             .stdin()
@@ -175,10 +226,11 @@ impl StdioMcpTransport {
         });
 
         Ok(Self {
-            child,
-            stdin: Arc::new(Mutex::new(stdin)),
+            child: Mutex::new(Some(child)),
+            stdin: Mutex::new(Some(stdin)),
+            reader_task: Mutex::new(Some(reader_task)),
+            pgid,
             pending,
-            reader_task,
             next_id: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -215,13 +267,26 @@ impl StdioMcpTransport {
         let mut line =
             serde_json::to_vec(&envelope).map_err(|e| McpError::Protocol(e.to_string()))?;
         line.push(b'\n');
-        if let Err(e) = self.stdin.lock().await.write_all(&line).await {
-            // The write failed — drop the entry with it so the map holds no
-            // sender whose receiver is already being abandoned.
+        let mut stdin = self.stdin.lock().await;
+        let write_result = match stdin.as_mut() {
+            // `shutdown()` already took the pipe: the connection is being
+            // torn down, and nothing can answer. Same contract as the
+            // reader-EOF fail-fast above.
+            None => Err(McpError::ServerExited),
+            Some(stdin) => stdin
+                .write_all(&line)
+                .await
+                .map_err(|e| McpError::Io(e.to_string())),
+        };
+        drop(stdin);
+        if let Err(e) = write_result {
+            // The write failed (or the pipe is gone) — drop the entry with
+            // it so the map holds no sender whose receiver is already
+            // being abandoned.
             if let Some(map) = self.pending.lock().await.as_mut() {
                 map.remove(&id);
             }
-            return Err(McpError::Io(e.to_string()));
+            return Err(e);
         }
 
         match tokio::time::timeout(timeout, rx).await {
@@ -371,30 +436,84 @@ impl McpTransport for StdioMcpTransport {
         })
     }
 
-    async fn shutdown(self: Box<Self>) -> Result<(), McpError> {
-        // Move out of the box so the pieces can be dropped in the order the
-        // lifecycle needs: reader first, then stdin's last Arc reference —
-        // dropping `ChildStdin` closes the pipe and sends EOF, so a
-        // well-behaved server exits on its own instead of being SIGKILLed
-        // after the timeout.
-        let this = *self;
-        let StdioMcpTransport {
-            mut child,
-            stdin,
-            pending: _,
-            reader_task,
-            next_id: _,
-        } = this;
-
-        reader_task.abort();
-        drop(stdin); // last Arc ref → ChildStdin dropped → child sees EOF
-        let exited = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
-        if exited.is_err() {
-            // kill() returns an unpinned `Box<dyn Future>`; into_pin makes it
-            // awaitable. process-wrap kills the whole group, not just the leader pid.
-            let _ = Box::into_pin(child.kill()).await;
+    /// End the connection and CONFIRM the server's process group is gone.
+    /// Idempotent by construction (see the struct doc): every killable
+    /// piece is taken out of interior state once; a second call finds
+    /// `child` already `None` and returns `Ok(())`.
+    async fn shutdown(&self) -> Result<(), McpError> {
+        // Abort the reader first so no response can be routed into a
+        // oneshot whose receiver is on its way out anyway.
+        if let Some(reader) = self.reader_task.lock().await.take() {
+            reader.abort();
         }
-        Ok(())
+        // Dropping the `ChildStdin` closes the pipe; a well-behaved server
+        // sees EOF and exits on its own instead of being SIGKILLed below.
+        drop(self.stdin.lock().await.take());
+
+        // Take, not borrow: the wait/kill below needs `&mut` on a type
+        // shared handle can't hand out, and the take doubles as the
+        // idempotency marker.
+        let Some(mut child) = self.child.lock().await.take() else {
+            // Already shut down (or `spawn` never got this far): KillOnDrop
+            // covered any child at drop time; nothing left to do.
+            return Ok(());
+        };
+
+        let _ = tokio::time::timeout(GRACEFUL_EXIT_TIMEOUT, child.wait()).await;
+
+        // `wait()` resolving (or timing out) says something only about the
+        // process WE spawned and reaped — never about the group. A server
+        // that forked a grandchild before exiting leaves it alive,
+        // reparented to init but still a member of OUR process group, so
+        // the killpg probe below still sees it (see the `pgid` field doc
+        // and `roundhouse-tools/src/shell/cancel.rs`, whose module docs
+        // work this exact hole out). Only the probe decides.
+        if group_is_empty(self.pgid)? {
+            return Ok(());
+        }
+
+        // SIGKILL, group-wide: `ProcessGroupChild::start_kill` routes
+        // through `killpg`, so this reaches every member, not just the
+        // leader.
+        child
+            .start_kill()
+            .map_err(|e| McpError::Io(format!("group SIGKILL for MCP server: {e}")))?;
+        // Best-effort reap of the direct child so its zombie doesn't keep
+        // answering the probe below; the proof of the group's fate is
+        // still the probe, not this call resolving.
+        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+
+        for attempt in 0..KILL_CONFIRM_ATTEMPTS {
+            if group_is_empty(self.pgid)? {
+                return Ok(());
+            }
+            if attempt + 1 < KILL_CONFIRM_ATTEMPTS {
+                tokio::time::sleep(KILL_CONFIRM_INTERVAL).await;
+            }
+        }
+
+        Err(McpError::Io(format!(
+            "MCP server process group {} still alive after SIGKILL and \
+             {KILL_CONFIRM_ATTEMPTS} liveness re-checks; shutdown could not \
+             be confirmed",
+            self.pgid.as_raw()
+        )))
+    }
+}
+
+/// Probes whether any process in `pgid`'s process group still exists, via
+/// a signal-0 `killpg` — an existence/permission check that delivers no
+/// actual signal. `ESRCH` means no process anywhere still carries that
+/// group id, and unlike `waitpid` that fact survives reparenting. Same
+/// primitive `roundhouse-tools`' cancellation path uses.
+fn group_is_empty(pgid: Pid) -> Result<bool, McpError> {
+    match killpg(pgid, None) {
+        Ok(()) => Ok(false),
+        Err(Errno::ESRCH) => Ok(true),
+        Err(e) => Err(McpError::Io(format!(
+            "liveness probe for MCP server group {}: {e}",
+            pgid.as_raw()
+        ))),
     }
 }
 
@@ -426,7 +545,7 @@ mod tests {
         assert_eq!(discovered.protocol_version, "2026-07-28");
         assert!(discovered.tools.is_empty());
 
-        Box::new(transport).shutdown().await.unwrap();
+        transport.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -493,7 +612,7 @@ mod tests {
             "reader EOF must clear every pending sender"
         );
 
-        Box::new(transport).shutdown().await.unwrap();
+        transport.shutdown().await.unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -517,7 +636,10 @@ mod tests {
         };
 
         let transport = StdioMcpTransport::spawn(&config).await.unwrap();
-        let pid = transport.child.id().expect("spawned child has a pid");
+        // `ProcessGroup::leader()` makes the leader pid the group id, so
+        // the captured pgid is the pid `/proc` can confirm the exec target
+        // for.
+        let pid = u32::try_from(transport.pgid.as_raw()).expect("pgid fits u32");
         let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
         assert_eq!(
             exe,
@@ -525,7 +647,7 @@ mod tests {
             "pinned spawn must exec the exact binary whose bytes were hashed"
         );
 
-        Box::new(transport).shutdown().await.unwrap(); // `cat` exits on stdin EOF
+        transport.shutdown().await.unwrap(); // `cat` exits on stdin EOF
     }
 
     #[test]
@@ -577,23 +699,27 @@ mod tests {
             );
         }
 
-        Box::new(transport).shutdown().await.unwrap();
+        transport.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn write_failure_cleans_up_its_pending_entry() {
         // The child closes its own stdin before signaling readiness on
-        // stdout, then stays alive briefly. Receiving the bootstrap line
-        // proves the read end is already closed while the reader is still
-        // running — so the request reaches write_all, which must fail with
-        // a broken pipe and must not leak the pending entry it inserted.
+        // stdout, then STAYS ALIVE until teardown. Receiving the bootstrap
+        // line proves the read end is already closed while the reader is
+        // still running — so the request reaches write_all, which must
+        // fail with a broken pipe and must not leak the pending entry it
+        // inserted. (Phase 3 review-fix stress run: the previous version
+        // let the child self-exit after 200ms, which under CPU load let
+        // reader EOF drain the map — `ServerExited` — before the write
+        // ever ran, racing the very assertion this test exists to make.)
         let config = McpServerConfig {
             id: roundhouse_policy::ServerId("closed-stdin".into()),
             transport: McpTransportKind::Stdio {
                 command: "sh".into(),
                 args: vec![
                     "-c".into(),
-                    "exec 0<&-; echo '{\"jsonrpc\":\"2.0\",\"id\":18446744073709551615,\"result\":{}}'; exec sleep 0.2".into(),
+                    "exec 0<&-; echo '{\"jsonrpc\":\"2.0\",\"id\":18446744073709551615,\"result\":{}}'; exec sleep 30".into(),
                 ],
                 env: vec![],
                 pinned_binary_hash: None,
@@ -634,6 +760,89 @@ mod tests {
             );
         }
 
-        Box::new(transport).shutdown().await.unwrap();
+        // Deliberately DROP the still-live transport (no `shutdown()` call):
+        // `KillOnDrop` is the backstop that makes this safe — dropping the
+        // transport SIGKILLs the direct child instead of orphaning it,
+        // which is the exact guarantee the Phase 3 review demanded for
+        // paths that can't await a teardown.
+        drop(transport);
+    }
+
+    /// Phase 3 review fix (Critical: "MCP child processes are never
+    /// killed", third bullet): the old `shutdown` treated `child.wait()`
+    /// resolving as proof the server was gone. A server that forks a
+    /// grandchild and then exits cleanly on stdin EOF reaps *nothing* the
+    /// parent can see — the grandchild is reparented to init the instant
+    /// the leader exits, and `wait()` for the leader returns in
+    /// microseconds while the grandchild keeps running. Only the
+    /// `killpg(pgid, 0)` probe (same primitive and same bounded-retry
+    /// shape as `roundhouse-tools`' `shell/cancel.rs`) can see it, and
+    /// only a group-wide SIGKILL can stop it. This test drives exactly
+    /// that shape against a real process tree.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shutdown_confirms_a_forked_grandchild_dies_not_just_the_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        // Backgrounded `sleep` inherits the leader's process group
+        // (`ProcessGroup::leader()`); `read line` then blocks until
+        // shutdown closes the pipe, at which point `sh` exits promptly —
+        // the precise "leader exits on EOF, grandchild lives on" window.
+        let script = format!("sleep 30 & echo $! > {}; read line", pid_file.display());
+        let config = McpServerConfig {
+            id: roundhouse_policy::ServerId("forker".into()),
+            transport: McpTransportKind::Stdio {
+                command: "sh".into(),
+                args: vec!["-c".into(), script],
+                env: vec![],
+                pinned_binary_hash: None,
+            },
+        };
+
+        let transport = StdioMcpTransport::spawn(&config).await.unwrap();
+        let grandchild_pid = wait_for_pid_file(&pid_file).await;
+        assert!(
+            pid_alive(grandchild_pid),
+            "grandchild should be running before shutdown"
+        );
+
+        transport.shutdown().await.unwrap();
+
+        assert!(
+            !pid_alive(grandchild_pid),
+            "shutdown must not report Ok while a process still in the \
+             server's process group is alive — `Ok(())` means CONFIRMED dead"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_pid_file(path: &std::path::Path) -> i32 {
+        for _ in 0..100 {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                let trimmed = contents.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.parse().unwrap_or_else(|e| {
+                        panic!("pid file contents {trimmed:?} not an i32: {e}")
+                    });
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("grandchild never wrote its pid to {}", path.display());
+    }
+
+    /// `/proc`-based liveness check; a zombie (state `Z`) counts as dead —
+    /// what matters is that the process stopped executing, not that its
+    /// pid slot was reclaimed. Same semantics as the `shell_cancel` tests.
+    #[cfg(target_os = "linux")]
+    fn pid_alive(pid: i32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some((_, after_comm)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        let state = after_comm.trim_start().chars().next();
+        !matches!(state, None | Some('Z'))
     }
 }

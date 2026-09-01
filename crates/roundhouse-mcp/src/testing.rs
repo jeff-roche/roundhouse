@@ -23,6 +23,10 @@ pub struct FakeMcpTransport {
     tools: Vec<McpToolDef>,
     script: Mutex<VecDeque<ScriptedResponse>>,
     pub calls: Mutex<Vec<ToolCallRequest>>,
+    /// Counts `shutdown()` calls so executor-level teardown tests can
+    /// prove every connection was reached (and that repeated teardown is
+    /// the idempotent no-op the `&self` contract requires).
+    pub shutdowns: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeMcpTransport {
@@ -31,6 +35,7 @@ impl FakeMcpTransport {
             tools,
             script: Mutex::new(script.into()),
             calls: Mutex::new(Vec::new()),
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -69,7 +74,9 @@ impl McpTransport for FakeMcpTransport {
         }
     }
 
-    async fn shutdown(self: Box<Self>) -> Result<(), McpError> {
+    async fn shutdown(&self) -> Result<(), McpError> {
+        self.shutdowns
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 }

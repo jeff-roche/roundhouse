@@ -19,7 +19,17 @@ fn main() {
     // — the malformed discovery shape `McpHost::start` must fail closed on
     // without echoing the payload. Default (no-arg) behavior is unchanged;
     // every other test spawns this binary with no args.
-    let bad_schema = std::env::args().any(|arg| arg == "bad-schema");
+    let args: Vec<String> = std::env::args().collect();
+    let bad_schema = args.iter().any(|arg| arg == "bad-schema");
+    // Phase 3 review-fix coverage: `pidfile:<path>` announces this process's
+    // own pid before serving. The transport spawns the server as its own
+    // process-group leader, so the host's pgid == this pid, and lifecycle
+    // tests (`host.shutdown()` confirmed; partial-startup teardown) can
+    // then verify against `/proc` that the REAL child is gone rather than
+    // trusting the teardown's return value alone.
+    if let Some(path) = args.iter().find_map(|a| a.strip_prefix("pidfile:")) {
+        std::fs::write(path, format!("{}\n", std::process::id())).expect("write pidfile");
+    }
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     // Opaque server-side booking state (§10.1): the real server would seal

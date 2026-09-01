@@ -21,6 +21,11 @@ roundhouse-provider = { path = "../roundhouse-provider" }
 tokio = { workspace = true, features = ["process", "io-util", "io-std", "fs"] }
 tokio-util = { workspace = true }
 process-wrap = { version = "10.0.0", features = ["tokio1"] }
+# Same nix pin/features as roundhouse-tools (which shares process-wrap's
+# 0.29.x-era nix): `shutdown()`'s group-liveness probe is a signal-0
+# `killpg`, the same primitive `shell/cancel.rs` uses for the same reason.
+nix = { version = "0.31.1", default-features = false, features = ["signal"] }
+futures = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -36,3 +41,4 @@ base64 = "0.22"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"

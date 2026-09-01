@@ -22,6 +22,12 @@ roundhouse-policy = { path = "../roundhouse-policy" }
 roundhouse-sandbox = { path = "../roundhouse-sandbox" }
 roundhouse-provider = { path = "../roundhouse-provider" }
 roundhouse-tools = { path = "../roundhouse-tools" }
+# ⚠️ KNOWN GAP (Phase 3 review, 2026-09-01): this dependency is NOT yet
+# wired — no daemon code path calls `McpHost::start`/`McpExecutor`, so no
+# MCP server is spawned or dispatched to at runtime yet. It is declared
+# because the seam (`roundhouse-mcp::host`) is built and tested here;
+# boot-time wiring needs the engine-side production `TaskSpawner` first.
+# See the KNOWN GAP note in `crates/roundhouse-mcp/src/host.rs`.
 roundhouse-mcp = { path = "../roundhouse-mcp" }
 roundhouse-acp = { path = "../roundhouse-acp" }
 roundhouse-bus = { path = "../roundhouse-bus" }
