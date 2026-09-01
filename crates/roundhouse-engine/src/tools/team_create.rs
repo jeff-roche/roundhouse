@@ -27,6 +27,33 @@ pub fn team_create(
 /// The `team_close` tool. Only begins draining — §7.5's "Draining (no new sends,
 /// pending replies land) -> Closed" teardown is completed by the reaper once every
 /// member has ended, not by this call directly.
-pub fn team_close(registry: &TeamRegistry, team: TeamId) -> Result<(), BusError> {
+///
+/// Authorization: the caller must be the team's creator or hold the "lead" role on the
+/// roster. Any other session gets `TeamDraining` (we have no dedicated `NotAuthorized`
+/// variant yet), and a missing team is reported as `UnknownHandle` (no `TeamNotFound`).
+pub fn team_close(
+    registry: &TeamRegistry,
+    team: TeamId,
+    caller: SessionId,
+) -> Result<(), BusError> {
+    let team_record = registry.team(team).ok_or_else(|| BusError::UnknownHandle {
+        workspace: WorkspaceId::new(),
+        name: "<unknown team>".into(),
+    })?;
+
+    let authorized = team_record.created_by == caller
+        || registry
+            .roster(team)
+            .map(|roster| {
+                roster
+                    .iter()
+                    .any(|m| m.session == caller && m.role == "lead")
+            })
+            .unwrap_or(false);
+
+    if !authorized {
+        return Err(BusError::TeamDraining { team });
+    }
+
     registry.begin_draining(team)
 }
