@@ -5,6 +5,7 @@ pub mod bus_trait;
 pub mod event_sink;
 pub mod handle_registry;
 pub mod human_notifications;
+pub mod limits;
 pub mod local_bus;
 pub mod mailbox;
 pub mod rate_limit;
