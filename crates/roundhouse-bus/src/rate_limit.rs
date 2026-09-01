@@ -70,10 +70,12 @@ impl Default for RateLimiter {
     }
 }
 
-/// §7.7: "Repetition damper — ≥3 sends with identical (to, subject) and no state
-/// change between refuses the 4th. Cheap livelock kill."
+/// §7.7: "Repetition damper — ≥3 sends with identical (from, to, subject) and no
+/// state change between refuses the 4th. Cheap livelock kill." Keying on `from` too
+/// means no single session can permanently jam a (recipient, subject) pair — each
+/// (sender, recipient, subject) triple gets its own streak.
 pub struct RepetitionDamper {
-    counts: HashMap<(SessionId, String), u32>,
+    counts: HashMap<(SessionId, SessionId, String), u32>,
 }
 
 impl RepetitionDamper {
@@ -83,8 +85,13 @@ impl RepetitionDamper {
         }
     }
 
-    pub fn check_and_record(&mut self, to: SessionId, subject: &str) -> Result<(), BusError> {
-        let key = (to, subject.to_string());
+    pub fn check_and_record(
+        &mut self,
+        from: SessionId,
+        to: SessionId,
+        subject: &str,
+    ) -> Result<(), BusError> {
+        let key = (from, to, subject.to_string());
         let count = self.counts.entry(key).or_insert(0);
         if *count >= 3 {
             return Err(BusError::Repetitive {
@@ -98,9 +105,9 @@ impl RepetitionDamper {
 
     /// Called by the caller whenever it can observe that something changed as a
     /// result of a send (e.g. the recipient's state moved, or a reply carried new
-    /// information) — resets the streak for that `(to, subject)`.
-    pub fn note_state_change(&mut self, to: SessionId, subject: &str) {
-        self.counts.remove(&(to, subject.to_string()));
+    /// information) — resets the streak for that `(from, to, subject)`.
+    pub fn note_state_change(&mut self, from: SessionId, to: SessionId, subject: &str) {
+        self.counts.remove(&(from, to, subject.to_string()));
     }
 }
 
@@ -154,25 +161,27 @@ mod tests {
     #[test]
     fn repetition_damper_refuses_the_fourth_identical_send() {
         let mut damper = RepetitionDamper::new();
+        let from = SessionId::new();
         let to = SessionId::new();
         let subject = "status-check".to_string();
-        assert!(damper.check_and_record(to, &subject).is_ok());
-        assert!(damper.check_and_record(to, &subject).is_ok());
-        assert!(damper.check_and_record(to, &subject).is_ok());
-        assert!(damper.check_and_record(to, &subject).is_err());
+        assert!(damper.check_and_record(from, to, &subject).is_ok());
+        assert!(damper.check_and_record(from, to, &subject).is_ok());
+        assert!(damper.check_and_record(from, to, &subject).is_ok());
+        assert!(damper.check_and_record(from, to, &subject).is_err());
     }
 
     #[test]
     fn repetition_damper_resets_on_state_change() {
         let mut damper = RepetitionDamper::new();
+        let from = SessionId::new();
         let to = SessionId::new();
         let subject = "status-check".to_string();
-        damper.check_and_record(to, &subject).unwrap();
-        damper.check_and_record(to, &subject).unwrap();
-        damper.note_state_change(to, &subject);
-        damper.check_and_record(to, &subject).unwrap();
-        damper.check_and_record(to, &subject).unwrap();
-        assert!(damper.check_and_record(to, &subject).is_ok());
+        damper.check_and_record(from, to, &subject).unwrap();
+        damper.check_and_record(from, to, &subject).unwrap();
+        damper.note_state_change(from, to, &subject);
+        damper.check_and_record(from, to, &subject).unwrap();
+        damper.check_and_record(from, to, &subject).unwrap();
+        assert!(damper.check_and_record(from, to, &subject).is_ok());
     }
 
     #[test]

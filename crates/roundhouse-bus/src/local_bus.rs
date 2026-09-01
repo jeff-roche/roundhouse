@@ -22,7 +22,7 @@ pub struct LocalBus {
     pub(crate) human_sessions: DashSet<SessionId>,
     pub(crate) human_notifications: HumanNotificationRegistry,
     pub(crate) teams: Arc<TeamRegistry>,
-    pub(crate) rate_limiter: Mutex<RateLimiter>,
+    pub(crate) rate_limiter: RateLimiter,
     pub(crate) damper: Mutex<RepetitionDamper>,
 }
 
@@ -36,7 +36,7 @@ impl LocalBus {
             human_sessions: DashSet::new(),
             human_notifications: HumanNotificationRegistry::new(),
             teams: Arc::new(TeamRegistry::new()),
-            rate_limiter: Mutex::new(RateLimiter::default()),
+            rate_limiter: RateLimiter::default(),
             damper: Mutex::new(RepetitionDamper::default()),
         }
     }
@@ -155,19 +155,14 @@ impl LocalBus {
         let to = envelope.to;
 
         let ttl_hops = decrement_ttl(envelope.ttl_hops)?;
-        {
-            let limiter = self
-                .rate_limiter
-                .lock()
-                .expect("rate limiter mutex poisoned");
-            limiter.try_acquire(envelope.from, std::time::Instant::now())?;
-        }
+        self.rate_limiter
+            .try_acquire(envelope.from, std::time::Instant::now())?;
         {
             let mut damper = self
                 .damper
                 .lock()
                 .expect("repetition damper mutex poisoned");
-            damper.check_and_record(to, &envelope.subject)?;
+            damper.check_and_record(envelope.from, to, &envelope.subject)?;
         }
 
         let mut envelope = envelope;
@@ -528,20 +523,22 @@ mod send_wiring_tests {
     #[tokio::test]
     async fn send_enforces_the_repetition_damper_for_real() {
         let bus = LocalBus::new();
+        let from = SessionId::new();
         let to = SessionId::new();
         bus.register_mailbox(to, MailboxKind::Bounded(64))
             .await
             .unwrap();
 
-        // Vary `from` per send so the rate cap (per-sender) never triggers here —
-        // this test isolates the repetition damper (keyed on (to, subject)) alone.
+        // A fixed `from` + fixed subject trips the damper (keyed on (from, to,
+        // subject)). Only 4 sends are needed — well under the rate cap's per-sender
+        // burst of 10 — so this isolates the repetition damper alone.
         for _ in 0..3 {
-            bus.send(envelope(SessionId::new(), to, "status-check", 8))
+            bus.send(envelope(from, to, "status-check", 8))
                 .await
                 .unwrap();
         }
         let err = bus
-            .send(envelope(SessionId::new(), to, "status-check", 8))
+            .send(envelope(from, to, "status-check", 8))
             .await
             .unwrap_err();
         assert!(matches!(err, crate::types::BusError::Repetitive { .. }));
