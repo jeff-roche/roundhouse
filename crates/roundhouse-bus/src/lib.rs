@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod artifact_grant;
 pub mod bus_trait;
 pub mod event_sink;
 pub mod handle_registry;
