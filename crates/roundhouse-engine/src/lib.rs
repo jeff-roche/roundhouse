@@ -37,6 +37,7 @@ pub use session_actor::{
 pub use working_context::{ContextStateId, TokenBudget, WorkingContext};
 
 pub mod test_support;
+pub mod tools;
 
 use roundhouse_bus::Bus;
 use roundhouse_core::TaskRunner;
