@@ -22,6 +22,12 @@ impl CredentialProvider for HeaderKeyCredential {
         _ctx: &'a CredentialCtx<'a>,
     ) -> BoxFut<'a, Result<(), CredentialError>> {
         Box::pin(async move {
+            // Idempotent per `CredentialProvider::apply`'s documented
+            // contract: drop any prior value under this same header name
+            // before pushing, so a repeat `apply` (e.g. a retry) never
+            // accumulates duplicates.
+            req.headers
+                .retain(|(k, _)| !k.eq_ignore_ascii_case(&self.header));
             // Distinct header name means this can't reuse
             // `apply_bearer_secret` (which always writes `authorization`),
             // so it is its own physical exposure call site.

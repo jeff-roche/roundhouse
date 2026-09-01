@@ -62,7 +62,14 @@ use roundhouse_provider::HttpRequest;
 /// occurrence of that call) by every credential mechanism that resolves to a
 /// bearer token. See the module doc comment's "Call-site accounting"
 /// section.
+///
+/// Idempotent per `CredentialProvider::apply`'s documented contract: removes
+/// any `authorization` header this same function previously set before
+/// pushing the new one, so a repeat `apply` on the same request (the natural
+/// shape for a retry) never accumulates duplicate headers.
 fn apply_bearer_secret(secret: &Secret, req: &mut HttpRequest) {
+    req.headers
+        .retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
     crate::provider_bridge::expose_secret_for_provider_call(secret, |s| {
         req.headers
             .push(("authorization".to_string(), format!("Bearer {s}")));

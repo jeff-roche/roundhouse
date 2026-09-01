@@ -14,21 +14,24 @@ pub struct AzureEntraCredential {
 }
 
 impl AzureEntraCredential {
+    /// `scope` is threaded into the token request body — Entra's v2.0
+    /// endpoint makes `scope` **required** for `grant_type=client_credentials`
+    /// and returns `AADSTS900144` without it (this was a real, fixed defect
+    /// in an earlier draft of this type, not an intentional omission).
     pub fn new(
         token_endpoint: impl Into<String>,
         client_id: impl Into<String>,
         client_secret: Secret,
-        _scope: &str,
-    ) -> Self {
-        // `_scope` is a construction-time parameter so callers never need
-        // Entra-specific knowledge beyond "which scope am I requesting" —
-        // threading it into the token request body is real follow-up wiring
-        // on `OAuthRefreshCredential`'s request builder, out of this task's
-        // scope (both credentials resolve to the identical Bearer wire shape
-        // either way, which is what this type exists to prove).
-        Self {
-            inner: OAuthRefreshCredential::new(token_endpoint, client_id, client_secret),
-        }
+        scope: &str,
+    ) -> Result<Self, CredentialError> {
+        Ok(Self {
+            inner: OAuthRefreshCredential::with_scope(
+                token_endpoint,
+                client_id,
+                client_secret,
+                Some(scope.to_string()),
+            )?,
+        })
     }
 }
 

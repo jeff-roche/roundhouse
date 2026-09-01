@@ -1,6 +1,8 @@
 use crate::secret::Secret;
 use futures::StreamExt;
-use roundhouse_provider::credential::{CredentialCtx, CredentialError, CredentialProvider};
+use roundhouse_provider::credential::{
+    record_base_url_override, CredentialCtx, CredentialError, CredentialProvider,
+};
 use roundhouse_provider::{BoxFut, HttpRequest};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -21,6 +23,11 @@ pub struct OAuthRefreshCredential {
     refresh_url: String,
     client_id: String,
     client_secret: Secret,
+    /// Entra's v2.0 endpoint (and OAuth2 generally, when the authorization
+    /// server requires it) makes `scope` a required field of the
+    /// client-credentials grant. `None` for a plain OAuth2 server that
+    /// doesn't need one.
+    scope: Option<String>,
     /// §9.9: "single-flight, 60s skew."
     skew: Duration,
     cached: Mutex<Option<CachedToken>>,
@@ -32,19 +39,55 @@ struct OAuthTokenResponse {
     expires_in: u64,
 }
 
+/// Rejects a `refresh_url` that could route this credential's secret
+/// material somewhere unintended: embedded userinfo (`https://user:pass@host/`)
+/// would ride along on every token request, and a non-`https` scheme would
+/// send the client secret in the clear.
+fn validate_refresh_url(raw: &str) -> Result<(), CredentialError> {
+    let parsed =
+        url::Url::parse(raw).map_err(|e| CredentialError::InvalidBaseUrl(format!("{raw}: {e}")))?;
+    if parsed.scheme() != "https" {
+        return Err(CredentialError::InvalidBaseUrl(format!(
+            "refresh_url must use https, got scheme `{}`: {raw}",
+            parsed.scheme()
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(CredentialError::InvalidBaseUrl(format!(
+            "refresh_url must not contain embedded userinfo: {raw}"
+        )));
+    }
+    Ok(())
+}
+
 impl OAuthRefreshCredential {
+    /// Plain OAuth2 client-credentials grant with no `scope`. Use
+    /// [`OAuthRefreshCredential::with_scope`] for an authorization server
+    /// (e.g. Azure Entra) that requires one.
     pub fn new(
         refresh_url: impl Into<String>,
         client_id: impl Into<String>,
         client_secret: Secret,
-    ) -> Self {
-        Self {
-            refresh_url: refresh_url.into(),
+    ) -> Result<Self, CredentialError> {
+        Self::with_scope(refresh_url, client_id, client_secret, None)
+    }
+
+    pub fn with_scope(
+        refresh_url: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret: Secret,
+        scope: Option<String>,
+    ) -> Result<Self, CredentialError> {
+        let refresh_url = refresh_url.into();
+        validate_refresh_url(&refresh_url)?;
+        Ok(Self {
+            refresh_url,
             client_id: client_id.into(),
             client_secret,
+            scope,
             skew: Duration::from_secs(60),
             cached: Mutex::new(None),
-        }
+        })
     }
 }
 
@@ -71,14 +114,20 @@ impl CredentialProvider for OAuthRefreshCredential {
             // (`client_secret`, not a resolved bearer token) and distinct
             // purpose (authenticating to the token endpoint), so it cannot
             // reuse `apply_bearer_secret`.
+            //
+            // RFC 6749 §4.4.2 (and both of Azure Entra's token endpoints)
+            // require the client-credentials grant as
+            // `application/x-www-form-urlencoded`, not JSON.
             let body =
                 crate::provider_bridge::expose_secret_for_provider_call(&self.client_secret, |s| {
-                    serde_json::to_vec(&serde_json::json!({
-                        "grant_type": "client_credentials",
-                        "client_id": self.client_id,
-                        "client_secret": s,
-                    }))
-                    .expect("static shape always serializes")
+                    let mut form = url::form_urlencoded::Serializer::new(String::new());
+                    form.append_pair("grant_type", "client_credentials");
+                    form.append_pair("client_id", &self.client_id);
+                    form.append_pair("client_secret", s);
+                    if let Some(scope) = &self.scope {
+                        form.append_pair("scope", scope);
+                    }
+                    form.finish().into_bytes()
                 });
 
             let resp = ctx
@@ -86,16 +135,41 @@ impl CredentialProvider for OAuthRefreshCredential {
                 .send(HttpRequest {
                     method: "POST".into(),
                     url: self.refresh_url.clone(),
-                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    headers: vec![(
+                        "content-type".to_string(),
+                        "application/x-www-form-urlencoded".to_string(),
+                    )],
                     body,
                 })
                 .await
-                .map_err(|e| CredentialError::RefreshFailed(e.to_string()))?;
+                .map_err(|_e| {
+                    // Never interpolate `TransportError`'s `Display` here:
+                    // reqwest 0.13.4's error `Display` ends with
+                    // `" for url ({url})"`, and `Url`'s `Display` includes
+                    // any userinfo component — report the host only.
+                    CredentialError::RefreshFailed(format!(
+                        "token request to {} failed",
+                        record_base_url_override(&self.refresh_url)
+                    ))
+                })?;
+
+            if !(200..300).contains(&resp.status) {
+                return Err(CredentialError::RefreshFailed(format!(
+                    "token endpoint {} returned HTTP {}",
+                    record_base_url_override(&self.refresh_url),
+                    resp.status
+                )));
+            }
 
             let mut body_bytes = Vec::new();
             let mut stream = resp.body;
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| CredentialError::RefreshFailed(e.to_string()))?;
+                let chunk = chunk.map_err(|_e| {
+                    CredentialError::RefreshFailed(format!(
+                        "reading token response from {} failed",
+                        record_base_url_override(&self.refresh_url)
+                    ))
+                })?;
                 body_bytes.extend_from_slice(&chunk);
             }
             let parsed: OAuthTokenResponse = serde_json::from_slice(&body_bytes)
