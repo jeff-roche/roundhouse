@@ -14,8 +14,9 @@ pub enum McpTransportKind {
         command: String,
         args: Vec<String>,
         /// Explicit allowlist only — never inherits the daemon's own env.
-        /// (§6.7: MCP stdio servers are spawned by the daemon outside the
-        /// session's namespace; nothing here is session-derived.)
+        /// (Per §6.7's secret/session-isolation rationale: MCP stdio
+        /// servers are spawned by the daemon, outside the session's
+        /// namespace — nothing here is session-derived.)
         env: Vec<(String, String)>,
         /// §6.9 hardened profile: "MCP servers pinned by binary hash."
         /// Hex-encoded blake3 digest of the `command` binary's bytes,

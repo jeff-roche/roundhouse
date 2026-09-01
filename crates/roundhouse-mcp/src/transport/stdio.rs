@@ -100,7 +100,7 @@ impl StdioMcpTransport {
             pinned_binary_hash,
         } = &config.transport;
 
-        // finding 5: §6.5 hardened profile — "MCP servers pinned by binary
+        // finding 5: §6.9 hardened profile — "MCP servers pinned by binary
         // hash." Verified BEFORE the process is ever spawned; a mismatch
         // refuses to start the server at all rather than spawning first and
         // discovering the problem later. When pinned, the resolved file is
