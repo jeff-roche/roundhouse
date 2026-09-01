@@ -67,6 +67,44 @@ async fn request_ctx_credentials_field_applies_to_a_request() {
         .any(|(k, v)| k == "x-fixed" && v == "fixed-value"));
 }
 
+#[tokio::test]
+async fn request_ctx_credentials_field_carries_a_real_secrets_crate_implementation() {
+    // Exercises the actual cross-crate wiring end to end: a real,
+    // secret-holding `CredentialProvider` from `roundhouse-secrets` (taken
+    // here only as a dev-dependency — see that crate's Cargo.toml comment on
+    // the edge) plugged into `RequestCtx.credentials` and applied through
+    // the trait object this crate defines.
+    use roundhouse_secrets::credential::BearerCredential;
+    use roundhouse_secrets::secret::Secret;
+
+    let cred: Arc<dyn CredentialProvider> = Arc::new(BearerCredential::new(Secret::new(
+        "sk-real-123".to_string(),
+    )));
+    let _ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(NullTransport),
+        api_key: String::new(),
+        credentials: Some(Arc::clone(&cred)),
+    };
+
+    let mut req = HttpRequest {
+        method: "POST".into(),
+        url: "https://example.com".into(),
+        headers: vec![],
+        body: vec![],
+    };
+    let cred_ctx = CredentialCtx {
+        provider_id: "test",
+        transport: &NullTransport,
+        now: std::time::Instant::now(),
+    };
+    cred.apply(&mut req, &cred_ctx).await.unwrap();
+    assert!(req
+        .headers
+        .iter()
+        .any(|(k, v)| k == "authorization" && v == "Bearer sk-real-123"));
+}
+
 #[test]
 fn request_ctx_credentials_field_defaults_to_none_for_existing_call_sites() {
     // Existing (Phase 1) construction sites keep working untouched with
