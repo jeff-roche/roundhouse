@@ -8,6 +8,28 @@
 # here rather than replaced with unreliable fetch output.
 id = "qwen"
 codec = "openai-chat"
+# Round-8 review, M1/M2: the previous table's three keys
+# (Throttling.RateQuota/InternalError/InvalidApiKey) are native DashScope
+# REST-API error codes, not what this profile's OpenAI-*compatible-mode*
+# endpoint actually returns — a real mismatch independent of the pointer
+# bug. Confirmed two ways: (1) a live curl against
+# `dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions`
+# (2026-09) with a bad key returned the OpenAI-shaped
+# `{"error":{"message":"Incorrect API key provided...","type":
+# "invalid_request_error","param":null,"code":"invalid_api_key"},
+# "request_id":"..."}` — `type` is the same coarse bucket for many
+# unrelated 4xxs, so the fine-grained code lives at `/error/code`, not the
+# default `/error/type`; (2) Alibaba Cloud's own error-code reference
+# (`alibabacloud.com/help/en/model-studio/error-code`, fetched 2026-09)
+# lists each condition as "<status>-<native code>/<compat-mode code>",
+# explicitly separating the two surfaces, e.g. "429-Throttling.RateQuota/
+# LimitRequests/limit_requests" and "429-Throttling.AllocationQuota/
+# insufficient_quota" — the lowercase snake_case member of each slash-
+# separated group is the compatible-mode value (matching the live-observed
+# `invalid_api_key` for "401-InvalidApiKey/invalid_api_key"), the
+# PascalCase/dotted member is the native-API value this profile does not
+# use.
+error_pointer = "/error/code"
 
 [defaults]
 allow_raw_extra = false
@@ -45,6 +67,6 @@ high = "true"
 max = "true"
 
 [errors]
-"Throttling.RateQuota" = { disposition = "shed_concurrency" }
-"InternalError" = { disposition = "retry_backoff" }
-"InvalidApiKey" = { disposition = "fatal", category = "quota" }
+"limit_requests" = { disposition = "shed_concurrency" }
+"insufficient_quota" = { disposition = "fatal", category = "quota" }
+"model_not_supported" = { disposition = "fatal", category = "model_not_found" }

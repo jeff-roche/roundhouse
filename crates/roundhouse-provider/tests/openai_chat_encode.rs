@@ -33,6 +33,7 @@ fn no_reasoning_profile() -> ProviderProfile {
         },
         model: vec![],
         errors: BTreeMap::new(),
+        error_pointer: "/error/type".into(),
     }
 }
 

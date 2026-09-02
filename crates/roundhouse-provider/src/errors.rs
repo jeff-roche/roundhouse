@@ -41,6 +41,13 @@ pub struct ErrorProfile {
     // populate it too; lookups stay `&str` via `HashMap::get`.
     pub code_table: HashMap<String, ProviderErrorKind>,
     pub message_patterns: Vec<(regex::Regex, ProviderErrorKind)>,
+    /// Round-8 review, M2: the RFC 6901 JSON pointer `classify` walks to
+    /// find this vendor's machine-readable error code. Used to hardcode
+    /// `/error/type` inline below — an OpenAI-shape assumption that simply
+    /// never matched for vendors whose real error body doesn't nest a
+    /// `type` string there (see `profile::ProviderProfile::error_pointer`'s
+    /// doc comment for the full list of real shapes that broke it).
+    pub error_pointer: String,
 }
 
 impl ErrorProfile {
@@ -48,6 +55,7 @@ impl ErrorProfile {
         Self {
             code_table: HashMap::new(),
             message_patterns: Vec::new(),
+            error_pointer: "/error/type".to_string(),
         }
     }
 
@@ -70,6 +78,7 @@ impl ErrorProfile {
                 regex::Regex::new("credit balance is too low").unwrap(),
                 ProviderErrorKind::QuotaExhausted,
             )],
+            error_pointer: "/error/type".to_string(),
         }
     }
 }
@@ -86,7 +95,7 @@ pub fn classify(
     let parsed: Option<serde_json::Value> = serde_json::from_slice(body).ok();
 
     if let Some(v) = &parsed {
-        if let Some(code) = v.pointer("/error/type").and_then(|x| x.as_str()) {
+        if let Some(code) = v.pointer(&profile.error_pointer).and_then(|x| x.as_str()) {
             if let Some(kind) = profile.code_table.get(code) {
                 return kind_to_error(*kind, headers);
             }

@@ -18,7 +18,20 @@ auth = { kind = "bearer" }
 [[model]]
 match = ["*"]
 
+# Round-8 review, M1/M2: the previous table's keys ("429"/"503"/"401") were
+# HTTP status codes placed in a slot meant to hold `error.type` *values* --
+# NIM's real error body has no `error` object at all. Confirmed both live
+# (community-reproduced responses against integrate.api.nvidia.com) and
+# from the same 429 seen in this crate's own earlier authoring pass: NIM
+# returns RFC 7807-shaped problem details, e.g.
+# `{"status":429,"title":"Too Many Requests"}`,
+# `{"status":401,"title":"Unauthorized","detail":"..."}`,
+# `{"status":404,"title":"Not Found","detail":"..."}`. `title` is always
+# the exact HTTP reason phrase for `status` (`"Too Many Requests"` for 429,
+# `"Unauthorized"` for 401, `"Not Found"` for 404) -- it carries zero
+# information `classify()` doesn't already have from the raw HTTP status,
+# so there is no vendor-specific billing-vs-rate-limit distinction to
+# recover here (unlike OpenAI's insufficient_quota-on-429 case). An empty
+# table is the correct, honest outcome for this vendor -- not omitted
+# oversight, but confirmed absence of a matchable signal.
 [errors]
-"429" = { disposition = "shed_concurrency" }
-"503" = { disposition = "retry_backoff" }
-"401" = { disposition = "fatal", category = "quota" }

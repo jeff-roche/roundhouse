@@ -4,6 +4,24 @@
 # reasoning_effort vocabulary on grok-4*: low/medium/high(default)/xhigh.
 id = "xai"
 codec = "openai-chat"
+# Round-8 review, M1/M2: the previous table's three keys never appeared in
+# xAI's real error body. xAI does not publish a JSON error-body schema;
+# real captured responses (reproduced verbatim in public bug reports
+# against api.x.ai — e.g. `{"code":"The service is currently unavailable",
+# "error":"Timed out waiting for first token"}` and `{"code":"Client
+# specified an invalid argument","error":"..."}`) show a FLAT
+# `{"code": "<canonical description>", "error": "<message>"}` shape — note
+# `error` here is xAI's message field, the opposite of every OpenAI-shaped
+# vendor, and `code` carries a human-readable category string rather than a
+# short enum token. `error_pointer` is set to `/code` accordingly (the
+# default `/error/type` can never resolve against this shape). Only the one
+# value with a directly reproduced example is populated below
+# ("The service is currently unavailable", a capacity/overload condition);
+# no primary or reproduced source confirms xAI's exact `code` text for rate
+# limiting or billing exhaustion (docs.x.ai/developers/debugging documents
+# HTTP-status causes only, no JSON body), so those are deliberately not
+# guessed. The HTTP-status fallback tier already gives 429 -> RateLimited.
+error_pointer = "/code"
 
 [defaults]
 allow_raw_extra = false
@@ -35,6 +53,4 @@ max = "xhigh"
 match = ["grok-*"]
 
 [errors]
-"rate_limit_exceeded" = { disposition = "shed_concurrency" }
-"internal_server_error" = { disposition = "retry_backoff" }
-"invalid_api_key" = { disposition = "fatal", category = "quota" }
+"The service is currently unavailable" = { disposition = "retry_backoff" }

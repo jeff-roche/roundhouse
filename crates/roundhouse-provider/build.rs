@@ -66,6 +66,7 @@ mod errors {
     pub struct ErrorProfile {
         pub code_table: HashMap<String, ProviderErrorKind>,
         pub message_patterns: Vec<(String, ProviderErrorKind)>,
+        pub error_pointer: String,
     }
 }
 
@@ -85,6 +86,14 @@ mod errors {
 // like `schema.rs`/`reasoning.rs` above.
 #[path = "src/codec/openai_chat/reasoning_field_validation.rs"]
 mod reasoning_field_validation;
+
+// Round-8 review, M2: validates every profile's `error_pointer` is a
+// well-formed RFC 6901 pointer at build time. Dependency-free, mounted the
+// same way as `reasoning_field_validation` above (a build script cannot
+// depend on the crate it builds), so the real crate calls the identical
+// function through `profile::validate_error_pointer`.
+#[path = "src/profile/error_pointer_validation.rs"]
+mod error_pointer_validation;
 
 fn main() {
     let profiles_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
@@ -106,6 +115,8 @@ fn main() {
                  typo in a quirk profile is a BUILD error, not a production 400: {e}"
             )
         });
+        error_pointer_validation::validate_error_pointer(&path, &parsed.error_pointer);
+
         for model in &parsed.model {
             if let Some(control) = &model.reasoning {
                 // Fix round 7, K6: `value_type` is part of `ReasoningControl`'s
@@ -127,6 +138,26 @@ fn main() {
                     reasoning_field_validation::validate_openai_chat_reasoning_field(
                         &path,
                         &control.field,
+                    );
+                } else if control.value_type != reasoning::ReasoningValueType::String {
+                    // Round-8 review, M3: only `openai_chat::encode`'s
+                    // `encode_openai_chat` calls `resolve_wire_value` (the
+                    // `WireValue`-typed path). `cohere_v2`, `google_genai`
+                    // and `openai_responses` all call the untyped `resolve()`
+                    // instead, so a `value_type` other than the default
+                    // `String` on any of their profiles would build clean
+                    // and then be silently ignored at request-encode time —
+                    // exactly the "typo in a quirk profile" §9.5 promises
+                    // turns into a BUILD error, not a silent runtime gap.
+                    panic!(
+                        "profile {path:?} declares a [[model]].reasoning value_type of \
+                         {:?}, but its codec ({:?}) does not consume typed WireValue — only \
+                         openai-chat's encoder calls resolve_wire_value; every other codec \
+                         calls the untyped resolve(), so a non-String value_type here would \
+                         build clean and then be silently ignored. This is the §9.5 guarantee \
+                         that a typo in a quirk profile is a BUILD error, not a silent runtime \
+                         gap",
+                        control.value_type, parsed.codec
                     );
                 }
             }

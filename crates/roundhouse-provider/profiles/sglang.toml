@@ -2,6 +2,29 @@
 # long-documented SGLang `python -m sglang.launch_server` default).
 id = "sglang"
 codec = "openai-chat"
+# Round-8 review, M1/M2: "engine_busy" never appeared in SGLang's real error
+# body. Verified against SGLang's current source
+# (github.com/sgl-project/sglang,
+# `python/sglang/srt/entrypoints/openai/protocol.py`):
+# `ErrorResponse { object: "error", message, type, param, code: int }` is
+# FLAT (no nested "error" wrapper, unlike vLLM/OpenAI) -- so
+# `error_pointer` is corrected to `/type`, since the default `/error/type`
+# can never resolve. `serving_base.py`'s `create_error_response` and its
+# call sites in `serving_chat.py`/`serving_base.py` show the OpenAI-compat
+# route's actual `type` values are only `"BadRequest"` (400),
+# `"InternalServerError"` (500, the generic `except Exception` catch-all --
+# used for both real bugs and any other unhandled failure), and
+# `"NotImplementedError"` (501); a stray `HTTPException` bubbling up from
+# elsewhere is stamped with `type: str(status_code)` (a numeric string
+# duplicating the HTTP status SGLang's own dispatcher already carries,
+# e.g. `http_server.py`'s generic exception handler). None of these
+# reliably distinguishes a genuine capacity/overload condition from an
+# ordinary bug or validation failure the way vLLM's dedicated
+# `QueueOverflowError` does -- asserting `"InternalServerError"` means
+# "provider overloaded" would be the same wrong-specific-guess E1 already
+# rejects. This table is deliberately empty; the HTTP-status fallback
+# tier already covers what SGLang's OpenAI-compat route actually conveys.
+error_pointer = "/type"
 [defaults]
 allow_raw_extra = true
 params = { mode = "allow_all", fields = [] }
@@ -12,4 +35,3 @@ auth = { kind = "bearer" }
 match = ["*"]
 
 [errors]
-"engine_busy" = { disposition = "shed_concurrency" }

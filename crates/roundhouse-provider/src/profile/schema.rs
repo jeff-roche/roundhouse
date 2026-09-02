@@ -30,6 +30,27 @@ pub struct ProviderProfile {
     pub model: Vec<ModelEntry>,
     #[serde(default)]
     pub errors: BTreeMap<String, ErrorEntry>,
+    /// M2 (round-8 review, M1/M2): the RFC 6901 JSON pointer into a
+    /// vendor's error body where this profile's `[errors]` table keys are
+    /// found. `classify()` used to hardcode `/error/type` — an
+    /// OpenAI-shape assumption that silently never matched for every
+    /// vendor whose real error body doesn't nest a `type` string at that
+    /// exact location (Mistral nests `type` at the top level; Z.ai/Qwen/
+    /// DeepInfra key their machine-readable code under `/error/code`, not
+    /// `/error/type`; vLLM/SGLang key `type` at different nesting depths).
+    /// Defaults to `/error/type` so every profile shipped before this field
+    /// existed (moonshot, azure-openai, and the rest whose real shape
+    /// genuinely nests `type` there) keeps resolving exactly as before.
+    /// `build.rs` validates this is a well-formed pointer — see
+    /// `error_pointer_validation::validate_error_pointer` — the same
+    /// "typo is a BUILD error" guarantee `value_type` (`c058dbe`) already
+    /// gives `[[model]].reasoning`.
+    #[serde(default = "default_error_pointer")]
+    pub error_pointer: String,
+}
+
+fn default_error_pointer() -> String {
+    "/error/type".to_string()
 }
 
 impl ProviderProfile {
@@ -53,6 +74,7 @@ impl ProviderProfile {
         crate::errors::ErrorProfile {
             code_table,
             message_patterns: Vec::new(),
+            error_pointer: self.error_pointer.clone(),
         }
     }
 }

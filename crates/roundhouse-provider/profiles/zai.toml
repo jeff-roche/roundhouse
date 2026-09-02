@@ -15,6 +15,28 @@
 # entries, not `/thinking/type`.
 id = "zai"
 codec = "openai-chat"
+# Round-8 review, M1/M2: the previous table's "1301" -> retry_backoff entry
+# was wrong on top of being unreachable. Verified live two ways: a direct
+# curl against `api.z.ai/api/paas/v4/chat/completions` (2026-09) with a bad
+# key returned `{"error":{"code":"401","message":"token expired or
+# incorrect"}}` — confirming the real shape is nested with `code`+`message`
+# but no `type` key at all, so `error_pointer` must be `/error/code`, not
+# the default `/error/type` (which can never resolve here). The actual
+# numeric codes come from `docs.z.ai/api-reference/api-code` (fetched
+# 2026-09), which documents:
+#   - 1302: "Rate limit reached for requests" (429)
+#   - 1305: "The service may be temporarily overloaded, please try again
+#     later" (429) — a capacity condition, not a per-caller rate limit;
+#     mapped to retry_backoff (Overloaded) rather than shed_concurrency.
+#   - 1113: "Insufficient balance or no resource package" (429) — a
+#     permanent billing condition arriving on the SAME HTTP status as a
+#     genuine rate limit, exactly the OpenAI insufficient_quota shape
+#     `errors.rs`'s module doc calls out as the reason this table exists.
+#   - 1301: "potentially unsafe or sensitive content" (400, a content-policy
+#     rejection) — not retryable and not a quota condition, so it maps to
+#     none of the four `ProviderErrorKind` variants and is intentionally
+#     omitted rather than guessed (per fix-round-1 E1's precedent).
+error_pointer = "/error/code"
 
 [defaults]
 allow_raw_extra = false
@@ -59,5 +81,5 @@ max = "max"
 
 [errors]
 "1302" = { disposition = "shed_concurrency" }
-"1301" = { disposition = "retry_backoff" }
+"1305" = { disposition = "retry_backoff" }
 "1113" = { disposition = "fatal", category = "quota" }

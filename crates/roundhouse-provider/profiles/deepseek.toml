@@ -45,7 +45,26 @@ medium = "medium"
 high = "high"
 max = "high"
 
+
+# Round-8 review, M1/M2: the previous table's three keys
+# (rate_limit_exceeded/server_error/authentication_error) never appear
+# anywhere in DeepSeek's real error body and were pure fabrication.
+# DeepSeek's real error body is `{"error": "<status> <reason phrase>",
+# "message": "..."}` — `error` is a FLAT STRING (e.g. "429 Too Many
+# Requests"), not an object with a `type`/`code` key, so `/error/type` (or
+# any object-pointer) can never resolve. Two independent sources agree on
+# this shape: reproduced 429 responses on aggregator sites
+# (deepseek-usa.ai/docs/deepseek-error-codes; consistent with community
+# reports of the literal body `{"error":"429 Too Many Requests","message":
+# "Rate limit exceeded..."}`), and DeepSeek's own
+# `api-docs.deepseek.com/quick_start/error_codes` page (fetched 2026-09),
+# which documents only HTTP-status-keyed causes (400/401/402/422/429/500/
+# 503) and never shows a machine-readable code string alongside them.
+# There is no stable field to key a code_table on — the only candidate is
+# the whole human-readable phrase, which is a message, not a code — so
+# this table is deliberately empty. The HTTP-status fallback tier
+# (`classify()`'s third tier) already gives 429 -> RateLimited and
+# 500/503 -> Server correctly for this vendor; a real 402-vs-429 quota
+# distinction cannot be built here without fabricating a match on message
+# text, which this profile does not do.
 [errors]
-"rate_limit_exceeded" = { disposition = "shed_concurrency" }
-"server_error" = { disposition = "retry_backoff" }
-"authentication_error" = { disposition = "fatal", category = "quota" }
