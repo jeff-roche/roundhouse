@@ -107,16 +107,25 @@ fn m1_and_m2_malformed_duration_text_is_rejected_precisely() {
 }
 
 #[test]
-fn m2_a_literal_zero_base_is_treated_as_unconfigured_not_a_real_zero_delay() {
-    // Fix round 1 (finding M2): `base: "0s"` is syntactically valid but
-    // would otherwise mean "never wait" — combined with a large attempt
-    // count, that is the same zero-delay-storm shape as the malformed-text
-    // case above, so it falls back to the 1s default instead.
+fn m2_and_round2_a_literal_zero_base_is_rejected_not_silently_substituted() {
+    // Fix round 1 (finding M2) originally treated `base: "0s"` as
+    // "unconfigured" and silently substituted the 1s default. Fix round 2
+    // pointed out the contradiction: a validly-parsed `0s` is just as
+    // explicit an author statement as any other duration, so silently
+    // overriding it is exactly the silent-normalization pattern this
+    // round's other fixes (M1/M2's malformed-text handling) exist to stop.
+    // It's rejected outright now, consistent with the rest of the module.
     let mut d = def();
     d.base = Some("0s".to_string());
-    let policy =
-        retry_policy_from_def(&d).expect("a literal zero is not an error, just unconfigured");
-    assert_eq!(policy.base, Duration::from_secs(1));
+    let err = retry_policy_from_def(&d)
+        .expect_err("an explicit zero duration must be rejected, not silently substituted");
+    assert_eq!(
+        err,
+        RetryPolicyError::ZeroDuration {
+            field: "base",
+            value: "0s".to_string(),
+        }
+    );
 }
 
 #[test]

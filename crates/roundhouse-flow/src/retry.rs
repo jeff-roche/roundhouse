@@ -66,6 +66,10 @@ pub enum RetryPolicyError {
     DurationOverflow { field: &'static str, value: String },
     #[error("retry.attempts is {actual}, exceeding the limit of {max}")]
     TooManyAttempts { actual: u32, max: u32 },
+    #[error(
+        "{field} is an explicit zero duration ({value:?}), which would mean \"never wait\"/\"cap every backoff at zero\" — omit {field} entirely to use its default instead"
+    )]
+    ZeroDuration { field: &'static str, value: String },
 }
 
 /// No real retry policy needs more than a handful of attempts — §8.4's own
@@ -122,13 +126,19 @@ fn parse_duration_str(field: &'static str, s: &str) -> Result<Duration, RetryPol
 }
 
 /// Resolves an optional YAML duration field to a `Duration`, applying
-/// `default` both when the field is absent *and* when it is present but
-/// parses to exactly zero. Fix round 1 on Task 10 (finding M2): a
-/// literal `base: 0s` (or `max: 0s`) is syntactically valid but would
-/// otherwise mean "never wait" / "cap every backoff at zero" — combined
-/// with a large `attempts`, that is the same zero-delay-retry-storm shape
-/// as an unparseable duration silently defaulting to zero, so an explicit
-/// zero is treated as "unconfigured" rather than as a real setting.
+/// `default` when the field is absent, and rejecting it outright when
+/// present but parsed to exactly zero.
+///
+/// Fix round 1 on Task 10 (finding M2) originally treated a literal
+/// `base: 0s` as "unconfigured" and silently substituted `default` — on
+/// the same reasoning as this round's M1/M2 fixes, that a malformed
+/// duration should never silently become a guessed value. Fix round 2
+/// pointed out the contradiction directly: a *validly parsed* `0s` is
+/// just as explicit an author statement as any other duration, so
+/// silently overriding it was exactly the silent-normalization pattern
+/// this whole module was written to stop doing. It is now rejected with
+/// [`RetryPolicyError::ZeroDuration`] instead, consistent with every other
+/// malformed/degenerate input this function's siblings reject.
 fn resolve_duration(
     field: &'static str,
     raw: Option<&str>,
@@ -138,7 +148,14 @@ fn resolve_duration(
         None => Ok(default),
         Some(s) => {
             let parsed = parse_duration_str(field, s)?;
-            Ok(if parsed.is_zero() { default } else { parsed })
+            if parsed.is_zero() {
+                Err(RetryPolicyError::ZeroDuration {
+                    field,
+                    value: s.to_string(),
+                })
+            } else {
+                Ok(parsed)
+            }
         }
     }
 }
