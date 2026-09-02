@@ -1,6 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
+<!-- Fix round 1 (security review): launchd does not expand `~`. The
+     ProgramArguments path and the two log paths below are all placeholders
+     that `service_install::render_launchd_plist` replaces with absolute
+     paths at install time; a copy of this file installed by hand (rather
+     than via `round service install`) must have all three fixed up first,
+     or launchd will look for a literal `~` and daemon logs will silently
+     go nowhere. -->
 <dict>
     <key>Label</key>
     <string>com.roundhouse.daemon</string>

@@ -1,9 +1,7 @@
 [Unit]
 Description=Roundhouse daemon
-Documentation=https://github.com/roundhouse/roundhouse
-After=network-online.target roundhouse.socket
+After=network-online.target
 Wants=network-online.target
-Requires=roundhouse.socket
 
 [Service]
 Type=simple
@@ -16,6 +14,16 @@ RestartSec=2
 # own catch-up (Scheduling Task 4's compute_catch_up, wired through
 # Scheduler::tick and catch_up_after_wake), so relying on systemd's own
 # missed-timer replay would be a second, disagreeing source of truth.
+#
+# Fix round 1 (security review): a paired `roundhouse.socket` unit
+# (§8.7: "ideally socket-activated") was removed from this package. The
+# daemon binds `$XDG_RUNTIME_DIR/roundhouse-<user>/round.sock`
+# (`roundhouse_tui::paths::default_socket_path`), not the
+# `%t/roundhouse/daemon.sock` a `.socket` unit here would have listened on,
+# and implements no socket-activation protocol (no `LISTEN_FDS`/
+# `sd_listen_fds` anywhere in `roundhouse-daemon`) — so shipping one would
+# have created a socket nobody accepts on and hung anyone who connected to
+# it. Revisit once the daemon actually implements socket activation.
 Environment=RUST_LOG=info
 
 [Install]

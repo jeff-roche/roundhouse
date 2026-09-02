@@ -5,8 +5,10 @@ sessions, driven from a terminal UI and a web UI, speaking to any LLM
 provider, with every action recorded as a first-class, typed, queryable
 **Task** in an append-only event log.
 
-The CLI binary is `round`. The daemon is `round daemon` — the same binary,
-not a second one.
+The CLI binary is `round`. `round daemon` is a subcommand of it that locates
+and spawns the real daemon binary as a separate child process — not the same
+binary linked together — so `roundhouse-cli` never depends on
+`roundhouse-daemon` (see `docs/architecture/02-system-architecture.md` §5.2).
 
 ## Status: pre-Phase 0
 

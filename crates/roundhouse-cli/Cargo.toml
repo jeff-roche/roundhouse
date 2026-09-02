@@ -26,9 +26,15 @@ tokio = { workspace = true, features = ["process"] }
 # Task A8/G6's CLI subcommand scaffold (`round daemon`, `round service
 # install`/`uninstall`) — the plan text this task is built from named no
 # argument-parsing dependency at all (§5.3 pins none), so this is a net-new
-# addition this task introduces, pinned like every other dependency in this
-# manifest rather than left floating.
-clap = { version = "4.6.6", features = ["derive"] }
+# addition this task introduces. Global Constraints §5.3's pin discipline
+# ("never track to latest", a soft range is exactly what it forbids) applies
+# to a net-new addition regardless of which task introduces it, so this is
+# an exact `=` pin, not a caret range (fix round 1: the first cut of this
+# manifest claimed to be pinned while actually leaving the range open).
+clap = { version = "=4.6.6", features = ["derive"] }
+# Not a net-new dependency to the workspace (every other crate already
+# depends on `thiserror` via the workspace-pinned "2.0.20"); this is just a
+# new *consumer* of it, for `ServiceInstallError`.
 thiserror = { workspace = true }
 # Same pins as `roundhouse-tui`'s own manifest (Task 19) — this crate constructs
 # the real `CrosstermBackend` the dashboard draws into, so the two must agree on
@@ -37,4 +43,5 @@ ratatui = { version = "0.30.2", features = ["layout-cache"] }
 crossterm = "0.29"
 
 [dev-dependencies]
-tempfile = "3"
+# Same exact-pin discipline as the `clap` addition above.
+tempfile = "=3.27.0"
