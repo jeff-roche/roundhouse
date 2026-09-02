@@ -938,3 +938,57 @@ fn eval_requires_an_expression_source_not_a_bare_str() {
         json!("trusted-value")
     );
 }
+
+// ---- `preserve_order` must stay off (ruling P24, supersedes P21's manual
+// `cargo tree` check): `index_field`'s O(sibling count) `Map::remove`
+// complexity argument (see `expr.rs`'s doc comment on `index_field`)
+// depends on `serde_json::Map` staying `BTreeMap`-backed. The feature is
+// runtime-detectable because it swaps `BTreeMap` (sorted iteration) for
+// `IndexMap` (insertion order): asserting sorted iteration here converts a
+// manual, skippable merge-time check into a test that fails loudly the
+// moment any crate in the workspace turns the feature on. ----
+
+#[test]
+fn preserve_order_feature_is_off() {
+    let v: Value = serde_json::from_str(r#"{"z":1,"a":2,"m":3}"#).unwrap();
+    let obj = v.as_object().unwrap();
+    let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        vec!["a", "m", "z"],
+        "serde_json::Map is no longer BTreeMap-backed — `preserve_order` is \
+         on somewhere in the workspace's unified feature set. Re-measure \
+         `index_field`'s owned-chain fix (module doc comment's \"Cost\" \
+         section) and requalify its complexity wording (ruling P21/P24) \
+         before relying on this crate's flat-not-quadratic claim."
+    );
+}
+
+// ---- `7b441b4`'s bare-`}` tightening changes the `ExprError` variant a
+// `}`-continuation input produces (fix round 3, m-4): a candidate closing
+// quote followed by a lone `}` used to be accepted as a plausible
+// continuation (so the scan kept going, found no real `}}`, and the parser
+// later raised `UnexpectedToken` on the leftover text); it is now rejected,
+// so the scan itself reports `Unterminated`. Strictly information-reducing
+// (no secret text differs between the two variants), but a public-API
+// behaviour change for any caller matching on `ExprError`, previously
+// asserted nowhere. ----
+
+#[test]
+fn a_lone_closing_brace_is_unterminated_not_unexpected_token() {
+    // `'x'` closes at its second quote; what immediately follows (after
+    // whitespace) is a single `}`, not `}}`. Before this fix, a lone `}`
+    // was accepted as a plausible continuation, so the string closed here,
+    // the scan found the real `}}` two bytes later, and the resulting inner
+    // expression `'x' }` failed to *parse* (trailing garbage after the
+    // string literal) — `ExprError::UnexpectedToken`. After this fix, the
+    // lone `}` is rejected (it is not paired), so the string is treated as
+    // still open, no later quote character exists to close it, and the
+    // scan itself reports `ExprError::Unterminated` instead — it never
+    // reaches the parser at all.
+    let err = interpolate(TemplateSource::from_workflow_file("${{ 'x' } }}"), &ctx()).unwrap_err();
+    assert!(
+        matches!(err, ExprError::Unterminated),
+        "expected Unterminated, got {err:?}"
+    );
+}

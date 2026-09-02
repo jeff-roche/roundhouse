@@ -859,7 +859,11 @@ pub fn interpolate(template: TemplateSource<'_>, ctx: &ExprContext) -> Result<St
 /// every expression goes through, for a difference that has no observed
 /// behavioural consequence today) or removing it from this function (giving
 /// back the exact cross-block merge the lookahead was added to fix). Neither
-/// is this fix round's call to make unilaterally.
+/// is this fix round's call to make unilaterally (fix round 3, m-3: named
+/// here rather than left ownerless). **Owner: whoever next touches
+/// [`Parser::parse_string_literal`] or [`find_closing_delimiter`]** — align
+/// the two functions' quote-closing rules, or explicitly re-affirm the
+/// disagreement, as part of that change rather than as a separate pass.
 fn find_closing_delimiter(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -905,6 +909,19 @@ fn find_closing_delimiter(s: &str) -> Option<usize> {
 /// not followed by a second one still fails to parse moments later). Now
 /// requires the second byte, matching [`find_closing_delimiter`]'s own
 /// `b'}' && bytes.get(i + 1) == Some(&b'}')` check exactly.
+///
+/// **This does change one observable thing (fix round 3, m-4): the
+/// `ExprError` variant a `}`-continuation input produces.** Driven
+/// end-to-end through [`interpolate`], a candidate closing quote followed
+/// by a lone `}` (or `}x`, or `} `) used to be accepted as a plausible
+/// continuation, so the scan would keep going, find no real `}}`, and the
+/// overall result was [`ExprError::UnexpectedToken`] raised later by the
+/// parser on the leftover text; it is now rejected here, so the scan
+/// reports [`ExprError::Unterminated`] instead. All other 15 measured
+/// continuation shapes are unaffected. Strictly information-reducing (no
+/// secret text is in either variant either way), but it is a public-API
+/// behaviour change for any caller matching on `ExprError`, pinned by
+/// `tests/expr.rs::a_lone_closing_brace_is_unterminated_not_unexpected_token`.
 fn looks_like_a_real_string_close(bytes: &[u8], mut i: usize) -> bool {
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
@@ -1388,19 +1405,24 @@ fn as_f64(v: &Value) -> f64 {
 /// "Cost" section for the numbers and the harness that produced them.
 ///
 /// **This still assumes `serde_json::Map` is its default, `BTreeMap`-backed
-/// form (ruling P21).** `Map::remove` being O(sibling count) rather than
-/// O(subtree size) is what makes the claim above hold; if any crate in this
-/// workspace ever enables serde_json's `preserve_order` feature, Cargo's
-/// workspace-wide feature unification silently changes `Map` to an
-/// `IndexMap`, and `IndexMap::shift_remove` becomes a shift of every sibling
-/// after the removed key — still linear in sibling count, not subtree size,
-/// so this fix does not regress, but the wording above ("a lookup plus a
-/// move ... touches only the current level's own bookkeeping") would need a
-/// qualifier. `roundhouse-flow` does not enable `preserve_order` itself and
-/// has no way to see whether some other crate in the workspace does; this is
-/// tracked as a final-integration check (`cargo tree -e features -i
-/// serde_json` should show it off), not something this module can verify on
-/// its own.
+/// form (ruling P21, upgraded to a test by P24).** `Map::remove` being
+/// O(sibling count) rather than O(subtree size) is what makes the claim
+/// above hold; if any crate in this workspace ever enables serde_json's
+/// `preserve_order` feature, Cargo's workspace-wide feature unification
+/// silently changes `Map` to an `IndexMap`. Checked against the pinned
+/// `serde_json` 1.0.151 source
+/// (`~/.cargo/registry/src/index.crates.io-*/serde_json-1.0.151/src/map.rs:156-165`),
+/// not assumed: under `preserve_order`, `Map::remove` routes to
+/// **`swap_remove`**, not `shift_remove` — O(1) (swap with the last
+/// element), not O(sibling count) — so this fix would not regress even
+/// then, and the claim above is *stronger* than the O(sibling count)
+/// fallback this comment used to describe. `preserve_order` is
+/// runtime-detectable (`serde_json::Map`'s iteration order is sorted
+/// without the feature, insertion-ordered with it), so
+/// `tests/expr.rs::preserve_order_feature_is_off` asserts sorted iteration
+/// directly rather than leaving this to a manual `cargo tree -e features -i
+/// serde_json` check at integration — see that test for the assertion this
+/// module now enforces on its own.
 fn index_field<'a>(v: Cow<'a, Value>, field: &str) -> Cow<'a, Value> {
     match v {
         Cow::Borrowed(r) => match r.get(field) {
