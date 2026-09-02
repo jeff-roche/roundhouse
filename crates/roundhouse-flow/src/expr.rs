@@ -101,6 +101,38 @@
 //! absence of a fix for the absence of a decision, and does not have to
 //! rediscover the residual by reading `call_function`'s `"env"` arm cold.
 //!
+//! ## The trust newtypes assert at the call site, not the parse boundary — a Task 13 design input (ruling P23)
+//!
+//! [`TemplateSource`], [`JsonTemplateSource`], and [`ExpressionSource`] meet
+//! ruling P20's stated bar — one visible, greppable `::from_workflow_file`
+//! call at the point a template or expression's trust is established — and
+//! no more. All three constructors are infallible and accept any `&str`/
+//! `&Value`; none of the three types derive `Clone`/`Debug`, so nothing can
+//! hold one, and every call site in this crate builds one inline as a
+//! temporary, immediately consumed by `interpolate`/`interpolate_json`/
+//! `eval`. Wrapping an untrusted `String` reproduces the P20 abuse
+//! verbatim — the newtype makes the trust assertion auditable at each call
+//! site, but does not make an *un*trusted value harder to wrap.
+//!
+//! The design that would buy real visibility is to establish trust where it
+//! is actually established, not where the template is consumed: have
+//! `parse::parse_workflow` hand back step fields already typed as
+//! `TemplateSource`/`ExpressionSource`, so the assertion happens once per
+//! workflow at the YAML boundary and the type *flows* into the evaluator —
+//! a caller holding an untrusted `String` would then have nothing to wrap
+//! and no obvious way to obtain one, instead of a one-line escape available
+//! at every call site.
+//!
+//! **Deliberately not done here.** It requires a storable (owned + `Clone`)
+//! type and it changes `parse`'s output types, which Tasks 13-21 build on —
+//! retrofitting that through nine downstream tasks is the expensive
+//! version; doing it speculatively now, before an executor exists to show
+//! what actually needs to flow, is the wrong version. It is a required
+//! design input to Task 13 (the first task that holds both a parsed
+//! workflow and an evaluator, and therefore the first place this can be
+//! decided against real usage, not speculatively) — recorded here so the
+//! next owner finds this analysis rather than rediscovering it.
+//!
 //! ## A resolved value can carry control characters the workflow YAML never had
 //!
 //! §8.9 requires `json()`, and `json('"a\nb"')` decodes the two literal
@@ -563,6 +595,46 @@ impl fmt::Debug for ExprContext {
     }
 }
 
+/// Asserts that the wrapped text is safe to evaluate as a bare `${{ }}`
+/// expression — the sibling of [`TemplateSource`] for [`eval`] rather than
+/// [`interpolate`]. See ruling P22 (fix round 3, item 1): P20's trust
+/// assertion covers **all three** public entry points into this module, not
+/// just `interpolate`/`interpolate_json`. `eval` is in fact the *shortest*
+/// path to the abuse P20 exists to prevent, because it skips the `${{ }}`
+/// delimiters entirely — `eval` on the bare text `env('ANTHROPIC_API_KEY')`
+/// (no `${{ }}` needed at all) returns the daemon's provider key exactly as
+/// `${{ env('ANTHROPIC_API_KEY') }}` does through `interpolate`. Measured on
+/// HEAD with a planted key: `eval("env('ANTHROPIC_API_KEY')", &ctx)` ->
+/// `"sk-ant-PRETEND-KEY"`.
+///
+/// A distinct type from [`TemplateSource`], not a reuse of it, because the
+/// two wrap different grammars: `TemplateSource` wraps a whole template —
+/// arbitrary surrounding text plus zero or more `${{ }}` blocks —
+/// `ExpressionSource` wraps a single bare expression with no delimiters and
+/// no surrounding text. Constructible only through
+/// [`ExpressionSource::from_workflow_file`], for the same reason
+/// `TemplateSource` is: one explicit, greppable call site at the point an
+/// expression's trust is established, rather than an invisible type
+/// coincidence between `&str` (expression text) and `&str` (an ordinary,
+/// possibly-untrusted string value). The abuse path this closes: a Task 5/6
+/// caller evaluating an `if:`/`over:` expression whose text is not
+/// workflow-file-controlled (a webhook field, a `map.over` item, a
+/// previously evaluated result) must not be able to hand that text straight
+/// to `eval`.
+pub struct ExpressionSource<'a>(&'a str);
+
+impl<'a> ExpressionSource<'a> {
+    /// Asserts that `expr` is the workflow file's own YAML source for a
+    /// bare expression field (`if:`, `over:`, …) as authored — not an
+    /// evaluated expression result, a `map.over` item, webhook payload, or
+    /// any other value this evaluator's caller does not control. See
+    /// [`ExpressionSource`]'s own doc comment for what is at stake if that
+    /// assertion is wrong.
+    pub fn from_workflow_file(expr: &'a str) -> Self {
+        Self(expr)
+    }
+}
+
 /// Evaluates one `${{ ... }}` inner expression (without the delimiters)
 /// against `ctx`. See the module doc comment for the frozen grammar and
 /// function set.
@@ -574,7 +646,23 @@ impl fmt::Debug for ExprContext {
 /// read and `json()`'s documented string-argument parse). Named `eval` to
 /// match §8.9's own vocabulary for this frozen language, not because it
 /// evaluates arbitrary input.
-pub fn eval(expr: &str, ctx: &ExprContext) -> Result<Value, ExprError> {
+///
+/// Takes an [`ExpressionSource`], not a bare `&str` — see its doc comment
+/// for why (ruling P22). `eval` carries the identical P20 trust assertion
+/// that [`interpolate`]/[`interpolate_json`] carry: the three public entry
+/// points into this module are symmetric, not two guarded and one bare.
+pub fn eval(expr: ExpressionSource<'_>, ctx: &ExprContext) -> Result<Value, ExprError> {
+    eval_inner(expr.0, ctx)
+}
+
+/// The recursive-descent implementation behind [`eval`]. Private and
+/// untyped-by-`ExpressionSource` on purpose, mirroring
+/// [`interpolate_json_inner`]: the trust assertion belongs once, at the
+/// public entry point, not re-asserted at [`interpolate`]'s own internal
+/// call for each `${{ }}` block it finds — that inner text is already known
+/// trusted by construction, because it was sliced out of a template that
+/// itself only reached [`interpolate`] through a [`TemplateSource`].
+fn eval_inner(expr: &str, ctx: &ExprContext) -> Result<Value, ExprError> {
     let mut p = Parser {
         s: expr.as_bytes(),
         pos: 0,
@@ -649,7 +737,7 @@ pub fn interpolate(template: TemplateSource<'_>, ctx: &ExprContext) -> Result<St
         let after = &rest[start + 3..];
         let end = find_closing_delimiter(after).ok_or(ExprError::Unterminated)?;
         let inner = &after[..end];
-        let value = eval(inner.trim(), ctx)?;
+        let value = eval_inner(inner.trim(), ctx)?;
         out.push_str(&value_to_string(&value));
         // Resume scanning strictly after the consumed `}}`, in the
         // *original* template — never re-scan `value`'s own text. This is
