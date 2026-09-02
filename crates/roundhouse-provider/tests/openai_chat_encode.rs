@@ -58,6 +58,7 @@ fn reasoning_profile() -> ProviderProfile {
                 ]),
             }),
             endpoint_preference: vec![],
+            azure_deployment: None,
         }],
         ..no_reasoning_profile()
     }
@@ -87,6 +88,7 @@ fn zai_like_profile() -> ProviderProfile {
                 ]),
             }),
             endpoint_preference: vec![],
+            azure_deployment: None,
         }],
         ..no_reasoning_profile()
     }
@@ -118,6 +120,7 @@ fn qwen_like_profile() -> ProviderProfile {
                 ]),
             }),
             endpoint_preference: vec![],
+            azure_deployment: None,
         }],
         ..no_reasoning_profile()
     }

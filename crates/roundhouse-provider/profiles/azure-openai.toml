@@ -1,0 +1,43 @@
+# crates/roundhouse-provider/profiles/azure-openai.toml
+#
+# Azure OpenAI: ordinary openai-chat wire bodies (encode_openai_chat/
+# decode_openai_chat_stream, reused verbatim), routed by DEPLOYMENT NAME
+# rather than model id -- see azure_provider.rs / azure_deployment_routing.rs.
+#
+# URL shape and auth verified against Microsoft's own current REST API
+# reference (fetched 2026-09-02):
+# https://learn.microsoft.com/en-us/azure/foundry/openai/reference -- "REST
+# API versioning" section:
+#   POST https://YOUR_RESOURCE_NAME.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT_NAME/chat/completions?api-version=2024-06-01
+# and its "Authentication" section: "API Key authentication: ... the API Key
+# in the api-key HTTP header" / "Microsoft Entra ID authentication: ...
+# Authorization header ... preceded by Bearer".
+id = "azure-openai"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+# Customer-resource-specific in reality (`https://{resource}.openai.azure.com`)
+# -- this is the profile default; every real deployment overrides it via
+# ROUNDHOUSE_AZURE_OPENAI_BASE_URL (§9.9).
+base_url = "https://my-resource.openai.azure.com"
+# Azure supports both a static `api-key` header and Entra OAuth; the header-key
+# form is the default here since it needs no tenant/client-id setup to try.
+# Entra is reachable the same way every other profile's alternate credential
+# is: supply an `AzureEntraCredential` via `RequestCtx.credentials`, which
+# `AzureOpenAiProvider` applies without ever matching on which concrete
+# `CredentialProvider` it was given.
+auth = { kind = "header_key", header = "api-key" }
+
+[[model]]
+match = ["gpt-5.4"]
+azure_deployment = "gpt-5-4-prod"
+
+[[model]]
+match = ["gpt-4o"]
+azure_deployment = "gpt-4o-prod"
+
+[errors]
+"429" = { disposition = "shed_concurrency" }
+"503" = { disposition = "retry_backoff" }
+"401" = { disposition = "fatal", category = "quota" }

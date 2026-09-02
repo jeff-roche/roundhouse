@@ -14,6 +14,14 @@ use std::pin::Pin;
 /// crate.
 pub mod eventstream;
 
+/// The `azure-deployment-routing` transport shim (§9.4, Phase 6 Task 14):
+/// pure URL construction for Azure OpenAI's deployment-name-based routing.
+/// `pub`, not `pub(crate)`, for the same reason as `eventstream` above
+/// (`transport` itself stays a crate-private `mod` in `lib.rs`) — re-exported
+/// at the crate root (`lib.rs`) so external test crates can reach it despite
+/// `transport` being private.
+pub mod azure_deployment_routing;
+
 /// HTTP request to be sent via `HttpTransport`.
 pub struct HttpRequest {
     /// HTTP method (e.g., "GET", "POST").

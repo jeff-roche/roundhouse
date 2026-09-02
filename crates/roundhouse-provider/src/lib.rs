@@ -45,6 +45,13 @@ pub use ir::{
 pub use provider_trait::{BoxFut, Provider};
 pub use reqwest_transport::ReqwestTransport;
 pub use stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
+// REALITY-CORRECTIONS §2/§14a: `transport` is a private `mod`, so its public
+// submodules aren't externally reachable through it directly — re-export the
+// whole submodule here (as `eventstream`'s sibling shim, `azure_deployment_routing`,
+// needs to be usable from this crate's external `tests/` crates, unlike
+// `eventstream`, which today is only ever reached from `codec::bedrock_converse`,
+// a sibling module inside this same crate).
+pub use transport::azure_deployment_routing;
 pub use transport::{HttpRequest, HttpResponseStream, HttpTransport, TransportError};
 
 // §9.5: build.rs validates every `profiles/*.toml` at compile time and emits

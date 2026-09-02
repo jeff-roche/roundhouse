@@ -6,10 +6,12 @@
 //! reused unchanged by every `openai-chat` profile from here on (§9.1's "the
 //! provider is data" thesis).
 
+pub mod azure_provider;
 mod decode;
 mod encode;
 pub mod provider;
 mod reasoning_field_validation;
+pub use azure_provider::AzureOpenAiProvider;
 pub use decode::decode_openai_chat_stream;
 pub use encode::encode_openai_chat;
 pub use provider::OpenAiChatProvider;

@@ -140,6 +140,12 @@ pub struct ModelEntry {
     /// `#[serde(default)]` keeps `moonshot.toml` and friends parsing unchanged.
     #[serde(default)]
     pub endpoint_preference: Vec<EndpointPref>,
+    /// Azure OpenAI only (Task 14, audit finding 2): the deployment name
+    /// this model id maps to in the customer's Azure resource. `None` for
+    /// every non-Azure profile — `#[serde(default)]` keeps every existing
+    /// profile parsing unchanged.
+    #[serde(default)]
+    pub azure_deployment: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
