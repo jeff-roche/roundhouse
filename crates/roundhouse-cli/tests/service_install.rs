@@ -23,7 +23,7 @@ fn systemd_unit_names_the_actual_installed_binary_and_restarts_always() {
     // Fix round 1 (security review, H1): the exec path is now quoted so
     // systemd's `ExecStart=` word-splitting can't be fooled by a space in
     // the path — see `systemd_execstart_names_the_exact_verified_path_*`
-    // below for the property test this format exists to satisfy.
+    // below for the round-trip check this format exists to satisfy.
     assert!(unit.contains("ExecStart=\"/home/user/.local/bin/round\" daemon"));
     assert!(unit.contains("Restart=always"));
     // §8.7: "Persistent=true buys nothing" — we do our own catch-up, so the
@@ -45,6 +45,10 @@ fn launchd_plist_names_the_actual_installed_binary_and_keeps_alive() {
 /// space. Before this fix, an unquoted `ExecStart=/tmp/rh build/round
 /// daemon` would have systemd split it into executable `/tmp/rh` with argv
 /// `build/round daemon` — a completely different, attacker-creatable path.
+///
+/// Example-based (this one input, not a generative property test), but the
+/// escaping model it checks against real `systemd-analyze verify --user`
+/// behavior has been independently confirmed by security review.
 #[test]
 fn systemd_execstart_names_the_exact_verified_path_even_with_a_space() {
     let exec_path = Path::new("/tmp/rh build/round");
@@ -77,8 +81,9 @@ fn systemd_execstart_doubles_percent_signs_so_systemd_does_not_expand_a_specifie
 /// Inverse of the escaping `render_systemd_unit` applies to its
 /// `ExecStart=` value: strips the wrapping double quotes, un-backslash
 /// escapes, then un-doubles `%` — i.e. exactly what systemd's own unit-file
-/// parser does before exec'ing. Test-only: proves the round-trip property
-/// directly rather than just eyeballing the rendered string.
+/// parser does before exec'ing. Test-only: demonstrates the round-trip for
+/// these specific example inputs rather than just eyeballing the rendered
+/// string.
 fn unescape_systemd_word(quoted: &str) -> String {
     let inner = quoted
         .strip_prefix('"')
@@ -105,10 +110,53 @@ fn launchd_plist_escapes_xml_special_characters_in_the_exec_path() {
     assert!(!plist.contains("<string>/tmp/a&b<c>/round</string>"));
 }
 
+/// Fix round 2 (code review): the systemd side round-trips through a real
+/// unescape; the launchd tests before this one only used `contains`, which
+/// would still pass even if a future escaping regression left the raw
+/// substring present alongside broken XML elsewhere. This extracts the
+/// first `<string>` in `ProgramArguments` and un-escapes it exactly the way
+/// an XML parser would, proving the recovered value equals the original
+/// path — for a path with XML-special characters, and for one with a space.
 #[test]
-fn launchd_plist_preserves_a_path_with_a_space() {
-    let plist = render_launchd_plist(Path::new("/tmp/rh build/round"));
-    assert!(plist.contains("<string>/tmp/rh build/round</string>"));
+fn launchd_plist_program_argument_round_trips_xml_special_characters() {
+    let exec_path = Path::new("/tmp/a&b<c>/round");
+    let plist = render_launchd_plist(exec_path);
+    let recovered = unescape_xml_text(&first_program_argument(&plist));
+    assert_eq!(recovered, exec_path.to_str().unwrap());
+}
+
+#[test]
+fn launchd_plist_program_argument_round_trips_a_path_with_a_space() {
+    let exec_path = Path::new("/tmp/rh build/round");
+    let plist = render_launchd_plist(exec_path);
+    let recovered = unescape_xml_text(&first_program_argument(&plist));
+    assert_eq!(recovered, exec_path.to_str().unwrap());
+}
+
+/// Extracts the text of the first `<string>` element inside
+/// `<key>ProgramArguments</key>`'s `<array>` — the binary path
+/// `render_launchd_plist` substitutes. Test-only parsing, deliberately
+/// simple (no real XML parser dependency) since it only needs to locate one
+/// well-known element in output this same test file controls the shape of.
+fn first_program_argument(plist: &str) -> String {
+    let key = "<key>ProgramArguments</key>";
+    let after_key = &plist[plist.find(key).expect("ProgramArguments key present") + key.len()..];
+    let array_start = after_key.find("<array>").expect("array present") + "<array>".len();
+    let after_array_open = &after_key[array_start..];
+    let string_start =
+        after_array_open.find("<string>").expect("string present") + "<string>".len();
+    let after_string_open = &after_array_open[string_start..];
+    let string_end = after_string_open
+        .find("</string>")
+        .expect("closing string tag present");
+    after_string_open[..string_end].to_string()
+}
+
+/// Inverse of `escape_xml_text` in the crate under test.
+fn unescape_xml_text(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 /// Fix round 1 (security review, H1.4): launchd's log paths use `~`, which
@@ -212,6 +260,33 @@ fn install_to_writes_files_that_are_not_group_or_world_writable() {
     );
 }
 
+/// Fix round 2 (code review, M): `--force` must *repair* a unit file that
+/// already exists at a permissive mode, not just overwrite its contents.
+/// The first cut of `write_unit_file` moved `0o644` from a post-open
+/// `set_permissions` to `OpenOptionsExt::mode`, which `open(2)` silently
+/// ignores whenever `O_CREAT` doesn't actually create the file — exactly
+/// the `--force` overwrite-an-existing-file path.
+#[cfg(unix)]
+#[test]
+fn install_to_with_force_repairs_a_permissive_existing_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let exec_path = Path::new("/home/user/.local/bin/round");
+    let unit_path = dir.path().join("roundhouse.service");
+    std::fs::write(&unit_path, "# stale, world-writable\n").unwrap();
+    std::fs::set_permissions(&unit_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    install_to(dir.path(), OsFamily::Linux, exec_path, true).unwrap();
+
+    let mode = std::fs::metadata(&unit_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode & 0o022,
+        0,
+        "--force must repair a pre-existing permissive mode, not just overwrite content"
+    );
+}
+
 /// Fix round 1 (security review, M1's downstream item): a *pre-existing*
 /// install directory that is group/world-writable must be refused, not
 /// silently written into -- a writable directory defeats the file's own
@@ -228,6 +303,28 @@ fn install_to_refuses_a_pre_existing_group_writable_install_dir() {
     let err = install_to(dir.path(), OsFamily::Linux, exec_path, false).unwrap_err();
     assert!(matches!(err, ServiceInstallError::UnsafeInstallDir { .. }));
     assert!(!dir.path().join("roundhouse.service").exists());
+}
+
+/// Fix round 2 (code review, L): the install-directory check must walk
+/// ancestors just like the exec-path check does -- `$XDG_CONFIG_HOME` at
+/// `/srv/shared/cfg` with `/srv/shared` group-writable and `cfg/` itself a
+/// safe `0700` must still be refused, because any group member can rename
+/// `cfg` out from under the victim and substitute their own tree.
+#[cfg(unix)]
+#[test]
+fn install_to_refuses_an_install_dir_with_a_writable_grandparent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+    let cfg_dir = root.path().join("cfg");
+    std::fs::create_dir(&cfg_dir).unwrap();
+    std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let exec_path = Path::new("/home/user/.local/bin/round");
+
+    let err = install_to(&cfg_dir, OsFamily::Linux, exec_path, false).unwrap_err();
+    assert!(matches!(err, ServiceInstallError::UnsafeInstallDir { .. }));
+    assert!(!cfg_dir.join("roundhouse.service").exists());
 }
 
 /// H1.2 (security review): a raw newline in the exec path must be rejected
@@ -274,6 +371,27 @@ fn uninstall_from_removes_previously_installed_files_and_tolerates_absence() {
 
     // Uninstalling again (nothing left to remove) is not an error.
     uninstall_from(dir.path(), OsFamily::Linux).unwrap();
+}
+
+/// Fix round 2 (code review, L): `uninstall_from` must also clean up
+/// `roundhouse.socket`, a file an earlier version of this installer wrote
+/// (before the orchestrator ruling that removed it from `install_to`) but
+/// that current code never writes and therefore, without this, would never
+/// remove either -- leaving an upgraded user's enabled, still-loaded socket
+/// unit orphaned forever.
+#[test]
+fn uninstall_from_removes_the_legacy_socket_unit_left_by_an_earlier_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let exec_path = Path::new("/home/user/.local/bin/round");
+    install_to(dir.path(), OsFamily::Linux, exec_path, false).unwrap();
+    // Simulate a leftover from the previous installer version, which wrote
+    // this file directly (current `install_to` no longer does).
+    std::fs::write(dir.path().join("roundhouse.socket"), "[Socket]\n").unwrap();
+
+    uninstall_from(dir.path(), OsFamily::Linux).unwrap();
+
+    assert!(!dir.path().join("roundhouse.service").exists());
+    assert!(!dir.path().join("roundhouse.socket").exists());
 }
 
 #[cfg(unix)]
@@ -326,6 +444,28 @@ fn check_exec_path_safe_walks_ancestors_and_rejects_a_shared_writable_grandparen
 
     let err = check_exec_path_safe(&exe).unwrap_err();
     assert!(matches!(err, ServiceInstallError::UnsafeExecPath { .. }));
+}
+
+/// Fix round 2 (code review): the ancestor-directory walk doesn't cover a
+/// permissive mode on the exec *file* itself -- a `round` binary at
+/// `0666` under perfectly safe `0755` ancestors is still directly
+/// overwritable by any local user.
+#[cfg(unix)]
+#[test]
+fn check_exec_path_safe_rejects_a_world_writable_exec_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let exe = dir.path().join("round");
+    std::fs::write(&exe, b"").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    let err = check_exec_path_safe(&exe).unwrap_err();
+    assert!(matches!(
+        err,
+        ServiceInstallError::UnsafeExecFileMode { .. }
+    ));
 }
 
 #[cfg(unix)]

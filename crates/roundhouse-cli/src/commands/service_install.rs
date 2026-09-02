@@ -17,15 +17,21 @@
 //!   `/Library/LaunchDaemons` — and nothing here shells out to `sudo`.
 //! - **The exec path is derived from the running executable**
 //!   ([`resolve_exec_path`]), canonicalized to resolve any symlink, and
-//!   rejected by [`check_exec_path_safe`] if *any ancestor directory* — not
-//!   just its immediate parent — is group- or world-writable without the
-//!   sticky bit. Without the ancestor walk, `/srv/shared/bin/round` would
-//!   pass with `bin/` at a safe `0755` even though `/srv/shared` itself is a
-//!   shared, writable-by-everyone directory: any other member could replace
-//!   `bin/` wholesale. Without the group-write check, a `0775` directory
-//!   owned by a shared group (common on build hosts / NFS trees) would pass
-//!   too. Either gap lets a boot-persistent unit end up pointed at a path
-//!   another local user can later replace with their own binary.
+//!   checked by [`check_exec_path_safe`], which rejects it if: the exec
+//!   *file itself* is group- or world-writable (directly overwritable by
+//!   any local user regardless of what its ancestor directories look like);
+//!   or *any ancestor directory* — not just its immediate parent — is
+//!   group- or world-writable without the sticky bit. Without the ancestor
+//!   walk, `/srv/shared/bin/round` would pass with `bin/` at a safe `0755`
+//!   even though `/srv/shared` itself is a shared, writable-by-everyone
+//!   directory: any other member could replace `bin/` wholesale. Without
+//!   the group-write check, a `0775` directory owned by a shared group
+//!   (common on build hosts / NFS trees) would pass too. Any of these gaps
+//!   lets a boot-persistent unit end up pointed at a path another local
+//!   user can replace with their own binary. [`install_to`] applies the
+//!   same ancestor walk to the *install directory* for the identical
+//!   reason: a shared, writable `$XDG_CONFIG_HOME` grandparent is just as
+//!   replaceable as a shared exec-path grandparent.
 //! - **The exec path is validated before it is ever embedded in a rendered
 //!   unit/plist** ([`resolve_exec_path`] and [`install_to`] both call
 //!   [`validate_exec_path_for_render`]): non-UTF-8 paths are rejected
@@ -47,16 +53,23 @@
 //! - **Never clobbers.** [`install_to`] refuses to overwrite an existing
 //!   unit file unless `force` is set, so a hand-customised unit is never
 //!   silently destroyed.
-//! - **File permissions.** Every file this module writes is created with
-//!   `0o644` (owner read/write, group/other read-only) passed directly to
-//!   the creating `open(2)` call (`OpenOptionsExt::mode`), not applied via a
-//!   separate `chmod` afterwards — so there is no window in which the file
-//!   briefly exists with a more permissive mode under a permissive umask.
-//!   The directory [`install_to`] creates is `0o700`; if the directory
-//!   already existed with a group- or world-writable mode, `install_to`
-//!   refuses rather than writing into it (a writable *directory* lets
-//!   another user replace the unit file wholesale regardless of the file's
-//!   own mode).
+//! - **File permissions, on both the create and `--force` paths.** Every
+//!   file this module writes is created with `0o644` passed directly to the
+//!   creating `open(2)` call (`OpenOptionsExt::mode`), closing the
+//!   permissive-umask window a post-hoc `chmod` would otherwise leave open
+//!   on first creation — *and* `write_unit_file` additionally calls
+//!   `set_permissions(0o644)` after opening, because `open(2)`'s mode
+//!   argument is silently ignored whenever `O_CREAT` doesn't actually
+//!   create the file (i.e. exactly the `--force` overwrite path). Without
+//!   the second call, `round service install --force` over a unit file that
+//!   already existed at a permissive mode (hand-copied under a loose umask,
+//!   restored from an archive, synced from another host) would leave it
+//!   just as permissive — precisely the moment a user expects the file to
+//!   be put right. The directory [`install_to`] creates is `0o700`; if the
+//!   directory (or any of its ancestors) already existed group- or
+//!   world-writable, `install_to` refuses rather than writing into it (a
+//!   writable *directory* lets another user replace the unit file wholesale
+//!   regardless of the file's own mode).
 //! - **`$HOME`/`$XDG_CONFIG_HOME` must be absolute.** [`install`]/
 //!   [`uninstall`] hard-error if `$HOME` is unset or relative, rather than
 //!   falling back to the process's current directory — matching the
@@ -64,11 +77,17 @@
 //!   rejects a relative `$XDG_RUNTIME_DIR` for the same reason. A relative
 //!   `$XDG_CONFIG_HOME` is likewise ignored per the XDG base-directory
 //!   spec, falling back to `$HOME/.config`.
-//! - **No socket-activation unit is shipped.** See the comment in
-//!   `packaging/systemd/roundhouse.service` and this module's `install_to`:
-//!   the daemon does not implement `sd_listen_fds`/`LISTEN_FDS`, so a
-//!   `.socket` unit here would bind a socket nobody accepts on and hang
-//!   whoever connects to it.
+//! - **No socket-activation unit is shipped** (new installs), **and a
+//!   leftover one from before this decision is cleaned up** (upgrades). See
+//!   the comment in `packaging/systemd/roundhouse.service` and this
+//!   module's `install_to`: the daemon does not implement
+//!   `sd_listen_fds`/`LISTEN_FDS`, so a `.socket` unit here would bind a
+//!   socket nobody accepts on and hang whoever connects to it.
+//!   [`uninstall_from`] additionally removes [`LINUX_LEGACY_UNIT_FILES`] —
+//!   the `.socket` unit an earlier version of this installer wrote — so
+//!   upgrading and then uninstalling doesn't orphan an enabled, still-loaded
+//!   socket unit that nothing installed by the *current* version would ever
+//!   clean up.
 //!
 //! ## Testability
 //!
@@ -107,6 +126,16 @@ pub enum OsFamily {
 const LINUX_UNIT_FILES: &[&str] = &["roundhouse.service"];
 /// Files a macOS install writes, relative to [`install_dir`].
 const MACOS_UNIT_FILES: &[&str] = &["com.roundhouse.daemon.plist"];
+/// Files an earlier version of this installer wrote for Linux that
+/// [`install_to`] no longer writes, but [`uninstall_from`] must still remove
+/// — fix round 2 (code review): shrinking [`LINUX_UNIT_FILES`] correctly
+/// stopped *writing* `roundhouse.socket`, but it also stopped *removing* it,
+/// so anyone who installed the previous version and then upgraded and ran
+/// `round service uninstall` would be left with an enabled, still-loaded
+/// socket unit nobody accepts on — exactly the client-hang its removal was
+/// meant to prevent, now orphaned and unreachable by the tool that created
+/// it.
+const LINUX_LEGACY_UNIT_FILES: &[&str] = &["roundhouse.socket"];
 
 /// Renders the systemd *user* unit (§8.7: "ship a systemd user service")
 /// with the actual installed binary path substituted in. The committed
@@ -200,11 +229,13 @@ fn escape_xml_text(s: &str) -> String {
 ///
 /// Best-effort: falls back to `.` if `$HOME` is unset, because this
 /// function's signature (pinned by this task's brief) returns a plain
-/// `PathBuf` with no way to report an error. [`install`]/[`uninstall`] — the
-/// functions that actually touch the filesystem — use
-/// [`resolved_install_dir`] instead, which hard-errors on an unset or
-/// relative `$HOME` rather than silently resolving into the process's
-/// current directory.
+/// `PathBuf` with no way to report an error. **Prefer [`resolved_install_dir`]
+/// for anything other than shape-checking/testing** — it hard-errors on an
+/// unset or relative `$HOME` instead of silently degrading to a path
+/// relative to the process's current directory, and is the function
+/// [`install`]/[`uninstall`] actually use. This function's `PathBuf`-only,
+/// best-effort shape exists only because this task's brief pins that exact
+/// signature, not because it's the one new callers should reach for.
 pub fn install_dir(os: OsFamily) -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -238,11 +269,16 @@ fn build_install_dir(os: OsFamily, home: &Path, xdg_config_home: Option<&Path>) 
     }
 }
 
-/// [`install_dir`]'s hard-erroring counterpart, used by [`install`]/
-/// [`uninstall`]: refuses to guess a fallback when `$HOME` is unset or
-/// relative rather than risk writing a boot-persistent unit under the
-/// process's current directory.
-fn resolved_install_dir(os: OsFamily) -> Result<PathBuf, ServiceInstallError> {
+/// [`install_dir`]'s hard-erroring counterpart: refuses to guess a fallback
+/// when `$HOME` is unset or relative rather than risk writing a
+/// boot-persistent unit under the process's current directory.
+/// [`install`]/[`uninstall`] use this, not [`install_dir`] — and so should
+/// any future caller that needs the *real* install location (a `round
+/// service status`, or a "would install to X" dry run, say). Public since
+/// fix round 2 (code review): this is the safe function to reach for, and
+/// [`install_dir`]'s best-effort fallback existing as the only previously
+/// public option was a trap for exactly that kind of future caller.
+pub fn resolved_install_dir(os: OsFamily) -> Result<PathBuf, ServiceInstallError> {
     let home = require_home(std::env::var_os("HOME").map(PathBuf::from))?;
     let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     Ok(build_install_dir(os, &home, xdg_config_home.as_deref()))
@@ -281,14 +317,21 @@ pub enum ServiceInstallError {
          to and retry"
     )]
     UnsafeExecPath { path: PathBuf, dir: PathBuf },
+    #[error(
+        "refusing to use {path} as the daemon's install path: the file itself is group- or \
+         world-writable, so another local user could overwrite it directly regardless of its \
+         directory's permissions; fix its mode (chmod 755) and retry"
+    )]
+    UnsafeExecFileMode { path: PathBuf },
     #[error("refusing to use {path:?} as the daemon's install path: it {reason}")]
     InvalidExecPath { path: PathBuf, reason: String },
     #[error("{path} already exists; rerun with --force to overwrite")]
     AlreadyExists { path: PathBuf },
     #[error(
-        "refusing to write into {dir}: it already exists and is group- or world-writable, \
-         which would let another local user replace an installed unit file regardless of the \
-         file's own permissions; fix its mode (chmod 700) and retry"
+        "refusing to write into {dir}: it (or one of its ancestor directories) is group- or \
+         world-writable without the sticky bit, which would let another local user replace an \
+         installed unit file wholesale regardless of the file's own permissions; fix its mode \
+         (chmod 700) and retry"
     )]
     UnsafeInstallDir { dir: PathBuf },
     #[error(
@@ -327,41 +370,86 @@ pub fn validate_exec_path_for_render(path: &Path) -> Result<(), ServiceInstallEr
     Ok(())
 }
 
-/// Rejects an exec path that resolves under a group- or world-writable
-/// directory without the sticky bit (the same shape `/tmp` deliberately
-/// avoids via `+t`), walking *every* ancestor directory up to the
-/// filesystem root — not just the immediate parent.
+/// A directory mode unsafe to leave a unit/binary sitting under: group- or
+/// world-writable (`0o022`) without the sticky bit (`0o1000`) — the sticky
+/// bit is what makes an otherwise-shared, writable directory safe (only the
+/// owner of an entry can rename/delete it out from under another user), the
+/// same shape `/tmp` relies on via `+t`.
+#[cfg(unix)]
+fn dir_mode_is_unsafely_writable(mode: u32) -> bool {
+    let group_or_world_writable = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    group_or_world_writable && !sticky
+}
+
+/// A *file* mode unsafe to execute/write-into: group- or world-writable.
+/// Unlike a directory, a regular file's sticky bit carries no
+/// restricted-write semantics, so there is no exemption to check for — any
+/// group/world write bit means any other local user (or, for world-write,
+/// anyone on the host) can overwrite its contents directly, regardless of
+/// what its parent directory's permissions look like.
+#[cfg(unix)]
+fn file_mode_is_unsafely_writable(mode: u32) -> bool {
+    mode & 0o022 != 0
+}
+
+/// Walks every ancestor directory of `path` (**not** including `path`
+/// itself) up to the filesystem root, returning the first one found
+/// unsafely writable by [`dir_mode_is_unsafely_writable`], or `None` if
+/// every ancestor is safe. Shared by [`check_exec_path_safe`] (walking the
+/// exec path's ancestors) and [`install_to`] (walking the install
+/// directory's ancestors) — the same "a shared, writable ancestor lets
+/// someone replace the whole subtree" attack shape applies to both, so
+/// fix round 2 made both use this one implementation rather than leaving
+/// the install-directory check one level deep while the exec-path check
+/// walked all the way up.
+#[cfg(unix)]
+fn first_unsafe_ancestor(path: &Path) -> io::Result<Option<PathBuf>> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        let mode = std::fs::metadata(d)?.permissions().mode();
+        if dir_mode_is_unsafely_writable(mode) {
+            return Ok(Some(d.to_path_buf()));
+        }
+        dir = d.parent();
+    }
+    Ok(None)
+}
+
+/// Rejects an exec path that is itself group- or world-writable
+/// ([`file_mode_is_unsafely_writable`]), or that resolves under a group- or
+/// world-writable ancestor directory without the sticky bit
+/// ([`first_unsafe_ancestor`]).
 ///
-/// The ancestor walk matters: `/srv/shared/bin/round` would pass a
-/// parent-only check if `bin/` itself is a safe `0755`, even though
-/// `/srv/shared` is a shared, writable directory anyone could replace `bin/`
-/// wholesale inside. Checking the group-write bit (`0o020`), not just
-/// world-write (`0o002`), matters too: a `0775` directory owned by a shared
-/// group — common on build hosts and NFS-mounted trees — is exactly as
-/// replaceable by any group member as a `0777` one is by any user.
+/// Checking the file's own mode matters on top of the ancestor walk: a
+/// `round` binary at `~/.local/bin/round` with mode `0664`/`0666` under
+/// perfectly safe `0755` ancestors is still directly overwritable by any
+/// local user — exactly the boot-persistent-execution risk the ancestor
+/// walk exists to prevent, just reached through the file instead of a
+/// directory.
 ///
-/// Deliberately does *not* check ownership (uid): the ancestor walk plus the
-/// group/world-write check already closes both concrete exploit shapes
-/// without it, and a uid comparison needs either a new capability or
-/// `/proc` parsing (`roundhouse-daemon`'s `check_owned_by_current_user`
-/// pattern), neither of which this narrower check needs to take on.
+/// Deliberately does *not* check ownership (uid) anywhere in this function:
+/// the ancestor walk plus the group/world-write checks already close every
+/// concrete exploit shape identified in review without it, and a uid
+/// comparison needs either a new capability or `/proc` parsing
+/// (`roundhouse-daemon`'s `check_owned_by_current_user` pattern), neither of
+/// which this narrower check needs to take on.
 pub fn check_exec_path_safe(path: &Path) -> Result<(), ServiceInstallError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut dir = path.parent();
-        while let Some(d) = dir {
-            let meta = std::fs::metadata(d)?;
-            let mode = meta.permissions().mode();
-            let group_or_world_writable = mode & 0o022 != 0;
-            let sticky = mode & 0o1000 != 0;
-            if group_or_world_writable && !sticky {
-                return Err(ServiceInstallError::UnsafeExecPath {
-                    path: path.to_path_buf(),
-                    dir: d.to_path_buf(),
-                });
-            }
-            dir = d.parent();
+        let file_mode = std::fs::metadata(path)?.permissions().mode();
+        if file_mode_is_unsafely_writable(file_mode) {
+            return Err(ServiceInstallError::UnsafeExecFileMode {
+                path: path.to_path_buf(),
+            });
+        }
+        if let Some(dir) = first_unsafe_ancestor(path)? {
+            return Err(ServiceInstallError::UnsafeExecPath {
+                path: path.to_path_buf(),
+                dir,
+            });
         }
     }
     Ok(())
@@ -379,13 +467,25 @@ pub fn resolve_exec_path() -> Result<PathBuf, ServiceInstallError> {
     Ok(real)
 }
 
-/// Creates `path` with `0o644` permissions set *at creation* (via
-/// `OpenOptionsExt::mode`, not a separate `set_permissions` call
-/// afterwards, so there is no window in which the file briefly exists with
-/// whatever the process umask would otherwise allow), refusing to overwrite
-/// an existing file unless `force` is set. Using `create_new` for the
-/// non-`force` case makes the existence check atomic (`O_EXCL`) rather than
-/// a separate `exists()` call racing another writer.
+/// Creates (or, with `force`, overwrites) `path` with contents that end up
+/// at `0o644` regardless of which branch is taken:
+///
+/// - On first creation, `OpenOptionsExt::mode(0o644)` is passed directly to
+///   the creating `open(2)` call, so there is no window in which the file
+///   briefly exists at whatever the process umask would otherwise allow.
+/// - On the `--force` overwrite path the file already exists, so `open(2)`
+///   silently ignores the `mode` argument (it only applies when `O_CREAT`
+///   actually creates the file) — fix round 2 (code review) caught that the
+///   first cut of this function dropped the permission repair that used to
+///   run here, so an existing file that was already group/world-writable
+///   (hand-copied under a loose umask, restored from an archive preserving
+///   modes, synced from another host) would survive `--force` unchanged.
+///   The explicit `set_permissions` call below is what repairs it; it is a
+///   harmless no-op on the fresh-create path.
+///
+/// Refuses to overwrite an existing file unless `force` is set. Using
+/// `create_new` for the non-`force` case makes the existence check atomic
+/// (`O_EXCL`) rather than a separate `exists()` call racing another writer.
 fn write_unit_file(path: &Path, contents: &str, force: bool) -> Result<(), ServiceInstallError> {
     use std::io::Write as _;
 
@@ -402,7 +502,7 @@ fn write_unit_file(path: &Path, contents: &str, force: bool) -> Result<(), Servi
         options.create_new(true);
     }
 
-    let mut file = match options.open(path) {
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
             return Err(ServiceInstallError::AlreadyExists {
@@ -412,7 +512,13 @@ fn write_unit_file(path: &Path, contents: &str, force: bool) -> Result<(), Servi
         Err(err) => return Err(err.into()),
     };
 
-    file.write_all(contents.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    }
+
+    (&file).write_all(contents.as_bytes())?;
     Ok(())
 }
 
@@ -423,10 +529,12 @@ fn write_unit_file(path: &Path, contents: &str, force: bool) -> Result<(), Servi
 /// Pre-checks that no target file already exists before writing any of them
 /// when `force` is `false`, so an install that would clobber one of several
 /// target files but not another fails cleanly instead of leaving a
-/// half-written set. Also pre-checks that `dir`, if it already existed
-/// before this call, isn't itself group- or world-writable — a writable
-/// *directory* lets another user replace an installed unit file wholesale
-/// regardless of the file's own `0o644` mode.
+/// half-written set. Also pre-checks that `dir` — whether freshly created or
+/// pre-existing — and every one of its ancestors is safe
+/// ([`dir_mode_is_unsafely_writable`]/[`first_unsafe_ancestor`], the same
+/// check [`check_exec_path_safe`] applies to the exec path): a writable
+/// *directory* anywhere in the chain lets another user replace an installed
+/// unit file wholesale regardless of the file's own `0o644` mode.
 pub fn install_to(
     dir: &Path,
     os: OsFamily,
@@ -447,10 +555,13 @@ pub fn install_to(
             .mode(0o700)
             .create(dir)?;
         let mode = std::fs::metadata(dir)?.permissions().mode();
-        if mode & 0o022 != 0 {
+        if dir_mode_is_unsafely_writable(mode) {
             return Err(ServiceInstallError::UnsafeInstallDir {
                 dir: dir.to_path_buf(),
             });
+        }
+        if let Some(bad_ancestor) = first_unsafe_ancestor(dir)? {
+            return Err(ServiceInstallError::UnsafeInstallDir { dir: bad_ancestor });
         }
     }
     #[cfg(not(unix))]
@@ -484,18 +595,32 @@ pub fn install_to(
     Ok(targets[0].0.clone())
 }
 
+/// Removes a single file, tolerating its absence.
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 /// Removes the unit/plist files for `os` from `dir`, tolerating any that
-/// are already absent (uninstalling twice is not an error).
+/// are already absent (uninstalling twice is not an error). On Linux, also
+/// removes [`LINUX_LEGACY_UNIT_FILES`] — files an earlier version of this
+/// installer wrote that [`install_to`] no longer writes — so upgrading and
+/// then uninstalling doesn't leave a dangling unit behind that nothing else
+/// would ever clean up.
 pub fn uninstall_from(dir: &Path, os: OsFamily) -> io::Result<()> {
     let files: &[&str] = match os {
         OsFamily::Linux => LINUX_UNIT_FILES,
         OsFamily::MacOs => MACOS_UNIT_FILES,
     };
     for name in files {
-        match std::fs::remove_file(dir.join(name)) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
+        remove_if_present(&dir.join(name))?;
+    }
+    if os == OsFamily::Linux {
+        for name in LINUX_LEGACY_UNIT_FILES {
+            remove_if_present(&dir.join(name))?;
         }
     }
     Ok(())
@@ -518,8 +643,9 @@ pub fn install(
     install_to(&resolved_install_dir(os)?, os, exec_path, force)
 }
 
-/// `round service uninstall`: removes the unit/plist for this OS from its
-/// real per-user service directory.
+/// `round service uninstall`: removes the unit/plist (and any legacy unit —
+/// see [`uninstall_from`]) for this OS from its real per-user service
+/// directory.
 pub fn uninstall(os: OsFamily) -> Result<(), ServiceInstallError> {
     uninstall_from(&resolved_install_dir(os)?, os)?;
     Ok(())
