@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+pub mod decision;
 pub mod elicit;
 pub mod remote_claim;
 pub mod server;
