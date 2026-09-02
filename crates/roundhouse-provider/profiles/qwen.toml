@@ -26,6 +26,15 @@ match = ["qwen3*"]
 [model.reasoning]
 kind = "effort"
 field = "/enable_thinking"
+# Fix round 7, K6: DashScope documents `enable_thinking` as a JSON boolean,
+# not a string -- without `value_type`, this control's resolved wire value
+# ("false"/"true") is emitted as the JSON *string* "true", which is a
+# protocol violation the gateway may silently ignore rather than reject
+# (thinking stays off with no error). No live Qwen endpoint was reachable
+# to confirm this against a real response; this cassette proves the
+# codec's own self-consistency (it emits a real boolean), not a verified
+# live behavior change.
+value_type = "bool"
 vocabulary = ["false", "true"]
 
 [model.reasoning.map]

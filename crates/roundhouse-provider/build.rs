@@ -106,9 +106,24 @@ fn main() {
                  typo in a quirk profile is a BUILD error, not a production 400: {e}"
             )
         });
-        if parsed.codec == "openai-chat" {
-            for model in &parsed.model {
-                if let Some(control) = &model.reasoning {
+        for model in &parsed.model {
+            if let Some(control) = &model.reasoning {
+                // Fix round 7, K6: `value_type` is part of `ReasoningControl`'s
+                // own schema, not an `openai-chat`-specific concept, so this
+                // runs for every codec's profile -- a profile declaring
+                // `value_type = "bool"` against a non-boolean vocabulary/map
+                // entry must fail the build regardless of which codec reads
+                // it (§9.5: "a wrong type must be a BUILD error, not a
+                // runtime surprise").
+                control.validate_value_type().unwrap_or_else(|e| {
+                    panic!(
+                        "profile {path:?} declares a [[model]].reasoning control whose \
+                         value_type is inconsistent with its vocabulary/map — this is the §9.5 \
+                         guarantee that a typo in a quirk profile is a BUILD error, not a \
+                         production 400: {e}"
+                    )
+                });
+                if parsed.codec == "openai-chat" {
                     reasoning_field_validation::validate_openai_chat_reasoning_field(
                         &path,
                         &control.field,

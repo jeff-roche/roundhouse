@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use crate::ir::{
     ChatRequest, ContentBlock, Message, MessageRole as Role, ReasoningIntent, ToolChoice, ToolDef,
 };
-use crate::profile::{glob_match, ProviderProfile};
+use crate::profile::{glob_match, ProviderProfile, WireValue};
 
 /// Finds the `[[model]]` entry (if any) whose `match` globs match `model`,
 /// and returns its `reasoning` control -- the same (provider, model) keying
@@ -163,13 +163,32 @@ pub fn encode_openai_chat(req: &ChatRequest, profile: &ProviderProfile) -> Value
     let intent = req.reasoning.intent.unwrap_or(ReasoningIntent::Off);
     if intent != ReasoningIntent::Off {
         if let Some(control) = reasoning_control_for(profile, &req.model.0) {
-            if let Ok(wire) = control.resolve(intent) {
-                set_json_pointer(&mut body, &control.field, json!(wire));
+            // Fix round 7, K6: `resolve_wire_value` (not bare `resolve`)
+            // types the wire value per the profile's declared `value_type` --
+            // `/reasoning_effort`-style controls (the default, `value_type =
+            // "string"`) still emit exactly the JSON string they always have;
+            // Qwen's `value_type = "bool"` now emits a genuine JSON boolean
+            // instead of the string `"true"`, matching what DashScope
+            // documents `enable_thinking` as.
+            if let Ok(value) = control.resolve_wire_value(intent) {
+                set_json_pointer(&mut body, &control.field, wire_value_to_json(value));
             }
         }
     }
 
     body
+}
+
+/// Converts a profile-typed [`WireValue`] into the `serde_json::Value` it
+/// belongs on the wire as. Kept here (not in `profile::reasoning`, which is
+/// mirrored dependency-free into `build.rs`'s own compilation unit) since
+/// JSON encoding is this codec's concern, not the profile schema's.
+fn wire_value_to_json(value: WireValue) -> Value {
+    match value {
+        WireValue::String(s) => Value::String(s),
+        WireValue::Bool(b) => Value::Bool(b),
+        WireValue::Number(n) => json!(n),
+    }
 }
 
 fn encode_tool(tool: &ToolDef) -> Value {

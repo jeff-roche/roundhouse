@@ -12,5 +12,6 @@ pub use glob::glob_match;
 pub use reasoning::{
     resolve_endpoint_preference, EndpointKind, EndpointPref, EndpointResolution, Intent,
     NoEndpointAvailable, ProfileReasoningError, ReasoningControl, ReasoningKind,
+    ReasoningValueType, WireValue,
 };
 pub use schema::*;

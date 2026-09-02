@@ -31,7 +31,9 @@
 //!   vendor's schema" does not apply the way it does to a hosted API — the
 //!   requests these profiles produce are OpenAI-compatible pass-throughs the
 //!   already-frozen `OpenAiChatProvider`/`encode_openai_chat` fully own.
-use roundhouse_provider::profile::ProviderProfile;
+use roundhouse_provider::codec::openai_chat::encode_openai_chat;
+use roundhouse_provider::profile::{ProviderProfile, ReasoningValueType};
+use roundhouse_provider::{ChatRequest, ReasoningIntent, ReasoningRequest};
 
 fn load(name: &str) -> ProviderProfile {
     let path = format!("{}/profiles/{name}.toml", env!("CARGO_MANIFEST_DIR"));
@@ -46,6 +48,69 @@ fn qwen_compat_mode_profile_shape() {
         p.defaults.base_url,
         "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     );
+}
+
+/// Fix round 7, K6: the REAL, shipped `qwen.toml` (not a hand-built mirror
+/// in `tests/openai_chat_encode.rs`) declares `value_type = "bool"` for its
+/// `enable_thinking` reasoning control, and `encode_openai_chat` must emit a
+/// genuine JSON boolean through it -- DashScope documents `enable_thinking`
+/// as a boolean, and encoding the string `"true"` instead is a silent
+/// protocol violation a gateway may accept-but-ignore (thinking silently
+/// stays off) rather than reject with a loud error. No live Qwen endpoint
+/// was reachable to confirm this against a real response; this proves the
+/// codec's own self-consistency with the profile's declared type, not a
+/// verified live behavior change.
+#[test]
+fn qwen_reasoning_control_declares_a_bool_value_type_and_encodes_one() {
+    let profile = load("qwen");
+    let control = profile.model[0]
+        .reasoning
+        .as_ref()
+        .expect("qwen.toml declares a [[model]].reasoning control");
+    assert_eq!(control.value_type, ReasoningValueType::Bool);
+
+    let req = ChatRequest {
+        reasoning: ReasoningRequest {
+            intent: Some(ReasoningIntent::High),
+        },
+        ..minimal_qwen_request()
+    };
+    let body = encode_openai_chat(&req, &profile);
+    assert_eq!(body["enable_thinking"], serde_json::json!(true));
+    assert!(
+        body["enable_thinking"].is_boolean(),
+        "enable_thinking must be a genuine JSON boolean, not a string: {:?}",
+        body["enable_thinking"]
+    );
+}
+
+/// A minimal `ChatRequest` that matches `qwen.toml`'s `qwen3*` model glob --
+/// used only by [`qwen_reasoning_control_declares_a_bool_value_type_and_encodes_one`].
+fn minimal_qwen_request() -> ChatRequest {
+    use roundhouse_provider::{
+        ContentBlock, Message, ModelId, Params, ProviderExt, RequestPolicy, ResponseFormat, Role,
+        ToolChoice,
+    };
+    ChatRequest {
+        model: ModelId("qwen3-14b".into()),
+        system: vec![],
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "hi".into(),
+                cache: None,
+                citations: vec![],
+            }],
+        }],
+        tools: vec![],
+        tool_choice: ToolChoice::Auto,
+        params: Params::default(),
+        reasoning: ReasoningRequest::default(),
+        response_format: ResponseFormat::default(),
+        ext: ProviderExt::None,
+        extra: std::collections::BTreeMap::new(),
+        policy: RequestPolicy::Drop,
+    }
 }
 
 #[test]

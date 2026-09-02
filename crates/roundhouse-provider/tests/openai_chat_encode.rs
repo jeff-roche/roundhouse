@@ -1,7 +1,7 @@
 use roundhouse_provider::codec::openai_chat::encode_openai_chat;
 use roundhouse_provider::profile::{
     AuthKind, Defaults, ModelEntry, ParamsMode, ParamsPolicy, ProviderProfile, ReasoningControl,
-    ReasoningKind,
+    ReasoningKind, ReasoningValueType,
 };
 use roundhouse_provider::{
     tool_def_from_schema, ChatRequest, ContentBlock, IdOrigin, Message, ModelId, Params,
@@ -47,6 +47,7 @@ fn reasoning_profile() -> ProviderProfile {
             reasoning: Some(ReasoningControl {
                 kind: ReasoningKind::Effort,
                 field: "/reasoning_effort".into(),
+                value_type: ReasoningValueType::String,
                 vocabulary: vec!["none".into(), "low".into(), "medium".into(), "high".into()],
                 map: BTreeMap::from([
                     ("off".into(), "none".into()),
@@ -75,6 +76,7 @@ fn zai_like_profile() -> ProviderProfile {
             reasoning: Some(ReasoningControl {
                 kind: ReasoningKind::Effort,
                 field: "/thinking/type".into(),
+                value_type: ReasoningValueType::String,
                 vocabulary: vec!["disabled".into(), "enabled".into(), "deep".into()],
                 map: BTreeMap::from([
                     ("off".into(), "disabled".into()),
@@ -95,6 +97,9 @@ fn zai_like_profile() -> ProviderProfile {
 /// than moonshot's `/reasoning_effort`, proving the key itself is read from
 /// `field` rather than a hardcoded literal), `vocabulary = ["false",
 /// "true"]`, `map` sends every non-`off` intent to the string `"true"`.
+/// Fix round 7, K6: `value_type = "bool"`, mirroring the real, shipped
+/// `qwen.toml` -- DashScope documents `enable_thinking` as a JSON boolean,
+/// not a string.
 fn qwen_like_profile() -> ProviderProfile {
     ProviderProfile {
         model: vec![ModelEntry {
@@ -102,6 +107,7 @@ fn qwen_like_profile() -> ProviderProfile {
             reasoning: Some(ReasoningControl {
                 kind: ReasoningKind::Effort,
                 field: "/enable_thinking".into(),
+                value_type: ReasoningValueType::Bool,
                 vocabulary: vec!["false".into(), "true".into()],
                 map: BTreeMap::from([
                     ("off".into(), "false".into()),
@@ -363,6 +369,11 @@ fn a_nested_field_pointer_honors_the_profiles_intent_map() {
 /// hardcoded `reasoning_effort` (Qwen's real `/enable_thinking`) must be
 /// written under ITS OWN key, not silently dropped or misfiled under
 /// `reasoning_effort`.
+///
+/// Fix round 7, K6: the value itself must be a genuine JSON boolean, not the
+/// string `"true"` -- `json!(true) != json!("true")` in `serde_json`, so
+/// this assertion fails outright (not merely "wrong value") if a future
+/// change regresses `value_type` back to always emitting a string.
 #[test]
 fn a_differently_named_flat_field_pointer_uses_its_own_key() {
     let req = ChatRequest {
@@ -374,7 +385,12 @@ fn a_differently_named_flat_field_pointer_uses_its_own_key() {
 
     let body = encode_openai_chat(&req, &qwen_like_profile());
 
-    assert_eq!(body["enable_thinking"], json!("true"));
+    assert_eq!(body["enable_thinking"], json!(true));
+    assert!(
+        body["enable_thinking"].is_boolean(),
+        "enable_thinking must be a genuine JSON boolean, not a string: {:?}",
+        body["enable_thinking"]
+    );
     assert!(body.get("reasoning_effort").is_none());
 }
 
