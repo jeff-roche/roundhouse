@@ -1,0 +1,22 @@
+[Unit]
+Description=Roundhouse daemon
+Documentation=https://github.com/roundhouse/roundhouse
+After=network-online.target roundhouse.socket
+Wants=network-online.target
+Requires=roundhouse.socket
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/round daemon
+Restart=always
+RestartSec=2
+# §8.7: "the OS answers 'is the daemon running', the daemon answers 'what
+# runs when'" — the timer unit's `Persistent` directive (which would replay
+# missed runs on the next boot) is deliberately left unset here. We run our
+# own catch-up (Scheduling Task 4's compute_catch_up, wired through
+# Scheduler::tick and catch_up_after_wake), so relying on systemd's own
+# missed-timer replay would be a second, disagreeing source of truth.
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

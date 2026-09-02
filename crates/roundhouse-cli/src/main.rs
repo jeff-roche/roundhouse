@@ -1,22 +1,99 @@
 //! The `round` binary: TUI attach, headless/one-shot runs, and `round
-//! daemon` (the same binary, invoked as a subprocess — not a Cargo
-//! dependency edge; see §5.2's dependency table note on why this crate
-//! deliberately doesn't depend on `roundhouse-daemon` despite the table
-//! listing that edge).
+//! daemon` (a separate process, spawned by `commands::daemon::run` — not a
+//! Cargo dependency edge; see §5.2's dependency table note on why this
+//! crate deliberately doesn't depend on `roundhouse-daemon` despite the
+//! table listing that edge).
 //!
-//! Phase 1 implements the attach path only: connect to the daemon's Unix
-//! socket and render every incoming `ServerMessage` through
-//! `roundhouse_tui::Dashboard`. Command parsing, headless runs, and session
-//! selection are Phase 2+.
+//! Phase 1 implemented the attach path only. Task A8/G6 adds this binary's
+//! first argument parsing (`cli::Cli`, ruling P11): `round daemon` and
+//! `round service install`/`round service uninstall`. Running `round` with
+//! no subcommand keeps the Phase 1 behavior below unchanged. Session
+//! selection and other headless runs are later tasks, extending
+//! `cli::Command` rather than replacing it.
 #![forbid(unsafe_code)]
 
+use clap::Parser;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use roundhouse_cli::cli::{Cli, Command, ServiceAction};
+use roundhouse_cli::commands::{daemon, service_install};
 use roundhouse_tui::Dashboard;
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
+
+    match Cli::parse().command {
+        Some(Command::Daemon) => run_daemon().await,
+        Some(Command::Service { action }) => run_service(action),
+        None => attach().await,
+    }
+}
+
+/// `round daemon`: runs the real daemon binary in the foreground and exits
+/// with its exit code, per `commands::daemon`'s module doc.
+async fn run_daemon() -> color_eyre::Result<()> {
+    let status = daemon::run()
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// `round service install`/`round service uninstall`, per
+/// `commands::service_install`'s module doc.
+fn run_service(action: ServiceAction) -> color_eyre::Result<()> {
+    let os = current_os_family()?;
+    match action {
+        ServiceAction::Install { force } => {
+            let exec_path = service_install::resolve_exec_path()
+                .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+            let installed = service_install::install(os, &exec_path, force)
+                .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+            println!("installed {}", installed.display());
+            print_enable_instructions(os);
+        }
+        ServiceAction::Uninstall => {
+            service_install::uninstall(os).map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+            println!("removed the roundhouse service for this user");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn current_os_family() -> color_eyre::Result<service_install::OsFamily> {
+    Ok(service_install::OsFamily::Linux)
+}
+
+#[cfg(target_os = "macos")]
+fn current_os_family() -> color_eyre::Result<service_install::OsFamily> {
+    Ok(service_install::OsFamily::MacOs)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn current_os_family() -> color_eyre::Result<service_install::OsFamily> {
+    Err(color_eyre::eyre::eyre!(
+        "round service is only supported on Linux (systemd) and macOS (launchd)"
+    ))
+}
+
+/// Enabling/starting the unit is left to the operator (see
+/// `service_install::install`'s doc comment for why `install` itself never
+/// shells out): print the exact next command instead of running it.
+fn print_enable_instructions(os: service_install::OsFamily) {
+    match os {
+        service_install::OsFamily::Linux => println!(
+            "run: systemctl --user daemon-reload && systemctl --user enable --now roundhouse.service"
+        ),
+        service_install::OsFamily::MacOs => println!(
+            "run: launchctl load -w ~/Library/LaunchAgents/com.roundhouse.daemon.plist"
+        ),
+    }
+}
+
+/// Phase 1's attach path, unchanged: connect to the daemon's Unix socket and
+/// render every incoming `ServerMessage` through `roundhouse_tui::Dashboard`.
+async fn attach() -> color_eyre::Result<()> {
     // Phase 0's placeholder `roundhouse_tui::client_schema()`: not yet consumed
     // for anything beyond proving the wire-schema call site exists.
     let _schema = roundhouse_tui::client_schema();
