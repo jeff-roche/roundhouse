@@ -1,0 +1,8 @@
+200
+content-type: text/event-stream
+x-request-id: abc123
+
+data: {"type":"ping"}
+
+data: {"type":"pong"}
+
