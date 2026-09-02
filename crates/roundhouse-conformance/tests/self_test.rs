@@ -429,6 +429,16 @@ impl ConformanceSubject for CredentialAwareSubject {
 /// state (`ConformanceSubject`'s methods take no `&self`), so this is the
 /// simplest way for the fake credential and the fake provider built from two
 /// separate trait methods to share one observable flag.
+///
+/// **For `CredentialAwareSubject`'s sole use only.** This is a single
+/// process-wide `OnceLock`, sound today only because exactly one test
+/// (`conformance_subjects_credentials_reach_the_request_ctx_stream_chat_receives`)
+/// and one subject touch it. `cargo test` runs tests in this file in
+/// parallel by default -- a second `FakeCredential`-using subject added to
+/// this file would race on this same flag and could false-pass (or
+/// false-fail) depending on interleaving. If you're adding another
+/// credential-aware fixture, give it its own flag rather than reusing this
+/// one.
 fn shared_flag() -> &'static Arc<AtomicBool> {
     static FLAG: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
     FLAG.get_or_init(|| Arc::new(AtomicBool::new(false)))

@@ -515,21 +515,41 @@ mod tests {
             start.elapsed()
         }
 
+        /// Fix-round-3 close-out: a single measurement per sample size
+        /// flaked under CI load — 200-trial measurement found 0/200 at
+        /// idle, 10/200 under 2x load, and 63/200 (31.5%) under 4x load on a
+        /// 2-core box, because the two sample sizes are asymmetrically
+        /// sensitive to scheduler preemption (the larger sample spans more
+        /// timeslices and so absorbs proportionally more stalls -- a
+        /// systematic upward drift, not symmetric noise). Preemption stalls
+        /// are one-sided and additive (they only ever ADD time, never
+        /// subtract it), which makes `min` over several repetitions the
+        /// right estimator: the minimum repetition is the one that best
+        /// approximates an uninterrupted run, for both sample sizes alike.
+        fn min_of_repetitions(chunk_count: usize, repetitions: u32) -> std::time::Duration {
+            (0..repetitions)
+                .map(|_| feed_one_byte_at_a_time(chunk_count))
+                .min()
+                .expect("repetitions is always > 0")
+        }
+
         const SMALL: usize = 5_000;
         const LARGE: usize = 50_000; // 10x SMALL
+        const REPETITIONS: u32 = 7;
 
         // A floor under the small measurement avoids a division blowing up
         // on a machine fast enough to round it to (near) zero.
-        let small = feed_one_byte_at_a_time(SMALL).max(std::time::Duration::from_micros(200));
-        let large = feed_one_byte_at_a_time(LARGE);
+        let small =
+            min_of_repetitions(SMALL, REPETITIONS).max(std::time::Duration::from_micros(200));
+        let large = min_of_repetitions(LARGE, REPETITIONS);
 
         let ratio = large.as_secs_f64() / small.as_secs_f64();
         assert!(
             ratio < 40.0,
-            "feeding {LARGE} one-byte chunks ({large:?}) took {ratio:.1}x as long as feeding \
-             {SMALL} ({small:?}) -- expected roughly 10x (linear, O(1) remaining()/advance()); \
-             a ratio this far above linear is the exact shape of fix-round-1 H1's quadratic \
-             blowup if it regresses"
+            "feeding {LARGE} one-byte chunks ({large:?}, min of {REPETITIONS}) took {ratio:.1}x \
+             as long as feeding {SMALL} ({small:?}, min of {REPETITIONS}) -- expected roughly \
+             10x (linear, O(1) remaining()/advance()); a ratio this far above linear is the \
+             exact shape of fix-round-1 H1's quadratic blowup if it regresses"
         );
     }
 }
