@@ -697,22 +697,42 @@ fn minor1_an_ordinary_env_value_with_an_expression_parses() {
 // -- with a narrow exemption (space/$/{/}) for expression syntax, -------
 // -- applied everywhere, not skipped outright when `${{` is present. ----
 
+/// Builds a `map` step whose `worktree.base_ref` is `base_ref`. `{base_ref:?}`
+/// emits a Rust-escaped double-quoted string, which is also valid YAML
+/// double-quoted scalar syntax for the escapes these tests use (`\n`, `\0`,
+/// `\"`, `\\`).
+fn base_ref_step_yaml(base_ref: &str) -> String {
+    format!(
+        "id: a\nmap: {{ over: x, as: y, isolation: {{ worktree: {{ base_ref: {base_ref:?} }} }} }}\nsteps: [{{ id: b, tool: shell }}]"
+    )
+}
+
+/// Asserts `base_ref` is rejected and returns the rendered error message, so
+/// each caller can pin *why* it was rejected.
+///
+/// Fix round 4: every test in this section previously asserted only
+/// `matches!(err, ParseError::Yaml(_))`, which any YAML-level error
+/// satisfies — a test named for a specific bypass would have stayed green if
+/// the payload were rejected for an unrelated reason (a YAML syntax
+/// accident, a `deny_unknown_fields` hit, a different rule firing first).
+/// The message substring each caller asserts is what actually pins the
+/// property the test's name claims.
+fn base_ref_rejection_message(base_ref: &str) -> String {
+    let err = try_step(&base_ref_step_yaml(base_ref)).unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+    err.to_string()
+}
+
 #[test]
 fn minor2_a_base_ref_starting_with_a_dash_is_rejected() {
-    let err = try_step(
-        "id: a\nmap: { over: x, as: y, isolation: { worktree: { base_ref: \"--upload-pack=/tmp/x\" } } }\nsteps: [{ id: b, tool: shell }]",
-    )
-    .unwrap_err();
-    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+    let msg = base_ref_rejection_message("--upload-pack=/tmp/x");
+    assert!(msg.contains("must not start with `-`"), "msg was: {msg}");
 }
 
 #[test]
 fn minor2_a_base_ref_containing_shell_metacharacters_is_rejected() {
-    let err = try_step(
-        "id: a\nmap: { over: x, as: y, isolation: { worktree: { base_ref: \"$(id)\" } } }\nsteps: [{ id: b, tool: shell }]",
-    )
-    .unwrap_err();
-    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+    let msg = base_ref_rejection_message("$(id)");
+    assert!(msg.contains("must not contain '$'"), "msg was: {msg}");
 }
 
 #[test]
@@ -755,50 +775,219 @@ fn minor2_a_templated_base_ref_with_a_narrow_exemption_still_parses() {
 
 #[test]
 fn minor2_an_overlong_base_ref_is_rejected() {
-    let long_ref = "a".repeat(roundhouse_flow::parse::steps::MAX_STEP_ID_LEN + 1);
-    let yaml = format!(
-        "id: a\nmap: {{ over: x, as: y, isolation: {{ worktree: {{ base_ref: \"{long_ref}\" }} }} }}\nsteps: [{{ id: b, tool: shell }}]"
+    let max = roundhouse_flow::parse::steps::MAX_GIT_REF_LEN;
+    let msg = base_ref_rejection_message(&"a".repeat(max + 1));
+    assert!(
+        msg.contains(&format!("exceeds the {max}-character limit")),
+        "msg was: {msg}"
     );
-    let err = try_step(&yaml).unwrap_err();
-    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
 }
 
 // -- Fix round 3's own defining regression cases: every payload the ------
 // -- Minor-2 fix was written to reject, with `${{` appended, must still --
 // -- be rejected — the earlier `${{`-exemption made all five pass. -------
 
-fn base_ref_step_yaml(base_ref: &str) -> String {
-    format!(
-        "id: a\nmap: {{ over: x, as: y, isolation: {{ worktree: {{ base_ref: {base_ref:?} }} }} }}\nsteps: [{{ id: b, tool: shell }}]"
-    )
-}
-
 #[test]
 fn fix_round_3_leading_dash_plus_expression_suffix_is_still_rejected() {
-    let err = try_step(&base_ref_step_yaml("--upload-pack=/tmp/x${{")).unwrap_err();
-    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+    let msg = base_ref_rejection_message("--upload-pack=/tmp/x${{");
+    assert!(msg.contains("must not start with `-`"), "msg was: {msg}");
 }
 
 #[test]
 fn fix_round_3_command_substitution_plus_expression_suffix_is_still_rejected() {
-    let err = try_step(&base_ref_step_yaml("$(id)${{")).unwrap_err();
-    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+    let msg = base_ref_rejection_message("$(id)${{");
+    assert!(msg.contains("must not contain '$'"), "msg was: {msg}");
 }
 
 #[test]
 fn fix_round_3_shell_command_plus_expression_suffix_is_still_rejected() {
-    let err = try_step(&base_ref_step_yaml("; rm -rf / #${{")).unwrap_err();
-    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+    let msg = base_ref_rejection_message("; rm -rf / #${{");
+    assert!(msg.contains("must not contain ';'"), "msg was: {msg}");
 }
 
 #[test]
 fn fix_round_3_embedded_newline_plus_expression_suffix_is_still_rejected() {
-    let err = try_step(&base_ref_step_yaml("refs/heads/main\n--exec=evil${{")).unwrap_err();
-    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+    let msg = base_ref_rejection_message("refs/heads/main\n--exec=evil${{");
+    assert!(msg.contains("must not contain '\\n'"), "msg was: {msg}");
 }
 
 #[test]
 fn fix_round_3_embedded_nul_plus_expression_suffix_is_still_rejected() {
-    let err = try_step(&base_ref_step_yaml("refs/heads/x\0${{")).unwrap_err();
-    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+    let msg = base_ref_rejection_message("refs/heads/x\0${{");
+    assert!(msg.contains("must not contain '\\0'"), "msg was: {msg}");
+}
+
+// =======================================================================
+// Fix round 4 (security review on fix round 3).
+//
+// Fix round 3 replaced a whole-value `${{`-skip with a uniform
+// four-character exemption (space, `$`, `{`, `}`) on the charset scan
+// only. The rules *above* that scan are position-anchored (leading `-`,
+// leading/trailing `/`, trailing `.lock`), so a uniform space exemption
+// let one leading space — or one interior space — move a payload out from
+// under every anchored rule. These are the seven payloads the review
+// measured as newly accepted, plus the further variants of the same class
+// found while fixing them.
+// =======================================================================
+
+// -- The review's own seven payloads. ------------------------------------
+
+#[test]
+fn fix_round_4_a_leading_space_does_not_evade_the_leading_dash_rule() {
+    let msg = base_ref_rejection_message(" --upload-pack=/tmp/evil");
+    assert!(
+        msg.contains("must not begin or end with whitespace"),
+        "msg was: {msg}"
+    );
+}
+
+#[test]
+fn fix_round_4_a_trailing_flag_segment_is_rejected() {
+    let msg = base_ref_rejection_message("refs/heads/main --upload-pack=/tmp/evil");
+    assert!(msg.contains("must not start with `-`"), "msg was: {msg}");
+    assert!(
+        msg.contains("\"--upload-pack=/tmp/evil\""),
+        "message should name the offending segment; msg was: {msg}"
+    );
+}
+
+#[test]
+fn fix_round_4_a_trailing_force_flag_segment_is_rejected() {
+    let msg = base_ref_rejection_message("HEAD --force");
+    assert!(msg.contains("must not start with `-`"), "msg was: {msg}");
+}
+
+#[test]
+fn fix_round_4_a_leading_space_does_not_evade_the_leading_slash_rule() {
+    let msg = base_ref_rejection_message(" /etc/passwd");
+    assert!(
+        msg.contains("must not begin or end with whitespace"),
+        "msg was: {msg}"
+    );
+}
+
+#[test]
+fn fix_round_4_a_trailing_space_does_not_evade_the_dot_lock_rule() {
+    let msg = base_ref_rejection_message("refs/heads/x.lock ");
+    assert!(
+        msg.contains("must not begin or end with whitespace"),
+        "msg was: {msg}"
+    );
+}
+
+#[test]
+fn fix_round_4_a_shell_variable_reference_is_rejected() {
+    let msg = base_ref_rejection_message("refs/heads/main $HOME");
+    assert!(msg.contains("must not contain '$'"), "msg was: {msg}");
+}
+
+#[test]
+fn fix_round_4_an_ifs_expansion_is_rejected() {
+    let msg = base_ref_rejection_message("refs/heads/main ${IFS}");
+    assert!(msg.contains("must not contain '$'"), "msg was: {msg}");
+}
+
+// -- Further variants of the same class, found while fixing the seven. ---
+
+#[test]
+fn fix_round_4_an_ifs_expansion_needs_no_literal_space_to_split_a_word() {
+    // The sharper form of the same class: `${IFS}` expands to whitespace in
+    // a shell string, so it re-creates the word split the seven payloads
+    // above use a literal space for — from a value with no literal
+    // whitespace at all, and therefore exactly one whitespace-separated
+    // segment for the segment rules to look at.
+    let msg = base_ref_rejection_message("refs/heads/main${IFS}--upload-pack=/tmp/evil");
+    assert!(msg.contains("must not contain '$'"), "msg was: {msg}");
+}
+
+#[test]
+fn fix_round_4_a_brace_expansion_is_rejected() {
+    // `{`/`}` were named in fix round 3's exemption but were never in
+    // `FORBIDDEN_GIT_REF_CHARS` to begin with, so exempting them was a
+    // no-op and bash brace expansion was accepted unconditionally. Fix
+    // round 4 adds them to the set and exempts them only where they form a
+    // literal `${{` / `}}` delimiter.
+    let msg = base_ref_rejection_message("refs/heads/{main,--upload-pack=/tmp/evil}");
+    assert!(msg.contains("must not contain '{'"), "msg was: {msg}");
+}
+
+#[test]
+fn fix_round_4_a_dollar_inside_a_template_placeholder_is_still_rejected() {
+    // The exemption is positional, not "anywhere once a `${{` appears": a
+    // second `$` that is not itself the start of a `${{` is rejected even
+    // though the value opens with a well-formed placeholder.
+    let msg = base_ref_rejection_message("${{ x }}$HOME");
+    assert!(msg.contains("must not contain '$'"), "msg was: {msg}");
+}
+
+#[test]
+fn fix_round_4_a_second_absolute_path_segment_is_rejected() {
+    let msg = base_ref_rejection_message("refs/heads/main /etc/passwd");
+    assert!(
+        msg.contains("must not start or end with `/`"),
+        "msg was: {msg}"
+    );
+}
+
+#[test]
+fn fix_round_4_a_dot_lock_suffix_on_an_earlier_segment_is_rejected() {
+    // Deliberately not the last segment: `value.ends_with(".lock")` alone
+    // already catches a trailing one, so a `.lock` segment followed by
+    // another segment is what actually pins the per-segment rule.
+    let msg = base_ref_rejection_message("refs/heads/x.lock refs/heads/main");
+    assert!(msg.contains("must not end with `.lock`"), "msg was: {msg}");
+}
+
+#[test]
+fn fix_round_4_a_tab_separated_flag_segment_is_rejected() {
+    // A tab is not the exempt character (only a plain space is), so this is
+    // caught by the charset scan rather than the segment rules — pinned so
+    // the two mechanisms don't silently swap roles.
+    let msg = base_ref_rejection_message("refs/heads/main\t--force");
+    assert!(msg.contains("must not contain '\\t'"), "msg was: {msg}");
+}
+
+#[test]
+fn fix_round_4_an_extra_plain_segment_is_still_accepted_a_documented_residual() {
+    // NOT a bypass this round closed — pinned so it stays a stated
+    // limitation rather than being rediscovered as a finding. An extra
+    // whitespace-separated segment that starts with neither `-` nor `/` and
+    // does not end in `.lock` breaks none of the per-segment rules, so it
+    // parses. Under a shell-string interpolation it would still become an
+    // extra argv element. Closing it means rejecting interior spaces, which
+    // is exactly what the frozen fixture's `${{ pr.number }}` needs, so this
+    // parser cannot close it without modelling placeholder boundaries. The
+    // executor (Task 5) owns the real guarantee: pass `base_ref` as one
+    // discrete argv element after a `--` separator.
+    // See `validate_git_ref`'s "What this does *not* cover" doc section.
+    let s = step(&base_ref_step_yaml("refs/heads/main HEAD"));
+    let StepBody::Map { isolation, .. } = &s.body else {
+        panic!("expected Map step");
+    };
+    assert_eq!(
+        isolation,
+        &Some(MapIsolationDef::Worktree {
+            base_ref: Some("refs/heads/main HEAD".to_string())
+        })
+    );
+}
+
+// -- What the fix must NOT break. ----------------------------------------
+
+#[test]
+fn fix_round_4_the_frozen_fixtures_templated_base_ref_still_parses() {
+    // Same value as `minor2_a_templated_base_ref_with_a_narrow_exemption_still_parses`,
+    // restated here as this round's own regression anchor: it has no
+    // leading/trailing whitespace, no segment starting with `-` or `/`, and
+    // its `$`/`{`/`}` are all part of a literal `${{` or `}}`.
+    let s = step(&base_ref_step_yaml("refs/pull/${{ pr.number }}/head"));
+    let StepBody::Map { isolation, .. } = &s.body else {
+        panic!("expected Map step");
+    };
+    assert_eq!(
+        isolation,
+        &Some(MapIsolationDef::Worktree {
+            base_ref: Some("refs/pull/${{ pr.number }}/head".to_string())
+        })
+    );
 }

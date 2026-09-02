@@ -38,34 +38,57 @@
 //! bound), `env`'s key names and value contents (charset), `map.as`
 //! (charset, plus a reserved-root check), `map.on_item_error` (closed
 //! enum), `map.isolation` and its `worktree.base_ref` parameter (closed
-//! tier set, plus a git-ref-shaped charset check — see
-//! [`validate_git_ref`]'s own doc comment for the narrow, four-character
-//! exemption that check makes for expression syntax; fix round 3 found
-//! and closed a version of that exemption that was a complete bypass, not
-//! a narrowing, so this summary line says "check" rather than implying
-//! zero exceptions), `caps.max_cost_usd` (finiteness/sign), and
+//! tier set, plus a git-ref-shaped charset, length, and per-segment check
+//! — [`validate_git_ref`]'s own doc comment carries the full rule list, the
+//! exemption it makes for `${{ }}` expression syntax, and two residual
+//! acceptances it does not cover; this summary line says "check" rather
+//! than implying zero exceptions because rounds 3 and 4 each found the
+//! previous round's version of that exemption admitted payloads it was
+//! written to reject), `caps.max_cost_usd` (finiteness/sign), and
 //! `gate.on_timeout` (closed enum).
 //!
-//! **Fix round 3: the not-validated list below was incomplete, found by
-//! the same review that caught the `base_ref` bypass.** It is deliberately
-//! **not** true of `gate.timeout` (stays free-form text — bounded
-//! elsewhere, by §8.11's own 7-day reaper cap, same reasoning as the
-//! nested-`map`-depth bound `parse_step`'s doc comment names as the
-//! executor's responsibility rather than this parser's), nor of `tool`,
-//! `call`, `map.over`, `when`, `agent.prompt`, `agent.model`, `gate.title`
-//! (expression strings, tool/workflow names, a prompt, a model name, and a
-//! human-facing title are not closed value spaces to begin with — `when`
-//! in particular is structurally identical to `map.over`, which the
-//! original version of this list already named, so omitting `when` read
-//! as a deliberate exclusion rather than the oversight it was), nor of
-//! `agent.tools` (a list of tool names, each unvalidated), nor of
-//! `map.max_parallel` (an unbounded `u32` — `0` and `u32::MAX` both parse,
-//! named in `parse_step`'s own doc comment as an executor-owned gap, not
-//! repeated here as if unstated), nor of a `map`'s nested `steps:
-//! Vec<serde_yaml::Value>` (each entry is itself unparsed until a caller
-//! invokes [`parse_step`] on it individually). This module was never
-//! going to make any of the above a closed value space, and this list
-//! exists so that isn't left to be inferred.
+//! **What is deliberately *not* validated. Fix round 4 re-derived this list
+//! by walking [`StepDefWire`], [`AgentBodyDef`], [`MapBodyDef`] and
+//! [`GateBodyDef`] field by field, because fix round 3 extended it from the
+//! previous round's prose and left two fields out** (`idempotency_key`, and
+//! `caps.max_tool_calls` — the latter sitting next to `map.max_parallel`,
+//! its structural twin, which *was* named, so its absence read as a
+//! deliberate exclusion rather than the oversight it was). One entry per
+//! unvalidated field, in `StepDefWire` declaration order:
+//!
+//! - `when` — an expression string, structurally identical to `map.over`.
+//! - `needs` — the *count* is bounded ([`MAX_NEEDS_PER_STEP`]); the contents
+//!   are not charset-checked here. [`topological_order`] rejects any entry
+//!   that doesn't name an existing step id, and every step id has itself
+//!   been charset-checked, so a `needs` entry that survives a full workflow
+//!   parse is a validated id — but [`parse_step`] alone does not check one.
+//! - `idempotency_key` — free-form `Option<String>`, unbounded in length and
+//!   charset. Whatever later uses it as a dedup key owns any constraint it
+//!   needs.
+//! - `caps.max_tool_calls` — an unbounded `u32`; `0` and `u32::MAX` both
+//!   parse. Only `caps.max_cost_usd` is validated (finite, non-negative).
+//! - `tool`, `call` — a tool name and a workflow name, neither a closed set
+//!   this parser knows.
+//! - `with` — a generic argument bag (see the five `Value` fields above).
+//! - `agent.model`, `agent.prompt` — a model name and a prompt.
+//! - `agent.tools` — a list of tool names, each unvalidated.
+//! - `agent.output_schema` — a generic `Value`.
+//! - `map.over` — an expression string.
+//! - `map.max_parallel` — an unbounded `u32`; `0` and `u32::MAX` both parse.
+//! - a `map`'s nested `steps: Vec<serde_yaml::Value>` — neither
+//!   length-bounded nor parsed until a caller invokes [`parse_step`] on each
+//!   entry individually.
+//! - `gate.title` — a human-facing title.
+//! - `gate.form` — a generic `Value`.
+//! - `gate.timeout` — free-form text, bounded elsewhere by §8.11's own
+//!   7-day reaper cap, the same reasoning [`parse_step`]'s doc comment
+//!   applies to nested-`map` depth.
+//! - `emit`, `report` — generic `Value` payloads.
+//!
+//! (`continue_on_error` is a `bool`, so its value space is closed by its
+//! type and it needs no check.) This module was never going to make any of
+//! the above a closed value space, and this list exists so that isn't left
+//! to be inferred.
 //!
 //! **This deliberately does *not* use `#[serde(flatten)]` the way an
 //! earlier version of this module did, and the reason is a measured, not
@@ -232,6 +255,19 @@ pub const MAX_STEP_ID_LEN: usize = 128;
 /// doc comment — that finding is about `serde_yaml` parsing raw text, this
 /// is about graph size after parsing has already succeeded.
 pub const MAX_NEEDS_PER_STEP: usize = 64;
+
+/// Sanity bound on a `worktree.base_ref` value's length ([`validate_git_ref`]).
+///
+/// Fix round 3 added this bound but reused [`MAX_STEP_ID_LEN`] for it. Fix
+/// round 4 splits it into its own constant: the two bound different things
+/// (a workflow-author-chosen identifier vs. a git ref name that ends up in
+/// a `git worktree add` invocation) and nothing ties their values together,
+/// so a future change to one should not silently move the other. The value
+/// stays 128 — git itself imposes no ref-name length limit, and 128 bytes
+/// comfortably fits every realistic `refs/...` path plus a `${{ }}`
+/// placeholder, so this is a refusal to accept an absurd ref, not a limit
+/// derived from anything git enforces.
+pub const MAX_GIT_REF_LEN: usize = 128;
 
 /// Reserved expression-language context roots (§8.9's own vocabulary:
 /// `secrets.*`, `steps.*`, `inputs.*`, `run.*`, `vars.*`, `env.*`) that a
@@ -473,15 +509,25 @@ struct WorktreeIsolationParams {
 ///
 /// This is a reasonable approximation of `git check-ref-format`'s own
 /// rules plus defense-in-depth against a shell-string invocation, not a
-/// byte-for-byte reimplementation of either: rejects empty, a leading `-`
-/// (the injection vector above), a leading/trailing `/`, any `..` run, a
-/// trailing `.lock`, control characters/whitespace, and
-/// [`FORBIDDEN_GIT_REF_CHARS`] (see its own doc comment for the two
-/// different reasons its two halves exist). It does not implement every
-/// `check-ref-format` rule (e.g. `@{` sequences, a lone `@`) — those are
-/// additional git-specific edge cases this function doesn't claim to
-/// catch, left for git itself to reject at worktree-creation time if they
-/// slip through.
+/// byte-for-byte reimplementation of either. The complete rule list, in the
+/// order it is applied:
+///
+/// 1. not empty;
+/// 2. at most [`MAX_GIT_REF_LEN`] bytes;
+/// 3. no leading or trailing whitespace (`value.trim() == value`);
+/// 4. no `..` run anywhere;
+/// 5. no control character, no whitespace other than a plain space, and
+///    none of [`FORBIDDEN_GIT_REF_CHARS`] — **except** that a plain space is
+///    allowed anywhere, and `$`, `{`, `}` are allowed at the byte positions
+///    where they form a literal `${{` opener or `}}` closer (see
+///    [`expression_delimiter_positions`]);
+/// 6. per whitespace-separated segment: no leading `-` (the injection
+///    vector above), no leading or trailing `/`, no trailing `.lock`.
+///
+/// It does not implement every `check-ref-format` rule (e.g. `@{`
+/// sequences, a lone `@`) — those are additional git-specific edge cases
+/// this function doesn't claim to catch, left for git itself to reject at
+/// worktree-creation time if they slip through.
 ///
 /// # Fix round 3: the `${{`-exemption was a complete bypass, not a narrowing
 ///
@@ -502,73 +548,205 @@ struct WorktreeIsolationParams {
 /// exemption disagreed by construction: nothing downstream was ever going
 /// to treat that string as anything other than exactly what it says.
 ///
-/// **Fix: narrow the exemption to the four characters expression syntax
-/// actually needs — a plain space, `$`, `{`, `}` — and apply every other
-/// rule unconditionally**, expression or not. This is deliberately not
-/// the span-parsing alternative (find `${{`, require a matching `}}`,
-/// validate only the literal parts around it): that would still be
-/// reasoning about where a second grammar's tokens start and end, the
-/// same shape of heuristic this crate's DoS-scan history
-/// (`parse/mod.rs`'s module doc, three bypassed designs) warns against.
-/// The four-character exemption needs no such reasoning — it just widens
-/// what counts as an acceptable character, uniformly, everywhere in the
-/// string — and every one of the payloads above is rejected under it
-/// regardless of what's appended: a leading `-` is checked before any
-/// character-class scan even runs; `(`, `)`, `;` are still forbidden
-/// characters (not part of the four-character exemption); control
-/// characters (including `\n`, `\r`, `\0`) are rejected unconditionally,
-/// never exempted. The frozen fixture's own `base_ref` still parses: its
-/// only exempt-class characters are the two spaces and the `${`/`}`
-/// pairs, and its `.` (in `pr.number`) never repeats into a `..` run.
+/// Fix round 3's replacement narrowed the exemption to four characters — a
+/// plain space, `$`, `{`, `}` — applied uniformly to the character-class
+/// scan, with every other rule unconditional.
+///
+/// # Fix round 4: a uniform exemption under position-anchored rules
+///
+/// Fix round 3's exemption was uniform across the whole string, but three of
+/// the rules it left "unconditional" were *position-anchored* to the ends of
+/// the whole value (leading `-`, leading/trailing `/`, trailing `.lock`).
+/// Exempting the space that separates words therefore let a payload step out
+/// from under all three. Security review measured seven new acceptances, all
+/// returning `Ok(())` against fix round 3's code:
+///
+/// ```text
+/// " --upload-pack=/tmp/evil"                 one leading space evades the leading-`-` rule
+/// "refs/heads/main --upload-pack=/tmp/evil"  the flag is no longer at position 0
+/// "HEAD --force"
+/// " /etc/passwd"                             one leading space evades the leading-`/` rule
+/// "refs/heads/x.lock "                       one trailing space evades the `.lock` rule
+/// "refs/heads/main $HOME"                    `$` was exempt everywhere
+/// "refs/heads/main ${IFS}"
+/// ```
+///
+/// The sink is unchanged from fix round 2: word splitting in a shell string
+/// makes each of those tails its own argv element, and `--upload-pack=`,
+/// `--exec=`, `-c` all name a program git will execute.
+///
+/// **Fix, in three parts.**
+///
+/// 1. Two new unconditional rules: reject any value with leading or
+///    trailing whitespace, and apply the three anchored rules to *every*
+///    whitespace-separated segment rather than to the whole value. For a
+///    value with no space — every literal ref — there is exactly one
+///    segment, so this is identical to the old check.
+/// 2. `$`, `{`, `}` are no longer exempt uniformly: they are exempt only at
+///    the byte positions where they form a literal `${{` or `}}` (see
+///    [`expression_delimiter_positions`]). This closes `$HOME` and, more
+///    sharply, `${IFS}` — which expands to whitespace in a shell string and
+///    so re-creates a word split from a value containing no literal
+///    whitespace at all, i.e. from a value the per-segment rules see as one
+///    segment.
+/// 3. `{` and `}` are added to [`FORBIDDEN_GIT_REF_CHARS`], which they had
+///    never been in — fix round 3's exemption list named them as though
+///    they were being exempted from something, but nothing was rejecting
+///    them and bash brace expansion was accepted unconditionally.
+///
+/// This is still not the span-parsing alternative (find `${{`, require a
+/// matching `}}`, validate only the literal parts around it):
+/// [`expression_delimiter_positions`] never pairs an opener with a closer
+/// and never reasons about what sits between them. The frozen fixture's own
+/// `base_ref` still parses: `"refs/pull/${{ pr.number }}/head"` has no
+/// leading or trailing whitespace; its three segments (`refs/pull/${{`,
+/// `pr.number`, `}}/head`) each start with neither `-` nor `/`, end with
+/// neither `/` nor `.lock`; every `$`/`{`/`}` in it belongs to the literal
+/// `${{` or `}}`; and its `.` (in `pr.number`) never repeats into a `..`.
+///
+/// # What this does *not* cover
+///
+/// Two residual acceptances, named rather than left to be discovered:
+///
+/// - **An extra whitespace-separated segment that breaks none of the
+///   per-segment rules is still accepted** — `"refs/heads/main HEAD"` and
+///   `"refs/heads/main origin"` parse. Under a shell-string interpolation
+///   they still become an extra argv element; they just cannot be a flag, an
+///   absolute path, or a `.lock` name. Rejecting interior spaces outright is
+///   what would close this, and that is exactly what the frozen fixture's
+///   `${{ pr.number }}` needs, so this function cannot close it without
+///   modelling where a placeholder begins and ends. **The executor (Task 5)
+///   is the owner of the real guarantee here: pass `base_ref` as one
+///   discrete argv element after a `--` separator, never interpolated into a
+///   shell string.**
+/// - **The exemption only supports simple placeholders.** Anything richer
+///   than `${{ dotted.path }}` — a function call, a quoted literal — uses
+///   `(`, `)`, `'`, or `"`, all of which are still rejected. If Task 4's
+///   expression language turns out to need those inside a `base_ref`, this
+///   function is what has to change, deliberately, not something to be
+///   worked around at the call site.
 fn validate_git_ref(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("must not be empty".to_string());
     }
-    if value.len() > MAX_STEP_ID_LEN {
-        return Err(format!("exceeds the {MAX_STEP_ID_LEN}-character limit"));
+    if value.len() > MAX_GIT_REF_LEN {
+        return Err(format!("exceeds the {MAX_GIT_REF_LEN}-character limit"));
     }
-    if value.starts_with('-') {
+    if value.trim() != value {
         return Err(
-            "must not start with `-` (would be read as a command-line flag by git, not a ref name)"
+            "must not begin or end with whitespace (leading/trailing whitespace moves the rest of the value out from under the anchored rules below, and is never part of a real ref name)"
                 .to_string(),
         );
-    }
-    if value.starts_with('/') || value.ends_with('/') {
-        return Err("must not start or end with `/`".to_string());
     }
     if value.contains("..") {
         return Err("must not contain `..`".to_string());
     }
-    if value.ends_with(".lock") {
-        return Err("must not end with `.lock`".to_string());
+
+    let delimiter = expression_delimiter_positions(value);
+    for (offset, c) in value.char_indices() {
+        let exempt = match c {
+            // A plain space is exempt everywhere: `${{ pr.number }}` needs
+            // interior spaces and this function does not model where a
+            // placeholder starts or ends. The word-splitting consequence of
+            // that exemption is what the per-segment rules below bound.
+            ' ' => true,
+            // Exempt only where the character is part of a literal `${{`
+            // opener or `}}` closer — not merely because one appears
+            // somewhere in the value.
+            '$' | '{' | '}' => delimiter[offset],
+            _ => false,
+        };
+        if exempt {
+            continue;
+        }
+        if c.is_control() || c.is_whitespace() || FORBIDDEN_GIT_REF_CHARS.contains(c) {
+            return Err(format!(
+                "must not contain {c:?} — outside a literal `${{{{` / `}}}}` expression delimiter, a git ref name may not contain control characters, whitespace other than a plain space, or any of `{FORBIDDEN_GIT_REF_CHARS}`"
+            ));
+        }
     }
-    let is_expression_syntax_char = |c: char| matches!(c, ' ' | '$' | '{' | '}');
-    if value.chars().any(|c| {
-        !is_expression_syntax_char(c)
-            && (c.is_control() || c.is_whitespace() || FORBIDDEN_GIT_REF_CHARS.contains(c))
-    }) {
-        return Err(format!(
-            "must not contain control characters, whitespace, or any of `{FORBIDDEN_GIT_REF_CHARS}` — a plain space, `$`, `{{`, and `}}` are allowed, needed for `${{{{ }}}}` expression syntax"
-        ));
+
+    // The rules below are position-anchored. Because a plain space is
+    // exempt above, they are applied to every whitespace-separated segment,
+    // not just to the whole value: a shell that word-splits an interpolated
+    // `base_ref` turns each segment into its own argv element, and an
+    // anchored rule checked only against the whole string never sees the
+    // second one. For a value with no space (every literal ref) there is
+    // exactly one segment and this is identical to checking the value.
+    for segment in value.split_whitespace() {
+        if segment.starts_with('-') {
+            return Err(format!(
+                "segment {segment:?} must not start with `-` (git would read it as a command-line flag, not a ref name)"
+            ));
+        }
+        if segment.starts_with('/') || segment.ends_with('/') {
+            return Err(format!(
+                "segment {segment:?} must not start or end with `/`"
+            ));
+        }
+        if segment.ends_with(".lock") {
+            return Err(format!("segment {segment:?} must not end with `.lock`"));
+        }
     }
     Ok(())
 }
 
+/// Marks the byte positions of every literal `${{` and `}}` in `value`.
+///
+/// This is *not* a placeholder parser: it never pairs an opener with a
+/// closer, never requires a `}}` to exist, and knows nothing about what sits
+/// between them. It answers exactly one local question per byte — "is this
+/// `$`/`{`/`}` part of one of the two three-or-two-character delimiter
+/// sequences the expression syntax spells?" — with a fixed-size window, so
+/// there is no span to mis-derive. Everything it does not mark is subject to
+/// the ordinary forbidden-character rule.
+fn expression_delimiter_positions(value: &str) -> Vec<bool> {
+    let bytes = value.as_bytes();
+    let mut marked = vec![false; bytes.len()];
+    for start in 0..bytes.len() {
+        if bytes[start..].starts_with(b"${{") {
+            marked[start] = true;
+            marked[start + 1] = true;
+            marked[start + 2] = true;
+        } else if bytes[start..].starts_with(b"}}") {
+            marked[start] = true;
+            marked[start + 1] = true;
+        }
+    }
+    marked
+}
+
 /// `~^:?*[\` is `git check-ref-format`'s own disallowed set for a ref
-/// component. `$`() ;|&<>'"` is *not* — check-ref-format doesn't forbid
+/// component. `` $`();|&<>'"{} `` is *not* — check-ref-format doesn't forbid
 /// shell metacharacters, because they're not a git concern, they're a
 /// concern only if something later builds a shell command string out of
-/// this value instead of passing it as a discrete argv element. Measured
-/// directly: without this second half, `validate_git_ref` let
-/// `"$(id)"` through (fix round 2's own review caught this — the first
-/// version of this constant was git's charset alone, and a test written
-/// against the reviewer's exact example failed). Added as defense in
-/// depth: this parser doesn't know whether the executor (Task 5) invokes
-/// git via argv (safe regardless of these characters) or via a shell
-/// string (unsafe if it does), and none of these characters ever
+/// this value instead of passing it as a discrete argv element. Added as
+/// defense in depth: this parser doesn't know whether the executor (Task 5)
+/// invokes git via argv (safe regardless of these characters) or via a
+/// shell string (unsafe if it does), and none of these characters ever
 /// legitimately appears in a real git ref name, so rejecting them costs
 /// nothing either way.
-const FORBIDDEN_GIT_REF_CHARS: &str = "~^:?*[\\$`();|&<>'\"";
+///
+/// **Fix round 4 corrects two claims this comment carried.**
+///
+/// 1. Fix round 2's version said `$(id)` was the *measured* reason `$` is in
+///    this set. That was true when written, but is no longer the evidence it
+///    claims to be: `(` and `)` are in the set too, so `$(id)` is rejected by
+///    those alone. The reason `$` earns its place independently is variable
+///    expansion with no parentheses at all — `$HOME`, `$IFS`, `${IFS}` — and
+///    `${IFS}` in particular expands to whitespace inside a shell string,
+///    re-creating word splitting from a value that contains no literal
+///    whitespace for [`validate_git_ref`]'s per-segment rules to split on.
+///    That is the payload class this entry actually defends against, and it
+///    is what `fix_round_4_an_ifs_expansion_needs_no_literal_space_to_split_a_word`
+///    pins.
+/// 2. `{` and `}` were named in fix round 3's exemption list as though they
+///    were being exempted from something — but they had never been in this
+///    set, so nothing was exempting them and bash brace expansion
+///    (`{main,--upload-pack=/tmp/evil}`) was accepted unconditionally. Fix
+///    round 4 adds them here, and [`validate_git_ref`] exempts them only at
+///    the byte positions where they form a literal `${{` or `}}`.
+const FORBIDDEN_GIT_REF_CHARS: &str = "~^:?*[\\$`();|&<>'\"{}";
 
 /// The other four isolation tiers take no documented parameters today;
 /// deserializing into this zero-field, `deny_unknown_fields` struct is how
@@ -992,7 +1170,7 @@ impl TryFrom<StepDefWire> for StepDef {
                     return Err(ParseError::InvalidStepBody {
                         step: w.id.clone(),
                         reason: format!(
-                            "env variable {name:?}'s value must not contain a newline, carriage return, or NUL byte"
+                            "env variable {name:?}'s value must not contain any control character (including a newline, carriage return, tab, or NUL byte)"
                         ),
                     });
                 }
