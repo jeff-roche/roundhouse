@@ -289,6 +289,22 @@ calling it, in both the HTTP-status-error branch and the in-band
 building a body from a `StreamFailure` struct; here, renaming one field of an
 already-real body).
 
+### Correction (fix-round-1 F4): the legacy `toolConfig`/`functionCallingConfig` citation was wrong
+
+`encode_generate_content_tool_config`'s original doc comment cited
+`generate-content.md.txt` as the verification source for
+`toolConfig.functionCallingConfig`'s `mode`/`allowedFunctionNames` shape.
+That citation was itself wrong in the same way as Task 5's C1: `allowedFunctionNames`
+appears **zero** times in `generate-content.md.txt`, and of the `mode` values
+this codec sends (`"ANY"`, `"NONE"`), only `"ANY"` appears there at all (in
+unrelated code samples, not a schema definition). The **values are correct**
+— confirmed at `https://ai.google.dev/api/caching.md.txt`'s
+`FunctionCallingConfig`/`Mode` sections, which is the real schema location
+for this type (`CachedContent.toolConfig` in the caching API references the
+same `FunctionCallingConfig` shape `generateContent`'s `toolConfig` field
+uses) — but the document named as having verified them did not contain them.
+Fixed in both the code comment and this record; no wire behavior changed.
+
 ## Divergence 5 (minor, in this codec's favor): `is_error` and `stop_sequences` DO exist here
 
 Two places where this codec's real spec is *more* permissive than Task 5's
@@ -309,10 +325,13 @@ mechanically copy Task 5's opposite conclusion across:
   validate this; that is left to the server, matching this crate's existing
   precedent of not client-side-validating provider limits).
 
-## Divergence 6 (scope decision, not a spec-shape finding): Image/Document and Thinking blocks are not encoded
+## Divergence 6 (scope decision, not a spec-shape finding): Image/Document/Thinking/Opaque are not encoded — all four now fail closed
 
 Matches Task 5's own established precedent and reasoning, re-confirmed rather
-than assumed:
+than assumed. **Corrected by fix-round-1 F1** (originally this codec silently
+dropped `Thinking`/`Opaque` via `Ok(None)`, which the review found is NOT
+the same situation as `openai_responses`' accepted `Thinking` precedent —
+see below):
 
 - `roundhouse-provider` has no `base64` dependency today, and both `ImageContent`/
   `DocumentContent` (Interactions) and `Blob` (legacy `inlineData`) require
@@ -326,17 +345,67 @@ than assumed:
   D1 lesson: the guard must live on the path production callers actually
   take, not only on `resolve`, which has zero production callers in this
   workspace).
-- `ContentBlock::Thinking` is not encoded in either mode. Interactions' real
-  `thought` step *could* structurally carry a passed-through `signature`
-  string, and Gemini 3 models are documented to require exactly this
-  round-trip for multi-step tool use — but correctly reconstructing that
-  (attaching a signature to a step, and per some documentation to the *first*
-  of several parallel function calls specifically) needs cross-block state
-  this task's per-block `encode_block(role, block) -> Result<Option<Value>,
-  _>` signature cannot express, and is out of scope here. Flagged under
-  Concerns in the task report, matching Task 5's Image/Document flag.
-  `ContentBlock::Opaque` is dropped for the same same-provider-round-trip
-  reasoning Task 5 gave.
+- `ContentBlock::Thinking` is **also** not encoded in either mode, and
+  **also** now returns `Err(EncodeError::UnencodableMedia("Thinking"))`, not
+  `Ok(None)` as originally shipped. The distinction from `openai_responses`'
+  accepted `Thinking` precedent (silently dropped there, no error) is load-
+  bearing, not cosmetic: that codec never receives a resendable
+  `encrypted_content` for `Thinking` in the first place, so dropping it is a
+  genuine no-op. Gemini's spec, by contrast, **documents this round-trip as
+  required**: `missing_thought_signature` is a real, standalone Interactions
+  error code ("The response is missing a required thought signature") and
+  `MISSING_THOUGHT_SIGNATURE` a real legacy `FinishReason` — both verified in
+  the fetched specs. Silently dropping a `Thinking` block here doesn't fail
+  loudly the way a genuinely-unsupported-forever case should; it quietly
+  breaks multi-step tool use downstream with no record of why. Correctly
+  reconstructing the real round-trip (attaching a signature to a step, and
+  per some documentation to the *first* of several parallel function calls
+  specifically) needs cross-block state this task's per-block
+  `encode_block(role, block) -> Result<Option<Value>, _>` signature cannot
+  express, and remains out of scope here — but failing closed until that's
+  built is the honest choice, not silence. Flagged under Concerns in the
+  task report.
+- `ContentBlock::Opaque` is likewise changed to
+  `Err(EncodeError::UnencodableMedia("Opaque"))`, for consistency with the
+  ruling above rather than a distinct spec finding of its own — this
+  decoder never produces an `Opaque` block itself, so the case is not known
+  to be reachable in practice today, but failing closed costs nothing and
+  avoids silently trusting that a future caller can never hand this codec
+  one from a different provider.
+
+## Known gap (equal prominence to the one above): `EndpointMode::GenerateContent` has thinner test coverage than Interactions
+
+The brief instructs running the full conformance suite only against
+`EndpointMode::Interactions` ("that's Gemini's default surface per §9.2"),
+which is honored — Interactions is the fully cassette-driven,
+`ConformanceSubject`-tested surface. That instruction does **not** mean
+`GenerateContent` is untested, but its coverage is real and narrower, and a
+future reader pointing this codec at real legacy traffic should know exactly
+where the edges are:
+
+- **Fix-round-1 F3 added integration coverage this codec did not originally
+  have**: one success cassette
+  (`testdata/cassettes/google_genai/generate_content_text.cassette`) and one
+  error cassette (`generate_content_error_429.cassette`), both replayed
+  through the real `GoogleGenAiProvider::stream_chat` (not just synthetic
+  unit-test frames) — see `conformance_google_genai.rs`'s
+  `generate_content_mode_text_cassette_decodes_via_real_stream_chat`/
+  `generate_content_mode_error_429_cassette_classifies_via_the_status_remap_branch`.
+  This is what caught nothing new by itself, but it is what would have
+  caught F2 mechanically had it existed from the start — F2 (an
+  unconditional `MessageStop`, the one real defect this fix round found) was
+  invisible to unit tests built from well-formed synthetic frames, since
+  those can only confirm the decoder agrees with itself.
+- **What remains cassette-free**: `GenerateContent` mode does not have a
+  full `ConformanceSubject` (mask/round-trip-fidelity/fold-determinism-
+  across-chunk-boundaries checks) the way Interactions does — a second one
+  was judged not required by fix-round-1's review, and Interactions
+  correctly stays canonical. The legacy positional text-continuation
+  heuristic (`decode_generate_content_stream`'s "does this part continue the
+  currently-open text/thinking block?" logic) is unit-tested directly
+  (`decode.rs`'s `generate_content_stream_tests` module) against synthetic
+  multi-chunk scenarios, but has not been exercised against real,
+  multi-chunk legacy traffic.
 
 ## Streaming envelope facts (verified, feeding `decode.rs`)
 
@@ -392,10 +461,12 @@ than assumed:
   counterpart in the schema the way Open Responses' `arguments` does), so the
   decoder treats each `functionCall` part as one immediate
   `BlockStart`+`BlockDelta`+`BlockStop` triple rather than an incrementally
-  assembled one. This mode has no required cassette in this task (the brief
-  runs conformance against `EndpointMode::Interactions` only); it is covered
-  by direct unit tests in `decode.rs` instead, and flagged as a Concern in the
-  task report for anyone pointing it at real legacy traffic later.
+  assembled one. `Part.thought: boolean` is a SIBLING field alongside
+  `text`, not an alternative union member (fix-round-1 F8 — the original
+  decoder folded thought-flagged text into the visible message); a part with
+  `thought: true` now opens a dedicated `Thinking` block instead. See "Known
+  gap" above for exactly what this mode's test coverage does and does not
+  include.
 
 ## Auth
 

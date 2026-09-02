@@ -106,7 +106,24 @@ async fn decode_interactions_stream(
     let mut events = Vec::new();
 
     while let Some(frame) = sse.next().await {
-        let Ok(frame) = frame else { continue };
+        // Fix-round-1 F2: a mid-stream transport/SSE-framing error must not
+        // be swallowed as a benign "nothing to see here" -- it's currently
+        // benign here (the loop simply ends and `Ok(events)` is returned
+        // either way, since this decoder never fabricates a `MessageStop`),
+        // but surfacing it explicitly avoids relying on that being true
+        // forever, and matches the sibling `GenerateContent` decoder where
+        // swallowing it was the actual defect.
+        let frame = match frame {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(StreamFailure {
+                    code: None,
+                    message: format!(
+                        "SSE transport error while decoding the interaction stream: {e}"
+                    ),
+                })
+            }
+        };
         let Some(data) = frame.data else { continue };
         let data = data.trim();
         if data.is_empty() {
@@ -334,6 +351,17 @@ fn interactions_usage_delta(usage_json: &Value) -> StreamEvent {
 // Legacy generateContent / streamGenerateContent
 // ============================================================================
 
+/// Which kind of block is currently open while decoding
+/// [`decode_generate_content_stream`]'s `text`/`thought` parts -- fix-round-1
+/// F8 (a `thought: true` part is a SIBLING of `text`, not an alternative to
+/// it, so both are handled by the same "does a part carry `text`?" branch;
+/// this distinguishes which normalized block that text belongs to).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenTextPartKind {
+    Text,
+    Thinking,
+}
+
 /// Decodes the legacy surface's stream: a sequence of complete, partial
 /// `GenerateContentResponse` JSON objects with no `event_type` discriminator
 /// at all (verified -- requires `?alt=sse` on the URL to be framed as SSE in
@@ -341,21 +369,43 @@ fn interactions_usage_delta(usage_json: &Value) -> StreamEvent {
 /// (verified: `FunctionCall.args` has no delta/fragment counterpart in the
 /// fetched schema), so each `functionCall` part becomes an immediate
 /// `BlockStart`+`BlockDelta`+`BlockStop` triple; `text` parts are treated as
-/// continuations of the currently-open text block (REALITY-CORRECTIONS'
-/// "Gemini's positional-no-key parts" description, for this endpoint
-/// specifically).
+/// continuations of the currently-open text/thinking block (REALITY-
+/// CORRECTIONS' "Gemini's positional-no-key parts" description, for this
+/// endpoint specifically).
+///
+/// Fix-round-1 F2 (the one real defect this round found, and the reason it
+/// went unnoticed: this path has no cassette): `StreamEvent::MessageStop` is
+/// pushed ONLY when a `finishReason: "STOP"` was actually observed on some
+/// chunk -- never unconditionally at end-of-body. `roundhouse-engine`'s
+/// `compact.rs` detects a truncated inference *solely* by the absence of a
+/// `MessageStop`; fabricating one for a connection reset, a proxy cut, or a
+/// stream that simply ends without ever carrying a terminal `finishReason`
+/// would have made a truncated turn persist as a completed one on an
+/// immutable log -- Task 5's `response.failed`-fell-through-a-`_`-arm defect,
+/// reproduced on this path. A mid-stream SSE/transport read error (`frame`
+/// itself being `Err`) is likewise surfaced as a `StreamFailure` now, not
+/// silently `continue`d.
 async fn decode_generate_content_stream(
     body: impl Stream<Item = Result<Bytes, TransportError>> + Send + Unpin,
 ) -> Result<Vec<StreamEvent>, StreamFailure> {
     let mut sse = SseStream::from_bytes_stream(body);
     let mut keyer = DeltaKeyer::new();
     let mut events = Vec::new();
-    let mut open_text_index: Option<u32> = None;
-    let mut next_text_slot: u32 = 0;
+    let mut open_block: Option<(OpenTextPartKind, u32)> = None;
+    let mut next_block_slot: u32 = 0;
     let mut next_call_slot: u32 = 0;
+    let mut saw_stop = false;
 
     while let Some(frame) = sse.next().await {
-        let Ok(frame) = frame else { continue };
+        let frame = match frame {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(StreamFailure {
+                    code: None,
+                    message: format!("SSE transport error while decoding the response stream: {e}"),
+                })
+            }
+        };
         let Some(data) = frame.data else { continue };
         let data = data.trim();
         if data.is_empty() {
@@ -384,11 +434,16 @@ async fn decode_generate_content_stream(
         {
             // "" / absent: "the model has not stopped generating tokens" per
             // the fetched spec -- a genuinely non-terminal, mid-stream chunk.
-            // "STOP": the only success-shaped terminal reason. Every other
-            // documented `FinishReason` (`MAX_TOKENS` included -- a truncated
-            // generation must not read as a clean success, matching Task 5's
-            // `response.incomplete` precedent) is a `StreamFailure`.
-            if !finish_reason.is_empty() && finish_reason != "STOP" {
+            // "STOP": the only success-shaped terminal reason -- recorded via
+            // `saw_stop`, not acted on immediately, since usage/remaining
+            // parts on this same chunk still need decoding below. Every
+            // other documented `FinishReason` (`MAX_TOKENS` included -- a
+            // truncated generation must not read as a clean success,
+            // matching Task 5's `response.incomplete` precedent) is a
+            // `StreamFailure`.
+            if finish_reason == "STOP" {
+                saw_stop = true;
+            } else if !finish_reason.is_empty() {
                 return Err(StreamFailure {
                     code: None,
                     message: format!("generation stopped: {finish_reason}"),
@@ -401,26 +456,56 @@ async fn decode_generate_content_stream(
             .and_then(Value::as_array)
         {
             for part in parts {
+                // Fix-round-1 F8: `thought` (verified `Part.thought: boolean`)
+                // is a SIBLING field alongside `text`, not an alternative
+                // union member -- a part can be `{"thought": true, "text":
+                // "..."}`. Folding thought-flagged text into the visible
+                // `Text` block (the original bug) leaks the model's internal
+                // reasoning into the assistant-visible message and re-feeds
+                // it as context on the next turn.
+                let is_thought = part
+                    .get("thought")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    let index = match open_text_index {
-                        Some(idx) => idx,
-                        None => {
-                            let idx = keyer.index_for(&format!("text-{next_text_slot}"));
-                            next_text_slot += 1;
+                    let desired_kind = if is_thought {
+                        OpenTextPartKind::Thinking
+                    } else {
+                        OpenTextPartKind::Text
+                    };
+                    let index = match open_block {
+                        Some((kind, idx)) if kind == desired_kind => idx,
+                        _ => {
+                            if let Some((_, idx)) = open_block.take() {
+                                events.push(StreamEvent::BlockStop { index: idx });
+                            }
+                            let idx = keyer.index_for(&format!("block-{next_block_slot}"));
+                            next_block_slot += 1;
+                            let block_kind = match desired_kind {
+                                OpenTextPartKind::Text => BlockKind::Text,
+                                OpenTextPartKind::Thinking => BlockKind::Thinking,
+                            };
                             events.push(StreamEvent::BlockStart {
                                 index: idx,
-                                kind: BlockKind::Text,
+                                kind: block_kind,
                             });
-                            open_text_index = Some(idx);
+                            open_block = Some((desired_kind, idx));
                             idx
                         }
                     };
-                    events.push(StreamEvent::BlockDelta {
-                        index,
-                        delta: BlockDelta::Text(text.to_string()),
-                    });
+                    let delta = match desired_kind {
+                        OpenTextPartKind::Text => BlockDelta::Text(text.to_string()),
+                        OpenTextPartKind::Thinking => BlockDelta::Thinking {
+                            text: text.to_string(),
+                            signature: part
+                                .get("thoughtSignature")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        },
+                    };
+                    events.push(StreamEvent::BlockDelta { index, delta });
                 } else if let Some(fc) = part.get("functionCall") {
-                    if let Some(idx) = open_text_index.take() {
+                    if let Some((_, idx)) = open_block.take() {
                         events.push(StreamEvent::BlockStop { index: idx });
                     }
                     let name = fc
@@ -442,8 +527,8 @@ async fn decode_generate_content_stream(
                     });
                     events.push(StreamEvent::BlockStop { index: idx });
                 }
-                // Every other part kind (`inlineData`, a `thought`-only part,
-                // `executableCode`, ...): no IR equivalent, skipped.
+                // Every other part kind (`inlineData`, `executableCode`, ...):
+                // no IR equivalent, skipped.
             }
         }
 
@@ -452,10 +537,18 @@ async fn decode_generate_content_stream(
         }
     }
 
-    if let Some(idx) = open_text_index {
-        events.push(StreamEvent::BlockStop { index: idx });
+    // Fix-round-1 F2: only a genuinely observed `finishReason: "STOP"` earns
+    // a `MessageStop` (and the closing `BlockStop` for whatever was still
+    // open). A stream that ends without one is left unterminated on purpose
+    // -- `fold_stream` records a loss event for the still-open block, and
+    // `compact.rs`'s absent-`MessageStop` check correctly reports it as
+    // interrupted rather than completed.
+    if saw_stop {
+        if let Some((_, idx)) = open_block.take() {
+            events.push(StreamEvent::BlockStop { index: idx });
+        }
+        events.push(StreamEvent::MessageStop);
     }
-    events.push(StreamEvent::MessageStop);
     Ok(events)
 }
 
@@ -664,6 +757,101 @@ mod generate_content_stream_tests {
         let body = sse_body(&[r#"{"promptFeedback":{"blockReason":"SAFETY"},"candidates":[]}"#]);
         let err = expect_stream_failure(decode_generate_content_stream(body).await);
         assert!(err.message.contains("SAFETY"));
+    }
+
+    /// Fix-round-1 F2 (the one real defect this round found): a stream that
+    /// ends without ever carrying a terminal `finishReason` -- a connection
+    /// reset, a proxy cut, or simply a truncated body -- must NOT fabricate
+    /// `StreamEvent::MessageStop`. `roundhouse-engine`'s `compact.rs` detects
+    /// truncation solely by that event's absence; fabricating it here would
+    /// have made a truncated inference read as a completed one.
+    #[tokio::test]
+    async fn a_stream_with_no_observed_finish_reason_does_not_fabricate_message_stop() {
+        let body = sse_body(&[
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"partial"}]}}]}"#,
+        ]);
+        let events = decode_generate_content_stream(body)
+            .await
+            .expect("an unterminated stream is not itself an error -- just unterminated");
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::MessageStop)),
+            "a stream that ends with no observed finishReason must not fabricate a terminal \
+             MessageStop"
+        );
+    }
+
+    /// The success-path complement: a real `finishReason: \"STOP\"` DOES
+    /// still earn a `MessageStop` (proves the fix didn't just delete the
+    /// event unconditionally).
+    #[tokio::test]
+    async fn a_stream_that_actually_observes_stop_does_emit_message_stop() {
+        let body = sse_body(&[
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"done"}]},"finishReason":"STOP"}]}"#,
+        ]);
+        let events = decode_generate_content_stream(body)
+            .await
+            .expect("must decode successfully");
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::MessageStop)),
+            "a stream that genuinely observed finishReason: STOP must still emit MessageStop"
+        );
+    }
+
+    /// Fix-round-1 F8: `{"thought": true, "text": "..."}` is a SIBLING shape
+    /// (verified `Part.thought: boolean`, not an alternative union member) --
+    /// it must open a `Thinking` block, not fold into the visible `Text`
+    /// block the way the original code did.
+    #[tokio::test]
+    async fn a_thought_flagged_part_opens_a_thinking_block_not_visible_text() {
+        let body = sse_body(&[
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"Let me reason about this."},{"text":"The answer is 4."}]},"finishReason":"STOP"}]}"#,
+        ]);
+        let events = decode_generate_content_stream(body)
+            .await
+            .expect("must decode successfully");
+
+        let mut thinking_texts = Vec::new();
+        let mut visible_texts = Vec::new();
+        let mut saw_thinking_start = false;
+        let mut saw_text_start = false;
+        for event in events {
+            match event {
+                StreamEvent::BlockStart {
+                    kind: BlockKind::Thinking,
+                    ..
+                } => saw_thinking_start = true,
+                StreamEvent::BlockStart {
+                    kind: BlockKind::Text,
+                    ..
+                } => saw_text_start = true,
+                StreamEvent::BlockDelta {
+                    delta: BlockDelta::Thinking { text, .. },
+                    ..
+                } => thinking_texts.push(text),
+                StreamEvent::BlockDelta {
+                    delta: BlockDelta::Text(text),
+                    ..
+                } => visible_texts.push(text),
+                _ => {}
+            }
+        }
+        assert!(
+            saw_thinking_start,
+            "a thought-flagged part must open a Thinking block"
+        );
+        assert!(
+            saw_text_start,
+            "the following non-thought part must open a separate Text block"
+        );
+        assert_eq!(
+            thinking_texts,
+            vec!["Let me reason about this.".to_string()]
+        );
+        assert_eq!(
+            visible_texts,
+            vec!["The answer is 4.".to_string()],
+            "the model's internal reasoning must not leak into the visible assistant text"
+        );
     }
 }
 

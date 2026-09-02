@@ -1,9 +1,18 @@
 # Vendored from https://ai.google.dev/gemini-api/docs/api-errors.md.txt
 # ("This page provides a reference for all Interactions API error codes"),
-# fetched during Task 6's spec-verification gate -- the full documented
-# "Standard API error codes" table (lowercase snake_case, NOT the classic
-# UPPER_SNAKE google.rpc.Code vocabulary). See
+# fetched during Task 6's spec-verification gate (lowercase snake_case, NOT
+# the classic UPPER_SNAKE google.rpc.Code vocabulary). See
 # docs/decisions/2026-08-27-google-genai-spec-verification.md Divergence 4.
+#
+# Fix-round-1 F10: the original version of this file vendored only the
+# "Standard API error codes" table (18 codes) and the tripwire's assertion
+# message implied that was the complete set -- so a legitimate future
+# `[errors.safety]`-style entry (a real, documented code from either of the
+# page's other two tables) would have been wrongly rejected as "not a real
+# spec value." All three of the page's documented tables are vendored below
+# now (35 codes total), matching what the tripwire actually asserts.
+
+# "Standard API error codes" (general request-level, map to HTTP statuses):
 invalid_request
 failed_precondition
 out_of_range
@@ -22,3 +31,24 @@ api_error
 unimplemented
 service_unavailable
 deadline_exceeded
+
+# "Generation blocked codes" (policy/safety/content restrictions):
+safety
+recitation
+language
+prohibited_content
+spii
+blocklist
+image_safety
+image_prohibited_content
+image_recitation
+image_other
+content_blocked
+
+# "Generation error codes" (structural issues with generated output):
+malformed_function_call
+malformed_tool_call
+unexpected_tool_call
+no_image
+too_many_tool_calls
+missing_thought_signature

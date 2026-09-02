@@ -73,7 +73,7 @@ impl Provider for GoogleGenAiProvider {
             let (base_url, _host_only) =
                 resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None)
                     .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
-            let endpoint_url = build_endpoint_url(&base_url, self.mode, &req.model.0);
+            let endpoint_url = build_endpoint_url(&base_url, self.mode, &req.model.0)?;
 
             let mut http_req = HttpRequest {
                 method: "POST".to_string(),
@@ -112,11 +112,22 @@ impl Provider for GoogleGenAiProvider {
                             format!("Bearer {}", ctx.api_key),
                         ));
                     }
-                    // SigV4/AzureEntra need the real `CredentialProvider`
-                    // (signing/token-exchange logic no bare api_key string
-                    // can express) -- not reachable via this profile's own
-                    // `header_key` auth, listed for exhaustiveness only.
-                    AuthKind::SigV4 { .. } | AuthKind::AzureEntra { .. } => {}
+                    // Fix-round-1 F7: SigV4/AzureEntra need the real
+                    // `CredentialProvider` (signing/token-exchange logic no
+                    // bare api_key string can express) -- not reachable via
+                    // this profile's own `header_key` auth today, but a
+                    // silent `{}` here would have sent the request
+                    // completely UNAUTHENTICATED rather than failing it
+                    // locally. A missing credential must fail closed, not
+                    // become a remote 401 the caller has to notice on its
+                    // own.
+                    AuthKind::SigV4 { .. } | AuthKind::AzureEntra { .. } => {
+                        return Err(ProviderError::Unsupported(format!(
+                            "google-genai codec has no CredentialProvider and its bare \
+                             api_key fallback cannot express {:?} auth",
+                            self.profile.defaults.auth
+                        )));
+                    }
                 }
             }
 
@@ -173,7 +184,20 @@ impl Provider for GoogleGenAiProvider {
 /// prefix and query string (matches `openai_responses::provider`'s
 /// `append_path_segment` precedent -- never `Url::join`, which drops a base
 /// URL's existing query string per WHATWG relative-URL resolution).
-fn build_endpoint_url(base: &url::Url, mode: EndpointMode, model: &str) -> url::Url {
+///
+/// Fix-round-1 F9: `model` (only `GenerateContent` mode interpolates it into
+/// the path) is rejected outright if it contains `/`, `..`, or `%` --
+/// `ModelId` is config-sourced today, so the host cannot actually be
+/// redirected and this is not exploitable *yet*, but the moment a model id
+/// can arrive from a sub-agent spec, a workflow trigger, or an MCP field,
+/// silently trusting it as a URL path segment (including a percent-encoded
+/// `..` traversal, which naive string interpolation would pass through
+/// unnoticed) stops being purely theoretical.
+fn build_endpoint_url(
+    base: &url::Url,
+    mode: EndpointMode,
+    model: &str,
+) -> Result<url::Url, ProviderError> {
     let mut url = base.clone();
     let base_path = url.path().strip_suffix('/').unwrap_or(url.path());
     match mode {
@@ -181,6 +205,12 @@ fn build_endpoint_url(base: &url::Url, mode: EndpointMode, model: &str) -> url::
             url.set_path(&format!("{base_path}/v1beta/interactions"));
         }
         EndpointMode::GenerateContent => {
+            if model.contains('/') || model.contains("..") || model.contains('%') {
+                return Err(ProviderError::Unsupported(format!(
+                    "model id `{model}` contains a character not allowed in a URL path segment \
+                     (/, .., or %)"
+                )));
+            }
             // Verified: `streamGenerateContent` requires `?alt=sse` on the
             // URL to be framed as SSE at all -- `query_pairs_mut` appends
             // rather than replacing, so a gateway base URL's own query
@@ -191,7 +221,7 @@ fn build_endpoint_url(base: &url::Url, mode: EndpointMode, model: &str) -> url::
             url.query_pairs_mut().append_pair("alt", "sse");
         }
     }
-    url
+    Ok(url)
 }
 
 /// Remaps a Gemini error body into the `{"error": {"type", "message"}}` shape
@@ -272,7 +302,7 @@ mod build_endpoint_url_tests {
     #[test]
     fn interactions_mode_targets_v1beta_interactions() {
         let base = url::Url::parse("https://generativelanguage.googleapis.com").unwrap();
-        let url = build_endpoint_url(&base, EndpointMode::Interactions, "gemini-3.0-pro");
+        let url = build_endpoint_url(&base, EndpointMode::Interactions, "gemini-3.0-pro").unwrap();
         assert_eq!(
             url.as_str(),
             "https://generativelanguage.googleapis.com/v1beta/interactions"
@@ -282,7 +312,8 @@ mod build_endpoint_url_tests {
     #[test]
     fn generate_content_mode_targets_the_colon_method_with_alt_sse() {
         let base = url::Url::parse("https://generativelanguage.googleapis.com").unwrap();
-        let url = build_endpoint_url(&base, EndpointMode::GenerateContent, "gemini-3.0-pro");
+        let url =
+            build_endpoint_url(&base, EndpointMode::GenerateContent, "gemini-3.0-pro").unwrap();
         assert_eq!(
             url.as_str(),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.0-pro:streamGenerateContent?alt=sse"
@@ -294,11 +325,38 @@ mod build_endpoint_url_tests {
     #[test]
     fn preserves_a_gateway_query_string() {
         let base = url::Url::parse("https://gateway.example.com/proxy?key=abc123").unwrap();
-        let url = build_endpoint_url(&base, EndpointMode::Interactions, "gemini-3.0-pro");
+        let url = build_endpoint_url(&base, EndpointMode::Interactions, "gemini-3.0-pro").unwrap();
         assert_eq!(
             url.as_str(),
             "https://gateway.example.com/proxy/v1beta/interactions?key=abc123"
         );
+    }
+
+    /// Fix-round-1 F9: a model id containing `/`, `..`, or `%` must be
+    /// rejected before it ever reaches URL construction, not silently
+    /// interpolated into the path.
+    #[test]
+    fn generate_content_mode_rejects_a_path_traversal_shaped_model_id() {
+        let base = url::Url::parse("https://generativelanguage.googleapis.com").unwrap();
+        for bad_model in [
+            "../v1beta/admin",
+            "foo/bar",
+            "%2e%2e/admin",
+            "gemini-3.0-pro/../../admin",
+        ] {
+            assert!(
+                build_endpoint_url(&base, EndpointMode::GenerateContent, bad_model).is_err(),
+                "expected model id `{bad_model}` to be rejected"
+            );
+        }
+    }
+
+    /// Interactions mode never interpolates `model` into the URL at all, so
+    /// the same rejection must not false-positive there.
+    #[test]
+    fn interactions_mode_does_not_validate_model_since_it_never_uses_it_in_the_path() {
+        let base = url::Url::parse("https://generativelanguage.googleapis.com").unwrap();
+        assert!(build_endpoint_url(&base, EndpointMode::Interactions, "../whatever").is_ok());
     }
 }
 

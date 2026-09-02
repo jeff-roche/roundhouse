@@ -295,39 +295,160 @@ impl HttpTransport for PanicsIfCalledTransport {
     }
 }
 
+/// Fix-round-1 F3: exercised under BOTH endpoint modes, not just
+/// Interactions -- the original version only proved the Interactions
+/// fail-closed path was wired; the legacy `GenerateContent` path shares the
+/// same `encode(...)?` propagation but had never actually been driven
+/// through `stream_chat` at all before this fix round.
 #[tokio::test]
 async fn stream_chat_rejects_image_content_before_any_transport_call() {
     use roundhouse_provider::{ContentBlock, MediaSource, Message};
-    let req = ChatRequest {
-        messages: vec![Message {
-            role: roundhouse_provider::Role::User,
-            content: vec![
-                ContentBlock::Text {
-                    text: "What's in this image?".into(),
-                    cache: None,
-                    citations: vec![],
-                },
-                ContentBlock::Image {
-                    source: MediaSource {
-                        mime_type: "image/png".into(),
-                        data: vec![0, 1, 2, 3],
+    for mode in [EndpointMode::Interactions, EndpointMode::GenerateContent] {
+        let req = ChatRequest {
+            messages: vec![Message {
+                role: roundhouse_provider::Role::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "What's in this image?".into(),
+                        cache: None,
+                        citations: vec![],
                     },
-                    cache: None,
-                },
-            ],
-        }],
-        ..fixtures::single_turn_text()
-    };
+                    ContentBlock::Image {
+                        source: MediaSource {
+                            mime_type: "image/png".into(),
+                            data: vec![0, 1, 2, 3],
+                        },
+                        cache: None,
+                    },
+                ],
+            }],
+            ..fixtures::single_turn_text()
+        };
+        let ctx = RequestCtx {
+            trace_id: None,
+            transport: Arc::new(PanicsIfCalledTransport),
+            api_key: "test-key".into(),
+            credentials: None,
+        };
+        let provider = GoogleGenAiProvider::new(fixture_profile(), mode);
+        let err = expect_err(provider.stream_chat(&req, &ctx).await);
+        assert!(
+            matches!(err, ProviderError::Unsupported(_)),
+            "expected Unsupported under {mode:?}, got {err:?}"
+        );
+    }
+}
+
+// ============================================================================
+// Fix-round-1 F3: `EndpointMode::GenerateContent` integration coverage
+//
+// Before this fix round, `GoogleGenAiProvider::new(profile,
+// EndpointMode::GenerateContent)` was never constructed in any test --
+// its `stream_chat` URL building, auth attachment, and error classification
+// (including the `/error/status` remap branch) had never run once, even
+// against a synthetic cassette. Both reviewers independently concluded that
+// well-formed synthetic unit-test frames can only confirm the decoder agrees
+// with itself; F2's defect (an unconditional `MessageStop`) is the proof a
+// cassette driven through the real `Provider::stream_chat` would have caught
+// mechanically. These two tests are the minimum F3 asks for: one success
+// cassette, one error cassette, both replayed through the real provider.
+// Interactions correctly stays the canonical, fully-conformance-tested
+// surface; a full second `ConformanceSubject` for this mode was judged not
+// required.
+//
+// Per REALITY-CORRECTIONS §13b item 3 (state where cassette bytes came
+// from): both cassettes below are hand-authored, not recorded against a live
+// API. `generate_content_text.cassette`'s shape (two `data:` frames, each a
+// partial `GenerateContentResponse` with no `event_type` discriminator, the
+// second carrying `finishReason: "STOP"` and `usageMetadata`) is built from
+// the verified schemas in `generate-content.md.txt`'s literal JSON-
+// representation blocks (`Content`/`Part`/`Candidate`/`FinishReason`/
+// `UsageMetadata`), not copied from a live response. Likewise the four
+// Interactions-mode cassettes committed earlier in this task
+// (`text`/`tools`/`parallel_tools`/`reasoning`) are hand-authored from
+// `interactions.openapi.json`'s verified `event_type`/`step.type`/
+// `delta.type` `const` values and the vendored tripwire lists, not recorded.
+// `generate_content_error_429.cassette`'s body is the long-standing,
+// corroborated-but-not-directly-fetched `google.rpc.Status` shape (see the
+// decision doc) -- chosen specifically to exercise
+// `remap_error_body_for_classify`'s `/error/status` fallback branch, since
+// `/error/code` here is a JSON number, not a string.
+// ============================================================================
+
+#[tokio::test]
+async fn generate_content_mode_text_cassette_decodes_via_real_stream_chat() {
+    let transport = CassetteTransport::from_file(
+        &cassette_path("generate_content_text.cassette"),
+        ChunkStrategy::WholeBody,
+    )
+    .expect("generate_content_text.cassette must parse");
     let ctx = RequestCtx {
         trace_id: None,
-        transport: Arc::new(PanicsIfCalledTransport),
+        transport: Arc::new(transport),
         api_key: "test-key".into(),
         credentials: None,
     };
-    let provider = GoogleGenAiProvider::new(fixture_profile(), EndpointMode::Interactions);
-    let err = expect_err(provider.stream_chat(&req, &ctx).await);
+    let provider = GoogleGenAiProvider::new(fixture_profile(), EndpointMode::GenerateContent);
+    let stream = provider
+        .stream_chat(&fixtures::single_turn_text(), &ctx)
+        .await
+        .expect("must decode successfully via the real stream_chat pipeline");
+    let folded = roundhouse_conformance::checks::fold_stream(stream).await;
+
+    let text: String = folded
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            roundhouse_provider::ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "4.");
+    assert_eq!(folded.usage.input_tokens, 9);
+    assert_eq!(folded.usage.output_tokens, 3);
     assert!(
-        matches!(err, ProviderError::Unsupported(_)),
-        "expected Unsupported, got {err:?}"
+        folded.loss_events.is_empty(),
+        "no block should be left unterminated: {:?}",
+        folded.loss_events
+    );
+}
+
+/// Also proves URL construction and header attachment for this mode
+/// actually work end to end (`build_endpoint_url`'s `:streamGenerateContent`
+/// + `?alt=sse` path, `x-goog-api-key` header via the `AuthKind::HeaderKey`
+/// fallback) -- `CassetteTransport` ignores the request it's given, but a
+/// panic anywhere in `stream_chat` before `transport.send` (URL building,
+/// serialization, auth) would still fail this test.
+#[tokio::test]
+async fn generate_content_mode_error_429_cassette_classifies_via_the_status_remap_branch() {
+    let transport = CassetteTransport::from_file(
+        &cassette_path("generate_content_error_429.cassette"),
+        ChunkStrategy::WholeBody,
+    )
+    .expect("generate_content_error_429.cassette must parse");
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(transport),
+        api_key: "test-key".into(),
+        credentials: None,
+    };
+    let provider = GoogleGenAiProvider::new(fixture_profile(), EndpointMode::GenerateContent);
+    let err = expect_err(
+        provider
+            .stream_chat(&fixtures::single_turn_text(), &ctx)
+            .await,
+    );
+    // `RESOURCE_EXHAUSTED` is not a key in this profile's `[errors]` table
+    // (that table targets the Interactions API's snake_case vocabulary,
+    // deliberately -- see the decision doc's Divergence 4), so this falls
+    // through to `classify`'s HTTP-status default tier for a bare 429. The
+    // point of this test is not the specific `ProviderError` variant it
+    // lands on -- it's that `remap_error_body_for_classify`'s `/error/status`
+    // branch (the "corroborated but not directly fetched" shape) is
+    // exercised for real, through the actual `stream_chat` pipeline, and
+    // does not panic or misparse a numeric `/error/code`.
+    assert!(
+        matches!(err, ProviderError::RateLimited { .. }),
+        "expected RateLimited via the HTTP-status default tier, got {err:?}"
     );
 }

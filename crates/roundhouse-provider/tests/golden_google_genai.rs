@@ -289,6 +289,63 @@ fn golden_document_content_block() {
     insta::assert_snapshot!("google_genai_document_content_block", err.to_string());
 }
 
+/// Fix-round-1 F1 (Critical): a `Thinking` block must fail closed, not
+/// silently vanish -- Gemini's spec documents thought-signature round-
+/// tripping as required for multi-step tool use (`missing_thought_signature`
+/// is a real Interactions error code; `MISSING_THOUGHT_SIGNATURE` a real
+/// legacy `FinishReason`), unlike `openai_responses`' `Thinking` case, which
+/// never receives a resendable value in the first place. Covers both modes,
+/// since the fix applies to both `encode_interactions_step` and
+/// `encode_generate_content_part`.
+#[test]
+fn golden_thinking_content_block_fails_closed_in_both_modes() {
+    fn request_with_thinking() -> ChatRequest {
+        ChatRequest {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Thinking {
+                    text: "Let me work through this step by step.".into(),
+                    signature: Some(roundhouse_provider::Signature("thought_sig_abc".into())),
+                    redacted: false,
+                }],
+            }],
+            ..base_request(vec![user_text("Prove sqrt(2) is irrational.")])
+        }
+    }
+
+    let provider_interactions =
+        GoogleGenAiProvider::new(fixture_profile(), EndpointMode::Interactions);
+    assert!(
+        matches!(
+            provider_interactions.resolve(&request_with_thinking()),
+            Err(ProviderError::Unsupported(_))
+        ),
+        "resolve() must reject a request containing a Thinking block, not silently drop it later"
+    );
+
+    let interactions_err = encode(
+        &request_with_thinking(),
+        &fixture_profile(),
+        EndpointMode::Interactions,
+    )
+    .expect_err("encode() must refuse to silently drop a Thinking block (Interactions mode)");
+    insta::assert_snapshot!(
+        "google_genai_thinking_content_block_interactions",
+        interactions_err.to_string()
+    );
+
+    let legacy_err = encode(
+        &request_with_thinking(),
+        &fixture_profile(),
+        EndpointMode::GenerateContent,
+    )
+    .expect_err("encode() must refuse to silently drop a Thinking block (GenerateContent mode)");
+    insta::assert_snapshot!(
+        "google_genai_thinking_content_block_generate_content",
+        legacy_err.to_string()
+    );
+}
+
 /// The two error messages above must be distinguishable (a carried-forward
 /// fix from Task 5's review, applied here from the start).
 #[test]

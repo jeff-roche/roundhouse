@@ -62,17 +62,31 @@ pub fn encode(
     }
 }
 
-/// True if `req` contains an `Image` or `Document` block anywhere in its
-/// messages -- used by `GoogleGenAiProvider::resolve` as a cheap, I/O-free
-/// pre-flight. The guarantee that actually holds on the production path is
-/// `encode_block`'s `Err(EncodeError::UnencodableMedia)` return, propagated
-/// through `stream_chat` -- see this module's doc comment on `EncodeError`.
+/// True if `req` contains a block anywhere in its messages that this codec
+/// cannot encode -- used by `GoogleGenAiProvider::resolve` as a cheap,
+/// I/O-free pre-flight. The guarantee that actually holds on the production
+/// path is `encode_block`'s `Err(EncodeError::UnencodableMedia)` return,
+/// propagated through `stream_chat` -- see this module's doc comment on
+/// `EncodeError`.
+///
+/// Fix-round-1 F1: `Thinking`/`Opaque` are included here, not just
+/// `Image`/`Document`. Unlike `openai_responses` (which never receives a
+/// resendable `encrypted_content` for `Thinking`, so silently dropping it is
+/// genuinely a no-op there), Gemini's spec documents thought-signature
+/// round-tripping as REQUIRED for multi-step tool use --
+/// `missing_thought_signature` is a real Interactions error code and
+/// `MISSING_THOUGHT_SIGNATURE` a real legacy `FinishReason`. Silently
+/// dropping a `Thinking` block here doesn't fail loudly the way it should;
+/// it breaks multi-step tool use downstream with no record of why.
 pub fn contains_unencodable_media(req: &ChatRequest) -> bool {
     req.messages.iter().any(|m| {
         m.content.iter().any(|b| {
             matches!(
                 b,
-                ContentBlock::Image { .. } | ContentBlock::Document { .. }
+                ContentBlock::Image { .. }
+                    | ContentBlock::Document { .. }
+                    | ContentBlock::Thinking { .. }
+                    | ContentBlock::Opaque { .. }
             )
         })
     })
@@ -189,13 +203,16 @@ fn interactions_thinking_level(intent: ReasoningIntent) -> Option<&'static str> 
 
 /// Encodes one content block into zero or one Interactions API `Step`.
 ///
-/// `Ok(None)` for `Thinking`/`Opaque` -- see this module's doc comment on
-/// `EncodeError` and the decision doc's Divergence 6 for why encoding a real
-/// `thought` step (which needs cross-block state to attach a signature to an
-/// adjacent `function_call` step correctly) is out of this task's scope.
-///
-/// `Err(EncodeError::UnencodableMedia(kind))` -- never `Ok(None)` -- for
-/// `Image`/`Document`: this crate has no `base64` dependency (Divergence 6).
+/// Every unencodable kind returns `Err(EncodeError::UnencodableMedia(kind))`
+/// -- never `Ok(None)` -- naming which kind. `Image`/`Document`: this crate
+/// has no `base64` dependency (Divergence 6). `Thinking`/`Opaque`
+/// (fix-round-1 F1, reversing the original `Ok(None)`): encoding a real
+/// `thought` step correctly needs cross-block state to attach a signature to
+/// an adjacent `function_call` step, which is out of this task's scope --
+/// but Gemini's spec documents that round-trip as REQUIRED for multi-step
+/// tool use (see `contains_unencodable_media`'s doc comment), so silently
+/// dropping it is not an acceptable degrade. Failing closed until real
+/// cross-block signature attachment is implemented is the honest choice.
 fn encode_interactions_step(
     role: Role,
     block: &ContentBlock,
@@ -242,7 +259,8 @@ fn encode_interactions_step(
         }
         ContentBlock::Image { .. } => Err(EncodeError::UnencodableMedia("Image")),
         ContentBlock::Document { .. } => Err(EncodeError::UnencodableMedia("Document")),
-        ContentBlock::Thinking { .. } | ContentBlock::Opaque { .. } => Ok(None),
+        ContentBlock::Thinking { .. } => Err(EncodeError::UnencodableMedia("Thinking")),
+        ContentBlock::Opaque { .. } => Err(EncodeError::UnencodableMedia("Opaque")),
     }
 }
 
@@ -404,13 +422,21 @@ fn encode_generate_content_part(block: &ContentBlock) -> Result<Option<Value>, E
         }
         ContentBlock::Image { .. } => Err(EncodeError::UnencodableMedia("Image")),
         ContentBlock::Document { .. } => Err(EncodeError::UnencodableMedia("Document")),
-        ContentBlock::Thinking { .. } | ContentBlock::Opaque { .. } => Ok(None),
+        ContentBlock::Thinking { .. } => Err(EncodeError::UnencodableMedia("Thinking")),
+        ContentBlock::Opaque { .. } => Err(EncodeError::UnencodableMedia("Opaque")),
     }
 }
 
-/// `toolConfig.functionCallingConfig` (verified via code samples in
-/// `generate-content.md.txt`): `{ "mode": "AUTO"|"ANY"|"NONE",
-/// "allowedFunctionNames": [string] }`.
+/// `toolConfig.functionCallingConfig` (fix-round-1 F4: corrected provenance
+/// -- the original comment cited `generate-content.md.txt`'s code samples,
+/// but `allowedFunctionNames` appears zero times there and that document only
+/// shows the `ANY` value. The real, verified source is
+/// `https://ai.google.dev/api/caching.md.txt`'s `FunctionCallingConfig`/`Mode`
+/// sections: `{ "mode": "MODE_UNSPECIFIED"|"AUTO"|"ANY"|"NONE"|"VALIDATED",
+/// "allowedFunctionNames": [string] }`. The values this codec uses (`"NONE"`,
+/// `"ANY"`) are unaffected by the correction -- only the citation was wrong,
+/// the same shape as Task 5's C1 (a literal asserted as spec-verified from a
+/// document that doesn't contain it).
 fn encode_generate_content_tool_config(choice: &ToolChoice) -> Option<Value> {
     match choice {
         ToolChoice::Auto => None,
