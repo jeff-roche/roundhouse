@@ -75,40 +75,77 @@
 //!   anywhere, so there is no log-line leak surface *inside* `expr.rs`
 //!   itself to audit.
 //!
-//! ## `env()` is a second, independent secret-exposure surface
+//! ## `env()` is a second, independent secret-exposure surface — AWAITING AN OWNER
 //!
-//! `env()` (§8.9's own required function) reads the **calling process's
-//! real environment** via [`std::env::var`] — the daemon's environment, not
-//! a workflow-scoped view of it, and not restricted to whatever a workflow
-//! declared under its own `secrets:` list. If the daemon process's
-//! environment holds a provider API key or any other daemon-wide secret,
-//! `env('ANTHROPIC_API_KEY')` reads it directly, through a path that has
-//! nothing to do with `${{ secrets.* }}` or its (separately owned, not
-//! built by this task) resolution pipeline. This is a real residual, not a
-//! hypothetical: it is exactly what §8.9 asks this function to do, and
-//! this task has no brief to scope it down (to what — an allowlist of
-//! names? decided by whom?) without inventing a restriction nobody asked
-//! for. Stated here so the next reader does not have to discover it by
-//! reading `call_function`'s `"env"` arm.
+//! `env()` (§8.9's own required function, `docs/architecture/05-scheduling-and-workflows.md:295-296`)
+//! reads the **calling process's real environment** via [`std::env::var`] —
+//! the daemon's environment, not a workflow-scoped view of it, and not
+//! restricted to whatever a workflow declared under its own `secrets:`
+//! list. Building it exactly this way, with no allowlist invented
+//! unilaterally, is correct against the frozen contract — a security review
+//! independently confirmed both that §8.9 really does freeze `env` in the
+//! function list and that declining to scope it down without a brief to do
+//! so was the right call. **What is not settled is what happens next.**
+//! Concretely: `crates/roundhouse-daemon/src/main.rs:125` reads
+//! `ANTHROPIC_API_KEY` from the daemon's process environment to configure
+//! the real provider; `env()` reads that same environment, unscoped; so
+//! `${{ env('ANTHROPIC_API_KEY') }}` in any workflow file yields the
+//! provider key as cleartext into an `env:`/`with:`/header/`run:` value,
+//! bypassing `roundhouse-secrets` and the redaction discipline at
+//! `crates/roundhouse-secrets/src/resolve.rs:108`, and bypassing the
+//! workflow's own declared `secrets:` list entirely. This residual is
+//! **escalated, not closed**: it needs an owner and a decision (process-env
+//! scrubbing before workflow evaluation, or a daemon-config allowlist of
+//! which variable names `env()` may read) that this task is not the one to
+//! make unilaterally. Stated here so the next reader does not mistake the
+//! absence of a fix for the absence of a decision, and does not have to
+//! rediscover the residual by reading `call_function`'s `"env"` arm cold.
 //!
-//! ## `json()` can synthesize control characters the source text never had
+//! ## A resolved value can carry control characters the workflow YAML never had
 //!
-//! §8.9 also requires `json()`. `json('"a\nb"')` decodes the two literal
+//! §8.9 requires `json()`, and `json('"a\nb"')` decodes the two literal
 //! source characters `\` and `n` into an actual newline byte in the
 //! resulting `Value::String` — the same escape-decoding any JSON parser
-//! does. This means the frozen function set can, on its own, produce a
-//! newline (or `\t`, `\0`, any other JSON escape) in a value that did
-//! not literally contain that byte in the workflow YAML source, which is
-//! the exact shape of thing the dispatch's risk item 2 asked this task not
-//! to add. It cannot be omitted (it is one of the ~10 frozen functions),
-//! so it is documented instead: **whatever downstream sink consumes an
-//! `interpolate`/`interpolate_json` result that passed through a `json()`
-//! call must not assume the result is free of control characters just
-//! because the source YAML looked clean.** Task 3's own `worktree.base_ref`
+//! does. **`json()` is not the dominant path here, and naming it as the
+//! reason this gap is real would be wrong: plain context data already
+//! carries the same risk with no `json()` call involved at all** —
+//! whatever deserializes a `map.over` item or a webhook payload into the
+//! `serde_json::Value` this module receives already turns an escaped
+//! sequence in *that* source data into a real control byte before
+//! `ExprContext::set` ever runs, so freezing or removing `json()` would
+//! narrow this vector by exactly zero: `json()` can merely reach the same
+//! outcome from expression text the author typed directly, which is a
+//! smaller and more visible surface than attacker-controlled `map.over`
+//! data. The residual belongs on **whatever deserializes context data**
+//! (this module included, when `json()` is the one doing the decoding),
+//! and on **whatever sink consumes the resulting string**, not on `json()`
+//! alone.
+//!
+//! Blast radius, measured at the sinks a resolved value can reach:
+//! a synthesized **NUL byte reaching an argv element fails closed**
+//! (`std::process::Command::arg` returns `InvalidInput: nul byte found`,
+//! measured directly). A synthesized **newline reaching an argv element
+//! placed after a `--` separator is inert** — the argument stays one
+//! element rather than splitting, which is the shape Task 3's
+//! `worktree.base_ref` argv+`--` requirement
+//! (`crates/roundhouse-flow/src/parse/steps.rs:657-658`) depends on, *if*
+//! the executor that actually spawns the process (Task 6) honors that
+//! requirement — this module cannot verify that from here. **A synthesized
+//! newline reaching an `env:` value is the real hazard**: measured
+//! directly, `/usr/bin/env` rendered a value containing an embedded newline
+//! as two separate lines, forging a second `KEY=VALUE` entry that was not
+//! present in the original single value. Any consumer that parses
+//! `KEY=VALUE` lines (a `.env` file, `--env-file`, a systemd
+//! `EnvironmentFile`, a `GITHUB_ENV`-style append) would see the forged
+//! entry as genuine. [`interpolate_json`] exists precisely to resolve a
+//! step's `env:` block, so this is not a hypothetical shape for this
+//! module's own output to reach. Task 3's own `worktree.base_ref`
 //! validator already reasons about this in the other direction (it
 //! deliberately does not re-validate post-substitution content, see its
-//! own doc comment) — this module is the reason that gap is real, not just
-//! theoretical.
+//! own doc comment) — whatever wires `env:` resolution up for real is where
+//! this residual needs to be closed, by validating the resolved value
+//! before it reaches an env-file-style sink, not by restricting this
+//! module's own functions.
 //!
 //! # Substitution is single-pass — no re-evaluation of substituted output
 //!
@@ -278,36 +315,55 @@
 //! or webhook payload can make arbitrarily large, the same shape as the
 //! open Task 10 finding) and is left open rather than papered over.
 //!
-//! **A separate, more alarming finding, also measured directly and not
-//! assumed:** constructing and then dropping a `serde_json::Value` that is
-//! deeply nested (thousands of levels of `{"next": {"next": {...}}}`) can
-//! by itself overflow the default test-thread stack and abort the whole
-//! process — `serde_json::Value`'s `Drop` implementation recurses one
-//! stack frame per nesting level, and this happens with **no expression
-//! evaluation involved at all**: building the value and immediately
-//! dropping it is enough. Measured directly (a throwaway test, not
-//! committed): 2,000 levels dropped cleanly, 4,000 levels aborted the
-//! process with `SIGABRT`/stack overflow. [`MAX_EXPR_DEPTH`] above bounds
-//! recursion driven by *expression syntax* nesting (`[`, `(`, `? :` written
-//! in the `${{ ... }}` text); it does nothing for recursion driven by
-//! *context data* nesting, because this module never walks a whole context
-//! value recursively — it only follows the fixed property/index chain an
-//! expression names. But a deeply-nested `Value` sitting in `ExprContext`
-//! is a bomb this module cannot defuse: even an expression that never
-//! touches the deep part of the tree still shares an `ExprContext` with it,
-//! and the value's own `Drop`, whenever it eventually runs, pays the same
-//! stack cost regardless of what any expression did. Since risk item 3
-//! names `map.over` external data (attacker-influenced) as exactly what
-//! populates a context like this, whatever deserializes that data into a
-//! `serde_json::Value` before calling [`ExprContext::set`] is where a real
-//! bound would have to live — a maximum nesting-depth check at
-//! deserialization time, before a `Value` this deep is ever constructed.
-//! Nothing in `roundhouse-flow` does that today, for context data generally
-//! (not just `map.over`), and this module cannot add it without ceasing to
-//! be "a pure evaluator over a `serde_json::Value` context" — the value
-//! already has to exist before this module ever sees it. Recorded here
-//! rather than left for the next person to rediscover by crashing a
-//! shared machine.
+//! **A separate finding, measured directly, corrected once already after
+//! the first measurement turned out to be a debug-build artifact:**
+//! constructing and then dropping a `serde_json::Value` that is deeply
+//! nested (thousands of levels of `{"next": {"next": {...}}}`) can by
+//! itself overflow a small enough stack and abort the whole process —
+//! `serde_json::Value`'s `Drop` implementation recurses one stack frame
+//! per nesting level, and this happens with **no expression evaluation
+//! involved at all**: building the value and immediately dropping it is
+//! enough. An earlier measurement of this, taken in a debug build, reported
+//! depth 4,000 aborting; that number does not hold in the release profile
+//! this crate actually ships. Re-measured in `--release`, each figure its
+//! own separate run: depth 10,000 drops cleanly on the ~8 MiB default main
+//! thread stack; depth 4,000 drops cleanly on an explicit 2 MiB thread
+//! stack; depth 20,000 on that same 2 MiB thread stack aborts with
+//! `SIGABRT` (exit 134) — stack size, not depth alone, is what determines
+//! where this lands, and this module has no way to know how large the
+//! stack of whatever thread eventually drops a given `Value` will be.
+//!
+//! **This diff cannot itself construct a `Value` anywhere near deep enough
+//! to hit either failure point, measured, not assumed:** `json()`'s
+//! `serde_json::from_str` enforces its own fixed recursion limit —
+//! verified directly, parsing `{"a":{"a":...1...}}}` errors with "recursion
+//! limit exceeded" at exactly depth 128, succeeding at 127 — and this
+//! module's own array-literal syntax is independently capped by
+//! [`MAX_EXPR_DEPTH`] (64), already pinned by
+//! `excessive_bracket_nesting_is_a_typed_error_not_a_stack_overflow`. Both
+//! are one to two orders of magnitude below either abort threshold above.
+//! [`MAX_EXPR_DEPTH`] bounds recursion driven by *expression syntax*
+//! nesting (`[`, `(`, `? :` written in the `${{ ... }}` text); it does
+//! nothing for recursion driven by *context data* nesting, because this
+//! module never walks a whole context value recursively — it only follows
+//! the fixed property/index chain an expression names — but `json()`'s own
+//! limit closes that gap for the one way this module can itself produce a
+//! `Value` from text it does not already have. **What remains open is data
+//! this module never constructed at all**: a deeply-nested `Value` handed
+//! to [`ExprContext::set`] by a caller — risk item 3 names `map.over`
+//! external data (attacker-influenced) as exactly what could populate a
+//! context like this — still shares that `ExprContext`, and the value's
+//! own `Drop`, whenever it eventually runs on whatever thread holds it,
+//! pays the stack cost measured above regardless of what any expression
+//! did. Whatever deserializes that external data before calling
+//! `ExprContext::set` is where a real bound would have to live — a maximum
+//! nesting-depth check at deserialization time, before a `Value` this deep
+//! is ever constructed. Nothing in `roundhouse-flow` does that today, for
+//! context data generally (not just `map.over`), and this module cannot
+//! add it without ceasing to be "a pure evaluator over a
+//! `serde_json::Value` context" — the value already has to exist before
+//! this module ever sees it. Recorded here rather than left for the next
+//! person to rediscover by crashing a shared machine.
 //!
 //! Separately, nesting depth (`[`, `(`, or `? :` chained inside one
 //! another) recurses through [`Parser::parse_ternary`] once per level with

@@ -103,6 +103,22 @@ fn interpolate_json_walks_every_string_leaf_of_a_steps_with_block() {
     );
 }
 
+// ---- `value_to_string`'s object/array rendering (review round 1, code
+// lens Minor 2): reasonable, but unspecified by the brief and previously
+// untested. Pinned here. ----
+
+#[test]
+fn interpolating_an_object_or_array_value_renders_it_as_compact_json() {
+    let mut c = ExprContext::new();
+    c.set("obj", json!({"a": 1, "b": [1, 2]}));
+    c.set("arr", json!([1, "two", null]));
+    assert_eq!(
+        interpolate("${{ obj }}", &c).unwrap(),
+        r#"{"a":1,"b":[1,2]}"#
+    );
+    assert_eq!(interpolate("${{ arr }}", &c).unwrap(), r#"[1,"two",null]"#);
+}
+
 // ---- Additional coverage for this task's identified risks ----
 
 #[test]
