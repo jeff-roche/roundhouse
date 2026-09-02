@@ -94,6 +94,43 @@ fn two_matcher_kinds_on_one_rule_is_rejected() {
 }
 
 #[test]
+fn zero_matchers_on_one_rule_is_rejected() {
+    // Fix round 2 on Task 10, minor: a rule with no recognised matcher key
+    // at all (just `effect:`) was already correctly rejected by the same
+    // `matcher_fields.len() != 1` check that catches the two-matcher case,
+    // but had no test of its own naming it.
+    let yaml = "name: t\nversion: 1\npermissions:\n  rules:\n    - { effect: allow }\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n";
+    let err = parse_workflow(yaml).expect_err("a rule with zero matchers must fail closed");
+    assert!(matches!(err, ParseError::Yaml(_)));
+}
+
+#[test]
+fn serializing_and_reparsing_a_permission_rule_round_trips() {
+    // Fix round 2 on Task 10, minor: `PermissionRuleDef`'s derived
+    // `Serialize` used to emit its own struct layout
+    // (`{"matcher": {"http": {...}}, "effect": "allow"}`) rather than the
+    // wire shape its own `Deserialize` expects
+    // (`{"http": {...}, "effect": "allow"}`), so re-parsing serialized
+    // output failed. No exploitable path reaches this today, but a type
+    // whose own output its own parser rejects is a trap for a future
+    // normalize-persist-reparse path.
+    use roundhouse_flow::parse::types::{HttpMatcher, PermissionMatcher, PermissionRuleDef};
+
+    let rule = PermissionRuleDef {
+        matcher: PermissionMatcher::Http(HttpMatcher {
+            methods: vec!["GET".to_string()],
+            hosts: vec!["api.github.com".to_string()],
+        }),
+        effect: Effect::Allow,
+    };
+
+    let serialized = serde_yaml::to_string(&rule).expect("PermissionRuleDef must serialize");
+    let reparsed: PermissionRuleDef =
+        serde_yaml::from_str(&serialized).expect("serialized output must re-parse");
+    assert_eq!(reparsed, rule, "round trip must preserve the rule exactly");
+}
+
+#[test]
 fn isolation_omitted_defaults_to_worktree_never_none() {
     // Risk callout, applied to isolation: an omitted `defaults.isolation`
     // must never silently mean unsandboxed (`Tier::None`).
@@ -200,6 +237,65 @@ fn rejects_pathological_flow_nesting_cheaply() {
         elapsed < std::time::Duration::from_secs(1),
         "the nesting bound must fire in well under a second even on a 200KB payload that \
          previously cost ~84s when handed to serde_yaml directly; took {elapsed:?}"
+    );
+}
+
+#[test]
+fn rejects_a_bracket_bomb_hidden_behind_an_apostrophe() {
+    // Fix round 2 on Task 10 (finding H2): the previous scan tracked
+    // single-/double-quote state char-by-char to skip quoted content. An
+    // apostrophe in perfectly ordinary YAML text (`don't` is literal text
+    // here, not a scalar delimiter — YAML only treats a quote as an
+    // indicator at scalar-start position) flipped that scanner into
+    // "quoted" state *permanently*, since nothing ever closed it — every
+    // character for the rest of the document, brackets included, was then
+    // silently skipped. Measured through the real `parse_workflow`
+    // (release build): this exact shape cost 2.53s at a 50 KB bomb, 38.8s
+    // at 200 KB. The fix drops quote-tracking entirely, so this must be
+    // rejected, and rejected fast.
+    let bomb = "[".repeat(200_000);
+    let yaml = format!("{}note: \"don't\"\nbomb: {bomb}\n", minimal_header());
+    assert!(yaml.len() < MAX_YAML_BYTES);
+
+    let start = std::time::Instant::now();
+    let err = parse_workflow(&yaml)
+        .expect_err("a bracket bomb after an apostrophe must still be rejected");
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(err, ParseError::TooDeeplyNested { .. }),
+        "expected the nesting bound to fire despite the preceding apostrophe, got {err:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "must reject cheaply, not fall through to serde_yaml (previously ~38.8s at this size); took {elapsed:?}"
+    );
+}
+
+#[test]
+fn accepts_a_bracket_heavy_block_scalar_prompt() {
+    // Fix round 2 on Task 10 (finding H2): the same scan that must reject
+    // a real bracket bomb must NOT reject a legitimate `prompt: |` block
+    // scalar just because its literal text happens to contain many `[`
+    // characters — block-scalar bodies carry zero nesting cost to YAML
+    // regardless of what characters they contain. Reviewer's reproduction:
+    // a 173-byte workflow whose `prompt: |` held 70 `[` characters was
+    // rejected as "nests 65 deep" by the previous (non-block-scalar-aware)
+    // scan, while `serde_yaml` itself accepts it without hesitation.
+    let brackets: String = "[".repeat(70);
+    let yaml = format!(
+        "name: t\nversion: 1\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n    agent:\n      prompt: |\n        some literal brackets: {brackets}\n"
+    );
+
+    let start = std::time::Instant::now();
+    let def = parse_workflow(&yaml)
+        .expect("a bracket-heavy block scalar body must not trip the nesting bound");
+    let elapsed = start.elapsed();
+
+    assert_eq!(def.name, "t");
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "took {elapsed:?}"
     );
 }
 

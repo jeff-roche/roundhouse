@@ -44,12 +44,55 @@
 //!   at 520 KB), all comfortably under [`MAX_YAML_BYTES`]. This is a
 //!   property of tokenizing the text, not of any one YAML library's
 //!   internals, so [`nesting_depth_bound_violation`] bounds it with a
-//!   cheap, library-independent linear pre-scan over the raw text —
-//!   counting `[`/`{`/`]`/`}` nesting depth and per-line leading
-//!   indentation width, skipping quoted-string and comment content — run
+//!   cheap, library-independent linear pre-scan over the raw text, run
 //!   *before* the text is ever handed to `serde_yaml`. See
 //!   `rejects_pathological_flow_nesting_cheaply` in
 //!   `tests/parse_top_level.rs`, which times this bound firing.
+//!
+//!   **Fix round 2 on Task 10 (finding H2) replaced this scan's design
+//!   entirely** — an earlier version tracked single-/double-quote state
+//!   char-by-char to skip quoted content, on the theory that under
+//!   -counting (treating something as quoted when it wasn't) was the only
+//!   possible failure and was safe. That was wrong on both ends, and both
+//!   were found by execution, not reasoning:
+//!   - A quote character appearing mid-plain-scalar (`name: don't` —
+//!     entirely ordinary YAML; the apostrophe is literal text, not a
+//!     scalar delimiter, because YAML only treats a quote as an indicator
+//!     at scalar-start position) flipped the scanner into "quoted" state
+//!     *permanently*, since nothing ever closed it — every character for
+//!     the rest of the document, brackets included, was then silently
+//!     skipped. Measured: a 50 KB bracket bomb preceded by `name: don't`
+//!     passed the scan entirely and cost 2.53s once handed to `serde_yaml`
+//!     regardless (38.8s at 200 KB, 80.3s at 300 KB) — quadratic, so ~15
+//!     minutes of pinned CPU at the `MAX_YAML_BYTES` cap. This was not "a
+//!     bracket disguised inside a string" as the previous version of this
+//!     doc comment characterized the residual risk — the scanner's own
+//!     corrupted state is what skipped the brackets, which were not
+//!     inside any string at all.
+//!   - Symmetrically, that scan also *over*-rejected: a block-scalar body
+//!     (`prompt: |`) is literal text with zero nesting cost to YAML, but
+//!     its `[`/`{` characters counted against the same global counter as
+//!     structural brackets, so an ordinary prompt with a few dozen literal
+//!     `[` characters could be rejected as "too deeply nested" while
+//!     `serde_yaml` accepts it without hesitation.
+//!
+//!   The replacement drops quote-tracking entirely (never treats any
+//!   region as "quoted," so it cannot get stuck in the wrong state the way
+//!   the quote tracker did) and is block-scalar-aware instead: it detects
+//!   a `|`/`>` block-scalar indicator ending a line and skips exactly that
+//!   block's body (identified purely by indentation, the same rule
+//!   `serde_yaml` itself uses) from both bracket-counting and the
+//!   indentation-width check, resuming normal scanning at the first line
+//!   indented at or below the block's own line. Counting every `[`/`{`
+//!   outside a block-scalar body — including ones that happen to sit
+//!   inside a quoted flow scalar, e.g. `${{ ... }}` interpolations — can
+//!   only ever *over*-count relative to `serde_yaml`'s real structural
+//!   depth, never under-count, so the scan's failure mode is now strictly
+//!   "occasionally rejects a document with an unusually bracket-heavy
+//!   quoted flow scalar," never "silently admits a real bomb." See
+//!   `rejects_a_bracket_bomb_hidden_behind_an_apostrophe` (the bypass) and
+//!   `accepts_a_bracket_heavy_block_scalar_prompt` (the over-rejection
+//!   case) in `tests/parse_top_level.rs`, both timed.
 //! - **Overall document size / "huge number of steps":** none of the
 //!   protections above bound the size of an honestly large document, so
 //!   this module adds its own caps on top: [`MAX_YAML_BYTES`] on the raw
@@ -121,6 +164,11 @@ pub enum ParseError {
     )]
     TooDeeplyNested { depth: usize, max: usize },
 
+    #[error(
+        "a line in the workflow YAML opens with {width} characters of leading whitespace, exceeding the {max}-character limit enforced before parsing"
+    )]
+    ExcessiveIndentWidth { width: usize, max: usize },
+
     #[error("workflow YAML parse error: {0}")]
     Yaml(#[from] serde_yaml::Error),
 }
@@ -152,11 +200,20 @@ pub fn parse_workflow(yaml: &str) -> Result<WorkflowDef, ParseError> {
         });
     }
 
-    if let Some(depth) = nesting_depth_bound_violation(yaml) {
-        return Err(ParseError::TooDeeplyNested {
-            depth,
-            max: MAX_FLOW_NESTING_DEPTH,
-        });
+    match nesting_depth_bound_violation(yaml) {
+        Some(NestingViolation::FlowDepth(depth)) => {
+            return Err(ParseError::TooDeeplyNested {
+                depth,
+                max: MAX_FLOW_NESTING_DEPTH,
+            });
+        }
+        Some(NestingViolation::IndentWidth(width)) => {
+            return Err(ParseError::ExcessiveIndentWidth {
+                width,
+                max: MAX_LEADING_INDENT_CHARS,
+            });
+        }
+        None => {}
     }
 
     let def: WorkflowDef = serde_yaml::from_str(yaml)?;
@@ -194,92 +251,139 @@ fn validate_unattended(unattended: &UnattendedDef) -> Result<(), ParseError> {
     Ok(())
 }
 
-/// A cheap, `serde_yaml`-independent, single linear pass over the raw text
+/// Which of [`nesting_depth_bound_violation`]'s two bounds was exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NestingViolation {
+    FlowDepth(usize),
+    IndentWidth(usize),
+}
+
+/// A cheap, `serde_yaml`-independent, line-oriented pass over the raw text
 /// that rejects two shapes of pathological nesting *before* the text is
 /// handed to `serde_yaml` at all: `[`/`{` flow-collection depth beyond
 /// [`MAX_FLOW_NESTING_DEPTH`], and any line whose leading whitespace
-/// exceeds [`MAX_LEADING_INDENT_CHARS`]. Returns the offending depth/width
-/// on violation, `None` if the document stays within both bounds.
+/// exceeds [`MAX_LEADING_INDENT_CHARS`]. Returns the specific violation, or
+/// `None` if the document stays within both bounds.
 ///
-/// Skips the contents of single- and double-quoted scalars and `#`
-/// comments so ordinary content (a URL containing `[`, a comment
-/// mentioning "nested arrays") is never miscounted — worst case this under
-/// -counts (e.g. treating a `#` inside a genuinely unterminated quote as a
-/// comment starts), which only makes this scan *more* permissive, never
-/// less, so it can never reject a document `serde_yaml` would have
-/// accepted; it can only fail to catch a pathological one that disguises
-/// its brackets inside strings, which is not the resource-exhaustion shape
-/// this bound defends against (a bracket inside a quoted string does not
-/// drive the scanner's own nesting cost).
-fn nesting_depth_bound_violation(yaml: &str) -> Option<usize> {
+/// # Design (fix round 2 on Task 10, finding H2)
+///
+/// Does **not** track quote state at all — an earlier version did, and a
+/// quote character in an entirely ordinary position (`name: don't`) could
+/// desynchronize it permanently, silently disabling the depth bound for
+/// the rest of the document (see the module doc comment above for the
+/// measured exploit). Instead, every `[`/`{`/`]`/`}` outside a
+/// block-scalar body counts toward `depth`, full stop — including ones
+/// that happen to sit inside a quoted flow scalar. This can only ever
+/// *over*-count relative to `serde_yaml`'s real structural nesting (never
+/// under-count), so the scan's only failure mode is rejecting an unusually
+/// bracket-heavy quoted flow scalar, never admitting a real bomb.
+///
+/// The one content this scan *does* skip — deliberately, and by a rule
+/// with no quote-like ambiguity — is a block scalar's body
+/// (`is_block_scalar_indicator` / the `in_block_scalar` handling below):
+/// `serde_yaml` itself decides where such a body ends purely by
+/// indentation (strictly more indented than the line that opened it, or
+/// blank), so this scan uses the identical rule, with no dependency on
+/// character-level state that a crafted value could desynchronize.
+fn nesting_depth_bound_violation(yaml: &str) -> Option<NestingViolation> {
     let mut depth: usize = 0;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut at_line_start = true;
-    let mut indent_width: usize = 0;
+    let mut in_block_scalar = false;
+    let mut block_scalar_parent_indent: usize = 0;
 
-    let mut chars = yaml.chars().peekable();
-    while let Some(c) = chars.next() {
-        if at_line_start {
-            if c == ' ' || c == '\t' {
-                indent_width += 1;
-                continue;
+    for line in yaml.split('\n') {
+        let indent = line.chars().take_while(|&c| c == ' ' || c == '\t').count();
+        let trimmed = line.trim();
+
+        if in_block_scalar {
+            if trimmed.is_empty() {
+                continue; // a blank line never ends a block scalar
             }
-            at_line_start = false;
-            if indent_width > MAX_LEADING_INDENT_CHARS {
-                return Some(indent_width);
+            if indent > block_scalar_parent_indent {
+                continue; // still inside the block scalar's body — not scanned at all
             }
+            in_block_scalar = false; // this line is at or below the parent's indentation: the block ended before it
         }
 
-        if in_single_quote {
-            if c == '\'' {
-                if chars.peek() == Some(&'\'') {
-                    chars.next(); // YAML escapes `'` inside a single-quoted scalar as `''`
-                } else {
-                    in_single_quote = false;
-                }
-            }
-            continue;
+        if indent > MAX_LEADING_INDENT_CHARS {
+            return Some(NestingViolation::IndentWidth(indent));
         }
-        if in_double_quote {
+
+        if is_block_scalar_indicator_line(trimmed) {
+            in_block_scalar = true;
+            block_scalar_parent_indent = indent;
+            // The indicator itself (`prompt: |`) carries no brackets of its
+            // own interest, but scan it anyway below for uniformity — a
+            // key name could theoretically carry a stray `[`/`{`.
+        }
+
+        for c in line.chars() {
             match c {
-                '\\' => {
-                    chars.next();
-                }
-                '"' => in_double_quote = false,
-                _ => {}
-            }
-            continue;
-        }
-
-        match c {
-            '\n' => {
-                at_line_start = true;
-                indent_width = 0;
-            }
-            '#' => {
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        at_line_start = true;
-                        indent_width = 0;
-                        break;
+                '[' | '{' => {
+                    depth += 1;
+                    if depth > MAX_FLOW_NESTING_DEPTH {
+                        return Some(NestingViolation::FlowDepth(depth));
                     }
                 }
+                ']' | '}' => depth = depth.saturating_sub(1),
+                _ => {}
             }
-            '\'' => in_single_quote = true,
-            '"' => in_double_quote = true,
-            '[' | '{' => {
-                depth += 1;
-                if depth > MAX_FLOW_NESTING_DEPTH {
-                    return Some(depth);
-                }
-            }
-            ']' | '}' => {
-                depth = depth.saturating_sub(1);
-            }
-            _ => {}
         }
     }
 
     None
+}
+
+/// True if `trimmed` (a line with leading whitespace already stripped) is
+/// exactly a YAML block-scalar indicator (`|` or `>`), optionally followed
+/// by a chomping indicator (`+`/`-`) and/or an explicit indentation digit
+/// (`1`-`9`) in either order — the value-position content of a `key: |`,
+/// `key: |-2`, or `- |` line, ignoring a trailing `# comment`.
+fn is_block_scalar_indicator_line(trimmed: &str) -> bool {
+    // A block-scalar indicator can only legally be followed by whitespace,
+    // its own modifier characters, or a comment before the newline — a
+    // trailing `# comment` is stripped the same simple way regardless
+    // (this heuristic is only used to *detect* the indicator, never to
+    // decide what counts as a bracket, so a false negative here just means
+    // a block scalar's body gets bracket-scanned like ordinary text, which
+    // is the safe/over-counting direction, not a bypass).
+    let without_comment = strip_trailing_comment(trimmed);
+
+    let value_part = if let Some(idx) = without_comment.rfind(':') {
+        without_comment[idx + 1..].trim()
+    } else if let Some(rest) = without_comment.strip_prefix("- ") {
+        rest.trim()
+    } else {
+        without_comment.trim()
+    };
+
+    is_block_scalar_indicator_token(value_part)
+}
+
+fn strip_trailing_comment(line: &str) -> &str {
+    match line.find(" #") {
+        Some(idx) => line[..idx].trim_end(),
+        None => line,
+    }
+}
+
+fn is_block_scalar_indicator_token(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some('|') | Some('>') => {}
+        _ => return false,
+    }
+    let rest: &str = chars.as_str();
+    if rest.len() > 2 {
+        return false;
+    }
+    let mut seen_digit = false;
+    let mut seen_chomp = false;
+    for c in rest.chars() {
+        match c {
+            '+' | '-' if !seen_chomp => seen_chomp = true,
+            '1'..='9' if !seen_digit => seen_digit = true,
+            _ => return false,
+        }
+    }
+    true
 }

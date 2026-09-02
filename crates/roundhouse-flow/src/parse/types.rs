@@ -8,13 +8,17 @@
 //!
 //! Workflow YAML is untrusted input whose parsed result decides what an
 //! agent is allowed to do. Every struct in this module is
-//! `#[serde(deny_unknown_fields)]` (except [`PermissionRuleDef`] — see its
-//! doc comment for why flatten makes that attribute unnecessary there
-//! rather than merely absent), and every field whose value space is a known
-//! finite set (`type`, `isolation`, `effect`, `escalate`, `on_timeout`,
-//! `permissions.default`) is a Rust enum, not a raw `String` — an unknown
-//! variant or a misspelled value is a deserialize error, never a silently
-//! ignored field.
+//! `#[serde(deny_unknown_fields)]` except [`PermissionRuleDef`], whose
+//! validation instead comes from a `#[serde(try_from = ...)]` conversion —
+//! see its doc comment for why. (Fix round 1 on Task 10, finding H1,
+//! replaced an earlier `#[serde(flatten)]`ed-closed-enum design whose own
+//! claim to already be fail-closed was measured false; this summary
+//! sentence originally still described that retracted design and was
+//! corrected in fix round 2 after review caught the inconsistency.) Every
+//! field whose value space is a known finite set (`type`, `isolation`,
+//! `effect`, `escalate`, `on_timeout`, `permissions.default`) is a Rust
+//! enum, not a raw `String` — an unknown variant or a misspelled value is
+//! a deserialize error, never a silently ignored field.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -198,11 +202,15 @@ pub enum PermissionMatcher {
     Shell(ShellMatcher),
 }
 
-/// The as-written-in-YAML shape of a `permissions.rules[]` entry, used only
-/// to deserialize into a validated [`PermissionRuleDef`] (see
-/// [`PermissionRuleDef`]'s doc comment) — never constructed or read
-/// directly otherwise.
-#[derive(Debug, Deserialize)]
+/// The as-written-in-YAML shape of a `permissions.rules[]` entry: deserialize
+/// into a validated [`PermissionRuleDef`] (see its doc comment), and
+/// serialize a [`PermissionRuleDef`] back into this same wire shape (fix
+/// round 2 on Task 10, minor: an earlier version only derived `Deserialize`
+/// here, so `PermissionRuleDef`'s derived `Serialize` emitted its own
+/// struct layout — `{"matcher": {"http": {...}}, "effect": "allow"}` —
+/// instead of the wire shape, which `Deserialize` then rejected on
+/// re-parsing). Never constructed or read directly otherwise.
+#[derive(Debug, Serialize, Deserialize)]
 struct PermissionRuleDefWire {
     effect: Effect,
     #[serde(flatten)]
@@ -239,13 +247,45 @@ struct PermissionRuleDefWire {
 /// recognised matcher). All three failure modes above are now rejected —
 /// see `tests/parse_top_level.rs`'s
 /// `unknown_permission_matcher_kind_is_rejected`,
-/// `unknown_field_within_a_permission_matcher_is_rejected`, and
-/// `two_matcher_kinds_on_one_rule_is_rejected`.
+/// `unknown_field_within_a_permission_matcher_is_rejected`,
+/// `two_matcher_kinds_on_one_rule_is_rejected`, and
+/// `zero_matchers_on_one_rule_is_rejected`.
+///
+/// `#[serde(into = "PermissionRuleDefWire")]` (fix round 2 on Task 10,
+/// minor) makes `Serialize` go back through the same wire shape
+/// `Deserialize` expects, via [`From<PermissionRuleDef> for
+/// PermissionRuleDefWire`] below — see `serializing_and_reparsing_a_
+/// permission_rule_round_trips` in `tests/parse_top_level.rs`. No
+/// exploitable path reaches this today (nothing in this crate
+/// re-serializes a parsed `WorkflowDef`), but a security-relevant type
+/// whose own output its own parser rejects is exactly the kind of trap a
+/// future normalize-persist-reparse path would fall into silently.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "PermissionRuleDefWire")]
+#[serde(try_from = "PermissionRuleDefWire", into = "PermissionRuleDefWire")]
 pub struct PermissionRuleDef {
     pub matcher: PermissionMatcher,
     pub effect: Effect,
+}
+
+impl From<PermissionRuleDef> for PermissionRuleDefWire {
+    fn from(def: PermissionRuleDef) -> Self {
+        let (kind, matcher_value) = match def.matcher {
+            PermissionMatcher::Http(http) => (
+                "http",
+                serde_yaml::to_value(http).expect("HttpMatcher always serializes"),
+            ),
+            PermissionMatcher::Shell(shell) => (
+                "shell",
+                serde_yaml::to_value(shell).expect("ShellMatcher always serializes"),
+            ),
+        };
+        let mut matcher_fields = std::collections::BTreeMap::new();
+        matcher_fields.insert(kind.to_string(), matcher_value);
+        PermissionRuleDefWire {
+            effect: def.effect,
+            matcher_fields,
+        }
+    }
 }
 
 impl TryFrom<PermissionRuleDefWire> for PermissionRuleDef {
