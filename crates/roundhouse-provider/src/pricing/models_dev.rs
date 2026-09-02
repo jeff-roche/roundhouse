@@ -35,8 +35,23 @@ pub struct ModelsDevEntry {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelsDevCost {
-    pub input: f64,
-    pub output: f64,
+    /// `Option`, not a mandatory `f64` (fix round 2 close-out item 2): the
+    /// live dataset has zero occurrences of a `cost` object with a missing
+    /// or `null` `input`/`output` today, but requiring it as mandatory would
+    /// mean one upstream model publishing `"input": null` fails the entire
+    /// typed parse of the ~7,500-entry live dataset, so `refresh_pricing`
+    /// refuses to write and the weekly PR silently stops opening — pricing
+    /// quietly freezes with no alarm. `flatten_root` below skips a model
+    /// with a `None` `input`/`output`, exactly as it already skips one with
+    /// no `cost` object at all; `pricing::price_usage_with_cache_write`
+    /// additionally fails closed to `Cost::Unknown` for the same case as
+    /// defense-in-depth, since this struct is also deserialized directly by
+    /// the hand-written test fixtures (which don't go through
+    /// `flatten_root`'s skip).
+    #[serde(default)]
+    pub input: Option<f64>,
+    #[serde(default)]
+    pub output: Option<f64>,
     /// Absent for a real, verified fraction of models.dev's live dataset —
     /// not every model publishes a cache-read discount.
     #[serde(default)]
@@ -67,11 +82,13 @@ pub struct ModelsDevRawModel {
 
 /// Flattens the real, live nested dataset (`provider -> models -> model`) into
 /// the same flat `ModelsDevEntry` shape the hand-written test fixtures use,
-/// id-qualified as `"<provider>/<model>"`. Models with no `cost` object are
-/// skipped: no price data means `PricingSnapshot` correctly has no entry for
-/// them, which `price_usage` already turns into `Cost::Unknown` rather than a
-/// guess — silently defaulting an unpriced model to `$0` would be exactly the
-/// kind of silent mispricing this task exists to prevent.
+/// id-qualified as `"<provider>/<model>"`. Models with no `cost` object, or
+/// with a `cost` object missing `input`/`output` (fix round 2 close-out item
+/// 2), are skipped: no price data means `PricingSnapshot` correctly has no
+/// entry for them, which `price_usage` already turns into `Cost::Unknown`
+/// rather than a guess — silently defaulting an unpriced model to `$0` would
+/// be exactly the kind of silent mispricing this task exists to prevent. One
+/// bad model entry costs that one model, never the whole ~7,500-entry parse.
 pub fn flatten_root(root: BTreeMap<String, ModelsDevProvider>) -> Vec<ModelsDevEntry> {
     root.into_iter()
         .flat_map(|(provider_id, provider)| {
@@ -80,6 +97,8 @@ pub fn flatten_root(root: BTreeMap<String, ModelsDevProvider>) -> Vec<ModelsDevE
                 .into_iter()
                 .filter_map(move |(model_id, m)| {
                     let cost = m.cost?;
+                    cost.input?;
+                    cost.output?;
                     Some(ModelsDevEntry {
                         id: format!("{provider_id}/{model_id}"),
                         cost,

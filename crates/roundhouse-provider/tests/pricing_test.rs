@@ -433,3 +433,54 @@ fn a_malformed_litellm_cache_rate_falls_back_to_models_dev_rather_than_going_fre
     // $0.30/M = $30,000,000,000 pico-USD.
     assert_eq!(cost, Cost::Known(30_000_000_000));
 }
+
+#[test]
+fn a_models_dev_model_missing_input_or_output_is_skipped_not_priced_at_a_fabricated_rate() {
+    // Fix round 2 close-out item 2: `ModelsDevCost.input`/`.output` are
+    // `Option<f64>` so one upstream model publishing `"input": null` (or
+    // omitting the field) costs that ONE model, not the whole
+    // ~7,500-entry parse -- `flatten_root` skips it, exactly as it already
+    // skips a model with no `cost` object at all.
+    let body = br#"{
+        "anthropic": {
+            "models": {
+                "claude-good": { "id": "claude-good", "cost": { "input": 3.0, "output": 15.0 } },
+                "claude-null-input": { "id": "claude-null-input", "cost": { "input": null, "output": 15.0 } },
+                "claude-missing-output": { "id": "claude-missing-output", "cost": { "input": 3.0 } }
+            }
+        }
+    }"#;
+    let entries = PricingSnapshot::parse_models_dev_snapshot(body).unwrap();
+    let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["anthropic/claude-good"],
+        "only the fully-priced model should survive flattening"
+    );
+}
+
+#[test]
+fn a_fixture_model_with_null_input_prices_as_unknown_not_a_fabricated_rate() {
+    // Defense-in-depth complement to the flatten_root skip above: the
+    // hand-written fixture path (`PricingSnapshot::from_fixture_for_test`)
+    // deserializes `Vec<ModelsDevEntry>` directly and never goes through
+    // `flatten_root`'s skip, so `price_usage_with_cache_write` must
+    // independently fail closed to `Cost::Unknown` when `cost.input`/
+    // `.output` is `None`, rather than treating a missing rate as free or
+    // panicking on an unwrap.
+    let models_dev_json = r#"[
+      { "id": "anthropic/claude-null-input", "cost": { "input": null, "output": 15.0 } }
+    ]"#;
+    let snapshot = PricingSnapshot::from_fixture_for_test(models_dev_json);
+    let usage = Usage {
+        input_tokens: 1_000,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+    };
+    let cost = price_usage(
+        &usage,
+        &ModelId("anthropic/claude-null-input".into()),
+        &snapshot,
+    );
+    assert!(matches!(cost, Cost::Unknown));
+}

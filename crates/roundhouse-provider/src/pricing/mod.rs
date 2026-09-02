@@ -129,17 +129,26 @@ impl PicoUsdPerToken {
 
 /// The per-model rates `price_usage` actually needs, merged from both
 /// datasets. `input`/`output` always come from models.dev (the primary
-/// source, §9.7); `cache_read_pico`/`cache_write_pico` prefer LiteLLM when it
-/// has an entry for this model ("better on cache-write/per-image cost corner
-/// cases," §9.7) and fall back to models.dev's own `cache_read`/`cache_write`
-/// fields otherwise. `None` means neither source has a cache rate for this
-/// model — `price_usage` then falls back to the base input rate for that
-/// portion rather than silently charging $0 (audit finding 4: the bug this
-/// whole task fixes was silently mispricing cache tokens, so a missing rate
-/// must never resolve to "free").
+/// source, §9.7) — `Option` because `ModelsDevCost.input`/`.output` are now
+/// `Option<f64>` too (fix round 2 close-out item 2), and a `None` here means
+/// `price_usage` fails closed to `Cost::Unknown` rather than pricing with a
+/// fabricated rate; `flatten_root` already skips a live-dataset model
+/// missing either field, so this is defense-in-depth for that plus the
+/// hand-written test fixture path, which bypasses `flatten_root` entirely.
+/// `cache_read_pico`/`cache_write_pico` prefer LiteLLM when it has an entry
+/// for this model ("better on cache-write/per-image cost corner cases,"
+/// §9.7 — though fix round 1's O7 measurement found this contributes only
+/// 5 net-new models of 7,056 even after id-normalization; models.dev's own
+/// cache coverage already dominates, see `litellm.rs`'s module doc) and fall
+/// back to models.dev's own `cache_read`/`cache_write` fields otherwise.
+/// `None` means neither source has a cache rate for this model —
+/// `price_usage` then falls back to the base input rate for that portion
+/// rather than silently charging $0 (audit finding 4: the bug this whole
+/// task fixes was silently mispricing cache tokens, so a missing rate must
+/// never resolve to "free").
 struct MergedPricingEntry {
-    input: f64,
-    output: f64,
+    input: Option<f64>,
+    output: Option<f64>,
     cache_read_pico: Option<PicoUsdPerToken>,
     cache_write_pico: Option<PicoUsdPerToken>,
 }
@@ -435,10 +444,21 @@ pub fn price_usage_with_cache_write(
     let Some(entry) = snapshot.by_model_id.get(&model.0) else {
         return Cost::Unknown;
     };
-    let Ok(input_rate) = PicoUsdPerToken::from_usd_per_million(entry.input) else {
+    // A `None` here means models.dev published this model's `cost` object
+    // without `input`/`output` -- fails closed rather than fabricating a
+    // rate. `flatten_root` already skips this case for the live dataset;
+    // this covers the hand-written test-fixture path too (fix round 2
+    // close-out item 2).
+    let Some(input) = entry.input else {
         return Cost::Unknown;
     };
-    let Ok(output_rate) = PicoUsdPerToken::from_usd_per_million(entry.output) else {
+    let Some(output) = entry.output else {
+        return Cost::Unknown;
+    };
+    let Ok(input_rate) = PicoUsdPerToken::from_usd_per_million(input) else {
+        return Cost::Unknown;
+    };
+    let Ok(output_rate) = PicoUsdPerToken::from_usd_per_million(output) else {
         return Cost::Unknown;
     };
 

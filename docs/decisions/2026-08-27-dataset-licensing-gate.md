@@ -92,3 +92,39 @@ to that provider's quirk profile (§9.5). This loses the cross-provider dataset'
 convenience (one ingest, ~28 providers covered) but not the correctness of any
 individual cost calculation — `Cost::Unknown` still applies to anything not
 covered by a vendored page.
+
+## Follow-up: measured LiteLLM contribution (Task 9, fix rounds 1-2)
+
+This record's licensing verdict stands unchanged (both sources MIT,
+`FALLBACK_ACTIVE: false`). This note corrects the *rationale* text carried in
+`docs/architecture/06-provider-abstraction.md` §9.7 and
+`crates/roundhouse-provider/src/pricing/litellm.rs`'s module doc, which
+originally justified vendoring LiteLLM as a secondary source because it is
+"better on cache-write/per-image cost corner cases" — a claim that was never
+measured against the live data until code review asked for it.
+
+**Measured, against the live-fetched files:** of 7,056 priced models.dev
+models and 3,518 LiteLLM entries, only 332 (4.7%) reconcile by exact
+`"<provider>/<model>"` id match, and LiteLLM supplies a cache rate models.dev
+lacks (the actual "corner case" value-add) for just 37 of them (0.5%). The
+frontier providers where prompt caching is the dominant real-world cost
+pattern — the entire stated motivation — reconciled at **zero** under an
+exact-match lookup: anthropic 0/14, openai 0/43, google 0/33,
+amazon-bedrock 0/123.
+
+Fix round 2 added minimal bare-id normalization for exactly those four
+providers (LiteLLM's real key convention for them is the bare upstream model
+name, not models.dev's id shape). Reconciliation jumped to 199/213, but
+**net-new cache coverage rose only 5 models** — anthropic +0/14, openai
++2/43, google +2/33, amazon-bedrock +1/123 — for a global total of 42/7,056
+(0.6%).
+
+**Conclusion: the merge is kept, but the reason is coverage of long-tail
+aggregators/resellers, not the frontier-model cache-cost case originally
+assumed.** models.dev already carries cache rates for the frontier providers
+on its own; LiteLLM's measured contribution there is negligible even after
+fixing the id mismatch that could have been masking a real signal. The merge
+stays because it is real, tested, and hardened (a plausibility ceiling on
+rates, parse validation before vendoring, and a CI test that force-evaluates
+the parsed snapshot) — not because the original per-provider rationale held
+up under measurement.

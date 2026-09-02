@@ -240,9 +240,16 @@ per-request to hard-fail on signature loss instead of silently degrading.
 
 **models.dev as primary** (provider-scoped, matches our `(provider, model)` key,
 7,351 model entries, MIT), **LiteLLM's `model_prices_and_context_window.json` as a
-pricing-only secondary** (better on cache-write/per-image cost corner cases; per-token not
-per-million — unit mismatch is a real bug source, normalized to `PicoUsdPerToken(u64)` on
-ingest). **Vendor at build time** (`include_bytes!`, parsed lazily, ~2MB compressed) as
+pricing-only secondary** — kept for long-tail aggregator/reseller cache-rate coverage,
+**not** the frontier-model cache-cost case originally assumed here. Measured
+(Phase 6 Task 9, fix rounds 1-2, against the live files): even after id-normalizing
+the four providers where prompt caching dominates cost (anthropic, openai, google,
+amazon-bedrock — reconciliation 0/213 → 199/213), LiteLLM supplies a cache rate
+models.dev lacks for only 42 of 7,056 priced models (0.6%), 5 of them from those four
+providers; anthropic alone contributes zero net-new despite 14/14 reconciled.
+models.dev already carries cache rates for the frontier providers on its own. Per-token
+not per-million — unit mismatch is a real bug source, normalized to `PicoUsdPerToken(u64)`
+on ingest. **Vendor at build time** (`include_bytes!`, parsed lazily, ~2MB compressed) as
 the source of truth; a weekly CI job refreshes and opens a **human-reviewable PR** — model
 pricing changes should be reviewed, not silently pulled. Runtime refresh is opt-in and
 never blocks a request. Unknown models degrade **explicitly**: unknown context disables
