@@ -22,9 +22,9 @@
 //! that results in a new run starting or being queued issues the matching
 //! [`RunRegistry`] mutation ([`RunRegistry::note_admitted`] /
 //! [`RunRegistry::note_queued`] / [`RunRegistry::cancel_active`]) itself,
-//! through the same `&mut dyn RunRegistry` borrow it used to read the
-//! counts, before it returns. There is no step where a caller is trusted
-//! to "remember" to record the admission later.
+//! through the same `&dyn RunRegistry` borrow it used to read the counts,
+//! before it returns. There is no step where a caller is trusted to
+//! "remember" to record the admission later.
 //!
 //! **Fix round 1 correction — withdrawing an earlier, wrong claim.** The
 //! first version of this module argued that `&mut self` on every
@@ -51,19 +51,15 @@
 //!
 //! The actual fix is structural, not a doc-comment: [`SharedRegistry`]
 //! below is the crate-supported way to share one [`RunRegistry`] across
-//! concurrent callers. It holds a `std::sync::Mutex` locked for the
-//! *entire* [`decide_admission`] call — acquire, decide (every read and
-//! every write), release — so two callers racing the same binding are
-//! fully serialized: the second call's reads cannot start until the
-//! first call's writes have already landed. Callers embedding this crate
-//! must go through `SharedRegistry::decide` (or reproduce its exact lock
-//! discipline) rather than decomposing a decision into separate
-//! lock-read / decide / lock-write steps — decomposing it that way
-//! reopens precisely the window this type exists to close.
+//! concurrent callers. Every [`RunRegistry`] method now takes `&self`
+//! (fix round 2 — see below) because a value shared across concurrent
+//! callers was always going to need interior mutability; `SharedRegistry`
+//! makes that honest instead of pretending a single exclusive `&mut`
+//! owner exists.
 //!
 //! A registry backed by a real database (e.g. SQLite via
 //! `roundhouse-store`, per Ruling P4) cannot use `SharedRegistry` as-is —
-//! there's no single in-process value to put behind one `Mutex` once
+//! there's no single in-process value to put behind one lock once
 //! multiple daemon processes or connections are in play. Such an
 //! implementation must not decompose the check into separate read/write
 //! calls against a pool at all: route the whole `decide_admission` call
@@ -74,6 +70,43 @@
 //! ?1 AND active < ?2` and branching on the affected-row count — never
 //! `SELECT active ...` followed by a separate `UPDATE` on the same
 //! connection or pool checkout.
+//!
+//! **Fix round 2 — the lock must be per-binding, and `cancel_active` must
+//! never block.** Round 1's `SharedRegistry` held one `Mutex` across the
+//! *whole registry*, keyed by nothing. Under `OverlapPolicy::CancelPrevious`
+//! that lock's critical section includes a call to
+//! [`RunRegistry::cancel_active`], and this module's own docs mapped that
+//! to `cancel_running_shell` — an async SIGTERM → wait-up-to-`grace` →
+//! SIGKILL → re-probe sequence that can legitimately run for several
+//! seconds and can fail to confirm at all. A single global lock held
+//! across that call means one binding stuck in a slow or
+//! termination-resistant cancellation (a `D`-state process, or one that
+//! traps `SIGTERM`) stalls admission for *every other binding in the
+//! process* for the duration — and `TriggerSpec::Fs` defaults to
+//! `CancelPrevious` with no `tick()` rate limit on that path (see the
+//! deferred-hazard section below), so this needs no adversary at all.
+//! Worse, a synchronous trait method has no legitimate way to wait on that
+//! async primitive other than `Handle::block_on`, and calling that from
+//! inside a tokio worker thread panics — poisoning the (global) lock
+//! permanently.
+//!
+//! Two changes close this:
+//! 1. [`SharedRegistry`]'s lock is now **per-binding**: a panic, a slow
+//!    call, or a poisoned lock for one `BindingId` cannot stall or wedge
+//!    admission for any other binding. See
+//!    `shared_registry_does_not_block_unrelated_bindings` in
+//!    `tests/admission.rs`.
+//! 2. [`RunRegistry::cancel_active`]'s contract is now a hard requirement
+//!    that it **must not block** and **must never** bridge to an async
+//!    runtime via `block_on` — it requests termination and reports
+//!    whatever it can confirm *synchronously, immediately*. This needs no
+//!    new state machine: it composes directly with the `Unconfirmed`
+//!    outcome fix round 1 already added (finding D) — a non-blocking
+//!    `cancel_active` returns `Unconfirmed` for anything it can't confirm
+//!    on the spot, `decide_admission` declines to admit a replacement,
+//!    and a *later* occurrence's call re-checks and can see `Confirmed`
+//!    once the (separately, asynchronously driven) cancellation actually
+//!    lands.
 //!
 //! # Deferred hazard: `CancelPrevious` thrash (not fixed here)
 //!
@@ -99,22 +132,14 @@
 //!   from outside.
 use crate::trigger::OverlapPolicy;
 use roundhouse_core::BindingId;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
-/// Hard sanity ceiling on `OverlapPolicy::Concurrent`'s `max`. Without
-/// this, a binding configured (accidentally or maliciously — this policy
-/// round-trips through `serde` with no validation of its own) with
-/// `max: u32::MAX` disables the concurrency bound entirely while still
-/// looking like a bounded policy to anyone reading the config. Chosen the
-/// same way `scheduler.rs`'s `MAX_INTERVAL` is: comfortably above any
-/// concurrency a real deployment would legitimately configure (a binding
-/// running 1,000 copies of its job at once is already a misconfiguration
-/// worth surfacing), while still bounding the worst case.
-pub const MAX_OVERLAP_CONCURRENCY: u32 = 1_000;
-
-/// Hard sanity ceiling on `OverlapPolicy::Queue`'s `depth`, for the same
-/// reason and by the same reasoning as [`MAX_OVERLAP_CONCURRENCY`].
-pub const MAX_OVERLAP_QUEUE_DEPTH: u32 = 1_000;
+// Re-exported so existing callers of this module see no path change now
+// that the sanity ceilings are defined alongside `OverlapPolicy` itself
+// (fix round 2, finding L1) — see `crate::trigger` for the values and the
+// reasoning.
+pub use crate::trigger::{MAX_OVERLAP_CONCURRENCY, MAX_OVERLAP_QUEUE_DEPTH};
 
 /// Failure modes a [`RunRegistry`] can report. Every one of them makes
 /// [`decide_admission`] fail *closed* (return `Err`, admit nothing) rather
@@ -131,23 +156,38 @@ pub enum RegistryError {
     #[error("run registry read failed for binding {binding_id}; admission gate fails closed")]
     ReadFailed { binding_id: BindingId },
     /// A counter mutation (`note_admitted`/`note_queued`/`note_finished`/
-    /// `note_dequeued`) would have overflowed or underflowed. Implementors
-    /// must report this instead of wrapping — a wrapping `+= 1` on a
-    /// `u32::MAX` counter silently becomes `0`, which is exactly the
-    /// fail-open failure mode this whole gate exists to prevent.
+    /// `note_dequeued`/`note_promoted`) would have overflowed or
+    /// underflowed. Implementors must report this instead of wrapping — a
+    /// wrapping `+= 1` on a `u32::MAX` counter silently becomes `0`, which
+    /// is exactly the fail-open failure mode this whole gate exists to
+    /// prevent.
     #[error(
         "run registry counter for binding {binding_id} would overflow or underflow; \
          admission gate fails closed"
     )]
     CounterOutOfRange { binding_id: BindingId },
-    /// A [`SharedRegistry`]'s internal mutex was poisoned by a panic while
+    /// A [`SharedRegistry`]'s internal lock was poisoned by a panic while
     /// a previous call held it. The wrapped registry's state after a panic
     /// mid-mutation cannot be trusted, so this also fails closed rather
     /// than silently recovering the poisoned guard's contents.
-    #[error(
-        "shared registry lock was poisoned by a panicking holder; admission gate fails closed"
-    )]
-    Poisoned,
+    ///
+    /// Fix round 2: [`SharedRegistry`]'s locks are per-binding, so a
+    /// poison event denies admission only for the `BindingId` whose lock
+    /// was held at the time of the panic — every other binding continues
+    /// operating normally. `decide`/`note_finished`/`note_dequeued`/
+    /// `note_promoted` all emit `tracing::error!` at the moment a poison
+    /// is detected, naming the affected binding, so the outage is
+    /// observable rather than silently inferred from a stream of `Err`
+    /// returns. **Operator recovery:** a poisoned in-process lock has no
+    /// programmatic reset exposed today (`SharedRegistry` does not hand
+    /// out its internal lock handles); the supported recovery path is
+    /// restarting the daemon process, which drops every lock — poisoned
+    /// or not — along with the in-memory registry state itself. A future
+    /// enhancement could expose a per-binding `clear_poison`-style
+    /// recovery call if operational experience shows a restart is too
+    /// coarse; that is out of scope for this fix round.
+    #[error("admission lock for binding {binding_id} is poisoned; admission gate fails closed")]
+    Poisoned { binding_id: BindingId },
 }
 
 /// How a [`RunRegistry::cancel_active`] attempt actually concluded.
@@ -157,8 +197,8 @@ pub enum RegistryError {
 pub enum CancellationOutcome {
     /// The previous run is verified stopped.
     Confirmed,
-    /// Cancellation was requested but could not be confirmed within this
-    /// call. The previous run may still be alive.
+    /// Cancellation was requested but could not be confirmed
+    /// synchronously. The previous run may still be alive.
     Unconfirmed,
 }
 
@@ -173,6 +213,14 @@ pub enum CancellationOutcome {
 /// See the [module docs](self) for the race-freedom obligation every
 /// method here participates in, and [`SharedRegistry`] for the supported
 /// way to share one implementation across concurrent callers.
+///
+/// Every method takes `&self`, not `&mut self` (fix round 2): a
+/// `RunRegistry` shared across concurrent callers always needs interior
+/// mutability in any real implementation (there is no way to hand out
+/// `&mut` to two callers at once), so implementors must provide their own
+/// synchronization (a `Mutex`/`RwLock` field, a lock-free map, a DB
+/// connection) rather than this trait pretending a single exclusive owner
+/// exists.
 ///
 /// Every counter-mutating method's contract requires the mutation to be
 /// visible to the matching read (`active_run_count`/`queued_count`)
@@ -192,44 +240,57 @@ pub trait RunRegistry {
     fn queued_count(&self, binding_id: BindingId) -> Result<u32, RegistryError>;
 
     /// Attempts to cancel `binding_id`'s currently active run and reports
-    /// whether termination was actually confirmed before returning.
+    /// whatever can be confirmed *synchronously, without blocking*.
     ///
-    /// `roundhouse-flow`'s real implementation sits on top of
+    /// **Hard requirement (fix round 2, finding H): this method must not
+    /// block, and must never bridge to an async runtime via
+    /// `Handle::block_on` or equivalent.** It runs inside
+    /// [`SharedRegistry`]'s per-binding lock; a call that blocks for any
+    /// real amount of time stalls every other admission decision *for
+    /// that one binding* for as long as it blocks, and calling
+    /// `block_on` from within a tokio worker thread panics outright,
+    /// poisoning that binding's lock. `roundhouse-flow`'s real
+    /// implementation sits on top of
     /// `roundhouse_tools::shell::cancel::cancel_running_shell` — an async
-    /// SIGTERM -> wait -> SIGKILL -> re-probe sequence whose own
-    /// `CancelError::GroupStillAlive` variant documents that it may not
-    /// confirm an empty process group within any bounded time. This
-    /// method's contract is honest about that instead of pretending
-    /// cancellation is always immediate and complete:
-    /// - `Ok(CancellationOutcome::Confirmed)` (a real implementation's
-    ///   `Ok(ExitDisposition::Terminated | ExitDisposition::Killed)`
-    ///   case): the previous run is verified gone.
-    ///   `active_run_count(binding_id)` must already reflect 0.
-    /// - `Ok(CancellationOutcome::Unconfirmed)` (a real implementation's
-    ///   `Err(CancelError::GroupStillAlive)` case, mapped rather than
-    ///   propagated as a hard error — an unconfirmed cancel is an expected
-    ///   outcome this trait models explicitly, not a failure of the
-    ///   registry itself): the implementor must **not** report
+    /// SIGTERM -> wait -> SIGKILL -> re-probe sequence that can run for
+    /// multiple seconds and whose own `CancelError::GroupStillAlive`
+    /// variant documents that it may never confirm at all. The correct
+    /// bridge is: kick that async sequence off *without waiting for it*
+    /// (e.g. `tokio::spawn` it, with the spawned task updating the
+    /// registry's real state via `note_finished` once it actually
+    /// confirms), and have this method report whatever is already known
+    /// synchronously — which, the first time it's called for a given
+    /// active run, is essentially always
+    /// `CancellationOutcome::Unconfirmed`. That composes correctly with
+    /// no new state machine needed:
+    /// - `Ok(CancellationOutcome::Confirmed)`: the previous run is
+    ///   *already* verified gone (e.g. a prior spawned cancellation
+    ///   already landed). `active_run_count(binding_id)` must already
+    ///   reflect 0.
+    /// - `Ok(CancellationOutcome::Unconfirmed)`: cancellation has been
+    ///   requested (or was already in flight) but nothing confirms
+    ///   termination yet. The implementor must **not** report
     ///   `active_run_count` as 0 — the process group may still be alive.
     ///   [`decide_admission`] fails closed on this: it will not admit a
     ///   replacement run on top of a predecessor that might still be
-    ///   running.
+    ///   running. A *later* occurrence's call will see `Confirmed` once
+    ///   the spawned cancellation actually completes and updates the
+    ///   registry.
     /// - `Err(RegistryError)`: some other, genuine registry failure (e.g.
-    ///   `CancelError::Signal`/`Wait`/`Probe`'s underlying I/O error).
-    fn cancel_active(
-        &mut self,
-        binding_id: BindingId,
-    ) -> Result<CancellationOutcome, RegistryError>;
+    ///   the underlying `CancelError::Signal`/`Wait`/`Probe` I/O error
+    ///   *synchronously* returned by issuing the signal itself, as
+    ///   opposed to waiting for the group to die).
+    fn cancel_active(&self, binding_id: BindingId) -> Result<CancellationOutcome, RegistryError>;
 
     /// Records that a new run of `binding_id` is starting immediately.
     /// `active_run_count(binding_id)` must reflect the increment before
     /// this call returns.
-    fn note_admitted(&mut self, binding_id: BindingId) -> Result<(), RegistryError>;
+    fn note_admitted(&self, binding_id: BindingId) -> Result<(), RegistryError>;
 
     /// Records that one occurrence of `binding_id` has been queued.
     /// `queued_count(binding_id)` must reflect the increment before this
     /// call returns.
-    fn note_queued(&mut self, binding_id: BindingId) -> Result<(), RegistryError>;
+    fn note_queued(&self, binding_id: BindingId) -> Result<(), RegistryError>;
 
     /// Records that one of `binding_id`'s active runs has finished.
     /// `active_run_count(binding_id)` must reflect the decrement before
@@ -237,16 +298,32 @@ pub trait RunRegistry {
     /// `note_admitted` is permanent: a `Skip` binding that is never told
     /// its run finished is wedged shut forever (see the module docs'
     /// note on the leaked-admission hazard this closes).
-    fn note_finished(&mut self, binding_id: BindingId) -> Result<(), RegistryError>;
+    fn note_finished(&self, binding_id: BindingId) -> Result<(), RegistryError>;
 
     /// Records that one of `binding_id`'s queued occurrences has been
-    /// dequeued (promoted to running, or otherwise removed from the
-    /// backlog). `queued_count(binding_id)` must reflect the decrement
-    /// before this call returns. Without this release side,
-    /// `queued_count` only ever grows, and once it reaches `depth` every
-    /// later occurrence for that binding is dropped forever — a `Message`
-    /// binding could be permanently silenced by one small burst.
-    fn note_dequeued(&mut self, binding_id: BindingId) -> Result<(), RegistryError>;
+    /// removed from the backlog *without* starting it (e.g. the binding
+    /// was disabled, or the queued occurrence expired). `queued_count`
+    /// must reflect the decrement before this call returns.
+    ///
+    /// Do **not** use this when a queued occurrence is being promoted to
+    /// running — use [`Self::note_promoted`] for that. Calling
+    /// `note_dequeued` followed by a separate `note_admitted` for the same
+    /// promotion reopens a real race: a `decide_admission` call for a
+    /// third occurrence landing in the gap between those two calls can
+    /// observe `queued_count == 0 && active_run_count == 0` (the
+    /// momentarily-decremented queue, before the increment lands) and
+    /// admit immediately — jumping ahead of the very occurrence that was
+    /// mid-promotion (fix round 2, finding M1).
+    fn note_dequeued(&self, binding_id: BindingId) -> Result<(), RegistryError>;
+
+    /// Records that one of `binding_id`'s queued occurrences has been
+    /// promoted to running — `queued_count` decremented and
+    /// `active_run_count` incremented **together**, both visible before
+    /// this call returns. This is the only correct way to move an
+    /// occurrence out of the queue and into execution; see
+    /// [`Self::note_dequeued`]'s doc comment for the race two separate
+    /// calls would reopen.
+    fn note_promoted(&self, binding_id: BindingId) -> Result<(), RegistryError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,17 +346,78 @@ pub enum AdmissionDecision {
     /// A `Queue{depth}` binding's backlog was already at `depth` when this
     /// occurrence arrived: dropped as backpressure, not queued. Kept
     /// distinct from `SkipDueToOverlap` so an operator can tell "overflow
-    /// under load" (this) from "suppression by design" (that) — see the
-    /// module's fix-round-1 notes. `decide_admission` also emits a
-    /// `tracing::warn!` when returning this, so the drop is visible even
-    /// if a caller doesn't inspect the decision.
+    /// under load" (this) from "suppression by design" (that). Logged via
+    /// `tracing::warn!`, rate-limited per binding (see the module's
+    /// internal `DropLogGate`) so a sustained flood cannot itself become a
+    /// logging flood.
     SkippedQueueFull { depth: u32 },
     /// `CancelPrevious` found an active run but could not confirm it
     /// actually stopped; the replacement was **not** admitted (fail
-    /// closed — see [`RunRegistry::cancel_active`]'s doc comment).
-    /// `decide_admission` also emits a `tracing::warn!` when returning
-    /// this.
+    /// closed — see [`RunRegistry::cancel_active`]'s doc comment). Logged
+    /// the same way as `SkippedQueueFull`.
     SkippedCancellationUnconfirmed,
+}
+
+/// Rate-limits a repeating `tracing::warn!` for one (binding, condition)
+/// pair so a sustained flood — which costs whoever's driving it nothing —
+/// cannot turn into a logging flood of its own (fix round 2, finding L2).
+/// Logs are worth emitting at occurrence 1, 2, 4, 8, 16, ... (so an
+/// operator sees the *start* of an episode immediately, and its ongoing
+/// severity without linear volume), and the count resets once the binding
+/// produces a decision that isn't the condition being tracked, so the next
+/// distinct episode starts its own count from 1 rather than continuing a
+/// stale one.
+///
+/// Deliberately process-global (keyed by `BindingId`, not by which
+/// `RunRegistry`/`SharedRegistry` instance is asking): this is purely a
+/// log-volume control, not decision state, so sharing it across every
+/// registry in the process is harmless and keeps `decide_admission`
+/// itself free of extra parameters.
+#[derive(Default)]
+struct DropLogGate {
+    counts: Mutex<HashMap<BindingId, u64>>,
+}
+
+impl DropLogGate {
+    /// Notes one more occurrence for `binding_id` and returns the running
+    /// count for this episode.
+    fn note(&self, binding_id: BindingId) -> u64 {
+        // A poisoned counter here is a logging-volume concern, not a
+        // correctness one — recover rather than propagate, unlike every
+        // other lock in this module.
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = counts.entry(binding_id).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    /// Ends `binding_id`'s current episode, so the next one starts at 1.
+    fn reset(&self, binding_id: BindingId) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        counts.remove(&binding_id);
+    }
+
+    /// Whether `count` (as returned by [`Self::note`]) is worth a log
+    /// line: the first occurrence, then every power of two after it.
+    fn is_log_worthy(count: u64) -> bool {
+        count.is_power_of_two()
+    }
+}
+
+fn queue_full_drop_gate() -> &'static DropLogGate {
+    static GATE: OnceLock<DropLogGate> = OnceLock::new();
+    GATE.get_or_init(DropLogGate::default)
+}
+
+fn cancellation_unconfirmed_drop_gate() -> &'static DropLogGate {
+    static GATE: OnceLock<DropLogGate> = OnceLock::new();
+    GATE.get_or_init(DropLogGate::default)
 }
 
 /// Decides what happens to one incoming occurrence of `binding_id` under
@@ -295,7 +433,7 @@ pub enum AdmissionDecision {
 /// control).
 pub fn decide_admission(
     policy: OverlapPolicy,
-    registry: &mut dyn RunRegistry,
+    registry: &dyn RunRegistry,
     binding_id: BindingId,
 ) -> Result<AdmissionDecision, RegistryError> {
     match policy {
@@ -329,16 +467,24 @@ pub fn decide_admission(
             // under a sustained stream.
             if active == 0 && queued == 0 {
                 registry.note_admitted(binding_id)?;
+                queue_full_drop_gate().reset(binding_id);
                 Ok(AdmissionDecision::Admit)
             } else if queued < depth {
                 registry.note_queued(binding_id)?;
+                queue_full_drop_gate().reset(binding_id);
                 Ok(AdmissionDecision::QueueAt(queued))
             } else {
-                tracing::warn!(
-                    binding_id = %binding_id,
-                    depth,
-                    "overlap-policy Queue backlog is full; dropping occurrence as backpressure"
-                );
+                let count = queue_full_drop_gate().note(binding_id);
+                if DropLogGate::is_log_worthy(count) {
+                    tracing::warn!(
+                        binding_id = %binding_id,
+                        depth,
+                        dropped_so_far = count,
+                        "overlap-policy Queue backlog is full; dropping occurrences as \
+                         backpressure (logged at drop 1, 2, 4, 8, ... to bound log volume \
+                         under a sustained flood)"
+                    );
+                }
                 Ok(AdmissionDecision::SkippedQueueFull { depth })
             }
         }
@@ -347,19 +493,26 @@ pub fn decide_admission(
                 match registry.cancel_active(binding_id)? {
                     CancellationOutcome::Confirmed => {
                         registry.note_admitted(binding_id)?;
+                        cancellation_unconfirmed_drop_gate().reset(binding_id);
                         Ok(AdmissionDecision::CancelledPreviousAndAdmit)
                     }
                     CancellationOutcome::Unconfirmed => {
-                        tracing::warn!(
-                            binding_id = %binding_id,
-                            "CancelPrevious could not confirm the previous run terminated; \
-                             refusing to admit a replacement"
-                        );
+                        let count = cancellation_unconfirmed_drop_gate().note(binding_id);
+                        if DropLogGate::is_log_worthy(count) {
+                            tracing::warn!(
+                                binding_id = %binding_id,
+                                occurrences_so_far = count,
+                                "CancelPrevious could not confirm the previous run terminated; \
+                                 refusing to admit a replacement (logged at occurrence 1, 2, 4, \
+                                 8, ... to bound log volume under a sustained flood)"
+                            );
+                        }
                         Ok(AdmissionDecision::SkippedCancellationUnconfirmed)
                     }
                 }
             } else {
                 registry.note_admitted(binding_id)?;
+                cancellation_unconfirmed_drop_gate().reset(binding_id);
                 Ok(AdmissionDecision::CancelledPreviousAndAdmit)
             }
         }
@@ -368,113 +521,209 @@ pub fn decide_admission(
 
 /// The crate-supported way to share one [`RunRegistry`] across concurrent
 /// callers (threads or async tasks). See the [module docs](self) for why
-/// `&mut self` alone cannot provide this on its own — `SharedRegistry`
-/// holds a `std::sync::Mutex` locked for an entire [`decide_admission`]
-/// call, so two callers racing the same binding are fully serialized.
+/// `&mut self` alone cannot provide this on its own.
+///
+/// **Fix round 2:** the lock here is **per-binding**, not one lock for the
+/// whole registry. A `Mutex` per `BindingId` is created on first use and
+/// held for the entire [`decide_admission`] (or `note_*`) call, so two
+/// callers racing the *same* binding are fully serialized, while calls
+/// for *different* bindings never wait on each other — a slow, panicking,
+/// or poisoned call for one binding cannot stall or wedge any other
+/// binding's admission decisions. See
+/// `shared_registry_does_not_block_unrelated_bindings` and
+/// `shared_registry_never_lets_two_calls_run_concurrently_for_one_binding`
+/// in `tests/admission.rs`.
 ///
 /// Only usable for a single in-process registry value. A registry backed
 /// by a real database shared across multiple processes needs its own
 /// atomicity story (one transaction or one conditional statement per
 /// decision — see the module docs) rather than this wrapper.
 pub struct SharedRegistry<R> {
-    inner: Mutex<R>,
+    registry: R,
+    // The directory itself is protected by a short-lived lock (just a
+    // hashmap get-or-insert, no user code runs under it — see
+    // `with_binding_lock`'s doc comment for why this essentially never
+    // poisons in practice); each binding's own `Mutex<()>` is what's
+    // actually held across the real work.
+    binding_locks: Mutex<HashMap<BindingId, std::sync::Arc<Mutex<()>>>>,
 }
 
 impl<R: RunRegistry> SharedRegistry<R> {
     pub fn new(registry: R) -> Self {
         SharedRegistry {
-            inner: Mutex::new(registry),
+            registry,
+            binding_locks: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Runs [`decide_admission`] against the wrapped registry with the
-    /// lock held for the call's entire duration. This is the supported
-    /// way to share a [`RunRegistry`] across concurrent callers — never
-    /// decompose this into a separate lock/read/decide/write/unlock
-    /// sequence at the call site; that reintroduces the exact race this
-    /// type exists to close.
+    /// Runs [`decide_admission`] against the wrapped registry with
+    /// `binding_id`'s own lock held for the call's entire duration. This
+    /// is the supported way to share a [`RunRegistry`] across concurrent
+    /// callers — never decompose this into a separate
+    /// lock/read/decide/write/unlock sequence at the call site; that
+    /// reintroduces the exact race this type exists to close.
     pub fn decide(
         &self,
         policy: OverlapPolicy,
         binding_id: BindingId,
     ) -> Result<AdmissionDecision, RegistryError> {
-        let mut guard = self.lock()?;
-        decide_admission(policy, &mut *guard, binding_id)
+        self.with_binding_lock(binding_id, || {
+            decide_admission(policy, &self.registry, binding_id)
+        })
     }
 
-    /// Records a run's completion under the same lock discipline as
-    /// [`Self::decide`] (see [`RunRegistry::note_finished`]).
+    /// Consumes the `SharedRegistry`, returning the wrapped registry.
+    /// Useful for graceful-shutdown paths that want to inspect or persist
+    /// final state, and for tests that need to assert on the wrapped
+    /// registry's own state directly.
+    pub fn into_inner(self) -> R {
+        self.registry
+    }
+
+    /// Records a run's completion under the same per-binding lock
+    /// discipline as [`Self::decide`] (see [`RunRegistry::note_finished`]).
     pub fn note_finished(&self, binding_id: BindingId) -> Result<(), RegistryError> {
-        self.lock()?.note_finished(binding_id)
+        self.with_binding_lock(binding_id, || self.registry.note_finished(binding_id))
     }
 
-    /// Records a queued occurrence's dequeue under the same lock
-    /// discipline as [`Self::decide`] (see [`RunRegistry::note_dequeued`]).
+    /// Records a queued occurrence's removal without starting it, under
+    /// the same lock discipline as [`Self::decide`] (see
+    /// [`RunRegistry::note_dequeued`]).
     pub fn note_dequeued(&self, binding_id: BindingId) -> Result<(), RegistryError> {
-        self.lock()?.note_dequeued(binding_id)
+        self.with_binding_lock(binding_id, || self.registry.note_dequeued(binding_id))
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, R>, RegistryError> {
-        // A poisoned mutex means some previous holder panicked mid-call,
-        // possibly after mutating the registry but before its invariants
-        // were restored. Recovering the guard and proceeding as if nothing
-        // happened would risk making decisions against corrupted state;
-        // failing closed instead (Ruling: see `RegistryError::Poisoned`).
-        self.inner.lock().map_err(|_| RegistryError::Poisoned)
+    /// Records a queued occurrence's promotion to running, under the same
+    /// lock discipline as [`Self::decide`] (see
+    /// [`RunRegistry::note_promoted`]).
+    pub fn note_promoted(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+        self.with_binding_lock(binding_id, || self.registry.note_promoted(binding_id))
+    }
+
+    /// Looks up (creating if necessary) `binding_id`'s own lock, holds it
+    /// for the duration of `f`, and runs `f`. `f` must not block for any
+    /// real amount of time and must not call back into this
+    /// `SharedRegistry` for the same `binding_id` — see
+    /// [`RunRegistry::cancel_active`]'s "must not block" requirement,
+    /// which is exactly what keeps this safe to rely on.
+    fn with_binding_lock<T>(
+        &self,
+        binding_id: BindingId,
+        f: impl FnOnce() -> Result<T, RegistryError>,
+    ) -> Result<T, RegistryError> {
+        let lock = {
+            // Held only long enough to get-or-insert one map entry — no
+            // user-supplied code runs in this critical section, so in
+            // practice this directory lock does not poison; if it ever
+            // did, that failure is genuinely global (there would be no
+            // way to look up *any* binding's own lock), unlike the
+            // per-binding poison case below.
+            let mut directory = self.binding_locks.lock().map_err(|_| {
+                tracing::error!(
+                    "SharedRegistry's binding-lock directory was poisoned; admission is \
+                     denied for ALL bindings until the process is restarted"
+                );
+                RegistryError::Poisoned { binding_id }
+            })?;
+            std::sync::Arc::clone(
+                directory
+                    .entry(binding_id)
+                    .or_insert_with(|| std::sync::Arc::new(Mutex::new(()))),
+            )
+        };
+        let _guard = lock.lock().map_err(|_| {
+            tracing::error!(
+                binding_id = %binding_id,
+                "admission lock for this binding was poisoned by a panicking holder; \
+                 admission is denied for this binding until the process is restarted \
+                 (poisoning is scoped to this binding only — other bindings are unaffected)"
+            );
+            RegistryError::Poisoned { binding_id }
+        })?;
+        f()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
 
     #[derive(Default)]
     struct FakeRegistry {
-        active: HashMap<BindingId, u32>,
-        queued: HashMap<BindingId, u32>,
+        active: StdMutex<HashMap<BindingId, u32>>,
+        queued: StdMutex<HashMap<BindingId, u32>>,
+    }
+
+    impl FakeRegistry {
+        fn with_active(binding_id: BindingId, count: u32) -> Self {
+            let registry = FakeRegistry::default();
+            registry.active.lock().unwrap().insert(binding_id, count);
+            registry
+        }
     }
 
     impl RunRegistry for FakeRegistry {
         fn active_run_count(&self, binding_id: BindingId) -> Result<u32, RegistryError> {
-            Ok(*self.active.get(&binding_id).unwrap_or(&0))
+            Ok(*self.active.lock().unwrap().get(&binding_id).unwrap_or(&0))
         }
         fn queued_count(&self, binding_id: BindingId) -> Result<u32, RegistryError> {
-            Ok(*self.queued.get(&binding_id).unwrap_or(&0))
+            Ok(*self.queued.lock().unwrap().get(&binding_id).unwrap_or(&0))
         }
         fn cancel_active(
-            &mut self,
+            &self,
             binding_id: BindingId,
         ) -> Result<CancellationOutcome, RegistryError> {
-            self.active.insert(binding_id, 0);
+            self.active.lock().unwrap().insert(binding_id, 0);
             Ok(CancellationOutcome::Confirmed)
         }
-        fn note_admitted(&mut self, binding_id: BindingId) -> Result<(), RegistryError> {
-            let slot = self.active.entry(binding_id).or_insert(0);
+        fn note_admitted(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+            let mut active = self.active.lock().unwrap();
+            let slot = active.entry(binding_id).or_insert(0);
             *slot = slot
                 .checked_add(1)
                 .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
             Ok(())
         }
-        fn note_queued(&mut self, binding_id: BindingId) -> Result<(), RegistryError> {
-            let slot = self.queued.entry(binding_id).or_insert(0);
+        fn note_queued(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+            let mut queued = self.queued.lock().unwrap();
+            let slot = queued.entry(binding_id).or_insert(0);
             *slot = slot
                 .checked_add(1)
                 .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
             Ok(())
         }
-        fn note_finished(&mut self, binding_id: BindingId) -> Result<(), RegistryError> {
-            let slot = self.active.entry(binding_id).or_insert(0);
+        fn note_finished(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+            let mut active = self.active.lock().unwrap();
+            let slot = active.entry(binding_id).or_insert(0);
             *slot = slot
                 .checked_sub(1)
                 .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
             Ok(())
         }
-        fn note_dequeued(&mut self, binding_id: BindingId) -> Result<(), RegistryError> {
-            let slot = self.queued.entry(binding_id).or_insert(0);
+        fn note_dequeued(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+            let mut queued = self.queued.lock().unwrap();
+            let slot = queued.entry(binding_id).or_insert(0);
             *slot = slot
                 .checked_sub(1)
                 .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
+            Ok(())
+        }
+        fn note_promoted(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+            {
+                let mut queued = self.queued.lock().unwrap();
+                let slot = queued.entry(binding_id).or_insert(0);
+                *slot = slot
+                    .checked_sub(1)
+                    .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
+            }
+            {
+                let mut active = self.active.lock().unwrap();
+                let slot = active.entry(binding_id).or_insert(0);
+                *slot = slot
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
+            }
             Ok(())
         }
     }
@@ -492,21 +741,24 @@ mod tests {
             Err(RegistryError::ReadFailed { binding_id })
         }
         fn cancel_active(
-            &mut self,
+            &self,
             binding_id: BindingId,
         ) -> Result<CancellationOutcome, RegistryError> {
             Err(RegistryError::ReadFailed { binding_id })
         }
-        fn note_admitted(&mut self, binding_id: BindingId) -> Result<(), RegistryError> {
+        fn note_admitted(&self, binding_id: BindingId) -> Result<(), RegistryError> {
             Err(RegistryError::ReadFailed { binding_id })
         }
-        fn note_queued(&mut self, binding_id: BindingId) -> Result<(), RegistryError> {
+        fn note_queued(&self, binding_id: BindingId) -> Result<(), RegistryError> {
             Err(RegistryError::ReadFailed { binding_id })
         }
-        fn note_finished(&mut self, binding_id: BindingId) -> Result<(), RegistryError> {
+        fn note_finished(&self, binding_id: BindingId) -> Result<(), RegistryError> {
             Err(RegistryError::ReadFailed { binding_id })
         }
-        fn note_dequeued(&mut self, binding_id: BindingId) -> Result<(), RegistryError> {
+        fn note_dequeued(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+            Err(RegistryError::ReadFailed { binding_id })
+        }
+        fn note_promoted(&self, binding_id: BindingId) -> Result<(), RegistryError> {
             Err(RegistryError::ReadFailed { binding_id })
         }
     }
@@ -514,20 +766,20 @@ mod tests {
     #[test]
     fn concurrent_admits_up_to_max_then_skips() {
         let binding_id = BindingId::new();
-        let mut registry = FakeRegistry::default();
+        let registry = FakeRegistry::default();
         let policy = OverlapPolicy::Concurrent { max: 2 };
 
         assert_eq!(
-            decide_admission(policy, &mut registry, binding_id).unwrap(),
+            decide_admission(policy, &registry, binding_id).unwrap(),
             AdmissionDecision::Admit
         );
         assert_eq!(
-            decide_admission(policy, &mut registry, binding_id).unwrap(),
+            decide_admission(policy, &registry, binding_id).unwrap(),
             AdmissionDecision::Admit
         );
         assert_eq!(registry.active_run_count(binding_id).unwrap(), 2);
         assert_eq!(
-            decide_admission(policy, &mut registry, binding_id).unwrap(),
+            decide_admission(policy, &registry, binding_id).unwrap(),
             AdmissionDecision::SkipDueToOverlap
         );
     }
@@ -535,27 +787,27 @@ mod tests {
     #[test]
     fn queue_bounds_backlog_independently_of_active_count() {
         let binding_id = BindingId::new();
-        let mut registry = FakeRegistry::default();
+        let registry = FakeRegistry::default();
         let policy = OverlapPolicy::Queue { depth: 2 };
 
         // First occurrence: nothing active, admitted immediately.
         assert_eq!(
-            decide_admission(policy, &mut registry, binding_id).unwrap(),
+            decide_admission(policy, &registry, binding_id).unwrap(),
             AdmissionDecision::Admit
         );
         // Now something is active; subsequent occurrences queue up to depth.
         assert_eq!(
-            decide_admission(policy, &mut registry, binding_id).unwrap(),
+            decide_admission(policy, &registry, binding_id).unwrap(),
             AdmissionDecision::QueueAt(0)
         );
         assert_eq!(
-            decide_admission(policy, &mut registry, binding_id).unwrap(),
+            decide_admission(policy, &registry, binding_id).unwrap(),
             AdmissionDecision::QueueAt(1)
         );
         // Queue is now at depth: further arrivals are backpressured, not
         // silently treated as more concurrency.
         assert_eq!(
-            decide_admission(policy, &mut registry, binding_id).unwrap(),
+            decide_admission(policy, &registry, binding_id).unwrap(),
             AdmissionDecision::SkippedQueueFull { depth: 2 }
         );
         assert_eq!(registry.active_run_count(binding_id).unwrap(), 1);
@@ -566,20 +818,20 @@ mod tests {
     fn admission_state_is_isolated_per_binding() {
         let a = BindingId::new();
         let b = BindingId::new();
-        let mut registry = FakeRegistry::default();
+        let registry = FakeRegistry::default();
         let policy = OverlapPolicy::Skip;
 
         assert_eq!(
-            decide_admission(policy, &mut registry, a).unwrap(),
+            decide_admission(policy, &registry, a).unwrap(),
             AdmissionDecision::Admit
         );
         // A second, unrelated binding is unaffected by `a`'s active run.
         assert_eq!(
-            decide_admission(policy, &mut registry, b).unwrap(),
+            decide_admission(policy, &registry, b).unwrap(),
             AdmissionDecision::Admit
         );
         assert_eq!(
-            decide_admission(policy, &mut registry, a).unwrap(),
+            decide_admission(policy, &registry, a).unwrap(),
             AdmissionDecision::SkipDueToOverlap
         );
     }
@@ -595,13 +847,12 @@ mod tests {
     #[test]
     fn a_burst_of_fire_events_never_exceeds_the_concurrency_bound() {
         let binding_id = BindingId::new();
-        let mut registry = FakeRegistry::default();
+        let registry = FakeRegistry::default();
         let policy = OverlapPolicy::Concurrent { max: 3 };
 
         let mut admitted = 0;
         for _ in 0..100 {
-            if decide_admission(policy, &mut registry, binding_id).unwrap()
-                == AdmissionDecision::Admit
+            if decide_admission(policy, &registry, binding_id).unwrap() == AdmissionDecision::Admit
             {
                 admitted += 1;
             }
@@ -617,7 +868,7 @@ mod tests {
     #[test]
     fn an_unreadable_registry_fails_closed_not_open() {
         let binding_id = BindingId::new();
-        let mut registry = AlwaysFailingRegistry;
+        let registry = AlwaysFailingRegistry;
 
         for policy in [
             OverlapPolicy::Skip,
@@ -625,7 +876,7 @@ mod tests {
             OverlapPolicy::Queue { depth: 5 },
             OverlapPolicy::CancelPrevious,
         ] {
-            let result = decide_admission(policy, &mut registry, binding_id);
+            let result = decide_admission(policy, &registry, binding_id);
             assert!(
                 result.is_err(),
                 "policy {policy:?} admitted against an unreadable registry"
@@ -640,17 +891,17 @@ mod tests {
     #[test]
     fn concurrent_max_is_clamped_to_the_sanity_ceiling() {
         let binding_id = BindingId::new();
-        let mut registry = FakeRegistry::default();
+        let registry = FakeRegistry::default();
         let policy = OverlapPolicy::Concurrent { max: u32::MAX };
 
         for _ in 0..MAX_OVERLAP_CONCURRENCY {
             assert_eq!(
-                decide_admission(policy, &mut registry, binding_id).unwrap(),
+                decide_admission(policy, &registry, binding_id).unwrap(),
                 AdmissionDecision::Admit
             );
         }
         assert_eq!(
-            decide_admission(policy, &mut registry, binding_id).unwrap(),
+            decide_admission(policy, &registry, binding_id).unwrap(),
             AdmissionDecision::SkipDueToOverlap,
             "max: u32::MAX must still be bounded by MAX_OVERLAP_CONCURRENCY"
         );
@@ -661,49 +912,161 @@ mod tests {
     #[test]
     fn cancel_previous_does_not_admit_when_cancellation_is_unconfirmed() {
         struct UnconfirmedCancelRegistry {
-            active: HashMap<BindingId, u32>,
+            active: StdMutex<HashMap<BindingId, u32>>,
         }
         impl RunRegistry for UnconfirmedCancelRegistry {
             fn active_run_count(&self, binding_id: BindingId) -> Result<u32, RegistryError> {
-                Ok(*self.active.get(&binding_id).unwrap_or(&0))
+                Ok(*self.active.lock().unwrap().get(&binding_id).unwrap_or(&0))
             }
             fn queued_count(&self, _binding_id: BindingId) -> Result<u32, RegistryError> {
                 Ok(0)
             }
             fn cancel_active(
-                &mut self,
+                &self,
                 _binding_id: BindingId,
             ) -> Result<CancellationOutcome, RegistryError> {
-                // Requested, but (like a real SIGKILL that still can't
-                // confirm an empty process group) not confirmed: the
+                // Requested, but (like a real, non-blocking SIGTERM whose
+                // effect hasn't been re-probed yet) not confirmed: the
                 // active count is deliberately left unchanged.
                 Ok(CancellationOutcome::Unconfirmed)
             }
-            fn note_admitted(&mut self, binding_id: BindingId) -> Result<(), RegistryError> {
-                *self.active.entry(binding_id).or_insert(0) += 1;
+            fn note_admitted(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+                *self.active.lock().unwrap().entry(binding_id).or_insert(0) += 1;
                 Ok(())
             }
-            fn note_queued(&mut self, _binding_id: BindingId) -> Result<(), RegistryError> {
+            fn note_queued(&self, _binding_id: BindingId) -> Result<(), RegistryError> {
                 Ok(())
             }
-            fn note_finished(&mut self, binding_id: BindingId) -> Result<(), RegistryError> {
-                *self.active.entry(binding_id).or_insert(0) = 0;
+            fn note_finished(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+                *self.active.lock().unwrap().entry(binding_id).or_insert(0) = 0;
                 Ok(())
             }
-            fn note_dequeued(&mut self, _binding_id: BindingId) -> Result<(), RegistryError> {
+            fn note_dequeued(&self, _binding_id: BindingId) -> Result<(), RegistryError> {
+                Ok(())
+            }
+            fn note_promoted(&self, _binding_id: BindingId) -> Result<(), RegistryError> {
                 Ok(())
             }
         }
 
         let binding_id = BindingId::new();
-        let mut registry = UnconfirmedCancelRegistry {
-            active: HashMap::from([(binding_id, 1)]),
+        let registry = UnconfirmedCancelRegistry {
+            active: StdMutex::new(HashMap::from([(binding_id, 1)])),
         };
         let decision =
-            decide_admission(OverlapPolicy::CancelPrevious, &mut registry, binding_id).unwrap();
+            decide_admission(OverlapPolicy::CancelPrevious, &registry, binding_id).unwrap();
         assert_eq!(decision, AdmissionDecision::SkippedCancellationUnconfirmed);
         // Still 1, not 2 (no replacement admitted) and not 0 (the
         // predecessor's own count wasn't fabricated away either).
         assert_eq!(registry.active_run_count(binding_id).unwrap(), 1);
+    }
+
+    /// M1: `note_promoted` must move a queued occurrence to active in one
+    /// call — `queued_count` and `active_run_count` both update together,
+    /// and the gate's subsequent view of the binding is consistent (the
+    /// promoted run is now counted as active, so a further occurrence
+    /// queues behind it rather than jumping ahead).
+    #[test]
+    fn note_promoted_moves_a_queued_occurrence_to_active_in_one_call() {
+        let binding_id = BindingId::new();
+        let registry = FakeRegistry::default();
+        let policy = OverlapPolicy::Queue { depth: 2 };
+
+        // Occurrence 1 admitted; occurrence 2 queues behind it.
+        assert_eq!(
+            decide_admission(policy, &registry, binding_id).unwrap(),
+            AdmissionDecision::Admit
+        );
+        assert_eq!(
+            decide_admission(policy, &registry, binding_id).unwrap(),
+            AdmissionDecision::QueueAt(0)
+        );
+
+        // Occurrence 1 finishes; the flow layer promotes occurrence 2.
+        registry.note_finished(binding_id).unwrap();
+        registry.note_promoted(binding_id).unwrap();
+        assert_eq!(registry.active_run_count(binding_id).unwrap(), 1);
+        assert_eq!(registry.queued_count(binding_id).unwrap(), 0);
+
+        // Occurrence 3 arrives: the promoted run is correctly counted as
+        // active, so this queues rather than jumping ahead or double-admitting.
+        assert_eq!(
+            decide_admission(policy, &registry, binding_id).unwrap(),
+            AdmissionDecision::QueueAt(0)
+        );
+    }
+
+    /// The `note_dequeued`/`CounterOutOfRange` paths the fix-round-2
+    /// review flagged as untested: a queued occurrence can be dropped
+    /// without ever starting (distinct from `note_promoted`), and an
+    /// implementor's own counter arithmetic must report underflow rather
+    /// than wrap.
+    #[test]
+    fn note_dequeued_drops_a_queued_occurrence_without_starting_it() {
+        let binding_id = BindingId::new();
+        let registry = FakeRegistry::default();
+        let policy = OverlapPolicy::Queue { depth: 2 };
+
+        decide_admission(policy, &registry, binding_id).unwrap(); // Admit
+        decide_admission(policy, &registry, binding_id).unwrap(); // QueueAt(0)
+
+        registry.note_dequeued(binding_id).unwrap();
+        assert_eq!(registry.queued_count(binding_id).unwrap(), 0);
+        // Unaffected — the active run was never touched by this dequeue.
+        assert_eq!(registry.active_run_count(binding_id).unwrap(), 1);
+    }
+
+    #[test]
+    fn note_finished_reports_counter_out_of_range_on_underflow() {
+        let binding_id = BindingId::new();
+        let registry = FakeRegistry::default();
+        assert_eq!(
+            registry.note_finished(binding_id).unwrap_err(),
+            RegistryError::CounterOutOfRange { binding_id }
+        );
+    }
+
+    #[test]
+    fn note_dequeued_reports_counter_out_of_range_on_underflow() {
+        let binding_id = BindingId::new();
+        let registry = FakeRegistry::default();
+        assert_eq!(
+            registry.note_dequeued(binding_id).unwrap_err(),
+            RegistryError::CounterOutOfRange { binding_id }
+        );
+    }
+
+    /// Pure-logic coverage for the L2 rate limiter, independent of
+    /// `tracing`'s own output (which nothing here asserts on): the count
+    /// sequence that's "log worthy" is 1, 2, 4, 8, ... and `reset` starts
+    /// a fresh episode at 1 again.
+    #[test]
+    fn drop_log_gate_is_worth_logging_at_powers_of_two_and_resets() {
+        assert!(DropLogGate::is_log_worthy(1));
+        assert!(DropLogGate::is_log_worthy(2));
+        assert!(!DropLogGate::is_log_worthy(3));
+        assert!(DropLogGate::is_log_worthy(4));
+        assert!(!DropLogGate::is_log_worthy(5));
+        assert!(!DropLogGate::is_log_worthy(7));
+        assert!(DropLogGate::is_log_worthy(8));
+
+        let gate = DropLogGate::default();
+        let binding_id = BindingId::new();
+        assert_eq!(gate.note(binding_id), 1);
+        assert_eq!(gate.note(binding_id), 2);
+        assert_eq!(gate.note(binding_id), 3);
+        gate.reset(binding_id);
+        assert_eq!(gate.note(binding_id), 1);
+
+        // Independent of other bindings.
+        let other = BindingId::new();
+        assert_eq!(gate.note(other), 1);
+    }
+
+    #[test]
+    fn fake_registry_with_active_seeds_the_active_count() {
+        let binding_id = BindingId::new();
+        let registry = FakeRegistry::with_active(binding_id, 3);
+        assert_eq!(registry.active_run_count(binding_id).unwrap(), 3);
     }
 }

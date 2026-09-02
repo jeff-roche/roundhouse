@@ -22,6 +22,43 @@ fn cron_trigger_round_trips_through_json_with_required_tz() {
     assert_eq!(spec, back);
 }
 
+/// Fix round 2, finding L1: `OverlapPolicy` clamps `Concurrent`'s `max`
+/// and `Queue`'s `depth` to their sanity ceilings at *deserialize* time —
+/// a persisted `Binding` never carries an unbounded value in the first
+/// place, rather than the ceiling only existing as a use-site `.min()` in
+/// `roundhouse-sched::admission::decide_admission`.
+#[test]
+fn overlap_policy_concurrent_max_is_clamped_at_deserialize_time() {
+    let json = r#"{"Concurrent":{"max":4294967295}}"#;
+    let policy: OverlapPolicy = serde_json::from_str(json).expect("deserialize");
+    assert_eq!(
+        policy,
+        OverlapPolicy::Concurrent {
+            max: roundhouse_sched::trigger::MAX_OVERLAP_CONCURRENCY
+        }
+    );
+}
+
+#[test]
+fn overlap_policy_queue_depth_is_clamped_at_deserialize_time() {
+    let json = r#"{"Queue":{"depth":5000}}"#;
+    let policy: OverlapPolicy = serde_json::from_str(json).expect("deserialize");
+    assert_eq!(
+        policy,
+        OverlapPolicy::Queue {
+            depth: roundhouse_sched::trigger::MAX_OVERLAP_QUEUE_DEPTH
+        }
+    );
+}
+
+#[test]
+fn overlap_policy_within_bounds_round_trips_unchanged() {
+    let policy = OverlapPolicy::Queue { depth: 8 };
+    let json = serde_json::to_string(&policy).expect("serialize");
+    let back: OverlapPolicy = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(policy, back);
+}
+
 #[test]
 fn binding_default_overlap_policy_is_skip_for_cron() {
     let binding = Binding::new_cron(JobId::new(), "0 2 * * *".to_string(), Tz::America__New_York);

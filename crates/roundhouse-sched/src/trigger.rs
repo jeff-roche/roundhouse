@@ -9,7 +9,7 @@
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use roundhouse_core::{Address, BindingId, JobId, SessionId};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -126,12 +126,98 @@ pub enum TriggerSpec {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Sanity ceiling on `OverlapPolicy::Concurrent`'s `max`. Without this, a
+/// binding configured (accidentally, maliciously, or by a corrupted
+/// persisted record — this policy round-trips through `serde` with no
+/// validation of its own) with `max: u32::MAX` would disable the
+/// concurrency bound entirely while still looking like a bounded policy to
+/// anyone reading the config. Enforced at deserialize time (see
+/// `OverlapPolicy`'s manual `Deserialize` impl below) rather than only at
+/// the point `roundhouse-sched::admission` reads the policy, so a
+/// persisted `Binding` never carries an unbounded value in the first
+/// place — admission-round-1 fix that only clamped at the read site left
+/// exactly that gap (fix round 2, finding L1). Chosen the same way this
+/// module's other sanity ceilings are (see `scheduler.rs`'s
+/// `MAX_INTERVAL`): comfortably above any concurrency a real deployment
+/// would legitimately configure, while still bounding the worst case.
+/// Re-exported from `roundhouse_sched::admission` so existing callers of
+/// that module see no path change.
+pub const MAX_OVERLAP_CONCURRENCY: u32 = 1_000;
+
+/// Sanity ceiling on `OverlapPolicy::Queue`'s `depth`, for the same reason
+/// and by the same reasoning as [`MAX_OVERLAP_CONCURRENCY`].
+pub const MAX_OVERLAP_QUEUE_DEPTH: u32 = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum OverlapPolicy {
     Skip,
     Queue { depth: u32 },
     Concurrent { max: u32 },
     CancelPrevious,
+}
+
+/// Serde wire shape for [`OverlapPolicy`] — identical variants/fields, so
+/// it reads exactly what `OverlapPolicy`'s derived `Serialize` writes.
+/// `OverlapPolicy`'s own `Deserialize` impl (below) deserializes into this
+/// first and then validates/clamps `Queue`'s `depth` and `Concurrent`'s
+/// `max`, which a plain `#[derive(Deserialize)]` on `OverlapPolicy` itself
+/// cannot do.
+#[derive(Deserialize)]
+enum OverlapPolicyWire {
+    Skip,
+    Queue { depth: u32 },
+    Concurrent { max: u32 },
+    CancelPrevious,
+}
+
+impl<'de> Deserialize<'de> for OverlapPolicy {
+    /// Fix round 2, finding L1: a bare `#[derive(Deserialize)]` let a
+    /// persisted `Binding` carry `Concurrent { max: u32::MAX }` or
+    /// `Queue { depth: u32::MAX }` — a policy that *looks* bounded but
+    /// isn't — with the only enforcement living in
+    /// `roundhouse_sched::admission::decide_admission`'s use-site `.min()`
+    /// clamp. This impl clamps at load time instead, so the ceiling is a
+    /// property of the value from the moment it's decoded, and logs once
+    /// (at `WARN`) naming both the configured and the effective value so a
+    /// misconfiguration is visible rather than silently rewritten.
+    /// `decide_admission`'s own clamp stays in place as a silent backstop
+    /// for policies constructed directly in Rust code (this enum's fields
+    /// are public, so nothing stops `OverlapPolicy::Concurrent { max:
+    /// u32::MAX }` as a struct literal, which never goes through
+    /// `Deserialize` at all) — the warning here covers the realistic
+    /// "loaded from persisted/external config" vector this finding is
+    /// about.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match OverlapPolicyWire::deserialize(deserializer)? {
+            OverlapPolicyWire::Skip => OverlapPolicy::Skip,
+            OverlapPolicyWire::CancelPrevious => OverlapPolicy::CancelPrevious,
+            OverlapPolicyWire::Queue { depth } => {
+                let effective = depth.min(MAX_OVERLAP_QUEUE_DEPTH);
+                if effective != depth {
+                    tracing::warn!(
+                        configured = depth,
+                        effective,
+                        "OverlapPolicy::Queue depth clamped to the sanity ceiling at load time"
+                    );
+                }
+                OverlapPolicy::Queue { depth: effective }
+            }
+            OverlapPolicyWire::Concurrent { max } => {
+                let effective = max.min(MAX_OVERLAP_CONCURRENCY);
+                if effective != max {
+                    tracing::warn!(
+                        configured = max,
+                        effective,
+                        "OverlapPolicy::Concurrent max clamped to the sanity ceiling at load time"
+                    );
+                }
+                OverlapPolicy::Concurrent { max: effective }
+            }
+        })
+    }
 }
 
 impl OverlapPolicy {
