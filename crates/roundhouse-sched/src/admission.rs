@@ -378,7 +378,9 @@ pub enum AdmissionDecision {
 /// `reset(binding_id)` only from *this gate's own* policy branch's success
 /// path — the `Queue` arm resets the queue-full gate on `Admit`/`QueueAt`,
 /// the `CancelPrevious` arm resets the cancellation-unconfirmed gate on
-/// `Confirmed`. It is **not** reset by "any other decision for this
+/// both of its admitting paths (a `Confirmed` cancellation, and the
+/// no-active-run case where there was nothing to cancel). It is **not**
+/// reset by "any other decision for this
 /// binding", and in particular not by a *different* `OverlapPolicy`
 /// entirely: if a binding's policy changes at runtime (e.g. `Queue` ->
 /// `Skip` -> back to `Queue`), the queue-full gate's count for that
@@ -404,10 +406,20 @@ struct DropLogGate {
     // of global contention on the hot path that per-binding locking
     // (fix round 2, finding H) was about eliminating. `has_any` lets the
     // overwhelmingly common "nothing has ever gone wrong on this gate"
-    // case skip the lock entirely; once anything has actually triggered a
-    // drop (a real anomaly), later `reset` calls fall back to acquiring
-    // the lock as before, which is an acceptable cost only in the
-    // already-degraded case this gate exists to log.
+    // case skip the lock entirely.
+    //
+    // The flag is never cleared, and that is deliberate: one drop
+    // anywhere in the process — for any binding, at any time — sets it
+    // permanently, so from then on every `reset` call for every binding
+    // acquires this gate's global `Mutex` again for the rest of the
+    // process's life. The fast path is therefore a one-way optimization
+    // for processes that have never dropped an occurrence, not a
+    // self-healing one. Keeping it monotone is the safe choice: clearing
+    // it under the counts lock would race `note`'s pre-lock store, and a
+    // lost store there would suppress the *first* log line of a
+    // genuinely new episode — losing the operator signal this gate
+    // exists to emit, to save a lock acquisition on a path that only
+    // runs when something is already going wrong.
     has_any: std::sync::atomic::AtomicBool,
 }
 
@@ -590,8 +602,9 @@ pub fn decide_admission(
 /// id taken directly from untrusted external input (a webhook path
 /// parameter, say) — an unauthenticated caller able to invoke `decide`
 /// with arbitrary UUIDs could otherwise grow this map without bound. Call
-/// [`Self::forget`] when a binding is unbound/deleted to reclaim its
-/// entry.
+/// [`Self::forget`] when a binding is unbound/deleted to reclaim its entry
+/// — best effort, since it deliberately skips a binding that is currently
+/// in use.
 pub struct SharedRegistry<R> {
     registry: R,
     // The directory itself is protected by a short-lived lock (just a
@@ -646,13 +659,35 @@ impl<R: RunRegistry> SharedRegistry<R> {
     /// unbound/deleted so [`SharedRegistry`]'s directory does not retain
     /// an entry for it forever (see the struct's own doc comment on why
     /// the directory never evicts on its own). Safe to call even if no
-    /// entry exists (a no-op) or if the binding is not currently under
-    /// contention; do **not** call this while a `decide`/`note_*` call for
-    /// the same `binding_id` might still be in flight elsewhere — doing so
-    /// cannot corrupt state (a fresh lock is simply created on the next
-    /// call), but it does mean that in-flight call's lock is no longer the
-    /// one new callers will contend on, briefly narrowing the mutual
-    /// exclusion this type provides for that one id.
+    /// entry exists.
+    ///
+    /// **Reclaiming is best effort, and safe to call concurrently (fix
+    /// round 4).** A binding whose lock is currently in use is *skipped*:
+    /// the entry stays in the directory and this call is a no-op for it.
+    /// That is what makes the method safe to call at any time — an earlier
+    /// version removed the entry unconditionally, which reopened the exact
+    /// double-admit race the per-binding lock exists to close. Removing an
+    /// entry a caller still holds means the next caller's get-or-insert
+    /// mints a *fresh, uncontended* mutex, so two `decide_admission` calls
+    /// for one binding run concurrently again: `Skip` admits twice,
+    /// `Concurrent { max }` exceeds `max`, `Queue { depth }` exceeds
+    /// `depth`, and [`RunRegistry::note_promoted`]'s "both counters visible
+    /// together" contract breaks for any implementation that uses two
+    /// critical sections.
+    ///
+    /// Skipping is decided by the entry's `Arc` strong count, read while
+    /// the directory lock is held: `with_binding_lock` clones the
+    /// `Arc` out of the directory *before* releasing the directory lock and
+    /// keeps that clone alive until after it releases the binding's mutex,
+    /// so a count of 1 (the directory's own reference, and nothing else)
+    /// proves no call is in flight or about to acquire the lock. A stale
+    /// higher count can only cause an extra skip, never an unsafe removal.
+    ///
+    /// The consequence for callers: this does **not** guarantee the entry
+    /// is gone when it returns. A caller that needs the entry definitely
+    /// reclaimed must ensure no `decide`/`note_*` call for that
+    /// `binding_id` is in flight (and none can start) before calling, or
+    /// call again later.
     pub fn forget(&self, binding_id: BindingId) -> Result<(), RegistryError> {
         let mut directory = self.binding_locks.lock().map_err(|_| {
             tracing::error!(
@@ -661,7 +696,12 @@ impl<R: RunRegistry> SharedRegistry<R> {
             );
             RegistryError::Poisoned { binding_id }
         })?;
-        directory.remove(&binding_id);
+        if directory
+            .get(&binding_id)
+            .is_some_and(|lock| std::sync::Arc::strong_count(lock) == 1)
+        {
+            directory.remove(&binding_id);
+        }
         Ok(())
     }
 
@@ -744,7 +784,7 @@ impl<R: RunRegistry> SharedRegistry<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{Arc, Condvar, Mutex as StdMutex};
 
     #[derive(Default)]
     struct FakeRegistry {
@@ -1188,6 +1228,10 @@ mod tests {
             AdmissionDecision::Admit
         );
         shared.forget(binding_id).unwrap();
+        // Nothing is in flight, so the entry really is reclaimed — this
+        // guards against `forget`'s in-use check (fix round 4) degrading
+        // into a method that silently never reclaims anything.
+        assert!(shared.binding_locks.lock().unwrap().is_empty());
         // Forgetting the lock entry is not the same as forgetting the
         // binding's run state: the underlying registry still reports the
         // active run, so a fresh lock still enforces `Skip` correctly.
@@ -1195,5 +1239,146 @@ mod tests {
             shared.decide(OverlapPolicy::Skip, binding_id).unwrap(),
             AdmissionDecision::SkipDueToOverlap
         );
+    }
+
+    /// A registry whose `active_run_count` parks inside the call — it
+    /// announces that it has been entered, then waits for an explicit
+    /// release — so a test can hold one binding's `SharedRegistry` lock
+    /// open for exactly as long as it needs, with no sleeps and no
+    /// timing assumptions.
+    struct ParkingRegistry {
+        entered: Arc<(StdMutex<bool>, Condvar)>,
+        release: Arc<(StdMutex<bool>, Condvar)>,
+    }
+
+    fn signal(flag: &(StdMutex<bool>, Condvar)) {
+        *flag.0.lock().unwrap() = true;
+        flag.1.notify_all();
+    }
+
+    fn await_signal(flag: &(StdMutex<bool>, Condvar)) {
+        let mut raised = flag.0.lock().unwrap();
+        while !*raised {
+            raised = flag.1.wait(raised).unwrap();
+        }
+    }
+
+    impl RunRegistry for ParkingRegistry {
+        fn active_run_count(&self, _binding_id: BindingId) -> Result<u32, RegistryError> {
+            signal(&self.entered);
+            await_signal(&self.release);
+            Ok(0)
+        }
+        fn queued_count(&self, _binding_id: BindingId) -> Result<u32, RegistryError> {
+            Ok(0)
+        }
+        fn cancel_active(
+            &self,
+            _binding_id: BindingId,
+        ) -> Result<CancellationOutcome, RegistryError> {
+            Ok(CancellationOutcome::Confirmed)
+        }
+        fn note_admitted(&self, _binding_id: BindingId) -> Result<(), RegistryError> {
+            Ok(())
+        }
+        fn note_queued(&self, _binding_id: BindingId) -> Result<(), RegistryError> {
+            Ok(())
+        }
+        fn note_finished(&self, _binding_id: BindingId) -> Result<(), RegistryError> {
+            Ok(())
+        }
+        fn note_dequeued(&self, _binding_id: BindingId) -> Result<(), RegistryError> {
+            Ok(())
+        }
+        fn note_promoted(&self, _binding_id: BindingId) -> Result<(), RegistryError> {
+            Ok(())
+        }
+    }
+
+    /// Fix round 4: `forget` must not evict a binding's lock entry while a
+    /// call is holding it. Evicting a held entry makes the *next* caller's
+    /// get-or-insert mint a fresh, uncontended mutex, so two
+    /// `decide_admission` calls for one binding run concurrently — the
+    /// exact double-admit race the per-binding lock exists to close.
+    ///
+    /// Deterministic by construction: the parked thread is provably inside
+    /// the guarded call (it signalled from within `active_run_count`, which
+    /// only runs under the binding's mutex) for the whole window in which
+    /// this test inspects the directory and calls `forget`. No sleeps, no
+    /// racing threads to observe. Every observation is *recorded* while the
+    /// thread is parked and only asserted on after it has been released and
+    /// joined, so a regression fails the assertion instead of deadlocking
+    /// the parked thread inside `thread::scope`'s implicit join.
+    #[test]
+    fn forget_does_not_evict_a_binding_lock_that_is_currently_held() {
+        /// What the directory held for the binding at one instant: the
+        /// lock's identity (compared as an address, never dereferenced) and
+        /// whether it was locked at the time.
+        type Observed = Option<(*const Mutex<()>, bool)>;
+
+        let binding_id = BindingId::new();
+        let entered = Arc::new((StdMutex::new(false), Condvar::new()));
+        let release = Arc::new((StdMutex::new(false), Condvar::new()));
+        let shared = SharedRegistry::new(ParkingRegistry {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+
+        let observe = |shared: &SharedRegistry<ParkingRegistry>| -> Observed {
+            let directory = shared.binding_locks.lock().unwrap();
+            directory
+                .get(&binding_id)
+                .map(|entry| (Arc::as_ptr(entry), entry.try_lock().is_err()))
+        };
+
+        let (before, strong_count, forgot, after, decision) = std::thread::scope(|scope| {
+            let parked = scope.spawn(|| shared.decide(OverlapPolicy::Skip, binding_id));
+
+            // The spawned call is now inside `decide`, holding this
+            // binding's lock, and stays there until released below.
+            await_signal(&entered);
+
+            let strong_count = shared
+                .binding_locks
+                .lock()
+                .unwrap()
+                .get(&binding_id)
+                .map(Arc::strong_count);
+            let before = observe(&shared);
+            let forgot = shared.forget(binding_id);
+            let after = observe(&shared);
+
+            signal(&release);
+            let decision = parked.join().unwrap();
+            (before, strong_count, forgot, after, decision)
+        });
+
+        // The directory's own reference plus the in-flight call's clone.
+        assert_eq!(strong_count, Some(2));
+        let (before_addr, before_held) =
+            before.expect("the in-flight call's lock entry must be in the directory");
+        assert!(
+            before_held,
+            "the in-flight call must actually be holding this lock"
+        );
+        forgot.expect("forget must not fail here");
+        let (after_addr, after_held) =
+            after.expect("forget must not evict a lock entry that is currently held");
+        assert_eq!(
+            after_addr, before_addr,
+            "the surviving entry must be the very same lock the in-flight call holds, \
+             not a replacement"
+        );
+        assert!(
+            after_held,
+            "mutual exclusion must still hold after forget: a new caller would contend \
+             on this same, still-held lock"
+        );
+        assert_eq!(decision.unwrap(), AdmissionDecision::Admit);
+
+        // Once the call has finished, the entry is genuinely idle and
+        // `forget` reclaims it as intended.
+        shared.forget(binding_id).unwrap();
+        assert!(shared.binding_locks.lock().unwrap().is_empty());
     }
 }
