@@ -244,12 +244,20 @@ pub trait RunRegistry {
     ///
     /// **Hard requirement (fix round 2, finding H): this method must not
     /// block, and must never bridge to an async runtime via
-    /// `Handle::block_on` or equivalent.** It runs inside
-    /// [`SharedRegistry`]'s per-binding lock; a call that blocks for any
-    /// real amount of time stalls every other admission decision *for
-    /// that one binding* for as long as it blocks, and calling
-    /// `block_on` from within a tokio worker thread panics outright,
-    /// poisoning that binding's lock. `roundhouse-flow`'s real
+    /// `Handle::block_on` or equivalent.** This is a documentation-only
+    /// requirement — nothing in this trait or in `decide_admission` can
+    /// check it at compile time or at runtime; a violating implementation
+    /// still type-checks and still compiles. The per-binding lock in
+    /// [`SharedRegistry`] is the *containment*, not an enforcement of this
+    /// rule: precisely *because* the crate cannot verify an implementor
+    /// obeys it, blast radius is scoped so that a violation (a
+    /// blocking, or a panicking, `cancel_active`) can only ever stall or
+    /// poison the one `BindingId` whose lock it runs under, never any
+    /// other binding. A call that blocks for any real amount of time
+    /// stalls every other admission decision *for that one binding* for
+    /// as long as it blocks, and calling `block_on` from within a tokio
+    /// worker thread panics outright, poisoning that binding's lock (see
+    /// `RegistryError::Poisoned`). `roundhouse-flow`'s real
     /// implementation sits on top of
     /// `roundhouse_tools::shell::cancel::cancel_running_shell` — an async
     /// SIGTERM -> wait -> SIGKILL -> re-probe sequence that can run for
@@ -358,15 +366,27 @@ pub enum AdmissionDecision {
     SkippedCancellationUnconfirmed,
 }
 
-/// Rate-limits a repeating `tracing::warn!` for one (binding, condition)
-/// pair so a sustained flood — which costs whoever's driving it nothing —
-/// cannot turn into a logging flood of its own (fix round 2, finding L2).
-/// Logs are worth emitting at occurrence 1, 2, 4, 8, 16, ... (so an
-/// operator sees the *start* of an episode immediately, and its ongoing
-/// severity without linear volume), and the count resets once the binding
-/// produces a decision that isn't the condition being tracked, so the next
-/// distinct episode starts its own count from 1 rather than continuing a
-/// stale one.
+/// Rate-limits a repeating `tracing::warn!` for one condition (there are
+/// two instances of this type: one for `Queue`-full drops, one for
+/// `CancelPrevious`-unconfirmed occurrences) so a sustained flood — which
+/// costs whoever's driving it nothing — cannot turn into a logging flood
+/// of its own (fix round 2, finding L2). Logs are worth emitting at
+/// occurrence 1, 2, 4, 8, 16, ... (so an operator sees the *start* of an
+/// episode immediately, and its ongoing severity without linear volume).
+///
+/// **Reset semantics (corrected, fix round 3):** `decide_admission` calls
+/// `reset(binding_id)` only from *this gate's own* policy branch's success
+/// path — the `Queue` arm resets the queue-full gate on `Admit`/`QueueAt`,
+/// the `CancelPrevious` arm resets the cancellation-unconfirmed gate on
+/// `Confirmed`. It is **not** reset by "any other decision for this
+/// binding", and in particular not by a *different* `OverlapPolicy`
+/// entirely: if a binding's policy changes at runtime (e.g. `Queue` ->
+/// `Skip` -> back to `Queue`), the queue-full gate's count for that
+/// binding is untouched by the intervening `Skip` decisions and resumes
+/// from wherever it left off. This is a minor, accepted imprecision (a
+/// binding's `OverlapPolicy` is not expected to change mid-flood in
+/// practice) rather than a bug to fix — noted here so the doc matches
+/// what the code actually does.
 ///
 /// Deliberately process-global (keyed by `BindingId`, not by which
 /// `RunRegistry`/`SharedRegistry` instance is asking): this is purely a
@@ -376,12 +396,27 @@ pub enum AdmissionDecision {
 #[derive(Default)]
 struct DropLogGate {
     counts: Mutex<HashMap<BindingId, u64>>,
+    // Fix round 3, finding 3: `reset` is called from every *success* path
+    // (the overwhelmingly common case) of the policy branch it belongs
+    // to, but almost always has nothing to remove. Without this flag,
+    // every such call — for every binding, on every admission — would
+    // acquire this gate's single `Mutex`, reintroducing exactly the kind
+    // of global contention on the hot path that per-binding locking
+    // (fix round 2, finding H) was about eliminating. `has_any` lets the
+    // overwhelmingly common "nothing has ever gone wrong on this gate"
+    // case skip the lock entirely; once anything has actually triggered a
+    // drop (a real anomaly), later `reset` calls fall back to acquiring
+    // the lock as before, which is an acceptable cost only in the
+    // already-degraded case this gate exists to log.
+    has_any: std::sync::atomic::AtomicBool,
 }
 
 impl DropLogGate {
     /// Notes one more occurrence for `binding_id` and returns the running
     /// count for this episode.
     fn note(&self, binding_id: BindingId) -> u64 {
+        self.has_any
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         // A poisoned counter here is a logging-volume concern, not a
         // correctness one — recover rather than propagate, unlike every
         // other lock in this module.
@@ -396,6 +431,12 @@ impl DropLogGate {
 
     /// Ends `binding_id`'s current episode, so the next one starts at 1.
     fn reset(&self, binding_id: BindingId) {
+        if !self.has_any.load(std::sync::atomic::Ordering::Relaxed) {
+            // Nothing has ever been recorded on this gate (for any
+            // binding), so there is certainly nothing to remove for this
+            // one — skip the lock entirely.
+            return;
+        }
         let mut counts = self
             .counts
             .lock()
@@ -538,10 +579,23 @@ pub fn decide_admission(
 /// by a real database shared across multiple processes needs its own
 /// atomicity story (one transaction or one conditional statement per
 /// decision — see the module docs) rather than this wrapper.
+///
+/// **Caller obligation (fix round 3, finding 2): `binding_locks` never
+/// evicts.** Every distinct `BindingId` ever passed to [`Self::decide`] or
+/// any `note_*` method permanently allocates one `Arc<Mutex<()>>` entry —
+/// there is no automatic eviction, and nothing here checks that the id
+/// names a real, registered binding before allocating its lock. Only ever
+/// call this with a `BindingId` of an actually-registered binding (e.g.
+/// one resolved from the scheduler's own `Binding` table), never with an
+/// id taken directly from untrusted external input (a webhook path
+/// parameter, say) — an unauthenticated caller able to invoke `decide`
+/// with arbitrary UUIDs could otherwise grow this map without bound. Call
+/// [`Self::forget`] when a binding is unbound/deleted to reclaim its
+/// entry.
 pub struct SharedRegistry<R> {
     registry: R,
     // The directory itself is protected by a short-lived lock (just a
-    // hashmap get-or-insert, no user code runs under it — see
+    // hashmap get-or-insert/remove, no user code runs under it — see
     // `with_binding_lock`'s doc comment for why this essentially never
     // poisons in practice); each binding's own `Mutex<()>` is what's
     // actually held across the real work.
@@ -576,8 +630,39 @@ impl<R: RunRegistry> SharedRegistry<R> {
     /// Useful for graceful-shutdown paths that want to inspect or persist
     /// final state, and for tests that need to assert on the wrapped
     /// registry's own state directly.
+    ///
+    /// **Do not re-share the returned `R` across concurrent callers
+    /// directly** (e.g. by putting it behind a new `Arc<R>` without a
+    /// `Mutex`, or by handing clones to multiple tasks) — doing so
+    /// silently drops the per-binding locking discipline this type exists
+    /// to provide, reopening the exact race fix round 2 closed. If the
+    /// registry needs to be shared again, re-wrap it in a *new*
+    /// `SharedRegistry::new(...)` first.
     pub fn into_inner(self) -> R {
         self.registry
+    }
+
+    /// Reclaims `binding_id`'s lock entry — call this when a binding is
+    /// unbound/deleted so [`SharedRegistry`]'s directory does not retain
+    /// an entry for it forever (see the struct's own doc comment on why
+    /// the directory never evicts on its own). Safe to call even if no
+    /// entry exists (a no-op) or if the binding is not currently under
+    /// contention; do **not** call this while a `decide`/`note_*` call for
+    /// the same `binding_id` might still be in flight elsewhere — doing so
+    /// cannot corrupt state (a fresh lock is simply created on the next
+    /// call), but it does mean that in-flight call's lock is no longer the
+    /// one new callers will contend on, briefly narrowing the mutual
+    /// exclusion this type provides for that one id.
+    pub fn forget(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+        let mut directory = self.binding_locks.lock().map_err(|_| {
+            tracing::error!(
+                "SharedRegistry's binding-lock directory was poisoned; admission is \
+                 denied for ALL bindings until the process is restarted"
+            );
+            RegistryError::Poisoned { binding_id }
+        })?;
+        directory.remove(&binding_id);
+        Ok(())
     }
 
     /// Records a run's completion under the same per-binding lock
@@ -602,10 +687,22 @@ impl<R: RunRegistry> SharedRegistry<R> {
 
     /// Looks up (creating if necessary) `binding_id`'s own lock, holds it
     /// for the duration of `f`, and runs `f`. `f` must not block for any
-    /// real amount of time and must not call back into this
-    /// `SharedRegistry` for the same `binding_id` — see
-    /// [`RunRegistry::cancel_active`]'s "must not block" requirement,
-    /// which is exactly what keeps this safe to rely on.
+    /// real amount of time (see [`RunRegistry::cancel_active`]'s "must not
+    /// block" requirement, which is what this is here to contain) and
+    /// must not call back into this `SharedRegistry` for **any**
+    /// `binding_id` — not just the same one.
+    ///
+    /// Fix round 3, finding 4: an earlier version of this doc only
+    /// forbade re-entrancy for *the same* `binding_id` (which does matter
+    /// — it self-deadlocks on `std::sync::Mutex`, which is not
+    /// reentrant). But permitting cross-binding re-entrancy by omission is
+    /// the more dangerous case: a call already holding binding A's lock
+    /// that calls back in for binding B establishes an A-then-B lock
+    /// order; a concurrent call doing the reverse (holding B, calling in
+    /// for A) is a textbook ABBA deadlock that hangs both threads
+    /// permanently. Nothing in a `RunRegistry` implementation should ever
+    /// need to call back into its own `SharedRegistry` wrapper regardless
+    /// of which binding is named, so the rule is simply: don't.
     fn with_binding_lock<T>(
         &self,
         binding_id: BindingId,
@@ -709,6 +806,13 @@ mod tests {
                 .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
             Ok(())
         }
+        // Fix round 3, finding 5: two separate critical sections (queued,
+        // then active), which only satisfies `note_promoted`'s "both
+        // visible together" contract because every real caller reaches
+        // this through `SharedRegistry::note_promoted`'s per-binding
+        // lock — see `tests/admission.rs`'s identical `FakeRegistry` for
+        // the full explanation aimed at implementors who'd copy this
+        // shape.
         fn note_promoted(&self, binding_id: BindingId) -> Result<(), RegistryError> {
             {
                 let mut queued = self.queued.lock().unwrap();
@@ -1068,5 +1172,28 @@ mod tests {
         let binding_id = BindingId::new();
         let registry = FakeRegistry::with_active(binding_id, 3);
         assert_eq!(registry.active_run_count(binding_id).unwrap(), 3);
+    }
+
+    /// Finding 2: `SharedRegistry::forget` reclaims a binding's lock entry,
+    /// and — since the wrapped `RunRegistry`'s own state is untouched by
+    /// this — a later `decide` for the same binding still behaves
+    /// correctly against a freshly-created lock.
+    #[test]
+    fn forget_reclaims_a_binding_lock_entry_without_disturbing_registry_state() {
+        let binding_id = BindingId::new();
+        let shared = SharedRegistry::new(FakeRegistry::default());
+
+        assert_eq!(
+            shared.decide(OverlapPolicy::Skip, binding_id).unwrap(),
+            AdmissionDecision::Admit
+        );
+        shared.forget(binding_id).unwrap();
+        // Forgetting the lock entry is not the same as forgetting the
+        // binding's run state: the underlying registry still reports the
+        // active run, so a fresh lock still enforces `Skip` correctly.
+        assert_eq!(
+            shared.decide(OverlapPolicy::Skip, binding_id).unwrap(),
+            AdmissionDecision::SkipDueToOverlap
+        );
     }
 }

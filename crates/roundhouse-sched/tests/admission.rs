@@ -77,6 +77,19 @@ impl RunRegistry for FakeRegistry {
             .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
         Ok(())
     }
+    // Fix round 3, finding 5: this takes the `queued` mutex, releases it,
+    // then takes `active` — two separate critical sections, not one. On
+    // its own that would NOT satisfy `note_promoted`'s "both visible
+    // together" contract (another reader could observe the moment
+    // between them, with `queued` already decremented but `active` not
+    // yet incremented). It only satisfies the contract here because every
+    // real caller reaches this through `SharedRegistry::note_promoted`,
+    // whose per-binding lock already wraps this whole method in one
+    // exclusive critical section — this is the shape a real (e.g.
+    // DB-backed) implementor would copy, and it must not omit that outer
+    // lock, or must otherwise make the two updates genuinely atomic on
+    // its own (e.g. one `UPDATE` statement, or its own internal lock
+    // covering both fields together).
     fn note_promoted(&self, binding_id: BindingId) -> Result<(), RegistryError> {
         {
             let mut queued = self.queued.lock().unwrap();

@@ -52,8 +52,44 @@ fn overlap_policy_queue_depth_is_clamped_at_deserialize_time() {
 }
 
 #[test]
-fn overlap_policy_within_bounds_round_trips_unchanged() {
+fn overlap_policy_queue_within_bounds_round_trips_unchanged() {
     let policy = OverlapPolicy::Queue { depth: 8 };
+    let json = serde_json::to_string(&policy).expect("serialize");
+    let back: OverlapPolicy = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(policy, back);
+}
+
+/// Fix round 3, finding 1: the manual `Deserialize` impl added for L1
+/// deserializes into a private `OverlapPolicyWire` shadow type first, then
+/// matches on it — a mismatch between that shadow's variant shapes and
+/// `OverlapPolicy`'s own externally-tagged representation would silently
+/// break persisted config for whichever variant(s) it affected, with no
+/// prior test to catch it (the round-1/round-2 clamp tests only exercise
+/// `Concurrent`/`Queue`, and only ever as struct variants). Unit variants
+/// in particular are where this would bite hardest — they serialize as a
+/// bare JSON string (`"Skip"`), not an object, which is a different shape
+/// entirely from the struct variants the existing tests cover.
+#[test]
+fn overlap_policy_skip_round_trips_unchanged() {
+    let policy = OverlapPolicy::Skip;
+    let json = serde_json::to_string(&policy).expect("serialize");
+    assert_eq!(json, "\"Skip\"");
+    let back: OverlapPolicy = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(policy, back);
+}
+
+#[test]
+fn overlap_policy_cancel_previous_round_trips_unchanged() {
+    let policy = OverlapPolicy::CancelPrevious;
+    let json = serde_json::to_string(&policy).expect("serialize");
+    assert_eq!(json, "\"CancelPrevious\"");
+    let back: OverlapPolicy = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(policy, back);
+}
+
+#[test]
+fn overlap_policy_concurrent_within_bounds_round_trips_unchanged() {
+    let policy = OverlapPolicy::Concurrent { max: 4 };
     let json = serde_json::to_string(&policy).expect("serialize");
     let back: OverlapPolicy = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(policy, back);
