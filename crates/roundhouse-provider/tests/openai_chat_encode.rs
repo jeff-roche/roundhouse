@@ -62,6 +62,61 @@ fn reasoning_profile() -> ProviderProfile {
     }
 }
 
+/// Fix round 2: mirrors Z.ai's real, shipped `glm-5.3*` shape from Task
+/// 11's brief -- `field = "/thinking/type"` (NESTED, unlike moonshot's
+/// flat `/reasoning_effort`), `vocabulary = ["disabled", "enabled",
+/// "deep"]`, `map = { off -> disabled, low/medium -> enabled, high/max ->
+/// deep }`. Proves `set_json_pointer` actually creates the intermediate
+/// `thinking` object rather than only handling flat keys.
+fn zai_like_profile() -> ProviderProfile {
+    ProviderProfile {
+        model: vec![ModelEntry {
+            match_globs: vec!["glm-5.3*".into()],
+            reasoning: Some(ReasoningControl {
+                kind: ReasoningKind::Effort,
+                field: "/thinking/type".into(),
+                vocabulary: vec!["disabled".into(), "enabled".into(), "deep".into()],
+                map: BTreeMap::from([
+                    ("off".into(), "disabled".into()),
+                    ("low".into(), "enabled".into()),
+                    ("medium".into(), "enabled".into()),
+                    ("high".into(), "deep".into()),
+                    ("max".into(), "deep".into()),
+                ]),
+            }),
+            endpoint_preference: vec![],
+        }],
+        ..no_reasoning_profile()
+    }
+}
+
+/// Fix round 2: mirrors Qwen's real, shipped `qwen3*` shape from Task 12's
+/// brief -- `field = "/enable_thinking"` (flat, but a DIFFERENT key name
+/// than moonshot's `/reasoning_effort`, proving the key itself is read from
+/// `field` rather than a hardcoded literal), `vocabulary = ["false",
+/// "true"]`, `map` sends every non-`off` intent to the string `"true"`.
+fn qwen_like_profile() -> ProviderProfile {
+    ProviderProfile {
+        model: vec![ModelEntry {
+            match_globs: vec!["qwen3*".into()],
+            reasoning: Some(ReasoningControl {
+                kind: ReasoningKind::Effort,
+                field: "/enable_thinking".into(),
+                vocabulary: vec!["false".into(), "true".into()],
+                map: BTreeMap::from([
+                    ("off".into(), "false".into()),
+                    ("low".into(), "true".into()),
+                    ("medium".into(), "true".into()),
+                    ("high".into(), "true".into()),
+                    ("max".into(), "true".into()),
+                ]),
+            }),
+            endpoint_preference: vec![],
+        }],
+        ..no_reasoning_profile()
+    }
+}
+
 /// Test params struct for the "read" tool.
 #[derive(schemars::JsonSchema)]
 struct ReadParams {
@@ -264,5 +319,61 @@ fn reasoning_effort_is_omitted_when_intent_is_off() {
 
     let body = encode_openai_chat(&req, &reasoning_profile());
 
+    assert!(body.get("reasoning_effort").is_none());
+}
+
+/// Fix round 2: `ReasoningControl.field` is a genuine JSON pointer, walked
+/// (not hardcoded) so a NESTED path like Z.ai's real `/thinking/type`
+/// produces a nested object, not a flat `thinking/type` string key or a
+/// silently-wrong `reasoning_effort` key.
+#[test]
+fn a_nested_field_pointer_produces_a_nested_wire_object() {
+    let req = ChatRequest {
+        reasoning: ReasoningRequest {
+            intent: Some(ReasoningIntent::High),
+        },
+        ..no_reasoning_request("glm-5.3-turbo")
+    };
+
+    let body = encode_openai_chat(&req, &zai_like_profile());
+
+    assert_eq!(body["thinking"]["type"], json!("deep"));
+    // And nothing was written under the OLD fix-round-1 hardcoded key.
+    assert!(body.get("reasoning_effort").is_none());
+}
+
+/// The `low`/`medium` intents both map to Z.ai's `"enabled"` wire value
+/// (not `"deep"`) -- proves the map is genuinely consulted per-intent, not
+/// just "any non-Off intent produces the same nested shape."
+#[test]
+fn a_nested_field_pointer_honors_the_profiles_intent_map() {
+    let req = ChatRequest {
+        reasoning: ReasoningRequest {
+            intent: Some(ReasoningIntent::Medium),
+        },
+        ..no_reasoning_request("glm-5.3-turbo")
+    };
+
+    let body = encode_openai_chat(&req, &zai_like_profile());
+
+    assert_eq!(body["thinking"]["type"], json!("enabled"));
+}
+
+/// Fix round 2: a flat field with a DIFFERENT key name than the fix-round-1
+/// hardcoded `reasoning_effort` (Qwen's real `/enable_thinking`) must be
+/// written under ITS OWN key, not silently dropped or misfiled under
+/// `reasoning_effort`.
+#[test]
+fn a_differently_named_flat_field_pointer_uses_its_own_key() {
+    let req = ChatRequest {
+        reasoning: ReasoningRequest {
+            intent: Some(ReasoningIntent::High),
+        },
+        ..no_reasoning_request("qwen3-14b")
+    };
+
+    let body = encode_openai_chat(&req, &qwen_like_profile());
+
+    assert_eq!(body["enable_thinking"], json!("true"));
     assert!(body.get("reasoning_effort").is_none());
 }
