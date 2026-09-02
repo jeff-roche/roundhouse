@@ -1,0 +1,15 @@
+---
+source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
+expression: body
+---
+{
+  "messages": [
+    {
+      "content": "permission denied",
+      "role": "tool",
+      "tool_call_id": "call_1"
+    }
+  ],
+  "model": "command-a-03-2026",
+  "stream": true
+}

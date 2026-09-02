@@ -1,0 +1,17 @@
+---
+source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
+expression: body
+---
+{
+  "messages": [
+    {
+      "content": "Prove sqrt(2) is irrational.",
+      "role": "user"
+    }
+  ],
+  "model": "command-a-reasoning-03-2026",
+  "stream": true,
+  "thinking": {
+    "type": "enabled"
+  }
+}

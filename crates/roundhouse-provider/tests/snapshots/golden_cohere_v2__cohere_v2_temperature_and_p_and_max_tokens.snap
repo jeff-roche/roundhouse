@@ -1,0 +1,17 @@
+---
+source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
+expression: body
+---
+{
+  "max_tokens": 512,
+  "messages": [
+    {
+      "content": "Hello.",
+      "role": "user"
+    }
+  ],
+  "model": "command-a-03-2026",
+  "p": 0.8999999761581421,
+  "stream": true,
+  "temperature": 0.699999988079071
+}

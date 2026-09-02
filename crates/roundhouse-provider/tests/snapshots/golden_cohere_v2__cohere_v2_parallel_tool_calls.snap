@@ -1,0 +1,40 @@
+---
+source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
+expression: enc(&req)
+---
+{
+  "messages": [
+    {
+      "content": "Weather and time in Tokyo?",
+      "role": "user"
+    }
+  ],
+  "model": "command-a-03-2026",
+  "stream": true,
+  "tools": [
+    {
+      "function": {
+        "description": "Get the current weather",
+        "name": "get_weather",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "title": "NoParams",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Get the current time",
+        "name": "get_time",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "title": "NoParams",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+# Cohere v2 assistant-message content-block `type` values (content-start's
+# delta.message.content.type), fetched from
+# https://docs.cohere.com/reference/chat on 2026-09-02.
+text
+thinking

@@ -1,0 +1,14 @@
+---
+source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
+expression: enc(&req)
+---
+{
+  "messages": [
+    {
+      "content": "こんにちは 🌍 — café naïve",
+      "role": "user"
+    }
+  ],
+  "model": "command-a-03-2026",
+  "stream": true
+}

@@ -1,0 +1,61 @@
+# Cohere v2/chat -- a stable, well-documented, non-spec-gated surface (Task
+# 8's own brief text). Verified against the real, fetched Cohere API
+# reference (docs.cohere.com/reference/chat and /reference/chat-stream) on
+# 2026-09-02 -- see `src/codec/cohere_v2/mod.rs`'s module doc comment for the
+# fetch record and `tests/cohere_v2_wire_literal_tripwire.rs` for the vendored
+# literal lists this profile's `[errors]` table and the decoder's matched
+# strings are checked against.
+#
+# REALITY-CORRECTIONS §12d: the task brief's own "Interfaces" line says this
+# codec consumes `HeaderKeyCredential`, but that is wrong -- this TOML (the
+# authoritative source per REALITY-CORRECTIONS' own framing) declares
+# `auth = { kind = "bearer" }`, matching Cohere's real `Authorization: Bearer
+# <key>` scheme (verified: the fetched reference's auth section names
+# `Authorization: BEARER <API_KEY>`, not a custom header).
+id = "cohere-v2"
+codec = "cohere-v2"
+
+[defaults]
+allow_raw_extra = false
+base_url = "https://api.cohere.com/v2"
+auth = { kind = "bearer" }
+
+[defaults.params]
+mode = "allow_only"
+fields = ["temperature", "p", "k", "max_tokens", "stop_sequences"]
+
+[[model]]
+match = ["command-a-reasoning*"]
+
+[model.reasoning]
+kind = "effort"
+field = "/thinking/type"
+vocabulary = ["disabled", "enabled"]
+
+[model.reasoning.map]
+off = "disabled"
+low = "enabled"
+medium = "enabled"
+high = "enabled"
+max = "enabled"
+
+# Verified (docs.cohere.com/reference/errors, fetched 2026-09-02): Cohere's
+# real error bodies carry only a plain `{"message": "..."}` string -- no
+# machine-readable error-code/type discriminator field exists anywhere on the
+# wire. That means these three disposition entries (kept verbatim from the
+# task brief, which REALITY-CORRECTIONS §12d/its own preamble treats as
+# authoritative TOML content for this task) can never actually match a real
+# response body's `/error/type` in `crate::errors::classify` -- there is no
+# such field for them to match against. `error_429`/`error_500` cassettes
+# below are classified entirely by `classify`'s HTTP-status fallback tier,
+# not by this table. Flagged as a known, honest gap in the task report rather
+# than papered over with an invented discriminator field Cohere doesn't send.
+[errors."too_many_requests"]
+disposition = "shed_concurrency"
+
+[errors."internal_error"]
+disposition = "retry_backoff"
+
+[errors."invalid_api_key"]
+disposition = "fatal"
+category = "quota"

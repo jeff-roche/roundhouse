@@ -1,0 +1,29 @@
+---
+source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
+expression: body
+---
+{
+  "messages": [
+    {
+      "content": "What's the weather in Tokyo?",
+      "role": "user"
+    }
+  ],
+  "model": "command-a-03-2026",
+  "stream": true,
+  "tool_choice": "REQUIRED",
+  "tools": [
+    {
+      "function": {
+        "description": "Get the current weather",
+        "name": "get_weather",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "title": "NoParams",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+---
+source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
+expression: err.to_string()
+---
+cohere-v2 codec does not encode Image blocks
