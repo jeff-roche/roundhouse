@@ -27,6 +27,15 @@ impl HandleRegistry {
         name: String,
         session: SessionId,
     ) -> Result<(), BusError> {
+        // LOAD-BEARING: `entry(workspace).or_default()` holds the outer
+        // `by_workspace` shard's *write* guard for this entire function —
+        // that is what makes the check-then-insert below an atomic
+        // compare-and-swap rather than a TOCTOU race. Do NOT rewrite this as
+        // `self.by_workspace.get(&workspace)` (what `unregister`/`resolve`
+        // below use, since they don't need the same guarantee): that reads
+        // under a shared guard, drops it, and would silently reintroduce
+        // last-writer-wins between the read and the `insert` a few lines
+        // down, with no test able to catch the race deterministically.
         let names = self.by_workspace.entry(workspace).or_default();
         if let Some(existing) = names.get(&name).map(|e| *e.value()) {
             if existing != session {
