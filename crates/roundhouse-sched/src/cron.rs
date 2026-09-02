@@ -41,7 +41,37 @@ pub enum CronError {
     /// interval trigger fires less often than once a century.
     #[error("interval trigger's `every` duration of {0:?} is too large to schedule")]
     IntervalTooLarge(Duration),
+    /// Fold-in fix (parity with `IntervalTooLarge`, same defect class): the
+    /// old `chrono::Duration::from_std(deterministic_jitter(base,
+    /// jitter)).unwrap_or_default()` silently turned a `jitter` beyond
+    /// `chrono::TimeDelta::MAX` (~9.22e15s) into a zero offset instead of
+    /// reporting it, and a `jitter` large enough to produce an offset that
+    /// overflows `DateTime<Utc> + TimeDelta`'s representable year range
+    /// (~8.3e12s and up) would have panicked via the bare `base + offset`
+    /// that followed. `jitter` reaches [`next_fire_after`] straight from a
+    /// deserialized `TriggerSpec::Cron`, so a corrupted or malicious
+    /// persisted binding could otherwise reach either failure mode with
+    /// nothing in between to validate it — the same gap `MAX_INTERVAL`
+    /// closed for `TriggerSpec::Interval::every`, but on the jitter path,
+    /// which that bound does not cover.
+    #[error("cron trigger's jitter duration of {0:?} is too large to schedule")]
+    JitterTooLarge(Duration),
 }
+
+/// Sane ceiling on `TriggerSpec::Cron`'s `jitter` field — parity with
+/// [`crate::scheduler::MAX_INTERVAL`]'s reasoning, applied to the jitter
+/// path instead of the interval path. A cron binding's jitter exists to
+/// spread near-simultaneous fires apart by at most a few minutes, nowhere
+/// near this bound, but nothing upstream of [`next_fire_after`] validated
+/// the value before it reached `chrono::Duration::from_std`/
+/// `checked_add_signed` — exactly the gap `MAX_INTERVAL` closed for
+/// `Interval::every`. Chosen comfortably below both the
+/// `chrono::Duration::from_std` failure threshold (~9.22e15s,
+/// `TimeDelta::MAX`) and the `DateTime<Utc> + TimeDelta` panic threshold
+/// (~8.3e12s, chrono's representable year range) confirmed against pinned
+/// chrono 0.4.45, while comfortably above any jitter window a real
+/// deployment would legitimately configure.
+pub const MAX_JITTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The pinned `cron` crate's real API (`cron = "0.15"`): there is no
 /// `after_naive` method anywhere on `Schedule`, and no way to iterate bare
@@ -86,6 +116,13 @@ pub fn next_fire_after(
     dst_ambiguous: &DstAmbiguous,
     jitter: Duration,
 ) -> Result<DateTime<Utc>, CronError> {
+    // Fold-in fix: refuse an out-of-range jitter up front, at the same
+    // "fail fast at the boundary" point `Scheduler::add_binding`'s
+    // `*every > MAX_INTERVAL` check uses for `Interval` — see
+    // `CronError::JitterTooLarge`'s doc comment for why this matters.
+    if jitter > MAX_JITTER {
+        return Err(CronError::JitterTooLarge(jitter));
+    }
     let schedule = Schedule::from_str(&format!("0 {expr}"))
         .map_err(|e| CronError::InvalidExpr(expr.to_string(), e.to_string()))?;
     let after_local = after.with_timezone(&tz).naive_local();
@@ -127,9 +164,19 @@ pub fn next_fire_after(
             },
         };
         if let Some(base) = resolved {
-            let offset =
-                chrono::Duration::from_std(deterministic_jitter(base, jitter)).unwrap_or_default();
-            return Ok(base + offset);
+            // Fold-in fix: the early `jitter > MAX_JITTER` guard above
+            // means `deterministic_jitter`'s `[0, jitter)` output can never
+            // actually be large enough to fail `from_std` or overflow
+            // `checked_add_signed` at this point — but both are still
+            // propagated as `CronError::JitterTooLarge`, not
+            // `unwrap_or_default()`/a bare `+`, so a future change to the
+            // bound (or to `deterministic_jitter` itself) fails closed
+            // instead of silently degrading to a zero offset or panicking.
+            let offset = chrono::Duration::from_std(deterministic_jitter(base, jitter))
+                .map_err(|_| CronError::JitterTooLarge(jitter))?;
+            return base
+                .checked_add_signed(offset)
+                .ok_or(CronError::JitterTooLarge(jitter));
         }
     }
     Err(CronError::Exhausted(expr.to_string()))
@@ -250,5 +297,48 @@ mod tests {
     fn deterministic_jitter_is_zero_when_jitter_window_is_zero() {
         let base = Utc.with_ymd_and_hms(2026, 1, 1, 2, 0, 0).unwrap();
         assert_eq!(deterministic_jitter(base, Duration::ZERO), Duration::ZERO);
+    }
+
+    /// Fold-in fix, first magnitude (parity with
+    /// `adding_an_interval_binding_beyond_chronos_representable_range_is_rejected`):
+    /// a `jitter` beyond `chrono::TimeDelta::MAX` (~9.22e15s), where the old
+    /// `unwrap_or_default()` would have silently turned `from_std`'s `Err`
+    /// into a zero offset. Confirmed this is rejected (not silently
+    /// accepted, and not a panic).
+    #[test]
+    fn next_fire_after_rejects_jitter_beyond_chronos_representable_range() {
+        let err = next_fire_after(
+            "* * * * *",
+            Tz::UTC,
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            &DstGap::FireAtGapEnd,
+            &DstAmbiguous::First,
+            Duration::from_secs(u64::MAX),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CronError::JitterTooLarge(_)));
+    }
+
+    /// Fold-in fix, second magnitude (parity with
+    /// `adding_an_interval_binding_that_would_overflow_datetime_arithmetic_is_rejected`):
+    /// roughly 8.3e12s <= `jitter` <= `TimeDelta::MAX`, where `from_std`
+    /// would have succeeded but the old bare `base + offset` could overflow
+    /// chrono's representable year range and panic. Confirmed this
+    /// magnitude is rejected too, by the same `MAX_JITTER` bound, rather
+    /// than reaching the panicking addition.
+    #[test]
+    fn next_fire_after_rejects_jitter_that_would_overflow_datetime_arithmetic() {
+        let err = next_fire_after(
+            "* * * * *",
+            Tz::UTC,
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            &DstGap::FireAtGapEnd,
+            &DstAmbiguous::First,
+            // ~9e12 seconds: from_std would succeed at this magnitude, but
+            // the resulting DateTime addition would overflow chrono's range.
+            Duration::from_secs(9_000_000_000_000),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CronError::JitterTooLarge(_)));
     }
 }

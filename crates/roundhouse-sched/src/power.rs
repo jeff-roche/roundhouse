@@ -234,6 +234,27 @@ pub async fn run_power_watch(
                     // clearing immediately is enough to stop
                     // `lock_or_recover`'s `tracing::error!` from repeating on
                     // every wake for the rest of the process's life.
+                    //
+                    // **Sole-holder precondition (fold-in, Phase 5 Task 7):**
+                    // clearing this latch with no repair step in between is
+                    // only safe because `run_power_watch` is, today, the
+                    // *only* code that ever locks this particular
+                    // `Arc<Mutex<..>>` — nothing else can have panicked while
+                    // holding it, and nothing else can observe an
+                    // inconsistent `T` behind it before this call clears the
+                    // poison. If a future `RetryableMarker` implementation
+                    // is also locked from elsewhere — e.g. an in-flight-call
+                    // registry the provider layer mutates directly, rather
+                    // than only through this loop — a panic at *that other*
+                    // call site would poison this same mutex, and this
+                    // branch would clear the latch without repairing
+                    // whatever that other site left inconsistent, silently
+                    // papering over a real corruption instead of surfacing
+                    // it. Whoever adds a second lock site for this `Mutex`
+                    // must re-examine this branch (and decide whether it
+                    // still needs a real repair step, the way the scheduler
+                    // branch above has `recompute_all`) rather than assuming
+                    // this comment's reasoning still holds.
                     retryable.clear_poison();
                 }
                 retryable_guard.mark_all_in_flight_retryable();
