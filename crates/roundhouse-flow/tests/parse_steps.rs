@@ -1,0 +1,392 @@
+use roundhouse_flow::parse::steps::{
+    parse_step, topological_order, OnItemError, StepBody, StepDef,
+};
+use roundhouse_flow::parse::types::OnTimeout;
+use roundhouse_flow::parse::{parse_workflow, ParseError};
+
+const PR_REVIEW_YAML: &str = include_str!("fixtures/pr_review.yaml");
+
+fn step(yaml: &str) -> StepDef {
+    parse_step(&serde_yaml::from_str(yaml).unwrap()).unwrap()
+}
+
+fn try_step(yaml: &str) -> Result<StepDef, ParseError> {
+    parse_step(&serde_yaml::from_str(yaml).unwrap())
+}
+
+#[test]
+fn parses_every_step_kind_in_the_fixture() {
+    let def = parse_workflow(PR_REVIEW_YAML).unwrap();
+    let top_steps: Vec<StepDef> = def.steps.iter().map(|v| parse_step(v).unwrap()).collect();
+
+    assert_eq!(top_steps[0].id, "list_prs");
+    assert!(matches!(top_steps[0].body, StepBody::Tool { .. }));
+
+    assert_eq!(top_steps[1].id, "per_pr");
+    let StepBody::Map {
+        over,
+        r#as,
+        max_parallel,
+        on_item_error,
+        steps: inner,
+        ..
+    } = &top_steps[1].body
+    else {
+        panic!("expected Map step");
+    };
+    assert_eq!(
+        over,
+        "${{ slice(steps.list_prs.output, 0, inputs.max_prs) }}"
+    );
+    assert_eq!(r#as, "pr");
+    assert_eq!(*max_parallel, 4);
+    assert_eq!(*on_item_error, OnItemError::Continue);
+
+    let inner_steps: Vec<StepDef> = inner.iter().map(|v| parse_step(v).unwrap()).collect();
+    assert!(matches!(inner_steps[0].body, StepBody::Agent { .. }));
+    assert!(matches!(inner_steps[1].body, StepBody::Tool { .. }));
+    assert!(matches!(inner_steps[2].body, StepBody::Gate { .. }));
+    assert_eq!(
+        inner_steps[3].when.as_deref(),
+        Some("${{ steps.gate.output.approve }}")
+    );
+    assert_eq!(
+        inner_steps[3].idempotency_key.as_deref(),
+        Some("pr-${{ pr.number }}-review-${{ run.id }}")
+    );
+
+    let StepBody::Gate {
+        title, on_timeout, ..
+    } = &inner_steps[2].body
+    else {
+        panic!("expected Gate step");
+    };
+    assert_eq!(title, "Post review on PR #${{ pr.number }}?");
+    assert_eq!(*on_timeout, OnTimeout::Deny);
+
+    let catch_step = parse_step(&def.catch[0]).unwrap();
+    assert!(matches!(catch_step.body, StepBody::Emit { .. }));
+    let finally_step = parse_step(&def.finally[0]).unwrap();
+    assert!(matches!(finally_step.body, StepBody::Report { .. }));
+}
+
+#[test]
+fn file_order_is_default_but_needs_declares_explicit_dag() {
+    let a = step("id: a\ntool: shell\nwith: { cmd: [echo] }");
+    let b = step("id: b\nneeds: [a]\ntool: shell\nwith: { cmd: [echo] }");
+    let c = step("id: c\ntool: shell\nwith: { cmd: [echo] }");
+    // Declared out of dependency order (c before b) but b needs a, which is before it.
+    let steps = [c.clone(), a.clone(), b.clone()];
+    let order = topological_order(&steps).unwrap();
+    let pos = |id: &str| order.iter().position(|&i| steps[i].id == id).unwrap();
+    assert!(
+        pos("a") < pos("b"),
+        "b's declared dependency on a must be honored"
+    );
+    // c has no dependency, so it keeps its file-order position (index 0).
+    assert_eq!(order[0], 0);
+}
+
+#[test]
+fn a_plain_tool_step_parses_with_default_with() {
+    let s = step("id: a\ntool: shell");
+    let StepBody::Tool { tool, with } = &s.body else {
+        panic!("expected Tool step");
+    };
+    assert_eq!(tool, "shell");
+    assert_eq!(with, &serde_json::json!({}));
+}
+
+#[test]
+fn a_call_step_parses_workflow_and_with() {
+    let s = step("id: a\ncall: other-workflow\nwith: { x: 1 }");
+    let StepBody::Call { workflow, with } = &s.body else {
+        panic!("expected Call step");
+    };
+    assert_eq!(workflow, "other-workflow");
+    assert_eq!(with, &serde_json::json!({ "x": 1 }));
+}
+
+// ---------------------------------------------------------------------
+// "Exactly one of tool/agent/map/gate/call/emit/report" — zero and two-key
+// cases each get a distinct, actionable error (per this task's brief: "give
+// zero-key and two-key cases distinct, actionable errors").
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_step_body_with_no_recognized_kind_is_rejected() {
+    // Every field here is individually recognised by `StepDefWire` — none
+    // of them is a body-kind key, so this exercises the "zero kinds found"
+    // branch specifically, not `deny_unknown_fields`.
+    let err = try_step("id: a\nwhen: \"${{ true }}\"").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("found none"), "message was: {msg}");
+}
+
+#[test]
+fn a_step_body_with_two_recognized_kinds_is_rejected() {
+    let err = try_step("id: a\ntool: shell\nagent: { prompt: hi }").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("found 2"), "message was: {msg}");
+}
+
+#[test]
+fn an_orphaned_with_key_is_rejected() {
+    // `with` only makes sense alongside `tool`/`call`; alone with `agent` it
+    // would otherwise be silently ignored.
+    let err = try_step("id: a\nagent: { prompt: hi }\nwith: { x: 1 }").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("`with`"), "message was: {msg}");
+}
+
+#[test]
+fn an_orphaned_steps_key_is_rejected() {
+    // `steps` only makes sense alongside `map`.
+    let err = try_step("id: a\ntool: shell\nsteps: [{ id: b, tool: shell }]").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("`steps`"), "message was: {msg}");
+}
+
+#[test]
+fn a_map_step_without_a_sibling_steps_list_is_rejected() {
+    let err = try_step("id: a\nmap: { over: x, as: y }").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("requires a sibling `steps:`"),
+        "message was: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Fail-closed nested shapes: `deny_unknown_fields` inside each body kind.
+// ---------------------------------------------------------------------
+
+#[test]
+fn unknown_step_level_key_is_rejected() {
+    let err = try_step("id: a\ntool: shell\ntoolz: 1").unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)));
+}
+
+#[test]
+fn unknown_field_inside_agent_body_is_rejected() {
+    let err = try_step("id: a\nagent: { promt: hi }").unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)));
+}
+
+#[test]
+fn unknown_field_inside_map_body_is_rejected() {
+    let err = try_step(
+        "id: a\nmap: { over: x, as: y, on_itme_error: continue }\nsteps: [{ id: b, tool: shell }]",
+    )
+    .unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)));
+}
+
+#[test]
+fn unknown_field_inside_gate_body_is_rejected() {
+    let err =
+        try_step("id: a\ngate: { title: t, timeout: 1h, on_timeout: deny, extra: 1 }").unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)));
+}
+
+#[test]
+fn misspelled_on_item_error_value_is_rejected() {
+    let err = try_step(
+        "id: a\nmap: { over: x, as: y, on_item_error: continu }\nsteps: [{ id: b, tool: shell }]",
+    )
+    .unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)));
+}
+
+#[test]
+fn misspelled_gate_on_timeout_value_is_rejected() {
+    let err = try_step("id: a\ngate: { title: t, timeout: 1h, on_timeout: aproove }").unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)));
+}
+
+// ---------------------------------------------------------------------
+// Duplicate keys inside a step body. This task's brief characterized this
+// as "silently last-wins today", framing typing the body as the fix.
+// Measured against the pinned serde_yaml 0.9.34 before relying on that
+// framing: it is not true for this library version — see
+// `parse::steps`'s module doc comment for the full finding.
+// `serde_yaml::Mapping::deserialize` already rejects a duplicate key when
+// parsing raw YAML text, before a `Value` even exists, so `parse_step`
+// (which only ever receives an already-successfully-built `Value`) can
+// never actually observe one. The tests below prove that at the two places
+// it's actually observable: the raw-`Value` stage directly, and this
+// crate's real entry point (`parse_workflow`) end to end.
+// ---------------------------------------------------------------------
+
+#[test]
+fn duplicate_step_body_key_is_rejected_at_the_raw_value_stage() {
+    // This task's brief characterized duplicate keys in a step body as
+    // "silently last-wins today" (true of a `serde_yaml::Value` built
+    // *programmatically*, e.g. via `Mapping::insert`, which just overwrites
+    // a repeated key). Measured against the pinned `serde_yaml` 0.9.34
+    // rather than assumed: parsing raw YAML *text* into a plain untyped
+    // `Value` already rejects a duplicate key, before this module's types
+    // are involved at all (`serde_yaml::Mapping`'s own `Deserialize` impl
+    // checks `mapping.entry(key)` and errors on the second occurrence).
+    let raw = "id: a\ntool: shell\ntool: http\nwith: {}";
+    let err = serde_yaml::from_str::<serde_yaml::Value>(raw).unwrap_err();
+    assert!(
+        err.to_string().contains("duplicate entry"),
+        "err was: {err}"
+    );
+}
+
+#[test]
+fn duplicate_step_body_key_is_rejected_end_to_end_through_parse_workflow() {
+    // The consequence for this task's actual entry point: a workflow whose
+    // step body has a duplicate key never reaches `parse_step` with a
+    // silently-merged `Value` — the whole document fails to parse first,
+    // at `parse_workflow`'s `serde_yaml::from_str::<WorkflowDef>` call,
+    // because building `WorkflowDef.steps: Vec<serde_yaml::Value>` already
+    // goes through the same `Mapping` deserialization checked above.
+    let yaml = "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: a\n    tool: shell\n    tool: http\n    with: {}\n";
+    let err = parse_workflow(yaml).unwrap_err();
+    assert!(
+        err.to_string().contains("duplicate entry"),
+        "err was: {err}"
+    );
+}
+
+#[test]
+fn duplicate_step_id_key_is_rejected_at_the_raw_value_stage() {
+    let raw = "id: a\nid: b\ntool: shell";
+    let err = serde_yaml::from_str::<serde_yaml::Value>(raw).unwrap_err();
+    assert!(
+        err.to_string().contains("duplicate entry"),
+        "err was: {err}"
+    );
+}
+
+#[test]
+fn duplicate_nested_agent_field_is_rejected_at_the_raw_value_stage() {
+    let raw = "id: a\nagent: { prompt: hi, prompt: bye }";
+    let err = serde_yaml::from_str::<serde_yaml::Value>(raw).unwrap_err();
+    assert!(
+        err.to_string().contains("duplicate entry"),
+        "err was: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Step id validation.
+// ---------------------------------------------------------------------
+
+#[test]
+fn empty_step_id_is_rejected() {
+    let err = try_step("id: \"\"\ntool: shell").unwrap_err();
+    assert!(matches!(err, ParseError::InvalidStepId { .. }));
+}
+
+#[test]
+fn a_step_id_with_illegal_characters_is_rejected() {
+    let err = try_step("id: \"a b\"\ntool: shell").unwrap_err();
+    assert!(matches!(err, ParseError::InvalidStepId { .. }));
+}
+
+#[test]
+fn an_overlong_step_id_is_rejected() {
+    let long_id = "a".repeat(roundhouse_flow::parse::steps::MAX_STEP_ID_LEN + 1);
+    let yaml = format!("id: {long_id}\ntool: shell");
+    let err = try_step(&yaml).unwrap_err();
+    assert!(matches!(err, ParseError::InvalidStepId { .. }));
+}
+
+#[test]
+fn a_step_id_at_exactly_the_length_limit_parses() {
+    let id = "a".repeat(roundhouse_flow::parse::steps::MAX_STEP_ID_LEN);
+    let yaml = format!("id: {id}\ntool: shell");
+    let s = try_step(&yaml).unwrap();
+    assert_eq!(s.id, id);
+}
+
+#[test]
+fn too_many_needs_entries_is_rejected() {
+    let needs: Vec<String> = (0..roundhouse_flow::parse::steps::MAX_NEEDS_PER_STEP + 1)
+        .map(|i| format!("s{i}"))
+        .collect();
+    let yaml = format!("id: a\nneeds: [{}]\ntool: shell", needs.join(", "));
+    let err = try_step(&yaml).unwrap_err();
+    assert!(
+        matches!(err, ParseError::TooManyNeeds { .. }),
+        "err was: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// `needs:` graph hazards: cycle, self-reference, unknown reference,
+// duplicate step id — each a clean typed error, never a panic or a hang.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_cycle_is_rejected() {
+    let a = step("id: a\nneeds: [b]\ntool: shell");
+    let b = step("id: b\nneeds: [a]\ntool: shell");
+    let err = topological_order(&[a, b]).unwrap_err();
+    assert!(
+        matches!(err, ParseError::StepGraphCycle { .. }),
+        "err was: {err:?}"
+    );
+}
+
+#[test]
+fn a_longer_cycle_is_rejected() {
+    let a = step("id: a\nneeds: [c]\ntool: shell");
+    let b = step("id: b\nneeds: [a]\ntool: shell");
+    let c = step("id: c\nneeds: [b]\ntool: shell");
+    let err = topological_order(&[a, b, c]).unwrap_err();
+    let ParseError::StepGraphCycle { steps: stuck } = err else {
+        panic!("expected StepGraphCycle");
+    };
+    assert_eq!(stuck.len(), 3);
+}
+
+#[test]
+fn a_self_reference_is_rejected_as_a_cycle() {
+    let a = step("id: a\nneeds: [a]\ntool: shell");
+    let err = topological_order(&[a]).unwrap_err();
+    assert!(
+        matches!(err, ParseError::StepGraphCycle { .. }),
+        "err was: {err:?}"
+    );
+}
+
+#[test]
+fn needs_naming_an_unknown_step_id_is_rejected() {
+    let a = step("id: a\nneeds: [nonexistent]\ntool: shell");
+    let err = topological_order(&[a]).unwrap_err();
+    let ParseError::UnknownStepDependency { step, needs } = err else {
+        panic!("expected UnknownStepDependency, got {err:?}");
+    };
+    assert_eq!(step, "a");
+    assert_eq!(needs, "nonexistent");
+}
+
+#[test]
+fn duplicate_step_ids_across_a_list_are_rejected() {
+    let a1 = step("id: a\ntool: shell");
+    let a2 = step("id: a\ntool: shell");
+    let err = topological_order(&[a1, a2]).unwrap_err();
+    let ParseError::DuplicateStepId { id } = err else {
+        panic!("expected DuplicateStepId, got {err:?}");
+    };
+    assert_eq!(id, "a");
+}
+
+#[test]
+fn a_diamond_dependency_parses_deterministically() {
+    // a <- b, a <- c, b and c <- d (d needs both b and c). File order:
+    // a, b, c, d. Expected order: a first (no deps), then b before c (file
+    // order tie-break among two steps that both only need a), then d.
+    let a = step("id: a\ntool: shell");
+    let b = step("id: b\nneeds: [a]\ntool: shell");
+    let c = step("id: c\nneeds: [a]\ntool: shell");
+    let d = step("id: d\nneeds: [b, c]\ntool: shell");
+    let steps = [a, b, c, d];
+    let order = topological_order(&steps).unwrap();
+    assert_eq!(order, vec![0, 1, 2, 3]);
+}

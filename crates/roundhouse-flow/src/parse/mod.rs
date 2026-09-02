@@ -5,10 +5,13 @@
 //! the parser spend** — read the open finding below before wiring this to
 //! anything that accepts untrusted YAML.
 //!
-//! Step bodies (`Task 3`, `StepDef`) are out of scope here; `WorkflowDef`
-//! carries `steps`/`catch`/`finally` as raw `serde_yaml::Value` for that
-//! task to type. (`pub mod steps;` will be added here in Task 3, alongside
-//! `parse::steps`, without disturbing this module's public surface.)
+//! Step bodies are typed by [`steps`] (`StepDef`, `StepBody`,
+//! `steps::parse_step`), which this module hands each `WorkflowDef.steps` /
+//! `.catch` / `.finally` entry to individually — `WorkflowDef` itself keeps
+//! `steps`/`catch`/`finally` as raw `serde_yaml::Value` (see its doc
+//! comment), so a caller who wants typed steps calls `steps::parse_step` on
+//! each entry, and `steps::topological_order` to get a `needs:`-respecting
+//! run order.
 //!
 //! # OPEN, UNFIXED SECURITY FINDING: parse cost is unbounded
 //!
@@ -191,6 +194,7 @@
 //!   result's lists. **None of them is a security bound**, and the two
 //!   size-shaped ones interact on purpose: see [`MAX_YAML_BYTES`].
 
+pub mod steps;
 pub mod types;
 
 pub use types::WorkflowDef;
@@ -303,6 +307,29 @@ pub enum ParseError {
 
     #[error("workflow YAML parse error: {0}")]
     Yaml(#[from] serde_yaml::Error),
+
+    #[error("step id {id:?} is invalid: {reason}")]
+    InvalidStepId { id: String, reason: String },
+
+    #[error("step {step:?} declares {actual} `needs` entries, exceeding the limit of {max}")]
+    TooManyNeeds {
+        step: String,
+        actual: usize,
+        max: usize,
+    },
+
+    #[error(
+        "duplicate step id {id:?} — step ids must be unique within the list passed to `topological_order`"
+    )]
+    DuplicateStepId { id: String },
+
+    #[error(
+        "step {step:?} declares `needs: [{needs:?}]`, but no step with that id exists in the same list"
+    )]
+    UnknownStepDependency { step: String, needs: String },
+
+    #[error("the `needs:` graph has a cycle; these steps could never become ready: {steps:?}")]
+    StepGraphCycle { steps: Vec<String> },
 }
 
 impl ParseError {
