@@ -6,13 +6,19 @@
 //! carries, via [`Body::to_workflow_yaml`].
 //!
 //! Editing a job never mutates an existing [`JobVersion`] in place: it
-//! appends a new version to [`Job::versions`], so every prior version stays
-//! retrievable via [`Job::pinned`] and a `workflow_run` can pin
-//! `(job_id, version, content_hash)` and mean it forever.
+//! appends a new version via [`Job::add_version`], so every prior version
+//! stays retrievable via [`Job::pinned`] and a `workflow_run` can pin
+//! `(job_id, version, content_hash)` and mean it forever. Immutability is
+//! enforced by the type, not just by convention: `JobVersion` and `Job`
+//! fields are private, there are no setters, `Job` cannot be constructed
+//! without a first version (making the empty-versions state
+//! unrepresentable), and `add_version` rejects anything that isn't a
+//! strictly higher version number for the same job.
 
 use roundhouse_core::{JobId, Tier};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 /// The session shape a job's run executes under: provider/model selection,
 /// working directory, tool allowlist, isolation tier, and a *reference* to
@@ -85,36 +91,133 @@ impl Body {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputSchema(pub serde_json::Value);
 
-/// One immutable version of a `Job`'s content. Never mutated after creation
-/// — editing a job always produces a new `JobVersion` with `version`
-/// incremented, appended to `Job::versions`.
+/// One immutable version of a `Job`'s content. Fields are private and there
+/// are no setters — the only way to get a `JobVersion` is [`JobVersion::new`],
+/// and the only way to change one is to build a different one. Editing a
+/// job always produces a new `JobVersion` with `version` incremented,
+/// appended via [`Job::add_version`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobVersion {
-    pub job_id: JobId,
-    pub version: u32,
-    pub template: SessionTemplate,
-    pub body: Body,
-    pub input_schema: InputSchema,
+    job_id: JobId,
+    version: u32,
+    template: SessionTemplate,
+    body: Body,
+    input_schema: InputSchema,
+}
+
+impl JobVersion {
+    pub fn new(
+        job_id: JobId,
+        version: u32,
+        template: SessionTemplate,
+        body: Body,
+        input_schema: InputSchema,
+    ) -> Self {
+        Self {
+            job_id,
+            version,
+            template,
+            body,
+            input_schema,
+        }
+    }
+
+    pub fn job_id(&self) -> JobId {
+        self.job_id
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn template(&self) -> &SessionTemplate {
+        &self.template
+    }
+
+    pub fn body(&self) -> &Body {
+        &self.body
+    }
+
+    pub fn input_schema(&self) -> &InputSchema {
+        &self.input_schema
+    }
+}
+
+/// Why [`Job::add_version`] refused a `JobVersion`.
+#[derive(Debug, Error, Clone, PartialEq)]
+pub enum AddVersionError {
+    #[error(
+        "version belongs to job {actual}, but this job is {expected} — a JobVersion can only be added to its own job"
+    )]
+    JobIdMismatch { expected: JobId, actual: JobId },
+    #[error(
+        "versions must be added in strictly increasing order: latest is {latest}, attempted {attempted}"
+    )]
+    NotMonotonic { latest: u32, attempted: u32 },
 }
 
 /// A job, identified by `id`, retaining every version it has ever had.
+/// `versions` is private and append-only (via [`Job::add_version`]) and can
+/// never be empty: [`Job::new`] requires a first version, so the
+/// no-versions state this type could otherwise represent simply doesn't
+/// exist, and [`Job::latest`] never needs to panic to account for it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Job {
-    pub id: JobId,
+    id: JobId,
     /// Every prior version is retained; nothing here is ever mutated in
-    /// place — see the module docs.
-    pub versions: Vec<JobVersion>,
+    /// place — see the module docs. Always non-empty; see the type docs.
+    versions: Vec<JobVersion>,
 }
 
 impl Job {
-    /// The highest-numbered version. Panics if `versions` is empty, which
-    /// should never happen: a `Job` is never constructed without at least
-    /// one version.
+    /// Creates a job with its first version. There is no way to construct a
+    /// `Job` with zero versions.
+    pub fn new(id: JobId, first_version: JobVersion) -> Self {
+        Self {
+            id,
+            versions: vec![first_version],
+        }
+    }
+
+    pub fn id(&self) -> JobId {
+        self.id
+    }
+
+    /// Every version this job has ever had, oldest first.
+    pub fn versions(&self) -> &[JobVersion] {
+        &self.versions
+    }
+
+    /// Appends a new version. Rejects a version that isn't strictly higher
+    /// than every existing version (editing a job must always move forward,
+    /// never rewrite or reorder history) or that belongs to a different
+    /// job id.
+    pub fn add_version(&mut self, version: JobVersion) -> Result<(), AddVersionError> {
+        if version.job_id() != self.id {
+            return Err(AddVersionError::JobIdMismatch {
+                expected: self.id,
+                actual: version.job_id(),
+            });
+        }
+        let latest = self.latest().version();
+        if version.version() <= latest {
+            return Err(AddVersionError::NotMonotonic {
+                latest,
+                attempted: version.version(),
+            });
+        }
+        self.versions.push(version);
+        Ok(())
+    }
+
+    /// The highest-numbered version. Never panics: `versions` is guaranteed
+    /// non-empty by construction (see the type docs), not merely by
+    /// convention.
     pub fn latest(&self) -> &JobVersion {
         self.versions
             .iter()
             .max_by_key(|v| v.version)
-            .expect("job always has >=1 version")
+            .expect("Job::versions is non-empty by construction — see Job::new/add_version")
     }
 
     /// Look up a specific, pinned version. Old versions are never removed,

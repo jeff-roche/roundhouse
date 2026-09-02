@@ -1,5 +1,7 @@
 use roundhouse_core::JobId;
-use roundhouse_flow::job::{content_hash, Body, InputSchema, Job, JobVersion, SessionTemplate};
+use roundhouse_flow::job::{
+    content_hash, AddVersionError, Body, InputSchema, Job, JobVersion, SessionTemplate,
+};
 
 fn template() -> SessionTemplate {
     SessionTemplate {
@@ -14,35 +16,116 @@ fn template() -> SessionTemplate {
 
 #[test]
 fn editing_a_job_produces_a_new_immutable_version_with_a_different_hash() {
-    let v1 = JobVersion {
-        job_id: JobId::new(),
-        version: 1,
-        template: template(),
-        body: Body::Workflow {
+    let job_id = JobId::new();
+    let v1 = JobVersion::new(
+        job_id,
+        1,
+        template(),
+        Body::Workflow {
             workflow_yaml: "name: pr-review\nversion: 1\n".to_string(),
         },
-        input_schema: InputSchema(serde_json::json!({"type": "object"})),
-    };
-    let mut v2 = v1.clone();
-    v2.version = 2;
-    v2.body = Body::Workflow {
-        workflow_yaml: "name: pr-review\nversion: 2\n".to_string(),
-    };
+        InputSchema(serde_json::json!({"type": "object"})),
+    );
+    // There is no setter to bump `v1`'s version or swap its body in place —
+    // editing a job means building a whole new `JobVersion`, never mutating
+    // an existing one.
+    let v2 = JobVersion::new(
+        job_id,
+        2,
+        template(),
+        Body::Workflow {
+            workflow_yaml: "name: pr-review\nversion: 2\n".to_string(),
+        },
+        InputSchema(serde_json::json!({"type": "object"})),
+    );
 
     let hash1 = content_hash(&v1);
     let hash2 = content_hash(&v2);
     assert_ne!(hash1, hash2, "different body content must hash differently");
 
-    let job = Job {
-        id: v1.job_id,
-        versions: vec![v1, v2],
-    };
-    assert_eq!(job.latest().version, 2);
+    let mut job = Job::new(job_id, v1);
+    job.add_version(v2).expect("version 2 follows version 1");
+    assert_eq!(job.latest().version(), 2);
     assert_eq!(
-        job.pinned(1).unwrap().version,
+        job.pinned(1).unwrap().version(),
         1,
         "old versions remain retrievable, never mutated"
     );
+}
+
+#[test]
+fn job_cannot_be_constructed_or_extended_into_an_invalid_state() {
+    // `Job` has no zero-version state to begin with (`Job::new` requires a
+    // first version), and `add_version` refuses anything that isn't a
+    // strictly higher version number for the same job — editing a job must
+    // always move forward, never rewrite or reorder history.
+    let job_id = JobId::new();
+    let v1 = JobVersion::new(
+        job_id,
+        1,
+        template(),
+        Body::Prompt {
+            template: "hello".to_string(),
+        },
+        InputSchema(serde_json::json!({"type": "object"})),
+    );
+    let mut job = Job::new(job_id, v1.clone());
+
+    let same_version_again = JobVersion::new(
+        job_id,
+        1,
+        template(),
+        Body::Prompt {
+            template: "different content, same version number".to_string(),
+        },
+        InputSchema(serde_json::json!({"type": "object"})),
+    );
+    assert_eq!(
+        job.add_version(same_version_again),
+        Err(AddVersionError::NotMonotonic {
+            latest: 1,
+            attempted: 1
+        }),
+        "a version number must never be reused for different content"
+    );
+
+    let wrong_job = JobVersion::new(
+        JobId::new(),
+        2,
+        template(),
+        Body::Prompt {
+            template: "hello".to_string(),
+        },
+        InputSchema(serde_json::json!({"type": "object"})),
+    );
+    let expected = job.id();
+    let actual = wrong_job.job_id();
+    assert_eq!(
+        job.add_version(wrong_job),
+        Err(AddVersionError::JobIdMismatch { expected, actual }),
+        "a JobVersion belonging to a different job must never be attached here"
+    );
+
+    // Both rejected attempts left the job untouched.
+    assert_eq!(job.versions().len(), 1);
+    assert_eq!(job.latest().version(), 1);
+}
+
+#[test]
+fn pinned_returns_none_for_a_version_that_was_never_added() {
+    let job_id = JobId::new();
+    let v1 = JobVersion::new(
+        job_id,
+        1,
+        template(),
+        Body::Prompt {
+            template: "hello".to_string(),
+        },
+        InputSchema(serde_json::json!({"type": "object"})),
+    );
+    let job = Job::new(job_id, v1);
+    assert!(job.pinned(0).is_none());
+    assert!(job.pinned(2).is_none());
 }
 
 #[test]
@@ -126,22 +209,15 @@ fn content_hash_is_stable_for_a_known_input() {
     // precisely the defect class this test exists to catch (content
     // addressing requires the same content to hash identically across
     // processes and across runs).
-    let v = JobVersion {
-        job_id: JobId::from_uuid(uuid::Uuid::nil()),
-        version: 1,
-        template: SessionTemplate {
-            provider: "anthropic".to_string(),
-            model: "claude-sonnet".to_string(),
-            cwd: "/repo".to_string(),
-            tools: vec!["read".to_string(), "shell".to_string()],
-            isolation: roundhouse_core::Tier::Worktree,
-            permission_policy_ref: "pr-review-default".to_string(),
-        },
-        body: Body::Workflow {
+    let v = JobVersion::new(
+        JobId::from_uuid(uuid::Uuid::nil()),
+        1,
+        template(),
+        Body::Workflow {
             workflow_yaml: "name: pr-review\nversion: 1\n".to_string(),
         },
-        input_schema: InputSchema(serde_json::json!({"type": "object"})),
-    };
+        InputSchema(serde_json::json!({"type": "object"})),
+    );
 
     assert_eq!(
         content_hash(&v),
@@ -181,17 +257,24 @@ fn equal_content_hashes_the_same_regardless_of_how_it_was_built() {
         "sanity check: these two Values are equal despite differing construction order"
     );
 
-    let v_a = JobVersion {
+    let v_a = JobVersion::new(
         job_id,
-        version: 1,
-        template: template(),
-        body: Body::Prompt {
+        1,
+        template(),
+        Body::Prompt {
             template: "hello".to_string(),
         },
-        input_schema: InputSchema(schema_a),
-    };
-    let mut v_b = v_a.clone();
-    v_b.input_schema = InputSchema(schema_b);
+        InputSchema(schema_a),
+    );
+    let v_b = JobVersion::new(
+        job_id,
+        1,
+        template(),
+        Body::Prompt {
+            template: "hello".to_string(),
+        },
+        InputSchema(schema_b),
+    );
 
     assert_eq!(
         content_hash(&v_a),

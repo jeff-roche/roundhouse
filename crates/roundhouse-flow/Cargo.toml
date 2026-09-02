@@ -13,6 +13,7 @@ roundhouse-engine = { path = "../roundhouse-engine" }
 roundhouse-store = { path = "../roundhouse-store" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 # Pinned, fixed-algorithm content hash for `content_hash` (Task 1): the point
 # of a content hash is that identical content hashes identically across
 # processes and across releases. `std::collections::hash_map::DefaultHasher`
