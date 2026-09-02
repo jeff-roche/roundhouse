@@ -1,0 +1,22 @@
+# DeepInfra — hosted OpenAI-compatible catalog of third-party open models.
+# Verified against docs.deepinfra.com/chat/overview (redirect target of
+# deepinfra.com/docs/openai_api, fetched live 2026-09): base_url
+# `https://api.deepinfra.com/v1/openai` and Bearer auth
+# (`Authorization: Bearer $DEEPINFRA_TOKEN`) confirmed verbatim. DeepInfra
+# hosts many different underlying models with no single vendor-specific
+# request quirk, so this is a plain pass-through profile.
+id = "deepinfra"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://api.deepinfra.com/v1/openai"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"rate_limit_exceeded" = { disposition = "shed_concurrency" }
+"model_overloaded" = { disposition = "retry_backoff" }
+"insufficient_balance" = { disposition = "fatal", category = "quota" }

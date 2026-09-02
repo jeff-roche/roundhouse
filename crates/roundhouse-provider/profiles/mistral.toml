@@ -1,0 +1,18 @@
+# Mistral — direct vendor API. Verified against docs.mistral.ai/api/
+# (fetched live 2026-09): base_url and Bearer auth confirmed verbatim. No
+# vendor-specific request quirk found; plain pass-through profile.
+id = "mistral"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://api.mistral.ai/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"rate_limit_exceeded" = { disposition = "shed_concurrency" }
+"service_unavailable" = { disposition = "retry_backoff" }
+"invalid_api_key" = { disposition = "fatal", category = "quota" }

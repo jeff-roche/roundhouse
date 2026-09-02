@@ -1,0 +1,24 @@
+# NVIDIA NIM — hosted OpenAI-compatible catalog of third-party open models.
+# Verified against docs.api.nvidia.com/nim/reference/llm-apis (fetched live
+# 2026-09): base_url `https://integrate.api.nvidia.com` with endpoint
+# `/v1/chat/completions`, i.e. base_url `https://integrate.api.nvidia.com/v1`.
+# Bearer auth is NVIDIA's universal, well-documented pattern for
+# integrate.api.nvidia.com/build.nvidia.com (the fetched page's excerpt did
+# not itself carry an auth section). NIM hosts many different underlying
+# models with no single vendor-specific request quirk, so this is a plain
+# pass-through profile.
+id = "nvidia-nim"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://integrate.api.nvidia.com/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"429" = { disposition = "shed_concurrency" }
+"503" = { disposition = "retry_backoff" }
+"401" = { disposition = "fatal", category = "quota" }

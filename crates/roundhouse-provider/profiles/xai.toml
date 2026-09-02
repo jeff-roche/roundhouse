@@ -1,0 +1,40 @@
+# xAI (Grok) — direct vendor API. Verified against docs.x.ai/docs/api-reference
+# (base_url, Bearer auth, finish_reason stop/length) and
+# docs.x.ai/docs/guides/reasoning (fetched live 2026-09) for the
+# reasoning_effort vocabulary on grok-4*: low/medium/high(default)/xhigh.
+id = "xai"
+codec = "openai-chat"
+
+[defaults]
+allow_raw_extra = false
+base_url = "https://api.x.ai/v1"
+
+[defaults.params]
+mode = "deny_list"
+fields = []
+
+[defaults.auth]
+kind = "bearer"
+
+[[model]]
+match = ["grok-4*"]
+
+[model.reasoning]
+kind = "effort"
+field = "/reasoning_effort"
+vocabulary = ["low", "medium", "high", "xhigh"]
+
+[model.reasoning.map]
+off = "low"
+low = "low"
+medium = "medium"
+high = "high"
+max = "xhigh"
+
+[[model]]
+match = ["grok-*"]
+
+[errors]
+"rate_limit_exceeded" = { disposition = "shed_concurrency" }
+"internal_server_error" = { disposition = "retry_backoff" }
+"invalid_api_key" = { disposition = "fatal", category = "quota" }

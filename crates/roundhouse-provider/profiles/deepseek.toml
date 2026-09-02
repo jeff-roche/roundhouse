@@ -1,0 +1,51 @@
+# DeepSeek — direct vendor API.
+#
+# Corrected against the plan brief after live verification:
+# - base_url: api-docs.deepseek.com/api/create-chat-completion and
+#   .../quick_start/first_api_call (fetched 2026-09) both give the bare
+#   `https://api.deepseek.com` with no documented `/v1` alias — the brief
+#   assumed `/v1`; current docs disagree, so this profile uses the
+#   currently-documented value.
+# - presence_penalty/frequency_penalty: the same page states both are "no
+#   longer supported" for the current model catalog (deepseek-v4-flash,
+#   deepseek-v4-pro, deepseek-v4-flash-vision-exp) — API-wide, not scoped to
+#   a "reasoner" model as the brief assumed (that model name no longer
+#   appears in the current catalog at all).
+# - reasoning: api-docs.deepseek.com/guides/reasoning_model (fetched 2026-09)
+#   shows depth is controlled by a top-level `reasoning_effort` field,
+#   separate from a `thinking: {"type": "enabled"}` toggle object. This
+#   profile targets `reasoning_effort`, the effort-vocabulary control our
+#   schema expresses.
+id = "deepseek"
+codec = "openai-chat"
+
+[defaults]
+allow_raw_extra = false
+base_url = "https://api.deepseek.com"
+
+[defaults.params]
+mode = "deny_list"
+fields = ["presence_penalty", "frequency_penalty"]
+
+[defaults.auth]
+kind = "bearer"
+
+[[model]]
+match = ["deepseek-v4*"]
+
+[model.reasoning]
+kind = "effort"
+field = "/reasoning_effort"
+vocabulary = ["low", "medium", "high"]
+
+[model.reasoning.map]
+off = "low"
+low = "low"
+medium = "medium"
+high = "high"
+max = "high"
+
+[errors]
+"rate_limit_exceeded" = { disposition = "shed_concurrency" }
+"server_error" = { disposition = "retry_backoff" }
+"authentication_error" = { disposition = "fatal", category = "quota" }
