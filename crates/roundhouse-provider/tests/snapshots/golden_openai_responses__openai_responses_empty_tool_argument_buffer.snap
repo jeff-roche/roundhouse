@@ -1,0 +1,16 @@
+---
+source: crates/roundhouse-provider/tests/golden_openai_responses.rs
+expression: body
+---
+{
+  "input": [
+    {
+      "arguments": "{}",
+      "call_id": "call_1",
+      "name": "ping",
+      "type": "function_call"
+    }
+  ],
+  "model": "gpt-5.4",
+  "stream": true
+}

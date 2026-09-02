@@ -1,0 +1,43 @@
+---
+source: crates/roundhouse-provider/tests/golden_openai_responses.rs
+expression: "encode(&req, &fixture_profile())"
+---
+{
+  "input": [
+    {
+      "content": [
+        {
+          "text": "Weather and time in Tokyo?",
+          "type": "input_text"
+        }
+      ],
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "model": "gpt-5.4",
+  "stream": true,
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "description": "Get the current weather",
+      "name": "get_weather",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "NoParams",
+        "type": "object"
+      },
+      "type": "function"
+    },
+    {
+      "description": "Get the current time",
+      "name": "get_time",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "NoParams",
+        "type": "object"
+      },
+      "type": "function"
+    }
+  ]
+}

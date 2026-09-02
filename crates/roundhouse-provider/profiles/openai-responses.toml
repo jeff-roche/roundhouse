@@ -1,0 +1,43 @@
+# OpenAI first-party, on the `openai-responses` codec. §9.4's provider table
+# lists "OpenAI first-party" as the first provider on this codec's row; the
+# remaining `openai-responses` providers (NVIDIA, Vercel, OpenRouter,
+# HuggingFace, Databricks, AWS) are added as data by a later batch task,
+# reusing this codec's encode/decode unchanged.
+id = "openai-responses"
+codec = "openai-responses"
+
+[defaults]
+allow_raw_extra = false
+base_url = "https://api.openai.com/v1"
+
+[defaults.params]
+mode = "deny_list"
+fields = []
+
+[defaults.auth]
+kind = "bearer"
+
+[[model]]
+match = ["gpt-5.4*", "gpt-5*"]
+
+[model.reasoning]
+kind = "effort"
+field = "/reasoning/effort"
+vocabulary = ["none", "low", "medium", "high"]
+
+[model.reasoning.map]
+off = "none"
+low = "low"
+medium = "medium"
+high = "high"
+max = "high"
+
+[errors.rate_limit_exceeded]
+disposition = "shed_concurrency"
+
+[errors.server_error]
+disposition = "retry_backoff"
+
+[errors.insufficient_quota]
+disposition = "fatal"
+category = "quota"

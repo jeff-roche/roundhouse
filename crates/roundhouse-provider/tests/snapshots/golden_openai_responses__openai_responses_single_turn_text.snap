@@ -1,0 +1,20 @@
+---
+source: crates/roundhouse-provider/tests/golden_openai_responses.rs
+expression: "encode(&req, &fixture_profile())"
+---
+{
+  "input": [
+    {
+      "content": [
+        {
+          "text": "What is 2+2?",
+          "type": "input_text"
+        }
+      ],
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "model": "gpt-5.4",
+  "stream": true
+}

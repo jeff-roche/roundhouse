@@ -1,0 +1,40 @@
+---
+source: crates/roundhouse-provider/tests/golden_openai_responses.rs
+expression: "encode(&req, &fixture_profile())"
+---
+{
+  "input": [
+    {
+      "content": [
+        {
+          "text": "What is the capital of France?",
+          "type": "input_text"
+        }
+      ],
+      "role": "user",
+      "type": "message"
+    },
+    {
+      "content": [
+        {
+          "text": "Paris.",
+          "type": "input_text"
+        }
+      ],
+      "role": "assistant",
+      "type": "message"
+    },
+    {
+      "content": [
+        {
+          "text": "And its population?",
+          "type": "input_text"
+        }
+      ],
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "model": "gpt-5.4",
+  "stream": true
+}

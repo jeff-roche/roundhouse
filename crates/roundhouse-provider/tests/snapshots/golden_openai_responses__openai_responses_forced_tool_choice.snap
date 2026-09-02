@@ -1,0 +1,36 @@
+---
+source: crates/roundhouse-provider/tests/golden_openai_responses.rs
+expression: body
+---
+{
+  "input": [
+    {
+      "content": [
+        {
+          "text": "What's the weather in Tokyo?",
+          "type": "input_text"
+        }
+      ],
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "model": "gpt-5.4",
+  "stream": true,
+  "tool_choice": {
+    "name": "get_weather",
+    "type": "function"
+  },
+  "tools": [
+    {
+      "description": "Get the current weather",
+      "name": "get_weather",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "NoParams",
+        "type": "object"
+      },
+      "type": "function"
+    }
+  ]
+}
