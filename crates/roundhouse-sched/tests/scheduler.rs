@@ -597,6 +597,76 @@ fn catch_up_after_wake_with_none_policy_drops_an_entire_multi_batch_backlog() {
     );
 }
 
+/// Fix round 2 (Low, security review of Task 6): `recompute_all` must clear
+/// `catch_up_progress`, or a binding caught mid-backlog keeps a stranded
+/// entry that outlives the backlog it was tracking. Sequence: (1) put a
+/// `CatchUp::None` binding genuinely mid-backlog (a capped batch that did
+/// *not* exhaust it, so a `catch_up_progress` entry is left behind); (2) a
+/// backward wall-clock step beyond `DRIFT_THRESHOLD` at wake, which routes
+/// through `recompute_all`; (3) let one *ordinary* single occurrence come
+/// due afterward and assert it fires. Without the `clear()`, the stranded
+/// entry makes `is_catch_up_pass` true for that lone, unrelated occurrence,
+/// and `CatchUp::None` swallows it — a genuinely ordinary firing lost to a
+/// backlog that no longer exists.
+#[test]
+fn recompute_all_clears_catch_up_progress_so_a_later_ordinary_occurrence_still_fires() {
+    let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let start_mono = Instant::now();
+    let mut binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
+    if let TriggerSpec::Cron { catch_up, .. } = &mut binding.spec {
+        *catch_up = CatchUp::None;
+    }
+    let binding_id = binding.id;
+
+    let add_clock = FakeClock {
+        mono: RefCell::new(start_mono),
+        wall: RefCell::new(start_wall),
+    };
+    let mut sched = Scheduler::new();
+    sched.add_binding(binding, &add_clock).unwrap();
+
+    // Step 1: a backlog bigger than the cap, advanced in lockstep (no
+    // drift) via plain `tick`, so the first capped batch does *not* exhaust
+    // the backlog and leaves a `catch_up_progress` entry behind.
+    let cap = MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK;
+    let backlog_wall = start_wall + chrono::Duration::minutes((cap + 50) as i64);
+    let backlog_mono = start_mono + Duration::from_secs((cap as u64 + 50) * 60);
+    let first = sched.tick(&clock_at(backlog_wall, backlog_mono));
+    assert!(
+        fires_for(&first, binding_id).is_empty(),
+        "CatchUp::None must fire nothing from the first (non-exhausting) batch: {first:?}"
+    );
+
+    // Step 2: a backward wake step beyond `DRIFT_THRESHOLD` relative to
+    // `backlog_wall` — routes through `recompute_all`, which must also
+    // clear the `catch_up_progress` entry `step 1` just left behind.
+    let corrected_wall = start_wall + chrono::Duration::minutes(10);
+    let corrected_mono = backlog_mono + Duration::from_millis(5);
+    let woke = sched.catch_up_after_wake(corrected_mono, corrected_wall);
+    assert!(
+        woke.iter()
+            .any(|e| matches!(e, SchedulerEvent::DriftDetected { .. })),
+        "the backward step must be reported as drift, confirming recompute_all's path was \
+         actually taken: {woke:?}"
+    );
+
+    // Step 3: the schedule is now re-anchored to `corrected_wall`
+    // (`* * * * *` → next fire at `corrected_wall + 1min`). This is a
+    // genuinely ordinary single occurrence, unrelated to the backlog from
+    // step 1 — it must fire regardless of `CatchUp::None`, which is only
+    // fixed by `recompute_all` having cleared the stranded progress entry.
+    let ordinary_fire_at = corrected_wall + chrono::Duration::minutes(1);
+    let probe_mono = corrected_mono + Duration::from_secs(60);
+    let after = sched.tick(&clock_at(ordinary_fire_at, probe_mono));
+    assert_eq!(
+        fires_for(&after, binding_id),
+        vec![ordinary_fire_at],
+        "a genuinely ordinary single occurrence after an unrelated backlog was abandoned by \
+         recompute_all must still fire — CatchUp::None must not swallow it via a stale, \
+         stranded catch_up_progress entry from the old backlog: {after:?}"
+    );
+}
+
 /// Fix round 2 (CRITICAL, security review of Task 6): a non-cron trigger
 /// (in practice, only `TriggerSpec::Interval` is heap-scheduled) has no
 /// `CatchUp` concept at all — `compute_catch_up`'s documented contract is
