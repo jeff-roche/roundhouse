@@ -10,11 +10,30 @@
 //! (`RequestPermissionRequest.options: Vec<PermissionOption>`), never by a
 //! free-standing verdict enum. This module selects from those offered
 //! options instead of fabricating a verdict type.
+//!
+//! **Role note (SEC-7, round-2 review):** `session/request_permission` is
+//! answered by the ACP **client** role — the schema marks it
+//! `x-side = "client"` (the agent sends the request; the client decides and
+//! replies). This module lives under `src/server/` because the task plan
+//! names that path and `crate::decision` (Task 4/C4) imports
+//! `crate::server::PolicyOutcome` from here — the directory name does not
+//! describe an ACP "server" role. Whichever Roundhouse component eventually
+//! calls [`handle_request_permission`] is acting as the ACP **client**
+//! responding to a peer **agent**'s request.
+//!
+//! **`options: &[PermissionOption]` is supplied by that untrusted peer, not
+//! by Roundhouse.** It cannot be trusted to be well-formed, non-adversarial,
+//! or offered in good faith. Every extra check in this module beyond "look
+//! up the required kind" — [`ambiguous_option_ids`], the `Ask`-never-
+//! `RejectAlways` restriction, refusing to select an unmatched kind — exists
+//! because of that, not out of general caution.
 use agent_client_protocol::schema::v1::{
-    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, SelectedPermissionOutcome,
+    PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
+    SelectedPermissionOutcome, ToolCallUpdate, ToolKind,
 };
 use roundhouse_core::PolicyDecision;
 use serde_json::Value;
+use std::collections::HashSet;
 use thiserror::Error;
 
 /// The one real decision type is Phase 0's payload-free `PolicyDecision`
@@ -38,10 +57,10 @@ pub struct AcpServer<'a> {
     pub policy: &'a dyn PolicyEngineLike,
 }
 
-/// This must fail closed: nothing converts `NoMatchingOption` into an allow
-/// anywhere in this module. It carries the tool name, the decision that
-/// drove the search, and every kind the peer actually offered, so a caller
-/// can log what happened without re-deriving it.
+/// This must fail closed: nothing anywhere in this module converts any of
+/// these variants into a selection. Each carries enough context (tool,
+/// decision, and/or the offered kinds) to log what happened without a
+/// caller having to re-derive it.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PermissionError {
     #[error(
@@ -52,6 +71,50 @@ pub enum PermissionError {
         decision: PolicyDecision,
         offered_kinds: Vec<PermissionOptionKind>,
     },
+
+    /// SEC-4 (round-2 review): `Ask` may select `RejectOnce` but must never
+    /// fall back to `RejectAlways` the way `Deny` does — see
+    /// [`handle_request_permission`]'s doc for why. This is a distinct
+    /// variant from `NoMatchingOption` specifically so the fail-closed
+    /// reasoning ("we refused to fall back," not merely "nothing matched")
+    /// is legible in the error itself, including when `RejectAlways` *was*
+    /// offered.
+    #[error(
+        "Ask decision for tool {tool:?} has no RejectOnce option to select; RejectAlways cannot be used as a fallback for Ask (unlike for Deny) because that would permanently discard a still-pending human decision — offered kinds: {offered_kinds:?}"
+    )]
+    AskCannotFallBackToRejectAlways {
+        tool: String,
+        offered_kinds: Vec<PermissionOptionKind>,
+    },
+
+    /// SEC-1 (round-2 review): selection is by `kind`, but the only thing a
+    /// wire response can name back is `option_id` — nothing in the protocol
+    /// requires ids to be unique or non-empty. Offered options with an
+    /// empty or duplicated `option_id` are refused before any selection is
+    /// attempted; see [`ambiguous_option_ids`].
+    #[error(
+        "offered PermissionOptions for tool {tool:?} are ambiguous and cannot be trusted to bind a decision to a single option: {reason}"
+    )]
+    AmbiguousOptions { tool: String, reason: String },
+
+    /// SEC-2 (round-2 review): [`normalize_tool_call_for_policy`] refuses a
+    /// `ToolCallUpdate` with no `rawInput` rather than substituting `{}`,
+    /// since that substitution is indistinguishable from a real empty-args
+    /// call and would let a peer bypass any policy rule that classifies on
+    /// argument content.
+    #[error(
+        "ToolCallUpdate {tool_call_id:?} has no rawInput; substituting an empty object would be indistinguishable from a real empty-args call and could bypass policy rules that classify on argument content"
+    )]
+    MissingRawInput { tool_call_id: String },
+
+    /// SEC-2 (round-2 review): [`normalize_tool_call_for_policy`] refuses a
+    /// `ToolCallUpdate` whose `kind` is absent or `ToolKind::Other` — see
+    /// that function's doc for why `title` is deliberately never used as a
+    /// fallback identifier.
+    #[error(
+        "ToolCallUpdate {tool_call_id:?} does not identify a tool: `kind` is missing or ToolKind::Other (the wire default and the deserialization fallback for any kind this SDK version doesn't recognize), and `title` is agent-authored free text, never used as a tool identifier"
+    )]
+    UnidentifiableTool { tool_call_id: String },
 }
 
 fn find_option(
@@ -61,26 +124,70 @@ fn find_option(
     options.iter().find(|opt| opt.kind == kind)
 }
 
+/// Returns a human-legible reason `options` cannot be trusted to bind a
+/// decision to a unique option (an empty `option_id`, or the same
+/// `option_id` reused across more than one offered option), or `None` if
+/// every id is present, non-empty, and unique.
+///
+/// **SEC-1 (round-2 review):** selection elsewhere in this module is done by
+/// `kind`, but the wire response we build only ever names an `option_id`
+/// (`RequestPermissionResponse { outcome: Selected(SelectedPermissionOutcome
+/// { option_id, .. }) } }`). Nothing in the protocol requires `option_id`s to
+/// be unique or non-empty, so an untrusted peer offering
+/// `[{option_id: "go", kind: RejectOnce}, {option_id: "go", kind: AllowOnce}]`
+/// can make our `Selected{option_id: "go"}` response resolve to whichever
+/// kind *it* prefers, once *it* reads that id back — we'd have decided
+/// "deny" and recorded it as such, while the peer legitimately reads back an
+/// allow. Refusing ambiguous input outright, before ever selecting, closes
+/// that off.
+fn ambiguous_option_ids(options: &[PermissionOption]) -> Option<String> {
+    let mut seen: HashSet<&PermissionOptionId> = HashSet::new();
+    for opt in options {
+        if opt.option_id.0.is_empty() {
+            return Some("an offered PermissionOption has an empty option_id".to_string());
+        }
+        if !seen.insert(&opt.option_id) {
+            return Some(format!(
+                "option_id {:?} is offered by more than one PermissionOption",
+                opt.option_id.to_string()
+            ));
+        }
+    }
+    None
+}
+
 /// Selects a wire-level `RequestPermissionOutcome` from the options the peer
 /// offered, per our engine's `PolicyDecision` for `tool`/`args`. Security
 /// rules, in force regardless of how the peer phrased its options:
 ///
+/// - `options` is validated first (see [`ambiguous_option_ids`]): an empty
+///   or duplicated `option_id` anywhere in it fails the whole call with
+///   `Err(PermissionError::AmbiguousOptions)` before any selection is
+///   attempted. Validate first, select second.
 /// - `Allow` selects the offered `AllowOnce` option — **never `AllowAlways`**,
 ///   since selecting that would persist a grant on the peer's side that our
 ///   engine never made.
 /// - `Deny` selects `RejectOnce`, falling back to `RejectAlways` only if no
 ///   `RejectOnce` was offered.
-/// - `Ask` **also** selects a reject option (same `RejectOnce`-then-
-///   `RejectAlways` search as `Deny`). `Ask` means a human decision is
-///   pending, so nothing may be granted while it is; this function does not
-///   block waiting for that decision. The caller is responsible for
-///   re-entering this function (or the underlying `session/request_permission`
-///   exchange) once the real approval flow (Phase 2's persisted
-///   `Suspended{AwaitingApproval}`, §6.4) resolves the human's answer into a
-///   fresh `Allow`/`Deny` from the policy engine.
-/// - If no option of the required kind was offered at all, this returns
-///   `Err(PermissionError::NoMatchingOption)`. **This must fail closed**:
-///   no code path turns that error into an allow.
+/// - `Ask` selects `RejectOnce` **only** — it does **not** fall back to
+///   `RejectAlways` the way `Deny` does. `Ask` means a human decision is
+///   pending; `RejectAlways` tells a conforming peer to permanently remember
+///   the rejection and never ask again, which would make a later human
+///   `Allow` unreachable through this protocol (a `session/request_permission`
+///   is answered once). `Deny`'s rejection is real and final, so
+///   `RejectAlways` is a safe fallback there; `Ask`'s is provisional, so it
+///   isn't. If no `RejectOnce` was offered for `Ask`, this returns
+///   `Err(PermissionError::AskCannotFallBackToRejectAlways)` rather than ever
+///   selecting `RejectAlways`. This function does not block waiting for the
+///   human decision either way; the caller is responsible for re-entering it
+///   (or the underlying `session/request_permission` exchange) once the real
+///   approval flow (Phase 2's persisted `Suspended{AwaitingApproval}`, §6.4)
+///   resolves the human's answer into a fresh `Allow`/`Deny` from the policy
+///   engine.
+/// - If no option of the required kind was offered at all (and the decision
+///   isn't the `Ask`-specific case above), this returns
+///   `Err(PermissionError::NoMatchingOption)`. **This must fail closed**: no
+///   code path turns any `PermissionError` variant into a selection.
 ///
 /// `PermissionOptionKind` and `RequestPermissionOutcome` are both
 /// `#[non_exhaustive]` in the SDK; this function never exhaustively matches
@@ -93,19 +200,31 @@ pub fn handle_request_permission(
     args: &Value,
     options: &[PermissionOption],
 ) -> Result<RequestPermissionOutcome, PermissionError> {
+    if let Some(reason) = ambiguous_option_ids(options) {
+        return Err(PermissionError::AmbiguousOptions {
+            tool: tool.to_string(),
+            reason,
+        });
+    }
+
     let outcome = server.policy.decide(tool, args);
     let selected = match outcome.decision {
         PolicyDecision::Allow => find_option(options, PermissionOptionKind::AllowOnce),
-        PolicyDecision::Deny | PolicyDecision::Ask => {
-            find_option(options, PermissionOptionKind::RejectOnce)
-                .or_else(|| find_option(options, PermissionOptionKind::RejectAlways))
-        }
+        PolicyDecision::Deny => find_option(options, PermissionOptionKind::RejectOnce)
+            .or_else(|| find_option(options, PermissionOptionKind::RejectAlways)),
+        PolicyDecision::Ask => find_option(options, PermissionOptionKind::RejectOnce),
     };
 
     match selected {
         Some(opt) => Ok(RequestPermissionOutcome::Selected(
             SelectedPermissionOutcome::new(opt.option_id.clone()),
         )),
+        None if outcome.decision == PolicyDecision::Ask => {
+            Err(PermissionError::AskCannotFallBackToRejectAlways {
+                tool: tool.to_string(),
+                offered_kinds: options.iter().map(|opt| opt.kind).collect(),
+            })
+        }
         None => Err(PermissionError::NoMatchingOption {
             tool: tool.to_string(),
             decision: outcome.decision,
@@ -122,9 +241,7 @@ pub fn handle_request_permission(
 /// future, currently-unknown outcome variant the `#[non_exhaustive]` wildcard
 /// arm below catches. Consumers of a `RequestPermissionOutcome` should route
 /// through this instead of assuming `Selected`.
-pub fn selected_option_id(
-    outcome: &RequestPermissionOutcome,
-) -> Option<&agent_client_protocol::schema::v1::PermissionOptionId> {
+pub fn selected_option_id(outcome: &RequestPermissionOutcome) -> Option<&PermissionOptionId> {
     match outcome {
         RequestPermissionOutcome::Selected(sel) => Some(&sel.option_id),
         RequestPermissionOutcome::Cancelled => None,
@@ -132,9 +249,100 @@ pub fn selected_option_id(
     }
 }
 
+/// Resolves the `PermissionOptionKind` a `RequestPermissionOutcome` selected,
+/// by looking its `option_id` up against the `options` a peer offered.
+///
+/// **SEC-1 (round-2 review):** in the direction where *we* sent a
+/// `session/request_permission` request (with our own offered options) and
+/// are reading back what the peer chose, this id→kind lookup **is** the
+/// authorization decision — so it belongs here, audited once, rather than
+/// reimplemented ad hoc by every caller that reads an outcome off the wire.
+///
+/// Returns `None` — never guesses — when: the outcome isn't `Selected`
+/// (`selected_option_id` already handles `Cancelled` and any future
+/// non_exhaustive variant); the selected id doesn't appear in `options` at
+/// all; or `options` itself is ambiguous (see [`ambiguous_option_ids`] — the
+/// same empty/duplicate-id condition [`handle_request_permission`] refuses
+/// to select from). An ambiguous options list cannot resolve any id to a
+/// single trustworthy kind, so refusing here is the same fail-closed posture
+/// as refusing to select from it in the first place.
+pub fn resolve_selection(
+    options: &[PermissionOption],
+    outcome: &RequestPermissionOutcome,
+) -> Option<PermissionOptionKind> {
+    if ambiguous_option_ids(options).is_some() {
+        return None;
+    }
+    let id = selected_option_id(outcome)?;
+    options
+        .iter()
+        .find(|opt| &opt.option_id == id)
+        .map(|opt| opt.kind)
+}
+
+/// Normalizes a peer-supplied `ToolCallUpdate` (the `tool_call` field of an
+/// incoming `RequestPermissionRequest` — see the module doc for which role
+/// receives it) into the `(tool, args)` pair [`handle_request_permission`]
+/// needs to consult the policy engine.
+///
+/// **SEC-2 (round-2 review): this must fail closed, not guess.**
+/// `ToolCallUpdate` carries no tool-name field at all — verified against
+/// `agent-client-protocol-schema` 1.5.0's `v1/tool_call.rs`
+/// (`ToolCallUpdateFields { kind: Option<ToolKind>, title: Option<String>,
+/// raw_input: Option<Value>, .. }`, all optional). The only candidates are:
+///
+/// - `fields.title` — agent-authored free prose, not a namespaced tool
+///   identifier. **Deliberately never used here**: a peer could craft a
+///   title to fool a string-matching policy rule into classifying the call
+///   as something it isn't.
+/// - `fields.kind: Option<ToolKind>` — whose `Other` variant is *both* the
+///   `#[default]` value *and* the `#[serde(other)]` deserialization fallback
+///   for any kind this SDK version doesn't recognize. So `Other`/absent
+///   isn't "no kind was given," it's "any kind we can't distinguish," and
+///   must not be treated as identifying one specific tool.
+/// - `fields.raw_input: Option<Value>` — the closest thing to `args`, but
+///   optional; a peer can omit it outright.
+///
+/// This function does **not** map `kind` onto Roundhouse's own tool
+/// namespace (`shell`/`read`/`write`/`edit`/`find`/...) — that mapping is
+/// daemon-owned integration knowledge this crate does not have and, per this
+/// subsystem's standing rules (`roundhouse-acp` depends on
+/// `{roundhouse-core, roundhouse-proto}` only), must not acquire. **The
+/// daemon supplies the namespace mapping; this function's only job is to
+/// refuse rather than guess** when the wire data can't support a real
+/// decision:
+///
+/// - `fields.raw_input` absent → `Err(MissingRawInput)`. This is
+///   deliberately distinct from a present-but-empty `{}` object: collapsing
+///   "the peer sent nothing" into `args = json!({})` would let a peer bypass
+///   any policy rule that classifies on argument content (e.g. shell command
+///   text) just by omitting `rawInput`.
+/// - `fields.kind` absent or `ToolKind::Other` → `Err(UnidentifiableTool)`.
+pub fn normalize_tool_call_for_policy(
+    update: &ToolCallUpdate,
+) -> Result<(String, Value), PermissionError> {
+    let tool = match update.fields.kind {
+        Some(kind) if kind != ToolKind::Other => format!("{kind:?}"),
+        _ => {
+            return Err(PermissionError::UnidentifiableTool {
+                tool_call_id: update.tool_call_id.to_string(),
+            })
+        }
+    };
+    let args = update
+        .fields
+        .raw_input
+        .clone()
+        .ok_or_else(|| PermissionError::MissingRawInput {
+            tool_call_id: update.tool_call_id.to_string(),
+        })?;
+    Ok((tool, args))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::ToolCallUpdateFields;
 
     struct FakePolicy(PolicyOutcome);
     impl PolicyEngineLike for FakePolicy {
@@ -227,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_decision_also_selects_a_reject_option() {
+    fn ask_decision_selects_reject_once_when_offered() {
         let policy = FakePolicy(PolicyOutcome {
             decision: PolicyDecision::Ask,
             rule: None,
@@ -244,6 +452,38 @@ mod tests {
         assert_eq!(
             selected_option_id(&outcome).map(|id| id.to_string()),
             Some("reject-once".to_string())
+        );
+    }
+
+    #[test]
+    fn ask_decision_does_not_fall_back_to_reject_always_when_reject_once_not_offered() {
+        // SEC-4: unlike Deny, Ask must never fall back to RejectAlways —
+        // that would permanently discard a still-pending human decision.
+        let policy = FakePolicy(PolicyOutcome {
+            decision: PolicyDecision::Ask,
+            rule: None,
+            hint: None,
+        });
+        let server = AcpServer { policy: &policy };
+        let options = vec![
+            PermissionOption::new("allow-once", "Allow once", PermissionOptionKind::AllowOnce),
+            PermissionOption::new(
+                "reject-always",
+                "Reject always",
+                PermissionOptionKind::RejectAlways,
+            ),
+        ];
+        let err = handle_request_permission(&server, "shell", &serde_json::json!({}), &options)
+            .expect_err("RejectOnce was not offered, and Ask must not settle for RejectAlways");
+        assert_eq!(
+            err,
+            PermissionError::AskCannotFallBackToRejectAlways {
+                tool: "shell".to_string(),
+                offered_kinds: vec![
+                    PermissionOptionKind::AllowOnce,
+                    PermissionOptionKind::RejectAlways
+                ],
+            }
         );
     }
 
@@ -304,6 +544,192 @@ mod tests {
         assert_eq!(
             selected_option_id(&RequestPermissionOutcome::Cancelled),
             None
+        );
+    }
+
+    // ---- SEC-1: ambiguous option_id handling ----
+
+    #[test]
+    fn duplicate_option_id_across_conflicting_kinds_is_rejected_before_selection() {
+        // The exact attack from round-2 review: a peer offers the same
+        // option_id under two different kinds. If we selected by kind and
+        // emitted Selected{option_id: "go"}, a consumer resolving "go" back
+        // to a kind by first match could read AllowOnce even though we
+        // picked the RejectOnce entry — the peer chooses which. This must
+        // be refused outright, not merely selected "correctly" by luck of
+        // iteration order.
+        let policy = FakePolicy(PolicyOutcome {
+            decision: PolicyDecision::Deny,
+            rule: None,
+            hint: None,
+        });
+        let server = AcpServer { policy: &policy };
+        let options = vec![
+            PermissionOption::new("go", "Reject", PermissionOptionKind::RejectOnce),
+            PermissionOption::new("go", "Allow", PermissionOptionKind::AllowOnce),
+        ];
+        let err = handle_request_permission(&server, "shell", &serde_json::json!({}), &options)
+            .expect_err("duplicate option_id across conflicting kinds must be refused");
+        assert!(matches!(err, PermissionError::AmbiguousOptions { .. }));
+    }
+
+    #[test]
+    fn empty_option_id_is_rejected_before_selection() {
+        let policy = FakePolicy(PolicyOutcome {
+            decision: PolicyDecision::Allow,
+            rule: None,
+            hint: None,
+        });
+        let server = AcpServer { policy: &policy };
+        let options = vec![PermissionOption::new(
+            "",
+            "Allow",
+            PermissionOptionKind::AllowOnce,
+        )];
+        let err = handle_request_permission(&server, "shell", &serde_json::json!({}), &options)
+            .expect_err("an empty option_id must be refused");
+        assert!(matches!(err, PermissionError::AmbiguousOptions { .. }));
+    }
+
+    #[test]
+    fn duplicate_option_id_with_the_same_kind_is_still_rejected() {
+        // Same id offered twice under the *same* kind is also ambiguous —
+        // a caller resolving the id can't tell which PermissionOption record
+        // (e.g. differing `name`) the peer meant.
+        let policy = FakePolicy(PolicyOutcome {
+            decision: PolicyDecision::Allow,
+            rule: None,
+            hint: None,
+        });
+        let server = AcpServer { policy: &policy };
+        let options = vec![
+            PermissionOption::new("dup", "Allow (first)", PermissionOptionKind::AllowOnce),
+            PermissionOption::new("dup", "Allow (second)", PermissionOptionKind::AllowOnce),
+        ];
+        let err = handle_request_permission(&server, "shell", &serde_json::json!({}), &options)
+            .expect_err("duplicate option_id must be refused even under one kind");
+        assert!(matches!(err, PermissionError::AmbiguousOptions { .. }));
+    }
+
+    // ---- resolve_selection ----
+
+    #[test]
+    fn resolve_selection_returns_the_kind_for_a_valid_unambiguous_selection() {
+        let options = all_four_options();
+        let outcome =
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("reject-once"));
+        assert_eq!(
+            resolve_selection(&options, &outcome),
+            Some(PermissionOptionKind::RejectOnce)
+        );
+    }
+
+    #[test]
+    fn resolve_selection_returns_none_when_options_are_ambiguous() {
+        let options = vec![
+            PermissionOption::new("go", "Reject", PermissionOptionKind::RejectOnce),
+            PermissionOption::new("go", "Allow", PermissionOptionKind::AllowOnce),
+        ];
+        let outcome = RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("go"));
+        assert_eq!(resolve_selection(&options, &outcome), None);
+    }
+
+    #[test]
+    fn resolve_selection_returns_none_when_the_selected_id_is_not_offered() {
+        let options = all_four_options();
+        let outcome =
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("not-an-offered-id"));
+        assert_eq!(resolve_selection(&options, &outcome), None);
+    }
+
+    #[test]
+    fn resolve_selection_returns_none_for_cancelled() {
+        let options = all_four_options();
+        assert_eq!(
+            resolve_selection(&options, &RequestPermissionOutcome::Cancelled),
+            None
+        );
+    }
+
+    // ---- normalize_tool_call_for_policy ----
+
+    #[test]
+    fn normalize_tool_call_extracts_tool_and_args_when_both_are_present() {
+        let update = ToolCallUpdate::new(
+            "tc-1",
+            ToolCallUpdateFields::new()
+                .kind(ToolKind::Execute)
+                .raw_input(serde_json::json!({"cmd": "ls"})),
+        );
+        let (tool, args) = normalize_tool_call_for_policy(&update).expect("both fields present");
+        assert_eq!(tool, "Execute");
+        assert_eq!(args, serde_json::json!({"cmd": "ls"}));
+    }
+
+    #[test]
+    fn normalize_tool_call_fails_closed_when_raw_input_is_absent() {
+        // Absent rawInput must not be silently treated as `{}` — that would
+        // be indistinguishable from a real empty-args call.
+        let update =
+            ToolCallUpdate::new("tc-2", ToolCallUpdateFields::new().kind(ToolKind::Execute));
+        let err = normalize_tool_call_for_policy(&update).expect_err("rawInput was never supplied");
+        assert_eq!(
+            err,
+            PermissionError::MissingRawInput {
+                tool_call_id: "tc-2".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn normalize_tool_call_distinguishes_absent_raw_input_from_present_but_empty() {
+        // A present-but-empty {} object is a legitimate normalization result,
+        // not an error — only *absence* is refused.
+        let update = ToolCallUpdate::new(
+            "tc-3",
+            ToolCallUpdateFields::new()
+                .kind(ToolKind::Execute)
+                .raw_input(serde_json::json!({})),
+        );
+        let (_, args) =
+            normalize_tool_call_for_policy(&update).expect("rawInput was `{}`, not absent");
+        assert_eq!(args, serde_json::json!({}));
+    }
+
+    #[test]
+    fn normalize_tool_call_fails_closed_when_kind_is_absent() {
+        let update = ToolCallUpdate::new(
+            "tc-4",
+            ToolCallUpdateFields::new().raw_input(serde_json::json!({})),
+        );
+        let err = normalize_tool_call_for_policy(&update).expect_err("kind was never supplied");
+        assert_eq!(
+            err,
+            PermissionError::UnidentifiableTool {
+                tool_call_id: "tc-4".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn normalize_tool_call_fails_closed_when_kind_is_other() {
+        // ToolKind::Other is both the default and the deserialization
+        // fallback for any unrecognized kind — it must not be trusted to
+        // identify a specific tool, even though a title might be present.
+        let update = ToolCallUpdate::new(
+            "tc-5",
+            ToolCallUpdateFields::new()
+                .kind(ToolKind::Other)
+                .title("Doing something".to_string())
+                .raw_input(serde_json::json!({})),
+        );
+        let err = normalize_tool_call_for_policy(&update)
+            .expect_err("kind was Other, and title is never used as a fallback identifier");
+        assert_eq!(
+            err,
+            PermissionError::UnidentifiableTool {
+                tool_call_id: "tc-5".to_string()
+            }
         );
     }
 }

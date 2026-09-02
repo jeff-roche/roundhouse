@@ -1,5 +1,6 @@
 use roundhouse_acp::decision::{
     acp_permission_request_to_our_decision, decision_to_mcp_tool_result, deny_and_continue_error,
+    McpCallDisposition, DEFAULT_DENY_HINT,
 };
 use roundhouse_acp::server::PolicyOutcome;
 use roundhouse_core::PolicyDecision;
@@ -23,29 +24,58 @@ fn an_agent_told_it_may_not_git_push_gets_legible_context_not_a_hang() {
         rule: Some("no-git-push".to_string()),
         hint: Some("write a patch file instead".to_string()),
     };
-    let result = decision_to_mcp_tool_result(&outcome);
-    assert!(result.is_some());
-    assert_eq!(result.unwrap().error, "permission_denied");
+    match decision_to_mcp_tool_result(&outcome) {
+        McpCallDisposition::Denied(err) => assert_eq!(err.error, "permission_denied"),
+        other => panic!("expected Denied, got {other:?}"),
+    }
 }
 
 #[test]
-fn allow_produces_no_tool_error_at_all() {
+fn deny_with_no_rule_or_hint_still_produces_legible_context_not_empty_strings() {
+    // SEC-5 (round-2 review): a missing hint must not collapse to "".
+    let outcome = PolicyOutcome {
+        decision: PolicyDecision::Deny,
+        rule: None,
+        hint: None,
+    };
+    match decision_to_mcp_tool_result(&outcome) {
+        McpCallDisposition::Denied(err) => {
+            assert_eq!(err.rule, "unspecified-rule");
+            assert_eq!(err.hint, DEFAULT_DENY_HINT);
+            assert!(!err.hint.is_empty());
+        }
+        other => panic!("expected Denied, got {other:?}"),
+    }
+}
+
+#[test]
+fn allow_proceeds() {
     let outcome = PolicyOutcome {
         decision: PolicyDecision::Allow,
         rule: None,
         hint: None,
     };
-    assert!(decision_to_mcp_tool_result(&outcome).is_none());
+    assert_eq!(
+        decision_to_mcp_tool_result(&outcome),
+        McpCallDisposition::Proceed
+    );
 }
 
 #[test]
-fn ask_produces_no_tool_error_either_it_suspends_for_a_human_instead() {
+fn ask_suspends_it_is_not_a_proceed_and_not_a_denial() {
+    // SEC-3 (round-2 review): under the old Option<StructuredToolError>
+    // return type, Allow and Ask were both `None`, so a caller doing
+    // `if let Some(err) = ... { deny } else { execute }` would execute a
+    // tool call while a human decision was still pending. Proceed/Suspend
+    // must be distinct dispositions.
     let outcome = PolicyOutcome {
         decision: PolicyDecision::Ask,
         rule: None,
         hint: None,
     };
-    assert!(decision_to_mcp_tool_result(&outcome).is_none());
+    let disposition = decision_to_mcp_tool_result(&outcome);
+    assert_eq!(disposition, McpCallDisposition::Suspend);
+    assert_ne!(disposition, McpCallDisposition::Proceed);
 }
 
 #[test]

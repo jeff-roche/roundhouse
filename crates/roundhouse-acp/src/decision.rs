@@ -16,6 +16,16 @@ pub struct StructuredToolError {
     pub hint: String,
 }
 
+/// Used when a `Deny` decision doesn't carry a specific `hint`. SEC-5
+/// (round-2 review): an empty string here would produce
+/// `{"error":"permission_denied","rule":"unspecified-rule","hint":""}`,
+/// which defeats §8.5's "legible, not a hang" requirement just as surely as
+/// no structured error at all — a model reading `hint: ""` has nothing more
+/// to act on than if the field were absent. This names a general remedy
+/// instead.
+pub const DEFAULT_DENY_HINT: &str =
+    "this action was denied by policy; consult the operator or workspace configuration for an alternative approach";
+
 pub fn deny_and_continue_error(rule: &str, hint: &str) -> StructuredToolError {
     StructuredToolError {
         error: "permission_denied",
@@ -24,21 +34,57 @@ pub fn deny_and_continue_error(rule: &str, hint: &str) -> StructuredToolError {
     }
 }
 
+/// What an MCP `tools/call` caller must do with a `PolicyOutcome`, produced
+/// by [`decision_to_mcp_tool_result`].
+///
+/// SEC-3 (round-2 review): this replaces an `Option<StructuredToolError>`
+/// return type. Under `Option`, both `Allow` and `Ask` returned `None`, and
+/// the natural caller shape —
+///
+/// ```ignore
+/// if let Some(err) = decision_to_mcp_tool_result(&o) { return err } else { execute() }
+/// ```
+///
+/// — executes the tool on `Ask`, i.e. while a human decision is still
+/// pending. `handle_request_permission` (`crate::server`) already keeps
+/// `Ask` and `Deny` apart; this was the only place in the crate where that
+/// distinction was lost. `Option` is the wrong carrier at a permission
+/// boundary: a two-armed `if let`/`else` can only express "blocked" and
+/// "not blocked," and `Ask` is neither.
+#[derive(Debug, Clone, PartialEq)]
+pub enum McpCallDisposition {
+    /// `Allow`: the tool call may proceed.
+    Proceed,
+    /// `Ask`: a human decision is pending. The call must not execute yet,
+    /// and must not be treated as denied either — the caller suspends
+    /// (Phase 2's persisted `Suspended{AwaitingApproval}`, §6.4) rather than
+    /// returning either a result or an error.
+    Suspend,
+    /// `Deny`: the tool call is refused. Carries the structured error to
+    /// feed back into model context so the caller can respond legibly
+    /// rather than hang.
+    Denied(StructuredToolError),
+}
+
 /// An MCP `tools/call` denial becomes a structured tool result fed back into
 /// the model's context rather than a bare protocol error — this is the
 /// direction "an MCP tools/call we want approved becomes an ACP
 /// session/request_permission upward" resolves to when the answer is no.
 /// `outcome.rule`/`outcome.hint` (both threaded alongside the real
 /// `PolicyDecision`, per `crate::server::PolicyOutcome`) supply the
-/// structured error's fields.
-pub fn decision_to_mcp_tool_result(outcome: &PolicyOutcome) -> Option<StructuredToolError> {
+/// structured error's fields; a missing `hint` falls back to
+/// [`DEFAULT_DENY_HINT`], never an empty string.
+pub fn decision_to_mcp_tool_result(outcome: &PolicyOutcome) -> McpCallDisposition {
     match outcome.decision {
-        PolicyDecision::Allow => None,
-        PolicyDecision::Deny => Some(deny_and_continue_error(
+        PolicyDecision::Allow => McpCallDisposition::Proceed,
+        PolicyDecision::Deny => McpCallDisposition::Denied(deny_and_continue_error(
             outcome.rule.as_deref().unwrap_or("unspecified-rule"),
-            outcome.hint.as_deref().unwrap_or(""),
+            outcome.hint.as_deref().unwrap_or(DEFAULT_DENY_HINT),
         )),
-        PolicyDecision::Ask => None, // Ask suspends for a real approval (§6.4); it is not itself a deny, so no structured error is emitted here
+        // Ask suspends for a real approval (§6.4); it is neither a proceed
+        // nor a deny, so it gets its own disposition rather than collapsing
+        // into either.
+        PolicyDecision::Ask => McpCallDisposition::Suspend,
     }
 }
 
@@ -106,29 +152,58 @@ mod tests {
             rule: Some("no-git-push".to_string()),
             hint: Some("write a patch file instead".to_string()),
         };
-        let result = decision_to_mcp_tool_result(&outcome);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().error, "permission_denied");
+        match decision_to_mcp_tool_result(&outcome) {
+            McpCallDisposition::Denied(err) => assert_eq!(err.error, "permission_denied"),
+            other => panic!("expected Denied, got {other:?}"),
+        }
     }
 
     #[test]
-    fn allow_produces_no_tool_error_at_all() {
+    fn deny_with_no_rule_or_hint_still_produces_legible_context_not_empty_strings() {
+        // SEC-5: every prior test supplied Some(rule)/Some(hint); this covers
+        // the fallback path, which must not collapse the hint into "".
+        let outcome = PolicyOutcome {
+            decision: PolicyDecision::Deny,
+            rule: None,
+            hint: None,
+        };
+        match decision_to_mcp_tool_result(&outcome) {
+            McpCallDisposition::Denied(err) => {
+                assert_eq!(err.rule, "unspecified-rule");
+                assert_eq!(err.hint, DEFAULT_DENY_HINT);
+                assert!(!err.hint.is_empty());
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allow_proceeds() {
         let outcome = PolicyOutcome {
             decision: PolicyDecision::Allow,
             rule: None,
             hint: None,
         };
-        assert!(decision_to_mcp_tool_result(&outcome).is_none());
+        assert_eq!(
+            decision_to_mcp_tool_result(&outcome),
+            McpCallDisposition::Proceed
+        );
     }
 
     #[test]
-    fn ask_produces_no_tool_error_either_it_suspends_instead() {
+    fn ask_suspends_distinctly_from_allow_proceeding() {
+        // SEC-3: Allow and Ask must be distinguishable results, not both
+        // collapse into "no error" — a caller that executes on anything
+        // that isn't `Denied` must not execute while a human decision is
+        // still pending.
         let outcome = PolicyOutcome {
             decision: PolicyDecision::Ask,
             rule: None,
             hint: None,
         };
-        assert!(decision_to_mcp_tool_result(&outcome).is_none());
+        let disposition = decision_to_mcp_tool_result(&outcome);
+        assert_eq!(disposition, McpCallDisposition::Suspend);
+        assert_ne!(disposition, McpCallDisposition::Proceed);
     }
 
     #[test]

@@ -75,6 +75,59 @@ fn tool_call_update_with_embedded_newline_in_title_maps_to_none() {
     .is_none());
 }
 
+/// SEC-6 (round-2 review): a hardcoded list of representatives is
+/// bypassable by an unrelated edit — a seventh `AcpSessionUpdate` variant
+/// could be added and this list would keep compiling, silently unmapped by
+/// the guard test below. The exact class of mistake the no-forgery
+/// invariant exists to prevent, one level up.
+///
+/// Matching a representative `seed` value through every `AcpSessionUpdate`
+/// variant with no wildcard arm makes adding a variant without extending
+/// this function a compile error (`non-exhaustive patterns`) — the same
+/// "exhaustive destructure as a compile-time tripwire" idiom
+/// `roundhouse-core`'s `_event_shape_is_exhaustive` (`event.rs`) uses for
+/// `Event`.
+fn all_representatives() -> Vec<AcpSessionUpdate> {
+    let seed = AcpSessionUpdate::AgentMessageChunk {
+        text: String::new(),
+    };
+    match seed {
+        AcpSessionUpdate::AgentMessageChunk { .. } => vec![
+            AcpSessionUpdate::AgentMessageChunk {
+                text: "hello".into(),
+            },
+            AcpSessionUpdate::AgentThoughtChunk {
+                text: "thinking...".into(),
+            },
+            AcpSessionUpdate::ToolCallUpdate {
+                id: "tc-1".into(),
+                status: "running".into(),
+                title: "Reading file.rs".into(),
+            },
+            AcpSessionUpdate::PlanUpdate {
+                entries: vec!["step 1".into()],
+            },
+            AcpSessionUpdate::StateUpdateIdle {
+                stop_reason: "end_turn".into(),
+            },
+            AcpSessionUpdate::UsageUpdate {
+                tokens: 1,
+                cost_usd: 0.0,
+            },
+        ],
+        // Unreachable at runtime (`seed` is always `AgentMessageChunk`
+        // above) — these arms exist purely so the match has no wildcard,
+        // which is what makes a future variant a compile error here.
+        AcpSessionUpdate::AgentThoughtChunk { .. }
+        | AcpSessionUpdate::ToolCallUpdate { .. }
+        | AcpSessionUpdate::PlanUpdate { .. }
+        | AcpSessionUpdate::StateUpdateIdle { .. }
+        | AcpSessionUpdate::UsageUpdate { .. } => {
+            unreachable!("seed is always AcpSessionUpdate::AgentMessageChunk")
+        }
+    }
+}
+
 #[test]
 fn no_two_arms_emit_the_same_payload_shape_the_no_forgery_invariant_is_enforced() {
     // `map_update`'s doc comment states an invariant in prose: "an arm may
@@ -111,29 +164,7 @@ fn no_two_arms_emit_the_same_payload_shape_the_no_forgery_invariant_is_enforced(
         }
     }
 
-    let representatives = [
-        AcpSessionUpdate::AgentMessageChunk {
-            text: "hello".into(),
-        },
-        AcpSessionUpdate::AgentThoughtChunk {
-            text: "thinking...".into(),
-        },
-        AcpSessionUpdate::ToolCallUpdate {
-            id: "tc-1".into(),
-            status: "running".into(),
-            title: "Reading file.rs".into(),
-        },
-        AcpSessionUpdate::PlanUpdate {
-            entries: vec!["step 1".into()],
-        },
-        AcpSessionUpdate::StateUpdateIdle {
-            stop_reason: "end_turn".into(),
-        },
-        AcpSessionUpdate::UsageUpdate {
-            tokens: 1,
-            cost_usd: 0.0,
-        },
-    ];
+    let representatives = all_representatives();
 
     let mut seen = HashSet::new();
     let mut emitted_count = 0;
