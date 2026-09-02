@@ -22,12 +22,13 @@
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use regex::{Captures, Regex};
 use serde_json::Value;
 use sse_stream::SseStream;
 use std::collections::HashSet;
-use std::sync::LazyLock;
 
+// Fix round 2, N2: `redact_transport_error_text` now lives in `mod.rs` so
+// `provider.rs`'s three other transport-error sinks can share it too.
+use super::redact_transport_error_text;
 use crate::stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 use crate::TransportError;
 
@@ -69,15 +70,19 @@ pub enum StreamFailureKind {
 /// by `kind`, per this module's doc comment. Mirrors
 /// `google_genai::decode::StreamFailure`, extended with `kind` and
 /// `partial_text` (fix round 1, L1/L2).
+///
+/// Fix round 2, N3: this originally also carried a `code: Option<String>`
+/// (the raw or sanitized `finish_reason` string). Its only reader was
+/// `stream_failure_body`, deleted along with the `classify`-at-200 path L2
+/// removed -- after that, `code` was write-only outside a single test
+/// assertion, AND inconsistent (raw for a known value, `{:?}`-quoted for the
+/// sanitized unknown arm). Dropped rather than given a reader that doesn't
+/// exist yet; `message` already carries the same information, consistently
+/// formatted, for every arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamFailure {
     /// How `provider.rs` should map this into a `ProviderError`.
     pub kind: StreamFailureKind,
-    /// The provider's `finish_reason` value, when the event carried one.
-    /// Length-capped and escaped (fix round 1, L10) -- this string can
-    /// originate from an untrusted upstream response and reach a persisted
-    /// error field.
-    pub code: Option<String>,
     /// A human-readable description of the failure. Redacted (fix round 1,
     /// L3) for the `Transport` kind, since a mid-stream transport error's
     /// text can embed the full request URL, query string and all.
@@ -90,9 +95,9 @@ pub struct StreamFailure {
 }
 
 /// Caps how much of an untrusted `finish_reason` string is echoed into a
-/// diagnostic message or `StreamFailure.code` (fix round 1, L10) -- Cohere's
-/// documented values are all well under this, so it never truncates a real
-/// one; only an attacker- or bug-supplied arbitrary-length string is capped.
+/// diagnostic message (fix round 1, L10) -- Cohere's documented values are
+/// all well under this, so it never truncates a real one; only an attacker-
+/// or bug-supplied arbitrary-length string is capped.
 const MAX_FINISH_REASON_ECHO_LEN: usize = 64;
 
 /// Truncates `raw` to [`MAX_FINISH_REASON_ECHO_LEN`] chars and renders it via
@@ -126,46 +131,38 @@ fn partial_text_from_events(events: &[StreamEvent]) -> String {
     text
 }
 
-/// Matches an embedded `http(s)://` URL inside a larger error-message string
-/// (fix round 1, L3) -- `reqwest::Error`'s `Display` appends `for url
-/// (<full url>)` verbatim, query string and userinfo included, to a
-/// transport error's text. Stops at the first whitespace, parenthesis, or
-/// quote character, which is always where such an embedded URL ends in
-/// practice (a bare URL token, not URL-encoded punctuation of that shape).
-static EMBEDDED_URL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"https?://[^\s()'"]+"#).unwrap());
-
-/// Redacts a mid-stream transport-error message for safe inclusion in a
-/// `StreamFailure` (fix round 1, L3): every embedded `http(s)://` URL is
-/// reduced to `host[:port]` via the same host-only helper
-/// `resolve_base_url` already uses before a base-URL override is ever
-/// persisted (`crate::credential::record_base_url_override`), THEN the
-/// result is passed through this crate's general secret-shape redactor
-/// (`crate::audit::redact_error_body`) to catch anything else (a bearer
-/// token, an API key) the error text might otherwise echo.
-///
-/// Without this, a gateway base URL carrying credentials in its query
-/// string (this codec's own `preserves_a_gateway_query_string` test proves
-/// that shape is supported) would leak them into `StreamFailure.message`,
-/// a `pub` field one step from a persisted `Event` row.
-fn redact_transport_error_text(raw: &str) -> String {
-    let url_redacted = EMBEDDED_URL.replace_all(raw, |caps: &Captures| {
-        crate::credential::record_base_url_override(&caps[0])
-    });
-    crate::audit::redact_error_body(&url_redacted)
+/// Which wire index namespace a `wire_index` belongs to (fix round 2, N1).
+/// Cohere v2 indexes `message.content[]` and `message.tool_calls[]` from
+/// INDEPENDENT counters (verified; also visible in this codec's own
+/// `reasoning.cassette` -- content indexes 0,1 -- and `parallel_tools.cassette`
+/// -- tool indexes 0,1, each starting its own count from 0). A codec
+/// advertising `thinking = true` AND `tools = true` (this one) can receive a
+/// thinking block and a tool call that both carry wire index 0 in the same
+/// turn; treating that as one namespace collides them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum IndexFamily {
+    /// `content-start`/`content-delta`/`content-end`'s `index`.
+    Content,
+    /// `tool-call-start`/`tool-call-delta`/`tool-call-end`'s `index`.
+    Tool,
 }
 
-/// Tracks which wire `index` values were opened by a RECOGNIZED
+/// Tracks which `(family, wire index)` pairs were opened by a RECOGNIZED
 /// block-opening event (`content-start`/`tool-call-start`) -- mirrors
 /// `google_genai::decode`'s `StepKeyer` for the identical reason: a
 /// `content-end`/`tool-call-end` for an index this decoder never opened must
 /// not fabricate a `BlockStop`, and `citation-start`/`citation-end` (which
 /// reuse a CONTENT block's own index -- verified: the fetched `citation-start`
 /// example carries the same `"index":0` as the content block it annotates,
-/// not a fresh one) must never consume a keyer slot.
+/// not a fresh one) must never consume a keyer slot. Keyed on `(IndexFamily,
+/// u64)`, not bare `u64` (fix round 2, N1): the two families are independent
+/// wire-index namespaces that legitimately reuse the same numbers, and
+/// deduping on the raw number alone silently dropped whichever block opened
+/// second -- worse than the duplicate-`BlockStart` bug L8 fixed, since the
+/// lost block never surfaces at all.
 struct IndexKeyer {
     keyer: DeltaKeyer,
-    recognized: HashSet<u64>,
+    recognized: HashSet<(IndexFamily, u64)>,
 }
 
 impl IndexKeyer {
@@ -176,27 +173,39 @@ impl IndexKeyer {
         }
     }
 
-    /// Opens a new recognized block at `wire_index`, returning its stable
-    /// normalized index -- but only if `wire_index` was not already open.
-    /// `None` for a repeat (fix round 1, L8): a second `content-start`/
-    /// `tool-call-start` for an index this decoder already opened must not
-    /// fabricate a second `BlockStart` for the same normalized index (which
-    /// `roundhouse-engine::infer`'s fold would otherwise materialize as a
-    /// phantom second block).
-    fn open(&mut self, wire_index: u64) -> Option<u32> {
-        if self.recognized.contains(&wire_index) {
-            return None;
+    /// The `DeltaKeyer` key for `(family, wire_index)` -- prefixed by family
+    /// so a content-index and a tool-index of the same number never collide
+    /// onto the same normalized index either.
+    fn keyer_key(family: IndexFamily, wire_index: u64) -> String {
+        match family {
+            IndexFamily::Content => format!("content:{wire_index}"),
+            IndexFamily::Tool => format!("tool:{wire_index}"),
         }
-        self.recognized.insert(wire_index);
-        Some(self.keyer.index_for(&wire_index.to_string()))
     }
 
-    /// The stable normalized index for `wire_index`, but only if it was
-    /// previously `open`ed -- `None` otherwise, without ever calling
+    /// Opens a new recognized block at `(family, wire_index)`, returning its
+    /// stable normalized index -- but only if that pair was not already
+    /// open. `None` for a repeat (fix round 1, L8): a second `content-start`/
+    /// `tool-call-start` for an index this decoder already opened, WITHIN
+    /// THE SAME FAMILY, must not fabricate a second `BlockStart` for the
+    /// same normalized index (which `roundhouse-engine::infer`'s fold would
+    /// otherwise materialize as a phantom second block). A cross-family
+    /// reuse of the same number is not a repeat and correctly opens a second
+    /// block (fix round 2, N1).
+    fn open(&mut self, family: IndexFamily, wire_index: u64) -> Option<u32> {
+        if self.recognized.contains(&(family, wire_index)) {
+            return None;
+        }
+        self.recognized.insert((family, wire_index));
+        Some(self.keyer.index_for(&Self::keyer_key(family, wire_index)))
+    }
+
+    /// The stable normalized index for `(family, wire_index)`, but only if
+    /// it was previously `open`ed -- `None` otherwise, without ever calling
     /// `index_for` (which would burn a slot).
-    fn existing(&mut self, wire_index: u64) -> Option<u32> {
-        if self.recognized.contains(&wire_index) {
-            Some(self.keyer.index_for(&wire_index.to_string()))
+    fn existing(&mut self, family: IndexFamily, wire_index: u64) -> Option<u32> {
+        if self.recognized.contains(&(family, wire_index)) {
+            Some(self.keyer.index_for(&Self::keyer_key(family, wire_index)))
         } else {
             None
         }
@@ -226,7 +235,6 @@ pub async fn decode_cohere_v2_stream(
                 // redacted before it ever reaches this `pub` field.
                 return Err(StreamFailure {
                     kind: StreamFailureKind::Transport,
-                    code: None,
                     message: redact_transport_error_text(&format!(
                         "SSE transport error while decoding the cohere-v2 chat stream: {e}"
                     )),
@@ -260,8 +268,18 @@ pub async fn decode_cohere_v2_stream(
                     events.push(ev);
                 }
             }
-            "content-end" | "tool-call-end" => {
-                if let Some(ev) = decode_block_end(&payload, &mut keyer) {
+            // Fix round 2, N1: `content-end` and `tool-call-end` close a
+            // block in DIFFERENT index namespaces -- routed through the
+            // matching `IndexFamily` rather than one shared arm, so a
+            // content-index and a tool-index of the same wire value never
+            // resolve to the same normalized block.
+            "content-end" => {
+                if let Some(ev) = decode_block_end(&payload, &mut keyer, IndexFamily::Content) {
+                    events.push(ev);
+                }
+            }
+            "tool-call-end" => {
+                if let Some(ev) = decode_block_end(&payload, &mut keyer, IndexFamily::Tool) {
                     events.push(ev);
                 }
             }
@@ -309,7 +327,6 @@ pub async fn decode_cohere_v2_stream(
     // `sse-stream` drops silently) never surfaces there.
     Err(StreamFailure {
         kind: StreamFailureKind::Truncated,
-        code: None,
         message: "cohere-v2 chat stream ended without ever observing a message-end event -- \
                    the generation was truncated"
             .into(),
@@ -349,25 +366,21 @@ fn decode_message_end(
         }
         "MAX_TOKENS" => Err(StreamFailure {
             kind: StreamFailureKind::MaxTokens,
-            code: Some(finish_reason.to_string()),
             message: format!("cohere-v2 chat generation stopped: {finish_reason}"),
             partial_text: partial_text_from_events(&events),
         }),
         "ERROR" => Err(StreamFailure {
             kind: StreamFailureKind::Error,
-            code: Some(finish_reason.to_string()),
             message: format!("cohere-v2 chat generation stopped: {finish_reason}"),
             partial_text: partial_text_from_events(&events),
         }),
         "TIMEOUT" => Err(StreamFailure {
             kind: StreamFailureKind::Timeout,
-            code: Some(finish_reason.to_string()),
             message: format!("cohere-v2 chat generation stopped: {finish_reason}"),
             partial_text: partial_text_from_events(&events),
         }),
         "" => Err(StreamFailure {
             kind: StreamFailureKind::UnrecognizedFinishReason,
-            code: None,
             message: "cohere-v2 chat stream's message-end event carried no finish_reason".into(),
             partial_text: partial_text_from_events(&events),
         }),
@@ -378,7 +391,6 @@ fn decode_message_end(
             let safe = sanitize_finish_reason_for_message(other);
             Err(StreamFailure {
                 kind: StreamFailureKind::UnrecognizedFinishReason,
-                code: Some(safe.clone()),
                 message: format!(
                     "cohere-v2 chat stream ended with an unrecognized finish_reason {safe}"
                 ),
@@ -405,7 +417,7 @@ fn decode_content_start(payload: &Value, keyer: &mut IndexKeyer) -> Option<Strea
         "thinking" => BlockKind::Thinking,
         _ => return None,
     };
-    let index = keyer.open(wire_index)?;
+    let index = keyer.open(IndexFamily::Content, wire_index)?;
     Some(StreamEvent::BlockStart { index, kind })
 }
 
@@ -415,7 +427,7 @@ fn decode_content_start(payload: &Value, keyer: &mut IndexKeyer) -> Option<Strea
 /// being `text`).
 fn decode_content_delta(payload: &Value, keyer: &mut IndexKeyer) -> Option<StreamEvent> {
     let wire_index = payload.get("index").and_then(Value::as_u64)?;
-    let index = keyer.existing(wire_index)?;
+    let index = keyer.existing(IndexFamily::Content, wire_index)?;
     let content = payload.pointer("/delta/message/content")?;
     if let Some(text) = content.get("text").and_then(Value::as_str) {
         return Some(StreamEvent::BlockDelta {
@@ -436,10 +448,16 @@ fn decode_content_delta(payload: &Value, keyer: &mut IndexKeyer) -> Option<Strea
 }
 
 /// `content-end`/`tool-call-end`: `{type, index}` -- both close whichever
-/// block `index` refers to, so one function serves both event types.
-fn decode_block_end(payload: &Value, keyer: &mut IndexKeyer) -> Option<StreamEvent> {
+/// block `index` refers to, so one function serves both event types, but
+/// `family` (fix round 2, N1) picks the right namespace so a content-index
+/// and a tool-index of the same wire value don't resolve to the same block.
+fn decode_block_end(
+    payload: &Value,
+    keyer: &mut IndexKeyer,
+    family: IndexFamily,
+) -> Option<StreamEvent> {
     let wire_index = payload.get("index").and_then(Value::as_u64)?;
-    let index = keyer.existing(wire_index)?;
+    let index = keyer.existing(family, wire_index)?;
     Some(StreamEvent::BlockStop { index })
 }
 
@@ -462,7 +480,7 @@ fn decode_tool_call_start(payload: &Value, keyer: &mut IndexKeyer) -> Option<Str
         .get("id")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let index = keyer.open(wire_index)?;
+    let index = keyer.open(IndexFamily::Tool, wire_index)?;
     Some(StreamEvent::BlockStart {
         index,
         kind: BlockKind::ToolUse { name, provider_id },
@@ -475,7 +493,7 @@ fn decode_tool_call_start(payload: &Value, keyer: &mut IndexKeyer) -> Option<Str
 /// matching this crate's §9.3 normative rule.
 fn decode_tool_call_delta(payload: &Value, keyer: &mut IndexKeyer) -> Option<StreamEvent> {
     let wire_index = payload.get("index").and_then(Value::as_u64)?;
-    let index = keyer.existing(wire_index)?;
+    let index = keyer.existing(IndexFamily::Tool, wire_index)?;
     let fragment = payload
         .pointer("/delta/message/tool_calls/function/arguments")
         .and_then(Value::as_str)
@@ -567,7 +585,9 @@ mod usage_tests {
 
 #[cfg(test)]
 mod terminal_tests {
-    use super::{decode_block_end, decode_content_start, decode_message_end, IndexKeyer};
+    use super::{
+        decode_block_end, decode_content_start, decode_message_end, IndexFamily, IndexKeyer,
+    };
     use crate::stream_event::{BlockKind, StreamEvent};
 
     /// Mirrors `google_genai::decode`'s `an_unrecognized_step_type_never_
@@ -587,7 +607,7 @@ mod terminal_tests {
 
         let unrecognized_end = serde_json::json!({ "type": "content-end", "index": 0 });
         assert!(
-            decode_block_end(&unrecognized_end, &mut keyer).is_none(),
+            decode_block_end(&unrecognized_end, &mut keyer, IndexFamily::Content).is_none(),
             "a content-end for a content type this decoder never opened must not \
              fabricate a BlockStop"
         );
@@ -742,7 +762,6 @@ mod terminal_tests {
     fn a_missing_finish_reason_is_a_stream_failure_not_a_silent_success() {
         let payload = serde_json::json!({ "type": "message-end", "delta": {} });
         let err = expect_failure(decode_message_end(&payload, Vec::new()));
-        assert!(err.code.is_none());
         assert_eq!(err.kind, super::StreamFailureKind::UnrecognizedFinishReason);
     }
 
@@ -1055,52 +1074,98 @@ mod stream_tests {
             serde_json::from_str(&args).expect("concatenated fragments must form valid JSON");
         assert_eq!(parsed["location"], "Tokyo");
     }
+
+    /// Fix round 2, N1: `message.content[]` and `message.tool_calls[]` are
+    /// independent wire index namespaces (verified; also visible in this
+    /// codec's own `reasoning.cassette` and `parallel_tools.cassette`, each
+    /// of which independently starts counting from 0). A thinking block at
+    /// content-index 0 followed by a tool call at tool-index 0 must NOT
+    /// collide: before this fix, `IndexKeyer` keyed both families on the raw
+    /// wire index, so the tool-call-start's `open` call saw content-index 0
+    /// already `recognized` and returned `None` -- silently dropping the
+    /// tool call's `BlockStart` entirely, after which its `tool-call-delta`
+    /// fell through `existing`'s lookup onto the THINKING block's normalized
+    /// index (the only one ever opened), and its `tool-call-end` fired a
+    /// second, phantom `BlockStop` on that same already-stopped block.
+    #[tokio::test]
+    async fn a_thinking_block_and_a_tool_call_sharing_wire_index_zero_do_not_collide() {
+        let body = sse_body(&[
+            r#"{"id":"r7","type":"message-start","delta":{"message":{"role":"assistant"}}}"#,
+            r#"{"type":"content-start","index":0,"delta":{"message":{"content":{"type":"thinking","thinking":""}}}}"#,
+            r#"{"type":"content-delta","index":0,"delta":{"message":{"content":{"thinking":"I should call a tool."}}}}"#,
+            r#"{"type":"content-end","index":0}"#,
+            r#"{"type":"tool-call-start","index":0,"delta":{"message":{"tool_calls":{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}}}}"#,
+            r#"{"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{"function":{"arguments":"{\"location\": \"Tokyo\"}"}}}}}"#,
+            r#"{"type":"tool-call-end","index":0}"#,
+            r#"{"type":"message-end","delta":{"finish_reason":"TOOL_CALL"}}"#,
+        ]);
+        let events = decode_cohere_v2_stream(body)
+            .await
+            .expect("must decode successfully");
+
+        let mut block_starts: Vec<(u32, &'static str)> = Vec::new();
+        let mut block_stops: Vec<u32> = Vec::new();
+        let mut tool_args = String::new();
+        let mut thinking_text = String::new();
+        for event in &events {
+            match event {
+                StreamEvent::BlockStart {
+                    index,
+                    kind: BlockKind::Thinking,
+                } => block_starts.push((*index, "thinking")),
+                StreamEvent::BlockStart {
+                    index,
+                    kind: BlockKind::ToolUse { name, .. },
+                } => {
+                    assert_eq!(name, "get_weather");
+                    block_starts.push((*index, "tool"));
+                }
+                StreamEvent::BlockStart { .. } => panic!("unexpected block kind"),
+                StreamEvent::BlockStop { index } => block_stops.push(*index),
+                StreamEvent::BlockDelta {
+                    delta: BlockDelta::ToolArgsFragment(f),
+                    ..
+                } => tool_args.push_str(f),
+                StreamEvent::BlockDelta {
+                    delta: BlockDelta::Thinking { text, .. },
+                    ..
+                } => thinking_text.push_str(text),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            block_starts.len(),
+            2,
+            "both the thinking block and the tool call must open distinct blocks, got {block_starts:?}"
+        );
+        let thinking_index = block_starts
+            .iter()
+            .find(|(_, kind)| *kind == "thinking")
+            .map(|(i, _)| *i)
+            .expect("thinking block must have opened");
+        let tool_index = block_starts
+            .iter()
+            .find(|(_, kind)| *kind == "tool")
+            .map(|(i, _)| *i)
+            .expect("tool block must not have been silently dropped");
+        assert_ne!(
+            thinking_index, tool_index,
+            "a content-index and a tool-index of the same wire value must not collide \
+             onto the same normalized block"
+        );
+        assert_eq!(
+            block_stops.len(),
+            2,
+            "exactly one stop per real block, got {block_stops:?}"
+        );
+        assert_eq!(thinking_text, "I should call a tool.");
+        assert_eq!(
+            tool_args, r#"{"location": "Tokyo"}"#,
+            "tool arguments must land on the tool block, not the thinking block"
+        );
+    }
 }
 
-#[cfg(test)]
-mod redaction_tests {
-    //! Fix round 1, L3: `redact_transport_error_text` must strip an embedded
-    //! request URL down to host-only, on top of the crate's existing
-    //! secret-shape redaction.
-    use super::redact_transport_error_text;
-
-    #[test]
-    fn strips_query_string_and_userinfo_from_an_embedded_url() {
-        let raw = "transport io error: error sending request for url \
-                    (https://user:pass@gateway.example.com/proxy?key=abc123): \
-                    operation timed out";
-        let redacted = redact_transport_error_text(raw);
-        assert!(
-            !redacted.contains("abc123"),
-            "the query string's credential-shaped value must not survive: {redacted}"
-        );
-        assert!(
-            !redacted.contains("user:pass"),
-            "userinfo must not survive: {redacted}"
-        );
-        assert!(
-            redacted.contains("gateway.example.com"),
-            "the host itself is not secret and should stay, for diagnosability: {redacted}"
-        );
-        assert!(
-            redacted.contains("operation timed out"),
-            "the non-URL diagnostic text must survive redaction intact: {redacted}"
-        );
-    }
-
-    #[test]
-    fn a_message_with_no_url_at_all_passes_through_unchanged() {
-        let raw = "connection reset by peer";
-        assert_eq!(redact_transport_error_text(raw), raw);
-    }
-
-    /// The crate's general secret-shape redactor still applies on top of
-    /// the URL-stripping pass -- a bearer token appearing outside any URL
-    /// must also be caught.
-    #[test]
-    fn a_bearer_token_outside_any_url_is_still_redacted() {
-        let raw = "unauthorized: Authorization: Bearer sk-test-abcdefgh12345678";
-        let redacted = redact_transport_error_text(raw);
-        assert!(!redacted.contains("sk-test-abcdefgh12345678"));
-    }
-}
+// Fix round 2, N2: `redaction_tests` moved to `mod.rs`, next to
+// `redact_transport_error_text` itself.

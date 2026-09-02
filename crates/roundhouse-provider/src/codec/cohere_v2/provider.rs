@@ -13,7 +13,7 @@
 
 use super::decode::{decode_cohere_v2_stream, StreamFailure, StreamFailureKind};
 use super::encode::{contains_unencodable_media, encode, requests_unsupported_tool_choice};
-use crate::audit::redact_error_body;
+use super::redact_transport_error_text;
 use crate::credential::{resolve_base_url, CredentialCtx};
 use crate::errors::classify;
 use crate::ir::{
@@ -79,8 +79,9 @@ impl Provider for CohereV2Provider {
             let body = encode(req, &self.profile)?;
 
             let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None)
-                    .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
+                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
+                )?;
             let endpoint_url = build_endpoint_url(&base_url);
 
             let mut http_req = HttpRequest {
@@ -104,15 +105,19 @@ impl Provider for CohereV2Provider {
                 credentials
                     .apply(&mut http_req, &cred_ctx)
                     .await
-                    .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+                    .map_err(|e| {
+                        ProviderError::Transport(redact_transport_error_text(&e.to_string()))
+                    })?;
             } else {
                 match &self.profile.defaults.auth {
-                    // Fix round 1, L7: an empty `api_key` must fail closed,
+                    // Fix round 1, L7 (tightened by fix round 2, N4): an
+                    // empty OR whitespace-only `api_key` must fail closed,
                     // not silently send a header-shaped-but-credential-less
-                    // `authorization: Bearer ` -- matching the doc comment
-                    // on the `other` arm below, which already makes this
-                    // exact promise for a missing `CredentialProvider`.
-                    AuthKind::Bearer if ctx.api_key.is_empty() => {
+                    // `authorization: Bearer ` (or `Bearer   `) that only
+                    // earns a remote 401 -- matching the doc comment on the
+                    // `other` arm below, which already makes this exact
+                    // promise for a missing `CredentialProvider`.
+                    AuthKind::Bearer if ctx.api_key.trim().is_empty() => {
                         return Err(ProviderError::Unsupported(
                             "cohere-v2 codec requires a non-empty api_key (or a \
                              CredentialProvider) for Bearer auth"
@@ -140,11 +145,9 @@ impl Provider for CohereV2Provider {
                 }
             }
 
-            let response = ctx
-                .transport
-                .send(http_req)
-                .await
-                .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+            let response = ctx.transport.send(http_req).await.map_err(|e| {
+                ProviderError::Transport(redact_transport_error_text(&e.to_string()))
+            })?;
 
             if !(200..300).contains(&response.status) {
                 // §9.8: never `?` on JSON parsing in the error path.
@@ -298,7 +301,6 @@ mod stream_failure_to_provider_error_tests {
     fn failure(kind: StreamFailureKind, partial_text: &str) -> StreamFailure {
         StreamFailure {
             kind,
-            code: None,
             message: "synthetic".into(),
             partial_text: partial_text.into(),
         }

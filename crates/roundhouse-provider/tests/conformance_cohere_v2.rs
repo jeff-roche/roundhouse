@@ -374,24 +374,36 @@ async fn bare_api_key_fallback_attaches_a_bearer_authorization_header() {
 /// panic there instead of via the expected `ProviderError::Unsupported`.
 #[tokio::test]
 async fn an_empty_api_key_with_no_credential_provider_fails_closed() {
-    struct PanicsOnSend;
-
-    impl roundhouse_provider::HttpTransport for PanicsOnSend {
-        fn send<'a>(
-            &'a self,
-            _req: roundhouse_provider::HttpRequest,
-        ) -> roundhouse_provider::BoxFut<
-            'a,
-            Result<roundhouse_provider::HttpResponseStream, roundhouse_provider::TransportError>,
-        > {
-            panic!("must fail closed on an empty api_key before ever calling send()")
-        }
-    }
-
     let ctx = RequestCtx {
         trace_id: None,
-        transport: Arc::new(PanicsOnSend),
+        transport: Arc::new(PanicsIfCalledTransport),
         api_key: String::new(),
+        credentials: None,
+    };
+    let provider = CohereV2Provider::new(fixture_profile());
+    let err = expect_err(
+        provider
+            .stream_chat(&fixtures::single_turn_text(), &ctx)
+            .await,
+    );
+    assert!(
+        matches!(err, ProviderError::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
+}
+
+/// Fix round 2, N4: `is_empty()` alone let a whitespace-only `api_key`
+/// (`"   "`) slip past the L7 guard and still send an
+/// `authorization: Bearer    ` header that only earns a remote 401 -- the
+/// exact outcome the guard exists to prevent locally. Same panicking
+/// transport as the empty-string case: this test can only pass if the guard
+/// rejects before any transport call.
+#[tokio::test]
+async fn a_whitespace_only_api_key_with_no_credential_provider_fails_closed() {
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(PanicsIfCalledTransport),
+        api_key: "   ".to_string(),
         credentials: None,
     };
     let provider = CohereV2Provider::new(fixture_profile());
@@ -471,5 +483,65 @@ async fn a_max_tokens_cassette_maps_to_stream_interrupted_with_partial_text() {
             assert_eq!(partial, "This response got cut off");
         }
         other => panic!("expected StreamInterrupted, got {other:?}"),
+    }
+}
+
+/// Fix round 2, N2: `stream_chat`'s `HttpTransport::send` failure sink must
+/// redact an embedded gateway URL's query string, not just the crate's
+/// general secret-shape redactor -- `redact_error_body` alone does not
+/// strip URL query/userinfo (it only matches a labeled `api_key`/
+/// `access_token`/`client_secret`-shaped field of >=16 chars), so a
+/// gateway base URL's bare `?key=abc123` (this codec's own supported
+/// override shape -- see `build_endpoint_url`'s `preserves_a_gateway_query_
+/// string` test) would have survived into a persisted `ProviderError::
+/// Transport` row through this sink before this fix.
+struct FailsWithUrlInMessage;
+
+impl HttpTransport for FailsWithUrlInMessage {
+    fn send<'a>(
+        &'a self,
+        _req: HttpRequest,
+    ) -> futures::future::BoxFuture<'a, Result<HttpResponseStream, TransportError>> {
+        Box::pin(async {
+            Err(TransportError::Io(
+                "error sending request for url \
+                 (https://user:pass@gateway.example.com/proxy/chat?key=abc123): \
+                 operation timed out"
+                    .to_string(),
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_send_failure_redacts_an_embedded_gateway_query_string_and_userinfo() {
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(FailsWithUrlInMessage),
+        api_key: "test-key".into(),
+        credentials: None,
+    };
+    let provider = CohereV2Provider::new(fixture_profile());
+    let err = expect_err(
+        provider
+            .stream_chat(&fixtures::single_turn_text(), &ctx)
+            .await,
+    );
+    match err {
+        ProviderError::Transport(msg) => {
+            assert!(
+                !msg.contains("abc123"),
+                "the query string's credential-shaped value must not survive: {msg}"
+            );
+            assert!(
+                !msg.contains("user:pass"),
+                "userinfo must not survive: {msg}"
+            );
+            assert!(
+                msg.contains("gateway.example.com"),
+                "the host itself is not secret and should stay: {msg}"
+            );
+        }
+        other => panic!("expected Transport, got {other:?}"),
     }
 }
