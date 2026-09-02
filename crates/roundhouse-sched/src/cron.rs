@@ -18,6 +18,15 @@ pub enum CronError {
     InvalidExpr(String, String),
     #[error("cron schedule '{0}' has no future occurrences")]
     Exhausted(String),
+    /// M5 fold-in: `TriggerSpec::Interval { every: Duration::ZERO, .. }`
+    /// makes the scheduler's `occurrences_after` return `after` unchanged
+    /// forever (`after + 0`), which without this guard hangs `Scheduler::
+    /// tick`'s `while` loop on a single malformed binding. Validated and
+    /// refused here so `Scheduler::add_binding` fails fast at registration
+    /// time instead of silently accepting a binding that can never
+    /// meaningfully schedule.
+    #[error("interval trigger's `every` duration must be greater than zero")]
+    ZeroInterval,
 }
 
 /// The pinned `cron` crate's real API (`cron = "0.15"`): there is no

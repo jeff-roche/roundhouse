@@ -21,10 +21,11 @@
 //! could now be stale (in the past, or wildly in the future) relative to
 //! wall-clock reality.
 use crate::cron::{fire_all_ambiguous, is_ambiguous_local, next_fire_after, CronError};
+use crate::store::compute_catch_up;
 use crate::trigger::{Binding, DstAmbiguous, TriggerSpec};
 use chrono::{DateTime, Utc};
 use roundhouse_core::BindingId;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -66,6 +67,20 @@ pub enum SchedulerEvent {
 /// merely to have ticked normally, and every binding is recomputed from
 /// scratch against the new wall-clock reading.
 const DRIFT_THRESHOLD: Duration = Duration::from_secs(2);
+
+/// M5: hard ceiling on how many missed occurrences a single binding's
+/// catch-up pass considers in one `tick()` call. Without this, a binding
+/// that was offline for an extended period (e.g. a daemon down for a month
+/// with a `* * * * *` cron) would have its entire backlog computed and,
+/// under `CatchUp::All`, fired in one pass — unbounded work and an
+/// unbounded burst of `Fire` events from a single tick. A binding whose
+/// backlog exceeds this cap simply catches up progressively: each `tick()`
+/// call processes at most one capped batch per binding, deferring the rest
+/// to the next call (see `tick`'s `processed_this_tick` guard). Chosen
+/// generously above what any realistic short outage at the tightest
+/// practical cron cadence (once a minute) would produce, while still
+/// bounding the worst case.
+pub const MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK: usize = 100;
 
 /// One scheduled occurrence in the heap. Multiple entries can share a
 /// `binding_id` — most obviously the two instants of a `DstAmbiguous::Both`
@@ -197,6 +212,15 @@ impl Scheduler {
                 Ok(vec![first])
             }
             TriggerSpec::Interval { every, .. } => {
+                // Fold-in fix: `every == Duration::ZERO` would make this
+                // return `after` unchanged (`after + 0`) forever, which
+                // `tick`'s catch-up gather loop (and, before this fix, its
+                // per-fire reschedule) would treat as an always-due,
+                // never-advancing occurrence — a hang from one malformed
+                // binding. Refused here so `add_binding` fails fast instead.
+                if every.is_zero() {
+                    return Err(CronError::ZeroInterval);
+                }
                 // `align`/`anchor` are not applied here — no task in this
                 // phase's plan implements interval alignment, and Task 3's
                 // scope is heap scheduling + drift detection, not that
@@ -286,21 +310,108 @@ impl Scheduler {
         self.last_mono = Some(now_mono);
         self.last_wall = Some(now_wall);
 
+        // M5: bindings whose catch-up pass has already run once this tick.
+        // A capped pass (see the loop body below) can reschedule an
+        // occurrence that is still `<= now_wall` — without this guard, the
+        // outer `while` loop would immediately pop that freshly-rescheduled
+        // entry and run a *second* capped pass for the same binding within
+        // the same tick, and so on, defeating
+        // `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK` entirely. Entries
+        // deferred here are pushed back onto the heap once the loop ends, so
+        // they are due again — and processed exactly once more — on the
+        // *next* `tick()` call.
+        let mut processed_this_tick: HashSet<BindingId> = HashSet::new();
+        let mut deferred: Vec<HeapEntry> = Vec::new();
+
         while let Some(top) = self.heap.peek() {
             if top.fire_at > now_wall {
                 break;
             }
             let entry = self.heap.pop().expect("heap.peek() just returned Some");
-            events.push(SchedulerEvent::Fire(entry.binding_id, entry.fire_at));
-            if let Some(binding) = self.bindings.get_mut(&entry.binding_id) {
-                binding.last_fired_for = Some(entry.fire_at);
-                if entry.advances_schedule {
-                    if let Ok(instants) = Self::occurrences_after(binding, entry.fire_at) {
-                        Self::push_occurrences(&mut self.heap, binding, &instants);
+
+            if !entry.advances_schedule {
+                // The earlier instant of a `DstAmbiguous::Both` fold
+                // (Ruling P16): always fires exactly once and never
+                // accumulates catch-up backlog — the later instant is what
+                // advances the schedule.
+                events.push(SchedulerEvent::Fire(entry.binding_id, entry.fire_at));
+                if let Some(binding) = self.bindings.get_mut(&entry.binding_id) {
+                    binding.last_fired_for = Some(entry.fire_at);
+                }
+                continue;
+            }
+
+            if !processed_this_tick.insert(entry.binding_id) {
+                deferred.push(entry);
+                continue;
+            }
+
+            let Some(binding) = self.bindings.get_mut(&entry.binding_id) else {
+                continue;
+            };
+
+            // Walk forward from the entry that just came due, collecting
+            // every occurrence this binding missed, capped so an extended
+            // outage can never flood this tick with an unbounded backlog
+            // (M5). A single `occurrences_after` call can yield more than
+            // one instant (a `DstAmbiguous::Both` fold), so each is
+            // considered individually against both the `now_wall` bound and
+            // the cap, rather than only ever inspecting the first.
+            let mut missed = vec![entry.fire_at];
+            let mut cursor = entry.fire_at;
+            'gather: while missed.len() < MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK {
+                let Ok(instants) = Self::occurrences_after(binding, cursor) else {
+                    break;
+                };
+                for next in instants {
+                    if next > now_wall {
+                        break 'gather;
+                    }
+                    cursor = next;
+                    missed.push(next);
+                    if missed.len() >= MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK {
+                        break 'gather;
                     }
                 }
             }
+
+            // M5: the binding's own `CatchUp` policy decides which of the
+            // missed occurrences actually fire — previously computed
+            // (`compute_catch_up`) but never consulted by the scheduler at
+            // all, so every missed occurrence fired regardless of policy.
+            //
+            // The policy only applies to a genuine backlog (more than one
+            // occurrence overdue at once — "you fell behind"). The ordinary
+            // single-occurrence case (a normal tick finding its one due
+            // occurrence, whether exactly on time or a tick-interval late)
+            // is not catching up at all and must always fire regardless of
+            // `CatchUp`: `CatchUp::None` means "silently drop a backlog,"
+            // not "never fire this binding again."
+            let to_fire = if missed.len() > 1 {
+                compute_catch_up(binding, missed.clone())
+            } else {
+                missed.clone()
+            };
+            for fire_at in &to_fire {
+                events.push(SchedulerEvent::Fire(entry.binding_id, *fire_at));
+            }
+            binding.last_fired_for = missed.last().copied();
+
+            // Reschedule from the last instant *considered*, not just the
+            // last one *fired*: `CatchUp::None`/`Latest` intentionally drop
+            // occurrences from `to_fire`, but the schedule must still
+            // advance past every considered instant, or a dropped
+            // occurrence would be reconsidered (and re-dropped, forever) on
+            // every subsequent tick.
+            if let Ok(instants) = Self::occurrences_after(binding, cursor) {
+                Self::push_occurrences(&mut self.heap, binding, &instants);
+            }
         }
+
+        for entry in deferred {
+            self.heap.push(entry);
+        }
+
         events
     }
 }

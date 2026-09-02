@@ -1,7 +1,10 @@
 use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use roundhouse_core::JobId;
-use roundhouse_sched::scheduler::{ClockSource, Scheduler, SchedulerEvent};
+use roundhouse_sched::cron::CronError;
+use roundhouse_sched::scheduler::{
+    ClockSource, Scheduler, SchedulerEvent, MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK,
+};
 use roundhouse_sched::trigger::{Binding, CatchUp, DstAmbiguous, DstGap, TriggerSpec};
 use std::cell::RefCell;
 use std::time::Duration;
@@ -256,4 +259,200 @@ fn dst_ambiguous_first_fires_only_the_earlier_instant_on_the_same_fold() {
         vec![Utc.with_ymd_and_hms(2026, 11, 1, 5, 30, 0).unwrap()],
         "DstAmbiguous::First must fire exactly once, at the earlier instant: {events:?}"
     );
+}
+
+fn fires_for(
+    events: &[SchedulerEvent],
+    binding_id: roundhouse_core::BindingId,
+) -> Vec<DateTime<Utc>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SchedulerEvent::Fire(id, at) if *id == binding_id => Some(*at),
+            _ => None,
+        })
+        .collect()
+}
+
+/// M5: `Scheduler::tick` previously never consulted `CatchUp` at all — every
+/// missed occurrence fired regardless of the binding's policy. A binding
+/// offline for several missed once-a-minute occurrences under
+/// `CatchUp::None` must fire nothing, while still advancing its schedule
+/// past the whole missed backlog (not re-considering it on the next tick).
+#[test]
+fn catch_up_none_is_actually_applied_by_tick_and_still_advances_the_schedule() {
+    let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let start_mono = Instant::now();
+    let clock = FakeClock {
+        mono: RefCell::new(start_mono),
+        wall: RefCell::new(start_wall),
+    };
+    let mut sched = Scheduler::new();
+    let mut binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
+    if let TriggerSpec::Cron { catch_up, .. } = &mut binding.spec {
+        *catch_up = CatchUp::None;
+    }
+    let binding_id = binding.id;
+    sched.add_binding(binding, &clock).unwrap();
+
+    // Simulate an outage: 5 missed once-a-minute occurrences (00:01..00:05).
+    let target = start_wall + chrono::Duration::minutes(5);
+    let elapsed = (target - start_wall).to_std().unwrap();
+    *clock.mono.borrow_mut() = start_mono + elapsed;
+    *clock.wall.borrow_mut() = target;
+
+    let events = sched.tick(&clock);
+    assert!(
+        fires_for(&events, binding_id).is_empty(),
+        "CatchUp::None must fire nothing for missed occurrences: {events:?}"
+    );
+
+    // The schedule must have advanced past the whole missed backlog, not
+    // gotten stuck re-considering it: the very next occurrence (00:06) must
+    // now be the one that's due, not 00:01 again.
+    let next_target = target + chrono::Duration::minutes(1);
+    let total_elapsed = (next_target - start_wall).to_std().unwrap();
+    *clock.mono.borrow_mut() = start_mono + total_elapsed;
+    *clock.wall.borrow_mut() = next_target;
+    let events2 = sched.tick(&clock);
+    assert_eq!(fires_for(&events2, binding_id), vec![next_target]);
+}
+
+/// M5: `CatchUp::Latest` applied through `tick` for real — a 5-minute
+/// backlog must fire exactly the most recent missed occurrence, not all 5.
+#[test]
+fn catch_up_latest_is_actually_applied_by_tick() {
+    let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let start_mono = Instant::now();
+    let clock = FakeClock {
+        mono: RefCell::new(start_mono),
+        wall: RefCell::new(start_wall),
+    };
+    let mut sched = Scheduler::new();
+    // `Binding::new_cron` already defaults to `CatchUp::Latest`.
+    let binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
+    let binding_id = binding.id;
+    sched.add_binding(binding, &clock).unwrap();
+
+    let target = start_wall + chrono::Duration::minutes(5);
+    let elapsed = (target - start_wall).to_std().unwrap();
+    *clock.mono.borrow_mut() = start_mono + elapsed;
+    *clock.wall.borrow_mut() = target;
+
+    let events = sched.tick(&clock);
+    assert_eq!(
+        fires_for(&events, binding_id),
+        vec![target],
+        "CatchUp::Latest must fire only the most recent missed occurrence: {events:?}"
+    );
+}
+
+/// M5: `CatchUp::All` applied through `tick` for real — every missed
+/// occurrence in a small backlog must fire.
+#[test]
+fn catch_up_all_is_actually_applied_by_tick() {
+    let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let start_mono = Instant::now();
+    let clock = FakeClock {
+        mono: RefCell::new(start_mono),
+        wall: RefCell::new(start_wall),
+    };
+    let mut sched = Scheduler::new();
+    let mut binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
+    if let TriggerSpec::Cron { catch_up, .. } = &mut binding.spec {
+        *catch_up = CatchUp::All;
+    }
+    let binding_id = binding.id;
+    sched.add_binding(binding, &clock).unwrap();
+
+    let target = start_wall + chrono::Duration::minutes(5);
+    let elapsed = (target - start_wall).to_std().unwrap();
+    *clock.mono.borrow_mut() = start_mono + elapsed;
+    *clock.wall.borrow_mut() = target;
+
+    let events = sched.tick(&clock);
+    let expected: Vec<DateTime<Utc>> = (1..=5)
+        .map(|m| start_wall + chrono::Duration::minutes(m))
+        .collect();
+    assert_eq!(fires_for(&events, binding_id), expected);
+}
+
+/// M5: a backlog larger than
+/// `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK` must not flood a single
+/// `tick()` call — each call processes at most one capped batch per
+/// binding, catching up progressively over successive calls instead of all
+/// at once.
+#[test]
+fn catch_up_all_is_capped_per_tick_and_completes_progressively_across_calls() {
+    let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let start_mono = Instant::now();
+    let clock = FakeClock {
+        mono: RefCell::new(start_mono),
+        wall: RefCell::new(start_wall),
+    };
+    let mut sched = Scheduler::new();
+    let mut binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
+    if let TriggerSpec::Cron { catch_up, .. } = &mut binding.spec {
+        *catch_up = CatchUp::All;
+    }
+    let binding_id = binding.id;
+    sched.add_binding(binding, &clock).unwrap();
+
+    let cap = MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK;
+    let extra = 51usize;
+    let total_missed = cap * 2 + extra;
+    let target = start_wall + chrono::Duration::minutes(total_missed as i64);
+    let elapsed = (target - start_wall).to_std().unwrap();
+    *clock.mono.borrow_mut() = start_mono + elapsed;
+    *clock.wall.borrow_mut() = target;
+
+    let first = sched.tick(&clock);
+    assert_eq!(
+        fires_for(&first, binding_id).len(),
+        cap,
+        "the first tick's catch-up pass must be capped, not unbounded: {first:?}"
+    );
+
+    let second = sched.tick(&clock);
+    assert_eq!(
+        fires_for(&second, binding_id).len(),
+        cap,
+        "the backlog must continue draining on the next tick: {second:?}"
+    );
+
+    let third = sched.tick(&clock);
+    assert_eq!(
+        fires_for(&third, binding_id).len(),
+        extra,
+        "the remainder must fire once the backlog is exhausted: {third:?}"
+    );
+
+    let fourth = sched.tick(&clock);
+    assert!(
+        fires_for(&fourth, binding_id).is_empty(),
+        "the backlog is fully caught up; a later tick at the same wall clock must fire nothing more: {fourth:?}"
+    );
+}
+
+/// Fold-in fix: an `Interval` binding with `every == Duration::ZERO` must be
+/// rejected at registration time, not accepted and left to hang `tick`'s
+/// catch-up gather loop on a never-advancing occurrence.
+#[test]
+fn adding_a_zero_duration_interval_binding_is_rejected_not_silently_accepted() {
+    let clock = FakeClock {
+        mono: RefCell::new(Instant::now()),
+        wall: RefCell::new(Utc::now()),
+    };
+    let mut sched = Scheduler::new();
+    let binding = Binding::new(
+        JobId::new(),
+        TriggerSpec::Interval {
+            every: Duration::ZERO,
+            align: false,
+            anchor: None,
+        },
+    );
+
+    let err = sched.add_binding(binding, &clock).unwrap_err();
+    assert!(matches!(err, CronError::ZeroInterval));
 }
