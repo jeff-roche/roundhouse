@@ -249,6 +249,47 @@ pub fn selected_option_id(outcome: &RequestPermissionOutcome) -> Option<&Permiss
     }
 }
 
+/// What resolving a `RequestPermissionOutcome`'s selected id against a set
+/// of offered `options` establishes — see [`resolve_selection`].
+///
+/// **FIX-B (round-3 review):** `resolve_selection` originally returned
+/// `Option<PermissionOptionKind>`, reintroducing exactly the carrier
+/// `McpCallDisposition` (SEC-3, round-2 review) was created to move away
+/// from — this function's own doc already says the id→kind lookup **is**
+/// the authorization decision, so collapsing it back into an `Option` was
+/// inconsistent with that lesson. Worse, the collapsed `None` merged three
+/// materially different situations an investigation needs to tell apart:
+/// the peer legitimately cancelled; the peer named an id that was never
+/// offered (a protocol violation worth logging); and the options list
+/// itself is ambiguous (an attack signal, see [`ambiguous_option_ids`]).
+/// This enum keeps them distinct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionResolution {
+    /// The outcome selected exactly this kind, unambiguously.
+    Resolved(PermissionOptionKind),
+    /// `RequestPermissionOutcome::Cancelled`: the peer sent `session/cancel`
+    /// before answering. Not a protocol violation, not an attack signal —
+    /// just no selection was made.
+    Cancelled,
+    /// The outcome's `Selected.option_id` does not appear anywhere in
+    /// `options`. Unlike `Cancelled`, this is the peer's response naming
+    /// something it was never offered — a protocol violation worth logging
+    /// on its own, separately from a legitimate cancellation.
+    UnknownOptionId(PermissionOptionId),
+    /// `options` itself is ambiguous (see [`ambiguous_option_ids`]) and
+    /// cannot be trusted to resolve any id to a single kind — the same
+    /// fail-closed refusal [`handle_request_permission`] applies before
+    /// ever selecting.
+    AmbiguousOptions,
+    /// `outcome` is some `RequestPermissionOutcome` variant this crate does
+    /// not recognize (the type is `#[non_exhaustive]`; as of SDK 1.5.0 the
+    /// only variants are `Cancelled`/`Selected`, so this is currently
+    /// unreachable in practice). Kept distinct from `Cancelled` rather than
+    /// folded into it, since a future variant might mean something entirely
+    /// different — labeling the unknown as a cancellation would be a guess.
+    UnrecognizedOutcome,
+}
+
 /// Resolves the `PermissionOptionKind` a `RequestPermissionOutcome` selected,
 /// by looking its `option_id` up against the `options` a peer offered.
 ///
@@ -258,32 +299,69 @@ pub fn selected_option_id(outcome: &RequestPermissionOutcome) -> Option<&Permiss
 /// authorization decision — so it belongs here, audited once, rather than
 /// reimplemented ad hoc by every caller that reads an outcome off the wire.
 ///
-/// Returns `None` — never guesses — when: the outcome isn't `Selected`
-/// (`selected_option_id` already handles `Cancelled` and any future
-/// non_exhaustive variant); the selected id doesn't appear in `options` at
-/// all; or `options` itself is ambiguous (see [`ambiguous_option_ids`] — the
-/// same empty/duplicate-id condition [`handle_request_permission`] refuses
-/// to select from). An ambiguous options list cannot resolve any id to a
-/// single trustworthy kind, so refusing here is the same fail-closed posture
-/// as refusing to select from it in the first place.
+/// **Caller responsibility this function does not verify (deliberately, per
+/// round-3 review):** `options` must be the same list that was offered in
+/// the original `RequestPermissionRequest` this `outcome` answers. Nothing
+/// in the plain SDK types lets this function check that binding on its own
+/// — passing a mismatched `options` list is a caller error, a
+/// daemon-integration convention point, not something detectable from here.
 pub fn resolve_selection(
     options: &[PermissionOption],
     outcome: &RequestPermissionOutcome,
-) -> Option<PermissionOptionKind> {
+) -> SelectionResolution {
     if ambiguous_option_ids(options).is_some() {
-        return None;
+        return SelectionResolution::AmbiguousOptions;
     }
-    let id = selected_option_id(outcome)?;
-    options
-        .iter()
-        .find(|opt| &opt.option_id == id)
-        .map(|opt| opt.kind)
+    match outcome {
+        RequestPermissionOutcome::Selected(sel) => {
+            match options.iter().find(|opt| opt.option_id == sel.option_id) {
+                Some(opt) => SelectionResolution::Resolved(opt.kind),
+                None => SelectionResolution::UnknownOptionId(sel.option_id.clone()),
+            }
+        }
+        RequestPermissionOutcome::Cancelled => SelectionResolution::Cancelled,
+        _ => SelectionResolution::UnrecognizedOutcome,
+    }
 }
+
+/// A `ToolKind` extracted from a peer's `ToolCallUpdate`, wrapped rather
+/// than returned bare or as a `String`.
+///
+/// **FIX-A (round-3 review):** the original version of
+/// [`normalize_tool_call_for_policy`] returned `(String, Value)` — the exact
+/// shape [`handle_request_permission`]'s `(tool: &str, args: &Value, ..)`
+/// consumes — built via `format!("{kind:?}")`. That was a trap, not a
+/// guardrail, for two compounding reasons:
+///
+/// - `ToolKind` is a nine-value coarse *category* (`Read`, `Edit`, `Delete`,
+///   `Move`, `Search`, `Execute`, `Think`, `Fetch`, `SwitchMode`), not a
+///   Roundhouse tool identifier — `shell` and every other command-running
+///   tool alike collapse into `Execute`.
+/// - Returning a bare `String` type-checks directly against
+///   `handle_request_permission`'s `tool: &str` parameter, with nothing at
+///   the type level stopping `let (tool, args) = normalize(..)?;
+///   handle_request_permission(&s, &tool, &args, opts)` — feeding a coarse
+///   SDK category straight into a rule engine keyed on Roundhouse's own
+///   tool namespace, silently.
+///
+/// This newtype closes that gap the same way `AcpClientTier` does elsewhere
+/// in this crate: an opaque wrapper makes "the daemon forgot to map this"
+/// a compile error instead of an invisible mistake. There is deliberately
+/// no `From`/`Into`/`Display` to `&str`/`String` here — the daemon must
+/// perform an explicit `AcpToolKindClaim -> &str` mapping (e.g.
+/// `Execute -> "shell"`, informed by whatever else it knows about the call)
+/// before it can call `handle_request_permission`.
+///
+/// The name says "claim" deliberately: per §6.4, such tasks record
+/// `enforced_by = RemoteAgentClaim` — this is the peer's self-declared,
+/// unverified category, not a validated Roundhouse tool name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcpToolKindClaim(pub ToolKind);
 
 /// Normalizes a peer-supplied `ToolCallUpdate` (the `tool_call` field of an
 /// incoming `RequestPermissionRequest` — see the module doc for which role
-/// receives it) into the `(tool, args)` pair [`handle_request_permission`]
-/// needs to consult the policy engine.
+/// receives it) into the `(tool, args)` pair a daemon-owned namespace
+/// mapping step needs before calling [`handle_request_permission`].
 ///
 /// **SEC-2 (round-2 review): this must fail closed, not guess.**
 /// `ToolCallUpdate` carries no tool-name field at all — verified against
@@ -303,9 +381,13 @@ pub fn resolve_selection(
 /// - `fields.raw_input: Option<Value>` — the closest thing to `args`, but
 ///   optional; a peer can omit it outright.
 ///
-/// This function does **not** map `kind` onto Roundhouse's own tool
-/// namespace (`shell`/`read`/`write`/`edit`/`find`/...) — that mapping is
-/// daemon-owned integration knowledge this crate does not have and, per this
+/// **FIX-A (round-3 review): this returns [`AcpToolKindClaim`], never a
+/// `String`.** `format!("{kind:?}")` would also have been unsound as a
+/// policy key on its own terms: it's `Debug`-derive output, not stable SDK
+/// API, so an upstream variant rename would silently change the string a
+/// policy rule matches on. Mapping `kind` onto Roundhouse's own tool
+/// namespace (`shell`/`read`/`write`/`edit`/`find`/...) is daemon-owned
+/// integration knowledge this crate does not have and, per this
 /// subsystem's standing rules (`roundhouse-acp` depends on
 /// `{roundhouse-core, roundhouse-proto}` only), must not acquire. **The
 /// daemon supplies the namespace mapping; this function's only job is to
@@ -320,9 +402,9 @@ pub fn resolve_selection(
 /// - `fields.kind` absent or `ToolKind::Other` → `Err(UnidentifiableTool)`.
 pub fn normalize_tool_call_for_policy(
     update: &ToolCallUpdate,
-) -> Result<(String, Value), PermissionError> {
+) -> Result<(AcpToolKindClaim, Value), PermissionError> {
     let tool = match update.fields.kind {
-        Some(kind) if kind != ToolKind::Other => format!("{kind:?}"),
+        Some(kind) if kind != ToolKind::Other => AcpToolKindClaim(kind),
         _ => {
             return Err(PermissionError::UnidentifiableTool {
                 tool_call_id: update.tool_call_id.to_string(),
@@ -612,6 +694,10 @@ mod tests {
     }
 
     // ---- resolve_selection ----
+    //
+    // FIX-B (round-3 review): these four tests exist specifically to prove
+    // the four SelectionResolution outcomes are distinguishable, not
+    // collapsed into one shape the way the old `Option` return type was.
 
     #[test]
     fn resolve_selection_returns_the_kind_for_a_valid_unambiguous_selection() {
@@ -620,34 +706,44 @@ mod tests {
             RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("reject-once"));
         assert_eq!(
             resolve_selection(&options, &outcome),
-            Some(PermissionOptionKind::RejectOnce)
+            SelectionResolution::Resolved(PermissionOptionKind::RejectOnce)
         );
     }
 
     #[test]
-    fn resolve_selection_returns_none_when_options_are_ambiguous() {
+    fn resolve_selection_reports_ambiguous_options_distinctly() {
         let options = vec![
             PermissionOption::new("go", "Reject", PermissionOptionKind::RejectOnce),
             PermissionOption::new("go", "Allow", PermissionOptionKind::AllowOnce),
         ];
         let outcome = RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("go"));
-        assert_eq!(resolve_selection(&options, &outcome), None);
+        assert_eq!(
+            resolve_selection(&options, &outcome),
+            SelectionResolution::AmbiguousOptions
+        );
     }
 
     #[test]
-    fn resolve_selection_returns_none_when_the_selected_id_is_not_offered() {
+    fn resolve_selection_reports_an_unknown_option_id_distinctly_from_ambiguous_or_cancelled() {
+        // A peer naming an id it was never offered is a protocol violation
+        // worth logging on its own — not the same thing as a cancellation
+        // or an ambiguous options list, even though all three used to
+        // collapse into the same `None`.
         let options = all_four_options();
         let outcome =
             RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("not-an-offered-id"));
-        assert_eq!(resolve_selection(&options, &outcome), None);
+        assert_eq!(
+            resolve_selection(&options, &outcome),
+            SelectionResolution::UnknownOptionId(PermissionOptionId::new("not-an-offered-id"))
+        );
     }
 
     #[test]
-    fn resolve_selection_returns_none_for_cancelled() {
+    fn resolve_selection_reports_cancelled_distinctly() {
         let options = all_four_options();
         assert_eq!(
             resolve_selection(&options, &RequestPermissionOutcome::Cancelled),
-            None
+            SelectionResolution::Cancelled
         );
     }
 
@@ -662,8 +758,35 @@ mod tests {
                 .raw_input(serde_json::json!({"cmd": "ls"})),
         );
         let (tool, args) = normalize_tool_call_for_policy(&update).expect("both fields present");
-        assert_eq!(tool, "Execute");
+        assert_eq!(tool, AcpToolKindClaim(ToolKind::Execute));
         assert_eq!(args, serde_json::json!({"cmd": "ls"}));
+    }
+
+    #[test]
+    fn normalize_tool_call_result_does_not_type_check_directly_against_handle_request_permission() {
+        // FIX-A (round-3 review), compile-time proof: this is intentionally
+        // NOT a test that asserts behavior — it's here so that if
+        // `AcpToolKindClaim` ever grows a `Deref`/`AsRef<str>`/`Display`
+        // impl that would let it flow into `handle_request_permission`'s
+        // `tool: &str` parameter without an explicit daemon-owned mapping
+        // step, a reviewer sees this comment fail to describe reality
+        // rather than the code failing to compile silently doing the wrong
+        // thing. (`AcpToolKindClaim` has no such impl today — this normalize
+        // step's whole point is that the daemon must write that mapping out
+        // by hand.)
+        let update = ToolCallUpdate::new(
+            "tc-1",
+            ToolCallUpdateFields::new()
+                .kind(ToolKind::Execute)
+                .raw_input(serde_json::json!({})),
+        );
+        let (tool, _args) = normalize_tool_call_for_policy(&update).expect("both fields present");
+        // An explicit, daemon-owned mapping step, exactly as documented:
+        let mapped_tool_name: &str = match tool {
+            AcpToolKindClaim(ToolKind::Execute) => "shell",
+            _ => "unknown",
+        };
+        assert_eq!(mapped_tool_name, "shell");
     }
 
     #[test]

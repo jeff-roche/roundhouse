@@ -10,7 +10,7 @@ use agent_client_protocol::schema::v1::{
 };
 use roundhouse_acp::server::{
     handle_request_permission, resolve_selection, selected_option_id, AcpServer, PermissionError,
-    PolicyEngineLike, PolicyOutcome,
+    PolicyEngineLike, PolicyOutcome, SelectionResolution,
 };
 use roundhouse_core::PolicyDecision;
 
@@ -295,7 +295,7 @@ fn resolve_selection_round_trips_a_valid_choice() {
     let outcome = RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("RejectOnce"));
     assert_eq!(
         resolve_selection(&offered, &outcome),
-        Some(PermissionOptionKind::RejectOnce)
+        SelectionResolution::Resolved(PermissionOptionKind::RejectOnce)
     );
 }
 
@@ -306,5 +306,54 @@ fn resolve_selection_refuses_to_resolve_against_an_ambiguous_options_list() {
         PermissionOption::new("go", "Allow", PermissionOptionKind::AllowOnce),
     ];
     let outcome = RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("go"));
-    assert_eq!(resolve_selection(&offered, &outcome), None);
+    assert_eq!(
+        resolve_selection(&offered, &outcome),
+        SelectionResolution::AmbiguousOptions
+    );
+}
+
+#[test]
+fn resolve_selection_distinguishes_cancelled_unknown_id_and_ambiguous_options() {
+    // FIX-B (round-3 review): these three outcomes used to collapse into
+    // one `None`. An investigation needs to tell "the user cancelled" apart
+    // from "the peer sent an id it was never offered" (a protocol
+    // violation) apart from "the options list is attacker-shaped."
+    let offered = options(&[
+        PermissionOptionKind::AllowOnce,
+        PermissionOptionKind::RejectOnce,
+    ]);
+
+    assert_eq!(
+        resolve_selection(&offered, &RequestPermissionOutcome::Cancelled),
+        SelectionResolution::Cancelled
+    );
+
+    let unknown_id_outcome =
+        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("never-offered"));
+    assert_eq!(
+        resolve_selection(&offered, &unknown_id_outcome),
+        SelectionResolution::UnknownOptionId(
+            agent_client_protocol::schema::v1::PermissionOptionId::new("never-offered")
+        )
+    );
+
+    let ambiguous_options = vec![
+        PermissionOption::new("dup", "Allow", PermissionOptionKind::AllowOnce),
+        PermissionOption::new("dup", "Reject", PermissionOptionKind::RejectOnce),
+    ];
+    let selected_dup = RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("dup"));
+    assert_eq!(
+        resolve_selection(&ambiguous_options, &selected_dup),
+        SelectionResolution::AmbiguousOptions
+    );
+
+    // All three are distinct from each other and from a successful resolution.
+    let resolved = resolve_selection(
+        &offered,
+        &RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("RejectOnce")),
+    );
+    assert_eq!(
+        resolved,
+        SelectionResolution::Resolved(PermissionOptionKind::RejectOnce)
+    );
 }

@@ -3,7 +3,7 @@
 // `normalize_tool_call_for_policy`'s fail-closed behavior against the real
 // SDK type from outside the crate.
 use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
-use roundhouse_acp::server::{normalize_tool_call_for_policy, PermissionError};
+use roundhouse_acp::server::{normalize_tool_call_for_policy, AcpToolKindClaim, PermissionError};
 
 #[test]
 fn identifies_tool_and_args_when_kind_and_raw_input_are_both_present() {
@@ -14,8 +14,30 @@ fn identifies_tool_and_args_when_kind_and_raw_input_are_both_present() {
             .raw_input(serde_json::json!({"cmd": "ls"})),
     );
     let (tool, args) = normalize_tool_call_for_policy(&update).expect("both fields present");
-    assert_eq!(tool, "Execute");
+    assert_eq!(tool, AcpToolKindClaim(ToolKind::Execute));
     assert_eq!(args, serde_json::json!({"cmd": "ls"}));
+}
+
+#[test]
+fn the_returned_claim_requires_an_explicit_daemon_owned_mapping_to_become_a_tool_name() {
+    // FIX-A (round-3 review): AcpToolKindClaim carries no From/Into/Display
+    // to &str/String, so it cannot flow directly into
+    // handle_request_permission's `tool: &str` parameter — a caller must
+    // write out the ToolKind -> Roundhouse-tool-namespace mapping
+    // explicitly, as demonstrated here.
+    let update = ToolCallUpdate::new(
+        "tc-6",
+        ToolCallUpdateFields::new()
+            .kind(ToolKind::Execute)
+            .raw_input(serde_json::json!({"cmd": "ls"})),
+    );
+    let (claim, _args) = normalize_tool_call_for_policy(&update).expect("both fields present");
+    let daemon_mapped_tool_name: &str = match claim {
+        AcpToolKindClaim(ToolKind::Execute) => "shell",
+        AcpToolKindClaim(ToolKind::Read) => "read",
+        _ => "unmapped",
+    };
+    assert_eq!(daemon_mapped_tool_name, "shell");
 }
 
 #[test]
