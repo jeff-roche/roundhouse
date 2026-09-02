@@ -9,14 +9,13 @@
 //! field names). Regenerate with
 //! `cargo run --example gen_bedrock_cassettes -p roundhouse-provider`.
 
-use roundhouse_conformance::{checks, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
+use roundhouse_conformance::{checks, run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
 use roundhouse_provider::codec::bedrock_converse::encode::encode;
 use roundhouse_provider::codec::bedrock_converse::BedrockConverseProvider;
 use roundhouse_provider::credential::CredentialProvider;
 use roundhouse_provider::profile::ProviderProfile;
 use roundhouse_provider::{
-    CassetteTransport, ChatRequest, ChunkStrategy, ContentBlock, Provider, ProviderError,
-    RequestCtx,
+    CassetteTransport, ChatRequest, ChunkStrategy, Provider, ProviderError, RequestCtx,
 };
 use roundhouse_secrets::credential::SigV4Credential;
 use roundhouse_secrets::secret::Secret;
@@ -209,135 +208,21 @@ impl ConformanceSubject for BedrockConverseSubject {
     fn wire_body(req: &ChatRequest) -> serde_json::Value {
         encode(req, &fixture_profile())
     }
-}
 
-/// The 4 chunk boundaries every case is replayed at -- mirrors
-/// `roundhouse_conformance::checks`'s private `CHUNK_STRATEGIES` constant
-/// (not `pub`, so it can't be reused directly; see this file's module doc
-/// comment on why this test doesn't call `roundhouse_conformance::run`
-/// unchanged).
-const CHUNK_STRATEGIES: [ChunkStrategy; 4] = [
-    ChunkStrategy::WholeBody,
-    ChunkStrategy::Fixed(1),
-    ChunkStrategy::Fixed(3),
-    ChunkStrategy::Prime(17),
-];
-
-fn extract_request_blocks(req: &ChatRequest) -> Vec<ContentBlock> {
-    req.messages
-        .iter()
-        .flat_map(|m| m.content.clone())
-        .collect()
-}
-
-/// Replays `case` against its cassette at every [`CHUNK_STRATEGIES`] entry
-/// and asserts the folded result is identical across all of them --
-/// functionally identical to
-/// `roundhouse_conformance::checks::check_fold_determinism`, reimplemented
-/// here ONLY because that function hardcodes `RequestCtx { credentials:
-/// None, .. }` internally with no way to override it (see this file's module
-/// doc comment: `roundhouse-conformance`'s shared harness has no path for a
-/// credential-REQUIRED provider like `bedrock-converse`, which has no bare
-/// `api_key` fallback to fall back to). Every other check
-/// (`check_mask`/`check_round_trip_fidelity`/`check_usage_invariants`) is
-/// still the genuine, shared, unmodified `roundhouse_conformance::checks`
-/// function.
-async fn check_fold_determinism_with_credentials(
-    provider: &BedrockConverseProvider,
-    case: &ConformanceCase,
-) -> (Vec<String>, Option<checks::FoldedResult>) {
-    let mut failures = Vec::new();
-    let mut results: Vec<checks::FoldedResult> = Vec::new();
-
-    for strategy in CHUNK_STRATEGIES {
-        let transport = match CassetteTransport::from_file(&case.cassette_path, strategy) {
-            Ok(t) => t,
-            Err(e) => {
-                failures.push(format!(
-                    "could not load cassette {} for chunk strategy {strategy:?}: {e}",
-                    case.cassette_path.display()
-                ));
-                continue;
-            }
-        };
-        let ctx = RequestCtx {
-            trace_id: None,
-            transport: Arc::new(transport),
-            api_key: "unused-bare-key".into(),
-            credentials: Some(test_credentials()),
-        };
-        match (
-            provider.stream_chat(&case.request, &ctx).await,
-            case.expected_error,
-        ) {
-            (Ok(_), Some(_)) => failures.push(format!(
-                "expected stream_chat to fail replaying cassette {} at chunk strategy \
-                 {strategy:?}, but it returned a successful stream",
-                case.cassette_path.display()
-            )),
-            (Ok(stream), None) => results.push(checks::fold_stream(stream).await),
-            (Err(e), Some(predicate)) => {
-                if !predicate(&e) {
-                    failures.push(format!(
-                        "stream_chat failed replaying cassette {} at chunk strategy \
-                         {strategy:?}, but the error didn't match the declared \
-                         expected_error predicate: {e}",
-                        case.cassette_path.display()
-                    ));
-                }
-            }
-            (Err(e), None) => failures.push(format!(
-                "stream_chat failed replaying cassette {} at chunk strategy {strategy:?}: {e}",
-                case.cassette_path.display()
-            )),
-        }
+    /// Fix-round-1 H3: `bedrock-converse` has no bare-`api_key` fallback
+    /// (SigV4 cannot sign a request from a bare string), so it overrides the
+    /// defaulted `credentials()` to supply a real one -- this is what lets
+    /// `run::<BedrockConverseSubject>()` below reach `HttpTransport::send`
+    /// at all instead of failing closed on a missing credential before ever
+    /// touching the cassette transport.
+    fn credentials() -> Option<Arc<dyn CredentialProvider>> {
+        Some(test_credentials())
     }
-
-    for pair in results.windows(2) {
-        if serde_json::to_value(&pair[0].blocks).ok() != serde_json::to_value(&pair[1].blocks).ok()
-            || serde_json::to_value(&pair[0].usage).ok()
-                != serde_json::to_value(&pair[1].usage).ok()
-            || pair[0].loss_events != pair[1].loss_events
-        {
-            failures.push(format!(
-                "fold determinism violated for cassette {}: folded result differs between \
-                 chunk strategies",
-                case.cassette_path.display()
-            ));
-        }
-    }
-
-    (failures, results.into_iter().next())
 }
 
 #[tokio::test]
 async fn bedrock_converse_is_conformant() {
-    let provider = BedrockConverseProvider::new(fixture_profile());
-    let mut failures = Vec::new();
-
-    for case in BedrockConverseSubject::cases() {
-        let wire_body = BedrockConverseSubject::wire_body(&case.request);
-        failures.extend(checks::check_mask(&wire_body, &case.mask));
-
-        let (det_failures, folded) =
-            check_fold_determinism_with_credentials(&provider, &case).await;
-        failures.extend(det_failures);
-
-        if let Some(result) = folded {
-            failures.extend(checks::check_round_trip_fidelity(
-                &extract_request_blocks(&case.request),
-                &result.blocks,
-                &case.declared_loss_events,
-            ));
-            failures.extend(checks::check_usage_invariants(&result.usage));
-        }
-    }
-
-    assert!(
-        failures.is_empty(),
-        "conformance suite failures:\n{}",
-        failures.join("\n")
-    );
+    run::<BedrockConverseSubject>().await.assert_green();
 }
 
 /// `Result::expect_err` needs `T: Debug`, and `ChatStream` deliberately isn't
@@ -415,6 +300,77 @@ fn bedrock_converse_error_table_access_denied_exception_maps_to_quota_exhausted(
     );
 }
 
+/// Fix-round-1 H7: `InternalServerException`/`ServiceUnavailableException`/
+/// `ModelStreamErrorException` are all retryable per AWS's own documented
+/// HTTP-status mapping (500/503/424 respectively when they occur
+/// out-of-band), and all three are recognized in-band exceptions this codec
+/// decodes -- each must map to `Overloaded`, not fall through to a
+/// permanently-fatal default.
+#[test]
+fn bedrock_converse_error_table_internal_server_exception_maps_to_overloaded() {
+    let error_profile = fixture_profile().error_profile();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": { "type": "InternalServerException", "message": "internal error" }
+    }))
+    .unwrap();
+    let classified =
+        roundhouse_provider::errors::classify(&error_profile, 400, &body, &http::HeaderMap::new());
+    assert!(
+        matches!(classified, ProviderError::Overloaded),
+        "expected Overloaded, got {classified:?}"
+    );
+}
+
+#[test]
+fn bedrock_converse_error_table_service_unavailable_exception_maps_to_overloaded() {
+    let error_profile = fixture_profile().error_profile();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": { "type": "ServiceUnavailableException", "message": "unavailable" }
+    }))
+    .unwrap();
+    let classified =
+        roundhouse_provider::errors::classify(&error_profile, 400, &body, &http::HeaderMap::new());
+    assert!(
+        matches!(classified, ProviderError::Overloaded),
+        "expected Overloaded, got {classified:?}"
+    );
+}
+
+#[test]
+fn bedrock_converse_error_table_model_stream_error_exception_maps_to_overloaded() {
+    let error_profile = fixture_profile().error_profile();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": { "type": "ModelStreamErrorException", "message": "stream error" }
+    }))
+    .unwrap();
+    let classified =
+        roundhouse_provider::errors::classify(&error_profile, 400, &body, &http::HeaderMap::new());
+    assert!(
+        matches!(classified, ProviderError::Overloaded),
+        "expected Overloaded, got {classified:?}"
+    );
+}
+
+/// The end-to-end regression this fix actually closes: BEFORE it, a real
+/// in-band `InternalServerException` frame (status 200, since it arrives
+/// after a successful connection) fell through `classify`'s HTTP-status
+/// default tier to a permanently-fatal `BadRequest { status: 200 }` instead
+/// of the retryable `Overloaded` AWS documents for this condition.
+#[tokio::test]
+async fn exception_internal_server_cassette_classifies_as_overloaded_not_fatal() {
+    let (provider, ctx) = provider_ctx_pair("exception_internal_server.cassette").await;
+    let err = expect_err(
+        provider
+            .stream_chat(&fixtures::single_turn_text(), &ctx)
+            .await,
+    );
+    assert!(
+        matches!(err, ProviderError::Overloaded),
+        "expected Overloaded (retryable), got {err:?} -- an in-band InternalServerException \
+         must not be permanently fatal"
+    );
+}
+
 #[tokio::test]
 async fn error_429_cassette_classifies_via_the_x_amzn_errortype_header_remap() {
     let (provider, ctx) = provider_ctx_pair("error_429.cassette").await;
@@ -463,6 +419,40 @@ async fn exception_throttling_cassette_is_an_error_not_a_truncated_success() {
     assert!(
         matches!(err, ProviderError::RateLimited { .. }),
         "got {err:?}"
+    );
+}
+
+/// Fix-round-1 H6: `check_usage_invariants` (`input_tokens >=
+/// cache_read_tokens`) passes vacuously at `40 >= 0` if
+/// `cacheReadInputTokens` silently fails to decode, and at `0 >= 0` if the
+/// `metadata` frame never decodes at all -- `decode.rs`'s own
+/// `usage_adds_cache_read_tokens_into_input_tokens` unit test pins the exact
+/// sum, but only against an in-process JSON value, never against bytes that
+/// went through the real binary framing pipeline
+/// (`EventStreamDecoder`/`aws-smithy-eventstream`). This drives the
+/// `reasoning.cassette` bytes through the genuine `stream_chat` path and
+/// asserts the exact, non-zero decoded figure -- false if
+/// `cacheReadInputTokens` fails to decode for any reason along that real
+/// pipeline, not merely true-at-zero.
+#[tokio::test]
+async fn reasoning_cassette_decodes_the_real_cache_read_token_count_through_the_wire_pipeline() {
+    let (provider, ctx) = provider_ctx_pair("reasoning.cassette").await;
+    let stream = provider
+        .stream_chat(&fixtures::single_turn_text(), &ctx)
+        .await
+        .expect("reasoning.cassette must replay as a successful stream");
+    let folded = checks::fold_stream(stream).await;
+    assert_eq!(
+        folded.usage.cache_read_tokens, 10,
+        "expected the cassette's real cacheReadInputTokens (10) to survive the full binary \
+         eventstream decode pipeline, got {}",
+        folded.usage.cache_read_tokens
+    );
+    assert_eq!(
+        folded.usage.input_tokens, 50,
+        "expected inputTokens (40) + cacheReadInputTokens (10) = 50 to survive the full \
+         pipeline, got {}",
+        folded.usage.input_tokens
     );
 }
 

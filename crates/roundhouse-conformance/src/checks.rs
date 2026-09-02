@@ -195,11 +195,19 @@ fn seal_block(block: OpenBlock, index: u32) -> ContentBlock {
 /// also a failure (the codec errored, but not with the right disposition),
 /// and a matching `Err` is a pass with no `FoldedResult` to compare across
 /// chunk strategies (there is nothing to fold).
+///
+/// `credentials` (fix-round-1 H3 on Phase 6 Task 7): threads
+/// `ConformanceSubject::credentials()` into the `RequestCtx` built for every
+/// chunk strategy, so a credential-REQUIRED provider (no meaningful bare-
+/// `api_key` fallback — SigV4 cannot sign a request from a bare string) can
+/// actually reach its cassette transport instead of failing closed on a
+/// missing credential before `stream_chat` ever calls `HttpTransport::send`.
 pub async fn check_fold_determinism<P: Provider>(
     provider: &P,
     request: &ChatRequest,
     cassette_path: &Path,
     expected_error: Option<fn(&roundhouse_provider::ProviderError) -> bool>,
+    credentials: Option<std::sync::Arc<dyn roundhouse_provider::credential::CredentialProvider>>,
 ) -> (Vec<String>, Option<FoldedResult>) {
     let mut failures = Vec::new();
     let mut results: Vec<FoldedResult> = Vec::new();
@@ -219,7 +227,7 @@ pub async fn check_fold_determinism<P: Provider>(
             trace_id: None,
             transport: std::sync::Arc::new(transport),
             api_key: "conformance-test-key".into(),
-            credentials: None,
+            credentials: credentials.clone(),
         };
         match (provider.stream_chat(request, &ctx).await, expected_error) {
             (Ok(_), Some(_)) => failures.push(format!(
@@ -605,8 +613,14 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/cassettes/simple.cassette");
         let request = crate::fixtures::simple_request();
 
-        let (failures, _) =
-            check_fold_determinism(&ChunkSensitiveProvider, &request, &cassette_path, None).await;
+        let (failures, _) = check_fold_determinism(
+            &ChunkSensitiveProvider,
+            &request,
+            &cassette_path,
+            None,
+            None,
+        )
+        .await;
 
         assert!(
             failures

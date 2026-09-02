@@ -81,6 +81,21 @@ pub trait ConformanceSubject {
     /// against — see REALITY-CORRECTIONS §5: `Plan` carries no wire-body
     /// preview, so the harness asks the subject directly instead.
     fn wire_body(req: &ChatRequest) -> serde_json::Value;
+
+    /// The `CredentialProvider` every case should be replayed with, if any.
+    /// Defaults to `None` so every existing `impl ConformanceSubject` (whose
+    /// providers all have a meaningful bare-`api_key` fallback) compiles
+    /// unchanged (fix-round-1 H3, Phase 6 Task 7: added as a defaulted trait
+    /// method specifically so it touches zero existing call sites). A
+    /// provider with no such fallback (e.g. SigV4, which cannot sign a
+    /// request from a bare string) overrides this to supply a real
+    /// credential so `check_fold_determinism` can actually drive
+    /// `stream_chat` all the way to its cassette transport instead of
+    /// failing closed before ever reaching it.
+    fn credentials(
+    ) -> Option<std::sync::Arc<dyn roundhouse_provider::credential::CredentialProvider>> {
+        None
+    }
 }
 
 /// The result of running every case for one [`ConformanceSubject`].
@@ -114,6 +129,7 @@ pub async fn run<S: ConformanceSubject>() -> ConformanceReport {
             &case.request,
             &case.cassette_path,
             case.expected_error,
+            S::credentials(),
         )
         .await;
         failures.extend(determinism_failures);

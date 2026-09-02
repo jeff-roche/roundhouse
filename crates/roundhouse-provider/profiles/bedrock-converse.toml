@@ -43,3 +43,26 @@ disposition = "retry_backoff"
 [errors."AccessDeniedException"]
 disposition = "fatal"
 category = "quota"
+
+# Fix-round-1 H7: of the 5 real in-band `ConverseStreamOutput` exceptions
+# this codec recognizes (`decode.rs`'s `KNOWN_EXCEPTION_SHAPES`), only
+# `ThrottlingException` had an entry above -- the other three all reach
+# `stream_chat`'s caller as an `Err` (§13b item 4 was already satisfied), but
+# with no matching table entry `classify` fell through to its HTTP-status
+# default tier keyed on `response.status` (200, since these arrive in-band
+# after a successful connection), landing on `BadRequest { status: 200 }` --
+# permanently fatal for conditions AWS itself documents as retryable
+# (`InternalServerException`: HTTP 500; `ServiceUnavailableException`: HTTP
+# 503; `ModelStreamErrorException`: HTTP 424, all from the fetched
+# `ConverseStream` "Errors" section). `ValidationException` (HTTP 400, a
+# request AWS already rejected on shape) is correctly left with no entry --
+# `classify`'s fallback tier already lands it on the equally-non-retryable
+# `BadRequest`, which is the right disposition for it.
+[errors."InternalServerException"]
+disposition = "retry_backoff"
+
+[errors."ServiceUnavailableException"]
+disposition = "retry_backoff"
+
+[errors."ModelStreamErrorException"]
+disposition = "retry_backoff"

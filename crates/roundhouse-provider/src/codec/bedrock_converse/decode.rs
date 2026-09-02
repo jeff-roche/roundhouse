@@ -131,10 +131,19 @@ pub async fn decode_bedrock_converse_stream(
 
         let messages = match decoder.feed(&chunk) {
             Ok(messages) => messages,
+            // Fix-round-1 H4: dead today (this loop always returns on the
+            // very first `Err` from `feed`, so a *second* call that could
+            // observe `Poisoned` never happens) -- but "abandon the stream,
+            // report success" is exactly the shape that produced this
+            // phase's two prior Criticals in the SSE codecs, and it stops
+            // being dead the moment this decoder is ever hoisted or reused
+            // across calls. Must never silently fall through to `Ok`.
             Err(EventStreamDecodeError::Poisoned) => {
-                // The decoder already failed on an earlier frame in this
-                // same body and reported it then; nothing new to report.
-                break;
+                return Err(StreamFailure {
+                    code: None,
+                    message: "eventstream decoder already poisoned by a previous framing error"
+                        .to_string(),
+                })
             }
             Err(e) => {
                 return Err(StreamFailure {
@@ -150,6 +159,25 @@ pub async fn decode_bedrock_converse_stream(
             }
             decode_event(message, &mut keyer, &mut opened_kinds, &mut events);
         }
+    }
+
+    // Fix-round-1 H2: binary framing makes truncation POSITIVELY detectable
+    // in a way SSE cannot be -- the decoder knows exactly when it is sitting
+    // on a partial, not-yet-complete frame. A transport stream that ends
+    // while that is true means the underlying connection was cut mid-frame
+    // (e.g. mid-generation), not that the model cleanly finished producing
+    // events; persisting the events decoded so far as `Ok` would let a
+    // truncated inference read as a normally-completed one on a
+    // physically-immutable event log. This is distinct from -- and must not
+    // be conflated with -- a body that ends cleanly at a frame boundary but
+    // never sent `messageStop` at all, which is handled by that event's own
+    // absence (no `StreamEvent::MessageStop` is ever fabricated) rather than
+    // as a hard decode error here.
+    if decoder.is_mid_frame() {
+        return Err(StreamFailure {
+            code: None,
+            message: "eventstream body ended mid-frame".to_string(),
+        });
     }
 
     Ok(events)
@@ -589,6 +617,12 @@ mod stream_decode_tests {
         stream::iter(vec![Ok(bytes::Bytes::from(raw))])
     }
 
+    fn raw_body(
+        raw: Vec<u8>,
+    ) -> impl futures::Stream<Item = Result<bytes::Bytes, crate::TransportError>> {
+        stream::iter(vec![Ok(bytes::Bytes::from(raw))])
+    }
+
     /// Mirrors `google_genai`/`openai_responses`' identical fix-round-1
     /// finding: a stream that ends with no observed `messageStop` must NOT
     /// fabricate one. `roundhouse-engine`'s `compact.rs` detects a truncated
@@ -608,6 +642,37 @@ mod stream_decode_tests {
         assert!(
             !events.iter().any(|e| matches!(e, StreamEvent::MessageStop)),
             "must not fabricate MessageStop when the wire never sent messageStop"
+        );
+    }
+
+    /// Fix-round-1 H2: unlike an SSE codec, binary framing makes truncation
+    /// POSITIVELY detectable -- the decoder knows it is sitting on a
+    /// partial, not-yet-complete frame. Cuts a well-formed message's
+    /// encoded bytes in half (never at a frame boundary) after a prior,
+    /// fully complete message, and asserts the whole decode is an `Err`
+    /// naming "mid-frame" -- not a silent `Ok` carrying only the events from
+    /// the complete message that preceded it.
+    #[tokio::test]
+    async fn a_body_that_ends_mid_frame_is_an_error_not_a_silent_partial_success() {
+        let complete = event("messageStart", serde_json::json!({ "role": "assistant" }));
+        let truncated = event(
+            "contentBlockDelta",
+            serde_json::json!({ "contentBlockIndex": 0, "delta": { "text": "partial" } }),
+        );
+
+        let mut raw = Vec::new();
+        write_message_to(&complete, &mut raw).unwrap();
+        let mut truncated_bytes = Vec::new();
+        write_message_to(&truncated, &mut truncated_bytes).unwrap();
+        // Cut the second message's bytes in half -- well past its 12-byte
+        // prelude, so this is genuinely mid-frame, not merely "prelude not
+        // yet readable."
+        raw.extend_from_slice(&truncated_bytes[..truncated_bytes.len() / 2]);
+
+        let failure = expect_stream_failure(decode_bedrock_converse_stream(raw_body(raw)).await);
+        assert!(
+            failure.message.contains("mid-frame"),
+            "expected a mid-frame truncation message, got: {failure:?}"
         );
     }
 

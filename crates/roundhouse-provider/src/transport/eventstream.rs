@@ -14,8 +14,8 @@
 //! This module's only job is to feed it bytes at whatever chunk boundary the
 //! transport actually delivered them (verified against that crate's own
 //! vendored source at `aws-smithy-eventstream` 0.60.21 / `aws-smithy-types`
-//! 1.6.2 — see this file's `ChunkQueue` doc comment for why a persistent,
-//! incrementally-advanced buffer is required, not a fresh clone per call).
+//! 1.6.2 — see [`EventStreamDecoder`]'s doc comment for why a persistent,
+//! incrementally-advanced buffer is required, not a fresh one per call).
 //!
 //! **One gap in the underlying crate this shim closes itself**: reading
 //! `aws-smithy-eventstream 0.60.21`'s `MessageFrameDecoder::decode_frame`
@@ -33,8 +33,7 @@
 
 use aws_smithy_eventstream::frame::{DecodedFrame, MessageFrameDecoder};
 use aws_smithy_types::event_stream::Message;
-use bytes::{Buf, Bytes};
-use std::collections::VecDeque;
+use bytes::BytesMut;
 
 /// A generous ceiling above AWS's own documented real maximum message size
 /// (24 MB payload + 128 kB headers, see the module doc comment) — high
@@ -72,82 +71,38 @@ pub enum EventStreamDecodeError {
     Poisoned,
 }
 
-/// A minimal growable multi-chunk buffer implementing [`bytes::Buf`] by
-/// draining a queue of [`Bytes`] chunks as `advance`/`copy_to_slice`/etc.
-/// consume bytes.
-///
-/// This exists because `aws_smithy_eventstream::frame::MessageFrameDecoder::
-/// decode_frame` needs to be called **repeatedly against the SAME buffer
-/// instance** across `Incomplete` returns: reading its vendored source shows
-/// the decoder caches the message prelude *inside itself*
-/// (`prelude_read: bool` + a fixed-size `prelude` array) the very first time
-/// it sees enough bytes to read one, and on every later call it trusts that
-/// the bytes it already consumed from the buffer are GONE for good — it does
-/// not re-read or re-skip them. A fresh `Bytes` clone reconstructed from
-/// scratch on every `feed()` call would therefore desynchronize the decoder
-/// the moment a message's prelude and its remaining bytes arrive in
-/// different `feed()` calls: the decoder would look for the post-prelude
-/// bytes starting at the front of the new buffer, in bytes that are actually
-/// still the prelude the decoder already believes it consumed. Reusing one
-/// persistent `ChunkQueue` (pushed onto, never rebuilt) whose `Buf::advance`
-/// calls are the caller's REAL, permanent cursor position sidesteps that
-/// bug entirely, matching the pattern `aws-smithy-eventstream`'s own test
-/// suite uses (`bytes_utils::SegmentedBuf`, a dev-dependency of that crate
-/// only, not a production one — this hand-rolls the same small amount of
-/// chunk bookkeeping rather than adding a new production dependency for it;
-/// nothing here is wire-format parsing, which is the part the brief calls
-/// out as not to hand-roll).
-#[derive(Default)]
-struct ChunkQueue {
-    chunks: VecDeque<Bytes>,
-}
-
-impl ChunkQueue {
-    fn push(&mut self, chunk: Bytes) {
-        if !chunk.is_empty() {
-            self.chunks.push_back(chunk);
-        }
-    }
-}
-
-impl Buf for ChunkQueue {
-    fn remaining(&self) -> usize {
-        self.chunks.iter().map(Buf::remaining).sum()
-    }
-
-    fn chunk(&self) -> &[u8] {
-        self.chunks.front().map(Buf::chunk).unwrap_or(&[])
-    }
-
-    fn advance(&mut self, mut cnt: usize) {
-        // Deliberately does not panic if `cnt` exceeds what's actually
-        // buffered (the `bytes::Buf` contract technically allows a panic
-        // here) — `MessageFrameDecoder` never does this in practice, but a
-        // decoder driven by wire input should not be one `unwrap`/one
-        // off-by-one away from a remote panic if that ever stopped being
-        // true.
-        while cnt > 0 {
-            let Some(front) = self.chunks.front_mut() else {
-                break;
-            };
-            let front_len = front.remaining();
-            if cnt < front_len {
-                front.advance(cnt);
-                cnt = 0;
-            } else {
-                cnt -= front_len;
-                self.chunks.pop_front();
-            }
-        }
-    }
-}
-
 /// Decodes a stream of raw bytes (delivered at whatever chunk boundary the
 /// transport chose — this is exactly what the conformance suite's
 /// adversarial `ChunkStrategy` replay exercises) into discrete
 /// [`aws_smithy_types::event_stream::Message`]s.
+///
+/// The accumulator is a single [`bytes::BytesMut`], not a hand-rolled
+/// multi-chunk queue (fix-round-1 H1: an earlier version kept a
+/// `VecDeque<Bytes>` and implemented `bytes::Buf` over it by hand, which made
+/// `remaining()` an O(chunks) scan — called ~3× per `feed` (once here, twice
+/// more inside the vendored `decode_frame`) — so a peer drip-feeding one byte
+/// per chunk turned ~1M attacker chunks into ~10¹² operations, wedging the
+/// task long before the byte-count ceiling below could ever fire; each
+/// 1-byte `Bytes` entry also cost roughly 50-60× its payload in allocator/
+/// struct overhead, so the ceiling bounded wire bytes, not process memory).
+/// `BytesMut` gives `remaining()`/`chunk()`/`advance()` all O(1) (verified
+/// against its own vendored source: `remaining` is `self.len()`, `advance`
+/// is a pointer bump within the existing allocation, `chunk()` returns the
+/// single contiguous remaining slice), and `extend_from_slice` amortizes
+/// growth the same way `Vec::push` does — no per-chunk allocation at all, so
+/// the byte-count ceiling now actually bounds memory, not just a miscounted
+/// proxy for it. This still needs to be **one persistent instance reused
+/// across calls**, for the same reason a hand-rolled queue did:
+/// `aws_smithy_eventstream::frame::MessageFrameDecoder::decode_frame` caches
+/// the message prelude *inside itself* the first time it sees enough bytes
+/// to read one (`prelude_read: bool` + a fixed-size `prelude` array, per its
+/// vendored source), and on every later call it trusts that the bytes it
+/// already consumed from the buffer are gone for good — it does not re-read
+/// or re-skip them. A fresh buffer reconstructed from scratch on every
+/// `feed()` call would desynchronize the decoder the moment a message's
+/// prelude and its remaining bytes arrive in different `feed()` calls.
 pub struct EventStreamDecoder {
-    queue: ChunkQueue,
+    buf: BytesMut,
     decoder: MessageFrameDecoder,
     poisoned: bool,
 }
@@ -161,7 +116,7 @@ impl Default for EventStreamDecoder {
 impl EventStreamDecoder {
     pub fn new() -> Self {
         Self {
-            queue: ChunkQueue::default(),
+            buf: BytesMut::new(),
             decoder: MessageFrameDecoder::new(),
             poisoned: false,
         }
@@ -175,20 +130,25 @@ impl EventStreamDecoder {
     /// exceed [`MAX_BUFFERED_BYTES`], or the underlying parser rejects the
     /// bytes outright. Either way, framing can no longer be trusted to be
     /// correctly boundary-aligned, so this never tries to keep going.
+    ///
+    /// Fix-round-1 H8: the size check runs against `chunk.len()` BEFORE any
+    /// bytes are copied into the accumulator, so an oversized chunk is
+    /// rejected without ever being copied (bounded in practice by the
+    /// transport's own read-buffer size, but free to check regardless).
     pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<Message>, EventStreamDecodeError> {
         if self.poisoned {
             return Err(EventStreamDecodeError::Poisoned);
         }
 
-        self.queue.push(Bytes::copy_from_slice(chunk));
-        if self.queue.remaining() > MAX_BUFFERED_BYTES {
+        if self.buf.len().saturating_add(chunk.len()) > MAX_BUFFERED_BYTES {
             self.poisoned = true;
             return Err(EventStreamDecodeError::MessageTooLarge);
         }
+        self.buf.extend_from_slice(chunk);
 
         let mut messages = Vec::new();
         loop {
-            match self.decoder.decode_frame(&mut self.queue) {
+            match self.decoder.decode_frame(&mut self.buf) {
                 Ok(DecodedFrame::Complete(message)) => messages.push(message),
                 Ok(DecodedFrame::Incomplete) => break,
                 Err(e) => {
@@ -198,6 +158,20 @@ impl EventStreamDecoder {
             }
         }
         Ok(messages)
+    }
+
+    /// True if this decoder is currently holding bytes belonging to a frame
+    /// that has not yet completed (fix-round-1 H2). `feed`'s inner loop
+    /// always drains every complete frame it can before returning, so any
+    /// bytes still buffered afterward are unambiguously partial-frame data,
+    /// never "nothing pending yet" -- this is exactly, and only, "positive
+    /// truncation detection." A caller whose transport stream ends while
+    /// this is true knows the underlying connection was cut mid-frame, not
+    /// merely between two logically complete messages (the latter is not an
+    /// error on its own -- see `decode_bedrock_converse_stream`'s handling
+    /// of a body that ends with no `messageStop` at all).
+    pub fn is_mid_frame(&self) -> bool {
+        !self.buf.is_empty()
     }
 }
 
@@ -380,5 +354,52 @@ mod tests {
             .feed(&[])
             .expect("empty chunk is not an error")
             .is_empty());
+    }
+
+    /// Fix-round-1 H1 regression test: a peer drip-feeding one byte per
+    /// chunk (e.g. one TLS record per socket read) must not make `feed`
+    /// degrade quadratically. Sized at 100,000 one-byte chunks forming a
+    /// single still-incomplete message, so almost every call takes the
+    /// `Incomplete` branch (the one that used to re-scan the whole
+    /// accumulated queue on every call, several times per call). Under the
+    /// O(1) `BytesMut`-backed accumulator this completes in well under a
+    /// second; under the previous O(chunks) `VecDeque<Bytes>` + hand-rolled
+    /// `Buf::remaining()` implementation, this single test took long enough
+    /// that a `timeout 15 cargo test` run never printed a result at all (see
+    /// the task report's fix-round-1 H1 section for the actual pasted
+    /// before/after command output).
+    #[test]
+    fn feeding_one_byte_at_a_time_does_not_degrade_quadratically() {
+        // A payload large enough that 100,000 one-byte feeds still leave the
+        // message incomplete for the vast majority of calls.
+        let big_payload = vec![b'x'; 150_000];
+        let message = build_message(&[(":message-type", "event")], &big_payload);
+        let bytes = encode(&message);
+        assert!(
+            bytes.len() >= 100_000,
+            "fixture payload must be large enough to drive 100,000 one-byte feeds"
+        );
+
+        let start = std::time::Instant::now();
+        let mut decoder = EventStreamDecoder::new();
+        let mut decoded = Vec::new();
+        for byte in bytes.iter().take(100_000) {
+            decoded.extend(
+                decoder
+                    .feed(std::slice::from_ref(byte))
+                    .expect("must decode"),
+            );
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "100,000 one-byte feeds took {elapsed:?} -- expected well under 5s under O(1) \
+             remaining()/advance(); this is the exact shape of fix-round-1 H1's quadratic \
+             blowup if it regresses"
+        );
+        // The message is 150,000+ bytes but only the first 100,000 were fed,
+        // so it must still be incomplete -- this test is about the cost of
+        // getting here, not about completing the message.
+        assert!(decoded.is_empty());
     }
 }

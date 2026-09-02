@@ -25,9 +25,25 @@
 //!   3-member `ReasoningContentBlockDelta` union.
 //! - `bedrock_converse_2026_tool_choice_kinds.txt` -- the full 3-member
 //!   `ToolChoice` union.
+//! - `bedrock_converse_2026_message_type_values.txt` -- the full 3-value
+//!   `:message-type` header (fix-round-1 H5).
+//! - `bedrock_converse_2026_eventstream_reserved_headers.txt` -- the full
+//!   6-name eventstream reserved-header set (fix-round-1 H5).
+//! - `bedrock_converse_2026_token_usage_fields.txt` -- the full 6-field
+//!   `TokenUsage` shape (fix-round-1 H5).
+//! - `bedrock_converse_2026_metadata_event_fields.txt` -- the full 5-field
+//!   `ConverseStreamMetadataEvent` shape (fix-round-1 H5).
 //!
 //! Each scan also asserts a count floor (not just non-empty), so a scanner
 //! that only catches one match arm out of several doesn't pass vacuously.
+//!
+//! Fix-round-1 H5: the failure path (`terminal_failure`'s `:message-type`/
+//! `:exception-type`/`:error-code`/`:error-message` handling) and
+//! `decode_usage`/the `"usage"` metadata key previously matched real wire
+//! values with **no vendored list at all** -- meaning the cassette and the
+//! decoder agreed only because one author wrote both (the exact
+//! green-against-a-fiction condition REALITY-CORRECTIONS §13b warns about).
+//! The four tests below close that gap.
 
 use std::fs;
 use std::path::Path;
@@ -206,6 +222,140 @@ fn expand_pointer_paths(literals: Vec<String>) -> Vec<String> {
         }
     }
     found
+}
+
+/// Extracts the literal name argument of every `header_str(message,
+/// "<name>")` call in `text` (fix-round-1 H5) -- the one place `decode.rs`
+/// names an eventstream reserved header. Comment lines are skipped.
+fn header_str_call_literals(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(pos) = rest.find("header_str(") {
+            let after_call = &rest[pos + "header_str(".len()..];
+            let Some(q1) = after_call.find('"') else {
+                rest = after_call;
+                continue;
+            };
+            let after_q1 = &after_call[q1 + 1..];
+            let Some(q2) = after_q1.find('"') else {
+                rest = after_call;
+                continue;
+            };
+            let literal = &after_q1[..q2];
+            if !found.iter().any(|f| f == literal) {
+                found.push(literal.to_string());
+            }
+            rest = &after_q1[q2 + 1..];
+        }
+    }
+    found
+}
+
+#[test]
+fn every_header_name_read_is_a_real_eventstream_reserved_header() {
+    let vendored = vendored_list("bedrock_converse_2026_eventstream_reserved_headers.txt");
+    let src = decode_rs_source();
+    let matched = header_str_call_literals(&src);
+
+    assert!(
+        matched.len() >= 4,
+        "sanity/count-floor check failed: expected at least 4 distinct header_str() name \
+         literals (:message-type, :event-type, :exception-type, :error-code at minimum), \
+         found {}: {matched:?} -- the scan itself may be broken",
+        matched.len()
+    );
+
+    let unknown: Vec<&String> = matched.iter().filter(|m| !vendored.contains(m)).collect();
+    assert!(
+        unknown.is_empty(),
+        "decode.rs reads header_str() with a name that is not a real eventstream reserved \
+         header: {unknown:?}"
+    );
+}
+
+#[test]
+fn every_matched_message_type_value_is_a_real_spec_value() {
+    let vendored = vendored_list("bedrock_converse_2026_message_type_values.txt");
+    let src = decode_rs_source();
+    let matched = match_arm_literals(function_body(&src, "terminal_failure"));
+
+    assert!(
+        matched.len() >= 2,
+        "sanity/count-floor check failed: expected at least 2 :message-type literals in \
+         terminal_failure (exception, error), found {}: {matched:?}",
+        matched.len()
+    );
+
+    let unknown: Vec<&String> = matched.iter().filter(|m| !vendored.contains(m)).collect();
+    assert!(
+        unknown.is_empty(),
+        "terminal_failure matches on a :message-type literal that is not one of the real, \
+         vendored values: {unknown:?}"
+    );
+}
+
+#[test]
+fn every_decoded_usage_field_is_a_real_tokenusage_field() {
+    let vendored = vendored_list("bedrock_converse_2026_token_usage_fields.txt");
+    let src = decode_rs_source();
+    let matched = all_string_literals(function_body(&src, "decode_usage"));
+
+    assert!(
+        matched.len() >= 3,
+        "sanity/count-floor check failed: expected at least 3 field literals in decode_usage \
+         (inputTokens, outputTokens, cacheReadInputTokens), found {}: {matched:?}",
+        matched.len()
+    );
+
+    let unknown: Vec<&String> = matched.iter().filter(|m| !vendored.contains(m)).collect();
+    assert!(
+        unknown.is_empty(),
+        "decode_usage reads a field literal that is not a real TokenUsage field: {unknown:?}"
+    );
+}
+
+/// Fix-round-1 H5: the `"usage"` key `decode_event`'s `"metadata"` arm reads
+/// had no vendored list at all -- this pins it against the real
+/// `ConverseStreamMetadataEvent` field set.
+#[test]
+fn the_metadata_usage_key_is_a_real_metadata_event_field() {
+    let vendored = vendored_list("bedrock_converse_2026_metadata_event_fields.txt");
+    let src = decode_rs_source();
+    let decode_event_body = function_body(&src, "decode_event");
+    let arm_pattern = "\"metadata\" =>";
+    // Start scanning AFTER the arm's own match pattern -- otherwise the
+    // pattern literal itself ("metadata") is picked up as a field read and
+    // flagged as unknown, since it isn't a `ConverseStreamMetadataEvent`
+    // field name.
+    let metadata_arm_start = decode_event_body
+        .find(arm_pattern)
+        .map(|pos| pos + arm_pattern.len())
+        .expect("decode_event must have a \"metadata\" match arm");
+    // The metadata arm is the last arm with a body before "messageStart" --
+    // slicing to that boundary keeps this scan specific to the arm, not the
+    // whole function.
+    let metadata_arm_end = decode_event_body[metadata_arm_start..]
+        .find("\"messageStart\"")
+        .map(|rel| metadata_arm_start + rel)
+        .unwrap_or(decode_event_body.len());
+    let matched = all_string_literals(&decode_event_body[metadata_arm_start..metadata_arm_end]);
+
+    assert!(
+        matched.contains(&"usage".to_string()),
+        "expected the metadata arm to read the literal \"usage\", found: {matched:?} -- the \
+         scan itself may be broken"
+    );
+
+    let unknown: Vec<&String> = matched.iter().filter(|m| !vendored.contains(m)).collect();
+    assert!(
+        unknown.is_empty(),
+        "decode_event's metadata arm reads a field literal that is not a real \
+         ConverseStreamMetadataEvent field: {unknown:?}"
+    );
 }
 
 #[test]

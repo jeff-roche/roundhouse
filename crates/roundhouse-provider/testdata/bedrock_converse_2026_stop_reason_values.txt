@@ -1,0 +1,20 @@
+# The full documented `stopReason` enum, fetched verbatim from
+# https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html
+# (the `stopReason` response field's "Valid Values", fetched 2026-09-02) and
+# cross-checked against `API_runtime_MessageStopEvent.html`'s identical list.
+#
+# NOT scanned by any tripwire test today: `decode.rs` deliberately never
+# reads `stopReason` at all (`messageStop` -> `StreamEvent::MessageStop`
+# unconditionally, matching `anthropic_messages::decode`'s identical
+# precedent and REALITY-CORRECTIONS §1's "a wire stop-reason is dropped" --
+# see the task report's design-decision note). Vendored here per fix-round-1
+# H5 so the real enum is on record if a later task adds branching on it.
+end_turn
+tool_use
+max_tokens
+stop_sequence
+guardrail_intervened
+content_filtered
+malformed_model_output
+malformed_tool_use
+model_context_window_exceeded

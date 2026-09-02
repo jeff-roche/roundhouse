@@ -268,6 +268,24 @@ fn main() {
         ],
     );
 
+    // Fix-round-1 H7 regression cassette: a real in-band
+    // `InternalServerException` (retryable, HTTP 500 when it occurs
+    // out-of-band per the fetched `ConverseStream` "Errors" section) must
+    // classify as `Overloaded` via this profile's own `[errors]` table, not
+    // fall through to `classify`'s HTTP-status default tier keyed on the
+    // response's real status (200, since this arrives in-band after a
+    // successful connection) and land on a permanently-fatal `BadRequest`.
+    write_eventstream_cassette(
+        "exception_internal_server.cassette",
+        &[
+            event_message("messageStart", &json!({ "role": "assistant" })),
+            exception_message(
+                "InternalServerException",
+                &json!({ "message": "An internal error occurred, please retry." }),
+            ),
+        ],
+    );
+
     // error_429.cassette / error_500.cassette: plain HTTP-level errors (the
     // request never even reached a 200 + eventstream body), matching
     // `openai_responses`' identical two-cassette precedent.
