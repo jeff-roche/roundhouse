@@ -21,7 +21,7 @@ use serde_json::Value;
 use sse_stream::SseStream;
 use std::collections::HashSet;
 
-use crate::audit::redact_transport_error_text;
+use crate::audit::{redact_error_body, redact_transport_error_text};
 use crate::stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 use crate::TransportError;
 
@@ -176,12 +176,29 @@ pub struct StreamFailure {
 /// an attacker- or bug-supplied arbitrary-length string is capped.
 const MAX_UNTRUSTED_STRING_ECHO_LEN: usize = 200;
 
-/// Truncates `raw` to [`MAX_UNTRUSTED_STRING_ECHO_LEN`] chars and renders it
-/// via `{:?}` -- `Debug` on `&str` escapes control characters and quotes, so
-/// a value containing e.g. a newline can't inject fake log lines into a
-/// persisted diagnostic message.
+/// Redacts, then truncates `raw` to [`MAX_UNTRUSTED_STRING_ECHO_LEN`] chars,
+/// then renders it via `{:?}` -- `Debug` on `&str` escapes control characters
+/// and quotes, so a value containing e.g. a newline can't inject fake log
+/// lines into a persisted diagnostic message.
+///
+/// Fix round 7, K1: redaction MUST run before the `{:?}` escaping, not after.
+/// `Debug`-formatting a string containing a quote character (e.g. a JSON
+/// fragment a provider echoed back, `{"x-api-key": "..."}`) turns every `"`
+/// into `\"`. `audit::redact::LABELED_SECRET_VALUE` matches an *optional*,
+/// unescaped quote (`["']?`) around the labeled value -- the interposed `\`
+/// breaks that match, so a caller that redacted the already-`{:?}`-escaped
+/// string (the previous order here) handed the matcher a string it could
+/// never match. Demonstrated end to end via `decode_openai_chat_stream` in
+/// this module's own tests: an in-band error frame's
+/// `invalid request headers: {"x-api-key": "<32-hex-char-secret>"}` message
+/// used to reach `StreamFailure.message` with the secret intact; redacting
+/// on the raw (pre-`{:?}`) text first closes that gap.
 fn sanitize_untrusted_wire_string(raw: &str) -> String {
-    let truncated: String = raw.chars().take(MAX_UNTRUSTED_STRING_ECHO_LEN).collect();
+    let redacted = redact_error_body(raw);
+    let truncated: String = redacted
+        .chars()
+        .take(MAX_UNTRUSTED_STRING_ECHO_LEN)
+        .collect();
     format!("{truncated:?}")
 }
 
@@ -524,6 +541,36 @@ mod decode_streaming_tests {
         assert_eq!(failure.kind, super::StreamFailureKind::Error);
         assert!(failure.message.contains("overloaded"));
         assert_eq!(failure.partial_text, "before ");
+    }
+
+    /// Fix round 7, K1: an in-band error frame's `message` field is untrusted
+    /// wire text that can echo a request back, quotes and all (a real
+    /// example a security reviewer traced: `invalid request headers:
+    /// {"x-api-key": "<secret>"}`). `sanitize_untrusted_wire_string` used to
+    /// `{:?}`-escape BEFORE redacting, which turns every `"` into `\"` --
+    /// `audit::redact::LABELED_SECRET_VALUE` matches an *unescaped* optional
+    /// quote around the labeled value, so redacting the already-escaped
+    /// string could never match. Driven through the real decoder (not a
+    /// hand-built `StreamFailure`), because that is exactly where the escape
+    /// this defect depends on actually happens.
+    #[tokio::test]
+    async fn an_in_band_error_message_with_a_labeled_api_key_is_redacted_not_merely_escaped() {
+        const SECRET: &str = "f4c2a1b09d8e7f6a5b4c3d2e1f009988";
+        let body = sse_body(&[
+            r#"{"error":{"message":"invalid request headers: {\"x-api-key\": \"f4c2a1b09d8e7f6a5b4c3d2e1f009988\"}"}}"#,
+        ]);
+        let failure = expect_failure(decode_openai_chat_stream(body).await);
+        assert_eq!(failure.kind, super::StreamFailureKind::Error);
+        assert!(
+            !failure.message.contains(SECRET),
+            "the labeled api-key value must not survive redaction: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("REDACTED"),
+            "expected a redaction marker in the message: {}",
+            failure.message
+        );
     }
 
     #[tokio::test]

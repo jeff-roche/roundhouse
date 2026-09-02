@@ -30,7 +30,7 @@ use std::collections::HashSet;
 // `provider.rs`'s three other transport-error sinks could share it too.
 // Fix round 4, R4: hoisted again, to `crate::audit`, so `openai_chat` can
 // share the same real implementation instead of its own weaker one.
-use crate::audit::redact_transport_error_text;
+use crate::audit::{redact_error_body, redact_transport_error_text};
 use crate::stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 use crate::TransportError;
 
@@ -108,8 +108,15 @@ const MAX_FINISH_REASON_ECHO_LEN: usize = 64;
 /// lines into a persisted diagnostic message. Mirrors
 /// `google_genai::provider::build_endpoint_url`'s identical `{:?}`-escaping
 /// precedent for an untrusted string reaching the same kind of sink.
+///
+/// Fix round 7, K1: redacts BEFORE the `{:?}`-escaping, not after -- mirrors
+/// `openai_chat::decode::sanitize_untrusted_wire_string`'s identical fix and
+/// the same reasoning: `Debug`-formatting a labeled-secret-shaped string
+/// escapes its quotes, which breaks `audit::redact::LABELED_SECRET_VALUE`'s
+/// match on an *unescaped* quote if redaction ran afterward.
 fn sanitize_finish_reason_for_message(raw: &str) -> String {
-    let truncated: String = raw.chars().take(MAX_FINISH_REASON_ECHO_LEN).collect();
+    let redacted = redact_error_body(raw);
+    let truncated: String = redacted.chars().take(MAX_FINISH_REASON_ECHO_LEN).collect();
     format!("{truncated:?}")
 }
 
@@ -951,6 +958,43 @@ mod stream_tests {
         };
         assert_eq!(failure.kind, super::StreamFailureKind::Truncated);
         assert_eq!(failure.partial_text, "partial");
+    }
+
+    /// Fix round 7, K1: `sanitize_finish_reason_for_message` used to
+    /// `{:?}`-escape an unrecognized `finish_reason` value BEFORE redacting
+    /// it, mirroring `openai_chat::decode`'s identical defect --
+    /// `audit::redact::LABELED_SECRET_VALUE` matches an *unescaped* optional
+    /// quote around a labeled secret value, so redacting the already-escaped
+    /// string could never match a labeled value containing a quote. This
+    /// fixture's `finish_reason` needs no embedded quote to demonstrate the
+    /// underlying "redact before escape" ordering bug, but is driven through
+    /// the real decoder end to end, not a hand-built `StreamFailure` (mirrors
+    /// `openai_chat::decode`'s identical fix-round-7 test).
+    #[tokio::test]
+    async fn an_unrecognized_finish_reason_carrying_a_labeled_api_key_is_redacted() {
+        const SECRET: &str = "f4c2a1b09d8e7f6a5b4c3d2e1f009988";
+        let body = sse_body(&[
+            r#"{"id":"r8","type":"message-start","delta":{"message":{"role":"assistant"}}}"#,
+            r#"{"type":"message-end","delta":{"finish_reason":"api_key: f4c2a1b09d8e7f6a5b4c3d2e1f009988"}}"#,
+        ]);
+        let failure = match decode_cohere_v2_stream(body).await {
+            Ok(_) => panic!("expected a StreamFailure"),
+            Err(f) => f,
+        };
+        assert_eq!(
+            failure.kind,
+            super::StreamFailureKind::UnrecognizedFinishReason
+        );
+        assert!(
+            !failure.message.contains(SECRET),
+            "the labeled api-key value must not survive redaction: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("REDACTED"),
+            "expected a redaction marker in the message: {}",
+            failure.message
+        );
     }
 
     /// Fix round 1, L6: citations reuse an already-open block's own index

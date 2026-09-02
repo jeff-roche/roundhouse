@@ -136,30 +136,48 @@ static EMBEDDED_URL: LazyLock<Regex> =
 ///
 /// Fix round 6, J5 narrows what "every codec in this crate" actually means,
 /// rather than repeating a blanket claim of the same shape that let the
-/// original gap sit undetected for four rounds. What is covered, concretely,
-/// as of fix round 6:
+/// original gap sit undetected for four rounds. Fix round 7, K4 corrects two
+/// enumerations below that were themselves inexact -- an over-broad or
+/// merely-mostly-true claim in this doc comment is exactly what let the
+/// original gap (and, separately, the K1/K2 defects fix round 7 fixes) sit
+/// undetected across several rounds. What is covered, concretely, as of fix
+/// round 7:
 ///
 /// - Every `ProviderError::Transport` construction site in this crate that
 ///   can carry a `TransportError`'s or a credential/base-URL-resolution
-///   error's text -- all three `provider.rs` sinks in each of
-///   `anthropic_provider`, `openai_chat`, `cohere_v2`, `google_genai`,
-///   `openai_responses`, and `bedrock_converse` -- now routes through this
-///   function (J4 closed the one remaining gap, `anthropic_provider.rs`'s
-///   `send(..)` sink; its status-only `Transport(format!("...{status}"))`
-///   sink carries no error text and needs no redaction).
+///   error's text: all three `provider.rs` sinks in each of `openai_chat`,
+///   `cohere_v2`, `google_genai`, `openai_responses`, and `bedrock_converse`,
+///   plus `anthropic_provider.rs`'s single such sink (its `send(..)` call,
+///   J4) -- `anthropic_provider.rs` has only ONE `ProviderError::Transport`
+///   sink carrying error text, not three; its other `Transport` construction
+///   site (`anthropic_provider.rs:100`) is a fixed, status-only
+///   `format!("...{status}")` string with no error text to redact.
 /// - Every mid-stream `StreamFailure.message` (or equivalent) construction
-///   site that echoes a transport/framing error's `{e}` text directly --
-///   `google_genai::decode`'s two SSE-transport-error sites and
-///   `bedrock_converse::decode`'s transport-error and eventstream-framing-
-///   error sites (fix round 6, J3) -- also routes through this function.
+///   site that echoes a transport/framing error's `{e}` text directly:
+///   `openai_chat::decode`'s and `cohere_v2::decode`'s one SSE-transport-error
+///   site each, and `google_genai::decode`'s and `bedrock_converse::decode`'s
+///   two SSE-transport-error sites each (`bedrock_converse::decode`'s second
+///   is its eventstream-framing-error site, fix round 6, J3) -- six sites
+///   total, all routed through this function.
+/// - The `tracing::warn!` log site in `openai_chat::provider`'s and
+///   `cohere_v2::provider`'s `stream_failure_to_provider_error` (fix round 7,
+///   K2) -- belt-and-braces on top of the construction-site redaction the
+///   next paragraph describes, since a `StreamFailure.message` built by
+///   `sanitize_untrusted_wire_string`/`sanitize_finish_reason_for_message`
+///   only ever runs the *shape*-based [`redact_error_body`], which does not
+///   reduce an embedded URL's query string or userinfo.
 ///
-/// Not covered by this function, by design: a mid-stream in-band failure
-/// frame's *own* diagnostic text (e.g. `openai_chat::decode`'s
-/// `StreamFailureKind::Error` message, built from a provider's own
-/// `{"error": {...}}` frame) carries no embedded URL to reduce, so it is
-/// redacted via [`redact_error_body`] alone, applied at the `tracing::warn!`
-/// log site in `openai_chat::provider`/`cohere_v2::provider` (fix round 6,
-/// J2) rather than at construction.
+/// Not covered by this function, by design: `redact_error_body` alone (not
+/// this function) is what runs *at construction* inside
+/// `openai_chat::decode::sanitize_untrusted_wire_string` and
+/// `cohere_v2::decode::sanitize_finish_reason_for_message` (fix round 7, K1)
+/// for a mid-stream in-band failure frame's *own* diagnostic text (e.g. an
+/// in-band `{"error": {...}}` frame's `message` field, or an unrecognized
+/// `finish_reason` value) -- that text is not URL-shaped in the general case,
+/// so the shape-based redactor is the right tool at that specific
+/// construction site. The `tracing::warn!` sink these construction sites feed
+/// into, listed above, is what closes the remaining "what if it embeds a URL
+/// anyway" gap.
 pub(crate) fn redact_transport_error_text(raw: &str) -> String {
     let url_redacted = EMBEDDED_URL.replace_all(raw, |caps: &Captures| {
         crate::credential::record_base_url_override(&caps[0])

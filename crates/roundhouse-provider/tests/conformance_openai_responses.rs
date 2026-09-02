@@ -363,9 +363,19 @@ impl HttpTransport for LeakyFailingTransport {
         _req: HttpRequest,
     ) -> futures::future::BoxFuture<'a, Result<HttpResponseStream, TransportError>> {
         Box::pin(async {
+            // Fix round 7, K3: the secret also sits in a path segment
+            // (`gw-path-secret-...`) and a fragment (`gw-frag-secret-...`),
+            // not just the query string and userinfo -- `record_base_url_
+            // override` (`credential/host_only.rs`) reduces a URL to
+            // `host[:port]` ONLY, dropping path/query/fragment entirely, so
+            // this is the strongest fixture that can distinguish "redaction
+            // reduces to host[:port]" from "redaction merely strips query
+            // strings and userinfo" (which would still leak a path- or
+            // fragment-embedded secret).
             Err(TransportError::Io(
                 "error sending request for url \
-                 (https://gwuser:gwpass@gateway.example.invalid/v1/responses?key=gw-live-9f2b8c1d4e6a7b3c)"
+                 (https://gwuser:gwpass@gateway.example.invalid/v1/responses/gw-path-secret-7a3f9c2e1b4d6a80\
+                 ?key=gw-live-9f2b8c1d4e6a7b3c#gw-frag-secret-3c8e1a4f9d2b7601)"
                     .into(),
             ))
         })
@@ -398,9 +408,21 @@ impl HttpTransport for LeakyFailingTransport {
 /// puts it behind a URL carrying userinfo AND a differently-named query
 /// param, so the only way this test can pass is via the URL-reduction
 /// guarantee itself.
+///
+/// Fix round 7, K3: the fixture URL also embeds a secret in a PATH SEGMENT
+/// and a FRAGMENT, neither of which the previous version of this fixture
+/// covered. `record_base_url_override` (`credential/host_only.rs`) is
+/// `host[:port]`-only -- it drops path, query, AND fragment unconditionally
+/// -- so production behavior here was already correct; this only makes the
+/// test capable of catching a regression that redacted the query string and
+/// userinfo but left the path or fragment intact (a real, distinct way to
+/// leak a URL-embedded secret that the pre-K3 fixture could not detect at
+/// all, since it never put a secret in either place).
 #[tokio::test]
 async fn a_transport_failure_never_leaks_a_key_shaped_string_from_the_url() {
-    const SECRET: &str = "gw-live-9f2b8c1d4e6a7b3c";
+    const QUERY_SECRET: &str = "gw-live-9f2b8c1d4e6a7b3c";
+    const PATH_SECRET: &str = "gw-path-secret-7a3f9c2e1b4d6a80";
+    const FRAGMENT_SECRET: &str = "gw-frag-secret-3c8e1a4f9d2b7601";
     let ctx = RequestCtx {
         trace_id: None,
         transport: Arc::new(LeakyFailingTransport),
@@ -415,8 +437,16 @@ async fn a_transport_failure_never_leaks_a_key_shaped_string_from_the_url() {
     );
     let rendered = format!("{err} / {err:?}");
     assert!(
-        !rendered.contains(SECRET),
-        "the key-shaped string leaked into a ProviderError unredacted: {rendered}"
+        !rendered.contains(QUERY_SECRET),
+        "the query-string-embedded secret leaked into a ProviderError unredacted: {rendered}"
+    );
+    assert!(
+        !rendered.contains(PATH_SECRET),
+        "the path-segment-embedded secret leaked into a ProviderError unredacted: {rendered}"
+    );
+    assert!(
+        !rendered.contains(FRAGMENT_SECRET),
+        "the fragment-embedded secret leaked into a ProviderError unredacted: {rendered}"
     );
     assert!(
         rendered.contains("gateway.example.invalid"),

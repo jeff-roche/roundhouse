@@ -252,17 +252,23 @@ impl Provider for OpenAiChatProvider {
 /// `failure.message` cannot ride along unredacted here. `decode.rs`'s
 /// `StreamFailureKind::Error` arm builds this message from a provider's own
 /// in-band `{"error": {...}}` frame via `sanitize_untrusted_wire_string`,
-/// which caps length and `{:?}`-escapes control characters but performs no
-/// redaction -- a provider echoing the request back (`audit/redact.rs`'s own
-/// module doc: "more often than you'd like") can carry an `sk-`-shaped key or
-/// a `Bearer` token straight into this event. Routed through
-/// `redact_error_body` at the log site itself, not only at construction, so
-/// the guarantee holds regardless of which `StreamFailureKind` arm produced
-/// the message.
+/// which now redacts (fix round 7, K1) before it caps length and
+/// `{:?}`-escapes control characters -- but a provider echoing the request
+/// back (`audit/redact.rs`'s own module doc: "more often than you'd like")
+/// can still carry an embedded URL whose query string or userinfo holds a
+/// credential that no *shape*-based matcher recognizes (e.g. a gateway's
+/// `?key=...` rather than a labeled `api_key=...`).
+///
+/// Fix round 7, K2: routed through `redact_transport_error_text` at the log
+/// site itself, not the weaker `redact_error_body` -- belt-and-braces on top
+/// of `decode.rs`'s own construction-site redaction, so the guarantee that
+/// this event never carries an unredacted URL credential does not depend on
+/// every current and future `StreamFailure.message` construction site in
+/// `decode.rs` staying disciplined forever.
 fn stream_failure_to_provider_error(failure: StreamFailure) -> ProviderError {
     tracing::warn!(
         kind = ?failure.kind,
-        message = %redact_error_body(&failure.message),
+        message = %redact_transport_error_text(&failure.message),
         "openai-chat stream failed mid-generation"
     );
     match failure.kind {
@@ -384,7 +390,10 @@ mod stream_failure_diagnosability_tests {
     //! proves both halves of the constraint at once: the *reason* reaches an
     //! observable event, and the model's *content* never does, not even via
     //! the tracing event itself.
-    use super::{stream_failure_to_provider_error, StreamFailure, StreamFailureKind};
+    use super::{
+        decode_openai_chat_stream, stream_failure_to_provider_error, StreamFailure,
+        StreamFailureKind,
+    };
     use crate::ir::ProviderError;
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
@@ -513,6 +522,82 @@ mod stream_failure_diagnosability_tests {
                 .iter()
                 .any(|line| line.contains("Bearer sk-live-abcdefgh12345678")),
             "a Bearer token leaked into the tracing event unredacted: {captured:?}"
+        );
+    }
+
+    /// Fix round 7, K2: a mid-stream in-band failure frame's own message can
+    /// embed a full URL whose credential is NOT shape-matched by
+    /// `redact_error_body` (a differently-named query param like `?key=...`
+    /// rather than a labeled `api_key=...`, or userinfo). `decode.rs`'s
+    /// `sanitize_untrusted_wire_string` (fix round 7, K1) only ever runs the
+    /// shape-based `redact_error_body`, so `failure.message` itself still
+    /// carries the credential intact -- this test's first assertion pins
+    /// that down as a sanity check, so a future strengthening of K1 doesn't
+    /// silently make this test vacuous. The real guarantee under test is
+    /// that the `tracing::warn!` log site's `redact_transport_error_text`
+    /// catches what construction-site redaction structurally cannot.
+    /// Driven through the real decoder, per REALITY-CORRECTIONS §15/§13b:
+    /// a hand-built `StreamFailure` would never exercise `decode.rs`'s own
+    /// message-construction path at all.
+    #[tokio::test]
+    async fn an_in_band_error_message_embedding_a_credentialed_url_is_redacted_at_the_log_site() {
+        fn sse_body(
+            frames: &[&str],
+        ) -> impl futures::Stream<Item = Result<bytes::Bytes, crate::TransportError>> {
+            let mut raw = String::new();
+            for frame in frames {
+                raw.push_str("data: ");
+                raw.push_str(frame);
+                raw.push_str("\n\n");
+            }
+            futures::stream::iter(vec![Ok(bytes::Bytes::from(raw))])
+        }
+
+        let body = sse_body(&[
+            r#"{"error":{"message":"upstream rejected https://gwuser:gwpass@gw.example.invalid/v1?key=gw-live-9f2b8c1d4e6a7b3c"}}"#,
+        ]);
+        let failure = match decode_openai_chat_stream(body).await {
+            Ok(_) => panic!("expected a StreamFailure"),
+            Err(f) => f,
+        };
+        assert_eq!(failure.kind, StreamFailureKind::Error);
+        assert!(
+            failure.message.contains("gwuser:gwpass")
+                && failure.message.contains("gw-live-9f2b8c1d4e6a7b3c"),
+            "sanity check: this fixture's URL credential is not shape-matched by the \
+             construction-site redactor, so it must still be present on `failure.message` -- \
+             if this assertion fails, this test no longer exercises the log-site guarantee: {}",
+            failure.message
+        );
+
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CapturingSubscriber {
+            lines: lines.clone(),
+        };
+        let provider_err = tracing::subscriber::with_default(subscriber, || {
+            stream_failure_to_provider_error(failure)
+        });
+        assert!(matches!(
+            provider_err,
+            ProviderError::Server { status: 500 }
+        ));
+
+        let captured = lines.lock().unwrap();
+        assert!(
+            !captured.iter().any(|line| line.contains("gwuser:gwpass")),
+            "URL userinfo leaked into the tracing event unredacted: {captured:?}"
+        );
+        assert!(
+            !captured
+                .iter()
+                .any(|line| line.contains("gw-live-9f2b8c1d4e6a7b3c")),
+            "the URL query-string credential leaked into the tracing event unredacted: {captured:?}"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|line| line.contains("gw.example.invalid")),
+            "the host itself should still be visible for diagnosability: {captured:?}"
         );
     }
 }
