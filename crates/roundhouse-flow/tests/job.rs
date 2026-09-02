@@ -225,6 +225,47 @@ fn a_crafted_template_cannot_inject_sibling_yaml_keys() {
 }
 
 #[test]
+fn a_name_containing_del_c1_and_noncharacter_codepoints_round_trips() {
+    // Fix round 3 on Task 10: `yaml_double_quoted` originally escaped only
+    // `c < 0x20`, so DEL (U+007F), C1 controls (U+0080..U+009F), and
+    // Unicode noncharacters (e.g. U+FFFE) survived unescaped into
+    // `to_workflow_yaml`'s own output — which then failed to re-parse with
+    // "control characters are not allowed."
+    let name = "a\u{7f}b\u{80}c\u{9f}d\u{fffe}e";
+    let body = Body::Prompt {
+        template: "hello".to_string(),
+    };
+    let yaml = body.to_workflow_yaml(name, 1);
+    let def = roundhouse_flow::parse::parse_workflow(&yaml)
+        .expect("to_workflow_yaml's own output must be parseable");
+    assert_eq!(
+        def.name, name,
+        "the exact original codepoints must round-trip"
+    );
+}
+
+#[test]
+fn a_name_containing_nel_and_line_separator_round_trips_exactly() {
+    // Fix round 3 on Task 10: U+0085 (NEL) and U+2028 (LINE SEPARATOR) are
+    // printable YAML characters, but `libyaml` treats each as a line break
+    // inside a double-quoted scalar and *folds* it when it appears
+    // literally — `"a\u{0085}b"` used to round-trip as `"a b"`, silently
+    // mutating the value rather than rejecting it outright. Escaping
+    // (rather than emitting literally) avoids the fold.
+    let name = "a\u{85}b\u{2028}c\u{2029}d";
+    let body = Body::Prompt {
+        template: "hello".to_string(),
+    };
+    let yaml = body.to_workflow_yaml(name, 1);
+    let def = roundhouse_flow::parse::parse_workflow(&yaml)
+        .expect("to_workflow_yaml's own output must be parseable");
+    assert_eq!(
+        def.name, name,
+        "NEL/LS/PS must round-trip exactly, not be folded into a space"
+    );
+}
+
+#[test]
 fn prompt_lowering_is_actually_consumable_by_the_task_2_workflow_parser_shape() {
     // The cross-task seam this task's dispatch flagged: `Body::Workflow`
     // carries raw YAML, `parse_workflow(yaml: &str) -> Result<WorkflowDef, ParseError>`

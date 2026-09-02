@@ -134,10 +134,40 @@ impl Body {
 /// exactly one physical line, splice-safe anywhere. Verified to round-trip
 /// exactly (including at a non-trivial nesting depth) before landing this;
 /// see `tests/job.rs`'s injection tests for the adversarial cases above.
+///
+/// # Fix round 3 on Task 10: escape every codepoint that isn't exact
+///
+/// A security audit swept every codepoint U+0000–U+FFFF (plus samples to
+/// U+10FFFF) through `to_workflow_yaml` → `parse_workflow` and found this
+/// function's original version — which only escaped `c < 0x20` — let 34
+/// codepoints through unescaped that `serde_yaml` itself then either
+/// rejected outright or silently mutated:
+/// - **DEL (U+007F) and the C1 control range (U+0080–U+009F, minus
+///   U+0085)**: not printable YAML characters at all — emitting them
+///   literally made `to_workflow_yaml`'s *own* output fail to re-parse
+///   with "control characters are not allowed."
+/// - **U+0085 (NEL), and separately U+2028 (LINE SEPARATOR) /
+///   U+2029 (PARAGRAPH SEPARATOR)**: these three *are* printable YAML
+///   characters, but `libyaml` treats each as a line break inside a
+///   double-quoted scalar and folds it — verified: `"a\u{0085}b"`
+///   round-trips as `"a b"`, i.e. not an injection (the value stays one
+///   scalar), but a silent mutation of a security-adjacent field whose
+///   whole premise, per this doc comment above, is exactness.
+/// - **Unicode noncharacters** (U+FDD0–U+FDEF, and the last two code
+///   points of every plane — U+FFFE/U+FFFF and their per-plane
+///   equivalents up to U+10FFFE/U+10FFFF): not valid for open
+///   interchange, so escaped rather than emitted literally.
+///
+/// Escaping (rather than emitting literally) sidesteps all three
+/// categories — verified empirically that `\xNN`/`\uNNNN`/`\UNNNNNNNN`
+/// round-trip to the *exact* original code point, including U+0085 (no
+/// line-fold happens when the character is spelled as an escape rather
+/// than appearing as a literal control character in the source text).
 fn yaml_double_quoted(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
+        let cp = c as u32;
         match c {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
@@ -145,8 +175,25 @@ fn yaml_double_quoted(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             '\0' => out.push_str("\\0"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\x{:02x}", c as u32));
+            _ if cp < 0x20 => out.push_str(&format!("\\x{cp:02x}")),
+            // DEL + C1 controls (U+007F..U+009F): not printable YAML at
+            // all; U+0085 (NEL) inside that range is additionally a
+            // line-fold hazard (see doc comment above) — `\xNN` handles
+            // both reasons identically and correctly.
+            _ if (0x7F..=0x9F).contains(&cp) => out.push_str(&format!("\\x{cp:02x}")),
+            // U+2028/U+2029: the same line-fold hazard as NEL, one BMP
+            // plane over.
+            '\u{2028}' | '\u{2029}' => out.push_str(&format!("\\u{cp:04x}")),
+            // Unicode noncharacters: last two code points of every plane
+            // (`cp & 0xFFFE == 0xFFFE` matches U+_FFFE/U+_FFFF for every
+            // plane prefix, including plane 0), plus the reserved
+            // U+FDD0..=U+FDEF block.
+            _ if (0xFDD0..=0xFDEF).contains(&cp) || (cp & 0xFFFE) == 0xFFFE => {
+                if cp <= 0xFFFF {
+                    out.push_str(&format!("\\u{cp:04x}"));
+                } else {
+                    out.push_str(&format!("\\U{cp:08x}"));
+                }
             }
             c => out.push(c),
         }
