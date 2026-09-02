@@ -387,7 +387,8 @@ fn decode_message_end(
         other => {
             // Fix round 1, L10: `other` is an untrusted, unbounded-length
             // string from the wire -- capped and escaped before it reaches
-            // either the diagnostic message or `code`.
+            // the diagnostic message (fix round 2, N3 dropped the separate
+            // `code` field this comment used to also mention).
             let safe = sanitize_finish_reason_for_message(other);
             Err(StreamFailure {
                 kind: StreamFailureKind::UnrecognizedFinishReason,

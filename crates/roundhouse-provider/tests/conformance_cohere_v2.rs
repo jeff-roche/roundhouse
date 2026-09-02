@@ -545,3 +545,66 @@ async fn a_send_failure_redacts_an_embedded_gateway_query_string_and_userinfo() 
         other => panic!("expected Transport, got {other:?}"),
     }
 }
+
+/// Fix round 2 close-out: `provider.rs:83`'s `resolve_base_url` sink and
+/// `:109`'s `credentials.apply` sink were fixed by the same N2 promotion as
+/// the `send()` sink above, but had NO covering test -- reverting either of
+/// them back to `redact_error_body` alone left the entire crate suite
+/// green. This closes the `credentials.apply` sink: a `CredentialProvider`
+/// whose `apply` fails with a `CredentialError::Transport` wrapping a
+/// URL-bearing message must have that URL's query string and userinfo
+/// stripped before it reaches a persisted `ProviderError::Transport`.
+struct FailsWithUrlInCredentialApply;
+
+impl roundhouse_provider::credential::CredentialProvider for FailsWithUrlInCredentialApply {
+    fn apply<'a>(
+        &'a self,
+        _req: &'a mut HttpRequest,
+        _ctx: &'a roundhouse_provider::credential::CredentialCtx<'a>,
+    ) -> roundhouse_provider::BoxFut<'a, Result<(), roundhouse_provider::credential::CredentialError>>
+    {
+        Box::pin(async {
+            Err(roundhouse_provider::credential::CredentialError::Transport(
+                TransportError::Io(
+                    "error sending request for url \
+                     (https://user:pass@gateway.example.com/proxy/chat?key=abc123): \
+                     connection refused"
+                        .to_string(),
+                ),
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_credential_apply_failure_redacts_an_embedded_gateway_query_string_and_userinfo() {
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(PanicsIfCalledTransport),
+        api_key: "unused-because-credentials-is-some".into(),
+        credentials: Some(Arc::new(FailsWithUrlInCredentialApply)),
+    };
+    let provider = CohereV2Provider::new(fixture_profile());
+    let err = expect_err(
+        provider
+            .stream_chat(&fixtures::single_turn_text(), &ctx)
+            .await,
+    );
+    match err {
+        ProviderError::Transport(msg) => {
+            assert!(
+                !msg.contains("abc123"),
+                "the query string's credential-shaped value must not survive: {msg}"
+            );
+            assert!(
+                !msg.contains("user:pass"),
+                "userinfo must not survive: {msg}"
+            );
+            assert!(
+                msg.contains("gateway.example.com"),
+                "the host itself is not secret and should stay: {msg}"
+            );
+        }
+        other => panic!("expected Transport, got {other:?}"),
+    }
+}
