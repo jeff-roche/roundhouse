@@ -49,6 +49,13 @@ rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Task 5 (admission gate, fix round 1): `decide_admission` warns when a
+# `Queue` binding's backlog is dropped as backpressure and when a
+# `CancelPrevious` cancellation can't be confirmed — both are anomalies an
+# operator needs visibility into, not silent `SkipDueToOverlap` returns.
+# Already a workspace dependency used by several other crates; no new edge
+# in the frozen crate dependency table.
+tracing = { workspace = true }
 # Task 3 (scheduler): only `tokio::time::Instant` is used, for a monotonic
 # clock reading that is immune to wall-clock adjustments. No async runtime
 # is spun up by this crate, so only the `time` feature is enabled.
