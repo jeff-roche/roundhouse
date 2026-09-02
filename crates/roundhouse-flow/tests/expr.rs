@@ -351,17 +351,27 @@ fn excessive_function_call_nesting_is_a_typed_error_not_a_stack_overflow() {
 }
 
 // ---- Cost: flat (non-nested) expressions are roughly linear, not
-// quadratic, in their own length — measured, not assumed. ----
+// quadratic, in their own length — measured, not assumed. Split into two
+// tests (review round 1, Minor 1 + S-Imp-1): the original test's name
+// claimed to cover "long flat expressions" generally, but its shape (a bare
+// `pr.next.next...` chain rooted directly at a `ctx` variable) only ever
+// exercises the *borrowed* path through `parse_primary_chain`. The *owned*
+// path — reached once a chain's root has already left `ctx`'s borrow, e.g.
+// via `default(...)` — had its own, separate quadratic defect (S-Imp-1),
+// which this borrowed-only test could not have caught and did not claim
+// to. ----
 
 #[test]
-fn long_flat_expressions_do_not_show_quadratic_blowup() {
+fn long_flat_expressions_over_the_borrowed_chain_path_do_not_show_quadratic_blowup() {
     use std::time::Instant;
 
     fn time_chain(depth: usize) -> std::time::Duration {
-        // A deeply chained-but-flat property access: `pr.next.next...next`.
-        // This exercises parse_primary_chain's loop, never parse_ternary's
-        // recursion, so it is not bounded by MAX_EXPR_DEPTH and is the
-        // right shape to check for length-driven quadratic cost.
+        // A deeply chained-but-flat property access: `pr.next.next...next`,
+        // rooted directly at the `pr` context variable so every step stays
+        // on the `Cow::Borrowed` path. This exercises parse_primary_chain's
+        // loop, never parse_ternary's recursion, so it is not bounded by
+        // MAX_EXPR_DEPTH and is the right shape to check for length-driven
+        // quadratic cost on this specific path.
         let mut inner = json!("bottom");
         for _ in 0..depth {
             inner = json!({ "next": inner });
@@ -395,6 +405,49 @@ fn long_flat_expressions_do_not_show_quadratic_blowup() {
         ratio < 40.0,
         "expected roughly linear scaling (~8x for an 8x length increase), measured {ratio}x \
          (small={small:?}, large={large:?})"
+    );
+}
+
+#[test]
+fn long_flat_expressions_over_the_owned_chain_path_do_not_show_quadratic_blowup() {
+    use std::time::Instant;
+
+    // Regression for S-Imp-1: `default(missing, pr)` flips the chain's root
+    // from `Cow::Borrowed` to `Cow::Owned` (since `default` always returns
+    // an owned `Value`), then `.next` is walked `depth` times entirely on
+    // the owned path — the exact shape whose `index_field`/`index_array`
+    // used to clone the whole remaining subtree at every step. See the
+    // module doc comment's "Cost" section for the measured before/after
+    // numbers this test is a permanent, CI-safe stand-in for (that
+    // exploration used explicit byte padding and a standalone release
+    // harness to get precise figures; this test just has to keep failing
+    // if the quadratic behavior comes back).
+    fn time_owned_chain(depth: usize) -> std::time::Duration {
+        let mut inner = json!("bottom");
+        for _ in 0..depth {
+            inner = json!({ "next": inner, "pad": "x".repeat(200) });
+        }
+        let mut c = ExprContext::new();
+        c.set("pr", inner);
+        let mut path = String::from("default(missing, pr)");
+        for _ in 0..depth {
+            path.push_str(".next");
+        }
+        let start = Instant::now();
+        let _ = eval(&path, &c).unwrap();
+        start.elapsed()
+    }
+
+    let small = time_owned_chain(50);
+    let large = time_owned_chain(400); // 8x the length
+                                       // Same generous headroom as the borrowed-path test above, for the same
+                                       // reason: this catches a real quadratic regression without flaking on
+                                       // scheduling noise.
+    let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
+    assert!(
+        ratio < 40.0,
+        "expected roughly linear scaling (~8x for an 8x length increase) on the owned chain \
+         path, measured {ratio}x (small={small:?}, large={large:?})"
     );
 }
 
@@ -478,6 +531,46 @@ fn json_function_can_decode_escapes_into_control_characters_documented_residual(
 fn json_function_rejects_invalid_json_as_a_typed_error() {
     let err = eval("json('not json')", &ctx()).unwrap_err();
     assert!(matches!(err, ExprError::Json(_)));
+    // Strengthened per review round 1 (S-Min-4): the rendered text is a
+    // fixed category string, not `serde_json::Error`'s own `Display` (which
+    // would include a line/column derived from the input).
+    assert_eq!(
+        err.to_string(),
+        "json() argument is not valid JSON (syntax error)"
+    );
+}
+
+#[test]
+fn json_error_never_carries_a_byte_offset_derived_from_the_argument_length() {
+    // Regression for S-Min-4: `json()`'s argument is any expression, so
+    // `json(secrets.TOKEN)` is valid syntax, and `serde_json::Error`'s own
+    // `Display` echoes a line/column that is a property of the secret's
+    // own length, not its bytes. These are the exact two shapes review
+    // round 1 measured leaking "column 13" (the secret's exact length,
+    // classified `Eof`) and "column 6" (the length of its leading numeric
+    // run, classified `Syntax`) before this fix.
+    let mut c = ExprContext::new();
+    c.set(
+        "secrets",
+        json!({"a": "\"unterminated", "b": "12345abcdef"}),
+    );
+    let eof_err = eval("json(secrets.a)", &c).unwrap_err().to_string();
+    let syntax_err = eval("json(secrets.b)", &c).unwrap_err().to_string();
+    for msg in [&eof_err, &syntax_err] {
+        assert!(!msg.contains("column"), "leaked a column offset: {msg}");
+        assert!(
+            !msg.chars().any(|c| c.is_ascii_digit()),
+            "leaked a digit derived from the secret's length: {msg}"
+        );
+    }
+    assert_eq!(
+        eof_err,
+        "json() argument is not valid JSON (unexpected end of input)"
+    );
+    assert_eq!(
+        syntax_err,
+        "json() argument is not valid JSON (syntax error)"
+    );
 }
 
 // ---- Case sensitivity: identifiers are looked up by exact byte string,

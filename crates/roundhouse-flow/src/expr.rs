@@ -47,13 +47,24 @@
 //!   the token for a caller to use (e.g. as an `env:` value). What the
 //!   *caller* then does with that returned value (log it, print it, put it
 //!   in a `Debug` derive somewhere) is outside this module's control.
-//! - **Cannot appear** in any [`ExprError`] variant. Every error variant
-//!   below carries only source-expression text (the unparsed remainder, a
-//!   function name, a byte position) or a `serde_json::Error` from parsing
-//!   a `json()` argument's *own* text — never a context value. Verified by
-//!   inspection of every construction site in this file: no `ExprError`
-//!   variant is ever built from a `Value` pulled out of `ctx.vars` or a
-//!   function's arguments.
+//! - **Cannot appear** in any [`ExprError`] variant, **including as a
+//!   derived byte offset.** Every error variant below carries only
+//!   source-expression text (the unparsed remainder, a function name, a
+//!   byte position) or a [`JsonErrorCategory`] — a fixed, four-way enum
+//!   with no message text or position from `serde_json` at all. This is
+//!   stronger than an earlier version of this claim: `json()`'s argument is
+//!   any expression (`json(secrets.T)` is valid syntax), and a prior
+//!   `ExprError::Json(#[from] serde_json::Error)` rendered that error's own
+//!   `Display` text, which does not echo input *bytes* but does echo a
+//!   line/column — a property of the secret's own shape. Measured directly:
+//!   `json(secrets.T)` with `T = "unterminated` produced "column 13" (the
+//!   secret's exact length); `T = "12345abcdef"` produced "column 6" (the
+//!   length of its leading numeric run). [`JsonErrorCategory`]'s own doc
+//!   comment has the full measurement. Verified by inspection of every
+//!   construction site in this file: no `ExprError` variant is ever built
+//!   from a `Value` pulled out of `ctx.vars` or a function's arguments, and
+//!   the one variant that used to carry a third party's error type now
+//!   carries only a closed, four-way category.
 //! - **Cannot appear** in [`ExprContext`]'s `Debug` impl. `ExprContext`
 //!   deliberately does **not** derive `Debug` — it implements it by hand to
 //!   print only the sorted list of root names that have been `set`, never
@@ -160,12 +171,18 @@
 //! each named function) does work proportional to the length of the text
 //! it consumes and nothing more — there is no sub-loop whose iteration
 //! count depends on a different piece of the same input, so this shape of
-//! expression is linear in its own length. This was measured, not assumed
-//! (see `long_flat_expressions_do_not_show_quadratic_blowup`): a
-//! property-chain expression's evaluation time roughly tracks its length as
-//! the length is repeatedly doubled, rather than growing quadratically.
+//! expression is linear in its own length **on the path this was actually
+//! measured on** (see
+//! `long_flat_expressions_over_the_borrowed_chain_path_do_not_show_quadratic_blowup`):
+//! a property-chain expression rooted at a `ctx` variable, never leaving
+//! that borrow, has its evaluation time roughly track its length as the
+//! length is repeatedly doubled, rather than growing quadratically. The
+//! *owned*-root path (below) was a second, separate defect on the same
+//! function and is measured separately, not covered by that test.
 //!
-//! **That linearity is a fix, not the starting point.** A property-chain
+//! **This is the second time this exact shape has needed fixing, and the
+//! first fix's own doc comment overclaimed the second time round** — worth
+//! recording plainly rather than smoothing over. A property-chain
 //! implementation written against plain owned `Value` at every step (the
 //! brief's own illustrative code) clones the *entire remaining nested
 //! substructure* on each `.field`/`[idx]` step — `O(depth)` work repeated
@@ -173,28 +190,93 @@
 //! context data. Measured directly on exactly that code shape, before
 //! fixing it: an 8x increase in chain length (and matching context nesting
 //! depth) took roughly 70x longer to evaluate, consistent with quadratic
-//! scaling. The fix — [`Parser::parse_primary_chain`]/[`index_field`]/
-//! [`index_array`] threading a [`Cow`] through the chain so a step
-//! resolved from data still reachable via `ctx`'s own borrow costs no
-//! clone at all, only the final leaf is cloned once — is what the
-//! measurement above actually confirms. This is bounded for the common
-//! case (a chain rooted at a context variable, which is what `steps.*`,
-//! `inputs.*`, and a `map.as` binding all are) but **not** for a chain
-//! rooted at a value this module just computed itself (an array literal,
-//! or a function's return value) — once the chain has no `ctx` borrow left
-//! to extend, each further step clones one level, and the brief's original
-//! quadratic shape reappears for exactly that path. That residual is
-//! bounded by [`MAX_EXPR_DEPTH`] (an expression can only *write* that many
-//! nested literal levels before the depth guard rejects it), not by
-//! context size, so its worst case is on the order of `MAX_EXPR_DEPTH²`
-//! trivial clones — negligible, and worth stating rather than leaving
-//! unscoped.
+//! scaling. The first fix — [`Parser::parse_primary_chain`]/[`index_field`]/
+//! [`index_array`] threading a [`Cow`] through the chain — made the
+//! *borrowed*-root case above genuinely linear, but its own doc comment
+//! then claimed the leftover owned-root case was "bounded by
+//! `MAX_EXPR_DEPTH`, so its worst case is `MAX_EXPR_DEPTH²` trivial clones —
+//! negligible." Review-round measurement showed **both halves of that
+//! claim false**: chain length is not depth-counted at all (`.field`/`[idx]`
+//! steps loop rather than recursing through the one function
+//! `MAX_EXPR_DEPTH` counts), and the clones were not trivial — they scaled
+//! with context size, not a fixed small constant. Measured directly on the
+//! code as it stood at that point (a 50-level `.next` chain forced onto the
+//! owned path via `default(missing, root)`, context padded to ~16 KB per
+//! level): depth 50 → 1.88 ms; depth 100 (2x) → 7.52 ms (4.0x); depth 200
+//! (2x again) → 29.66 ms (3.9x) — quadratic, not negligible, and **not**
+//! stopped by `MAX_EXPR_DEPTH` (this chain shape never recurses through
+//! `parse_ternary`, so the depth guard never engages).
 //!
-//! What is **not** covered by that: the cost of a single `map.over` fan-out
-//! evaluating the same expression once per item is `O(items × per-item
-//! cost)` by construction, and this module has no per-run or per-item
-//! budget of its own — that is the executor's concern (a later task), not
-//! this evaluator's.
+//! **The actual fix** was in [`index_field`]/[`index_array`]'s `Cow::Owned`
+//! arm: move the matched element out of the owned map/vec (`Map::remove`,
+//! `Vec::swap_remove`) instead of cloning it. Re-measured with the same
+//! three depths after this fix: depth 50 → 45 µs; depth 100 → 66 µs; depth
+//! 200 → 163 µs — roughly linear in depth, not quadratic, and about 180x
+//! faster than the pre-fix depth-200 figure above. Pushed further (depths
+//! this module has no reason to expect in practice, to confirm the
+//! quadratic term is actually gone rather than just smaller): depth 1,000
+//! → 1.57 ms; depth 4,000 (4x) → 11.24 ms (7.1x) — the sub-4x-per-4x-input
+//! residual above 1.0 tracks the cost of *constructing* the padded test
+//! context itself (`O(depth)` JSON building, unrelated to this module),
+//! not evaluation. **What this module now actually verifies, not
+//! assumes:** a chain rooted at owned data costs no more than a chain
+//! rooted at borrowed data, to within measurement noise, for chain lengths
+//! from 50 to 4,000. What it does **not** claim: a bound in terms of
+//! `MAX_EXPR_DEPTH` (this path does not go through that guard) or any
+//! bound independent of measurement past the depths actually tried.
+//!
+//! What is **not** covered by any of the above: the cost of a single
+//! `map.over` fan-out evaluating the same expression once per item is
+//! `O(items × per-item cost)` by construction, and this module has no
+//! per-run or per-item budget of its own — that is the executor's concern
+//! (a later task), not this evaluator's.
+//!
+//! ## A second, independent clone-amplification defect: unused arguments
+//!
+//! Distinct from the chain-cloning defect above: [`Parser::parse_primary_chain`]
+//! used to end with `Ok(v.into_owned())`, unconditionally, regardless of
+//! whether the caller needed an owned value at all. [`parse_args_until`]
+//! (a function call's or array literal's comma-separated arguments) called
+//! that once per argument — so every mention of a context root inside a
+//! function call, *even one the function never reads* (this parser does
+//! not enforce arity — `default(payload, x, payload, payload, ...)` is
+//! syntactically fine and evaluates every argument), paid one full clone of
+//! whatever that root resolved to. Measured directly, before this fix, with
+//! a 20 MiB context bound to `payload` and a single `default(payload,
+//! payload, ..., payload)` expression, one argument used and the rest
+//! discarded: 1 mention → 84 MiB peak RSS; 5 mentions (48-byte expression)
+//! → 187 MiB; 15 mentions (128-byte expression) → 391 MiB — amplification
+//! tracking mention count 1:1, independent of whether the mentioned value
+//! was ever used by the function it was passed to.
+//!
+//! **The fix**: thread the `Cow` all the way through
+//! [`Parser::parse_comparison`]/[`Parser::parse_ternary`]/[`parse_args_until`]/[`call_function`]
+//! instead of forcing ownership at the end of [`Parser::parse_primary_chain`];
+//! [`eval`]'s own top-level call is now the only unconditional
+//! `.into_owned()` left. Re-measured after this fix, same expression and
+//! context, 1/5/15/**50** mentions: 64,188 KB / 64,204 KB / 64,188 KB /
+//! 64,200 KB peak RSS — flat, within normal measurement noise, regardless
+//! of mention count, because `default` only ever materializes the one
+//! argument it actually selects and every other mention stays a zero-copy
+//! `Cow::Borrowed` that is simply dropped.
+//!
+//! **This does not eliminate every amplification shape, and it would be
+//! the same "bounded, so negligible" mistake called out above to claim it
+//! does.** An array literal genuinely must own N independent copies of
+//! whatever N elements it names — `[payload, payload, ..., payload]` is a
+//! *request* for N copies of `payload` to exist in the result, not N
+//! discarded reads of it, so [`Parser::parse_array_literal`] calling
+//! `Cow::into_owned()` on every element is necessary work, not a residual
+//! of this fix. Measured directly, same 20 MiB `payload`, expression
+//! `[payload, payload, ..., payload]`: 1 mention → 64 MiB; 5 mentions
+//! (41-byte expression) → 146 MiB; 15 mentions (121 bytes) → 351 MiB; 50
+//! mentions (401 bytes) → **1,068 MiB**. Peak scales linearly with mention
+//! count at very close to the full context size per mention (~20 MiB per
+//! mention against a 20 MiB context) — this residual is **not capped** by
+//! this module (an expression-length or argument-count cap would not bound
+//! the work either, since the multiplicand is the context size a `map.over`
+//! or webhook payload can make arbitrarily large, the same shape as the
+//! open Task 10 finding) and is left open rather than papered over.
 //!
 //! **A separate, more alarming finding, also measured directly and not
 //! assumed:** constructing and then dropping a `serde_json::Value` that is
@@ -270,8 +352,63 @@ pub enum ExprError {
     Unterminated,
     #[error("expression nesting exceeds the depth limit of {0}")]
     ExpressionTooDeep(usize),
-    #[error("json() argument is not valid JSON: {0}")]
-    Json(#[from] serde_json::Error),
+    #[error("json() argument is not valid JSON ({0})")]
+    Json(JsonErrorCategory),
+}
+
+/// What kind of problem `json()`'s `serde_json::from_str` hit, **carrying
+/// only [`serde_json::Error::classify`]'s category, never the error's own
+/// `Display` text.** This is a fix, not the obvious choice: `json()`'s
+/// argument is any expression (`json(secrets.TOKEN)` is valid syntax), so a
+/// prior version of this module that stored the `serde_json::Error` itself
+/// via `#[from]` and rendered it in `ExprError::Json`'s `#[error(...)]`
+/// text leaked a byte offset derived from the context value's own length —
+/// `serde_json` never echoes input *bytes*, but it does echo a line/column,
+/// and that column is a property of the secret: measured directly,
+/// `json(secrets.T)` with `T = "unterminated` (13 bytes before EOF)
+/// produced an error whose text contained "column 13" — the secret's exact
+/// length — and `T = "12345abcdef"` produced "column 6" — the length of
+/// its leading numeric run. Reducing to a fixed, small category (no line,
+/// no column, no message text from `serde_json`) removes that channel
+/// entirely: every one of these variants renders the same fixed string
+/// regardless of what was fed to `json()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonErrorCategory {
+    /// The input was not syntactically valid JSON at all (e.g. `not json`).
+    Syntax,
+    /// The input ended before a complete JSON value was parsed (e.g. an
+    /// unterminated string or object).
+    Eof,
+    /// The input parsed but did not fit the type being deserialized into.
+    /// `json()` always deserializes into `serde_json::Value`, which accepts
+    /// any valid JSON, so this arm is unreachable in practice — kept for
+    /// exhaustiveness against `serde_json::error::Category`.
+    Data,
+    /// An I/O error occurred. Unreachable for `from_str` (which reads from
+    /// an in-memory `&str`, not an I/O source) — kept for exhaustiveness.
+    Io,
+}
+
+impl fmt::Display for JsonErrorCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            JsonErrorCategory::Syntax => "syntax error",
+            JsonErrorCategory::Eof => "unexpected end of input",
+            JsonErrorCategory::Data => "wrong shape for the target type",
+            JsonErrorCategory::Io => "I/O error",
+        })
+    }
+}
+
+impl From<serde_json::Error> for JsonErrorCategory {
+    fn from(e: serde_json::Error) -> Self {
+        match e.classify() {
+            serde_json::error::Category::Io => JsonErrorCategory::Io,
+            serde_json::error::Category::Syntax => JsonErrorCategory::Syntax,
+            serde_json::error::Category::Data => JsonErrorCategory::Data,
+            serde_json::error::Category::Eof => JsonErrorCategory::Eof,
+        }
+    }
 }
 
 /// The evaluation context: a flat table of named roots (`inputs`, `steps`,
@@ -339,7 +476,12 @@ pub fn eval(expr: &str, ctx: &ExprContext) -> Result<Value, ExprError> {
     if p.pos != p.s.len() {
         return Err(ExprError::UnexpectedToken(p.pos, expr[p.pos..].to_string()));
     }
-    Ok(v)
+    // The one unavoidable clone: `eval`'s own signature returns an owned
+    // `Value`, and `ctx` must outlive this call, so the top-level result has
+    // to be materialized here regardless of how much of the evaluation
+    // above stayed borrowed. See the module doc comment's "Cost" section
+    // for what staying borrowed through here actually saves.
+    Ok(v.into_owned())
 }
 
 /// Replaces every `${{ ... }}` block in `template` with its evaluated,
@@ -472,7 +614,7 @@ impl<'a> Parser<'a> {
     /// every form of nesting (`[`, `(`, `? :`) recurses back through — see
     /// the module doc comment's "Cost" section. Counts and bounds its own
     /// recursion depth via [`MAX_EXPR_DEPTH`] before doing any work.
-    fn parse_ternary(&mut self) -> Result<Value, ExprError> {
+    fn parse_ternary(&mut self) -> Result<Cow<'a, Value>, ExprError> {
         self.depth += 1;
         if self.depth > MAX_EXPR_DEPTH {
             self.depth -= 1;
@@ -483,7 +625,7 @@ impl<'a> Parser<'a> {
         result
     }
 
-    fn parse_ternary_inner(&mut self) -> Result<Value, ExprError> {
+    fn parse_ternary_inner(&mut self) -> Result<Cow<'a, Value>, ExprError> {
         let cond = self.parse_comparison()?;
         self.skip_ws();
         if self.peek() == Some(b'?') {
@@ -497,12 +639,16 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             self.skip_ws();
             let else_v = self.parse_ternary()?;
-            return Ok(if truthy(&cond) { then_v } else { else_v });
+            return Ok(if truthy(cond.as_ref()) {
+                then_v
+            } else {
+                else_v
+            });
         }
         Ok(cond)
     }
 
-    fn parse_comparison(&mut self) -> Result<Value, ExprError> {
+    fn parse_comparison(&mut self) -> Result<Cow<'a, Value>, ExprError> {
         let lhs = self.parse_primary_chain()?;
         self.skip_ws();
         for (tok, op) in COMPARISON_OPS {
@@ -510,30 +656,49 @@ impl<'a> Parser<'a> {
                 self.pos += tok.len();
                 self.skip_ws();
                 let rhs = self.parse_primary_chain()?;
-                return Ok(Value::Bool(op(&lhs, &rhs)));
+                return Ok(Cow::Owned(Value::Bool(op(lhs.as_ref(), rhs.as_ref()))));
             }
         }
         Ok(lhs)
     }
 
     /// Resolves a primary value followed by zero or more `.field`/`[idx]`
-    /// steps. **Threads a borrowed [`Cow`] through the whole chain instead
-    /// of an owned `Value`, cloning at most once, at the very end** — see
-    /// [`index_field`]/[`index_array`]'s own doc comments for why this is
-    /// load-bearing rather than a style choice: a version written against
-    /// plain `Value` (the brief's own illustrative code) clones the
-    /// *entire remaining nested substructure* on every `.field` step, which
-    /// is `O(depth)` work repeated `O(depth)` times — `O(depth²)` overall
-    /// for indexing `depth` levels into context data. Measured directly on
-    /// this exact code shape before the fix: an 8x increase in property-
-    /// chain length (and matching context depth) took roughly 70x longer,
-    /// consistent with quadratic, not linear, scaling — this is precisely
-    /// the "quadratic in context size" risk this task was told to check
-    /// for. After this fix, every step that resolves from data still
-    /// reachable through `ctx`'s original borrow returns a fresh
-    /// `Cow::Borrowed` at zero copy cost; only the final `.into_owned()`
-    /// below clones anything, and only the one leaf value being returned.
-    fn parse_primary_chain(&mut self) -> Result<Value, ExprError> {
+    /// steps. **Threads a borrowed [`Cow`] through the whole chain, and
+    /// returns it still as a `Cow` rather than forcing it to an owned
+    /// `Value` here** — see [`index_field`]/[`index_array`]'s own doc
+    /// comments for why the *chaining* half of this is load-bearing (a
+    /// version written against plain `Value`, the brief's own illustrative
+    /// code, clones the entire remaining nested substructure on every
+    /// `.field` step — `O(depth²)` overall; measured directly, before that
+    /// fix, an 8x increase in property-chain length took roughly 70x
+    /// longer).
+    ///
+    /// **Not forcing ownership here is a second, independent fix**, for a
+    /// different defect than the chain-cloning one above: a version of this
+    /// function that ended with `Ok(v.into_owned())` (this module's own
+    /// prior shape) clones its *result* unconditionally, even when the
+    /// caller — [`parse_args_until`] collecting a function's arguments, or
+    /// [`Parser::parse_comparison`] comparing two chains — only ever reads
+    /// through a reference and never needs an owned copy at all. Every
+    /// mention of a context root inside a function call (`len(payload)`,
+    /// or an unused extra argument like `default(payload, x, payload,
+    /// payload, ...)`) paid one full clone of whatever that root resolved
+    /// to, regardless of whether the function that received it ever used
+    /// the clone. Measured directly on that exact code shape, before this
+    /// fix, with a 20 MiB context bound to `payload` and a single
+    /// `default(payload, payload, ..., payload)` expression: 1 mention →
+    /// 84 MiB peak RSS; 5 mentions (48-byte expression) → 187 MiB; 15
+    /// mentions (128-byte expression) → 391 MiB — amplification tracking
+    /// mention count, independent of whether the mentioned value was ever
+    /// used. See the module doc comment's "Cost" section for the
+    /// post-fix numbers and the harness that produced both sets. Every
+    /// step that resolves from data still reachable through `ctx`'s
+    /// original borrow now returns a fresh `Cow::Borrowed` all the way up
+    /// through comparisons and argument collection at zero copy cost;
+    /// [`eval`]'s own top-level `.into_owned()` is the only place left that
+    /// unconditionally clones, and it clones only the one final result
+    /// `eval` actually returns.
+    fn parse_primary_chain(&mut self) -> Result<Cow<'a, Value>, ExprError> {
         self.skip_ws();
         let mut v = self.parse_primary()?;
         loop {
@@ -550,12 +715,12 @@ impl<'a> Parser<'a> {
                     return Err(ExprError::UnexpectedToken(self.pos, "expected ']'".into()));
                 }
                 self.pos += 1;
-                v = index_array(v, &idx_val);
+                v = index_array(v, idx_val.as_ref());
             } else {
                 break;
             }
         }
-        Ok(v.into_owned())
+        Ok(v)
     }
 
     fn parse_primary(&mut self) -> Result<Cow<'a, Value>, ExprError> {
@@ -668,17 +833,39 @@ impl<'a> Parser<'a> {
         Ok(serde_json::json!(n))
     }
 
+    /// Builds a new, owned array literal. Unlike a function's arguments (see
+    /// [`parse_args`]), every element here genuinely must be cloned into the
+    /// new `Value::Array` this constructs — the result **is** a brand-new
+    /// value that has to own N independent copies of whatever N elements
+    /// were written, so `Cow::into_owned()` on each item is necessary work,
+    /// not a residual of the argument-clone amplification fixed in
+    /// [`Parser::parse_primary_chain`]'s doc comment. It is still a real,
+    /// measured cost when an element is itself a mention of a large context
+    /// root repeated many times (`[payload, payload, ..., payload]`) — see
+    /// the module doc comment's "Cost" section for the measured coefficient
+    /// and why this residual is left open rather than capped.
     fn parse_array_literal(&mut self) -> Result<Value, ExprError> {
         self.pos += 1; // '['
         let items = self.parse_args_until(b']')?;
-        Ok(Value::Array(items))
+        Ok(Value::Array(
+            items.into_iter().map(Cow::into_owned).collect(),
+        ))
     }
 
-    fn parse_args(&mut self) -> Result<Vec<Value>, ExprError> {
+    /// Collects a function call's comma-separated arguments **without**
+    /// forcing any of them to an owned `Value` — see
+    /// [`Parser::parse_primary_chain`]'s doc comment for why that matters.
+    /// A pure-read function (`len`, `contains`, `slice`'s source array,
+    /// `flatten`'s outer array) can read straight through the `Cow` and
+    /// never pay for a clone at all; only a function that must produce new
+    /// owned data from a chosen argument (`default` returning the one
+    /// branch it picked) calls `Cow::into_owned()`, and only on that one
+    /// argument.
+    fn parse_args(&mut self) -> Result<Vec<Cow<'a, Value>>, ExprError> {
         self.parse_args_until(b')')
     }
 
-    fn parse_args_until(&mut self, close: u8) -> Result<Vec<Value>, ExprError> {
+    fn parse_args_until(&mut self, close: u8) -> Result<Vec<Cow<'a, Value>>, ExprError> {
         let mut args = Vec::new();
         self.skip_ws();
         if self.peek() == Some(close) {
@@ -763,16 +950,38 @@ fn as_f64(v: &Value) -> f64 {
 /// than going through `Cow`'s `Deref` is what lets this stay zero-copy for
 /// the `Cow::Borrowed` case instead of accidentally re-shortening the
 /// lifetime to this call.
+///
+/// **The `Cow::Owned` arm moves the field out of `o` by removing it from the
+/// map, it does not clone it.** An earlier version of this function called
+/// `o.get(field).cloned()` here, which — because `o` is itself already an
+/// owned clone made once when the chain's root left the `ctx` borrow (see
+/// [`Parser::parse_primary_chain`]'s doc comment) — clones the **entire
+/// subtree still hanging off `field`** at every single step of a chain
+/// evaluated after that point, i.e. `O(depth)` work repeated `O(depth)`
+/// times once a chain is rooted at owned data. Measured directly on that
+/// exact code (a 50-level `.next` chain over a context padded to ~16 KB
+/// per level, evaluated through `default(missing, root)` to force the
+/// owned root): depth 50 → 1.88 ms; depth 100 (2x) → 7.52 ms (4.0x); depth
+/// 200 (2x again) → 29.66 ms (3.9x) — quadratic, not linear, in chain
+/// length, matching security's independent measurement of the same shape.
+/// `Map::remove` (a lookup plus a move of the one matched value out of the
+/// map) does none of that: it touches only the current level's own
+/// bookkeeping, not the size of what it returns, so the chain's total cost
+/// across all steps drops to being bounded by the size of the data actually
+/// touched, not by depth times remaining-subtree size. Re-measured after
+/// this fix with the same three depths: see this module's doc comment
+/// "Cost" section for the numbers and the harness that produced them.
 fn index_field<'a>(v: Cow<'a, Value>, field: &str) -> Cow<'a, Value> {
     match v {
         Cow::Borrowed(r) => match r.get(field) {
             Some(inner) => Cow::Borrowed(inner),
             None => Cow::Owned(Value::Null),
         },
-        Cow::Owned(o) => match o.get(field) {
-            Some(inner) => Cow::Owned(inner.clone()),
+        Cow::Owned(Value::Object(mut map)) => match map.remove(field) {
+            Some(inner) => Cow::Owned(inner),
             None => Cow::Owned(Value::Null),
         },
+        Cow::Owned(_) => Cow::Owned(Value::Null),
     }
 }
 
@@ -801,7 +1010,11 @@ fn as_index(v: &Value) -> Option<usize> {
 }
 
 /// Resolves `v[idx]`, borrow-preserving like [`index_field`] — see its doc
-/// comment for why.
+/// comment for why, including why the `Cow::Owned` arm below uses
+/// `Vec::swap_remove` (an O(1) move of the matched element, with the last
+/// element moved into its place, no clone of the element or of any sibling)
+/// rather than `a.get(i).cloned()`, which paid the same per-step
+/// whole-remaining-subtree clone cost `index_field` used to.
 fn index_array<'a>(v: Cow<'a, Value>, idx: &Value) -> Cow<'a, Value> {
     let i = match as_index(idx) {
         Some(i) => i,
@@ -812,10 +1025,13 @@ fn index_array<'a>(v: Cow<'a, Value>, idx: &Value) -> Cow<'a, Value> {
             Some(inner) => Cow::Borrowed(inner),
             None => Cow::Owned(Value::Null),
         },
-        Cow::Owned(Value::Array(a)) => match a.get(i) {
-            Some(inner) => Cow::Owned(inner.clone()),
-            None => Cow::Owned(Value::Null),
-        },
+        Cow::Owned(Value::Array(mut a)) => {
+            if i < a.len() {
+                Cow::Owned(a.swap_remove(i))
+            } else {
+                Cow::Owned(Value::Null)
+            }
+        }
         _ => Cow::Owned(Value::Null),
     }
 }
@@ -824,50 +1040,57 @@ fn index_array<'a>(v: Cow<'a, Value>, idx: &Value) -> Cow<'a, Value> {
 /// `slice`, `default`, `contains`, `flatten`, `json`, `env`). Do not add a
 /// function here without going back to §8.9 first; this list is meant to
 /// stay this short forever.
-fn call_function(name: &str, args: Vec<Value>) -> Result<Value, ExprError> {
+///
+/// Takes its arguments as `Cow<Value>`, not owned `Value` — see
+/// [`Parser::parse_primary_chain`]'s doc comment for the amplification bug
+/// this avoids. Every arm below reads through `.as_ref()` and clones only
+/// what it actually returns: `len`/`contains` never clone at all; `slice`
+/// clones just the sliced range, not the source array; `flatten` clones
+/// only the elements it copies into the new flattened array, never the
+/// outer array itself; `default` clones only whichever one of its two
+/// arguments it selects, leaving any others (including extra, unused ones —
+/// this parser does not enforce arity) untouched.
+fn call_function<'a>(name: &str, args: Vec<Cow<'a, Value>>) -> Result<Value, ExprError> {
     match name {
-        "len" => Ok(serde_json::json!(match args.first() {
+        "len" => Ok(serde_json::json!(match args.first().map(|v| v.as_ref()) {
             Some(Value::Array(a)) => a.len(),
             Some(Value::String(s)) => s.len(),
             Some(Value::Object(o)) => o.len(),
             _ => 0,
         })),
         "slice" => {
-            let arr = args
-                .first()
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let start = args.get(1).and_then(as_index).unwrap_or(0);
+            let arr = args.first().and_then(|v| v.as_ref().as_array());
+            let arr_len = arr.map(|a| a.len()).unwrap_or(0);
+            let start = args.get(1).and_then(|v| as_index(v.as_ref())).unwrap_or(0);
             let end = args
                 .get(2)
-                .and_then(as_index)
-                .unwrap_or(arr.len())
-                .min(arr.len());
-            Ok(Value::Array(
-                arr.get(start.min(end)..end).unwrap_or(&[]).to_vec(),
-            ))
+                .and_then(|v| as_index(v.as_ref()))
+                .unwrap_or(arr_len)
+                .min(arr_len);
+            let sliced = arr.and_then(|a| a.get(start.min(end)..end)).unwrap_or(&[]);
+            Ok(Value::Array(sliced.to_vec()))
         }
         "default" => {
-            let primary = args.first().cloned().unwrap_or(Value::Null);
-            let fallback = args.get(1).cloned().unwrap_or(Value::Null);
-            Ok(if matches!(primary, Value::Null) {
-                fallback
+            let mut it = args.into_iter();
+            let primary = it.next();
+            let primary_is_null = matches!(primary.as_deref(), None | Some(Value::Null));
+            if primary_is_null {
+                Ok(it.next().map(Cow::into_owned).unwrap_or(Value::Null))
             } else {
-                primary
-            })
+                Ok(primary.map(Cow::into_owned).unwrap_or(Value::Null))
+            }
         }
         "contains" => {
-            let hay = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let needle = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            let hay = args.first().and_then(|v| v.as_ref().as_str()).unwrap_or("");
+            let needle = args.get(1).and_then(|v| v.as_ref().as_str()).unwrap_or("");
             Ok(Value::Bool(hay.contains(needle)))
         }
         "flatten" => {
             let mut out = Vec::new();
-            if let Some(Value::Array(outer)) = args.first() {
+            if let Some(Value::Array(outer)) = args.first().map(|v| v.as_ref()) {
                 for inner in outer {
                     if let Value::Array(a) = inner {
-                        out.extend(a.clone());
+                        out.extend(a.iter().cloned());
                     } else {
                         out.push(inner.clone());
                     }
@@ -876,15 +1099,18 @@ fn call_function(name: &str, args: Vec<Value>) -> Result<Value, ExprError> {
             Ok(Value::Array(out))
         }
         "json" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("null");
-            Ok(serde_json::from_str(s)?)
+            let s = args
+                .first()
+                .and_then(|v| v.as_ref().as_str())
+                .unwrap_or("null");
+            serde_json::from_str(s).map_err(|e| ExprError::Json(JsonErrorCategory::from(e)))
         }
         "env" => {
             // Reads the real process environment — see the module doc
             // comment's "`env()` is a second, independent secret-exposure
             // surface" section. Not scoped to a workflow's declared
             // `secrets:` list.
-            let key = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let key = args.first().and_then(|v| v.as_ref().as_str()).unwrap_or("");
             Ok(match std::env::var(key) {
                 Ok(v) => Value::String(v),
                 Err(_) => Value::Null,
