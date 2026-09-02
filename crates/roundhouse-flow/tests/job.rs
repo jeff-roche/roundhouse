@@ -141,6 +141,24 @@ fn a_prompt_job_is_sugar_for_a_single_step_workflow() {
 }
 
 #[test]
+fn prompt_job_lowering_round_trips_through_parse_workflow() {
+    // Fix round 1 on Task 10 (finding C): the previous test below only
+    // proved the lowering is *shaped like* workflow YAML by parsing it as
+    // a generic `serde_yaml::Value` — it never actually called Task 2's
+    // real `parse_workflow`, so a lowering that Task 2's own validation
+    // rejected (`escalate: park` with no `deadline`/`on_timeout`) went
+    // undetected. This calls the real parser.
+    let body = Body::Prompt {
+        template: "Summarize open PRs in ${{ inputs.repo }}".to_string(),
+    };
+    let yaml = body.to_workflow_yaml("adhoc-prompt", 1);
+    let def = roundhouse_flow::parse::parse_workflow(&yaml)
+        .expect("a prompt job's lowering must be accepted by this crate's own parser");
+    assert_eq!(def.name, "adhoc-prompt");
+    assert_eq!(def.version, 1);
+}
+
+#[test]
 fn prompt_lowering_is_actually_consumable_by_the_task_2_workflow_parser_shape() {
     // The cross-task seam this task's dispatch flagged: `Body::Workflow`
     // carries raw YAML, `parse_workflow(yaml: &str) -> Result<WorkflowDef, ParseError>`

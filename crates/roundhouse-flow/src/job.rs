@@ -58,9 +58,21 @@ impl Body {
     /// The synthesized YAML for `Prompt` deliberately includes every field
     /// `WorkflowDef` requires without a `#[serde(default)]` — `name`,
     /// `version`, `permissions` (with its own required `default` and
-    /// `unattended.escalate`), and `steps` — not just `steps`/`agent`, so a
-    /// prompt job's lowering actually round-trips through `parse_workflow`
-    /// rather than merely resembling workflow YAML.
+    /// `unattended.escalate`, plus `deadline`/`on_timeout` — Task 2's
+    /// `parse_workflow` rejects `escalate: park` without both, per §8.5
+    /// point 2, so this lowering must carry them too, not just the bare
+    /// `escalate` tag), and `steps` — not just `steps`/`agent`, so a prompt
+    /// job's lowering actually round-trips through `parse_workflow` rather
+    /// than merely resembling workflow YAML. This is exercised directly by
+    /// `tests/job.rs`'s
+    /// `prompt_job_lowering_round_trips_through_parse_workflow`, which
+    /// calls the real `roundhouse_flow::parse::parse_workflow` (fix round
+    /// 1 on Task 10: an earlier version of this method emitted
+    /// `escalate: park` alone, which Task 2's own cross-field validation —
+    /// added in that same round — then rejected; the only test that
+    /// existed at the time parsed the lowering as generic
+    /// `serde_yaml::Value`, never through `parse_workflow`, so the break
+    /// went undetected).
     pub fn to_workflow_yaml(&self, name: &str, version: u32) -> String {
         match self {
             Body::Workflow { workflow_yaml } => workflow_yaml.clone(),
@@ -73,6 +85,13 @@ impl Body {
                 yaml.push_str("  default: deny\n");
                 yaml.push_str("  unattended:\n");
                 yaml.push_str("    escalate: park\n");
+                // A prompt job is unattended-by-default sugar (§8.3); a
+                // `park` escalation with no deadline/timeout would leave it
+                // parked forever with nobody accountable for it, so this
+                // lowering picks the same safe values §8.9's example
+                // fixture uses for its own `park` escalation.
+                yaml.push_str("    deadline: 24h\n");
+                yaml.push_str("    on_timeout: deny\n");
                 yaml.push_str("steps:\n");
                 yaml.push_str("  - id: run\n");
                 yaml.push_str("    agent:\n");
