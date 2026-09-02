@@ -56,9 +56,16 @@ static GOOGLE_API_KEY: LazyLock<Regex> =
 /// unlabeled — false-positive city over arbitrary text), and any other
 /// provider's opaque token. Anchored on a nearby field-name label so it
 /// doesn't fire on arbitrary base64-shaped text with no such context.
+///
+/// The trailing `\S*` (added fix-round-2, B4) consumes any remaining
+/// non-whitespace characters after the initial 16-character run — the
+/// earlier version stopped at the first character outside
+/// `[A-Za-z0-9/_+.~-]`, so a value containing punctuation
+/// (`"abcdefghijklmnop!QRSTUVWX"`) redacted only its first 16 characters and
+/// left the rest, `!QRSTUVWX`, sitting in the persisted body untouched.
 static LABELED_SECRET_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)(client[_-]?secret|secret[_-]?access[_-]?key|api[_-]?key|access[_-]?token)["']?\s*[:=]\s*["']?[A-Za-z0-9/_+.~-]{16,}"#,
+        r#"(?i)(client[_-]?secret|secret[_-]?access[_-]?key|api[_-]?key|access[_-]?token)["']?\s*[:=]\s*["']?[A-Za-z0-9/_+.~-]{16,}\S*"#,
     )
     .unwrap()
 });

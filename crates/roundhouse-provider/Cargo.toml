@@ -46,3 +46,8 @@ tokio = { version = "1.53", features = ["full", "test-util"] }
 # this out of `[dev-dependencies]`.
 roundhouse-secrets = { path = "../roundhouse-secrets" }
 walkdir = "2.5"
+# `tests/credential_test.rs`'s `provider_manifest_never_depends_on_secrecy`
+# parses this crate's own Cargo.toml as TOML (not a text scan — B2,
+# fix-round-2) to catch dotted-key and renamed-dependency forms a
+# line-oriented scan would miss.
+toml = "0.8"

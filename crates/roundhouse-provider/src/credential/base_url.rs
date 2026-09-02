@@ -25,8 +25,18 @@ pub fn resolve_base_url(
         );
         std::env::var(&env_key).unwrap_or_else(|_| profile_default.to_string())
     };
-    let parsed = url::Url::parse(&raw)
-        .map_err(|e| CredentialError::InvalidBaseUrl(format!("{raw}: {e}")))?;
+    // Never interpolate `raw` itself into the error — a malformed override
+    // can carry a query string (e.g. a gateway API key) or embedded
+    // userinfo, and this project persists error text onto
+    // physically-immutable `Event` rows. `record_base_url_override` already
+    // degrades gracefully to `<unparseable-host>` when `raw` doesn't parse,
+    // so it's safe to call here even on the failure path this feeds.
+    let parsed = url::Url::parse(&raw).map_err(|e| {
+        CredentialError::InvalidBaseUrl(format!(
+            "base URL for host `{}` is not a valid URL: {e}",
+            record_base_url_override(&raw)
+        ))
+    })?;
     let recorded = record_base_url_override(&raw);
     Ok((parsed, recorded))
 }

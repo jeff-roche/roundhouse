@@ -159,6 +159,35 @@ fn base_url_resolution_order_is_override_then_env_then_profile_default() {
 }
 
 #[test]
+fn base_url_parse_failure_never_echoes_the_malformed_override_verbatim() {
+    // B1 (fix-round-2): `resolve_base_url`'s own A6 test above proves the
+    // host-only pairing works on the SUCCESS path (a well-formed override
+    // carrying `?api_key=...`). An earlier version of the parse-FAILURE
+    // path (`InvalidBaseUrl(format!("{raw}: {e}"))`) still interpolated the
+    // raw string verbatim — so a malformed override carrying the same
+    // sensitive query string would land in the error this project persists
+    // onto immutable Event rows, even though the well-formed case was
+    // already fixed.
+    let malformed = "not-a-valid-url-at-all?api_key=sk-should-never-appear";
+    let err = roundhouse_provider::credential::resolve_base_url(
+        "testprov",
+        "https://default.example.com",
+        Some(malformed),
+    )
+    .err()
+    .unwrap();
+    let message = err.to_string();
+    assert!(
+        !message.contains("api_key"),
+        "parse-failure error must never carry the malformed override's query string: {message}"
+    );
+    assert!(
+        !message.contains("sk-should-never-appear"),
+        "parse-failure error must never carry the malformed override's secret-shaped value: {message}"
+    );
+}
+
+#[test]
 fn provider_src_never_touches_secret_material_directly() {
     // §9.9 / REALITY-CORRECTIONS §6: `roundhouse-provider` defines the
     // `CredentialProvider` trait vocabulary only. It must never gain a
@@ -194,22 +223,47 @@ fn provider_src_never_touches_secret_material_directly() {
 #[test]
 fn provider_manifest_never_depends_on_secrecy() {
     // A10: a source-text scan for `secrecy::` is defeated by `use secrecy as
-    // s;` — an aliased import never spells that substring anywhere. The
-    // manifest check above's text scan can't be renamed around: if
-    // `secrecy` isn't a declared dependency at all, no code in this crate
-    // can reference it under any alias.
+    // s;` — an aliased import never spells that substring anywhere. A
+    // dependency can't be renamed away from the manifest the same way, so
+    // this parses `Cargo.toml` as TOML rather than scanning its text.
+    //
+    // B2 (fix-round-2): the previous version of this check DID scan text —
+    // splitting each line on `=`/whitespace to get a "key" — which caught
+    // `secrecy = "0.10"` but missed two forms a real TOML document allows:
+    // dotted-key syntax (`secrecy.workspace = true`, which a genuine TOML
+    // parser normalizes into the identical table structure as
+    // `secrecy = { workspace = true }`, so parsing catches it automatically)
+    // and a rename (`s = { package = "secrecy" }`, checked explicitly below
+    // via each entry's own `package` field). The old comment claimed this
+    // "cannot be aliased around" — true of a source-text scan, but the
+    // manifest-level check itself had the same class of gap; parsing
+    // properly closes it instead of just re-claiming it does.
     let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let manifest = std::fs::read_to_string(&manifest_path).unwrap();
-    let declares_secrecy = manifest.lines().any(|line| {
-        let key = line
-            .trim_start()
-            .split(|c: char| c == '=' || c.is_whitespace())
-            .next()
-            .unwrap_or("");
-        key == "secrecy"
-    });
+    let parsed: toml::Value = manifest.parse().expect("parse Cargo.toml");
+    let mut hits = Vec::new();
+    for table_name in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        let Some(table) = parsed.get(table_name).and_then(|t| t.as_table()) else {
+            continue;
+        };
+        for (key, value) in table {
+            if key == "secrecy" {
+                hits.push(format!("[{table_name}] key `{key}`"));
+                continue;
+            }
+            let renamed_from_secrecy = value
+                .get("package")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| p == "secrecy");
+            if renamed_from_secrecy {
+                hits.push(format!(
+                    "[{table_name}] `{key}` renamed from package = \"secrecy\""
+                ));
+            }
+        }
+    }
     assert!(
-        !declares_secrecy,
-        "roundhouse-provider's Cargo.toml must never declare a `secrecy` dependency"
+        hits.is_empty(),
+        "roundhouse-provider's Cargo.toml must never declare a `secrecy` dependency, found: {hits:?}"
     );
 }

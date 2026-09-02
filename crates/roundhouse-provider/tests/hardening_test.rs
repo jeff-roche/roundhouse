@@ -110,3 +110,22 @@ fn error_body_redaction_catches_aws_and_google_key_shapes_and_labeled_secrets() 
         "non-secret content must survive redaction"
     );
 }
+
+#[test]
+fn error_body_redaction_consumes_the_full_labeled_secret_value_past_punctuation() {
+    // B4 (fix-round-2): the labeled-secret pattern's value class stops at
+    // the first character outside `[A-Za-z0-9/_+.~-]`, so a value
+    // containing punctuation used to redact only its first 16 characters
+    // and leave the rest sitting in the persisted body untouched.
+    let body = r#"{"client_secret":"abcdefghijklmnop!QRSTUVWX"}"#;
+    let redacted = redact_error_body(body);
+    assert!(
+        !redacted.contains("abcdefghijklmnop"),
+        "the matched prefix must be redacted: {redacted}"
+    );
+    assert!(
+        !redacted.contains("!QRSTUVWX"),
+        "the tail past the first punctuation character must also be redacted, not left \
+         behind: {redacted}"
+    );
+}

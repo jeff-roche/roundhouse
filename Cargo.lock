@@ -3188,6 +3188,7 @@ dependencies = [
  "sse-stream",
  "thiserror 2.0.20",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "url",
  "walkdir",
