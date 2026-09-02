@@ -82,6 +82,18 @@ const DRIFT_THRESHOLD: Duration = Duration::from_secs(2);
 /// bounding the worst case.
 pub const MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK: usize = 100;
 
+/// NEW-2 (fix round 2): upper bound on `TriggerSpec::Interval`'s `every`.
+/// Comfortably below both degenerate magnitudes confirmed against pinned
+/// chrono 0.4.45 — `chrono::TimeDelta::MAX` (~9.22e15s, beyond which
+/// `chrono::Duration::from_std` returns `Err`) and the much smaller
+/// ~8.3e12s threshold beyond which `DateTime<Utc> + TimeDelta` overflows
+/// chrono's representable year range (max year 262143) and panics. No real
+/// interval trigger fires less often than once a century (100 years ≈
+/// 3.16e9 seconds — a margin of roughly six orders of magnitude below the
+/// nearer of the two thresholds), so anything at or beyond this bound is
+/// necessarily degenerate configuration, not a legitimate schedule.
+pub const MAX_INTERVAL: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
 /// One scheduled occurrence in the heap. Multiple entries can share a
 /// `binding_id` — most obviously the two instants of a `DstAmbiguous::Both`
 /// fold (Ruling P16), which are pushed as two independent entries for the
@@ -221,13 +233,25 @@ impl Scheduler {
                 if every.is_zero() {
                     return Err(CronError::ZeroInterval);
                 }
+                // NEW-2 (fix round 2): a single upper bound rejects both of
+                // the non-zero degenerate magnitudes `is_zero()` missed (see
+                // `CronError::IntervalTooLarge`'s doc comment) before ever
+                // reaching `chrono::Duration::from_std`/`checked_add_signed`
+                // — neither of which is then allowed to silently default or
+                // panic; both map to the same typed error instead.
+                if *every > MAX_INTERVAL {
+                    return Err(CronError::IntervalTooLarge(*every));
+                }
+                let delta = chrono::Duration::from_std(*every)
+                    .map_err(|_| CronError::IntervalTooLarge(*every))?;
+                let next = after
+                    .checked_add_signed(delta)
+                    .ok_or(CronError::IntervalTooLarge(*every))?;
                 // `align`/`anchor` are not applied here — no task in this
                 // phase's plan implements interval alignment, and Task 3's
                 // scope is heap scheduling + drift detection, not that
                 // feature. Left as a plain fixed-offset-from-`after` step.
-                Ok(vec![
-                    after + chrono::Duration::from_std(*every).unwrap_or_default(),
-                ])
+                Ok(vec![next])
             }
             // Fs/Git/Webhook/RunComplete/Message/Manual are event-driven,
             // not heap-scheduled: they have no "next fire" to compute.

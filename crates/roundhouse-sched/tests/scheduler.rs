@@ -456,3 +456,58 @@ fn adding_a_zero_duration_interval_binding_is_rejected_not_silently_accepted() {
     let err = sched.add_binding(binding, &clock).unwrap_err();
     assert!(matches!(err, CronError::ZeroInterval));
 }
+
+/// NEW-2 (fix round 2): `is_zero()` alone missed a non-zero magnitude beyond
+/// `chrono::TimeDelta::MAX` (~9.22e15s), where `chrono::Duration::from_std`
+/// returns `Err` and the old `unwrap_or_default()` silently turned that into
+/// `TimeDelta::zero()` — bit-for-bit the same degenerate never-advances
+/// behavior `ZeroInterval` exists to prevent. Confirmed this is rejected
+/// (not silently accepted, and not a panic) at registration time.
+#[test]
+fn adding_an_interval_binding_beyond_chronos_representable_range_is_rejected() {
+    let clock = FakeClock {
+        mono: RefCell::new(Instant::now()),
+        wall: RefCell::new(Utc::now()),
+    };
+    let mut sched = Scheduler::new();
+    let binding = Binding::new(
+        JobId::new(),
+        TriggerSpec::Interval {
+            every: Duration::from_secs(u64::MAX),
+            align: false,
+            anchor: None,
+        },
+    );
+
+    let err = sched.add_binding(binding, &clock).unwrap_err();
+    assert!(matches!(err, CronError::IntervalTooLarge(_)));
+}
+
+/// NEW-2 (fix round 2): the second missed magnitude — roughly
+/// 8.3e12s <= `every` <= `TimeDelta::MAX`, where `from_std` succeeds but the
+/// later `DateTime<Utc> + TimeDelta` overflows chrono's representable year
+/// range (max year 262143) and panics via `.expect(...)`-style addition, a
+/// panic no `if let Ok(..)` call site could catch. Confirmed this magnitude
+/// is rejected at registration time rather than reaching, and panicking,
+/// inside `occurrences_after`'s arithmetic.
+#[test]
+fn adding_an_interval_binding_that_would_overflow_datetime_arithmetic_is_rejected() {
+    let clock = FakeClock {
+        mono: RefCell::new(Instant::now()),
+        wall: RefCell::new(Utc::now()),
+    };
+    let mut sched = Scheduler::new();
+    let binding = Binding::new(
+        JobId::new(),
+        TriggerSpec::Interval {
+            // ~9e12 seconds: from_std succeeds at this magnitude, but the
+            // resulting DateTime addition would overflow chrono's range.
+            every: Duration::from_secs(9_000_000_000_000),
+            align: false,
+            anchor: None,
+        },
+    );
+
+    let err = sched.add_binding(binding, &clock).unwrap_err();
+    assert!(matches!(err, CronError::IntervalTooLarge(_)));
+}

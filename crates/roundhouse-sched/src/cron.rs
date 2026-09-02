@@ -27,6 +27,20 @@ pub enum CronError {
     /// meaningfully schedule.
     #[error("interval trigger's `every` duration must be greater than zero")]
     ZeroInterval,
+    /// NEW-2 (fix round 2): `ZeroInterval`'s `is_zero()` guard missed two
+    /// non-zero degenerate magnitudes, both confirmed against pinned chrono
+    /// 0.4.45: `every > chrono::TimeDelta::MAX` (~9.22e15s) makes
+    /// `chrono::Duration::from_std` return `Err`, which the old
+    /// `unwrap_or_default()` silently turned into `TimeDelta::zero()` —
+    /// bit-for-bit the same degenerate behavior `ZeroInterval` exists to
+    /// prevent; and roughly 8.3e12s <= `every` <= `TimeDelta::MAX` makes
+    /// `from_std` succeed but the later `DateTime<Utc> + TimeDelta`
+    /// overflow chrono's representable year range (max year 262143) and
+    /// panic, which no `if let Ok(..)` call site can catch. Both are
+    /// refused by one sane upper bound on interval length — no real
+    /// interval trigger fires less often than once a century.
+    #[error("interval trigger's `every` duration of {0:?} is too large to schedule")]
+    IntervalTooLarge(Duration),
 }
 
 /// The pinned `cron` crate's real API (`cron = "0.15"`): there is no
