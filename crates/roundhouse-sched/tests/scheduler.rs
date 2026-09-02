@@ -597,6 +597,70 @@ fn catch_up_after_wake_with_none_policy_drops_an_entire_multi_batch_backlog() {
     );
 }
 
+/// Fix round 2 (CRITICAL, security review of Task 6): a non-cron trigger
+/// (in practice, only `TriggerSpec::Interval` is heap-scheduled) has no
+/// `CatchUp` concept at all — `compute_catch_up`'s documented contract is
+/// that every missed instant always fires for these. The original fix
+/// round 1 M2 fold tested only `Some(CatchUp::All)` for the "fire every
+/// batch immediately" identity path, so a non-cron binding
+/// (`catch_up_policy` returns `None` for it) fell through into the
+/// `Latest`-shaped branch instead, where `compute_catch_up` correctly
+/// returns `missed` unchanged (its non-cron contract) but the surrounding
+/// `.into_iter().max()` then collapsed it to a single instant anyway —
+/// unrecoverably dropping every other missed `Interval` occurrence, on any
+/// late tick (not just a suspend/wake). Spans two capped batches
+/// (`cap * 2 + 3`) so the fix is proven across `drain_due`'s cross-batch
+/// bookkeeping too, not just within a single batch.
+#[test]
+fn interval_binding_backlog_fires_every_missed_occurrence_across_multiple_capped_batches() {
+    let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let start_mono = Instant::now();
+    let clock = FakeClock {
+        mono: RefCell::new(start_mono),
+        wall: RefCell::new(start_wall),
+    };
+    let mut sched = Scheduler::new();
+    let binding = Binding::new(
+        JobId::new(),
+        TriggerSpec::Interval {
+            every: Duration::from_secs(60),
+            align: false,
+            anchor: None,
+        },
+    );
+    let binding_id = binding.id;
+    sched.add_binding(binding, &clock).unwrap();
+
+    let cap = MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK;
+    let total_missed = cap * 2 + 3;
+    let target = start_wall + chrono::Duration::minutes(total_missed as i64);
+    let elapsed = (target - start_wall).to_std().unwrap();
+    *clock.mono.borrow_mut() = start_mono + elapsed;
+    *clock.wall.borrow_mut() = target;
+
+    let mut all_fires: Vec<DateTime<Utc>> = Vec::new();
+    for _ in 0..10 {
+        let fired = fires_for(&sched.tick(&clock), binding_id);
+        if fired.is_empty() {
+            break;
+        }
+        all_fires.extend(fired);
+    }
+
+    let expected: Vec<DateTime<Utc>> = (1..=total_missed as i64)
+        .map(|m| start_wall + chrono::Duration::minutes(m))
+        .collect();
+    assert_eq!(
+        all_fires,
+        expected,
+        "a non-cron (Interval) binding has no CatchUp policy to apply — every missed \
+         occurrence must fire, not just the latest one, across every capped batch: \
+         got {} fires, expected {}",
+        all_fires.len(),
+        expected.len()
+    );
+}
+
 /// Fix round 1 (M1): a *backward* wall-clock step reported at wake — the
 /// same "NTP correction after suspend/resume overshoots" scenario `tick`'s
 /// own drift check exists to catch — must fall back to a full
@@ -646,8 +710,19 @@ fn catch_up_after_wake_falls_back_to_recompute_on_a_backward_wall_clock_step() {
         t0 + chrono::Duration::minutes(10),
     );
     assert!(
-        fired2.is_empty(),
-        "a clock correction must not itself fire anything"
+        !fired2.iter().any(|e| matches!(e, SchedulerEvent::Fire(..))),
+        "a clock correction must not itself fire a Fire event: {fired2:?}"
+    );
+    // Fix round 2 (optional item): emitted for symmetry with `tick`'s own
+    // drift-triggered `recompute_all`, so a caller watching only the event
+    // stream can still tell "a clock correction happened" apart from
+    // "woke, nothing was due" — previously only a `tracing::warn!` recorded
+    // the difference.
+    assert!(
+        fired2
+            .iter()
+            .any(|e| matches!(e, SchedulerEvent::DriftDetected { .. })),
+        "a backward wake step must report DriftDetected, matching tick's own symmetry: {fired2:?}"
     );
 
     // Probe with plain `tick` at a wall clock chosen to fall strictly

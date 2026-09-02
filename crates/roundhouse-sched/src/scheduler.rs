@@ -76,7 +76,7 @@ const DRIFT_THRESHOLD: Duration = Duration::from_secs(2);
 /// unbounded burst of `Fire` events from a single tick. A binding whose
 /// backlog exceeds this cap simply catches up progressively: each `tick()`
 /// call processes at most one capped batch per binding, deferring the rest
-/// to the next call (see `tick`'s `processed_this_tick` guard). Chosen
+/// to the next call (see `drain_due`'s `processed_this_drain` guard). Chosen
 /// generously above what any realistic short outage at the tightest
 /// practical cron cadence (once a minute) would produce, while still
 /// bounding the worst case.
@@ -160,9 +160,18 @@ pub struct Scheduler {
     /// on a trailing batch that happens to contain exactly one occurrence.
     /// Present only while a binding is mid-backlog; the payload carries the
     /// running temporally-latest occurrence seen so far (`CatchUp::Latest`
-    /// only — `None` always carries `None`, `All` doesn't need the payload
-    /// at all since it fires every batch immediately and correctly). Purely
+    /// only — `None` always carries `None`, `All` and non-cron triggers
+    /// never get an entry at all, since both fire every batch immediately
+    /// and correctly with no cross-batch reduction to carry). Purely
     /// in-memory bookkeeping, not persisted.
+    ///
+    /// Bounded today by "one entry per binding currently mid-backlog,"
+    /// cleared on completion — not a concern at any realistic binding
+    /// count. If a future task adds a binding-*removal* API, that removal
+    /// must also drop this binding's entry here (and from `bindings`/the
+    /// heap), or a removed-then-re-added binding sharing an id could pick
+    /// up a stale carried value; no such API exists yet, so this is a
+    /// forward note, not a current bug.
     catch_up_progress: HashMap<BindingId, Option<DateTime<Utc>>>,
 }
 
@@ -301,6 +310,16 @@ impl Scheduler {
     /// the heap outright. Called on drift detection, where every
     /// already-heaped fire time is potentially stale relative to the new
     /// wall-clock reading.
+    ///
+    /// Fix round 2 (Low, security review of Task 6): also clears
+    /// `catch_up_progress`. The heap replacement above already abandons
+    /// whatever backlog those in-progress entries were tracking (their
+    /// seed heap entries are gone), so the entries must be discarded
+    /// together — otherwise a binding's stale carried value lingers, and
+    /// the next *unrelated* single occurrence for that binding would be
+    /// wrongly treated as the tail of an old backlog (`is_catch_up_pass`
+    /// keys off `catch_up_progress.contains_key`), silently dropping one
+    /// genuinely ordinary firing under `CatchUp::None`.
     pub fn recompute_all(&mut self, after: DateTime<Utc>) {
         let mut new_heap = BinaryHeap::new();
         for binding in self.bindings.values_mut() {
@@ -309,6 +328,7 @@ impl Scheduler {
             }
         }
         self.heap = new_heap;
+        self.catch_up_progress.clear();
     }
 
     /// One scheduler tick: measures monotonic-vs-wall-clock drift since the
@@ -400,28 +420,45 @@ impl Scheduler {
     /// unreconciled. A forward step (the overwhelmingly common real case —
     /// an actual suspend/resume) drains as documented above.
     #[must_use]
+    ///
+    /// Fix round 2 (optional item, security review of Task 6): the backward
+    /// case emits a [`SchedulerEvent::DriftDetected`] just as `tick`'s own
+    /// drift-triggered `recompute_all` does, with the same field semantics
+    /// (elapsed monotonic and absolute wall time since this scheduler's
+    /// previous reading). Without it, a caller watching the event stream
+    /// alone (rather than logs) cannot distinguish "woke, found nothing due"
+    /// from "woke, but the wall clock reading itself was corrected" — only
+    /// the `tracing::warn!` recorded the difference.
     pub fn catch_up_after_wake(
         &mut self,
         monotonic_now: Instant,
         wall_now: DateTime<Utc>,
     ) -> Vec<SchedulerEvent> {
-        let backward_step_beyond_threshold = self.last_wall.is_some_and(|last_wall| {
+        let backward_step = self.last_wall.and_then(|last_wall| {
             (last_wall - wall_now)
                 .to_std()
-                .is_ok_and(|backward| backward > DRIFT_THRESHOLD)
+                .ok()
+                .filter(|backward| *backward > DRIFT_THRESHOLD)
         });
+        let previous_mono = self.last_mono;
 
         self.last_mono = Some(monotonic_now);
         self.last_wall = Some(wall_now);
 
-        if backward_step_beyond_threshold {
+        if let Some(wall_elapsed) = backward_step {
             tracing::warn!(
                 "wake reported a wall clock reading earlier than the last one this scheduler \
                  saw (beyond the drift threshold); treating as a clock correction, not a \
                  catch-up backlog, and forcing a full recompute instead of draining"
             );
             self.recompute_all(wall_now);
-            Vec::new()
+            let monotonic_elapsed = previous_mono
+                .map(|last_mono| monotonic_now.duration_since(last_mono))
+                .unwrap_or(Duration::ZERO);
+            vec![SchedulerEvent::DriftDetected {
+                monotonic_elapsed,
+                wall_elapsed,
+            }]
         } else {
             self.drain_due(wall_now)
         }
@@ -551,32 +588,45 @@ impl Scheduler {
             // means "silently drop a backlog," not "never fire this binding
             // again."
             //
-            // `CatchUp::All`'s reduction is the identity (fire everything),
-            // so firing each batch immediately and unconditionally is
-            // already globally correct — the union of every batch's full
-            // contents is the whole backlog, no cross-batch state needed.
-            // `None`/`Latest` are not: reducing *each batch* independently
-            // (what a naive per-batch `compute_catch_up` call would do)
-            // makes `Latest` fire once per batch instead of once for the
-            // whole backlog, and can make `None` wrongly fire on a trailing
-            // batch that happens to contain exactly one occurrence. Both
-            // are folded into `catch_up_progress`'s running
-            // temporally-latest-seen value instead, and only actually fired
-            // (or, for `None`, confirmed as never fired) once
+            // `CatchUp::All`'s reduction is the identity (fire everything).
+            // Fix round 2 (CRITICAL, security review of Task 6): so is a
+            // non-cron trigger's — `catch_up_policy` returns `None` for
+            // every non-`Cron` spec, because a non-cron trigger has no
+            // `CatchUp` concept at all to reduce (`compute_catch_up`'s own
+            // documented contract: it returns `missed` unchanged for these).
+            // The original fix round 1 code tested only
+            // `Some(CatchUp::All)` here, so a non-cron binding (in
+            // practice, `TriggerSpec::Interval` — the only other
+            // heap-scheduled spec) fell through into the `Latest`-shaped
+            // branch below, where `compute_catch_up`'s unchanged `missed`
+            // then got collapsed by `.max()` to a single instant — silently
+            // and unrecoverably dropping every other missed `Interval` fire
+            // in the backlog, on every late tick, suspend or not. Both
+            // `None` (no policy to apply) and `Some(CatchUp::All)` now take
+            // this identity branch: fire every batch immediately and
+            // unconditionally, which is already globally correct — the
+            // union of every batch's full contents is the whole backlog, no
+            // cross-batch state needed, so `catch_up_progress` is never
+            // touched here (fix round 2 cleanup: the previous code
+            // inserted/removed an entry that nothing ever read for this
+            // branch).
+            //
+            // `Latest` is the only policy that actually needs cross-batch
+            // folding: reducing *each batch* independently (what a naive
+            // per-batch `compute_catch_up` call would do) makes it fire
+            // once per batch instead of once for the whole backlog, and can
+            // make it wrongly fire on a trailing batch that happens to
+            // contain exactly one occurrence when it should have collapsed
+            // with an earlier batch's later occurrence instead. That
+            // reduction is folded into `catch_up_progress`'s running
+            // temporally-latest-seen value, and only actually fired once
             // `backlog_exhausted` says the whole backlog has been walked.
             let is_catch_up_pass =
                 missed.len() > 1 || self.catch_up_progress.contains_key(&entry.binding_id);
             if is_catch_up_pass {
-                if matches!(catch_up_policy(binding), Some(CatchUp::All)) {
+                if matches!(catch_up_policy(binding), None | Some(CatchUp::All)) {
                     for fire_at in &missed {
                         events.push(SchedulerEvent::Fire(entry.binding_id, *fire_at));
-                    }
-                    if backlog_exhausted {
-                        self.catch_up_progress.remove(&entry.binding_id);
-                    } else {
-                        self.catch_up_progress
-                            .entry(entry.binding_id)
-                            .or_insert(None);
                     }
                 } else {
                     let batch_latest = compute_catch_up(binding, missed.clone()).into_iter().max();

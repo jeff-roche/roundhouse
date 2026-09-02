@@ -120,7 +120,18 @@ pub enum PowerWatchEvent {
     Woke(Vec<SchedulerEvent>),
 }
 
-#[allow(async_fn_in_trait)]
+/// Fix round 2 (Low, security review of Task 6): `accept` is synchronous
+/// and infallible, called from `run_power_watch`'s own loop with no
+/// `.await` between the drain and the call — so an implementation that
+/// blocks (waiting on a full bounded channel, a lock held elsewhere, I/O)
+/// stalls this loop *and* whatever tokio worker thread is running it, which
+/// reintroduces — one layer further out — exactly the kind of silent stall
+/// this whole task exists to prevent. An implementation that instead drops
+/// events under backpressure (e.g. a bare `try_send`) silently loses a
+/// `Woke` drain's contents, which is precisely the destructive-drain
+/// property [`PowerWatchEvent::Woke`]'s own doc warns about. Concretely:
+/// use an unbounded channel, or hand off to a separate task/thread that
+/// itself never blocks on this one.
 pub trait PowerWatchSink {
     fn accept(&mut self, event: PowerWatchEvent);
 }
@@ -167,10 +178,32 @@ pub async fn run_power_watch(
                 );
                 let monotonic_now = clock.monotonic_now();
                 let wall_now = clock.wall_now();
-                let drained = lock_or_recover(&sched, "scheduler")
-                    .catch_up_after_wake(monotonic_now, wall_now);
+                let (mut sched_guard, sched_was_poisoned) = lock_or_recover(&sched, "scheduler");
+                if sched_was_poisoned {
+                    // Fix round 2 (Low, security review of Task 6): a panic
+                    // *inside* `Scheduler::drain_due` (reached via
+                    // `catch_up_after_wake`) can unwind with entries already
+                    // popped off the heap into locals that never made it
+                    // back on — `PoisonError::into_inner` is memory-safe but
+                    // not invariant-preserving, so the recovered heap can be
+                    // missing entries outright, not merely stale. A missing
+                    // binding would then simply stop firing forever with
+                    // nothing louder than the error log below. Forcing a
+                    // full recompute here converts that into a bounded,
+                    // visible cost (this wake's backlog is dropped once,
+                    // loudly) rather than an unbounded, silent one (the
+                    // binding never fires again).
+                    tracing::warn!(
+                        "scheduler mutex was poisoned; forcing a full recompute so no binding \
+                         is left permanently missing from the heap by whatever unwound mid-drain"
+                    );
+                    sched_guard.recompute_all(wall_now);
+                }
+                let drained = sched_guard.catch_up_after_wake(monotonic_now, wall_now);
+                drop(sched_guard);
                 sink.accept(PowerWatchEvent::Woke(drained));
-                lock_or_recover(&retryable, "retryable marker").mark_all_in_flight_retryable();
+                let (mut retryable_guard, _) = lock_or_recover(&retryable, "retryable marker");
+                retryable_guard.mark_all_in_flight_retryable();
             }
         }
     }
@@ -186,9 +219,21 @@ pub async fn run_power_watch(
 /// wake events and keep trying to drain/mark-retryable — recovering and
 /// continuing, loudly, is strictly better than going permanently and
 /// silently dark.
-fn lock_or_recover<'a, T: ?Sized>(mutex: &'a Mutex<T>, what: &str) -> std::sync::MutexGuard<'a, T> {
-    mutex.lock().unwrap_or_else(|poisoned| {
-        tracing::error!("{what} mutex poisoned; recovering its last state and continuing");
-        poisoned.into_inner()
-    })
+///
+/// Fix round 2: returns whether the lock was actually poisoned (not just
+/// the recovered guard), so a caller that knows how to repair its
+/// particular `T`'s invariants — as the scheduler branch above does, via
+/// `recompute_all` — can do so. A generic helper can't make that repair
+/// itself: it has no idea what invariants `T` needs restored.
+fn lock_or_recover<'a, T: ?Sized>(
+    mutex: &'a Mutex<T>,
+    what: &str,
+) -> (std::sync::MutexGuard<'a, T>, bool) {
+    match mutex.lock() {
+        Ok(guard) => (guard, false),
+        Err(poisoned) => {
+            tracing::error!("{what} mutex poisoned; recovering its last state and continuing");
+            (poisoned.into_inner(), true)
+        }
+    }
 }
