@@ -297,23 +297,58 @@
 //! argument it actually selects and every other mention stays a zero-copy
 //! `Cow::Borrowed` that is simply dropped.
 //!
-//! **This does not eliminate every amplification shape, and it would be
-//! the same "bounded, so negligible" mistake called out above to claim it
-//! does.** An array literal genuinely must own N independent copies of
-//! whatever N elements it names — `[payload, payload, ..., payload]` is a
-//! *request* for N copies of `payload` to exist in the result, not N
-//! discarded reads of it, so [`Parser::parse_array_literal`] calling
-//! `Cow::into_owned()` on every element is necessary work, not a residual
-//! of this fix. Measured directly, same 20 MiB `payload`, expression
-//! `[payload, payload, ..., payload]`: 1 mention → 64 MiB; 5 mentions
-//! (41-byte expression) → 146 MiB; 15 mentions (121 bytes) → 351 MiB; 50
-//! mentions (401 bytes) → **1,068 MiB**. Peak scales linearly with mention
-//! count at very close to the full context size per mention (~20 MiB per
-//! mention against a 20 MiB context) — this residual is **not capped** by
-//! this module (an expression-length or argument-count cap would not bound
-//! the work either, since the multiplicand is the context size a `map.over`
-//! or webhook payload can make arbitrarily large, the same shape as the
-//! open Task 10 finding) and is left open rather than papered over.
+//! **This does not eliminate every amplification shape, and — corrected in
+//! fix round 2 (security finding S2-Imp-1) — an earlier version of this
+//! paragraph overclaimed why the remaining one is there.** It used to say an
+//! array literal "genuinely must own N independent copies ... not N
+//! discarded reads", and called [`Parser::parse_array_literal`]'s per-element
+//! `Cow::into_owned()` "necessary work, not a residual". **That is true only
+//! when the array literal's value actually escapes into the result** —
+//! becomes the expression's final value, is selected by `default(...)`, or
+//! is read by `slice`/`flatten` (which copy the elements they return). It is
+//! false whenever the literal is consumed by a function that only *reads*
+//! it and returns something else entirely: `len([payload, ..., payload])`
+//! discards every one of the N clones and returns a single integer, and
+//! `contains`/a comparison/an index on an array literal are the same shape.
+//! Measured directly (reproduced independently by security, then again for
+//! this fix round, both agreeing with the original figures to within normal
+//! process-baseline noise): `len([payload x N])` against a 20 MiB `payload`,
+//! 50 mentions (406-byte expression) → 1,046,832 kB peak RSS; 100 mentions
+//! (806 bytes) → 2,071,684 kB; and against a 100 MiB `payload`, 15 mentions
+//! (126 bytes) → 1,641,396 kB. Coefficient ≈ `(expr_len / 8.1) × context_size`
+//! — the multiplicand is the context, the exact shape the argument-clone fix
+//! above just closed, and the exact shape this module's own claims elsewhere
+//! say a length or argument-count cap cannot bound (an expression-length or
+//! argument-count cap would not bound the work either, since the
+//! multiplicand is the context size a `map.over` or webhook payload can make
+//! arbitrarily large — the same shape as the open Task 10 finding).
+//!
+//! **This is left open, not closed, and that is a deliberate choice, not an
+//! oversight.** Closing it in general requires an array literal to flow
+//! through this module's chain-evaluation pipeline (`parse_ternary` →
+//! `parse_ternary_inner` → `parse_comparison` → `parse_primary_chain` →
+//! `parse_args_until` → [`call_function`]) as something other than a single,
+//! already-owned `Value` — i.e. threading a second, lazy representation
+//! (an unresolved list of still-borrowed elements) through every one of
+//! those functions, so that `len`/`contains`/a comparison/an index can read
+//! through it without forcing ownership, while `default`/`slice`/`flatten`
+//! and the top-level result still force it exactly where the value
+//! genuinely escapes. That is precisely the same shape of pervasive
+//! Cow-threading change that produced *both* of this file's own prior
+//! quadratic-clone defects (the property-chain fix and the argument-clone
+//! fix immediately above) — each time, the fix itself, not the original
+//! bug, was where an overclaim or a second defect crept in and had to be
+//! caught by a later review round. Repeating that shape of change a third
+//! time, under this fix round's time budget, for a residual that is not
+//! reachable by any caller today (this module still has zero callers
+//! anywhere in the workspace) trades a real but inert residual for a real
+//! risk of a fresh correctness bug in a security-load-bearing module. The
+//! honest, narrower claim above, with its measured coefficient, is the
+//! chosen fix for this round; a lazy-array representation through the full
+//! pipeline is the correct fix for whoever picks this back up with room to
+//! rebuild the byte-identical-output test coverage this kind of change
+//! needs (see the argument-clone fix's own review history for what that
+//! coverage looked like).
 //!
 //! **A separate finding, measured directly, corrected once already after
 //! the first measurement turned out to be a debug-build artifact:**
@@ -976,17 +1011,20 @@ impl<'a> Parser<'a> {
         Ok(serde_json::json!(n))
     }
 
-    /// Builds a new, owned array literal. Unlike a function's arguments (see
-    /// [`parse_args`]), every element here genuinely must be cloned into the
-    /// new `Value::Array` this constructs — the result **is** a brand-new
-    /// value that has to own N independent copies of whatever N elements
-    /// were written, so `Cow::into_owned()` on each item is necessary work,
-    /// not a residual of the argument-clone amplification fixed in
-    /// [`Parser::parse_primary_chain`]'s doc comment. It is still a real,
-    /// measured cost when an element is itself a mention of a large context
-    /// root repeated many times (`[payload, payload, ..., payload]`) — see
-    /// the module doc comment's "Cost" section for the measured coefficient
-    /// and why this residual is left open rather than capped.
+    /// Builds a new, owned array literal by cloning every element into the
+    /// new `Value::Array` this constructs, unconditionally — regardless of
+    /// whether the caller that receives this array literal ever reads past
+    /// its length or type. **This clone is necessary work only when the
+    /// array literal's own value escapes into the result** (the literal
+    /// itself is the expression's value, or it is selected by `default`, or
+    /// read by `slice`/`flatten`); when the only consumer is `len`,
+    /// `contains`, a comparison, or an index, the clone is a discarded
+    /// residual with the same shape as the argument-clone amplification
+    /// fixed in [`Parser::parse_primary_chain`]'s doc comment — see the
+    /// module doc comment's "Cost" section (fix round 2, item 1) for the
+    /// measured coefficient, why it is left open rather than capped, and why
+    /// closing it in general was judged not worth the risk of a third
+    /// pervasive-Cow-threading change to this same module in one fix round.
     fn parse_array_literal(&mut self) -> Result<Value, ExprError> {
         self.pos += 1; // '['
         let items = self.parse_args_until(b']')?;
