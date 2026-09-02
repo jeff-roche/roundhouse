@@ -17,7 +17,7 @@
 //! `InitializeResponse` and act on the resulting [`AcpVersion`].
 
 use agent_client_protocol::schema::v1::InitializeResponse;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// Which ACP wire schema surface a connection negotiated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,28 +62,59 @@ pub struct VersionHint {
     pub observed: AcpVersion,
 }
 
+/// Cap on the number of distinct (binary, version) hints kept at once. The
+/// natural source for `agent_version` is `InitializeResponse.agent_info`,
+/// which the connecting agent self-reports — an agent that reports a fresh
+/// value per connection (accidentally or otherwise) would otherwise grow
+/// this map without bound in a long-lived daemon. `cache_capacity_holds`
+/// below inserts past this cap and asserts the map never exceeds it.
+const MAX_HINTS: usize = 256;
+
 /// A purely local, opportunistic cache of observed negotiation results,
 /// keyed by exact (binary, version) — never a maintained compatibility
 /// table (§10.2/§10.4's explicit "nobody maintains this" decision). Losing
-/// this cache (restart, new agent version) costs one redundant negotiation
-/// round, nothing more.
+/// a hint (restart, new agent version, or eviction under `MAX_HINTS`) costs
+/// one redundant negotiation round, nothing more — so eviction just needs
+/// to keep the map bounded, not be exact: on overflow this evicts the
+/// oldest-inserted key (tracked by `order`), a plain FIFO with no attempt
+/// at LRU/usage-based ranking.
 #[derive(Debug, Default)]
-pub struct VersionHintCache(HashMap<HintKey, AcpVersion>);
+pub struct VersionHintCache {
+    hints: HashMap<HintKey, AcpVersion>,
+    order: VecDeque<HintKey>,
+}
 
 impl VersionHintCache {
     pub fn new() -> Self {
-        VersionHintCache(HashMap::new())
+        VersionHintCache {
+            hints: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.hints.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hints.is_empty()
     }
 }
 
 pub fn cache_hint(cache: &mut VersionHintCache, hint: VersionHint) {
-    cache.0.insert(
-        HintKey {
-            agent_binary: hint.agent_binary,
-            agent_version: hint.agent_version,
-        },
-        hint.observed,
-    );
+    let key = HintKey {
+        agent_binary: hint.agent_binary,
+        agent_version: hint.agent_version,
+    };
+    if !cache.hints.contains_key(&key) {
+        if cache.hints.len() >= MAX_HINTS {
+            if let Some(oldest) = cache.order.pop_front() {
+                cache.hints.remove(&oldest);
+            }
+        }
+        cache.order.push_back(key.clone());
+    }
+    cache.hints.insert(key, hint.observed);
 }
 
 pub fn lookup_hint(
@@ -92,7 +123,7 @@ pub fn lookup_hint(
     agent_version: &str,
 ) -> Option<AcpVersion> {
     cache
-        .0
+        .hints
         .get(&HintKey {
             agent_binary: agent_binary.to_string(),
             agent_version: agent_version.to_string(),

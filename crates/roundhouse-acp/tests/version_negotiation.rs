@@ -34,6 +34,40 @@ fn observed_result_is_cached_as_a_hint_only_reused_to_skip_a_redundant_round() {
 }
 
 #[test]
+fn hint_cache_stays_bounded_when_an_agent_self_reports_unbounded_distinct_versions() {
+    let mut cache = VersionHintCache::new();
+    // A single self-reporting agent that mints a fresh "version" per
+    // connection (accidentally or adversarially) must not grow the cache
+    // without bound: insert far more distinct (binary, version) keys than
+    // any plausible cap, then assert the cache size never exceeded it.
+    for i in 0..1_000 {
+        cache_hint(
+            &mut cache,
+            VersionHint {
+                agent_binary: "self-reporting-agent".to_string(),
+                agent_version: format!("v{i}"),
+                observed: AcpVersion::V1,
+            },
+        );
+        assert!(
+            cache.len() <= 256,
+            "cache grew past its bound after {} inserts: len={}",
+            i + 1,
+            cache.len()
+        );
+    }
+    assert_eq!(cache.len(), 256);
+
+    // The earliest-inserted hint is the one evicted under FIFO; the most
+    // recent one is still present.
+    assert_eq!(lookup_hint(&cache, "self-reporting-agent", "v0"), None);
+    assert_eq!(
+        lookup_hint(&cache, "self-reporting-agent", "v999"),
+        Some(AcpVersion::V1)
+    );
+}
+
+#[test]
 fn negotiate_response_reads_the_real_sdk_initialize_response() {
     use agent_client_protocol::schema::v1::InitializeResponse;
     use agent_client_protocol::schema::ProtocolVersion;
