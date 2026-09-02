@@ -965,17 +965,25 @@ mod stream_tests {
     /// it, mirroring `openai_chat::decode`'s identical defect --
     /// `audit::redact::LABELED_SECRET_VALUE` matches an *unescaped* optional
     /// quote around a labeled secret value, so redacting the already-escaped
-    /// string could never match a labeled value containing a quote. This
-    /// fixture's `finish_reason` needs no embedded quote to demonstrate the
-    /// underlying "redact before escape" ordering bug, but is driven through
-    /// the real decoder end to end, not a hand-built `StreamFailure` (mirrors
-    /// `openai_chat::decode`'s identical fix-round-7 test).
+    /// string could never match a labeled value containing a quote.
+    ///
+    /// Audit L2 (round 8): the original version of this fixture had NO
+    /// embedded quote around the secret (`"api_key: f4c2a1..."`), so
+    /// `{:?}`-escaping it added nothing for `LABELED_SECRET_VALUE`'s
+    /// optional `["']?` to trip over -- the test passed whether redaction
+    /// ran before or after escaping, and stayed green with the ordering bug
+    /// reintroduced. The fixture below embeds the secret inside a
+    /// JSON-quoted field (`{"api_key": "..."}`), mirroring
+    /// `openai_chat::decode`'s working fix-round-7 test, so a literal `"`
+    /// sits immediately before the value: only "redact first" leaves that
+    /// quote unescaped for the regex to match, and driven through the real
+    /// decoder end to end, not a hand-built `StreamFailure`.
     #[tokio::test]
     async fn an_unrecognized_finish_reason_carrying_a_labeled_api_key_is_redacted() {
         const SECRET: &str = "f4c2a1b09d8e7f6a5b4c3d2e1f009988";
         let body = sse_body(&[
             r#"{"id":"r8","type":"message-start","delta":{"message":{"role":"assistant"}}}"#,
-            r#"{"type":"message-end","delta":{"finish_reason":"api_key: f4c2a1b09d8e7f6a5b4c3d2e1f009988"}}"#,
+            r#"{"type":"message-end","delta":{"finish_reason":"invalid request headers: {\"api_key\": \"f4c2a1b09d8e7f6a5b4c3d2e1f009988\"}"}}"#,
         ]);
         let failure = match decode_cohere_v2_stream(body).await {
             Ok(_) => panic!("expected a StreamFailure"),

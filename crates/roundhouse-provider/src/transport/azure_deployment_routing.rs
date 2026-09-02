@@ -53,7 +53,18 @@
 //! the `url` crate's own documented behavior, which would otherwise send
 //! the deployment-routed request to whatever the original opaque path
 //! happened to be instead of failing loudly.
+//!
+//! Both of `base_url`'s error paths (an unparseable URL, and a parseable but
+//! "cannot be a base" one) interpolate `base_url` itself into the returned
+//! `ProviderError::Transport` — and `base_url` is exactly the kind of
+//! operator-supplied value that carries a credential (userinfo, or a
+//! `?key=...` query parameter some gateways use), especially on the
+//! malformed-URL path, which is precisely when an operator has just pasted
+//! one in wrong. Both sites are routed through
+//! `crate::audit::redact_transport_error_text`, the same helper every other
+//! codec's transport-error sinks use, before the error is ever constructed.
 
+use crate::audit::redact_transport_error_text;
 use crate::ir::ProviderError;
 use crate::profile::{glob_match, ProviderProfile};
 
@@ -83,11 +94,15 @@ pub fn azure_deployment_url(
     api_version: &str,
 ) -> Result<url::Url, ProviderError> {
     let mut url = url::Url::parse(base_url).map_err(|e| {
-        ProviderError::Transport(format!("invalid Azure base_url {base_url:?}: {e}"))
+        ProviderError::Transport(redact_transport_error_text(&format!(
+            "invalid Azure base_url {base_url:?}: {e}"
+        )))
     })?;
     if url.cannot_be_a_base() {
-        return Err(ProviderError::Transport(format!(
-            "Azure base_url {base_url:?} cannot be a base URL (no host/path to route through)"
+        return Err(ProviderError::Transport(redact_transport_error_text(
+            &format!(
+                "Azure base_url {base_url:?} cannot be a base URL (no host/path to route through)"
+            ),
         )));
     }
     if !is_safe_deployment_name(deployment_name) {

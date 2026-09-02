@@ -179,3 +179,55 @@ fn error_body_redaction_does_not_destroy_fields_after_a_labeled_secret_form_enco
         "fields AFTER the labeled secret must survive: {redacted}"
     );
 }
+
+/// Audit L4: `API_KEY_SHAPED` used to cover only `sk-`/`pk-`/`rk-`. A
+/// provider's own free-prose 401 body (no `label=`/`label:` anchor for
+/// `LABELED_SECRET_VALUE`, no `Bearer ` prefix for `BEARER_TOKEN`) echoing a
+/// rejected key back verbatim is exactly the shape demonstrated in the
+/// audit finding:
+/// `"Incorrect API key provided: gsk_ABCDEFGH..."` used to survive
+/// redaction untouched.
+#[test]
+fn error_body_redaction_catches_the_five_newly_added_provider_key_prefixes() {
+    let cases = [
+        ("Groq", "gsk_wJ3pQ7mN2xK9vR5tL8yH4cA6bD1fE0g"),
+        ("Cerebras", "csk-4f8a2b1c9d7e6f5a4b3c2d1e0f9a8b7c"),
+        ("Fireworks", "fw_3c8a5b2d1e9f4a7b6c5d4e3f2a1b0c9d"),
+        ("xAI", "xai-8f7e6d5c4b3a2918f7e6d5c4b3a29187"),
+        ("NVIDIA NIM", "nvapi-a1b2c3d4e5f60718293a4b5c6d7e8f90"),
+    ];
+    for (vendor, key) in cases {
+        let body = format!("Incorrect API key provided: {key}");
+        let redacted = redact_error_body(&body);
+        assert!(
+            !redacted.contains(key),
+            "{vendor}'s key-shaped string must be redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("[REDACTED-KEY]"),
+            "{vendor}'s key must be replaced with the redaction marker: {redacted}"
+        );
+    }
+}
+
+/// Audit L4b: this is the residual gap `API_KEY_SHAPED`'s doc comment states
+/// deliberately, not one silently forgotten. Mistral, DeepInfra, and Z.ai
+/// issue bare opaque tokens with no distinguishing prefix -- in a free-prose
+/// 401 with no `label=`/`label:` anchor and no `Bearer ` prefix, nothing in
+/// this module matches a bare token, and a generic length-based fallback was
+/// deliberately rejected (it would also redact commit SHAs, request IDs, and
+/// trace IDs throughout every persisted error body). This test pins that gap
+/// down: if it ever starts failing because the string below stops surviving
+/// redaction, that's a signal this module's coverage changed, not that this
+/// test rotted.
+#[test]
+fn a_bare_token_key_with_no_prefix_label_or_bearer_anchor_is_not_redacted_a_known_gap() {
+    let body = "Incorrect API key provided: yZ4qT9wL2mN7pR5vX8kH1cA6bD3fE0gJ";
+    let redacted = redact_error_body(body);
+    assert!(
+        redacted.contains("yZ4qT9wL2mN7pR5vX8kH1cA6bD3fE0gJ"),
+        "a bare-token key with no prefix, label, or Bearer anchor is a known, \
+         documented gap in this module's coverage -- it is NOT expected to be \
+         redacted here: {redacted}"
+    );
+}

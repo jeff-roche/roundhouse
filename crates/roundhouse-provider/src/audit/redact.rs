@@ -23,12 +23,72 @@
 //! neither has a fixed shape) Azure `client_secret` values and AWS secret
 //! access keys — is covered. `regex`'s engine is linear-time by
 //! construction, so broadening this has no backtracking/ReDoS cost.
+//!
+//! Audit L4/L4b (round 8): the twelve `openai-chat`-family profiles this
+//! phase shipped include several providers whose current published key
+//! format has its own fixed, recognizable prefix -- `API_KEY_SHAPED` only
+//! covered `sk-`/`pk-`/`rk-` (Anthropic/OpenAI-style) until this round, so a
+//! provider's own 401 body (`"Incorrect API key provided: gsk_ABCDEFGH..."`)
+//! echoed the key back verbatim: `LABELED_SECRET_VALUE` doesn't save this
+//! case either, since it requires the label immediately followed by `:`/`=`,
+//! and a free-prose 401 message has no such anchor. Five more fixed-prefix
+//! shapes, each checked against that vendor's own current docs (or, where
+//! the vendor's own docs don't spell out the shape, the same
+//! community-maintained secret-pattern corpora several open-source secret
+//! scanners draw on) as of 2026-09-02:
+//!
+//! - `gsk_` (Groq) -- <https://console.groq.com/docs/quickstart> shows
+//!   `GROQ_API_KEY=gsk_...`; corroborated by
+//!   <https://github.com/mazen160/secrets-patterns-db> and
+//!   <https://github.com/h33tlit/secret-regex-list>'s Groq entries.
+//! - `csk-` (Cerebras) -- <https://inference-docs.cerebras.ai/resources/openai>'s
+//!   own example reads `csk-your-cerebras-api-key`; corroborated by the same
+//!   two community pattern corpora above.
+//! - `fw_` (Fireworks) -- <https://docs.fireworks.ai/api-reference/create-api-key>
+//!   documents `fw_...` as the direct-routing key format (a separate
+//!   `fpk_`-prefixed "Fire Pass" key also exists but is out of scope here --
+//!   not one of this phase's shipped profiles). Community secret-scanner
+//!   rules for this one gate `fw_` on a nearby `fireworks` keyword rather
+//!   than shipping it as a bare prefix, since three characters is short and
+//!   collision-prone on its own; this pattern's `{16,}` minimum body length
+//!   (already applied to every prefix here, matching `sk-`/`pk-`/`rk-`'s
+//!   existing threshold) gives the same protection without a keyword gate,
+//!   since `fw_` immediately followed by 16+ opaque characters is not a
+//!   shape ordinary text produces by accident.
+//! - `xai-` (xAI/Grok) -- confirmed directly on
+//!   <https://docs.x.ai/build/overview>: "If your key doesn't start with
+//!   `xai-`, it's not an xAI key."
+//! - `nvapi-` (NVIDIA NIM) -- confirmed directly on
+//!   <https://docs.nvidia.com/nemo/retriever/26.5.0/extraction/api-keys/>:
+//!   "Keys typically start with `nvapi-`."
+//!
+//! **Residual gap, stated rather than papered over (L4b):** Mistral,
+//! DeepInfra, and Z.ai issue bare opaque tokens with no distinguishing
+//! prefix of their own. In a free-prose 401 body there is no prefix to
+//! anchor on, no `label=`/`label:` anchor for `LABELED_SECRET_VALUE` to
+//! catch, and (unless the provider happens to echo it inside an
+//! `Authorization` header string) no `Bearer ` anchor for `BEARER_TOKEN`
+//! either -- so a bare-token key in free prose is NOT redacted by this
+//! module today. Closing that with a generic "N-char alphanumeric" pattern
+//! was considered and rejected: it would also redact commit SHAs, request
+//! IDs, and trace IDs throughout every persisted error body, and a redactor
+//! that fires constantly on non-secrets gets distrusted and worked around.
+//! Bare-token keys stay covered only when a label (`api_key=...`) or
+//! `Bearer ` anchor is present in the text, matching every other opaque,
+//! unprefixed secret this module already handles the same way (Azure
+//! `client_secret`, AWS secret access keys). See
+//! `hardening_test.rs::a_bare_token_key_with_no_prefix_label_or_bearer_anchor_is_not_redacted_a_known_gap`
+//! for the test that keeps this gap visible rather than silently forgotten.
 
 use regex::{Captures, Regex};
 use std::sync::LazyLock;
 
-static API_KEY_SHAPED: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(sk|pk|rk)-[A-Za-z0-9_-]{16,}\b").unwrap());
+static API_KEY_SHAPED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:sk|pk|rk|csk|xai|nvapi)-[A-Za-z0-9_-]{16,}\b|\b(?:gsk|fw)_[A-Za-z0-9_-]{16,}\b",
+    )
+    .unwrap()
+});
 static BEARER_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Bearer\s+[A-Za-z0-9._-]{8,}").unwrap());
 /// Only a JWT's *header* segment is guaranteed to start `eyJ` — it's the
@@ -136,48 +196,41 @@ static EMBEDDED_URL: LazyLock<Regex> =
 ///
 /// Fix round 6, J5 narrows what "every codec in this crate" actually means,
 /// rather than repeating a blanket claim of the same shape that let the
-/// original gap sit undetected for four rounds. Fix round 7, K4 corrects two
-/// enumerations below that were themselves inexact -- an over-broad or
-/// merely-mostly-true claim in this doc comment is exactly what let the
-/// original gap (and, separately, the K1/K2 defects fix round 7 fixes) sit
-/// undetected across several rounds. What is covered, concretely, as of fix
-/// round 7:
+/// original gap sit undetected for four rounds. Fix round 7, K4 corrected an
+/// enumeration below that was itself inexact -- and by audit round 8 (L3),
+/// that hand-maintained enumeration's own running count had been wrong
+/// *three rounds running* (each recount produced a different, still-wrong
+/// number as new codecs and transport shims kept landing sinks the prose
+/// never got updated for). The mechanism was wrong, not the arithmetic: a
+/// prose count of something this cheap to check mechanically will always
+/// drift.
 ///
-/// - Every `ProviderError::Transport` construction site in this crate that
-///   can carry a `TransportError`'s or a credential/base-URL-resolution
-///   error's text: all three `provider.rs` sinks in each of `openai_chat`,
-///   `cohere_v2`, `google_genai`, `openai_responses`, and `bedrock_converse`,
-///   plus `anthropic_provider.rs`'s single such sink (its `send(..)` call,
-///   J4) -- `anthropic_provider.rs` has only ONE `ProviderError::Transport`
-///   sink carrying error text, not three; its other `Transport` construction
-///   site (`anthropic_provider.rs:100`) is a fixed, status-only
-///   `format!("...{status}")` string with no error text to redact.
-/// - Every mid-stream `StreamFailure.message` (or equivalent) construction
-///   site that echoes a transport/framing error's `{e}` text directly:
-///   `openai_chat::decode`'s and `cohere_v2::decode`'s one SSE-transport-error
-///   site each, and `google_genai::decode`'s and `bedrock_converse::decode`'s
-///   two SSE-transport-error sites each (`bedrock_converse::decode`'s second
-///   is its eventstream-framing-error site, fix round 6, J3) -- six sites
-///   total, all routed through this function.
-/// - The `tracing::warn!` log site in `openai_chat::provider`'s and
-///   `cohere_v2::provider`'s `stream_failure_to_provider_error` (fix round 7,
-///   K2) -- belt-and-braces on top of the construction-site redaction the
-///   next paragraph describes, since a `StreamFailure.message` built by
-///   `sanitize_untrusted_wire_string`/`sanitize_finish_reason_for_message`
-///   only ever runs the *shape*-based [`redact_error_body`], which does not
-///   reduce an embedded URL's query string or userinfo.
+/// **What is actually covered is no longer stated here as a count.** It is
+/// enforced by
+/// `tests/transport_error_redaction_test.rs::every_provider_error_transport_site_is_redacted_or_explicitly_allowlisted`,
+/// which greps every `.rs` file under `src/` for `ProviderError::Transport(`
+/// and fails the build unless each occurrence either calls this function on
+/// the same line or is named in that test's own `ALLOWLIST`, with a stated
+/// reason (a fixed, status-only `format!` with no error text; a `match` arm
+/// that only forwards an already-redacted `StreamFailure.message`; a pattern
+/// match rather than a construction; or a test assertion). That test is the
+/// source of truth for coverage, not this doc comment -- read it, don't
+/// recount by hand.
 ///
-/// Not covered by this function, by design: `redact_error_body` alone (not
-/// this function) is what runs *at construction* inside
-/// `openai_chat::decode::sanitize_untrusted_wire_string` and
-/// `cohere_v2::decode::sanitize_finish_reason_for_message` (fix round 7, K1)
-/// for a mid-stream in-band failure frame's *own* diagnostic text (e.g. an
-/// in-band `{"error": {...}}` frame's `message` field, or an unrecognized
-/// `finish_reason` value) -- that text is not URL-shaped in the general case,
-/// so the shape-based redactor is the right tool at that specific
-/// construction site. The `tracing::warn!` sink these construction sites feed
-/// into, listed above, is what closes the remaining "what if it embeds a URL
-/// anyway" gap.
+/// Two related sinks this function does NOT cover, by design, are still
+/// worth naming here because the reason is about *design*, not a count:
+/// `redact_error_body` alone (not this function) is what runs *at
+/// construction* inside `openai_chat::decode::sanitize_untrusted_wire_string`
+/// and `cohere_v2::decode::sanitize_finish_reason_for_message` (fix round 7,
+/// K1) for a mid-stream in-band failure frame's *own* diagnostic text (e.g.
+/// an in-band `{"error": {...}}` frame's `message` field, or an unrecognized
+/// `finish_reason` value) -- that text is not URL-shaped in the general
+/// case, so the shape-based redactor is the right tool at that specific
+/// construction site. The `tracing::warn!` log site in `openai_chat::provider`'s
+/// and `cohere_v2::provider`'s `stream_failure_to_provider_error` (fix round
+/// 7, K2) calls *this* function as belt-and-braces on top of that
+/// construction-site redaction, closing the remaining "what if it embeds a
+/// URL anyway" gap.
 pub(crate) fn redact_transport_error_text(raw: &str) -> String {
     let url_redacted = EMBEDDED_URL.replace_all(raw, |caps: &Captures| {
         crate::credential::record_base_url_override(&caps[0])

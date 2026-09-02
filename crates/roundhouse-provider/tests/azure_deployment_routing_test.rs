@@ -132,6 +132,69 @@ fn rejects_a_deployment_name_shaped_as_a_path_traversal_or_containing_url_metach
     }
 }
 
+/// Security (audit L1): `base_url` is operator-supplied and can carry a
+/// credential (userinfo, or a `?key=...` query parameter some gateways use).
+/// Both of `azure_deployment_url`'s `base_url` error paths interpolate
+/// `base_url` into the returned `ProviderError`, so both must be routed
+/// through the crate's transport-error redactor rather than leaking it raw
+/// into a message that can reach a persisted, physically-immutable `events`
+/// row. This fixture triggers the "unparseable URL" branch: a stray leading
+/// word (no colon of its own) means the candidate scheme run up to the
+/// credential-bearing URL's own first colon contains a space, which is not a
+/// legal scheme character, so `Url::parse` rejects the string outright --
+/// exactly the "operator pasted a URL wrong" shape -- while the
+/// credential-bearing URL embedded inside it is itself well-formed, so the
+/// redactor's embedded-URL matcher still finds and reduces it. (Verified
+/// against `url` 2.5: `Url::parse("not a url https://...")` returns
+/// `Err(RelativeUrlWithoutBase)`, not `Ok`.)
+#[test]
+fn the_invalid_base_url_rejection_does_not_leak_userinfo_or_a_query_credential() {
+    let base_url = "not a url https://user:s3cr3t-p4ss@evil.example.com/proxy?api_key=SECRETVALUEABCDEFGHIJKLMN";
+    let err = azure_deployment_url(base_url, "dep", "2026-06-01")
+        .expect_err("a base_url with a stray leading word must fail to parse as a URL");
+    let rendered = err.to_string();
+    assert!(
+        !rendered.contains("user:s3cr3t-p4ss"),
+        "userinfo must not survive: {rendered}"
+    );
+    assert!(
+        !rendered.contains("SECRETVALUEABCDEFGHIJKLMN"),
+        "the query string's credential-shaped value must not survive: {rendered}"
+    );
+    assert!(
+        rendered.contains("evil.example.com"),
+        "the host itself is not secret and should stay, for diagnosability: {rendered}"
+    );
+}
+
+/// Security (audit L1), the second sink: the "cannot be a base" branch fires
+/// on a URL that parses fine but has no hierarchical part to route through
+/// (e.g. a non-`http(s)` scheme whose remainder isn't `//`-prefixed). An
+/// operator-pasted value can still carry a `https://user:pass@host?key=...`
+/// credential embedded in it even when the outer string as a whole takes
+/// this shape, so this sink needs the same redaction as the parse-failure
+/// one.
+#[test]
+fn the_cannot_be_a_base_rejection_does_not_leak_userinfo_or_a_query_credential() {
+    let base_url =
+        "gateway:https://user:s3cr3t-p4ss@evil.example.com/proxy?api_key=SECRETVALUEABCDEFGHIJKLMN";
+    let err = azure_deployment_url(base_url, "dep", "2026-06-01")
+        .expect_err("a non-special, non-`//`-prefixed scheme must be rejected as cannot-be-a-base");
+    let rendered = err.to_string();
+    assert!(
+        !rendered.contains("user:s3cr3t-p4ss"),
+        "userinfo must not survive: {rendered}"
+    );
+    assert!(
+        !rendered.contains("SECRETVALUEABCDEFGHIJKLMN"),
+        "the query string's credential-shaped value must not survive: {rendered}"
+    );
+    assert!(
+        rendered.contains("evil.example.com"),
+        "the host itself is not secret and should stay, for diagnosability: {rendered}"
+    );
+}
+
 /// The allowlist must not over-reject real deployment names (customer-chosen
 /// identifiers, typically alphanumerics/hyphens/underscores/dots).
 #[test]
