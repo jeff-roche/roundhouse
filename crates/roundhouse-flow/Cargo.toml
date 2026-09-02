@@ -30,6 +30,10 @@ sha2 = "0.10"
 # Constraints don't name a YAML crate at all — this is this crate's own
 # choice, not a §5.3 pin.
 serde_yaml = "0.9"
-
-[dev-dependencies]
-uuid = { version = "1", features = ["v4"] }
+# Promoted from a dev-dependency (Task 1) to a real one: Task 13's
+# `exec::provenance::RunId` is this crate's own identity newtype (ruling P6 —
+# `roundhouse-core`'s equivalent macro is private, so `RunId` is written out
+# by hand here following the identical pattern), which needs `Uuid` and its
+# `serde` impls in non-test code. Same version/feature set
+# `roundhouse-core`'s own `Cargo.toml` already pins for the same purpose.
+uuid = { version = "1", features = ["v4", "serde"] }
