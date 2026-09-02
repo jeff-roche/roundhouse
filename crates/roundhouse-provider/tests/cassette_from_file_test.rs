@@ -11,6 +11,10 @@ fn hello_cassette_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cassettes/hello.cassette")
 }
 
+fn hello_crlf_cassette_path() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cassettes/hello_crlf.cassette")
+}
+
 #[test]
 fn from_file_parses_status_headers_and_body() {
     let transport = CassetteTransport::from_file(&hello_cassette_path(), ChunkStrategy::WholeBody)
@@ -27,6 +31,28 @@ fn from_file_parses_status_headers_and_body() {
     assert_eq!(
         transport.body,
         b"data: {\"type\":\"ping\"}\n\ndata: {\"type\":\"pong\"}\n\n".to_vec()
+    );
+}
+
+/// D2 (fix round 1): the CRLF separator branch (`find_header_body_separator`'s
+/// `"\r\n\r\n"` case) was previously untested — every other fixture uses bare
+/// `"\n\n"`. Real recorded HTTP traffic is plausibly CRLF, and twelve more
+/// tasks hand-author `.cassette` files, so this pins that a CRLF-separated
+/// cassette parses identically to an LF one.
+#[test]
+fn from_file_parses_a_crlf_separated_cassette() {
+    let transport =
+        CassetteTransport::from_file(&hello_crlf_cassette_path(), ChunkStrategy::WholeBody)
+            .expect("hello_crlf.cassette must parse");
+
+    assert_eq!(transport.status, 200);
+    assert_eq!(
+        transport.headers,
+        vec![("content-type".to_string(), "text/event-stream".to_string())]
+    );
+    assert_eq!(
+        transport.body,
+        b"data: {\"type\":\"ping\"}\r\n\r\n".to_vec()
     );
 }
 

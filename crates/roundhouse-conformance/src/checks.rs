@@ -251,23 +251,66 @@ pub fn check_usage_invariants(usage: &Usage) -> Vec<String> {
 /// original request that isn't recognizably present in the decoded result
 /// must have a matching declared loss event — an undeclared drop is a bug,
 /// not a known, logged degradation.
+///
+/// Compares **multiplicity per kind**, not mere presence (fix round 1, D3):
+/// the shared 16-case golden corpus includes `parallel_tool_calls`, which
+/// this check must be able to catch — two `ToolUse` blocks going in and one
+/// coming out is a real drop even though `ToolUse` as a kind is still
+/// "present" in the decoded result. A declared loss event only excuses the
+/// gap for a kind if it names that kind as a whole, delimited token (see
+/// [`loss_event_names_kind`]) — plain substring matching (the original
+/// implementation's `e.contains(kind)`) let an unrelated loss event whose
+/// text happened to contain the kind name as part of a larger word silently
+/// satisfy the check.
 pub fn check_round_trip_fidelity(
     original_request_blocks: &[ContentBlock],
     decoded_blocks: &[ContentBlock],
     declared_loss_events: &[String],
 ) -> Vec<String> {
     let mut failures = Vec::new();
-    for block in original_request_blocks {
-        let kind = block_kind_name(block);
-        let survived = decoded_blocks.iter().any(|d| block_kind_name(d) == kind);
-        let declared = declared_loss_events.iter().any(|e| e.contains(kind));
-        if !survived && !declared {
+
+    let original_counts = count_by_kind(original_request_blocks);
+    let decoded_counts = count_by_kind(decoded_blocks);
+
+    for (kind, original_count) in &original_counts {
+        let decoded_count = decoded_counts.get(kind).copied().unwrap_or(0);
+        if *original_count <= decoded_count {
+            continue;
+        }
+        let missing = original_count - decoded_count;
+        let declared = declared_loss_events
+            .iter()
+            .any(|e| loss_event_names_kind(e, kind));
+        if !declared {
             failures.push(format!(
-                "content block kind `{kind}` was dropped on round-trip with no declared LossEvent"
+                "content block kind `{kind}` count mismatch on round-trip: request has \
+                 {original_count}, decoded result has {decoded_count} (missing {missing}), and \
+                 no declared LossEvent names `{kind}`"
             ));
         }
     }
+
     failures
+}
+
+fn count_by_kind(blocks: &[ContentBlock]) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::new();
+    for block in blocks {
+        *counts.entry(block_kind_name(block)).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// A declared loss event "names" `kind` only when `kind` appears as a
+/// whole, delimited token in the event's text (split on any non-alphanumeric
+/// character) — never merely as a substring of a larger word. Without this,
+/// a loss event describing something unrelated whose text happens to
+/// contain `kind` as a fragment (e.g. "ContextText" containing "Text")
+/// would silently excuse an unrelated drop.
+fn loss_event_names_kind(event: &str, kind: &str) -> bool {
+    event
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|token| token == kind)
 }
 
 fn block_kind_name(block: &ContentBlock) -> &'static str {
@@ -353,6 +396,59 @@ mod tests {
         let decoded: Vec<ContentBlock> = vec![];
         let declared = vec!["dropped a Text block: unsupported by this profile".to_string()];
         assert!(check_round_trip_fidelity(&original, &decoded, &declared).is_empty());
+    }
+
+    fn tool_use(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: ToolCallId(id.into()),
+            id_origin: IdOrigin::Provider,
+            name: "search".into(),
+            input: serde_json::json!({}),
+            cache: None,
+        }
+    }
+
+    /// D3 (fix round 1): the shared 16-case golden corpus includes
+    /// `parallel_tool_calls` — two `ToolUse` blocks going in, one coming
+    /// out. A presence-only check (is `ToolUse` present *at all* in the
+    /// decoded result?) is blind to this, since `ToolUse` as a kind did
+    /// survive. This must catch the count mismatch.
+    #[test]
+    fn round_trip_fidelity_flags_a_multiplicity_drop_not_just_presence() {
+        let original = vec![tool_use("call-1"), tool_use("call-2")];
+        let decoded = vec![tool_use("call-1")]; // one ToolUse silently dropped
+        let failures = check_round_trip_fidelity(&original, &decoded, &[]);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("ToolUse"));
+        assert!(failures[0].contains('2')); // original count
+        assert!(failures[0].contains('1')); // decoded count
+    }
+
+    #[test]
+    fn round_trip_fidelity_accepts_a_declared_loss_event_that_names_the_multiplicity_gap() {
+        let original = vec![tool_use("call-1"), tool_use("call-2")];
+        let decoded = vec![tool_use("call-1")];
+        let declared = vec!["parallel ToolUse calls beyond the first are collapsed".to_string()];
+        assert!(check_round_trip_fidelity(&original, &decoded, &declared).is_empty());
+    }
+
+    /// D3: loss-event matching must be exact (whole-token), not substring —
+    /// a declared loss event whose text happens to contain the kind name as
+    /// a fragment of an unrelated word must not silence a real drop.
+    #[test]
+    fn round_trip_fidelity_does_not_accept_a_coincidental_substring_match() {
+        let original = vec![ContentBlock::Text {
+            text: "hi".into(),
+            cache: None,
+            citations: vec![],
+        }];
+        let decoded: Vec<ContentBlock> = vec![];
+        // "ContextText" contains "Text" as a substring but is not the whole
+        // token "Text" — must not satisfy the check.
+        let declared = vec!["ContextText field removed".to_string()];
+        let failures = check_round_trip_fidelity(&original, &decoded, &declared);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("Text"));
     }
 
     #[tokio::test]

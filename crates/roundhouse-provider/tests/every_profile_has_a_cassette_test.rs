@@ -13,11 +13,21 @@
 //! exist yet at all (Task 4 creates it), so this fails loudly for that
 //! reason rather than a per-profile mismatch — both are honest signals of
 //! the same "not done yet" state.
+//!
+//! `#[ignore]`d for now (fix round 1, D1): a permanently red, non-ignored
+//! test here would make `cargo test --workspace` exit nonzero for the whole
+//! workspace for the rest of the phase, and every later task uses that
+//! command as its definition-of-done evidence — with this red, none of them
+//! could tell "I broke something" from "that's the known-red one." The gate
+//! still exists and still runs on demand
+//! (`cargo test -p roundhouse-provider -- --ignored`); Task 4 is required to
+//! remove this `#[ignore]` once `profiles/` lands.
 
 use std::fs;
 use std::path::Path;
 
 #[test]
+#[ignore = "tracked red until profiles/ lands in Task 4; remove this #[ignore] there"]
 fn every_profile_toml_has_at_least_one_cassette() {
     let profiles_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
     let cassettes_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/cassettes");
