@@ -10,6 +10,8 @@
 //! `07-protocols-acp-mcp.md`.
 #![forbid(unsafe_code)]
 
+pub mod version;
+
 use roundhouse_proto::ApiVersion;
 
 pub fn negotiated_api_version() -> ApiVersion {

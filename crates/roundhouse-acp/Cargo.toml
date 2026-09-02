@@ -10,3 +10,17 @@ workspace = true
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-proto = { path = "../roundhouse-proto" }
+# Deliberate, tracked deviation from the frozen crate dependency table
+# (`docs/architecture/02-system-architecture.md` §5.2): this crate's whole purpose is
+# speaking the Agent Client Protocol, which requires the pinned `agent-client-protocol`
+# SDK (exact version per the Phase 5 plan's §5.3 pin list). This is a third-party crate
+# edge, not another `roundhouse-*` path dependency, so it does not widen this crate's
+# internal-crate dependency set (still `{core, proto}` only).
+agent-client-protocol = "=2.0.0"
+
+[features]
+# Forwards to the SDK's own `unstable_protocol_v2` feature so that
+# `agent_client_protocol::schema::v2` actually exists when this feature is enabled —
+# without this forwarding, enabling `acp-v2` on this crate alone would enable nothing on
+# the dependency and the v2 schema module would never be reachable.
+acp-v2 = ["agent-client-protocol/unstable_protocol_v2"]
