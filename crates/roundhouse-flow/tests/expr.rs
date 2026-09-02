@@ -1,6 +1,6 @@
 use roundhouse_flow::expr::{
-    eval, interpolate, interpolate_json, ExprContext, ExprError, ExpressionSource,
-    JsonTemplateSource, TemplateSource,
+    eval, eval_delimited_expression, interpolate, interpolate_json, ExprContext, ExprError,
+    ExpressionSource, JsonTemplateSource, TemplateSource,
 };
 use serde_json::{json, Value};
 
@@ -990,5 +990,116 @@ fn a_lone_closing_brace_is_unterminated_not_unexpected_token() {
     assert!(
         matches!(err, ExprError::Unterminated),
         "expected Unterminated, got {err:?}"
+    );
+}
+
+// ---- `eval_delimited_expression` (fix round 1, item 4): the form §8.9
+// documents for `when:` and `map.over` — a whole field that must be exactly
+// one `${{ ... }}` block, evaluated to its own typed `Value` rather than
+// stringified the way `interpolate` would. ----
+
+#[test]
+fn a_delimited_boolean_expression_evaluates_to_a_typed_bool_not_a_string() {
+    assert_eq!(
+        eval_delimited_expression(TemplateSource::from_workflow_file("${{ 1 == 1 }}"), &ctx())
+            .unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        eval_delimited_expression(TemplateSource::from_workflow_file("${{ 1 == 2 }}"), &ctx())
+            .unwrap(),
+        json!(false)
+    );
+}
+
+#[test]
+fn a_delimited_expression_using_a_property_chain_matches_the_documented_when_examples() {
+    // Taken verbatim from §8.9's own reference workflow.
+    assert_eq!(
+        eval_delimited_expression(
+            TemplateSource::from_workflow_file("${{ len(steps.review.output.findings) > 0 }}"),
+            &ctx()
+        )
+        .unwrap(),
+        json!(true)
+    );
+}
+
+#[test]
+fn a_delimited_expression_tolerates_surrounding_whitespace() {
+    assert_eq!(
+        eval_delimited_expression(
+            TemplateSource::from_workflow_file("  ${{ 1 == 1 }}  "),
+            &ctx()
+        )
+        .unwrap(),
+        json!(true)
+    );
+}
+
+#[test]
+fn a_delimited_expression_with_a_quoted_double_brace_does_not_truncate_early() {
+    // Reuses `find_closing_delimiter`'s quote-aware scan: the `}}` inside
+    // the string argument must not be mistaken for the block's own
+    // terminator.
+    assert_eq!(
+        eval_delimited_expression(
+            TemplateSource::from_workflow_file("${{ contains('a}}b', '}}') }}"),
+            &ctx()
+        )
+        .unwrap(),
+        json!(true)
+    );
+}
+
+#[test]
+fn a_bare_undelimited_field_is_rejected_as_not_delimited() {
+    let err = eval_delimited_expression(TemplateSource::from_workflow_file("1 == 1"), &ctx())
+        .unwrap_err();
+    assert!(
+        matches!(err, ExprError::NotADelimitedExpression(_)),
+        "expected NotADelimitedExpression, got {err:?}"
+    );
+}
+
+#[test]
+fn trailing_content_after_the_closing_delimiter_is_rejected() {
+    let err = eval_delimited_expression(
+        TemplateSource::from_workflow_file("${{ 1 == 1 }} extra"),
+        &ctx(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ExprError::NotADelimitedExpression(_)),
+        "expected NotADelimitedExpression, got {err:?}"
+    );
+}
+
+#[test]
+fn an_unterminated_delimited_field_is_unterminated_not_not_delimited() {
+    let err = eval_delimited_expression(TemplateSource::from_workflow_file("${{ 1 == 1"), &ctx())
+        .unwrap_err();
+    assert!(
+        matches!(err, ExprError::Unterminated),
+        "expected Unterminated, got {err:?}"
+    );
+}
+
+#[test]
+fn a_delimited_field_whose_inner_expression_calls_an_unknown_function_names_the_real_problem() {
+    // This is the exact payload the fix-1 brief's endorsed-but-vacuous test
+    // used (`${{ not_a_real_function(1) }}`) — with delimiter-stripping now
+    // in place, it genuinely reaches the unknown-function path, unlike a
+    // bare `eval` call on the same still-delimited text (which dies on the
+    // leading `$` at position 0 — see `probe_old_bare_eval_on_delimited_when_text`
+    // in this task's fix report for the measured old-code error text).
+    let err = eval_delimited_expression(
+        TemplateSource::from_workflow_file("${{ not_a_real_function(1) }}"),
+        &ctx(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ExprError::UnknownFunction(ref f) if f == "not_a_real_function"),
+        "expected UnknownFunction(\"not_a_real_function\"), got {err:?}"
     );
 }

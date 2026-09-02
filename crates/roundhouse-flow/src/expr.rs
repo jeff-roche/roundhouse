@@ -497,6 +497,23 @@ pub enum ExprError {
     ExpressionTooDeep(usize),
     #[error("json() argument is not valid JSON ({0})")]
     Json(JsonErrorCategory),
+    /// Fix round 1, item 4: the field's whole text was not a single
+    /// delimited expression — either it wasn't wrapped in `${{ }}` at all
+    /// (a bare expression, e.g. a `when:` field written as `"1 == 1"`
+    /// instead of `"${{ 1 == 1 }}"`), or non-whitespace text followed the
+    /// block's closing `}}`. Named separately from
+    /// [`ExprError::UnexpectedToken`] specifically so the message states
+    /// the real problem (missing/misplaced delimiters) rather than
+    /// "unexpected character", which is what a naive attempt to feed the
+    /// still-delimited text straight to the bare-expression parser used to
+    /// produce (it died on the leading `$`, at position 0, before parsing
+    /// anything).
+    #[error(
+        "expected the field's whole text to be wrapped in the documented expression \
+         delimiters (docs/architecture/05-scheduling-and-workflows.md section 8.9), not a \
+         bare expression; found: {0:?}"
+    )]
+    NotADelimitedExpression(String),
 }
 
 /// What kind of problem `json()`'s `serde_json::from_str` hit, **carrying
@@ -681,6 +698,65 @@ fn eval_inner(expr: &str, ctx: &ExprContext) -> Result<Value, ExprError> {
     // above stayed borrowed. See the module doc comment's "Cost" section
     // for what staying borrowed through here actually saves.
     Ok(v.into_owned())
+}
+
+/// Evaluates a whole workflow-file field that §8.9 documents as always
+/// being a single `${{ ... }}` block — the form used for `when:`
+/// (`when: "${{ len(steps.review.output.findings) > 0 }}"`,
+/// `when: "${{ steps.gate.output.approve }}"`, both taken verbatim from
+/// `docs/architecture/05-scheduling-and-workflows.md` §8.9's own reference
+/// workflow) and, by the identical grammar, `map.over`. Returns the
+/// expression's own typed [`Value`] — a `when:` field evaluates to
+/// `Value::Bool`, not the *string* `"true"`/`"false"` that stringifying
+/// through [`interpolate`] would produce — which matters because a caller
+/// gating on the result (`matches!(v, Value::Bool(true))`) must not have to
+/// re-parse a string back into a bool.
+///
+/// **Fix round 1, item 4.** An earlier caller passed a `when:` field's raw
+/// text — still wrapped in its documented `${{ }}` delimiters — straight to
+/// [`eval`], which takes an undelimited [`ExpressionSource`] and has no
+/// delimiter-stripping of its own (that is `eval`'s whole contract: a bare
+/// expression, no surrounding text). The result was that every `when:`
+/// written in the documented form failed immediately with
+/// `unexpected token at position 0: '${{ ... }}'` — the parser choked on
+/// the leading `$`, which is not valid expression syntax, before it ever
+/// reached the expression inside. Only an undocumented bare form
+/// (`when: "1 == 1"`, no delimiters at all) happened to work. This function
+/// is the fix: it requires and strips exactly one well-formed `${{ ... }}`
+/// wrapper — reusing [`find_closing_delimiter`]'s quote-aware scan, the same
+/// one [`interpolate`] uses, so a `}}` appearing inside a string argument
+/// (e.g. `${{ contains(x, '}}') }}`) does not truncate the block early —
+/// and evaluates the interior. A field that isn't wrapped at all, or that
+/// has non-whitespace text following the block's closing `}}`, is
+/// [`ExprError::NotADelimitedExpression`], which names the actual problem
+/// (missing/misplaced delimiters) rather than the misleading
+/// "unexpected token" a bare pass-through to [`eval`] would report.
+///
+/// Only the delimited form is supported — no bare-expression fallback —
+/// because every `when:`/`map.over` example in the frozen §8.9 reference
+/// workflow uses the delimited form and none uses a bare one; ruling P28
+/// requires implementing exactly what the frozen spec shows, not inventing
+/// a second accepted form it does not document.
+///
+/// Takes a [`TemplateSource`], not a bare `&str` — the trust assertion is
+/// identical to [`interpolate`]'s (ruling P20): the caller must construct
+/// this from the workflow file's own YAML source for the field, never from
+/// a `map.over` item, webhook payload, or previously evaluated result.
+pub fn eval_delimited_expression(
+    field: TemplateSource<'_>,
+    ctx: &ExprContext,
+) -> Result<Value, ExprError> {
+    let text = field.0.trim();
+    let after_open = text
+        .strip_prefix("${{")
+        .ok_or_else(|| ExprError::NotADelimitedExpression(text.to_string()))?;
+    let end = find_closing_delimiter(after_open).ok_or(ExprError::Unterminated)?;
+    let inner = &after_open[..end];
+    let trailing = after_open[end + 2..].trim();
+    if !trailing.is_empty() {
+        return Err(ExprError::NotADelimitedExpression(text.to_string()));
+    }
+    eval_inner(inner.trim(), ctx)
 }
 
 /// Asserts that the wrapped text is safe to evaluate as `${{ }}` template
