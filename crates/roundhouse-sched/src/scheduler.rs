@@ -334,16 +334,72 @@ impl Scheduler {
         self.last_mono = Some(now_mono);
         self.last_wall = Some(now_wall);
 
-        // M5: bindings whose catch-up pass has already run once this tick.
+        events.extend(self.drain_due(now_wall));
+        events
+    }
+
+    /// Task 6 (§8.7): wake-from-suspend handling. Unlike the drift-triggered
+    /// path inside [`tick`](Self::tick) — which calls
+    /// [`recompute_all`](Self::recompute_all) and thereby *discards* every
+    /// occurrence a binding missed, rescheduling only its next future one —
+    /// a real suspend/resume must not silently drop the backlog that
+    /// accumulated while the machine was asleep, nor flood the caller with
+    /// an unbounded burst of catch-up fires. `recompute_all` is correct for
+    /// an ordinary clock step (an NTP correction with no real backlog to
+    /// speak of) but exactly wrong for this case.
+    ///
+    /// This reuses [`drain_due`](Self::drain_due) — the *same*
+    /// per-binding-capped, `CatchUp`-policy-aware machinery `tick` already
+    /// applies to a binding that merely falls behind between ordinary
+    /// ticks — against the heap exactly as it stood before the sleep. Every
+    /// already-heaped fire time remains a valid absolute UTC instant
+    /// regardless of how long the process was suspended, so it is a
+    /// perfectly good seed for `drain_due`'s missed-occurrence walk; nothing
+    /// needs to be recomputed from scratch. A backlog beyond
+    /// `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK` per binding drains
+    /// progressively across successive calls (a wake event, then the
+    /// daemon's own regular `tick` calls), exactly as it would for any other
+    /// capped catch-up pass.
+    ///
+    /// `monotonic_now`/`wall_now` are both taken explicitly — not read
+    /// internally via a `ClockSource` — so the caller's choice of which
+    /// clock backs which value is visible at the call site. They reset this
+    /// scheduler's drift baseline exactly as an ordinary `tick` would,
+    /// so the very next `tick` call measures drift from *this* wake instant
+    /// forward and does not re-report the already-handled sleep gap as
+    /// fresh drift.
+    pub fn catch_up_after_wake(
+        &mut self,
+        monotonic_now: Instant,
+        wall_now: DateTime<Utc>,
+    ) -> Vec<SchedulerEvent> {
+        self.last_mono = Some(monotonic_now);
+        self.last_wall = Some(wall_now);
+        self.drain_due(wall_now)
+    }
+
+    /// Pops and fires whatever in the heap is now due (`fire_at <=
+    /// now_wall`), applying each binding's `CatchUp` policy to any backlog
+    /// found and capping the work done per binding to
+    /// `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK` (M5). Shared by
+    /// [`tick`](Self::tick) (called after its own drift check) and
+    /// [`catch_up_after_wake`](Self::catch_up_after_wake) (called directly,
+    /// with no drift check or heap replacement first) — the two differ only
+    /// in what happens *before* this runs, not in how the actual draining
+    /// and catch-up capping works.
+    fn drain_due(&mut self, now_wall: DateTime<Utc>) -> Vec<SchedulerEvent> {
+        let mut events = Vec::new();
+
+        // M5: bindings whose catch-up pass has already run once this call.
         // A capped pass (see the loop body below) can reschedule an
         // occurrence that is still `<= now_wall` — without this guard, the
         // outer `while` loop would immediately pop that freshly-rescheduled
         // entry and run a *second* capped pass for the same binding within
-        // the same tick, and so on, defeating
+        // the same call, and so on, defeating
         // `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK` entirely. Entries
         // deferred here are pushed back onto the heap once the loop ends, so
         // they are due again — and processed exactly once more — on the
-        // *next* `tick()` call.
+        // *next* call.
         let mut processed_this_tick: HashSet<BindingId> = HashSet::new();
         let mut deferred: Vec<HeapEntry> = Vec::new();
 
@@ -376,7 +432,7 @@ impl Scheduler {
 
             // Walk forward from the entry that just came due, collecting
             // every occurrence this binding missed, capped so an extended
-            // outage can never flood this tick with an unbounded backlog
+            // outage can never flood this call with an unbounded backlog
             // (M5). A single `occurrences_after` call can yield more than
             // one instant (a `DstAmbiguous::Both` fold), so each is
             // considered individually against both the `now_wall` bound and
@@ -406,7 +462,7 @@ impl Scheduler {
             //
             // The policy only applies to a genuine backlog (more than one
             // occurrence overdue at once — "you fell behind"). The ordinary
-            // single-occurrence case (a normal tick finding its one due
+            // single-occurrence case (a normal call finding its one due
             // occurrence, whether exactly on time or a tick-interval late)
             // is not catching up at all and must always fire regardless of
             // `CatchUp`: `CatchUp::None` means "silently drop a backlog,"
@@ -426,7 +482,7 @@ impl Scheduler {
             // occurrences from `to_fire`, but the schedule must still
             // advance past every considered instant, or a dropped
             // occurrence would be reconsidered (and re-dropped, forever) on
-            // every subsequent tick.
+            // every subsequent call.
             if let Ok(instants) = Self::occurrences_after(binding, cursor) {
                 Self::push_occurrences(&mut self.heap, binding, &instants);
             }
@@ -437,5 +493,11 @@ impl Scheduler {
         }
 
         events
+    }
+
+    /// Test-observability accessor (Task 6): the number of entries currently
+    /// heaped, across all bindings.
+    pub fn heap_len(&self) -> usize {
+        self.heap.len()
     }
 }

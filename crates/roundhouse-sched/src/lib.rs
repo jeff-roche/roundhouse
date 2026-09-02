@@ -13,6 +13,7 @@
 pub mod admission;
 pub mod cron;
 pub mod message_trigger;
+pub mod power;
 pub mod scheduler;
 pub mod store;
 pub mod trigger;

@@ -434,6 +434,106 @@ fn catch_up_all_is_capped_per_tick_and_completes_progressively_across_calls() {
     );
 }
 
+/// Task 6 (§8.7): `Scheduler::catch_up_after_wake` must drain a real
+/// suspend-scale backlog through the same capped, progressive machinery as
+/// `tick`'s ordinary catch-up path — not the drift-triggered
+/// `recompute_all` path, which would silently discard it. Modeled as a
+/// genuinely long sleep (a `* * * * *` cron offline for 10 days — 14,400
+/// missed occurrences, two orders of magnitude past the per-call cap), with
+/// the monotonic/wall asymmetry a real suspend produces: the monotonic
+/// clock barely advances while the wall clock jumps by the full sleep
+/// duration.
+#[test]
+fn catch_up_after_wake_drains_a_long_sleep_progressively_across_calls() {
+    let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let start_mono = Instant::now();
+    let mut binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
+    if let TriggerSpec::Cron { catch_up, .. } = &mut binding.spec {
+        *catch_up = CatchUp::All;
+    }
+    let binding_id = binding.id;
+
+    let clock = FakeClock {
+        mono: RefCell::new(start_mono),
+        wall: RefCell::new(start_wall),
+    };
+    let mut sched = Scheduler::new();
+    sched.add_binding(binding, &clock).unwrap();
+
+    let cap = MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK;
+    let total_missed = cap * 100 + 7; // a "daemon asleep for ~10 days" scale backlog
+    let target_wall = start_wall + chrono::Duration::minutes(total_missed as i64);
+    // The whole point: monotonic barely moves across a real suspend, unlike
+    // an NTP-style correction where both clocks would move in step.
+    let woke_mono = start_mono + Duration::from_millis(5);
+
+    let first = sched.catch_up_after_wake(woke_mono, target_wall);
+    assert_eq!(
+        fires_for(&first, binding_id).len(),
+        cap,
+        "a single wake call must drain at most one capped batch, not the whole 10-day \
+         backlog and not zero of it: {first:?}"
+    );
+    assert!(
+        sched.heap_len() > 0,
+        "the rest of the backlog must remain heaped for progressive draining, not be lost"
+    );
+
+    // The remainder drains across subsequent calls exactly like `tick`'s
+    // own progressive catch-up (proving the wake path really does go
+    // through that shared machinery, not around it).
+    let mut remaining = total_missed - cap;
+    let mut guard_iterations = 0;
+    while remaining > 0 {
+        guard_iterations += 1;
+        assert!(
+            guard_iterations <= 200,
+            "catch-up did not converge; backlog is not draining"
+        );
+        let events = sched.tick(&clock_at(target_wall, woke_mono));
+        let fired = fires_for(&events, binding_id).len();
+        assert!(
+            fired > 0,
+            "backlog stalled with {remaining} occurrences left"
+        );
+        assert!(
+            fired <= cap,
+            "a single tick must never exceed the per-binding cap"
+        );
+        remaining -= fired;
+    }
+    assert_eq!(remaining, 0);
+
+    // Fully drained: a later tick at the same wall clock must fire nothing
+    // more, and must not report the already-handled sleep gap as fresh
+    // drift (the wake call already reset the drift baseline).
+    let last = sched.tick(&clock_at(target_wall, woke_mono));
+    assert!(
+        fires_for(&last, binding_id).is_empty(),
+        "backlog is fully caught up; nothing more should fire: {last:?}"
+    );
+    assert!(
+        !last
+            .iter()
+            .any(|e| matches!(e, SchedulerEvent::DriftDetected { .. })),
+        "catch_up_after_wake must reset the drift baseline so the already-handled sleep gap \
+         is not re-reported as drift by a later tick at the same clock reading: {last:?}"
+    );
+}
+
+/// A held-constant clock (both readings equal to whatever
+/// `catch_up_after_wake` last set as the baseline) used to drive further
+/// `tick()` calls in the progressive-drain test above without introducing
+/// any *additional* drift of its own — isolating "does the backlog drain"
+/// from "does advancing the clock further also work" (already covered by
+/// `catch_up_all_is_capped_per_tick_and_completes_progressively_across_calls`).
+fn clock_at(wall: DateTime<Utc>, mono: Instant) -> FakeClock {
+    FakeClock {
+        mono: RefCell::new(mono),
+        wall: RefCell::new(wall),
+    }
+}
+
 /// Fold-in fix: an `Interval` binding with `every == Duration::ZERO` must be
 /// rejected at registration time, not accepted and left to hang `tick`'s
 /// catch-up gather loop on a never-advancing occurrence.
