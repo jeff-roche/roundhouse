@@ -1,0 +1,55 @@
+# Gemini Interactions API (default surface, §9.2) + legacy generateContent
+# (`EndpointMode::GenerateContent`), one profile shared by both — see
+# docs/decisions/2026-08-27-google-genai-spec-verification.md for the fetch
+# record. `[model.reasoning]` below is Budget-kind and is consumed only by
+# `EndpointMode::GenerateContent`'s `generationConfig.thinkingConfig.thinkingBudget`
+# (its field path's camelCase `generationConfig` is the legacy surface's own
+# JSON casing); `EndpointMode::Interactions` encodes reasoning via a small
+# hardcoded `thinking_level` mapping instead, since the Interactions API has
+# no numeric thinking-budget field at all (verified — see the decision doc's
+# Divergence 2).
+id = "google-genai"
+codec = "google-genai"
+
+[defaults]
+allow_raw_extra = false
+base_url = "https://generativelanguage.googleapis.com"
+
+[defaults.params]
+mode = "deny_list"
+fields = []
+
+[defaults.auth]
+kind = "header_key"
+header = "x-goog-api-key"
+
+[[model]]
+match = ["gemini-3.0*"]
+
+[model.reasoning]
+kind = "budget"
+field = "/generationConfig/thinkingConfig/thinkingBudget"
+vocabulary = ["0", "1024", "8192", "24576"]
+
+[model.reasoning.map]
+off = "0"
+low = "1024"
+medium = "8192"
+high = "24576"
+max = "24576"
+
+# Verified real Interactions API error codes (lowercase snake_case,
+# https://ai.google.dev/gemini-api/docs/api-errors) -- NOT the classic
+# UPPER_SNAKE google.rpc.Code vocabulary. Dispositions preserve the intent a
+# first draft of this table gave each entry; see the decision doc's
+# Divergence 4 for why `quota_exceeded` (not `permission_denied`) is the
+# correct real code for the quota-flavoured entry.
+[errors.rate_limit_exceeded]
+disposition = "shed_concurrency"
+
+[errors.service_unavailable]
+disposition = "retry_backoff"
+
+[errors.quota_exceeded]
+disposition = "fatal"
+category = "quota"

@@ -1,0 +1,13 @@
+200
+content-type: text/event-stream
+
+data: {"event_type":"interaction.created","interaction":{"id":"int_2","model":"gemini-3.0-pro","status":"in_progress"}}
+
+data: {"event_type":"step.start","index":0,"step":{"type":"function_call","id":"call_1","name":"get_weather"}}
+
+data: {"event_type":"step.delta","index":0,"delta":{"type":"arguments_delta","arguments":"{\"location\": \"Tokyo\"}"}}
+
+data: {"event_type":"step.stop","index":0}
+
+data: {"event_type":"interaction.completed","interaction":{"id":"int_2","model":"gemini-3.0-pro","status":"requires_action","usage":{"total_input_tokens":12,"total_output_tokens":8,"total_cached_tokens":0,"total_tokens":20}}}
+

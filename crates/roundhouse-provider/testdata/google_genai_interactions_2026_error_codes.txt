@@ -1,0 +1,24 @@
+# Vendored from https://ai.google.dev/gemini-api/docs/api-errors.md.txt
+# ("This page provides a reference for all Interactions API error codes"),
+# fetched during Task 6's spec-verification gate -- the full documented
+# "Standard API error codes" table (lowercase snake_case, NOT the classic
+# UPPER_SNAKE google.rpc.Code vocabulary). See
+# docs/decisions/2026-08-27-google-genai-spec-verification.md Divergence 4.
+invalid_request
+failed_precondition
+out_of_range
+parameter_unknown
+authentication
+permission_denied
+not_found
+model_not_found
+already_exists
+aborted
+rate_limit_exceeded
+quota_exceeded
+too_many_requests
+cancelled
+api_error
+unimplemented
+service_unavailable
+deadline_exceeded

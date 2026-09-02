@@ -1,0 +1,16 @@
+---
+source: crates/roundhouse-provider/tests/golden_google_genai.rs
+expression: body
+---
+{
+  "input": [
+    {
+      "call_id": "call_1",
+      "is_error": true,
+      "result": "permission denied",
+      "type": "function_result"
+    }
+  ],
+  "model": "gemini-3.0-pro",
+  "stream": true
+}

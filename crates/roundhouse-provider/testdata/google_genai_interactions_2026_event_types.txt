@@ -1,0 +1,13 @@
+# Vendored from `interactions.openapi.json` (fetched
+# https://ai.google.dev/static/api/interactions.openapi.json, info.version
+# "v1beta", x-google-revision "0") -- every `InteractionSseEvent` oneOf
+# member's real `event_type` `const` value, extracted mechanically (never
+# from a schema's `description`). See
+# docs/decisions/2026-08-27-google-genai-spec-verification.md.
+error
+interaction.completed
+interaction.created
+interaction.status_update
+step.delta
+step.start
+step.stop

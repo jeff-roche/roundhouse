@@ -1,0 +1,337 @@
+//! `GoogleGenAiProvider`: bridges this module's pure `encode`/`decode`
+//! functions to a real [`HttpTransport`], parameterized by [`EndpointMode`]
+//! at construction (the brief's Interfaces line: "constructed with an
+//! `EndpointMode`"). Mirrors `openai_responses::provider`'s shape (profile-
+//! driven, `[errors]`-table classification via `crate::errors::classify`).
+
+use serde_json::Value;
+
+use super::decode::{decode_google_genai_stream, StreamFailure};
+use super::encode::{contains_unencodable_media, encode};
+use super::EndpointMode;
+use crate::audit::redact_error_body;
+use crate::credential::{resolve_base_url, CredentialCtx};
+use crate::errors::classify;
+use crate::ir::{
+    Capabilities, ChatRequest, ChatStream, ModelId, Plan, ProviderError, RequestCtx, TokenCount,
+};
+use crate::profile::{AuthKind, ProviderProfile};
+use crate::provider_trait::{BoxFut, Provider};
+use crate::transport::HttpRequest;
+
+/// The live `Provider` for the Google GenAI codec. One `ProviderProfile`
+/// (`google-genai.toml`) serves both endpoint modes; which wire surface a
+/// given instance speaks is fixed at construction via `mode`.
+pub struct GoogleGenAiProvider {
+    profile: ProviderProfile,
+    mode: EndpointMode,
+}
+
+impl GoogleGenAiProvider {
+    pub fn new(profile: ProviderProfile, mode: EndpointMode) -> Self {
+        Self { profile, mode }
+    }
+}
+
+impl Provider for GoogleGenAiProvider {
+    fn capabilities(&self, _model: &ModelId) -> Capabilities {
+        Capabilities {
+            streaming: true,
+            tools: true,
+            thinking: true,
+            // Gemini has no explicit prompt-cache breakpoint mechanism on
+            // either surface (it caches automatically) -- see the
+            // `system_prompt_with_cache_breakpoint` golden case.
+            max_breakpoints: 0,
+        }
+    }
+
+    /// Fails closed on a request containing an `Image`/`Document` block, as
+    /// a cheap pre-flight. The guard that matters lives in `stream_chat`'s
+    /// `encode(...)?` propagation -- see `encode.rs`'s `EncodeError` doc
+    /// comment for why (Task 5's fix-round-2 D1 lesson: `resolve` has zero
+    /// production callers anywhere in this workspace).
+    fn resolve(&self, req: &ChatRequest) -> Result<Plan, ProviderError> {
+        if contains_unencodable_media(req) {
+            return Err(ProviderError::Unsupported(
+                "google-genai codec does not encode Image/Document blocks".into(),
+            ));
+        }
+        Ok(Plan {
+            endpoint: "google-genai".into(),
+        })
+    }
+
+    fn stream_chat<'a>(
+        &'a self,
+        req: &'a ChatRequest,
+        ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<ChatStream, ProviderError>> {
+        Box::pin(async move {
+            let body = encode(req, &self.profile, self.mode)?;
+
+            let (base_url, _host_only) =
+                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None)
+                    .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+            let endpoint_url = build_endpoint_url(&base_url, self.mode, &req.model.0);
+
+            let mut http_req = HttpRequest {
+                method: "POST".to_string(),
+                url: endpoint_url.to_string(),
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: serde_json::to_vec(&body)
+                    .map_err(|e| ProviderError::Unsupported(e.to_string()))?,
+            };
+
+            // REALITY-CORRECTIONS §6: prefer the real `CredentialProvider`
+            // mechanism when present, falling back to the Phase 1 bare
+            // `api_key` path when it is not. Unlike `openai_responses`'
+            // fallback (which hardcodes a `Bearer` header, flagged there as a
+            // known limitation), this fallback reads the profile's own
+            // `AuthKind` so a `header_key` auth (this profile's real shape --
+            // `x-goog-api-key`) is honored correctly rather than assumed to
+            // be Bearer.
+            if let Some(credentials) = &ctx.credentials {
+                let cred_ctx = CredentialCtx {
+                    provider_id: &self.profile.id,
+                    transport: ctx.transport.as_ref(),
+                    now: std::time::Instant::now(),
+                };
+                credentials
+                    .apply(&mut http_req, &cred_ctx)
+                    .await
+                    .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+            } else {
+                match &self.profile.defaults.auth {
+                    AuthKind::HeaderKey { header } => {
+                        http_req.headers.push((header.clone(), ctx.api_key.clone()));
+                    }
+                    AuthKind::Bearer => {
+                        http_req.headers.push((
+                            "authorization".to_string(),
+                            format!("Bearer {}", ctx.api_key),
+                        ));
+                    }
+                    // SigV4/AzureEntra need the real `CredentialProvider`
+                    // (signing/token-exchange logic no bare api_key string
+                    // can express) -- not reachable via this profile's own
+                    // `header_key` auth, listed for exhaustiveness only.
+                    AuthKind::SigV4 { .. } | AuthKind::AzureEntra { .. } => {}
+                }
+            }
+
+            let response = ctx
+                .transport
+                .send(http_req)
+                .await
+                .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+
+            if !(200..300).contains(&response.status) {
+                // §9.8: never `?` on JSON parsing in the error path.
+                let headers = to_header_map(&response.headers);
+                let body_bytes = collect_body(response.body).await;
+                let remapped = remap_error_body_for_classify(&body_bytes);
+                return Err(classify(
+                    &self.profile.error_profile(),
+                    response.status,
+                    &remapped,
+                    &headers,
+                ));
+            }
+
+            let headers = to_header_map(&response.headers);
+            let mode = self.mode;
+            let events = decode_google_genai_stream(response.body, mode)
+                .await
+                .map_err(|failure| {
+                    classify(
+                        &self.profile.error_profile(),
+                        response.status,
+                        &stream_failure_body(&failure),
+                        &headers,
+                    )
+                })?;
+            let stream = ChatStream(Box::pin(futures::stream::iter(events)));
+            Ok(stream)
+        })
+    }
+
+    fn count_tokens<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<TokenCount, ProviderError>> {
+        Box::pin(async move {
+            Err(ProviderError::Unsupported(
+                "count_tokens is not built for the google-genai codec in this task".into(),
+            ))
+        })
+    }
+}
+
+/// Builds the full request URL for `mode`, preserving `base`'s existing path
+/// prefix and query string (matches `openai_responses::provider`'s
+/// `append_path_segment` precedent -- never `Url::join`, which drops a base
+/// URL's existing query string per WHATWG relative-URL resolution).
+fn build_endpoint_url(base: &url::Url, mode: EndpointMode, model: &str) -> url::Url {
+    let mut url = base.clone();
+    let base_path = url.path().strip_suffix('/').unwrap_or(url.path());
+    match mode {
+        EndpointMode::Interactions => {
+            url.set_path(&format!("{base_path}/v1beta/interactions"));
+        }
+        EndpointMode::GenerateContent => {
+            // Verified: `streamGenerateContent` requires `?alt=sse` on the
+            // URL to be framed as SSE at all -- `query_pairs_mut` appends
+            // rather than replacing, so a gateway base URL's own query
+            // string (e.g. `?key=...`) survives alongside it.
+            url.set_path(&format!(
+                "{base_path}/v1beta/models/{model}:streamGenerateContent"
+            ));
+            url.query_pairs_mut().append_pair("alt", "sse");
+        }
+    }
+    url
+}
+
+/// Remaps a Gemini error body into the `{"error": {"type", "message"}}` shape
+/// `crate::errors::classify` hardcodes reading (`/error/type`) -- the real
+/// wire field is named `code` (Interactions API, verified) or `status`
+/// (legacy `generateContent`'s long-standing `google.rpc.Status` convention,
+/// not directly fetched -- see the decision doc). Falls through to the raw
+/// body unchanged when neither is present as a string (e.g. an HTML error
+/// page from an outage), so `classify`'s own `serde_json::from_slice` still
+/// degrades gracefully to the HTTP-status tier rather than this function
+/// inventing a shape.
+fn remap_error_body_for_classify(raw: &[u8]) -> Vec<u8> {
+    let Ok(parsed) = serde_json::from_slice::<Value>(raw) else {
+        return raw.to_vec();
+    };
+    let code = parsed
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .or_else(|| parsed.pointer("/error/status").and_then(Value::as_str));
+    let Some(code) = code else {
+        return raw.to_vec();
+    };
+    let message = parsed
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    serde_json::to_vec(&serde_json::json!({ "error": { "type": code, "message": message } }))
+        .unwrap_or_else(|_| raw.to_vec())
+}
+
+/// Renders a [`StreamFailure`] as the same shape `remap_error_body_for_classify`
+/// produces, so an in-band terminal failure goes through the identical §9.8
+/// classification path as an HTTP-level error. Mirrors
+/// `openai_responses::provider::stream_failure_body`.
+fn stream_failure_body(failure: &StreamFailure) -> Vec<u8> {
+    let mut error_obj = serde_json::json!({ "message": failure.message });
+    if let Some(code) = &failure.code {
+        error_obj["type"] = serde_json::json!(code);
+    }
+    serde_json::to_vec(&serde_json::json!({ "error": error_obj })).unwrap_or_default()
+}
+
+fn to_header_map(raw: &[(String, String)]) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in raw {
+        if let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    headers
+}
+
+async fn collect_body(
+    mut body: std::pin::Pin<
+        Box<
+            dyn futures::Stream<Item = Result<bytes::Bytes, crate::transport::TransportError>>
+                + Send,
+        >,
+    >,
+) -> Vec<u8> {
+    use futures::StreamExt;
+    let mut out = Vec::new();
+    while let Some(chunk) = body.next().await {
+        if let Ok(chunk) = chunk {
+            out.extend_from_slice(&chunk);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod build_endpoint_url_tests {
+    use super::{build_endpoint_url, EndpointMode};
+
+    #[test]
+    fn interactions_mode_targets_v1beta_interactions() {
+        let base = url::Url::parse("https://generativelanguage.googleapis.com").unwrap();
+        let url = build_endpoint_url(&base, EndpointMode::Interactions, "gemini-3.0-pro");
+        assert_eq!(
+            url.as_str(),
+            "https://generativelanguage.googleapis.com/v1beta/interactions"
+        );
+    }
+
+    #[test]
+    fn generate_content_mode_targets_the_colon_method_with_alt_sse() {
+        let base = url::Url::parse("https://generativelanguage.googleapis.com").unwrap();
+        let url = build_endpoint_url(&base, EndpointMode::GenerateContent, "gemini-3.0-pro");
+        assert_eq!(
+            url.as_str(),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.0-pro:streamGenerateContent?alt=sse"
+        );
+    }
+
+    /// Same fix-round-1 C5 concern as `openai_responses`: a gateway base URL
+    /// carrying its own query string must keep it.
+    #[test]
+    fn preserves_a_gateway_query_string() {
+        let base = url::Url::parse("https://gateway.example.com/proxy?key=abc123").unwrap();
+        let url = build_endpoint_url(&base, EndpointMode::Interactions, "gemini-3.0-pro");
+        assert_eq!(
+            url.as_str(),
+            "https://gateway.example.com/proxy/v1beta/interactions?key=abc123"
+        );
+    }
+}
+
+#[cfg(test)]
+mod remap_error_body_tests {
+    use super::remap_error_body_for_classify;
+
+    #[test]
+    fn remaps_the_verified_interactions_shape() {
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "error": { "code": "rate_limit_exceeded", "message": "slow down" }
+        }))
+        .unwrap();
+        let remapped: serde_json::Value =
+            serde_json::from_slice(&remap_error_body_for_classify(&raw)).unwrap();
+        assert_eq!(remapped["error"]["type"], "rate_limit_exceeded");
+        assert_eq!(remapped["error"]["message"], "slow down");
+    }
+
+    #[test]
+    fn remaps_the_legacy_status_shape() {
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "error": { "code": 503, "message": "backend down", "status": "UNAVAILABLE" }
+        }))
+        .unwrap();
+        let remapped: serde_json::Value =
+            serde_json::from_slice(&remap_error_body_for_classify(&raw)).unwrap();
+        assert_eq!(remapped["error"]["type"], "UNAVAILABLE");
+    }
+
+    #[test]
+    fn a_non_json_html_outage_body_passes_through_unchanged() {
+        let raw = b"<html>502 Bad Gateway</html>".to_vec();
+        assert_eq!(remap_error_body_for_classify(&raw), raw);
+    }
+}

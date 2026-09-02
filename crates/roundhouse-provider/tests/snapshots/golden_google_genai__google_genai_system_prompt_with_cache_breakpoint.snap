@@ -1,0 +1,20 @@
+---
+source: crates/roundhouse-provider/tests/golden_google_genai.rs
+expression: body
+---
+{
+  "input": [
+    {
+      "content": [
+        {
+          "text": "Hello.",
+          "type": "text"
+        }
+      ],
+      "type": "user_input"
+    }
+  ],
+  "model": "gemini-3.0-pro",
+  "stream": true,
+  "system_instruction": "You are a careful assistant."
+}

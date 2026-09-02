@@ -1,0 +1,21 @@
+---
+source: crates/roundhouse-provider/tests/golden_google_genai.rs
+expression: body
+---
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "Summarize this briefly."
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "thinkingConfig": {
+      "thinkingBudget": 8192
+    }
+  }
+}
