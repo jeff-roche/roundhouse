@@ -236,6 +236,34 @@ async fn openrouter_insufficient_credits_error_classifies_as_quota_exhausted() {
     );
 }
 
+/// Fix round 1, P5: `resolve()` has no production caller anywhere in this
+/// workspace, so this is cheap insurance rather than a coverage gap --
+/// proves the same `contains_unencodable_content` guard `stream_chat` uses
+/// is also wired into `resolve()`, matching every sibling codec's identical
+/// "cheap, I/O-free pre-flight" precedent.
+#[test]
+fn resolve_rejects_image_content() {
+    let mut req = fixtures::single_turn_text("openrouter");
+    req.messages.push(Message {
+        role: Role::User,
+        content: vec![ContentBlock::Image {
+            source: MediaSource {
+                mime_type: "image/png".into(),
+                data: vec![0, 1, 2, 3],
+            },
+            cache: None,
+        }],
+    });
+    let provider = OpenAiChatProvider::new(load("openrouter"));
+    let err = provider
+        .resolve(&req)
+        .expect_err("Image content must be rejected");
+    assert!(
+        matches!(err, ProviderError::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
+}
+
 /// A plain 500 with no recognizable `[errors]`-table code falls through
 /// `classify`'s HTTP-status default tier.
 #[tokio::test]

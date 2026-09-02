@@ -9,30 +9,20 @@
 //! groq,cerebras}/text.cassette` are hand-authored (no live credential to
 //! record against), copying the exact JSON chunk shape of the
 //! already-shipped `testdata/cassettes/moonshot/text.cassette` (Task 4) --
-//! `data: {"choices":[{"delta":{...}}]}` frames terminated by `data:
-//! [DONE]`, matching OpenAI's real, widely-documented `/v1/chat/completions`
-//! streaming shape and, more importantly, the exact fields the FROZEN
-//! Phase 1 `decode_openai_chat_stream`'s own `Chunk`/`Choice`/`Delta`/`Usage`
-//! structs read (`choices[].delta.tool_calls`, `usage.prompt_tokens`,
-//! `usage.completion_tokens`) -- this task authors no new decode logic, so
-//! the wire contract under test is that frozen, already-covered-by-
-//! `tests/openai_chat_decode.rs` decoder, not a freshly-researched spec.
-//! Every cassette ends with a trailing blank line (REALITY-CORRECTIONS
-//! §13b item 6), verified for the whole `testdata/cassettes/` tree by
-//! `every_sse_cassette_has_a_terminator_test.rs`.
-//!
-//! **A genuine, frozen-codec limitation surfaces here and must be declared,
-//! not hidden:** `decode_openai_chat_stream`'s `Delta` struct deserializes
-//! only `tool_calls` (see its own doc comment: "text deltas are Track B's
-//! other decode path, out of scope for this task's fixture") -- it never
-//! reads `delta.content` at all. A plain-text response (this task's "text"
-//! cassette, per the brief: "plain streamed text, no tools") therefore
-//! decodes to ZERO content blocks, even though the request's own Text
-//! prompt is a real `ContentBlock::Text` the round-trip-fidelity check would
-//! otherwise expect to see echoed. Per REALITY-CORRECTIONS §13b item 5 ("a
-//! degrade must be observable, not silent"), every case below declares this
-//! loss explicitly rather than letting it slip through as an accidental
-//! green.
+//! `data: {"choices":[{"delta":{...}}]}` frames (a `role`+`content` delta, a
+//! second `content` delta, a final empty-delta+`finish_reason`+`usage`
+//! frame) terminated by `data: [DONE]`, matching OpenAI's real, widely-
+//! documented `/v1/chat/completions` streaming shape. This IS a fresh
+//! exercise of the `role`+`content` delta shape specifically: fix round 1,
+//! P1 found that `decode_openai_chat_stream`'s `Delta` struct previously had
+//! no `content` field at all, and the only pre-existing coverage
+//! (`tests/openai_chat_decode.rs`) exercised solely the `tool_calls`/`usage`
+//! path via a different fixture -- these `text` cases (and
+//! `tests/openai_chat_decode.rs`'s new `decodes_streaming_text_content_into_block_events`
+//! test, added in the same fix round) are what actually exercises the
+//! `content` field end to end. Every cassette ends with a trailing blank
+//! line (REALITY-CORRECTIONS §13b item 6), verified for the whole
+//! `testdata/cassettes/` tree by `every_sse_cassette_has_a_terminator_test.rs`.
 
 use roundhouse_conformance::{run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
 use roundhouse_provider::codec::openai_chat::{encode_openai_chat, OpenAiChatProvider};
@@ -60,11 +50,16 @@ fn cassette_path(id: &str, name: &str) -> PathBuf {
 /// `ParamsPolicy::allowed_fields` (REALITY-CORRECTIONS §12c) so each
 /// subject's mask is derived from that profile's OWN declared policy, not a
 /// hardcoded mask shared across the batch -- the whole point being that
-/// `groq`'s mask excludes `logprobs` and `cerebras`'s excludes `n`, which a
-/// shared generic mask would make vacuous. `logprobs`/`n` have no
-/// corresponding field on this crate's IR `Params` at all (`encode_openai_chat`
-/// never emits them), so they are permitted-but-never-emitted mask entries --
-/// the same shape as `cohere_v2`'s `k` precedent.
+/// `groq`'s mask excludes `logprobs` and `cerebras`'s excludes `n`.
+///
+/// Fix round 1, P4: `logprobs` and `n` have no corresponding field on this
+/// crate's IR `Params` at all (`ir.rs`'s `Params` struct only has
+/// `temperature`/`top_p`/`max_output_tokens`/`stop`), so `encode_openai_chat`
+/// can never actually emit them regardless of policy -- these two entries
+/// are future-proofing, permitted-but-never-emitted mask slots (the same
+/// shape as `cohere_v2`'s `k` precedent), not currently-exercised
+/// differentiators. The mask-derivation mechanism itself is still real and
+/// per-profile; it's specifically these two wire keys that are inert today.
 const ALL_KNOWN_PARAM_FIELDS: &[&str] = &[
     "temperature",
     "top_p",
@@ -106,6 +101,12 @@ fn mask(profile: &ProviderProfile) -> SerializeOnlyMask {
         "stream".into(),
         "tools".into(),
         "tool_choice".into(),
+        // Independent of `[defaults.params]` -- governed by `[[model]].reasoning`
+        // instead (fix round 1, P2). Not exercised by these `text` fixtures
+        // (none set a reasoning intent), but permitted the same way
+        // `logprobs`/`n` above are: a future case that does exercise it
+        // shouldn't need a mask change.
+        "reasoning_effort".into(),
     ];
     for field in profile
         .defaults
@@ -118,20 +119,6 @@ fn mask(profile: &ProviderProfile) -> SerializeOnlyMask {
         mandatory: vec!["model".into(), "messages".into()],
         allowed,
     }
-}
-
-/// `decode_openai_chat_stream` never reads `delta.content` (a documented,
-/// frozen Phase 1 scope gap -- see this file's module doc comment), so a
-/// text-only cassette's decoded result has zero content blocks. The
-/// request's own `Text` prompt is therefore an honest, declared drop, not
-/// an accidental one.
-fn text_content_not_decoded_by_this_frozen_codec() -> Vec<String> {
-    vec![
-        "decode_openai_chat_stream does not decode assistant Text content deltas (a documented \
-         Phase 1 scope gap: its Delta struct reads only tool_calls) -- the request's Text \
-         prompt does not survive into a plain-text response"
-            .to_string(),
-    ]
 }
 
 /// One conformance subject per profile, all reusing the same
@@ -152,12 +139,17 @@ macro_rules! openai_chat_profile_subject {
                     request: fixtures::single_turn_text($id),
                     cassette_path: cassette_path($id, "text.cassette"),
                     mask: mask(&load($id)),
-                    declared_loss_events: text_content_not_decoded_by_this_frozen_codec(),
+                    // Fix round 1, P1: the decoder now genuinely decodes
+                    // `delta.content`, so text really does round-trip -- no
+                    // declared loss needed (and none should ever be added
+                    // here again just to make a broken decoder pass; see
+                    // this codec's `decode.rs` module history).
+                    declared_loss_events: vec![],
                     expected_error: None,
                 }]
             }
             fn wire_body(req: &ChatRequest) -> serde_json::Value {
-                encode_openai_chat(req)
+                encode_openai_chat(req, &load($id))
             }
         }
     };

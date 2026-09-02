@@ -87,7 +87,7 @@ impl Provider for OpenAiChatProvider {
                 ));
             }
 
-            let body = encode_openai_chat(req);
+            let body = encode_openai_chat(req, &self.profile);
 
             let (base_url, _host_only) =
                 resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None)

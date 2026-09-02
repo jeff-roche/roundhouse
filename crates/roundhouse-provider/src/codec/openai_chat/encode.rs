@@ -1,11 +1,41 @@
 use serde_json::{json, Value};
 
-use crate::ir::{ChatRequest, ContentBlock, Message, MessageRole as Role, ToolChoice, ToolDef};
+use crate::ir::{
+    ChatRequest, ContentBlock, Message, MessageRole as Role, ReasoningIntent, ToolChoice, ToolDef,
+};
+use crate::profile::{glob_match, ProviderProfile};
+
+/// Finds the `[[model]]` entry (if any) whose `match` globs match `model`,
+/// and returns its `reasoning` control -- the same (provider, model) keying
+/// every other codec's `reasoning_control_for` uses (mirrors
+/// `cohere_v2::encode::reasoning_control_for` exactly).
+fn reasoning_control_for<'p>(
+    profile: &'p ProviderProfile,
+    model: &str,
+) -> Option<&'p crate::profile::ReasoningControl> {
+    profile
+        .model
+        .iter()
+        .find(|entry| entry.match_globs.iter().any(|glob| glob_match(glob, model)))
+        .and_then(|entry| entry.reasoning.as_ref())
+}
 
 /// Encodes a `ChatRequest` into an OpenAI-compatible `/v1/chat/completions` request body.
 ///
 /// Streaming is always enabled (`stream: true`) as per §9.3.
-pub fn encode_openai_chat(req: &ChatRequest) -> Value {
+///
+/// Fix round 1, P2: previously took only `&ChatRequest`, so a profile's
+/// declared `[[model]].reasoning` (e.g. moonshot's `reasoning_effort`
+/// control) was fully modeled and deserialized but never consulted --
+/// dead configuration. Now looks up the matched model's `ReasoningControl`
+/// the same way `cohere_v2::encode::encode` does, and forwards the resolved
+/// wire value under the real, verified OpenAI-compatible top-level
+/// `reasoning_effort` field (moonshot's own declared `field =
+/// "/reasoning_effort"` names this same key; as with every other codec in
+/// this crate, `.field`'s string is documentation, not mechanically walked
+/// as a JSON pointer -- `cohere_v2`/`google_genai`/`openai_responses` all
+/// hardcode their own wire path the same way).
+pub fn encode_openai_chat(req: &ChatRequest, profile: &ProviderProfile) -> Value {
     let mut messages: Vec<Value> = Vec::new();
 
     if !req.system.is_empty() {
@@ -41,6 +71,24 @@ pub fn encode_openai_chat(req: &ChatRequest) -> Value {
     if let Some(stop) = &req.params.stop {
         if !stop.is_empty() {
             body["stop"] = json!(stop);
+        }
+    }
+
+    // REALITY-CORRECTIONS §7: `ReasoningRequest.intent` is
+    // `Option<ReasoningIntent>`; a missing intent means Off. `resolve()` can
+    // fail if a profile's `map`/`vocabulary` are inconsistent for this
+    // intent (a profile-authoring bug, not a request-shape one); this
+    // function is infallible (`-> Value`, matching its established Phase 1
+    // signature and every one of its 4 call sites), so — same as an
+    // unmatched model glob — an `Err` here just means no `reasoning_effort`
+    // field is added, rather than propagating a new error type through
+    // every caller.
+    let intent = req.reasoning.intent.unwrap_or(ReasoningIntent::Off);
+    if intent != ReasoningIntent::Off {
+        if let Some(control) = reasoning_control_for(profile, &req.model.0) {
+            if let Ok(wire) = control.resolve(intent) {
+                body["reasoning_effort"] = json!(wire);
+            }
         }
     }
 

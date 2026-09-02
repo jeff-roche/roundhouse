@@ -33,10 +33,20 @@ struct Choice {
     delta: Delta,
 }
 
-/// Incremental content for a choice: only tool-call deltas are decoded in Phase 1 scope
-/// (text deltas are Track B's other decode path, out of scope for this task's fixture).
+/// Incremental content for a choice.
+///
+/// Fix round 1, P1: this struct previously deserialized only `tool_calls`
+/// -- `decode_openai_chat_stream` was the sole codec decoder in this
+/// workspace that never read `delta.content` at all, so any plain-text
+/// (no tool calls) streaming response decoded to ZERO content blocks.
+/// `content` is additive (`#[serde(default)]`, no `deny_unknown_fields` on
+/// this struct), so it cannot disturb the tool-call path.
 #[derive(Deserialize, Default)]
 struct Delta {
+    /// An incremental fragment of the assistant's plain-text reply, present
+    /// only on choices that aren't emitting a tool call.
+    #[serde(default)]
+    content: Option<String>,
     /// Incremental tool-call fragments, keyed by `index` (see [`ToolCallDelta`]).
     #[serde(default)]
     tool_calls: Vec<ToolCallDelta>,
@@ -119,6 +129,30 @@ pub async fn decode_openai_chat_stream(
         };
 
         for choice in &chunk.choices {
+            // Fix round 1, P1: text deltas are keyed through the SAME
+            // `DeltaKeyer` as tool calls, but via a non-numeric sentinel key
+            // (`"content"`) rather than a stringified integer -- tool-call
+            // indices are always `tc.index.to_string()` (e.g. `"0"`, `"1"`),
+            // so `"content"` can never collide with one. A shared keyer
+            // namespace where a text and a tool-call index DID collide is
+            // exactly what silently dropped a tool call in `cohere_v2` two
+            // tasks ago; this sentinel avoids reproducing that.
+            if let Some(content) = &choice.delta.content {
+                if !content.is_empty() {
+                    let index = keyer.index_for("content");
+                    if !started.contains(&index) {
+                        started.push(index);
+                        events.push(StreamEvent::BlockStart {
+                            index,
+                            kind: BlockKind::Text,
+                        });
+                    }
+                    events.push(StreamEvent::BlockDelta {
+                        index,
+                        delta: BlockDelta::Text(content.clone()),
+                    });
+                }
+            }
             for tc in &choice.delta.tool_calls {
                 let index = keyer.index_for(&tc.index.to_string());
                 if !started.contains(&index) {
