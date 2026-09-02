@@ -13,6 +13,7 @@
 pub mod client;
 pub mod elicit;
 pub mod remote_claim;
+pub mod server;
 pub mod version;
 
 use roundhouse_proto::ApiVersion;
