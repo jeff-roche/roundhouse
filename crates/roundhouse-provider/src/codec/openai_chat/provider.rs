@@ -19,6 +19,7 @@
 //! `stream_chat` guard is the one that actually matters for "content the
 //! codec can't encode fails closed."
 
+use super::decode::{StreamFailure, StreamFailureKind};
 use super::{decode_openai_chat_stream, encode_openai_chat};
 use crate::audit::redact_error_body;
 use crate::credential::{resolve_base_url, CredentialCtx};
@@ -98,8 +99,15 @@ impl Provider for OpenAiChatProvider {
                 method: "POST".to_string(),
                 url: endpoint_url.to_string(),
                 headers: vec![("content-type".to_string(), "application/json".to_string())],
+                // Fix round 3, Q5: the one error sink in `stream_chat` that
+                // bypassed `redact_error_body` (the other four sinks in
+                // this function already use it) -- effectively infallible
+                // (`body` is a `serde_json::Value` this function just
+                // built), but this project persists error text onto
+                // physically-immutable `Event` rows, so consistency here
+                // costs nothing and closes the gap.
                 body: serde_json::to_vec(&body)
-                    .map_err(|e| ProviderError::Unsupported(e.to_string()))?,
+                    .map_err(|e| ProviderError::Unsupported(redact_error_body(&e.to_string())))?,
             };
 
             // REALITY-CORRECTIONS §6: prefer the real `CredentialProvider`
@@ -167,7 +175,9 @@ impl Provider for OpenAiChatProvider {
                 ));
             }
 
-            let events = decode_openai_chat_stream(response.body).await;
+            let events = decode_openai_chat_stream(response.body)
+                .await
+                .map_err(stream_failure_to_provider_error)?;
             Ok(ChatStream(Box::pin(futures::stream::iter(events))))
         })
     }
@@ -182,6 +192,42 @@ impl Provider for OpenAiChatProvider {
                 "count_tokens is not offered by openai-chat-family providers".into(),
             ))
         })
+    }
+}
+
+/// Maps a mid-stream [`StreamFailure`] directly onto a `ProviderError`, by
+/// `kind` (fix round 3, Q1) -- never through `crate::errors::classify` at
+/// the enclosing (always 200) HTTP status, which has no 2xx arm and would
+/// land everything in a permanently-fatal `BadRequest { status: 200, .. }`,
+/// discarding this module's diagnostics along with any chance of a correct
+/// retry decision. Mirrors `cohere_v2::provider::stream_failure_to_provider_error`.
+///
+/// - `Transport`: a genuine transport-layer error mid-stream -- becomes
+///   `ProviderError::Transport`, retried with backoff by `retry.rs` (a
+///   transient blip, not a permanent client error).
+/// - `Truncated`/`Length`/`ContentFilter`/`UnrecognizedFinishReason`: real
+///   partial output exists (or might), and this generic retry loop should
+///   not transparently retry a request whose prefix would need to be
+///   resent at the caller's discretion -- `ProviderError::StreamInterrupted
+///   { partial }` is `retry.rs`'s own `Disposition::Fatal` from ITS
+///   perspective, exactly because that decision belongs to the agent loop,
+///   not to this transport-retry layer. Mirrors `cohere_v2`'s identical use
+///   of this variant for the same "ended without a clean stop" shape.
+/// - `Error`: an opaque, provider-side in-band failure (an OpenAI-
+///   compatible gateway's `{"error": {...}}` frame) -- treated like an
+///   opaque 5xx (`ProviderError::Server`), also retried with backoff,
+///   matching `cohere_v2`'s identical treatment of its own `finish_reason:
+///   "ERROR"`.
+fn stream_failure_to_provider_error(failure: StreamFailure) -> ProviderError {
+    match failure.kind {
+        StreamFailureKind::Transport => ProviderError::Transport(failure.message),
+        StreamFailureKind::Truncated
+        | StreamFailureKind::Length
+        | StreamFailureKind::ContentFilter
+        | StreamFailureKind::UnrecognizedFinishReason => ProviderError::StreamInterrupted {
+            partial: failure.partial_text,
+        },
+        StreamFailureKind::Error => ProviderError::Server { status: 500 },
     }
 }
 

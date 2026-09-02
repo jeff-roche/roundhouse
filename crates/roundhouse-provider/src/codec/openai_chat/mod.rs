@@ -9,6 +9,10 @@
 mod decode;
 mod encode;
 pub mod provider;
+mod reasoning_field_validation;
 pub use decode::decode_openai_chat_stream;
 pub use encode::encode_openai_chat;
 pub use provider::OpenAiChatProvider;
+pub use reasoning_field_validation::{
+    validate_openai_chat_reasoning_field, RESERVED_REASONING_FIELD_KEYS,
+};

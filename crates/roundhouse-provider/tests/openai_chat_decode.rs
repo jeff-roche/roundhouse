@@ -23,7 +23,9 @@ async fn decodes_streaming_tool_call_into_block_events() {
         .await
         .unwrap();
 
-    let events = decode_openai_chat_stream(resp.body).await;
+    let events = decode_openai_chat_stream(resp.body)
+        .await
+        .expect("must decode successfully");
 
     assert!(matches!(
         events[0],
@@ -105,7 +107,9 @@ async fn decodes_streaming_text_content_into_block_events() {
         .await
         .unwrap();
 
-    let events = decode_openai_chat_stream(resp.body).await;
+    let events = decode_openai_chat_stream(resp.body)
+        .await
+        .expect("must decode successfully");
 
     assert!(matches!(
         events[0],

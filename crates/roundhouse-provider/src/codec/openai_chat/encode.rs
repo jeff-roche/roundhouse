@@ -39,38 +39,57 @@ fn reasoning_control_for<'p>(
 /// at the final segment. `/thinking/type` against an otherwise-populated
 /// `body` therefore inserts a NEW `body.thinking` object rather than
 /// requiring one to already exist.
+///
+/// Fix round 3, Q2/Q4: a code-reviewer harness demonstrated the original
+/// (fix round 2) version of this function would silently CLOBBER an
+/// existing non-object value it descended through mid-pointer (e.g.
+/// `/messages/0` replacing the entire `messages` array with `{"0": ...}`),
+/// because it unconditionally replaced any non-object intermediate rather
+/// than treating that as a collision. `build.rs`'s
+/// `validate_openai_chat_reasoning_field` now rejects the specific,
+/// statically-visible case of this (a `field` whose FIRST segment names a
+/// reserved top-level key) at compile time, but that check cannot see a
+/// collision deeper than the first segment — this function is the second,
+/// unconditional line of defense: descending through anything that is
+/// neither `Null` (a fresh slot) nor an existing `Object` is now a hard
+/// `panic!`, in both debug and release builds, never a silent overwrite.
+/// Fix round 2's `debug_assert!` on a missing leading `/` is folded into
+/// the same unconditional-panic posture for the identical reason (Q4): a
+/// debug-panics/release-silently-no-ops split is the worst of both worlds.
 fn set_json_pointer(root: &mut Value, pointer: &str, value: Value) {
-    let Some(stripped) = pointer.strip_prefix('/') else {
-        // No leading `/`: not a valid RFC 6901 pointer. Every profile in
-        // this crate declares a `/`-prefixed field; fail visibly in debug
-        // builds rather than silently doing nothing, so a malformed profile
-        // is caught in testing rather than shipping a dropped reasoning
-        // control.
-        debug_assert!(
-            pointer.is_empty(),
-            "ReasoningControl.field {pointer:?} is not a valid JSON pointer (must start with '/')"
-        );
-        return;
-    };
+    let stripped = pointer.strip_prefix('/').unwrap_or_else(|| {
+        panic!(
+            "ReasoningControl.field {pointer:?} is not a valid JSON pointer (must start with \
+             '/') -- build.rs's validate_openai_chat_reasoning_field should have rejected this \
+             profile at compile time"
+        )
+    });
     let segments: Vec<String> = stripped
         .split('/')
         .map(|s| s.replace("~1", "/").replace("~0", "~"))
         .collect();
     let mut current = root;
     for (i, segment) in segments.iter().enumerate() {
-        if !current.is_object() {
-            *current = Value::Object(serde_json::Map::new());
+        match current {
+            Value::Null => *current = Value::Object(serde_json::Map::new()),
+            Value::Object(_) => {}
+            other => panic!(
+                "reasoning field pointer {pointer:?} tried to write through an existing \
+                 non-object value ({other:?}) at path segment {segment:?} -- writing here \
+                 would silently overwrite it instead of adding a new field. \
+                 build.rs's validate_openai_chat_reasoning_field should have rejected a field \
+                 pointer whose first segment collides with a reserved top-level wire key; if \
+                 this fires, RESERVED_REASONING_FIELD_KEYS itself needs updating"
+            ),
         }
         let map = current
             .as_object_mut()
-            .expect("just normalized to an object above");
-        if i == segments.len() - 1 {
+            .expect("normalized to an object, or already one, just above");
+        if i + 1 == segments.len() {
             map.insert(segment.clone(), value);
             return;
         }
-        current = map
-            .entry(segment.clone())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        current = map.entry(segment.clone()).or_insert(Value::Null);
     }
 }
 
@@ -280,5 +299,36 @@ mod set_json_pointer_tests {
         let mut body = json!({});
         set_json_pointer(&mut body, "/a~1b~0c", json!(1));
         assert_eq!(body, json!({ "a/b~c": 1 }));
+    }
+
+    /// Fix round 3, Q4: a pointer with no leading `/` is not valid RFC 6901
+    /// and must panic unconditionally (not the fix-round-2 `debug_assert!`,
+    /// which was a silent no-op in release builds).
+    #[test]
+    #[should_panic(expected = "not a valid JSON pointer")]
+    fn a_pointer_missing_the_leading_slash_panics() {
+        let mut body = json!({});
+        set_json_pointer(&mut body, "no_leading_slash", json!("x"));
+    }
+
+    /// Fix round 3, Q2: the exact shape a code-reviewer harness
+    /// demonstrated silently clobbers real request data against the
+    /// fix-round-2 implementation -- `/messages/0` descending through an
+    /// EXISTING array (not a fresh `Null` slot) must hard-error, never
+    /// replace the whole array with `{"0": ...}`.
+    #[test]
+    #[should_panic(expected = "existing non-object value")]
+    fn a_pointer_descending_through_an_existing_non_object_value_panics() {
+        let mut body = json!({ "messages": [1, 2, 3] });
+        set_json_pointer(&mut body, "/messages/0", json!("clobbered"));
+    }
+
+    /// Same collision, one level deeper -- proves the check applies at
+    /// every intermediate segment, not just the first.
+    #[test]
+    #[should_panic(expected = "existing non-object value")]
+    fn a_deeper_pointer_descending_through_an_existing_non_object_value_panics() {
+        let mut body = json!({ "thinking": { "type": "already a string, not nested further" } });
+        set_json_pointer(&mut body, "/thinking/type/nested", json!("x"));
     }
 }

@@ -69,6 +69,23 @@ mod errors {
     }
 }
 
+// Fix round 3, Q2/Q4: `openai_chat::encode::set_json_pointer` walks a
+// matched model's `ReasoningControl.field` as a real RFC 6901 JSON pointer
+// and writes the resolved reasoning value there. A `field` whose first path
+// segment names one of `encode_openai_chat`'s own top-level wire keys would
+// silently CLOBBER that key instead of adding a new one (a code-reviewer
+// harness confirmed `/model`, `/stream`, and `/messages/0` all do exactly
+// this against the fix-round-2 implementation) — exactly the class of "a
+// typo in a quirk profile" §9.5 promises turns into a BUILD error, not a
+// production data-corruption bug. Kept dependency-free (only
+// `std::path::Path`/`&str`) so it can be `#[path]`-mounted here (a build
+// script cannot depend on the crate it builds) while the REAL crate calls
+// the identical function through its normal `pub` surface — see the
+// module's own doc comment for why this isn't a third hand-mirrored copy
+// like `schema.rs`/`reasoning.rs` above.
+#[path = "src/codec/openai_chat/reasoning_field_validation.rs"]
+mod reasoning_field_validation;
+
 fn main() {
     let profiles_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
     println!("cargo:rerun-if-changed={}", profiles_dir.display());
@@ -89,6 +106,16 @@ fn main() {
                  typo in a quirk profile is a BUILD error, not a production 400: {e}"
             )
         });
+        if parsed.codec == "openai-chat" {
+            for model in &parsed.model {
+                if let Some(control) = &model.reasoning {
+                    reasoning_field_validation::validate_openai_chat_reasoning_field(
+                        &path,
+                        &control.field,
+                    );
+                }
+            }
+        }
         manifest_entries.push((parsed.id.clone(), path.canonicalize().unwrap()));
     }
 
