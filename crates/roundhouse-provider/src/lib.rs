@@ -24,6 +24,7 @@ pub mod credential;
 pub mod errors;
 pub mod fallback;
 mod ir;
+pub mod profile;
 mod provider_trait;
 mod reqwest_transport;
 pub mod retry;
@@ -44,3 +45,19 @@ pub use provider_trait::{BoxFut, Provider};
 pub use reqwest_transport::ReqwestTransport;
 pub use stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 pub use transport::{HttpRequest, HttpResponseStream, HttpTransport, TransportError};
+
+// §9.5: build.rs validates every `profiles/*.toml` at compile time and emits
+// this manifest of (id, raw source) pairs so `load_profile` can look one up
+// by id without re-globbing the filesystem (which would not work once
+// installed).
+include!(concat!(env!("OUT_DIR"), "/profiles_manifest.rs"));
+
+/// Looks up a build.rs-validated quirk profile by id and parses it. The
+/// `.expect` is safe: `build.rs` already proved every file in `profiles/`
+/// deserializes, using the same `profile::ProviderProfile` struct.
+pub fn load_profile(id: &str) -> Option<profile::ProviderProfile> {
+    PROFILE_SOURCES
+        .iter()
+        .find(|(pid, _)| *pid == id)
+        .map(|(_, src)| toml::from_str(src).expect("build.rs already validated this profile"))
+}

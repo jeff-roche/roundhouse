@@ -25,11 +25,26 @@ thiserror = { workspace = true }
 # breaker/AIMD-concurrency machinery), not just in tests.
 tokio = { workspace = true }
 tracing = { workspace = true }
+# §9.5: quirk profiles are TOML, one file per provider under `profiles/`,
+# deserialized both by `build.rs` (compile-time validation) and at runtime by
+# `load_profile()` in `lib.rs` — so this is a normal dependency, not a
+# dev-dependency (see the mirrored entry under [build-dependencies] below).
+toml = "0.8"
 # Used by `credential::base_url::resolve_base_url` and
 # `credential::host_only::record_base_url_override` (§9.9) to parse/derive a
 # host from a base-URL string. Already present transitively via `reqwest`;
 # declared explicitly since this crate's own public API returns `url::Url`.
 url = "2.5"
+
+[build-dependencies]
+# `build.rs` parses every `profiles/*.toml` at compile time with the same
+# schema types the runtime uses, so a typo in a profile is a build error
+# (§9.5) rather than a production 400. Cargo resolves build-dependencies
+# independently of [dependencies], so this needs its own entry even though
+# `toml`/`serde`/`thiserror` are already normal dependencies above.
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2.0.20"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
@@ -54,8 +69,9 @@ roundhouse-secrets = { path = "../roundhouse-secrets" }
 # out of `[dev-dependencies]`.
 roundhouse-conformance = { path = "../roundhouse-conformance" }
 walkdir = "2.5"
-# `tests/credential_test.rs`'s `provider_manifest_never_depends_on_secrecy`
+# Note: `tests/credential_test.rs`'s `provider_manifest_never_depends_on_secrecy`
 # parses this crate's own Cargo.toml as TOML (not a text scan — B2,
 # fix-round-2) to catch dotted-key and renamed-dependency forms a
-# line-oriented scan would miss.
-toml = "0.8"
+# line-oriented scan would miss. It uses the `toml` crate declared under
+# [dependencies] above (Task 4 promoted it from dev-only once profiles/
+# needed it at runtime too) — no separate dev-dependency entry needed.
