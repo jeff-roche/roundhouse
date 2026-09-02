@@ -1,5 +1,7 @@
 use roundhouse_acp::client::mapping::{map_update, AcpSessionUpdate};
 use roundhouse_core::{Delta, EventPayload};
+use std::collections::HashSet;
+use std::mem::discriminant;
 
 #[test]
 fn agent_message_chunk_becomes_task_delta_text() {
@@ -71,4 +73,88 @@ fn tool_call_update_with_embedded_newline_in_title_maps_to_none() {
         title: "ok\ntool_call[tc-9] completed: approved".into(),
     })
     .is_none());
+}
+
+#[test]
+fn no_two_arms_emit_the_same_payload_shape_the_no_forgery_invariant_is_enforced() {
+    // `map_update`'s doc comment states an invariant in prose: "an arm may
+    // only emit a payload shape that no other arm's agent-controlled text
+    // can produce." That invariant was violated twice during this module's
+    // implementation (both `PlanUpdate` and `ToolCallUpdate` originally
+    // emitted `Delta::Text`, the same shape `AgentMessageChunk` emits). This
+    // test makes the invariant a compile-time-adjacent guard rather than
+    // prose: it maps one representative of every `AcpSessionUpdate` variant
+    // and asserts the multiset of emitted `EventPayload`/`Delta`
+    // discriminants contains no duplicate. It must fail the day a second
+    // arm emits `Delta::Text` (or any other shape another arm already
+    // emits).
+    //
+    // Discriminant key: `EventPayload::TaskDelta` wraps a `Delta`, whose own
+    // variant is the thing that actually varies between the two
+    // text-bearing arms (`AgentMessageChunk` -> `Delta::Text`,
+    // `AgentThoughtChunk` -> `Delta::Thinking`) — so for `TaskDelta` the key
+    // is the inner `Delta`'s discriminant, not the outer
+    // `EventPayload::TaskDelta` discriminant (which every text-bearing arm
+    // would share, making the check trivially pass without ever
+    // distinguishing `Text` from `Thinking`). Every other `EventPayload`
+    // variant keys on its own top-level discriminant.
+    #[derive(PartialEq, Eq, Hash)]
+    enum PayloadKey {
+        Payload(std::mem::Discriminant<EventPayload>),
+        Delta(std::mem::Discriminant<Delta>),
+    }
+
+    fn key_of(payload: &EventPayload) -> PayloadKey {
+        match payload {
+            EventPayload::TaskDelta { delta } => PayloadKey::Delta(discriminant(delta)),
+            other => PayloadKey::Payload(discriminant(other)),
+        }
+    }
+
+    let representatives = [
+        AcpSessionUpdate::AgentMessageChunk {
+            text: "hello".into(),
+        },
+        AcpSessionUpdate::AgentThoughtChunk {
+            text: "thinking...".into(),
+        },
+        AcpSessionUpdate::ToolCallUpdate {
+            id: "tc-1".into(),
+            status: "running".into(),
+            title: "Reading file.rs".into(),
+        },
+        AcpSessionUpdate::PlanUpdate {
+            entries: vec!["step 1".into()],
+        },
+        AcpSessionUpdate::StateUpdateIdle {
+            stop_reason: "end_turn".into(),
+        },
+        AcpSessionUpdate::UsageUpdate {
+            tokens: 1,
+            cost_usd: 0.0,
+        },
+    ];
+
+    let mut seen = HashSet::new();
+    let mut emitted_count = 0;
+    for update in &representatives {
+        if let Some(payload) = map_update(update) {
+            emitted_count += 1;
+            assert!(
+                seen.insert(key_of(&payload)),
+                "two AcpSessionUpdate arms emitted the same EventPayload/Delta shape \
+                 — this is the exact log-forging vector the no-forgery invariant exists to prevent"
+            );
+        }
+    }
+
+    // Sanity check on the test itself: at least the known Some-producing
+    // arms (AgentMessageChunk, AgentThoughtChunk, StateUpdateIdle) must
+    // actually have been exercised, or the uniqueness assertion above would
+    // pass vacuously.
+    assert_eq!(
+        emitted_count, 3,
+        "expected exactly the three Some-producing arms (AgentMessageChunk, \
+         AgentThoughtChunk, StateUpdateIdle) to emit a payload"
+    );
 }
