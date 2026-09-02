@@ -1,0 +1,10 @@
+200
+content-type: text/event-stream
+
+data: {"choices":[{"delta":{"role":"assistant","content":"Hello"}}]}
+
+data: {"choices":[{"delta":{"content":", world!"}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":3}}
+
+data: [DONE]
