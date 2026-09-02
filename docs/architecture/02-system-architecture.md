@@ -40,6 +40,7 @@ agent team** — one crate, one owner, one test suite, minimal shared mutable su
 | `roundhouse-policy` | Permission rule language + evaluation engine | core, store (Task 15: the project-scope trust ledger persists through `roundhouse-store`) |
 | `roundhouse-sandbox` | Isolation tiers behind one trait | `roundhouse-core` |
 | `roundhouse-provider` | Provider trait + adapters, capability registry | `roundhouse-core` |
+| `roundhouse-conformance` | Shared provider-adapter conformance test library (§9.10): `ConformanceSubject`/`ConformanceCase`/`SerializeOnlyMask`/`run()`/`ConformanceReport::assert_green()`. Per §13.3, this crate IS the review artifact for a provider adapter. (The `.cassette` on-disk fixture format and `CassetteTransport::from_file` it replays through live in `roundhouse-provider` itself, since that's where `CassetteTransport` is defined.) | core (for `Usage`, not re-exported from `roundhouse-provider`'s crate root), provider (real dependency, for the `Provider` trait and IR types every case exercises; `roundhouse-provider` only takes this crate back as a `[dev-dependencies]` entry, so Tasks 5-17's own `tests/*_conformance.rs` files can call into it, which keeps the edge one-way and acyclic) |
 | `roundhouse-tools` | Task executors (shell/fs/http/web/git/memory) | core, sandbox, policy, net (Task 24: the `http` executor is constructible only from a `roundhouse-net::ProxyHandle`, so `http` traffic is structurally forced through `LoopbackProxy`'s egress allowlist/metadata-IP hard-deny rather than reaching the network directly) |
 | `roundhouse-mcp` | MCP host (rmcp) | core, policy, provider (Task 1, Phase 3: `ContentBlock`/`MediaSource` live in `roundhouse-provider`, not `roundhouse-core`) |
 | `roundhouse-acp` | ACP client + ACP server (agent-client-protocol) | core, proto |
@@ -78,13 +79,12 @@ except `roundhouse-sandbox` (which needs it, and confines it to one module).
 > previously created ad hoc by its phase plan without a matching row here; this table is
 > still the single source of truth, now including it.
 >
-> **Correction (final Phase 2 whole-branch-review cleanup):** an earlier version of this
-> table also carried a `roundhouse-conformance` row (Phase 6's planned conformance-suite
-> library, §9.10). That crate does not exist in the workspace as of this writing — Phase 6
-> is still ahead per `docs/architecture/10-implementation-phasing.md`, and no
-> `crates/roundhouse-conformance` directory or workspace member was ever created. The row
-> was premature and has been removed; re-add it here, following this same pattern, once
-> Phase 6 actually creates the crate.
+> **Correction (final Phase 2 whole-branch-review cleanup), superseded below:** an earlier
+> version of this table carried a `roundhouse-conformance` row before the crate existed and
+> had it removed pending Phase 6 Task 3 actually creating it. Task 3 has now landed
+> `crates/roundhouse-conformance` and it is a real workspace member, so the row above is
+> restored — this note is kept as a record of the same "row added before the crate existed"
+> pattern flagged elsewhere in this section.
 >
 > **A third crate added the same way (Task 23, Phase 2):** §6.6's loopback-proxy network
 > boundary had no implementing crate anywhere in the plan before Task 23 — a full-text

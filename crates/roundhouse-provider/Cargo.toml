@@ -45,6 +45,14 @@ tokio = { version = "1.53", features = ["full", "test-util"] }
 # Cargo (dev-deps are excluded from the normal build graph); do not move
 # this out of `[dev-dependencies]`.
 roundhouse-secrets = { path = "../roundhouse-secrets" }
+# Dev-dependency only, per Phase 6 Task 3's dependency-direction ruling: the
+# shared conformance test library depends on this crate for real (the
+# `Provider` trait and IR types every case exercises); this crate takes it
+# back only here, so Tasks 5-17's own `tests/*_conformance.rs` files can call
+# `roundhouse_conformance::run::<S>()`. A dev-dependency cycle is legal in
+# Cargo (dev-deps are excluded from the normal build graph); do not move this
+# out of `[dev-dependencies]`.
+roundhouse-conformance = { path = "../roundhouse-conformance" }
 walkdir = "2.5"
 # `tests/credential_test.rs`'s `provider_manifest_never_depends_on_secrecy`
 # parses this crate's own Cargo.toml as TOML (not a text scan — B2,
