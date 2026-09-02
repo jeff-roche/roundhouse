@@ -29,8 +29,8 @@ use roundhouse_provider::codec::openai_responses::encode::encode;
 use roundhouse_provider::codec::openai_responses::OpenAiResponsesProvider;
 use roundhouse_provider::profile::ProviderProfile;
 use roundhouse_provider::{
-    CassetteTransport, ChatRequest, ChunkStrategy, HttpRequest, HttpResponseStream, HttpTransport,
-    Provider, ProviderError, RequestCtx, TransportError,
+    CassetteTransport, ChatRequest, ChunkStrategy, ContentBlock, HttpRequest, HttpResponseStream,
+    HttpTransport, MediaSource, Message, Provider, ProviderError, RequestCtx, TransportError,
 };
 use std::sync::Arc;
 
@@ -398,5 +398,68 @@ async fn a_transport_failure_never_leaks_a_key_shaped_string_from_the_url() {
     assert!(
         rendered.contains("REDACTED"),
         "expected redact_error_body's marker to be present, got: {rendered}"
+    );
+}
+
+/// A transport that panics if `send` is ever called -- used to prove a
+/// request is rejected before any network I/O is attempted, not merely
+/// rejected eventually.
+struct PanicsIfCalledTransport;
+
+impl HttpTransport for PanicsIfCalledTransport {
+    fn send<'a>(
+        &'a self,
+        _req: HttpRequest,
+    ) -> futures::future::BoxFuture<'a, Result<HttpResponseStream, TransportError>> {
+        panic!(
+            "stream_chat must reject an Image/Document request before ever calling \
+             HttpTransport::send -- fix-round-2 D1"
+        )
+    }
+}
+
+/// Fix-round-2 D1 (BLOCKER): fix-round-1 C6 put its Image/Document guard
+/// only on `Provider::resolve`, which the review found has zero production
+/// callers anywhere in this workspace -- every real path
+/// (`roundhouse-engine`'s `chat.rs`/`compact.rs`, `fallback.rs`) calls
+/// `stream_chat` directly. This is the test C6 should have had: it drives
+/// the actual production entry point with an Image block and asserts the
+/// rejection, using a transport that panics if `send` is ever reached, so a
+/// regression that let the request through to the network would fail this
+/// test even if the returned `Result` were somehow still `Err` for an
+/// unrelated reason.
+#[tokio::test]
+async fn stream_chat_rejects_image_content_before_any_transport_call() {
+    let req = ChatRequest {
+        messages: vec![Message {
+            role: roundhouse_provider::Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "What's in this image?".into(),
+                    cache: None,
+                    citations: vec![],
+                },
+                ContentBlock::Image {
+                    source: MediaSource {
+                        mime_type: "image/png".into(),
+                        data: vec![0, 1, 2, 3],
+                    },
+                    cache: None,
+                },
+            ],
+        }],
+        ..fixtures::single_turn_text()
+    };
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(PanicsIfCalledTransport),
+        api_key: "test-key".into(),
+        credentials: None,
+    };
+    let provider = OpenAiResponsesProvider::new(fixture_profile());
+    let err = expect_err(provider.stream_chat(&req, &ctx).await);
+    assert!(
+        matches!(err, ProviderError::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
     );
 }

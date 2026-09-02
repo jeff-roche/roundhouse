@@ -176,11 +176,17 @@ fn golden_unicode_content() {
 
 #[test]
 fn golden_image_content_block() {
-    // Fix-round-1 C6: there is no `LossEvent` type anywhere in this
-    // codebase, so silently dropping the Image block (what `encode` alone
-    // does, snapshotted below purely to show that shape) was never an
-    // honest option -- `OpenAiResponsesProvider::resolve` must fail closed
-    // BEFORE a request like this ever reaches `encode`/`stream_chat` at all.
+    // Fix-round-2 D1: `encode` itself now refuses to silently drop an Image
+    // block -- `encode_block` returns `Err(EncodeError::UnencodableMedia)`
+    // for it, not `Ok(None)` -- so there is no successful wire body left to
+    // snapshot here. `resolve()`'s cheap pre-flight check is exercised too,
+    // but the guarantee that matters is `encode` itself: fix-round-1 C6 put
+    // the ONLY guard on `resolve`, which the review found has zero
+    // production callers, so it never actually protected the path
+    // `stream_chat` (every real caller) takes. A `stream_chat`-level test
+    // proving THAT path rejects the request lives in
+    // `conformance_openai_responses.rs`
+    // (`stream_chat_rejects_image_content_before_any_transport_call`).
     let req = ChatRequest {
         messages: vec![Message {
             role: Role::User,
@@ -208,15 +214,9 @@ fn golden_image_content_block() {
         "resolve() must reject a request containing an Image block, not silently drop it later"
     );
 
-    let body =
-        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
-    assert_eq!(
-        body["input"].as_array().unwrap().len(),
-        1,
-        "encode() alone (bypassing resolve()) still just drops the Image block -- shown here \
-         only to document that shape, never reached in practice since resolve() rejects first"
-    );
-    insta::assert_json_snapshot!("openai_responses_image_content_block", body);
+    let err = encode(&req, &fixture_profile())
+        .expect_err("encode() must refuse to silently drop an Image block");
+    insta::assert_snapshot!("openai_responses_image_content_block", err.to_string());
 }
 
 #[test]
@@ -249,15 +249,9 @@ fn golden_document_content_block() {
         "resolve() must reject a request containing a Document block, not silently drop it later"
     );
 
-    let body =
-        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
-    assert_eq!(
-        body["input"].as_array().unwrap().len(),
-        1,
-        "encode() alone (bypassing resolve()) still just drops the Document block -- shown here \
-         only to document that shape, never reached in practice since resolve() rejects first"
-    );
-    insta::assert_json_snapshot!("openai_responses_document_content_block", body);
+    let err = encode(&req, &fixture_profile())
+        .expect_err("encode() must refuse to silently drop a Document block");
+    insta::assert_snapshot!("openai_responses_document_content_block", err.to_string());
 }
 
 /// A request that contains neither an `Image` nor a `Document` block must

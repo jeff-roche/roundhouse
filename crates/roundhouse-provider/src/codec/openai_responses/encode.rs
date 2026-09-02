@@ -9,9 +9,41 @@
 use serde_json::{json, Value};
 
 use crate::ir::{
-    ChatRequest, ContentBlock, MessageRole as Role, ReasoningIntent, ToolChoice, ToolDef,
+    ChatRequest, ContentBlock, MessageRole as Role, ProviderError, ReasoningIntent, ToolChoice,
+    ToolDef,
 };
 use crate::profile::{glob_match, ProfileReasoningError, ProviderProfile, ReasoningControl};
+
+/// Everything that can go wrong turning a `ChatRequest` into a wire body.
+///
+/// Fix-round-2 D1: `EncodeError::UnencodableMedia` exists so a caller
+/// (`encode_block`) CANNOT silently drop an `Image`/`Document` block by
+/// returning `None` -- fix-round-1 C6 put that guard on `Provider::resolve`
+/// instead, and the review found `resolve` has zero production callers
+/// anywhere in this workspace (every real path calls `stream_chat`, which
+/// calls `encode` directly), so the guard was dead code protecting a seam
+/// nothing exercises. Making `encode_block`'s return type itself refuse to
+/// express "silently drop this" is a structural fix, not a guard someone
+/// has to remember to call -- the same reasoning behind the C1 event-type
+/// tripwire (a vendored list a test checks against, not a comment asking
+/// the next codec author to be careful).
+#[derive(Debug, thiserror::Error)]
+pub enum EncodeError {
+    #[error("reasoning encode failed: {0}")]
+    Reasoning(#[from] ProfileReasoningError),
+    #[error("openai-responses codec does not encode Image/Document blocks")]
+    UnencodableMedia,
+}
+
+/// `stream_chat` propagates an `EncodeError` via `?` (its `Result`'s error
+/// type is `ProviderError`) -- this is what makes that propagation
+/// structural rather than an explicit per-call-site `.map_err(..)` a future
+/// edit could drop.
+impl From<EncodeError> for ProviderError {
+    fn from(err: EncodeError) -> Self {
+        ProviderError::Unsupported(err.to_string())
+    }
+}
 
 /// Encodes a `ChatRequest` into an Open Responses `/v1/responses` request
 /// body. Streaming is always enabled (`stream: true`), matching the
@@ -25,19 +57,22 @@ use crate::profile::{glob_match, ProfileReasoningError, ProviderProfile, Reasoni
 /// nothing was requested, when actually a request for `high` effort just
 /// vanished. The caller (`OpenAiResponsesProvider::stream_chat`) surfaces
 /// this as a `ProviderError`.
-pub fn encode(
-    req: &ChatRequest,
-    profile: &ProviderProfile,
-) -> Result<Value, ProfileReasoningError> {
-    let input: Vec<Value> = req
-        .messages
-        .iter()
-        .flat_map(|msg| {
-            msg.content
-                .iter()
-                .filter_map(move |block| encode_block(msg.role, block))
-        })
-        .collect();
+///
+/// Fix-round-2 D1: also returns `Err` (never silently drops) for a request
+/// containing an `Image`/`Document` block -- see `EncodeError`'s doc
+/// comment. `Provider::resolve`'s `contains_unencodable_media` check is kept
+/// as a cheap, `stream_chat`-free pre-flight a caller MAY use, but this is
+/// now the guarantee that actually holds on the path every production
+/// caller takes.
+pub fn encode(req: &ChatRequest, profile: &ProviderProfile) -> Result<Value, EncodeError> {
+    let mut input: Vec<Value> = Vec::new();
+    for msg in &req.messages {
+        for block in &msg.content {
+            if let Some(value) = encode_block(msg.role, block)? {
+                input.push(value);
+            }
+        }
+    }
 
     let mut body = json!({
         "model": req.model.0,
@@ -153,26 +188,28 @@ fn encode_tool_choice(choice: &ToolChoice) -> Value {
 }
 
 /// Encodes one content block into zero or one Open Responses input item.
-/// Returns `None` for a block this codec doesn't put on the wire in this
-/// task's scope:
 ///
-/// - `Image`/`Document`: Open Responses supports `input_image`/`input_file`
-///   items, but `roundhouse-provider` has no `base64` dependency today, and
-///   both existing codecs in this crate already establish the precedent of
-///   dropping these blocks in-scope with a "Phase 2 LossEvent" comment (see
-///   `anthropic_messages::encode::encode_block`). This codec follows the same
-///   precedent for the *implementation* -- but per fix-round-1 C6,
-///   `OpenAiResponsesProvider::resolve` fails closed with `Unsupported`
-///   before a request containing one of these ever reaches `encode` at all
-///   (there is no `LossEvent` type anywhere in this codebase to declare a
-///   silent drop against, so silently vanishing was never an honest option).
+/// Returns `Ok(None)` for a block that is legitimately, silently omitted:
+///
 /// - `Thinking`: Open Responses' `reasoning` item type carries provider-opaque
 ///   `encrypted_content` from a prior turn; this codec never receives one to
 ///   resend in this task's scope.
 /// - `Opaque`: round-trips only to the SAME (provider, model) by design, and
 ///   this codec's own decoder never produces one, so there is nothing for a
 ///   caller to resend here.
-fn encode_block(role: Role, block: &ContentBlock) -> Option<Value> {
+///
+/// Returns `Err(EncodeError::UnencodableMedia)` -- never `Ok(None)` -- for
+/// `Image`/`Document`: Open Responses supports `input_image`/`input_file`
+/// items, but `roundhouse-provider` has no `base64` dependency today (see the
+/// spec-verification note). Fix-round-2 D1: this used to be `Ok(None)` too,
+/// with the guard against silently dropping it living only on
+/// `Provider::resolve` -- which the fix-round-1 review found has zero
+/// production callers, so the guard never actually ran. Refusing to express
+/// "silently drop this" in `encode_block`'s own return type means
+/// `stream_chat` (the path every production caller actually takes) cannot
+/// regress back to a silent drop no matter what future edit touches this
+/// function or its caller.
+fn encode_block(role: Role, block: &ContentBlock) -> Result<Option<Value>, EncodeError> {
     match block {
         // Fix-round-1 C3: the real spec has two DIFFERENT `ItemParam` union
         // members for `role: "user"` vs `role: "assistant"` messages --
@@ -187,20 +224,20 @@ fn encode_block(role: Role, block: &ContentBlock) -> Option<Value> {
                 Role::User => "input_text",
                 Role::Assistant => "output_text",
             };
-            Some(json!({
+            Ok(Some(json!({
                 "type": "message",
                 "role": role_str(role),
                 "content": [{ "type": content_type, "text": text }],
-            }))
+            })))
         }
         ContentBlock::ToolUse {
             id, name, input, ..
-        } => Some(json!({
+        } => Ok(Some(json!({
             "type": "function_call",
             "call_id": id.0,
             "name": name,
             "arguments": input.to_string(),
-        })),
+        }))),
         ContentBlock::ToolResult {
             tool_use_id,
             content,
@@ -216,16 +253,16 @@ fn encode_block(role: Role, block: &ContentBlock) -> Option<Value> {
                 .map(|p| p.text.as_str())
                 .collect::<Vec<_>>()
                 .join("");
-            Some(json!({
+            Ok(Some(json!({
                 "type": "function_call_output",
                 "call_id": tool_use_id.0,
                 "output": joined,
-            }))
+            })))
         }
-        ContentBlock::Image { .. }
-        | ContentBlock::Document { .. }
-        | ContentBlock::Thinking { .. }
-        | ContentBlock::Opaque { .. } => None,
+        ContentBlock::Image { .. } | ContentBlock::Document { .. } => {
+            Err(EncodeError::UnencodableMedia)
+        }
+        ContentBlock::Thinking { .. } | ContentBlock::Opaque { .. } => Ok(None),
     }
 }
 

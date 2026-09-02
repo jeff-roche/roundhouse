@@ -1,20 +1,5 @@
 ---
 source: crates/roundhouse-provider/tests/golden_openai_responses.rs
-expression: body
+expression: err.to_string()
 ---
-{
-  "input": [
-    {
-      "content": [
-        {
-          "text": "What's in this image?",
-          "type": "input_text"
-        }
-      ],
-      "role": "user",
-      "type": "message"
-    }
-  ],
-  "model": "gpt-5.4",
-  "stream": true
-}
+openai-responses codec does not encode Image/Document blocks

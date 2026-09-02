@@ -1,0 +1,25 @@
+# Vendored from the real Open Responses spec: github.com/openresponses/openresponses,
+# revision 2026-04-24 (public/openapi/2026-04-24/openapi.json, fetched and confirmed
+# byte-identical to public/openapi/openapi.json's "latest" pointer at the time of
+# fetch -- see docs/decisions/2026-08-27-open-responses-spec-verification.md).
+#
+# One line per real member of the `ItemField` discriminated union (the `item` an
+# `output_item.added`/`.done` event carries), taken from that member's own
+# `properties.type.enum`/`.default` value -- fix-round-2 D3: a wrong item-type
+# literal in `decode_output_item_added`'s match is the identical failure mode as
+# C1 (a block kind that never resolves correctly, here silently returning `None`
+# instead of opening the wrong kind of block), so it gets the same vendored-list
+# treatment as the event-type strings.
+#
+# Extracted mechanically via:
+#   python3 -c "
+#   import json
+#   d = json.load(open('openapi.json'))
+#   for name in ['Message','FunctionCall','FunctionCallOutput','ReasoningBody','CompactionBody']:
+#       print(d['components']['schemas'][name]['properties']['type']['enum'][0])
+#   "
+message
+function_call
+function_call_output
+reasoning
+compaction

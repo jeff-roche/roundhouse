@@ -46,16 +46,27 @@ impl Provider for OpenAiResponsesProvider {
         }
     }
 
-    /// Fix-round-1 C6: fails closed on a request containing an `Image`/
-    /// `Document` block, rather than letting `encode` silently drop it.
-    /// There is no `LossEvent` type anywhere in this codebase to declare a
-    /// drop against (every reference is a comment promising a future one),
-    /// so "declare it as a loss" was never actually available -- an
-    /// observable, fail-closed rejection (§9.8: "a degrade like this must be
-    /// observable, not silent") is the only honest option until real
-    /// `input_image`/`input_file` encoding lands (blocked on this crate
-    /// gaining a `base64` dependency, deliberately out of this task's scope
-    /// -- see the spec-verification note).
+    /// Fails closed on a request containing an `Image`/`Document` block,
+    /// rather than letting `encode` silently drop it. There is no
+    /// `LossEvent` type anywhere in this codebase to declare a drop against
+    /// (every reference is a comment promising a future one), so "declare it
+    /// as a loss" was never actually available -- an observable, fail-closed
+    /// rejection (§9.8: "a degrade like this must be observable, not
+    /// silent") is the only honest option until real `input_image`/
+    /// `input_file` encoding lands (blocked on this crate gaining a `base64`
+    /// dependency, deliberately out of this task's scope -- see the
+    /// spec-verification note).
+    ///
+    /// Fix-round-2 D1: fix-round-1 C6 put this check ONLY here, and the
+    /// review found `Provider::resolve` has zero production callers anywhere
+    /// in this workspace -- every real path calls `stream_chat` directly, so
+    /// the guard never actually ran and production behavior was unchanged by
+    /// C6. This check is kept as a cheap, I/O-free pre-flight a caller MAY
+    /// use, but the guarantee that actually holds on the path every
+    /// production caller takes now lives structurally in `encode_block`'s
+    /// own return type (`EncodeError::UnencodableMedia`, propagated through
+    /// `encode` and then `stream_chat` below) -- see `encode.rs`'s
+    /// `EncodeError` doc comment.
     fn resolve(&self, req: &ChatRequest) -> Result<Plan, ProviderError> {
         if contains_unencodable_media(req) {
             return Err(ProviderError::Unsupported(
@@ -73,8 +84,14 @@ impl Provider for OpenAiResponsesProvider {
         ctx: &'a RequestCtx,
     ) -> BoxFut<'a, Result<ChatStream, ProviderError>> {
         Box::pin(async move {
-            let body = encode(req, &self.profile)
-                .map_err(|e| ProviderError::Unsupported(format!("reasoning encode failed: {e}")))?;
+            // Fix-round-2 D1: `encode` returning `Err` here (including for a
+            // request containing an `Image`/`Document` block, per
+            // `EncodeError::UnencodableMedia`) now converts into
+            // `ProviderError` via `?` and the `From<EncodeError>` impl in
+            // `encode.rs` -- this is the guard that actually runs on
+            // production's `stream_chat` path, not just on `resolve` (which
+            // fix-round-1 review found has zero production callers).
+            let body = encode(req, &self.profile)?;
 
             // Fix-round-1 C5: routed through the §9.9 seam
             // (`resolve_base_url`/host-only recording) instead of reading
