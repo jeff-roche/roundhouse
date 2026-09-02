@@ -46,15 +46,22 @@ impl Provider for GoogleGenAiProvider {
         }
     }
 
-    /// Fails closed on a request containing an `Image`/`Document` block, as
-    /// a cheap pre-flight. The guard that matters lives in `stream_chat`'s
+    /// Fails closed on a request containing a block this codec cannot
+    /// encode (`Image`/`Document`/`Thinking`/`Opaque` -- fix-round-2 G3:
+    /// this doc comment and the error string below went stale when F1
+    /// extended `contains_unencodable_media` past `Image`/`Document`), as a
+    /// cheap pre-flight. The guard that matters lives in `stream_chat`'s
     /// `encode(...)?` propagation -- see `encode.rs`'s `EncodeError` doc
     /// comment for why (Task 5's fix-round-2 D1 lesson: `resolve` has zero
-    /// production callers anywhere in this workspace).
+    /// production callers anywhere in this workspace). Unlike `encode`'s
+    /// per-block error (which names the specific offending kind),
+    /// `contains_unencodable_media` only reports whether ANY of the four
+    /// kinds is present, not which one -- this message names the full set
+    /// this pre-flight covers rather than guessing at a specific kind.
     fn resolve(&self, req: &ChatRequest) -> Result<Plan, ProviderError> {
         if contains_unencodable_media(req) {
             return Err(ProviderError::Unsupported(
-                "google-genai codec does not encode Image/Document blocks".into(),
+                "google-genai codec does not encode Image/Document/Thinking/Opaque blocks".into(),
             ));
         }
         Ok(Plan {
@@ -185,14 +192,23 @@ impl Provider for GoogleGenAiProvider {
 /// `append_path_segment` precedent -- never `Url::join`, which drops a base
 /// URL's existing query string per WHATWG relative-URL resolution).
 ///
-/// Fix-round-1 F9: `model` (only `GenerateContent` mode interpolates it into
-/// the path) is rejected outright if it contains `/`, `..`, or `%` --
-/// `ModelId` is config-sourced today, so the host cannot actually be
-/// redirected and this is not exploitable *yet*, but the moment a model id
-/// can arrive from a sub-agent spec, a workflow trigger, or an MCP field,
-/// silently trusting it as a URL path segment (including a percent-encoded
-/// `..` traversal, which naive string interpolation would pass through
-/// unnoticed) stops being purely theoretical.
+/// Fix-round-1 F9 / fix-round-2 G1: `model` (only `GenerateContent` mode
+/// interpolates it into the path) must pass a positive allowlist before
+/// being trusted as a URL path segment. `ModelId` is config-sourced today,
+/// so the host cannot actually be redirected and this is not exploitable
+/// *yet*, but the moment a model id can arrive from a sub-agent spec, a
+/// workflow trigger, or an MCP field, silently trusting it stops being
+/// purely theoretical.
+///
+/// G1: the original check denylisted `/`, `..`, and `%` as raw substrings,
+/// but `Url::set_path` normalizes AFTER that check runs, so none of those
+/// three ever needed to appear in the pre-check string to reach a traversal:
+/// `\` is a path separator for special schemes (`foo\bar` becomes
+/// `foo/bar`), and the parser strips tab/LF/CR before parsing (`.` + TAB +
+/// `.` reassembles into a literal `..` segment). A positive allowlist --
+/// only ASCII alphanumerics, `.`, `-`, `_` -- has no such gap: every one of
+/// those bypass characters (`\`, TAB) is rejected outright, and there is no
+/// second normalization pass this check runs before that could undo it.
 fn build_endpoint_url(
     base: &url::Url,
     mode: EndpointMode,
@@ -205,10 +221,14 @@ fn build_endpoint_url(
             url.set_path(&format!("{base_path}/v1beta/interactions"));
         }
         EndpointMode::GenerateContent => {
-            if model.contains('/') || model.contains("..") || model.contains('%') {
+            if !model
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                || model.is_empty()
+            {
                 return Err(ProviderError::Unsupported(format!(
                     "model id `{model}` contains a character not allowed in a URL path segment \
-                     (/, .., or %)"
+                     (only ASCII alphanumerics, '.', '-', '_' are permitted)"
                 )));
             }
             // Verified: `streamGenerateContent` requires `?alt=sse` on the
@@ -343,10 +363,20 @@ mod build_endpoint_url_tests {
             "foo/bar",
             "%2e%2e/admin",
             "gemini-3.0-pro/../../admin",
+            // Fix-round-2 G1: the two live bypasses the reviewer reproduced
+            // against the original denylist-of-substrings check (`/`, `..`,
+            // `%`) using url 2.5.8's actual normalization behavior -- `\` is
+            // a path separator for special schemes, and the parser strips
+            // tab/LF/CR BEFORE parsing, so a tab-separated `.` + `.`
+            // reassembles into a literal `..` segment that never appeared in
+            // the pre-check string.
+            "foo\\bar",
+            ".\t.\\admin",
+            "",
         ] {
             assert!(
                 build_endpoint_url(&base, EndpointMode::GenerateContent, bad_model).is_err(),
-                "expected model id `{bad_model}` to be rejected"
+                "expected model id `{bad_model:?}` to be rejected"
             );
         }
     }
@@ -391,5 +421,34 @@ mod remap_error_body_tests {
     fn a_non_json_html_outage_body_passes_through_unchanged() {
         let raw = b"<html>502 Bad Gateway</html>".to_vec();
         assert_eq!(remap_error_body_for_classify(&raw), raw);
+    }
+
+    /// Fix-round-2 G2: `generate_content_mode_error_429_cassette_classifies_via_
+    /// the_status_remap_branch` (`conformance_google_genai.rs`) can pass even
+    /// with `remap_error_body_for_classify` deleted entirely, because
+    /// `classify`'s HTTP-status default tier independently returns
+    /// `RateLimited` for a bare 429 regardless of whether this remap (or the
+    /// profile's code table) was ever consulted -- the branch does execute,
+    /// but the integration test alone cannot fail on a regression in this
+    /// function specifically. This asserts on the function's own output,
+    /// against the SAME cassette body that integration test replays, so a
+    /// regression here is caught directly rather than only by coincidence of
+    /// which `ProviderError` variant it happens to land on.
+    #[test]
+    fn remaps_the_generate_content_error_429_cassette_body_to_the_real_status() {
+        let cassette = include_str!(
+            "../../../testdata/cassettes/google_genai/generate_content_error_429.cassette"
+        );
+        let body = cassette
+            .split_once("\n\n")
+            .expect("cassette must have a header/body separator")
+            .1;
+        let remapped: serde_json::Value =
+            serde_json::from_slice(&remap_error_body_for_classify(body.as_bytes())).unwrap();
+        assert_eq!(remapped["error"]["type"], "RESOURCE_EXHAUSTED");
+        assert_eq!(
+            remapped["error"]["message"],
+            "You exceeded your current quota, please check your plan and billing details."
+        );
     }
 }

@@ -365,6 +365,22 @@ see below):
   express, and remains out of scope here — but failing closed until that's
   built is the honest choice, not silence. Flagged under Concerns in the
   task report.
+  **Fix-round-2 G4 — the consequence of this ruling that was not written down
+  when F1 landed:** `roundhouse-engine/src/infer.rs` folds a decoded
+  `BlockKind::Thinking` into a persisted `ContentBlock::Thinking`, and by
+  design that block is resent as history on the next turn. After F1 (and
+  after F8 extends the same recognition to the legacy surface, where
+  thought-flagged text previously folded harmlessly into `Text` and encoded
+  fine), **any turn whose history contains a `Thinking` block now hard-fails
+  `encode` with `Unsupported`** — so on a thinking-enabled model, this makes
+  turn 2 onward unusable rather than merely degraded, for as long as this
+  codec has no cross-block signature attachment. The ruling stands (loud
+  beats silent, and — confirmed by grep — nothing in `roundhouse-daemon` or
+  `roundhouse-engine` references `google_genai` yet, so no user is affected
+  by this today), but anyone wiring this codec into the daemon/engine needs
+  to hit this sentence before they hit turn 2's failure: either build the
+  real cross-block signature round-trip first, or accept that this codec is
+  single-turn-only on thinking-enabled models until it exists.
 - `ContentBlock::Opaque` is likewise changed to
   `Err(EncodeError::UnencodableMedia("Opaque"))`, for consistency with the
   ruling above rather than a distinct spec finding of its own — this
