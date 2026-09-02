@@ -1,0 +1,15 @@
+id = "together"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://api.together.xyz/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"rate_limit"      = { disposition = "shed_concurrency" }
+"model_overloaded" = { disposition = "retry_backoff" }
+"invalid_api_key"  = { disposition = "fatal", category = "quota" }
