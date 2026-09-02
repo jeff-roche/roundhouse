@@ -116,6 +116,76 @@ async fn wake_event_triggers_full_recompute_and_marks_in_flight_calls_retryable(
     }
 }
 
+/// Fix round 1 (L1): `run_power_watch` must recover from a poisoned
+/// scheduler mutex rather than let the panic propagate into its own
+/// `loop {}` (see `lock_or_recover` in `power.rs`). A poisoned
+/// `std::sync::Mutex` does not block future `lock()` calls — it just makes
+/// them return `Err(PoisonError)` — so this test poisons the mutex directly
+/// (panicking on a separate OS thread while holding the lock, which unwinds
+/// and releases it, marking it poisoned; this cannot deadlock, the
+/// poisoning thread's panic completes almost immediately) and then drives a
+/// real `Woke` event through `run_power_watch`, asserting the drained
+/// events still reach the sink.
+///
+/// If `lock_or_recover` regresses back to `.expect(...)`/`.unwrap()`, this
+/// fails rather than hangs: the spawned task panics while processing
+/// `Woke`, which drops its `done_tx` sender, so `done_rx.await` resolves to
+/// `Err` immediately — verified by actually reverting the helper and
+/// watching this test fail (see the fix-round-1 report addendum for the
+/// exact command and output).
+#[tokio::test]
+async fn poisoned_scheduler_mutex_is_recovered_not_left_permanently_broken() {
+    let sched = Arc::new(Mutex::new(Scheduler::new()));
+
+    // Poison the mutex: panic on a separate thread while holding the lock.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {})); // suppress this deliberate panic's backtrace noise
+    let poison_sched = sched.clone();
+    let joined = std::thread::spawn(move || {
+        let _guard = poison_sched.lock().unwrap();
+        panic!("deliberately poisoning the scheduler mutex for this test");
+    })
+    .join();
+    std::panic::set_hook(default_hook);
+    assert!(joined.is_err(), "the poisoning thread should have panicked");
+    assert!(
+        sched.lock().is_err(),
+        "the mutex should now report itself as poisoned"
+    );
+
+    // Drive one real `Woke` through `run_power_watch` anyway.
+    let clock = Arc::new(SystemClock);
+    let retryable: Arc<Mutex<dyn RetryableMarker + Send>> =
+        Arc::new(Mutex::new(NoopRetryableMarker));
+    let sink = RecordingSink::default();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let events = SingleWokeThenSignal {
+        fired: false,
+        done_tx: Some(done_tx),
+    };
+
+    let sched_clone = sched.clone();
+    let sink_clone = sink.clone();
+    let handle = tokio::spawn(async move {
+        run_power_watch(sched_clone, clock, events, retryable, sink_clone).await;
+    });
+
+    done_rx
+        .await
+        .expect("run_power_watch must recover from the poisoned lock and keep running, not panic");
+    handle.abort();
+
+    let recorded = sink.0.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    match &recorded[0] {
+        PowerWatchEvent::Woke(fired) => assert!(
+            fired.is_empty(),
+            "no bindings were registered, so the recovered drain must produce no events: {fired:?}"
+        ),
+        other => panic!("expected PowerWatchEvent::Woke, got {other:?}"),
+    }
+}
+
 /// A fixed-reading fake clock: the point of this test is what happens once
 /// the machine has already woken with a fixed (monotonic, wall) reading
 /// pair, not clock mutation over time, so no interior mutability is needed
