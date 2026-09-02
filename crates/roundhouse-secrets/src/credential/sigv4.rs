@@ -108,15 +108,17 @@ fn uri_encode(s: &str, preserve_slash: bool) -> String {
 
 /// Strict RFC 3986 percent-decoding — deliberately NOT
 /// `application/x-www-form-urlencoded` decoding, which treats a literal `+`
-/// as an encoded space. Used to undo the percent-encoding `url::Url` itself
-/// already applies to `path()`/the raw query string at parse time, so
-/// `canonical_uri`/`canonical_query` re-encode the actual literal
-/// characters AWS's algorithm expects them to encode, not
-/// `url`'s-already-encoded output a second (or third) time (B3, fix-round-2:
-/// `canonical_uri` used to feed `url.path()` — already one layer of
-/// percent-encoding — straight into its own once-or-twice encoding step,
-/// over-encoding every non-plain-ASCII path; a literal `%` in the source
-/// path would compound this further with each pass).
+/// as an encoded space. Used only by [`canonical_query`] (see its doc
+/// comment) to undo the percent-encoding `url::Url` applies to the raw
+/// query string at parse time, so query canonicalization re-encodes the
+/// actual literal characters AWS's algorithm expects, not `url`'s
+/// already-encoded output a second time.
+///
+/// **Deliberately NOT used by [`canonical_uri`] any more** (C1, fix-round-3):
+/// an earlier version of this fix decoded `url.path()` before
+/// re-encoding it, which seemed parallel to the query fix but was wrong for
+/// the path — see `canonical_uri`'s doc comment for why decode-then-encode
+/// is only correct for the query, not the path.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -124,10 +126,18 @@ fn percent_decode(s: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'%' {
             if let Some(hex) = s.get(i + 1..i + 3) {
-                if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    out.push(byte);
-                    i += 3;
-                    continue;
+                // C2 (fix-round-3): `u8::from_str_radix` alone accepts a
+                // leading `+` (Rust integer parsing is more permissive than
+                // a hex-pair grammar), so `%+f` would decode to `0x0F`
+                // identically to `%0f` — a second aliasing, and a real
+                // deviation from "strict RFC 3986" above. Require both
+                // characters to actually be hex digits first.
+                if hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                        out.push(byte);
+                        i += 3;
+                        continue;
+                    }
                 }
             }
         }
@@ -137,23 +147,39 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// AWS's "CanonicalURI" (SigV4 "Task 1"): the request path's LITERAL
-/// characters (recovered via [`percent_decode`] — see its doc comment for
-/// why `url.path()` can't be fed in directly), URI-encoded once for every
-/// service, and encoded a **second** time for every service except S3,
-/// which signs against the once-encoded path (S3 object keys can
-/// themselves contain `%`-sequences that must not be re-escaped). `url`'s
-/// own path is already RFC 3986-normalized (dot-segments resolved) by the
-/// `url` crate at parse time, so normalization itself is not this
-/// function's job — only decode-then-(re-)encode.
+/// AWS's "CanonicalURI" (SigV4 "Task 1"): `url.path()` treated as
+/// **already the wire form**, URI-encoded once more for every service
+/// except S3 (which signs the path exactly as it appears on the wire, with
+/// no further encoding).
+///
+/// `url::Url` **preserves percent-escapes verbatim** in the path — it does
+/// not decode them at parse time, confirmed empirically against `url 2.5`
+/// (`https://h/a%2Fb` parses to path `/a%2Fb`, not `/a/b`). So `url.path()`
+/// already IS the once-encoded canonical form for a non-S3 service, and the
+/// literal string S3 needs.
+///
+/// **C1 (fix-round-3, Important): do NOT percent-decode `path` here before
+/// re-encoding it**, even though [`canonical_query`] correctly does exactly
+/// that for the query string. An earlier version of this function did:
+/// `percent_decode(path)` then `uri_encode(_, true)` with `preserve_slash:
+/// true`. That makes `/` a fixed point of the round-trip, which erases the
+/// distinction between a literal wire `/` (a path-segment delimiter) and an
+/// *encoded* `%2F` inside a single segment — `/a%2Fb` and `/a/b` are two
+/// different resources on the wire, but the decode-then-preserve-slash
+/// version canonicalized both to `/a/b` and therefore signed them
+/// identically. It also contradicted its own reasoning: this function
+/// treats S3 specially because "S3 object keys can contain `%`-sequences
+/// that must not be re-escaped" — and then the decode step un-escaped them
+/// first, before that special case ever got a chance to matter. Percent-
+/// decoding a path before AWS's own encode-once/-twice step is simply not
+/// part of SigV4's algorithm; treating `url.path()` as already-encoded and
+/// re-encoding *that* string is.
 fn canonical_uri(path: &str, service: &str) -> String {
     let path = if path.is_empty() { "/" } else { path };
-    let literal = percent_decode(path);
-    let once = uri_encode(&literal, true);
     if service.eq_ignore_ascii_case("s3") {
-        once
+        path.to_string()
     } else {
-        uri_encode(&once, true)
+        uri_encode(path, true)
     }
 }
 

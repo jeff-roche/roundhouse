@@ -370,14 +370,60 @@ async fn oauth_refresh_reports_transport_failure_as_host_only() {
 
 #[tokio::test]
 async fn oauth_refresh_rejects_a_non_https_refresh_url_at_construction() {
+    // C4 (fix-round-3): the scheme check runs BEFORE the userinfo check
+    // (`validate_refresh_url`), so `http://user:pass@host/token` — the
+    // likeliest real-world paste, since it's what you get pasting an
+    // http-with-basic-auth URL by mistake — exits through THIS arm, not the
+    // userinfo arm. The userinfo arm already got an absence-based test in
+    // round 2; this arm didn't, even though it's just as capable of seeing
+    // the same embedded secret. Use the same shape (`s3cr3t-password`) here
+    // too, so this arm is held to the same standard.
     let err = OAuthRefreshCredential::new(
-        "http://auth.example.com/token",
+        "http://user:s3cr3t-password@auth.example.com/token",
         "client-1",
         Secret::new("secret".to_string()),
     )
     .err()
     .unwrap();
-    assert!(err.to_string().contains("https"));
+    let message = err.to_string();
+    assert!(
+        !message.contains("s3cr3t-password"),
+        "the scheme-rejection message must never carry embedded userinfo either: {message}"
+    );
+    assert!(
+        !message.contains("user:s3cr3t-password"),
+        "the scheme-rejection message must never carry embedded userinfo either: {message}"
+    );
+    assert!(
+        message.contains("https"),
+        "message should still explain what's wrong: {message}"
+    );
+    assert!(
+        message.contains("auth.example.com"),
+        "message should still name the host: {message}"
+    );
+}
+
+#[tokio::test]
+async fn oauth_refresh_rejects_a_malformed_refresh_url_without_echoing_it() {
+    // C4 (fix-round-3): the parse-failure arm had no test at all. A
+    // malformed refresh_url could still carry a secret-shaped fragment
+    // (e.g. a URL a caller half-constructed by string-concatenating a
+    // secret into it before it was validated), so this arm needs the same
+    // absence-based standard as the other two.
+    let malformed = "not a valid url at all s3cr3t-password";
+    let err = OAuthRefreshCredential::new(malformed, "client-1", Secret::new("secret".to_string()))
+        .err()
+        .unwrap();
+    let message = err.to_string();
+    assert!(
+        !message.contains("s3cr3t-password"),
+        "the parse-failure message must never echo the malformed input verbatim: {message}"
+    );
+    assert!(
+        !message.contains(malformed),
+        "the parse-failure message must never echo the malformed input verbatim: {message}"
+    );
 }
 
 #[tokio::test]
@@ -782,6 +828,113 @@ fn sigv4_signs_a_path_with_a_space_and_a_query_value_with_a_literal_plus() {
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \
          SignedHeaders=host;x-amz-date, \
          Signature=c9fe220a073930f40f22522be59d46960b31c94906d542f360da097704b24eef"
+    );
+}
+
+/// Signs `url` with the same fixed credentials/date/region used by every
+/// other KAT in this file, returning the `authorization` header's value.
+/// Shared by the C1 (fix-round-3) tests below, which compare signatures
+/// across several path shapes.
+fn sign_fixed(url: &url::Url, service: &str) -> String {
+    let secret_key = Secret::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string());
+    let now = chrono::DateTime::parse_from_rfc3339("2015-08-30T12:36:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let mut headers = Vec::new();
+    roundhouse_secrets::credential::sigv4::sign(
+        "AKIDEXAMPLE",
+        &secret_key,
+        None,
+        "us-east-1",
+        service,
+        "GET",
+        url,
+        &mut headers,
+        b"",
+        now,
+    )
+    .unwrap();
+    headers
+        .into_iter()
+        .find(|(k, _)| k == "authorization")
+        .map(|(_, v)| v)
+        .expect("sign() must set an authorization header")
+}
+
+/// C1 (fix-round-3, Important): an earlier version of the B3 fix
+/// percent-decoded `url.path()` before re-encoding it with `preserve_slash:
+/// true`, which makes `/` a fixed point of that round-trip — erasing the
+/// distinction between a literal wire `/` (a path-segment delimiter) and an
+/// *encoded* `%2F` inside one segment. `/a%2Fb` and `/a/b` are two
+/// different resources on the wire (`url::Url` preserves percent-escapes
+/// verbatim, confirmed by the inline assertion below), but that version
+/// canonicalized both to `/a/b` and therefore signed them identically — a
+/// genuine weakening of a signing primitive, not just an availability bug.
+/// This must never regress: the two signatures below must differ.
+#[test]
+fn sigv4_does_not_collide_an_encoded_slash_with_a_literal_one() {
+    let encoded_slash = url::Url::parse("https://example.amazonaws.com/a%2Fb").unwrap();
+    let literal_slash = url::Url::parse("https://example.amazonaws.com/a/b").unwrap();
+    // Sanity-check the premise: `url::Url` really does preserve `%2F`
+    // verbatim rather than decoding it to `/` at parse time.
+    assert_eq!(encoded_slash.path(), "/a%2Fb");
+    assert_eq!(literal_slash.path(), "/a/b");
+
+    let auth_encoded = sign_fixed(&encoded_slash, "service");
+    let auth_literal = sign_fixed(&literal_slash, "service");
+    assert_ne!(
+        auth_encoded, auth_literal,
+        "an encoded %2F and a literal / are two different resources and must sign differently"
+    );
+    // Pinned exact value, independently computed via the same from-scratch
+    // Python hmac/hashlib script used for every other KAT in this file:
+    // canonical URI = uri_encode(\"/a%2Fb\", preserve_slash: true) =
+    // \"/a%252Fb\" (the literal '%' re-encoded to %25, the two literal
+    // slashes preserved).
+    assert_eq!(
+        auth_encoded,
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \
+         SignedHeaders=host;x-amz-date, \
+         Signature=4c098ea9403745cddad2fdda83316ae58fdfa0b352411519615a9476655c1e1b"
+    );
+}
+
+/// C1 (fix-round-3): S3's `canonical_uri` arm must sign the path exactly as
+/// it appears on the wire, with NO further encoding — not even after
+/// decode-then-re-encode, which is what the earlier (buggy) fix did. A key
+/// containing a literal `%2F` (an encoded slash inside a single S3 object
+/// key, not a path delimiter) must be signed as that literal string, not
+/// unescaped into an actual delimiter first.
+#[test]
+fn sigv4_s3_signs_the_wire_path_verbatim_with_no_further_encoding() {
+    let url = url::Url::parse("https://example.amazonaws.com/a%2Fb").unwrap();
+    assert_eq!(url.path(), "/a%2Fb");
+    let auth = sign_fixed(&url, "s3");
+    // Independently computed the same way as every other KAT here, with
+    // service "s3" and canonical URI equal to the wire path unchanged
+    // ("/a%2Fb", not "/a/b" and not "/a%252Fb").
+    assert_eq!(
+        auth,
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, \
+         SignedHeaders=host;x-amz-date, \
+         Signature=f4a2fdd4d2c215503f7e6fc32795757cb21bdfade84eaa745117185133a1e3ae"
+    );
+}
+
+/// C2 (fix-round-3, Minor): `percent_decode` (used by `canonical_query`)
+/// must reject a `+` inside a would-be hex pair (`%+f`) rather than
+/// silently accepting it via `u8::from_str_radix`'s more permissive integer
+/// grammar — otherwise `%+f` and `%0f` alias to the same decoded byte,
+/// which is a second instance of exactly the collision class C1 fixed.
+#[test]
+fn sigv4_query_percent_decode_rejects_a_plus_sign_in_a_hex_pair() {
+    let plus_hex = url::Url::parse("https://example.amazonaws.com/?q=a%+fb").unwrap();
+    let real_hex = url::Url::parse("https://example.amazonaws.com/?q=a%0fb").unwrap();
+    let auth_plus = sign_fixed(&plus_hex, "service");
+    let auth_real = sign_fixed(&real_hex, "service");
+    assert_ne!(
+        auth_plus, auth_real,
+        "`%+f` must not alias to the same decoded byte as `%0f`"
     );
 }
 
