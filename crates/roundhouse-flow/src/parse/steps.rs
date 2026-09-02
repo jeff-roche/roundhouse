@@ -27,9 +27,27 @@
 //! generic payloads a tool/agent/notification/report consumes, not values
 //! that gate an isolation, permission, or budget decision: `tool`'s/`call`'s
 //! `with:` argument bag, `agent.output_schema`, `gate.form`, `emit`, and
-//! `report`. Leaving these as `Value` is a scope choice, not an oversight —
-//! but it means "fail-closed by construction" is true of the sixteen named,
-//! closed-value-space fields in this module, not of the module as a whole.
+//! `report`. Leaving these as `Value` is a scope choice, not an oversight.
+//!
+//! **Fix round 2, finding Minor 3: a specific field count ("sixteen") was
+//! asserted here and could not be reconstructed under any reading** — this
+//! is the fourth "fail-closed" claim in this module's own history, and the
+//! third to be falsified by execution rather than merely reworded, so the
+//! fix is to stop quantifying and name the fields instead. "Fail-closed by
+//! construction" is true of: `id` (charset/length), `needs` (length
+//! bound), `env`'s key names and value contents (charset), `map.as`
+//! (charset, plus a reserved-root check), `map.on_item_error` (closed
+//! enum), `map.isolation` and its `worktree.base_ref` parameter (closed
+//! tier set, plus a ref-name charset check), `caps.max_cost_usd`
+//! (finiteness/sign), and `gate.on_timeout` (closed enum). It is
+//! deliberately **not** true of `gate.timeout` (stays free-form text —
+//! bounded elsewhere, by §8.11's own 7-day reaper cap, same reasoning as
+//! the nested-`map`-depth bound `parse_step`'s doc comment names as the
+//! executor's responsibility rather than this parser's), nor of `tool`,
+//! `call`, `map.over`, `agent.prompt`, or `gate.title` — a tool name, a
+//! workflow name, an expression string, a prompt, and a human-facing title
+//! are not closed value spaces to begin with, and this module was never
+//! going to make them one.
 //!
 //! **This deliberately does *not* use `#[serde(flatten)]` the way an
 //! earlier version of this module did, and the reason is a measured, not
@@ -75,7 +93,7 @@
 //! for) got an unvalidated `StepDef`, silently skipping every check
 //! `parse_step` only ran on its own direct callers.
 //!
-//! **Fix:** id/needs/`map.as`/`env`-name validation now lives inside
+//! **Fix:** `id`/`needs`/`env`-name validation now lives inside
 //! `TryFrom<StepDefWire> for StepDef` itself — the same conversion
 //! `StepDef`'s derived `Deserialize` impl calls internally, so it fires
 //! for *any* deserialize entry point, not just [`parse_step`]. To keep
@@ -89,14 +107,64 @@
 //! every check — the input is still rejected — but sees it as a generic
 //! `serde_yaml`/`serde_json` error message rather than a matchable
 //! `ParseError` variant, since that erasure happens inside `serde`'s own
-//! generated bridging code, not this module's.
+//! generated bridging code, not this module's. (`map.as`, `map.isolation`,
+//! and `caps.max_cost_usd` are validated the same unbypassable way, but one
+//! level deeper than this paragraph originally claimed — see "Fix round 2"
+//! below for exactly where, and what that costs [`parse_step`]'s own error
+//! typing for those three specifically.)
 //!
-//! **What this does not claim:** every `StepDef` field is `pub`, so Rust
-//! code within this crate can still construct an invalid `StepDef` via a
-//! struct literal, entirely outside any `Deserialize` call — that is a
-//! different concern (library-internal misuse, not untrusted-input
-//! handling) and this fix does not close it. "Validated for every
-//! deserialization path" is the claim; "impossible to construct" is not.
+//! **What this does not claim:** every `StepDef`/`StepBody` field is `pub`,
+//! in a `pub mod`, on `pub` types — so any downstream crate (not just code
+//! within this one) can still construct an invalid `StepDef` via a struct
+//! literal, entirely outside any `Deserialize` call. That is a different
+//! concern (library-internal/downstream misuse, not untrusted-input
+//! handling) and this fix does not close it — nothing today is harmed by
+//! it (there are no consumers yet, and serializing such a value would
+//! produce output this same type's own `Deserialize` rejects on the way
+//! back in, so it fails closed on re-entry even if not on construction).
+//! "Validated for every deserialization path" is the claim; "impossible to
+//! construct" is not.
+//!
+//! # Fix round 2: nested-type checks stay unbypassable, but surface as `ParseError::Yaml`
+//!
+//! Fix round 1's own text above overstated its scope in two ways security
+//! review measured directly rather than accepting on inspection:
+//!
+//! 1. **`map.as` validation does not live in `TryFrom<StepDefWire>`.** It
+//!    lives in `TryFrom<MapBodyDefWire> for MapBodyDef` — one level
+//!    deeper, since `map.as` is a field of the nested `map:` value, not of
+//!    the step itself. The unbypassable-validation *property* still holds
+//!    (it fires whenever a `MapBodyDef` is deserialized, which happens
+//!    during `StepDefWire`'s own deserialize call, before
+//!    `StepDef::try_from` ever runs) — only the *location* claim above was
+//!    wrong, and is corrected here rather than left standing.
+//! 2. **Because of that nesting, [`parse_step`] does *not* surface
+//!    `caps`/`map.as`/`map.isolation` violations as a typed `ParseError`
+//!    variant** — they surface as `ParseError::Yaml(...)`, the same
+//!    generic erasure the text above describes only for *other* callers
+//!    that bypass `parse_step`. `type Error = ParseError` on
+//!    `TryFrom<StepDefWire> for StepDef` only preserves typed errors for
+//!    checks that run *inside that specific `TryFrom` impl* (`id`,
+//!    `needs`, `env` names, and the step-body-shape checks). A nested
+//!    type's own `TryFrom` (`CapsDef`, `MapBodyDef`, `MapIsolationDef`)
+//!    still goes through serde's ordinary `Error::custom(Display)` bridge
+//!    during `StepDefWire`'s deserialization — *before* the outer
+//!    `TryFrom<StepDefWire>` body even runs — so there is no path for that
+//!    error to arrive as anything other than a `serde_yaml::Error` already
+//!    wrapped by the `?` in [`parse_step`]. `tests/parse_steps.rs`'s own
+//!    pre-existing assertions already confirmed this without anyone
+//!    noticing the doc text disagreed: `h2_nan_max_cost_usd_is_rejected`,
+//!    `m3_an_empty_map_as_is_rejected`,
+//!    `h1_a_misspelled_isolation_tier_is_rejected`, and several others all
+//!    assert `matches!(err, ParseError::Yaml(_))`, never a specific
+//!    variant.
+//!
+//! **Stated plainly, so it doesn't need reconstructing from the above a
+//! third time:** the step-level checks in `TryFrom<StepDefWire> for
+//! StepDef` (`id`, `needs`, `env` names, and the body-shape checks)
+//! surface as typed `ParseError` variants for [`parse_step`]'s own
+//! callers; nested-type checks (`caps`, `map.as`, `map.isolation`)
+//! surface as `ParseError::Yaml` regardless of entry point.
 //!
 //! # Duplicate keys inside a step body: already handled below `serde`
 //!
@@ -236,6 +304,23 @@ fn is_valid_env_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Fix round 2, finding Minor 1: [`is_valid_env_name`]'s own doc comment
+/// named `docker run --env`, a systemd unit, and a `.env` file as the
+/// sinks a bad *name* could reach — the same reasoning applies identically
+/// to the *value* half, which fix round 1 left unchecked. Measured:
+/// `env: { A: "safe\nLD_PRELOAD=/tmp/evil.so" }` parsed successfully and
+/// would render to a `.env` file as two lines; a NUL byte in a value
+/// parsed too, which `std::process::Command` rejects at spawn time — a
+/// runtime error surfacing far from the YAML that caused it. This rejects
+/// `\n`, `\r`, and `\0` specifically (the three ways a single logical
+/// value stops being a single line, or stops being a value
+/// `execve`/`Command` accepts at all) rather than restricting to a name-
+/// style charset, since a value legitimately holds e.g. `${{
+/// secrets.GH_TOKEN }}` or arbitrary URLs/paths.
+fn is_valid_env_value(value: &str) -> bool {
+    !value.contains(['\n', '\r', '\0'])
+}
+
 /// A step's resource caps (§8.9: `caps: { max_cost_usd, max_tool_calls }`).
 /// A transfer out of the run's remaining budget (§8.9's `map`-item caps
 /// note) — enforcing that transfer is the executor's job (Task 5), not
@@ -355,6 +440,94 @@ struct WorktreeIsolationParams {
     base_ref: Option<String>,
 }
 
+/// `base_ref` reaches a git ref-name position (the value is handed to git
+/// as the ref to base a new worktree on). Fix round 2, finding Minor 2:
+/// this field was free-form — `"--upload-pack=/tmp/x"`, `"$(id)"`, and
+/// `"; rm -rf /"` all parsed. A leading `-` is the standard git argument-
+/// injection vector (a value starting with `-` is read as a flag, not a
+/// ref, by any git plumbing that doesn't defensively insert a `--`
+/// separator), and the tier name itself already declares the sink — this
+/// isn't a generic "sanitize everything" pass, it's specific to what this
+/// one field is used for.
+///
+/// This is a reasonable approximation of `git check-ref-format`'s own
+/// rules plus defense-in-depth against a shell-string invocation, not a
+/// byte-for-byte reimplementation of either: rejects empty, a leading `-`
+/// (the injection vector above), a leading/trailing `/`, any `..` run, a
+/// trailing `.lock`, control characters/whitespace, and
+/// [`FORBIDDEN_GIT_REF_CHARS`] (see its own doc comment for the two
+/// different reasons its two halves exist). It does not implement every
+/// `check-ref-format` rule (e.g. `@{` sequences, a lone `@`) — those are
+/// additional git-specific edge cases this function doesn't claim to
+/// catch, left for git itself to reject at worktree-creation time if they
+/// slip through.
+///
+/// **Skipped entirely when `value` contains an expression placeholder
+/// (`${{`).** §8.9's own frozen fixture uses exactly this shape —
+/// `base_ref: "refs/pull/${{ pr.number }}/head"` — where the space inside
+/// `${{ pr.number }}` is legitimate expression syntax the evaluator (Task
+/// 4) substitutes a real value into at run time; this function has no way
+/// to know what that substitution produces, so a charset rule applied to
+/// the literal template text would reject the frozen fixture itself
+/// (confirmed by executing this exact case before choosing this design,
+/// not assumed: the naive version of this check rejected it). Inventing a
+/// rule that understands where a template placeholder starts and ends
+/// well enough to validate only the literal parts around it is exactly
+/// the shape of heuristic this crate's own DoS-scan history
+/// (`parse/mod.rs`'s module doc, three bypassed designs) warns against —
+/// a validator that has to model enough of a second grammar to stay safe
+/// is the wrong shape. The executor is responsible for validating the
+/// *evaluated* ref text before handing it to git; this parser validates
+/// only a fully-literal `base_ref` that contains no expression at all.
+fn validate_git_ref(value: &str) -> Result<(), String> {
+    if value.contains("${{") {
+        return Ok(());
+    }
+    if value.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if value.starts_with('-') {
+        return Err(
+            "must not start with `-` (would be read as a command-line flag by git, not a ref name)"
+                .to_string(),
+        );
+    }
+    if value.starts_with('/') || value.ends_with('/') {
+        return Err("must not start or end with `/`".to_string());
+    }
+    if value.contains("..") {
+        return Err("must not contain `..`".to_string());
+    }
+    if value.ends_with(".lock") {
+        return Err("must not end with `.lock`".to_string());
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || FORBIDDEN_GIT_REF_CHARS.contains(c))
+    {
+        return Err(format!(
+            "must not contain control characters, whitespace, or any of `{FORBIDDEN_GIT_REF_CHARS}`"
+        ));
+    }
+    Ok(())
+}
+
+/// `~^:?*[\` is `git check-ref-format`'s own disallowed set for a ref
+/// component. `$`() ;|&<>'"` is *not* — check-ref-format doesn't forbid
+/// shell metacharacters, because they're not a git concern, they're a
+/// concern only if something later builds a shell command string out of
+/// this value instead of passing it as a discrete argv element. Measured
+/// directly: without this second half, `validate_git_ref` let
+/// `"$(id)"` through (fix round 2's own review caught this — the first
+/// version of this constant was git's charset alone, and a test written
+/// against the reviewer's exact example failed). Added as defense in
+/// depth: this parser doesn't know whether the executor (Task 5) invokes
+/// git via argv (safe regardless of these characters) or via a shell
+/// string (unsafe if it does), and none of these characters ever
+/// legitimately appears in a real git ref name, so rejecting them costs
+/// nothing either way.
+const FORBIDDEN_GIT_REF_CHARS: &str = "~^:?*[\\$`();|&<>'\"";
+
 /// The other four isolation tiers take no documented parameters today;
 /// deserializing into this zero-field, `deny_unknown_fields` struct is how
 /// `{sandbox: {some_param: 1}}` is rejected rather than silently accepted
@@ -462,6 +635,11 @@ impl TryFrom<MapIsolationWire> for MapIsolationDef {
                     IsolationDef::Worktree => {
                         let params: WorktreeIsolationParams = serde_json::from_value(value)
                             .map_err(|e| format!("invalid `worktree` isolation params: {e}"))?;
+                        if let Some(base_ref) = &params.base_ref {
+                            validate_git_ref(base_ref).map_err(|reason| {
+                                format!("worktree.base_ref {base_ref:?}: {reason}")
+                            })?;
+                        }
                         Ok(MapIsolationDef::Worktree {
                             base_ref: params.base_ref,
                         })
@@ -759,12 +937,20 @@ impl TryFrom<StepDefWire> for StepDef {
             });
         }
         if let Some(env) = &w.env {
-            for name in env.keys() {
+            for (name, value) in env {
                 if !is_valid_env_name(name) {
                     return Err(ParseError::InvalidStepBody {
                         step: w.id.clone(),
                         reason: format!(
                             "env variable name {name:?} is invalid — must match POSIX-style [A-Za-z_][A-Za-z0-9_]*"
+                        ),
+                    });
+                }
+                if !is_valid_env_value(value) {
+                    return Err(ParseError::InvalidStepBody {
+                        step: w.id.clone(),
+                        reason: format!(
+                            "env variable {name:?}'s value must not contain a newline, carriage return, or NUL byte"
                         ),
                     });
                 }

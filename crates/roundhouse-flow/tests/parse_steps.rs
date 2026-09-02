@@ -649,3 +649,105 @@ fn l2_a_non_string_env_value_is_rejected() {
     let err = try_step("id: a\ntool: shell\nenv: { X: [1, 2] }").unwrap_err();
     assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
 }
+
+// =======================================================================
+// Fix round 2 (security + code review on fix round 1).
+// =======================================================================
+
+// -- Minor 1: env *values* are validated too, not just names. -----------
+
+#[test]
+fn minor1_an_env_value_containing_a_newline_is_rejected() {
+    let err =
+        try_step("id: a\ntool: shell\nenv: { A: \"safe\\nLD_PRELOAD=/tmp/evil.so\" }").unwrap_err();
+    assert!(
+        matches!(err, ParseError::InvalidStepBody { .. }),
+        "err was: {err:?}"
+    );
+}
+
+#[test]
+fn minor1_an_env_value_containing_a_carriage_return_is_rejected() {
+    let err = try_step("id: a\ntool: shell\nenv: { A: \"x\\ry\" }").unwrap_err();
+    assert!(
+        matches!(err, ParseError::InvalidStepBody { .. }),
+        "err was: {err:?}"
+    );
+}
+
+#[test]
+fn minor1_an_env_value_containing_a_nul_byte_is_rejected() {
+    let err = try_step("id: a\ntool: shell\nenv: { A: \"x\\0y\" }").unwrap_err();
+    assert!(
+        matches!(err, ParseError::InvalidStepBody { .. }),
+        "err was: {err:?}"
+    );
+}
+
+#[test]
+fn minor1_an_ordinary_env_value_with_an_expression_parses() {
+    let s = step("id: a\ntool: shell\nenv: { GH_TOKEN: \"${{ secrets.GH_TOKEN }}\" }");
+    assert_eq!(
+        s.env.unwrap().get("GH_TOKEN"),
+        Some(&"${{ secrets.GH_TOKEN }}".to_string())
+    );
+}
+
+// -- Minor 2: `worktree.base_ref` gets a git-ref-shaped charset check, ---
+// -- skipped when it's an expression template rather than a literal. ----
+
+#[test]
+fn minor2_a_base_ref_starting_with_a_dash_is_rejected() {
+    let err = try_step(
+        "id: a\nmap: { over: x, as: y, isolation: { worktree: { base_ref: \"--upload-pack=/tmp/x\" } } }\nsteps: [{ id: b, tool: shell }]",
+    )
+    .unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn minor2_a_base_ref_containing_shell_metacharacters_is_rejected() {
+    let err = try_step(
+        "id: a\nmap: { over: x, as: y, isolation: { worktree: { base_ref: \"$(id)\" } } }\nsteps: [{ id: b, tool: shell }]",
+    )
+    .unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn minor2_an_ordinary_literal_base_ref_parses() {
+    let s = step(
+        "id: a\nmap: { over: x, as: y, isolation: { worktree: { base_ref: \"refs/heads/main\" } } }\nsteps: [{ id: b, tool: shell }]",
+    );
+    let StepBody::Map { isolation, .. } = &s.body else {
+        panic!("expected Map step");
+    };
+    assert_eq!(
+        isolation,
+        &Some(MapIsolationDef::Worktree {
+            base_ref: Some("refs/heads/main".to_string())
+        })
+    );
+}
+
+#[test]
+fn minor2_a_templated_base_ref_is_not_charset_checked() {
+    // The frozen §8.9 fixture's own shape: an expression placeholder
+    // legitimately contains a space, which a literal-git-ref charset
+    // check cannot distinguish from an injection attempt without parsing
+    // the expression language itself — deliberately not attempted here.
+    // This is also this test's regression coverage for the fixture test
+    // itself, from the other direction.
+    let s = step(
+        "id: a\nmap: { over: x, as: y, isolation: { worktree: { base_ref: \"refs/pull/${{ pr.number }}/head\" } } }\nsteps: [{ id: b, tool: shell }]",
+    );
+    let StepBody::Map { isolation, .. } = &s.body else {
+        panic!("expected Map step");
+    };
+    assert_eq!(
+        isolation,
+        &Some(MapIsolationDef::Worktree {
+            base_ref: Some("refs/pull/${{ pr.number }}/head".to_string())
+        })
+    );
+}
