@@ -177,6 +177,26 @@
 //! an env value as inert-looking punctuation. Tested:
 //! `an_unpaired_opening_delimiter_is_an_error`.
 //!
+//! # A ternary evaluates both branches before selecting one (documented, not fixed — fix round 2)
+//!
+//! [`Parser::parse_ternary_inner`] parses and evaluates `cond`, `then_v`,
+//! *and* `else_v` unconditionally, and only picks which of `then_v`/`else_v`
+//! to return afterward, based on [`truthy`]. This is pre-existing behaviour,
+//! not a leak introduced by this fix round, and the argument-clone fix
+//! above made the discarded branch's *evaluation cost* free in the common
+//! case (an unused chain mention now stays a zero-copy `Cow::Borrowed` that
+//! is simply dropped) — but it does not change *whether* the untaken branch
+//! runs at all. Concretely: `${{ allowed ? secrets.TOKEN : '' }}` evaluates
+//! `secrets.TOKEN` — including any `env()` call nested inside that branch —
+//! regardless of whether `allowed` is true. Nothing in this module's frozen
+//! grammar has short-circuit evaluation, and adding it would be exactly the
+//! kind of grammar change the module doc's opening paragraph forbids without
+//! going back to §8.9 first. This matters wherever `if:`-style conditional
+//! semantics get built on top of this evaluator later: a condition guarding
+//! whether a step *runs* is not the same as a condition guarding which
+//! *value* an already-running ternary selects, and the latter does not
+//! prevent the untaken side's lookups (or its `env()` calls) from happening.
+//!
 //! # Case sensitivity — the coupling with Task 3's reserved-root check
 //!
 //! `parse::steps::validate_map_as` rejects `map.as` values that
@@ -674,6 +694,45 @@ pub fn interpolate(template: &str, ctx: &ExprContext) -> Result<String, ExprErro
 /// escapes (a language change §8.9 does not ask for) or changing
 /// `interpolate` to attempt more than one candidate split per block
 /// (a bigger change than this fix round's scope).
+///
+/// **How general this hole is, measured, not assumed (fix round 2):** every
+/// one of the twelve continuation bytes [`looks_like_a_real_string_close`]
+/// accepts — `.` `[` `)` `]` `,` `?` `:` `==` `!=` `<` `>` and `}}` — hosts a
+/// forged clean merge of this shape; only end-of-input cannot (no `}}`
+/// follows it to forge). An earlier report on this fix accurately described
+/// what was then known — that the other eleven continuations were
+/// unexplored — while this doc comment's claim that the hole is general was
+/// already correct; the two were not in conflict, just at different points
+/// of what had actually been established at the time each was written.
+/// Realism is a separate axis from generality, and does differ across the
+/// twelve: four prose-shaped forgeries constructed directly against this
+/// scan all failed closed, and the accidental risk in practice is dominated
+/// by the `' }}` shape above — the other eleven continuations need
+/// deliberate construction by whoever writes the template, not an accidental
+/// typo, to actually trigger.
+///
+/// **A second, narrower disagreement, left unaligned rather than closed
+/// (fix round 2):** this function's lookahead and [`Parser::parse_string_literal`]'s
+/// own quote-closing rule can disagree with each other. This function
+/// consults [`looks_like_a_real_string_close`] before accepting a candidate
+/// closing quote; the parser itself still closes a string literal at the
+/// *first* matching quote character, unconditionally, with no lookahead at
+/// all. So when this splitter *rejects* a quote character that the parser
+/// would happily accept as a close, the block this function reports as
+/// unterminated (or as extending further than the author intended) can
+/// still differ from where the parser itself would have closed the string,
+/// had it been asked to parse that same text. Both sides fail closed — no
+/// clean, successfully-parsed differential between the two was
+/// constructible — and the only observed effect is that error text can now
+/// carry strictly more of the original template than it used to, and the
+/// cross-block merge above remains reachable via a malformed first block as
+/// well as an unterminated one. Left as a documented disagreement rather
+/// than aligned: doing so would mean either adding the same lookahead to
+/// `parse_string_literal` (touching the one function every string literal in
+/// every expression goes through, for a difference that has no observed
+/// behavioural consequence today) or removing it from this function (giving
+/// back the exact cross-block merge the lookahead was added to fix). Neither
+/// is this fix round's call to make unilaterally.
 fn find_closing_delimiter(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -1152,6 +1211,21 @@ fn as_f64(v: &Value) -> f64 {
 /// touched, not by depth times remaining-subtree size. Re-measured after
 /// this fix with the same three depths: see this module's doc comment
 /// "Cost" section for the numbers and the harness that produced them.
+///
+/// **This still assumes `serde_json::Map` is its default, `BTreeMap`-backed
+/// form (ruling P21).** `Map::remove` being O(sibling count) rather than
+/// O(subtree size) is what makes the claim above hold; if any crate in this
+/// workspace ever enables serde_json's `preserve_order` feature, Cargo's
+/// workspace-wide feature unification silently changes `Map` to an
+/// `IndexMap`, and `IndexMap::shift_remove` becomes a shift of every sibling
+/// after the removed key — still linear in sibling count, not subtree size,
+/// so this fix does not regress, but the wording above ("a lookup plus a
+/// move ... touches only the current level's own bookkeeping") would need a
+/// qualifier. `roundhouse-flow` does not enable `preserve_order` itself and
+/// has no way to see whether some other crate in the workspace does; this is
+/// tracked as a final-integration check (`cargo tree -e features -i
+/// serde_json` should show it off), not something this module can verify on
+/// its own.
 fn index_field<'a>(v: Cow<'a, Value>, field: &str) -> Cow<'a, Value> {
     match v {
         Cow::Borrowed(r) => match r.get(field) {
