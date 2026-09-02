@@ -79,6 +79,7 @@ impl Bus for NoopBus {
         &self,
         _workspace: WorkspaceId,
         _name: &str,
+        _session: SessionId,
     ) -> Result<(), BusError> {
         Ok(())
     }

@@ -332,13 +332,16 @@ impl Bus for LocalBus {
         name: String,
         session: SessionId,
     ) -> Result<(), BusError> {
-        self.handles.register(workspace, name, session);
-        Ok(())
+        self.handles.register(workspace, name, session)
     }
 
-    async fn unregister_handle(&self, workspace: WorkspaceId, name: &str) -> Result<(), BusError> {
-        self.handles.unregister(workspace, name);
-        Ok(())
+    async fn unregister_handle(
+        &self,
+        workspace: WorkspaceId,
+        name: &str,
+        session: SessionId,
+    ) -> Result<(), BusError> {
+        self.handles.unregister(workspace, name, session)
     }
 }
 

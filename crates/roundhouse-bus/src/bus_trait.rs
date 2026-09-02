@@ -41,11 +41,27 @@ pub trait Bus: Send + Sync {
     /// `Address::Handle` support. `roundhouse-sched`'s `Message` trigger
     /// binding is the first real caller; nothing in Phase 4 needed this
     /// because its scope only covered point-to-point session sends.
+    ///
+    /// H2: refuses (`BusError::HandleAlreadyRegistered`) rather than
+    /// silently overwriting when `name` is already held by a *different*
+    /// session — a bare last-writer-wins insert would let whichever binding
+    /// registers second silently steal the name and start receiving the
+    /// first binding's payloads, with no error and no log. Re-registering
+    /// the same `(workspace, name) -> session` mapping is a no-op.
     async fn register_handle(
         &self,
         workspace: WorkspaceId,
         name: String,
         session: SessionId,
     ) -> Result<(), BusError>;
-    async fn unregister_handle(&self, workspace: WorkspaceId, name: &str) -> Result<(), BusError>;
+    /// H2: a compare-and-remove against `session` (the caller's own),
+    /// refusing (`BusError::NotAuthorizedForHandle`) to remove a mapping a
+    /// *different* session owns. Unregistering a name that isn't registered
+    /// at all is a no-op.
+    async fn unregister_handle(
+        &self,
+        workspace: WorkspaceId,
+        name: &str,
+        session: SessionId,
+    ) -> Result<(), BusError>;
 }

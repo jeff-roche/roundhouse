@@ -399,8 +399,9 @@ mod tests {
             &self,
             workspace: WorkspaceId,
             name: &str,
+            session: SessionId,
         ) -> Result<(), BusError> {
-            self.inner.unregister_handle(workspace, name).await
+            self.inner.unregister_handle(workspace, name, session).await
         }
     }
 
