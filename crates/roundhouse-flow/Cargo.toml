@@ -21,12 +21,15 @@ thiserror = { workspace = true }
 # defect for binding/job addressing and had to replace it) — sha2's SHA-256
 # is a fixed, versioned algorithm we pin here instead.
 sha2 = "0.10"
+# Promoted from a Task 1 dev-dependency to a real one: Task 2's
+# `parse::parse_workflow` deserializes workflow YAML at runtime (not just in
+# tests), consuming exactly the `workflow_yaml` shape
+# `job::Body::to_workflow_yaml` produces. Still unpinned beyond the minor
+# version (`"0.9"`, matching what Task 1 already recorded in `Cargo.lock`)
+# since `roundhouse-flow`'s frozen deps/pins in the Phase 5 Global
+# Constraints don't name a YAML crate at all — this is this crate's own
+# choice, not a §5.3 pin.
+serde_yaml = "0.9"
 
 [dev-dependencies]
-# Used only by `tests/job.rs`, to prove `Body::Prompt::to_workflow_yaml`
-# actually produces well-formed YAML carrying every field Task 2's
-# `WorkflowDef` requires without a `#[serde(default)]` — the cross-task
-# hand-off this task's dispatch flagged as otherwise unconnected by
-# construction. Not used by `src/`.
-serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4"] }

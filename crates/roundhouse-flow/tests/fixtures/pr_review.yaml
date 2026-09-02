@@ -1,0 +1,56 @@
+name: pr-review
+version: 3
+inputs:
+  repo:    { type: string, required: true }
+  max_prs: { type: integer, default: 10 }
+defaults:
+  isolation: worktree
+  retry: { attempts: 3, backoff: exponential, base: 10s, max: 5m, on: [retryable] }
+secrets: [GH_TOKEN]
+permissions:
+  default: deny
+  rules:
+    - { http:  { methods: [GET], hosts: ["api.github.com"] },   effect: allow }
+    - { shell: { program: "cargo", args: ["test", "*"] },       effect: allow }
+    - { shell: { program: "gh", args: ["pr", "comment", "*"] }, effect: escalate }
+  unattended: { escalate: park, deadline: 12h, on_timeout: deny }
+steps:
+  - id: list_prs
+    tool: http
+    with: { method: GET, url: "https://api.github.com/repos/${{ inputs.repo }}/pulls?state=open" }
+  - id: per_pr
+    map:
+      over: "${{ slice(steps.list_prs.output, 0, inputs.max_prs) }}"
+      as: pr
+      max_parallel: 4
+      on_item_error: continue
+      isolation: { worktree: { base_ref: "refs/pull/${{ pr.number }}/head" } }
+    steps:
+      - id: review
+        agent:
+          model: "${{ vars.review_model }}"
+          tools: [read, find, git]
+          prompt: |
+            Review PR #${{ pr.number }}: "${{ pr.title }}".
+            Report only defects you can point at a line for. No style nits.
+          output_schema: { type: object, properties: { findings: { type: array } } }
+        caps: { max_cost_usd: 0.50, max_tool_calls: 60 }
+      - id: tests
+        tool: shell
+        with: { cmd: ["cargo", "test", "--all"] }
+        continue_on_error: true
+      - id: gate
+        when: "${{ len(steps.review.output.findings) > 0 }}"
+        gate:
+          title: "Post review on PR #${{ pr.number }}?"
+          form: { approve: { type: boolean, default: true }, note: { type: string } }
+          timeout: 24h
+          on_timeout: deny
+      - id: post
+        when: "${{ steps.gate.output.approve }}"
+        tool: shell
+        idempotency_key: "pr-${{ pr.number }}-review-${{ run.id }}"
+        with: { cmd: ["gh","pr","comment","${{ pr.number }}","--body-file","${{ steps.review.artifact }}"] }
+        env: { GH_TOKEN: "${{ secrets.GH_TOKEN }}" }
+catch:   [ { id: on_failure, emit: { notify: [desktop], severity: high } } ]
+finally: [ { id: report, report: { outcome: "…", headline: "…" } } ]
