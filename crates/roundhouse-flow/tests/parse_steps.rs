@@ -778,7 +778,7 @@ fn minor2_an_overlong_base_ref_is_rejected() {
     let max = roundhouse_flow::parse::steps::MAX_GIT_REF_LEN;
     let msg = base_ref_rejection_message(&"a".repeat(max + 1));
     assert!(
-        msg.contains(&format!("exceeds the {max}-character limit")),
+        msg.contains(&format!("exceeds the {max}-byte limit")),
         "msg was: {msg}"
     );
 }
@@ -844,17 +844,31 @@ fn fix_round_4_a_leading_space_does_not_evade_the_leading_dash_rule() {
 #[test]
 fn fix_round_4_a_trailing_flag_segment_is_rejected() {
     let msg = base_ref_rejection_message("refs/heads/main --upload-pack=/tmp/evil");
-    assert!(msg.contains("must not start with `-`"), "msg was: {msg}");
+    // Fix round 5 note: this payload is now rejected one rule earlier, by
+    // the tightened space rule, rather than by the per-segment rule it was
+    // written against — a non-delimiter-adjacent space is itself forbidden
+    // now. The payload is kept as regression coverage; the per-segment rules
+    // are pinned separately by the `fix_round_5_*_inside_a_placeholder_*`
+    // tests, where a space is legitimately exempt.
     assert!(
-        msg.contains("\"--upload-pack=/tmp/evil\""),
-        "message should name the offending segment; msg was: {msg}"
+        msg.contains("must not contain a space outside"),
+        "msg was: {msg}"
     );
 }
 
 #[test]
 fn fix_round_4_a_trailing_force_flag_segment_is_rejected() {
     let msg = base_ref_rejection_message("HEAD --force");
-    assert!(msg.contains("must not start with `-`"), "msg was: {msg}");
+    // Fix round 5 note: this payload is now rejected one rule earlier, by
+    // the tightened space rule, rather than by the per-segment rule it was
+    // written against — a non-delimiter-adjacent space is itself forbidden
+    // now. The payload is kept as regression coverage; the per-segment rules
+    // are pinned separately by the `fix_round_5_*_inside_a_placeholder_*`
+    // tests, where a space is legitimately exempt.
+    assert!(
+        msg.contains("must not contain a space outside"),
+        "msg was: {msg}"
+    );
 }
 
 #[test]
@@ -878,13 +892,34 @@ fn fix_round_4_a_trailing_space_does_not_evade_the_dot_lock_rule() {
 #[test]
 fn fix_round_4_a_shell_variable_reference_is_rejected() {
     let msg = base_ref_rejection_message("refs/heads/main $HOME");
-    assert!(msg.contains("must not contain '$'"), "msg was: {msg}");
+    // Fix round 5 note: this payload is now rejected one rule earlier, by
+    // the tightened space rule, rather than by the per-segment rule it was
+    // written against — a non-delimiter-adjacent space is itself forbidden
+    // now. The payload is kept as regression coverage; the per-segment rules
+    // are pinned separately by the `fix_round_5_*_inside_a_placeholder_*`
+    // tests, where a space is legitimately exempt.
+    // The `$` itself is independently pinned by
+    // `fix_round_4_an_ifs_expansion_needs_no_literal_space_to_split_a_word`
+    // and `fix_round_4_a_dollar_inside_a_template_placeholder_is_still_rejected`.
+    assert!(
+        msg.contains("must not contain a space outside"),
+        "msg was: {msg}"
+    );
 }
 
 #[test]
 fn fix_round_4_an_ifs_expansion_is_rejected() {
     let msg = base_ref_rejection_message("refs/heads/main ${IFS}");
-    assert!(msg.contains("must not contain '$'"), "msg was: {msg}");
+    // Fix round 5 note: this payload is now rejected one rule earlier, by
+    // the tightened space rule, rather than by the per-segment rule it was
+    // written against — a non-delimiter-adjacent space is itself forbidden
+    // now. The payload is kept as regression coverage; the per-segment rules
+    // are pinned separately by the `fix_round_5_*_inside_a_placeholder_*`
+    // tests, where a space is legitimately exempt.
+    assert!(
+        msg.contains("must not contain a space outside"),
+        "msg was: {msg}"
+    );
 }
 
 // -- Further variants of the same class, found while fixing the seven. ---
@@ -923,8 +958,14 @@ fn fix_round_4_a_dollar_inside_a_template_placeholder_is_still_rejected() {
 #[test]
 fn fix_round_4_a_second_absolute_path_segment_is_rejected() {
     let msg = base_ref_rejection_message("refs/heads/main /etc/passwd");
+    // Fix round 5 note: this payload is now rejected one rule earlier, by
+    // the tightened space rule, rather than by the per-segment rule it was
+    // written against — a non-delimiter-adjacent space is itself forbidden
+    // now. The payload is kept as regression coverage; the per-segment rules
+    // are pinned separately by the `fix_round_5_*_inside_a_placeholder_*`
+    // tests, where a space is legitimately exempt.
     assert!(
-        msg.contains("must not start or end with `/`"),
+        msg.contains("must not contain a space outside"),
         "msg was: {msg}"
     );
 }
@@ -935,7 +976,16 @@ fn fix_round_4_a_dot_lock_suffix_on_an_earlier_segment_is_rejected() {
     // already catches a trailing one, so a `.lock` segment followed by
     // another segment is what actually pins the per-segment rule.
     let msg = base_ref_rejection_message("refs/heads/x.lock refs/heads/main");
-    assert!(msg.contains("must not end with `.lock`"), "msg was: {msg}");
+    // Fix round 5 note: this payload is now rejected one rule earlier, by
+    // the tightened space rule, rather than by the per-segment rule it was
+    // written against — a non-delimiter-adjacent space is itself forbidden
+    // now. The payload is kept as regression coverage; the per-segment rules
+    // are pinned separately by the `fix_round_5_*_inside_a_placeholder_*`
+    // tests, where a space is legitimately exempt.
+    assert!(
+        msg.contains("must not contain a space outside"),
+        "msg was: {msg}"
+    );
 }
 
 #[test]
@@ -947,27 +997,122 @@ fn fix_round_4_a_tab_separated_flag_segment_is_rejected() {
     assert!(msg.contains("must not contain '\\t'"), "msg was: {msg}");
 }
 
+// =======================================================================
+// Fix round 5 (security review on fix round 4).
+//
+// Fix round 4 exempted a plain space everywhere and documented the
+// resulting extra-plain-segment acceptance as un-closable "without
+// modelling where a placeholder begins and ends". That was wrong: a local
+// adjacency test closes it. A space is now exempt only when it touches a
+// delimiter — after the `{` of a `${{`, or before the `}` of a `}}`.
+// =======================================================================
+
 #[test]
-fn fix_round_4_an_extra_plain_segment_is_still_accepted_a_documented_residual() {
-    // NOT a bypass this round closed — pinned so it stays a stated
-    // limitation rather than being rediscovered as a finding. An extra
-    // whitespace-separated segment that starts with neither `-` nor `/` and
-    // does not end in `.lock` breaks none of the per-segment rules, so it
-    // parses. Under a shell-string interpolation it would still become an
-    // extra argv element. Closing it means rejecting interior spaces, which
-    // is exactly what the frozen fixture's `${{ pr.number }}` needs, so this
-    // parser cannot close it without modelling placeholder boundaries. The
-    // executor (Task 5) owns the real guarantee: pass `base_ref` as one
-    // discrete argv element after a `--` separator.
-    // See `validate_git_ref`'s "What this does *not* cover" doc section.
-    let s = step(&base_ref_step_yaml("refs/heads/main HEAD"));
+fn fix_round_5_an_extra_plain_segment_is_now_rejected() {
+    // Fix round 4 accepted this and called it an un-closable residual.
+    let msg = base_ref_rejection_message("refs/heads/main HEAD");
+    assert!(
+        msg.contains("must not contain a space outside"),
+        "msg was: {msg}"
+    );
+}
+
+#[test]
+fn fix_round_5_a_space_after_a_closing_delimiter_is_rejected() {
+    // The space touches a `}` — but the *following* byte, not the one it
+    // precedes. Exemption is directional: after a `{`, or before a `}`.
+    let msg = base_ref_rejection_message("${{ x }} HEAD");
+    assert!(
+        msg.contains("must not contain a space outside"),
+        "msg was: {msg}"
+    );
+}
+
+#[test]
+fn fix_round_5_a_multi_word_placeholder_is_rejected() {
+    // The stated cost of the adjacency rule, pinned rather than assumed:
+    // the space between `a` and `b` touches no delimiter.
+    let msg = base_ref_rejection_message("${{ a b }}");
+    assert!(
+        msg.contains("must not contain a space outside"),
+        "msg was: {msg}"
+    );
+}
+
+#[test]
+fn fix_round_5_a_comment_introducer_is_rejected() {
+    // `git check-ref-format 'refs/heads/a#b'` succeeds, so this is a
+    // deliberate deviation from git's own charset: in a shell string `#`
+    // does not add an argument, it deletes the rest of the command line —
+    // a trailing `--` separator, a redirect, or an `&&` clause. No space is
+    // needed to reach it, so the space rule cannot be what makes this pass.
+    let msg = base_ref_rejection_message("refs/heads/main#--extra");
+    assert!(msg.contains("must not contain '#'"), "msg was: {msg}");
+}
+
+#[test]
+fn fix_round_5_the_spaced_comment_payload_is_rejected_by_the_space_rule() {
+    // The review's own measured payload. It is rejected one rule earlier
+    // than the `#`, by the space; the `#` itself is pinned above.
+    let msg = base_ref_rejection_message("refs/heads/main #");
+    assert!(
+        msg.contains("must not contain a space outside"),
+        "msg was: {msg}"
+    );
+}
+
+// -- The per-segment rules stay reachable: a space inside a placeholder --
+// -- is still exempt, so its contents still go through them. -------------
+
+#[test]
+fn fix_round_5_a_flag_inside_a_placeholder_is_rejected_by_the_segment_rule() {
+    let msg = base_ref_rejection_message("${{ --force }}");
+    assert!(msg.contains("must not start with `-`"), "msg was: {msg}");
+}
+
+#[test]
+fn fix_round_5_an_absolute_path_inside_a_placeholder_is_rejected_by_the_segment_rule() {
+    let msg = base_ref_rejection_message("${{ /etc/passwd }}");
+    assert!(
+        msg.contains("must not start or end with `/`"),
+        "msg was: {msg}"
+    );
+}
+
+#[test]
+fn fix_round_5_a_dot_lock_inside_a_placeholder_is_rejected_by_the_segment_rule() {
+    let msg = base_ref_rejection_message("${{ x.lock }}");
+    assert!(msg.contains("must not end with `.lock`"), "msg was: {msg}");
+}
+
+// -- Two acceptances deliberately left in place, pinned so a future -----
+// -- change to either is a decision rather than a side effect. -----------
+
+#[test]
+fn fix_round_5_a_function_call_placeholder_is_rejected_a_stated_trade() {
+    // `${{ default(inputs.base, 'refs/heads/main') }}` is the canonical
+    // idiom for exactly this field, and it does not parse: `(`, `)` and `'`
+    // are all forbidden. Pinned so the trade is visible in the suite rather
+    // than only in a doc comment — it fails closed and loud at parse time,
+    // naming the offending character.
+    let msg = base_ref_rejection_message("${{ default(inputs.base, 'refs/heads/main') }}");
+    assert!(msg.contains("must not contain '('"), "msg was: {msg}");
+}
+
+#[test]
+fn fix_round_5_a_closer_run_without_an_opener_is_accepted() {
+    // `expression_delimiter_positions` never pairs an opener with a closer,
+    // so a bare `}}` run marks itself and passes. Deliberate: `}` is inert
+    // outside command position, and the alternative is the span reasoning
+    // this function refuses. Pinned so it stays a choice.
+    let s = step(&base_ref_step_yaml("refs/heads/}}main"));
     let StepBody::Map { isolation, .. } = &s.body else {
         panic!("expected Map step");
     };
     assert_eq!(
         isolation,
         &Some(MapIsolationDef::Worktree {
-            base_ref: Some("refs/heads/main HEAD".to_string())
+            base_ref: Some("refs/heads/}}main".to_string())
         })
     );
 }

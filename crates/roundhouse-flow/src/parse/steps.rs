@@ -40,9 +40,9 @@
 //! enum), `map.isolation` and its `worktree.base_ref` parameter (closed
 //! tier set, plus a git-ref-shaped charset, length, and per-segment check
 //! — [`validate_git_ref`]'s own doc comment carries the full rule list, the
-//! exemption it makes for `${{ }}` expression syntax, and two residual
+//! exemption it makes for `${{ }}` expression syntax, and three residual
 //! acceptances it does not cover; this summary line says "check" rather
-//! than implying zero exceptions because rounds 3 and 4 each found the
+//! than implying zero exceptions because rounds 3, 4 and 5 each found the
 //! previous round's version of that exemption admitted payloads it was
 //! written to reject), `caps.max_cost_usd` (finiteness/sign), and
 //! `gate.on_timeout` (closed enum).
@@ -516,11 +516,12 @@ struct WorktreeIsolationParams {
 /// 2. at most [`MAX_GIT_REF_LEN`] bytes;
 /// 3. no leading or trailing whitespace (`value.trim() == value`);
 /// 4. no `..` run anywhere;
-/// 5. no control character, no whitespace other than a plain space, and
-///    none of [`FORBIDDEN_GIT_REF_CHARS`] — **except** that a plain space is
-///    allowed anywhere, and `$`, `{`, `}` are allowed at the byte positions
-///    where they form a literal `${{` opener or `}}` closer (see
-///    [`expression_delimiter_positions`]);
+/// 5. no control character, no whitespace, and none of
+///    [`FORBIDDEN_GIT_REF_CHARS`] — **except** that `$`, `{`, `}` are
+///    allowed at the byte positions where they form a literal `${{` opener
+///    or `}}` closer ([`expression_delimiter_positions`]), and a plain space
+///    is allowed where it sits directly against one of those delimiters
+///    ([`space_is_delimiter_adjacent`]);
 /// 6. per whitespace-separated segment: no leading `-` (the injection
 ///    vector above), no leading or trailing `/`, no trailing `.lock`.
 ///
@@ -602,35 +603,65 @@ struct WorktreeIsolationParams {
 /// leading or trailing whitespace; its three segments (`refs/pull/${{`,
 /// `pr.number`, `}}/head`) each start with neither `-` nor `/`, end with
 /// neither `/` nor `.lock`; every `$`/`{`/`}` in it belongs to the literal
-/// `${{` or `}}`; and its `.` (in `pr.number`) never repeats into a `..`.
+/// `${{` or `}}`; its two spaces each touch one of those delimiters (the
+/// first follows the `{` of `${{`, the second precedes the `}` of `}}`);
+/// and its `.` (in `pr.number`) never repeats into a `..`.
+///
+/// # Fix round 5: the space exemption narrowed again, and one claim retracted
+///
+/// Fix round 4 left an extra plain segment accepted (`"refs/heads/main
+/// HEAD"`) and asserted this function "cannot close it without modelling
+/// where a placeholder begins and ends". **That was false as written, and is
+/// retracted.** A strictly local adjacency rule closes it with no more
+/// machinery than the delimiter scan already uses: a space is exempt only
+/// when the byte before it is a `{` marked as part of a `${{`, or the byte
+/// after it is a `}` marked as part of a `}}` — see
+/// [`space_is_delimiter_adjacent`]. `"refs/heads/main HEAD"` and
+/// `"${{ x }} HEAD"` are now both rejected; `"refs/pull/${{ pr.number
+/// }}/head"` still parses.
+///
+/// The per-segment rules stay load-bearing, because a space is still
+/// reachable *inside* a placeholder: `"${{ --force }}"` splits into
+/// `${{` / `--force` / `}}` and is caught by the leading-`-` segment rule.
 ///
 /// # What this does *not* cover
 ///
-/// Two residual acceptances, named rather than left to be discovered:
+/// Three residual acceptances, named rather than left to be discovered. All
+/// three are scope/cost choices with a stated reason — none is an
+/// impossibility claim:
 ///
-/// - **An extra whitespace-separated segment that breaks none of the
-///   per-segment rules is still accepted** — `"refs/heads/main HEAD"` and
-///   `"refs/heads/main origin"` parse. Under a shell-string interpolation
-///   they still become an extra argv element; they just cannot be a flag, an
-///   absolute path, or a `.lock` name. Rejecting interior spaces outright is
-///   what would close this, and that is exactly what the frozen fixture's
-///   `${{ pr.number }}` needs, so this function cannot close it without
-///   modelling where a placeholder begins and ends. **The executor (Task 5)
-///   is the owner of the real guarantee here: pass `base_ref` as one
-///   discrete argv element after a `--` separator, never interpolated into a
-///   shell string.**
-/// - **The exemption only supports simple placeholders.** Anything richer
-///   than `${{ dotted.path }}` — a function call, a quoted literal — uses
-///   `(`, `)`, `'`, or `"`, all of which are still rejected. If Task 4's
-///   expression language turns out to need those inside a `base_ref`, this
-///   function is what has to change, deliberately, not something to be
-///   worked around at the call site.
+/// - **A placeholder may hold only a single space-free token.**
+///   `"${{ a b }}"` is rejected: the space between `a` and `b` touches no
+///   delimiter. The cost is multi-word expression syntax inside a
+///   `base_ref`, which the next bullet already excludes on other grounds, so
+///   this buys the previous residual's closure for nothing that was working.
+/// - **Anything richer than `${{ dotted.path }}` is rejected**, and this
+///   *will* be hit: `(`, `)` and `'` are all forbidden, so the canonical
+///   idiom for this very field —
+///   `${{ default(inputs.base, 'refs/heads/main') }}`, using the `default`
+///   function the expression language already freezes — does not parse
+///   today. This is a known trade, not an oversight: it fails closed and
+///   loud at parse time with a message naming the offending character, and
+///   supporting it means deciding how a function call's own quoting
+///   interacts with a ref charset. Whoever needs it changes this function
+///   deliberately; it is not something to work around at the call site.
+/// - **What a placeholder *evaluates to* is not validated here at all.**
+///   This function sees `${{ pr.number }}`, never the text it becomes. A
+///   hostile expression result reaches git unchecked by anything in this
+///   parser. That cannot be closed in a parser, which is the third reason
+///   the argv requirement below is not optional.
+///
+/// **The owner of the real guarantee is Task 6** — the `map`-step per-item
+/// worktree fan-out, which is what actually creates a worktree from this
+/// value (Task 5 is the step-graph executor core; fix round 4 named it here
+/// and was wrong). **Pass `base_ref` as one discrete argv element after a
+/// `--` separator, never interpolated into a shell string.**
 fn validate_git_ref(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("must not be empty".to_string());
     }
     if value.len() > MAX_GIT_REF_LEN {
-        return Err(format!("exceeds the {MAX_GIT_REF_LEN}-character limit"));
+        return Err(format!("exceeds the {MAX_GIT_REF_LEN}-byte limit"));
     }
     if value.trim() != value {
         return Err(
@@ -642,37 +673,48 @@ fn validate_git_ref(value: &str) -> Result<(), String> {
         return Err("must not contain `..`".to_string());
     }
 
+    let bytes = value.as_bytes();
     let delimiter = expression_delimiter_positions(value);
     for (offset, c) in value.char_indices() {
-        let exempt = match c {
-            // A plain space is exempt everywhere: `${{ pr.number }}` needs
-            // interior spaces and this function does not model where a
-            // placeholder starts or ends. The word-splitting consequence of
-            // that exemption is what the per-segment rules below bound.
-            ' ' => true,
+        match c {
+            // A plain space is exempt only where it sits directly against a
+            // delimiter — after the `{` that closes a `${{`, or before the
+            // `}` that opens a `}}`. That is the whole of what
+            // `${{ pr.number }}` needs, and it is still a fixed-window
+            // adjacency test: no pairing of an opener with a closer, no
+            // reasoning about what lies between them.
+            ' ' if space_is_delimiter_adjacent(bytes, &delimiter, offset) => continue,
             // Exempt only where the character is part of a literal `${{`
             // opener or `}}` closer — not merely because one appears
             // somewhere in the value.
-            '$' | '{' | '}' => delimiter[offset],
-            _ => false,
-        };
-        if exempt {
-            continue;
+            '$' | '{' | '}' if delimiter[offset] => continue,
+            ' ' => {
+                return Err(
+                    "must not contain a space outside a `${{ … }}` placeholder (a space word-splits into a second argv element wherever the value reaches a shell string)"
+                        .to_string(),
+                );
+            }
+            _ => {}
         }
         if c.is_control() || c.is_whitespace() || FORBIDDEN_GIT_REF_CHARS.contains(c) {
             return Err(format!(
-                "must not contain {c:?} — outside a literal `${{{{` / `}}}}` expression delimiter, a git ref name may not contain control characters, whitespace other than a plain space, or any of `{FORBIDDEN_GIT_REF_CHARS}`"
+                "must not contain {c:?} — outside a literal `${{{{` / `}}}}` expression delimiter, a git ref name may not contain control characters, whitespace, or any of `{FORBIDDEN_GIT_REF_CHARS}`"
             ));
         }
     }
 
-    // The rules below are position-anchored. Because a plain space is
-    // exempt above, they are applied to every whitespace-separated segment,
-    // not just to the whole value: a shell that word-splits an interpolated
-    // `base_ref` turns each segment into its own argv element, and an
-    // anchored rule checked only against the whole string never sees the
-    // second one. For a value with no space (every literal ref) there is
-    // exactly one segment and this is identical to checking the value.
+    // The rules below are position-anchored. Because a delimiter-adjacent
+    // space survives the scan above, they are applied to every
+    // whitespace-separated segment, not just to the whole value: a shell
+    // that word-splits an interpolated `base_ref` turns each segment into
+    // its own argv element, and an anchored rule checked only against the
+    // whole string never sees the second one. Still reachable after fix
+    // round 5's narrowing — `"${{ --force }}"` is three segments, and the
+    // middle one is why this loop exists. For a value with no space (every
+    // literal ref) there is exactly one segment and this is identical to
+    // checking the value. Applied strictly after the scan above, which is
+    // why a value with a *non*-delimiter-adjacent space is reported as a
+    // space rather than by whichever segment rule its tail happens to trip.
     for segment in value.split_whitespace() {
         if segment.starts_with('-') {
             return Err(format!(
@@ -700,6 +742,23 @@ fn validate_git_ref(value: &str) -> Result<(), String> {
 /// sequences the expression syntax spells?" — with a fixed-size window, so
 /// there is no span to mis-derive. Everything it does not mark is subject to
 /// the ordinary forbidden-character rule.
+/// Is the space at `offset` directly against an expression delimiter?
+///
+/// True when the byte before it is a `{` marked as part of a `${{`, or the
+/// byte after it is a `}` marked as part of a `}}` — i.e. exactly the two
+/// positions `${{ x }}` puts a space in. Fix round 5's replacement for the
+/// blanket space exemption fix round 4 shipped: same fixed-window shape as
+/// [`expression_delimiter_positions`], looking one byte in each direction,
+/// with no opener/closer pairing and no notion of a span. `{`/`}` are ASCII,
+/// so the neighbouring-byte test can never land inside a multi-byte
+/// character.
+fn space_is_delimiter_adjacent(bytes: &[u8], delimiter: &[bool], offset: usize) -> bool {
+    let follows_opener = offset > 0 && bytes[offset - 1] == b'{' && delimiter[offset - 1];
+    let precedes_closer =
+        offset + 1 < bytes.len() && bytes[offset + 1] == b'}' && delimiter[offset + 1];
+    follows_opener || precedes_closer
+}
+
 fn expression_delimiter_positions(value: &str) -> Vec<bool> {
     let bytes = value.as_bytes();
     let mut marked = vec![false; bytes.len()];
@@ -721,11 +780,21 @@ fn expression_delimiter_positions(value: &str) -> Vec<bool> {
 /// shell metacharacters, because they're not a git concern, they're a
 /// concern only if something later builds a shell command string out of
 /// this value instead of passing it as a discrete argv element. Added as
-/// defense in depth: this parser doesn't know whether the executor (Task 5)
-/// invokes git via argv (safe regardless of these characters) or via a
-/// shell string (unsafe if it does), and none of these characters ever
+/// defense in depth: this parser doesn't know whether the `map`-step
+/// worktree fan-out (Task 6, the task that actually creates a worktree from
+/// this value) invokes git via argv (safe regardless of these characters) or
+/// via a shell string (unsafe if it does), and none of these characters ever
 /// legitimately appears in a real git ref name, so rejecting them costs
 /// nothing either way.
+///
+/// **Fix round 5 adds `#`, deliberately against git.** `git check-ref-format
+/// 'refs/heads/a#b'` *succeeds* — `#` is a legal ref character. It is here
+/// for the same reason `$`, `;` and `|` are: in a shell string it is a
+/// comment introducer, and it does not merely add something, it *removes*
+/// what follows. Measured: `bash -c 'echo git worktree add p refs/heads/main
+/// #  --extra'` drops `--extra` entirely, so a `#` in this value can silently
+/// swallow a trailing `--` separator, a redirect, or an `&&` clause the
+/// caller believed it had appended.
 ///
 /// **Fix round 4 corrects two claims this comment carried.**
 ///
@@ -746,7 +815,7 @@ fn expression_delimiter_positions(value: &str) -> Vec<bool> {
 ///    (`{main,--upload-pack=/tmp/evil}`) was accepted unconditionally. Fix
 ///    round 4 adds them here, and [`validate_git_ref`] exempts them only at
 ///    the byte positions where they form a literal `${{` or `}}`.
-const FORBIDDEN_GIT_REF_CHARS: &str = "~^:?*[\\$`();|&<>'\"{}";
+const FORBIDDEN_GIT_REF_CHARS: &str = "~^:?*[\\$`();|&<>'\"{}#";
 
 /// The other four isolation tiers take no documented parameters today;
 /// deserializing into this zero-field, `deny_unknown_fields` struct is how
