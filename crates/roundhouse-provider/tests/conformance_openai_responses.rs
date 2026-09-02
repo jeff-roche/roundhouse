@@ -1,33 +1,22 @@
 //! `roundhouse-conformance` wiring for the `openai-responses` codec (§9.10).
 //!
-//! **Escalation, documented rather than worked around silently**: the
-//! generic 4-`ChunkStrategy` `check_fold_determinism` path
-//! (`roundhouse_conformance::checks`) calls `Provider::stream_chat` and
-//! treats *any* `Err` result as a harness failure -- it has no way to express
-//! "this cassette is supposed to produce an error." That fits every
-//! *success*-path cassette (`text`/`tools`/`parallel_tools`/`reasoning`)
-//! perfectly, but running `error_429`/`error_500` through
-//! `ConformanceSubject::cases()` would make `assert_green()` fail for a
-//! harness-shape reason unrelated to this codec's own correctness -- Task 3's
-//! harness was built and self-tested only against success-path fixtures, and
-//! this task is the first to need an error-status cassette at all.
+//! **Fix-round-1 C7 update**: this file originally found and documented that
+//! `check_fold_determinism` had no way to express "this cassette is supposed
+//! to produce an error", so `error_429`/`error_500` were exercised only via
+//! direct `stream_chat` calls, outside `ConformanceSubject::cases()`. That
+//! gap is now closed additively in `roundhouse-conformance`
+//! (`ConformanceCase::expected_error: Option<fn(&ProviderError) -> bool>`,
+//! consulted by `check_fold_determinism`) — both error cassettes are now
+//! real cases in `OpenAiResponsesSubject::cases()` below, replayed at all 4
+//! `ChunkStrategy`s like every other case. The original direct tests are
+//! kept too: they still add value the generic case can't (pinning the exact
+//! wire pipeline end to end with a plain assertion, not a predicate).
 //!
-//! Both error cassettes still exist on disk (satisfying the "≥6 cassettes"
-//! Definition of Done and the `every_profile_toml_has_at_least_one_cassette`
-//! gate) and are still exercised by real tests below -- just directly against
-//! `OpenAiResponsesProvider::stream_chat`, the same pattern
-//! `anthropic_provider_cassette.rs`'s
-//! `stream_chat_classifies_error_statuses_by_disposition` already established
-//! for pinning a specific `ProviderError` disposition, rather than through
-//! the generic per-`ChunkStrategy` replay loop.
-//!
-//! **A second, narrower gap found while writing these**: `error_429`/
-//! `error_500`'s cassette-based tests below prove the full pipeline (cassette
-//! bytes -> transport -> provider -> `classify`) produces the right
-//! `ProviderError`, but 429 and 500 both already have their own entries in
-//! `classify`'s generic HTTP-status fallback tier -- so those two tests would
-//! still pass even if `openai-responses.toml`'s own `[errors]` table were
-//! never consulted at all. The
+//! **A second, narrower gap found while writing the original direct tests**:
+//! 429 and 500 both already have their own entries in `classify`'s generic
+//! HTTP-status fallback tier, so a same-status test — cassette-based or via
+//! `expected_error` — would pass even if `openai-responses.toml`'s own
+//! `[errors]` table were never consulted at all. The
 //! `openai_responses_error_table_*_maps_to_*` tests below close that gap the
 //! same way `profile_errors_wiring_test.rs` already does for `moonshot.toml`:
 //! deliberately using status 400 (which carries none of these codes in its
@@ -40,7 +29,8 @@ use roundhouse_provider::codec::openai_responses::encode::encode;
 use roundhouse_provider::codec::openai_responses::OpenAiResponsesProvider;
 use roundhouse_provider::profile::ProviderProfile;
 use roundhouse_provider::{
-    CassetteTransport, ChatRequest, ChunkStrategy, Provider, ProviderError, RequestCtx,
+    CassetteTransport, ChatRequest, ChunkStrategy, HttpRequest, HttpResponseStream, HttpTransport,
+    Provider, ProviderError, RequestCtx, TransportError,
 };
 use std::sync::Arc;
 
@@ -125,6 +115,7 @@ impl ConformanceSubject for OpenAiResponsesSubject {
                 cassette_path: cassette_path("text.cassette"),
                 mask: mask.clone(),
                 declared_loss_events: vec![],
+                expected_error: None,
             },
             ConformanceCase {
                 name: "tools",
@@ -132,6 +123,7 @@ impl ConformanceSubject for OpenAiResponsesSubject {
                 cassette_path: cassette_path("tools.cassette"),
                 mask: mask.clone(),
                 declared_loss_events: text_not_expected_in_a_tool_call_response.clone(),
+                expected_error: None,
             },
             ConformanceCase {
                 name: "parallel_tools",
@@ -139,19 +131,94 @@ impl ConformanceSubject for OpenAiResponsesSubject {
                 cassette_path: cassette_path("parallel_tools.cassette"),
                 mask: mask.clone(),
                 declared_loss_events: text_not_expected_in_a_tool_call_response,
+                expected_error: None,
             },
             ConformanceCase {
                 name: "reasoning",
                 request: fixtures::reasoning_on(),
                 cassette_path: cassette_path("reasoning.cassette"),
+                mask: mask.clone(),
+                declared_loss_events: vec![],
+                expected_error: None,
+            },
+            // Fix-round-1 C7: both error cassettes now run through the
+            // generic harness via `expected_error`, at all 4 `ChunkStrategy`s
+            // -- not just the direct tests below.
+            ConformanceCase {
+                name: "error_429",
+                request: fixtures::single_turn_text(),
+                cassette_path: cassette_path("error_429.cassette"),
+                mask: mask.clone(),
+                declared_loss_events: vec![],
+                expected_error: Some(|e| matches!(e, ProviderError::RateLimited { .. })),
+            },
+            ConformanceCase {
+                name: "error_500",
+                request: fixtures::single_turn_text(),
+                cassette_path: cassette_path("error_500.cassette"),
+                mask: mask.clone(),
+                declared_loss_events: vec![],
+                expected_error: Some(|e| matches!(e, ProviderError::Server { status: 500 })),
+            },
+            // Fix-round-1 C2: `response.failed`/`response.incomplete`/`error`
+            // arrive IN-BAND after a 200 -- these three cases prove
+            // `decode_openai_responses_stream` surfaces them as an error
+            // rather than a silently "successful" empty/truncated stream.
+            // `response_failed`/`in_band_error` both carry a `code` that
+            // matches one of this profile's own `[errors]` entries
+            // (`server_error`/`rate_limit_exceeded`), so a mismatch here
+            // would prove the code-table lookup wasn't reached (status 200
+            // has no explicit branch of its own in `classify`'s fallback
+            // tier, so there's no ambiguity the way there was for
+            // `error_429`/`error_500`).
+            ConformanceCase {
+                name: "response_failed",
+                request: fixtures::single_turn_text(),
+                cassette_path: cassette_path("response_failed.cassette"),
+                mask: mask.clone(),
+                declared_loss_events: vec![],
+                expected_error: Some(|e| matches!(e, ProviderError::Overloaded)),
+            },
+            ConformanceCase {
+                name: "response_incomplete",
+                request: fixtures::single_turn_text(),
+                cassette_path: cassette_path("response_incomplete.cassette"),
+                mask: mask.clone(),
+                declared_loss_events: vec![],
+                // `response.incomplete` carries only a `reason` string, no
+                // error `code` -- nothing in this profile's `[errors]` table
+                // has "max_output_tokens" as a key, so this falls through to
+                // `classify`'s HTTP-status default tier for the real 200
+                // status this response actually had.
+                expected_error: Some(|e| {
+                    matches!(e, ProviderError::BadRequest { status: 200, .. })
+                }),
+            },
+            ConformanceCase {
+                name: "in_band_error",
+                request: fixtures::single_turn_text(),
+                cassette_path: cassette_path("in_band_error.cassette"),
+                mask: mask.clone(),
+                declared_loss_events: vec![],
+                expected_error: Some(|e| matches!(e, ProviderError::RateLimited { .. })),
+            },
+            // A non-terminal delta this codec previously dropped entirely --
+            // now carried as `BlockDelta::Text` (the closest IR concept to
+            // refusal content) rather than silently vanishing. Success path:
+            // no `expected_error`.
+            ConformanceCase {
+                name: "refusal",
+                request: fixtures::single_turn_text(),
+                cassette_path: cassette_path("refusal.cassette"),
                 mask,
                 declared_loss_events: vec![],
+                expected_error: None,
             },
         ]
     }
 
     fn wire_body(req: &ChatRequest) -> serde_json::Value {
-        encode(req, &fixture_profile())
+        encode(req, &fixture_profile()).expect("encode must succeed for this fixture profile")
     }
 }
 
@@ -281,5 +348,55 @@ async fn error_500_cassette_classifies_as_server_error_without_panicking_on_an_h
     assert!(
         matches!(err, ProviderError::Server { status: 500 }),
         "expected Server{{500}}, got {err:?}"
+    );
+}
+
+/// A transport that always fails with an error message shaped like a leaked
+/// gateway API key -- the exact shape the fix-round-1 C5 reviewer traced
+/// (`reqwest`'s `Display` appends `" for url ({url})"`, userinfo and query
+/// string included, straight into `TransportError::Io`).
+struct LeakyFailingTransport;
+
+impl HttpTransport for LeakyFailingTransport {
+    fn send<'a>(
+        &'a self,
+        _req: HttpRequest,
+    ) -> futures::future::BoxFuture<'a, Result<HttpResponseStream, TransportError>> {
+        Box::pin(async {
+            Err(TransportError::Io(
+                "error sending request for url \
+                 (https://gateway.example.invalid/v1/responses?api_key=sk-should-be-redacted-1234567890)"
+                    .into(),
+            ))
+        })
+    }
+}
+
+/// Fix-round-1 C5: `redact_error_body` must actually be applied to a
+/// transport-error string before it becomes a `ProviderError`, not merely
+/// exist in the crate unused by this codec.
+#[tokio::test]
+async fn a_transport_failure_never_leaks_a_key_shaped_string_from_the_url() {
+    const SECRET: &str = "sk-should-be-redacted-1234567890";
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(LeakyFailingTransport),
+        api_key: "test-key".into(),
+        credentials: None,
+    };
+    let provider = OpenAiResponsesProvider::new(fixture_profile());
+    let err = expect_err(
+        provider
+            .stream_chat(&fixtures::single_turn_text(), &ctx)
+            .await,
+    );
+    let rendered = format!("{err} / {err:?}");
+    assert!(
+        !rendered.contains(SECRET),
+        "the key-shaped string leaked into a ProviderError unredacted: {rendered}"
+    );
+    assert!(
+        rendered.contains("REDACTED"),
+        "expected redact_error_body's marker to be present, got: {rendered}"
     );
 }

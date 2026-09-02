@@ -88,7 +88,8 @@ fn simple_cassette_path() -> std::path::PathBuf {
 }
 
 /// A single [`ConformanceCase`] built around [`simple_request`], with the
-/// given mask and no declared loss events.
+/// given mask and no declared loss events. Expects the cassette to replay as
+/// a successful stream (`expected_error: None`).
 pub fn simple_case(mask: SerializeOnlyMask) -> ConformanceCase {
     ConformanceCase {
         name: "simple",
@@ -96,5 +97,21 @@ pub fn simple_case(mask: SerializeOnlyMask) -> ConformanceCase {
         cassette_path: simple_cassette_path(),
         mask,
         declared_loss_events: Vec::new(),
+        expected_error: None,
+    }
+}
+
+/// Same as [`simple_case`], but declares that `Provider::stream_chat` is
+/// expected to return an error matching `predicate` rather than a successful
+/// stream (fix-round-1 C7 on Task 5 of `2026-08-27-phase6-provider-breadth`)
+/// — used by `tests/self_test.rs` to prove `check_fold_determinism` actually
+/// enforces the `expected_error` field rather than ignoring it.
+pub fn simple_case_expecting_error(
+    mask: SerializeOnlyMask,
+    predicate: fn(&roundhouse_provider::ProviderError) -> bool,
+) -> ConformanceCase {
+    ConformanceCase {
+        expected_error: Some(predicate),
+        ..simple_case(mask)
     }
 }

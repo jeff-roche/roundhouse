@@ -11,6 +11,6 @@ mod schema;
 pub use glob::glob_match;
 pub use reasoning::{
     resolve_endpoint_preference, EndpointKind, EndpointPref, EndpointResolution, Intent,
-    NoEndpointAvailable, ReasoningControl, ReasoningKind,
+    NoEndpointAvailable, ProfileReasoningError, ReasoningControl, ReasoningKind,
 };
 pub use schema::*;

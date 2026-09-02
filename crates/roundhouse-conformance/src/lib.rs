@@ -33,7 +33,7 @@ pub mod mask;
 pub use checks::FoldedResult;
 pub use mask::SerializeOnlyMask;
 
-use roundhouse_provider::{ChatRequest, ContentBlock, Provider};
+use roundhouse_provider::{ChatRequest, ContentBlock, Provider, ProviderError};
 
 /// One conformance case: a request, the recorded cassette to replay it
 /// against, the mask its encoded wire body must stay inside, and any
@@ -44,6 +44,27 @@ pub struct ConformanceCase {
     pub cassette_path: std::path::PathBuf,
     pub mask: SerializeOnlyMask,
     pub declared_loss_events: Vec<String>,
+    /// `None` (the common case): this cassette is expected to replay as a
+    /// successful stream, and `check_fold_determinism` runs the usual
+    /// fold-determinism / round-trip-fidelity / usage-invariant checks
+    /// against it.
+    ///
+    /// `Some(predicate)`: this cassette is expected to make
+    /// `Provider::stream_chat` return `Err`, and `predicate` decides whether
+    /// the specific error returned is the right one. A `ConformanceSubject`
+    /// with an error-status cassette (a 429/500/etc. response, or an in-band
+    /// terminal failure event) sets this instead of omitting the case
+    /// entirely — before this field existed, `check_fold_determinism` had no
+    /// way to express "this cassette is supposed to fail", so every
+    /// `Err` from `stream_chat` was unconditionally a harness failure
+    /// (fix-round-1 C7 on Task 5 of `2026-08-27-phase6-provider-breadth`: the
+    /// first task with an error-status cassette hit this wall).
+    ///
+    /// A plain `fn` pointer (not `Box<dyn Fn>`): every real predicate is a
+    /// capture-less `matches!` check against a `ProviderError` variant, so
+    /// the simpler, `Copy` type is enough and avoids allocating a trait
+    /// object per case.
+    pub expected_error: Option<fn(&ProviderError) -> bool>,
 }
 
 /// The thing under test: one provider adapter, plus everything the harness
@@ -88,8 +109,13 @@ pub async fn run<S: ConformanceSubject>() -> ConformanceReport {
         let wire_body = S::wire_body(&case.request);
         failures.extend(checks::check_mask(&wire_body, &case.mask));
 
-        let (determinism_failures, folded) =
-            checks::check_fold_determinism(&provider, &case.request, &case.cassette_path).await;
+        let (determinism_failures, folded) = checks::check_fold_determinism(
+            &provider,
+            &case.request,
+            &case.cassette_path,
+            case.expected_error,
+        )
+        .await;
         failures.extend(determinism_failures);
 
         if let Some(result) = folded {

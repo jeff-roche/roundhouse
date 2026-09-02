@@ -9,10 +9,11 @@
 //! `openai_chat_encode.rs`'s existing note).
 
 use roundhouse_provider::codec::openai_responses::encode::encode;
+use roundhouse_provider::codec::openai_responses::OpenAiResponsesProvider;
 use roundhouse_provider::profile::ProviderProfile;
 use roundhouse_provider::{
-    ChatRequest, ContentBlock, IdOrigin, MediaSource, Message, Params, ReasoningIntent,
-    ReasoningRequest, Role, SystemBlock, ToolCallId, ToolResultPart,
+    ChatRequest, ContentBlock, IdOrigin, MediaSource, Message, Params, Provider, ProviderError,
+    ReasoningIntent, ReasoningRequest, Role, SystemBlock, ToolCallId, ToolResultPart,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -30,7 +31,7 @@ fn golden_single_turn_text() {
     let req = fixtures::single_turn_text();
     insta::assert_json_snapshot!(
         "openai_responses_single_turn_text",
-        encode(&req, &fixture_profile())
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile")
     );
 }
 
@@ -39,14 +40,15 @@ fn golden_parallel_tool_calls() {
     let req = fixtures::parallel_tool_calls();
     insta::assert_json_snapshot!(
         "openai_responses_parallel_tool_calls",
-        encode(&req, &fixture_profile())
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile")
     );
 }
 
 #[test]
 fn golden_reasoning_on() {
     let req = fixtures::reasoning_on();
-    let body = encode(&req, &fixture_profile());
+    let body =
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
     assert_eq!(body["reasoning"]["effort"], "high");
     insta::assert_json_snapshot!("openai_responses_reasoning_on", body);
 }
@@ -70,7 +72,7 @@ fn golden_multi_turn_text() {
     };
     insta::assert_json_snapshot!(
         "openai_responses_multi_turn_text",
-        encode(&req, &fixture_profile())
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile")
     );
 }
 
@@ -86,7 +88,8 @@ fn golden_system_prompt_with_cache_breakpoint() {
         }],
         ..base_request(vec![user_text("Hello.")])
     };
-    let body = encode(&req, &fixture_profile());
+    let body =
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
     assert_eq!(body["instructions"], "You are a careful assistant.");
     insta::assert_json_snapshot!("openai_responses_system_prompt_with_cache_breakpoint", body);
 }
@@ -94,7 +97,8 @@ fn golden_system_prompt_with_cache_breakpoint() {
 #[test]
 fn golden_forced_tool_choice() {
     let req = fixtures::forced_tool_choice();
-    let body = encode(&req, &fixture_profile());
+    let body =
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
     assert_eq!(
         body["tool_choice"],
         json!({"type": "function", "name": "get_weather"})
@@ -120,7 +124,8 @@ fn golden_tool_result_is_error() {
         }],
         ..base_request(vec![])
     };
-    let body = encode(&req, &fixture_profile());
+    let body =
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
     assert!(
         body["input"][0].get("is_error").is_none(),
         "function_call_output has no is_error field in the real spec"
@@ -136,7 +141,8 @@ fn golden_reasoning_off() {
         },
         ..base_request(vec![user_text("Hello.")])
     };
-    let body = encode(&req, &fixture_profile());
+    let body =
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
     assert!(body.get("reasoning").is_none());
     insta::assert_json_snapshot!("openai_responses_reasoning_off", body);
 }
@@ -153,7 +159,8 @@ fn golden_reasoning_budget_variant() {
         },
         ..base_request(vec![user_text("Summarize this briefly.")])
     };
-    let body = encode(&req, &fixture_profile());
+    let body =
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
     assert_eq!(body["reasoning"]["effort"], "medium");
     insta::assert_json_snapshot!("openai_responses_reasoning_budget_variant", body);
 }
@@ -163,15 +170,17 @@ fn golden_unicode_content() {
     let req = base_request(vec![user_text("こんにちは 🌍 — café naïve")]);
     insta::assert_json_snapshot!(
         "openai_responses_unicode_content",
-        encode(&req, &fixture_profile())
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile")
     );
 }
 
 #[test]
 fn golden_image_content_block() {
-    // Scope decision (not a spec divergence): Image/Document blocks are
-    // dropped in this task, matching the sibling codecs' existing precedent
-    // -- see the spec-verification note.
+    // Fix-round-1 C6: there is no `LossEvent` type anywhere in this
+    // codebase, so silently dropping the Image block (what `encode` alone
+    // does, snapshotted below purely to show that shape) was never an
+    // honest option -- `OpenAiResponsesProvider::resolve` must fail closed
+    // BEFORE a request like this ever reaches `encode`/`stream_chat` at all.
     let req = ChatRequest {
         messages: vec![Message {
             role: Role::User,
@@ -192,11 +201,20 @@ fn golden_image_content_block() {
         }],
         ..base_request(vec![])
     };
-    let body = encode(&req, &fixture_profile());
+
+    let provider = OpenAiResponsesProvider::new(fixture_profile());
+    assert!(
+        matches!(provider.resolve(&req), Err(ProviderError::Unsupported(_))),
+        "resolve() must reject a request containing an Image block, not silently drop it later"
+    );
+
+    let body =
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
     assert_eq!(
         body["input"].as_array().unwrap().len(),
         1,
-        "the Image block is dropped, only the Text block is encoded"
+        "encode() alone (bypassing resolve()) still just drops the Image block -- shown here \
+         only to document that shape, never reached in practice since resolve() rejects first"
     );
     insta::assert_json_snapshot!("openai_responses_image_content_block", body);
 }
@@ -224,20 +242,41 @@ fn golden_document_content_block() {
         }],
         ..base_request(vec![])
     };
-    let body = encode(&req, &fixture_profile());
+
+    let provider = OpenAiResponsesProvider::new(fixture_profile());
+    assert!(
+        matches!(provider.resolve(&req), Err(ProviderError::Unsupported(_))),
+        "resolve() must reject a request containing a Document block, not silently drop it later"
+    );
+
+    let body =
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
     assert_eq!(
         body["input"].as_array().unwrap().len(),
         1,
-        "the Document block is dropped, only the Text block is encoded"
+        "encode() alone (bypassing resolve()) still just drops the Document block -- shown here \
+         only to document that shape, never reached in practice since resolve() rejects first"
     );
     insta::assert_json_snapshot!("openai_responses_document_content_block", body);
 }
 
+/// A request that contains neither an `Image` nor a `Document` block must
+/// resolve cleanly -- fix-round-1 C6's fail-closed check must be specific to
+/// unencodable media, not an accidental blanket rejection.
+#[test]
+fn resolve_accepts_a_request_with_no_unencodable_media() {
+    let provider = OpenAiResponsesProvider::new(fixture_profile());
+    assert!(provider.resolve(&fixtures::single_turn_text()).is_ok());
+}
+
 #[test]
 fn golden_temperature_forbidden_model() {
-    // This profile's [[model]] entries only ever match gpt-5* reasoning
-    // models, which OpenAI's real API rejects temperature/top_p for --
-    // temperature is never encoded, unconditionally.
+    // Fix-round-1 C4: gated on this MODEL having a `[model.reasoning]` entry
+    // in the profile, not hardcoded off for every model. "gpt-5.4" matches
+    // this profile's `gpt-5*` `[[model]]` entry, which declares a reasoning
+    // control -- so temperature/top_p are omitted for it specifically, not
+    // because this codec can never send them at all (see the companion test
+    // below).
     let req = ChatRequest {
         params: Params {
             temperature: Some(0.7),
@@ -247,10 +286,39 @@ fn golden_temperature_forbidden_model() {
         },
         ..base_request(vec![user_text("Hello.")])
     };
-    let body = encode(&req, &fixture_profile());
+    let body =
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
     assert!(body.get("temperature").is_none());
     assert!(body.get("top_p").is_none());
     insta::assert_json_snapshot!("openai_responses_temperature_forbidden_model", body);
+}
+
+/// Fix-round-1 C4's other half: a model with NO matching `[[model]]` entry at
+/// all (so, in particular, none carrying a `[model.reasoning]` control) must
+/// have `temperature`/`top_p` forwarded -- proving the omission above is
+/// genuinely profile-driven data, not encode.rs silently hardcoding "never
+/// send these" for every model this codec's `encode`/`decode` will ever be
+/// reused against (Task 16 reuses this exact pair for non-reasoning
+/// `openai-responses` providers).
+#[test]
+fn temperature_and_top_p_are_forwarded_for_a_model_with_no_reasoning_control() {
+    let req = ChatRequest {
+        model: roundhouse_provider::ModelId("some-non-reasoning-model".into()),
+        params: Params {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            max_output_tokens: None,
+            stop: None,
+        },
+        ..base_request(vec![user_text("Hello.")])
+    };
+    let body =
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
+    // `Params.temperature`/`top_p` are `f32`; compare against the same
+    // f32->f64 widening `json!` performs on the encoded value, rather than
+    // an f64 literal that doesn't bit-for-bit match a widened f32.
+    assert_eq!(body["temperature"].as_f64(), Some(0.7_f32 as f64));
+    assert_eq!(body["top_p"].as_f64(), Some(0.9_f32 as f64));
 }
 
 #[test]
@@ -268,7 +336,8 @@ fn golden_empty_tool_argument_buffer() {
         }],
         ..base_request(vec![])
     };
-    let body = encode(&req, &fixture_profile());
+    let body =
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
     assert_eq!(body["input"][0]["arguments"], "{}");
     insta::assert_json_snapshot!("openai_responses_empty_tool_argument_buffer", body);
 }
@@ -286,7 +355,8 @@ fn golden_long_stop_sequence_list() {
         },
         ..base_request(vec![user_text("Hello.")])
     };
-    let body = encode(&req, &fixture_profile());
+    let body =
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
     assert!(body.get("stop").is_none());
     insta::assert_json_snapshot!("openai_responses_long_stop_sequence_list", body);
 }
@@ -300,7 +370,62 @@ fn golden_raw_extra_passthrough_denied() {
         extra,
         ..base_request(vec![user_text("Hello.")])
     };
-    let body = encode(&req, &fixture_profile());
+    let body =
+        encode(&req, &fixture_profile()).expect("encode must succeed for this fixture profile");
     assert!(body.get("custom_vendor_field").is_none());
     insta::assert_json_snapshot!("openai_responses_raw_extra_passthrough_denied", body);
+}
+
+/// Fix-round-1 minor: a profile whose `[model.reasoning]` map is internally
+/// inconsistent (here: no entry at all for `high`) must surface as an
+/// `Err`, not silently omit `reasoning` from the wire body while reporting
+/// success -- a caller who asked for high-effort reasoning would otherwise
+/// never learn the request was actually sent as if reasoning were off.
+#[test]
+fn encode_surfaces_a_broken_reasoning_map_instead_of_silently_omitting_reasoning() {
+    let broken_profile: ProviderProfile = toml::from_str(
+        r#"
+        id = "broken-fixture"
+        codec = "openai-responses"
+
+        [defaults]
+        allow_raw_extra = false
+        base_url = "https://example.invalid"
+
+        [defaults.params]
+        mode = "deny_list"
+        fields = []
+
+        [defaults.auth]
+        kind = "bearer"
+
+        [[model]]
+        match = ["gpt-5.4*"]
+
+        [model.reasoning]
+        kind = "effort"
+        field = "/reasoning/effort"
+        vocabulary = ["none", "low", "medium", "high"]
+
+        [model.reasoning.map]
+        off = "none"
+        low = "low"
+        medium = "medium"
+        # "high" is deliberately missing.
+        "#,
+    )
+    .expect("fixture profile must deserialize");
+
+    let req = ChatRequest {
+        reasoning: ReasoningRequest {
+            intent: Some(ReasoningIntent::High),
+        },
+        ..base_request(vec![user_text("Prove sqrt(2) is irrational.")])
+    };
+
+    assert!(
+        encode(&req, &broken_profile).is_err(),
+        "a reasoning map with no entry for the requested intent must be a hard error, \
+         not a silently-dropped reasoning field"
+    );
 }

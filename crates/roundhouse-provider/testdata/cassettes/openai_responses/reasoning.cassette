@@ -3,7 +3,7 @@ content-type: text/event-stream
 
 data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"item_1","type":"reasoning","summary":[],"status":"in_progress"}}
 
-data: {"type":"response.reasoning_summary.delta","sequence_number":2,"item_id":"item_1","output_index":0,"summary_index":0,"delta":"Assume sqrt(2) is rational and derive a contradiction."}
+data: {"type":"response.reasoning_summary_text.delta","sequence_number":2,"item_id":"item_1","output_index":0,"summary_index":0,"delta":"Assume sqrt(2) is rational and derive a contradiction."}
 
 data: {"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"id":"item_1","type":"reasoning","summary":[{"type":"summary_text","text":"Assume sqrt(2) is rational and derive a contradiction."}],"status":"completed"}}
 
@@ -14,3 +14,4 @@ data: {"type":"response.output_text.delta","sequence_number":5,"item_id":"item_2
 data: {"type":"response.output_item.done","sequence_number":6,"output_index":1,"item":{"id":"item_2","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"sqrt(2) is irrational by contradiction."}]}}
 
 data: {"type":"response.completed","sequence_number":7,"response":{"id":"resp_4","status":"completed","usage":{"input_tokens":30,"output_tokens":60,"total_tokens":90,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":40}}}}
+

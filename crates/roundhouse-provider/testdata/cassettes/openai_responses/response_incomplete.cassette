@@ -1,0 +1,9 @@
+200
+content-type: text/event-stream
+
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"item_1","type":"message","role":"assistant","status":"in_progress","content":[]}}
+
+data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"item_1","output_index":0,"content_index":0,"delta":"This is a very long answer that gets cut"}
+
+data: {"type":"response.incomplete","sequence_number":3,"response":{"id":"resp_6","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}
+

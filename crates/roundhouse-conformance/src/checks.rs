@@ -186,10 +186,20 @@ fn seal_block(block: OpenBlock, index: u32) -> ContentBlock {
 /// uses: build a `RequestCtx` whose transport is a `CassetteTransport`, then
 /// call the subject's own `Provider::stream_chat` and fold what comes back
 /// — there is no `replay_as_chat_stream` method, and none is needed.
+///
+/// `expected_error` (fix-round-1 C7 on Task 5): `None` for the ordinary
+/// success-path case, where any `Err` from `stream_chat` is a harness
+/// failure. `Some(predicate)` for a case whose cassette is *supposed* to make
+/// `stream_chat` fail (an HTTP error status, or an in-band terminal failure
+/// event) — there, an `Ok` result is the failure, a non-matching `Err` is
+/// also a failure (the codec errored, but not with the right disposition),
+/// and a matching `Err` is a pass with no `FoldedResult` to compare across
+/// chunk strategies (there is nothing to fold).
 pub async fn check_fold_determinism<P: Provider>(
     provider: &P,
     request: &ChatRequest,
     cassette_path: &Path,
+    expected_error: Option<fn(&roundhouse_provider::ProviderError) -> bool>,
 ) -> (Vec<String>, Option<FoldedResult>) {
     let mut failures = Vec::new();
     let mut results: Vec<FoldedResult> = Vec::new();
@@ -211,9 +221,25 @@ pub async fn check_fold_determinism<P: Provider>(
             api_key: "conformance-test-key".into(),
             credentials: None,
         };
-        match provider.stream_chat(request, &ctx).await {
-            Ok(stream) => results.push(fold_stream(stream).await),
-            Err(e) => failures.push(format!(
+        match (provider.stream_chat(request, &ctx).await, expected_error) {
+            (Ok(_), Some(_)) => failures.push(format!(
+                "expected stream_chat to fail replaying cassette {} at chunk strategy {strategy:?}, \
+                 but it returned a successful stream",
+                cassette_path.display()
+            )),
+            (Ok(stream), None) => results.push(fold_stream(stream).await),
+            (Err(e), Some(predicate)) => {
+                if !predicate(&e) {
+                    failures.push(format!(
+                        "stream_chat failed replaying cassette {} at chunk strategy {strategy:?}, \
+                         but the error didn't match the declared expected_error predicate: {e}",
+                        cassette_path.display()
+                    ));
+                }
+                // A matching error is a pass for this strategy: there is
+                // nothing to fold, so no `FoldedResult` is pushed.
+            }
+            (Err(e), None) => failures.push(format!(
                 "stream_chat failed replaying cassette {} at chunk strategy {strategy:?}: {e}",
                 cassette_path.display()
             )),
@@ -580,7 +606,7 @@ mod tests {
         let request = crate::fixtures::simple_request();
 
         let (failures, _) =
-            check_fold_determinism(&ChunkSensitiveProvider, &request, &cassette_path).await;
+            check_fold_determinism(&ChunkSensitiveProvider, &request, &cassette_path, None).await;
 
         assert!(
             failures

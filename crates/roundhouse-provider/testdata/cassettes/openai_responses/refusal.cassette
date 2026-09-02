@@ -1,0 +1,11 @@
+200
+content-type: text/event-stream
+
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"item_1","type":"message","role":"assistant","status":"in_progress","content":[]}}
+
+data: {"type":"response.refusal.delta","sequence_number":2,"item_id":"item_1","output_index":0,"content_index":0,"delta":"I can't help with that request."}
+
+data: {"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"id":"item_1","type":"message","role":"assistant","status":"completed","content":[{"type":"refusal","refusal":"I can't help with that request."}]}}
+
+data: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_8","status":"completed","usage":{"input_tokens":10,"output_tokens":8,"total_tokens":18,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}
+

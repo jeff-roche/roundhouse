@@ -1,6 +1,6 @@
 ---
 source: crates/roundhouse-provider/tests/golden_openai_responses.rs
-expression: "encode(&req, &fixture_profile())"
+expression: "encode(&req,\n&fixture_profile()).expect(\"encode must succeed for this fixture profile\")"
 ---
 {
   "input": [
@@ -18,7 +18,7 @@ expression: "encode(&req, &fixture_profile())"
       "content": [
         {
           "text": "Paris.",
-          "type": "input_text"
+          "type": "output_text"
         }
       ],
       "role": "assistant",
