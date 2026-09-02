@@ -9,7 +9,7 @@ use serde_json::Value;
 use super::decode::{decode_google_genai_stream, StreamFailure};
 use super::encode::{contains_unencodable_media, encode};
 use super::EndpointMode;
-use crate::audit::redact_error_body;
+use crate::audit::redact_transport_error_text;
 use crate::credential::{resolve_base_url, CredentialCtx};
 use crate::errors::classify;
 use crate::ir::{
@@ -78,8 +78,9 @@ impl Provider for GoogleGenAiProvider {
             let body = encode(req, &self.profile, self.mode)?;
 
             let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None)
-                    .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
+                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
+                )?;
             let endpoint_url = build_endpoint_url(&base_url, self.mode, &req.model.0)?;
 
             let mut http_req = HttpRequest {
@@ -107,7 +108,9 @@ impl Provider for GoogleGenAiProvider {
                 credentials
                     .apply(&mut http_req, &cred_ctx)
                     .await
-                    .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+                    .map_err(|e| {
+                        ProviderError::Transport(redact_transport_error_text(&e.to_string()))
+                    })?;
             } else {
                 match &self.profile.defaults.auth {
                     AuthKind::HeaderKey { header } => {
@@ -138,11 +141,9 @@ impl Provider for GoogleGenAiProvider {
                 }
             }
 
-            let response = ctx
-                .transport
-                .send(http_req)
-                .await
-                .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+            let response = ctx.transport.send(http_req).await.map_err(|e| {
+                ProviderError::Transport(redact_transport_error_text(&e.to_string()))
+            })?;
 
             if !(200..300).contains(&response.status) {
                 // §9.8: never `?` on JSON parsing in the error path.

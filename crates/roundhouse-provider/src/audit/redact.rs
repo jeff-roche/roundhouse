@@ -124,6 +124,17 @@ static EMBEDDED_URL: LazyLock<Regex> =
 /// function, which was false) so every codec in this crate shares the one
 /// real implementation instead of `cohere_v2` alone having it, or a second,
 /// weaker copy growing elsewhere.
+///
+/// That sharing claim was itself still false for four of six codecs until
+/// fix round 5, H1: `openai_chat::provider`, `google_genai::provider`,
+/// `openai_responses::provider`, and `bedrock_converse::provider` each had
+/// three `ProviderError::Transport` sinks still calling plain
+/// [`redact_error_body`] directly (the gap the previous paragraph's "was
+/// false" already flagged for `openai_chat::decode`'s doc claim, but the
+/// `provider.rs` sinks in all four files had the identical bug, not just the
+/// comment). H1 switched all twelve of those sinks to this function, so the
+/// claim in this doc comment's first paragraph is now actually true for
+/// every codec in this crate, not merely stated.
 pub(crate) fn redact_transport_error_text(raw: &str) -> String {
     let url_redacted = EMBEDDED_URL.replace_all(raw, |caps: &Captures| {
         crate::credential::record_base_url_override(&caps[0])

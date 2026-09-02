@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::decode::{decode_bedrock_converse_stream, StreamFailure};
 use super::encode::try_encode;
-use crate::audit::redact_error_body;
+use crate::audit::redact_transport_error_text;
 use crate::credential::{resolve_base_url, CredentialCtx};
 use crate::errors::classify;
 use crate::ir::{
@@ -69,8 +69,9 @@ impl Provider for BedrockConverseProvider {
             let body = try_encode(req, &self.profile)?;
 
             let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None)
-                    .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
+                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
+                )?;
             let endpoint_url = build_endpoint_url(&base_url, &req.model.0)?;
 
             let mut http_req = HttpRequest {
@@ -98,7 +99,9 @@ impl Provider for BedrockConverseProvider {
                     credentials
                         .apply(&mut http_req, &cred_ctx)
                         .await
-                        .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+                        .map_err(|e| {
+                            ProviderError::Transport(redact_transport_error_text(&e.to_string()))
+                        })?;
                 }
                 None => {
                     return Err(ProviderError::Unsupported(
@@ -109,11 +112,9 @@ impl Provider for BedrockConverseProvider {
                 }
             }
 
-            let response = ctx
-                .transport
-                .send(http_req)
-                .await
-                .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+            let response = ctx.transport.send(http_req).await.map_err(|e| {
+                ProviderError::Transport(redact_transport_error_text(&e.to_string()))
+            })?;
 
             if !(200..300).contains(&response.status) {
                 // §9.8: never `?` on JSON parsing in the error path.

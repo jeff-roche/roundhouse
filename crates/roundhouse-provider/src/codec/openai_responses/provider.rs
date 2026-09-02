@@ -6,7 +6,7 @@
 //! (REALITY-CORRECTIONS §14g) for status/body classification instead of a
 //! hand-written `match`.
 
-use crate::audit::redact_error_body;
+use crate::audit::redact_transport_error_text;
 use crate::codec::openai_responses::decode::{decode_openai_responses_stream, StreamFailure};
 use crate::codec::openai_responses::encode::{contains_unencodable_media, encode};
 use crate::credential::resolve_base_url;
@@ -104,8 +104,9 @@ impl Provider for OpenAiResponsesProvider {
             // entirely per WHATWG relative-URL resolution) preserves it
             // untouched.
             let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None)
-                    .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
+                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
+                )?;
             let endpoint_url = append_path_segment(&base_url, "responses");
 
             let mut http_req = HttpRequest {
@@ -140,7 +141,9 @@ impl Provider for OpenAiResponsesProvider {
                 credentials
                     .apply(&mut http_req, &cred_ctx)
                     .await
-                    .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+                    .map_err(|e| {
+                        ProviderError::Transport(redact_transport_error_text(&e.to_string()))
+                    })?;
             } else {
                 http_req.headers.push((
                     "authorization".to_string(),
@@ -153,15 +156,19 @@ impl Provider for OpenAiResponsesProvider {
             // ({url})"` (userinfo and query string included) to its error,
             // which otherwise flows straight into `ProviderError::Transport`
             // and then onto a physically-immutable `events` row.
-            // `redact_error_body` (§9.9's complementary, shape-based pass)
-            // is applied here rather than relied on further downstream,
-            // since this is the one place in this codec a raw transport
-            // error string is turned into persisted text.
-            let response = ctx
-                .transport
-                .send(http_req)
-                .await
-                .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+            //
+            // Fix round 5, H1: C5's original fix called plain
+            // `redact_error_body` here, which does NOT strip a URL's query
+            // string or userinfo (it only matches labeled, shaped secrets) --
+            // so the claim two paragraphs up was false for every sink in
+            // this file. Switched to `redact_transport_error_text`, which
+            // strips the embedded URL down to host-only THEN runs
+            // `redact_error_body` on top, so the leak this comment describes
+            // is now actually closed at all three of this file's transport-
+            // error sinks, not just described as closed.
+            let response = ctx.transport.send(http_req).await.map_err(|e| {
+                ProviderError::Transport(redact_transport_error_text(&e.to_string()))
+            })?;
 
             if !(200..300).contains(&response.status) {
                 // §9.8: never `?` on JSON parsing in the error path -- an

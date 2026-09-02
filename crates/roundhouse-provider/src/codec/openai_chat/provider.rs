@@ -21,7 +21,7 @@
 
 use super::decode::{StreamFailure, StreamFailureKind};
 use super::{decode_openai_chat_stream, encode_openai_chat};
-use crate::audit::redact_error_body;
+use crate::audit::{redact_error_body, redact_transport_error_text};
 use crate::credential::{resolve_base_url, CredentialCtx};
 use crate::errors::classify;
 use crate::ir::{
@@ -91,8 +91,9 @@ impl Provider for OpenAiChatProvider {
             let body = encode_openai_chat(req, &self.profile);
 
             let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None)
-                    .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
+                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
+                )?;
             let endpoint_url = build_endpoint_url(&base_url);
 
             let mut http_req = HttpRequest {
@@ -100,12 +101,17 @@ impl Provider for OpenAiChatProvider {
                 url: endpoint_url.to_string(),
                 headers: vec![("content-type".to_string(), "application/json".to_string())],
                 // Fix round 3, Q5: the one error sink in `stream_chat` that
-                // bypassed `redact_error_body` (the other four sinks in
-                // this function already use it) -- effectively infallible
+                // bypassed `redact_error_body` -- effectively infallible
                 // (`body` is a `serde_json::Value` this function just
-                // built), but this project persists error text onto
-                // physically-immutable `Event` rows, so consistency here
-                // costs nothing and closes the gap.
+                // built, so this is a `serde_json::Error` over data this
+                // codec constructed itself, never wire text), but this
+                // project persists error text onto physically-immutable
+                // `Event` rows, so consistency here costs nothing and closes
+                // the gap. This sink carries no URL (it never touches
+                // `resolve_base_url`/`HttpTransport`), so `redact_error_body`
+                // -- not the stronger `redact_transport_error_text` the
+                // other three sinks in this function use (fix round 5, H1)
+                // -- remains the right tool here.
                 body: serde_json::to_vec(&body)
                     .map_err(|e| ProviderError::Unsupported(redact_error_body(&e.to_string())))?,
             };
@@ -123,7 +129,9 @@ impl Provider for OpenAiChatProvider {
                 credentials
                     .apply(&mut http_req, &cred_ctx)
                     .await
-                    .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+                    .map_err(|e| {
+                        ProviderError::Transport(redact_transport_error_text(&e.to_string()))
+                    })?;
             } else {
                 match &self.profile.defaults.auth {
                     // An empty or whitespace-only `api_key` must fail
@@ -157,11 +165,9 @@ impl Provider for OpenAiChatProvider {
                 }
             }
 
-            let response = ctx
-                .transport
-                .send(http_req)
-                .await
-                .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
+            let response = ctx.transport.send(http_req).await.map_err(|e| {
+                ProviderError::Transport(redact_transport_error_text(&e.to_string()))
+            })?;
 
             if !(200..300).contains(&response.status) {
                 // §9.8: never `?` on JSON parsing in the error path.
@@ -229,12 +235,20 @@ impl Provider for OpenAiChatProvider {
 /// reached NOTHING observable for every kind but `Transport`: an operator
 /// saw `StreamInterrupted` with no cause, and couldn't file the capture
 /// that would let a real new `finish_reason` value be added. A `tracing`
-/// event at this mapping site (mirrors `errors.rs`'s existing
-/// `tracing::debug!` convention for "a degrade must be observable, not
-/// silent") makes the *reason* visible without ever touching
-/// `partial_text` -- the model's content is never passed to this event.
+/// event at this mapping site makes the *reason* visible without ever
+/// touching `partial_text` -- the model's content is never passed to this
+/// event.
+///
+/// Fix round 5, H3: this is `warn!`, not `errors.rs`'s `debug!` convention --
+/// that crate precedent is for a silent classification fallback that still
+/// yields a working, correctly-classified error (nothing user-visible
+/// degrades). A `StreamFailure` kills the entire turn, which is the shape
+/// `retry.rs` logs at `warn!` seven times over for exactly this reason
+/// ("user-visible degrades"). `debug!` also would not survive an eventual
+/// default `EnvFilter` (which typically admits `info` and above), silently
+/// discarding the one diagnostic this fix exists to make observable.
 fn stream_failure_to_provider_error(failure: StreamFailure) -> ProviderError {
-    tracing::debug!(
+    tracing::warn!(
         kind = ?failure.kind,
         message = %failure.message,
         "openai-chat stream failed mid-generation"

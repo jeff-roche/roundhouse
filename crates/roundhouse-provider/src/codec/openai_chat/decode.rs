@@ -588,8 +588,19 @@ mod decode_streaming_tests {
     /// keep-alive-ish shape some backends send) and a final usage-only
     /// chunk with NO `choices` key at all (relying on `Chunk.choices`'
     /// `#[serde(default)]`) must all still succeed and the usage must still
-    /// decode -- proving R1's `is_null()` guard didn't over- or
-    /// under-shoot the failure classifier.
+    /// decode.
+    ///
+    /// Fix round 5, H5: none of these frames carry an `"error"` key at all,
+    /// so this test never reaches R1's `is_null()` guard and proves nothing
+    /// about it (confirmed by a reviewer: it passes unchanged with the guard
+    /// reverted). What it actually covers is `Chunk.choices`'
+    /// `#[serde(default)]` tolerating both a present-but-empty `choices:
+    /// []` and an absent `choices` field in the same stream, without either
+    /// shape being misread as a failure or dropping the usage block that
+    /// follows. The `is_null()` guard itself is covered separately, by
+    /// `an_error_field_explicitly_set_to_null_is_not_treated_as_a_failure`
+    /// (the null case) and `an_in_band_error_frame_is_a_stream_failure`
+    /// (the genuine-failure case) above.
     #[tokio::test]
     async fn a_normal_completion_with_an_empty_choices_frame_and_a_choicesless_usage_frame_succeeds(
     ) {

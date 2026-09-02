@@ -372,9 +372,24 @@ impl HttpTransport for LeakyFailingTransport {
     }
 }
 
-/// Fix-round-1 C5: `redact_error_body` must actually be applied to a
-/// transport-error string before it becomes a `ProviderError`, not merely
-/// exist in the crate unused by this codec.
+/// Fix-round-1 C5 introduced this test against plain `redact_error_body`,
+/// whose `"[REDACTED-KEY]"` marker the second assertion below used to check
+/// for literally. Fix round 5, H1 found that check gave false confidence:
+/// `redact_error_body` alone does NOT strip a URL's query string or
+/// userinfo (it only matches a labeled `api_key`/`access_token`/
+/// `client_secret`-shaped field of >=16 chars against the RAW body text,
+/// which happens to match `?api_key=...` here only because this fixture's
+/// query param is literally named `api_key` -- a differently-named gateway
+/// param, e.g. `?key=...` as `build_endpoint_url`'s own
+/// `preserves_a_gateway_query_string` test uses, would NOT have matched and
+/// would have leaked unredacted even though this test stayed green). This
+/// sink now calls the stronger `redact_transport_error_text`, which reduces
+/// the whole embedded URL to `host[:port]` before `redact_error_body` ever
+/// runs -- the secret is gone via URL replacement, not via a labeled-field
+/// match, so no `"[REDACTED-KEY]"` marker is left behind to assert on.
+/// Updated to assert what actually matters and what
+/// `conformance_cohere_v2.rs`'s identical-shape regression test already
+/// asserts: the secret is gone, and the host survives for diagnosability.
 #[tokio::test]
 async fn a_transport_failure_never_leaks_a_key_shaped_string_from_the_url() {
     const SECRET: &str = "sk-should-be-redacted-1234567890";
@@ -396,8 +411,8 @@ async fn a_transport_failure_never_leaks_a_key_shaped_string_from_the_url() {
         "the key-shaped string leaked into a ProviderError unredacted: {rendered}"
     );
     assert!(
-        rendered.contains("REDACTED"),
-        "expected redact_error_body's marker to be present, got: {rendered}"
+        rendered.contains("gateway.example.invalid"),
+        "the host itself is not secret and should stay, for diagnosability: {rendered}"
     );
 }
 

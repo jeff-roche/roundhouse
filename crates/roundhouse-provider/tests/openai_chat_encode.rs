@@ -377,3 +377,54 @@ fn a_differently_named_flat_field_pointer_uses_its_own_key() {
     assert_eq!(body["enable_thinking"], json!("true"));
     assert!(body.get("reasoning_effort").is_none());
 }
+
+/// Fix round 5, H4: `RESERVED_REASONING_FIELD_KEYS`
+/// (`reasoning_field_validation.rs`) and this function's own emission sites
+/// are two hand-maintained lists coupled only by a comment -- exactly the
+/// coupling that let fix round 4's `max_tokens`/`temperature`/`stop` omission
+/// happen in the first place. Populates every optional `Params` field plus
+/// `tools` (which also triggers `tool_choice`) so every conditionally-
+/// emitted top-level key in `encode_openai_chat` is present in the same
+/// body at once, then asserts the body's full top-level key set is a subset
+/// of the reserved list -- so a future key added to this function without a
+/// matching addition to the reserved list fails this test instead of
+/// shipping a silent-clobber hazard.
+///
+/// Deliberately does NOT set a reasoning intent/profile: a `[[model]].
+/// reasoning.field` pointer's own destination key (e.g. moonshot's
+/// `reasoning_effort`) is expected NOT to appear in
+/// `RESERVED_REASONING_FIELD_KEYS` -- that list is exactly the set such a
+/// pointer must avoid colliding with, not a manifest of every key the codec
+/// can ever write.
+#[test]
+fn every_key_encode_openai_chat_can_emit_is_in_the_reserved_list() {
+    let req = ChatRequest {
+        tools: vec![tool_def_from_schema::<ReadParams>("read", "Read a file")],
+        tool_choice: ToolChoice::Auto,
+        params: Params {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            max_output_tokens: Some(2048),
+            stop: Some(vec!["STOP".into()]),
+        },
+        ..no_reasoning_request("gpt-5.4")
+    };
+
+    let body = encode_openai_chat(&req, &no_reasoning_profile());
+
+    let keys: Vec<&String> = body
+        .as_object()
+        .expect("encode_openai_chat must produce a JSON object")
+        .keys()
+        .collect();
+    assert!(!keys.is_empty(), "sanity: the body must not be empty");
+    for key in keys {
+        assert!(
+            roundhouse_provider::codec::openai_chat::RESERVED_REASONING_FIELD_KEYS
+                .contains(&key.as_str()),
+            "encode_openai_chat emitted top-level key {key:?}, which is not in \
+             RESERVED_REASONING_FIELD_KEYS -- a reasoning `field` pointer targeting \
+             this key would silently clobber it; add {key:?} to the reserved list"
+        );
+    }
+}

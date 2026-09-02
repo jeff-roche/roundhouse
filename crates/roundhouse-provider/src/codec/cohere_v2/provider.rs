@@ -220,7 +220,27 @@ fn build_endpoint_url(base: &url::Url) -> url::Url {
 ///   discards reasoning-model state"), not to this transport-retry layer.
 ///   Mirrors `roundhouse-engine::compact::fold_stream_text`'s identical use
 ///   of this variant for the same "ended without a clean stop" shape.
+///
+/// Fix round 5, H3: `failure.message` -- the actual, spec-verified reason
+/// this stream failed -- used to reach nothing observable for every kind but
+/// `Transport`, the same gap fix round 4 closed for
+/// `openai_chat::provider::stream_failure_to_provider_error`. A `warn!`
+/// event here (matching that fix's level, not `errors.rs`'s `debug!`
+/// convention -- a `StreamFailure` kills the entire turn, a user-visible
+/// degrade) makes the reason observable without ever touching
+/// `partial_text`. Every `message` construction site in `decode.rs` builds
+/// this from a fixed diagnostic string interpolating at most a verified
+/// `finish_reason` value (capped and escaped for the unrecognized case by
+/// `sanitize_finish_reason_for_message`) or a `redact_transport_error_text`-
+/// passed transport error -- never the model's own generated content, which
+/// only ever flows into the separate `partial_text` field this event does
+/// not log.
 fn stream_failure_to_provider_error(failure: StreamFailure) -> ProviderError {
+    tracing::warn!(
+        kind = ?failure.kind,
+        message = %failure.message,
+        "cohere-v2 stream failed mid-generation"
+    );
     match failure.kind {
         StreamFailureKind::Transport => ProviderError::Transport(failure.message),
         StreamFailureKind::Timeout => ProviderError::Timeout,
@@ -350,5 +370,94 @@ mod stream_failure_to_provider_error_tests {
             "",
         ));
         assert!(matches!(err, ProviderError::StreamInterrupted { .. }));
+    }
+}
+
+#[cfg(test)]
+mod stream_failure_diagnosability_tests {
+    //! Fix round 5, H3: mirrors `openai_chat::provider`'s identical
+    //! `stream_failure_diagnosability_tests` module verbatim in shape --
+    //! proves both halves of the same constraint for this codec's own
+    //! `stream_failure_to_provider_error`: the failure *reason* reaches an
+    //! observable `tracing` event, and the model's partial *content* never
+    //! does, not even via that event.
+    use super::{stream_failure_to_provider_error, StreamFailure, StreamFailureKind};
+    use crate::ir::ProviderError;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Default)]
+    struct LineVisitor {
+        line: String,
+    }
+
+    impl Visit for LineVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.line, "{}={:?} ", field.name(), value);
+        }
+    }
+
+    struct CapturingSubscriber {
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Subscriber for CapturingSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = LineVisitor::default();
+            event.record(&mut visitor);
+            self.lines.lock().unwrap().push(visitor.line);
+        }
+        fn enter(&self, _span: &Id) {}
+        fn exit(&self, _span: &Id) {}
+    }
+
+    #[test]
+    fn the_failure_reason_reaches_a_tracing_event_but_the_partial_content_never_does() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CapturingSubscriber {
+            lines: lines.clone(),
+        };
+        let failure = StreamFailure {
+            kind: StreamFailureKind::MaxTokens,
+            message: "cohere-v2 chat generation stopped: MAX_TOKENS".into(),
+            partial_text: "TOP SECRET MODEL OUTPUT".into(),
+        };
+
+        let provider_err = tracing::subscriber::with_default(subscriber, || {
+            stream_failure_to_provider_error(failure)
+        });
+
+        // Half 1: the `Display` impl -- what actually reaches a persisted,
+        // immutable row -- must never carry the model's partial output.
+        assert!(matches!(
+            provider_err,
+            ProviderError::StreamInterrupted { .. }
+        ));
+        assert!(!provider_err.to_string().contains("TOP SECRET"));
+
+        // Half 2: the reason must be observable somewhere -- here, a
+        // tracing event -- so an operator can act on it.
+        let captured = lines.lock().unwrap();
+        assert!(
+            captured.iter().any(|line| line.contains("MAX_TOKENS")),
+            "expected the failure reason to reach a tracing event: {captured:?}"
+        );
+        // And the partial content must never leak into the diagnostic
+        // event either -- only the reason is observable, never the content.
+        assert!(
+            !captured.iter().any(|line| line.contains("TOP SECRET")),
+            "the model's partial output must never be logged: {captured:?}"
+        );
     }
 }

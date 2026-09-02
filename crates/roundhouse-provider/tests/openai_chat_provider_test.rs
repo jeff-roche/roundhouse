@@ -289,3 +289,66 @@ async fn a_bare_500_with_no_matching_error_code_classifies_as_server_error() {
         "expected Server{{500}}, got {err:?}"
     );
 }
+
+/// Fix round 5, H1: this codec's three `ProviderError::Transport` sinks used
+/// to call plain `crate::audit::redact_error_body`, which does not strip a
+/// URL's query string or userinfo (it only matches a labeled
+/// `api_key`/`access_token`/`client_secret`-shaped field of >=16 chars) --
+/// so a gateway `base_url` override's own `?key=...` query string (the
+/// shape `build_endpoint_url`'s `preserves_a_gateway_query_string` test
+/// asserts survives into the requested URL) would have leaked verbatim into
+/// a persisted `ProviderError::Transport` row through `HttpTransport::send`'s
+/// failure sink. Mirrors `conformance_cohere_v2.rs`'s identical regression
+/// test for that codec -- this proves the same fix landed in a second,
+/// independently-fixed codec, not just in the one the leak was first found
+/// in.
+struct FailsWithUrlInMessage;
+
+impl HttpTransport for FailsWithUrlInMessage {
+    fn send<'a>(
+        &'a self,
+        _req: HttpRequest,
+    ) -> futures::future::BoxFuture<'a, Result<HttpResponseStream, TransportError>> {
+        Box::pin(async {
+            Err(TransportError::Io(
+                "error sending request for url \
+                 (https://user:pass@gateway.example.com/proxy/chat?key=abc123): \
+                 operation timed out"
+                    .to_string(),
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_send_failure_redacts_an_embedded_gateway_query_string_and_userinfo() {
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(FailsWithUrlInMessage),
+        api_key: "test-key".into(),
+        credentials: None,
+    };
+    let provider = OpenAiChatProvider::new(load("openrouter"));
+    let err = expect_err(
+        provider
+            .stream_chat(&fixtures::single_turn_text("openrouter"), &ctx)
+            .await,
+    );
+    match err {
+        ProviderError::Transport(msg) => {
+            assert!(
+                !msg.contains("abc123"),
+                "the query string's credential-shaped value must not survive: {msg}"
+            );
+            assert!(
+                !msg.contains("user:pass"),
+                "userinfo must not survive: {msg}"
+            );
+            assert!(
+                msg.contains("gateway.example.com"),
+                "the host itself is not secret and should stay: {msg}"
+            );
+        }
+        other => panic!("expected Transport, got {other:?}"),
+    }
+}
