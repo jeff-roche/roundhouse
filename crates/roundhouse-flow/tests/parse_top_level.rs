@@ -1,7 +1,6 @@
 use roundhouse_flow::parse::types::{Effect, IsolationDef, UnattendedEscalate};
 use roundhouse_flow::parse::{
-    parse_workflow, ParseError, MAX_ALIAS_TOKENS, MAX_LEADING_INDENT_CHARS, MAX_TOP_LEVEL_STEPS,
-    MAX_YAML_BYTES,
+    parse_workflow, ParseError, MAX_LEADING_INDENT_CHARS, MAX_TOP_LEVEL_STEPS, MAX_YAML_BYTES,
 };
 
 const PR_REVIEW_YAML: &str = include_str!("fixtures/pr_review.yaml");
@@ -370,8 +369,15 @@ fn the_retracted_cap_claim_held_only_for_the_one_shape_it_measured() {
     // is a bound on parse cost: see
     // `ignored_reproduction_of_the_open_anchor_alias_fanout_dos` below, and
     // the open finding in `parse/mod.rs`'s module doc comment.
-    let bomb = "[".repeat(MAX_YAML_BYTES);
-    assert_eq!(bomb.len(), MAX_YAML_BYTES);
+    //
+    // Fix round 5: the payload is a literal 32 KiB, deliberately NOT tied
+    // to `MAX_YAML_BYTES`. Round 3's claim was made about 32 KiB, so 32 KiB
+    // is what characterizing it means; and pinning the size keeps this
+    // test's cost independent of a future change to the cap (round 4 raised
+    // the cap 8x and this payload silently grew 8x with it, which is what
+    // made the timing assertion flaky).
+    const ROUND_3_CAP_BYTES: usize = 32_768;
+    let bomb = "[".repeat(ROUND_3_CAP_BYTES);
 
     let start = std::time::Instant::now();
     let result: Result<serde_yaml::Value, _> = serde_yaml::from_str(&bomb);
@@ -381,10 +387,16 @@ fn the_retracted_cap_claim_held_only_for_the_one_shape_it_measured() {
         result.is_err(),
         "an unclosed bracket bomb must not parse successfully"
     );
+    // A smoke test that this shape is not quadratic, not a calibration.
+    // Measured here: ~80 ms release, ~500 ms debug. 60 s is ~120x the debug
+    // figure, chosen so a contended CI runner cannot turn a *timing* margin
+    // into a failure inside a test whose real subject is a security claim —
+    // a flake here invites the next reader to "fix" it by weakening the
+    // narrative. If this ever actually fires, the shape became quadratic
+    // and that is a real finding, not a slow machine.
     assert!(
-        elapsed < std::time::Duration::from_secs(10),
-        "this one shape is cheap at the cap (measured ~650ms at 256 KiB in this environment); \
-         took {elapsed:?}"
+        elapsed < std::time::Duration::from_secs(60),
+        "took {elapsed:?} for {ROUND_3_CAP_BYTES} bytes — this shape should be roughly linear"
     );
 }
 
@@ -424,9 +436,9 @@ fn ignored_reproduction_of_the_open_anchor_alias_fanout_dos() {
     // The executable record of the open finding in `parse/mod.rs`'s module
     // doc comment. A ~2.3 KB document — SMALLER than the frozen §8.9
     // fixture (2,271 B) — costs seconds of pinned CPU, and every bound this
-    // module enforces admits it: it is well under `MAX_YAML_BYTES`, it has
-    // 28 alias tokens (under `MAX_ALIAS_TOKENS`), its brackets are balanced
-    // at depth 1 (under `MAX_FLOW_NESTING_DEPTH`), and it declares one step.
+    // module enforces admits it: it is well under `MAX_YAML_BYTES`, its
+    // brackets are balanced at depth 1 (under `MAX_FLOW_NESTING_DEPTH`),
+    // and it declares one step.
     //
     // Measured in this environment, release build, via `parse_workflow`:
     // 2,268 B -> 137 ms; 2,300 B -> 537 ms; 2,332 B -> 2.1 s;
@@ -450,48 +462,27 @@ fn ignored_reproduction_of_the_open_anchor_alias_fanout_dos() {
 }
 
 #[test]
-fn an_alias_dense_document_is_rejected_cheaply() {
-    // Fix round 4 on Task 10: `MAX_ALIAS_TOKENS` is best-effort defence in
-    // depth against alias fan-out. It catches the wide-fan variants; it
-    // provably does NOT catch the narrow-fan ones (see `MAX_ALIAS_TOKENS`'s
-    // own doc comment for the measured table). This pins the half it does.
-    let yaml = anchor_alias_fanout(10, 16, 8);
-    assert!(yaml.len() < MAX_YAML_BYTES);
-
-    let start = std::time::Instant::now();
-    let err = parse_workflow(&yaml).expect_err("an alias-dense document must be rejected");
-    let elapsed = start.elapsed();
-
-    match err {
-        ParseError::TooManyAliases { actual, max } => {
-            assert_eq!(max, MAX_ALIAS_TOKENS);
-            assert!(actual > max, "{actual} must exceed {max}");
-        }
-        other => panic!("expected ParseError::TooManyAliases, got {other:?}"),
-    }
-    assert!(
-        elapsed < std::time::Duration::from_secs(1),
-        "the check must reject before paying serde_yaml's cost; took {elapsed:?}"
-    );
-}
-
-#[test]
-fn shell_globs_are_not_counted_as_alias_tokens() {
-    // The refinement that keeps `MAX_ALIAS_TOKENS` off legitimate
-    // workflows: an alias is `*` followed by an anchor-name character. The
-    // frozen §8.9 fixture's only two `*` characters are shell globs, each
-    // followed by `"` — so it counts zero, not two. This builds a workflow
-    // with far more globs than the threshold and asserts it still parses.
-    let mut yaml = String::from("name: t\nversion: 1\npermissions:\n  default: deny\n  rules:\n");
-    for i in 0..(MAX_ALIAS_TOKENS * 2) {
-        yaml.push_str(&format!(
-            "    - {{ shell: {{ program: \"p{i}\", args: [\"run\", \"*\"] }}, effect: allow }}\n"
+fn an_alias_heavy_prose_prompt_parses() {
+    // Fix round 5 on Task 10: fix round 4 shipped a `MAX_ALIAS_TOKENS`
+    // guard rejecting more than 64 `*[A-Za-z0-9_-]` tokens. That pattern is
+    // also markdown emphasis, so this document — an ordinary agent prompt
+    // using `*word*` and `**bold**` in prose — was rejected outright as
+    // `TooManyAliases` (measured: 140 "alias" tokens in 4,719 bytes). The
+    // guard is gone; this pins that a real prompt parses, so a future
+    // reader does not reintroduce the same shape of check.
+    let mut prose = String::new();
+    for i in 0..70 {
+        prose.push_str(&format!(
+            "        Check the *config{i}* file and note any **bold** findings.\n"
         ));
     }
-    yaml.push_str("  unattended: { escalate: fail }\nsteps:\n  - id: s\n");
+    let yaml = format!(
+        "name: t\nversion: 1\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n    agent:\n      prompt: |\n{prose}"
+    );
+    assert!(yaml.len() < MAX_YAML_BYTES);
 
-    let def = parse_workflow(&yaml).expect("shell globs must not be counted as alias tokens");
-    assert_eq!(def.permissions.rules.len(), MAX_ALIAS_TOKENS * 2);
+    let def = parse_workflow(&yaml).expect("markdown emphasis in a prompt must not be rejected");
+    assert_eq!(def.name, "t");
 }
 
 #[test]

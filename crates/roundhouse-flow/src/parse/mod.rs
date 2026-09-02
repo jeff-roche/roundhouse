@@ -96,8 +96,24 @@
 //!   whose size is itself proportional to the document. The real product
 //!   is quadratic — see the open finding above. See
 //!   `rejects_a_billion_laughs_style_alias_bomb` in
-//!   `tests/parse_top_level.rs`, which exercises the guard directly, and
-//!   [`MAX_ALIAS_TOKENS`] for this module's own best-effort density check.
+//!   `tests/parse_top_level.rs`, which exercises the guard directly.
+//!
+//!   **This module deliberately adds no alias check of its own.** Fix
+//!   round 4 shipped one (`MAX_ALIAS_TOKENS`, rejecting above 64 tokens
+//!   matching `*[A-Za-z0-9_-]`) as best-effort defence in depth; fix
+//!   round 5 removed it, because it turned out to cost more than it
+//!   bought. It could not bound the attack — at a fixed 64 alias tokens,
+//!   cost spans over 3,000x purely by widening the anchored leaf list (10
+//!   leaves 9.6 ms, 100 leaves 160 ms, 1,000 leaves 4.26 s, 5,000 leaves
+//!   29.3 s), so alias count and parse cost are close to independent and
+//!   no threshold yields a ceiling. Meanwhile it rejected real workflows:
+//!   the pattern is also markdown emphasis, so a 4,719-byte `agent.prompt`
+//!   using `*word*` and `**bold**` in ordinary prose was rejected outright
+//!   (measured), as were `src/*rs` and `rm *tmp`. And a constant named
+//!   `MAX_ALIAS_TOKENS` checked before `serde_yaml` reads as "alias
+//!   fan-out is handled", which is the exact misreading this module has
+//!   been bitten by three times. The open finding above is more legible
+//!   without it.
 //! - **Pathological nesting depth, materializing a Rust value:** bounded by
 //!   `serde_yaml`'s own `remaining_depth: 128` recursion guard
 //!   (`RecursionLimitExceeded`), on by default. **This guard applies only
@@ -170,11 +186,10 @@
 //!   this module no longer pretends otherwise.
 //! - **Overall document size / "huge number of steps":** these are coarse
 //!   sanity bounds on absurd input — [`MAX_YAML_BYTES`] on the raw input
-//!   before it is handed to `serde_yaml`, [`MAX_ALIAS_TOKENS`] on alias
-//!   density, and [`MAX_TOP_LEVEL_STEPS`] / [`MAX_CATCH_HANDLERS`] /
-//!   [`MAX_FINALLY_HANDLERS`] on the parsed result's lists. **None of them
-//!   is a security bound**, and the two size-shaped ones interact on
-//!   purpose: see [`MAX_YAML_BYTES`].
+//!   before it is handed to `serde_yaml`, and [`MAX_TOP_LEVEL_STEPS`] /
+//!   [`MAX_CATCH_HANDLERS`] / [`MAX_FINALLY_HANDLERS`] on the parsed
+//!   result's lists. **None of them is a security bound**, and the two
+//!   size-shaped ones interact on purpose: see [`MAX_YAML_BYTES`].
 
 pub mod types;
 
@@ -223,37 +238,6 @@ pub const MAX_YAML_BYTES: usize = 262_144;
 /// [`MAX_YAML_BYTES`] for how the two interact: a 500-step workflow with
 /// real prompts in it hits the byte cap before it hits this one.
 pub const MAX_TOP_LEVEL_STEPS: usize = 500;
-/// Maximum number of YAML alias tokens (`*` immediately followed by an
-/// anchor-name character) [`parse_workflow`] will accept.
-///
-/// **Best-effort defence in depth from day one — not a bound, and no
-/// soundness claim is made for it.** It is the same kind of text heuristic
-/// as [`nesting_depth_bound_violation`], and like that scan it cannot tell
-/// a real alias from the characters `*a` inside a quoted scalar. Since
-/// over-counting only costs a rejection, that direction is acceptable;
-/// under-counting is not detectable and is not claimed against.
-///
-/// **What it is measured to be worth, honestly.** It rejects wide-fan
-/// alias documents cheaply, and no legitimate workflow comes close: the
-/// frozen §8.9 fixture contains zero alias tokens (its two `*` characters
-/// are shell globs, each followed by `"`), and the alias-bomb regression
-/// test in `tests/parse_top_level.rs` carries 30. But it does **not** catch
-/// the open finding in the module doc comment, and this was measured, not
-/// assumed:
-///
-/// | payload (release, via `parse_workflow`) | alias tokens | cost |
-/// |---|---|---|
-/// | 2,364 B, fan 4 | 32 | 8.1 s — **admitted** |
-/// | 4,396 B, fan 4 | 36 | 33.9 s — **admitted** |
-/// | 2,428 B, fan 16 | 64 | 7.0 s — **admitted** (at the threshold) |
-/// | 2,508 B, fan 16 | 80 | 11.5 s — rejected |
-///
-/// An attacker simply lowers the fan and deepens the nesting to buy the
-/// same cost with a third of the aliases. No threshold high enough to
-/// admit real workflows is low enough to matter here; only the mitigations
-/// named in the module doc comment (out-of-process parsing, or a parser
-/// with a work budget) close that.
-pub const MAX_ALIAS_TOKENS: usize = 64;
 pub const MAX_CATCH_HANDLERS: usize = 50;
 pub const MAX_FINALLY_HANDLERS: usize = 50;
 /// Maximum nesting depth of `[`/`{` flow collections
@@ -317,11 +301,6 @@ pub enum ParseError {
     )]
     ExcessiveIndentWidth { width: usize, max: usize },
 
-    #[error(
-        "workflow YAML uses {actual} alias tokens, exceeding the limit of {max} (a best-effort density check, not a bound on parse cost — see this module's doc comment)"
-    )]
-    TooManyAliases { actual: usize, max: usize },
-
     #[error("workflow YAML parse error: {0}")]
     Yaml(#[from] serde_yaml::Error),
 }
@@ -350,14 +329,6 @@ pub fn parse_workflow(yaml: &str) -> Result<WorkflowDef, ParseError> {
         return Err(ParseError::TooLarge {
             actual: yaml.len(),
             max: MAX_YAML_BYTES,
-        });
-    }
-
-    let aliases = count_alias_tokens(yaml);
-    if aliases > MAX_ALIAS_TOKENS {
-        return Err(ParseError::TooManyAliases {
-            actual: aliases,
-            max: MAX_ALIAS_TOKENS,
         });
     }
 
@@ -412,30 +383,6 @@ fn validate_unattended(unattended: &UnattendedDef) -> Result<(), ParseError> {
     Ok(())
 }
 
-/// Counts YAML alias tokens in the raw text: a `*` immediately followed by
-/// an anchor-name character (`[A-Za-z0-9_-]`). Anchors (`&`) are
-/// deliberately **not** counted — `&` is entirely plausible in a shell
-/// allowlist argument (`&&`), so counting anchors risks rejecting a real
-/// workflow, while an alias is what actually triggers expansion work.
-///
-/// The refinement to "`*` followed by an anchor-name character" matters:
-/// the frozen §8.9 fixture contains two `*` characters, both shell globs
-/// (`args: ["test", "*"]`), each followed by `"` — so the fixture counts
-/// zero. See [`MAX_ALIAS_TOKENS`] for what this check is and is not worth;
-/// it is best-effort and makes no soundness claim (it cannot tell a real
-/// alias from `*a` inside a quoted scalar, and it does not need to — only
-/// the over-counting direction is reachable from that confusion).
-fn count_alias_tokens(yaml: &str) -> usize {
-    let bytes = yaml.as_bytes();
-    bytes
-        .iter()
-        .zip(bytes.iter().skip(1))
-        .filter(|(&c, &next)| {
-            c == b'*' && (next.is_ascii_alphanumeric() || next == b'_' || next == b'-')
-        })
-        .count()
-}
-
 /// Which of [`nesting_depth_bound_violation`]'s two bounds was exceeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NestingViolation {
@@ -486,10 +433,17 @@ enum NestingViolation {
 /// each trades a rare false positive for a fresh chance at a false
 /// negative. Since this scan is best-effort defence in depth and not a
 /// boundary, its false-positive rate is a usability property, not a
-/// security one — and tripping it requires 256 *net-unbalanced* opening
-/// brackets in one document, which balanced content (`[x]`, `{...}`, JSON
-/// examples in a prompt) never accumulates. The error message names the
-/// bound, so an author who somehow hits it can see why.
+/// security one — and tripping it requires 256 opening brackets that the
+/// counter never cancels. *Well-nested* content — `[a-z]`, `- [x]`,
+/// `[text](url)`, `[INFO]`, JSON examples in a prompt — cancels and never
+/// accumulates. Note the precise condition: it is well-nestedness, not
+/// mere balance. Because `depth` uses `saturating_sub(1)`, closes that
+/// arrive ahead of their opens clamp at zero rather than going negative,
+/// so a globally *balanced* but ill-nested run (`]]]…[[[`) still
+/// accumulates. That shape is contrived, and it is in the over-rejection
+/// direction, but the distinction is worth stating rather than rounding
+/// off to "balanced". The error message names the bound, so an author who
+/// somehow hits it can see why.
 ///
 /// It still does not track quote state (an earlier version did, and a
 /// quote character in an entirely ordinary position — `name: don't` — could
