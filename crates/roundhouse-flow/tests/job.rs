@@ -266,6 +266,79 @@ fn a_name_containing_nel_and_line_separator_round_trips_exactly() {
 }
 
 #[test]
+fn a_name_containing_supplementary_plane_noncharacters_round_trips() {
+    // Fix round 4 on Task 10: fix round 3 generalised `yaml_double_quoted`
+    // from the two BMP noncharacters the audit found (U+FFFE/U+FFFF) to the
+    // full Unicode noncharacter class, which introduced a second escape
+    // form — `\UNNNNNNNN`, the 8-digit path taken when `cp > 0xFFFF`. No
+    // test exercised that path: every round-trip test used U+FFFE, which
+    // takes the 4-digit `\uNNNN` path. These are the last two code points
+    // of planes 1 and 16, plus a plane-2 one for good measure.
+    let name = "a\u{1fffe}b\u{2ffff}c\u{10fffe}d";
+    let body = Body::Prompt {
+        template: "hello".to_string(),
+    };
+    let yaml = body.to_workflow_yaml(name, 1);
+    assert!(
+        yaml.contains("\\U0001fffe"),
+        "expected the 8-digit escape form for a supplementary-plane noncharacter, got: {yaml}"
+    );
+    let def = roundhouse_flow::parse::parse_workflow(&yaml)
+        .expect("to_workflow_yaml's own output must be parseable");
+    assert_eq!(
+        def.name, name,
+        "supplementary-plane noncharacters must round-trip exactly"
+    );
+}
+
+#[test]
+fn a_name_containing_the_fdd0_noncharacter_block_round_trips() {
+    // Fix round 4 on Task 10: the other half of round 3's generalisation
+    // that nothing exercised — the reserved U+FDD0..=U+FDEF noncharacter
+    // block, which is matched by its own range test rather than by the
+    // `cp & 0xFFFE == 0xFFFE` plane-end test. Both ends of the block plus
+    // one interior code point.
+    let name = "a\u{fdd0}b\u{fde0}c\u{fdef}d";
+    let body = Body::Prompt {
+        template: "hello".to_string(),
+    };
+    let yaml = body.to_workflow_yaml(name, 1);
+    assert!(
+        yaml.contains("\\ufdd0"),
+        "expected the U+FDD0 block to be escaped, got: {yaml}"
+    );
+    let def = roundhouse_flow::parse::parse_workflow(&yaml)
+        .expect("to_workflow_yaml's own output must be parseable");
+    assert_eq!(
+        def.name, name,
+        "the U+FDD0..=U+FDEF noncharacter block must round-trip exactly"
+    );
+}
+
+#[test]
+fn a_prompt_containing_noncharacters_round_trips_at_real_nesting_depth() {
+    // The same escaper feeds `template`, which is spliced six columns deep
+    // under `steps[0].agent.prompt` rather than at column 0. Round 3's
+    // noncharacter tests only covered `name`.
+    let template = "x\u{1fffe}y\u{fdd0}z\u{fffe}w";
+    let body = Body::Prompt {
+        template: template.to_string(),
+    };
+    let yaml = body.to_workflow_yaml("t", 1);
+    let def = roundhouse_flow::parse::parse_workflow(&yaml)
+        .expect("to_workflow_yaml's own output must be parseable");
+    let prompt = def.steps[0]
+        .get("agent")
+        .and_then(|agent| agent.get("prompt"))
+        .and_then(|prompt| prompt.as_str())
+        .expect("the lowered step carries an agent prompt");
+    assert_eq!(
+        prompt, template,
+        "noncharacters must round-trip exactly at real nesting depth too"
+    );
+}
+
+#[test]
 fn prompt_lowering_is_actually_consumable_by_the_task_2_workflow_parser_shape() {
     // The cross-task seam this task's dispatch flagged: `Body::Workflow`
     // carries raw YAML, `parse_workflow(yaml: &str) -> Result<WorkflowDef, ParseError>`

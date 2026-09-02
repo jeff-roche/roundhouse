@@ -1,6 +1,7 @@
 use roundhouse_flow::parse::types::{Effect, IsolationDef, UnattendedEscalate};
 use roundhouse_flow::parse::{
-    parse_workflow, ParseError, MAX_LEADING_INDENT_CHARS, MAX_TOP_LEVEL_STEPS, MAX_YAML_BYTES,
+    parse_workflow, ParseError, MAX_ALIAS_TOKENS, MAX_LEADING_INDENT_CHARS, MAX_TOP_LEVEL_STEPS,
+    MAX_YAML_BYTES,
 };
 
 const PR_REVIEW_YAML: &str = include_str!("fixtures/pr_review.yaml");
@@ -355,15 +356,20 @@ fn excessive_leading_indent_is_rejected() {
 }
 
 #[test]
-fn worst_case_bracket_nesting_at_the_byte_cap_is_bounded() {
-    // Fix round 3 on Task 10 (finding H2): after two scan designs each had
-    // their own bypass, `MAX_YAML_BYTES` (now 32 KiB, down from 1 MiB) is
-    // the real bound on untrusted-input parse cost, not the best-effort
-    // nesting scan. This measures the worst case *the cap itself* must
-    // bound: a document that is nothing but deeply nested flow brackets,
-    // fed directly to raw `serde_yaml::from_str` — bypassing this crate's
-    // scan on purpose, standing in for "some future crafted input the scan
-    // doesn't catch" — at exactly the byte cap.
+fn the_retracted_cap_claim_held_only_for_the_one_shape_it_measured() {
+    // Fix round 3 on Task 10 claimed `MAX_YAML_BYTES` bounded worst-case
+    // parse cost "regardless of payload shape". Fix round 4 retracted that.
+    // This test is what survives of the old
+    // `worst_case_bracket_nesting_at_the_byte_cap_is_bounded`: the *one*
+    // shape round 3 actually measured — a run of unclosed `[` fed straight
+    // to raw `serde_yaml::from_str`, bypassing this crate's scan on purpose
+    // — really is cheap at the cap. It is roughly linear in the input, not
+    // quadratic, so raising the cap 32 KiB -> 256 KiB kept it cheap.
+    //
+    // What it does NOT show, and what round 3 wrongly generalised from it,
+    // is a bound on parse cost: see
+    // `ignored_reproduction_of_the_open_anchor_alias_fanout_dos` below, and
+    // the open finding in `parse/mod.rs`'s module doc comment.
     let bomb = "[".repeat(MAX_YAML_BYTES);
     assert_eq!(bomb.len(), MAX_YAML_BYTES);
 
@@ -376,10 +382,175 @@ fn worst_case_bracket_nesting_at_the_byte_cap_is_bounded() {
         "an unclosed bracket bomb must not parse successfully"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(5),
-        "worst-case cost at exactly MAX_YAML_BYTES must stay bounded (measured ~1.5s in this \
-         environment; 5s leaves headroom for slower machines while still proving the cap, not \
-         the scan, is what bounds this); took {elapsed:?}"
+        elapsed < std::time::Duration::from_secs(10),
+        "this one shape is cheap at the cap (measured ~650ms at 256 KiB in this environment); \
+         took {elapsed:?}"
+    );
+}
+
+/// Builds the open finding's attack payload: one anchored leaf list of
+/// `leaves` plain scalars, then `levels` levels each aliasing the previous
+/// one `fan` times. Every bracket is balanced, nesting is one level deep,
+/// and the alias count stays low — so none of this module's shape checks
+/// see anything unusual.
+fn anchor_alias_fanout(leaves: usize, fan: usize, levels: usize) -> String {
+    let mut yaml = String::from(
+        "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n    bomb:\n",
+    );
+    yaml.push_str("      a0: &a0 [");
+    for i in 0..leaves {
+        if i > 0 {
+            yaml.push(',');
+        }
+        yaml.push('x');
+    }
+    yaml.push_str("]\n");
+    for level in 1..=levels {
+        yaml.push_str(&format!("      a{level}: &a{level} ["));
+        for i in 0..fan {
+            if i > 0 {
+                yaml.push(',');
+            }
+            yaml.push_str(&format!("*a{}", level - 1));
+        }
+        yaml.push_str("]\n");
+    }
+    yaml
+}
+
+#[test]
+#[ignore = "reproduces an OPEN, UNFIXED denial-of-service finding: burns seconds of CPU on purpose. Run with `cargo test -p roundhouse-flow --release -- --ignored`."]
+fn ignored_reproduction_of_the_open_anchor_alias_fanout_dos() {
+    // The executable record of the open finding in `parse/mod.rs`'s module
+    // doc comment. A ~2.3 KB document — SMALLER than the frozen §8.9
+    // fixture (2,271 B) — costs seconds of pinned CPU, and every bound this
+    // module enforces admits it: it is well under `MAX_YAML_BYTES`, it has
+    // 28 alias tokens (under `MAX_ALIAS_TOKENS`), its brackets are balanced
+    // at depth 1 (under `MAX_FLOW_NESTING_DEPTH`), and it declares one step.
+    //
+    // Measured in this environment, release build, via `parse_workflow`:
+    // 2,268 B -> 137 ms; 2,300 B -> 537 ms; 2,332 B -> 2.1 s;
+    // 2,364 B -> 8.1 s; 4,396 B -> 33.9 s. Doubling the document roughly
+    // quadruples the cost, which is the O(bytes^2) mechanism the module doc
+    // comment explains. This test uses the 2,332 B point.
+    let yaml = anchor_alias_fanout(1000, 4, 7);
+    assert!(yaml.len() < 3_000, "payload must stay tiny: {}", yaml.len());
+    assert!(yaml.len() < MAX_YAML_BYTES);
+
+    let start = std::time::Instant::now();
+    let _ = parse_workflow(&yaml);
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed > std::time::Duration::from_millis(250),
+        "if this ever stops being expensive, the finding is fixed and this test (and the open \
+         finding in parse/mod.rs) should be retired; took {elapsed:?} for {} bytes",
+        yaml.len()
+    );
+}
+
+#[test]
+fn an_alias_dense_document_is_rejected_cheaply() {
+    // Fix round 4 on Task 10: `MAX_ALIAS_TOKENS` is best-effort defence in
+    // depth against alias fan-out. It catches the wide-fan variants; it
+    // provably does NOT catch the narrow-fan ones (see `MAX_ALIAS_TOKENS`'s
+    // own doc comment for the measured table). This pins the half it does.
+    let yaml = anchor_alias_fanout(10, 16, 8);
+    assert!(yaml.len() < MAX_YAML_BYTES);
+
+    let start = std::time::Instant::now();
+    let err = parse_workflow(&yaml).expect_err("an alias-dense document must be rejected");
+    let elapsed = start.elapsed();
+
+    match err {
+        ParseError::TooManyAliases { actual, max } => {
+            assert_eq!(max, MAX_ALIAS_TOKENS);
+            assert!(actual > max, "{actual} must exceed {max}");
+        }
+        other => panic!("expected ParseError::TooManyAliases, got {other:?}"),
+    }
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the check must reject before paying serde_yaml's cost; took {elapsed:?}"
+    );
+}
+
+#[test]
+fn shell_globs_are_not_counted_as_alias_tokens() {
+    // The refinement that keeps `MAX_ALIAS_TOKENS` off legitimate
+    // workflows: an alias is `*` followed by an anchor-name character. The
+    // frozen §8.9 fixture's only two `*` characters are shell globs, each
+    // followed by `"` — so it counts zero, not two. This builds a workflow
+    // with far more globs than the threshold and asserts it still parses.
+    let mut yaml = String::from("name: t\nversion: 1\npermissions:\n  default: deny\n  rules:\n");
+    for i in 0..(MAX_ALIAS_TOKENS * 2) {
+        yaml.push_str(&format!(
+            "    - {{ shell: {{ program: \"p{i}\", args: [\"run\", \"*\"] }}, effect: allow }}\n"
+        ));
+    }
+    yaml.push_str("  unattended: { escalate: fail }\nsteps:\n  - id: s\n");
+
+    let def = parse_workflow(&yaml).expect("shell globs must not be counted as alias tokens");
+    assert_eq!(def.permissions.rules.len(), MAX_ALIAS_TOKENS * 2);
+}
+
+#[test]
+fn known_false_positive_bracket_heavy_prompt_after_an_unbalanced_bracket() {
+    // Fix round 4 on Task 10: a characterization test for an over-rejection
+    // fix round 3 introduced and this round documents rather than fixes
+    // (see `nesting_depth_bound_violation`'s doc comment for why).
+    //
+    // Round 3 made the block-scalar opener detector refuse to recognise an
+    // opener while the running bracket depth is non-zero. Because that
+    // depth counter also counts brackets inside comments and quoted
+    // scalars, ONE net-unbalanced `[` earlier in the document suppresses
+    // block-scalar recognition for everything after it — so a legitimate
+    // `prompt: |` body gets bracket-counted as if it were structure.
+    //
+    // The result is a document `serde_yaml` accepts and `parse_workflow`
+    // rejects. It takes 256 net-unbalanced opening brackets to reach, which
+    // no realistic workflow accumulates. If a future change fixes this,
+    // this test flips to `Ok` and should be rewritten as an acceptance
+    // test rather than deleted.
+    let brackets = "[".repeat(300);
+    let yaml = format!(
+        "name: t\nversion: 1\n# allowlist hint: program args match [a-z\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n    agent:\n      prompt: |\n        literal text {brackets}\n"
+    );
+
+    let raw: Result<serde_yaml::Value, _> = serde_yaml::from_str(&yaml);
+    assert!(
+        raw.is_ok(),
+        "serde_yaml itself accepts this document, which is what makes it a false positive"
+    );
+
+    let err = parse_workflow(&yaml)
+        .expect_err("documented over-rejection: the scan counts the prompt body's brackets");
+    assert!(
+        matches!(err, ParseError::TooDeeplyNested { .. }),
+        "expected the documented TooDeeplyNested false positive, got {err:?}"
+    );
+
+    // Remove the single unbalanced bracket from the comment and the very
+    // same prompt body is recognised as a block scalar and skipped.
+    let repaired = yaml.replace("match [a-z", "match a-z");
+    parse_workflow(&repaired)
+        .expect("without the stray unbalanced bracket, the block scalar is recognised again");
+}
+
+#[test]
+fn the_byte_cap_and_the_step_cap_are_coherent() {
+    // Fix round 4 on Task 10: `MAX_YAML_BYTES` is no longer a security
+    // bound (see `parse/mod.rs`'s open finding); its remaining job is to
+    // refuse absurdly large documents, which means it must not be so tight
+    // that `MAX_TOP_LEVEL_STEPS` is unreachable for realistic steps. At
+    // 32 KiB it left ~65 bytes per step at the step limit — less than an
+    // empty step costs. This pins the two constants against each other.
+    let bytes_per_step_at_the_step_limit = MAX_YAML_BYTES / MAX_TOP_LEVEL_STEPS;
+    assert!(
+        bytes_per_step_at_the_step_limit >= 512,
+        "MAX_YAML_BYTES ({MAX_YAML_BYTES}) leaves only \
+         {bytes_per_step_at_the_step_limit} bytes per step at MAX_TOP_LEVEL_STEPS \
+         ({MAX_TOP_LEVEL_STEPS}), which is too tight for a step carrying a prompt"
     );
 }
 
