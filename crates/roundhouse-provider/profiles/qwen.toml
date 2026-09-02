@@ -1,0 +1,41 @@
+# Qwen — DashScope OpenAI-compat mode (international endpoint).
+#
+# base_url and the enable_thinking parameter are DashScope's long-
+# established, widely-documented international-region values; live fetches
+# attempted during this task returned mutually inconsistent domains (see
+# profile_test_openai_chat_batch_c.rs's module doc for the detail) and never
+# confirmed a workable static alternative, so the brief's values are kept
+# here rather than replaced with unreliable fetch output.
+id = "qwen"
+codec = "openai-chat"
+
+[defaults]
+allow_raw_extra = false
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+
+[defaults.params]
+mode = "deny_list"
+fields = []
+
+[defaults.auth]
+kind = "bearer"
+
+[[model]]
+match = ["qwen3*"]
+
+[model.reasoning]
+kind = "effort"
+field = "/enable_thinking"
+vocabulary = ["false", "true"]
+
+[model.reasoning.map]
+off = "false"
+low = "true"
+medium = "true"
+high = "true"
+max = "true"
+
+[errors]
+"Throttling.RateQuota" = { disposition = "shed_concurrency" }
+"InternalError" = { disposition = "retry_backoff" }
+"InvalidApiKey" = { disposition = "fatal", category = "quota" }

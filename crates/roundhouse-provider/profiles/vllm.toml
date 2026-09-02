@@ -1,0 +1,15 @@
+# vLLM — self-hosted OpenAI-compatible server, default port 8000 (stable,
+# long-documented vLLM `vllm serve` default).
+id = "vllm"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = true
+params = { mode = "allow_all", fields = [] }
+base_url = "http://localhost:8000/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"engine_busy" = { disposition = "shed_concurrency" }

@@ -1,0 +1,16 @@
+# LM Studio — local OpenAI-compatible server, default port 1234 (stable,
+# long-documented LM Studio default). A local dev tool: unknown fields
+# shouldn't hard-fail, so allow_raw_extra/allow_all.
+id = "lm-studio"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = true
+params = { mode = "allow_all", fields = [] }
+base_url = "http://localhost:1234/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"model_not_loaded" = { disposition = "fatal", category = "quota" }

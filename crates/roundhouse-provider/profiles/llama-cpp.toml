@@ -1,0 +1,15 @@
+# llama.cpp — self-hosted OpenAI-compatible server (`llama-server`), default
+# port 8080 (stable, long-documented llama.cpp default).
+id = "llama-cpp"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = true
+params = { mode = "allow_all", fields = [] }
+base_url = "http://localhost:8080/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"slot_unavailable" = { disposition = "shed_concurrency" }

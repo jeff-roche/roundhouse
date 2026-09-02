@@ -1,0 +1,15 @@
+# SGLang — self-hosted OpenAI-compatible server, default port 30000 (stable,
+# long-documented SGLang `python -m sglang.launch_server` default).
+id = "sglang"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = true
+params = { mode = "allow_all", fields = [] }
+base_url = "http://localhost:30000/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"engine_busy" = { disposition = "shed_concurrency" }

@@ -1,0 +1,18 @@
+# Ollama — self-hosted OpenAI-compatible /v1 surface, default port 11434
+# (stable, long-documented Ollama default). §9.4 gates the bespoke
+# `ollama-native` codec as conditional and unneeded so far; this profile
+# targets Ollama's OpenAI-compat surface via the already-frozen
+# `openai-chat` codec.
+id = "ollama"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = true
+params = { mode = "allow_all", fields = [] }
+base_url = "http://localhost:11434/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"model_not_found" = { disposition = "fatal", category = "quota" }
