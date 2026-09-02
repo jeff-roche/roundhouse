@@ -365,7 +365,7 @@ impl HttpTransport for LeakyFailingTransport {
         Box::pin(async {
             Err(TransportError::Io(
                 "error sending request for url \
-                 (https://gateway.example.invalid/v1/responses?api_key=sk-should-be-redacted-1234567890)"
+                 (https://gwuser:gwpass@gateway.example.invalid/v1/responses?key=gw-live-9f2b8c1d4e6a7b3c)"
                     .into(),
             ))
         })
@@ -387,12 +387,20 @@ impl HttpTransport for LeakyFailingTransport {
 /// the whole embedded URL to `host[:port]` before `redact_error_body` ever
 /// runs -- the secret is gone via URL replacement, not via a labeled-field
 /// match, so no `"[REDACTED-KEY]"` marker is left behind to assert on.
-/// Updated to assert what actually matters and what
-/// `conformance_cohere_v2.rs`'s identical-shape regression test already
-/// asserts: the secret is gone, and the host survives for diagnosability.
+///
+/// Fix round 6, J1: the fixture itself was still a second, independent
+/// coincidence on top of the one above -- `sk-should-be-redacted-1234567890`
+/// is *also* `sk-`-shaped, so `API_KEY_SHAPED` alone caught it even with
+/// `redact_transport_error_text` reverted back to plain `redact_error_body`
+/// (REALITY-CORRECTIONS §15). The fixture below uses a secret no other
+/// matcher in `audit/redact.rs` recognizes on its own (no `sk-`/`pk-`/`rk-`
+/// prefix, not a labeled `api_key`/`access_token`/`client_secret` field) and
+/// puts it behind a URL carrying userinfo AND a differently-named query
+/// param, so the only way this test can pass is via the URL-reduction
+/// guarantee itself.
 #[tokio::test]
 async fn a_transport_failure_never_leaks_a_key_shaped_string_from_the_url() {
-    const SECRET: &str = "sk-should-be-redacted-1234567890";
+    const SECRET: &str = "gw-live-9f2b8c1d4e6a7b3c";
     let ctx = RequestCtx {
         trace_id: None,
         transport: Arc::new(LeakyFailingTransport),
@@ -413,6 +421,10 @@ async fn a_transport_failure_never_leaks_a_key_shaped_string_from_the_url() {
     assert!(
         rendered.contains("gateway.example.invalid"),
         "the host itself is not secret and should stay, for diagnosability: {rendered}"
+    );
+    assert!(
+        !rendered.contains("gwuser:gwpass"),
+        "URL userinfo must not survive into a persisted error field: {rendered}"
     );
 }
 

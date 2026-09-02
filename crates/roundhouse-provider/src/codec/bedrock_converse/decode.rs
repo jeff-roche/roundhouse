@@ -27,6 +27,7 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::audit::redact_transport_error_text;
 use crate::stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 use crate::transport::eventstream::{EventStreamDecodeError, EventStreamDecoder};
 use crate::TransportError;
@@ -122,9 +123,9 @@ pub async fn decode_bedrock_converse_stream(
             Err(e) => {
                 return Err(StreamFailure {
                     code: None,
-                    message: format!(
+                    message: redact_transport_error_text(&format!(
                         "transport error while decoding the bedrock-converse eventstream: {e}"
-                    ),
+                    )),
                 })
             }
         };
@@ -148,7 +149,9 @@ pub async fn decode_bedrock_converse_stream(
             Err(e) => {
                 return Err(StreamFailure {
                     code: None,
-                    message: format!("eventstream framing error: {e}"),
+                    message: redact_transport_error_text(&format!(
+                        "eventstream framing error: {e}"
+                    )),
                 })
             }
         };
@@ -844,5 +847,35 @@ mod stream_decode_tests {
         let failure = expect_stream_failure(decode_bedrock_converse_stream(body(&[message])).await);
         assert_eq!(failure.code.as_deref(), Some("InternalError"));
         assert_eq!(failure.message, "something broke");
+    }
+
+    /// Fix round 6, J3: the transport-error branch built `StreamFailure.message`
+    /// from a bare `{e}` interpolation. That leaked nothing in production only
+    /// because `errors.rs::classify` hardcodes `body_snippet: String::new()` --
+    /// a downstream dead end, not a guarantee at the source. Now wrapped in
+    /// `redact_transport_error_text`.
+    #[tokio::test]
+    async fn a_transport_error_redacts_a_credentialed_url() {
+        let failing = stream::iter(vec![Err(crate::TransportError::Io(
+            "error sending request for url \
+             (https://gwuser:gwpass@gateway.example.invalid/v1?key=gw-live-9f2b8c1d4e6a7b3c)"
+                .to_string(),
+        ))]);
+        let failure = expect_stream_failure(decode_bedrock_converse_stream(failing).await);
+        assert!(
+            !failure.message.contains("gw-live-9f2b8c1d4e6a7b3c"),
+            "the key-shaped query value leaked unredacted: {}",
+            failure.message
+        );
+        assert!(
+            !failure.message.contains("gwuser:gwpass"),
+            "URL userinfo leaked unredacted: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("gateway.example.invalid"),
+            "the host itself is not secret and should survive for diagnosability: {}",
+            failure.message
+        );
     }
 }

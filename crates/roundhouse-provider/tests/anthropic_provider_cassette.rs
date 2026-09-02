@@ -349,6 +349,68 @@ async fn a_transport_failure_is_a_transport_error_that_omits_the_api_key() {
     );
 }
 
+/// A transport that always fails with an error message shaped like a leaked
+/// gateway API key -- the shape `reqwest`'s `Display` actually produces
+/// (`" for url ({url})"`, userinfo and query string included), straight into
+/// `TransportError::Io`. Distinct from `FailingTransport` above: that one's
+/// message carries no URL at all, so it can't exercise the URL-reduction half
+/// of `redact_transport_error_text`.
+struct LeakyFailingTransport;
+
+impl HttpTransport for LeakyFailingTransport {
+    fn send<'a>(
+        &'a self,
+        _req: HttpRequest,
+    ) -> BoxFuture<'a, Result<HttpResponseStream, TransportError>> {
+        Box::pin(async {
+            Err(TransportError::Io(
+                "error sending request for url \
+                 (https://gwuser:gwpass@gateway.example.invalid/v1/messages?key=gw-live-9f2b8c1d4e6a7b3c)"
+                    .into(),
+            ))
+        })
+    }
+}
+
+/// Fix round 6, J4: `base_url` is only ever set by `::new()` today (a fixed,
+/// non-secret literal), so this sink (`anthropic_provider.rs`'s `send(..)`
+/// error path) had no live exposure -- but the field is `pub`, and its own
+/// doc comment says the §9.9 `ROUNDHOUSE_<PROVIDER>_BASE_URL` override "will
+/// set this field", at which point a gateway URL carrying credentials would
+/// flow straight into this error. Now routed through the same
+/// `redact_transport_error_text` every other codec's transport-error sinks
+/// use.
+#[tokio::test]
+async fn a_transport_failure_never_leaks_a_key_shaped_string_from_the_url() {
+    const SECRET: &str = "gw-live-9f2b8c1d4e6a7b3c";
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(LeakyFailingTransport),
+        api_key: "test-key".into(),
+        credentials: None,
+    };
+
+    let err = expect_err(
+        AnthropicMessagesProvider::new()
+            .stream_chat(&sample_request(), &ctx)
+            .await,
+    );
+
+    let rendered = format!("{err} / {err:?}");
+    assert!(
+        !rendered.contains(SECRET),
+        "the key-shaped string leaked into a ProviderError unredacted: {rendered}"
+    );
+    assert!(
+        rendered.contains("gateway.example.invalid"),
+        "the host itself is not secret and should stay, for diagnosability: {rendered}"
+    );
+    assert!(
+        !rendered.contains("gwuser:gwpass"),
+        "URL userinfo must not survive into a persisted error field: {rendered}"
+    );
+}
+
 /// `count_tokens` needs a second endpoint this task does not build; it must say
 /// so rather than silently returning a wrong (zero) count that a caller would
 /// use for budgeting.

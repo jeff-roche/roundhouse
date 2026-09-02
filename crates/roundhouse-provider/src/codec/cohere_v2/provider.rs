@@ -13,7 +13,7 @@
 
 use super::decode::{decode_cohere_v2_stream, StreamFailure, StreamFailureKind};
 use super::encode::{contains_unencodable_media, encode, requests_unsupported_tool_choice};
-use crate::audit::redact_transport_error_text;
+use crate::audit::{redact_error_body, redact_transport_error_text};
 use crate::credential::{resolve_base_url, CredentialCtx};
 use crate::errors::classify;
 use crate::ir::{
@@ -235,10 +235,20 @@ fn build_endpoint_url(base: &url::Url) -> url::Url {
 /// passed transport error -- never the model's own generated content, which
 /// only ever flows into the separate `partial_text` field this event does
 /// not log.
+///
+/// Fix round 6, J2: no construction site in `decode.rs` echoes untrusted
+/// wire text into this field today, so this codec has no live exposure --
+/// but `openai_chat::provider`'s identical `warn!` site did (a
+/// `sanitize_untrusted_wire_string`-only, unredacted in-band error message),
+/// and the two functions are maintained as mirrors of each other. Wrapping
+/// this log site in `redact_error_body` too makes "this event never carries
+/// an unredacted secret" a structural property of the log site rather than
+/// something that depends on every `decode.rs` construction site staying
+/// disciplined forever.
 fn stream_failure_to_provider_error(failure: StreamFailure) -> ProviderError {
     tracing::warn!(
         kind = ?failure.kind,
-        message = %failure.message,
+        message = %redact_error_body(&failure.message),
         "cohere-v2 stream failed mid-generation"
     );
     match failure.kind {

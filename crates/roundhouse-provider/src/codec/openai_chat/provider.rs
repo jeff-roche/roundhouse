@@ -247,10 +247,22 @@ impl Provider for OpenAiChatProvider {
 /// ("user-visible degrades"). `debug!` also would not survive an eventual
 /// default `EnvFilter` (which typically admits `info` and above), silently
 /// discarding the one diagnostic this fix exists to make observable.
+///
+/// Fix round 6, J2: `warn!` surviving a default `EnvFilter` is exactly why
+/// `failure.message` cannot ride along unredacted here. `decode.rs`'s
+/// `StreamFailureKind::Error` arm builds this message from a provider's own
+/// in-band `{"error": {...}}` frame via `sanitize_untrusted_wire_string`,
+/// which caps length and `{:?}`-escapes control characters but performs no
+/// redaction -- a provider echoing the request back (`audit/redact.rs`'s own
+/// module doc: "more often than you'd like") can carry an `sk-`-shaped key or
+/// a `Bearer` token straight into this event. Routed through
+/// `redact_error_body` at the log site itself, not only at construction, so
+/// the guarantee holds regardless of which `StreamFailureKind` arm produced
+/// the message.
 fn stream_failure_to_provider_error(failure: StreamFailure) -> ProviderError {
     tracing::warn!(
         kind = ?failure.kind,
-        message = %failure.message,
+        message = %redact_error_body(&failure.message),
         "openai-chat stream failed mid-generation"
     );
     match failure.kind {
@@ -455,6 +467,52 @@ mod stream_failure_diagnosability_tests {
         assert!(
             !captured.iter().any(|line| line.contains("TOP SECRET")),
             "the model's partial output must never be logged: {captured:?}"
+        );
+    }
+
+    /// Fix round 6, J2: `decode.rs`'s `StreamFailureKind::Error` arm builds
+    /// `message` straight from a provider's own in-band `{"error": {...}}`
+    /// frame, passed only through `sanitize_untrusted_wire_string` (length
+    /// cap + `{:?}` escaping -- no redaction). A gateway echoing the request
+    /// back in that frame (`audit/redact.rs`'s own module doc: "more often
+    /// than you'd like") can carry an `sk-`-shaped key or a `Bearer` token
+    /// straight into this `warn!` event, which -- unlike `debug!` -- survives
+    /// a default `EnvFilter`. This proves the log site itself redacts,
+    /// regardless of which `StreamFailureKind` produced the message.
+    #[test]
+    fn a_key_shaped_token_in_an_in_band_error_frame_does_not_reach_the_event() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CapturingSubscriber {
+            lines: lines.clone(),
+        };
+        let failure = StreamFailure {
+            kind: StreamFailureKind::Error,
+            message: "openai-chat stream carried an in-band error frame: \
+                      \"invalid Authorization header: Bearer sk-live-abcdefgh12345678\""
+                .into(),
+            partial_text: String::new(),
+        };
+
+        let provider_err = tracing::subscriber::with_default(subscriber, || {
+            stream_failure_to_provider_error(failure)
+        });
+        assert!(matches!(
+            provider_err,
+            ProviderError::Server { status: 500 }
+        ));
+
+        let captured = lines.lock().unwrap();
+        assert!(
+            !captured
+                .iter()
+                .any(|line| line.contains("sk-live-abcdefgh12345678")),
+            "an sk-shaped key leaked into the tracing event unredacted: {captured:?}"
+        );
+        assert!(
+            !captured
+                .iter()
+                .any(|line| line.contains("Bearer sk-live-abcdefgh12345678")),
+            "a Bearer token leaked into the tracing event unredacted: {captured:?}"
         );
     }
 }

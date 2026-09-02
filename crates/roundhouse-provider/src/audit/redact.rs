@@ -132,9 +132,34 @@ static EMBEDDED_URL: LazyLock<Regex> =
 /// [`redact_error_body`] directly (the gap the previous paragraph's "was
 /// false" already flagged for `openai_chat::decode`'s doc claim, but the
 /// `provider.rs` sinks in all four files had the identical bug, not just the
-/// comment). H1 switched all twelve of those sinks to this function, so the
-/// claim in this doc comment's first paragraph is now actually true for
-/// every codec in this crate, not merely stated.
+/// comment). H1 switched all twelve of those sinks to this function.
+///
+/// Fix round 6, J5 narrows what "every codec in this crate" actually means,
+/// rather than repeating a blanket claim of the same shape that let the
+/// original gap sit undetected for four rounds. What is covered, concretely,
+/// as of fix round 6:
+///
+/// - Every `ProviderError::Transport` construction site in this crate that
+///   can carry a `TransportError`'s or a credential/base-URL-resolution
+///   error's text -- all three `provider.rs` sinks in each of
+///   `anthropic_provider`, `openai_chat`, `cohere_v2`, `google_genai`,
+///   `openai_responses`, and `bedrock_converse` -- now routes through this
+///   function (J4 closed the one remaining gap, `anthropic_provider.rs`'s
+///   `send(..)` sink; its status-only `Transport(format!("...{status}"))`
+///   sink carries no error text and needs no redaction).
+/// - Every mid-stream `StreamFailure.message` (or equivalent) construction
+///   site that echoes a transport/framing error's `{e}` text directly --
+///   `google_genai::decode`'s two SSE-transport-error sites and
+///   `bedrock_converse::decode`'s transport-error and eventstream-framing-
+///   error sites (fix round 6, J3) -- also routes through this function.
+///
+/// Not covered by this function, by design: a mid-stream in-band failure
+/// frame's *own* diagnostic text (e.g. `openai_chat::decode`'s
+/// `StreamFailureKind::Error` message, built from a provider's own
+/// `{"error": {...}}` frame) carries no embedded URL to reduce, so it is
+/// redacted via [`redact_error_body`] alone, applied at the `tracing::warn!`
+/// log site in `openai_chat::provider`/`cohere_v2::provider` (fix round 6,
+/// J2) rather than at construction.
 pub(crate) fn redact_transport_error_text(raw: &str) -> String {
     let url_redacted = EMBEDDED_URL.replace_all(raw, |caps: &Captures| {
         crate::credential::record_base_url_override(&caps[0])

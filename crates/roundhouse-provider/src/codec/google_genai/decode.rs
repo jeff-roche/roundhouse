@@ -16,6 +16,7 @@ use sse_stream::SseStream;
 use std::collections::HashSet;
 
 use super::EndpointMode;
+use crate::audit::redact_transport_error_text;
 use crate::stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 use crate::TransportError;
 
@@ -118,9 +119,9 @@ async fn decode_interactions_stream(
             Err(e) => {
                 return Err(StreamFailure {
                     code: None,
-                    message: format!(
+                    message: redact_transport_error_text(&format!(
                         "SSE transport error while decoding the interaction stream: {e}"
-                    ),
+                    )),
                 })
             }
         };
@@ -402,7 +403,9 @@ async fn decode_generate_content_stream(
             Err(e) => {
                 return Err(StreamFailure {
                     code: None,
-                    message: format!("SSE transport error while decoding the response stream: {e}"),
+                    message: redact_transport_error_text(&format!(
+                        "SSE transport error while decoding the response stream: {e}"
+                    )),
                 })
             }
         };
@@ -903,6 +906,81 @@ mod interactions_terminal_tests {
             ),
             "the first REAL block must land on index 0, not 1 -- the earlier \
              unrecognized step must not have consumed an index"
+        );
+    }
+}
+
+#[cfg(test)]
+mod transport_error_redaction_tests {
+    //! Fix round 6, J3: `decode_interactions_stream`/
+    //! `decode_generate_content_stream` build `StreamFailure.message` from a
+    //! bare `{e}` interpolation of the underlying `TransportError`. That
+    //! leaked nothing in production only because `errors.rs::classify`
+    //! hardcodes `body_snippet: String::new()` -- a field documented as
+    //! empty "only because no redaction pass existed yet" -- so the
+    //! guarantee must live at the source, not rest on that downstream dead
+    //! end. Both sites now wrap the message in `redact_transport_error_text`.
+    use super::{decode_generate_content_stream, decode_interactions_stream};
+    use crate::TransportError;
+    use futures::stream;
+
+    fn failing_body(
+        message: &str,
+    ) -> impl futures::Stream<Item = Result<bytes::Bytes, TransportError>> {
+        stream::iter(vec![Err(TransportError::Io(message.to_string()))])
+    }
+
+    #[tokio::test]
+    async fn interactions_stream_redacts_a_transport_error_carrying_a_credentialed_url() {
+        let body = failing_body(
+            "error sending request for url \
+             (https://gwuser:gwpass@gateway.example.invalid/v1?key=gw-live-9f2b8c1d4e6a7b3c)",
+        );
+        let failure = match decode_interactions_stream(body).await {
+            Ok(_) => panic!("a transport error must surface as a StreamFailure"),
+            Err(failure) => failure,
+        };
+        assert!(
+            !failure.message.contains("gw-live-9f2b8c1d4e6a7b3c"),
+            "the key-shaped query value leaked unredacted: {}",
+            failure.message
+        );
+        assert!(
+            !failure.message.contains("gwuser:gwpass"),
+            "URL userinfo leaked unredacted: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("gateway.example.invalid"),
+            "the host itself is not secret and should survive for diagnosability: {}",
+            failure.message
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_content_stream_redacts_a_transport_error_carrying_a_credentialed_url() {
+        let body = failing_body(
+            "error sending request for url \
+             (https://gwuser:gwpass@gateway.example.invalid/v1?key=gw-live-9f2b8c1d4e6a7b3c)",
+        );
+        let failure = match decode_generate_content_stream(body).await {
+            Ok(_) => panic!("a transport error must surface as a StreamFailure"),
+            Err(failure) => failure,
+        };
+        assert!(
+            !failure.message.contains("gw-live-9f2b8c1d4e6a7b3c"),
+            "the key-shaped query value leaked unredacted: {}",
+            failure.message
+        );
+        assert!(
+            !failure.message.contains("gwuser:gwpass"),
+            "URL userinfo leaked unredacted: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("gateway.example.invalid"),
+            "the host itself is not secret and should survive for diagnosability: {}",
+            failure.message
         );
     }
 }
