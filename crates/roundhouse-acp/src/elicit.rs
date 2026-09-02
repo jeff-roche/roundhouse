@@ -38,9 +38,33 @@ pub struct ElicitRequest {
     pub prompt: String,
 }
 
+/// Carries the same [`ElicitationSource`] identity as the [`ElicitRequest`]
+/// it answers. Without this, `complete_acp`/`complete_mcp` would have no
+/// way to check that a response actually answers the request it's paired
+/// with at the call site — a response for one elicitation could be routed
+/// to complete a different, unrelated one that happens to share a
+/// protocol. `for_request` is the recommended constructor: it copies the
+/// source off the request being answered, so a caller has to go out of its
+/// way to construct a mismatched pairing rather than doing so by accident.
+///
+/// Replay/dedup (the same `elicitation_id`/`request_state` answered twice)
+/// is caller state this module does not track — it is out of scope here,
+/// not silently assumed to be handled.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElicitResponse {
+    pub source: ElicitationSource,
     pub value: Value,
+}
+
+impl ElicitResponse {
+    /// Builds a response bound to `req`'s source, so the pairing check in
+    /// `complete_acp`/`complete_mcp` succeeds by construction.
+    pub fn for_request(req: &ElicitRequest, value: Value) -> Self {
+        ElicitResponse {
+            source: req.source.clone(),
+            value,
+        }
+    }
 }
 
 pub fn normalize_acp_elicitation(
@@ -72,22 +96,42 @@ pub fn normalize_mcp_elicitation(
 }
 
 /// Returns the ACP `elicitationId` to pass to `elicitation/complete`, or
-/// `None` if this request originated from MCP (in which case `complete_mcp`
-/// is the correct completion path instead).
-pub fn complete_acp(req: &ElicitRequest, _resp: &ElicitResponse) -> Option<String> {
-    match &req.source {
-        ElicitationSource::Acp { elicitation_id } => Some(elicitation_id.clone()),
-        ElicitationSource::Mcp { .. } => None,
+/// `None` if either this request didn't originate from ACP (in which case
+/// `complete_mcp` is the correct completion path instead) or `resp` doesn't
+/// answer `req` — its `source` must carry the *same* `elicitation_id`, not
+/// merely be `Acp { .. }`, otherwise one elicitation's answer could
+/// complete a different one.
+pub fn complete_acp(req: &ElicitRequest, resp: &ElicitResponse) -> Option<String> {
+    match (&req.source, &resp.source) {
+        (
+            ElicitationSource::Acp {
+                elicitation_id: req_id,
+            },
+            ElicitationSource::Acp {
+                elicitation_id: resp_id,
+            },
+        ) if req_id == resp_id => Some(req_id.clone()),
+        _ => None,
     }
 }
 
 /// Returns the opaque `requestState` to echo back on the retried
-/// `tools/call`/`prompts/get`/`resources/read`, or `None` if this request
-/// originated from ACP.
-pub fn complete_mcp(req: &ElicitRequest, _resp: &ElicitResponse) -> Option<String> {
-    match &req.source {
-        ElicitationSource::Mcp { request_state } => Some(request_state.clone()),
-        ElicitationSource::Acp { .. } => None,
+/// `tools/call`/`prompts/get`/`resources/read`, or `None` if either this
+/// request didn't originate from MCP (in which case `complete_acp` is the
+/// correct completion path instead) or `resp` doesn't answer `req` — its
+/// `source` must carry the *same* `request_state`, not merely be
+/// `Mcp { .. }`.
+pub fn complete_mcp(req: &ElicitRequest, resp: &ElicitResponse) -> Option<String> {
+    match (&req.source, &resp.source) {
+        (
+            ElicitationSource::Mcp {
+                request_state: req_state,
+            },
+            ElicitationSource::Mcp {
+                request_state: resp_state,
+            },
+        ) if req_state == resp_state => Some(req_state.clone()),
+        _ => None,
     }
 }
 
@@ -103,5 +147,42 @@ pub fn task_kind() -> TaskKind {
 pub fn suspend_reason(req: &ElicitRequest) -> SuspendReason {
     SuspendReason::AwaitingElicitation {
         schema: req.schema.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn response_for_request_completes_the_request_it_was_built_from() {
+        let req = normalize_acp_elicitation("elicit-1", &json!({"type": "boolean"}), "Approve?");
+        let resp = ElicitResponse::for_request(&req, json!(true));
+        assert_eq!(complete_acp(&req, &resp), Some("elicit-1".to_string()));
+    }
+
+    #[test]
+    fn response_with_a_different_acp_elicitation_id_does_not_complete() {
+        let req = normalize_acp_elicitation("elicit-1", &json!({"type": "boolean"}), "Approve?");
+        let resp = ElicitResponse {
+            source: ElicitationSource::Acp {
+                elicitation_id: "elicit-2".to_string(),
+            },
+            value: json!(true),
+        };
+        assert_eq!(complete_acp(&req, &resp), None);
+    }
+
+    #[test]
+    fn response_with_a_different_mcp_request_state_does_not_complete() {
+        let req = normalize_mcp_elicitation("state-1", &json!({"type": "boolean"}), "Approve?");
+        let resp = ElicitResponse {
+            source: ElicitationSource::Mcp {
+                request_state: "state-2".to_string(),
+            },
+            value: json!(true),
+        };
+        assert_eq!(complete_mcp(&req, &resp), None);
     }
 }

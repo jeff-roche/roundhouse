@@ -21,24 +21,59 @@ fn both_shapes_normalize_into_the_same_elicit_request_type() {
 #[test]
 fn completion_routes_back_through_the_original_protocols_correlation_mechanism() {
     let acp_req = normalize_acp_elicitation("elicit-123", &json!({"type": "boolean"}), "Approve?");
-    let resp = ElicitResponse { value: json!(true) };
+    let acp_resp = ElicitResponse::for_request(&acp_req, json!(true));
     assert_eq!(
-        complete_acp(&acp_req, &resp),
+        complete_acp(&acp_req, &acp_resp),
         Some("elicit-123".to_string())
     );
     assert_eq!(
-        complete_mcp(&acp_req, &resp),
+        complete_mcp(&acp_req, &acp_resp),
         None,
         "an ACP-sourced request never produces an MCP requestState echo"
     );
 
     let mcp_req =
         normalize_mcp_elicitation("opaque-state-blob", &json!({"type": "boolean"}), "Approve?");
+    let mcp_resp = ElicitResponse::for_request(&mcp_req, json!(true));
     assert_eq!(
-        complete_mcp(&mcp_req, &resp),
+        complete_mcp(&mcp_req, &mcp_resp),
         Some("opaque-state-blob".to_string())
     );
-    assert_eq!(complete_acp(&mcp_req, &resp), None);
+    assert_eq!(complete_acp(&mcp_req, &mcp_resp), None);
+}
+
+#[test]
+fn a_response_built_for_one_acp_request_does_not_complete_a_different_one() {
+    let req_a = normalize_acp_elicitation("elicit-a", &json!({"type": "boolean"}), "Approve?");
+    let req_b = normalize_acp_elicitation("elicit-b", &json!({"type": "boolean"}), "Approve?");
+    let resp_for_b = ElicitResponse::for_request(&req_b, json!(true));
+
+    assert_eq!(
+        complete_acp(&req_a, &resp_for_b),
+        None,
+        "req_a must not be completed by a response minted for req_b"
+    );
+    assert_eq!(
+        complete_acp(&req_b, &resp_for_b),
+        Some("elicit-b".to_string())
+    );
+}
+
+#[test]
+fn a_response_built_for_one_mcp_request_does_not_complete_a_different_one() {
+    let req_a = normalize_mcp_elicitation("state-a", &json!({"type": "boolean"}), "Approve?");
+    let req_b = normalize_mcp_elicitation("state-b", &json!({"type": "boolean"}), "Approve?");
+    let resp_for_b = ElicitResponse::for_request(&req_b, json!(true));
+
+    assert_eq!(
+        complete_mcp(&req_a, &resp_for_b),
+        None,
+        "req_a must not be completed by a response minted for req_b"
+    );
+    assert_eq!(
+        complete_mcp(&req_b, &resp_for_b),
+        Some("state-b".to_string())
+    );
 }
 
 #[test]
