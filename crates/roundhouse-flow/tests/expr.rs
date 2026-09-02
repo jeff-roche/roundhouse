@@ -470,19 +470,79 @@ fn excessive_function_call_nesting_is_a_typed_error_not_a_stack_overflow() {
 // path — reached once a chain's root has already left `ctx`'s borrow, e.g.
 // via `default(...)` — had its own, separate quadratic defect (S-Imp-1),
 // which this borrowed-only test could not have caught and did not claim
-// to. ----
+// to.
+//
+// Fix round 2, item 4: both tests used to compare wall-clock time at two
+// depths against an identical `< 40.0x` ratio — the same fragile shape
+// twice, which is what round 1's own brief asked to move away from and
+// round 2 faulted for doubling instead of reducing. Two non-wall-clock
+// alternatives were considered and rejected, for concrete reasons, not by
+// default:
+//
+// - **An allocation-byte-count via a custom `#[global_allocator]`** would
+//   measure the real defect directly (a per-step whole-remaining-subtree
+//   clone allocates memory proportional to what it clones, which a timer
+//   only sees indirectly) — this was actually implemented and measured
+//   during this fix round, and it worked. It was reverted because it
+//   requires `unsafe impl GlobalAlloc`, and this workspace forbids unsafe
+//   code everywhere via a workspace-level lint (`unsafe_code = "forbid"` in
+//   the root `Cargo.toml`, applied here through `[lints] workspace = true`)
+//   — confirmed by actually attempting the build, not assumed: `cargo test`
+//   on the implementation rejected it with "implementation of an `unsafe`
+//   method ... requested on the command line with `-F unsafe-code`". This is
+//   a hard constraint recorded in `AGENTS.md` ("`#![forbid(unsafe_code)]`
+//   everywhere except one confined module in `roundhouse-sandbox`"), not a
+//   style preference this fix round can waive for its own test binary.
+// - **A hand-rolled operation counter** (e.g. a `#[cfg(test)]` `Cell<usize>`
+//   incremented inside `index_field`/`index_array`) was considered and
+//   rejected on a different ground: counting *how many times* the
+//   owned-chain arms run is `O(depth)` in both the fixed and the pre-fix
+//   code — the defect was never about call *count*, it was about the *size*
+//   of what each call cloned. A counter that only counts calls would not
+//   actually detect a regression back to `.cloned()`; it would report the
+//   same fixed, small number in both cases and pass either way, which is
+//   worse than the flake it would replace: a green test that cannot fail on
+//   the exact regression it exists to catch, right up until someone
+//   trusts it.
+//
+// What is done instead: each measurement below takes the **minimum** of
+// several repeated timings at each depth (noise from CPU scheduling or
+// machine load can only ever add time, never subtract it, so the minimum
+// across repetitions converges toward the noise-free cost — the same
+// technique benchmarking harnesses such as Criterion use), and the depth
+// ratio between the two measurements is widened well past what round 1
+// used, so that expected-linear and would-be-quadratic scaling separate by
+// orders of magnitude rather than by single-digit multiples, leaving a wide
+// dead zone in between for the assertion threshold to sit in without being
+// close to either. Still wall-clock, and said so plainly rather than
+// re-labelled — but a materially more robust measurement of the same
+// property, not a second copy of the fragile one. ----
+
+/// Runs `f` `tries` times and returns the minimum elapsed duration —
+/// scheduling noise and machine load can only slow a given run down, never
+/// speed it up, so the minimum across several tries is the closest available
+/// approximation of the noise-free cost. See the block comment above for why
+/// this replaces a single-shot wall-clock measurement here.
+fn min_elapsed(tries: usize, mut f: impl FnMut()) -> std::time::Duration {
+    (0..tries)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            f();
+            start.elapsed()
+        })
+        .min()
+        .expect("tries > 0")
+}
 
 #[test]
 fn long_flat_expressions_over_the_borrowed_chain_path_do_not_show_quadratic_blowup() {
-    use std::time::Instant;
-
+    // A deeply chained-but-flat property access: `pr.next.next...next`,
+    // rooted directly at the `pr` context variable so every step stays on
+    // the `Cow::Borrowed` path. This exercises parse_primary_chain's loop,
+    // never parse_ternary's recursion, so it is not bounded by
+    // MAX_EXPR_DEPTH and is the right shape to check for length-driven
+    // quadratic cost on this specific path.
     fn time_chain(depth: usize) -> std::time::Duration {
-        // A deeply chained-but-flat property access: `pr.next.next...next`,
-        // rooted directly at the `pr` context variable so every step stays
-        // on the `Cow::Borrowed` path. This exercises parse_primary_chain's
-        // loop, never parse_ternary's recursion, so it is not bounded by
-        // MAX_EXPR_DEPTH and is the right shape to check for length-driven
-        // quadratic cost on this specific path.
         let mut inner = json!("bottom");
         for _ in 0..depth {
             inner = json!({ "next": inner });
@@ -493,11 +553,9 @@ fn long_flat_expressions_over_the_borrowed_chain_path_do_not_show_quadratic_blow
         for _ in 0..depth {
             path.push_str(".next");
         }
-        let start = Instant::now();
-        for _ in 0..20 {
+        min_elapsed(9, || {
             let _ = eval(&path, &c).unwrap();
-        }
-        start.elapsed()
+        })
     }
 
     // Depths kept well under the ~2,000-4,000-level range where a
@@ -505,24 +563,22 @@ fn long_flat_expressions_over_the_borrowed_chain_path_do_not_show_quadratic_blow
     // overflow the stack on its own (measured separately, unrelated to
     // this parser — see the module doc comment's "Cost" section) so this
     // test measures parsing/evaluation cost, not `Value`'s drop cost.
-    let small = time_chain(150);
-    let large = time_chain(1_200); // 8x the length
-                                   // A quadratic implementation would show roughly a 64x slowdown here;
-                                   // allow generous headroom for scheduling noise while still catching a
-                                   // real quadratic blowup. If this ever flakes under load, that is a
-                                   // signal to re-measure, not to raise the ratio silently.
+    let small = time_chain(80);
+    let large = time_chain(1_600); // 20x the length
     let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
+    // A linear implementation lands near 20x; a quadratic one lands near
+    // 400x. 150x sits in the wide gap between the two rather than close to
+    // either, so ordinary noise on a linear run (even several-fold, which
+    // min-of-9 already suppresses) cannot cross it.
     assert!(
-        ratio < 40.0,
-        "expected roughly linear scaling (~8x for an 8x length increase), measured {ratio}x \
+        ratio < 150.0,
+        "expected roughly linear scaling (~20x for a 20x length increase), measured {ratio}x \
          (small={small:?}, large={large:?})"
     );
 }
 
 #[test]
 fn long_flat_expressions_over_the_owned_chain_path_do_not_show_quadratic_blowup() {
-    use std::time::Instant;
-
     // Regression for S-Imp-1: `default(missing, pr)` flips the chain's root
     // from `Cow::Borrowed` to `Cow::Owned` (since `default` always returns
     // an owned `Value`), then `.next` is walked `depth` times entirely on
@@ -544,20 +600,20 @@ fn long_flat_expressions_over_the_owned_chain_path_do_not_show_quadratic_blowup(
         for _ in 0..depth {
             path.push_str(".next");
         }
-        let start = Instant::now();
-        let _ = eval(&path, &c).unwrap();
-        start.elapsed()
+        min_elapsed(9, || {
+            let _ = eval(&path, &c).unwrap();
+        })
     }
 
-    let small = time_owned_chain(50);
-    let large = time_owned_chain(400); // 8x the length
-                                       // Same generous headroom as the borrowed-path test above, for the same
-                                       // reason: this catches a real quadratic regression without flaking on
-                                       // scheduling noise.
+    let small = time_owned_chain(30);
+    let large = time_owned_chain(600); // 20x the length
     let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
+    // Same widened margin and same reasoning as the borrowed-path test
+    // above: ~20x expected for linear scaling, ~400x for a quadratic
+    // regression, 150x sitting well clear of both.
     assert!(
-        ratio < 40.0,
-        "expected roughly linear scaling (~8x for an 8x length increase) on the owned chain \
+        ratio < 150.0,
+        "expected roughly linear scaling (~20x for a 20x length increase) on the owned chain \
          path, measured {ratio}x (small={small:?}, large={large:?})"
     );
 }
