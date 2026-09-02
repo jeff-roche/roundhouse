@@ -21,7 +21,7 @@ use serde_json::Value;
 use sse_stream::SseStream;
 use std::collections::HashSet;
 
-use crate::audit::redact_error_body;
+use crate::audit::redact_transport_error_text;
 use crate::stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 use crate::TransportError;
 
@@ -156,8 +156,11 @@ pub struct StreamFailure {
     /// How `provider.rs` should map this into a `ProviderError`.
     pub kind: StreamFailureKind,
     /// A human-readable description of the failure. Redacted for the
-    /// `Transport` kind, since a mid-stream transport error's text can
-    /// embed the full request URL, query string and all.
+    /// `Transport` kind via the shared `crate::audit::redact_transport_error_text`
+    /// (fix round 4, R4 -- not merely `crate::audit::redact_error_body`, which
+    /// strips only labeled token/key-shaped secrets, not an embedded URL's
+    /// query string or userinfo), since a mid-stream transport error's text
+    /// can embed the full request URL verbatim.
     pub message: String,
     /// Text decoded before the failure occurred (`BlockDelta::Text`
     /// fragments, concatenated in first-seen order) -- lets `provider.rs`
@@ -285,12 +288,19 @@ pub async fn decode_openai_chat_stream(
         // identical fix. `e`'s `Display` can embed the full request URL
         // (query string, userinfo) verbatim, so it is redacted before it
         // ever reaches this `pub` field.
+        //
+        // Fix round 4, R4: redacted via the shared
+        // `crate::audit::redact_transport_error_text`, not
+        // `crate::audit::redact_error_body` alone -- the latter strips only
+        // labeled token/key-shaped secrets, not a URL's query string or
+        // userinfo, so the claim above was false until this codec started
+        // sharing `cohere_v2`'s real implementation of it.
         let frame = match frame {
             Ok(f) => f,
             Err(e) => {
                 return Err(StreamFailure {
                     kind: StreamFailureKind::Transport,
-                    message: redact_error_body(&format!(
+                    message: redact_transport_error_text(&format!(
                         "SSE transport error while decoding the openai-chat stream: {e}"
                     )),
                     partial_text: partial_text_from_events(&events),
@@ -316,7 +326,15 @@ pub async fn decode_openai_chat_stream(
         // deserialize it as a harmless-looking, entirely empty `Chunk` now
         // that `choices` has `#[serde(default)]`, silently discarding the
         // error).
-        if let Some(err_obj) = value.get("error") {
+        //
+        // Fix round 4, R1: `value.get("error")` returns `Some(&Value::Null)`
+        // for a chunk that explicitly serializes `"error": null` -- the
+        // default shape an SDK-generated OpenAI-*compatible* gateway emits
+        // on every normal chunk. Without the `is_null()` guard, EVERY such
+        // chunk was misclassified as an in-band failure and the model's
+        // real output was thrown away. Only a present, non-null `error`
+        // value is a genuine failure signal.
+        if let Some(err_obj) = value.get("error").filter(|v| !v.is_null()) {
             let message = err_obj
                 .get("message")
                 .and_then(Value::as_str)
@@ -532,6 +550,81 @@ mod decode_streaming_tests {
             failure.kind,
             super::StreamFailureKind::UnrecognizedFinishReason
         );
+    }
+
+    /// Fix round 4, R1: `value.get("error")` matches `Some(Value::Null)` --
+    /// serde_json's representation of an explicitly-`null` JSON key -- so an
+    /// OpenAI-*compatible* gateway that always serializes an optional
+    /// `error` field (`null` on every normal chunk, the default shape for
+    /// SDK-generated servers) had every one of its successful turns
+    /// misclassified as a `StreamFailureKind::Error` and thrown away, with
+    /// the model's actual output discarded. Only a non-null `error` value is
+    /// an in-band failure.
+    #[tokio::test]
+    async fn an_error_field_explicitly_set_to_null_is_not_treated_as_a_failure() {
+        let body = sse_body(&[
+            r#"{"error":null,"choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]);
+        let events = decode_openai_chat_stream(body)
+            .await
+            .expect("a null `error` field must not fail the decode");
+
+        let mut text = String::new();
+        for event in &events {
+            if let StreamEvent::BlockDelta {
+                delta: crate::stream_event::BlockDelta::Text(t),
+                ..
+            } = event
+            {
+                text.push_str(t);
+            }
+        }
+        assert_eq!(text, "a");
+    }
+
+    /// Fix round 4: re-check requested alongside R1 -- a normal completion
+    /// interleaved with a mid-stream `{"choices":[]}` frame (a legitimate
+    /// keep-alive-ish shape some backends send) and a final usage-only
+    /// chunk with NO `choices` key at all (relying on `Chunk.choices`'
+    /// `#[serde(default)]`) must all still succeed and the usage must still
+    /// decode -- proving R1's `is_null()` guard didn't over- or
+    /// under-shoot the failure classifier.
+    #[tokio::test]
+    async fn a_normal_completion_with_an_empty_choices_frame_and_a_choicesless_usage_frame_succeeds(
+    ) {
+        let body = sse_body(&[
+            r#"{"choices":[{"delta":{"role":"assistant","content":"hi there"}}]}"#,
+            r#"{"choices":[]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
+            "[DONE]",
+        ]);
+        let events = decode_openai_chat_stream(body)
+            .await
+            .expect("must decode successfully");
+
+        let mut text = String::new();
+        let mut usage_seen = None;
+        let mut saw_message_stop = false;
+        for event in &events {
+            match event {
+                StreamEvent::BlockDelta {
+                    delta: crate::stream_event::BlockDelta::Text(t),
+                    ..
+                } => text.push_str(t),
+                StreamEvent::UsageDelta {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => usage_seen = Some((*input_tokens, *output_tokens)),
+                StreamEvent::MessageStop => saw_message_stop = true,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "hi there");
+        assert_eq!(usage_seen, Some((Some(10), Some(2))));
+        assert!(saw_message_stop);
     }
 
     /// Fix round 3, Q3: a text preamble before a tool call is the common

@@ -13,7 +13,7 @@
 
 use super::decode::{decode_cohere_v2_stream, StreamFailure, StreamFailureKind};
 use super::encode::{contains_unencodable_media, encode, requests_unsupported_tool_choice};
-use super::redact_transport_error_text;
+use crate::audit::redact_transport_error_text;
 use crate::credential::{resolve_base_url, CredentialCtx};
 use crate::errors::classify;
 use crate::ir::{

@@ -90,3 +90,105 @@ pub fn redact_error_body(body: &str) -> String {
     let redacted = API_KEY_SHAPED.replace_all(&redacted, "[REDACTED-KEY]");
     redacted.into_owned()
 }
+
+/// Matches an embedded `http(s)://` URL inside a larger error-message string
+/// (fix round 1, L3 -- `cohere_v2`) -- `reqwest::Error`'s `Display` appends
+/// `for url (<full url>)` verbatim, query string and userinfo included, to a
+/// transport error's text. Stops at the first whitespace, parenthesis, or
+/// quote character, which is always where such an embedded URL ends in
+/// practice (a bare URL token, not URL-encoded punctuation of that shape).
+static EMBEDDED_URL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"https?://[^\s()'"]+"#).unwrap());
+
+/// Redacts a transport-error message for safe inclusion in a public error
+/// field: every embedded `http(s)://` URL is reduced to `host[:port]` via
+/// the same host-only helper `resolve_base_url` already uses before a
+/// base-URL override is ever persisted (`crate::credential::
+/// record_base_url_override`), THEN the result is passed through
+/// [`redact_error_body`] to catch anything else (a bearer token, an API key)
+/// the error text might otherwise echo.
+///
+/// Without this, a gateway base URL carrying credentials in its query
+/// string would leak them into a persisted error field. [`redact_error_body`]
+/// alone does NOT strip a URL's query string or userinfo (it only matches a
+/// labeled `api_key`/`access_token`/`client_secret`-shaped field of at least
+/// 16 chars), so a gateway base URL's bare `?key=abc123` matches neither.
+///
+/// Fix round 1, L3 introduced this in `cohere_v2::decode` for its mid-stream
+/// `StreamFailure.message`. Fix round 2, N2 promoted it to `cohere_v2::mod`
+/// so `cohere_v2::provider`'s three other transport-error sinks (base-URL
+/// resolution failure, credential-application failure, HTTP-send failure)
+/// could share it. Fix round 4, R4: hoisted here (a pure move -- no logic
+/// changes, this crate's `openai_chat::decode` made the identical claim
+/// about its own `Transport`-kind message without ever calling this
+/// function, which was false) so every codec in this crate shares the one
+/// real implementation instead of `cohere_v2` alone having it, or a second,
+/// weaker copy growing elsewhere.
+pub(crate) fn redact_transport_error_text(raw: &str) -> String {
+    let url_redacted = EMBEDDED_URL.replace_all(raw, |caps: &Captures| {
+        crate::credential::record_base_url_override(&caps[0])
+    });
+    redact_error_body(&url_redacted)
+}
+
+#[cfg(test)]
+mod redact_transport_error_text_tests {
+    //! Fix round 1, L3: `redact_transport_error_text` must strip an embedded
+    //! request URL down to host-only, on top of the crate's existing
+    //! secret-shape redaction. Moved verbatim from `cohere_v2::mod`'s
+    //! `redaction_tests` module (fix round 4, R4) -- unchanged.
+    use super::redact_transport_error_text;
+
+    #[test]
+    fn strips_query_string_and_userinfo_from_an_embedded_url() {
+        let raw = "transport io error: error sending request for url \
+                    (https://user:pass@gateway.example.com/proxy?key=abc123): \
+                    operation timed out";
+        let redacted = redact_transport_error_text(raw);
+        assert!(
+            !redacted.contains("abc123"),
+            "the query string's credential-shaped value must not survive: {redacted}"
+        );
+        assert!(
+            !redacted.contains("user:pass"),
+            "userinfo must not survive: {redacted}"
+        );
+        assert!(
+            redacted.contains("gateway.example.com"),
+            "the host itself is not secret and should stay, for diagnosability: {redacted}"
+        );
+        assert!(
+            redacted.contains("operation timed out"),
+            "the non-URL diagnostic text must survive redaction intact: {redacted}"
+        );
+    }
+
+    #[test]
+    fn a_message_with_no_url_at_all_passes_through_unchanged() {
+        let raw = "connection reset by peer";
+        assert_eq!(redact_transport_error_text(raw), raw);
+    }
+
+    /// The crate's general secret-shape redactor still applies on top of
+    /// the URL-stripping pass -- a bearer token appearing outside any URL
+    /// must also be caught.
+    #[test]
+    fn a_bearer_token_outside_any_url_is_still_redacted() {
+        let raw = "unauthorized: Authorization: Bearer sk-test-abcdefgh12345678";
+        let redacted = redact_transport_error_text(raw);
+        assert!(!redacted.contains("sk-test-abcdefgh12345678"));
+    }
+
+    /// Fix round 2, N2: the same helper `decode.rs` uses for its mid-stream
+    /// `StreamFailure.message` now also covers `provider.rs`'s three other
+    /// transport-error sinks -- a gateway base URL's query-string credential
+    /// must not survive a connection-failure error either.
+    #[test]
+    fn strips_a_gateway_query_string_from_a_connection_failure_message() {
+        let raw = "error trying to connect: dns error: failed to lookup address \
+                    information for url (https://gateway.example.com/proxy?key=abc123)";
+        let redacted = redact_transport_error_text(raw);
+        assert!(!redacted.contains("abc123"));
+        assert!(redacted.contains("gateway.example.com"));
+    }
+}

@@ -21,8 +21,27 @@ use std::path::Path;
 /// `encode_openai_chat`'s own top-level wire keys (see `encode.rs`) -- a
 /// reasoning `field` pointer whose first segment names one of these would
 /// silently overwrite that key instead of adding a new one.
-pub const RESERVED_REASONING_FIELD_KEYS: &[&str] =
-    &["model", "messages", "stream", "tools", "tool_choice"];
+///
+/// Fix round 4, R2: `max_tokens` (`encode.rs:143`), `temperature`
+/// (`encode.rs:146`), and `stop` (`encode.rs:150`) were missing. All three
+/// are written *conditionally* (only when the matching `req.params` field is
+/// `Some`) -- exactly why they were missed, and exactly why they're
+/// dangerous: a profile declaring `reasoning.field = "/max_tokens"` built
+/// clean and silently rewrote the caller's token cap to a reasoning
+/// vocabulary string (e.g. `max_tokens: "high"`) on any request that also
+/// set `max_output_tokens`; `reasoning.field = "/stop/0"` built clean and
+/// panicked at request-encode time in release (`set_json_pointer`
+/// descending through the existing `stop` array as a non-object).
+pub const RESERVED_REASONING_FIELD_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "stream",
+    "tools",
+    "tool_choice",
+    "max_tokens",
+    "temperature",
+    "stop",
+];
 
 /// Panics — a BUILD error when called from `build.rs`'s `main`, per §9.5
 /// ("a typo in a quirk profile is a BUILD error, not a production 400") —
@@ -108,6 +127,37 @@ mod tests {
     #[should_panic(expected = "\"tool_choice\"")]
     fn rejects_a_field_colliding_with_the_reserved_tool_choice_key() {
         validate_openai_chat_reasoning_field(p(), "/tool_choice");
+    }
+
+    /// Fix round 4, R2: `encode_openai_chat` (`encode.rs:143`) also writes
+    /// `max_tokens` conditionally (only when `req.params.max_output_tokens`
+    /// is `Some`), which is exactly why it was missing from the reserved
+    /// list -- a profile declaring `reasoning.field = "/max_tokens"` built
+    /// clean and silently rewrote the caller's token cap to the reasoning
+    /// vocabulary string (e.g. `max_tokens: "high"`) on every request that
+    /// also set `max_output_tokens`.
+    #[test]
+    #[should_panic(expected = "\"max_tokens\"")]
+    fn rejects_a_field_colliding_with_the_reserved_max_tokens_key() {
+        validate_openai_chat_reasoning_field(p(), "/max_tokens");
+    }
+
+    /// Fix round 4, R2: `encode.rs:146` writes `temperature` conditionally
+    /// the same way `max_tokens` does.
+    #[test]
+    #[should_panic(expected = "\"temperature\"")]
+    fn rejects_a_field_colliding_with_the_reserved_temperature_key() {
+        validate_openai_chat_reasoning_field(p(), "/temperature");
+    }
+
+    /// Fix round 4, R2: `encode.rs:150` writes `stop` conditionally the same
+    /// way -- `reasoning.field = "/stop/0"` built clean and panicked at
+    /// request-encode time in release (`set_json_pointer` descending
+    /// through the existing `stop` array as a non-object).
+    #[test]
+    #[should_panic(expected = "\"stop\"")]
+    fn rejects_a_field_colliding_with_the_reserved_stop_key() {
+        validate_openai_chat_reasoning_field(p(), "/stop");
     }
 
     /// The exact shape a code-reviewer harness demonstrated actually

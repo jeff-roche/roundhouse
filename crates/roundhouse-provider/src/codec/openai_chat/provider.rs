@@ -218,7 +218,27 @@ impl Provider for OpenAiChatProvider {
 ///   opaque 5xx (`ProviderError::Server`), also retried with backoff,
 ///   matching `cohere_v2`'s identical treatment of its own `finish_reason:
 ///   "ERROR"`.
+///
+/// Fix round 4, R3: `ProviderError::StreamInterrupted`'s `Display`
+/// deliberately omits `partial` (`ir.rs:417`'s own doc comment; model output
+/// must never land in a persisted error row -- `roundhouse-engine::chat`
+/// persists `provider_err.to_string()` verbatim as `TaskError.message` on a
+/// physically-immutable `Event` row). That's the right call for `partial`,
+/// but it also meant `failure.message` -- the actual, spec-verified reason
+/// this stream failed (an unrecognized `finish_reason` value included) --
+/// reached NOTHING observable for every kind but `Transport`: an operator
+/// saw `StreamInterrupted` with no cause, and couldn't file the capture
+/// that would let a real new `finish_reason` value be added. A `tracing`
+/// event at this mapping site (mirrors `errors.rs`'s existing
+/// `tracing::debug!` convention for "a degrade must be observable, not
+/// silent") makes the *reason* visible without ever touching
+/// `partial_text` -- the model's content is never passed to this event.
 fn stream_failure_to_provider_error(failure: StreamFailure) -> ProviderError {
+    tracing::debug!(
+        kind = ?failure.kind,
+        message = %failure.message,
+        "openai-chat stream failed mid-generation"
+    );
     match failure.kind {
         StreamFailureKind::Transport => ProviderError::Transport(failure.message),
         StreamFailureKind::Truncated
@@ -319,6 +339,108 @@ mod build_endpoint_url_tests {
         assert_eq!(
             url.as_str(),
             "https://gateway.example.com/proxy/chat/completions?key=abc123"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stream_failure_diagnosability_tests {
+    //! Fix round 4, R3: `stream_failure_to_provider_error` discarded
+    //! `StreamFailure.message` for every kind except `Transport`, and
+    //! `ProviderError::StreamInterrupted`'s `Display` deliberately omits
+    //! `partial` (`ir.rs`'s own doc comment; `roundhouse-engine::chat`
+    //! persists `provider_err.to_string()` verbatim as `TaskError.message`
+    //! on a physically-immutable `Event` row) -- so an operator saw
+    //! `StreamInterrupted` with no cause at all, and could not file the
+    //! capture that would let a future value be added to the fail-closed
+    //! `finish_reason` match. This hand-rolled `tracing::Subscriber` (no new
+    //! dependency -- `tracing` is already a real dependency of this crate)
+    //! proves both halves of the constraint at once: the *reason* reaches an
+    //! observable event, and the model's *content* never does, not even via
+    //! the tracing event itself.
+    use super::{stream_failure_to_provider_error, StreamFailure, StreamFailureKind};
+    use crate::ir::ProviderError;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Default)]
+    struct LineVisitor {
+        line: String,
+    }
+
+    impl Visit for LineVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.line, "{}={:?} ", field.name(), value);
+        }
+    }
+
+    struct CapturingSubscriber {
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Subscriber for CapturingSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = LineVisitor::default();
+            event.record(&mut visitor);
+            self.lines.lock().unwrap().push(visitor.line);
+        }
+        fn enter(&self, _span: &Id) {}
+        fn exit(&self, _span: &Id) {}
+    }
+
+    #[test]
+    fn the_failure_reason_reaches_a_tracing_event_but_the_partial_content_never_does() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CapturingSubscriber {
+            lines: lines.clone(),
+        };
+        let failure = StreamFailure {
+            kind: StreamFailureKind::Length,
+            message: "openai-chat generation stopped: length (a token/context limit was reached \
+                       before the model finished)"
+                .into(),
+            partial_text: "TOP SECRET MODEL OUTPUT".into(),
+        };
+
+        let provider_err = tracing::subscriber::with_default(subscriber, || {
+            stream_failure_to_provider_error(failure)
+        });
+
+        // Half 1 (ir.rs:417 / chat.rs's persisted `TaskError.message`): the
+        // Display impl -- what actually reaches a persisted, immutable row
+        // -- must never carry the model's partial output.
+        assert!(matches!(
+            provider_err,
+            ProviderError::StreamInterrupted { .. }
+        ));
+        assert!(!provider_err.to_string().contains("TOP SECRET"));
+
+        // Half 2: the reason must be observable somewhere -- here, a
+        // tracing event -- so an operator can file the capture that would
+        // let this value be added.
+        let captured = lines.lock().unwrap();
+        assert!(
+            captured
+                .iter()
+                .any(|line| line.contains("length") && line.contains("token/context limit")),
+            "expected the failure reason to reach a tracing event: {captured:?}"
+        );
+        // And the partial content must never leak into the diagnostic
+        // event either -- only the reason is observable, never the content.
+        assert!(
+            !captured.iter().any(|line| line.contains("TOP SECRET")),
+            "the model's partial output must never be logged: {captured:?}"
         );
     }
 }

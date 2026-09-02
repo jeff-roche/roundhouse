@@ -26,9 +26,11 @@ use serde_json::Value;
 use sse_stream::SseStream;
 use std::collections::HashSet;
 
-// Fix round 2, N2: `redact_transport_error_text` now lives in `mod.rs` so
-// `provider.rs`'s three other transport-error sinks can share it too.
-use super::redact_transport_error_text;
+// Fix round 2, N2: `redact_transport_error_text` used to live in `mod.rs` so
+// `provider.rs`'s three other transport-error sinks could share it too.
+// Fix round 4, R4: hoisted again, to `crate::audit`, so `openai_chat` can
+// share the same real implementation instead of its own weaker one.
+use crate::audit::redact_transport_error_text;
 use crate::stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 use crate::TransportError;
 

@@ -9,3 +9,6 @@ pub mod redact;
 
 pub use header_capture::capture_headers_for_audit;
 pub use redact::redact_error_body;
+// Fix round 4, R4: crate-internal only (no public surface change) -- shared
+// by `cohere_v2` and `openai_chat`'s transport-error sinks.
+pub(crate) use redact::redact_transport_error_text;
