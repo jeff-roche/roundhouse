@@ -75,8 +75,20 @@ impl ReasoningValueType {
                 .map_err(|_| ProfileReasoningError::WireValueWrongType(self, wire.to_string())),
             ReasoningValueType::Number => wire
                 .parse::<f64>()
+                .ok()
+                // Round-8 review, M4: `"1e400".parse::<f64>()` is `Ok(f64::
+                // INFINITY)`, not an `Err` -- an out-of-range literal must
+                // not fail open. `f64::is_finite()` rejects both infinities
+                // and NaN, so this build-time check (`validate_value_type`
+                // calls `parse` over every vocabulary/map entry) catches a
+                // non-finite literal the same way it already catches a
+                // non-numeric one, instead of `json!(f64::INFINITY)` later
+                // silently serializing to `null` and dropping the field —
+                // the same fail-open shape as `google_genai/encode.rs:366`'s
+                // `.unwrap_or(0)`.
+                .filter(|parsed| parsed.is_finite())
                 .map(WireValue::Number)
-                .map_err(|_| ProfileReasoningError::WireValueWrongType(self, wire.to_string())),
+                .ok_or_else(|| ProfileReasoningError::WireValueWrongType(self, wire.to_string())),
         }
     }
 }
@@ -316,6 +328,36 @@ mod reasoning_value_type_tests {
             err,
             super::ProfileReasoningError::WireValueWrongType(..)
         ));
+    }
+
+    /// Round-8 review, M4: `"1e400"` parses as `Ok(f64::INFINITY)`, not an
+    /// `Err` -- without the `is_finite()` guard this would build clean and
+    /// then `json!(f64::INFINITY)` would silently serialize to `null` at
+    /// request-encode time, dropping the field with no error. This must be
+    /// a BUILD error instead (`validate_value_type` calls `parse` over
+    /// every vocabulary/map entry).
+    #[test]
+    fn validate_value_type_rejects_a_non_finite_number_literal() {
+        let mut c = control(ReasoningValueType::Number, &["0", "1e400"]);
+        c.map = BTreeMap::from([
+            ("off".to_string(), "0".to_string()),
+            ("high".to_string(), "1e400".to_string()),
+        ]);
+        let err = c.validate_value_type().unwrap_err();
+        assert!(matches!(
+            err,
+            super::ProfileReasoningError::WireValueWrongType(..)
+        ));
+    }
+
+    #[test]
+    fn resolve_wire_value_rejects_nan() {
+        let mut c = control(ReasoningValueType::Number, &["0", "nan"]);
+        c.map = BTreeMap::from([
+            ("off".to_string(), "0".to_string()),
+            ("high".to_string(), "nan".to_string()),
+        ]);
+        assert!(c.resolve_wire_value(Intent::High).is_err());
     }
 
     #[test]
