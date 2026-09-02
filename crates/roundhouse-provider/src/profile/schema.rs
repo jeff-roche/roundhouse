@@ -37,12 +37,18 @@ impl ProviderProfile {
     /// the real §9.8 classification path (`crate::errors::classify`), which
     /// otherwise never reads it. Each `ErrorEntry`'s disposition/category is
     /// mapped onto the closest-fitting `ProviderErrorKind` — see the mapping
-    /// notes on `disposition_to_kind` for the cases that cannot be mapped
-    /// exactly.
+    /// notes on `ErrorEntry::error_kind` for the cases that cannot be mapped
+    /// exactly. An entry that `error_kind()` can't map faithfully (fix round
+    /// 1, E1) is simply omitted from `code_table`: `classify()` then falls
+    /// through to its existing, already-tested HTTP-status tier for that
+    /// code, rather than this wiring asserting a specific, wrong
+    /// `ProviderErrorKind`.
     pub fn error_profile(&self) -> crate::errors::ErrorProfile {
         let mut code_table = HashMap::new();
         for (code, entry) in &self.errors {
-            code_table.insert(code.clone(), entry.error_kind());
+            if let Some(kind) = entry.error_kind() {
+                code_table.insert(code.clone(), kind);
+            }
         }
         crate::errors::ErrorProfile {
             code_table,
@@ -157,18 +163,27 @@ impl ErrorEntry {
     ///   off and reduce request rate/concurrency).
     /// - `Fatal` is not retryable, but *why* it's fatal varies. `category =
     ///   "quota"` maps to `QuotaExhausted` and `category = "model_not_found"`
-    ///   maps to `ModelNotFound` — both are exact fits. A `Fatal` entry with
-    ///   no recognized category has no exact fit among the four variants;
-    ///   this falls back to `QuotaExhausted` (the more common real-world
-    ///   `Fatal` case) rather than inventing a fifth variant. See this task's
-    ///   report for the concrete callout.
-    pub fn error_kind(&self) -> crate::errors::ProviderErrorKind {
+    ///   maps to `ModelNotFound` — both are exact fits.
+    /// - Fix round 1, E1: a `Fatal` entry with any OTHER category, or no
+    ///   category at all, returns `None` rather than guessing. The earlier
+    ///   draft defaulted an unrecognized `Fatal` to `QuotaExhausted`, which
+    ///   is not imprecise, it's a *wrong specific*: `QuotaExhausted` is an
+    ///   actionable claim about billing state, and a permanent auth failure
+    ///   or a content-policy rejection would then be reported to the caller
+    ///   as "you are out of quota." `error_profile()` skips a `None` entry
+    ///   entirely, so `classify()` falls through to its existing
+    ///   HTTP-status tier for that code instead — honest about not
+    ///   knowing, rather than confidently wrong.
+    pub fn error_kind(&self) -> Option<crate::errors::ProviderErrorKind> {
         use crate::errors::ProviderErrorKind;
         match (self.disposition, self.category.as_deref()) {
-            (DispositionKind::RetryBackoff, _) => ProviderErrorKind::Overloaded,
-            (DispositionKind::ShedConcurrency, _) => ProviderErrorKind::RateLimited,
-            (DispositionKind::Fatal, Some("model_not_found")) => ProviderErrorKind::ModelNotFound,
-            (DispositionKind::Fatal, _) => ProviderErrorKind::QuotaExhausted,
+            (DispositionKind::RetryBackoff, _) => Some(ProviderErrorKind::Overloaded),
+            (DispositionKind::ShedConcurrency, _) => Some(ProviderErrorKind::RateLimited),
+            (DispositionKind::Fatal, Some("model_not_found")) => {
+                Some(ProviderErrorKind::ModelNotFound)
+            }
+            (DispositionKind::Fatal, Some("quota")) => Some(ProviderErrorKind::QuotaExhausted),
+            (DispositionKind::Fatal, _) => None,
         }
     }
 }

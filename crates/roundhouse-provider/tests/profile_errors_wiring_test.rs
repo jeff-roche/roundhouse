@@ -74,3 +74,76 @@ fn without_the_profile_error_table_the_same_body_falls_back_to_status_default() 
         "expected the HTTP-status fallback (Server{{503}}), got {classified:?}"
     );
 }
+
+/// Builds a minimal, otherwise-valid `ProviderProfile` whose only interesting
+/// content is the `[errors.*]` table(s) supplied by `errors_toml` — lets the
+/// two fix-round-1 (E1) tests below exercise a `Fatal` disposition shape that
+/// `moonshot.toml` doesn't have (moonshot's one `Fatal` entry is always
+/// `category = "quota"`, an exact-fit case).
+fn profile_with_errors(errors_toml: &str) -> ProviderProfile {
+    let toml_src = format!(
+        r#"
+        id = "fixture"
+        codec = "openai-chat"
+
+        [defaults]
+        allow_raw_extra = false
+        base_url = "https://example.invalid"
+
+        [defaults.params]
+        mode = "allow_only"
+        fields = []
+
+        [defaults.auth]
+        kind = "bearer"
+
+        {errors_toml}
+        "#
+    );
+    toml::from_str(&toml_src).expect("fixture profile must deserialize")
+}
+
+/// Fix round 1, E1: an unrecognized-`Fatal` code must NOT be asserted as
+/// `QuotaExhausted` — that would be a confidently wrong, actionable claim
+/// about billing state for what might be a permanent auth failure or a
+/// content-policy rejection. `error_kind()` returns `None` for this shape,
+/// `error_profile()` skips it entirely, and `classify()` falls through to
+/// its existing, already-tested HTTP-status tier.
+#[test]
+fn fatal_disposition_with_an_unrecognized_category_falls_through_to_status_default() {
+    let profile = profile_with_errors(
+        r#"
+        [errors.content_policy_violation]
+        disposition = "fatal"
+        category = "content_policy"
+        "#,
+    );
+    let error_profile = profile.error_profile();
+    let body = body_with_error_type("content_policy_violation");
+    let classified = classify(&error_profile, 400, &body, &http::HeaderMap::new());
+    assert!(
+        matches!(classified, ProviderError::BadRequest { status: 400, .. }),
+        "an unrecognized Fatal category must fall through to the HTTP-status \
+         default, not assert a specific ProviderErrorKind — got {classified:?}"
+    );
+}
+
+/// Same as above, for the even more common real shape: `disposition =
+/// "fatal"` with no `category` key at all.
+#[test]
+fn fatal_disposition_with_no_category_at_all_falls_through_to_status_default() {
+    let profile = profile_with_errors(
+        r#"
+        [errors.some_fatal_code]
+        disposition = "fatal"
+        "#,
+    );
+    let error_profile = profile.error_profile();
+    let body = body_with_error_type("some_fatal_code");
+    let classified = classify(&error_profile, 400, &body, &http::HeaderMap::new());
+    assert!(
+        matches!(classified, ProviderError::BadRequest { status: 400, .. }),
+        "a Fatal entry with no category at all must fall through to the \
+         HTTP-status default — got {classified:?}"
+    );
+}
