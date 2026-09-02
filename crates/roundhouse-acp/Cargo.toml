@@ -17,6 +17,7 @@ roundhouse-proto = { path = "../roundhouse-proto" }
 # edge, not another `roundhouse-*` path dependency, so it does not widen this crate's
 # internal-crate dependency set (still `{core, proto}` only).
 agent-client-protocol = "=2.0.0"
+serde_json = { workspace = true }
 
 [features]
 # Forwards to the SDK's own `unstable_protocol_v2` feature so that

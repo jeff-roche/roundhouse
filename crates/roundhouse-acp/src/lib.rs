@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+pub mod elicit;
 pub mod version;
 
 use roundhouse_proto::ApiVersion;

@@ -3229,6 +3229,7 @@ dependencies = [
  "agent-client-protocol",
  "roundhouse-core",
  "roundhouse-proto",
+ "serde_json",
 ]
 
 [[package]]
