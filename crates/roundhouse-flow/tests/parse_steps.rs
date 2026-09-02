@@ -1,5 +1,5 @@
 use roundhouse_flow::parse::steps::{
-    parse_step, topological_order, OnItemError, StepBody, StepDef,
+    parse_step, topological_order, MapIsolationDef, OnItemError, StepBody, StepDef,
 };
 use roundhouse_flow::parse::types::OnTimeout;
 use roundhouse_flow::parse::{parse_workflow, ParseError};
@@ -28,8 +28,8 @@ fn parses_every_step_kind_in_the_fixture() {
         r#as,
         max_parallel,
         on_item_error,
+        isolation,
         steps: inner,
-        ..
     } = &top_steps[1].body
     else {
         panic!("expected Map step");
@@ -41,6 +41,12 @@ fn parses_every_step_kind_in_the_fixture() {
     assert_eq!(r#as, "pr");
     assert_eq!(*max_parallel, 4);
     assert_eq!(*on_item_error, OnItemError::Continue);
+    assert_eq!(
+        isolation,
+        &Some(MapIsolationDef::Worktree {
+            base_ref: Some("refs/pull/${{ pr.number }}/head".to_string())
+        })
+    );
 
     let inner_steps: Vec<StepDef> = inner.iter().map(|v| parse_step(v).unwrap()).collect();
     assert!(matches!(inner_steps[0].body, StepBody::Agent { .. }));
@@ -389,4 +395,257 @@ fn a_diamond_dependency_parses_deterministically() {
     let steps = [a, b, c, d];
     let order = topological_order(&steps).unwrap();
     assert_eq!(order, vec![0, 1, 2, 3]);
+}
+
+// =======================================================================
+// Fix round 1 (security + code review on the initial implementation).
+// =======================================================================
+
+// -- H3: validation moved from `parse_step` into `TryFrom`, so every ------
+// -- deserialize entry point gets it, not just `parse_step`'s callers. ---
+
+#[test]
+fn h3_an_invalid_step_id_is_rejected_through_serde_yaml_from_value_directly() {
+    // Before the fix, this exact call (bypassing `parse_step`) returned
+    // `Ok` — validation lived in `parse_step`, not in `StepDef`'s own
+    // `Deserialize`/`TryFrom`.
+    let v: serde_yaml::Value =
+        serde_yaml::from_str("id: \"../../../etc/passwd\"\ntool: shell\nwith: {}").unwrap();
+    let err = serde_yaml::from_value::<StepDef>(v).unwrap_err();
+    assert!(err.to_string().contains("is invalid"), "err was: {err}");
+}
+
+#[test]
+fn h3_too_many_needs_is_rejected_through_serde_json_from_str_directly() {
+    // The reviewer's exact second entry point: `serde_json::from_str`,
+    // never touching `parse_step`, `serde_yaml`, or this crate's own
+    // helpers at all.
+    let needs: Vec<String> = (0..roundhouse_flow::parse::steps::MAX_NEEDS_PER_STEP + 1)
+        .map(|i| format!("s{i}"))
+        .collect();
+    let json = serde_json::json!({
+        "id": "z",
+        "tool": "shell",
+        "with": {},
+        "needs": needs,
+    });
+    let err = serde_json::from_value::<StepDef>(json).unwrap_err();
+    assert!(
+        err.to_string().contains("exceeding the limit"),
+        "err was: {err}"
+    );
+}
+
+#[test]
+fn h3_parse_step_still_returns_a_fully_typed_error_for_its_own_callers() {
+    // The fix's other half: `parse_step`'s own direct callers must not
+    // lose typed-error granularity as the price of closing the bypass.
+    let err = try_step("id: \"a b\"\ntool: shell").unwrap_err();
+    assert!(
+        matches!(err, ParseError::InvalidStepId { .. }),
+        "err was: {err:?}"
+    );
+}
+
+// -- H1: `map.isolation` is a closed, validated type. ---------------------
+
+#[test]
+fn h1_a_misspelled_isolation_tier_is_rejected() {
+    let err = try_step(
+        "id: a\nmap: { over: x, as: y, isolation: { worktreee: { base_ref: r } } }\nsteps: [{ id: b, tool: shell }]",
+    )
+    .unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn h1_an_unrecognised_isolation_param_is_rejected() {
+    let err = try_step(
+        "id: a\nmap: { over: x, as: y, isolation: { worktree: { basee_ref: r } } }\nsteps: [{ id: b, tool: shell }]",
+    )
+    .unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn h1_a_numeric_isolation_value_is_rejected() {
+    let err =
+        try_step("id: a\nmap: { over: x, as: y, isolation: 42 }\nsteps: [{ id: b, tool: shell }]")
+            .unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn h1_a_bare_worktree_isolation_string_parses_with_no_base_ref() {
+    let s = step(
+        "id: a\nmap: { over: x, as: y, isolation: worktree }\nsteps: [{ id: b, tool: shell }]",
+    );
+    let StepBody::Map { isolation, .. } = &s.body else {
+        panic!("expected Map step");
+    };
+    assert_eq!(
+        isolation,
+        &Some(MapIsolationDef::Worktree { base_ref: None })
+    );
+}
+
+#[test]
+fn h1_a_second_isolation_tier_key_is_rejected() {
+    let err = try_step(
+        "id: a\nmap: { over: x, as: y, isolation: { worktree: {}, sandbox: {} } }\nsteps: [{ id: b, tool: shell }]",
+    )
+    .unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn map_isolation_none_parses_without_checking_narrowing_against_defaults() {
+    // Documents, rather than fixes, the deferral in `MapIsolationDef`'s doc
+    // comment: `isolation: none` under `defaults.isolation: worktree`
+    // would *widen* the step's isolation (forbidden by the phase Global
+    // Constraint and §8.5), but `parse_step` has no visibility into the
+    // enclosing workflow's `defaults.isolation` to check that. The real
+    // narrowing check is the executor's (Task 5) responsibility.
+    let s =
+        step("id: a\nmap: { over: x, as: y, isolation: none }\nsteps: [{ id: b, tool: shell }]");
+    let StepBody::Map { isolation, .. } = &s.body else {
+        panic!("expected Map step");
+    };
+    assert_eq!(isolation, &Some(MapIsolationDef::None));
+}
+
+// -- H2: `caps.max_cost_usd` rejects non-finite and negative values. ------
+
+#[test]
+fn h2_nan_max_cost_usd_is_rejected() {
+    let err = try_step("id: a\ntool: shell\ncaps: { max_cost_usd: .nan }").unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn h2_infinite_max_cost_usd_is_rejected() {
+    let err = try_step("id: a\ntool: shell\ncaps: { max_cost_usd: .inf }").unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn h2_negative_max_cost_usd_is_rejected() {
+    let err = try_step("id: a\ntool: shell\ncaps: { max_cost_usd: -1.0 }").unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn h2_a_finite_non_negative_max_cost_usd_parses() {
+    let s = step("id: a\ntool: shell\ncaps: { max_cost_usd: 0.5 }");
+    assert_eq!(s.caps.unwrap().max_cost_usd, Some(0.5));
+}
+
+#[test]
+fn h2_a_zero_max_cost_usd_parses() {
+    // Zero is finite and non-negative — a legitimate (if unusual) "no
+    // spend allowed" cap, unlike retry.rs's own "0s means unconfigured"
+    // duration case (a different field with a different semantics).
+    let s = step("id: a\ntool: shell\ncaps: { max_cost_usd: 0.0 }");
+    assert_eq!(s.caps.unwrap().max_cost_usd, Some(0.0));
+}
+
+// -- M2: `gate.on_timeout: approve` parses; its §8.11 precondition is a ---
+// -- documented, tested deferral to the executor. -------------------------
+
+#[test]
+fn gate_on_timeout_approve_parses_without_checking_its_run_time_precondition() {
+    // §8.11: "approve is permitted only when the run's policy is narrower
+    // than the job default." This parser has no access to "the run's
+    // policy" (a run-time, bound fact) from one step's YAML alone, unlike
+    // Task 2's Park-escalation check (fully expressible from sibling
+    // fields in the same static document). Deferred to the executor.
+    let s = step("id: a\ngate: { title: t, timeout: 1h, on_timeout: approve }");
+    let StepBody::Gate { on_timeout, .. } = &s.body else {
+        panic!("expected Gate step");
+    };
+    assert_eq!(*on_timeout, OnTimeout::Approve);
+}
+
+// -- M3: `map.as` gets the same charset/length rule as a step id, plus ---
+// -- a reserved-expression-root check. ------------------------------------
+
+#[test]
+fn m3_an_empty_map_as_is_rejected() {
+    let err =
+        try_step("id: a\nmap: { over: x, as: \"\" }\nsteps: [{ id: b, tool: shell }]").unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn m3_a_map_as_with_illegal_characters_is_rejected() {
+    let err = try_step("id: a\nmap: { over: x, as: \"a b\" }\nsteps: [{ id: b, tool: shell }]")
+        .unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn m3_map_as_shadowing_a_reserved_expression_root_is_rejected() {
+    for reserved in ["secrets", "steps", "inputs", "run", "vars", "env"] {
+        let yaml =
+            format!("id: a\nmap: {{ over: x, as: {reserved} }}\nsteps: [{{ id: b, tool: shell }}]");
+        let err = try_step(&yaml).unwrap_err();
+        assert!(
+            matches!(err, ParseError::Yaml(_)),
+            "expected rejection for as: {reserved}, err was: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn m3_an_ordinary_map_as_parses() {
+    let s = step("id: a\nmap: { over: x, as: pr }\nsteps: [{ id: b, tool: shell }]");
+    let StepBody::Map { r#as, .. } = &s.body else {
+        panic!("expected Map step");
+    };
+    assert_eq!(r#as, "pr");
+}
+
+// -- L2: `env` is a typed string-to-string map with a POSIX name check. --
+
+#[test]
+fn l2_env_accepts_ordinary_names() {
+    let s = step("id: a\ntool: shell\nenv: { GH_TOKEN: secret, PATH_2: x }");
+    let env = s.env.unwrap();
+    assert_eq!(env.get("GH_TOKEN"), Some(&"secret".to_string()));
+    assert_eq!(env.get("PATH_2"), Some(&"x".to_string()));
+}
+
+#[test]
+fn l2_an_env_name_containing_equals_is_rejected() {
+    let err = try_step("id: a\ntool: shell\nenv: { \"A=B\": x }").unwrap_err();
+    assert!(
+        matches!(err, ParseError::InvalidStepBody { .. }),
+        "err was: {err:?}"
+    );
+}
+
+#[test]
+fn l2_an_env_name_containing_a_newline_is_rejected() {
+    let err = try_step("id: a\ntool: shell\nenv: { \"A\\nLD_PRELOAD\": x }").unwrap_err();
+    assert!(
+        matches!(err, ParseError::InvalidStepBody { .. }),
+        "err was: {err:?}"
+    );
+}
+
+#[test]
+fn l2_an_env_name_starting_with_a_digit_is_rejected() {
+    let err = try_step("id: a\ntool: shell\nenv: { \"2X\": x }").unwrap_err();
+    assert!(
+        matches!(err, ParseError::InvalidStepBody { .. }),
+        "err was: {err:?}"
+    );
+}
+
+#[test]
+fn l2_a_non_string_env_value_is_rejected() {
+    // Values are typed `String` now too, not arbitrary JSON — an array or
+    // nested object is a parse error, not silently accepted.
+    let err = try_step("id: a\ntool: shell\nenv: { X: [1, 2] }").unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
 }

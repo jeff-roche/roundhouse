@@ -330,6 +330,9 @@ pub enum ParseError {
 
     #[error("the `needs:` graph has a cycle; these steps could never become ready: {steps:?}")]
     StepGraphCycle { steps: Vec<String> },
+
+    #[error("step {step:?}: {reason}")]
+    InvalidStepBody { step: String, reason: String },
 }
 
 impl ParseError {
