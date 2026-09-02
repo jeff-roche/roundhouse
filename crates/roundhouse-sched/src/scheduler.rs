@@ -320,6 +320,21 @@ impl Scheduler {
     /// wrongly treated as the tail of an old backlog (`is_catch_up_pass`
     /// keys off `catch_up_progress.contains_key`), silently dropping one
     /// genuinely ordinary firing under `CatchUp::None`.
+    ///
+    /// This clear makes `CatchUp::Latest` and `CatchUp::All` deliberately
+    /// diverge for a binding caught mid-backlog when drift hits: under
+    /// `All`, every batch already fired *before* the drift check ran stays
+    /// fired (`drain_due` fires `All`'s batches immediately, unconditionally
+    /// — nothing to undo), so only the not-yet-processed tail of the
+    /// backlog is discarded. Under `Latest`, nothing in the pending
+    /// backlog had fired yet (its whole point is to defer until
+    /// `backlog_exhausted`), so clearing the carried "latest seen so far"
+    /// here discards the *entire* missed window for that binding — the
+    /// next occurrence it reports is simply whatever's next after `after`,
+    /// with no representation of anything from before the drift at all.
+    /// Both are defensible readings of "recompute discards the backlog";
+    /// this is `Latest`'s, recorded here so a future reader does not
+    /// rediscover the asymmetry as a bug.
     pub fn recompute_all(&mut self, after: DateTime<Utc>) {
         let mut new_heap = BinaryHeap::new();
         for binding in self.bindings.values_mut() {
@@ -419,7 +434,6 @@ impl Scheduler {
     /// re-anchored to the corrected clock rather than left silently
     /// unreconciled. A forward step (the overwhelmingly common real case —
     /// an actual suspend/resume) drains as documented above.
-    #[must_use]
     ///
     /// Fix round 2 (optional item, security review of Task 6): the backward
     /// case emits a [`SchedulerEvent::DriftDetected`] just as `tick`'s own
@@ -429,6 +443,7 @@ impl Scheduler {
     /// alone (rather than logs) cannot distinguish "woke, found nothing due"
     /// from "woke, but the wall clock reading itself was corrected" — only
     /// the `tracing::warn!` recorded the difference.
+    #[must_use]
     pub fn catch_up_after_wake(
         &mut self,
         monotonic_now: Instant,

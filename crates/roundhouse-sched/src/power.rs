@@ -117,6 +117,13 @@ pub enum PowerWatchEvent {
     /// admission-gate/dispatch path an ordinary `tick`'s events go
     /// through) — the drain that produced them already happened and is not
     /// repeatable; an event dropped here is gone.
+    ///
+    /// "Every `SchedulerEvent`" is not "every `Fire`": since fix round 2's
+    /// `DriftDetected` symmetry on the backward-wall-clock-step path, this
+    /// `Vec` can also contain a `DriftDetected` entry instead of (never
+    /// alongside) `Fire`s. A consumer that treats `drained.len()` as a
+    /// fire/catch-up count, rather than filtering for
+    /// `SchedulerEvent::Fire` specifically, will be wrong on that path.
     Woke(Vec<SchedulerEvent>),
 }
 
@@ -198,11 +205,37 @@ pub async fn run_power_watch(
                          is left permanently missing from the heap by whatever unwound mid-drain"
                     );
                     sched_guard.recompute_all(wall_now);
+                    // Fix round 3 (Important, security review of Task 6):
+                    // `std::sync::Mutex` poison is *latched* — it stays set
+                    // forever until explicitly cleared. Without this call,
+                    // `sched_was_poisoned` would be `true` again on *every*
+                    // subsequent `Woke` from here on, re-running
+                    // `recompute_all` (discarding that wake's whole backlog
+                    // too) forever — permanently disabling sleep/wake
+                    // catch-up after a single poisoning event, which is
+                    // exactly the "goes permanently and silently dark"
+                    // failure this whole recovery path exists to prevent,
+                    // reintroduced one layer in. The repair above has
+                    // already restored the heap's invariants, so it is
+                    // safe to clear the latch now: the next wake sees a
+                    // clean lock and drains normally again.
+                    sched.clear_poison();
                 }
                 let drained = sched_guard.catch_up_after_wake(monotonic_now, wall_now);
                 drop(sched_guard);
                 sink.accept(PowerWatchEvent::Woke(drained));
-                let (mut retryable_guard, _) = lock_or_recover(&retryable, "retryable marker");
+                let (mut retryable_guard, retryable_was_poisoned) =
+                    lock_or_recover(&retryable, "retryable marker");
+                if retryable_was_poisoned {
+                    // Fix round 3: same one-shot reasoning as the scheduler
+                    // mutex above. There is no equivalent "missing entries"
+                    // invariant to repair here (`mark_all_in_flight_retryable`
+                    // has no heap-like state of its own to restore), so
+                    // clearing immediately is enough to stop
+                    // `lock_or_recover`'s `tracing::error!` from repeating on
+                    // every wake for the rest of the process's life.
+                    retryable.clear_poison();
+                }
                 retryable_guard.mark_all_in_flight_retryable();
             }
         }
@@ -225,6 +258,21 @@ pub async fn run_power_watch(
 /// particular `T`'s invariants — as the scheduler branch above does, via
 /// `recompute_all` — can do so. A generic helper can't make that repair
 /// itself: it has no idea what invariants `T` needs restored.
+///
+/// Fix round 3 (Important, security review of Task 6): this function
+/// deliberately does *not* call `Mutex::clear_poison()` itself.
+/// `std::sync::Mutex` poison is latched — once set it stays set on every
+/// future `lock()` until explicitly cleared — so a caller that gets `true`
+/// back and needs to repair `T`'s invariants (again, the scheduler branch's
+/// `recompute_all`) MUST call `clear_poison()` on the same `Mutex` after
+/// finishing that repair, or every later call through this helper will
+/// report poisoned again and re-run the repair forever, which for a
+/// destructive repair like `recompute_all` means permanently discarding
+/// every future wake's backlog instead of just the one that actually
+/// followed the panic. A caller with no repair to perform (the retryable
+/// marker in `run_power_watch`) should still clear the poison once
+/// observed, if only to stop this function's own `tracing::error!` below
+/// from repeating on every subsequent call.
 fn lock_or_recover<'a, T: ?Sized>(
     mutex: &'a Mutex<T>,
     what: &str,
