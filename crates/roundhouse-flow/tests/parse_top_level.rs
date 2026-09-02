@@ -1,5 +1,7 @@
 use roundhouse_flow::parse::types::{Effect, IsolationDef, UnattendedEscalate};
-use roundhouse_flow::parse::{parse_workflow, ParseError, MAX_TOP_LEVEL_STEPS, MAX_YAML_BYTES};
+use roundhouse_flow::parse::{
+    parse_workflow, ParseError, MAX_LEADING_INDENT_CHARS, MAX_TOP_LEVEL_STEPS, MAX_YAML_BYTES,
+};
 
 const PR_REVIEW_YAML: &str = include_str!("fixtures/pr_review.yaml");
 
@@ -213,16 +215,21 @@ fn rejects_pathological_flow_nesting_cheaply() {
     // Fix round 1 on Task 10 (finding H2): a payload of nothing but a long
     // run of unclosed `[` characters, embedded in an otherwise-valid
     // document, was measured (through this crate's real `parse_workflow`,
-    // not the library in isolation) to cost single-digit seconds at ~50 KB
-    // and grow highly non-linearly from there — roughly 84s at 200 KB,
-    // ~560s at 520 KB — once handed to `serde_yaml`, all comfortably under
-    // `MAX_YAML_BYTES`. The pre-parse nesting scan must reject this before
-    // `serde_yaml` ever sees it, and must do so fast regardless of size.
-    let bomb = "[".repeat(200_000);
+    // not the library in isolation) to cost seconds once handed to
+    // `serde_yaml`, growing highly non-linearly with size. The best-effort
+    // pre-parse nesting scan rejects this shape before `serde_yaml` ever
+    // sees it, cheaply, whenever it understands the shape (fix round 3
+    // demoted this scan to best-effort defence in depth — `MAX_YAML_BYTES`,
+    // now 32 KiB, is the actual bound regardless of whether this scan
+    // catches a given payload; see
+    // `worst_case_bracket_nesting_at_the_byte_cap_is_bounded`). Bomb size
+    // kept well under the 32 KiB cap so this exercises the scan, not the
+    // cap.
+    let bomb = "[".repeat(300);
     let yaml = format!("{}bomb: {bomb}\n", minimal_header());
     assert!(
         yaml.len() < MAX_YAML_BYTES,
-        "the payload must stay under the byte cap — the point is that size alone doesn't catch this"
+        "the payload must stay under the byte cap — this test is about the scan, not the cap"
     );
 
     let start = std::time::Instant::now();
@@ -235,25 +242,24 @@ fn rejects_pathological_flow_nesting_cheaply() {
     );
     assert!(
         elapsed < std::time::Duration::from_secs(1),
-        "the nesting bound must fire in well under a second even on a 200KB payload that \
-         previously cost ~84s when handed to serde_yaml directly; took {elapsed:?}"
+        "the nesting bound should fire fast on an obvious bomb; took {elapsed:?}"
     );
 }
 
 #[test]
 fn rejects_a_bracket_bomb_hidden_behind_an_apostrophe() {
-    // Fix round 2 on Task 10 (finding H2): the previous scan tracked
+    // Fix round 2 on Task 10 (finding H2): the round-1 scan tracked
     // single-/double-quote state char-by-char to skip quoted content. An
     // apostrophe in perfectly ordinary YAML text (`don't` is literal text
     // here, not a scalar delimiter — YAML only treats a quote as an
     // indicator at scalar-start position) flipped that scanner into
     // "quoted" state *permanently*, since nothing ever closed it — every
     // character for the rest of the document, brackets included, was then
-    // silently skipped. Measured through the real `parse_workflow`
-    // (release build): this exact shape cost 2.53s at a 50 KB bomb, 38.8s
-    // at 200 KB. The fix drops quote-tracking entirely, so this must be
-    // rejected, and rejected fast.
-    let bomb = "[".repeat(200_000);
+    // silently skipped. The round-2 fix dropped quote-tracking entirely, so
+    // this specific shape must still be rejected (bomb size kept well
+    // under the 32 KiB cap from fix round 3, so this exercises the scan,
+    // not the cap).
+    let bomb = "[".repeat(300);
     let yaml = format!("{}note: \"don't\"\nbomb: {bomb}\n", minimal_header());
     assert!(yaml.len() < MAX_YAML_BYTES);
 
@@ -268,7 +274,112 @@ fn rejects_a_bracket_bomb_hidden_behind_an_apostrophe() {
     );
     assert!(
         elapsed < std::time::Duration::from_secs(1),
-        "must reject cheaply, not fall through to serde_yaml (previously ~38.8s at this size); took {elapsed:?}"
+        "should reject fast on an obvious bomb; took {elapsed:?}"
+    );
+}
+
+#[test]
+fn rejects_a_bracket_bomb_hidden_behind_a_comment_line_opener() {
+    // Fix round 3 on Task 10 (finding H2): the round-2 scan detected a
+    // block-scalar opener via a bare `rfind(':')` over the whole line, with
+    // no check for comment context. `# x: |` is pure comment text — the
+    // colon inside it used to be misread as a real mapping-value
+    // indicator, opening (bogus) block-scalar mode that hid every
+    // subsequent more-indented line, including a bracket bomb, from the
+    // depth counter for the rest of the document. Now rejected: a line
+    // starting with `#` can never be a block-scalar opener.
+    let bomb = "[".repeat(300);
+    let yaml = format!("{}# x: |\n    bomb: {bomb}\n", minimal_header());
+    assert!(yaml.len() < MAX_YAML_BYTES);
+
+    let start = std::time::Instant::now();
+    let err = parse_workflow(&yaml)
+        .expect_err("a bracket bomb hidden behind a comment-line opener must be rejected");
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(err, ParseError::TooDeeplyNested { .. }),
+        "expected the nesting bound to fire despite the comment-line opener, got {err:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "took {elapsed:?}"
+    );
+}
+
+#[test]
+fn rejects_a_bracket_bomb_hidden_behind_a_same_line_flow_context_opener() {
+    // Fix round 3 on Task 10 (finding H2): the same bare-`rfind(':')`
+    // opener detector also misread a colon inside an *unclosed flow
+    // collection on the same line* (`items: ["note: |`) as a real
+    // block-scalar opener, even though YAML has no block scalars in flow
+    // context at all. Now rejected: the colon this detector keys off of
+    // must sit at the line's own top level (bracket depth zero within the
+    // line), not merely be the last colon found anywhere in its text.
+    let bomb = "[".repeat(300);
+    let yaml = format!("{}items: [\"note: |\n    bomb: {bomb}\n", minimal_header());
+    assert!(yaml.len() < MAX_YAML_BYTES);
+
+    let start = std::time::Instant::now();
+    let err = parse_workflow(&yaml).expect_err(
+        "a bracket bomb hidden behind a same-line flow-context opener must be rejected",
+    );
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(err, ParseError::TooDeeplyNested { .. }),
+        "expected the nesting bound to fire despite the flow-context opener, got {err:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "took {elapsed:?}"
+    );
+}
+
+#[test]
+fn excessive_leading_indent_is_rejected() {
+    // Fix round 3 on Task 10, minor: `ExcessiveIndentWidth` was reachable
+    // and correctly labelled but had zero test coverage — nothing would
+    // have caught a future edit that swapped the two `NestingViolation`
+    // match arms back to the round-1 mislabeling bug.
+    let indent = " ".repeat(MAX_LEADING_INDENT_CHARS + 1);
+    let yaml = format!("{}{indent}x: 1\n", minimal_header());
+    let err = parse_workflow(&yaml).expect_err("excessive leading indentation must be rejected");
+    match err {
+        ParseError::ExcessiveIndentWidth { width, max } => {
+            assert_eq!(max, MAX_LEADING_INDENT_CHARS);
+            assert_eq!(width, MAX_LEADING_INDENT_CHARS + 1);
+        }
+        other => panic!("expected ParseError::ExcessiveIndentWidth, got {other:?}"),
+    }
+}
+
+#[test]
+fn worst_case_bracket_nesting_at_the_byte_cap_is_bounded() {
+    // Fix round 3 on Task 10 (finding H2): after two scan designs each had
+    // their own bypass, `MAX_YAML_BYTES` (now 32 KiB, down from 1 MiB) is
+    // the real bound on untrusted-input parse cost, not the best-effort
+    // nesting scan. This measures the worst case *the cap itself* must
+    // bound: a document that is nothing but deeply nested flow brackets,
+    // fed directly to raw `serde_yaml::from_str` — bypassing this crate's
+    // scan on purpose, standing in for "some future crafted input the scan
+    // doesn't catch" — at exactly the byte cap.
+    let bomb = "[".repeat(MAX_YAML_BYTES);
+    assert_eq!(bomb.len(), MAX_YAML_BYTES);
+
+    let start = std::time::Instant::now();
+    let result: Result<serde_yaml::Value, _> = serde_yaml::from_str(&bomb);
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "an unclosed bracket bomb must not parse successfully"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "worst-case cost at exactly MAX_YAML_BYTES must stay bounded (measured ~1.5s in this \
+         environment; 5s leaves headroom for slower machines while still proving the cap, not \
+         the scan, is what bounds this); took {elapsed:?}"
     );
 }
 
