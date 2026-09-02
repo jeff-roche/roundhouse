@@ -165,6 +165,31 @@
 //! property-chain expression's evaluation time roughly tracks its length as
 //! the length is repeatedly doubled, rather than growing quadratically.
 //!
+//! **That linearity is a fix, not the starting point.** A property-chain
+//! implementation written against plain owned `Value` at every step (the
+//! brief's own illustrative code) clones the *entire remaining nested
+//! substructure* on each `.field`/`[idx]` step — `O(depth)` work repeated
+//! `O(depth)` times, `O(depth²)` overall for indexing `depth` levels into
+//! context data. Measured directly on exactly that code shape, before
+//! fixing it: an 8x increase in chain length (and matching context nesting
+//! depth) took roughly 70x longer to evaluate, consistent with quadratic
+//! scaling. The fix — [`Parser::parse_primary_chain`]/[`index_field`]/
+//! [`index_array`] threading a [`Cow`] through the chain so a step
+//! resolved from data still reachable via `ctx`'s own borrow costs no
+//! clone at all, only the final leaf is cloned once — is what the
+//! measurement above actually confirms. This is bounded for the common
+//! case (a chain rooted at a context variable, which is what `steps.*`,
+//! `inputs.*`, and a `map.as` binding all are) but **not** for a chain
+//! rooted at a value this module just computed itself (an array literal,
+//! or a function's return value) — once the chain has no `ctx` borrow left
+//! to extend, each further step clones one level, and the brief's original
+//! quadratic shape reappears for exactly that path. That residual is
+//! bounded by [`MAX_EXPR_DEPTH`] (an expression can only *write* that many
+//! nested literal levels before the depth guard rejects it), not by
+//! context size, so its worst case is on the order of `MAX_EXPR_DEPTH²`
+//! trivial clones — negligible, and worth stating rather than leaving
+//! unscoped.
+//!
 //! What is **not** covered by that: the cost of a single `map.over` fan-out
 //! evaluating the same expression once per item is `O(items × per-item
 //! cost)` by construction, and this module has no per-run or per-item
