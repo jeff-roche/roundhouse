@@ -105,6 +105,21 @@ pub struct EventStreamDecoder {
     buf: BytesMut,
     decoder: MessageFrameDecoder,
     poisoned: bool,
+    /// Fix-round-2 J1: tracks whether the vendored decoder has consumed a
+    /// frame's 12-byte prelude into its own private cache (`prelude_read`
+    /// in `MessageFrameDecoder`, unreachable from here) while still waiting
+    /// on the rest of that frame. `!buf.is_empty()` alone is NOT sufficient:
+    /// `decode_frame` (`frame.rs:614-626` in the vendored source) removes
+    /// the prelude bytes from the buffer it's given as soon as they're
+    /// available, before it knows whether the rest of the frame has
+    /// arrived — so the buffer can be completely empty while the decoder is
+    /// still squarely mid-frame. Set whenever a `decode_frame` call
+    /// consumes bytes (buffer length drops) but returns `Incomplete`
+    /// (the only consumption that can happen before an `Incomplete` return
+    /// is exactly this prelude read); cleared on every `Complete` (the
+    /// vendored decoder's own `reset()` clears its private `prelude_read`
+    /// at the same moment, per its source).
+    prelude_pending: bool,
 }
 
 impl Default for EventStreamDecoder {
@@ -119,6 +134,7 @@ impl EventStreamDecoder {
             buf: BytesMut::new(),
             decoder: MessageFrameDecoder::new(),
             poisoned: false,
+            prelude_pending: false,
         }
     }
 
@@ -148,9 +164,23 @@ impl EventStreamDecoder {
 
         let mut messages = Vec::new();
         loop {
+            let before = self.buf.len();
             match self.decoder.decode_frame(&mut self.buf) {
-                Ok(DecodedFrame::Complete(message)) => messages.push(message),
-                Ok(DecodedFrame::Incomplete) => break,
+                Ok(DecodedFrame::Complete(message)) => {
+                    messages.push(message);
+                    self.prelude_pending = false;
+                }
+                Ok(DecodedFrame::Incomplete) => {
+                    // Fix-round-2 J1: the only consumption `decode_frame`
+                    // can do before returning `Incomplete` is reading the
+                    // prelude into its own private cache -- if the buffer
+                    // shrank, that's exactly what happened, even though the
+                    // buffer may now be completely empty.
+                    if self.buf.len() < before {
+                        self.prelude_pending = true;
+                    }
+                    break;
+                }
                 Err(e) => {
                     self.poisoned = true;
                     return Err(EventStreamDecodeError::Framing(e.to_string()));
@@ -160,18 +190,21 @@ impl EventStreamDecoder {
         Ok(messages)
     }
 
-    /// True if this decoder is currently holding bytes belonging to a frame
-    /// that has not yet completed (fix-round-1 H2). `feed`'s inner loop
-    /// always drains every complete frame it can before returning, so any
-    /// bytes still buffered afterward are unambiguously partial-frame data,
-    /// never "nothing pending yet" -- this is exactly, and only, "positive
-    /// truncation detection." A caller whose transport stream ends while
-    /// this is true knows the underlying connection was cut mid-frame, not
-    /// merely between two logically complete messages (the latter is not an
-    /// error on its own -- see `decode_bedrock_converse_stream`'s handling
-    /// of a body that ends with no `messageStop` at all).
+    /// True if this decoder is currently holding a not-yet-complete frame
+    /// (fix-round-1 H2; predicate corrected in fix-round-2 J1). `feed`'s
+    /// inner loop always drains every complete frame it can before
+    /// returning, so any bytes still buffered afterward are unambiguously
+    /// partial-frame data -- but an EMPTY buffer is not on its own proof of
+    /// the opposite: `prelude_pending` (see its field doc comment) covers
+    /// the case where the vendored decoder has already consumed a frame's
+    /// prelude into its own private cache while still waiting on the rest.
+    /// A caller whose transport stream ends while either is true knows the
+    /// underlying connection was cut mid-frame, not merely between two
+    /// logically complete messages (the latter is not an error on its own
+    /// -- see `decode_bedrock_converse_stream`'s handling of a body that
+    /// ends with no `messageStop` at all).
     pub fn is_mid_frame(&self) -> bool {
-        !self.buf.is_empty()
+        !self.buf.is_empty() || self.prelude_pending
     }
 }
 
@@ -212,7 +245,7 @@ mod tests {
         assert_eq!(decoded[0].payload().as_ref(), message.payload().as_ref());
     }
 
-    /// The exact bug this module's `ChunkQueue` doc comment describes: the
+    /// The exact bug `EventStreamDecoder`'s doc comment describes: the
     /// prelude (first 12 bytes) arrives in one `feed()` call, and the rest
     /// of the message arrives in later calls, one byte at a time. A fresh
     /// per-call buffer would desynchronize here; a persistent one must not.
@@ -356,50 +389,147 @@ mod tests {
             .is_empty());
     }
 
-    /// Fix-round-1 H1 regression test: a peer drip-feeding one byte per
-    /// chunk (e.g. one TLS record per socket read) must not make `feed`
-    /// degrade quadratically. Sized at 100,000 one-byte chunks forming a
-    /// single still-incomplete message, so almost every call takes the
-    /// `Incomplete` branch (the one that used to re-scan the whole
-    /// accumulated queue on every call, several times per call). Under the
-    /// O(1) `BytesMut`-backed accumulator this completes in well under a
-    /// second; under the previous O(chunks) `VecDeque<Bytes>` + hand-rolled
-    /// `Buf::remaining()` implementation, this single test took long enough
-    /// that a `timeout 15 cargo test` run never printed a result at all (see
-    /// the task report's fix-round-1 H1 section for the actual pasted
-    /// before/after command output).
-    #[test]
-    fn feeding_one_byte_at_a_time_does_not_degrade_quadratically() {
-        // A payload large enough that 100,000 one-byte feeds still leave the
-        // message incomplete for the vast majority of calls.
-        let big_payload = vec![b'x'; 150_000];
-        let message = build_message(&[(":message-type", "event")], &big_payload);
-        let bytes = encode(&message);
-        assert!(
-            bytes.len() >= 100_000,
-            "fixture payload must be large enough to drive 100,000 one-byte feeds"
-        );
+    /// A 12-byte prelude claiming a plausible (not oversized) `total_length`,
+    /// with no header or payload bytes -- used by both fix-round-2 J1
+    /// regression tests below. `remaining_bytes_if_frame_available` (the
+    /// vendored source) never validates the prelude CRC on this path, so the
+    /// trailing 4 bytes are never checked and can be anything.
+    fn plausible_prelude_bytes(claimed_total_len: u32) -> [u8; 12] {
+        let mut prelude = [0u8; 12];
+        prelude[0..4].copy_from_slice(&claimed_total_len.to_be_bytes());
+        prelude[4..8].copy_from_slice(&0u32.to_be_bytes()); // headers_length = 0
+        prelude[8..12].copy_from_slice(&0u32.to_be_bytes()); // prelude_crc, unchecked here
+        prelude
+    }
 
-        let start = std::time::Instant::now();
+    /// Fix-round-2 J1, CASE A: `MessageFrameDecoder::decode_frame` consumes
+    /// a frame's 12-byte prelude out of the buffer as soon as it's
+    /// available, caching it privately, and returns `Incomplete` -- so the
+    /// buffer can be completely empty (`is_mid_frame()`'s old
+    /// `!buf.is_empty()` predicate says "false") while the decoder is
+    /// squarely mid-frame waiting on the rest of a frame whose prelude it
+    /// already consumed. A complete frame followed by exactly the next
+    /// frame's 12-byte prelude, and nothing else, must be `is_mid_frame() ==
+    /// true`.
+    #[test]
+    fn case_a_a_complete_frame_followed_by_exactly_the_next_preludes_12_bytes_is_mid_frame() {
+        let complete = build_message(&[(":message-type", "event")], b"{}");
+        let mut bytes = encode(&complete);
+        bytes.extend_from_slice(&plausible_prelude_bytes(1000));
+
+        let mut decoder = EventStreamDecoder::new();
+        let decoded = decoder.feed(&bytes).expect("must decode");
+        assert_eq!(
+            decoded.len(),
+            1,
+            "the first complete frame must still decode"
+        );
+        assert!(
+            decoder.is_mid_frame(),
+            "a buffer left empty by consuming a subsequent prelude must still report mid-frame"
+        );
+    }
+
+    /// CASE A fed one byte at a time, exercising the same prelude-consumption
+    /// path across many `feed()` calls rather than one.
+    #[test]
+    fn case_a2_the_same_case_fed_one_byte_at_a_time() {
+        let complete = build_message(&[(":message-type", "event")], b"{}");
+        let mut bytes = encode(&complete);
+        bytes.extend_from_slice(&plausible_prelude_bytes(1000));
+
         let mut decoder = EventStreamDecoder::new();
         let mut decoded = Vec::new();
-        for byte in bytes.iter().take(100_000) {
+        for byte in &bytes {
             decoded.extend(
                 decoder
                     .feed(std::slice::from_ref(byte))
                     .expect("must decode"),
             );
         }
-        let elapsed = start.elapsed();
+        assert_eq!(decoded.len(), 1);
+        assert!(decoder.is_mid_frame());
+    }
+
+    /// Fix-round-2 J1, CASE C -- the sharp one: a body consisting of
+    /// NOTHING but 12 bytes (a bare prelude, no complete frame ever seen)
+    /// decodes as a clean, empty `Ok` with no error, and the prelude CRC is
+    /// never checked because `read_message_from` is never reached. Without
+    /// the `prelude_pending` fix this is indistinguishable from a
+    /// legitimately empty stream.
+    #[test]
+    fn case_c_a_body_of_exactly_twelve_bytes_and_nothing_else_is_mid_frame() {
+        let mut decoder = EventStreamDecoder::new();
+        let decoded = decoder
+            .feed(&plausible_prelude_bytes(1000))
+            .expect("a bare prelude alone is not itself a framing error");
+        assert!(decoded.is_empty());
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "100,000 one-byte feeds took {elapsed:?} -- expected well under 5s under O(1) \
-             remaining()/advance(); this is the exact shape of fix-round-1 H1's quadratic \
+            decoder.is_mid_frame(),
+            "12 bytes that are exactly one consumed prelude and nothing else must report \
+             mid-frame, not a clean empty success"
+        );
+    }
+
+    /// Fix-round-1 H1 regression test: a peer drip-feeding one byte per
+    /// chunk (e.g. one TLS record per socket read) must not make `feed`
+    /// degrade quadratically. Forms a single still-incomplete message, so
+    /// almost every call takes the `Incomplete` branch (the one that used to
+    /// re-scan the whole accumulated queue on every call, several times per
+    /// call).
+    ///
+    /// Fix-round-2 J4: an earlier version of this test asserted an absolute
+    /// wall-clock bound ("100,000 feeds complete in under 5s"), which is a
+    /// real regression signal but flakes under CI load unrelated to this
+    /// code's actual complexity -- and a flaky guard tends to get deleted by
+    /// whoever hits the flake, which loses the protection entirely. This
+    /// version instead compares the cost of feeding `N` chunks against `10N`
+    /// chunks: under the O(1) `BytesMut`-backed accumulator this fix uses,
+    /// 10x the chunks costs roughly 10x the time (linear); under the
+    /// previous O(chunks) `VecDeque<Bytes>` + hand-rolled `Buf::remaining()`
+    /// implementation it cost roughly 100x (quadratic) -- see the task
+    /// report's fix-round-1 H1 section for the actual measured before/after
+    /// numbers (a `timeout 15` run of the old implementation at 100,000
+    /// one-byte feeds never printed a result at all). A ratio threshold of
+    /// 40 sits comfortably above the ~10x linear prediction (generous
+    /// headroom for scheduler noise) and comfortably below the ~100x a real
+    /// quadratic regression would produce, regardless of how fast or slow
+    /// the machine running this test happens to be.
+    #[test]
+    fn feeding_one_byte_at_a_time_does_not_degrade_quadratically() {
+        fn feed_one_byte_at_a_time(chunk_count: usize) -> std::time::Duration {
+            // Payload large enough that the message is still incomplete
+            // after `chunk_count` one-byte feeds.
+            let big_payload = vec![b'x'; chunk_count + 50_000];
+            let message = build_message(&[(":message-type", "event")], &big_payload);
+            let bytes = encode(&message);
+            assert!(bytes.len() >= chunk_count);
+
+            let mut decoder = EventStreamDecoder::new();
+            let start = std::time::Instant::now();
+            for byte in bytes.iter().take(chunk_count) {
+                decoder
+                    .feed(std::slice::from_ref(byte))
+                    .expect("must decode");
+            }
+            start.elapsed()
+        }
+
+        const SMALL: usize = 5_000;
+        const LARGE: usize = 50_000; // 10x SMALL
+
+        // A floor under the small measurement avoids a division blowing up
+        // on a machine fast enough to round it to (near) zero.
+        let small = feed_one_byte_at_a_time(SMALL).max(std::time::Duration::from_micros(200));
+        let large = feed_one_byte_at_a_time(LARGE);
+
+        let ratio = large.as_secs_f64() / small.as_secs_f64();
+        assert!(
+            ratio < 40.0,
+            "feeding {LARGE} one-byte chunks ({large:?}) took {ratio:.1}x as long as feeding \
+             {SMALL} ({small:?}) -- expected roughly 10x (linear, O(1) remaining()/advance()); \
+             a ratio this far above linear is the exact shape of fix-round-1 H1's quadratic \
              blowup if it regresses"
         );
-        // The message is 150,000+ bytes but only the first 100,000 were fed,
-        // so it must still be incomplete -- this test is about the cost of
-        // getting here, not about completing the message.
-        assert!(decoded.is_empty());
     }
 }

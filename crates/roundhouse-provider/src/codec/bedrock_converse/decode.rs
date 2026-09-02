@@ -676,6 +676,53 @@ mod stream_decode_tests {
         );
     }
 
+    /// A 12-byte prelude claiming a plausible `total_length`, matching
+    /// `transport::eventstream::tests::plausible_prelude_bytes` -- the
+    /// vendored decoder never validates the prelude CRC on the `Incomplete`
+    /// path, so the trailing 4 bytes are never checked and can be anything.
+    fn plausible_prelude_bytes(claimed_total_len: u32) -> [u8; 12] {
+        let mut prelude = [0u8; 12];
+        prelude[0..4].copy_from_slice(&claimed_total_len.to_be_bytes());
+        prelude[4..8].copy_from_slice(&0u32.to_be_bytes());
+        prelude[8..12].copy_from_slice(&0u32.to_be_bytes());
+        prelude
+    }
+
+    /// Fix-round-2 J1, CASE A through the full pipeline: a cut at
+    /// `len()/2` (the pre-existing test above) cannot see this bug --
+    /// `MessageFrameDecoder::decode_frame` consumes a frame's 12-byte
+    /// prelude out of the buffer as soon as it's available, so a body
+    /// ending in exactly a complete frame plus the next frame's bare
+    /// 12-byte prelude leaves the accumulator buffer EMPTY while the
+    /// decoder is still squarely mid-frame.
+    #[tokio::test]
+    async fn a_body_ending_in_exactly_a_bare_next_prelude_is_mid_frame() {
+        let complete = event("messageStart", serde_json::json!({ "role": "assistant" }));
+        let mut raw = Vec::new();
+        write_message_to(&complete, &mut raw).unwrap();
+        raw.extend_from_slice(&plausible_prelude_bytes(1000));
+
+        let failure = expect_stream_failure(decode_bedrock_converse_stream(raw_body(raw)).await);
+        assert!(
+            failure.message.contains("mid-frame"),
+            "expected a mid-frame truncation message, got: {failure:?}"
+        );
+    }
+
+    /// Fix-round-2 J1, CASE C through the full pipeline -- the sharp one: a
+    /// body consisting of NOTHING but 12 bytes must not decode as a clean,
+    /// empty success (no events, no `MessageStop`, no error) with the
+    /// prelude CRC never checked.
+    #[tokio::test]
+    async fn a_body_of_exactly_twelve_bytes_and_nothing_else_is_mid_frame_not_a_clean_success() {
+        let raw = plausible_prelude_bytes(1000).to_vec();
+        let failure = expect_stream_failure(decode_bedrock_converse_stream(raw_body(raw)).await);
+        assert!(
+            failure.message.contains("mid-frame"),
+            "expected a mid-frame truncation message, got: {failure:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_genuine_messagestop_event_does_produce_message_stop() {
         let messages = [
