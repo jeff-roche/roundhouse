@@ -166,6 +166,21 @@ impl ConformanceSubject for CohereV2Subject {
                 name: "error_500",
                 request: fixtures::single_turn_text(),
                 cassette_path: cassette_path("error_500.cassette"),
+                mask: mask.clone(),
+                declared_loss_events: vec![],
+                expected_error: Some(|e| matches!(e, ProviderError::Server { status: 500 })),
+            },
+            // Fix round 1, L2: there was no conformance case at all covering
+            // an IN-BAND failure (a 200 response whose stream carries a
+            // failing `finish_reason`) -- which is exactly why the original
+            // `classify`-at-200 defect (everything landing in
+            // `BadRequest { status: 200, .. }`) went unnoticed. This drives
+            // `finish_reason: "ERROR"` through the real `stream_chat`
+            // pipeline, at all four chunk strategies.
+            ConformanceCase {
+                name: "mid_stream_error",
+                request: fixtures::single_turn_text(),
+                cassette_path: cassette_path("mid_stream_error.cassette"),
                 mask,
                 declared_loss_events: vec![],
                 expected_error: Some(|e| matches!(e, ProviderError::Server { status: 500 })),
@@ -350,4 +365,111 @@ async fn bare_api_key_fallback_attaches_a_bearer_authorization_header() {
         .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
         .map(|(_, value)| value.as_str());
     assert_eq!(auth, Some("Bearer sk-test-12345"));
+}
+
+/// Fix round 1, L7: an empty `api_key` with no `CredentialProvider` must
+/// fail closed BEFORE any transport call, not silently send a header-shaped-
+/// but-credential-less `authorization: Bearer ` request. Uses a transport
+/// that panics on `send` -- if this test failed to fail closed, it would
+/// panic there instead of via the expected `ProviderError::Unsupported`.
+#[tokio::test]
+async fn an_empty_api_key_with_no_credential_provider_fails_closed() {
+    struct PanicsOnSend;
+
+    impl roundhouse_provider::HttpTransport for PanicsOnSend {
+        fn send<'a>(
+            &'a self,
+            _req: roundhouse_provider::HttpRequest,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<roundhouse_provider::HttpResponseStream, roundhouse_provider::TransportError>,
+        > {
+            panic!("must fail closed on an empty api_key before ever calling send()")
+        }
+    }
+
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(PanicsOnSend),
+        api_key: String::new(),
+        credentials: None,
+    };
+    let provider = CohereV2Provider::new(fixture_profile());
+    let err = expect_err(
+        provider
+            .stream_chat(&fixtures::single_turn_text(), &ctx)
+            .await,
+    );
+    assert!(
+        matches!(err, ProviderError::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
+}
+
+/// Fix round 1, L1: a clean EOF with no `message-end` ever observed --
+/// `truncated.cassette` ends after a single `content-delta`, mid-block, with
+/// no `content-end`/`message-end` at all -- must map to
+/// `ProviderError::StreamInterrupted`, carrying the partial text that WAS
+/// decoded, driven through the real `stream_chat` pipeline (not just the
+/// decode-layer unit test). Before this fix round, the same cassette would
+/// have decoded as `Ok(ChatStream)` with no terminal `MessageStop` at all --
+/// silently indistinguishable from a real completion to any caller that
+/// doesn't itself check for a trailing `MessageStop`.
+#[tokio::test]
+async fn a_truncated_cassette_maps_to_stream_interrupted_with_partial_text() {
+    let transport = CassetteTransport::from_file(
+        &cassette_path("truncated.cassette"),
+        ChunkStrategy::WholeBody,
+    )
+    .expect("truncated.cassette must parse");
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(transport),
+        api_key: "test-key".into(),
+        credentials: None,
+    };
+    let provider = CohereV2Provider::new(fixture_profile());
+    let err = expect_err(
+        provider
+            .stream_chat(&fixtures::single_turn_text(), &ctx)
+            .await,
+    );
+    match err {
+        ProviderError::StreamInterrupted { partial } => {
+            assert_eq!(partial, "The answer is cut off here");
+        }
+        other => panic!("expected StreamInterrupted, got {other:?}"),
+    }
+}
+
+/// Fix round 1, L1/L2: `finish_reason: "MAX_TOKENS"` must map to
+/// `StreamInterrupted` (real partial output, an agent-loop decision to
+/// resume or not) rather than the generic-retry-loop-fatal
+/// `BadRequest { status: 200, .. }` the original `classify`-at-200 defect
+/// produced.
+#[tokio::test]
+async fn a_max_tokens_cassette_maps_to_stream_interrupted_with_partial_text() {
+    let transport = CassetteTransport::from_file(
+        &cassette_path("max_tokens.cassette"),
+        ChunkStrategy::WholeBody,
+    )
+    .expect("max_tokens.cassette must parse");
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(transport),
+        api_key: "test-key".into(),
+        credentials: None,
+    };
+    let provider = CohereV2Provider::new(fixture_profile());
+    let err = expect_err(
+        provider
+            .stream_chat(&fixtures::single_turn_text(), &ctx)
+            .await,
+    );
+    match err {
+        ProviderError::StreamInterrupted { partial } => {
+            assert_eq!(partial, "This response got cut off");
+        }
+        other => panic!("expected StreamInterrupted, got {other:?}"),
+    }
 }

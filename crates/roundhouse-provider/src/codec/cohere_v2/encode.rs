@@ -22,6 +22,21 @@ pub enum EncodeError {
     Reasoning(#[from] ProfileReasoningError),
     #[error("cohere-v2 codec does not encode {0} blocks")]
     UnencodableMedia(&'static str),
+    /// Fix round 1, L4 (reverses the original degrade-to-`"REQUIRED"`
+    /// decision): Cohere v2's `tool_choice` has no mechanism to force one
+    /// SPECIFIC named tool. Silently widening `ToolChoice::Named` into
+    /// `"REQUIRED"` (any tool) is a constraint the caller did not ask for,
+    /// with nothing downstream able to observe or reject the substitution --
+    /// there is no `LossEvent` type anywhere in this workspace, this codec
+    /// emits no tracing, and nothing compares the tool name that comes back
+    /// against the one that was requested. Failing closed, by name, is the
+    /// same posture this codec already takes on unencodable content -- same
+    /// shape as `UnencodableMedia` above.
+    #[error(
+        "cohere-v2 codec cannot force one specific named tool via tool_choice \
+         (only REQUIRED/NONE are supported on this wire format)"
+    )]
+    NamedToolChoiceUnsupported,
 }
 
 impl From<EncodeError> for ProviderError {
@@ -52,6 +67,14 @@ pub fn contains_unencodable_media(req: &ChatRequest) -> bool {
             )
         })
     })
+}
+
+/// True if `req.tool_choice` is a shape this codec cannot honor (fix round
+/// 1, L4: `ToolChoice::Named`) -- the request-level analogue of
+/// [`contains_unencodable_media`], used by `CohereV2Provider::resolve` for
+/// the same cheap, I/O-free pre-flight.
+pub fn requests_unsupported_tool_choice(req: &ChatRequest) -> bool {
+    matches!(req.tool_choice, ToolChoice::Named(_))
 }
 
 fn reasoning_control_for<'p>(
@@ -93,7 +116,7 @@ pub fn encode(req: &ChatRequest, profile: &ProviderProfile) -> Result<Value, Enc
 
     if !req.tools.is_empty() {
         body["tools"] = Value::Array(req.tools.iter().map(encode_tool).collect());
-        if let Some(tool_choice) = encode_tool_choice(&req.tool_choice) {
+        if let Some(tool_choice) = encode_tool_choice(&req.tool_choice)? {
             body["tool_choice"] = tool_choice;
         }
     }
@@ -154,17 +177,25 @@ fn encode_tool(tool: &ToolDef) -> Value {
 /// Verified (docs.cohere.com/reference/chat): `tool_choice` accepts ONLY
 /// `"REQUIRED"`/`"NONE"` -- there is no mechanism to force one SPECIFIC named
 /// tool. `Auto` (the default) is omitted from the wire body entirely.
-/// `Named` is degraded to `"REQUIRED"` (the closest honestly-expressible
-/// shape: force *a* tool call) -- mirrors
-/// `anthropic_messages::encode_tool_choice`'s identical, documented
-/// `None -> auto` degrade precedent; a Phase 2 LossEvent should mark this
-/// downgrade.
-fn encode_tool_choice(choice: &ToolChoice) -> Option<Value> {
+///
+/// Fix round 1, L4: `Named` fails closed (`Err(EncodeError::
+/// NamedToolChoiceUnsupported)`), NOT a degrade to `"REQUIRED"`. An earlier
+/// version of this codec silently substituted `"REQUIRED"` (force *any*
+/// tool) for a request that named a SPECIFIC tool -- widening the caller's
+/// constraint with no observable trace anywhere (no `LossEvent` type exists
+/// in this workspace, this codec emits no tracing, and nothing downstream
+/// compares the returned tool name against the one requested). That is
+/// inconsistent with this same codec's own posture on unencodable content
+/// (`Image`/`Document`/`Opaque` all fail closed, by name) -- fail closed
+/// here too, naming the exact constraint, matching `UnencodableMedia`'s
+/// shape. `Named` has zero production callers in this workspace today, so
+/// this costs nothing.
+fn encode_tool_choice(choice: &ToolChoice) -> Result<Option<Value>, EncodeError> {
     match choice {
-        ToolChoice::Auto => None,
-        ToolChoice::None => Some(json!("NONE")),
-        ToolChoice::Required => Some(json!("REQUIRED")),
-        ToolChoice::Named(_) => Some(json!("REQUIRED")),
+        ToolChoice::Auto => Ok(None),
+        ToolChoice::None => Ok(Some(json!("NONE"))),
+        ToolChoice::Required => Ok(Some(json!("REQUIRED"))),
+        ToolChoice::Named(_) => Err(EncodeError::NamedToolChoiceUnsupported),
     }
 }
 

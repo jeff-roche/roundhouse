@@ -26,14 +26,31 @@
 //!   prior turn's reasoning, unlike this crate's `google_genai`/
 //!   `openai_responses` codecs, which fail closed on `Thinking` for their own
 //!   documented reasons); the `tool_choice` enum's only two real values
-//!   (`REQUIRED`/`NONE` -- there is no per-tool named-forcing mechanism, an
-//!   API limitation this codec documents at its one call site rather than
-//!   silently working around); and the `thinking` request field's shape
-//!   (`{"type": "enabled"|"disabled", "token_budget": int}`).
+//!   (`REQUIRED`/`NONE` -- there is no per-tool named-forcing mechanism, so
+//!   `ToolChoice::Named` fails closed rather than silently widening the
+//!   request into `"REQUIRED"`, per fix round 1's L4); and the `thinking`
+//!   request field's shape (`{"type": "enabled"|"disabled", "token_budget":
+//!   int}`).
 //! - `https://docs.cohere.com/reference/errors` (fetched 2026-09-02): real
 //!   Cohere error bodies are a plain `{"message": "..."}` string with no
 //!   machine-readable code/type field at all -- see `profiles/cohere-v2.toml`'s
-//!   own doc comment on what that means for this profile's `[errors]` table.
+//!   own doc comment on what that means for this codec's `[errors]` table
+//!   (deliberately empty, per fix round 1's L5).
+//!
+//! **A note for institutional memory (fix round 1, L12):** a `WebSearch`
+//! query made during this task's initial verification pass returned a
+//! plausible-looking summary claiming `finish_reason`'s real values are
+//! LOWERCASE (`complete`, `max_tokens`, ...), sourced from a stale or
+//! different page than the live reference. Re-fetching
+//! `docs.cohere.com/reference/chat` directly and reading its own schema
+//! section (not a search-engine summary of it) showed the real values are
+//! UPPERCASE (`COMPLETE`, `MAX_TOKENS`, ...) -- confirmed independently by
+//! two reviewers in fix round 1. The lesson: a search snippet is not the
+//! same source as the page it summarizes, and a schema's own authoritative
+//! enum beats any prose describing it, search-engine-summarized prose
+//! included. The verified values are already committed in this module's
+//! vendored `.txt` lists and doc comments; this paragraph exists only so a
+//! future reader doesn't have to relearn why the check mattered.
 //!
 //! See `tests/cohere_v2_wire_literal_tripwire.rs` for the vendored literal
 //! lists these values are checked against, and `tests/conformance_cohere_v2.rs`'s

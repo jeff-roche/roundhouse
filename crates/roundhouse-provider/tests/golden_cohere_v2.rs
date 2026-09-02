@@ -100,13 +100,14 @@ fn golden_tool_choice_none() {
     insta::assert_json_snapshot!("cohere_v2_tool_choice_none", body);
 }
 
-/// Verified: Cohere v2 has no mechanism to force one SPECIFIC named tool --
-/// `Named` degrades to the closest honest wire-expressible shape
-/// (`"REQUIRED"`, forcing *a* tool call), matching
-/// `anthropic_messages::encode_tool_choice`'s identical documented-degrade
-/// precedent for `ToolChoice::None`.
+/// Fix round 1, L4: Cohere v2 has no mechanism to force one SPECIFIC named
+/// tool (only `REQUIRED`/`NONE` are real wire values) -- `Named` fails
+/// closed, both at `resolve()` (cheap pre-flight) and at `encode()` (the
+/// actual production-path guard), rather than silently widening the
+/// constraint into `"REQUIRED"` (any tool). Reverses this codec's original
+/// degrade decision.
 #[test]
-fn golden_named_tool_choice_degrades_to_required() {
+fn golden_named_tool_choice_fails_closed() {
     let req = ChatRequest {
         tools: vec![roundhouse_provider::tool_def_from_schema::<
             fixtures::NoParams,
@@ -114,8 +115,16 @@ fn golden_named_tool_choice_degrades_to_required() {
         tool_choice: ToolChoice::Named("get_weather".into()),
         ..base_request(vec![user_text("What's the weather?")])
     };
-    let body = enc(&req);
-    assert_eq!(body["tool_choice"], json!("REQUIRED"));
+
+    let provider = CohereV2Provider::new(fixture_profile());
+    assert!(
+        matches!(provider.resolve(&req), Err(ProviderError::Unsupported(_))),
+        "resolve() must reject a Named tool_choice, not silently widen it"
+    );
+
+    let err = encode(&req, &fixture_profile())
+        .expect_err("encode() must refuse to silently widen a Named tool_choice to REQUIRED");
+    insta::assert_snapshot!("cohere_v2_named_tool_choice_unsupported", err.to_string());
 }
 
 #[test]

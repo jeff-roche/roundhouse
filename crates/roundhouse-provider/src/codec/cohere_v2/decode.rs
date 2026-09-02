@@ -6,26 +6,153 @@
 //! this module recognizes (a `finish_reason` other than the three real
 //! success values) is enumerated explicitly and never falls into that "skip"
 //! bucket (REALITY-CORRECTIONS §13b item 4).
+//!
+//! Fix round 1, L1/L2: a clean EOF with no `message-end` ever observed is a
+//! FAILURE (a truncated generation), not `Ok(events)` -- the earlier version
+//! of this module returned `Ok` unconditionally at the bottom of the loop,
+//! which `roundhouse-engine::infer` cannot distinguish from a real
+//! `MessageStop`, so a truncated inference persisted as `TaskCompleted` on a
+//! physically-immutable row. `provider.rs` maps every [`StreamFailure`] here
+//! directly onto a `ProviderError` by [`StreamFailureKind`] rather than
+//! laundering it through `crate::errors::classify` at the enclosing HTTP
+//! response's (always 200, since this is an in-band failure) status --
+//! doing so would land everything in `BadRequest{200, ""}` (permanently
+//! fatal, per `retry.rs`'s disposition table) and discard every diagnostic
+//! message this module builds.
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use regex::{Captures, Regex};
 use serde_json::Value;
 use sse_stream::SseStream;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use crate::stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 use crate::TransportError;
 
+/// How `provider.rs` should map a [`StreamFailure`] onto a `ProviderError` --
+/// computed here, at decode time, since this module (not `provider.rs`) is
+/// the one that actually knows which real, verified wire condition produced
+/// the failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamFailureKind {
+    /// The stream ended (a clean EOF) without ever observing a `message-end`
+    /// event at all -- a proxy terminating gracefully mid-generation, an
+    /// HTTP/2 `END_STREAM`, or a final frame missing the blank-line
+    /// terminator `sse-stream` requires (dropped silently by that library).
+    /// Distinct from a reset connection, which surfaces as `Transport`
+    /// below via the SSE frame's own `Err`.
+    Truncated,
+    /// `finish_reason: "MAX_TOKENS"` -- generation was cut short by a length
+    /// limit; there is real partial output.
+    MaxTokens,
+    /// `finish_reason: "ERROR"` -- Cohere's own "the generation failed due
+    /// to an internal error" (verified enum value).
+    Error,
+    /// `finish_reason: "TIMEOUT"` -- verified enum value; maps directly onto
+    /// this crate's existing `ProviderError::Timeout`.
+    Timeout,
+    /// `message-end` arrived with a missing or genuinely unrecognized
+    /// `finish_reason` (a future spec revision's value this decoder doesn't
+    /// know about) -- an unknown terminal condition, not assumed to be any
+    /// specific known failure kind.
+    UnrecognizedFinishReason,
+    /// A mid-stream SSE/transport read error (a reset connection, a
+    /// malformed frame at the transport layer).
+    Transport,
+}
+
 /// A terminal, spec-verified failure signaled mid-stream. Deliberately not a
 /// `ProviderError` -- this module has no `ProviderProfile` to classify
-/// through; `provider.rs` maps this into the real `ProviderError` once
-/// decoding stops. Mirrors `google_genai::decode::StreamFailure`.
+/// through; `provider.rs` maps this into the real `ProviderError` directly,
+/// by `kind`, per this module's doc comment. Mirrors
+/// `google_genai::decode::StreamFailure`, extended with `kind` and
+/// `partial_text` (fix round 1, L1/L2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamFailure {
+    /// How `provider.rs` should map this into a `ProviderError`.
+    pub kind: StreamFailureKind,
     /// The provider's `finish_reason` value, when the event carried one.
+    /// Length-capped and escaped (fix round 1, L10) -- this string can
+    /// originate from an untrusted upstream response and reach a persisted
+    /// error field.
     pub code: Option<String>,
-    /// A human-readable description of the failure.
+    /// A human-readable description of the failure. Redacted (fix round 1,
+    /// L3) for the `Transport` kind, since a mid-stream transport error's
+    /// text can embed the full request URL, query string and all.
     pub message: String,
+    /// Text decoded before the failure occurred (`BlockDelta::Text`
+    /// fragments, concatenated in first-seen order) -- lets `provider.rs`
+    /// construct `ProviderError::StreamInterrupted { partial }` without
+    /// re-deriving it from the (already-consumed) event list.
+    pub partial_text: String,
+}
+
+/// Caps how much of an untrusted `finish_reason` string is echoed into a
+/// diagnostic message or `StreamFailure.code` (fix round 1, L10) -- Cohere's
+/// documented values are all well under this, so it never truncates a real
+/// one; only an attacker- or bug-supplied arbitrary-length string is capped.
+const MAX_FINISH_REASON_ECHO_LEN: usize = 64;
+
+/// Truncates `raw` to [`MAX_FINISH_REASON_ECHO_LEN`] chars and renders it via
+/// `{:?}` (fix round 1, L10) -- `Debug` on `&str` escapes control characters
+/// and quotes, so a value containing e.g. a newline can't inject fake log
+/// lines into a persisted diagnostic message. Mirrors
+/// `google_genai::provider::build_endpoint_url`'s identical `{:?}`-escaping
+/// precedent for an untrusted string reaching the same kind of sink.
+fn sanitize_finish_reason_for_message(raw: &str) -> String {
+    let truncated: String = raw.chars().take(MAX_FINISH_REASON_ECHO_LEN).collect();
+    format!("{truncated:?}")
+}
+
+/// Concatenates every `BlockDelta::Text` fragment in `events`, in order --
+/// the best-effort "partial output" `provider.rs` attaches to a
+/// `ProviderError::StreamInterrupted`. Mirrors
+/// `roundhouse-engine::compact::fold_stream_text`'s identical text-folding
+/// logic, but over an already-materialized `&[StreamEvent]` rather than a
+/// live stream.
+fn partial_text_from_events(events: &[StreamEvent]) -> String {
+    let mut text = String::new();
+    for event in events {
+        if let StreamEvent::BlockDelta {
+            delta: BlockDelta::Text(t),
+            ..
+        } = event
+        {
+            text.push_str(t);
+        }
+    }
+    text
+}
+
+/// Matches an embedded `http(s)://` URL inside a larger error-message string
+/// (fix round 1, L3) -- `reqwest::Error`'s `Display` appends `for url
+/// (<full url>)` verbatim, query string and userinfo included, to a
+/// transport error's text. Stops at the first whitespace, parenthesis, or
+/// quote character, which is always where such an embedded URL ends in
+/// practice (a bare URL token, not URL-encoded punctuation of that shape).
+static EMBEDDED_URL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"https?://[^\s()'"]+"#).unwrap());
+
+/// Redacts a mid-stream transport-error message for safe inclusion in a
+/// `StreamFailure` (fix round 1, L3): every embedded `http(s)://` URL is
+/// reduced to `host[:port]` via the same host-only helper
+/// `resolve_base_url` already uses before a base-URL override is ever
+/// persisted (`crate::credential::record_base_url_override`), THEN the
+/// result is passed through this crate's general secret-shape redactor
+/// (`crate::audit::redact_error_body`) to catch anything else (a bearer
+/// token, an API key) the error text might otherwise echo.
+///
+/// Without this, a gateway base URL carrying credentials in its query
+/// string (this codec's own `preserves_a_gateway_query_string` test proves
+/// that shape is supported) would leak them into `StreamFailure.message`,
+/// a `pub` field one step from a persisted `Event` row.
+fn redact_transport_error_text(raw: &str) -> String {
+    let url_redacted = EMBEDDED_URL.replace_all(raw, |caps: &Captures| {
+        crate::credential::record_base_url_override(&caps[0])
+    });
+    crate::audit::redact_error_body(&url_redacted)
 }
 
 /// Tracks which wire `index` values were opened by a RECOGNIZED
@@ -50,10 +177,18 @@ impl IndexKeyer {
     }
 
     /// Opens a new recognized block at `wire_index`, returning its stable
-    /// normalized index.
-    fn open(&mut self, wire_index: u64) -> u32 {
+    /// normalized index -- but only if `wire_index` was not already open.
+    /// `None` for a repeat (fix round 1, L8): a second `content-start`/
+    /// `tool-call-start` for an index this decoder already opened must not
+    /// fabricate a second `BlockStart` for the same normalized index (which
+    /// `roundhouse-engine::infer`'s fold would otherwise materialize as a
+    /// phantom second block).
+    fn open(&mut self, wire_index: u64) -> Option<u32> {
+        if self.recognized.contains(&wire_index) {
+            return None;
+        }
         self.recognized.insert(wire_index);
-        self.keyer.index_for(&wire_index.to_string())
+        Some(self.keyer.index_for(&wire_index.to_string()))
     }
 
     /// The stable normalized index for `wire_index`, but only if it was
@@ -86,12 +221,17 @@ pub async fn decode_cohere_v2_stream(
         let frame = match frame {
             Ok(f) => f,
             Err(e) => {
+                // Fix round 1, L3: `e`'s `Display` can embed the full
+                // request URL (query string, userinfo) verbatim --
+                // redacted before it ever reaches this `pub` field.
                 return Err(StreamFailure {
+                    kind: StreamFailureKind::Transport,
                     code: None,
-                    message: format!(
+                    message: redact_transport_error_text(&format!(
                         "SSE transport error while decoding the cohere-v2 chat stream: {e}"
-                    ),
-                })
+                    )),
+                    partial_text: partial_text_from_events(&events),
+                });
             }
         };
         let Some(data) = frame.data else { continue };
@@ -156,7 +296,25 @@ pub async fn decode_cohere_v2_stream(
         }
     }
 
-    Ok(events)
+    // Fix round 1, L1: the loop above only ever returns via the
+    // "message-end" arm's early `return`. Reaching here means the frame
+    // stream ended (a clean EOF) WITHOUT ever observing a `message-end`
+    // event -- a truncated generation, not a completed one. Returning
+    // `Ok(events)` here (the original defect) is indistinguishable
+    // downstream from a real `MessageStop`, and `roundhouse-engine::infer`
+    // persists it as `TaskCompleted` with partial output on an immutable
+    // row. This must never be conflated with the `Err` branch above (a
+    // genuinely reset connection, already caught): a graceful proxy
+    // termination or a final frame missing its blank-line terminator (which
+    // `sse-stream` drops silently) never surfaces there.
+    Err(StreamFailure {
+        kind: StreamFailureKind::Truncated,
+        code: None,
+        message: "cohere-v2 chat stream ended without ever observing a message-end event -- \
+                   the generation was truncated"
+            .into(),
+        partial_text: partial_text_from_events(&events),
+    })
 }
 
 /// `message-end`: `{type, delta: {finish_reason, usage}}`. Verified
@@ -189,20 +347,44 @@ fn decode_message_end(
             events.push(StreamEvent::MessageStop);
             Ok(events)
         }
-        "MAX_TOKENS" | "ERROR" | "TIMEOUT" => Err(StreamFailure {
+        "MAX_TOKENS" => Err(StreamFailure {
+            kind: StreamFailureKind::MaxTokens,
             code: Some(finish_reason.to_string()),
             message: format!("cohere-v2 chat generation stopped: {finish_reason}"),
+            partial_text: partial_text_from_events(&events),
+        }),
+        "ERROR" => Err(StreamFailure {
+            kind: StreamFailureKind::Error,
+            code: Some(finish_reason.to_string()),
+            message: format!("cohere-v2 chat generation stopped: {finish_reason}"),
+            partial_text: partial_text_from_events(&events),
+        }),
+        "TIMEOUT" => Err(StreamFailure {
+            kind: StreamFailureKind::Timeout,
+            code: Some(finish_reason.to_string()),
+            message: format!("cohere-v2 chat generation stopped: {finish_reason}"),
+            partial_text: partial_text_from_events(&events),
         }),
         "" => Err(StreamFailure {
+            kind: StreamFailureKind::UnrecognizedFinishReason,
             code: None,
             message: "cohere-v2 chat stream's message-end event carried no finish_reason".into(),
+            partial_text: partial_text_from_events(&events),
         }),
-        other => Err(StreamFailure {
-            code: Some(other.to_string()),
-            message: format!(
-                "cohere-v2 chat stream ended with an unrecognized finish_reason `{other}`"
-            ),
-        }),
+        other => {
+            // Fix round 1, L10: `other` is an untrusted, unbounded-length
+            // string from the wire -- capped and escaped before it reaches
+            // either the diagnostic message or `code`.
+            let safe = sanitize_finish_reason_for_message(other);
+            Err(StreamFailure {
+                kind: StreamFailureKind::UnrecognizedFinishReason,
+                code: Some(safe.clone()),
+                message: format!(
+                    "cohere-v2 chat stream ended with an unrecognized finish_reason {safe}"
+                ),
+                partial_text: partial_text_from_events(&events),
+            })
+        }
     }
 }
 
@@ -210,7 +392,9 @@ fn decode_message_end(
 /// Verified content `type` values: `"text"` and `"thinking"` (the assistant
 /// content array's two real block kinds -- see `mod.rs`'s fetch record). Any
 /// other content type has no IR equivalent and is skipped without consuming
-/// a keyer slot.
+/// a keyer slot. A REPEATED `content-start` for an already-open index
+/// (fix round 1, L8) is `None` too -- `IndexKeyer::open` refuses to
+/// fabricate a second `BlockStart` for the same normalized index.
 fn decode_content_start(payload: &Value, keyer: &mut IndexKeyer) -> Option<StreamEvent> {
     let wire_index = payload.get("index").and_then(Value::as_u64)?;
     let content_type = payload
@@ -221,7 +405,7 @@ fn decode_content_start(payload: &Value, keyer: &mut IndexKeyer) -> Option<Strea
         "thinking" => BlockKind::Thinking,
         _ => return None,
     };
-    let index = keyer.open(wire_index);
+    let index = keyer.open(wire_index)?;
     Some(StreamEvent::BlockStart { index, kind })
 }
 
@@ -263,7 +447,9 @@ fn decode_block_end(payload: &Value, keyer: &mut IndexKeyer) -> Option<StreamEve
 /// type, function: {name, arguments}}}}}` -- verified: `tool_calls` here is
 /// an OBJECT, not an array (unlike OpenAI's per-response `tool_calls[]`).
 /// `id` becomes `BlockKind::ToolUse.provider_id`, echoed back by a later
-/// `function_result`/`tool` message's `tool_call_id`.
+/// `function_result`/`tool` message's `tool_call_id`. A REPEATED
+/// `tool-call-start` for an already-open index (fix round 1, L8) is `None`
+/// too, for the identical reason `decode_content_start` is.
 fn decode_tool_call_start(payload: &Value, keyer: &mut IndexKeyer) -> Option<StreamEvent> {
     let wire_index = payload.get("index").and_then(Value::as_u64)?;
     let tool_call = payload.pointer("/delta/message/tool_calls")?;
@@ -276,7 +462,7 @@ fn decode_tool_call_start(payload: &Value, keyer: &mut IndexKeyer) -> Option<Str
         .get("id")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let index = keyer.open(wire_index);
+    let index = keyer.open(wire_index)?;
     Some(StreamEvent::BlockStart {
         index,
         kind: BlockKind::ToolUse { name, provider_id },
@@ -301,10 +487,25 @@ fn decode_tool_call_delta(payload: &Value, keyer: &mut IndexKeyer) -> Option<Str
     })
 }
 
-/// Normalizes `message-end`'s `usage` object (verified field names:
-/// `billed_units.input_tokens`/`billed_units.output_tokens`). Cohere v2's
-/// streaming reference documents no cache-read/cache-hit token count
-/// anywhere -- unlike Gemini/Anthropic, this API has no documented
+/// Normalizes `message-end`'s `usage` object. The verified example carries
+/// TWO usage shapes -- `billed_units.{input,output}_tokens` and
+/// `tokens.{input,output}_tokens` -- and they disagree substantially: the
+/// fetched reference's own example shows `billed_units.input_tokens: 5`
+/// against `tokens.input_tokens: 71`, a >14x gap (`tokens` presumably
+/// includes cached/system/tool-schema tokens Cohere doesn't bill for).
+///
+/// **Deliberate choice (fix round 1, L9): this function reads `billed_units`,
+/// not `tokens`.** `Usage` feeds this crate's cost-accounting path
+/// (`fallback::PricingLookup::cost_for`), and billed tokens are the correct
+/// input for a dollar figure -- reading `tokens` here would overstate cost.
+/// The trade-off: anything that treats `Usage.input_tokens` as a *context or
+/// budget* measure (how much of the model's context window this turn
+/// consumed) will see a large UNDERCOUNT relative to `tokens`. No consumer
+/// in this workspace does that today; if one is added for this provider,
+/// it needs `tokens`, not this field.
+///
+/// Cohere v2's streaming reference documents no cache-read/cache-hit token
+/// count anywhere -- unlike Gemini/Anthropic, this API has no documented
 /// prompt-cache mechanism at all, so `cache_read_tokens` is always `0`, a
 /// documented fact about the wire format rather than an undecoded field
 /// (REALITY-CORRECTIONS §13b item 6's "assert something that is false when a
@@ -428,6 +629,7 @@ mod terminal_tests {
         });
         let err = expect_failure(decode_message_end(&payload, Vec::new()));
         assert!(err.message.contains("MAX_TOKENS"));
+        assert_eq!(err.kind, super::StreamFailureKind::MaxTokens);
     }
 
     #[test]
@@ -438,6 +640,7 @@ mod terminal_tests {
         });
         let err = expect_failure(decode_message_end(&payload, Vec::new()));
         assert!(err.message.contains("ERROR"));
+        assert_eq!(err.kind, super::StreamFailureKind::Error);
     }
 
     #[test]
@@ -448,6 +651,61 @@ mod terminal_tests {
         });
         let err = expect_failure(decode_message_end(&payload, Vec::new()));
         assert!(err.message.contains("TIMEOUT"));
+        assert_eq!(err.kind, super::StreamFailureKind::Timeout);
+    }
+
+    /// Fix round 1, L1: `MAX_TOKENS`'s partial output must be recoverable --
+    /// `provider.rs` attaches this to `ProviderError::StreamInterrupted`.
+    #[test]
+    fn max_tokens_failure_carries_the_partial_text_decoded_so_far() {
+        let events = vec![
+            StreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::stream_event::BlockDelta::Text("partial ans".into()),
+            },
+            StreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::stream_event::BlockDelta::Text("wer".into()),
+            },
+        ];
+        let payload = serde_json::json!({
+            "type": "message-end",
+            "delta": { "finish_reason": "MAX_TOKENS" }
+        });
+        let err = expect_failure(decode_message_end(&payload, events));
+        assert_eq!(err.partial_text, "partial answer");
+    }
+
+    /// Fix round 1, L10: an unbounded, attacker-controlled `finish_reason`
+    /// string must be capped and escaped, never interpolated raw.
+    #[test]
+    fn an_unrecognized_finish_reason_is_capped_and_escaped_in_the_message() {
+        let huge = "X".repeat(10_000);
+        let payload = serde_json::json!({
+            "type": "message-end",
+            "delta": { "finish_reason": huge }
+        });
+        let err = expect_failure(decode_message_end(&payload, Vec::new()));
+        assert!(
+            err.message.len() < 200,
+            "message must be capped, got {} bytes",
+            err.message.len()
+        );
+        assert_eq!(err.kind, super::StreamFailureKind::UnrecognizedFinishReason);
+    }
+
+    /// A newline embedded in an unrecognized `finish_reason` must not reach
+    /// the diagnostic message unescaped (it could otherwise forge fake log
+    /// lines in a persisted error field).
+    #[test]
+    fn a_newline_in_an_unrecognized_finish_reason_is_escaped_not_raw() {
+        let payload = serde_json::json!({
+            "type": "message-end",
+            "delta": { "finish_reason": "weird\nvalue" }
+        });
+        let err = expect_failure(decode_message_end(&payload, Vec::new()));
+        assert!(!err.message.contains('\n'));
+        assert!(err.message.contains("\\n"));
     }
 
     #[test]
@@ -485,6 +743,62 @@ mod terminal_tests {
         let payload = serde_json::json!({ "type": "message-end", "delta": {} });
         let err = expect_failure(decode_message_end(&payload, Vec::new()));
         assert!(err.code.is_none());
+        assert_eq!(err.kind, super::StreamFailureKind::UnrecognizedFinishReason);
+    }
+
+    /// Fix round 1, L8: a repeated `content-start` on an already-open index
+    /// must not fabricate a second `BlockStart` -- `roundhouse-engine::infer`
+    /// would otherwise materialize a phantom second block.
+    #[test]
+    fn a_repeated_content_start_on_an_open_index_does_not_reopen_the_block() {
+        let mut keyer = IndexKeyer::new();
+        let first = serde_json::json!({
+            "type": "content-start",
+            "index": 0,
+            "delta": { "message": { "content": { "type": "text" } } }
+        });
+        assert!(decode_content_start(&first, &mut keyer).is_some());
+
+        let repeat = serde_json::json!({
+            "type": "content-start",
+            "index": 0,
+            "delta": { "message": { "content": { "type": "text" } } }
+        });
+        assert!(
+            decode_content_start(&repeat, &mut keyer).is_none(),
+            "a second content-start for an already-open index must not fabricate \
+             a second BlockStart"
+        );
+    }
+
+    /// Same guard, for `tool-call-start` (fix round 1, L8).
+    #[test]
+    fn a_repeated_tool_call_start_on_an_open_index_does_not_reopen_the_block() {
+        use super::decode_tool_call_start;
+        let mut keyer = IndexKeyer::new();
+        let first = serde_json::json!({
+            "type": "tool-call-start",
+            "index": 0,
+            "delta": { "message": { "tool_calls": {
+                "id": "call_1", "type": "function",
+                "function": { "name": "get_weather", "arguments": "" }
+            } } }
+        });
+        assert!(decode_tool_call_start(&first, &mut keyer).is_some());
+
+        let repeat = serde_json::json!({
+            "type": "tool-call-start",
+            "index": 0,
+            "delta": { "message": { "tool_calls": {
+                "id": "call_2", "type": "function",
+                "function": { "name": "get_time", "arguments": "" }
+            } } }
+        });
+        assert!(
+            decode_tool_call_start(&repeat, &mut keyer).is_none(),
+            "a second tool-call-start for an already-open index must not fabricate \
+             a phantom second block with an empty name and a synthesized id"
+        );
     }
 }
 
@@ -592,22 +906,79 @@ mod stream_tests {
         assert_eq!(args, r#"{"location": "Tokyo"}"#);
     }
 
-    /// A stream that ends without ever carrying a `message-end` event (a
-    /// connection reset, a proxy cut) must NOT fabricate `MessageStop`.
+    /// Fix round 1, L1 (inverted): a stream that ends -- a clean EOF, not a
+    /// reset connection -- without ever carrying a `message-end` event is a
+    /// FAILURE (`StreamFailureKind::Truncated`), not `Ok(events)`. The
+    /// original version of this test enshrined the opposite ("an
+    /// unterminated stream is not itself an error -- just unterminated"),
+    /// which is exactly the gap that let a truncated generation persist as
+    /// `TaskCompleted` downstream.
     #[tokio::test]
-    async fn a_stream_with_no_message_end_does_not_fabricate_message_stop() {
+    async fn a_stream_with_no_message_end_is_a_truncated_stream_failure() {
         let body = sse_body(&[
             r#"{"id":"r3","type":"message-start","delta":{"message":{"role":"assistant"}}}"#,
             r#"{"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}}"#,
             r#"{"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"partial"}}}}"#,
         ]);
+        let failure = match decode_cohere_v2_stream(body).await {
+            Ok(_) => panic!(
+                "a stream with no observed message-end must not decode as a success -- \
+                 it must never fabricate MessageStop"
+            ),
+            Err(f) => f,
+        };
+        assert_eq!(failure.kind, super::StreamFailureKind::Truncated);
+        assert_eq!(failure.partial_text, "partial");
+    }
+
+    /// Fix round 1, L6: citations reuse an already-open block's own index
+    /// (verified) and must not be mistaken for a new block, nor interfere
+    /// with `content-delta` tracking on that same index. Nothing drove this
+    /// through the real decode loop before this fix round -- only the
+    /// encode-side tripwire counted the `citation-start`/`citation-end`
+    /// literal.
+    #[tokio::test]
+    async fn a_citation_pair_interleaved_with_content_delta_does_not_disturb_the_block() {
+        let body = sse_body(&[
+            r#"{"id":"r5","type":"message-start","delta":{"message":{"role":"assistant"}}}"#,
+            r#"{"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}}"#,
+            r#"{"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"Nsync"}}}}"#,
+            r#"{"type":"citation-start","index":0,"delta":{"message":{"citations":{"start":0,"end":5,"text":"Nsync","sources":[],"type":"TEXT_CONTENT"}}}}"#,
+            r#"{"type":"citation-end","index":0}"#,
+            r#"{"type":"content-delta","index":0,"delta":{"message":{"content":{"text":" was popular."}}}}"#,
+            r#"{"type":"content-end","index":0}"#,
+            r#"{"type":"message-end","delta":{"finish_reason":"COMPLETE"}}"#,
+        ]);
         let events = decode_cohere_v2_stream(body)
             .await
-            .expect("an unterminated stream is not itself an error -- just unterminated");
-        assert!(
-            !events.iter().any(|e| matches!(e, StreamEvent::MessageStop)),
-            "a stream with no observed message-end must not fabricate MessageStop"
-        );
+            .expect("citations must not break decoding of the block they annotate");
+
+        let mut texts = Vec::new();
+        let mut block_starts = 0u32;
+        let mut block_stops = 0u32;
+        for event in events {
+            match event {
+                StreamEvent::BlockStart { index, .. } => {
+                    assert_eq!(index, 0, "the citation pair must not open a second block");
+                    block_starts += 1;
+                }
+                StreamEvent::BlockStop { index } => {
+                    assert_eq!(index, 0, "the citation pair must not close a phantom block");
+                    block_stops += 1;
+                }
+                StreamEvent::BlockDelta {
+                    delta: BlockDelta::Text(t),
+                    index,
+                } => {
+                    assert_eq!(index, 0);
+                    texts.push(t);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(block_starts, 1, "exactly one real block was opened");
+        assert_eq!(block_stops, 1, "exactly one real block was closed");
+        assert_eq!(texts.join(""), "Nsync was popular.");
     }
 
     /// Round-trips a `thinking` content block through the real decode path
@@ -646,5 +1017,90 @@ mod stream_tests {
         }
         assert_eq!(thinking_texts, vec!["Let me think.".to_string()]);
         assert_eq!(visible_texts, vec!["Answer.".to_string()]);
+    }
+
+    /// Fix round 1, L11: the codec's own claim ("fragments concatenated
+    /// verbatim, never parsed mid-stream") was never exercised across more
+    /// than one fragment by any existing cassette or unit test -- every one
+    /// delivered a tool call's complete arguments JSON in a SINGLE
+    /// `tool-call-delta`. This drives three fragments, none individually
+    /// valid JSON on its own, through the real decode loop.
+    #[tokio::test]
+    async fn tool_call_arguments_concatenate_correctly_across_multiple_fragments() {
+        let body = sse_body(&[
+            r#"{"id":"r6","type":"message-start","delta":{"message":{"role":"assistant"}}}"#,
+            r#"{"type":"tool-call-start","index":0,"delta":{"message":{"tool_calls":{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}}}}"#,
+            r#"{"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{"function":{"arguments":"{\"locat"}}}}}"#,
+            r#"{"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{"function":{"arguments":"ion\": \"T"}}}}}"#,
+            r#"{"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{"function":{"arguments":"okyo\"}"}}}}}"#,
+            r#"{"type":"tool-call-end","index":0}"#,
+            r#"{"type":"message-end","delta":{"finish_reason":"TOOL_CALL"}}"#,
+        ]);
+        let events = decode_cohere_v2_stream(body)
+            .await
+            .expect("must decode successfully");
+
+        let mut args = String::new();
+        for event in events {
+            if let StreamEvent::BlockDelta {
+                delta: BlockDelta::ToolArgsFragment(f),
+                ..
+            } = event
+            {
+                args.push_str(&f);
+            }
+        }
+        assert_eq!(args, r#"{"location": "Tokyo"}"#);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&args).expect("concatenated fragments must form valid JSON");
+        assert_eq!(parsed["location"], "Tokyo");
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    //! Fix round 1, L3: `redact_transport_error_text` must strip an embedded
+    //! request URL down to host-only, on top of the crate's existing
+    //! secret-shape redaction.
+    use super::redact_transport_error_text;
+
+    #[test]
+    fn strips_query_string_and_userinfo_from_an_embedded_url() {
+        let raw = "transport io error: error sending request for url \
+                    (https://user:pass@gateway.example.com/proxy?key=abc123): \
+                    operation timed out";
+        let redacted = redact_transport_error_text(raw);
+        assert!(
+            !redacted.contains("abc123"),
+            "the query string's credential-shaped value must not survive: {redacted}"
+        );
+        assert!(
+            !redacted.contains("user:pass"),
+            "userinfo must not survive: {redacted}"
+        );
+        assert!(
+            redacted.contains("gateway.example.com"),
+            "the host itself is not secret and should stay, for diagnosability: {redacted}"
+        );
+        assert!(
+            redacted.contains("operation timed out"),
+            "the non-URL diagnostic text must survive redaction intact: {redacted}"
+        );
+    }
+
+    #[test]
+    fn a_message_with_no_url_at_all_passes_through_unchanged() {
+        let raw = "connection reset by peer";
+        assert_eq!(redact_transport_error_text(raw), raw);
+    }
+
+    /// The crate's general secret-shape redactor still applies on top of
+    /// the URL-stripping pass -- a bearer token appearing outside any URL
+    /// must also be caught.
+    #[test]
+    fn a_bearer_token_outside_any_url_is_still_redacted() {
+        let raw = "unauthorized: Authorization: Bearer sk-test-abcdefgh12345678";
+        let redacted = redact_transport_error_text(raw);
+        assert!(!redacted.contains("sk-test-abcdefgh12345678"));
     }
 }

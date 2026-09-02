@@ -7,7 +7,11 @@ data: {"type":"tool-plan-delta","delta":{"message":{"tool_plan":"I will check th
 
 data: {"type":"tool-call-start","index":0,"delta":{"message":{"tool_calls":{"id":"get_weather_j3f0adww9pmr","type":"function","function":{"name":"get_weather","arguments":""}}}}}
 
-data: {"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{"function":{"arguments":"{\"location\": \"Tokyo\"}"}}}}}
+data: {"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{"function":{"arguments":"{\"locat"}}}}}
+
+data: {"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{"function":{"arguments":"ion\": \"T"}}}}}
+
+data: {"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{"function":{"arguments":"okyo\"}"}}}}}
 
 data: {"type":"tool-call-end","index":0}
 

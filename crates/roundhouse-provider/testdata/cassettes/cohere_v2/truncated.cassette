@@ -1,0 +1,9 @@
+200
+content-type: text/event-stream
+
+data: {"id":"a1b2c3d4-55e6-8fa2-bc44-69f2181742ge","type":"message-start","delta":{"message":{"role":"assistant"}}}
+
+data: {"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}}
+
+data: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"The answer is cut off here"}}}}
+

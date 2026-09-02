@@ -1,9 +1,18 @@
 //! `CohereV2Provider`: bridges this module's pure `encode`/`decode` functions
 //! to a real [`HttpTransport`]. Mirrors `google_genai::provider`'s shape
-//! (profile-driven, `[errors]`-table classification via `crate::errors::classify`).
+//! (profile-driven, `[errors]`-table classification via `crate::errors::classify`
+//! for HTTP-level errors) -- but a mid-stream [`StreamFailure`] (an in-band
+//! failure arriving after a 200) is mapped DIRECTLY onto a `ProviderError`
+//! by [`StreamFailureKind`], never through `classify` (fix round 1, L2):
+//! `classify` has no 2xx arm, so laundering a mid-stream failure through it
+//! at the response's real (200) status landed everything in
+//! `BadRequest { status: 200, body_snippet: "" }` -- permanently fatal per
+//! `retry.rs`'s disposition table, discarding both the correct retry
+//! semantics (a transient blip must not become permanently fatal) and every
+//! diagnostic message `decode.rs` builds.
 
-use super::decode::{decode_cohere_v2_stream, StreamFailure};
-use super::encode::{contains_unencodable_media, encode};
+use super::decode::{decode_cohere_v2_stream, StreamFailure, StreamFailureKind};
+use super::encode::{contains_unencodable_media, encode, requests_unsupported_tool_choice};
 use crate::audit::redact_error_body;
 use crate::credential::{resolve_base_url, CredentialCtx};
 use crate::errors::classify;
@@ -40,7 +49,8 @@ impl Provider for CohereV2Provider {
     }
 
     /// Fails closed on a request containing a block this codec cannot
-    /// encode (`Image`/`Document`/`Opaque`) as a cheap pre-flight. The guard
+    /// encode (`Image`/`Document`/`Opaque`) or a `tool_choice` it cannot
+    /// honor (`Named` -- fix round 1, L4) as a cheap pre-flight. The guard
     /// that matters lives in `stream_chat`'s `encode(...)?` propagation --
     /// see `encode.rs`'s `EncodeError` doc comment (`resolve` has zero
     /// production callers anywhere in this workspace).
@@ -48,6 +58,11 @@ impl Provider for CohereV2Provider {
         if contains_unencodable_media(req) {
             return Err(ProviderError::Unsupported(
                 "cohere-v2 codec does not encode Image/Document/Opaque blocks".into(),
+            ));
+        }
+        if requests_unsupported_tool_choice(req) {
+            return Err(ProviderError::Unsupported(
+                "cohere-v2 codec cannot force one specific named tool via tool_choice".into(),
             ));
         }
         Ok(Plan {
@@ -92,6 +107,18 @@ impl Provider for CohereV2Provider {
                     .map_err(|e| ProviderError::Transport(redact_error_body(&e.to_string())))?;
             } else {
                 match &self.profile.defaults.auth {
+                    // Fix round 1, L7: an empty `api_key` must fail closed,
+                    // not silently send a header-shaped-but-credential-less
+                    // `authorization: Bearer ` -- matching the doc comment
+                    // on the `other` arm below, which already makes this
+                    // exact promise for a missing `CredentialProvider`.
+                    AuthKind::Bearer if ctx.api_key.is_empty() => {
+                        return Err(ProviderError::Unsupported(
+                            "cohere-v2 codec requires a non-empty api_key (or a \
+                             CredentialProvider) for Bearer auth"
+                                .into(),
+                        ));
+                    }
                     AuthKind::Bearer => {
                         http_req.headers.push((
                             "authorization".to_string(),
@@ -131,17 +158,9 @@ impl Provider for CohereV2Provider {
                 ));
             }
 
-            let headers = to_header_map(&response.headers);
             let events = decode_cohere_v2_stream(response.body)
                 .await
-                .map_err(|failure| {
-                    classify(
-                        &self.profile.error_profile(),
-                        response.status,
-                        &stream_failure_body(&failure),
-                        &headers,
-                    )
-                })?;
+                .map_err(stream_failure_to_provider_error)?;
             let stream = ChatStream(Box::pin(futures::stream::iter(events)));
             Ok(stream)
         })
@@ -172,20 +191,43 @@ fn build_endpoint_url(base: &url::Url) -> url::Url {
     url
 }
 
-/// Renders a [`StreamFailure`] as the `{"error": {"type", "message"}}` shape
-/// `crate::errors::classify` reads (`/error/type`) -- mirrors
-/// `google_genai::provider::stream_failure_body`. Cohere's real HTTP-error
-/// bodies carry no such shape at all (see `profiles/cohere-v2.toml`'s doc
-/// comment), so this synthetic shape exists purely so an in-band terminal
-/// failure (a `finish_reason` failure arriving after a 200) goes through the
-/// same §9.8 classification path as any other error, with its `finish_reason`
-/// value as the classification code.
-fn stream_failure_body(failure: &StreamFailure) -> Vec<u8> {
-    let mut error_obj = serde_json::json!({ "message": failure.message });
-    if let Some(code) = &failure.code {
-        error_obj["type"] = serde_json::json!(code);
+/// Maps a mid-stream [`StreamFailure`] directly onto a `ProviderError`, by
+/// `kind` (fix round 1, L2) -- never through `crate::errors::classify` at
+/// the enclosing (always 200) HTTP status, which has no 2xx arm and would
+/// land everything in a permanently-fatal `BadRequest { status: 200,
+/// body_snippet: "" }`, discarding this module's diagnostics along with any
+/// chance of a correct retry decision.
+///
+/// - `Transport`: a genuine transport-layer error mid-stream -- becomes
+///   `ProviderError::Transport`, which `retry.rs` retries with backoff (a
+///   transient blip, not a permanent client error).
+/// - `Timeout`: Cohere's own verified `finish_reason` value -- maps directly
+///   onto this crate's existing, exact-fit `ProviderError::Timeout`
+///   variant, also retried with backoff.
+/// - `Error`: Cohere's "the generation failed due to an internal error" --
+///   treated like an opaque provider-side 5xx (`ProviderError::Server`),
+///   also retried with backoff.
+/// - `MaxTokens`, `UnrecognizedFinishReason`, `Truncated`: real partial
+///   output exists (or might), and this generic retry loop should not
+///   transparently retry a request whose prefix would need to be resent at
+///   the caller's discretion -- `ProviderError::StreamInterrupted { partial }`
+///   is `retry.rs`'s own `Disposition::Fatal` from ITS perspective, exactly
+///   because that decision belongs to the agent loop (its own doc comment:
+///   "resuming means re-sending a prefix, which changes billing and
+///   discards reasoning-model state"), not to this transport-retry layer.
+///   Mirrors `roundhouse-engine::compact::fold_stream_text`'s identical use
+///   of this variant for the same "ended without a clean stop" shape.
+fn stream_failure_to_provider_error(failure: StreamFailure) -> ProviderError {
+    match failure.kind {
+        StreamFailureKind::Transport => ProviderError::Transport(failure.message),
+        StreamFailureKind::Timeout => ProviderError::Timeout,
+        StreamFailureKind::Error => ProviderError::Server { status: 500 },
+        StreamFailureKind::MaxTokens
+        | StreamFailureKind::UnrecognizedFinishReason
+        | StreamFailureKind::Truncated => ProviderError::StreamInterrupted {
+            partial: failure.partial_text,
+        },
     }
-    serde_json::to_vec(&serde_json::json!({ "error": error_obj })).unwrap_or_default()
 }
 
 fn to_header_map(raw: &[(String, String)]) -> http::HeaderMap {
@@ -245,23 +287,66 @@ mod build_endpoint_url_tests {
 }
 
 #[cfg(test)]
-mod stream_failure_body_tests {
-    use super::stream_failure_body;
-    use crate::codec::cohere_v2::decode::StreamFailure;
-    use serde_json::Value;
+mod stream_failure_to_provider_error_tests {
+    //! Fix round 1, L2: proves the direct mapping, not a `classify`-at-200
+    //! round trip -- every arm here would previously have produced
+    //! `ProviderError::BadRequest { status: 200, body_snippet: "" }`.
+    use super::stream_failure_to_provider_error;
+    use crate::codec::cohere_v2::decode::{StreamFailure, StreamFailureKind};
+    use crate::ProviderError;
+
+    fn failure(kind: StreamFailureKind, partial_text: &str) -> StreamFailure {
+        StreamFailure {
+            kind,
+            code: None,
+            message: "synthetic".into(),
+            partial_text: partial_text.into(),
+        }
+    }
 
     #[test]
-    fn renders_the_classify_compatible_shape() {
-        let failure = StreamFailure {
-            code: Some("MAX_TOKENS".to_string()),
-            message: "cohere-v2 chat generation stopped: MAX_TOKENS".to_string(),
+    fn transport_maps_to_provider_transport_with_the_message_preserved() {
+        let f = StreamFailure {
+            message: "redacted transport message".into(),
+            ..failure(StreamFailureKind::Transport, "")
         };
-        let body = stream_failure_body(&failure);
-        let parsed: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["error"]["type"], "MAX_TOKENS");
-        assert_eq!(
-            parsed["error"]["message"],
-            "cohere-v2 chat generation stopped: MAX_TOKENS"
+        let err = stream_failure_to_provider_error(f);
+        assert!(matches!(err, ProviderError::Transport(m) if m == "redacted transport message"));
+    }
+
+    #[test]
+    fn timeout_maps_to_provider_timeout() {
+        let err = stream_failure_to_provider_error(failure(StreamFailureKind::Timeout, ""));
+        assert!(matches!(err, ProviderError::Timeout));
+    }
+
+    #[test]
+    fn error_maps_to_server_500() {
+        let err = stream_failure_to_provider_error(failure(StreamFailureKind::Error, ""));
+        assert!(matches!(err, ProviderError::Server { status: 500 }));
+    }
+
+    #[test]
+    fn max_tokens_maps_to_stream_interrupted_carrying_the_partial_text() {
+        let err =
+            stream_failure_to_provider_error(failure(StreamFailureKind::MaxTokens, "partial out"));
+        assert!(
+            matches!(err, ProviderError::StreamInterrupted { partial } if partial == "partial out")
         );
+    }
+
+    #[test]
+    fn truncated_maps_to_stream_interrupted() {
+        let err = stream_failure_to_provider_error(failure(StreamFailureKind::Truncated, "so far"));
+        assert!(matches!(err, ProviderError::StreamInterrupted { partial } if partial == "so far"));
+    }
+
+    #[test]
+    fn unrecognized_finish_reason_maps_to_stream_interrupted() {
+        let err = stream_failure_to_provider_error(failure(
+            StreamFailureKind::UnrecognizedFinishReason,
+            "",
+        ));
+        assert!(matches!(err, ProviderError::StreamInterrupted { .. }));
     }
 }
