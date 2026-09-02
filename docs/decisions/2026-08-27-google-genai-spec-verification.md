@@ -490,3 +490,22 @@ where the edges are:
 sample in the `Function` schema's `x-codeSamples` in the fetched OpenAPI JSON,
 matching the brief's TOML (`auth = { kind = "header_key", header =
 "x-goog-api-key" }`) exactly. No divergence.
+
+## Known gap (fix-round-2 close-out item 3): `tunedModels/{id}` is unreachable through `EndpointMode::GenerateContent`
+
+`build_endpoint_url`'s model-id allowlist (fix-round-1 F9, tightened in
+fix-round-2 G1 after the original substring denylist was found bypassable)
+only permits ASCII alphanumerics, `.`, `-`, and `_`. Google's real,
+documented legacy model-naming convention also includes tuned-model
+references shaped `tunedModels/{tunedModelId}` (a real path segment
+containing a literal `/`, verified by both `generateContent`'s own
+`{model=models/*}` path-template convention and equivalent
+`tunedModels/*`-shaped resources documented elsewhere in the fetched API
+surface). A model id in that shape is **rejected outright** by the current
+allowlist — this is not a new bug the allowlist introduced so much as a
+pre-existing gap the allowlist now makes *permanent* rather than an
+oversight someone could still stumble into fixing by accident. This codec
+today has zero support for tuned models on the legacy surface; anyone adding
+it needs a deliberate, reviewed carve-out (e.g. permitting exactly one literal
+`/` immediately after a `tunedModels` prefix, not a general loosening of the
+allowlist) rather than reverting to a denylist.

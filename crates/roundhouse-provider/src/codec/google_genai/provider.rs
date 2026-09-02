@@ -221,14 +221,30 @@ fn build_endpoint_url(
             url.set_path(&format!("{base_path}/v1beta/interactions"));
         }
         EndpointMode::GenerateContent => {
-            if !model
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-                || model.is_empty()
+            // Close-out item 3 (optional, taken): also reject a model id
+            // that is entirely `.` characters (".", "..", "...", ...) --
+            // makes this guard self-contained rather than relying solely on
+            // the `:streamGenerateContent` suffix always staying glued to
+            // `model` (see the test's doc comment on why that dependency
+            // exists). No abuse path exists today since the suffix is never
+            // dropped, but this costs nothing and removes the dependency.
+            let all_dots = !model.is_empty() && model.chars().all(|c| c == '.');
+            if model.is_empty()
+                || all_dots
+                || !model
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
             {
+                // Close-out item 2: `model` failed a character allowlist, so
+                // it may contain newlines or other control bytes -- these
+                // strings can reach a physically-immutable `events` row via
+                // `ProviderError`'s `Display`, so it is escaped with `{:?}`
+                // here (the test's own assertion already did this; this is
+                // the production string that hadn't).
                 return Err(ProviderError::Unsupported(format!(
-                    "model id `{model}` contains a character not allowed in a URL path segment \
-                     (only ASCII alphanumerics, '.', '-', '_' are permitted)"
+                    "model id {model:?} contains a character not allowed in a URL path segment \
+                     (only ASCII alphanumerics, '.', '-', '_' are permitted, and it may not be \
+                     empty or all dots)"
                 )));
             }
             // Verified: `streamGenerateContent` requires `?alt=sse` on the
@@ -352,9 +368,21 @@ mod build_endpoint_url_tests {
         );
     }
 
-    /// Fix-round-1 F9: a model id containing `/`, `..`, or `%` must be
-    /// rejected before it ever reaches URL construction, not silently
-    /// interpolated into the path.
+    /// Fix-round-1 F9 / fix-round-2 close-out item 1: this is the allowlist
+    /// property, not a denylist of `/`/`../`%` -- a bare `..` alone actually
+    /// PASSES the allowlist (`.` is a permitted char), so it is NOT itself
+    /// the invariant that prevents traversal. The real guarantee is
+    /// structural: `build_endpoint_url` always emits `model` immediately
+    /// followed by the literal `:streamGenerateContent` suffix
+    /// (`"{base_path}/v1beta/models/{model}:streamGenerateContent"`), so an
+    /// allowlisted `model` (alphanumerics, `.`, `-`, `_` only) can never
+    /// close out a path segment on its own and therefore can never form a
+    /// standalone `..` dot-segment -- the suffix is always still attached.
+    /// **This depends on that suffix never being dropped or reordered.**
+    /// Anyone changing the URL-building call must keep `model` and the
+    /// `:streamGenerateContent` suffix glued together in one segment, or
+    /// this guarantee silently stops holding even though every input below
+    /// still gets rejected today.
     #[test]
     fn generate_content_mode_rejects_a_path_traversal_shaped_model_id() {
         let base = url::Url::parse("https://generativelanguage.googleapis.com").unwrap();
@@ -373,6 +401,12 @@ mod build_endpoint_url_tests {
             "foo\\bar",
             ".\t.\\admin",
             "",
+            // Close-out item 3 (optional): all-dots is rejected on its own
+            // terms now, not merely because the `:streamGenerateContent`
+            // suffix happens to stay attached.
+            ".",
+            "..",
+            "...",
         ] {
             assert!(
                 build_endpoint_url(&base, EndpointMode::GenerateContent, bad_model).is_err(),
@@ -387,6 +421,44 @@ mod build_endpoint_url_tests {
     fn interactions_mode_does_not_validate_model_since_it_never_uses_it_in_the_path() {
         let base = url::Url::parse("https://generativelanguage.googleapis.com").unwrap();
         assert!(build_endpoint_url(&base, EndpointMode::Interactions, "../whatever").is_ok());
+    }
+
+    /// A handful of real, legitimately-formatted Gemini model ids must still
+    /// pass -- proves the allowlist doesn't over-reject.
+    #[test]
+    fn legitimate_model_ids_are_accepted() {
+        let base = url::Url::parse("https://generativelanguage.googleapis.com").unwrap();
+        for good_model in [
+            "gemini-2.5-flash",
+            "gemini-3-pro-preview-11-2025",
+            "gemini-1.5-pro-002",
+            "gemma-3-27b-it",
+        ] {
+            assert!(
+                build_endpoint_url(&base, EndpointMode::GenerateContent, good_model).is_ok(),
+                "expected legitimate model id `{good_model}` to be accepted"
+            );
+        }
+    }
+
+    /// Close-out item 2: a rejected model id, having failed a character
+    /// allowlist, may contain newlines or other control bytes -- the
+    /// rejection message must escape it (`{:?}`), not interpolate it raw,
+    /// since `ProviderError`'s `Display` can reach a persisted event row.
+    #[test]
+    fn the_rejection_message_escapes_a_newline_in_the_model_id_rather_than_interpolating_it_raw() {
+        let base = url::Url::parse("https://generativelanguage.googleapis.com").unwrap();
+        let err = build_endpoint_url(&base, EndpointMode::GenerateContent, "gemini\nadmin")
+            .expect_err("a model id containing a newline must be rejected");
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains('\n'),
+            "the rejection message must not contain a raw, unescaped newline: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\\n"),
+            "expected the newline to appear escaped (via {{:?}}) in the message: {rendered:?}"
+        );
     }
 }
 
