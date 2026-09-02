@@ -21,12 +21,16 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 /// One flattened models.dev pricing entry, keyed by a fully-qualified
-/// `"<provider>/<model>"` id.
+/// `"<provider>/<model>"` id. `limit` (context/output token caps) is
+/// deliberately not modeled here: nothing in this crate reads it, and
+/// requiring it as a mandatory field would mean one upstream model omitting
+/// `limit` aborts the parse of the entire ~7,500-entry live dataset (O10).
+/// Unknown JSON fields (including `limit`) are ignored by default, both for
+/// the hand-written test fixtures and the real vendored file.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelsDevEntry {
     pub id: String,
     pub cost: ModelsDevCost,
-    pub limit: ModelsDevLimit,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,12 +43,6 @@ pub struct ModelsDevCost {
     pub cache_read: Option<f64>,
     #[serde(default)]
     pub cache_write: Option<f64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModelsDevLimit {
-    pub context: u64,
-    pub output: u64,
 }
 
 /// One provider entry in the real, live `models.dev/api.json` shape: a
@@ -65,7 +63,6 @@ pub struct ModelsDevProvider {
 pub struct ModelsDevRawModel {
     #[serde(default)]
     pub cost: Option<ModelsDevCost>,
-    pub limit: ModelsDevLimit,
 }
 
 /// Flattens the real, live nested dataset (`provider -> models -> model`) into
@@ -86,7 +83,6 @@ pub fn flatten_root(root: BTreeMap<String, ModelsDevProvider>) -> Vec<ModelsDevE
                     Some(ModelsDevEntry {
                         id: format!("{provider_id}/{model_id}"),
                         cost,
-                        limit: m.limit,
                     })
                 })
         })

@@ -12,6 +12,17 @@ use roundhouse_provider::fallback::Cost;
 use roundhouse_provider::pricing::{price_usage, PicoUsdPerToken, PricingSnapshot};
 use roundhouse_provider::ModelId;
 
+/// Fix round 1, O1: same shape as `testdata/models_dev_fixture.json`'s
+/// `anthropic/claude-fixture-test` entry, except the input rate is
+/// implausibly high ($15,000/1M — the exact shape a compromised upstream
+/// entry would take: finite, non-negative, well inside `u64`'s pico range).
+const ABOVE_CEILING_MODELS_DEV_JSON: &str = r#"[
+  {
+    "id": "anthropic/claude-too-expensive",
+    "cost": { "input": 15000.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75 }
+  }
+]"#;
+
 #[test]
 fn models_dev_and_litellm_rates_normalize_identically() {
     // §9.7: "per-token not per-million — unit mismatch is a real bug source."
@@ -194,4 +205,231 @@ fn litellm_object_with_no_matching_entry_still_yields_models_dev_pricing() {
     // the `serde_json::from_str` inside `from_fixture_pair_for_test`, not
     // silently pass.
     assert_eq!(cost, Cost::Known(2_500_000_000));
+}
+
+#[test]
+fn a_model_with_a_rate_above_the_plausibility_ceiling_prices_as_unknown() {
+    // Fix round 1, O1: `PicoUsdPerToken::from_usd_per_million` now rejects
+    // implausible rates (see `pricing/mod.rs`'s internal unit tests for the
+    // constructor-level check); this is the black-box consequence —
+    // `price_usage` must fail closed to `Cost::Unknown` for such a model
+    // rather than propagating a confident, wrong `Cost::Known`.
+    let snapshot = PricingSnapshot::from_fixture_for_test(ABOVE_CEILING_MODELS_DEV_JSON);
+    let usage = Usage {
+        input_tokens: 1_000,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+    };
+    let cost = price_usage(
+        &usage,
+        &ModelId("anthropic/claude-too-expensive".into()),
+        &snapshot,
+    );
+    assert!(
+        matches!(cost, Cost::Unknown),
+        "a rate above the plausibility ceiling must yield Cost::Unknown, not a wrong Cost::Known"
+    );
+}
+
+#[test]
+fn cache_read_tokens_exceeding_input_tokens_prices_as_unknown_not_a_silent_underbill() {
+    // Fix round 1, O8: §9.3's invariant is that input_tokens INCLUDES cache
+    // reads, so cache_read_tokens must never exceed input_tokens. Usage that
+    // violates this is internally inconsistent; the old behavior silently
+    // clamped via `.min()`, which under-bills the excess. Failing to
+    // Cost::Unknown is the correct direction for a billing path.
+    let snapshot =
+        PricingSnapshot::from_fixture_for_test(include_str!("../testdata/models_dev_fixture.json"));
+    let usage = Usage {
+        input_tokens: 100,
+        output_tokens: 0,
+        cache_read_tokens: 900, // invariant violation: more cache reads than input tokens
+    };
+    let cost = price_usage(
+        &usage,
+        &ModelId("anthropic/claude-fixture-test".into()),
+        &snapshot,
+    );
+    assert!(
+        matches!(cost, Cost::Unknown),
+        "cache_read_tokens > input_tokens is an invariant violation and must not be silently priced"
+    );
+}
+
+#[test]
+fn id_normalization_reconciles_a_bare_litellm_key_for_a_frontier_provider() {
+    // Fix round 1, O7: LiteLLM's real key convention for anthropic/openai/
+    // google/amazon-bedrock is the bare upstream model name, not
+    // models.dev's fully-qualified "<provider>/<model>" id (verified live,
+    // 2026-09-02). Without normalization this LiteLLM entry would never be
+    // found for an "anthropic/..." models.dev id.
+    let models_dev_json = r#"[
+      {
+        "id": "anthropic/claude-bare-key-test",
+        "cost": { "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75 }
+      }
+    ]"#;
+    // Bare key -- no "anthropic/" prefix -- matching LiteLLM's real convention.
+    let litellm_json = r#"{
+      "claude-bare-key-test": {
+        "cache_read_input_token_cost": 0.0000005,
+        "cache_creation_input_token_cost": null
+      }
+    }"#;
+    let snapshot = PricingSnapshot::from_fixture_pair_for_test(models_dev_json, litellm_json);
+    let usage = Usage {
+        input_tokens: 100_000,
+        output_tokens: 0,
+        cache_read_tokens: 100_000,
+    };
+    let cost = price_usage(
+        &usage,
+        &ModelId("anthropic/claude-bare-key-test".into()),
+        &snapshot,
+    );
+    // If normalization didn't fire, this would fall back to models.dev's
+    // $0.30/M cache_read ($30,000,000,000 pico-USD) instead of LiteLLM's
+    // $0.50/M ($50,000,000,000 pico-USD).
+    assert_eq!(
+        cost,
+        Cost::Known(50_000_000_000),
+        "bare-id normalization must reconcile the LiteLLM entry for a frontier provider"
+    );
+}
+
+#[test]
+fn id_normalization_does_not_apply_to_an_unlisted_provider() {
+    // Fix round 1, O7: the normalization is deliberately scoped to the four
+    // measured frontier providers, not a blanket bare-id fallback for every
+    // provider -- an unlisted provider's bare-key collision with LiteLLM
+    // must NOT be picked up.
+    let models_dev_json = r#"[
+      {
+        "id": "some-other-provider/claude-bare-key-test",
+        "cost": { "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75 }
+      }
+    ]"#;
+    let litellm_json = r#"{
+      "claude-bare-key-test": {
+        "cache_read_input_token_cost": 0.0000005,
+        "cache_creation_input_token_cost": null
+      }
+    }"#;
+    let snapshot = PricingSnapshot::from_fixture_pair_for_test(models_dev_json, litellm_json);
+    let usage = Usage {
+        input_tokens: 100_000,
+        output_tokens: 0,
+        cache_read_tokens: 100_000,
+    };
+    let cost = price_usage(
+        &usage,
+        &ModelId("some-other-provider/claude-bare-key-test".into()),
+        &snapshot,
+    );
+    // Must fall back to models.dev's $0.30/M cache_read
+    // ($30,000,000,000 pico-USD), NOT LiteLLM's $0.50/M.
+    assert_eq!(cost, Cost::Known(30_000_000_000));
+}
+
+#[test]
+fn vendored_snapshot_parses_and_prices_a_known_model() {
+    // Fix round 1, O4: `PricingSnapshot::vendored()`'s `.expect()`s are only
+    // checked when the `LazyLock` is first forced -- NOT at build time. This
+    // test forces that evaluation under `cargo test --workspace`, so a
+    // committed-but-unparseable (or drastically restructured) vendor file
+    // fails CI instead of panicking the daemon on the first real pricing
+    // lookup in production.
+    let snapshot = PricingSnapshot::vendored();
+    let usage = Usage {
+        input_tokens: 1_000,
+        output_tokens: 100,
+        cache_read_tokens: 0,
+    };
+    // anthropic/claude-sonnet-5 is present in the live-fetched vendor file as
+    // of this commit; if a future refresh renames/removes it, swap this for
+    // another currently-vendored model rather than deleting the test -- the
+    // point is forcing real evaluation of the LazyLock, not this specific id.
+    let cost = price_usage(
+        &usage,
+        &ModelId("anthropic/claude-sonnet-5".into()),
+        snapshot,
+    );
+    assert!(
+        matches!(cost, Cost::Known(_)),
+        "expected a known vendored model to price successfully, got {cost:?}"
+    );
+}
+
+#[test]
+fn an_empty_models_dev_body_parses_but_yields_zero_priced_models() {
+    // Fix round 1, O2: `{}` is valid JSON and a valid (if trivial) instance
+    // of the real provider->models->model shape, so it parses successfully
+    // -- to zero entries. This is exactly the gap `refresh_pricing.rs`'s
+    // minimum-entry-count check exists to catch before such a body silently
+    // replaces the vendored snapshot with one that prices nothing.
+    let entries = PricingSnapshot::parse_models_dev_snapshot(b"{}").unwrap();
+    assert_eq!(entries.len(), 0);
+}
+
+#[test]
+fn a_wrong_shaped_models_dev_body_is_rejected_outright() {
+    // Fix round 1, O2: a body that is valid JSON but not even the right
+    // shape (e.g. an upstream API error payload) fails the typed parse
+    // itself, distinct from (and a stronger guard than) the empty-body case
+    // above.
+    let result = PricingSnapshot::parse_models_dev_snapshot(br#"{"error":"rate limited"}"#);
+    assert!(result.is_err());
+}
+
+#[test]
+fn a_real_shaped_models_dev_body_parses_to_a_nonzero_entry_count() {
+    // Sanity complement to the two tests above: confirms the zero/error
+    // cases are actually distinguishing "empty/malformed" from "real,"
+    // rather than this parse path always returning zero or always erroring.
+    let body = br#"{
+        "anthropic": {
+            "models": {
+                "claude-test": { "id": "claude-test", "cost": { "input": 3.0, "output": 15.0 } }
+            }
+        }
+    }"#;
+    let entries = PricingSnapshot::parse_models_dev_snapshot(body).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id, "anthropic/claude-test");
+}
+
+#[test]
+fn a_malformed_litellm_cache_rate_falls_back_to_models_dev_rather_than_going_free() {
+    // Fix round 1, O9: an invalid (negative) LiteLLM cache rate must not be
+    // silently treated as "no rate" and priced at zero -- it falls back to
+    // models.dev's own cache_read rate (fail-safe direction: never free).
+    // This crate additionally logs the rejection via `tracing::warn!` (see
+    // `pricing/mod.rs`'s `parse_cache_rate`) so it's observable in practice,
+    // not just correct in outcome.
+    let models_dev_json = r#"[
+      {
+        "id": "anthropic/claude-fixture-test",
+        "cost": { "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75 }
+      }
+    ]"#;
+    let litellm_json = r#"{
+      "anthropic/claude-fixture-test": {
+        "cache_read_input_token_cost": -1.0,
+        "cache_creation_input_token_cost": null
+      }
+    }"#;
+    let snapshot = PricingSnapshot::from_fixture_pair_for_test(models_dev_json, litellm_json);
+    let usage = Usage {
+        input_tokens: 100_000,
+        output_tokens: 0,
+        cache_read_tokens: 100_000,
+    };
+    let cost = price_usage(
+        &usage,
+        &ModelId("anthropic/claude-fixture-test".into()),
+        &snapshot,
+    );
+    // Falls back to models.dev's $0.30/M cache_read rate: 100,000 tokens @
+    // $0.30/M = $30,000,000,000 pico-USD.
+    assert_eq!(cost, Cost::Known(30_000_000_000));
 }
