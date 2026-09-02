@@ -7,6 +7,15 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# L7 (fix round 1 security review): gates `store::open_test_db` so daemon
+# code can never reach for it as if it were the crate's normal way to open a
+# connection (that would silently reduce trigger-event dedupe to
+# per-process, in-memory scope). Activated for this crate's own integration
+# tests via the self dev-dependency below; `cfg(test)` alone only covers
+# in-lib unit tests, not the separate `tests/*.rs` crates.
+test-util = []
+
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-engine = { path = "../roundhouse-engine" }
@@ -53,3 +62,7 @@ serde_json = { workspace = true }
 # entry Task 1 added, so no extra dev-dependency is needed for it.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+# Self dev-dependency, activating the `test-util` feature for this crate's
+# own `tests/*.rs` integration-test crates (L7) — `cfg(test)` alone does not
+# cover them, only this crate's in-lib `#[cfg(test)] mod tests`.
+roundhouse-sched = { path = ".", features = ["test-util"] }

@@ -4,7 +4,10 @@
 //! (the `trigger_event` table lives in `roundhouse_store::migrations`).
 use chrono::{TimeZone, Utc};
 use roundhouse_core::{BindingId, JobId};
-use roundhouse_sched::store::{compute_catch_up, open_test_db, record_trigger_event};
+use roundhouse_sched::store::{
+    compute_catch_up, occurrence_key, open_test_db, record_trigger_event, StoreError,
+    MAX_IDEMPOTENCY_KEY_LEN,
+};
 use roundhouse_sched::trigger::{Binding, CatchUp, TriggerEvent, TriggerSpec};
 
 fn cron_binding_with_catch_up(catch_up: CatchUp) -> Binding {
@@ -25,6 +28,26 @@ fn catch_up_latest_collapses_missed_occurrences_to_one() {
     ];
     let to_run = compute_catch_up(&binding, missed.clone());
     assert_eq!(to_run, vec![*missed.last().unwrap()]);
+}
+
+/// M5 fix: `.last()` on the input `Vec` is *positional*, not *temporal* —
+/// `CatchUp::Latest` must pick the temporally latest occurrence even when
+/// callers pass `missed` out of chronological order.
+#[test]
+fn catch_up_latest_picks_the_temporally_latest_occurrence_even_when_input_is_unsorted() {
+    let binding = cron_binding_with_catch_up(CatchUp::Latest);
+    let latest = Utc.with_ymd_and_hms(2026, 8, 26, 2, 0, 0).unwrap();
+    let missed = vec![
+        latest, // deliberately listed first, not last
+        Utc.with_ymd_and_hms(2026, 8, 24, 2, 0, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 8, 25, 2, 0, 0).unwrap(),
+    ];
+    let to_run = compute_catch_up(&binding, missed);
+    assert_eq!(
+        to_run,
+        vec![latest],
+        "Latest must pick the temporally latest instant, not whatever is positionally last"
+    );
 }
 
 #[test]
@@ -136,4 +159,107 @@ fn the_unique_index_itself_rejects_a_true_duplicate_insert() {
         }
         other => panic!("expected a SQLite constraint violation, got {other:?}"),
     }
+}
+
+/// M3: `occurrence_key` is keyed on the occurrence's own identity
+/// (`binding_id`, `scheduled_for`), so recomputing it for the *same*
+/// scheduled occurrence — as a crash-and-retry would — always reproduces the
+/// same key, which is exactly what lets the `trigger_event_dedupe` index
+/// catch a re-run of the same occurrence.
+#[test]
+fn occurrence_key_is_stable_across_recomputation_for_the_same_occurrence() {
+    let binding_id = BindingId::new();
+    let scheduled_for = Utc.with_ymd_and_hms(2026, 8, 24, 2, 0, 0).unwrap();
+
+    let key_a = occurrence_key(binding_id, scheduled_for);
+    let key_b = occurrence_key(binding_id, scheduled_for);
+
+    assert_eq!(
+        key_a, key_b,
+        "the same (binding_id, scheduled_for) must always derive the same key"
+    );
+}
+
+#[test]
+fn occurrence_key_differs_for_a_different_scheduled_occurrence() {
+    let binding_id = BindingId::new();
+    let key_a = occurrence_key(
+        binding_id,
+        Utc.with_ymd_and_hms(2026, 8, 24, 2, 0, 0).unwrap(),
+    );
+    let key_b = occurrence_key(
+        binding_id,
+        Utc.with_ymd_and_hms(2026, 8, 25, 2, 0, 0).unwrap(),
+    );
+
+    assert_ne!(key_a, key_b);
+}
+
+/// M3: using `occurrence_key` end to end proves the crash-and-retry case a
+/// fire-time-derived key would defeat — the *same* scheduled occurrence,
+/// "retried" after a simulated crash, still dedupes.
+#[test]
+fn occurrence_key_based_events_dedupe_across_a_simulated_crash_and_retry() {
+    let mut conn = open_test_db();
+    let binding_id = BindingId::new();
+    let scheduled_for = Utc.with_ymd_and_hms(2026, 8, 24, 2, 0, 0).unwrap();
+
+    // First attempt: fires, but the caller crashes before ever learning the
+    // firing was recorded.
+    let first_ev = TriggerEvent {
+        binding_id,
+        idempotency_key: occurrence_key(binding_id, scheduled_for),
+        scheduled_for,
+        fired_at: scheduled_for, // real fired_at would differ; irrelevant to the key
+        is_catch_up: false,
+        session_id: None,
+    };
+    assert!(record_trigger_event(&mut conn, &first_ev).unwrap());
+
+    // Retry after "recovery": same occurrence, but `fired_at` is necessarily
+    // a later wall-clock timestamp this time. The key must still match.
+    let retry_ev = TriggerEvent {
+        binding_id,
+        idempotency_key: occurrence_key(binding_id, scheduled_for),
+        scheduled_for,
+        fired_at: Utc::now(),
+        is_catch_up: false,
+        session_id: None,
+    };
+    assert!(
+        !record_trigger_event(&mut conn, &retry_ev).unwrap(),
+        "a retried occurrence must dedupe even though fired_at differs from the first attempt"
+    );
+}
+
+/// M3: the idempotency-key length cap is enforced, not merely documented.
+#[test]
+fn an_over_long_idempotency_key_is_rejected() {
+    let mut conn = open_test_db();
+    let ev = TriggerEvent {
+        binding_id: BindingId::new(),
+        idempotency_key: "x".repeat(MAX_IDEMPOTENCY_KEY_LEN + 1),
+        scheduled_for: Utc::now(),
+        fired_at: Utc::now(),
+        is_catch_up: false,
+        session_id: None,
+    };
+
+    let err = record_trigger_event(&mut conn, &ev).unwrap_err();
+    assert!(matches!(err, StoreError::IdempotencyKeyTooLong { .. }));
+}
+
+#[test]
+fn a_key_at_exactly_the_cap_is_accepted() {
+    let mut conn = open_test_db();
+    let ev = TriggerEvent {
+        binding_id: BindingId::new(),
+        idempotency_key: "x".repeat(MAX_IDEMPOTENCY_KEY_LEN),
+        scheduled_for: Utc::now(),
+        fired_at: Utc::now(),
+        is_catch_up: false,
+        session_id: None,
+    };
+
+    assert!(record_trigger_event(&mut conn, &ev).unwrap());
 }
