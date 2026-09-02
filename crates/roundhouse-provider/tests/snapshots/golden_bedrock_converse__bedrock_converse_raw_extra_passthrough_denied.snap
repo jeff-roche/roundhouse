@@ -1,0 +1,16 @@
+---
+source: crates/roundhouse-provider/tests/golden_bedrock_converse.rs
+expression: body
+---
+{
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Hello."
+        }
+      ],
+      "role": "user"
+    }
+  ]
+}

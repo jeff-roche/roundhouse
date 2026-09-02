@@ -1,0 +1,20 @@
+---
+source: crates/roundhouse-provider/tests/golden_bedrock_converse.rs
+expression: body
+---
+{
+  "messages": [
+    {
+      "content": [
+        {
+          "toolUse": {
+            "input": {},
+            "name": "ping",
+            "toolUseId": "call_1"
+          }
+        }
+      ],
+      "role": "assistant"
+    }
+  ]
+}

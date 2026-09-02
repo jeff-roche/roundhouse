@@ -1,0 +1,18 @@
+# The full request/response `ContentBlock` union, fetched verbatim from
+# https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ContentBlock.html
+# (fetched 2026-09-02): 12 members. `encode.rs`'s `encode_block` recognizes
+# `text`/`toolUse`/`toolResult`; every other member is unencodable on this
+# codec (fails closed via `EncodeError::UnencodableMedia`) but is still
+# vendored here in full.
+audio
+cachePoint
+citationsContent
+document
+guardContent
+image
+reasoningContent
+searchResult
+text
+toolResult
+toolUse
+video

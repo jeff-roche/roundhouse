@@ -1,0 +1,24 @@
+# The full documented exception shape set for Converse/ConverseStream,
+# fetched verbatim from the "Errors" sections of
+# https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html
+# and
+# https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html
+# (fetched 2026-09-02) -- 10 distinct shape names across both operations'
+# documented error lists (AccessDeniedException, InternalServerException,
+# ModelErrorException, ModelNotReadyException, ModelTimeoutException,
+# ResourceNotFoundException, ServiceUnavailableException,
+# ThrottlingException, ValidationException from the common "Errors" list,
+# plus ModelStreamErrorException, which only appears in ConverseStream's own
+# in-band `ConverseStreamOutput` union). This is the vendored authority for
+# both this profile's `[errors]` table keys and every exception-type literal
+# `decode.rs` recognizes.
+AccessDeniedException
+InternalServerException
+ModelErrorException
+ModelNotReadyException
+ModelStreamErrorException
+ModelTimeoutException
+ResourceNotFoundException
+ServiceUnavailableException
+ThrottlingException
+ValidationException

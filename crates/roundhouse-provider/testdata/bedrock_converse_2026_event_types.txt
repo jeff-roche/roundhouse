@@ -1,0 +1,11 @@
+# The 6 real `ConverseStreamOutput` union members, fetched verbatim from the
+# "Response Syntax" / "Response Elements" sections of
+# https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html
+# (fetched 2026-09-02). These are the values a real `:event-type` eventstream
+# header carries for an `event`-typed frame.
+messageStart
+contentBlockStart
+contentBlockDelta
+contentBlockStop
+messageStop
+metadata

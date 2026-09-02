@@ -1,0 +1,32 @@
+---
+source: crates/roundhouse-provider/tests/golden_bedrock_converse.rs
+expression: "encode(&req, &fixture_profile())"
+---
+{
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "What is the capital of France?"
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "Paris."
+        }
+      ],
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "text": "And its population?"
+        }
+      ],
+      "role": "user"
+    }
+  ]
+}

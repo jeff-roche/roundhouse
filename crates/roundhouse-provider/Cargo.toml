@@ -35,6 +35,17 @@ toml = "0.8"
 # host from a base-URL string. Already present transitively via `reqwest`;
 # declared explicitly since this crate's own public API returns `url::Url`.
 url = "2.5"
+# The `sigv4-eventstream` transport shim (`src/transport/eventstream.rs`,
+# Phase 6 Task 7): `bedrock-converse`'s response is
+# `application/vnd.amazon.eventstream` -- binary length-prefixed framing with
+# CRC32 checksums -- rather than SSE. AWS's own published implementation of
+# that framing, not hand-rolled: aws-smithy-eventstream's
+# `MessageFrameDecoder`/`read_message_from`/`write_message_to` own every byte
+# of prelude parsing, header decoding, and checksum verification;
+# aws-smithy-types supplies the `Message`/`Header`/`HeaderValue` types those
+# functions operate on.
+aws-smithy-eventstream = "0.60"
+aws-smithy-types = "1.2"
 
 [build-dependencies]
 # `build.rs` parses every `profiles/*.toml` at compile time with the same
