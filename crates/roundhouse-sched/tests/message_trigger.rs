@@ -12,7 +12,7 @@ use roundhouse_bus::types::{Envelope, MessageId, Provenance, Trust};
 use roundhouse_bus::Bus;
 use roundhouse_core::{Address, JobId, Origin, SessionId, WorkspaceId};
 use roundhouse_sched::message_trigger::{bind_message_trigger, poll_message_trigger};
-use roundhouse_sched::store::{open_test_db, record_trigger_event};
+use roundhouse_sched::store::{occurrence_key, open_test_db, record_trigger_event};
 use roundhouse_sched::trigger::{Binding, TriggerEvent, TriggerSpec};
 use uuid::Uuid;
 
@@ -32,7 +32,7 @@ async fn a_message_send_to_the_bound_handle_fires_the_trigger_end_to_end() {
         },
     );
 
-    bind_message_trigger(&bus, &binding)
+    bind_message_trigger(&bus, workspace, &binding)
         .await
         .expect("binds the handle on the real bus trait");
 
@@ -72,7 +72,9 @@ async fn a_message_send_to_the_bound_handle_fires_the_trigger_end_to_end() {
     .await
     .expect("a plain message_send, no special-cased trigger API");
 
-    let received = poll_message_trigger(&bus, &binding).await.unwrap();
+    let received = poll_message_trigger(&bus, workspace, &binding)
+        .await
+        .unwrap();
     assert!(
         received.is_some(),
         "the trigger actually received the send, resolved via Address::Handle"
@@ -81,11 +83,15 @@ async fn a_message_send_to_the_bound_handle_fires_the_trigger_end_to_end() {
 
     // The firing is persisted exactly like any other trigger (Task 4's own
     // record_trigger_event), so it shows up in the same dedupe/catch-up path.
+    // M3: keyed via `occurrence_key(binding_id, scheduled_for)`, not the
+    // wall clock *at fire time* — a fire-time key is different on every
+    // crash-and-retry and would defeat dedupe in exactly the case the
+    // `trigger_event_dedupe` index exists to catch.
     let mut conn = open_test_db();
     let now = Utc::now();
     let ev = TriggerEvent {
         binding_id: binding.id,
-        idempotency_key: format!("{}-{}", binding.id, now.to_rfc3339()),
+        idempotency_key: occurrence_key(binding.id, now),
         scheduled_for: now,
         fired_at: now,
         is_catch_up: false,

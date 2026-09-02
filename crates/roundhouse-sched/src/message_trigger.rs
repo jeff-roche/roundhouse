@@ -13,16 +13,62 @@ use thiserror::Error;
 pub enum MessageTriggerError {
     #[error("binding {0} is not a Message trigger, or its address is not a Handle")]
     NotAMessageHandleTrigger(String),
+    /// H1(a): a `Binding`'s `TriggerSpec::Message` address names its own
+    /// `workspace` — that field is the *spec's claim*, not proof of
+    /// ownership. `Binding` carries no owning workspace of its own to check
+    /// it against, so the caller (whoever creates the binding from a job in
+    /// a specific workspace) must supply the true owning workspace, and this
+    /// error is what a spec naming a *different* workspace produces —
+    /// otherwise a binding authored in workspace A could register a handle
+    /// in workspace B.
+    #[error(
+        "Message binding {binding} names workspace {spec_workspace:?}, but is owned by workspace {owning_workspace:?}"
+    )]
+    WorkspaceMismatch {
+        binding: String,
+        spec_workspace: WorkspaceId,
+        owning_workspace: WorkspaceId,
+    },
+    /// M4: `filter` narrows which messages reaching the bound handle
+    /// actually fire the trigger, but evaluating it needs `roundhouse-flow`'s
+    /// `${{ }}` expression engine, which this crate cannot depend on (the
+    /// edge points the other way). Every envelope arriving at a `Message`
+    /// trigger's handle is `Trust::Untrusted`/`Origin::Peer` by construction
+    /// (§6.8), and `filter` is the only narrowing between an untrusted
+    /// peer's message and starting a job — so a binding carrying `Some(_)`
+    /// is refused outright (fail-closed) rather than silently firing on any
+    /// message that reaches the handle (fail-open).
+    #[error(
+        "Message binding {0} carries a filter, but filter evaluation is not yet wired — refusing to fire unfiltered"
+    )]
+    FilterNotYetSupported(String),
     #[error(transparent)]
     Bus(#[from] roundhouse_bus::BusError),
 }
 
-fn handle_parts(binding: &Binding) -> Result<(WorkspaceId, &str), MessageTriggerError> {
+/// Extracts `(workspace, name, filter)` from a `Message` binding whose
+/// address is a `Handle`, and validates that the spec's claimed workspace
+/// matches `owning_workspace` (H1(a) — `Binding` itself carries no owning
+/// workspace, so the caller must supply the true one; the spec's own field
+/// is a claim to check, never an instruction to act on).
+fn handle_parts(
+    binding: &Binding,
+    owning_workspace: WorkspaceId,
+) -> Result<(WorkspaceId, &str, &Option<String>), MessageTriggerError> {
     match &binding.spec {
         TriggerSpec::Message {
             address: Address::Handle { workspace, name },
-            ..
-        } => Ok((*workspace, name.as_str())),
+            filter,
+        } => {
+            if *workspace != owning_workspace {
+                return Err(MessageTriggerError::WorkspaceMismatch {
+                    binding: binding.id.to_string(),
+                    spec_workspace: *workspace,
+                    owning_workspace,
+                });
+            }
+            Ok((*workspace, name.as_str(), filter))
+        }
         _ => Err(MessageTriggerError::NotAMessageHandleTrigger(
             binding.id.to_string(),
         )),
@@ -36,11 +82,26 @@ fn handle_parts(binding: &Binding) -> Result<(WorkspaceId, &str), MessageTrigger
 /// startup for every enabled `Message` binding (registration is
 /// re-derivable from `Binding` alone, so it never needs its own
 /// persistence).
+///
+/// `owning_workspace` is the workspace the binding's own job actually
+/// belongs to (H1(a)) — the caller's trusted context, not the address's own
+/// embedded field, which is only validated against it.
+///
+/// M4: refuses with `MessageTriggerError::FilterNotYetSupported` when the
+/// binding carries `Some(filter)` — filter evaluation is not wired yet, and
+/// binding anyway would let *any* message reaching the handle fire the
+/// trigger unfiltered, which is worse than refusing to bind at all.
 pub async fn bind_message_trigger(
     bus: &dyn Bus,
+    owning_workspace: WorkspaceId,
     binding: &Binding,
 ) -> Result<(), MessageTriggerError> {
-    let (workspace, name) = handle_parts(binding)?;
+    let (workspace, name, filter) = handle_parts(binding, owning_workspace)?;
+    if filter.is_some() {
+        return Err(MessageTriggerError::FilterNotYetSupported(
+            binding.id.to_string(),
+        ));
+    }
     let session = binding.trigger_session_id();
     bus.register_mailbox(session, MailboxKind::Bounded(64))
         .await?;
@@ -49,13 +110,19 @@ pub async fn bind_message_trigger(
     Ok(())
 }
 
+/// Reverses `bind_message_trigger`. Unlike bind/poll, this is NOT refused
+/// for a binding carrying `Some(filter)` — tearing down a registration must
+/// always be possible regardless of whether the trigger it belonged to was
+/// ever actually bindable.
 pub async fn unbind_message_trigger(
     bus: &dyn Bus,
+    owning_workspace: WorkspaceId,
     binding: &Binding,
 ) -> Result<(), MessageTriggerError> {
-    let (workspace, name) = handle_parts(binding)?;
-    bus.unregister_handle(workspace, name).await?;
-    bus.deregister_mailbox(binding.trigger_session_id()).await?;
+    let (workspace, name, _filter) = handle_parts(binding, owning_workspace)?;
+    let session = binding.trigger_session_id();
+    bus.unregister_handle(workspace, name, session).await?;
+    bus.deregister_mailbox(session).await?;
     Ok(())
 }
 
@@ -66,6 +133,18 @@ pub async fn unbind_message_trigger(
 /// (outside this crate — an integration point, same class as this plan's
 /// other daemon-owned wiring) calls this on an interval; `None` means
 /// nothing has arrived since the last poll.
+///
+/// `bus.poll` *removes* the returned envelope from the mailbox. Whoever
+/// eventually evaluates `filter` after polling (once M4's gap is closed and
+/// filter evaluation actually exists) MUST call `Bus::requeue` on a
+/// non-match — `poll_message_trigger` itself never does, since it always
+/// refuses bindings that carry a filter (M4) rather than returning an
+/// envelope that still needs filtering.
+///
+/// M4: refuses with `MessageTriggerError::FilterNotYetSupported` when the
+/// binding carries `Some(filter)`, for the same fail-closed reason as
+/// `bind_message_trigger` — a binding that could never legally be bound
+/// must never be polled either.
 ///
 /// Deviation from the plan text: the plan's declared return type was
 /// `Result<Option<roundhouse_core::Envelope>, MessageTriggerError>`. The
@@ -78,9 +157,15 @@ pub async fn unbind_message_trigger(
 /// `Envelope::to_core_envelope()`. This function returns the real bus type.
 pub async fn poll_message_trigger(
     bus: &dyn Bus,
+    owning_workspace: WorkspaceId,
     binding: &Binding,
 ) -> Result<Option<roundhouse_bus::types::Envelope>, MessageTriggerError> {
-    handle_parts(binding)?; // validates shape; the session id is what actually matters below
+    let (_workspace, _name, filter) = handle_parts(binding, owning_workspace)?;
+    if filter.is_some() {
+        return Err(MessageTriggerError::FilterNotYetSupported(
+            binding.id.to_string(),
+        ));
+    }
     Ok(bus.poll(binding.trigger_session_id()).await?)
 }
 
@@ -112,7 +197,9 @@ mod tests {
         let bus = LocalBus::new();
         let (binding, workspace, address) = message_binding("listener");
 
-        bind_message_trigger(&bus, &binding).await.unwrap();
+        bind_message_trigger(&bus, workspace, &binding)
+            .await
+            .unwrap();
 
         assert!(bus.has_mailbox(binding.trigger_session_id()));
         let resolved = bus.resolve_address(workspace, &address).await.unwrap();
@@ -123,9 +210,13 @@ mod tests {
     async fn unbind_removes_both_the_handle_and_the_mailbox() {
         let bus = LocalBus::new();
         let (binding, workspace, address) = message_binding("listener");
-        bind_message_trigger(&bus, &binding).await.unwrap();
+        bind_message_trigger(&bus, workspace, &binding)
+            .await
+            .unwrap();
 
-        unbind_message_trigger(&bus, &binding).await.unwrap();
+        unbind_message_trigger(&bus, workspace, &binding)
+            .await
+            .unwrap();
 
         assert!(!bus.has_mailbox(binding.trigger_session_id()));
         assert!(bus.resolve_address(workspace, &address).await.is_err());
@@ -136,7 +227,9 @@ mod tests {
         let bus = LocalBus::new();
         let binding = Binding::new(JobId::new(), TriggerSpec::Manual);
 
-        let err = bind_message_trigger(&bus, &binding).await.unwrap_err();
+        let err = bind_message_trigger(&bus, WorkspaceId::new(), &binding)
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             MessageTriggerError::NotAMessageHandleTrigger(_)
@@ -156,20 +249,122 @@ mod tests {
             },
         );
 
-        let err = bind_message_trigger(&bus, &binding).await.unwrap_err();
+        let err = bind_message_trigger(&bus, WorkspaceId::new(), &binding)
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             MessageTriggerError::NotAMessageHandleTrigger(_)
         ));
     }
 
+    /// H1(a): a spec naming a workspace different from the binding's real
+    /// owning workspace must be refused, not silently registered under
+    /// whichever workspace the spec happens to claim.
+    #[tokio::test]
+    async fn binding_whose_spec_workspace_does_not_match_the_owning_workspace_is_refused() {
+        let bus = LocalBus::new();
+        let spec_workspace = WorkspaceId::new();
+        let owning_workspace = WorkspaceId::new();
+        let binding = Binding::new(
+            JobId::new(),
+            TriggerSpec::Message {
+                address: Address::Handle {
+                    workspace: spec_workspace,
+                    name: "listener".to_string(),
+                },
+                filter: None,
+            },
+        );
+
+        let err = bind_message_trigger(&bus, owning_workspace, &binding)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MessageTriggerError::WorkspaceMismatch { .. }));
+        // Nothing must have been registered on the bus as a side effect of
+        // the refused attempt.
+        assert!(!bus.has_mailbox(binding.trigger_session_id()));
+    }
+
     #[tokio::test]
     async fn poll_with_nothing_sent_yet_returns_none() {
         let bus = LocalBus::new();
-        let (binding, _workspace, _address) = message_binding("listener");
-        bind_message_trigger(&bus, &binding).await.unwrap();
+        let (binding, workspace, _address) = message_binding("listener");
+        bind_message_trigger(&bus, workspace, &binding)
+            .await
+            .unwrap();
 
-        let received = poll_message_trigger(&bus, &binding).await.unwrap();
+        let received = poll_message_trigger(&bus, workspace, &binding)
+            .await
+            .unwrap();
         assert!(received.is_none());
+    }
+
+    /// M4: a binding carrying a filter must never bind, and must never
+    /// poll — fail-closed, since filter evaluation does not exist yet and
+    /// every envelope reaching the handle is untrusted peer input.
+    #[tokio::test]
+    async fn a_binding_with_a_filter_is_refused_at_bind_time() {
+        let bus = LocalBus::new();
+        let workspace = WorkspaceId::new();
+        let binding = Binding::new(
+            JobId::new(),
+            TriggerSpec::Message {
+                address: Address::Handle {
+                    workspace,
+                    name: "listener".to_string(),
+                },
+                filter: Some("payload.outcome == 'ok'".to_string()),
+            },
+        );
+
+        let err = bind_message_trigger(&bus, workspace, &binding)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MessageTriggerError::FilterNotYetSupported(_)));
+        assert!(!bus.has_mailbox(binding.trigger_session_id()));
+    }
+
+    #[tokio::test]
+    async fn a_binding_with_a_filter_is_refused_at_poll_time_even_if_somehow_bound() {
+        let bus = LocalBus::new();
+        let workspace = WorkspaceId::new();
+        let binding = Binding::new(
+            JobId::new(),
+            TriggerSpec::Message {
+                address: Address::Handle {
+                    workspace,
+                    name: "listener".to_string(),
+                },
+                filter: Some("payload.outcome == 'ok'".to_string()),
+            },
+        );
+
+        let err = poll_message_trigger(&bus, workspace, &binding)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MessageTriggerError::FilterNotYetSupported(_)));
+    }
+
+    #[tokio::test]
+    async fn unbind_is_allowed_even_for_a_binding_carrying_a_filter() {
+        // Unbind must always be possible for cleanup, regardless of whether
+        // the trigger it belonged to was ever bindable in the first place.
+        let bus = LocalBus::new();
+        let workspace = WorkspaceId::new();
+        let binding = Binding::new(
+            JobId::new(),
+            TriggerSpec::Message {
+                address: Address::Handle {
+                    workspace,
+                    name: "listener".to_string(),
+                },
+                filter: Some("payload.outcome == 'ok'".to_string()),
+            },
+        );
+
+        unbind_message_trigger(&bus, workspace, &binding)
+            .await
+            .expect("unbind is never refused for filter presence");
     }
 }
