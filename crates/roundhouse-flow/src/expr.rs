@@ -674,15 +674,26 @@ fn find_closing_delimiter(s: &str) -> Option<usize> {
 /// exists and what it does not fully solve. End of input counts as a valid
 /// continuation (a string can legitimately be the last thing before the
 /// block's own, already-consumed, `}}`).
+///
+/// **`}` requires its pair (fix round 2, code lens Minor).** The block's own
+/// terminator is always `}}`, never a lone `}` — this grammar has no other
+/// construct that starts with a single `}`. An earlier version of this
+/// function accepted a bare `}` as a plausible continuation on its own,
+/// which is looser than the grammar it is modeling (false-positive
+/// direction only; no misbehaviour was ever found from it, since a lone `}`
+/// not followed by a second one still fails to parse moments later). Now
+/// requires the second byte, matching [`find_closing_delimiter`]'s own
+/// `b'}' && bytes.get(i + 1) == Some(&b'}')` check exactly.
 fn looks_like_a_real_string_close(bytes: &[u8], mut i: usize) -> bool {
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
     match bytes.get(i) {
         None => true,
+        Some(b'}') => bytes.get(i + 1) == Some(&b'}'),
         Some(b) => matches!(
             b,
-            b'.' | b'[' | b')' | b']' | b',' | b'?' | b':' | b'=' | b'!' | b'<' | b'>' | b'}'
+            b'.' | b'[' | b')' | b']' | b',' | b'?' | b':' | b'=' | b'!' | b'<' | b'>'
         ),
     }
 }
