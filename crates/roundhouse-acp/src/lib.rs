@@ -10,6 +10,7 @@
 //! `07-protocols-acp-mcp.md`.
 #![forbid(unsafe_code)]
 
+pub mod client;
 pub mod version;
 
 use roundhouse_proto::ApiVersion;
