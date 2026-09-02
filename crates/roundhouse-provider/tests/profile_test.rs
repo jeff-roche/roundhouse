@@ -71,8 +71,16 @@ fn unknown_field_in_profile_is_a_deserialize_error_not_a_silent_ignore() {
         kind = "effort"
         field = "/reasoning_effort"
         vocabulary = ["none", "high"]
-        dispositon = { off = "none" }
+        dispositon = "off"
+
+        [model.reasoning.map]
+        off = "none"
     "#; // "dispositon" — deliberate typo of a field name that does not exist at all
+        // on `ReasoningControl`. Every field `ReasoningControl` actually
+        // requires (kind/field/vocabulary/map) is present and valid here, so
+        // this can ONLY fail via `deny_unknown_fields` rejecting `dispositon`
+        // — a missing-required-field error would pass this assertion for the
+        // wrong reason and not actually pin down the guarantee.
     let result: Result<ProviderProfile, _> = toml::from_str(broken);
     assert!(
         result.is_err(),

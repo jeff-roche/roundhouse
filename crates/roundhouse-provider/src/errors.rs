@@ -36,7 +36,10 @@ pub enum ProviderErrorKind {
 }
 
 pub struct ErrorProfile {
-    pub code_table: HashMap<&'static str, ProviderErrorKind>,
+    // §14g / Phase 6 Task 4: relaxed from `HashMap<&'static str, _>` so
+    // TOML-loaded, owned error codes (`ProviderProfile::error_profile`) can
+    // populate it too; lookups stay `&str` via `HashMap::get`.
+    pub code_table: HashMap<String, ProviderErrorKind>,
     pub message_patterns: Vec<(regex::Regex, ProviderErrorKind)>,
 }
 
@@ -50,8 +53,14 @@ impl ErrorProfile {
 
     pub fn anthropic_like() -> Self {
         let mut code_table = HashMap::new();
-        code_table.insert("rate_limit_error", ProviderErrorKind::RateLimited);
-        code_table.insert("overloaded_error", ProviderErrorKind::Overloaded);
+        code_table.insert(
+            "rate_limit_error".to_string(),
+            ProviderErrorKind::RateLimited,
+        );
+        code_table.insert(
+            "overloaded_error".to_string(),
+            ProviderErrorKind::Overloaded,
+        );
         Self {
             code_table,
             // Anthropic's real, verbatim wording is "Your credit balance is
