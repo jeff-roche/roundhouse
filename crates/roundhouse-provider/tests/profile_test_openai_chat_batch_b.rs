@@ -59,7 +59,12 @@
 //!   `https://api.deepinfra.com/v1/openai` and Bearer auth verbatim
 //!   (`Authorization: Bearer $DEEPINFRA_TOKEN`), matching the brief exactly.
 //!   DeepInfra is also a multi-model hosting layer; no single quirk applies.
+use roundhouse_provider::codec::openai_chat::encode_openai_chat;
 use roundhouse_provider::profile::{AuthKind, ParamsMode, ProviderProfile};
+use roundhouse_provider::{ChatRequest, ReasoningIntent, ReasoningRequest};
+
+#[path = "support/openai_chat_fixtures.rs"]
+mod fixtures;
 
 fn load(name: &str) -> ProviderProfile {
     let path = format!("{}/profiles/{name}.toml", env!("CARGO_MANIFEST_DIR"));
@@ -202,4 +207,86 @@ fn deepinfra_profile_shape() {
     let p = load("deepinfra");
     assert_eq!(p.defaults.base_url, "https://api.deepinfra.com/v1/openai");
     assert!(matches!(p.defaults.auth, AuthKind::Bearer));
+}
+
+// ---------------------------------------------------------------------
+// Round-8 review, M5: the tests above check `field`/`vocabulary` in
+// isolation -- none call `encode_openai_chat` with a `ReasoningIntent` and
+// assert the emitted wire body, so transposing `high` and `max` in any
+// profile's `map` would pass every one of them. These call the real
+// codec against the real, shipped profile and assert the exact emitted
+// value for two intents whose mapped values genuinely differ (`high` !=
+// `max`), which a transposition would flip.
+// ---------------------------------------------------------------------
+
+fn request_with_intent(model_id: &str, intent: ReasoningIntent) -> ChatRequest {
+    ChatRequest {
+        reasoning: ReasoningRequest {
+            intent: Some(intent),
+        },
+        ..fixtures::single_turn_text(model_id)
+    }
+}
+
+#[test]
+fn zai_glm_5_3_encodes_high_and_max_to_their_distinct_mapped_values() {
+    let profile = load("zai");
+    let high_body = encode_openai_chat(
+        &request_with_intent("glm-5.3", ReasoningIntent::High),
+        &profile,
+    );
+    let max_body = encode_openai_chat(
+        &request_with_intent("glm-5.3", ReasoningIntent::Max),
+        &profile,
+    );
+    assert_eq!(high_body["reasoning_effort"], serde_json::json!("high"));
+    assert_eq!(max_body["reasoning_effort"], serde_json::json!("max"));
+}
+
+#[test]
+fn zai_glm_5_2_encodes_high_and_max_to_their_distinct_mapped_values() {
+    let profile = load("zai");
+    let high_body = encode_openai_chat(
+        &request_with_intent("glm-5.2", ReasoningIntent::High),
+        &profile,
+    );
+    let max_body = encode_openai_chat(
+        &request_with_intent("glm-5.2", ReasoningIntent::Max),
+        &profile,
+    );
+    assert_eq!(high_body["reasoning_effort"], serde_json::json!("high"));
+    assert_eq!(max_body["reasoning_effort"], serde_json::json!("max"));
+}
+
+#[test]
+fn xai_grok_4_encodes_high_and_max_to_their_distinct_mapped_values() {
+    // grok-4's map sends `high -> "high"` but `max -> "xhigh"` -- the
+    // profile's one genuinely three-way-distinct control among this
+    // batch's reasoning-bearing profiles.
+    let profile = load("xai");
+    let high_body = encode_openai_chat(
+        &request_with_intent("grok-4", ReasoningIntent::High),
+        &profile,
+    );
+    let max_body = encode_openai_chat(
+        &request_with_intent("grok-4", ReasoningIntent::Max),
+        &profile,
+    );
+    assert_eq!(high_body["reasoning_effort"], serde_json::json!("high"));
+    assert_eq!(max_body["reasoning_effort"], serde_json::json!("xhigh"));
+}
+
+#[test]
+fn deepseek_v4_encodes_reasoning_effort_for_the_high_intent() {
+    // deepseek-v4's map sends both `high` and `max` to the same wire value
+    // ("high") -- a transposition of those two entries would be
+    // undetectable at the wire (there is nothing to transpose *to* that
+    // differs), so this asserts the one real, distinct emitted value
+    // instead of a high-vs-max contrast.
+    let profile = load("deepseek");
+    let body = encode_openai_chat(
+        &request_with_intent("deepseek-v4-pro", ReasoningIntent::High),
+        &profile,
+    );
+    assert_eq!(body["reasoning_effort"], serde_json::json!("high"));
 }
