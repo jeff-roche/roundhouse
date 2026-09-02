@@ -38,16 +38,34 @@
 //! bound), `env`'s key names and value contents (charset), `map.as`
 //! (charset, plus a reserved-root check), `map.on_item_error` (closed
 //! enum), `map.isolation` and its `worktree.base_ref` parameter (closed
-//! tier set, plus a ref-name charset check), `caps.max_cost_usd`
-//! (finiteness/sign), and `gate.on_timeout` (closed enum). It is
-//! deliberately **not** true of `gate.timeout` (stays free-form text —
-//! bounded elsewhere, by §8.11's own 7-day reaper cap, same reasoning as
-//! the nested-`map`-depth bound `parse_step`'s doc comment names as the
+//! tier set, plus a git-ref-shaped charset check — see
+//! [`validate_git_ref`]'s own doc comment for the narrow, four-character
+//! exemption that check makes for expression syntax; fix round 3 found
+//! and closed a version of that exemption that was a complete bypass, not
+//! a narrowing, so this summary line says "check" rather than implying
+//! zero exceptions), `caps.max_cost_usd` (finiteness/sign), and
+//! `gate.on_timeout` (closed enum).
+//!
+//! **Fix round 3: the not-validated list below was incomplete, found by
+//! the same review that caught the `base_ref` bypass.** It is deliberately
+//! **not** true of `gate.timeout` (stays free-form text — bounded
+//! elsewhere, by §8.11's own 7-day reaper cap, same reasoning as the
+//! nested-`map`-depth bound `parse_step`'s doc comment names as the
 //! executor's responsibility rather than this parser's), nor of `tool`,
-//! `call`, `map.over`, `agent.prompt`, or `gate.title` — a tool name, a
-//! workflow name, an expression string, a prompt, and a human-facing title
-//! are not closed value spaces to begin with, and this module was never
-//! going to make them one.
+//! `call`, `map.over`, `when`, `agent.prompt`, `agent.model`, `gate.title`
+//! (expression strings, tool/workflow names, a prompt, a model name, and a
+//! human-facing title are not closed value spaces to begin with — `when`
+//! in particular is structurally identical to `map.over`, which the
+//! original version of this list already named, so omitting `when` read
+//! as a deliberate exclusion rather than the oversight it was), nor of
+//! `agent.tools` (a list of tool names, each unvalidated), nor of
+//! `map.max_parallel` (an unbounded `u32` — `0` and `u32::MAX` both parse,
+//! named in `parse_step`'s own doc comment as an executor-owned gap, not
+//! repeated here as if unstated), nor of a `map`'s nested `steps:
+//! Vec<serde_yaml::Value>` (each entry is itself unparsed until a caller
+//! invokes [`parse_step`] on it individually). This module was never
+//! going to make any of the above a closed value space, and this list
+//! exists so that isn't left to be inferred.
 //!
 //! **This deliberately does *not* use `#[serde(flatten)]` the way an
 //! earlier version of this module did, and the reason is a measured, not
@@ -311,14 +329,17 @@ fn is_valid_env_name(name: &str) -> bool {
 /// `env: { A: "safe\nLD_PRELOAD=/tmp/evil.so" }` parsed successfully and
 /// would render to a `.env` file as two lines; a NUL byte in a value
 /// parsed too, which `std::process::Command` rejects at spawn time — a
-/// runtime error surfacing far from the YAML that caused it. This rejects
-/// `\n`, `\r`, and `\0` specifically (the three ways a single logical
-/// value stops being a single line, or stops being a value
-/// `execve`/`Command` accepts at all) rather than restricting to a name-
-/// style charset, since a value legitimately holds e.g. `${{
-/// secrets.GH_TOKEN }}` or arbitrary URLs/paths.
+/// runtime error surfacing far from the YAML that caused it. Rejects any
+/// Unicode control character (fix round 3 widened this from the original
+/// `\n`/`\r`/`\0`-only check to match [`validate_git_ref`]'s use of
+/// `is_control()` — nothing was reachable through the gap between the two
+/// definitions, since dotenv/systemd/`execve` all split only on `\n`, but
+/// leaving two different definitions of "control character" a few lines
+/// apart in the same module was worth closing for free) rather than
+/// restricting to a name-style charset, since a value legitimately holds
+/// e.g. `${{ secrets.GH_TOKEN }}` or arbitrary URLs/paths.
 fn is_valid_env_value(value: &str) -> bool {
-    !value.contains(['\n', '\r', '\0'])
+    !value.chars().any(|c| c.is_control())
 }
 
 /// A step's resource caps (§8.9: `caps: { max_cost_usd, max_tool_calls }`).
@@ -462,29 +483,49 @@ struct WorktreeIsolationParams {
 /// catch, left for git itself to reject at worktree-creation time if they
 /// slip through.
 ///
-/// **Skipped entirely when `value` contains an expression placeholder
-/// (`${{`).** §8.9's own frozen fixture uses exactly this shape —
-/// `base_ref: "refs/pull/${{ pr.number }}/head"` — where the space inside
-/// `${{ pr.number }}` is legitimate expression syntax the evaluator (Task
-/// 4) substitutes a real value into at run time; this function has no way
-/// to know what that substitution produces, so a charset rule applied to
-/// the literal template text would reject the frozen fixture itself
-/// (confirmed by executing this exact case before choosing this design,
-/// not assumed: the naive version of this check rejected it). Inventing a
-/// rule that understands where a template placeholder starts and ends
-/// well enough to validate only the literal parts around it is exactly
-/// the shape of heuristic this crate's own DoS-scan history
-/// (`parse/mod.rs`'s module doc, three bypassed designs) warns against —
-/// a validator that has to model enough of a second grammar to stay safe
-/// is the wrong shape. The executor is responsible for validating the
-/// *evaluated* ref text before handing it to git; this parser validates
-/// only a fully-literal `base_ref` that contains no expression at all.
+/// # Fix round 3: the `${{`-exemption was a complete bypass, not a narrowing
+///
+/// An earlier version of this function returned `Ok(())` outright whenever
+/// `value` contained `${{`, reasoning that a templated `base_ref` (the
+/// frozen fixture's own `"refs/pull/${{ pr.number }}/head"`) can't be
+/// validated against a literal-ref charset. Security review measured the
+/// actual consequence: **every payload this function was written to
+/// reject passed again once `${{` was appended** — `"--upload-pack=/tmp/x${{"`,
+/// `"$(id)${{"`, `"; rm -rf / #${{"`, and refs with an embedded `\n`/`\0`
+/// followed by `${{` all parsed successfully, because the check for
+/// *every* rule bailed out before looking at the rest of the string. Worse,
+/// the check was unanchored (`contains`, no required matching `}}`), so a
+/// string like `"; rm -rf / #${{"` — not a valid expression by any
+/// plausible evaluator, which leaves an unterminated `${{` as literal text
+/// or errors — passed this check *as if* it were an expression, while
+/// reaching git *as* the literal string un-evaluated. The two ends of the
+/// exemption disagreed by construction: nothing downstream was ever going
+/// to treat that string as anything other than exactly what it says.
+///
+/// **Fix: narrow the exemption to the four characters expression syntax
+/// actually needs — a plain space, `$`, `{`, `}` — and apply every other
+/// rule unconditionally**, expression or not. This is deliberately not
+/// the span-parsing alternative (find `${{`, require a matching `}}`,
+/// validate only the literal parts around it): that would still be
+/// reasoning about where a second grammar's tokens start and end, the
+/// same shape of heuristic this crate's DoS-scan history
+/// (`parse/mod.rs`'s module doc, three bypassed designs) warns against.
+/// The four-character exemption needs no such reasoning — it just widens
+/// what counts as an acceptable character, uniformly, everywhere in the
+/// string — and every one of the payloads above is rejected under it
+/// regardless of what's appended: a leading `-` is checked before any
+/// character-class scan even runs; `(`, `)`, `;` are still forbidden
+/// characters (not part of the four-character exemption); control
+/// characters (including `\n`, `\r`, `\0`) are rejected unconditionally,
+/// never exempted. The frozen fixture's own `base_ref` still parses: its
+/// only exempt-class characters are the two spaces and the `${`/`}`
+/// pairs, and its `.` (in `pr.number`) never repeats into a `..` run.
 fn validate_git_ref(value: &str) -> Result<(), String> {
-    if value.contains("${{") {
-        return Ok(());
-    }
     if value.is_empty() {
         return Err("must not be empty".to_string());
+    }
+    if value.len() > MAX_STEP_ID_LEN {
+        return Err(format!("exceeds the {MAX_STEP_ID_LEN}-character limit"));
     }
     if value.starts_with('-') {
         return Err(
@@ -501,12 +542,13 @@ fn validate_git_ref(value: &str) -> Result<(), String> {
     if value.ends_with(".lock") {
         return Err("must not end with `.lock`".to_string());
     }
-    if value
-        .chars()
-        .any(|c| c.is_control() || c.is_whitespace() || FORBIDDEN_GIT_REF_CHARS.contains(c))
-    {
+    let is_expression_syntax_char = |c: char| matches!(c, ' ' | '$' | '{' | '}');
+    if value.chars().any(|c| {
+        !is_expression_syntax_char(c)
+            && (c.is_control() || c.is_whitespace() || FORBIDDEN_GIT_REF_CHARS.contains(c))
+    }) {
         return Err(format!(
-            "must not contain control characters, whitespace, or any of `{FORBIDDEN_GIT_REF_CHARS}`"
+            "must not contain control characters, whitespace, or any of `{FORBIDDEN_GIT_REF_CHARS}` — a plain space, `$`, `{{`, and `}}` are allowed, needed for `${{{{ }}}}` expression syntax"
         ));
     }
     Ok(())

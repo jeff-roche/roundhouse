@@ -694,7 +694,8 @@ fn minor1_an_ordinary_env_value_with_an_expression_parses() {
 }
 
 // -- Minor 2: `worktree.base_ref` gets a git-ref-shaped charset check, ---
-// -- skipped when it's an expression template rather than a literal. ----
+// -- with a narrow exemption (space/$/{/}) for expression syntax, -------
+// -- applied everywhere, not skipped outright when `${{` is present. ----
 
 #[test]
 fn minor2_a_base_ref_starting_with_a_dash_is_rejected() {
@@ -731,13 +732,13 @@ fn minor2_an_ordinary_literal_base_ref_parses() {
 }
 
 #[test]
-fn minor2_a_templated_base_ref_is_not_charset_checked() {
+fn minor2_a_templated_base_ref_with_a_narrow_exemption_still_parses() {
     // The frozen §8.9 fixture's own shape: an expression placeholder
-    // legitimately contains a space, which a literal-git-ref charset
-    // check cannot distinguish from an injection attempt without parsing
-    // the expression language itself — deliberately not attempted here.
-    // This is also this test's regression coverage for the fixture test
-    // itself, from the other direction.
+    // legitimately contains a space and `$`/`{`/`}` — exempted from the
+    // charset check specifically, everywhere in the string, not by
+    // skipping validation for the whole value. This is also this test's
+    // regression coverage for the fixture test itself, from the other
+    // direction.
     let s = step(
         "id: a\nmap: { over: x, as: y, isolation: { worktree: { base_ref: \"refs/pull/${{ pr.number }}/head\" } } }\nsteps: [{ id: b, tool: shell }]",
     );
@@ -750,4 +751,54 @@ fn minor2_a_templated_base_ref_is_not_charset_checked() {
             base_ref: Some("refs/pull/${{ pr.number }}/head".to_string())
         })
     );
+}
+
+#[test]
+fn minor2_an_overlong_base_ref_is_rejected() {
+    let long_ref = "a".repeat(roundhouse_flow::parse::steps::MAX_STEP_ID_LEN + 1);
+    let yaml = format!(
+        "id: a\nmap: {{ over: x, as: y, isolation: {{ worktree: {{ base_ref: \"{long_ref}\" }} }} }}\nsteps: [{{ id: b, tool: shell }}]"
+    );
+    let err = try_step(&yaml).unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+// -- Fix round 3's own defining regression cases: every payload the ------
+// -- Minor-2 fix was written to reject, with `${{` appended, must still --
+// -- be rejected — the earlier `${{`-exemption made all five pass. -------
+
+fn base_ref_step_yaml(base_ref: &str) -> String {
+    format!(
+        "id: a\nmap: {{ over: x, as: y, isolation: {{ worktree: {{ base_ref: {base_ref:?} }} }} }}\nsteps: [{{ id: b, tool: shell }}]"
+    )
+}
+
+#[test]
+fn fix_round_3_leading_dash_plus_expression_suffix_is_still_rejected() {
+    let err = try_step(&base_ref_step_yaml("--upload-pack=/tmp/x${{")).unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn fix_round_3_command_substitution_plus_expression_suffix_is_still_rejected() {
+    let err = try_step(&base_ref_step_yaml("$(id)${{")).unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn fix_round_3_shell_command_plus_expression_suffix_is_still_rejected() {
+    let err = try_step(&base_ref_step_yaml("; rm -rf / #${{")).unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn fix_round_3_embedded_newline_plus_expression_suffix_is_still_rejected() {
+    let err = try_step(&base_ref_step_yaml("refs/heads/main\n--exec=evil${{")).unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn fix_round_3_embedded_nul_plus_expression_suffix_is_still_rejected() {
+    let err = try_step(&base_ref_step_yaml("refs/heads/x\0${{")).unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
 }
