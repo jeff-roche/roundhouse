@@ -1,4 +1,6 @@
-use roundhouse_flow::expr::{eval, interpolate, interpolate_json, ExprContext, ExprError};
+use roundhouse_flow::expr::{
+    eval, interpolate, interpolate_json, ExprContext, ExprError, JsonTemplateSource, TemplateSource,
+};
 use serde_json::{json, Value};
 
 fn ctx() -> ExprContext {
@@ -70,7 +72,9 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
 #[test]
 fn interpolate_substitutes_expr_blocks_inside_a_larger_string() {
     let out = interpolate(
-        "Review PR #${{ steps.list_prs.output[0].number }} in ${{ inputs.repo }}",
+        TemplateSource::from_workflow_file(
+            "Review PR #${{ steps.list_prs.output[0].number }} in ${{ inputs.repo }}",
+        ),
         &ctx(),
     )
     .unwrap();
@@ -90,7 +94,7 @@ fn interpolate_json_walks_every_string_leaf_of_a_steps_with_block() {
         "retries": 3,
         "headers": { "Accept": "application/vnd.github+json" }
     });
-    let resolved = interpolate_json(&with, &ctx()).unwrap();
+    let resolved = interpolate_json(JsonTemplateSource::from_workflow_file(&with), &ctx()).unwrap();
     assert_eq!(
         resolved["url"],
         json!("https://api.github.com/repos/acme/widgets/pulls")
@@ -113,10 +117,13 @@ fn interpolating_an_object_or_array_value_renders_it_as_compact_json() {
     c.set("obj", json!({"a": 1, "b": [1, 2]}));
     c.set("arr", json!([1, "two", null]));
     assert_eq!(
-        interpolate("${{ obj }}", &c).unwrap(),
+        interpolate(TemplateSource::from_workflow_file("${{ obj }}"), &c).unwrap(),
         r#"{"a":1,"b":[1,2]}"#
     );
-    assert_eq!(interpolate("${{ arr }}", &c).unwrap(), r#"[1,"two",null]"#);
+    assert_eq!(
+        interpolate(TemplateSource::from_workflow_file("${{ arr }}"), &c).unwrap(),
+        r#"[1,"two",null]"#
+    );
 }
 
 // ---- Additional coverage for this task's identified risks ----
@@ -235,7 +242,11 @@ fn non_ascii_context_values_round_trip_through_property_access_and_interpolation
         eval("pr.title", &c).unwrap(),
         json!("Fix \u{1F41B} in \u{00e9}migr\u{00e9} module — “quoted”")
     );
-    let out = interpolate("Title: ${{ pr.title }}", &c).unwrap();
+    let out = interpolate(
+        TemplateSource::from_workflow_file("Title: ${{ pr.title }}"),
+        &c,
+    )
+    .unwrap();
     assert_eq!(
         out,
         "Title: Fix \u{1F41B} in \u{00e9}migr\u{00e9} module — “quoted”"
@@ -267,7 +278,11 @@ fn interpolation_is_single_pass_and_does_not_re_evaluate_substituted_output() {
     // evaluate `${{ inputs.repo }}` a second time and produce
     // "acme/widgets" in the output; a single-pass one leaves it as literal
     // text.
-    let out = interpolate(r#"payload: ${{ json('"${{ inputs.repo }}"') }}"#, &ctx()).unwrap();
+    let out = interpolate(
+        TemplateSource::from_workflow_file(r#"payload: ${{ json('"${{ inputs.repo }}"') }}"#),
+        &ctx(),
+    )
+    .unwrap();
     assert_eq!(out, "payload: ${{ inputs.repo }}");
 }
 
@@ -281,7 +296,11 @@ fn a_literal_expression_delimiter_produced_by_one_substitution_does_not_feed_a_l
     let mut c = ExprContext::new();
     c.set("a", json!("${{"));
     c.set("b", json!("real"));
-    let out = interpolate("${{ a }} then ${{ b }}", &c).unwrap();
+    let out = interpolate(
+        TemplateSource::from_workflow_file("${{ a }} then ${{ b }}"),
+        &c,
+    )
+    .unwrap();
     assert_eq!(out, "${{ then real");
 }
 
@@ -289,13 +308,21 @@ fn a_literal_expression_delimiter_produced_by_one_substitution_does_not_feed_a_l
 
 #[test]
 fn an_unpaired_opening_delimiter_is_an_error() {
-    let err = interpolate("prefix ${{ inputs.repo without a closer", &ctx()).unwrap_err();
+    let err = interpolate(
+        TemplateSource::from_workflow_file("prefix ${{ inputs.repo without a closer"),
+        &ctx(),
+    )
+    .unwrap_err();
     assert!(matches!(err, ExprError::Unterminated));
 }
 
 #[test]
 fn text_with_no_delimiter_at_all_passes_through_unchanged() {
-    let out = interpolate("plain text, no expressions here", &ctx()).unwrap();
+    let out = interpolate(
+        TemplateSource::from_workflow_file("plain text, no expressions here"),
+        &ctx(),
+    )
+    .unwrap();
     assert_eq!(out, "plain text, no expressions here");
 }
 
@@ -319,7 +346,9 @@ fn an_apostrophe_in_prose_between_two_blocks_does_not_merge_them() {
     // rest of the input, and the correct diagnosis is that block one's
     // string is genuinely unterminated.
     let err = interpolate(
-        "${{ 'oops }} plain text with it's own apostrophe ${{ inputs.repo }}",
+        TemplateSource::from_workflow_file(
+            "${{ 'oops }} plain text with it's own apostrophe ${{ inputs.repo }}",
+        ),
         &ctx(),
     )
     .unwrap_err();
@@ -351,7 +380,9 @@ fn an_open_quote_can_still_silently_absorb_a_later_block_when_the_forgery_looks_
     let mut c = ExprContext::new();
     c.set("real", json!("REAL_VALUE"));
     let out = interpolate(
-        "${{ 'oops }} filler ${{ real }} trailing' }} rest of template",
+        TemplateSource::from_workflow_file(
+            "${{ 'oops }} filler ${{ real }} trailing' }} rest of template",
+        ),
         &c,
     )
     .unwrap();

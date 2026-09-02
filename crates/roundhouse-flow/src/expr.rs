@@ -595,6 +595,42 @@ pub fn eval(expr: &str, ctx: &ExprContext) -> Result<Value, ExprError> {
     Ok(v.into_owned())
 }
 
+/// Asserts that the wrapped text is safe to evaluate as `${{ }}` template
+/// text — see ruling P20 (fix round 2, item 2): **untrusted data must never
+/// become template text**, whether by being concatenated into a string
+/// handed to [`interpolate`] or by being the `Value` handed to
+/// [`interpolate_json`]. The consequence of getting this wrong is not the
+/// silent cross-block merge (that was P19's original, weaker justification,
+/// since corrected) — it is `${{ env('ANTHROPIC_API_KEY') }}` or
+/// `${{ secrets.* }}` appearing in attacker-influenced content and
+/// evaluating for real, emitting the daemon's provider key or the
+/// workflow's own secrets in cleartext. Untrusted data must reach this
+/// module only as a value bound into [`ExprContext`], never as template
+/// text.
+///
+/// Constructible only through [`TemplateSource::from_workflow_file`], so
+/// that assertion is one explicit, greppable call site at the point a
+/// template's trust is established, rather than an invisible type
+/// coincidence between `&str` (template text) and `&str` (an ordinary,
+/// possibly-untrusted string value). `roundhouse-flow` has no other callers
+/// of `interpolate` today (this crate's own `parse`/`job` modules do not
+/// call it) — whoever wires a step's `run:`/`with:`/`env:`/`if:` field up
+/// for real is the one who must construct this from that field's own YAML
+/// source text, not from any evaluated result or runtime data value.
+pub struct TemplateSource<'a>(&'a str);
+
+impl<'a> TemplateSource<'a> {
+    /// Asserts that `template` is the workflow file's own YAML source for a
+    /// step field (`run:`, `with:`, `env:`, `if:`, …) as authored — not an
+    /// evaluated expression result, a `map.over` item, webhook payload, or
+    /// any other value this evaluator's caller does not control. See
+    /// [`TemplateSource`]'s own doc comment for what is at stake if that
+    /// assertion is wrong.
+    pub fn from_workflow_file(template: &'a str) -> Self {
+        Self(template)
+    }
+}
+
 /// Replaces every `${{ ... }}` block in `template` with its evaluated,
 /// string-coerced result, leaving surrounding text untouched. Single-pass:
 /// substituted text is never re-scanned for further `${{` — see the module
@@ -602,9 +638,12 @@ pub fn eval(expr: &str, ctx: &ExprContext) -> Result<Value, ExprError> {
 /// (no matching `}}` anywhere in the rest of the template) is
 /// [`ExprError::Unterminated`] — see the module doc comment's "An unpaired
 /// `${{` is an error" section.
-pub fn interpolate(template: &str, ctx: &ExprContext) -> Result<String, ExprError> {
+///
+/// Takes a [`TemplateSource`], not a bare `&str` — see its doc comment for
+/// why (ruling P20).
+pub fn interpolate(template: TemplateSource<'_>, ctx: &ExprContext) -> Result<String, ExprError> {
     let mut out = String::new();
-    let mut rest = template;
+    let mut rest = template.0;
     while let Some(start) = rest.find("${{") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 3..];
@@ -799,6 +838,34 @@ fn value_to_string(v: &Value) -> String {
     }
 }
 
+/// The `Value`-shaped counterpart of [`TemplateSource`] — see its doc
+/// comment for the constraint this asserts and why (ruling P20). This is
+/// the more dangerous of the two shapes: [`interpolate_json`]'s own prior
+/// doc comment described it as walking "an arbitrary JSON value" with no
+/// trust caveat at all, which is exactly the invitation P20 was written
+/// against — handing it an untrusted `Value` (a `map.over` item, a webhook
+/// payload after `serde_json` deserialization, …) requires no string
+/// concatenation whatsoever to reach the same outcome as pasting untrusted
+/// text into a template: every string leaf of that value is evaluated as
+/// `${{ }}` template text, so `{"note": "${{ env('ANTHROPIC_API_KEY') }}"}`
+/// anywhere in the tree evaluates for real.
+pub struct JsonTemplateSource<'a>(&'a Value);
+
+impl<'a> JsonTemplateSource<'a> {
+    /// Asserts that every string leaf of `value` is workflow-file-controlled
+    /// template text — a `with:`/`env:` block as authored, after
+    /// `serde_yaml` deserialization, not any value this evaluator's caller
+    /// does not control. The assertion covers the **whole tree**, not just
+    /// the top level: [`interpolate_json`] walks every string leaf, so a
+    /// caller must not construct this from a value that merely has an
+    /// untrusted subtree grafted into an otherwise-trusted document. See
+    /// [`JsonTemplateSource`]'s own doc comment for what is at stake if that
+    /// assertion is wrong.
+    pub fn from_workflow_file(value: &'a Value) -> Self {
+        Self(value)
+    }
+}
+
 /// Walks an arbitrary JSON value and runs every string leaf through
 /// [`interpolate`] — a step's whole `with:`/`env:` block is JSON, not a
 /// single string, so a caller resolving every `${{ }}` in it needs this
@@ -808,18 +875,38 @@ fn value_to_string(v: &Value) -> String {
 /// which for a `with`/`env` block already passed through `serde_yaml`'s own
 /// nesting guard before reaching this function — this function adds no new
 /// depth bound of its own.
-pub fn interpolate_json(value: &Value, ctx: &ExprContext) -> Result<Value, ExprError> {
+///
+/// Takes a [`JsonTemplateSource`], not a bare `&Value` — see its doc comment
+/// for why (ruling P20).
+pub fn interpolate_json(
+    value: JsonTemplateSource<'_>,
+    ctx: &ExprContext,
+) -> Result<Value, ExprError> {
+    interpolate_json_inner(value.0, ctx)
+}
+
+/// The recursive implementation behind [`interpolate_json`]. Private and
+/// untyped-by-`JsonTemplateSource` on purpose: the trust assertion belongs
+/// once, at the public entry point, not re-asserted (or re-checked) at every
+/// recursive step over a value this function itself already knows is
+/// trusted by construction.
+fn interpolate_json_inner(value: &Value, ctx: &ExprContext) -> Result<Value, ExprError> {
     match value {
-        Value::String(s) => Ok(Value::String(interpolate(s, ctx)?)),
+        Value::String(s) => Ok(Value::String(interpolate(
+            TemplateSource::from_workflow_file(s),
+            ctx,
+        )?)),
         Value::Array(items) => {
-            let resolved: Result<Vec<Value>, ExprError> =
-                items.iter().map(|v| interpolate_json(v, ctx)).collect();
+            let resolved: Result<Vec<Value>, ExprError> = items
+                .iter()
+                .map(|v| interpolate_json_inner(v, ctx))
+                .collect();
             Ok(Value::Array(resolved?))
         }
         Value::Object(map) => {
             let mut resolved = serde_json::Map::with_capacity(map.len());
             for (k, v) in map {
-                resolved.insert(k.clone(), interpolate_json(v, ctx)?);
+                resolved.insert(k.clone(), interpolate_json_inner(v, ctx)?);
             }
             Ok(Value::Object(resolved))
         }
