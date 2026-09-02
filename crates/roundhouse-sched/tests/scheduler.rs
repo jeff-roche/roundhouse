@@ -534,6 +534,150 @@ fn clock_at(wall: DateTime<Utc>, mono: Instant) -> FakeClock {
     }
 }
 
+/// Fix round 1 (M2): `CatchUp::None` must drop an *entire* multi-batch
+/// backlog, not just each capped batch independently — the bug this guards
+/// against is a trailing batch that happens to contain exactly one
+/// occurrence being treated as an ordinary (always-fires) single
+/// occurrence instead of the tail of a real backlog. `cap * 3` is
+/// deliberately an exact multiple of the per-call cap, exercising the
+/// `next_after_cursor` lookahead fix (the gather loop hitting the cap and
+/// running out of backlog on the very same batch).
+#[test]
+fn catch_up_after_wake_with_none_policy_drops_an_entire_multi_batch_backlog() {
+    let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let start_mono = Instant::now();
+    let mut binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
+    if let TriggerSpec::Cron { catch_up, .. } = &mut binding.spec {
+        *catch_up = CatchUp::None;
+    }
+    let binding_id = binding.id;
+
+    let clock = FakeClock {
+        mono: RefCell::new(start_mono),
+        wall: RefCell::new(start_wall),
+    };
+    let mut sched = Scheduler::new();
+    sched.add_binding(binding, &clock).unwrap();
+
+    let cap = MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK;
+    let total_missed = cap * 3; // exact multiple of the cap: 3 batches, none partial
+    let target_wall = start_wall + chrono::Duration::minutes(total_missed as i64);
+    let woke_mono = start_mono + Duration::from_millis(5);
+
+    let mut all_fires = fires_for(
+        &sched.catch_up_after_wake(woke_mono, target_wall),
+        binding_id,
+    );
+    for _ in 0..10 {
+        if sched.heap_len() == 0 {
+            break;
+        }
+        all_fires.extend(fires_for(
+            &sched.tick(&clock_at(target_wall, woke_mono)),
+            binding_id,
+        ));
+    }
+    assert!(
+        all_fires.is_empty(),
+        "CatchUp::None must drop the whole backlog across every batch, including an exact \
+         multiple of the cap where the last batch's gather loop stops for the same reason \
+         (hitting the cap) as it running out of backlog: {all_fires:?}"
+    );
+
+    // The pass must actually finish (not leave `catch_up_progress` stuck):
+    // a later, genuinely ordinary single occurrence must still fire.
+    let next_minute = target_wall + chrono::Duration::minutes(1);
+    let next_mono = woke_mono + Duration::from_secs(60);
+    let after = sched.tick(&clock_at(next_minute, next_mono));
+    assert_eq!(
+        fires_for(&after, binding_id),
+        vec![next_minute],
+        "a single ordinary occurrence after the backlog must still fire normally, proving the \
+         catch-up pass actually finalized rather than leaving state stuck: {after:?}"
+    );
+}
+
+/// Fix round 1 (M1): a *backward* wall-clock step reported at wake — the
+/// same "NTP correction after suspend/resume overshoots" scenario `tick`'s
+/// own drift check exists to catch — must fall back to a full
+/// `recompute_all`, not be treated as a catch-up backlog. An `Interval`
+/// binding (no `CatchUp` policy at all) isolates this from M2's concerns:
+/// the only question here is which of `drain_due`/`recompute_all` ran,
+/// observed indirectly through where the schedule ends up anchored.
+#[test]
+fn catch_up_after_wake_falls_back_to_recompute_on_a_backward_wall_clock_step() {
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let mono0 = Instant::now();
+    let add_clock = FakeClock {
+        mono: RefCell::new(mono0),
+        wall: RefCell::new(t0),
+    };
+    let mut sched = Scheduler::new();
+    let every = chrono::Duration::minutes(200).to_std().unwrap();
+    let binding = Binding::new(
+        JobId::new(),
+        TriggerSpec::Interval {
+            every,
+            align: false,
+            anchor: None,
+        },
+    );
+    let binding_id = binding.id;
+    sched.add_binding(binding, &add_clock).unwrap(); // next fire: t0 + 200min
+
+    // First wake: forward step to t0 + 60min. Nothing due yet (200min away),
+    // so this is indistinguishable from a no-op either way — it only
+    // advances the baseline `last_wall` this test's backward step below
+    // needs to be backward *relative to*.
+    let fired1 = sched.catch_up_after_wake(
+        mono0 + Duration::from_secs(60 * 60),
+        t0 + chrono::Duration::minutes(60),
+    );
+    assert!(fired1.is_empty());
+
+    // Second wake: a *backward* step to t0 + 10min (50 minutes earlier than
+    // the t0 + 60min this scheduler just recorded — an NTP correction
+    // overshooting after a resume, exactly the scenario `tick`'s own drift
+    // check names). Must re-anchor via `recompute_all`, not silently do
+    // nothing via `drain_due` (which would find the still-t0+200min heap
+    // entry not yet due and leave it untouched).
+    let fired2 = sched.catch_up_after_wake(
+        mono0 + Duration::from_secs(70 * 60),
+        t0 + chrono::Duration::minutes(10),
+    );
+    assert!(
+        fired2.is_empty(),
+        "a clock correction must not itself fire anything"
+    );
+
+    // Probe with plain `tick` at a wall clock chosen to fall strictly
+    // between the two possible re-anchor points: t0 + 200min (if the
+    // backward step were wrongly treated as a catch-up backlog and the
+    // stale heap entry left untouched) and t0 + 210min (t0 + 10min + 200min,
+    // the correct `recompute_all`-from-the-corrected-clock answer). Monotonic
+    // is advanced in lockstep with wall time here so this probe's own drift
+    // check stays silent — it exists only to observe where the schedule
+    // ended up, not to exercise drift detection a second time.
+    let probe_wall = t0 + chrono::Duration::minutes(205);
+    let probe_mono = mono0 + Duration::from_secs(70 * 60) + Duration::from_secs(195 * 60);
+    let probe = sched.tick(&clock_at(probe_wall, probe_mono));
+    assert!(
+        fires_for(&probe, binding_id).is_empty(),
+        "a backward wake step must re-anchor the schedule to the corrected clock (next fire \
+         t0+210min), not leave the stale t0+200min entry due: {probe:?}"
+    );
+
+    let later_wall = t0 + chrono::Duration::minutes(211);
+    let later_mono = probe_mono + Duration::from_secs(6 * 60);
+    let later = sched.tick(&clock_at(later_wall, later_mono));
+    assert_eq!(
+        fires_for(&later, binding_id),
+        vec![t0 + chrono::Duration::minutes(210)],
+        "the re-anchored schedule must still fire once the corrected clock actually reaches \
+         it, proving the fallback re-anchored rather than losing the binding entirely: {later:?}"
+    );
+}
+
 /// Fold-in fix: an `Interval` binding with `every == Duration::ZERO` must be
 /// rejected at registration time, not accepted and left to hang `tick`'s
 /// catch-up gather loop on a never-advancing occurrence.

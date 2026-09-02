@@ -1,24 +1,14 @@
 use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use roundhouse_core::JobId;
-use roundhouse_sched::power::{run_power_watch, PowerEvent, PowerEvents, RetryableMarker};
-use roundhouse_sched::scheduler::{ClockSource, Scheduler, SystemClock};
+use roundhouse_sched::power::{
+    run_power_watch, PowerEvent, PowerEvents, PowerWatchEvent, PowerWatchSink, RetryableMarker,
+};
+use roundhouse_sched::scheduler::{ClockSource, Scheduler, SchedulerEvent, SystemClock};
 use roundhouse_sched::trigger::Binding;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
-
-struct ScriptedEvents(Vec<PowerEvent>);
-impl PowerEvents for ScriptedEvents {
-    async fn next_event(&mut self) -> PowerEvent {
-        if self.0.is_empty() {
-            std::future::pending::<()>().await;
-            unreachable!()
-        } else {
-            self.0.remove(0)
-        }
-    }
-}
 
 struct CountingRetryableMarker(Arc<std::sync::atomic::AtomicUsize>);
 impl RetryableMarker for CountingRetryableMarker {
@@ -27,22 +17,74 @@ impl RetryableMarker for CountingRetryableMarker {
     }
 }
 
+/// Fix round 1 (H): records every `PowerWatchEvent` `run_power_watch` hands
+/// it, so tests can assert the drained `SchedulerEvent`s (and the
+/// `PrepareForSleep` notification) actually reach a consumer, not just that
+/// `Scheduler`'s own internal state changed. Wraps a `Vec` behind a
+/// `std::sync::Mutex` since `run_power_watch` calls `PowerWatchSink::accept`
+/// from inside its own task, while the test inspects the same `Vec` from
+/// the outside after the task is done.
+#[derive(Clone, Default)]
+struct RecordingSink(Arc<Mutex<Vec<PowerWatchEvent>>>);
+
+impl PowerWatchSink for RecordingSink {
+    fn accept(&mut self, event: PowerWatchEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+/// Fix round 1 (fold-in item): a single scripted `Woke` event, observed via
+/// a oneshot channel once `next_event` has actually been polled and
+/// returned it — used so a test can wait for `run_power_watch` to have
+/// *finished* processing the event (deterministically, no `sleep`-and-hope,
+/// which is flaky on a loaded CI box) before inspecting state. Generalizes
+/// the pattern the second test in this file already used, now applied to
+/// the brief-supplied test too.
+struct EventsThenSignal {
+    remaining: Vec<PowerEvent>,
+    done_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl PowerEvents for EventsThenSignal {
+    async fn next_event(&mut self) -> PowerEvent {
+        if !self.remaining.is_empty() {
+            return self.remaining.remove(0);
+        }
+        // Signal completion only once every scripted event has actually
+        // been consumed by `run_power_watch`'s loop (i.e. after whatever
+        // that event's branch does has already run), then block forever so
+        // the spawned task can be cleanly aborted.
+        if let Some(tx) = self.done_tx.take() {
+            let _ = tx.send(());
+        }
+        std::future::pending::<()>().await;
+        unreachable!()
+    }
+}
+
 #[tokio::test]
 async fn wake_event_triggers_full_recompute_and_marks_in_flight_calls_retryable() {
     let sched = Arc::new(Mutex::new(Scheduler::new()));
     let clock = Arc::new(SystemClock);
-    let events = ScriptedEvents(vec![PowerEvent::PrepareForSleep, PowerEvent::Woke]);
     let mark_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let retryable: Arc<Mutex<dyn RetryableMarker + Send>> =
         Arc::new(Mutex::new(CountingRetryableMarker(mark_count.clone())));
+    let sink = RecordingSink::default();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let events = EventsThenSignal {
+        remaining: vec![PowerEvent::PrepareForSleep, PowerEvent::Woke],
+        done_tx: Some(done_tx),
+    };
 
     let sched_clone = sched.clone();
+    let sink_clone = sink.clone();
     let handle = tokio::spawn(async move {
-        run_power_watch(sched_clone, clock, events, retryable).await;
+        run_power_watch(sched_clone, clock, events, retryable, sink_clone).await;
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    done_rx.await.expect("run_power_watch dropped its signal");
     handle.abort();
+
     // recompute_all's correctness is already covered by Task 3's drift test;
     // this task's own assertion is that Woke actually reaches both seams.
     assert!(sched.lock().unwrap().heap_len() == 0); // no bindings were registered in this test
@@ -51,6 +93,27 @@ async fn wake_event_triggers_full_recompute_and_marks_in_flight_calls_retryable(
         1,
         "Woke must mark in-flight provider calls retryable exactly once per wake (§8.7 — G6's fix)"
     );
+
+    // Fix round 1 (H): the drained events must actually reach the sink, not
+    // be silently discarded — assert on the sink's contents, not just on
+    // `Scheduler`'s own state.
+    let recorded = sink.0.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        2,
+        "expected one notification per scripted event: {recorded:?}"
+    );
+    assert!(
+        matches!(recorded[0], PowerWatchEvent::PrepareForSleep),
+        "PrepareForSleep must reach the sink so a real caller can pause admissions: {recorded:?}"
+    );
+    match &recorded[1] {
+        PowerWatchEvent::Woke(fired) => assert!(
+            fired.is_empty(),
+            "no bindings were registered, so the drain must produce no events: {fired:?}"
+        ),
+        other => panic!("expected PowerWatchEvent::Woke, got {other:?}"),
+    }
 }
 
 /// A fixed-reading fake clock: the point of this test is what happens once
@@ -85,8 +148,7 @@ impl RetryableMarker for NoopRetryableMarker {
 /// `next_event` has actually been polled and returned it — used so the test
 /// can wait for `run_power_watch` to have *finished* processing the event
 /// (deterministically, no `sleep`-and-hope) before inspecting scheduler
-/// state, rather than the flat `Vec`-based `ScriptedEvents` above, which
-/// gives no such signal.
+/// state.
 struct SingleWokeThenSignal {
     fired: bool,
     done_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -100,8 +162,8 @@ impl PowerEvents for SingleWokeThenSignal {
         }
         // Signal completion of the Woke branch's processing (this fires
         // only once `run_power_watch` has looped back around for its next
-        // event, i.e. after `catch_up_after_wake` and
-        // `mark_all_in_flight_retryable` have both already run) and then
+        // event, i.e. after `catch_up_after_wake`, the sink, and
+        // `mark_all_in_flight_retryable` have all already run) and then
         // block forever so the spawned task can be cleanly aborted.
         if let Some(tx) = self.done_tx.take() {
             let _ = tx.send(());
@@ -121,6 +183,13 @@ impl PowerEvents for SingleWokeThenSignal {
 /// simulated sleep far longer than `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK`
 /// minutes (a "daemon down for a month" scale event, per Task 3's own
 /// framing of that cap).
+///
+/// `Binding::new_cron` defaults to `CatchUp::Latest` (fix round 1, M2:
+/// `Latest` is resolved once over the *whole* backlog, not once per capped
+/// batch), so a single `Woke` event — one capped batch, with far more than
+/// a batch's worth of backlog still outstanding — must not have fired
+/// anything yet: `heap_len` still shows a due-but-not-yet-caught-up entry,
+/// and the sink's `Woke` payload for this one event is empty.
 #[tokio::test]
 async fn long_simulated_sleep_drains_progressively_through_run_power_watch() {
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
@@ -153,6 +222,7 @@ async fn long_simulated_sleep_drains_progressively_through_run_power_watch() {
     let clock: Arc<dyn ClockSource + Send + Sync> = Arc::new(post_wake_clock);
     let retryable: Arc<Mutex<dyn RetryableMarker + Send>> =
         Arc::new(Mutex::new(NoopRetryableMarker));
+    let sink = RecordingSink::default();
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let events = SingleWokeThenSignal {
         fired: false,
@@ -160,8 +230,9 @@ async fn long_simulated_sleep_drains_progressively_through_run_power_watch() {
     };
 
     let sched_clone = sched.clone();
+    let sink_clone = sink.clone();
     let handle = tokio::spawn(async move {
-        run_power_watch(sched_clone, clock, events, retryable).await;
+        run_power_watch(sched_clone, clock, events, retryable, sink_clone).await;
     });
 
     done_rx.await.expect("run_power_watch dropped its signal");
@@ -179,5 +250,79 @@ async fn long_simulated_sleep_drains_progressively_through_run_power_watch() {
         "a single wake event drains one capped batch and leaves the rest of the backlog \
          heaped for progressive draining by subsequent ticks, not dropped and not fully \
          resolved in one call: heap_len={remaining}"
+    );
+
+    let recorded = sink.0.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    match &recorded[0] {
+        PowerWatchEvent::Woke(fired) => assert!(
+            fired.is_empty(),
+            "CatchUp::Latest must not fire anything until the whole backlog is drained, \
+             which takes many more calls than this single Woke event: {fired:?}"
+        ),
+        other => panic!("expected PowerWatchEvent::Woke, got {other:?}"),
+    }
+}
+
+/// Fix round 1 (H): once the rest of the 10-day backlog above is drained by
+/// plain `tick` calls (mirroring what the daemon's own regular ticking
+/// would do after the wake event above), `CatchUp::Latest` must produce
+/// *exactly one* `Fire` for the whole backlog — not one per capped batch
+/// (M2) — and it must be the temporally *last* missed occurrence.
+#[test]
+fn latest_policy_backlog_collapses_to_one_fire_once_fully_drained_via_tick() {
+    let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let start_mono = Instant::now();
+    let pre_sleep_clock = FakeClock {
+        mono: start_mono,
+        wall: start_wall,
+    };
+    let mut scheduler = Scheduler::new();
+    let binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
+    let binding_id = binding.id;
+    scheduler.add_binding(binding, &pre_sleep_clock).unwrap();
+
+    let sleep_duration = chrono::Duration::days(10);
+    let target_wall = start_wall + sleep_duration;
+    let woke_mono = start_mono + Duration::from_millis(5);
+
+    // 10 days at one-a-minute cadence is 14,400 missed occurrences —
+    // exactly 144 capped batches of 100 (`MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK`),
+    // deliberately chosen as an exact multiple to exercise the fix-round-1
+    // edge case where the cap and the true end of the backlog coincide on
+    // the same batch (see `drain_due`'s `next_after_cursor` lookahead).
+    let mut fired: Vec<SchedulerEvent> = scheduler.catch_up_after_wake(woke_mono, target_wall);
+
+    let hold_clock = FakeClock {
+        mono: woke_mono,
+        wall: target_wall,
+    };
+    // `heap_len()` never reaches 0 for a registered cron binding (a
+    // rescheduled future entry always remains); the real completion signal
+    // is a `Fire` event finally showing up for our binding, which — under
+    // `CatchUp::Latest` — happens on exactly one of these calls, not on
+    // every one.
+    for _ in 0..200 {
+        fired.extend(scheduler.tick(&hold_clock));
+        if fired
+            .iter()
+            .any(|e| matches!(e, SchedulerEvent::Fire(id, _) if *id == binding_id))
+        {
+            break;
+        }
+    }
+
+    let fires: Vec<_> = fired
+        .into_iter()
+        .filter_map(|e| match e {
+            SchedulerEvent::Fire(id, at) if id == binding_id => Some(at),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fires,
+        vec![target_wall],
+        "CatchUp::Latest must fire exactly once for the whole backlog, carrying the \
+         temporally latest missed occurrence, not once per capped batch"
     );
 }

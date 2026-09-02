@@ -21,14 +21,27 @@ pub enum StoreError {
     IdempotencyKeyTooLong { len: usize, max: usize },
 }
 
+/// The binding's configured `CatchUp` policy, or `None` for a non-cron
+/// trigger (which has no such policy — `compute_catch_up` always runs every
+/// missed instant for those). Shared by `compute_catch_up` below and by
+/// `scheduler::Scheduler`'s `drain_due`, which needs to know the policy
+/// *without* also needing a `missed` list on hand (fix round 1, M2: the
+/// policy decision has to span potentially many `drain_due` batches, not
+/// just the one batch `compute_catch_up` reduces).
+pub(crate) fn catch_up_policy(binding: &Binding) -> Option<&CatchUp> {
+    match &binding.spec {
+        TriggerSpec::Cron { catch_up, .. } => Some(catch_up),
+        _ => None,
+    }
+}
+
 /// Applies the binding's `CatchUp` policy to a list of missed scheduled
 /// instants, returning the instants that should actually be run. Non-cron
 /// triggers (e.g. `Message`, `Webhook`) don't accumulate misses the same
 /// way a cron schedule does, so every missed instant is run for those.
 pub fn compute_catch_up(binding: &Binding, missed: Vec<DateTime<Utc>>) -> Vec<DateTime<Utc>> {
-    let catch_up = match &binding.spec {
-        TriggerSpec::Cron { catch_up, .. } => catch_up,
-        _ => return missed,
+    let Some(catch_up) = catch_up_policy(binding) else {
+        return missed;
     };
     match catch_up {
         CatchUp::None => vec![],
