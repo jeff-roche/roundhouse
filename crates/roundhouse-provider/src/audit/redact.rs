@@ -57,15 +57,24 @@ static GOOGLE_API_KEY: LazyLock<Regex> =
 /// provider's opaque token. Anchored on a nearby field-name label so it
 /// doesn't fire on arbitrary base64-shaped text with no such context.
 ///
-/// The trailing `\S*` (added fix-round-2, B4) consumes any remaining
-/// non-whitespace characters after the initial 16-character run — the
-/// earlier version stopped at the first character outside
+/// The trailing `[^\s"',&}]*` (fix-round-3, C3 — replacing fix-round-2 B4's
+/// unbounded `\S*`) consumes any remaining characters of the value past the
+/// initial 16-character run, up to the value's own delimiter: whitespace,
+/// a closing quote, a comma, a `&` (form-encoded field separator), or a
+/// closing `}` (JSON object terminator). B4 fixed a real bug — the
+/// then-current pattern stopped at the first character outside
 /// `[A-Za-z0-9/_+.~-]`, so a value containing punctuation
 /// (`"abcdefghijklmnop!QRSTUVWX"`) redacted only its first 16 characters and
-/// left the rest, `!QRSTUVWX`, sitting in the persisted body untouched.
+/// left the rest sitting in the persisted body untouched — but `\S*` has no
+/// terminator except whitespace or end-of-string, so on a compact JSON or
+/// form-encoded body (the common case: no whitespace between fields) it ran
+/// to the end of the string, destroying every field after the labeled
+/// secret. This is bounded to the value's own delimiters instead, so it
+/// stops at the actual end of the value the way the surrounding
+/// `["']?`/`\s*[:=]\s*` context already implies one exists.
 static LABELED_SECRET_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)(client[_-]?secret|secret[_-]?access[_-]?key|api[_-]?key|access[_-]?token)["']?\s*[:=]\s*["']?[A-Za-z0-9/_+.~-]{16,}\S*"#,
+        r#"(?i)(client[_-]?secret|secret[_-]?access[_-]?key|api[_-]?key|access[_-]?token)["']?\s*[:=]\s*["']?[A-Za-z0-9/_+.~-]{16,}[^\s"',&}]*"#,
     )
     .unwrap()
 });

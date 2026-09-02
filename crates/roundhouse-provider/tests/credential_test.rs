@@ -243,22 +243,29 @@ fn provider_manifest_never_depends_on_secrecy() {
     let parsed: toml::Value = manifest.parse().expect("parse Cargo.toml");
     let mut hits = Vec::new();
     for table_name in ["dependencies", "dev-dependencies", "build-dependencies"] {
-        let Some(table) = parsed.get(table_name).and_then(|t| t.as_table()) else {
-            continue;
-        };
-        for (key, value) in table {
-            if key == "secrecy" {
-                hits.push(format!("[{table_name}] key `{key}`"));
+        if let Some(table) = parsed.get(table_name).and_then(|t| t.as_table()) {
+            scan_dependency_table_for_secrecy(table_name, table, &mut hits);
+        }
+    }
+    // C5 (fix-round-3): platform-scoped dependency tables
+    // (`[target.'cfg(unix)'.dependencies]`) are a real, valid place to
+    // declare a dependency that the top-level-only scan above would
+    // silently miss — B2's whole point was that a ratchet must not
+    // overstate its own strength, so this walks them too rather than
+    // leaving an unstated gap.
+    if let Some(targets) = parsed.get("target").and_then(|t| t.as_table()) {
+        for (cfg, target_table) in targets {
+            let Some(target_table) = target_table.as_table() else {
                 continue;
-            }
-            let renamed_from_secrecy = value
-                .get("package")
-                .and_then(|p| p.as_str())
-                .is_some_and(|p| p == "secrecy");
-            if renamed_from_secrecy {
-                hits.push(format!(
-                    "[{table_name}] `{key}` renamed from package = \"secrecy\""
-                ));
+            };
+            for table_name in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if let Some(table) = target_table.get(table_name).and_then(|t| t.as_table()) {
+                    scan_dependency_table_for_secrecy(
+                        &format!("target.'{cfg}'.{table_name}"),
+                        table,
+                        &mut hits,
+                    );
+                }
             }
         }
     }
@@ -266,4 +273,30 @@ fn provider_manifest_never_depends_on_secrecy() {
         hits.is_empty(),
         "roundhouse-provider's Cargo.toml must never declare a `secrecy` dependency, found: {hits:?}"
     );
+}
+
+/// Checks one `[dependencies]`-shaped TOML table (top-level or under a
+/// `[target.'cfg(...)'.*]` section) for a `secrecy` dependency, by key name
+/// or by an explicit `package = "secrecy"` rename, appending a description
+/// of each hit found to `hits`.
+fn scan_dependency_table_for_secrecy(
+    table_name: &str,
+    table: &toml::value::Table,
+    hits: &mut Vec<String>,
+) {
+    for (key, value) in table {
+        if key == "secrecy" {
+            hits.push(format!("[{table_name}] key `{key}`"));
+            continue;
+        }
+        let renamed_from_secrecy = value
+            .get("package")
+            .and_then(|p| p.as_str())
+            .is_some_and(|p| p == "secrecy");
+        if renamed_from_secrecy {
+            hits.push(format!(
+                "[{table_name}] `{key}` renamed from package = \"secrecy\""
+            ));
+        }
+    }
 }

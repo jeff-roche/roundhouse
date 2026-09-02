@@ -129,3 +129,53 @@ fn error_body_redaction_consumes_the_full_labeled_secret_value_past_punctuation(
          behind: {redacted}"
     );
 }
+
+#[test]
+fn error_body_redaction_does_not_destroy_fields_after_a_labeled_secret_json() {
+    // C3 (fix-round-3): B4's fix (`\S*`) is unbounded — it stops only at
+    // whitespace or end-of-string. Real provider error bodies are compact
+    // JSON with no whitespace between fields, so on a body like this one
+    // `\S*` ran clean off the end of the string, destroying
+    // `other_field`'s visible, non-secret value. This is fail-safe in
+    // direction (over-redaction, never a miss) but destroys exactly the
+    // diagnostic content this function exists to preserve. It shipped
+    // untested because the round-2 fixture happened to put the labeled
+    // secret last, where "eat to end of string" and "eat the tail" are
+    // indistinguishable — this fixture puts another field after it.
+    let body = r#"{"client_secret":"abcdefghijklmnop!QRSTUVWX","other_field":"visible-value-should-stay"}"#;
+    let redacted = redact_error_body(body);
+    assert!(
+        !redacted.contains("abcdefghijklmnop"),
+        "the labeled secret must still be redacted: {redacted}"
+    );
+    assert!(
+        redacted.contains("visible-value-should-stay"),
+        "a field AFTER the labeled secret must survive redaction, not be swallowed by an \
+         unbounded tail match: {redacted}"
+    );
+    assert!(
+        redacted.contains("other_field"),
+        "the following field's own key must survive too: {redacted}"
+    );
+}
+
+#[test]
+fn error_body_redaction_does_not_destroy_fields_after_a_labeled_secret_form_encoded() {
+    // C3 (fix-round-3): same defect, form-encoded shape (the actual wire
+    // shape OAuthRefreshCredential's token request uses, per this task's
+    // own A2 fix).
+    let body = "grant_type=client_credentials&client_secret=Tn8Q1a2B3c4D5e6F7g8H&client_id=my-app&scope=https://example.com/.default";
+    let redacted = redact_error_body(body);
+    assert!(
+        !redacted.contains("Tn8Q1a2B3c4D5e6F7g8H"),
+        "the labeled secret must still be redacted: {redacted}"
+    );
+    assert!(
+        redacted.contains("client_id=my-app"),
+        "fields AFTER the labeled secret must survive: {redacted}"
+    );
+    assert!(
+        redacted.contains("scope=https://example.com/.default"),
+        "fields AFTER the labeled secret must survive: {redacted}"
+    );
+}
