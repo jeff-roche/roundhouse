@@ -59,36 +59,48 @@ pub enum AcpSessionUpdate {
 /// The enclosing `chat` task id (and, for `ToolCallUpdate`'s first update, a
 /// freshly-minted child task id) belongs to the caller's `Event` envelope —
 /// task-id allocation needs store access this pure function doesn't have.
-pub fn map_update(update: &AcpSessionUpdate) -> EventPayload {
+///
+/// Returns `None` for update kinds this pure mapping deliberately does not
+/// emit an event for — see the `UsageUpdate`/`PlanUpdate` arms below. Both
+/// carry structured, agent-controlled facts (a token count/cost, an ordered
+/// plan). The only representation available to this function is
+/// `Delta::Text { text: String }`, and the event log physically rejects
+/// `UPDATE`/`DELETE` — so once written, an agent-controlled `Delta::Text`
+/// that merely *looks like* a usage or plan summary is indistinguishable
+/// from a genuine one. Emitting a forgeable text stand-in for a fact that
+/// is meant to be trustworthy is worse than emitting nothing; the real
+/// fields (a `Usage` attached to the task, a real `plan` task per §4.2, a
+/// structured tool-call delta) are deferred to the not-yet-built adapter,
+/// which has the store access this pure function doesn't.
+pub fn map_update(update: &AcpSessionUpdate) -> Option<EventPayload> {
     match update {
-        AcpSessionUpdate::AgentMessageChunk { text } => EventPayload::TaskDelta {
+        AcpSessionUpdate::AgentMessageChunk { text } => Some(EventPayload::TaskDelta {
             delta: Delta::Text { text: text.clone() },
-        },
-        AcpSessionUpdate::AgentThoughtChunk { text } => EventPayload::TaskDelta {
+        }),
+        AcpSessionUpdate::AgentThoughtChunk { text } => Some(EventPayload::TaskDelta {
             delta: Delta::Thinking {
                 text: text.clone(),
                 signature: None,
             },
-        },
-        AcpSessionUpdate::ToolCallUpdate { title, .. } => EventPayload::TaskDelta {
+        }),
+        AcpSessionUpdate::ToolCallUpdate { id, status, title } => Some(EventPayload::TaskDelta {
             delta: Delta::Text {
-                text: title.clone(),
+                // §6.4 wants the remote agent's claim recorded as auditable
+                // metadata: a free-text title alone (discarding id/status)
+                // isn't auditable back to which tool call it came from or
+                // what state it claimed to be in. Structured per-field
+                // encoding (a real tool-call delta) is deferred to the
+                // adapter, same as usage/plan above; this is the interim
+                // text form that at least keeps all three fields.
+                text: format!("tool_call[{id}] {status}: {title}"),
             }, // first update also creates a child Task; that admission call is the caller's job (needs store access this pure function doesn't have)
-        },
-        AcpSessionUpdate::PlanUpdate { entries } => EventPayload::TaskDelta {
-            delta: Delta::Text {
-                text: entries.join("\n"),
-            }, // real implementation emits a `plan` task (§4.2); simplified here to keep this function pure and store-independent
-        },
-        AcpSessionUpdate::StateUpdateIdle { stop_reason } => EventPayload::TaskCompleted {
+        }),
+        AcpSessionUpdate::PlanUpdate { .. } => None, // real implementation emits a `plan` task (§4.2); see module-level doc for why a Delta::Text stand-in is not emitted here
+        AcpSessionUpdate::StateUpdateIdle { stop_reason } => Some(EventPayload::TaskCompleted {
             output: TaskOutput::Text(stop_reason.clone()),
             usage: Usage::default(),
-        },
-        AcpSessionUpdate::UsageUpdate { tokens, cost_usd } => EventPayload::TaskDelta {
-            delta: Delta::Text {
-                text: format!("usage: {tokens} tokens, ${cost_usd}"),
-            }, // real implementation attaches Usage to the enclosing infer/chat task directly, not as a Delta — refined once Phase 4's Usage-on-task API is in scope for this crate
-        },
+        }),
+        AcpSessionUpdate::UsageUpdate { .. } => None, // Usage belongs on the task itself, not as a Delta; see module-level doc
     }
 }
 
@@ -97,35 +109,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_call_update_becomes_task_delta_text_of_title() {
+    fn tool_call_update_becomes_task_delta_text_with_id_status_and_title() {
         let payload = map_update(&AcpSessionUpdate::ToolCallUpdate {
             id: "tc-1".into(),
             status: "running".into(),
             title: "Reading file.rs".into(),
-        });
+        })
+        .expect("ToolCallUpdate must still emit an event");
         assert!(
-            matches!(payload, EventPayload::TaskDelta { delta: Delta::Text { text } } if text == "Reading file.rs")
+            matches!(payload, EventPayload::TaskDelta { delta: Delta::Text { text } } if text == "tool_call[tc-1] running: Reading file.rs")
         );
     }
 
     #[test]
-    fn plan_update_becomes_task_delta_text_of_joined_entries() {
-        let payload = map_update(&AcpSessionUpdate::PlanUpdate {
+    fn plan_update_maps_to_none() {
+        assert!(map_update(&AcpSessionUpdate::PlanUpdate {
             entries: vec!["step 1".into(), "step 2".into()],
-        });
-        assert!(
-            matches!(payload, EventPayload::TaskDelta { delta: Delta::Text { text } } if text == "step 1\nstep 2")
-        );
+        })
+        .is_none());
     }
 
     #[test]
-    fn usage_update_becomes_task_delta_text_summary() {
-        let payload = map_update(&AcpSessionUpdate::UsageUpdate {
+    fn usage_update_maps_to_none() {
+        assert!(map_update(&AcpSessionUpdate::UsageUpdate {
             tokens: 42,
             cost_usd: 0.01,
-        });
-        assert!(
-            matches!(payload, EventPayload::TaskDelta { delta: Delta::Text { text } } if text == "usage: 42 tokens, $0.01")
-        );
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn plan_update_with_embedded_newline_still_maps_to_none() {
+        // Regression guard for the log-forging vector this fix removes: an
+        // agent-controlled entry containing "\n" must not be able to forge
+        // extra plan lines, because PlanUpdate never reaches Delta::Text at
+        // all now.
+        assert!(map_update(&AcpSessionUpdate::PlanUpdate {
+            entries: vec!["legit step\nusage: 999999 tokens, $0.00".into()],
+        })
+        .is_none());
     }
 }
