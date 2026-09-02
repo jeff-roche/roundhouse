@@ -485,6 +485,14 @@ use thiserror::Error;
 /// for exactly what this does and does not cover.
 pub const MAX_EXPR_DEPTH: usize = 64;
 
+/// Fix round 2, item 7 (M-3): public, reachable from a second entry point
+/// this round ([`eval_delimited_expression`], alongside [`eval`]), and
+/// already grew a variant once ([`ExprError::NotADelimitedExpression`], fix
+/// round 1). Any downstream exhaustive `match` would break on the next
+/// variant added; `#[non_exhaustive]` makes that a compile error at the
+/// `match` site instead of a silent behavior change. No security impact —
+/// cheap insurance against a real, already-demonstrated growth pattern.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ExprError {
     #[error("unexpected token at position {0}: '{1}'")]
@@ -749,14 +757,46 @@ pub fn eval_delimited_expression(
     let text = field.0.trim();
     let after_open = text
         .strip_prefix("${{")
-        .ok_or_else(|| ExprError::NotADelimitedExpression(text.to_string()))?;
+        .ok_or_else(|| ExprError::NotADelimitedExpression(truncate_echoed_field(text)))?;
     let end = find_closing_delimiter(after_open).ok_or(ExprError::Unterminated)?;
     let inner = &after_open[..end];
     let trailing = after_open[end + 2..].trim();
     if !trailing.is_empty() {
-        return Err(ExprError::NotADelimitedExpression(text.to_string()));
+        return Err(ExprError::NotADelimitedExpression(truncate_echoed_field(
+            text,
+        )));
     }
     eval_inner(inner.trim(), ctx)
+}
+
+/// Bounds how much of the offending field's own text
+/// [`ExprError::NotADelimitedExpression`] echoes (fix round 2, item 2).
+/// Pre-fix, the whole field — bounded only by `parse::MAX_YAML_BYTES`, not
+/// by anything this module controls — was echoed verbatim into a `when:`
+/// evaluation failure, which `exec::steps_context_entry` writes into
+/// `steps.<id>.error`: an append-only field a dependent step can read and
+/// re-emit. Security measured this pre-fix: a 184,334-byte workflow (under
+/// `MAX_YAML_BYTES`) produced a 200,202-byte `steps.a.error`, and with 60
+/// dependent steps each reading and re-emitting it, 21,636,840 bytes reached
+/// the sink — 117.4x amplification in 410ms, into a table that physically
+/// rejects `UPDATE`/`DELETE`. A fixed prefix plus the original length names
+/// the actual problem (the field is missing its documented `${{ }}`
+/// delimiters) without reproducing the amplification.
+const MAX_ECHOED_FIELD_LEN: usize = 64;
+
+/// Truncates `text` to at most [`MAX_ECHOED_FIELD_LEN`] bytes (at a valid
+/// UTF-8 boundary — `text` is workflow-author YAML, not guaranteed ASCII),
+/// appending the original byte length so the truncation itself is visible
+/// rather than silently shortening the message.
+fn truncate_echoed_field(text: &str) -> String {
+    if text.len() <= MAX_ECHOED_FIELD_LEN {
+        return text.to_string();
+    }
+    let mut end = MAX_ECHOED_FIELD_LEN;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... ({} bytes total)", &text[..end], text.len())
 }
 
 /// Asserts that the wrapped text is safe to evaluate as `${{ }}` template
@@ -1480,25 +1520,33 @@ fn as_f64(v: &Value) -> f64 {
 /// this fix with the same three depths: see this module's doc comment
 /// "Cost" section for the numbers and the harness that produced them.
 ///
-/// **This still assumes `serde_json::Map` is its default, `BTreeMap`-backed
-/// form (ruling P21, upgraded to a test by P24).** `Map::remove` being
-/// O(sibling count) rather than O(subtree size) is what makes the claim
-/// above hold; if any crate in this workspace ever enables serde_json's
-/// `preserve_order` feature, Cargo's workspace-wide feature unification
-/// silently changes `Map` to an `IndexMap`. Checked against the pinned
-/// `serde_json` 1.0.151 source
+/// **`preserve_order` is now ACCEPTED workspace-wide (ruling P29, supersedes
+/// P21/P24).** This comment used to assume `serde_json::Map` stayed its
+/// default `BTreeMap`-backed form and treated any crate turning on
+/// `preserve_order` as a regression to catch. A human ruling, relayed via
+/// the coordinator, has since accepted the feature workspace-wide instead:
+/// the pinned ACP SDK (`agent-client-protocol` 2.0.0) enables it
+/// unconditionally, and vendoring the SDK to avoid it was considered and
+/// rejected. `tests/expr.rs::preserve_order_feature_is_off`, which asserted
+/// the feature was *off*, is obsolete under that ruling and has been
+/// replaced (see `tests/expr.rs`'s replacement test) — it would fail at
+/// merge on a decision someone deliberately made, which is exactly the
+/// "red build caused by an approved choice" the replacement exists to
+/// avoid.
+///
+/// What this does NOT change is whether this function's fix regresses.
+/// Checked against the pinned `serde_json` 1.0.151 source
 /// (`~/.cargo/registry/src/index.crates.io-*/serde_json-1.0.151/src/map.rs:156-165`),
 /// not assumed: under `preserve_order`, `Map::remove` routes to
 /// **`swap_remove`**, not `shift_remove` — O(1) (swap with the last
-/// element), not O(sibling count) — so this fix would not regress even
-/// then, and the claim above is *stronger* than the O(sibling count)
-/// fallback this comment used to describe. `preserve_order` is
-/// runtime-detectable (`serde_json::Map`'s iteration order is sorted
-/// without the feature, insertion-ordered with it), so
-/// `tests/expr.rs::preserve_order_feature_is_off` asserts sorted iteration
-/// directly rather than leaving this to a manual `cargo tree -e features -i
-/// serde_json` check at integration — see that test for the assertion this
-/// module now enforces on its own.
+/// element), not O(sibling count) — so this fix does not regress under
+/// `preserve_order` either; the claim above is in fact *stronger* than the
+/// O(sibling count) case this comment used to describe as the only one.
+/// What DOES change under `preserve_order` is object key **iteration**
+/// order (sorted -> insertion-ordered) — irrelevant to `index_field`, which
+/// does keyed lookup (`get`/`remove`) rather than iteration, and see
+/// `tests/expr.rs`'s replacement test for the property that actually
+/// depends on order-independence.
 fn index_field<'a>(v: Cow<'a, Value>, field: &str) -> Cow<'a, Value> {
     match v {
         Cow::Borrowed(r) => match r.get(field) {

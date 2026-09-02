@@ -939,29 +939,85 @@ fn eval_requires_an_expression_source_not_a_bare_str() {
     );
 }
 
-// ---- `preserve_order` must stay off (ruling P24, supersedes P21's manual
-// `cargo tree` check): `index_field`'s O(sibling count) `Map::remove`
-// complexity argument (see `expr.rs`'s doc comment on `index_field`)
-// depends on `serde_json::Map` staying `BTreeMap`-backed. The feature is
-// runtime-detectable because it swaps `BTreeMap` (sorted iteration) for
-// `IndexMap` (insertion order): asserting sorted iteration here converts a
-// manual, skippable merge-time check into a test that fails loudly the
-// moment any crate in the workspace turns the feature on. ----
+// ---- Ruling P29 (supersedes P21 and P24): `preserve_order` is ACCEPTED
+// workspace-wide — the pinned ACP SDK enables it unconditionally, and
+// vendoring it out was considered and rejected. The old
+// `preserve_order_feature_is_off` test asserted the feature stayed off,
+// which would fail at merge on that approved decision — "the worst kind of
+// guard: a red build caused by an approved choice" (task-13-fix-2.md, item
+// 8). It is replaced here, not deleted: what it was actually protecting —
+// `index_field`'s O(1)-or-better `Map::remove` cost (see `expr.rs`'s doc
+// comment on `index_field`) — is unaffected by which backing `Map` uses
+// (security separately established serde_json 1.0.151 routes `remove` to
+// `swap_remove`, O(1), under `preserve_order`), so there is nothing left to
+// guard on that front. What DOES change is object key iteration order,
+// sorted -> insertion-ordered — and per STANDING.md's rule from this same
+// ruling, nothing may assert on serialized JSON text where key order
+// affects the result. This test instead pins the property that actually
+// matters: evaluation results and `interpolate_json` output are the same
+// regardless of the order keys were inserted into a `serde_json::Map`, by
+// comparing two contexts built with the identical keys/values in opposite
+// insertion order and asserting the *parsed* results are equal — never
+// comparing `to_string()` output, which is exactly the order-sensitive
+// comparison STANDING.md forbids. ----
 
 #[test]
-fn preserve_order_feature_is_off() {
-    let v: Value = serde_json::from_str(r#"{"z":1,"a":2,"m":3}"#).unwrap();
-    let obj = v.as_object().unwrap();
-    let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+fn evaluation_and_interpolation_do_not_depend_on_object_key_insertion_order() {
+    let mut forward = serde_json::Map::new();
+    forward.insert("z".to_string(), json!(1));
+    forward.insert("a".to_string(), json!(2));
+    forward.insert("m".to_string(), json!(3));
+
+    let mut reversed = serde_json::Map::new();
+    reversed.insert("m".to_string(), json!(3));
+    reversed.insert("a".to_string(), json!(2));
+    reversed.insert("z".to_string(), json!(1));
+
+    let mut forward_ctx = ExprContext::new();
+    forward_ctx.set("obj", Value::Object(forward));
+    let mut reversed_ctx = ExprContext::new();
+    reversed_ctx.set("obj", Value::Object(reversed));
+
+    for field in ["z", "a", "m"] {
+        let path = format!("obj.{field}");
+        let via_forward = eval(ExpressionSource::from_workflow_file(&path), &forward_ctx).unwrap();
+        let via_reversed =
+            eval(ExpressionSource::from_workflow_file(&path), &reversed_ctx).unwrap();
+        assert_eq!(
+            via_forward, via_reversed,
+            "field `{field}` must evaluate identically regardless of the \
+             object's key insertion order"
+        );
+    }
+
+    // Same property through `interpolate_json`: the *values* assembled from
+    // a template must not depend on the source object's key insertion
+    // order, even though this test may not assert anything about the
+    // *emitted* object's own serialized key order (STANDING.md, ruling
+    // P29).
+    let template = json!({
+        "seen_z": "${{ obj.z }}",
+        "seen_a": "${{ obj.a }}",
+        "seen_m": "${{ obj.m }}",
+    });
+    let via_forward = interpolate_json(
+        JsonTemplateSource::from_workflow_file(&template),
+        &forward_ctx,
+    )
+    .unwrap();
+    let via_reversed = interpolate_json(
+        JsonTemplateSource::from_workflow_file(&template),
+        &reversed_ctx,
+    )
+    .unwrap();
     assert_eq!(
-        keys,
-        vec!["a", "m", "z"],
-        "serde_json::Map is no longer BTreeMap-backed — `preserve_order` is \
-         on somewhere in the workspace's unified feature set. Re-measure \
-         `index_field`'s owned-chain fix (module doc comment's \"Cost\" \
-         section) and requalify its complexity wording (ruling P21/P24) \
-         before relying on this crate's flat-not-quadratic claim."
+        via_forward, via_reversed,
+        "interpolate_json's result must not depend on the source object's \
+         key insertion order"
     );
+    assert_eq!(via_forward["seen_z"], json!("1"));
+    assert_eq!(via_forward["seen_a"], json!("2"));
+    assert_eq!(via_forward["seen_m"], json!("3"));
 }
 
 // ---- `7b441b4`'s bare-`}` tightening changes the `ExprError` variant a

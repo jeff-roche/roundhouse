@@ -315,9 +315,44 @@ fn validate_identifier_charset(value: &str) -> Result<(), String> {
 /// identifier.
 fn validate_step_id(id: &str) -> Result<(), ParseError> {
     validate_identifier_charset(id).map_err(|reason| ParseError::InvalidStepId {
-        id: id.to_string(),
+        id: truncate_echoed_identifier(id),
         reason,
     })
+}
+
+/// Bounds how much of an over-limit identifier (a step `id:` or a `map`'s
+/// `as:` binding) is echoed back into its own parse error (fix round 2,
+/// item 6 / M-1). `validate_identifier_charset` checks length before
+/// charset, so its only branch that can be reached by arbitrarily long text
+/// is the length-exceeded one — but nothing bounds *how much* longer than
+/// [`MAX_STEP_ID_LEN`] a workflow author's chosen text can be beyond
+/// `parse::MAX_YAML_BYTES` itself. Measured: a 5,000-character step id
+/// (violating the 128-character limit) produced a 5,054-character
+/// `ParseError::InvalidStepId` message pre-fix. This `Result` does not
+/// reach the append-only event log through this crate today (`exec/mod.rs`
+/// surfaces it as a run-level `Err`, not a `steps.<id>.error` field) — but
+/// it will reach whatever the daemon logs it through once Task 8 wires this
+/// crate's durability layer in. Applied uniformly to every
+/// `validate_identifier_charset` failure, not only the length-exceeded one,
+/// so a future reordering of that function's checks can't quietly
+/// reintroduce the unbounded echo.
+const MAX_ECHOED_IDENTIFIER_LEN: usize = 64;
+
+/// Truncates `text` to at most [`MAX_ECHOED_IDENTIFIER_LEN`] bytes (at a
+/// valid UTF-8 boundary — an identifier is workflow-author YAML, not
+/// guaranteed ASCII once it fails validation), appending the original byte
+/// length so the truncation is visible rather than silently shortening the
+/// message. Mirrors `crate::expr::truncate_echoed_field`'s identical
+/// reasoning for the sibling `when:`-field echo.
+fn truncate_echoed_identifier(text: &str) -> String {
+    if text.len() <= MAX_ECHOED_IDENTIFIER_LEN {
+        return text.to_string();
+    }
+    let mut end = MAX_ECHOED_IDENTIFIER_LEN;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... ({} bytes total)", &text[..end], text.len())
 }
 
 /// A `map` step's `as:` loop-item binding name becomes a root in Task 4's
@@ -333,7 +368,8 @@ fn validate_step_id(id: &str) -> Result<(), ParseError> {
 /// [`validate_identifier_charset`] (the same rule [`validate_step_id`]
 /// applies) and additionally rejects [`RESERVED_EXPRESSION_ROOTS`].
 fn validate_map_as(value: &str) -> Result<(), String> {
-    validate_identifier_charset(value).map_err(|reason| format!("map.as {value:?}: {reason}"))?;
+    validate_identifier_charset(value)
+        .map_err(|reason| format!("map.as {:?}: {reason}", truncate_echoed_identifier(value)))?;
     if RESERVED_EXPRESSION_ROOTS.contains(&value) {
         return Err(format!(
             "map.as {value:?} shadows the reserved expression-language root `{value}` (one of {RESERVED_EXPRESSION_ROOTS:?}) — choose a different loop-item binding name"

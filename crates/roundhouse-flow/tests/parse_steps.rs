@@ -311,6 +311,35 @@ fn a_step_id_at_exactly_the_length_limit_parses() {
 }
 
 #[test]
+fn a_wildly_overlong_step_id_does_not_get_echoed_into_the_error_in_full() {
+    // Fix round 2, item 6 (M-1): pre-fix, `ParseError::InvalidStepId`'s
+    // `{id:?}` echoed the whole offending id, so a 5,000-character step id
+    // (well past `MAX_STEP_ID_LEN`) produced a 5,054-character error
+    // message. Payload: 5,000 `'a'` bytes as the `id:` value.
+    let long_id = "a".repeat(5_000);
+    let yaml = format!("id: {long_id}\ntool: shell");
+    let err = try_step(&yaml).unwrap_err();
+    let ParseError::InvalidStepId { id, .. } = &err else {
+        panic!("expected InvalidStepId, got {err:?}");
+    };
+    assert!(
+        id.len() < 200,
+        "the echoed id field must be bounded, not the full 5,000-byte input: {} bytes",
+        id.len()
+    );
+    let rendered = err.to_string();
+    assert!(
+        rendered.len() < 300,
+        "the whole rendered error must be bounded too: {} bytes ({rendered:?})",
+        rendered.len()
+    );
+    assert!(
+        rendered.contains("5000 bytes total") || rendered.contains("5000"),
+        "the truncated message should still state the original length: {rendered:?}"
+    );
+}
+
+#[test]
 fn too_many_needs_entries_is_rejected() {
     let needs: Vec<String> = (0..roundhouse_flow::parse::steps::MAX_NEEDS_PER_STEP + 1)
         .map(|i| format!("s{i}"))

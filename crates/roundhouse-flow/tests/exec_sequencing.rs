@@ -1,6 +1,6 @@
 use roundhouse_core::TaskId;
 use roundhouse_core::TaskKind;
-use roundhouse_flow::exec::{Executor, RunContext, StepStatus, TaskSink};
+use roundhouse_flow::exec::{Executor, ExecutorError, RunContext, StepStatus, TaskSink};
 use roundhouse_flow::parse::{parse_workflow, ParseError};
 use std::collections::HashMap;
 
@@ -66,7 +66,7 @@ steps:
 fn steps_execute_in_dependency_order_each_as_its_own_task_subtree() {
     let def = parse_workflow(SIMPLE_YAML).unwrap();
     let mut sink = RecordingSink(Vec::new());
-    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({})));
+    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({}))).unwrap();
     let outcomes = exec.run_to_completion().unwrap();
 
     let order: Vec<&str> = outcomes.iter().map(|o| o.step_id.as_str()).collect();
@@ -108,7 +108,8 @@ steps:
         &def,
         &mut sink,
         run_ctx(serde_json::json!({"repo": "acme/widgets"})),
-    );
+    )
+    .unwrap();
     exec.run_to_completion().unwrap();
 
     let created = sink
@@ -148,7 +149,7 @@ steps:
 "#;
     let def = parse_workflow(yaml).unwrap();
     let mut sink = RecordingSink(Vec::new());
-    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({})));
+    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({}))).unwrap();
     exec.run_to_completion().unwrap();
 
     let report_events: Vec<_> = sink
@@ -216,7 +217,7 @@ steps:
 "#;
     let def = parse_workflow(yaml).unwrap();
     let mut sink = RecordingSink(Vec::new());
-    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({})));
+    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({}))).unwrap();
     let outcomes = exec.run_to_completion().unwrap();
 
     assert_eq!(outcomes.len(), 1);
@@ -261,7 +262,7 @@ steps:
 "#;
     let def = parse_workflow(yaml).unwrap();
     let mut sink = RecordingSink(Vec::new());
-    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({})));
+    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({}))).unwrap();
     let outcomes = exec.run_to_completion().unwrap();
 
     let runs = outcomes.iter().find(|o| o.step_id == "runs").unwrap();
@@ -307,7 +308,7 @@ steps:
 "#;
     let def = parse_workflow(yaml).unwrap();
     let mut sink = RecordingSink(Vec::new());
-    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({})));
+    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({}))).unwrap();
     let outcomes = exec.run_to_completion().unwrap();
 
     match &outcomes[0].status {
@@ -334,7 +335,7 @@ steps:
 fn status_seen_by_dependent(yaml: &str) -> String {
     let def = parse_workflow(yaml).unwrap();
     let mut sink = RecordingSink(Vec::new());
-    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({})));
+    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({}))).unwrap();
     exec.run_to_completion().unwrap();
 
     let flow_event = sink
@@ -462,7 +463,7 @@ steps:
         secrets,
         run_id: roundhouse_flow::exec::RunId::new(),
     };
-    let mut exec = Executor::new(&def, &mut sink, ctx);
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     let outcomes = exec.run_to_completion().unwrap();
 
     assert!(matches!(outcomes[0].status, StepStatus::Completed));
@@ -518,7 +519,7 @@ steps:
     let def = parse_workflow(yaml).unwrap();
     let mut sink = RecordingSink(Vec::new());
     let ctx = secret_run_ctx(serde_json::json!({}), "GH_TOKEN", "sk-super-secret");
-    let mut exec = Executor::new(&def, &mut sink, ctx);
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     exec.run_to_completion().unwrap();
 
     let created = sink
@@ -551,7 +552,7 @@ steps:
     let def = parse_workflow(yaml).unwrap();
     let mut sink = RecordingSink(Vec::new());
     let ctx = secret_run_ctx(serde_json::json!({}), "GH_TOKEN", "sk-super-secret");
-    let mut exec = Executor::new(&def, &mut sink, ctx);
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     exec.run_to_completion().unwrap();
 
     let flow_events: Vec<_> = sink
@@ -589,7 +590,7 @@ steps:
     let def = parse_workflow(yaml).unwrap();
     let mut sink = RecordingSink(Vec::new());
     let ctx = secret_run_ctx(serde_json::json!({}), "GH_TOKEN", "sk-super-secret");
-    let mut exec = Executor::new(&def, &mut sink, ctx);
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     exec.run_to_completion().unwrap();
 
     let report_events: Vec<_> = sink
@@ -634,7 +635,7 @@ steps:
     let def = parse_workflow(yaml).unwrap();
     let mut sink = RecordingSink(Vec::new());
     let ctx = secret_run_ctx(serde_json::json!({}), "GCP_KEY", &secret_json);
-    let mut exec = Executor::new(&def, &mut sink, ctx);
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     let outcomes = exec.run_to_completion().unwrap();
     assert!(
         matches!(outcomes[0].status, StepStatus::Completed),
@@ -696,7 +697,7 @@ steps:
 "#;
     let def = parse_workflow(yaml).unwrap();
     let mut sink = RecordingSink(Vec::new());
-    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({})));
+    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({}))).unwrap();
     let err = exec
         .run_to_completion()
         .expect_err("a step with no recognized body kind must be a run-level error, not a panic");
@@ -723,7 +724,7 @@ steps:
 "#;
     let def = parse_workflow(yaml).unwrap();
     let mut sink = RecordingSink(Vec::new());
-    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({})));
+    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({}))).unwrap();
     let err = exec
         .run_to_completion()
         .expect_err("a needs: cycle must be a run-level error, not a panic");
@@ -757,7 +758,7 @@ steps:
 "#;
     let def = parse_workflow(yaml).unwrap();
     let mut sink = RecordingSink(Vec::new());
-    let mut exec = Executor::new(&def, &mut sink, ctx);
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     exec.run_to_completion().unwrap();
 
     let completed = sink
@@ -773,4 +774,264 @@ steps:
         run_id.to_string(),
         "`${{ run.id }}` must resolve to the same RunId passed in via RunContext"
     );
+}
+
+// ---- Fix round 2, item 1: `StepOutcome` derives no `Debug` — the `Emit`/
+// `Report` arms deliberately keep `output` unredacted (a dependent step
+// must see the real value), so `run_to_completion`'s `Vec<StepOutcome>`
+// must never let a derived `Debug` reproduce a resolved secret. ----
+
+#[test]
+fn step_outcome_debug_never_prints_a_secrets_resolved_value() {
+    // Payload: an `emit:` step whose body resolves a secret to a planted
+    // marker value, exactly the shape the reviewer measured leaking through
+    // a derived `Debug`: `StepOutcome { ..., output: Object {"body":
+    // String("token=sk-MARKER-9999")}, ... }`.
+    let yaml = r#"
+name: outcome-debug-secret
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: a
+    emit: { body: "token=${{ secrets.GH_TOKEN }}" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "GH_TOKEN", "sk-MARKER-9999");
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    // Sanity: `output` really does carry the unredacted value (that's the
+    // whole point of this test — a redacted `output` would make the `Debug`
+    // impl trivially safe for the wrong reason).
+    assert_eq!(
+        outcomes[0].output,
+        serde_json::json!({"body": "token=sk-MARKER-9999"}),
+        "StepOutcome.output must stay unredacted so a dependent sees the real value"
+    );
+
+    let debug_output = format!("{:?}", outcomes[0]);
+    assert!(
+        !debug_output.contains("sk-MARKER-9999"),
+        "StepOutcome's Debug impl must never print a resolved secret's value: {debug_output}"
+    );
+    assert!(
+        debug_output.contains("body"),
+        "the output's shape (key list) may still appear: {debug_output}"
+    );
+}
+
+// ---- Fix round 2, item 2: the echoed `when:`-field text and the
+// `steps.<id>.error` field it feeds are each bounded independently. ----
+
+#[test]
+fn a_when_evaluation_error_echoes_only_a_bounded_prefix_of_the_offending_field() {
+    // Payload: a 2,000-byte bare (non-`${{ }}`-wrapped) `when:` field built
+    // from the marker byte `'Z'`. Pre-fix, `NotADelimitedExpression` echoed
+    // the whole field verbatim.
+    let marker = "Z".repeat(2_000);
+    let yaml = format!(
+        "name: bare-when-overlong\nversion: 1\ninputs: {{}}\ndefaults: {{ isolation: \
+         worktree }}\npermissions: {{ default: deny, unattended: {{ escalate: fail }} \
+         }}\nsteps:\n  - id: a\n    when: \"{marker}\"\n    tool: shell\n    with: {{ cmd: \
+         [\"echo\", \"a\"] }}\n"
+    );
+    let def = parse_workflow(&yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({}))).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+    match &outcomes[0].status {
+        StepStatus::Failed { message } => {
+            assert!(
+                message.len() < 300,
+                "the `when:` evaluation error must not echo the full 2,000-byte field: {} bytes \
+                 ({message})",
+                message.len()
+            );
+            assert!(
+                !message.contains(&marker),
+                "the full marker text must not appear verbatim in the error: {message}"
+            );
+            assert!(
+                message.contains("2000 bytes total"),
+                "the truncated message should still state the original field length: {message}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+#[test]
+fn steps_context_error_field_is_bounded_independently_of_the_underlying_message_source() {
+    // A source other than `NotADelimitedExpression` (which truncates its
+    // own echo): an `UnexpectedToken` from a malformed `with:` expression,
+    // whose echoed remainder is not itself bounded by `expr.rs`. This
+    // proves `steps_context_entry`'s bound is independent of the source,
+    // not merely a side effect of `expr.rs`'s own truncation. Payload:
+    // 5,000 `'Q'` bytes of trailing garbage after a valid `1` inside a
+    // `${{ }}` block, read back by a dependent's `emit:`.
+    let junk = "Q".repeat(5_000);
+    let mut yaml = String::from(
+        "name: overlong-unexpected-token\nversion: 1\ninputs: {}\ndefaults: { isolation: \
+         worktree }\npermissions: { default: deny, unattended: { escalate: fail } \
+         }\nsteps:\n  - id: a\n    tool: shell\n    with: { cmd: [\"echo\", \"${{ 1 ",
+    );
+    yaml.push_str(&junk);
+    yaml.push_str(
+        " }}\"] }\n  - id: b\n    needs: [a]\n    emit: { seen_error: \"${{ steps.a.error }}\" \
+         }\n",
+    );
+    let def = parse_workflow(&yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({}))).unwrap();
+    exec.run_to_completion().unwrap();
+
+    let flow_event = sink
+        .0
+        .iter()
+        .find(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCompleted").is_some())
+        .expect("dependent's emit: step was persisted");
+    let seen_error = flow_event.payload_json["TaskCompleted"]["output"]["Json"]["seen_error"]
+        .as_str()
+        .expect("seen_error is a string")
+        .to_string();
+    assert!(
+        seen_error.len() < 700,
+        "steps.<id>.error must be bounded independently of the underlying message's own \
+         length: {} bytes",
+        seen_error.len()
+    );
+    assert!(
+        !seen_error.contains(&junk),
+        "the full 5,000-byte junk text must not reach a dependent verbatim"
+    );
+}
+
+// ---- Fix round 2, item 3: a secret this crate cannot safely redact is
+// refused at `Executor::new`, not silently left unprotected. ----
+
+#[test]
+fn a_secret_shorter_than_the_redaction_floor_is_rejected_at_construction() {
+    // Payload: a 7-byte secret value, `"1234567"`. Pre-fix, this reached
+    // the log in cleartext with no signal to the operator at all.
+    let def = parse_workflow(SIMPLE_YAML).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "SHORT", "1234567");
+    let err = Executor::new(&def, &mut sink, ctx)
+        .err()
+        .expect("a 7-byte secret must be refused at construction, not silently unprotected");
+    if let ExecutorError::SecretTooShortToRedact { name, len } = err {
+        assert_eq!(name, "SHORT");
+        assert_eq!(len, 7);
+    } else {
+        panic!("unexpected ExecutorError variant: {err:?}");
+    }
+}
+
+#[test]
+fn a_secret_exactly_at_the_redaction_floor_is_accepted() {
+    // Boundary test, the other side of the previous test: exactly 8 bytes
+    // (`MIN_REDACTABLE_SECRET_LEN`) must construct successfully.
+    let def = parse_workflow(SIMPLE_YAML).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "EIGHTBYT", "12345678");
+    assert!(
+        Executor::new(&def, &mut sink, ctx).is_ok(),
+        "an 8-byte secret is exactly at the redactable floor and must be accepted"
+    );
+}
+
+// ---- Fix round 2, item 4 (ruling P30): a JSON-valued secret's leaf
+// expansion is gated to sensitive key names, so it no longer corrupts
+// ordinary public constants that happen to be leaves of the same secret
+// (e.g. a real GCP service-account key's `type`/`token_uri`/`project_id`
+// fields) while still catching the actually-sensitive leaf
+// (`private_key`). ----
+
+#[test]
+fn json_secret_leaf_expansion_does_not_corrupt_unrelated_public_constants() {
+    // Payload: a GCP-service-account-shaped secret (the exact fields a real
+    // key has) alongside a second step whose `with:` contains, verbatim,
+    // the four strings security measured corrupted pre-fix.
+    let gcp_key = serde_json::json!({
+        "type": "service_account",
+        "project_id": "my-project-1234",
+        "private_key": "-----BEGIN PRIVATE KEY-----AAAABBBB-----END PRIVATE KEY-----",
+        "client_email": "svc@example.iam",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    })
+    .to_string();
+
+    let yaml = r#"
+name: gcp-key-shaped-secret
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: uses_private_key
+    tool: shell
+    with: { cmd: ["auth", "${{ json(secrets.GCP_KEY).private_key }}"] }
+  - id: ordinary_strings
+    tool: shell
+    with:
+      cmd:
+        - "this is a service_account for the team"
+        - "https://storage.googleapis.com/public-bucket/x"
+        - "https://accounts.google.com/o/oauth2/auth"
+        - "deploying my-project-1234 to staging"
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "GCP_KEY", &gcp_key);
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| matches!(o.status, StepStatus::Completed)),
+        "expected both steps Completed, got {outcomes:?}"
+    );
+
+    let shell_events: Vec<_> = sink
+        .0
+        .iter()
+        .filter(|e| matches!(e.kind, TaskKind::Shell))
+        .collect();
+    assert_eq!(shell_events.len(), 2);
+
+    let private_key_event = shell_events
+        .iter()
+        .find(|e| e.payload_json["TaskCreated"]["input"]["Json"]["cmd"][0].as_str() == Some("auth"))
+        .expect("the private-key step was dispatched");
+    let private_key_logged = serde_json::to_string(&private_key_event.payload_json).unwrap();
+    assert!(
+        !private_key_logged.contains("BEGIN PRIVATE KEY"),
+        "the actually-sensitive `private_key` leaf must still be redacted: {private_key_logged}"
+    );
+    assert!(private_key_logged.contains("***"));
+
+    let ordinary_event = shell_events
+        .iter()
+        .find(|e| {
+            e.payload_json["TaskCreated"]["input"]["Json"]["cmd"][0].as_str()
+                == Some("this is a service_account for the team")
+        })
+        .expect("the ordinary-strings step was dispatched");
+    let ordinary_logged = serde_json::to_string(&ordinary_event.payload_json).unwrap();
+    for expected in [
+        "this is a service_account for the team",
+        "https://storage.googleapis.com/public-bucket/x",
+        "https://accounts.google.com/o/oauth2/auth",
+        "deploying my-project-1234 to staging",
+    ] {
+        assert!(
+            ordinary_logged.contains(expected),
+            "ordinary text containing a GCP public constant must survive redaction \
+             unmodified: expected {expected:?} in {ordinary_logged}"
+        );
+    }
 }
