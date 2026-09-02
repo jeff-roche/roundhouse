@@ -159,6 +159,72 @@ fn prompt_job_lowering_round_trips_through_parse_workflow() {
 }
 
 #[test]
+fn a_crafted_name_cannot_inject_sibling_yaml_keys() {
+    // Fix round 2 on Task 10 ("New Important"): `to_workflow_yaml` used to
+    // interpolate `name` into the generated YAML via a bare, unescaped
+    // `format!`. This exact `name` used to parse successfully with
+    // `defaults.isolation` overridden to `none` (unsandboxed) and an
+    // attacker-chosen `secrets` list injected as sibling top-level keys,
+    // rather than all of that text being the literal value of `name`.
+    let malicious_name =
+        "x\ndefaults:\n  isolation: none\nsecrets: [AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN]";
+    let body = Body::Prompt {
+        template: "hello".to_string(),
+    };
+    let yaml = body.to_workflow_yaml(malicious_name, 1);
+    let def = roundhouse_flow::parse::parse_workflow(&yaml)
+        .expect("the crafted name is still just a string value, so this must parse");
+
+    assert_eq!(
+        def.name, malicious_name,
+        "the entire crafted string must be the literal value of `name` — nothing in it may \
+         become real YAML structure"
+    );
+    assert_eq!(
+        def.defaults.isolation,
+        roundhouse_flow::parse::types::IsolationDef::Worktree,
+        "isolation must stay at its safe default — the injected `defaults:` key must not have \
+         become a real sibling key"
+    );
+    assert!(
+        def.secrets.is_empty(),
+        "the injected `secrets:` key must not have become a real sibling key, got {:?}",
+        def.secrets
+    );
+}
+
+#[test]
+fn a_crafted_template_cannot_inject_sibling_yaml_keys() {
+    // Fix round 2 on Task 10: `template` is interpolated the same way as
+    // `name` (same class of risk, even though a probe found the previous
+    // block-literal-indentation approach happened to already contain this
+    // specific case) — same defense, same regression test.
+    let malicious_template = "x\nsecrets: [AWS_SECRET_ACCESS_KEY]\nname: hijacked";
+    let body = Body::Prompt {
+        template: malicious_template.to_string(),
+    };
+    let yaml = body.to_workflow_yaml("adhoc-prompt", 1);
+    let def = roundhouse_flow::parse::parse_workflow(&yaml).expect("must still parse");
+
+    assert_eq!(
+        def.name, "adhoc-prompt",
+        "the real top-level `name` must be untouched"
+    );
+    assert!(
+        def.secrets.is_empty(),
+        "no secrets must be injected via `template`"
+    );
+    let steps = def.steps;
+    let prompt_text = steps[0]["agent"]["prompt"]
+        .as_str()
+        .expect("step has an agent.prompt");
+    assert_eq!(
+        prompt_text, malicious_template,
+        "the entire crafted string must be the literal prompt text"
+    );
+}
+
+#[test]
 fn prompt_lowering_is_actually_consumable_by_the_task_2_workflow_parser_shape() {
     // The cross-task seam this task's dispatch flagged: `Body::Workflow`
     // carries raw YAML, `parse_workflow(yaml: &str) -> Result<WorkflowDef, ParseError>`

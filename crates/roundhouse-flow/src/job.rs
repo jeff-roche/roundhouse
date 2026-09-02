@@ -77,9 +77,8 @@ impl Body {
         match self {
             Body::Workflow { workflow_yaml } => workflow_yaml.clone(),
             Body::Prompt { template } => {
-                let indented_prompt = template.replace('\n', "\n        ");
                 let mut yaml = String::new();
-                yaml.push_str(&format!("name: {name}\n"));
+                yaml.push_str(&format!("name: {}\n", yaml_double_quoted(name)));
                 yaml.push_str(&format!("version: {version}\n"));
                 yaml.push_str("permissions:\n");
                 yaml.push_str("  default: deny\n");
@@ -95,12 +94,65 @@ impl Body {
                 yaml.push_str("steps:\n");
                 yaml.push_str("  - id: run\n");
                 yaml.push_str("    agent:\n");
-                yaml.push_str("      prompt: |\n");
-                yaml.push_str(&format!("        {indented_prompt}\n"));
+                yaml.push_str(&format!("      prompt: {}\n", yaml_double_quoted(template)));
                 yaml
             }
         }
     }
+}
+
+/// Escapes `s` as a single-physical-line YAML double-quoted scalar, safe to
+/// splice inline at any nesting/indentation depth.
+///
+/// Fix round 2 on Task 10 ("New Important"): [`Body::to_workflow_yaml`]
+/// used to interpolate `name`/`template` into the generated YAML with a
+/// bare `format!`, unescaped. A crafted `name` — e.g. `"x\ndefaults:\n
+/// isolation: none\nsecrets: [AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN]"` —
+/// parsed successfully as a sibling `defaults`/`secrets` key rather than
+/// as the literal value of `name`, silently overriding
+/// `defaults.isolation` to `none` (`Tier::None`, unsandboxed — directly
+/// defeating [`crate::parse::types`]'s `default_isolation`, whose own doc
+/// comment says an *omitted* value "must never silently fall back to
+/// `None`" — this bypassed that by supplying an explicit one instead) and
+/// injecting an attacker-chosen `secrets` list. This was a latent bug
+/// predating this diff, but fix round 1 on Task 10 is what made it
+/// *reachable*: before that round, every `Body::Prompt` lowering was
+/// rejected by `parse_workflow`'s own Park-escalation validation (finding
+/// C), so no interpolated content ever reached a real `WorkflowDef`.
+///
+/// `serde_yaml::to_string` was considered first (a real serializer's
+/// escaping is presumptively correct), but its automatic style choice for
+/// a multi-line string is a *literal block* (`|-`) indented relative to
+/// column 0 — safe to splice only at the document's top level, and
+/// silently invalid YAML once spliced under `template`'s actual nesting
+/// (`steps[0].agent.prompt`, six columns deep), since a block scalar's
+/// body must be indented *more* than its parent, which column-0-relative
+/// output isn't once relocated. A hand-rolled double-quoted-scalar
+/// escaper avoids that entirely: double-quoted scalars are never
+/// indentation-sensitive (embedded newlines become the two-character
+/// sequence `\n`, never a literal line break), so the result is always
+/// exactly one physical line, splice-safe anywhere. Verified to round-trip
+/// exactly (including at a non-trivial nesting depth) before landing this;
+/// see `tests/job.rs`'s injection tests for the adversarial cases above.
+fn yaml_double_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// A job's declared input JSON Schema, validated against the run inputs
