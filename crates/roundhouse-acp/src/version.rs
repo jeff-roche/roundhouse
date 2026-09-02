@@ -66,8 +66,10 @@ pub struct VersionHint {
 /// natural source for `agent_version` is `InitializeResponse.agent_info`,
 /// which the connecting agent self-reports — an agent that reports a fresh
 /// value per connection (accidentally or otherwise) would otherwise grow
-/// this map without bound in a long-lived daemon. `cache_capacity_holds`
-/// below inserts past this cap and asserts the map never exceeds it.
+/// this map without bound in a long-lived daemon.
+/// `hint_cache_stays_bounded_when_an_agent_self_reports_unbounded_distinct_versions`
+/// (`tests/version_negotiation.rs`) inserts past this cap and asserts the
+/// map never exceeds it.
 const MAX_HINTS: usize = 256;
 
 /// A purely local, opportunistic cache of observed negotiation results,
