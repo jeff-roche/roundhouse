@@ -148,6 +148,35 @@ fn default_permission_effect() -> Effect {
     Effect::Deny
 }
 
+/// §8.9's `http:` matcher shape. `#[serde(deny_unknown_fields)]` here is
+/// what actually catches a typo like `hostz` instead of `hosts` — fix
+/// round 1 on Task 10 (finding H1) found that the previous design (a
+/// `#[serde(flatten)]`ed externally-tagged enum) did NOT reject that typo:
+/// flatten only guarantees *at least one* recognised matcher key is
+/// present among the leftover fields, not that every field inside that
+/// matcher's own mapping is recognised, and not that no second matcher key
+/// is also present. See [`PermissionRuleDef`]'s doc comment for the fixed
+/// mechanism and `unknown_field_within_a_permission_matcher_is_rejected` /
+/// `two_matcher_kinds_on_one_rule_is_rejected` in
+/// `tests/parse_top_level.rs` for what is now actually caught.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpMatcher {
+    #[serde(default)]
+    pub methods: Vec<String>,
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+/// §8.9's `shell:` matcher shape. See [`HttpMatcher`]'s doc comment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellMatcher {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// One matcher kind a [`PermissionRuleDef`] can key on. Closed on purpose:
 /// only the two kinds §8.9's format actually specifies (`http`, `shell`)
 /// are accepted today. A workflow author who reaches for a matcher kind
@@ -156,42 +185,106 @@ fn default_permission_effect() -> Effect {
 /// `roundhouse-flow` has no `roundhouse-policy` dependency (ruling P7), so
 /// this is a parse-time shape check only — actual matching against a live
 /// request happens in `roundhouse-policy` at bind/admission time.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Does not derive `Deserialize`: [`PermissionRuleDef`]'s custom
+/// `TryFrom`-based deserialization (see its doc comment) builds this
+/// directly from validated `HttpMatcher`/`ShellMatcher` values rather than
+/// deserializing a tagged enum itself.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum PermissionMatcher {
     #[serde(rename = "http")]
-    Http {
-        #[serde(default)]
-        methods: Vec<String>,
-        #[serde(default)]
-        hosts: Vec<String>,
-    },
+    Http(HttpMatcher),
     #[serde(rename = "shell")]
-    Shell {
-        program: String,
-        #[serde(default)]
-        args: Vec<String>,
-    },
+    Shell(ShellMatcher),
+}
+
+/// The as-written-in-YAML shape of a `permissions.rules[]` entry, used only
+/// to deserialize into a validated [`PermissionRuleDef`] (see
+/// [`PermissionRuleDef`]'s doc comment) — never constructed or read
+/// directly otherwise.
+#[derive(Debug, Deserialize)]
+struct PermissionRuleDefWire {
+    effect: Effect,
+    #[serde(flatten)]
+    matcher_fields: std::collections::BTreeMap<String, serde_yaml::Value>,
 }
 
 /// One `permissions.rules[]` entry: `{ <matcher-kind>: {...}, effect: ... }`.
 ///
-/// `matcher` is `#[serde(flatten)]`ed so `http`/`shell` sit as sibling keys
-/// of `effect` in the YAML mapping, matching §8.9's literal shape. This
-/// struct deliberately does NOT also carry `#[serde(deny_unknown_fields)]`
-/// — serde does not support combining that attribute with a flattened
-/// field (the flattened field always absorbs "the rest" of the mapping, so
-/// there is never anything left for `deny_unknown_fields` to reject).
-/// Fail-closed is preserved anyway: [`PermissionMatcher`] is an
-/// externally-tagged enum with a closed, fixed set of variants, so any key
-/// besides `http`/`shell` — or a rule carrying more than one matcher key —
-/// fails to deserialize as a `PermissionMatcher` regardless; the flattened
-/// "rest" of the mapping has to match exactly one known variant shape or
-/// the whole rule fails to parse.
+/// # Fix round 1 on Task 10 (finding H1): flatten alone does not fail closed
+///
+/// An earlier version of this type deserialized `matcher` as a
+/// `#[serde(flatten)]`ed, externally-tagged `PermissionMatcher` enum
+/// directly, with a doc comment (and this task's own report) claiming that
+/// was sufficient to reject any unrecognised or extra matcher key. Measured
+/// false: flatten's contract is "find *a* recognised key among the
+/// leftover fields and deserialize its value," not "every leftover field
+/// must belong to exactly one recognised matcher." Concretely, that
+/// version accepted `{ http: { methods: [GET], hostz: [...] }, effect:
+/// allow }` — silently dropping the whole `hosts` constraint into a typo'd
+/// `hostz` field the enum's `Http` variant doesn't have, producing an
+/// *unrestricted* allow rule that still reads as host-restricted in the
+/// source — and `{ http: {...}, shell: {...}, effect: allow }`, silently
+/// keeping whichever matcher happened to deserialize first and dropping
+/// the other one entirely.
+///
+/// This version instead deserializes into [`PermissionRuleDefWire`] (whose
+/// own `#[serde(flatten)]` field is an ordinary `BTreeMap`, not a fixed
+/// enum) via `#[serde(try_from = "PermissionRuleDefWire")]`, then validates
+/// explicitly in [`PermissionRuleDef`]'s `TryFrom` impl below: exactly one
+/// matcher key must be present (catching both "no matcher" and "more than
+/// one matcher"), it must be `http` or `shell`, and its value is
+/// deserialized into the corresponding `#[serde(deny_unknown_fields)]`
+/// [`HttpMatcher`]/[`ShellMatcher`] (catching a typo'd field *within* a
+/// recognised matcher). All three failure modes above are now rejected —
+/// see `tests/parse_top_level.rs`'s
+/// `unknown_permission_matcher_kind_is_rejected`,
+/// `unknown_field_within_a_permission_matcher_is_rejected`, and
+/// `two_matcher_kinds_on_one_rule_is_rejected`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "PermissionRuleDefWire")]
 pub struct PermissionRuleDef {
-    #[serde(flatten)]
     pub matcher: PermissionMatcher,
     pub effect: Effect,
+}
+
+impl TryFrom<PermissionRuleDefWire> for PermissionRuleDef {
+    type Error = String;
+
+    fn try_from(wire: PermissionRuleDefWire) -> Result<Self, Self::Error> {
+        if wire.matcher_fields.len() != 1 {
+            return Err(format!(
+                "a permission rule must have exactly one matcher (http or shell), found {}: {:?}",
+                wire.matcher_fields.len(),
+                wire.matcher_fields.keys().collect::<Vec<_>>()
+            ));
+        }
+        // `.len() == 1` was just checked, so this always succeeds.
+        let (kind, value) = wire
+            .matcher_fields
+            .into_iter()
+            .next()
+            .expect("checked above: matcher_fields has exactly one entry");
+        let matcher = match kind.as_str() {
+            "http" => PermissionMatcher::Http(
+                serde_yaml::from_value(value)
+                    .map_err(|err| format!("invalid `http` permission matcher: {err}"))?,
+            ),
+            "shell" => PermissionMatcher::Shell(
+                serde_yaml::from_value(value)
+                    .map_err(|err| format!("invalid `shell` permission matcher: {err}"))?,
+            ),
+            other => {
+                return Err(format!(
+                    "unrecognised permission rule matcher kind {other:?} — expected one of: http, shell"
+                ));
+            }
+        };
+        Ok(PermissionRuleDef {
+            matcher,
+            effect: wire.effect,
+        })
+    }
 }
 
 /// §8.5 point 2: "`Escalate` is configurable per job: `Park{deadline,

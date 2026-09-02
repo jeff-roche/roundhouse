@@ -70,6 +70,30 @@ fn unknown_permission_matcher_kind_is_rejected() {
 }
 
 #[test]
+fn unknown_field_within_a_permission_matcher_is_rejected() {
+    // Fix round 1 on Task 10 (finding H1): a typo'd field *inside* a
+    // recognised matcher (`hostz` for `hosts`) used to be silently dropped
+    // by `#[serde(flatten)]`'s leniency, turning a host-restricted allow
+    // rule into an unrestricted one that still *reads* as restricted.
+    let yaml = "name: t\nversion: 1\npermissions:\n  rules:\n    - { http: { methods: [GET], hostz: [\"evil.com\"] }, effect: allow }\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n";
+    let err = parse_workflow(yaml)
+        .expect_err("an unrecognised field inside a known matcher kind must fail closed");
+    assert!(matches!(err, ParseError::Yaml(_)));
+}
+
+#[test]
+fn two_matcher_kinds_on_one_rule_is_rejected() {
+    // Fix round 1 on Task 10 (finding H1): flatten only guarantees *a*
+    // recognised key is present, not that exactly one is — a rule
+    // carrying both `http` and `shell` used to silently keep one and drop
+    // the other.
+    let yaml = "name: t\nversion: 1\npermissions:\n  rules:\n    - { http: { methods: [GET] }, shell: { program: \"rm\" }, effect: allow }\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n";
+    let err =
+        parse_workflow(yaml).expect_err("a rule with more than one matcher kind must fail closed");
+    assert!(matches!(err, ParseError::Yaml(_)));
+}
+
+#[test]
 fn isolation_omitted_defaults_to_worktree_never_none() {
     // Risk callout, applied to isolation: an omitted `defaults.isolation`
     // must never silently mean unsandboxed (`Tier::None`).
@@ -144,6 +168,38 @@ fn yaml_syntax_error_reports_a_line_and_column() {
     assert!(
         err.location().is_some(),
         "expected a line/column for a YAML syntax error, got {err:?}"
+    );
+}
+
+#[test]
+fn rejects_pathological_flow_nesting_cheaply() {
+    // Fix round 1 on Task 10 (finding H2): a payload of nothing but a long
+    // run of unclosed `[` characters, embedded in an otherwise-valid
+    // document, was measured (through this crate's real `parse_workflow`,
+    // not the library in isolation) to cost single-digit seconds at ~50 KB
+    // and grow highly non-linearly from there — roughly 84s at 200 KB,
+    // ~560s at 520 KB — once handed to `serde_yaml`, all comfortably under
+    // `MAX_YAML_BYTES`. The pre-parse nesting scan must reject this before
+    // `serde_yaml` ever sees it, and must do so fast regardless of size.
+    let bomb = "[".repeat(200_000);
+    let yaml = format!("{}bomb: {bomb}\n", minimal_header());
+    assert!(
+        yaml.len() < MAX_YAML_BYTES,
+        "the payload must stay under the byte cap — the point is that size alone doesn't catch this"
+    );
+
+    let start = std::time::Instant::now();
+    let err = parse_workflow(&yaml).expect_err("pathological flow nesting must be rejected");
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(err, ParseError::TooDeeplyNested { .. }),
+        "expected the pre-parse nesting bound to fire, got {err:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the nesting bound must fire in well under a second even on a 200KB payload that \
+         previously cost ~84s when handed to serde_yaml directly; took {elapsed:?}"
     );
 }
 
