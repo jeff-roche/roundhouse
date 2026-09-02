@@ -283,6 +283,70 @@ fn text_with_no_delimiter_at_all_passes_through_unchanged() {
     assert_eq!(out, "plain text, no expressions here");
 }
 
+// ---- `find_closing_delimiter` correctness (review round 1, code lens):
+// an unterminated quote inside one block must not "borrow" a closing
+// quote from ordinary prose after that block's own intended end, silently
+// merging it with a later, well-formed block. ----
+
+#[test]
+fn an_apostrophe_in_prose_between_two_blocks_does_not_merge_them() {
+    // Exact repro from review round 1: block one's string literal never
+    // closes before its own `}}`; before the fix, the apostrophe in "it's"
+    // (ordinary prose, not expression syntax) was accepted as the closing
+    // quote, which then let the scan consume straight through a second,
+    // well-formed `${{ inputs.repo }}` placeholder and misattribute the
+    // resulting parse error to unrelated prose text
+    // (`UnexpectedToken(28, "'s own apostrophe ${{ inputs.repo")`).
+    // After the fix, the apostrophe is rejected as a candidate close
+    // (what follows it, "s own apostrophe...", is not a plausible
+    // expression continuation), no other quote character exists in the
+    // rest of the input, and the correct diagnosis is that block one's
+    // string is genuinely unterminated.
+    let err = interpolate(
+        "${{ 'oops }} plain text with it's own apostrophe ${{ inputs.repo }}",
+        &ctx(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, ExprError::Unterminated));
+}
+
+#[test]
+fn an_open_quote_can_still_silently_absorb_a_later_block_when_the_forgery_looks_syntactically_valid(
+) {
+    // Open question from review round 1 ruling P17: can a crafted template
+    // make a cross-block quote-merge parse *cleanly*, silently absorbing a
+    // well-formed second block into a string value with no error at all?
+    // Yes — constructed deliberately, not accidentally encountered. Block
+    // one's own string literal never closes before its intended `}}`, but
+    // the *next* occurrence of `'` in the template happens to be placed
+    // right before a `}}`, which is exactly the shape
+    // `looks_like_a_real_string_close` is designed to accept (a string
+    // immediately followed by the block terminator is completely normal,
+    // e.g. `${{ 'hello' }}`). The fix in this round narrows the specific
+    // apostrophe-in-prose shape above; it cannot and does not close this
+    // general hole, because this grammar has no escape mechanism at all —
+    // any quote character in prose can be made to look like a legitimate
+    // close by whoever writes the template, and a purely local lookahead
+    // cannot distinguish "intentional data" from "accidental forgery" once
+    // both are followed by the same plausible-looking byte. This residual
+    // is real, is not fixed here, and is recorded rather than papered
+    // over — see `find_closing_delimiter`'s doc comment for the full
+    // reasoning and what closing it for real would require.
+    let mut c = ExprContext::new();
+    c.set("real", json!("REAL_VALUE"));
+    let out = interpolate(
+        "${{ 'oops }} filler ${{ real }} trailing' }} rest of template",
+        &c,
+    )
+    .unwrap();
+    // No error at all, and `real` was never evaluated: its own `${{ }}`
+    // markers survive as literal characters inside the absorbed string,
+    // exactly as if the whole first block had been one intentional
+    // string literal.
+    assert_eq!(out, "oops }} filler ${{ real }} trailing rest of template");
+    assert!(!out.contains("REAL_VALUE"));
+}
+
 // ---- Cost: recursion-depth guard against nested-bracket stack overflow. ----
 
 #[test]

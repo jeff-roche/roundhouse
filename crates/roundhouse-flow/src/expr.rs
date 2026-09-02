@@ -525,8 +525,64 @@ pub fn interpolate(template: &str, ctx: &ExprContext) -> Result<String, ExprErro
 /// expression (missing its closing quote and parenthesis) that then failed
 /// to parse, rather than the intended value. This scan is still a single
 /// forward pass over `s` with one byte of state (which quote, if any, is
-/// currently open) — it does not parse or validate the expression itself,
-/// only decides where the block ends.
+/// currently open), plus a small bounded lookahead at each *candidate*
+/// closing quote (see [`looks_like_a_real_string_close`]) — it does not
+/// parse or validate the expression itself, only decides where the block
+/// ends.
+///
+/// # A correctness defect this scan used to have, and what fixing it does
+/// and does not cover
+///
+/// An earlier version of this function closed a string at the *first*
+/// occurrence of the matching quote character, unconditionally. Given this
+/// grammar's no-escapes rule, that is not wrong on its own — a string that
+/// never closes really does extend to the next matching quote character,
+/// wherever it is — but it means an author who simply forgets a closing
+/// quote inside one `${{ }}` block can have that open quote "borrow" a
+/// closing character from ordinary prose *after* the block's own intended
+/// end (an apostrophe in a contraction is enough), which can then swallow
+/// a second, well-formed `${{ }}` block whole, since nothing about `${{`
+/// or `}}` is special once scanning is inside quotes. Reproduced directly
+/// against the pre-fix code:
+/// `${{ 'oops }} plain text with it's own apostrophe ${{ inputs.repo }}`
+/// resolved to `unexpected token at position 28: 's own apostrophe ${{
+/// inputs.repo'` — the second, well-formed placeholder never evaluated,
+/// and the error pointed at prose text nowhere near the missing quote.
+///
+/// **The fix**: before accepting a candidate closing quote, check whether
+/// what immediately follows it (skipping whitespace) looks like a
+/// plausible continuation of an expression — end of input, `.`/`[` (a
+/// further chain step), `)`/`]`/`,` (closing a call/array or separating
+/// arguments), `?`/`:` (ternary), the first byte of a comparison operator,
+/// or `}` (the block's own `}}` terminator). If not, treat this quote
+/// character as ordinary data and keep scanning for a *later* one. Against
+/// the repro above, the apostrophe in "it's" is followed by `s own
+/// apostrophe...`, which matches none of those, so it is rejected; no
+/// later quote character exists in the rest of the input, so the scan now
+/// correctly reports [`ExprError::Unterminated`] instead of an
+/// unexpected-token error attributed to unrelated prose. Pinned by
+/// `an_apostrophe_in_prose_between_two_blocks_does_not_merge_them`.
+///
+/// **What this does not do: resolve the underlying ambiguity in general.**
+/// This grammar has no escape mechanism, so a quote character appearing in
+/// ordinary prose can always be *made* to look like a plausible
+/// continuation by whoever writes the template — the lookahead only
+/// rejects continuations that are locally implausible, it cannot tell
+/// intentional data from accidental prose when both happen to look
+/// syntactically valid afterward. Confirmed by deliberately constructing
+/// such a case (see `an_open_quote_can_still_silently_absorb_a_later_block_when_the_forgery_looks_syntactically_valid`
+/// in `tests/expr.rs`): a first, broken block whose forgotten quote closes
+/// on a *later* quote character chosen so what follows is exactly `' }}`
+/// still parses cleanly as a single string literal, silently swallowing an
+/// entire second `${{ ... }}` block's literal text (including a
+/// third party's `${{ real }}` reference, never evaluated) into that
+/// string's value, with no error at all. This residual is real, is not
+/// closed by this fix, and is left open rather than claimed fixed — see
+/// that test's own comment for the exact shape and why the grammar's lack
+/// of escaping makes it structurally unclosable without either adding
+/// escapes (a language change §8.9 does not ask for) or changing
+/// `interpolate` to attempt more than one candidate split per block
+/// (a bigger change than this fix round's scope).
 fn find_closing_delimiter(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -535,7 +591,7 @@ fn find_closing_delimiter(s: &str) -> Option<usize> {
         let b = bytes[i];
         match open_quote {
             Some(q) => {
-                if b == q {
+                if b == q && looks_like_a_real_string_close(bytes, i + 1) {
                     open_quote = None;
                 }
                 i += 1;
@@ -553,6 +609,26 @@ fn find_closing_delimiter(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Returns whether the byte immediately following a candidate
+/// string-closing quote at `bytes[i..]` (after skipping ASCII whitespace)
+/// is one this grammar could legitimately produce right after a string
+/// literal — see [`find_closing_delimiter`]'s doc comment for why this
+/// exists and what it does not fully solve. End of input counts as a valid
+/// continuation (a string can legitimately be the last thing before the
+/// block's own, already-consumed, `}}`).
+fn looks_like_a_real_string_close(bytes: &[u8], mut i: usize) -> bool {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    match bytes.get(i) {
+        None => true,
+        Some(b) => matches!(
+            b,
+            b'.' | b'[' | b')' | b']' | b',' | b'?' | b':' | b'=' | b'!' | b'<' | b'>' | b'}'
+        ),
+    }
 }
 
 fn value_to_string(v: &Value) -> String {
