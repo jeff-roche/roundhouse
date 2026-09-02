@@ -3284,6 +3284,7 @@ dependencies = [
  "aws-smithy-eventstream",
  "aws-smithy-types",
  "bytes",
+ "color-eyre",
  "futures",
  "http 1.5.0",
  "insta",

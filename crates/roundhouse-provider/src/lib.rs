@@ -24,6 +24,7 @@ pub mod credential;
 pub mod errors;
 pub mod fallback;
 mod ir;
+pub mod pricing;
 pub mod profile;
 mod provider_trait;
 mod reqwest_transport;

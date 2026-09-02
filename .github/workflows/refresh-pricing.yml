@@ -1,0 +1,27 @@
+name: Refresh pricing dataset
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # 06:00 UTC every Monday
+  workflow_dispatch: {}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run refresh binary
+        run: cargo run -p roundhouse-provider --bin refresh_pricing -- crates/roundhouse-provider/vendor
+      - name: Open PR if changed
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore(pricing): weekly models.dev/LiteLLM snapshot refresh"
+          branch: pricing-refresh/${{ github.run_id }}
+          title: "Weekly pricing dataset refresh"
+          body: |
+            Automated refresh of vendored models.dev + LiteLLM pricing snapshots.
+            **Human review required before merge** — this changes cost-attribution
+            numbers shown to users (§9.7). Runtime refresh is opt-in and never
+            blocks a request; this PR is the only path a price change reaches
+            production.
+          labels: pricing-refresh

@@ -1,0 +1,12 @@
+[
+  {
+    "id": "anthropic/claude-fixture-test",
+    "cost": { "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75 },
+    "limit": { "context": 200000, "output": 8192 }
+  },
+  {
+    "id": "openai/gpt-fixture-test",
+    "cost": { "input": 2.5, "output": 10.0, "cache_read": 0.25, "cache_write": null },
+    "limit": { "context": 128000, "output": 16384 }
+  }
+]
