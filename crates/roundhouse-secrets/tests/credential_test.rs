@@ -382,14 +382,38 @@ async fn oauth_refresh_rejects_a_non_https_refresh_url_at_construction() {
 
 #[tokio::test]
 async fn oauth_refresh_rejects_a_refresh_url_with_embedded_userinfo() {
+    // B1 (fix-round-2): the rejection message itself must never echo the
+    // userinfo it's rejecting — an earlier version of this validation did
+    // exactly that (`refresh_url must not contain embedded userinfo: {raw}`),
+    // which persisted the password into the very error raised to reject it.
+    // Asserting only `.contains("userinfo")` (the word) would have passed
+    // happily with the password sitting right there in the message — assert
+    // the SECRET COMPONENT's absence instead, which is the check that would
+    // have caught it.
     let err = OAuthRefreshCredential::new(
-        "https://user:pass@auth.example.com/token",
+        "https://user:s3cr3t-password@auth.example.com/token",
         "client-1",
         Secret::new("secret".to_string()),
     )
     .err()
     .unwrap();
-    assert!(err.to_string().contains("userinfo"));
+    let message = err.to_string();
+    assert!(
+        !message.contains("s3cr3t-password"),
+        "rejection message must never carry the embedded password: {message}"
+    );
+    assert!(
+        !message.contains("user:s3cr3t-password"),
+        "rejection message must never carry the embedded userinfo: {message}"
+    );
+    assert!(
+        message.contains("userinfo"),
+        "message should still explain what's wrong: {message}"
+    );
+    assert!(
+        message.contains("auth.example.com"),
+        "message should still name the host: {message}"
+    );
 }
 
 #[tokio::test]
@@ -703,6 +727,64 @@ fn sigv4_signs_a_multi_parameter_out_of_order_query_string() {
     );
 }
 
+/// B3 (fix-round-2): a path containing a space and a query value containing
+/// a literal `+`. This is AWS's own "get-space" test-suite shape (the same
+/// credentials/date/region/service as the vanilla KAT above): the correct
+/// canonical URI for a literal `/example space/` path is the DOUBLE-encoded
+/// `/example%2520space/` (once for the space itself, again because this
+/// isn't S3) — the earlier version of `canonical_uri` fed `url.path()`
+/// (already percent-encoded to `/example%20space/` by `url::Url` at parse
+/// time) straight into its own encode-once-or-twice step, producing the
+/// wrong, triple-encoded `/example%252520space/`. Likewise, the correct
+/// canonical query for a literal `b=x+y` is `b=x%2By` — the earlier version
+/// used `Url::query_pairs()`, which form-decodes `+` into a space before
+/// this function ever saw it, silently changing what got signed to `b=x%20y`.
+/// Expected canonical request/signature independently computed with the
+/// same from-scratch Python `hmac`/`hashlib` implementation used for the
+/// other two KATs, over this exact input.
+#[test]
+fn sigv4_signs_a_path_with_a_space_and_a_query_value_with_a_literal_plus() {
+    let secret_key = Secret::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string());
+    let url = url::Url::parse("https://example.amazonaws.com/example space/?a=1&b=x+y").unwrap();
+    // Sanity-check the assumption this test depends on: `url::Url` percent-
+    // encodes the literal space in the path at parse time, but leaves a
+    // literal `+` in the query untouched (it's not in the query
+    // percent-encode set) — if either assumption ever stops holding (a
+    // `url` crate upgrade, say), this test should fail loudly here rather
+    // than silently exercise a different case than it claims to.
+    assert_eq!(url.path(), "/example%20space/");
+    assert_eq!(url.query(), Some("a=1&b=x+y"));
+
+    let now = chrono::DateTime::parse_from_rfc3339("2015-08-30T12:36:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let mut headers = Vec::new();
+    roundhouse_secrets::credential::sigv4::sign(
+        "AKIDEXAMPLE",
+        &secret_key,
+        None,
+        "us-east-1",
+        "service",
+        "GET",
+        &url,
+        &mut headers,
+        b"",
+        now,
+    )
+    .unwrap();
+    let auth = headers
+        .iter()
+        .find(|(k, _)| k == "authorization")
+        .map(|(_, v)| v.as_str())
+        .expect("sign() must set an authorization header");
+    assert_eq!(
+        auth,
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \
+         SignedHeaders=host;x-amz-date, \
+         Signature=c9fe220a073930f40f22522be59d46960b31c94906d542f360da097704b24eef"
+    );
+}
+
 /// Whitespace-tolerant occurrence count: a literal-substring scan of
 /// `expose_secret_for_provider_call(` would silently undercount a call site
 /// written as `expose_secret_for_provider_call (` (a space before the
@@ -732,6 +814,11 @@ fn count_expose_call_sites(haystack: &str) -> usize {
 /// are the sanctioned callers of that method. Everything else in `src/` —
 /// this crate's `credential/` tree included — must go through
 /// `provider_bridge::expose_secret_for_provider_call` only.
+///
+/// Paths here are relative to `src/` (forward-slash-joined, so this stays
+/// portable) and matched against the WHOLE relative path, not just the
+/// basename (B2, fix-round-2): matching by basename alone would silently
+/// exempt a future `src/anything/secret.rs` or `src/anything/lib.rs` too.
 const SANCTIONED_EXPOSURE_FILES: &[&str] = &["secret.rs", "lib.rs"];
 
 #[test]
@@ -758,9 +845,15 @@ fn credential_module_never_reads_secret_material_outside_the_bridge() {
             expose_call_sites += count_expose_call_sites(&contents);
             let is_sanctioned = entry
                 .path()
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| SANCTIONED_EXPOSURE_FILES.contains(&n));
+                .strip_prefix(&src_dir)
+                .ok()
+                .map(|rel| {
+                    rel.components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .is_some_and(|rel| SANCTIONED_EXPOSURE_FILES.contains(&rel.as_str()));
             if is_sanctioned {
                 continue;
             }

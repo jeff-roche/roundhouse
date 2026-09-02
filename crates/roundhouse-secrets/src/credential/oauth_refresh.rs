@@ -43,18 +43,36 @@ struct OAuthTokenResponse {
 /// material somewhere unintended: embedded userinfo (`https://user:pass@host/`)
 /// would ride along on every token request, and a non-`https` scheme would
 /// send the client secret in the clear.
+///
+/// **Never interpolates `raw` (or anything derived from it besides
+/// [`record_base_url_override`]'s host-only form) into an error.** Fix-round-1's
+/// A5 closed three leak paths where a `TransportError`'s `Display` could carry
+/// embedded userinfo into a persisted error — round 2 found this function had
+/// reopened exactly that class here: the rejection message for a URL
+/// containing `user:s3cr3t@host` used to echo `raw` verbatim, meaning the
+/// password ended up in the very error raised to reject it, and this
+/// project persists error text onto physically-immutable `Event` rows.
+/// `url::ParseError`'s `Display` (used in the parse-failure arm) is a
+/// static, enum-driven description (e.g. "invalid port number") that never
+/// echoes the input string, so that one is safe to interpolate as-is.
 fn validate_refresh_url(raw: &str) -> Result<(), CredentialError> {
-    let parsed =
-        url::Url::parse(raw).map_err(|e| CredentialError::InvalidBaseUrl(format!("{raw}: {e}")))?;
+    let parsed = url::Url::parse(raw).map_err(|e| {
+        CredentialError::InvalidBaseUrl(format!(
+            "refresh_url for host `{}` is not a valid URL: {e}",
+            record_base_url_override(raw)
+        ))
+    })?;
     if parsed.scheme() != "https" {
         return Err(CredentialError::InvalidBaseUrl(format!(
-            "refresh_url must use https, got scheme `{}`: {raw}",
+            "refresh_url for host `{}` must use https, got scheme `{}`",
+            record_base_url_override(raw),
             parsed.scheme()
         )));
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(CredentialError::InvalidBaseUrl(format!(
-            "refresh_url must not contain embedded userinfo: {raw}"
+            "refresh_url for host `{}` must not contain embedded userinfo",
+            record_base_url_override(raw)
         )));
     }
     Ok(())

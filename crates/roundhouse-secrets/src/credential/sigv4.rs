@@ -106,16 +106,50 @@ fn uri_encode(s: &str, preserve_slash: bool) -> String {
     out
 }
 
-/// AWS's "CanonicalURI" (SigV4 "Task 1"): the request path, URI-encoded
-/// once for every service, and encoded a **second** time for every service
-/// except S3, which signs against the once-encoded path (S3 object keys can
+/// Strict RFC 3986 percent-decoding — deliberately NOT
+/// `application/x-www-form-urlencoded` decoding, which treats a literal `+`
+/// as an encoded space. Used to undo the percent-encoding `url::Url` itself
+/// already applies to `path()`/the raw query string at parse time, so
+/// `canonical_uri`/`canonical_query` re-encode the actual literal
+/// characters AWS's algorithm expects them to encode, not
+/// `url`'s-already-encoded output a second (or third) time (B3, fix-round-2:
+/// `canonical_uri` used to feed `url.path()` — already one layer of
+/// percent-encoding — straight into its own once-or-twice encoding step,
+/// over-encoding every non-plain-ASCII path; a literal `%` in the source
+/// path would compound this further with each pass).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let Some(hex) = s.get(i + 1..i + 3) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// AWS's "CanonicalURI" (SigV4 "Task 1"): the request path's LITERAL
+/// characters (recovered via [`percent_decode`] — see its doc comment for
+/// why `url.path()` can't be fed in directly), URI-encoded once for every
+/// service, and encoded a **second** time for every service except S3,
+/// which signs against the once-encoded path (S3 object keys can
 /// themselves contain `%`-sequences that must not be re-escaped). `url`'s
 /// own path is already RFC 3986-normalized (dot-segments resolved) by the
-/// `url` crate at parse time, so only the encode step is this function's
-/// job.
+/// `url` crate at parse time, so normalization itself is not this
+/// function's job — only decode-then-(re-)encode.
 fn canonical_uri(path: &str, service: &str) -> String {
     let path = if path.is_empty() { "/" } else { path };
-    let once = uri_encode(path, true);
+    let literal = percent_decode(path);
+    let once = uri_encode(&literal, true);
     if service.eq_ignore_ascii_case("s3") {
         once
     } else {
@@ -126,13 +160,23 @@ fn canonical_uri(path: &str, service: &str) -> String {
 /// AWS's "CanonicalQueryString": every parameter name/value URI-encoded
 /// (slashes included — unlike the path, a query value is not segmented),
 /// then sorted by encoded name (ties broken by encoded value), joined with
-/// `&`. Built from the URL's already-*decoded* query pairs
-/// (`Url::query_pairs`), not the raw query string, so a value's own
-/// `&`/`=`/`%` bytes are re-encoded correctly rather than assumed
-/// already-canonical.
+/// `&`. Built by splitting the URL's RAW query string on `&`/`=` and
+/// percent-decoding each piece with [`percent_decode`] — NOT
+/// `Url::query_pairs()`, which form-decodes and therefore turns a literal
+/// `+` in a query value into a space before this function ever sees it (B3,
+/// fix-round-2): `?b=x+y` would have canonicalized as `b=x%20y` (silently
+/// changing what's being signed) instead of the correct `b=x%2By`.
 fn canonical_query(url: &url::Url) -> String {
-    let mut pairs: Vec<(String, String)> = url
-        .query_pairs()
+    let raw = url.query().unwrap_or("");
+    let mut pairs: Vec<(String, String)> = raw
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let k = parts.next().unwrap_or("");
+            let v = parts.next().unwrap_or("");
+            (percent_decode(k), percent_decode(v))
+        })
         .map(|(k, v)| (uri_encode(&k, false), uri_encode(&v, false)))
         .collect();
     pairs.sort();
@@ -141,6 +185,13 @@ fn canonical_query(url: &url::Url) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// AWS's canonicalization rule for a header value: trim leading/trailing
+/// whitespace AND collapse internal runs of whitespace into a single space
+/// (B3, fix-round-2 — the previous version only trimmed the ends).
+fn canonicalize_header_value(v: &str) -> String {
+    v.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// AWS's "CanonicalHeaders" + "SignedHeaders": header names lowercased,
@@ -153,7 +204,7 @@ fn canonical_headers_and_signed(headers: &[(String, String)]) -> (String, String
         merged
             .entry(k.to_lowercase())
             .or_default()
-            .push(v.trim().to_string());
+            .push(canonicalize_header_value(v));
     }
     let canonical_headers: String = merged
         .iter()
