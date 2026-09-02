@@ -91,6 +91,19 @@ fn handle_parts(
 /// binding carries `Some(filter)` — filter evaluation is not wired yet, and
 /// binding anyway would let *any* message reaching the handle fire the
 /// trigger unfiltered, which is worse than refusing to bind at all.
+///
+/// NEW-1 (fix round 2): registers the handle *before* the mailbox. H2 made
+/// `register_handle` fallible (`BusError::HandleAlreadyRegistered`); the
+/// original mailbox-then-handle order left a successfully-registered
+/// mailbox behind whenever the handle step then failed — an orphan with no
+/// owner and no eviction (`LocalBus.mailboxes` is an unbounded `DashMap`),
+/// and since every retry mints a fresh `Binding` id, each failed attempt
+/// leaked a *distinct* entry. Registering the handle first means the
+/// failure path registers nothing at all. `register_mailbox` itself is
+/// effectively infallible in `LocalBus` today, but the rare/future case
+/// where it isn't is still handled: on that failure the just-registered
+/// handle is rolled back (best-effort) rather than left pointing at a
+/// session with no mailbox.
 pub async fn bind_message_trigger(
     bus: &dyn Bus,
     owning_workspace: WorkspaceId,
@@ -103,10 +116,15 @@ pub async fn bind_message_trigger(
         ));
     }
     let session = binding.trigger_session_id();
-    bus.register_mailbox(session, MailboxKind::Bounded(64))
-        .await?;
     bus.register_handle(workspace, name.to_string(), session)
         .await?;
+    if let Err(e) = bus
+        .register_mailbox(session, MailboxKind::Bounded(64))
+        .await
+    {
+        let _ = bus.unregister_handle(workspace, name, session).await;
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -114,6 +132,16 @@ pub async fn bind_message_trigger(
 /// for a binding carrying `Some(filter)` — tearing down a registration must
 /// always be possible regardless of whether the trigger it belonged to was
 /// ever actually bindable.
+///
+/// NEW-1 (fix round 2): `deregister_mailbox` is keyed on this binding's own
+/// `trigger_session_id()`, so it is never a cross-session/authorization
+/// action the way `unregister_handle` can be (a refused
+/// `BusError::NotAuthorizedForHandle` there means some *other* session
+/// currently owns that name — irrelevant to whether this session's own
+/// mailbox should go away). Both steps are attempted unconditionally, so a
+/// refused handle-unregistration never blocks the mailbox teardown the
+/// caller legitimately owns; the handle-unregistration error is still
+/// surfaced to the caller (after the mailbox is guaranteed gone either way).
 pub async fn unbind_message_trigger(
     bus: &dyn Bus,
     owning_workspace: WorkspaceId,
@@ -121,8 +149,9 @@ pub async fn unbind_message_trigger(
 ) -> Result<(), MessageTriggerError> {
     let (workspace, name, _filter) = handle_parts(binding, owning_workspace)?;
     let session = binding.trigger_session_id();
-    bus.unregister_handle(workspace, name, session).await?;
+    let handle_result = bus.unregister_handle(workspace, name, session).await;
     bus.deregister_mailbox(session).await?;
+    handle_result?;
     Ok(())
 }
 
@@ -220,6 +249,106 @@ mod tests {
 
         assert!(!bus.has_mailbox(binding.trigger_session_id()));
         assert!(bus.resolve_address(workspace, &address).await.is_err());
+    }
+
+    /// NEW-1 (fix round 2): a bind that fails at the handle-registration
+    /// step (H2's `HandleAlreadyRegistered`) must not leave the mailbox it
+    /// would have registered behind — `LocalBus.mailboxes` has no eviction,
+    /// and every retry mints a fresh `Binding` id, so each failed attempt
+    /// under the old mailbox-then-handle order leaked a distinct entry.
+    #[tokio::test]
+    async fn a_failed_bind_leaves_no_mailbox_behind() {
+        let bus = LocalBus::new();
+        let workspace = WorkspaceId::new();
+        let first = Binding::new(
+            JobId::new(),
+            TriggerSpec::Message {
+                address: Address::Handle {
+                    workspace,
+                    name: "listener".to_string(),
+                },
+                filter: None,
+            },
+        );
+        bind_message_trigger(&bus, workspace, &first).await.unwrap();
+
+        let second = Binding::new(
+            JobId::new(),
+            TriggerSpec::Message {
+                address: Address::Handle {
+                    workspace,
+                    name: "listener".to_string(),
+                },
+                filter: None,
+            },
+        );
+        let err = bind_message_trigger(&bus, workspace, &second)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MessageTriggerError::Bus(roundhouse_bus::BusError::HandleAlreadyRegistered { .. })
+        ));
+
+        assert!(
+            !bus.has_mailbox(second.trigger_session_id()),
+            "a failed bind must not leave an orphaned mailbox behind"
+        );
+        // The first binding's own registration must be untouched.
+        assert!(bus.has_mailbox(first.trigger_session_id()));
+    }
+
+    /// NEW-1 (fix round 2): `unbind_message_trigger` must always tear down
+    /// its own mailbox, even when `unregister_handle` is refused because a
+    /// *different* session currently owns that name — the mailbox is keyed
+    /// on this binding's own session id, never a cross-session action.
+    #[tokio::test]
+    async fn unbind_tears_down_the_mailbox_even_when_handle_unregistration_is_refused() {
+        let bus = LocalBus::new();
+        let workspace = WorkspaceId::new();
+        let handle_address = Address::Handle {
+            workspace,
+            name: "listener".to_string(),
+        };
+        let owner = Binding::new(
+            JobId::new(),
+            TriggerSpec::Message {
+                address: handle_address.clone(),
+                filter: None,
+            },
+        );
+        bind_message_trigger(&bus, workspace, &owner).await.unwrap();
+
+        // A different binding claiming the same handle name: it has its own
+        // mailbox (simulating a prior partial bind / stale state) but does
+        // not own the "listener" registration.
+        let impostor = Binding::new(
+            JobId::new(),
+            TriggerSpec::Message {
+                address: handle_address.clone(),
+                filter: None,
+            },
+        );
+        bus.register_mailbox(impostor.trigger_session_id(), MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        let err = unbind_message_trigger(&bus, workspace, &impostor)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MessageTriggerError::Bus(roundhouse_bus::BusError::NotAuthorizedForHandle { .. })
+        ));
+
+        // The mailbox must still be torn down.
+        assert!(!bus.has_mailbox(impostor.trigger_session_id()));
+        // The real owner's registration must be untouched.
+        let resolved = bus
+            .resolve_address(workspace, &handle_address)
+            .await
+            .unwrap();
+        assert_eq!(resolved, owner.trigger_session_id());
     }
 
     #[tokio::test]
