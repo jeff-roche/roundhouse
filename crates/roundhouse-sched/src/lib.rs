@@ -10,6 +10,7 @@
 //! `05-scheduling-and-workflows.md`.
 #![forbid(unsafe_code)]
 
+pub mod admission;
 pub mod cron;
 pub mod message_trigger;
 pub mod scheduler;
