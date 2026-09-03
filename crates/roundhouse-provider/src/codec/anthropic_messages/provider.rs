@@ -316,8 +316,21 @@ fn build_vertex_endpoint_url(base: &url::Url, model: &str) -> Result<url::Url, P
     // which failed against a `['/', '\n', '\r']` denylist that missed `\`.
     // Vertex publisher-model ids are restricted to this character set in
     // practice; anything outside it is rejected rather than interpreted.
+    //
+    // Fix-round-2 Fix 7: `@` was missing. Vertex publisher-model ids are
+    // `@`-versioned (e.g. `claude-sonnet-4-5@20250929`, a real, currently-
+    // supported model id from Anthropic's own Vertex page -- see
+    // `vertex_url_accepts_real_at_versioned_model_ids` below), and without
+    // `@` here the allowlist rejected every one of them. Adding it does not
+    // reopen the traversal bypass this allowlist exists to close: `@` only
+    // ever lands inside a path SEGMENT (`Url::set_path` operates purely on
+    // the already-parsed `Url`'s path component and cannot promote a
+    // segment to userinfo/host), and `:` -- needed to actually construct a
+    // `user:pass@host`-shaped userinfo -- remains excluded. See
+    // `vertex_url_at_sign_does_not_reopen_the_traversal_bypass` below for
+    // the re-run of every existing traversal case with `@` mixed in.
     let is_valid_model_id_char =
-        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@');
     if model.is_empty() || !model.chars().all(is_valid_model_id_char) {
         return Err(ProviderError::Unsupported(format!(
             "model id {model:?} is not a valid Vertex publisher-model path segment"
@@ -471,6 +484,87 @@ mod build_endpoint_url_tests {
             build_vertex_endpoint_url(&base, "%2e%2e\\%2e%2e\\zzz").is_err(),
             "percent-encoded dot-segments combined with backslashes must not pop path components"
         );
+    }
+
+    /// Fix-round-2 Fix 7: the allowlist's premise (Vertex model ids match
+    /// `^[A-Za-z0-9._-]+$`) was wrong -- Vertex publisher-model ids are
+    /// `@`-versioned. These four ids are real, currently-listed API model
+    /// IDs from Anthropic's own Vertex page (the one this codec's
+    /// `vertex-anthropic.toml` module comment already cites), and all four
+    /// match that profile's `match = ["claude-*"]` glob, so they route to
+    /// this provider and must be accepted, not rejected as an invalid path
+    /// segment. Per §15: this test must be run and shown to fail against the
+    /// unfixed (`@`-less) allowlist before `@` is added to it.
+    #[test]
+    fn vertex_url_accepts_real_at_versioned_model_ids() {
+        let base = url::Url::parse(
+            "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/anthropic/models",
+        )
+        .unwrap();
+        for model in [
+            "claude-sonnet-4-5@20250929",
+            "claude-opus-4-5@20251101",
+            "claude-haiku-4-5@20251001",
+            "claude-3-7-sonnet@20250219",
+        ] {
+            assert!(
+                build_vertex_endpoint_url(&base, model).is_ok(),
+                "expected {model:?} (a real, `claude-*`-matching Vertex API model ID) to be \
+                 accepted"
+            );
+        }
+    }
+
+    /// Fix-round-2 Fix 7: adding `@` to the allowlist must not reopen the
+    /// traversal bypass `vertex_url_rejects_a_backslash_shaped_model_id`
+    /// closed -- `@` only ever appears inside a path SEGMENT here (never
+    /// introducing an authority), since `Url::set_path` operates purely on
+    /// the path component of an already-parsed `Url` and cannot promote a
+    /// segment to userinfo/host. Re-runs every existing traversal case with
+    /// `@` mixed in, plus a userinfo-shaped `user:pass@host` case (still
+    /// rejected because `:` remains excluded from the allowlist).
+    #[test]
+    fn vertex_url_at_sign_does_not_reopen_the_traversal_bypass() {
+        let base = url::Url::parse(
+            "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/anthropic/models",
+        )
+        .unwrap();
+        for model in [
+            "a\\b",
+            "..\\..\\..\\..\\..\\..\\v1beta1\\evil",
+            "%2e%2e\\%2e%2e\\zzz",
+            "a/../b",
+            "user:pass@host",
+        ] {
+            assert!(
+                build_vertex_endpoint_url(&base, model).is_err(),
+                "expected {model:?} to still be rejected with `@` permitted in the allowlist"
+            );
+        }
+        // `@evil.com`/`..@..` are accepted (matching `is_valid_model_id_char`
+        // char-by-char), but that is exactly what "does not reopen the
+        // bypass" means here: they stay literal path segments, never
+        // reinterpreted as userinfo/host, because `Url::set_path` only ever
+        // sets the PATH of an already-parsed `Url` -- the authority
+        // (`aiplatform.googleapis.com`) is fixed before this function ever
+        // runs. Assert the host stays put and the path is exactly the
+        // expected literal segment, not some evil.com redirect.
+        for model in ["@evil.com", "..@.."] {
+            let url = build_vertex_endpoint_url(&base, model)
+                .unwrap_or_else(|_| panic!("{model:?} should build (inert path segment)"));
+            assert_eq!(
+                url.host_str(),
+                Some("aiplatform.googleapis.com"),
+                "{model:?} must not change the authority"
+            );
+            assert_eq!(
+                url.path(),
+                format!(
+                    "/v1/projects/p/locations/global/publishers/anthropic/models/{model}:streamRawPredict"
+                ),
+                "{model:?} must stay a literal path segment, not collapse via dot-segment removal"
+            );
+        }
     }
 }
 
