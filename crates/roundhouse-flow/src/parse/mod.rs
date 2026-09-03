@@ -3,7 +3,7 @@
 //! into a typed [`WorkflowDef`] that fails closed on anything it doesn't
 //! recognise. Anchor/alias expansion — the one resource a small hostile
 //! document could previously make the parser spend without limit — is
-//! bounded by [`MAX_EXPANDED_NODES`]; read the history section below,
+//! bounded by [`MAX_EXPANDED_WEIGHT`]; read the history section below,
 //! including the paragraph on what that bound does *not* cover, before
 //! wiring this to anything that accepts untrusted YAML.
 //!
@@ -68,36 +68,63 @@
 //! 5,026 → 21,048 → 85,134 → 341,476 → 1,366,842 → 5,468,304 nodes as the
 //! document grows 2,140 → 2,300 bytes, i.e. ×4 per 32 bytes of source.
 //!
-//! **What bounds it now: [`MAX_EXPANDED_NODES`], enforced by
+//! **What bounds it now: [`MAX_EXPANDED_WEIGHT`], enforced by
 //! `expansion::check_expansion` before `serde_yaml::from_str` is called.**
 //! The check walks the document with the real deserializer under a visitor
-//! that produces only a count, and aborts the walk — and with it the
-//! demand-driven expansion the walk is driving — the moment the count
-//! passes the ceiling. It does not predict the expansion; it incurs it
-//! under a meter and stops. Its unit is the real work unit rather than a
-//! proxy for it, which is exactly what the withdrawn `MAX_ALIAS_TOKENS`
-//! guard described in the next section was not. Read `src/parse/expansion.rs`'s
-//! module doc for the mechanism, the measured ratio between the metered
-//! walk and the subsequent real parse, and what a change in `serde_yaml`'s
-//! internals would break.
+//! that produces only a running weight — a per-node constant plus each
+//! scalar's own length — and aborts the walk, and with it the demand-driven
+//! expansion the walk is driving, the moment the total passes the ceiling.
+//! It does not predict the expansion; it incurs it under a meter and stops.
+//! Its unit is the quantity that materializes rather than a proxy for it,
+//! which is what the withdrawn `MAX_ALIAS_TOKENS` guard was not — and what
+//! this check's own first unit, a plain node count, also was not: see the
+//! second attack below. Read `src/parse/expansion.rs`'s module doc for the
+//! mechanism, what the weight does and does not imply about memory, and
+//! what a change in `serde_yaml`'s internals would break.
 //!
 //! Measured after the fix, release build, through the real
 //! `parse_workflow` — every payload from both tables above, plus a
 //! 260,364-byte member at the byte cap:
 //!
-//! | document | before | after |
+//! | document | before | after (release) |
 //! |---|---|---|
-//! | 706 B fan-out | 123 ms | rejected in 7.8 ms |
-//! | 2,268 B fan-out | 137 ms | rejected in 7.9 ms |
-//! | 2,332 B fan-out | 2.1 s | rejected in 7.9 ms |
-//! | 4,396 B fan-out | 33.9 s | rejected in 8.0 ms |
-//! | 32,764 B fan-out | 287.8 s (review) | rejected in 9.4 ms |
-//! | 260,364 B fan-out | not previously measured | rejected in 19.5 ms |
+//! | 706 B fan-out | 123 ms | rejected in 13.4 ms |
+//! | 2,268 B fan-out | 137 ms | rejected in 13.7 ms |
+//! | 2,332 B fan-out | 2.1 s | rejected in 13.6 ms |
+//! | 2,364 B fan-out | 8.1 s | rejected in 13.6 ms |
+//! | 4,396 B fan-out | 33.9 s | rejected in 13.9 ms |
+//! | 32,764 B fan-out | 287.8 s (review) | rejected in 16.1 ms |
+//! | 260,364 B fan-out | not previously measured | rejected in 35.2 ms |
+//! | 2,388 B tag-wrapped fan-out | not previously measured | rejected in 14.8 ms |
 //!
-//! (Across repeated runs the rejection figures ranged 7.8-21.6 ms; the
-//! table gives one run. Debug builds — what `cargo test` produces — run
-//! 123-199 ms.) Peak resident memory for the whole rejection sweep stayed
-//! under 50 MB, against the ~35 GiB the same family reached unbounded.
+//! Debug builds — what `cargo test` produces — run 213-302 ms on the same
+//! payloads. Process peak resident memory for the whole rejection sweep was
+//! 22 MB, against the ~35 GiB this family reached unbounded.
+//!
+//! ## The second attack: one large anchored scalar, aliased many times
+//!
+//! Found by a security review of the *first* fix, and the reason
+//! [`MAX_EXPANDED_WEIGHT`] weighs bytes rather than counting nodes. That
+//! first version charged one unit per node and discarded each scalar's
+//! length, so a single node could carry an arbitrarily large aliased
+//! payload. Aliasing an `L`-byte anchored scalar `K` times in a **flat**
+//! sequence cost `K` at the meter while materializing `K x L` bytes for
+//! real — and a flat sequence keeps alias jumps proportional to events, so
+//! `serde_yaml`'s repetition guard never fires either. Measured against
+//! that version: a **180,138-byte document was admitted** and drove the real
+//! parse to **4,593 MB** resident; a 260,210-byte one hit allocation failure
+//! past a 2 GiB address space.
+//!
+//! | document | before (node-count unit) | after (byte-weight unit) |
+//! |---|---|---|
+//! | 260,110 B, `K`=40,000 `L`=60,000 | admitted, 4,593 MB resident | rejected in 3.2 ms |
+//! | 130,110 B, `K`=2,000 `L`=120,000 | admitted | rejected in 0.8 ms |
+//! | 346,182 B, `K`=43,000 `L`=131,072 | admitted, allocation failure >2 GiB | rejected by [`MAX_YAML_BYTES`] |
+//!
+//! The lesson generalises past this module: **a meter whose unit omits an
+//! axis of the cost cannot bound that axis**, however faithfully it tracks
+//! the axes it does charge. Node count tracked CPU well and memory not at
+//! all.
 //!
 //! **What the bound does NOT cover, stated plainly:**
 //! - **Only the expansion stage.** Tokenizing the raw text into
@@ -106,12 +133,16 @@
 //!   [`nesting_depth_bound_violation`] scan below — neither of which is a
 //!   security boundary. The measured shape that gets past the scan (a run
 //!   of unclosed `[`) costs ~80 ms at 32 KiB and ~650 ms at 256 KiB.
-//! - **The observed walk-to-parse ratio is an observation, not a proof.**
-//!   Twelve admitted documents, six shaped to sit within 2% of the ceiling,
-//!   gave a worst ratio of 2.95 and a worst absolute real-parse cost of
-//!   24.5 ms. A future serde construct that re-visited the YAML *event
-//!   list* rather than an owned buffer would not be covered by those
-//!   numbers. See `src/parse/expansion.rs`'s doc comment.
+//! - **What an admitted document costs is measured, not proven.** Worst
+//!   observed across every shape probed, one document per child process
+//!   under a 6 GiB `ulimit -v`: **36.2 ms and 60.4 MB** peak resident.
+//!   Roughly 43 MB of that is inherent rather than a tuning choice — the
+//!   densest legitimate alias-free document at the byte cap measures
+//!   42.8 MB on its own, so only lowering [`MAX_YAML_BYTES`] moves it.
+//!   The previous round's equivalent figures (24.5 ms, 36 MB) were
+//!   falsified by the second attack above, which is why this bullet says
+//!   *measured* and not *bounded*. See `src/parse/expansion.rs`'s doc
+//!   comment for the table and its two qualifications.
 //! - **Nothing downstream of parsing.** A parsed workflow's dispatched-task
 //!   count is [`crate::caps`]'s problem (ruling P47).
 //!
@@ -155,10 +186,12 @@
 //!   whose size is itself proportional to the document. See
 //!   `rejects_a_billion_laughs_style_alias_bomb` in
 //!   `tests/parse_top_level.rs`, which exercises the guard directly —
-//!   though since Task X1 that payload is stopped by
-//!   [`MAX_EXPANDED_NODES`]'s walk, which reaches `serde_yaml`'s own
-//!   repetition limit at 40,062 nodes and reports it, rather than by the
-//!   typed parse.
+//!   though since Task X1 that payload is stopped during
+//!   [`MAX_EXPANDED_WEIGHT`]'s walk rather than by the typed parse. Which
+//!   of the two limits stops it is measured rather than assumed — see
+//!   `rejects_a_billion_laughs_style_alias_bomb`, whose comment records
+//!   it. Either way `parse_workflow` returns before deserializing for
+//!   real.
 //!
 //!   **This module's alias check is a metered walk, not a count.** Fix
 //!   round 4 shipped a count (`MAX_ALIAS_TOKENS`, rejecting above 64
@@ -172,12 +205,13 @@
 //!   the pattern is also markdown emphasis, so a 4,719-byte `agent.prompt`
 //!   using `*word*` and `**bold**` in ordinary prose was rejected outright
 //!   (measured), as were `src/*rs` and `rm *tmp`. Task X1's
-//!   [`MAX_EXPANDED_NODES`] is deliberately not another count of that
-//!   kind: it counts nodes the deserializer actually produced while
-//!   following the aliases, so its unit cannot decouple from cost the way
-//!   an alias-token count did, and it cannot see a `*word*` in a block
-//!   scalar at all because a block scalar is one node. See the history
-//!   section above.
+//!   [`MAX_EXPANDED_WEIGHT`] is deliberately not another count of that
+//!   kind: it weighs what the deserializer actually produced while
+//!   following the aliases — nodes *and* the bytes they carry — so its unit
+//!   cannot decouple from cost the way an alias-token count did, and it
+//!   cannot see a `*word*` in a block scalar at all, since a block scalar
+//!   is one node charged its own length once. See the history section
+//!   above.
 //! - **Pathological nesting depth, materializing a Rust value:** bounded by
 //!   `serde_yaml`'s own `remaining_depth: 128` recursion guard
 //!   (`RecursionLimitExceeded`), on by default. **This guard applies only
@@ -248,7 +282,7 @@
 //!   32 KiB, and the review measured 287.8 s at exactly the 32 KiB cap —
 //!   roughly 190x the claimed ceiling. **A byte cap is not a bound on parse
 //!   cost, and that is still true**: what bounds the fan-out is
-//!   [`MAX_EXPANDED_NODES`], not [`MAX_YAML_BYTES`], and the shape measured
+//!   [`MAX_EXPANDED_WEIGHT`], not [`MAX_YAML_BYTES`], and the shape measured
 //!   in this bullet — an unclosed-bracket run, whose cost is in the
 //!   tokenizer rather than in expansion — is still bounded by nothing but
 //!   the byte cap.
@@ -272,11 +306,13 @@ use thiserror::Error;
 /// called it "the real DoS bound"; that claim is retracted (see the module
 /// doc comment's history section — the anchor/alias fan-out cost minutes of
 /// CPU at a fraction of even the old 32 KiB, so no cap could separate
-/// hostile from legitimate; [`MAX_EXPANDED_NODES`] is what separates them
-/// now, and it is a node count, not a byte count). This constant's only
-/// remaining job is refusing to even look at an absurdly large document —
-/// though it does now have one load-bearing side effect, since
-/// [`MAX_EXPANDED_NODES`] is derived from it.
+/// hostile from legitimate; [`MAX_EXPANDED_WEIGHT`] is what separates them
+/// now, and it weighs the *expanded* document rather than the source).
+/// This constant's only remaining job is refusing to even look at an
+/// absurdly large document — though it is now load-bearing in one further
+/// way: [`MAX_EXPANDED_WEIGHT`] must stay large enough to admit any
+/// alias-free document this cap allows, which is asserted at compile time
+/// beside that constant.
 ///
 /// **Why 256 KiB and not 32 KiB.** 32 KiB was chosen as a security number
 /// and is far too tight as a sanity number: [`MAX_TOP_LEVEL_STEPS`] admits
@@ -301,67 +337,119 @@ use thiserror::Error;
 /// already measured 287.8 s at exactly 32 KiB, so the number being made
 /// larger already admitted an unusable-machine outcome.
 ///
-/// **What raising it costs now.** Task X1 changed the relationship.
-/// [`MAX_EXPANDED_NODES`] is defined as this constant, and the metered
-/// walk's cost is linear in nodes (measured: 3.9 ms at 32,738 nodes,
-/// 15.7 ms at 131,042), so raising this cap now raises worst-case parse
-/// cost *linearly* rather than quadratically. Raising it still raises the
-/// admitted node ceiling in lockstep, which is deliberate — see
-/// [`MAX_EXPANDED_NODES`]'s derivation — but anyone raising it should
-/// re-measure rather than assume the linearity holds arbitrarily far.
+/// **What raising it costs now.** Task X1 changed the relationship, and fix
+/// round 1 changed it again. [`MAX_EXPANDED_WEIGHT`] is an independently
+/// chosen constant, so raising this cap does **not** raise the expansion
+/// ceiling — it raises the weight an alias-free document may legitimately
+/// reach, and the `const` assert beside [`MAX_EXPANDED_WEIGHT`] fails the
+/// build once that outgrows the ceiling. Raising this cap therefore forces
+/// an explicit decision about the expansion ceiling instead of silently
+/// widening it, which is the opposite of what the previous round did. The
+/// metered walk's cost is linear in nodes (measured: 21.9 ms for the
+/// 131,044-node densest alias-free sequence at the cap, 26.6 ms for the
+/// 262,070-node densest mapping), so re-measure rather than assuming that
+/// linearity holds arbitrarily far.
 ///
 /// For scale: the frozen §8.9 fixture is 2,271 bytes.
 pub const MAX_YAML_BYTES: usize = 262_144;
 
-/// The maximum number of **expanded nodes** a workflow document may produce
-/// once its anchors and aliases are followed. This is the bound that closes
-/// the anchor/alias fan-out denial of service; see the module doc comment's
-/// history section for the attack and `src/parse/expansion.rs` for the
-/// mechanism that enforces it.
+/// The maximum **expanded byte weight** a workflow document may produce once
+/// its anchors and aliases are followed. This is the bound that closes the
+/// anchor/alias denial of service; see the module doc comment's history
+/// section for the attacks and `src/parse/expansion.rs` for the mechanism.
 ///
 /// # Unit
 ///
-/// One node is one value handed to a `serde::de::Visitor`: each scalar,
-/// each sequence, each mapping, and each mapping *key* counts one. An alias
-/// contributes the entire subtree it expands to, because the check follows
-/// it exactly as the real parse will. It is **not** a byte count, an alias
-/// count, or a nesting depth — the previous three attempts at this bound
-/// were each a proxy of that kind and each decoupled from the cost it was
-/// supposed to bound.
+/// [`expansion::NODE_WEIGHT_BYTES`] per node handed to the deserializer's
+/// visitor — each scalar, each sequence, each mapping, each mapping *key* —
+/// **plus each scalar's own byte length**. An alias contributes the full
+/// weight of the subtree it expands to, every time it expands.
+///
+/// It is not a byte count of the source, not an alias count, and not a
+/// nesting depth. It is also no longer a *node* count: fix round 1 replaced
+/// that unit after a security review proved it does not bound memory —
+/// `visit_str` discarded the string's length, so aliasing one large anchored
+/// scalar `K` times cost `K` at the meter while materializing `K x L` bytes
+/// for real. A 180,138-byte document was admitted and drove the parse to
+/// 4,593 MB resident. Every previous attempt at this bound was a proxy that
+/// decoupled from the cost it was meant to bound; the node count was the
+/// fourth. Charging the bytes makes the unit the quantity that actually
+/// materializes.
 ///
 /// # Derivation of the number
 ///
-/// It is an **absolute** ceiling — a constant, not a fraction of the
-/// document. Proportionality to the document was the defect in
-/// `serde_yaml`'s own `jumpcount > events.len() * 100` guard: it hands a
-/// larger attacker budget for a larger attack.
+/// It is an **absolute** ceiling, chosen independently of the byte cap.
+/// Proportionality to the document is the defect in `serde_yaml`'s own
+/// `jumpcount > events.len() * 100` guard: it hands a larger attacker
+/// budget for a larger attack.
 ///
-/// The number is `MAX_YAML_BYTES` — one admitted node per byte the byte cap
-/// admits — chosen so that **only alias amplification can trip it**. The
-/// densest alias-free YAML spends at least two source bytes per node (`x,`
-/// in a flow sequence), so an alias-free document at the byte cap yields at
-/// most about half this many: measured, a 262,142-byte `bomb: [x,x,…]`
-/// expands to 131,042 nodes, exactly 2.00x under. A document therefore
-/// cannot be rejected here for being large; it can only be rejected for
-/// expanding to more nodes than its own bytes could have encoded directly.
-/// That relationship is pinned by
-/// `the_node_ceiling_leaves_room_for_any_alias_free_document_under_the_byte_cap`
-/// in `tests/parse_top_level.rs`, so raising [`MAX_YAML_BYTES`] without
-/// revisiting this constant fails a test rather than silently starting to
-/// reject dense documents.
+/// The constraint the number has to satisfy is that **every alias-free
+/// document under [`MAX_YAML_BYTES`] is admitted**, so that nothing can be
+/// rejected here for being large — only for amplifying. For an alias-free
+/// document of `B` source bytes:
+///
+/// - **at most `B` nodes.** Every node needs at least one source byte, and
+///   the densest encoding reaches exactly that: a flow mapping with omitted
+///   values, `{a,a,a,…}`, yields one node per byte (measured: 262,070 nodes
+///   in 262,144 bytes, 1.00 nodes/byte). An earlier version of this comment
+///   claimed the densest encoding was `[x,x,…]` at *two* bytes per node,
+///   which is false — that shape measures 0.50 nodes/byte and `{a,a,…}` is
+///   twice as dense. Flow forms denser still (`{,,,}`, `[,,,]`, `{:,:,}`)
+///   are rejected outright by `serde_yaml`, so 1.00 is the constructible
+///   maximum.
+/// - **at most `B` bytes of expanded scalar content**, since without an
+///   alias every scalar's value is at most its own source text (escapes and
+///   `!!binary` shrink; nothing grows).
+///
+/// So an alias-free document weighs at most
+/// `B * (NODE_WEIGHT_BYTES + 1)` = **2,359,296** at today's constants —
+/// **56.2% of this ceiling, a 43.8% margin**. The densest one actually
+/// constructed weighs 2,227,640, or 53.1% (a 46.9% margin). The derived
+/// bound and the measured worst agree to within 6%.
+///
+/// That relationship is a real inequality between two independently chosen
+/// constants, and it is asserted in a `const` block below, so raising
+/// [`MAX_YAML_BYTES`] past what this ceiling can cover **fails the build**.
+/// (The equivalent guard in the previous round was
+/// `MAX_EXPANDED_NODES >= MAX_YAML_BYTES` where the former was *defined* as
+/// the latter — a tautology that could not fail for any value. That is the
+/// `MAX_ALIAS_TOKENS` defect one level up: a guard that reads as protection
+/// while protecting nothing.)
 ///
 /// # What a document at this ceiling costs — measured, release build
 ///
-/// Twelve documents admitted by the ceiling, six of them shaped to sit
-/// within 2% of it by different means: worst metered-walk cost 24.1 ms,
-/// worst subsequent real-parse cost 24.5 ms, worst peak-RSS growth across
-/// the real parse 36 MB. Every attack payload in the module doc comment's
-/// history table is rejected in 7.8–21.6 ms with the whole sweep peaking
-/// under 50 MB resident. The two-walk design means a *legitimate* document is
-/// walked twice: measured overhead is 0.07 ms on the frozen §8.9 fixture
-/// (2,271 B) and 15.7 ms — about +75% — on a maximally dense 256 KiB
-/// document, which is the worst case the byte cap allows.
-pub const MAX_EXPANDED_NODES: usize = MAX_YAML_BYTES;
+/// Weight is a charge model, not a memory measurement. What it implies
+/// directly is only that expanded scalar bytes are at most this ceiling and
+/// node count at most `ceiling / NODE_WEIGHT_BYTES`. What *that* costs was
+/// measured, one document per child process under a 6 GiB `ulimit -v`:
+/// **worst admitted real-parse cost 36.2 ms, worst peak RSS 60.4 MB**, over
+/// every shape probed including both attack families. Roughly 43 MB of that
+/// is inherent — the densest legitimate alias-free document at the byte cap
+/// measures 42.8 MB on its own — so the observed worst is about 1.4x a floor
+/// that only lowering [`MAX_YAML_BYTES`] could move. See
+/// `src/parse/expansion.rs`'s table and its two stated qualifications.
+///
+/// Rejection is cheap: every attack payload in the module doc comment's
+/// history tables is rejected in 0.6-26 ms release, with process peak RSS of
+/// 3.7-9.3 MB. The two-walk design means a legitimate document is walked
+/// twice: measured overhead is 0.07 ms on the frozen §8.9 fixture (2,271 B)
+/// and 21.9 ms on a maximally dense 256 KiB document, the worst case the
+/// byte cap allows.
+pub const MAX_EXPANDED_WEIGHT: usize = 4 * 1024 * 1024;
+
+// The derivation above, as a check that can actually fail: an alias-free
+// document under the byte cap weighs at most MAX_YAML_BYTES * (node weight +
+// 1), and that must fit under the ceiling or legitimate documents start
+// being rejected. Two independently chosen constants, so this is an
+// inequality rather than a tautology — raising MAX_YAML_BYTES to 512 KiB
+// fails this at compile time. `the_densest_alias_free_documents_under_the_byte_cap_still_parse`
+// in `tests/parse_top_level.rs` is the behavioural half of the same guard.
+const _: () = assert!(
+    MAX_YAML_BYTES * (expansion::NODE_WEIGHT_BYTES + 1) <= MAX_EXPANDED_WEIGHT,
+    "MAX_EXPANDED_WEIGHT is too small for MAX_YAML_BYTES: an alias-free document at \
+     the byte cap could weigh more than the ceiling and be rejected for being large \
+     rather than for amplifying"
+);
 
 /// No real workflow needs hundreds of top-level steps — a `map` step
 /// already provides fan-out — so this bounds a maliciously (or
@@ -385,7 +473,7 @@ pub const MAX_FINALLY_HANDLERS: usize = 50;
 /// in the actual document. This scan is best-effort, not a security
 /// boundary — and neither is [`MAX_YAML_BYTES`], which fix round 3 wrongly
 /// called "the real bound". The only bound on parse cost in this module is
-/// [`MAX_EXPANDED_NODES`], and it bounds the *expansion* stage only; the
+/// [`MAX_EXPANDED_WEIGHT`], and it bounds the *expansion* stage only; the
 /// tokenizing stage this scan tries to help with is still bounded by
 /// nothing but the byte cap. See the module doc comment's history
 /// section.
@@ -436,9 +524,9 @@ pub enum ParseError {
     ExcessiveIndentWidth { width: usize, max: usize },
 
     #[error(
-        "workflow YAML is only {actual_bytes} bytes but expands to more than {max} nodes once its anchors and aliases are followed; this is alias amplification, not size, and it is rejected before the document is deserialized (see this module's doc comment)"
+        "workflow YAML is only {actual_bytes} bytes but expands past the {max}-byte weight ceiling once its anchors and aliases are followed; this is alias amplification, not size, and it is rejected before the document is deserialized (see this module's doc comment)"
     )]
-    ExpandsTooManyNodes { actual_bytes: usize, max: usize },
+    ExpandsTooLarge { actual_bytes: usize, max: usize },
 
     #[error("workflow YAML parse error: {0}")]
     Yaml(#[from] serde_yaml::Error),
@@ -519,12 +607,12 @@ pub fn parse_workflow(yaml: &str) -> Result<WorkflowDef, ParseError> {
     // verdict is returned rather than passed through to the real parse: any
     // document that errors cheaply here but would parse expensively for
     // real is otherwise a complete bypass of the ceiling.
-    match expansion::check_expansion(yaml, MAX_EXPANDED_NODES) {
+    match expansion::check_expansion(yaml, MAX_EXPANDED_WEIGHT) {
         expansion::Verdict::WithinBudget => {}
         expansion::Verdict::OverBudget => {
-            return Err(ParseError::ExpandsTooManyNodes {
+            return Err(ParseError::ExpandsTooLarge {
                 actual_bytes: yaml.len(),
-                max: MAX_EXPANDED_NODES,
+                max: MAX_EXPANDED_WEIGHT,
             });
         }
         expansion::Verdict::Malformed(err) => return Err(ParseError::Yaml(err)),
@@ -585,7 +673,7 @@ enum NestingViolation {
 /// doc comment claimed soundness properties that execution then falsified
 /// — see the module doc comment for the full history.) Fix round 3 said
 /// "the actual bound on untrusted-input cost is [`MAX_YAML_BYTES`]"; that
-/// is retracted too. Task X1 added [`MAX_EXPANDED_NODES`], which does bound
+/// is retracted too. Task X1 added [`MAX_EXPANDED_WEIGHT`], which does bound
 /// the expansion stage — but not this stage: nothing bounds the cost of
 /// tokenizing raw text into `serde_yaml`'s event list, which is what this
 /// function is a partial, best-effort palliative for. This function exists

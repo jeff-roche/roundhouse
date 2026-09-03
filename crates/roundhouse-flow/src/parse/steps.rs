@@ -252,7 +252,7 @@ pub const MAX_STEP_ID_LEN: usize = 128;
 /// [`topological_order`]'s own work (`O(steps + total needs entries)`) to a
 /// predictable multiple of the step count; not tied to, and making no claim
 /// about, the anchor/alias YAML-parse-cost finding recorded in the parent
-/// module's doc comment (closed in Task X1 by `parse::MAX_EXPANDED_NODES`)
+/// module's doc comment (closed in Task X1 by `parse::MAX_EXPANDED_WEIGHT`)
 /// — that finding is about `serde_yaml` parsing raw text, this is about
 /// graph size after parsing has already succeeded.
 pub const MAX_NEEDS_PER_STEP: usize = 64;
@@ -1516,7 +1516,7 @@ impl From<StepDef> for StepDefWire {
 /// ([`MapIsolationWire`]'s `#[serde(untagged)]`, the `v.clone()` below) work
 /// on owned data rather than on `serde_yaml`'s event list — no alias is
 /// followed here at all. In this crate that `Value` can only have come from
-/// [`super::parse_workflow`], which applies [`super::MAX_EXPANDED_NODES`]
+/// [`super::parse_workflow`], which applies [`super::MAX_EXPANDED_WEIGHT`]
 /// before deserializing. A future caller that builds a `Value` from
 /// untrusted YAML by some other route inherits that bound's absence, and
 /// should go through `parse_workflow` rather than reaching here directly.

@@ -597,7 +597,7 @@
 //! recursion in this parser only. It says nothing about, and is not a
 //! restatement or extension of, the separate `parse/mod.rs` finding about
 //! `serde_yaml`'s own alias/anchor parse cost (closed in Task X1 by
-//! `parse::MAX_EXPANDED_NODES`) — that finding is about parsing YAML *text*
+//! `parse::MAX_EXPANDED_WEIGHT`) — that finding is about parsing YAML *text*
 //! into a `serde_yaml::Value` before any expression evaluation happens;
 //! this bound is about evaluating an expression *after* that YAML has
 //! already parsed successfully. Note also
