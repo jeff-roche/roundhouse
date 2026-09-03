@@ -2211,3 +2211,174 @@ steps:
         .count();
     assert_eq!(flow_created, 1, "only step `a` emitted anything");
 }
+
+// ---- Fix round 5, item 1: a `when:` that fails to evaluate records the gate
+// as secret-derived, because its taint is unknown (ruling P35). ----
+
+#[test]
+fn a_when_that_fails_to_evaluate_because_of_the_secrets_content_records_the_gate_as_secret_derived()
+{
+    // Payload — ONE workflow, two runs differing only in the secret's content:
+    //
+    //   when: "${{ inputs.arr[json(secrets.K).idx] }}"   inputs.arr = [true, false]
+    //
+    //   K = `{"idx":0}`               -> subscript 0, `arr[0]` is true -> Completed
+    //   K = `{"idx":"not-a-number"}`  -> subscript is a string         -> Failed
+    //
+    // Nothing but the secret's own content decides which of those happens, so
+    // both runs must record the gate as secret-derived. The failing run is the
+    // one that used to record `false` — i.e. "this gate read nothing secret" —
+    // for exactly the case where the secret decided the outcome.
+    let yaml = r#"
+name: gate-eval-failure-taint
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: g5
+    when: "${{ inputs.arr[json(secrets.K).idx] }}"
+    emit: { v: "v" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+
+    let mut observed: Vec<(String, bool)> = Vec::new();
+    for secret in [r#"{"idx":0}"#, r#"{"idx":"not-a-number"}"#] {
+        let mut sink = RecordingSink(Vec::new());
+        let ctx = secret_run_ctx(serde_json::json!({"arr": [true, false]}), "K", secret);
+        let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+        let outcomes = exec.run_to_completion().unwrap();
+        let g5 = outcomes.iter().find(|o| o.step_id == "g5").unwrap();
+        let status = match &g5.status {
+            StepStatus::Completed => "completed",
+            StepStatus::Failed { .. } => "failed",
+            StepStatus::Skipped { .. } => "skipped",
+        };
+        observed.push((status.to_string(), g5.gate_condition_was_secret_derived));
+    }
+
+    assert_eq!(
+        observed,
+        vec![
+            ("completed".to_string(), true),
+            ("failed".to_string(), true),
+        ],
+        "the secret's content alone flips this gate between completing and failing to \
+         evaluate; both runs must record the gate as secret-derived, and the failing one \
+         is the arm that used to report the gate as clean"
+    );
+}
+
+#[test]
+fn a_when_whose_evaluation_fails_records_the_gate_as_secret_derived_even_with_no_secret_in_it() {
+    // The other two shapes of an evaluation failure, and the price of the
+    // fail-safe default, both asserted so neither can drift silently:
+    //
+    //   - `when: "${{ nosuchfn(secrets.T) }}"`  — an unknown function applied
+    //     to a secret. The gate really is secret-derived; recording `false`
+    //     here would have been a straightforward miss.
+    //   - `when: "${{ nosuchfn(1) }}"`          — an unknown function applied
+    //     to a literal. Nothing secret is involved, and this still records
+    //     `true`. That is the accepted cost of the fail-safe default: an
+    //     over-redacted log line for a gate that failed for an unrelated
+    //     reason, rather than a clean-looking flag on a gate whose taint the
+    //     `Err` arm cannot see.
+    let yaml = r#"
+name: gate-eval-failure-shapes
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: with_secret
+    when: "${{ nosuchfn(secrets.T) }}"
+    emit: { v: "v" }
+  - id: without_secret
+    when: "${{ nosuchfn(1) }}"
+    emit: { v: "v" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "T", "sk-unknown-fn-probe-0007");
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    for id in ["with_secret", "without_secret"] {
+        let o = outcomes.iter().find(|o| o.step_id == id).unwrap();
+        let message = match &o.status {
+            StepStatus::Failed { message } => message.clone(),
+            other => panic!("expected `{id}` to fail its `when:`, got {other:?}"),
+        };
+        assert!(
+            message.contains("nosuchfn"),
+            "the failure really is the unknown-function path, not a delimiter or parse \
+             error at position 0: {message}"
+        );
+        assert!(
+            o.gate_condition_was_secret_derived,
+            "a `when:` that failed to evaluate has unknown taint, so `{id}` must record \
+             the gate as secret-derived"
+        );
+        assert!(
+            !message.contains("sk-unknown-fn-probe-0007"),
+            "the failure message still carries source text only: {message}"
+        );
+    }
+}
+
+// ---- Fix round 5, item 3: what per-substitution rendering stopped covering
+// incidentally at the P35 boundary. ----
+
+#[test]
+fn a_mis_bound_credential_sharing_a_leaf_with_a_secret_is_no_longer_covered_incidentally() {
+    // Payload: `emit: { v: "${{ secrets.T }} and ${{ inputs.cred }}", w: "${{ inputs.cred }}" }`
+    // with `secrets.T = "sk-colocated-secret-0009"` and the P35-boundary
+    // credential handed in through `inputs` as `INPUTS-CARRIED-CREDENTIAL-0009`.
+    //
+    // `v` logs `"*** and INPUTS-CARRIED-CREDENTIAL-0009"` — fix round 3's
+    // whole-leaf redaction would have logged `"***"` and hidden the mis-bound
+    // value as a side effect of the secret happening to share the leaf.
+    // `w` shows why that is not a new hole: the same value already logged in
+    // cleartext whenever it sat in a leaf of its own, in both rounds, so the
+    // set of values that can leak is unchanged.
+    let yaml = r#"
+name: colocated-boundary
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: a
+    emit:
+      v: "${{ secrets.T }} and ${{ inputs.cred }}"
+      w: "${{ inputs.cred }}"
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(
+        serde_json::json!({"cred": "INPUTS-CARRIED-CREDENTIAL-0009"}),
+        "T",
+        "sk-colocated-secret-0009",
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    exec.run_to_completion().unwrap();
+
+    let created = sink
+        .0
+        .iter()
+        .find(|e| e.payload_json.get("TaskCreated").is_some())
+        .unwrap();
+    let logged = &created.payload_json["TaskCreated"]["input"]["Json"];
+    assert_eq!(
+        logged["v"],
+        serde_json::json!("*** and INPUTS-CARRIED-CREDENTIAL-0009"),
+        "only the secret's own substitution is replaced; the co-located P35-boundary \
+         value is not covered, where whole-leaf redaction covered it incidentally"
+    );
+    assert_eq!(
+        logged["w"],
+        serde_json::json!("INPUTS-CARRIED-CREDENTIAL-0009"),
+        "and it already logged in cleartext in its own leaf under both renderings, which \
+         is why the leakable set is unchanged"
+    );
+}

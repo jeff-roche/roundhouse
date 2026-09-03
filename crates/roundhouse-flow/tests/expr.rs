@@ -1424,3 +1424,209 @@ fn slice_bounds_still_tolerate_a_missing_or_non_numeric_argument() {
         json!([3, 4])
     );
 }
+
+// ---- Fix round 5, item 2 (ruling P37): `set_from` propagates provenance off
+// the producer instead of asking the caller to re-assert it. ----
+
+#[test]
+fn a_secret_derived_producer_cannot_be_bound_as_clean_through_set_from() {
+    // Payload. `secrets.K = {"token": "sk-propagated-secret-0011"}` bound
+    // through `set_secret`, then the value the evaluator produces from it —
+    // `eval("json(secrets.K).token")` — is bound under the NEW root name
+    // `item`, standing in for Task 6's `map.as` per-item binding.
+    //
+    // The binding site says nothing about provenance: it hands `set_from` the
+    // `Evaluated` and the flag comes off that. Reading through the new root
+    // then still redacts, so taint does not stop at the binding boundary the
+    // way it used to stop at the step boundary.
+    let mut c = ExprContext::new();
+    c.set_secret(
+        "secrets",
+        json!({"K": r#"{"token":"sk-propagated-secret-0011"}"#}),
+    );
+
+    let produced = eval(
+        ExpressionSource::from_workflow_file("json(secrets.K).token"),
+        &c,
+    )
+    .unwrap();
+    assert_eq!(produced.value, json!("sk-propagated-secret-0011"));
+    assert!(produced.secret_derived, "the producer knows it is tainted");
+
+    c.set_from("item", &produced);
+
+    let read_back = eval(ExpressionSource::from_workflow_file("item"), &c).unwrap();
+    assert_eq!(
+        read_back.value,
+        json!("sk-propagated-secret-0011"),
+        "`set_from` binds the real value — a dependent reading this root must get the \
+         token, not the placeholder"
+    );
+    assert!(
+        read_back.secret_derived,
+        "…and it is still secret-derived: `set_from` read that off the producer, so the \
+         binding site had nothing to assert and nothing to get wrong"
+    );
+
+    let interpolated =
+        interpolate(TemplateSource::from_workflow_file("tok=${{ item }}"), &c).unwrap();
+    assert_eq!(
+        interpolated.redacted_for_logging(),
+        "tok=***",
+        "which is what keeps it out of the append-only log"
+    );
+    assert_eq!(
+        interpolated.unredacted_for_dispatch(),
+        "tok=sk-propagated-secret-0011",
+        "while real dispatch still receives it"
+    );
+}
+
+#[test]
+fn a_clean_producer_bound_through_set_from_stays_readable_in_the_log() {
+    // The other direction, so the test above cannot be passing by marking
+    // everything secret. Payload: `inputs.repo = "acme/widgets"` on a context
+    // that ALSO holds a genuine secret under a different name;
+    // `eval("inputs.repo")` is clean, so `set_from` binds it clean.
+    let mut c = ExprContext::new();
+    c.set_secret("secrets", json!({"T": "sk-unrelated-secret-0012"}));
+    c.set_public("inputs", json!({"repo": "acme/widgets"}));
+
+    let produced = eval(ExpressionSource::from_workflow_file("inputs.repo"), &c).unwrap();
+    assert!(!produced.secret_derived);
+    c.set_from("item", &produced);
+
+    let interpolated =
+        interpolate(TemplateSource::from_workflow_file("repo=${{ item }}"), &c).unwrap();
+    assert_eq!(
+        interpolated.redacted_for_logging(),
+        "repo=acme/widgets",
+        "propagating provenance is not the same as escalating everything: a clean \
+         producer stays readable"
+    );
+    assert!(!interpolated.is_secret_derived());
+}
+
+#[test]
+fn set_from_an_interpolated_json_binds_the_unredacted_value_and_carries_its_taint() {
+    // The `Interpolated<Value>` half of the same API, and the one way an
+    // otherwise-plausible implementation would be wrong: binding the
+    // `redacted_for_logging` rendering. Payload:
+    // `{"url": "https://api.example.com/v1?token=${{ secrets.T }}&x=1"}` with
+    // `secrets.T = "tok-INTERP-SECRET-0013"`, standing in for a resolved
+    // `with:` block being folded back into a context for a dependent step.
+    let mut c = ExprContext::new();
+    c.set_secret("secrets", json!({"T": "tok-INTERP-SECRET-0013"}));
+
+    let produced = interpolate_json(
+        JsonTemplateSource::from_workflow_file(
+            &json!({"url": "https://api.example.com/v1?token=${{ secrets.T }}&x=1"}),
+        ),
+        &c,
+    )
+    .unwrap();
+    assert!(produced.is_secret_derived());
+
+    c.set_from("resolved", &produced);
+
+    let read_back = eval(ExpressionSource::from_workflow_file("resolved.url"), &c).unwrap();
+    assert_eq!(
+        read_back.value,
+        json!("https://api.example.com/v1?token=tok-INTERP-SECRET-0013&x=1"),
+        "`set_from` must bind the UNREDACTED rendering — binding `***` would corrupt \
+         every downstream step's real value, and the redacted half is re-derived at \
+         render time from the provenance carried across here"
+    );
+    assert!(
+        read_back.secret_derived,
+        "…and the taint comes across with it"
+    );
+
+    let rendered = interpolate(
+        TemplateSource::from_workflow_file("GET ${{ resolved.url }}"),
+        &c,
+    )
+    .unwrap();
+    assert_eq!(rendered.redacted_for_logging(), "GET ***");
+}
+
+#[test]
+fn set_from_cannot_lower_a_root_already_marked_secret() {
+    // `set_from` composes with fix round 4's monotonicity rather than
+    // side-stepping it: a clean producer bound over a name that was already
+    // secret does not un-taint that name. Payload:
+    // `set_secret("item", "SECRETVALUE12345")`, then `set_from` with the clean
+    // `eval("'literal'")`.
+    let mut c = ExprContext::new();
+    c.set_secret("item", json!("SECRETVALUE12345"));
+
+    let clean = eval(ExpressionSource::from_workflow_file("'literal'"), &c).unwrap();
+    assert!(!clean.secret_derived);
+    c.set_from("item", &clean);
+
+    let read_back = eval(ExpressionSource::from_workflow_file("item"), &c).unwrap();
+    assert_eq!(read_back.value, json!("literal"), "the value is replaced");
+    assert!(
+        read_back.secret_derived,
+        "…but the name keeps the provenance it earned: `set_from` routes a clean \
+         producer through `set_public`, which is monotone"
+    );
+}
+
+// ---- Fix round 5, item 4: the carry-forward that `default()` no longer
+// rescues a bad subscript, pinned so the doc comment stating it cannot go
+// stale (this phase treats a doc whose reasoning stopped matching the code as
+// a real defect). ----
+
+#[test]
+fn default_cannot_rescue_a_failed_subscript_and_a_numeric_string_index_does_not_coerce() {
+    // The two exact payloads `ExprError::NonNumericIndex`'s carry-forward doc
+    // names, over `inputs = {"arr": [10, 20, 30], "obj": {}, "s": "1"}`:
+    //
+    //   default(inputs.arr[inputs.obj.nope], 'fallback')
+    //       before fix round 4's item F: Ok("fallback")   — the subscript was
+    //       a silent Null, so `default` substituted. Now: this error, because
+    //       the chain fails before `default` is ever called.
+    //   inputs.arr[inputs.s]   with s = "1"
+    //       before: Null. Now: this error — `"1"` is a string, and `[..]`
+    //       takes a number. No numeric-string coercion; that is the open
+    //       question the doc records, not settled here.
+    let mut c = ExprContext::new();
+    c.set_public("inputs", json!({"arr": [10, 20, 30], "obj": {}, "s": "1"}));
+
+    let err = eval(
+        ExpressionSource::from_workflow_file("default(inputs.arr[inputs.obj.nope], 'fallback')"),
+        &c,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ExprError::NonNumericIndex { index_expression, .. }
+                if index_expression == "inputs.obj.nope"
+        ),
+        "`default` catches a `Null`, not an error, so it cannot rescue this: {err:?}"
+    );
+
+    let err = eval(
+        ExpressionSource::from_workflow_file("inputs.arr[inputs.s]"),
+        &c,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ExprError::NonNumericIndex { index_expression, .. } if index_expression == "inputs.s"
+        ),
+        "a numeric *string* index is not coerced: {err:?}"
+    );
+
+    // …while the same subscript written as a number is still ordinary.
+    assert_eq!(
+        eval(ExpressionSource::from_workflow_file("inputs.arr[1]"), &c)
+            .unwrap()
+            .value,
+        json!(20),
+        "so the two payloads above fail on the subscript's *type*, not on indexing itself"
+    );
+}

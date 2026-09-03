@@ -117,6 +117,20 @@
 //! from a mis-bound secret — a field of it, a slice of it — is covered by
 //! neither mechanism.
 //!
+//! One narrowing of this boundary is worth recording so a later reader does not
+//! mistake it for a mitigation that was silently removed (fix round 5, item 3):
+//! fix round 3's **whole-leaf** redaction *incidentally* covered a
+//! P35-boundary value that happened to share a JSON leaf with a genuine
+//! secret, and fix round 4's per-substitution rendering (ruling E, correctly)
+//! does not. Executed:
+//! `emit: { v: "${{ secrets.T }} and ${{ inputs.cred }}" }` now logs
+//! `{"v":"*** and INPUTS-CARRIED-CREDENTIAL-0009"}` where round 3 logged
+//! `{"v":"***"}`. **This is not a new hole:** the same mis-bound value already
+//! logged in cleartext whenever it sat in a leaf of its own, in both rounds, so
+//! the set of values that can leak is unchanged — only the incidental coverage
+//! of one co-location is gone, and it was never a property anyone could rely
+//! on.
+//!
 //! This is the honest boundary of the design, and it relocates the
 //! correctness argument: it rests on **every binding site choosing the right
 //! constructor**. That is why [`ExprContext::set_public`] is named as an
@@ -124,6 +138,17 @@
 //! why binding a value of unknown provenance must use
 //! [`ExprContext::set_secret`], and why a rebinding can never *lower* a root's
 //! recorded provenance (see [`ExprContext::set_public`]).
+//!
+//! **Ruling P37's correction to that argument, and the strongest lever
+//! available (fix round 5, item 2).** Naming the non-secret path
+//! `set_public` is *convention*; it is one keystroke from `set_secret`, and an
+//! author who does not know a value's provenance still reaches for it because
+//! it is the only method that lets them proceed without knowing. Where a value
+//! has a **producer** — an [`Evaluated`] or an [`Interpolated<Value>`](Interpolated)
+//! this module returned — [`ExprContext::set_from`] reads the provenance off
+//! that producer, so the binding site never asserts anything. Propagate, do not
+//! re-assert. [`ProvenanceCarrier`] is sealed to the evaluator's own output
+//! types precisely so that "the producer says clean" cannot be forged.
 //!
 //! # Provenance-based redaction (ruling P33) — the complete propagation table
 //!
@@ -152,6 +177,7 @@
 //! | bare identifier bound by [`ExprContext::set_public`] | clean — *asserted* so by the binding site, not proven here (see the boundary section above) |
 //! | bare identifier bound by [`ExprContext::set_secret`] | **secret** |
 //! | bare identifier bound by [`ExprContext::set_with_secret_paths`] | **secret** — the whole object, secret sub-paths included, escapes |
+//! | bare identifier bound by [`ExprContext::set_from`] | whatever its producer recorded — *propagated* from the [`Evaluated`]/[`Interpolated`] it came from, never asserted by the binding site (ruling P37) |
 //! | unbound identifier (resolves to `Null`) | clean |
 //! | `.field` on a secret value | **secret** |
 //! | `.field` walking a root with declared secret paths | **secret** once the walked path reaches or passes a declared path; clean once it provably diverges from every one; still undecided while it is a strict prefix of one |
@@ -637,6 +663,35 @@ pub enum ExprError {
     /// never the value it evaluated to — same rule every other variant here
     /// follows, so a `${{ steps[secrets.T] }}` reports `secrets.T`, not the
     /// secret.
+    ///
+    /// # Carry-forward for Tasks 14-21: `default()` no longer rescues a bad subscript
+    ///
+    /// This error is raised while *evaluating the chain*, so it aborts the
+    /// whole expression rather than producing a `Null` for a wrapper to catch.
+    /// Two behaviours changed with it, and a workflow that relied on either now
+    /// fails its step instead:
+    ///
+    /// - `default(inputs.arr[inputs.obj.nope], 'fallback')` used to return
+    ///   `Ok("fallback")` — the subscript resolved to `Null`, so `default`
+    ///   substituted. It is now this error.
+    /// - `inputs.arr[inputs.s]` with `s = "1"` used to return `Null`. It is now
+    ///   this error: `"1"` is a *string*, and `[..]` takes a number.
+    ///
+    /// **The loss is deliberate** (fix round 4, item F; kept by fix round 5):
+    /// fail-loud beats silently-wrong, which is the defect F fixed — a silent
+    /// `Null` is what let a wrong result look like a right one.
+    ///
+    /// **Open question, not decided here:** whether a numeric *string* index
+    /// (`"1"`) should coerce to `1`. It is a real design question and it gets
+    /// its own decision, not a fix-round add-on. The place it will actually
+    /// bite is Subsystem D's trigger payloads, where values arrive from JSON
+    /// bodies and query strings and a numeric string is the normal shape;
+    /// whoever writes the first `${{ trigger.* }}` subscript should settle it.
+    /// Today: no coercion, and the error above.
+    ///
+    /// Both payloads are executed and pinned by
+    /// `tests/expr.rs::default_cannot_rescue_a_failed_subscript_and_a_numeric_string_index_does_not_coerce`,
+    /// so this carry-forward cannot quietly stop being true.
     #[error(
         "the subscript {index_expression:?} at position {position} did not evaluate to a \
          non-negative whole number; `[..]` indexes an array by position (use `.field` to read \
@@ -746,20 +801,96 @@ impl ExprContext {
         }
     }
 
-    /// Binds `name` as a root usable from an expression (`name.field`,
-    /// `name[0]`, or bare `name`), **asserting that nothing reachable through
-    /// it is secret material.**
+    /// Binds `name` to a value the evaluator produced, **carrying that value's
+    /// own provenance across with it** (ruling P37).
     ///
-    /// # This method is named for the assertion it makes (ruling P35, fix round 4)
+    /// This is the binding method to reach for whenever the value came from
+    /// [`eval`], [`eval_delimited_expression`] or [`interpolate_json`]: the
+    /// producer already computed whether reaching that value read secret
+    /// material, so nobody has to re-assert it. Provenance is *propagated*, not
+    /// *re-stated* — the third time in this phase that has been the right shape
+    /// (the fix-round-3 step boundary and fix-round-4 monotonicity were the
+    /// other two).
     ///
-    /// It used to be called `set`, which made the non-secret path both the
-    /// plainly-named one and the one a reader reaches for by default, with the
-    /// assertion living only in this doc comment. Ruling P35 requires the
-    /// opposite: taint's correctness rests entirely on binding sites, so the
-    /// non-secret path has to be the one you cannot pick without saying so.
-    /// If you do not know a value's provenance, bind it with
+    /// ```text
+    /// let item = eval(ExpressionSource::from_workflow_file(over), &ctx)?;
+    /// ctx.set_from("item", &item);   // secret iff `over` read a secret
+    /// ```
+    ///
+    /// # Why this is stronger than choosing between `set_public` and `set_secret`
+    ///
+    /// [`Self::set_public`] and [`Self::set_secret`] are one keystroke apart,
+    /// and an author who does not know a value's provenance will reach for
+    /// `set_public` because it is the only one that lets them proceed without
+    /// knowing (ruling P37's own diagnosis of the fix-round-4 rename). Here
+    /// there is nothing to know: the flag is read off
+    /// [`ProvenanceCarrier`], which is **sealed** to the evaluator's own output
+    /// types, so a caller cannot substitute a source of provenance that merely
+    /// claims to be clean.
+    ///
+    /// # What it binds
+    ///
+    /// The producer's **unredacted** value — see
+    /// [`ProvenanceCarrier::provenance_value`] for why binding `***` would be
+    /// wrong. This clones that value; the cost of the clone is unmeasured, and
+    /// this method has no callers in this crate yet (see the note below), so
+    /// no workload here exercises it.
+    ///
+    /// # Interaction with monotonicity, and the one thing it does not fix
+    ///
+    /// `set_from` on a clean producer goes through [`Self::set_public`], so it
+    /// inherits monotonicity: it cannot lower a name already marked secret.
+    /// It does **not** rescue a name from the per-root-name conservatism
+    /// described on [`Self::set_public`] — a loop that binds one name per item
+    /// still escalates that name permanently the first time an item is
+    /// tainted.
+    ///
+    /// # No callers here yet, deliberately
+    ///
+    /// As of fix round 5 nothing in `crate::exec` binds an `Evaluated` or an
+    /// `Interpolated<Value>` into a context: `inputs`/`vars` come from
+    /// [`crate::exec::RunContext`], `run.id` is literal, `secrets` is
+    /// `set_secret` by construction, and `steps` goes through
+    /// [`Self::set_with_secret_paths`], which is strictly *more* precise than
+    /// this (per-step paths rather than a whole root) and so is deliberately
+    /// not migrated. This exists because Tasks 14-21 — `map`'s per-item
+    /// binding first — are about to write exactly the binding sites the ruling
+    /// is about, and the API they write against is the one that ships now.
+    pub fn set_from<P: ProvenanceCarrier>(&mut self, name: &str, produced: &P) {
+        let value = produced.provenance_value().clone();
+        if produced.provenance_is_secret_derived() {
+            self.set_secret(name, value);
+        } else {
+            self.set_public(name, value);
+        }
+    }
+
+    /// Binds a value **you wrote literally yourself** as a root usable from an
+    /// expression (`name.field`, `name[0]`, or bare `name`), **asserting that
+    /// nothing reachable through it is secret material.**
+    ///
+    /// # This is the rare escape hatch, not the ordinary binding method (ruling P37)
+    ///
+    /// Reach for it only for genuinely literal data: `run.id`, a workflow
+    /// constant, a fixed test fixture. **If the value came from the evaluator,
+    /// bind it with [`Self::set_from`] instead**, which reads provenance off
+    /// the producer rather than asking you to re-assert it. If it came from
+    /// somewhere else and you do not know its provenance, bind it with
     /// [`Self::set_secret`] — over-redacting a log line is recoverable, and a
     /// credential in the append-only `events` table is not.
+    ///
+    /// # Why the name, and why the name is only half of it (rulings P35, P37)
+    ///
+    /// This used to be called `set`, which made the non-secret path both the
+    /// plainly-named one and the one a reader reaches for by default, with the
+    /// assertion living only in this doc comment. Ruling P35 made it
+    /// self-announcing. Ruling P37 then recorded the honest assessment of that
+    /// rename: it is **the weaker half of the fix.** `set_public` is one
+    /// keystroke from `set_secret`, and an author who does not know a value's
+    /// provenance will still reach for it, *because it is the only method that
+    /// lets them proceed without knowing*. What actually closes the hazard is
+    /// enforcement — the monotonicity below, and [`Self::set_from`] for values
+    /// that have a producer to read.
     ///
     /// # A rebinding can never *lower* a root's provenance
     ///
@@ -779,14 +910,27 @@ impl ExprContext {
     /// shape that had to be fixed at the step boundary in fix round 3, so it
     /// is made **unrepresentable** here rather than documented again.
     ///
-    /// **Accepted conservatism, stated rather than hidden:** monotonicity is
-    /// per *root name*, so a name that ever held secret material keeps
-    /// redacting for the life of the context even if a later binding of that
-    /// same name is genuinely clean (a `map.as` loop over a mixed collection
-    /// would be the shape). That over-redacts a log line; it does not corrupt
-    /// a dispatched value, which never consults provenance at all. Rebind
-    /// under a *different* name, or build a fresh [`ExprContext`], if a clean
-    /// binding must be readable in the log.
+    /// # Monotonicity is per root NAME and irreversible for the context's life — a REQUIREMENT on the caller, not a hint
+    ///
+    /// A name that has ever held secret material keeps redacting for as long as
+    /// that [`ExprContext`] lives, even if a later binding of that same name is
+    /// genuinely clean. **A caller that rebinds one name in a loop must
+    /// therefore use a per-item name or a fresh [`ExprContext`] per item** if
+    /// clean items are to stay readable in the log. This is a requirement, not
+    /// a suggestion: there is no way to undo the escalation afterwards, by
+    /// design.
+    ///
+    /// The scale of the consequence, as reported by the fix-round-4 review and
+    /// **not measured here** (Task 6's `map` does not exist yet, so nothing in
+    /// this tree can run it): a 500-item `map` in which item 1 carries a
+    /// credential produces 500 fully-redacted log lines, *including the item
+    /// names* — one tainted item costs the observability of the other 499. The
+    /// `steps` root is unaffected, because
+    /// [`Self::set_with_secret_paths`] keeps it per-step precise rather than
+    /// whole-root.
+    ///
+    /// What this conservatism cannot do is corrupt a dispatched value, which
+    /// never consults provenance at all; it costs log readability only.
     ///
     /// # What monotonicity does NOT cover
     ///
@@ -795,13 +939,13 @@ impl ExprContext {
     /// nothing checks you. Concretely, for Task 6's `map.as`: if the collection
     /// being iterated was itself derived from a secret (`over:
     /// "${{ json(secrets.K).items }}"`), the per-item binding is a fresh name
-    /// with no prior provenance, so it **must** go through
-    /// [`Self::set_secret`] — otherwise taint stops at the loop boundary
-    /// exactly the way it stopped at the step boundary before
-    /// [`Self::set_with_secret_paths`] existed. The rule is: propagate the
-    /// provenance of whatever the value was computed *from*
-    /// ([`Interpolated::is_secret_derived`]/[`Evaluated::secret_derived`] is
-    /// how you learn it), and choose `set_secret` when you cannot.
+    /// with no prior provenance, so binding it here would stop taint at the
+    /// loop boundary exactly the way it stopped at the step boundary before
+    /// [`Self::set_with_secret_paths`] existed. The rule is: **propagate the
+    /// provenance of whatever the value was computed from — call
+    /// [`Self::set_from`] with the [`Evaluated`]/[`Interpolated`] that produced
+    /// it** — and choose [`Self::set_secret`] when there is no producer to read
+    /// and you do not know.
     pub fn set_public(&mut self, name: &str, value: Value) {
         self.vars.insert(name.to_string(), value);
     }
@@ -813,8 +957,10 @@ impl ExprContext {
     /// rendering [`interpolate`]/[`interpolate_json`] produce — never in the
     /// real value, which still reaches the dispatched task.
     ///
-    /// This is also the correct choice for a value whose provenance the
-    /// binding site does not know (ruling P35).
+    /// This is the correct choice for a value whose provenance the binding
+    /// site does not know (ruling P35) — but if the value came from the
+    /// evaluator its provenance *is* known, and [`Self::set_from`] reads it off
+    /// the producer instead of making you decide (ruling P37).
     pub fn set_secret(&mut self, name: &str, value: Value) {
         self.vars.insert(name.to_string(), value);
         self.secret_provenance
@@ -1103,6 +1249,67 @@ impl<T: fmt::Debug> fmt::Debug for Interpolated<T> {
             .field("redacted", &self.redacted)
             .field("secret_derived", &self.secret_derived)
             .finish_non_exhaustive()
+    }
+}
+
+/// A value **this module's evaluator produced**, which therefore already knows
+/// whether producing it read secret-marked material.
+///
+/// This is what [`ExprContext::set_from`] reads provenance off (ruling P37).
+/// It is implemented for [`Evaluated`] and for
+/// [`Interpolated<Value>`](Interpolated) — the two of this module's three
+/// return shapes that already hold a `Value` a caller could bind — and it is
+/// **sealed**, so it cannot be implemented anywhere else. That is deliberate,
+/// and it is the enforcement the ruling asks for: if any type could implement
+/// this, a caller could hand `set_from` a hand-rolled struct answering `false`,
+/// which is exactly the re-assertion the whole mechanism exists to remove.
+/// Adding a producer therefore means implementing this here, beside the
+/// evaluator that computes the flag.
+///
+/// [`Interpolated<String>`](Interpolated) is left out on purpose rather than by
+/// oversight: [`Self::provenance_value`] returns a *borrow*, and a
+/// `String` rendering has no `&Value` to lend. A caller holding one should
+/// wrap it (`Value::String`) and choose the binding method deliberately, which
+/// is a visible decision rather than a silent conversion.
+pub trait ProvenanceCarrier: sealed::Sealed {
+    /// The **real, unredacted** value to bind — never the redacted rendering.
+    /// A bound root feeds real dispatch as well as the log (a dependent step
+    /// reading `${{ steps.a.output.token }}` must get the token), and the
+    /// redacted half is re-derived at render time from the provenance this
+    /// same trait carries, so binding `***` would corrupt every downstream
+    /// value while buying nothing.
+    fn provenance_value(&self) -> &Value;
+
+    /// Whether producing this value read a root bound as secret material.
+    fn provenance_is_secret_derived(&self) -> bool;
+}
+
+mod sealed {
+    /// Private supertrait of [`super::ProvenanceCarrier`]. Being in a private
+    /// module is what seals it against other crates while still letting this
+    /// one add a producer.
+    pub trait Sealed {}
+    impl Sealed for super::Evaluated {}
+    impl Sealed for super::Interpolated<serde_json::Value> {}
+}
+
+impl ProvenanceCarrier for Evaluated {
+    fn provenance_value(&self) -> &Value {
+        &self.value
+    }
+
+    fn provenance_is_secret_derived(&self) -> bool {
+        self.secret_derived
+    }
+}
+
+impl ProvenanceCarrier for Interpolated<Value> {
+    fn provenance_value(&self) -> &Value {
+        &self.unredacted
+    }
+
+    fn provenance_is_secret_derived(&self) -> bool {
+        self.secret_derived
     }
 }
 
@@ -2311,6 +2518,12 @@ fn index_array(v: Cow<'_, Value>, i: usize) -> Cow<'_, Value> {
 /// outer array itself; `default` clones only whichever one of its two
 /// arguments it selects, leaving any others (including extra, unused ones —
 /// this parser does not enforce arity) untouched.
+///
+/// **`default` catches a `Null`, not an error.** It cannot rescue a failed
+/// subscript — `default(inputs.arr[inputs.obj.nope], 'x')` fails the whole
+/// expression rather than returning `'x'`, because the chain errors before
+/// this function is ever called. See [`ExprError::NonNumericIndex`] for the
+/// two payloads that changed and why the loss is deliberate.
 fn call_function<'a>(name: &str, args: Vec<Cow<'a, Value>>) -> Result<Value, ExprError> {
     match name {
         "len" => Ok(serde_json::json!(match args.first().map(|v| v.as_ref()) {

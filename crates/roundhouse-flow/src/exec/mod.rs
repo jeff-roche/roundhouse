@@ -193,10 +193,20 @@ pub struct StepOutcome {
     /// *that* value already happened before it reached the sink.
     pub output_is_secret_derived: bool,
     /// Whether this step's `when:` condition was computed by reading
-    /// secret-marked material (fix round 4, item C). `false` for a step with
-    /// no `when:`, and `false` when the condition failed to evaluate — see
-    /// [`Executor::run_to_completion`]'s gate arm for what this records and
-    /// the channel it exists to make legible.
+    /// secret-marked material (fix round 4, item C).
+    ///
+    /// `false` **only** for a step with no `when:` at all, or for one whose
+    /// `when:` evaluated successfully without reading a secret-marked root. A
+    /// `when:` that *failed to evaluate* records `true` (fix round 5, item 1),
+    /// because its taint is unknown and ruling P35's rule for an unknown
+    /// provenance is to treat it as secret-derived — recording `false` there
+    /// reported the gate as clean for exactly the runs where the secret's
+    /// content caused the failure. See [`Executor::run_to_completion`]'s gate
+    /// arms for the executed payload and for the channel this exists to make
+    /// legible.
+    ///
+    /// Read this rather than re-deriving it: a re-derivation that disagrees
+    /// with this one is a leak.
     pub gate_condition_was_secret_derived: bool,
 }
 
@@ -204,7 +214,10 @@ impl StepOutcome {
     /// A step that did not run to completion: no output, so nothing derived
     /// from a secret can be in it. `gate_condition_was_secret_derived` is
     /// filled in by [`Executor::run_to_completion`], which is the only place
-    /// that has evaluated a `when:`.
+    /// that has evaluated a `when:` — including its `Err` arm, which
+    /// deliberately overrides the `false` set here with `true` (fix round 5,
+    /// item 1). Do not read the `false` below as a statement about the gate;
+    /// it is only the placeholder for a caller that has not evaluated one.
     fn failed(step_id: &str, message: String) -> Self {
         StepOutcome {
             step_id: step_id.to_string(),
@@ -576,16 +589,47 @@ impl<'a> Executor<'a> {
                         }
                     }
                     Err(e) => {
-                        // Residual, named rather than papered over: whether the
-                        // condition *failed to evaluate* is also a function of
-                        // the condition, and `ExprError` carries no taint flag
-                        // to record it with, so this stays `false`. The failure
-                        // path itself writes only a bounded, source-text-only
-                        // diagnostic (see `StepStatus`'s `Debug` impl), so no
-                        // secret *value* rides along; the missing bit is the
-                        // same one-bit shape accepted above.
-                        let outcome =
+                        // **Records `true`, and that is the whole point (fix
+                        // round 5, item 1).** `ExprError` carries no taint flag,
+                        // so this arm does not *know* whether the condition read
+                        // secret material — and ruling P35's rule for exactly
+                        // that situation is: if you do not know a value's
+                        // provenance, treat it as secret-derived. An earlier
+                        // version of this arm went through
+                        // `StepOutcome::failed`, which records `false`, and so
+                        // reported the gate as **clean for precisely the runs
+                        // where the secret's content caused the failure.**
+                        //
+                        // Executed, one workflow, two runs differing only in the
+                        // secret's content, asserted by
+                        // `a_when_that_fails_to_evaluate_because_of_the_secrets_content_records_the_gate_as_secret_derived`:
+                        // `when: "${{ inputs.arr[json(secrets.K).idx] }}"` with
+                        // `K = {"idx":0}` completes, and with
+                        // `K = {"idx":"not-a-number"}` fails — the subscript is
+                        // a non-number only because of what the secret said.
+                        // Fix round 4's item F *widened* this class: a
+                        // secret-derived subscript that used to evaluate
+                        // silently to `Null` is now an error, so more evaluation
+                        // failures than before are a function of a secret.
+                        //
+                        // This matters because the flag exists to be *read*
+                        // rather than re-derived (item D): a consumer seeing
+                        // `false` concludes "no redaction needed" for a gate
+                        // that did read `secrets.*`. `Option<bool>` was
+                        // considered and rejected — it makes "unknown"
+                        // representable but invites `unwrap_or(false)` at the
+                        // consumer, which is the same fail-open one layer up.
+                        // `true` is fail-safe by construction and asks no
+                        // discipline of a future caller; its cost is
+                        // over-redacting the log line of a gate that failed for
+                        // a reason having nothing to do with a secret.
+                        //
+                        // The failure path itself still writes only a bounded,
+                        // source-text-only diagnostic (see `StepStatus`'s
+                        // `Debug` impl), so no secret *value* rides along here.
+                        let mut outcome =
                             StepOutcome::failed(&step.id, format!("evaluating `when:`: {e}"));
+                        outcome.gate_condition_was_secret_derived = true;
                         steps_context.insert(step.id.clone(), steps_context_entry(&outcome));
                         outcomes.push(outcome);
                         continue;
