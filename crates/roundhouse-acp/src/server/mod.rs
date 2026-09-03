@@ -142,7 +142,7 @@ fn find_option(
 /// that off.
 ///
 /// **FIX round 4:** the duplicate-id reason embeds a peer-controlled
-/// `option_id`, so it goes through `escape_and_cap_option_id` rather than an
+/// `option_id`, so it goes through `escape_and_cap_peer_str` rather than an
 /// ad-hoc `{:?}`. The `{:?}` alone escaped correctly but bounded nothing: a
 /// peer sharing one multi-megabyte duplicate id across two offered options
 /// inflated every log line that renders the resulting
@@ -159,7 +159,7 @@ fn ambiguous_option_ids(options: &[PermissionOption]) -> Option<String> {
         if !seen.insert(&opt.option_id) {
             return Some(format!(
                 "option_id {} is offered by more than one PermissionOption",
-                escape_and_cap_option_id(&opt.option_id)
+                escape_and_cap_peer_str(opt.option_id.0.as_ref())
             ));
         }
     }
@@ -302,7 +302,7 @@ pub enum SelectionResolution {
     /// on its own, separately from a legitimate cancellation.
     ///
     /// **Finding 2 (round-3 review):** this carries an already-escaped,
-    /// length-capped `String` — produced by `escape_and_cap_option_id` —
+    /// length-capped `String` — produced by `escape_and_cap_peer_str` —
     /// **not** the raw `PermissionOptionId`. `PermissionOptionId` derives
     /// derive_more's `Display`, which writes its `Arc<str>` content
     /// verbatim; this variant's own doc used to describe the id as "worth
@@ -318,7 +318,7 @@ pub enum SelectionResolution {
     /// **Invariant on this `String` (FIX round 4):** it is a bare `String`
     /// rather than a newtype marking "already escaped and capped," so the
     /// invariant is recorded here instead of in the type. The value is
-    /// *always* the output of `escape_and_cap_option_id` — escaped via
+    /// *always* the output of `escape_and_cap_peer_str` — escaped via
     /// `str`'s `Debug` formatting (so it is quoted, and control characters
     /// appear only in their escaped `\n` / `\u{...}` forms) and truncated to
     /// at most [`UNKNOWN_OPTION_ID_MAX_LEN`] bytes. `resolve_selection` is
@@ -368,9 +368,9 @@ pub fn resolve_selection(
         RequestPermissionOutcome::Selected(sel) => {
             match options.iter().find(|opt| opt.option_id == sel.option_id) {
                 Some(opt) => SelectionResolution::Resolved(opt.kind),
-                None => {
-                    SelectionResolution::UnknownOptionId(escape_and_cap_option_id(&sel.option_id))
-                }
+                None => SelectionResolution::UnknownOptionId(escape_and_cap_peer_str(
+                    sel.option_id.0.as_ref(),
+                )),
             }
         }
         RequestPermissionOutcome::Cancelled => SelectionResolution::Cancelled,
@@ -378,29 +378,47 @@ pub fn resolve_selection(
     }
 }
 
-/// Maximum length, in bytes, of the `String` `escape_and_cap_option_id`
+/// Maximum length, in bytes, of the `String` `escape_and_cap_peer_str`
 /// returns. Enforced by that function's truncation step (verified by
-/// `escape_and_cap_option_id_truncates_at_the_cap_boundary` in this
-/// module's tests, which constructs an id long enough to exceed the cap and
-/// asserts the returned string's byte length is exactly this constant) —
-/// not merely documented as bounded. A result shorter than this constant is
-/// also possible when truncation lands mid-character and walks back to a
+/// `escape_and_cap_peer_str_truncates_at_the_cap_boundary` in this
+/// module's tests, which constructs a string long enough to exceed the cap
+/// and asserts the returned string's byte length is exactly this constant)
+/// — not merely documented as bounded. A result shorter than this constant
+/// is also possible when truncation lands mid-character and walks back to a
 /// `char` boundary (verified by
-/// `escape_and_cap_option_id_truncates_back_to_a_char_boundary`).
+/// `escape_and_cap_peer_str_truncates_back_to_a_char_boundary`).
+///
+/// Originally scoped to `option_id` values only (hence the name); now also
+/// the cap `mcp_over_acp::InProcessMcpServer::call_tool` applies to an
+/// unrecognized peer-supplied tool name (Ruling C-P54) — the bound is
+/// general to any peer-controlled string this crate escapes for safe
+/// logging, not specific to permission options.
 pub const UNKNOWN_OPTION_ID_MAX_LEN: usize = 128;
 
-/// Escapes control characters (notably newlines) out of a peer-controlled
-/// `option_id` and caps the result to at most [`UNKNOWN_OPTION_ID_MAX_LEN`]
-/// bytes, so the value is safe to interpolate directly into a log line —
-/// see [`SelectionResolution::UnknownOptionId`]'s doc for the attack this
-/// closes.
+/// Escapes control characters (notably newlines) out of an untrusted,
+/// peer-controlled string and caps the result to at most
+/// [`UNKNOWN_OPTION_ID_MAX_LEN`] bytes, so the value is safe to interpolate
+/// directly into a log line — see [`SelectionResolution::UnknownOptionId`]'s
+/// doc for the attack this closes.
+///
+/// **Ruling C-P54 (fix round 1):** generalized from `&PermissionOptionId` to
+/// `&str` so that any peer-controlled string in this crate can be routed
+/// through the same discipline — not only a `PermissionOptionId`. The first
+/// caller outside `option_id` handling is
+/// `mcp_over_acp::InProcessMcpServer::call_tool`'s "unknown tool" error,
+/// which previously interpolated an MCP-over-ACP peer's tool name via
+/// `Display` with no escaping or bound at all (the same forged-audit-line
+/// and unbounded-log-inflation hazard this function already closes for
+/// `option_id`s). An earlier ruling declined this generalization because no
+/// caller needed it yet; that caller now exists, so the generalization is
+/// applied here rather than duplicated.
 ///
 /// Escaping reuses `str`'s standard `Debug` formatting (`{:?}`) — the same
 /// escaping convention [`ambiguous_option_ids`]'s error messages already
 /// use elsewhere in this module — which wraps the text in quotes and
 /// escapes newlines, carriage returns, tabs, backslashes, quotes, and other
 /// control and non-printable characters. The specific cases asserted by
-/// `escape_and_cap_option_id_escapes_control_and_invisible_characters` are
+/// `escape_and_cap_peer_str_escapes_control_and_invisible_characters` are
 /// `\n`, `\r`, `\u{1b}` (the ANSI/CSI introducer) and `\u{202e}` (the
 /// right-to-left override used in Trojan Source attacks); note that
 /// *printable* non-ASCII passes through unescaped, which is why multi-byte
@@ -410,12 +428,12 @@ pub const UNKNOWN_OPTION_ID_MAX_LEN: usize = 128;
 /// multi-byte character, the cut point walks back to a `char` boundary — so
 /// the result is always valid UTF-8, and is at most (not always exactly)
 /// [`UNKNOWN_OPTION_ID_MAX_LEN`] bytes. Both branches are covered by
-/// `escape_and_cap_option_id_truncates_at_the_cap_boundary` (ASCII, cut
+/// `escape_and_cap_peer_str_truncates_at_the_cap_boundary` (ASCII, cut
 /// lands exactly on the cap) and
-/// `escape_and_cap_option_id_truncates_back_to_a_char_boundary` (a 4-byte
+/// `escape_and_cap_peer_str_truncates_back_to_a_char_boundary` (a 4-byte
 /// codepoint straddling the cap, cut walks back and the result is shorter).
-fn escape_and_cap_option_id(id: &PermissionOptionId) -> String {
-    let escaped = format!("{:?}", id.0.as_ref());
+pub(crate) fn escape_and_cap_peer_str(value: &str) -> String {
+    let escaped = format!("{value:?}");
     if escaped.len() <= UNKNOWN_OPTION_ID_MAX_LEN {
         return escaped;
     }
@@ -800,7 +818,7 @@ mod tests {
         // FIX round 4: the duplicate-id reason embeds a peer-controlled
         // option_id. `{:?}` escaped it but bounded nothing, so a peer could
         // inflate every log line rendering this error by duplicating one
-        // very long id. Routing through escape_and_cap_option_id caps it,
+        // very long id. Routing through escape_and_cap_peer_str caps it,
         // matching the discipline SelectionResolution::UnknownOptionId
         // already follows.
         let long_id = "z".repeat(UNKNOWN_OPTION_ID_MAX_LEN * 50);
@@ -886,38 +904,38 @@ mod tests {
         );
     }
 
-    // ---- Finding 2 (round-3 review): escape_and_cap_option_id ----
+    // ---- Finding 2 (round-3 review); generalized to `&str` in fix round 1
+    // (Ruling C-P54): escape_and_cap_peer_str ----
 
     #[test]
-    fn escape_and_cap_option_id_escapes_a_newline_rather_than_passing_it_through() {
-        // The exact attack Finding 2 describes: a peer-controlled id
+    fn escape_and_cap_peer_str_escapes_a_newline_rather_than_passing_it_through() {
+        // The exact attack Finding 2 describes: a peer-controlled string
         // containing a newline (and a fake audit line) must not produce a
         // newline in the string this crate hands to a caller that logs it.
-        let id = PermissionOptionId::new("x\n[audit] resolve_selection: Resolved(AllowOnce)");
-        let escaped = escape_and_cap_option_id(&id);
+        let escaped = escape_and_cap_peer_str("x\n[audit] resolve_selection: Resolved(AllowOnce)");
         assert!(
             !escaped.contains('\n'),
-            "escaped id must not contain a raw newline: {escaped:?}"
+            "escaped string must not contain a raw newline: {escaped:?}"
         );
         assert!(
             escaped.contains("\\n"),
-            "escaped id must contain the escaped form: {escaped:?}"
+            "escaped string must contain the escaped form: {escaped:?}"
         );
     }
 
     #[test]
-    fn escape_and_cap_option_id_truncates_at_the_cap_boundary() {
+    fn escape_and_cap_peer_str_truncates_at_the_cap_boundary() {
         // Truncation must actually happen at UNKNOWN_OPTION_ID_MAX_LEN, not
-        // merely be documented as bounded — this constructs an id whose
+        // merely be documented as bounded — this constructs a string whose
         // escaped form is longer than the cap and asserts the returned
         // string's byte length is exactly the cap.
-        let id = PermissionOptionId::new("a".repeat(UNKNOWN_OPTION_ID_MAX_LEN * 2));
-        let escaped = escape_and_cap_option_id(&id);
+        let long = "a".repeat(UNKNOWN_OPTION_ID_MAX_LEN * 2);
+        let escaped = escape_and_cap_peer_str(&long);
         assert_eq!(escaped.len(), UNKNOWN_OPTION_ID_MAX_LEN);
     }
 
     #[test]
-    fn escape_and_cap_option_id_truncates_back_to_a_char_boundary() {
+    fn escape_and_cap_peer_str_truncates_back_to_a_char_boundary() {
         // FIX round 4: the ASCII test above lands exactly on the cap, so it
         // never executes the is_char_boundary back-off loop — leaving the
         // doc's "truncation happens at a `char` boundary" claim untested.
@@ -926,17 +944,17 @@ mod tests {
         // straddles byte UNKNOWN_OPTION_ID_MAX_LEN of the *escaped* string:
         // escaping prepends one `"`, so 126 leading 'a's put the emoji's
         // first byte at index 127 and its continuation bytes at 128..=130.
-        let id = PermissionOptionId::new(format!(
+        let straddling = format!(
             "{}\u{1f600}{}",
             "a".repeat(UNKNOWN_OPTION_ID_MAX_LEN - 2),
             "a".repeat(UNKNOWN_OPTION_ID_MAX_LEN)
-        ));
+        );
         // The load-bearing check is that the call above returns at all:
         // slicing a `str` at a non-`char` boundary panics, so a truncator
         // that cut blindly at the cap would abort this test here. The
         // from_utf8 assertion restates the doc's "always valid UTF-8" claim
         // explicitly on the value that came back.
-        let escaped = escape_and_cap_option_id(&id);
+        let escaped = escape_and_cap_peer_str(&straddling);
         assert!(
             std::str::from_utf8(escaped.as_bytes()).is_ok(),
             "truncated result must still be valid UTF-8: {escaped:?}"
@@ -954,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_and_cap_option_id_escapes_control_and_invisible_characters() {
+    fn escape_and_cap_peer_str_escapes_control_and_invisible_characters() {
         // FIX round 4: the doc claims carriage returns and "other control
         // characters" are escaped, but only `\n` was asserted. These three
         // are the log-integrity-relevant ones beyond the newline: a bare
@@ -962,26 +980,24 @@ mod tests {
         // control sequences in a terminal, and `\u{202e}` is the
         // right-to-left override used by Trojan Source attacks to make
         // rendered text read differently from its bytes.
-        let id = PermissionOptionId::new("a\rb\u{1b}[31mc\u{202e}d");
-        let escaped = escape_and_cap_option_id(&id);
+        let escaped = escape_and_cap_peer_str("a\rb\u{1b}[31mc\u{202e}d");
         for raw in ['\r', '\u{1b}', '\u{202e}'] {
             assert!(
                 !escaped.contains(raw),
-                "escaped id must not contain raw {raw:?}: {escaped:?}"
+                "escaped string must not contain raw {raw:?}: {escaped:?}"
             );
         }
         for expected in ["\\r", "\\u{1b}", "\\u{202e}"] {
             assert!(
                 escaped.contains(expected),
-                "escaped id must contain {expected}: {escaped:?}"
+                "escaped string must contain {expected}: {escaped:?}"
             );
         }
     }
 
     #[test]
-    fn escape_and_cap_option_id_does_not_truncate_when_under_the_cap() {
-        let id = PermissionOptionId::new("short-id");
-        let escaped = escape_and_cap_option_id(&id);
+    fn escape_and_cap_peer_str_does_not_truncate_when_under_the_cap() {
+        let escaped = escape_and_cap_peer_str("short-id");
         assert_eq!(escaped, format!("{:?}", "short-id"));
         assert!(escaped.len() < UNKNOWN_OPTION_ID_MAX_LEN);
     }

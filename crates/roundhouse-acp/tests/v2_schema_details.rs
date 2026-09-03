@@ -141,3 +141,52 @@ fn from_the_real_sdk_v2_stop_reason_matches_the_compiler_proven_conversion() {
         StopReason::Other("future_stop_reason_v3".to_string())
     );
 }
+
+#[test]
+fn other_normalizes_known_wire_values_instead_of_holding_them() {
+    // Ruling C-P58: `StopReason::Other` must never hold a string equal to a
+    // known variant's wire encoding — `StopReason::other` is the
+    // normalization boundary that enforces it.
+    for (wire, known) in [
+        ("end_turn", StopReason::EndTurn),
+        ("max_tokens", StopReason::MaxTokens),
+        ("max_turn_requests", StopReason::MaxTurnRequests),
+        ("refusal", StopReason::Refusal),
+        ("cancelled", StopReason::Cancelled),
+    ] {
+        let normalized = StopReason::other(wire);
+        assert_eq!(
+            normalized, known,
+            "StopReason::other({wire:?}) must normalize to the known variant"
+        );
+        assert_ne!(
+            normalized,
+            StopReason::Other(wire.to_string()),
+            "StopReason::other({wire:?}) must not hold the known value inside Other"
+        );
+    }
+
+    // An actually-unrecognized value still falls through to Other, byte for
+    // byte, unchanged.
+    assert_eq!(
+        StopReason::other("future_stop_reason_v3"),
+        StopReason::Other("future_stop_reason_v3".to_string())
+    );
+}
+
+#[test]
+fn from_sdk_other_holding_a_known_wire_value_normalizes_instead_of_shadowing_it() {
+    // Ruling C-P58: no wire path may produce an `Other` holding a known
+    // value. This exercises the one construction path in this crate that
+    // could otherwise do so — the `From<SdkStopReason>` impl's `Other(s)`
+    // arm — with an SDK `Other` built to carry a known wire string directly
+    // (e.g. as a future SDK version might, if it ever stopped guaranteeing
+    // its own deserializer routes known strings to their named variants).
+    use agent_client_protocol::schema::v2::StopReason as SdkStopReason;
+    assert_eq!(
+        StopReason::from(SdkStopReason::Other("end_turn".to_string())),
+        StopReason::EndTurn,
+        "an SDK Other carrying a known wire value must normalize on conversion, \
+         not become a StopReason::Other holding a known value"
+    );
+}
