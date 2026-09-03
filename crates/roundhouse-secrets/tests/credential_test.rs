@@ -327,6 +327,60 @@ async fn oauth_refresh_does_not_cache_a_non_200_token_response() {
     );
 }
 
+/// A transport that streams a token response body past
+/// `OAuthRefreshCredential`'s safety ceiling, in small chunks so the guard
+/// must trip mid-stream (not merely on the first chunk).
+struct OversizedOAuthTransport;
+impl HttpTransport for OversizedOAuthTransport {
+    fn send<'a>(
+        &'a self,
+        _req: HttpRequest,
+    ) -> BoxFuture<'a, Result<HttpResponseStream, TransportError>> {
+        Box::pin(async {
+            // One byte over the documented 64 KiB ceiling, delivered as
+            // 1 KiB chunks -- large enough that a naive "check only the
+            // first chunk" guard would wrongly pass this.
+            let chunk = Bytes::from(vec![b'a'; 1024]);
+            let chunks: Vec<Result<Bytes, TransportError>> =
+                std::iter::repeat_with(|| Ok(chunk.clone()))
+                    .take(64)
+                    .chain(std::iter::once(Ok(Bytes::from(vec![b'a'; 1]))))
+                    .collect();
+            Ok(HttpResponseStream {
+                status: 200,
+                headers: vec![],
+                body: Box::pin(futures::stream::iter(chunks)),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn oauth_refresh_rejects_a_token_response_over_the_size_ceiling() {
+    // Fix round 4, Fix 3: the token endpoint's response is drained into an
+    // uncapped `Vec<u8>` before this fix. An oversized (or endlessly
+    // streaming) response must be rejected outright, not truncated and
+    // parsed as if it were complete.
+    let cred = OAuthRefreshCredential::new(
+        "https://auth.example.com/token",
+        "client-1",
+        Secret::new("secret".to_string()),
+    )
+    .unwrap();
+    let t = OversizedOAuthTransport;
+    let mut req = empty_request();
+    let err = cred.apply(&mut req, &ctx(&t)).await.unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("exceeded"),
+        "expected a size-ceiling rejection, got: {message}"
+    );
+    assert!(
+        header(&req, "authorization").is_none(),
+        "a rejected oversized response must not apply any credential to the request"
+    );
+}
+
 #[tokio::test]
 async fn oauth_refresh_reports_transport_failure_as_host_only() {
     // A5: never surface a transport error's full `Display` (which, for a

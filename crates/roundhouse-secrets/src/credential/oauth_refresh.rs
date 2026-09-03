@@ -12,6 +12,17 @@ struct CachedToken {
     expires_at: Instant,
 }
 
+/// A tight ceiling on the OAuth token endpoint's response body. Modelled on
+/// `transport/eventstream.rs`'s `MAX_BUFFERED_BYTES`, but far smaller: a
+/// client-credentials token response is a few hundred bytes of JSON
+/// (`access_token`, `token_type`, `expires_in`, optionally `scope`), and
+/// even a large opaque or JWT-shaped `access_token` comes nowhere near this.
+/// This sits on the credential-resolution path (reached before any codec is
+/// involved), so it is not covered by the seven codec `collect_body` copies'
+/// recorded residual. Exceeding it is a reject, not a truncate: a truncated
+/// token response must not be parsed as if it were complete.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// OAuth2 client-credentials grant, with a single-flight refresh cache.
 ///
 /// Single-flight is achieved via the cache mutex itself: `apply` holds the
@@ -188,6 +199,13 @@ impl CredentialProvider for OAuthRefreshCredential {
                         record_base_url_override(&self.refresh_url)
                     ))
                 })?;
+                if body_bytes.len().saturating_add(chunk.len()) > MAX_TOKEN_RESPONSE_BYTES {
+                    return Err(CredentialError::RefreshFailed(format!(
+                        "token response from {} exceeded the {MAX_TOKEN_RESPONSE_BYTES}-byte \
+                         safety ceiling before completing",
+                        record_base_url_override(&self.refresh_url)
+                    )));
+                }
                 body_bytes.extend_from_slice(&chunk);
             }
             let parsed: OAuthTokenResponse = serde_json::from_slice(&body_bytes)
