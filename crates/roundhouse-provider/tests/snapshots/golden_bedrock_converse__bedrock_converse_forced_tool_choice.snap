@@ -5,23 +5,19 @@ expression: body
 {
   "messages": [
     {
+      "role": "user",
       "content": [
         {
           "text": "What's the weather in Tokyo?"
         }
-      ],
-      "role": "user"
+      ]
     }
   ],
   "toolConfig": {
-    "toolChoice": {
-      "tool": {
-        "name": "get_weather"
-      }
-    },
     "tools": [
       {
         "toolSpec": {
+          "name": "get_weather",
           "description": "Get the current weather",
           "inputSchema": {
             "json": {
@@ -29,10 +25,14 @@ expression: body
               "title": "NoParams",
               "type": "object"
             }
-          },
-          "name": "get_weather"
+          }
         }
       }
-    ]
+    ],
+    "toolChoice": {
+      "tool": {
+        "name": "get_weather"
+      }
+    }
   }
 }

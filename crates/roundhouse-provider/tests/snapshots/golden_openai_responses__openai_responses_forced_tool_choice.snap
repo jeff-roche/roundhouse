@@ -3,34 +3,34 @@ source: crates/roundhouse-provider/tests/golden_openai_responses.rs
 expression: body
 ---
 {
+  "model": "gpt-5.4",
   "input": [
     {
+      "type": "message",
+      "role": "user",
       "content": [
         {
-          "text": "What's the weather in Tokyo?",
-          "type": "input_text"
+          "type": "input_text",
+          "text": "What's the weather in Tokyo?"
         }
-      ],
-      "role": "user",
-      "type": "message"
+      ]
     }
   ],
-  "model": "gpt-5.4",
   "stream": true,
-  "tool_choice": {
-    "name": "get_weather",
-    "type": "function"
-  },
   "tools": [
     {
-      "description": "Get the current weather",
+      "type": "function",
       "name": "get_weather",
+      "description": "Get the current weather",
       "parameters": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "NoParams",
         "type": "object"
-      },
-      "type": "function"
+      }
     }
-  ]
+  ],
+  "tool_choice": {
+    "type": "function",
+    "name": "get_weather"
+  }
 }

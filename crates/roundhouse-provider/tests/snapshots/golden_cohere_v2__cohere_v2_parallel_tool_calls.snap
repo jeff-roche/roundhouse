@@ -3,38 +3,38 @@ source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
 expression: enc(&req)
 ---
 {
+  "model": "command-a-03-2026",
   "messages": [
     {
-      "content": "Weather and time in Tokyo?",
-      "role": "user"
+      "role": "user",
+      "content": "Weather and time in Tokyo?"
     }
   ],
-  "model": "command-a-03-2026",
   "stream": true,
   "tools": [
     {
+      "type": "function",
       "function": {
-        "description": "Get the current weather",
         "name": "get_weather",
+        "description": "Get the current weather",
         "parameters": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
           "title": "NoParams",
           "type": "object"
         }
-      },
-      "type": "function"
+      }
     },
     {
+      "type": "function",
       "function": {
-        "description": "Get the current time",
         "name": "get_time",
+        "description": "Get the current time",
         "parameters": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
           "title": "NoParams",
           "type": "object"
         }
-      },
-      "type": "function"
+      }
     }
   ]
 }

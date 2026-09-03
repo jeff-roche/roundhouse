@@ -5,42 +5,42 @@ expression: "encode(&req, &fixture_profile())"
 {
   "messages": [
     {
+      "role": "user",
       "content": [
         {
           "text": "What's the weather in Tokyo?"
         }
-      ],
-      "role": "user"
+      ]
     },
     {
+      "role": "assistant",
       "content": [
         {
           "toolUse": {
+            "toolUseId": "call_1",
+            "name": "get_weather",
             "input": {
               "location": "Tokyo"
-            },
-            "name": "get_weather",
-            "toolUseId": "call_1"
+            }
           }
         }
-      ],
-      "role": "assistant"
+      ]
     },
     {
+      "role": "user",
       "content": [
         {
           "toolResult": {
+            "toolUseId": "call_1",
             "content": [
               {
                 "text": "sunny, 22C"
               }
             ],
-            "status": "success",
-            "toolUseId": "call_1"
+            "status": "success"
           }
         }
-      ],
-      "role": "user"
+      ]
     }
   ]
 }

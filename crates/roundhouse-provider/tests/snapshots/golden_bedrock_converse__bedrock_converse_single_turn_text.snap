@@ -5,12 +5,12 @@ expression: "encode(&req, &fixture_profile())"
 {
   "messages": [
     {
+      "role": "user",
       "content": [
         {
           "text": "What is 2+2?"
         }
-      ],
-      "role": "user"
+      ]
     }
   ]
 }

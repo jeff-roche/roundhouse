@@ -5,12 +5,12 @@ expression: body
 {
   "messages": [
     {
+      "role": "user",
       "content": [
         {
           "text": "Hello."
         }
-      ],
-      "role": "user"
+      ]
     }
   ],
   "system": [

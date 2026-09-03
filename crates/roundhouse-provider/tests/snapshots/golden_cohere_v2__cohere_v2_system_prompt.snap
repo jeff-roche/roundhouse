@@ -3,16 +3,16 @@ source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
 expression: body
 ---
 {
+  "model": "command-a-03-2026",
   "messages": [
     {
-      "content": "You are a careful assistant.",
-      "role": "system"
+      "role": "system",
+      "content": "You are a careful assistant."
     },
     {
-      "content": "Hello.",
-      "role": "user"
+      "role": "user",
+      "content": "Hello."
     }
   ],
-  "model": "command-a-03-2026",
   "stream": true
 }

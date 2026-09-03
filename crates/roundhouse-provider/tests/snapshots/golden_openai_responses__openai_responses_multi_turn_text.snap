@@ -3,38 +3,38 @@ source: crates/roundhouse-provider/tests/golden_openai_responses.rs
 expression: "encode(&req,\n&fixture_profile()).expect(\"encode must succeed for this fixture profile\")"
 ---
 {
+  "model": "gpt-5.4",
   "input": [
     {
+      "type": "message",
+      "role": "user",
       "content": [
         {
-          "text": "What is the capital of France?",
-          "type": "input_text"
+          "type": "input_text",
+          "text": "What is the capital of France?"
         }
-      ],
-      "role": "user",
-      "type": "message"
+      ]
     },
     {
-      "content": [
-        {
-          "text": "Paris.",
-          "type": "output_text"
-        }
-      ],
+      "type": "message",
       "role": "assistant",
-      "type": "message"
-    },
-    {
       "content": [
         {
-          "text": "And its population?",
-          "type": "input_text"
+          "type": "output_text",
+          "text": "Paris."
         }
-      ],
+      ]
+    },
+    {
+      "type": "message",
       "role": "user",
-      "type": "message"
+      "content": [
+        {
+          "type": "input_text",
+          "text": "And its population?"
+        }
+      ]
     }
   ],
-  "model": "gpt-5.4",
   "stream": true
 }

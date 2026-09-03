@@ -3,22 +3,22 @@ source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
 expression: body
 ---
 {
+  "model": "command-a-03-2026",
   "messages": [
     {
-      "content": null,
       "role": "assistant",
+      "content": null,
       "tool_calls": [
         {
-          "function": {
-            "arguments": "{}",
-            "name": "ping"
-          },
           "id": "call_1",
-          "type": "function"
+          "type": "function",
+          "function": {
+            "name": "ping",
+            "arguments": "{}"
+          }
         }
       ]
     }
   ],
-  "model": "command-a-03-2026",
   "stream": true
 }

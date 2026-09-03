@@ -3,17 +3,17 @@ source: crates/roundhouse-provider/tests/golden_google_genai.rs
 expression: "enc(&req, EndpointMode::Interactions)"
 ---
 {
+  "model": "gemini-3.0-pro",
   "input": [
     {
+      "type": "user_input",
       "content": [
         {
-          "text": "こんにちは 🌍 — café naïve",
-          "type": "text"
+          "type": "text",
+          "text": "こんにちは 🌍 — café naïve"
         }
-      ],
-      "type": "user_input"
+      ]
     }
   ],
-  "model": "gemini-3.0-pro",
   "stream": true
 }

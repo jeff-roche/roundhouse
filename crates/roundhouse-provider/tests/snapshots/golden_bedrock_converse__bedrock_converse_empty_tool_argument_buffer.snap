@@ -5,16 +5,16 @@ expression: body
 {
   "messages": [
     {
+      "role": "assistant",
       "content": [
         {
           "toolUse": {
-            "input": {},
+            "toolUseId": "call_1",
             "name": "ping",
-            "toolUseId": "call_1"
+            "input": {}
           }
         }
-      ],
-      "role": "assistant"
+      ]
     }
   ]
 }

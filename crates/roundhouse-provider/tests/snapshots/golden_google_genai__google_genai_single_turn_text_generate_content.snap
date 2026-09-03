@@ -5,12 +5,12 @@ expression: legacy
 {
   "contents": [
     {
+      "role": "user",
       "parts": [
         {
           "text": "What is 2+2?"
         }
-      ],
-      "role": "user"
+      ]
     }
   ]
 }

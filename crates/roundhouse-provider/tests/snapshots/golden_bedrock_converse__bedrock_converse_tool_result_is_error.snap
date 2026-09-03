@@ -5,20 +5,20 @@ expression: body
 {
   "messages": [
     {
+      "role": "user",
       "content": [
         {
           "toolResult": {
+            "toolUseId": "call_1",
             "content": [
               {
                 "text": "permission denied"
               }
             ],
-            "status": "error",
-            "toolUseId": "call_1"
+            "status": "error"
           }
         }
-      ],
-      "role": "user"
+      ]
     }
   ]
 }

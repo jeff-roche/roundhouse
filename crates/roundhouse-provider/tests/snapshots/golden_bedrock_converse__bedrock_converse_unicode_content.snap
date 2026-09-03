@@ -5,12 +5,12 @@ expression: "encode(&req, &fixture_profile())"
 {
   "messages": [
     {
+      "role": "user",
       "content": [
         {
           "text": "こんにちは 🌍 — café naïve"
         }
-      ],
-      "role": "user"
+      ]
     }
   ]
 }

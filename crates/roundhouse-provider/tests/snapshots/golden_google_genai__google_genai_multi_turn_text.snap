@@ -3,35 +3,35 @@ source: crates/roundhouse-provider/tests/golden_google_genai.rs
 expression: "enc(&req, EndpointMode::Interactions)"
 ---
 {
+  "model": "gemini-3.0-pro",
   "input": [
     {
+      "type": "user_input",
       "content": [
         {
-          "text": "What is the capital of France?",
-          "type": "text"
+          "type": "text",
+          "text": "What is the capital of France?"
         }
-      ],
-      "type": "user_input"
+      ]
     },
     {
+      "type": "model_output",
       "content": [
         {
-          "text": "Paris.",
-          "type": "text"
+          "type": "text",
+          "text": "Paris."
         }
-      ],
-      "type": "model_output"
+      ]
     },
     {
+      "type": "user_input",
       "content": [
         {
-          "text": "And its population?",
-          "type": "text"
+          "type": "text",
+          "text": "And its population?"
         }
-      ],
-      "type": "user_input"
+      ]
     }
   ],
-  "model": "gemini-3.0-pro",
   "stream": true
 }

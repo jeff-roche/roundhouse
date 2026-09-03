@@ -3,6 +3,31 @@ source: crates/roundhouse-provider/tests/golden_google_genai.rs
 expression: body
 ---
 {
+  "model": "gemini-3.0-pro",
+  "input": [
+    {
+      "type": "user_input",
+      "content": [
+        {
+          "type": "text",
+          "text": "What's the weather in Tokyo?"
+        }
+      ]
+    }
+  ],
+  "stream": true,
+  "tools": [
+    {
+      "type": "function",
+      "name": "get_weather",
+      "description": "Get the current weather",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "NoParams",
+        "type": "object"
+      }
+    }
+  ],
   "generation_config": {
     "tool_choice": {
       "allowed_tools": {
@@ -12,30 +37,5 @@ expression: body
         ]
       }
     }
-  },
-  "input": [
-    {
-      "content": [
-        {
-          "text": "What's the weather in Tokyo?",
-          "type": "text"
-        }
-      ],
-      "type": "user_input"
-    }
-  ],
-  "model": "gemini-3.0-pro",
-  "stream": true,
-  "tools": [
-    {
-      "description": "Get the current weather",
-      "name": "get_weather",
-      "parameters": {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "NoParams",
-        "type": "object"
-      },
-      "type": "function"
-    }
-  ]
+  }
 }

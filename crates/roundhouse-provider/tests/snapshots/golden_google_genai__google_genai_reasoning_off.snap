@@ -3,17 +3,17 @@ source: crates/roundhouse-provider/tests/golden_google_genai.rs
 expression: body
 ---
 {
+  "model": "gemini-3.0-pro",
   "input": [
     {
+      "type": "user_input",
       "content": [
         {
-          "text": "Hello.",
-          "type": "text"
+          "type": "text",
+          "text": "Hello."
         }
-      ],
-      "type": "user_input"
+      ]
     }
   ],
-  "model": "gemini-3.0-pro",
   "stream": true
 }

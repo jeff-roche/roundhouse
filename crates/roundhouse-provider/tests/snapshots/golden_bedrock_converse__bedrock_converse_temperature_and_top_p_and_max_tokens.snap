@@ -3,19 +3,19 @@ source: crates/roundhouse-provider/tests/golden_bedrock_converse.rs
 expression: body
 ---
 {
-  "inferenceConfig": {
-    "maxTokens": 256,
-    "temperature": 0.699999988079071,
-    "topP": 0.8999999761581421
-  },
   "messages": [
     {
+      "role": "user",
       "content": [
         {
           "text": "Hello."
         }
-      ],
-      "role": "user"
+      ]
     }
-  ]
+  ],
+  "inferenceConfig": {
+    "temperature": 0.699999988079071,
+    "topP": 0.8999999761581421,
+    "maxTokens": 256
+  }
 }

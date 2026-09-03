@@ -3,27 +3,27 @@ source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
 expression: body
 ---
 {
+  "model": "command-a-03-2026",
   "messages": [
     {
-      "content": "What's the weather in Tokyo?",
-      "role": "user"
+      "role": "user",
+      "content": "What's the weather in Tokyo?"
     }
   ],
-  "model": "command-a-03-2026",
   "stream": true,
-  "tool_choice": "REQUIRED",
   "tools": [
     {
+      "type": "function",
       "function": {
-        "description": "Get the current weather",
         "name": "get_weather",
+        "description": "Get the current weather",
         "parameters": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
           "title": "NoParams",
           "type": "object"
         }
-      },
-      "type": "function"
+      }
     }
-  ]
+  ],
+  "tool_choice": "REQUIRED"
 }

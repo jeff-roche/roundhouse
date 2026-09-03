@@ -3,13 +3,13 @@ source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
 expression: body
 ---
 {
+  "model": "command-a-03-2026",
   "messages": [
     {
-      "content": "permission denied",
       "role": "tool",
-      "tool_call_id": "call_1"
+      "tool_call_id": "call_1",
+      "content": "permission denied"
     }
   ],
-  "model": "command-a-03-2026",
   "stream": true
 }

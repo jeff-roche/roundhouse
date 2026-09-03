@@ -5,12 +5,12 @@ expression: body
 {
   "contents": [
     {
+      "role": "user",
       "parts": [
         {
           "text": "Summarize this briefly."
         }
-      ],
-      "role": "user"
+      ]
     }
   ],
   "generationConfig": {

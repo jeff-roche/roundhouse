@@ -5,18 +5,19 @@ expression: "encode(&req, &fixture_profile())"
 {
   "messages": [
     {
+      "role": "user",
       "content": [
         {
           "text": "Weather and time in Tokyo?"
         }
-      ],
-      "role": "user"
+      ]
     }
   ],
   "toolConfig": {
     "tools": [
       {
         "toolSpec": {
+          "name": "get_weather",
           "description": "Get the current weather",
           "inputSchema": {
             "json": {
@@ -24,12 +25,12 @@ expression: "encode(&req, &fixture_profile())"
               "title": "NoParams",
               "type": "object"
             }
-          },
-          "name": "get_weather"
+          }
         }
       },
       {
         "toolSpec": {
+          "name": "get_time",
           "description": "Get the current time",
           "inputSchema": {
             "json": {
@@ -37,8 +38,7 @@ expression: "encode(&req, &fixture_profile())"
               "title": "NoParams",
               "type": "object"
             }
-          },
-          "name": "get_time"
+          }
         }
       }
     ]

@@ -3,13 +3,14 @@ source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
 expression: body
 ---
 {
+  "model": "command-a-03-2026",
   "messages": [
     {
-      "content": "Hello.",
-      "role": "user"
+      "role": "user",
+      "content": "Hello."
     }
   ],
-  "model": "command-a-03-2026",
+  "stream": true,
   "stop_sequences": [
     "STOP_0",
     "STOP_1",
@@ -61,6 +62,5 @@ expression: body
     "STOP_47",
     "STOP_48",
     "STOP_49"
-  ],
-  "stream": true
+  ]
 }

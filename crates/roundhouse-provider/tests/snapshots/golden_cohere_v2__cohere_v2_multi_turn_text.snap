@@ -3,20 +3,20 @@ source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
 expression: enc(&req)
 ---
 {
+  "model": "command-a-03-2026",
   "messages": [
     {
-      "content": "What is the capital of France?",
-      "role": "user"
+      "role": "user",
+      "content": "What is the capital of France?"
     },
     {
-      "content": "Paris.",
-      "role": "assistant"
+      "role": "assistant",
+      "content": "Paris."
     },
     {
-      "content": "And its population?",
-      "role": "user"
+      "role": "user",
+      "content": "And its population?"
     }
   ],
-  "model": "command-a-03-2026",
   "stream": true
 }

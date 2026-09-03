@@ -5,28 +5,28 @@ expression: "encode(&req, &fixture_profile())"
 {
   "messages": [
     {
+      "role": "user",
       "content": [
         {
           "text": "What is the capital of France?"
         }
-      ],
-      "role": "user"
+      ]
     },
     {
+      "role": "assistant",
       "content": [
         {
           "text": "Paris."
         }
-      ],
-      "role": "assistant"
+      ]
     },
     {
+      "role": "user",
       "content": [
         {
           "text": "And its population?"
         }
-      ],
-      "role": "user"
+      ]
     }
   ]
 }
