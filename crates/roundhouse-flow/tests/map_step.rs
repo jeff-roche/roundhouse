@@ -729,3 +729,260 @@ steps:
          and items 1-2 never dispatch at all"
     );
 }
+
+// ---------------------------------------------------------------------
+// Fix round 2 tests.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_when_false_inner_step_gate_is_evaluated_and_skips_the_dispatch() {
+    // Fix round 2, item 1 (the working exploit this round exists to close):
+    // before the fix, `dispatch_map_step` never evaluated an inner step's
+    // `when:` at all, so a guarded destructive step dispatched anyway once
+    // per item. Payload: `inputs.approved = false`, a guarded `tool: shell`
+    // step whose `cmd` would be `["rm","-rf","/"]` if ever dispatched.
+    //
+    // Assert **zero sink events, counted** — not merely "the item's status
+    // isn't completed". Round 1's own shipped `fail_fast` test could not
+    // tell "the fan-out stopped" apart from "the failing step happened to
+    // emit nothing", because its failing step emitted nothing either way; a
+    // `tool: shell` step that actually dispatches is exactly what an event
+    // count catches and a bare status check would not.
+    let yaml = r#"
+name: map-inner-when-false
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: fan_out
+    map:
+      over: "${{ inputs.items }}"
+      as: item
+      on_item_error: continue
+    steps:
+      - id: guarded
+        when: "${{ inputs.approved }}"
+        tool: shell
+        with: { cmd: ["rm", "-rf", "/"] }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = run_ctx(serde_json::json!({"approved": false, "items": [1, 2, 3]}));
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let items = outcomes[0].output["items"]
+        .as_array()
+        .expect("map output has an `items` array");
+    assert_eq!(items.len(), 3);
+    for (i, item) in items.iter().enumerate() {
+        assert_eq!(
+            item["status"],
+            serde_json::json!("skipped"),
+            "item {i}: the guarded step's `when:` evaluated false, so the item is skipped, \
+             not completed: {item:?}"
+        );
+    }
+    assert_eq!(
+        sink.0.len(),
+        0,
+        "the guarded `rm -rf /` step must never dispatch for any item — zero sink events, \
+         counted, not just \"the map didn't report success\""
+    );
+}
+
+#[test]
+fn a_when_that_fails_to_evaluate_on_an_inner_step_fails_closed_and_never_dispatches() {
+    // Fix round 2, item 1, the "worse half": a gate that FAILS TO EVALUATE
+    // must fail closed inside a `map` exactly as it does at top level — not
+    // dispatch the guarded step. Payload: `when: "${{ no_such_fn(1) }}"`,
+    // an undefined-function reference (deterministic, unrelated to any
+    // future task's changes elsewhere), guarding the same destructive
+    // `tool: shell` step.
+    let yaml = r#"
+name: map-inner-when-error
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: fan_out
+    map:
+      over: "${{ inputs.items }}"
+      as: item
+      on_item_error: continue
+    steps:
+      - id: guarded
+        when: "${{ no_such_fn(1) }}"
+        tool: shell
+        with: { cmd: ["rm", "-rf", "/"] }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = run_ctx(serde_json::json!({"items": [1, 2, 3]}));
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let items = outcomes[0].output["items"]
+        .as_array()
+        .expect("map output has an `items` array");
+    assert_eq!(items.len(), 3);
+    for (i, item) in items.iter().enumerate() {
+        assert_eq!(
+            item["status"],
+            serde_json::json!("failed"),
+            "item {i}: an un-evaluable `when:` must fail the item closed, not dispatch: {item:?}"
+        );
+        let error = item["error"]
+            .as_str()
+            .expect("a failed item carries an error string");
+        assert!(
+            error.contains("when:"),
+            "the error should name the `when:` evaluation as the cause: {error}"
+        );
+    }
+    assert_eq!(
+        sink.0.len(),
+        0,
+        "the guarded `rm -rf /` step must never dispatch for any item when its gate fails to \
+         evaluate — zero sink events, counted"
+    );
+}
+
+#[test]
+fn a_skipped_inner_step_does_not_abort_the_item_and_later_inner_steps_still_run() {
+    // Fix round 2, item 1's own consequence: before the fix, `Skipped` was
+    // unreachable through `dispatch_map_step`'s inner loop (the only
+    // producer of `Skipped` is `when:`, and nothing reached it). Now that it
+    // is reachable, `Skipped` must behave like `run_to_completion`'s own
+    // top-level semantics — unlike `Failed`, a `Skipped` inner step must NOT
+    // abort the rest of that item's inner steps.
+    let yaml = r#"
+name: map-inner-skipped-continues
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: fan_out
+    map:
+      over: "${{ inputs.items }}"
+      as: item
+      on_item_error: continue
+    steps:
+      - id: guarded
+        when: "${{ inputs.approved }}"
+        emit: { v: "should be skipped" }
+      - id: after
+        emit: { v: "should still run" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = run_ctx(serde_json::json!({"approved": false, "items": [1, 2, 3]}));
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let items = outcomes[0].output["items"]
+        .as_array()
+        .expect("map output has an `items` array");
+    assert_eq!(items.len(), 3);
+    for (i, item) in items.iter().enumerate() {
+        assert_eq!(
+            item["status"],
+            serde_json::json!("completed"),
+            "item {i}: `guarded` is skipped but `after` still runs and completes the item: \
+             {item:?}"
+        );
+    }
+    let flow_created: Vec<&serde_json::Value> = sink
+        .0
+        .iter()
+        .filter(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .map(|e| &e.payload_json["TaskCreated"]["input"]["Json"])
+        .collect();
+    assert_eq!(
+        flow_created.len(),
+        3,
+        "exactly one dispatched event per item (`after`) — `guarded` never dispatches"
+    );
+    for created in &flow_created {
+        assert_eq!(created["v"], serde_json::json!("should still run"));
+    }
+}
+
+#[test]
+fn a_nested_maps_secret_derived_as_name_does_not_poison_the_outer_maps_use_of_the_same_as_name() {
+    // Fix round 2, items 2/3: the case the atomicity safety argument has to
+    // survive — a NESTED `map` reusing its parent's `as:` name, with the
+    // nested collection secret-derived and the outer's genuinely clean.
+    //
+    // Payload: outer `map` over one clean item ("OUTER-CLEAN-1"), `as: item`.
+    // Its inner steps: emit `item` (should log clean), a NESTED `map` also
+    // `as: item` over a secret-derived one-item collection whose own inner
+    // step emits `item` (should log `***`), then emit `item` again (should
+    // log clean again — proving the nested map's secret binding did not
+    // survive past its own restore).
+    let yaml = r#"
+name: nested-maps-same-name
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: outer
+    map:
+      over: "${{ inputs.outer_items }}"
+      as: item
+      on_item_error: continue
+    steps:
+      - id: echo_outer_before
+        emit: { v: "${{ item }}" }
+      - id: inner_map
+        map:
+          over: "${{ json(secrets.K).items }}"
+          as: item
+          on_item_error: continue
+        steps:
+          - id: echo_inner
+            emit: { v: "${{ item }}" }
+      - id: echo_outer_after
+        emit: { v: "${{ item }}" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let mut ctx = secret_run_ctx(serde_json::json!({}), "K", r#"{"items":["s1"]}"#);
+    ctx.inputs = serde_json::json!({"outer_items": ["OUTER-CLEAN-1"]});
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+    assert!(matches!(outcomes[0].status, StepStatus::Completed));
+
+    let flow_created: Vec<&serde_json::Value> = sink
+        .0
+        .iter()
+        .filter(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .map(|e| &e.payload_json["TaskCreated"]["input"]["Json"])
+        .collect();
+    assert_eq!(
+        flow_created.len(),
+        3,
+        "echo_outer_before, echo_inner (nested map's one item), echo_outer_after"
+    );
+    assert_eq!(
+        flow_created[0]["v"],
+        serde_json::json!("OUTER-CLEAN-1"),
+        "before the nested map runs, the outer's own clean binding logs in cleartext"
+    );
+    assert_eq!(
+        flow_created[1]["v"],
+        serde_json::json!("***"),
+        "inside the nested map, the secret-derived binding logs redacted"
+    );
+    assert_eq!(
+        flow_created[2]["v"],
+        serde_json::json!("OUTER-CLEAN-1"),
+        "after the nested map returns and restores its snapshot, the outer's own clean \
+         binding logs in cleartext again — the nested secret did not survive past its own \
+         restore"
+    );
+}

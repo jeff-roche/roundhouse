@@ -47,6 +47,197 @@ pub mod map_step;
 pub mod provenance;
 pub use provenance::{Provenance, RunId};
 
+/// The result of evaluating one step's `when:` gate (Task 14 fix round 2,
+/// item 1) — either the caller is cleared to dispatch the step for real (with
+/// whether the *condition itself* read secret material, to fold into the
+/// step's eventual [`StepOutcome`]), or the gate has already fully decided
+/// the step's outcome (`Skipped` when the condition evaluated to anything
+/// other than `Bool(true)`, `Failed` when it failed to evaluate at all) and
+/// the step must **not** be dispatched.
+pub(crate) enum GateDecision {
+    Proceed {
+        gate_condition_was_secret_derived: bool,
+    },
+    Decided(StepOutcome),
+}
+
+/// Evaluates `step.when` (if present) against `ctx`, with the identical
+/// `Ok(non-true) -> Skipped` / `Err -> Failed (fail-closed)` split for every
+/// caller — see [`GateDecision`]. A step with no `when:` at all always
+/// [`GateDecision::Proceed`]s, with the flag `false` (no condition was
+/// evaluated).
+///
+/// # Why this is a shared helper, not inlined at each dispatch site (fix round 2, item 1)
+///
+/// Before this existed, `when:` handling lived only in
+/// [`Executor::run_to_completion`]'s own loop — the **only** site in the
+/// crate that read `step.when` at all. [`Executor::dispatch_step`] never
+/// consulted it, and neither did [`map_step::Executor::dispatch_map_step`],
+/// which calls `dispatch_step` directly for each inner step. The
+/// consequence, measured end to end with `inputs.approved = false`: a
+/// `tool: shell` step with `cmd: ["rm","-rf","/"]` guarded by
+/// `when: "${{ inputs.approved }}"` is correctly `Skipped` at top level and
+/// **dispatched** when the identical step is nested one level under a `map`
+/// — the guard evaporates, once per item. Worse: the same nesting also loses
+/// this crate's fail-closed posture for a gate that *fails to evaluate* (an
+/// unknown-function reference, say) — at top level that is `Failed` and the
+/// step never runs; nested under a `map`, it dispatched too, because nothing
+/// there evaluated `when:` at all to produce either outcome.
+///
+/// A **second**, independently written copy of the `Ok`/`Err` split inside
+/// `dispatch_map_step` would have "fixed" the measured case while leaving
+/// the crate with two implementations of the same decision that can drift
+/// again the next time either one changes — which is exactly how this defect
+/// was created in the first place (`dispatch_map_step` was written without
+/// ever duplicating — or therefore ever including — `run_to_completion`'s
+/// gate logic). One function, called from both
+/// [`Executor::run_to_completion`] and
+/// [`map_step::Executor::dispatch_map_step`], is what makes that class of
+/// divergence structurally impossible rather than merely fixed today.
+pub(crate) fn evaluate_when_gate(step: &StepDef, ctx: &ExprContext) -> GateDecision {
+    let Some(when) = &step.when else {
+        return GateDecision::Proceed {
+            gate_condition_was_secret_derived: false,
+        };
+    };
+    // Fail-closed deviation from the plan's illustrative `unwrap_or(true)` —
+    // see Task 13's report, "Deviations from the plan text": a `when:` that
+    // fails to *evaluate* (bad syntax, unknown function) is not the same
+    // thing as a `when:` that evaluates to `false`, and running the step
+    // anyway on evaluation failure is the wrong default for a codebase whose
+    // stated posture elsewhere is "fail closed."
+    //
+    // Fix round 1, item 4: `when:` is documented (§8.9) as always being a
+    // single `${{ ... }}`-delimited block — both reference examples use that
+    // form, neither uses a bare one — so this goes through
+    // `eval_delimited_expression`, not the bare `eval`. An earlier version
+    // passed `when`'s still-delimited text straight to `eval`, which takes an
+    // undelimited `ExpressionSource`, so every documented-form `when:` died
+    // at position 0 on the leading `$` and only an undocumented bare form
+    // worked.
+    match eval_delimited_expression(TemplateSource::from_workflow_file(when), ctx) {
+        Ok(cond) => {
+            // The condition's own *value* cannot reach the log through this
+            // branch: all a `Decided(Skipped)` outcome writes into
+            // `steps.<id>` is a fixed `"skipped"`/`"completed"` discriminant
+            // and a fixed reason string.
+            //
+            // **That premise is true and the conclusion drawn from it used to
+            // be false (fix round 4, item C).** An earlier version of this
+            // comment concluded "so no secret material can reach the log" —
+            // but *which* of the two fixed strings gets written is a one-bit
+            // function of the condition, and the condition may be
+            // `${{ secrets.T == 'a' }}`.
+            //
+            // Executed, and asserted by
+            // `the_when_gates_branch_taken_is_a_one_bit_function_of_the_secret_and_is_observable`:
+            // two runs of one gated step, against secrets differing only in
+            // their first byte, produce (`completed`, 2 events) and
+            // (`skipped`, 0 events) — so the bit is readable from the event
+            // count alone, with no reader step at all. The fix-round-3
+            // security lens measured the multi-bit extension of the same
+            // shape (eight gate steps against `T = "abXdeXghXXXXXXXX"`
+            // recording that secret's exact character-presence pattern); that
+            // figure is theirs, reproduced here only at one bit.
+            //
+            // The per-run ceiling is arithmetic, not a measurement:
+            // `crate::parse::MAX_TOP_LEVEL_STEPS` is 500, so a run admits at
+            // most 500 such *top-level* steps and therefore at most ~500 bits
+            // (~62 bytes) through this route alone, into a table that
+            // physically rejects `UPDATE`/`DELETE`. **This ceiling is now
+            // shared with `map`** (fix round 2): a `map` inner step also
+            // reaches this function, and `MAX_MAP_ITEMS` (2,000 per `map`
+            // step) is a *larger* per-call ceiling than the top-level one,
+            // and per ruling P47 is not bounded at all across nesting levels
+            // — so the arithmetic bound stated here no longer holds for the
+            // `map`-reached call sites; see
+            // `map_step::Executor::dispatch_map_step`'s own doc comment for
+            // the current, larger figure. Nothing was measured at either
+            // size for this specific one-bit channel.
+            //
+            // **Accepted, not closed.** The only actor who can build this
+            // channel is the workflow author, who already has a designed
+            // full-bandwidth one: the unredacted half of every interpolation
+            // is handed to real dispatch, so `tool: shell` with
+            // `${{ secrets.T }}` delivers the plaintext by design. A covert
+            // side channel, even a larger one under `map`, is not worth
+            // paying for against an actor holding an overt unlimited one.
+            //
+            // **The condition that upgrades this.** If §8.5's per-step
+            // `permissions:` narrowing is ever meant to make an author *less*
+            // privileged than the secrets they may reference, this becomes
+            // the surviving channel and stops being Minor. This module
+            // consults `permissions:` nowhere today, so that does not hold
+            // yet; whoever wires it must revisit this branch.
+            //
+            // What is recorded instead of acted on: the flag, so the next
+            // task decides with a read rather than a re-derivation.
+            let gate_condition_was_secret_derived = cond.secret_derived();
+            if matches!(cond.value(), Value::Bool(true)) {
+                GateDecision::Proceed {
+                    gate_condition_was_secret_derived,
+                }
+            } else {
+                GateDecision::Decided(StepOutcome {
+                    step_id: step.id.clone(),
+                    output: Value::Null,
+                    status: StepStatus::Skipped {
+                        reason: "when: evaluated false".into(),
+                    },
+                    output_is_secret_derived: false,
+                    gate_condition_was_secret_derived,
+                })
+            }
+        }
+        Err(e) => {
+            // **Records `true`, and that is the whole point (fix round 5,
+            // item 1).** `ExprError` carries no taint flag, so this arm does
+            // not *know* whether the condition read secret material — and
+            // ruling P35's rule for exactly that situation is: if you do not
+            // know a value's provenance, treat it as secret-derived. An
+            // earlier version of this arm went through `StepOutcome::failed`,
+            // which records `false`, and so reported the gate as **clean for
+            // precisely the runs where the secret's content caused the
+            // failure.**
+            //
+            // Executed, one workflow, two runs differing only in the secret's
+            // content, asserted by
+            // `a_when_that_fails_to_evaluate_because_of_the_secrets_content_records_the_gate_as_secret_derived`:
+            // `when: "${{ inputs.arr[json(secrets.K).idx] }}"` with
+            // `K = {"idx":0}` completes, and with `K = {"idx":"not-a-number"}`
+            // fails — the subscript is a non-number only because of what the
+            // secret said. Fix round 4's item F *widened* this class: a
+            // secret-derived subscript that used to evaluate silently to
+            // `Null` is now an error, so more evaluation failures than before
+            // are a function of a secret.
+            //
+            // This matters because the flag exists to be *read* rather than
+            // re-derived (item D): a consumer seeing `false` concludes "no
+            // redaction needed" for a gate that did read `secrets.*`.
+            // `Option<bool>` was considered and rejected — it makes "unknown"
+            // representable but invites `unwrap_or(false)` at the consumer,
+            // which is the same fail-open one layer up. `true` is fail-safe
+            // by construction and asks no discipline of a future caller; its
+            // cost is over-redacting the log line of a gate that failed for a
+            // reason having nothing to do with a secret.
+            //
+            // The failure path itself still writes only a bounded,
+            // source-text-only diagnostic (see `StepStatus`'s `Debug` impl),
+            // so no secret *value* rides along here.
+            //
+            // Fix round 2, item 1: before this function existed, this
+            // fail-closed arm ran only at the top level — `dispatch_map_step`
+            // never evaluated `when:` at all, so an inner step's un-evaluable
+            // gate *dispatched* rather than failing closed. Measured:
+            // `when: "${{ no_such_fn(1) }}"` on a `map` inner step ran the
+            // guarded step.
+            let mut outcome = StepOutcome::failed(&step.id, format!("evaluating `when:`: {e}"));
+            outcome.gate_condition_was_secret_derived = true;
+            GateDecision::Decided(outcome)
+        }
+    }
+}
+
 use crate::expr::{
     eval_delimited_expression, interpolate, interpolate_json, ExprContext, JsonTemplateSource,
     TemplateSource,
@@ -494,150 +685,22 @@ impl<'a> Executor<'a> {
                     .map(|id| vec![id.clone(), "output".to_string()]),
             );
 
-            // Recorded on the outcome below (fix round 4, item C) so a later
-            // task can act on it without re-deriving it.
-            let mut gate_condition_was_secret_derived = false;
-
-            if let Some(when) = &step.when {
-                // Fail-closed deviation from the plan's illustrative
-                // `unwrap_or(true)` — see this task's report, "Deviations
-                // from the plan text": a `when:` that fails to *evaluate*
-                // (bad syntax, unknown function) is not the same thing as a
-                // `when:` that evaluates to `false`, and running the step
-                // anyway on evaluation failure is the wrong default for a
-                // codebase whose stated posture elsewhere is "fail closed."
-                //
-                // Fix round 1, item 4: `when:` is documented (§8.9) as
-                // always being a single `${{ ... }}`-delimited block — both
-                // reference examples use that form, neither uses a bare
-                // one — so this now goes through
-                // `eval_delimited_expression`, not the bare `eval`. The
-                // earlier version passed `when`'s still-delimited text
-                // straight to `eval`, which takes an undelimited
-                // `ExpressionSource`, so every documented-form `when:` died
-                // at position 0 on the leading `$` and only an undocumented
-                // bare form worked.
-                match eval_delimited_expression(TemplateSource::from_workflow_file(when), &self.ctx)
-                {
-                    Ok(cond) => {
-                        // The condition's own *value* cannot reach the log
-                        // through this branch: all it writes into
-                        // `steps.<id>` is a fixed `"skipped"`/`"completed"`
-                        // discriminant and a fixed reason string.
-                        //
-                        // **That premise is true and the conclusion drawn from
-                        // it used to be false (fix round 4, item C).** The
-                        // earlier comment here concluded "so no secret material
-                        // can reach the log" — but *which* of the two fixed
-                        // strings gets written is a one-bit function of the
-                        // condition, and the condition may be
-                        // `${{ secrets.T == 'a' }}`.
-                        //
-                        // Executed here, and asserted by
-                        // `the_when_gates_branch_taken_is_a_one_bit_function_of_the_secret_and_is_observable`:
-                        // two runs of one gated step, against secrets differing
-                        // only in their first byte, produce
-                        // (`completed`, 2 events) and (`skipped`, 0 events) —
-                        // so the bit is readable from the event count alone,
-                        // with no reader step at all. The fix-round-3 security
-                        // lens measured the multi-bit extension of the same
-                        // shape (eight gate steps against
-                        // `T = "abXdeXghXXXXXXXX"` recording that secret's
-                        // exact character-presence pattern); that figure is
-                        // theirs, reproduced here only at one bit.
-                        //
-                        // The per-run ceiling is arithmetic, not a measurement:
-                        // `crate::parse::MAX_TOP_LEVEL_STEPS` is 500, so a run
-                        // admits at most 500 such steps and therefore at most
-                        // ~500 bits (~62 bytes), into a table that physically
-                        // rejects `UPDATE`/`DELETE`. Nothing was measured at
-                        // that size.
-                        //
-                        // **Accepted, not closed.** The only actor who can
-                        // build this channel is the workflow author, who
-                        // already has a designed full-bandwidth one: the
-                        // unredacted half of every interpolation is handed to
-                        // real dispatch, so `tool: shell` with
-                        // `${{ secrets.T }}` delivers the plaintext by design.
-                        // A covert 62-bytes-per-run side channel is not worth
-                        // paying for against an actor holding an overt
-                        // unlimited one.
-                        //
-                        // **The condition that upgrades this.** If §8.5's
-                        // per-step `permissions:` narrowing is ever meant to
-                        // make an author *less* privileged than the secrets
-                        // they may reference, this becomes the surviving
-                        // channel and stops being Minor. This module consults
-                        // `permissions:` nowhere today, so that does not hold
-                        // yet; whoever wires it must revisit this branch.
-                        //
-                        // What is recorded instead of acted on: the flag, so
-                        // the next task decides with a read rather than a
-                        // re-derivation.
-                        gate_condition_was_secret_derived = cond.secret_derived();
-                        if !matches!(cond.value(), Value::Bool(true)) {
-                            let outcome = StepOutcome {
-                                step_id: step.id.clone(),
-                                output: Value::Null,
-                                status: StepStatus::Skipped {
-                                    reason: "when: evaluated false".into(),
-                                },
-                                output_is_secret_derived: false,
-                                gate_condition_was_secret_derived,
-                            };
-                            steps_context.insert(step.id.clone(), steps_context_entry(&outcome));
-                            outcomes.push(outcome);
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        // **Records `true`, and that is the whole point (fix
-                        // round 5, item 1).** `ExprError` carries no taint flag,
-                        // so this arm does not *know* whether the condition read
-                        // secret material — and ruling P35's rule for exactly
-                        // that situation is: if you do not know a value's
-                        // provenance, treat it as secret-derived. An earlier
-                        // version of this arm went through
-                        // `StepOutcome::failed`, which records `false`, and so
-                        // reported the gate as **clean for precisely the runs
-                        // where the secret's content caused the failure.**
-                        //
-                        // Executed, one workflow, two runs differing only in the
-                        // secret's content, asserted by
-                        // `a_when_that_fails_to_evaluate_because_of_the_secrets_content_records_the_gate_as_secret_derived`:
-                        // `when: "${{ inputs.arr[json(secrets.K).idx] }}"` with
-                        // `K = {"idx":0}` completes, and with
-                        // `K = {"idx":"not-a-number"}` fails — the subscript is
-                        // a non-number only because of what the secret said.
-                        // Fix round 4's item F *widened* this class: a
-                        // secret-derived subscript that used to evaluate
-                        // silently to `Null` is now an error, so more evaluation
-                        // failures than before are a function of a secret.
-                        //
-                        // This matters because the flag exists to be *read*
-                        // rather than re-derived (item D): a consumer seeing
-                        // `false` concludes "no redaction needed" for a gate
-                        // that did read `secrets.*`. `Option<bool>` was
-                        // considered and rejected — it makes "unknown"
-                        // representable but invites `unwrap_or(false)` at the
-                        // consumer, which is the same fail-open one layer up.
-                        // `true` is fail-safe by construction and asks no
-                        // discipline of a future caller; its cost is
-                        // over-redacting the log line of a gate that failed for
-                        // a reason having nothing to do with a secret.
-                        //
-                        // The failure path itself still writes only a bounded,
-                        // source-text-only diagnostic (see `StepStatus`'s
-                        // `Debug` impl), so no secret *value* rides along here.
-                        let mut outcome =
-                            StepOutcome::failed(&step.id, format!("evaluating `when:`: {e}"));
-                        outcome.gate_condition_was_secret_derived = true;
-                        steps_context.insert(step.id.clone(), steps_context_entry(&outcome));
-                        outcomes.push(outcome);
-                        continue;
-                    }
+            // `when:` handling is a shared helper (fix round 2, item 1) —
+            // see `evaluate_when_gate`'s own doc comment for why sharing it
+            // with `map_step::Executor::dispatch_map_step` is the fix, not
+            // an implementation detail, and for the full history of this
+            // exact decision (fail-closed on evaluation error, the delimited
+            // form, the one-bit covert-channel accounting).
+            let gate_condition_was_secret_derived = match evaluate_when_gate(step, &self.ctx) {
+                GateDecision::Decided(outcome) => {
+                    steps_context.insert(step.id.clone(), steps_context_entry(&outcome));
+                    outcomes.push(outcome);
+                    continue;
                 }
-            }
+                GateDecision::Proceed {
+                    gate_condition_was_secret_derived,
+                } => gate_condition_was_secret_derived,
+            };
 
             let mut outcome = self.dispatch_step(step);
             outcome.gate_condition_was_secret_derived = gate_condition_was_secret_derived;

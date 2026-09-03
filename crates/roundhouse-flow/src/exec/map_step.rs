@@ -24,12 +24,14 @@
 //!   `ExprContext::get`/`set`-based restore.** See [`Executor::dispatch_map_step`]'s
 //!   own doc comment for the full reasoning (ruling P40/R-1, R-2). This
 //!   crate therefore does not add the `ExprContext::get` accessor the plan's
-//!   Step 3 lists. **Fix round 1 changed *how* the per-item context is
-//!   managed** (originally a fresh clone per item; now one clone per `map`
-//!   step, mutated in place per item and restored once at the end) — see
-//!   `dispatch_map_step`'s own doc comment, "Fix round 1" section, for why
-//!   the original per-item-clone design was itself a defect, not just a
-//!   style choice.
+//!   Step 3 lists — it uses
+//!   [`crate::expr::ExprContext::snapshot_root`]/[`crate::expr::ExprContext::restore_root`]
+//!   instead, a `pub(crate)` pair that snapshots and restores one root's
+//!   value *and* provenance atomically. **This mechanism changed twice**
+//!   (fresh clone per item → one clone per `map` step → snapshot/restore one
+//!   root) — see `dispatch_map_step`'s own doc comment, "History of this
+//!   mechanism", for why each prior design was replaced, not merely
+//!   restyled.
 //! - **`map.isolation`/`base_ref` (the "worktree fan-out" the plan's own
 //!   title names) is out of scope for this diff, structurally, not by
 //!   omission.** `dispatch_map_step` below never reads `StepBody::Map`'s
@@ -49,7 +51,7 @@
 //!   broken by this diff. See this task's report for the full reasoning.
 
 use crate::caps::ResourceCaps;
-use crate::exec::{Executor, StepOutcome, StepStatus};
+use crate::exec::{evaluate_when_gate, Executor, GateDecision, StepOutcome, StepStatus};
 use crate::expr::{eval_delimited_expression, TemplateSource};
 use crate::parse::steps::{parse_step, OnItemError, StepDef};
 use serde_json::Value;
@@ -254,7 +256,7 @@ impl<'a> Executor<'a> {
     /// inner steps via the same [`Executor::dispatch_step`] sequencing every
     /// other step kind uses.
     ///
-    /// # Per-item binding: `Evaluated::derive`, one clone per MAP STEP not per item (ruling P40/P44/P45, R-1/R-2)
+    /// # Per-item binding: `Evaluated::derive` plus a per-root snapshot/restore, not a context clone (ruling P40/P44/P45/P46, R-1/R-2)
     ///
     /// `over:` is evaluated **once**, via [`eval_delimited_expression`],
     /// producing one [`crate::expr::Evaluated`] over the whole collection —
@@ -269,105 +271,160 @@ impl<'a> Executor<'a> {
     /// re-assertion-by-the-back-door ruling P37 exists to remove). Instead:
     /// [`crate::expr::Evaluated::derive`] produces a per-item `Evaluated`
     /// whose `secret_derived` is read off the collection's own evaluation,
-    /// and it is bound with `ExprContext::set_from`, which propagates rather
-    /// than re-asserts (ruling P37).
+    /// and it is bound with `ExprContext::set_from` **directly onto
+    /// `self.ctx`** — the run's own, shared context, not a clone of it —
+    /// which propagates rather than re-asserts (ruling P37).
     ///
-    /// # Fix round 1: the original per-item `ExprContext` clone was itself the defect (item 3)
+    /// # History of this mechanism — two prior designs, both replaced for measured reasons
     ///
-    /// The first landed version cloned a **fresh** `ExprContext` for every
-    /// item, forked from the pre-map context. That closed the *cross-step*
-    /// poisoning hazard (see below) but, because `ExprContext::clone` deep-
-    /// clones every bound root including `inputs`/`vars`/`secrets`/`steps`,
-    /// made this function's cost **O(items × context size)** — measured,
-    /// release build, one trivial `emit` inner step: 2,500 items → 620 ms;
-    /// 10,000 → 15.6 s; 20,000 → **148.7 s**. Attributed by a controlled
-    /// experiment (items fixed at 2,000, varying only an `inputs.pad` string
-    /// no expression references): 0 KB → 22.5 ms; 8 MB → 396.2 ms — the
-    /// per-item clone re-copies context data no expression in the map even
-    /// reads. Nested `map`s multiply this: three nested `map` steps over one
-    /// input array, k=100 items each level, produced **2,000,000 events**
-    /// from a 580-byte workflow in 4.4 s.
+    /// (Recorded so a future reader who finds an old fix-round report
+    /// describing either prior design does not mistake it for what the code
+    /// currently does — ruling P46: a mechanism change is accepted only once
+    /// every prose description of the *old* mechanism, crate-wide, has been
+    /// reconciled, not just the sites a report named.)
     ///
-    /// **The fix: one `ExprContext` clone per `map` STEP, not per item.**
-    /// `self.ctx` is cloned exactly once, into `saved_outer_ctx`, before the
-    /// item loop begins. For every item, `self.ctx` itself (not a fresh
-    /// clone) is mutated in place via `set_from(as_name, &item_evaluated)` —
-    /// an O(1)-ish `HashMap` insert, not a deep clone — then the item's inner
-    /// steps dispatch against `self.ctx` directly. After the *whole* `run_map`
-    /// call finishes (every item processed), `self.ctx` is restored to
-    /// `saved_outer_ctx` in a single move.
+    /// 1. **Landed with this task: a fresh `ExprContext` clone per item**,
+    ///    forked from the pre-map context, discarded after each item. Closed
+    ///    the cross-step poisoning hazard (see "Why this is still correct"
+    ///    below) but, because `ExprContext::clone` deep-clones every bound
+    ///    root including `inputs`/`vars`/`secrets`/`steps`, cost
+    ///    **O(items × context size)** — 20,000 items measured at 148.7 s.
+    /// 2. **Fix round 1: one `ExprContext` clone per `map` STEP, not per
+    ///    item** — `self.ctx` cloned once before the item loop, mutated in
+    ///    place per item, restored once after. Fixed the flat (non-nested)
+    ///    case (2,000 items: 3.15 ms) but a nested `map` is dispatched once
+    ///    per enclosing item, so the **clone count is the product of
+    ///    enclosing item counts** — fix round 2 measured `map(2000) ->
+    ///    map(1) -> emit`, identical 4,000 events as a flat 2,000-item map, a
+    ///    32 MB unreferenced `inputs.pad`: flat **4.83 ms**, nested **5.366
+    ///    s** — 1,111× for the same event count. A fix-round-1 doc section
+    ///    stated the flat measurement's "no longer multiplied by item count"
+    ///    conclusion unconditionally, which was false the moment nesting was
+    ///    tried.
+    /// 3. **Fix round 2 (current): snapshot and restore the *one root*
+    ///    `as_name`, not the whole context.** [`crate::expr::ExprContext::snapshot_root`]/
+    ///    [`crate::expr::ExprContext::restore_root`] capture and revert one
+    ///    name's value *and* provenance, atomically, in O(1) — see the next
+    ///    section for why this is still correct, and "Re-measured" below for
+    ///    what it costs under nesting now.
     ///
-    /// **Why this is still correct against R-2b's cross-step poisoning
-    /// hazard**, even though `self.ctx` is now mutated directly rather than
-    /// swapped for a fresh clone per item: `ExprContext` provenance is
-    /// monotone per root **name** and irreversible for the life of the
-    /// context, but *within one `map` step* every item shares the exact same
-    /// `secret_derived` bit (the paragraph above) — so repeatedly calling
-    /// `set_from(as_name, ..)` with a *constant* taint level across all
-    /// items of this map cannot mis-escalate or mis-lower anything; the
-    /// first call sets `as_name`'s provenance to the collection's own level,
-    /// every later call in the same map step is a no-op on provenance and
-    /// only updates the *value*. What still must not leak is this map
-    /// step's taint surviving into a **different** step (a later `map` reusing
-    /// the same `as:` name, or any other step) — that is exactly what
-    /// restoring `self.ctx = saved_outer_ctx` once, after the whole map
-    /// finishes, prevents: nothing this map step did to `as_name`'s
-    /// provenance is visible on `self.ctx` once `dispatch_map_step` returns.
+    /// # Why binding onto the shared context and reverting by name is correct against cross-step/cross-level poisoning
     ///
-    /// Measured, same payload as before the fix, confirming the property
-    /// still holds under the new design: `tests/map_step.rs`'s
+    /// `ExprContext` provenance is monotone per root **name** and
+    /// irreversible **for the life of one `ExprContext` instance** — see
+    /// [`crate::expr::ExprContext::set_public`]'s own doc comment. What makes
+    /// binding directly onto the long-lived, shared `self.ctx` safe is not
+    /// (only) that every item in one `map` step shares one taint bit — it is
+    /// that **[`crate::expr::ExprContext::restore_root`] reverts a root's
+    /// value and provenance together, atomically**, so `self.ctx` can never
+    /// be observed holding a stale value under a provenance that does not
+    /// match it. Monotonicity is therefore an invariant of the *span between
+    /// a snapshot and its restore*, not of the executor as a whole — and
+    /// `dispatch_map_step` deliberately opens and closes exactly one such
+    /// span per call, once around the whole item loop:
+    ///
+    /// 1. Before the first item: `outer_snapshot = self.ctx.snapshot_root(as_name)`.
+    /// 2. Per item: `self.ctx.set_from(as_name, &item_evaluated)` — an O(1)-ish
+    ///    `HashMap` insert, never a clone of anything but the one bound value.
+    /// 3. After the *whole* `run_map` call (every item processed):
+    ///    `self.ctx.restore_root(as_name, outer_snapshot)`.
+    ///
+    /// This is what makes the earlier, weaker justification ("one taint bit
+    /// per map step, so repeated `set_from` at a constant level cannot
+    /// mis-escalate") not the load-bearing reason, and not sufficient on its
+    /// own: it says nothing about **nested** maps sharing a name, where the
+    /// inner map's own taint bit can genuinely differ from the outer's.
+    /// Measured, the case the atomicity argument has to survive: outer
+    /// `as: item` clean, inner (nested) `map` also `as: item`, secret. Inside
+    /// the nested `map`, `${{ item }}` correctly logs `***`
+    /// (`tests/map_step.rs`'s
+    /// `a_nested_maps_secret_derived_as_name_does_not_poison_the_outer_maps_use_of_the_same_as_name`);
+    /// once the nested `map` restores its own snapshot and returns, the
+    /// *outer* item's remaining inner steps read `${{ item }}` again and get
+    /// the outer's real, clean value in cleartext — the nested secret never
+    /// survives past its own restore. The reverse direction (outer secret,
+    /// inner clean, same name) is deliberately conservative rather than
+    /// incorrect: the nested map's own clean items are over-redacted for the
+    /// duration of the nested call (they share the outer's still-`Whole`
+    /// provenance entry, since a clean [`crate::expr::ExprContext::set_public`]
+    /// call cannot lower it) — the same accepted, safe-direction cost this
+    /// crate already documents for same-name rebinding generally, never
+    /// under-redaction.
+    ///
+    /// Also confirmed, the sibling-step case fix round 1 originally proved:
+    /// `tests/map_step.rs`'s
     /// `a_secret_derived_maps_as_name_does_not_poison_a_later_clean_maps_use_of_the_same_as_name`
-    /// — two `map` steps, both `as: item`, the first over a secret-derived
-    /// collection, the second over a genuinely clean one — the second map's
-    /// items still log in cleartext, not `***`.
+    /// — two **sibling** `map` steps, both `as: item`, the first over a
+    /// secret-derived collection, the second over a genuinely clean one —
+    /// the second map's items still log in cleartext, not `***`.
     ///
-    /// **Re-measured after the fix (ruling P18 — a cost claim needs a
-    /// measurement in the diff), release build, through
-    /// [`Executor::run_to_completion`], one trivial `emit` inner step, same
-    /// shape as the pre-fix table above but at and below [`MAX_MAP_ITEMS`]
-    /// (added by this same fix round — see below):**
+    /// # Re-measured after fix round 2 (ruling P18)
+    ///
+    /// Release build, through [`Executor::run_to_completion`], one trivial
+    /// `emit` inner step. Flat case, same shape as fix round 1's own table
+    /// (unaffected by this round's change, restated for comparison):
     ///
     /// | items | events | elapsed |
     /// |---|---|---|
-    /// | 500 | 1,000 | 876 µs |
-    /// | 1,000 | 2,000 | 1.53 ms |
-    /// | 2,000 | 4,000 | 3.15 ms |
+    /// | 500 | 1,000 | ~0.9 ms |
+    /// | 2,000 | 4,000 | ~3 ms |
     ///
-    /// Roughly linear (each doubling of items costs ~2x, not ~4x+), and 2,000
-    /// items now completes in low-single-digit milliseconds versus the
-    /// pre-fix 2,500-item figure of 620 ms — a large constant-factor
-    /// improvement at comparable scale, consistent with removing the
-    /// per-item deep clone rather than merely trimming it.
+    /// **The case that actually needed re-measuring — nesting** (`map(2000)
+    /// items) -> map(1) item -> emit`, identical 4,000 events, `inputs.pad`
+    /// varied, referenced by nothing):
     ///
-    /// The `inputs.pad` attribution, repeated at a fixed 2,000 items: 0 B →
-    /// 2.63 ms; 1 MB → 2.57 ms; 8 MB → 4.13 ms — **flat**, not the pre-fix
-    /// 0 KB → 22.5 ms / 8 MB → 396.2 ms scaling. The residual ~1.5 ms growth
-    /// at 8 MB is exactly the *one* remaining clone (`saved_outer_ctx`,
-    /// taken once per map step) doing its one, now-unavoidable, O(context
-    /// size) unit of work — no longer multiplied by item count.
+    /// | pad | 0 B | 1 MB | 8 MB | 32 MB |
+    /// |---|---|---|---|---|
+    /// | nested, fix round 1 (whole-context clone per call) | 23.9 ms | 50.8 ms | 353.8 ms | **5.366 s** |
+    /// | nested, fix round 2 (snapshot/restore one root) | flat regardless of `pad` — no clone of `inputs` occurs at any nesting level |
     ///
-    /// Also confirmed: dispatching above [`MAX_MAP_ITEMS`] fails closed
-    /// *before* doing the expensive work, not after — 2,001 items: 209 µs;
-    /// 20,000 items: 6.8 ms (dominated by the harness building the input
-    /// array itself, not by this function, which never iterates it).
+    /// Nesting cost is now **O(1) per level** (one `HashMap` get plus one
+    /// insert/remove pair, per level, independent of context size) instead of
+    /// O(context size) per level, which was itself multiplied across
+    /// enclosing item counts. The residual cost of a nested `map` is now
+    /// dominated by dispatch work ([`Executor::dispatch_step`]/
+    /// [`evaluate_when_gate`] per inner step), not by anything this function
+    /// clones.
     ///
-    /// # `MAX_MAP_ITEMS`: an explicit, closed-fail item-count cap (fix round 1, item 3)
+    /// # `MAX_MAP_ITEMS`: an explicit, closed-fail item-count cap — bounds one call, NOT nesting (ruling P47)
     ///
-    /// The clone fix above removes the *quadratic* term but not the
-    /// *unbounded* one: nothing before fix round 1 stopped `over:` from
-    /// yielding an arbitrarily large array (data-driven — a webhook payload,
-    /// a `map.over` expression reading `inputs`/`steps`), and nested `map`s
-    /// still multiply item counts across levels. `MAX_TOP_LEVEL_STEPS` (500,
-    /// `crate::parse::mod`) bounds a *workflow-authored* quantity; a `map`
-    /// item count is *data-driven* and needs its own bound for the same
-    /// reason. [`MAX_MAP_ITEMS`] fails the step **closed** (not silently
-    /// truncated) before any item is dispatched. This bounds one
-    /// `dispatch_map_step` call; it does **not** bound the *product* across
-    /// nested `map`s (a 3-level nest at the cap could still multiply to the
-    /// cap cubed) — that requires a *run-level* dispatched-task counter this
-    /// crate does not have and Task 8's admission ledger
-    /// (`ResourceCaps::max_tasks`) is the eventual owner of, per
-    /// [`MapBudget::unenforced_placeholder`]'s own doc comment.
+    /// Fix round 1's clone-hoist (and fix round 2's further one) remove the
+    /// *quadratic*/*multiplicative* cost terms but not the *unbounded* one:
+    /// nothing stops `over:` from yielding an arbitrarily large array
+    /// (data-driven — a webhook payload, a `map.over` expression reading
+    /// `inputs`/`steps`). `MAX_TOP_LEVEL_STEPS` (500, `crate::parse::mod`)
+    /// bounds a *workflow-authored* quantity; a `map` item count is
+    /// *data-driven* and needs its own bound for the same reason.
+    /// [`MAX_MAP_ITEMS`] fails the step **closed** (not silently truncated)
+    /// before any item is dispatched — fix round 2, item 4: the check now
+    /// runs on the **borrowed** `over_evaluated.value()` array, before it is
+    /// cloned into `items: Vec<Value>`, so the one clone this function still
+    /// does for `items` itself never happens for a rejected call either.
+    ///
+    /// **This bounds one `dispatch_map_step` call. It does NOT bound the
+    /// product across nested `map`s** — the cap is *per call*, and a nested
+    /// `map` is one call per enclosing item, so each nesting level gets its
+    /// own full 2,000. Ruling P47, measured worst case **with the cap
+    /// enforced**: a **511-byte**, three-level nested workflow (each level
+    /// `map.over` a 2,000-element array) yields
+    /// **2 × 2000³ = 1.6 × 10¹⁰ events, ≈ 7.7 hours** at the crate's own
+    /// measured 577,000 events/s. Depth 4 is 3.2 × 10¹³. Neither
+    /// `MAX_FLOW_NESTING_DEPTH` (256) nor `MAX_YAML_BYTES` (256 KB) is a
+    /// binding constraint on this product. Closing it needs a *run-level*
+    /// dispatched-task counter this crate does not have — Task 8's admission
+    /// ledger (`ResourceCaps::max_tasks`) is the eventual owner, per
+    /// [`MapBudget::unenforced_placeholder`]'s own doc comment. This number
+    /// is recorded here, with its measurement, rather than left for a later
+    /// reader to rediscover — a cap that reads as a bound while the real
+    /// product is unbounded is the "placeholder that fails open" shape this
+    /// phase has now hit twice.
+    ///
+    /// **The safe half of the same interaction (ruling P47):** `MAX_MAP_ITEMS`
+    /// *does* bound the blast radius of ruling P45's accepted
+    /// collection-granularity over-redaction — at most 2,000 blackened log
+    /// lines per tainted collection, per `map` step. The cap and P45 interact
+    /// in the safe direction even though the cap and the nested-fan-out
+    /// hazard above interact in the unsafe one.
     ///
     /// Not a hazard, confirmed by fix round 1's security lens rather than
     /// assumed: recursion depth. `serde_yaml` rejects ≥64 nested `map`
@@ -439,6 +496,93 @@ impl<'a> Executor<'a> {
     /// and
     /// `on_item_error_fail_fast_through_dispatch_map_step_stops_at_a_non_final_inner_step_failure`,
     /// both with the failure in the **first** of two inner steps.
+    ///
+    /// # An inner step's own `when:` gate was silently ignored — fail-OPEN (fix round 2, item 1 — CLOSED, the reason this round exists)
+    ///
+    /// The first two landed versions of this function called
+    /// [`Executor::dispatch_step`] directly for every inner step, and
+    /// `dispatch_step` never read `step.when` — only
+    /// [`Executor::run_to_completion`]'s own loop did, making it the crate's
+    /// **only** site that evaluated a `when:` gate at all. So a `map` inner
+    /// step's `when:` was never evaluated, at any nesting level, ever.
+    ///
+    /// Measured, `inputs.approved = false`: a top-level `tool: shell` step
+    /// with `cmd: ["rm","-rf","/"]` guarded by
+    /// `when: "${{ inputs.approved }}"` correctly `Skipped`; the *identical*
+    /// step nested one level under a `map` **dispatched**, once per item.
+    /// Worse: a gate that **fails to evaluate**
+    /// (`when: "${{ no_such_fn(1) }}"`) is fail-*closed* (`Failed`, never
+    /// dispatched) at top level — this crate's stated posture, re-ruled on
+    /// repeatedly — but also **dispatched** when nested, because nothing in
+    /// the `map` path evaluated `when:` to produce either the `Skipped` or
+    /// the `Failed` outcome. A workflow author who moves a guarded
+    /// destructive step inside a `map` for legitimate reasons (fan-out over
+    /// a list of candidates, say) has the guard evaporate silently, once per
+    /// item, with no error and no warning.
+    ///
+    /// **The fix:** [`evaluate_when_gate`] (`crate::exec`) — the exact
+    /// `Ok(non-`Bool(true)`) -> Skipped` / `Err -> Failed` split
+    /// `run_to_completion` already used, extracted into one function **both**
+    /// dispatch paths call. See that function's own doc comment for why a
+    /// shared helper, not a second hand-written copy of the split, is the
+    /// actual fix — the two paths already had one implementation each, once,
+    /// and they had already diverged; writing the split a second time here
+    /// reproduces the exact defect class this closes rather than closing it.
+    /// The inner loop below now calls it before dispatching each inner step,
+    /// exactly mirroring `run_to_completion`'s own `Decided`/`Proceed`
+    /// handling.
+    ///
+    /// **A consequence worth stating explicitly:** the `StepStatus::Skipped`
+    /// arm in the inner loop below was, until this fix, **unreachable**
+    /// through this function — the only thing that ever produces `Skipped`
+    /// is a `when:` gate, and nothing reached one. It is reachable now, and
+    /// is covered by a dedicated test proving a `Skipped` inner step does
+    /// **not** abort the rest of that item's inner steps (unlike `Failed`,
+    /// which does): `tests/map_step.rs`'s
+    /// `a_skipped_inner_step_does_not_abort_the_item_and_later_inner_steps_still_run`.
+    ///
+    /// Pinned by two adversarial tests, **through this function**, asserting
+    /// **zero sink events, counted** (not merely "the map didn't run the
+    /// guarded step" — round 1's own shipped `fail_fast` test could not
+    /// distinguish "fan-out stopped" from "the failing step happens to emit
+    /// nothing", because its failing step emitted nothing either way; a
+    /// destructive `shell`/`tool` step that *dispatches* is exactly what a
+    /// sink-event count catches and a status-field check alone would not):
+    /// `tests/map_step.rs`'s
+    /// `a_when_false_inner_step_gate_is_evaluated_and_skips_the_dispatch`
+    /// and
+    /// `a_when_that_fails_to_evaluate_on_an_inner_step_fails_closed_and_never_dispatches`.
+    ///
+    /// # The map's own aggregate status is unconditionally `Completed` — recorded, not fixed here (fix round 2, item 5)
+    ///
+    /// The `StepOutcome` this function returns always carries
+    /// `status: StepStatus::Completed`, regardless of whether every item
+    /// failed. Measured: `on_item_error: fail_fast` with item 0 failed and
+    /// items 1-4 recorded `Skipped` still reports the map step itself
+    /// `Completed`; `on_item_error: collect` with **all five** items failed
+    /// and five `collected_errors` also reports `Completed`. So
+    /// `${{ steps.<map_id>.status }}` reads `"completed"` for a total
+    /// fan-out failure, and [`crate::expr`]'s own module doc comment
+    /// documents `status` as exactly the clean, stable discriminant a
+    /// downstream step is meant to guard on
+    /// (`when: "${{ steps.a.status != 'failed' }}"`).
+    ///
+    /// **This compounds with the `when:` fix above, not just with itself:** a
+    /// downstream step gated on `${{ steps.<map_id>.status != 'failed' }}`
+    /// to avoid running after a total `map` failure will run anyway, because
+    /// that status never becomes `"failed"` no matter how the fan-out went.
+    ///
+    /// **Not fixed here — Task 8's job.** No stop-on-failure/`catch:`
+    /// mechanism exists anywhere in this crate yet (see
+    /// [`Executor::run_to_completion`]'s own "Residual: dependents cannot
+    /// reliably detect an upstream failure at all" section, which names the
+    /// identical gap at the top level and the same owner). Deciding what
+    /// `map`'s own aggregate status *should* be — `Failed` if any item
+    /// failed? Only if `on_item_error` was not `continue`/`collect`? — is a
+    /// policy question that belongs with that mechanism, not a one-line
+    /// change made unilaterally here. Recorded loudly, at the construction
+    /// site below and here, so it is not silently rediscovered once
+    /// something finally reads `steps.<map_id>.status` for real.
     pub(crate) fn dispatch_map_step(
         &mut self,
         step_id: &str,
@@ -456,7 +600,23 @@ impl<'a> Executor<'a> {
                 }
             };
         let items: Vec<Value> = match over_evaluated.value() {
-            Value::Array(items) => items.clone(),
+            Value::Array(items) => {
+                // Fix round 2, item 4: the cap check moved here, onto the
+                // *borrowed* array, so a rejected call never even pays for
+                // cloning `items` — see this function's own doc comment,
+                // "`MAX_MAP_ITEMS`", for what this bounds and does not.
+                if items.len() > MAX_MAP_ITEMS {
+                    return StepOutcome::failed(
+                        step_id,
+                        format!(
+                            "`map.over` yielded {} items, exceeding the {MAX_MAP_ITEMS}-item \
+                             limit for a single `map` step",
+                            items.len()
+                        ),
+                    );
+                }
+                items.clone()
+            }
             other => {
                 return StepOutcome::failed(
                     step_id,
@@ -468,20 +628,6 @@ impl<'a> Executor<'a> {
             }
         };
 
-        // Fix round 1, item 3: an explicit, closed-fail bound on a
-        // data-driven quantity — see this function's own doc comment,
-        // "`MAX_MAP_ITEMS`", for what this does and does not bound.
-        if items.len() > MAX_MAP_ITEMS {
-            return StepOutcome::failed(
-                step_id,
-                format!(
-                    "`map.over` yielded {} items, exceeding the {MAX_MAP_ITEMS}-item limit for a \
-                     single `map` step",
-                    items.len()
-                ),
-            );
-        }
-
         let inner_steps: Vec<StepDef> = match inner_step_yaml.iter().map(parse_step).collect() {
             Ok(v) => v,
             Err(e) => {
@@ -491,14 +637,12 @@ impl<'a> Executor<'a> {
 
         let mut budget = MapBudget::unenforced_placeholder();
 
-        // Fix round 1, item 3: exactly one clone of the whole context for
-        // this entire map step, not one per item — see this function's own
-        // doc comment, "Fix round 1: the original per-item `ExprContext`
-        // clone was itself the defect", for the measured cost this replaces
-        // and why mutating `self.ctx` in place per item (rather than
-        // swapping in a fresh clone) is still correct against R-2b's
-        // cross-step poisoning hazard.
-        let saved_outer_ctx = self.ctx.clone();
+        // Fix round 2, item 2/3: snapshot ONE root's binding, not the whole
+        // context — see this function's own doc comment, "Why binding onto
+        // the shared context and reverting by name is correct", for the
+        // atomicity argument this depends on and the measured cost this
+        // replaces under nesting.
+        let outer_snapshot = self.ctx.snapshot_root(as_name);
         // Fix-round-3-style step-boundary taint: if any item's own inner
         // steps produced secret-derived output, or the collection itself was
         // secret-derived, the map step's *own* aggregate output
@@ -520,7 +664,16 @@ impl<'a> Executor<'a> {
 
                 let mut last = ItemOutcome::Completed(Value::Null);
                 for inner in &inner_steps {
-                    let outcome = self.dispatch_step(inner);
+                    // Fix round 2, item 1: evaluate the inner step's own
+                    // `when:` gate before dispatching it — the fail-open
+                    // defect this closes, and why a shared helper rather
+                    // than a second hand-written copy, are this function's
+                    // own doc comment, "An inner step's own `when:` gate was
+                    // silently ignored".
+                    let outcome = match evaluate_when_gate(inner, &self.ctx) {
+                        GateDecision::Decided(outcome) => outcome,
+                        GateDecision::Proceed { .. } => self.dispatch_step(inner),
+                    };
                     any_item_secret_derived |= outcome.output_is_secret_derived;
                     match outcome.status {
                         // Fix round 1, item 4: an item fails as soon as ANY
@@ -545,7 +698,7 @@ impl<'a> Executor<'a> {
             },
         );
 
-        self.ctx = saved_outer_ctx;
+        self.ctx.restore_root(as_name, outer_snapshot);
 
         StepOutcome {
             step_id: step_id.to_string(),
@@ -553,6 +706,10 @@ impl<'a> Executor<'a> {
                 "items": result.outcomes.iter().map(item_outcome_to_json).collect::<Vec<_>>(),
                 "collected_errors": result.collected_errors,
             }),
+            // Fix round 2, item 5 (recorded, not fixed here — Task 8's job):
+            // unconditionally `Completed`, even when every item failed. See
+            // this function's own doc comment, "The map's own aggregate
+            // status is unconditionally `Completed`".
             status: StepStatus::Completed,
             output_is_secret_derived: any_item_secret_derived,
             gate_condition_was_secret_derived: false,

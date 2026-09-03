@@ -800,6 +800,23 @@ pub struct ExprContext {
     secret_provenance: HashMap<String, RootProvenance>,
 }
 
+/// An opaque snapshot of one root's binding — both its [`Value`] and its
+/// taint provenance, or the fact that it is currently unbound — captured by
+/// [`ExprContext::snapshot_root`] and later restored, atomically, by
+/// [`ExprContext::restore_root`]. See that method's own doc comment for the
+/// full safety argument (Task 14 fix round 2, item 2/3).
+///
+/// Deliberately `pub(crate)` with private fields: a caller outside this
+/// module (or outside `roundhouse-flow` entirely) can hold a value of this
+/// type but cannot construct or inspect one — the only way to obtain one is
+/// [`ExprContext::snapshot_root`], and the only thing it is good for is
+/// handing straight back to [`ExprContext::restore_root`] on the same
+/// instance.
+pub(crate) struct RootSnapshot {
+    value: Option<Value>,
+    provenance: Option<RootProvenance>,
+}
+
 impl ExprContext {
     pub fn new() -> Self {
         Self {
@@ -880,32 +897,48 @@ impl ExprContext {
     ///
     /// The producer's **unredacted** value — see
     /// [`ProvenanceCarrier::provenance_value`] for why binding `***` would be
-    /// wrong. This clones that value; the cost of the clone is unmeasured
-    /// beyond `crate::exec::map_step`'s own per-item context-clone cost (a
-    /// distinct, measured cost — see `dispatch_map_step`'s doc comment).
+    /// wrong. This clones that value; the cost of the clone is unmeasured and
+    /// is the value's own size only — `set_from` does not clone anything
+    /// beyond the one value it is handed. (An earlier version of this
+    /// sentence pointed at a "per-item context-clone cost" in
+    /// `crate::exec::map_step`; that cost no longer exists there as of Task 14
+    /// fix round 2 — see [`Self::snapshot_root`]/[`Self::restore_root`].)
     ///
     /// # Interaction with monotonicity, and the one thing it does not fix
     ///
     /// `set_from` on a clean producer goes through [`Self::set_public`], so it
-    /// inherits monotonicity: it cannot lower a name already marked secret.
-    /// It does **not** rescue a name from the per-root-name conservatism
-    /// described on [`Self::set_public`] — a loop that binds one name per item
-    /// still escalates that name permanently the first time an item is
-    /// tainted, **for the life of whichever `ExprContext` it is called on**.
-    /// Ruling P45 records the sharpest form of this: since `map.over` is
-    /// evaluated once, every item in one `map` step shares one taint bit
-    /// regardless of which `ExprContext` (shared or per-item) `set_from`
-    /// binds it into — this is not a monotonicity artifact to be fixed, it is
-    /// collection-granularity taint, accepted. See [`Self::set_public`]'s own
-    /// doc comment for the full accounting and the measured figure.
+    /// inherits monotonicity: it cannot lower a name already marked secret
+    /// **on the `ExprContext` it is called on, for that instance's life**. It
+    /// does **not** rescue a name from the per-root-name conservatism
+    /// described on [`Self::set_public`] within one such life — a loop that
+    /// binds one name per item still escalates that name for as long as this
+    /// same `ExprContext` value persists, once any one item taints it. Ruling
+    /// P45 records the sharpest form of this: since `map.over` is evaluated
+    /// once, every item in one `map` step shares one taint bit regardless of
+    /// binding strategy — this is not a monotonicity artifact to be fixed, it
+    /// is collection-granularity taint, accepted. A caller that needs a name's
+    /// monotonic history to *end* — as `crate::exec::map_step::Executor::dispatch_map_step`
+    /// does, once per `map` step and once per nesting level — uses
+    /// [`Self::snapshot_root`]/[`Self::restore_root`] to revert the name to an
+    /// earlier, already-established state; that is not `set_from` rescuing
+    /// anything, it is a different, narrower operation for a different
+    /// purpose. See [`Self::set_public`]'s own doc comment for the full
+    /// accounting and the measured figure, and [`Self::restore_root`]'s for
+    /// why reverting a name's history this way is safe where lowering its
+    /// provenance by assertion would not be.
     ///
     /// # Callers (Task 14, landed)
     ///
     /// `crate::exec::map_step::Executor::dispatch_map_step` is this method's
     /// first real caller: it evaluates `over:` once, calls
     /// [`Evaluated::derive`] once per item, and binds the result with this
-    /// method into a **fresh, per-item** `ExprContext` (see that function's
-    /// own doc comment for why per-item rather than the shared run context).
+    /// method directly onto `self.ctx` — the run's own, shared
+    /// `ExprContext` — for the duration of that item's inner steps, then
+    /// reverts the binding via [`Self::restore_root`] once the whole `map`
+    /// step (or, when nested, the whole enclosing item) finishes. See that
+    /// function's own doc comment for why binding onto the shared context and
+    /// reverting by name, rather than forking a whole separate context, is
+    /// both correct and (unlike an earlier design) affordable under nesting.
     /// `inputs`/`vars`/`run.id`/`secrets` still bind through
     /// [`Self::set_public`]/[`Self::set_secret`] directly (none of them has a
     /// producer to read), and `steps` still goes through
@@ -967,66 +1000,79 @@ impl ExprContext {
     /// shape that had to be fixed at the step boundary in fix round 3, so it
     /// is made **unrepresentable** here rather than documented again.
     ///
-    /// # Monotonicity is per root NAME and irreversible for the context's life — a REQUIREMENT on the caller, not a hint
+    /// # Monotonicity is per root NAME and irreversible **for one `ExprContext` instance's life** — a REQUIREMENT on the caller, not a hint
     ///
-    /// A name that has ever held secret material keeps redacting for as long as
-    /// that [`ExprContext`] lives, even if a later binding of that same name is
-    /// genuinely clean. **A caller that rebinds one name in a loop must
-    /// therefore use a per-item name or a fresh [`ExprContext`] per item** if
-    /// clean items are to stay readable in the log. This is a requirement, not
-    /// a suggestion: there is no way to undo the escalation afterwards, by
-    /// design.
+    /// A name that has ever held secret material keeps redacting for as long
+    /// as **the particular `ExprContext` value** it was bound on lives, even
+    /// if a later binding of that same name, on that same instance, is
+    /// genuinely clean — there is no method on this type that lowers a root's
+    /// recorded provenance by *assertion*. **A caller that rebinds one name in
+    /// a loop, and wants clean items to stay readable in the log, must end
+    /// that name's monotonic history deliberately** — either by moving to a
+    /// different `ExprContext` instance (a fresh one, or a different existing
+    /// one), or by reverting the name to an earlier, already-established state
+    /// via [`Self::snapshot_root`]/[`Self::restore_root`], which is the
+    /// mechanism `crate::exec::map_step` actually uses (see below). This is a
+    /// requirement, not a suggestion: **within one instance**, there is no way
+    /// to lower a root's provenance by assertion, by design.
     ///
-    /// The scale of the consequence (ruling P45, correcting fix round 1's own
-    /// over-narrow framing of this figure): a 500-item `map` in which only
-    /// item 1 carries a credential produces 500 fully-redacted log lines,
-    /// *including every item's name* — one tainted item costs the
+    /// The scale of the consequence (ruling P45): a 500-item `map` in which
+    /// only item 1 carries a credential produces 500 fully-redacted log
+    /// lines, *including every item's name* — one tainted item costs the
     /// observability of the other 499. **This figure is unconditional under
     /// collection-granularity taint, not contingent on any particular binding
-    /// strategy.** An earlier version of this paragraph qualified it with "if
-    /// every item is bound into the same, shared `ExprContext` by rebinding
-    /// one name in place", which reads as "the landed `map` design avoids
-    /// this" — measured, by execution, that it does not: `map.over` is
-    /// evaluated **once** ([`eval_delimited_expression`]), producing a single
-    /// [`Evaluated`] whose `secret_derived` bit is then propagated to every
-    /// element by [`Evaluated::derive`], regardless of which `ExprContext`
-    /// each element is later bound into. There is no per-element evaluation
-    /// in this crate to give any one item a taint bit independent of the
-    /// others', so this is not a bug in `crate::exec::map_step`'s binding
-    /// strategy — it is the inherent cost of taint being tracked per
-    /// *collection*, not per *element*. **This is accepted, over- not
-    /// under-redaction**, and the `steps` root is unaffected regardless,
-    /// because [`Self::set_with_secret_paths`] keeps it per-step precise
-    /// rather than whole-root.
+    /// strategy or on which `ExprContext` mechanism a caller uses**:
+    /// `map.over` is evaluated **once** ([`eval_delimited_expression`]),
+    /// producing a single [`Evaluated`] whose `secret_derived` bit is then
+    /// propagated to every element by [`Evaluated::derive`]. There is no
+    /// per-element evaluation in this crate to give any one item a taint bit
+    /// independent of the others', so this is not a bug in
+    /// `crate::exec::map_step`'s binding strategy — it is the inherent cost of
+    /// taint being tracked per *collection*, not per *element*. **This is
+    /// accepted, over- not under-redaction**, and the `steps` root is
+    /// unaffected regardless, because [`Self::set_with_secret_paths`] keeps it
+    /// per-step precise rather than whole-root.
     ///
-    /// **What `crate::exec::map_step`'s fresh-`ExprContext`-per-item design
-    /// actually fixes — a different, real problem, not this one.**
-    /// `dispatch_map_step` clones a fresh `ExprContext` per item from the
-    /// context as it stood *before* the map step started, binds that one
-    /// item into the clone, runs the item's inner steps against it, and
-    /// discards the clone — so a name's taint from **one `map` step** can
-    /// never survive to poison a **different** `map` step (or a later
-    /// top-level step) that happens to reuse the same `as:` name. It does
-    /// **not**, and structurally cannot, give item 2 of a 500-item map a
-    /// taint bit independent of item 1's — both come from the same one
-    /// `Evaluated` the collection produced. Measured end to end (two `map`
-    /// steps in one workflow, both `as: item`, the first's `over:`
+    /// **What `crate::exec::map_step` actually fixes — a different, real
+    /// problem, not this one.** `dispatch_map_step` snapshots `as_name`'s
+    /// prior binding (via [`Self::snapshot_root`]) before its first item, binds
+    /// each item onto the run's own, shared `ExprContext` for that item's
+    /// inner steps, and restores the snapshot (via [`Self::restore_root`])
+    /// once the whole `map` step — or, when `map`s nest, once the enclosing
+    /// item — finishes. Because a restore reverts **value and provenance
+    /// together, atomically**, a name's taint from **one `map` step** (or one
+    /// nesting level) can never survive to poison a **different** `map` step,
+    /// or an *enclosing* one reusing the same `as:` name after a nested `map`
+    /// returns. This is not the same claim as "no monotonicity artifact
+    /// exists" — it is a **narrower**, correct one: monotonicity is real and
+    /// unavoidable within the span between a snapshot and its restore
+    /// (exactly the 500-item figure above), and `restore_root` is what ends
+    /// that span deliberately rather than leaving it open for the rest of the
+    /// run. It does **not**, and structurally cannot, give item 2 of one
+    /// 500-item map a taint bit independent of item 1's — both come from the
+    /// same one `Evaluated` the collection produced. Measured end to end (two
+    /// **sibling** `map` steps, both `as: item`, the first's `over:`
     /// secret-derived, the second's genuinely clean):
     /// `tests/map_step.rs`'s
     /// `a_secret_derived_maps_as_name_does_not_poison_a_later_clean_maps_use_of_the_same_as_name`
-    /// — the second map's items log in cleartext, not `***`. That is the
-    /// property this design closes: poisoning is bounded to *within* one
-    /// `map` step's own collection, never across steps.
+    /// — the second map's items log in cleartext, not `***`. Measured again
+    /// for **nested** maps sharing a name (the case this argument has to
+    /// survive, not just the sibling case):
+    /// `a_nested_maps_secret_derived_as_name_does_not_poison_the_outer_maps_use_of_the_same_as_name`
+    /// — inside the nested map, `${{ item }}` logs `***`; after it returns,
+    /// the outer item's own remaining inner steps read `${{ item }}` and get
+    /// the outer's real, clean value in cleartext.
     ///
     /// What this conservatism cannot do is corrupt a dispatched value, which
     /// never consults provenance at all; it costs log readability only.
     ///
     /// # What monotonicity does NOT cover
     ///
-    /// It only stops a *downgrade of a name already marked secret*. A **new**
-    /// name bound here for the first time is clean because you said so, and
-    /// nothing checks you. This is exactly why `map.as` (Task 14) does not
-    /// call this method with a bare item value at all: if the collection
+    /// It only stops a *downgrade of a name already marked secret, by
+    /// assertion, within one `ExprContext` instance's ordinary lifetime*. A
+    /// **new** name bound here for the first time is clean because you said
+    /// so, and nothing checks you. This is exactly why `map.as` (Task 14) does
+    /// not call this method with a bare item value at all: if the collection
     /// being iterated was itself derived from a secret (`over:
     /// "${{ json(secrets.K).items }}"`), a per-item binding built with this
     /// method would be a fresh name with no prior provenance, stopping taint
@@ -1108,6 +1154,102 @@ impl ExprContext {
                     self.secret_provenance
                         .insert(name.to_string(), RootProvenance::Paths(paths));
                 }
+            }
+        }
+    }
+
+    /// Captures `name`'s current binding — its value **and** its taint
+    /// provenance, or the fact that it is currently unbound — for later,
+    /// exact restoration via [`Self::restore_root`]. See that method's own
+    /// doc comment for what this pair exists to make affordable (Task 14 fix
+    /// round 2, item 2) and why bypassing the ordinary monotonicity
+    /// guarantee here is safe.
+    pub(crate) fn snapshot_root(&self, name: &str) -> RootSnapshot {
+        RootSnapshot {
+            value: self.vars.get(name).cloned(),
+            provenance: self.secret_provenance.get(name).cloned(),
+        }
+    }
+
+    /// Restores `name`'s binding to exactly what `snapshot` captured —
+    /// value and provenance together, in one call, so no reader of this
+    /// `ExprContext` ever observes a value under a provenance that does not
+    /// (yet) match it. If the snapshot recorded `name` as unbound, this
+    /// removes it (from both `vars` and `secret_provenance`) rather than
+    /// binding an empty value.
+    ///
+    /// # Why this may bypass monotonicity, when nothing else in this module may (Task 14 fix round 2)
+    ///
+    /// [`Self::set_public`]/[`Self::set_secret`]/[`Self::set_with_secret_paths`]
+    /// can never *lower* a root's recorded provenance, deliberately — see
+    /// [`Self::set_public`]'s own doc comment. This method is not one of
+    /// those, and does not weaken that guarantee: it never lets a caller
+    /// *assert* new, weaker provenance for a value it is choosing now. It
+    /// reverts a root to a state **this exact `ExprContext` instance
+    /// genuinely held a moment before** — the snapshot came from
+    /// [`Self::snapshot_root`] on this same instance, so no new information
+    /// is asserted and nothing is claimed clean that this instance had not
+    /// already, independently, established clean earlier in its own life.
+    ///
+    /// **The atomicity is the whole of what makes this safe, and it is load-
+    /// bearing, not incidental** (established by Task 14 fix round 2's
+    /// security lens, correcting a weaker justification an earlier draft of
+    /// `crate::exec::map_step` gave for the whole-context version of this
+    /// same idea). `ExprContext` monotonicity ("a name that has ever held
+    /// secret material keeps redacting") is an invariant of **one
+    /// `ExprContext` value**, not of anything outside it — nothing prevents
+    /// a *second*, later value (or the same value, deliberately reset by a
+    /// call like this one) from legitimately holding a different history for
+    /// the same name. `crate::exec::Executor::dispatch_map_step` deliberately
+    /// discards and reconstitutes root bindings across `map` step and
+    /// nesting-level boundaries for exactly this reason: value and
+    /// provenance always change *together*, so a reader can never observe
+    /// the mismatched combination (an old, secret-flavoured provenance still
+    /// attached to a new, clean value, or vice versa) that would make this
+    /// unsafe.
+    ///
+    /// **Verified, not merely argued** — the case this reasoning has to
+    /// survive is a *nested* `map` reusing its parent's `as:` name: outer
+    /// `as: item` clean, inner (nested) `map` also `as: item`, secret. Inside
+    /// the nested `map`, `${{ item }}` correctly logs `***`; once the nested
+    /// `map` returns (restoring `item` to the outer's snapshot), a sibling
+    /// step in the *outer* item's own remaining inner steps reads
+    /// `${{ item }}` again and gets the outer's real, clean value logged in
+    /// cleartext (`tests/map_step.rs`'s
+    /// `a_nested_maps_secret_derived_as_name_does_not_poison_the_outer_maps_use_of_the_same_as_name`).
+    /// The reverse direction (outer secret, inner clean, same name) also
+    /// holds and is deliberately **conservative rather than incorrect**: the
+    /// nested map's own clean items are over-redacted for the duration of
+    /// the nested call (they share the outer's still-`Whole` provenance
+    /// entry, since [`Self::set_public`] cannot lower it), which is the same
+    /// accepted, safe-direction cost this module already documents for
+    /// same-name rebinding generally — never under-redaction, only a log
+    /// readability cost, and never a corrupted dispatched value.
+    ///
+    /// `pub(crate)`, not `pub`: an external caller restoring an arbitrary,
+    /// self-supplied `RootSnapshot` would be indistinguishable from
+    /// re-assertion by the back door — precisely the shape rulings
+    /// P35/P37/P40/P44 close everywhere else this module is reachable from
+    /// outside the crate. In-crate, the one call site
+    /// (`crate::exec::map_step::Executor::dispatch_map_step`) is reviewed
+    /// alongside the invariant it depends on: a snapshot must always come
+    /// from [`Self::snapshot_root`] on the very `ExprContext` it is later
+    /// restored onto, never constructed by hand or carried across instances.
+    pub(crate) fn restore_root(&mut self, name: &str, snapshot: RootSnapshot) {
+        match snapshot.value {
+            Some(value) => {
+                self.vars.insert(name.to_string(), value);
+            }
+            None => {
+                self.vars.remove(name);
+            }
+        }
+        match snapshot.provenance {
+            Some(provenance) => {
+                self.secret_provenance.insert(name.to_string(), provenance);
+            }
+            None => {
+                self.secret_provenance.remove(name);
             }
         }
     }
