@@ -49,8 +49,12 @@ fn fails_closed_when_raw_input_is_absent_rather_than_substituting_an_empty_objec
     let err = normalize_tool_call_for_policy(&update).expect_err("rawInput was never supplied");
     assert_eq!(
         err,
+        // FIX round 2 (Item 4): tool_call_id is peer-controlled and now
+        // routed through the crate's escape-and-cap helper (same discipline
+        // as option_id), so the expected value is the escaped form (`str`'s
+        // `Debug` output), not the raw id.
         PermissionError::MissingRawInput {
-            tool_call_id: "tc-2".to_string()
+            tool_call_id: format!("{:?}", "tc-2")
         }
     );
 }
@@ -80,7 +84,7 @@ fn fails_closed_when_kind_is_absent() {
     assert_eq!(
         err,
         PermissionError::UnidentifiableTool {
-            tool_call_id: "tc-4".to_string()
+            tool_call_id: format!("{:?}", "tc-4")
         }
     );
 }
@@ -104,7 +108,7 @@ fn fails_closed_when_kind_is_other_even_if_title_looks_informative() {
     assert_eq!(
         err,
         PermissionError::UnidentifiableTool {
-            tool_call_id: "tc-5".to_string()
+            tool_call_id: format!("{:?}", "tc-5")
         }
     );
 }

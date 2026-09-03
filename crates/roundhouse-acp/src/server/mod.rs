@@ -27,6 +27,7 @@
 //! up the required kind" — [`ambiguous_option_ids`], the `Ask`-never-
 //! `RejectAlways` restriction, refusing to select an unmatched kind — exists
 //! because of that, not out of general caution.
+use crate::peer_text::escape_and_cap_peer_str;
 use agent_client_protocol::schema::v1::{
     PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
     SelectedPermissionOutcome, ToolCallUpdate, ToolKind,
@@ -102,8 +103,19 @@ pub enum PermissionError {
     /// since that substitution is indistinguishable from a real empty-args
     /// call and would let a peer bypass any policy rule that classifies on
     /// argument content.
+    ///
+    /// **`tool_call_id` is peer-controlled (fix round 2, Item 4):** an
+    /// earlier ruling declined to cap it, judging the generalization from
+    /// `&PermissionOptionId` to `&str` that would require "half a fix for a
+    /// full round"; fix round 1 performed that generalization (Ruling
+    /// C-P54), so the cost that justified deferring is gone. This field
+    /// always holds the output of [`escape_and_cap_peer_str`] — already
+    /// escaped and capped to at most [`crate::peer_text::PEER_STR_MAX_LEN`] bytes — which is
+    /// why the display format above interpolates it with `{tool_call_id}`
+    /// (plain `Display`) rather than `{tool_call_id:?}`: re-applying `Debug`
+    /// to an already-`Debug`-escaped string would double-escape it.
     #[error(
-        "ToolCallUpdate {tool_call_id:?} has no rawInput; substituting an empty object would be indistinguishable from a real empty-args call and could bypass policy rules that classify on argument content"
+        "ToolCallUpdate {tool_call_id} has no rawInput; substituting an empty object would be indistinguishable from a real empty-args call and could bypass policy rules that classify on argument content"
     )]
     MissingRawInput { tool_call_id: String },
 
@@ -111,8 +123,13 @@ pub enum PermissionError {
     /// `ToolCallUpdate` whose `kind` is absent or `ToolKind::Other` — see
     /// that function's doc for why `title` is deliberately never used as a
     /// fallback identifier.
+    ///
+    /// **`tool_call_id` is peer-controlled (fix round 2, Item 4):** same
+    /// escape-and-cap discipline as [`MissingRawInput`](Self::MissingRawInput)
+    /// above, and the same reason this field is interpolated with
+    /// `{tool_call_id}` rather than `{tool_call_id:?}`.
     #[error(
-        "ToolCallUpdate {tool_call_id:?} does not identify a tool: `kind` is missing or ToolKind::Other (the wire default and the deserialization fallback for any kind this SDK version doesn't recognize), and `title` is agent-authored free text, never used as a tool identifier"
+        "ToolCallUpdate {tool_call_id} does not identify a tool: `kind` is missing or ToolKind::Other (the wire default and the deserialization fallback for any kind this SDK version doesn't recognize), and `title` is agent-authored free text, never used as a tool identifier"
     )]
     UnidentifiableTool { tool_call_id: String },
 }
@@ -148,7 +165,7 @@ fn find_option(
 /// inflated every log line that renders the resulting
 /// `PermissionError::AmbiguousOptions`, with further amplification from
 /// `\u{...}` escape expansion. Same escaping, plus the
-/// [`UNKNOWN_OPTION_ID_MAX_LEN`] cap this module already applies one
+/// [`crate::peer_text::PEER_STR_MAX_LEN`] cap this module already applies one
 /// function away.
 fn ambiguous_option_ids(options: &[PermissionOption]) -> Option<String> {
     let mut seen: HashSet<&PermissionOptionId> = HashSet::new();
@@ -264,7 +281,7 @@ pub fn handle_request_permission(
 /// equality lookup against the offered `options` (see [`resolve_selection`]),
 /// where escaping would break id matching. A caller that needs to *log* it
 /// must escape and length-cap it first — at most
-/// [`UNKNOWN_OPTION_ID_MAX_LEN`] bytes, the same discipline this module
+/// [`crate::peer_text::PEER_STR_MAX_LEN`] bytes, the same discipline this module
 /// applies elsewhere.
 pub fn selected_option_id(outcome: &RequestPermissionOutcome) -> Option<&PermissionOptionId> {
     match outcome {
@@ -321,7 +338,7 @@ pub enum SelectionResolution {
     /// *always* the output of `escape_and_cap_peer_str` — escaped via
     /// `str`'s `Debug` formatting (so it is quoted, and control characters
     /// appear only in their escaped `\n` / `\u{...}` forms) and truncated to
-    /// at most [`UNKNOWN_OPTION_ID_MAX_LEN`] bytes. `resolve_selection` is
+    /// at most [`crate::peer_text::PEER_STR_MAX_LEN`] bytes. `resolve_selection` is
     /// the single construction site in this crate today, which is why a
     /// newtype would only add unused public surface for a mistake with
     /// nowhere to go. **Any future second construction site must preserve
@@ -376,72 +393,6 @@ pub fn resolve_selection(
         RequestPermissionOutcome::Cancelled => SelectionResolution::Cancelled,
         _ => SelectionResolution::UnrecognizedOutcome,
     }
-}
-
-/// Maximum length, in bytes, of the `String` `escape_and_cap_peer_str`
-/// returns. Enforced by that function's truncation step (verified by
-/// `escape_and_cap_peer_str_truncates_at_the_cap_boundary` in this
-/// module's tests, which constructs a string long enough to exceed the cap
-/// and asserts the returned string's byte length is exactly this constant)
-/// — not merely documented as bounded. A result shorter than this constant
-/// is also possible when truncation lands mid-character and walks back to a
-/// `char` boundary (verified by
-/// `escape_and_cap_peer_str_truncates_back_to_a_char_boundary`).
-///
-/// Originally scoped to `option_id` values only (hence the name); now also
-/// the cap `mcp_over_acp::InProcessMcpServer::call_tool` applies to an
-/// unrecognized peer-supplied tool name (Ruling C-P54) — the bound is
-/// general to any peer-controlled string this crate escapes for safe
-/// logging, not specific to permission options.
-pub const UNKNOWN_OPTION_ID_MAX_LEN: usize = 128;
-
-/// Escapes control characters (notably newlines) out of an untrusted,
-/// peer-controlled string and caps the result to at most
-/// [`UNKNOWN_OPTION_ID_MAX_LEN`] bytes, so the value is safe to interpolate
-/// directly into a log line — see [`SelectionResolution::UnknownOptionId`]'s
-/// doc for the attack this closes.
-///
-/// **Ruling C-P54 (fix round 1):** generalized from `&PermissionOptionId` to
-/// `&str` so that any peer-controlled string in this crate can be routed
-/// through the same discipline — not only a `PermissionOptionId`. The first
-/// caller outside `option_id` handling is
-/// `mcp_over_acp::InProcessMcpServer::call_tool`'s "unknown tool" error,
-/// which previously interpolated an MCP-over-ACP peer's tool name via
-/// `Display` with no escaping or bound at all (the same forged-audit-line
-/// and unbounded-log-inflation hazard this function already closes for
-/// `option_id`s). An earlier ruling declined this generalization because no
-/// caller needed it yet; that caller now exists, so the generalization is
-/// applied here rather than duplicated.
-///
-/// Escaping reuses `str`'s standard `Debug` formatting (`{:?}`) — the same
-/// escaping convention [`ambiguous_option_ids`]'s error messages already
-/// use elsewhere in this module — which wraps the text in quotes and
-/// escapes newlines, carriage returns, tabs, backslashes, quotes, and other
-/// control and non-printable characters. The specific cases asserted by
-/// `escape_and_cap_peer_str_escapes_control_and_invisible_characters` are
-/// `\n`, `\r`, `\u{1b}` (the ANSI/CSI introducer) and `\u{202e}` (the
-/// right-to-left override used in Trojan Source attacks); note that
-/// *printable* non-ASCII passes through unescaped, which is why multi-byte
-/// characters can reach the truncator at all.
-///
-/// Truncation happens after escaping. Because the escaped form can end in a
-/// multi-byte character, the cut point walks back to a `char` boundary — so
-/// the result is always valid UTF-8, and is at most (not always exactly)
-/// [`UNKNOWN_OPTION_ID_MAX_LEN`] bytes. Both branches are covered by
-/// `escape_and_cap_peer_str_truncates_at_the_cap_boundary` (ASCII, cut
-/// lands exactly on the cap) and
-/// `escape_and_cap_peer_str_truncates_back_to_a_char_boundary` (a 4-byte
-/// codepoint straddling the cap, cut walks back and the result is shorter).
-pub(crate) fn escape_and_cap_peer_str(value: &str) -> String {
-    let escaped = format!("{value:?}");
-    if escaped.len() <= UNKNOWN_OPTION_ID_MAX_LEN {
-        return escaped;
-    }
-    let mut end = UNKNOWN_OPTION_ID_MAX_LEN;
-    while end > 0 && !escaped.is_char_boundary(end) {
-        end -= 1;
-    }
-    escaped[..end].to_string()
 }
 
 /// A `ToolKind` extracted from a peer's `ToolCallUpdate`, wrapped rather
@@ -520,6 +471,14 @@ pub struct AcpToolKindClaim(pub ToolKind);
 ///   any policy rule that classifies on argument content (e.g. shell command
 ///   text) just by omitting `rawInput`.
 /// - `fields.kind` absent or `ToolKind::Other` → `Err(UnidentifiableTool)`.
+///
+/// **`tool_call_id` is peer-controlled and arbitrarily long (fix round 2,
+/// Item 4).** Both error variants above route it through
+/// [`escape_and_cap_peer_str`] rather than `ToolCallId`'s own `Display`
+/// (which writes its `Arc<str>` content verbatim) before embedding it —
+/// closing off the same forged-log-line and unbounded-log-inflation hazard
+/// [`ambiguous_option_ids`] and [`resolve_selection`] already close for
+/// `option_id`s.
 pub fn normalize_tool_call_for_policy(
     update: &ToolCallUpdate,
 ) -> Result<(AcpToolKindClaim, Value), PermissionError> {
@@ -527,7 +486,7 @@ pub fn normalize_tool_call_for_policy(
         Some(kind) if kind != ToolKind::Other => AcpToolKindClaim(kind),
         _ => {
             return Err(PermissionError::UnidentifiableTool {
-                tool_call_id: update.tool_call_id.to_string(),
+                tool_call_id: escape_and_cap_peer_str(update.tool_call_id.0.as_ref()),
             })
         }
     };
@@ -536,7 +495,7 @@ pub fn normalize_tool_call_for_policy(
         .raw_input
         .clone()
         .ok_or_else(|| PermissionError::MissingRawInput {
-            tool_call_id: update.tool_call_id.to_string(),
+            tool_call_id: escape_and_cap_peer_str(update.tool_call_id.0.as_ref()),
         })?;
     Ok((tool, args))
 }
@@ -544,6 +503,7 @@ pub fn normalize_tool_call_for_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer_text::PEER_STR_MAX_LEN;
     use agent_client_protocol::schema::v1::ToolCallUpdateFields;
 
     struct FakePolicy(PolicyOutcome);
@@ -821,7 +781,7 @@ mod tests {
         // very long id. Routing through escape_and_cap_peer_str caps it,
         // matching the discipline SelectionResolution::UnknownOptionId
         // already follows.
-        let long_id = "z".repeat(UNKNOWN_OPTION_ID_MAX_LEN * 50);
+        let long_id = "z".repeat(PEER_STR_MAX_LEN * 50);
         let policy = FakePolicy(PolicyOutcome {
             decision: PolicyDecision::Allow,
             rule: None,
@@ -850,10 +810,10 @@ mod tests {
             "the full peer-controlled id must not appear verbatim in the reason"
         );
         // The reason is a fixed sentence plus the capped id, so its length
-        // is bounded by that sentence plus UNKNOWN_OPTION_ID_MAX_LEN — far
+        // is bounded by that sentence plus PEER_STR_MAX_LEN — far
         // below the id's own length.
         assert!(
-            reason.len() < UNKNOWN_OPTION_ID_MAX_LEN + 64,
+            reason.len() < PEER_STR_MAX_LEN + 64,
             "reason must be bounded by the cap plus the fixed message, got {} bytes",
             reason.len()
         );
@@ -904,103 +864,9 @@ mod tests {
         );
     }
 
-    // ---- Finding 2 (round-3 review); generalized to `&str` in fix round 1
-    // (Ruling C-P54): escape_and_cap_peer_str ----
-
-    #[test]
-    fn escape_and_cap_peer_str_escapes_a_newline_rather_than_passing_it_through() {
-        // The exact attack Finding 2 describes: a peer-controlled string
-        // containing a newline (and a fake audit line) must not produce a
-        // newline in the string this crate hands to a caller that logs it.
-        let escaped = escape_and_cap_peer_str("x\n[audit] resolve_selection: Resolved(AllowOnce)");
-        assert!(
-            !escaped.contains('\n'),
-            "escaped string must not contain a raw newline: {escaped:?}"
-        );
-        assert!(
-            escaped.contains("\\n"),
-            "escaped string must contain the escaped form: {escaped:?}"
-        );
-    }
-
-    #[test]
-    fn escape_and_cap_peer_str_truncates_at_the_cap_boundary() {
-        // Truncation must actually happen at UNKNOWN_OPTION_ID_MAX_LEN, not
-        // merely be documented as bounded — this constructs a string whose
-        // escaped form is longer than the cap and asserts the returned
-        // string's byte length is exactly the cap.
-        let long = "a".repeat(UNKNOWN_OPTION_ID_MAX_LEN * 2);
-        let escaped = escape_and_cap_peer_str(&long);
-        assert_eq!(escaped.len(), UNKNOWN_OPTION_ID_MAX_LEN);
-    }
-
-    #[test]
-    fn escape_and_cap_peer_str_truncates_back_to_a_char_boundary() {
-        // FIX round 4: the ASCII test above lands exactly on the cap, so it
-        // never executes the is_char_boundary back-off loop — leaving the
-        // doc's "truncation happens at a `char` boundary" claim untested.
-        // Printable non-ASCII passes through `Debug` unescaped, so a 4-byte
-        // codepoint can reach the truncator intact. Position U+1F600 so it
-        // straddles byte UNKNOWN_OPTION_ID_MAX_LEN of the *escaped* string:
-        // escaping prepends one `"`, so 126 leading 'a's put the emoji's
-        // first byte at index 127 and its continuation bytes at 128..=130.
-        let straddling = format!(
-            "{}\u{1f600}{}",
-            "a".repeat(UNKNOWN_OPTION_ID_MAX_LEN - 2),
-            "a".repeat(UNKNOWN_OPTION_ID_MAX_LEN)
-        );
-        // The load-bearing check is that the call above returns at all:
-        // slicing a `str` at a non-`char` boundary panics, so a truncator
-        // that cut blindly at the cap would abort this test here. The
-        // from_utf8 assertion restates the doc's "always valid UTF-8" claim
-        // explicitly on the value that came back.
-        let escaped = escape_and_cap_peer_str(&straddling);
-        assert!(
-            std::str::from_utf8(escaped.as_bytes()).is_ok(),
-            "truncated result must still be valid UTF-8: {escaped:?}"
-        );
-        assert!(
-            escaped.len() < UNKNOWN_OPTION_ID_MAX_LEN,
-            "walking back off a mid-character cut must make the result \
-             strictly shorter than the cap, got {} bytes",
-            escaped.len()
-        );
-        assert!(
-            !escaped.contains('\u{1f600}'),
-            "the straddling codepoint must have been cut, not half-kept: {escaped:?}"
-        );
-    }
-
-    #[test]
-    fn escape_and_cap_peer_str_escapes_control_and_invisible_characters() {
-        // FIX round 4: the doc claims carriage returns and "other control
-        // characters" are escaped, but only `\n` was asserted. These three
-        // are the log-integrity-relevant ones beyond the newline: a bare
-        // `\r` can overwrite a rendered log line, `\u{1b}` introduces ANSI
-        // control sequences in a terminal, and `\u{202e}` is the
-        // right-to-left override used by Trojan Source attacks to make
-        // rendered text read differently from its bytes.
-        let escaped = escape_and_cap_peer_str("a\rb\u{1b}[31mc\u{202e}d");
-        for raw in ['\r', '\u{1b}', '\u{202e}'] {
-            assert!(
-                !escaped.contains(raw),
-                "escaped string must not contain raw {raw:?}: {escaped:?}"
-            );
-        }
-        for expected in ["\\r", "\\u{1b}", "\\u{202e}"] {
-            assert!(
-                escaped.contains(expected),
-                "escaped string must contain {expected}: {escaped:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn escape_and_cap_peer_str_does_not_truncate_when_under_the_cap() {
-        let escaped = escape_and_cap_peer_str("short-id");
-        assert_eq!(escaped, format!("{:?}", "short-id"));
-        assert!(escaped.len() < UNKNOWN_OPTION_ID_MAX_LEN);
-    }
+    // Note: the escape_and_cap_peer_str / PEER_STR_MAX_LEN unit tests moved
+    // to `crate::peer_text::tests` in fix round 2 (Item 5), alongside the
+    // function and constant they exercise.
 
     #[test]
     fn resolve_selection_reports_cancelled_distinctly() {
@@ -1054,6 +920,58 @@ mod tests {
     }
 
     #[test]
+    fn normalize_tool_call_escapes_and_caps_a_hostile_tool_call_id() {
+        // FIX round 2 (Item 4): tool_call_id is peer-controlled and
+        // arbitrarily long. This constructs one that is both — a fake audit
+        // line plus enough padding to exceed the cap — and asserts both
+        // PermissionError variants that embed it come back with no raw
+        // newline and a bounded length, instead of the peer's bytes
+        // verbatim.
+        let hostile_id = format!(
+            "x\n[audit] normalize_tool_call_for_policy: ok{}",
+            "y".repeat(PEER_STR_MAX_LEN * 10)
+        );
+
+        let missing_raw_input = ToolCallUpdate::new(
+            hostile_id.clone(),
+            ToolCallUpdateFields::new().kind(ToolKind::Execute),
+        );
+        let err = normalize_tool_call_for_policy(&missing_raw_input)
+            .expect_err("rawInput was never supplied");
+        let PermissionError::MissingRawInput { tool_call_id } = err else {
+            panic!("expected MissingRawInput, got {err:?}");
+        };
+        assert!(
+            !tool_call_id.contains('\n'),
+            "escaped tool_call_id must not contain a raw newline: {tool_call_id:?}"
+        );
+        assert!(
+            tool_call_id.len() <= PEER_STR_MAX_LEN,
+            "escaped tool_call_id must be capped, got {} bytes",
+            tool_call_id.len()
+        );
+
+        let unidentifiable = ToolCallUpdate::new(
+            hostile_id,
+            ToolCallUpdateFields::new().raw_input(serde_json::json!({})),
+        );
+        let err =
+            normalize_tool_call_for_policy(&unidentifiable).expect_err("kind was never supplied");
+        let PermissionError::UnidentifiableTool { tool_call_id } = err else {
+            panic!("expected UnidentifiableTool, got {err:?}");
+        };
+        assert!(
+            !tool_call_id.contains('\n'),
+            "escaped tool_call_id must not contain a raw newline: {tool_call_id:?}"
+        );
+        assert!(
+            tool_call_id.len() <= PEER_STR_MAX_LEN,
+            "escaped tool_call_id must be capped, got {} bytes",
+            tool_call_id.len()
+        );
+    }
+
+    #[test]
     fn normalize_tool_call_fails_closed_when_raw_input_is_absent() {
         // Absent rawInput must not be silently treated as `{}` — that would
         // be indistinguishable from a real empty-args call.
@@ -1062,8 +980,11 @@ mod tests {
         let err = normalize_tool_call_for_policy(&update).expect_err("rawInput was never supplied");
         assert_eq!(
             err,
+            // FIX round 2 (Item 4): tool_call_id is now escape-and-capped
+            // (same discipline as option_id), so the expected value is the
+            // escaped form, not the raw id.
             PermissionError::MissingRawInput {
-                tool_call_id: "tc-2".to_string()
+                tool_call_id: format!("{:?}", "tc-2")
             }
         );
     }
@@ -1093,7 +1014,7 @@ mod tests {
         assert_eq!(
             err,
             PermissionError::UnidentifiableTool {
-                tool_call_id: "tc-4".to_string()
+                tool_call_id: format!("{:?}", "tc-4")
             }
         );
     }
@@ -1115,7 +1036,7 @@ mod tests {
         assert_eq!(
             err,
             PermissionError::UnidentifiableTool {
-                tool_call_id: "tc-5".to_string()
+                tool_call_id: format!("{:?}", "tc-5")
             }
         );
     }

@@ -36,20 +36,21 @@ pub enum StopReason {
     /// byte-for-byte — the round-trip §10.1 requires, instead of an error or
     /// a silently dropped value.
     ///
-    /// **Hazard (Ruling C-P56, fix round 1):** the inner `String` is
-    /// **untrusted peer input of unbounded length.** A 2,000,000-byte JSON
-    /// string deserializes into this variant without error — nothing at
-    /// this layer caps it, and nothing should: capping on construction was
-    /// considered and rejected, because this variant must round-trip
+    /// **Hazard (Ruling C-P56, fix round 1; reworded fix round 2):** the
+    /// inner `String` is **untrusted peer input of unbounded length.** An
+    /// arbitrarily large JSON string deserializes into this variant without
+    /// error — nothing at this layer caps it, and nothing should: capping on
+    /// construction was considered and rejected, because this variant must round-trip
     /// unknown wire values byte-for-byte (the §10.1 requirement this module
     /// exists to satisfy), and truncating would silently corrupt any
     /// legitimate value over the limit. `Debug` formatting does escape
     /// control characters, which closes the newline/log-forgery half of the
-    /// hazard the same way `server::escape_and_cap_peer_str` does, but the
-    /// *length* is not bounded anywhere between the wire and this type.
-    /// **Any caller that renders this string into a log line, a TUI, or an
-    /// event payload must escape and cap it itself first** — e.g. via
-    /// `server::escape_and_cap_peer_str` — before doing so; this module
+    /// hazard the same way `crate::peer_text::escape_and_cap_peer_str` does,
+    /// but the *length* is not bounded anywhere between the wire and this
+    /// type. **Any caller that renders this string into a log line, a TUI,
+    /// or an event payload must escape and cap it itself first** — e.g. via
+    /// `crate::peer_text::escape_and_cap_peer_str` (moved out of
+    /// `server::mod` in fix round 2, Item 5) — before doing so; this module
     /// deliberately does not do that on the caller's behalf.
     ///
     /// **Invariant (Ruling C-P58, fix round 1):** this variant holds only

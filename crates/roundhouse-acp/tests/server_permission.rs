@@ -334,7 +334,8 @@ fn resolve_selection_distinguishes_cancelled_unknown_id_and_ambiguous_options() 
         resolve_selection(&offered, &unknown_id_outcome),
         // Finding 2 (round-3 review): UnknownOptionId now carries an
         // already-escaped String (str's Debug form), never the raw
-        // PermissionOptionId — see server::escape_and_cap_peer_str.
+        // PermissionOptionId — see crate::peer_text::escape_and_cap_peer_str
+        // (moved out of server::mod in fix round 2, Item 5).
         SelectionResolution::UnknownOptionId(format!("{:?}", "never-offered"))
     );
 

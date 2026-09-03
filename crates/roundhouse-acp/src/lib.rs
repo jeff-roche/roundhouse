@@ -14,6 +14,7 @@ pub mod client;
 pub mod decision;
 pub mod elicit;
 pub mod mcp_over_acp;
+mod peer_text;
 pub mod remote_claim;
 #[cfg(feature = "acp-v2")]
 pub mod schema;

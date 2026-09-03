@@ -28,15 +28,50 @@
 //! nothing in this file actually requires the `acp-v2` feature to compile or
 //! run.
 
-use crate::server::escape_and_cap_peer_str;
+use crate::peer_text::escape_and_cap_peer_str;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fmt;
 
 /// One MCP-over-ACP tool this process can serve in-process.
 pub trait McpOverAcpTool: Send + Sync {
     fn name(&self) -> &str;
     fn input_schema(&self) -> Value;
     fn call(&self, args: Value) -> Result<Value, String>;
+}
+
+/// [`InProcessMcpServer::register`]'s error: `name` was already registered.
+///
+/// **Fix round 2 (Item 3):** replaces the previous
+/// `Result<(), Box<dyn McpOverAcpTool>>` return type, whose error carried no
+/// `Debug`, `Display`, or `std::error::Error` impl at all — unusable by any
+/// idiomatic caller (`?` into `anyhow`/`color-eyre`, `.unwrap()`,
+/// `.expect()` all failed to compile), which pushed a real caller toward
+/// `let _ = server.register(..)`, silently discarding the collision
+/// `#[must_use]` only warns about. This type keeps the rejected tool (so the
+/// caller does not lose the value it passed in) while making `?`, `unwrap`,
+/// and logging all work.
+///
+/// `Box<dyn McpOverAcpTool>` has no `Debug` impl, so this type cannot derive
+/// `Debug` — see the manual impl below, which prints the escaped, capped
+/// name (never the rejected tool itself, which has nothing safe to print).
+#[derive(thiserror::Error)]
+#[error("a tool is already registered under the name {name:?}")]
+pub struct DuplicateToolName {
+    pub name: String,
+    pub rejected: Box<dyn McpOverAcpTool>,
+}
+
+impl fmt::Debug for DuplicateToolName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `name` is the tool's own self-reported name — peer/implementation
+        // controlled, per this module's own `register` doc — so it is
+        // routed through the same escape-and-cap discipline as every other
+        // peer-controlled string this crate formats, for consistency.
+        f.debug_struct("DuplicateToolName")
+            .field("name", &escape_and_cap_peer_str(&self.name))
+            .finish_non_exhaustive()
+    }
 }
 
 /// A real, testable in-process tool registry and dispatcher — the serving
@@ -72,20 +107,24 @@ impl InProcessMcpServer {
     /// this crate's existing exact-`Arc<str>`-id-comparison convention
     /// elsewhere (`PermissionOptionId` equality in `server::mod`).
     ///
-    /// Returns `Err(tool)` — handing the rejected tool back to the caller —
-    /// if a tool is already registered under that name, rather than
-    /// silently shadowing (first registration wins) or silently replacing
-    /// (last registration wins) it. Ruling C-P55: a caller that populates
-    /// this registry from more than one source of differing trust must make
-    /// an explicit decision about a name collision rather than have one
-    /// silently imposed on it.
-    pub fn register(
-        &mut self,
-        tool: Box<dyn McpOverAcpTool>,
-    ) -> Result<(), Box<dyn McpOverAcpTool>> {
+    /// Returns `Err(DuplicateToolName { name, rejected: tool })` — handing
+    /// the rejected tool back to the caller — if a tool is already
+    /// registered under that name, rather than silently shadowing (first
+    /// registration wins) or silently replacing (last registration wins)
+    /// it. Ruling C-P55: a caller that populates this registry from more
+    /// than one source of differing trust must make an explicit decision
+    /// about a name collision rather than have one silently imposed on it.
+    /// Fix round 2 (Item 3): `DuplicateToolName` implements
+    /// `std::error::Error`, unlike the plain `Box<dyn McpOverAcpTool>` this
+    /// used to return as `Err`.
+    pub fn register(&mut self, tool: Box<dyn McpOverAcpTool>) -> Result<(), DuplicateToolName> {
         use std::collections::btree_map::Entry;
-        match self.tools.entry(tool.name().to_string()) {
-            Entry::Occupied(_) => Err(tool),
+        let name = tool.name().to_string();
+        match self.tools.entry(name.clone()) {
+            Entry::Occupied(_) => Err(DuplicateToolName {
+                name,
+                rejected: tool,
+            }),
             Entry::Vacant(slot) => {
                 slot.insert(tool);
                 Ok(())
@@ -96,10 +135,21 @@ impl InProcessMcpServer {
     /// Shaped like MCP's own `tools/list` result — this is deliberate: the
     /// day the transport wiring above lands, this is the payload it hands
     /// the SDK unchanged.
+    ///
+    /// **Fix round 2 (Item 2):** publishes the `BTreeMap` key (the name
+    /// `register` actually dispatches on), not a second call to `t.name()`.
+    /// `McpOverAcpTool` is `Send + Sync` with `fn name(&self) -> &str` and no
+    /// determinism requirement — an implementation whose `name()` derives
+    /// from mutable state could previously advertise a different name in
+    /// `list_tools` than the key `call_tool` dispatches on, relocating the
+    /// exact confused-deputy shape the registry keying fix (Ruling C-P55)
+    /// was meant to close from the `Vec` into the trait contract. Keying the
+    /// published name off the map entry makes the list/dispatch agreement
+    /// structural rather than contractual.
     pub fn list_tools(&self) -> Vec<Value> {
         self.tools
-            .values()
-            .map(|t| serde_json::json!({"name": t.name(), "inputSchema": t.input_schema()}))
+            .iter()
+            .map(|(name, t)| serde_json::json!({"name": name, "inputSchema": t.input_schema()}))
             .collect()
     }
 

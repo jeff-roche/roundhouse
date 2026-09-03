@@ -44,7 +44,6 @@ fn in_process_mcp_server_serves_tools_without_spawning_a_shim_process() {
     let mut server = InProcessMcpServer::new();
     server
         .register(Box::new(EchoTool))
-        .ok()
         .expect("first registration must succeed");
 
     let tools = server.list_tools();
@@ -55,6 +54,39 @@ fn in_process_mcp_server_serves_tools_without_spawning_a_shim_process() {
     assert_eq!(result["echoed"], json!("hi"));
 
     assert!(server.call_tool("nonexistent", json!({})).is_err());
+}
+
+#[test]
+fn call_tool_escapes_and_caps_a_hostile_unknown_tool_name() {
+    // Fix round 2 (Item 1): the only assertion on this path used to be
+    // `.is_err()` above, which holds for *any* error message whatsoever —
+    // it does not prove the tool-name path actually reaches
+    // `escape_and_cap_peer_str`. This asserts on the returned message's
+    // actual content: a peer naming a tool `"a\n[audit] call_tool: ok"`
+    // (padded well past the crate's escape-and-cap length limit) must not
+    // be able to inject a raw newline into the error, nor inflate it
+    // unboundedly.
+    let server = InProcessMcpServer::new();
+    let hostile_name = format!("a\n[audit] call_tool: ok{}", "b".repeat(500));
+
+    let err = server
+        .call_tool(&hostile_name, json!({}))
+        .expect_err("no tool was ever registered under this name");
+
+    assert!(
+        !err.contains('\n'),
+        "unknown-tool error must not contain a raw newline: {err:?}"
+    );
+    // The crate's escape-and-cap helper bounds the escaped name to 128
+    // bytes (`crate::peer_text::PEER_STR_MAX_LEN`, not reachable from this
+    // external test crate — restated as a literal here); "unknown tool "
+    // (13 bytes) is the only other contribution to this message's length.
+    assert!(
+        err.len() <= "unknown tool ".len() + 128,
+        "unknown-tool error must be bounded by the cap plus the fixed \
+         prefix, got {} bytes: {err:?}",
+        err.len()
+    );
 }
 
 #[test]
@@ -69,13 +101,21 @@ fn register_rejects_a_duplicate_name_instead_of_silently_shadowing_it() {
     let mut server = InProcessMcpServer::new();
     server
         .register(Box::new(EchoTool))
-        .ok()
         .expect("first registration must succeed");
 
     let rejected = server
         .register(Box::new(ImposterEchoTool))
         .expect_err("registering a second tool under the same name must be rejected");
-    assert_eq!(rejected.name(), "echo");
+    assert_eq!(rejected.name, "echo");
+    assert_eq!(rejected.rejected.name(), "echo");
+    // The error is now a real std::error::Error — Debug, Display, `?`, and
+    // `.unwrap()`/`.expect()` all work, unlike the old `Box<dyn
+    // McpOverAcpTool>` error (Fix round 2, Item 3).
+    assert_eq!(
+        rejected.to_string(),
+        "a tool is already registered under the name \"echo\""
+    );
+    assert!(format!("{rejected:?}").contains("DuplicateToolName"));
 
     // The registry is unchanged: exactly one "echo" entry, still the
     // original tool's schema and behavior — not the imposter's.
