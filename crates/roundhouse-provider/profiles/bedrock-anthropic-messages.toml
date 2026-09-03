@@ -35,6 +35,15 @@ codec = "anthropic-messages"
 [defaults]
 allow_raw_extra = false
 params = { mode = "deny_list", fields = [] }
+# Region-specific in reality; this is the profile DEFAULT (§9.9) -- a caller
+# targeting another region sets ROUNDHOUSE_BEDROCK_ANTHROPIC_MESSAGES_BASE_URL
+# (matching bedrock-converse.toml's/vertex-anthropic.toml's identical
+# pattern). Note: the SigV4 SIGNING region is supplied out-of-band at
+# credential construction (`SigV4Credential::new`'s `region` argument) and is
+# NOT derived from this base_url -- overriding only this URL's region without
+# also updating the credential's region yields a canonical-request scope
+# mismatch. This fails closed (AWS rejects a mismatched signature; SigV4
+# binds `host` into the signed headers), but is easy to trip over.
 base_url = "https://bedrock-mantle.us-east-1.api.aws/anthropic"
 auth = { kind = "sigv4", service = "bedrock-mantle" }
 

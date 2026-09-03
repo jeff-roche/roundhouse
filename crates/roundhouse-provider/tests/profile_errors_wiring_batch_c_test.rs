@@ -57,7 +57,14 @@ fn qwen_insufficient_quota_is_not_in_the_table_and_falls_back_to_retryable_rate_
     // Part 1: prove the table is genuinely silent on this code -- not
     // merely agreeing by coincidence with whatever classify() returns below.
     // This assertion is false the instant the entry is re-added under any
-    // disposition, which is the whole point.
+    // disposition that maps to a `ProviderErrorKind` -- see
+    // `ErrorEntry::error_kind()` (profile/schema.rs), which deliberately
+    // returns `None` (not entering `code_table` at all) for a `Fatal` entry
+    // with no `category` or an unrecognized one; that specific non-mapping
+    // case is correct and deliberate (fix-round-1 E1: an honest `None` beats
+    // defaulting to a wrong specific like `QuotaExhausted`), so this
+    // assertion would stay true against an entry re-added that way. This is
+    // the whole point for every disposition this table can actually express.
     assert!(
         !error_profile.code_table.contains_key("insufficient_quota"),
         "the qwen profile's [errors] table must not classify insufficient_quota -- \

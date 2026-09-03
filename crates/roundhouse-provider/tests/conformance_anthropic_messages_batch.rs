@@ -25,7 +25,7 @@ use roundhouse_provider::codec::anthropic_messages::{
     encode_anthropic_messages, AnthropicMessagesProfileProvider,
 };
 use roundhouse_provider::credential::{CredentialCtx, CredentialError, CredentialProvider};
-use roundhouse_provider::profile::ProviderProfile;
+use roundhouse_provider::profile::{AuthKind, ProviderProfile};
 use roundhouse_provider::{BoxFut, ChatRequest, HttpRequest};
 use roundhouse_secrets::credential::SigV4Credential;
 use roundhouse_secrets::secret::Secret;
@@ -44,7 +44,28 @@ use std::sync::Arc;
 /// proves the same thing `test_sigv4_credentials` proves for Bedrock: that
 /// `stream_chat` reaches `HttpTransport::send` at all when a credential IS
 /// supplied, without depending on a second, unrelated OAuth mock.
-struct FakeAzureEntraCredential;
+///
+/// Fix-round-1 Fix 3: `scope` is read from the profile's own declared
+/// `AuthKind::AzureEntra { scope }` (`from_profile`) rather than being a
+/// hand-written literal, and is folded into the applied header value below --
+/// so the profile's declared `scope` reaches a real `CredentialProvider::apply`
+/// call site, not only a test that re-asserts the same TOML field it read.
+struct FakeAzureEntraCredential {
+    scope: String,
+}
+impl FakeAzureEntraCredential {
+    fn from_profile(profile: &ProviderProfile) -> Self {
+        match &profile.defaults.auth {
+            AuthKind::AzureEntra { scope } => Self {
+                scope: scope.clone(),
+            },
+            other => panic!(
+                "expected AzureEntra auth for {:?}, got {other:?}",
+                profile.id
+            ),
+        }
+    }
+}
 impl CredentialProvider for FakeAzureEntraCredential {
     fn apply<'a>(
         &'a self,
@@ -54,7 +75,7 @@ impl CredentialProvider for FakeAzureEntraCredential {
         Box::pin(async move {
             req.headers.push((
                 "authorization".to_string(),
-                "Bearer fake-entra-token".to_string(),
+                format!("Bearer fake-entra-token (scope={})", self.scope),
             ));
             Ok(())
         })
@@ -81,13 +102,23 @@ fn cassette_path(id: &str, name: &str) -> PathBuf {
 /// an AWS request (REALITY-CORRECTIONS §12b: SigV4 "applying" a credential
 /// IS signing it), so the conformance run for that one profile must supply
 /// one. Matches `conformance_bedrock_converse.rs`'s identical precedent.
-fn test_sigv4_credentials() -> Arc<dyn CredentialProvider> {
+///
+/// Fix-round-1 Fix 3: `service` is read from the profile's own declared
+/// `AuthKind::SigV4 { service }` rather than a hand-written `"bedrock-mantle"`
+/// literal, so the profile's declared value reaches the real `sigv4::sign()`
+/// signature path this credential's `apply` calls -- proving the data is
+/// load-bearing, not merely re-asserted by a test that reads the same TOML.
+fn test_sigv4_credentials(profile: &ProviderProfile) -> Arc<dyn CredentialProvider> {
+    let service = match &profile.defaults.auth {
+        AuthKind::SigV4 { service } => service.clone(),
+        other => panic!("expected SigV4 auth for {:?}, got {other:?}", profile.id),
+    };
     Arc::new(SigV4Credential::new(
         "AKIAEXAMPLETESTKEY00000",
         Secret::new("wJalrXUtnFEMIexampleSECRETkey1234567890".to_string()),
         None,
         "us-east-1",
-        "bedrock-mantle",
+        service,
     ))
 }
 
@@ -231,7 +262,9 @@ impl ConformanceSubject for MicrosoftFoundrySubject {
     /// `FakeAzureEntraCredential`'s own doc comment for why this uses a
     /// fake rather than the real `roundhouse_secrets::AzureEntraCredential`.
     fn credentials() -> Option<Arc<dyn CredentialProvider>> {
-        Some(Arc::new(FakeAzureEntraCredential))
+        Some(Arc::new(FakeAzureEntraCredential::from_profile(&load(
+            "microsoft-foundry",
+        ))))
     }
 }
 
@@ -261,7 +294,7 @@ impl ConformanceSubject for BedrockAnthropicMessagesSubject {
     /// `HttpTransport::send` at all instead of failing closed on a missing
     /// credential before ever touching the cassette transport.
     fn credentials() -> Option<Arc<dyn CredentialProvider>> {
-        Some(test_sigv4_credentials())
+        Some(test_sigv4_credentials(&load("bedrock-anthropic-messages")))
     }
 }
 

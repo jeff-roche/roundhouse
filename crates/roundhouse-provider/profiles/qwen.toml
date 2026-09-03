@@ -74,8 +74,15 @@ max = "true"
 # AllocationQuota") is deliberately LEFT OUT of this table. The vendor code
 # name says "Throttling", and Alibaba Cloud's own error-code reference gives
 # the remedy as adjusting the calling strategy or requesting a temporary TPM
-# increase -- that is a throughput cap, not a permanent billing block. A
-# previous version of this table classified it as `fatal`/quota, which was an
+# increase -- that is a throughput cap, not a permanent billing block. This
+# disposition is an inference from Alibaba Cloud's error-code reference plus
+# the vendor code's own "Throttling" naming, NOT something observed against a
+# live throttled response -- no billable Qwen key existed on this phase to
+# trigger a real 429-Throttling.AllocationQuota and capture its body. (This
+# is separate from the "confirmed two ways" claim above the `error_pointer`
+# setting, which is about the /error/code pointer location itself,
+# established against a live bad-key 401 -- that claim stands on its own.)
+# A previous version of this table classified it as `fatal`/quota, which was an
 # unevidenced guess and a behavioural regression: before that entry existed,
 # the code fell through to the HTTP-429 default (RateLimited, retried); the
 # `fatal` entry turned a transient condition into a permanent one. Leaving
