@@ -1,0 +1,53 @@
+# NVIDIA — hosted OpenAI-Responses-compatible catalog, distinct from
+# nvidia-nim.toml (Task 11, openai-chat) -- same vendor host, different wire
+# format, per §9.4's provider table.
+#
+# base_url is the same integrate.api.nvidia.com host nvidia-nim.toml already
+# uses (docs.api.nvidia.com/nim/reference/llm-apis, fetched live 2026-09).
+#
+# IMPORTANT DIVERGENCE, REPORTED (not silently resolved -- see this task's
+# report file for the full trail): this task's own research could NOT
+# confirm NVIDIA's hosted integrate.api.nvidia.com actually serves
+# /v1/responses at all.
+#   - docs.api.nvidia.com/nim/reference/llm-apis (fetched 2026-09-02)
+#     documents exactly one endpoint, POST /v1/chat/completions, and no
+#     /v1/responses path.
+#   - docs.nvidia.com/nim/large-language-models/latest/reference/
+#     api-reference.html DOES document a POST /v1/responses endpoint, but
+#     that page is the reference for the self-hosted NIM microservice
+#     container software (vLLM-backed), a different deployment from the
+#     hosted integrate.api.nvidia.com catalog this profile's base_url
+#     targets -- it does not establish that the hosted catalog exposes the
+#     same route.
+#   - A live integration report (github.com/zeroclaw-labs/zeroclaw issue
+#     #1282, fetched 2026-09-02) shows a real probe of
+#     integrate.api.nvidia.com's Responses API returning
+#     "404 page not found", while the same account's chat/completions calls
+#     succeeded.
+# This profile is still built, per the brief's explicit requirement (§9.4
+# lists NVIDIA on the openai-responses row) and because it is pure data --
+# nothing in this task exercises a live NVIDIA credential either way -- but
+# it should be treated as unverified-and-likely-nonfunctional against the
+# real vendor until someone confirms otherwise with a live key.
+id = "nvidia-open-responses"
+codec = "openai-responses"
+
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://integrate.api.nvidia.com/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+# Empty, evidenced (not omitted by oversight): nvidia-nim.toml already
+# established, for this SAME host, that NVIDIA returns RFC 7807-shaped
+# problem details with no "error" object at all (confirmed live and via this
+# crate's own earlier authoring pass -- see that file's [errors] comment).
+# `classify()`'s code-table lookup is keyed on this codec's error_pointer
+# default (/error/type), which can never resolve against a body with no
+# "error" object regardless of what keys this table declared, so populating
+# it here would be decorative. An empty table is the correct, honest outcome
+# for this vendor, not an oversight.
+[errors]

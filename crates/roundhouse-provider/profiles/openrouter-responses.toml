@@ -1,0 +1,51 @@
+# OpenRouter — its OpenAI-Responses-compatible endpoint, distinct from
+# openrouter.toml (Task 10, openai-chat) and openrouter-anthropic.toml
+# (Task 15, anthropic-messages) -- same vendor, third wire format, per §9.4's
+# provider table.
+#
+# Verified against OpenRouter's own current docs (fetched 2026-09-02):
+# https://openrouter.ai/docs/api_reference/responses/overview /
+# https://openrouter.ai/docs/api/api-reference/responses/create-a-response
+#   "POST https://openrouter.ai/api/v1/responses" -- base_url below plus this
+#   codec's "responses" path-append (provider.rs) reproduces this exactly.
+#   Authorization: Bearer $OPENROUTER_API_KEY.
+# https://openrouter.ai/docs/api_reference/errors-and-debugging (same fetch):
+#   for the Responses-API-specific error shape: "Both the streaming terminal
+#   event and the non-streaming JSON body carry the canonical error_type at
+#   the top level of the response object" -- e.g.
+#   {"error": {"code": "server_error", "message": "..."}, "error_type":
+#   "authentication"}. The machine-readable, documented-vocabulary field is
+#   the TOP-LEVEL error_type, not this codec's default /error/type (which
+#   would address a nested field this endpoint does not treat as its
+#   canonical code).
+# DIVERGENCE FROM THE TASK BRIEF, REPORTED: OpenRouter's documented error
+# categories for this endpoint are `rate_limit_exceeded`, `provider_
+# overloaded`, and `payment_required` (openrouter.ai/docs/api_reference/
+# errors-and-debugging's "Rate limiting and availability" / "Authentication
+# and authorization" category lists, fetched 2026-09-02) -- the brief's
+# third key, "insufficient_credits", does not appear anywhere in that
+# documented vocabulary; "payment_required" is the real evidenced string for
+# this exact condition (and matches openrouter-anthropic.toml's own citation
+# of the same underlying OpenRouter category, mapped there onto that
+# profile's different, Anthropic-native wire vocabulary).
+id = "openrouter-responses"
+codec = "openai-responses"
+error_pointer = "/error_type"
+
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://openrouter.ai/api/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"rate_limit_exceeded" = { disposition = "shed_concurrency" }
+"provider_overloaded" = { disposition = "retry_backoff" }
+# "The account or API key has insufficient credits" -- a genuine, permanent
+# billing block, not a throughput cap, so fatal/quota is correct here (same
+# reasoning openrouter-anthropic.toml already gives for its own
+# payment_required -> billing_error mapping).
+"payment_required" = { disposition = "fatal", category = "quota" }

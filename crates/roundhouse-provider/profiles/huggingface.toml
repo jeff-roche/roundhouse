@@ -1,0 +1,41 @@
+# Hugging Face — Inference Providers' OpenAI-Responses-compatible router.
+#
+# Verified against Hugging Face's own current docs (fetched 2026-09-02):
+# https://huggingface.co/docs/inference-providers/en/guides/responses-api
+#   "client = OpenAI(base_url=\"https://router.huggingface.co/v1\", ...)"
+#   and every curl example in that guide targets
+#   "https://router.huggingface.co/v1/responses" with
+#   "Authorization: Bearer $HF_TOKEN".
+#
+# DIVERGENCE FROM THE TASK BRIEF: the brief's sample base_url was
+# "https://api-inference.huggingface.co/v1" -- that host is the older,
+# pre-"Inference Providers" legacy Inference API (now largely superseded);
+# the guide above, and every other current Inference-Providers doc checked
+# during this task, uses router.huggingface.co exclusively and never
+# mentions api-inference.huggingface.co in connection with the Responses
+# API. Corrected here.
+id = "huggingface"
+codec = "openai-responses"
+
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://router.huggingface.co/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+# Empty, evidenced, not omitted by oversight: router.huggingface.co routes
+# each request to one of many independent underlying Inference Providers
+# (Groq, Together, Fireworks, Cerebras, ...), selected per-model or via a
+# ":provider" model-id suffix (see the guide's own tip about
+# "openai/gpt-oss-120b:groq"). No single Hugging-Face-specific error-code
+# vocabulary for the Responses endpoint could be found across this task's
+# research -- the router's error surface plausibly varies by which
+# underlying provider actually served (or rejected) a given request, which
+# would make any single evidenced code table wrong for some fraction of
+# real traffic through this profile. An empty table is the honest outcome
+# here, not an oversight; classify()'s generic HTTP-status tier still
+# handles 429/5xx for this profile.
+[errors]
