@@ -445,3 +445,96 @@ async fn bedrock_anthropic_messages_sigv4_header_scope_matches_declared_service(
          {EXPECTED_SERVICE:?} -- authorization header was {auth:?}"
     );
 }
+
+/// A transport that panics if `send` is ever called -- proves a request is
+/// rejected before any network I/O is attempted. Mirrors
+/// `conformance_openai_responses_batch.rs`'s identical helper.
+struct PanicsIfCalledTransport;
+
+impl roundhouse_provider::HttpTransport for PanicsIfCalledTransport {
+    fn send<'a>(
+        &'a self,
+        _req: roundhouse_provider::HttpRequest,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<roundhouse_provider::HttpResponseStream, roundhouse_provider::TransportError>,
+    > {
+        panic!(
+            "stream_chat must reject a SigV4/AzureEntra-declared profile's bare api_key \
+             fallback before ever calling HttpTransport::send -- no authorization header, \
+             Bearer or otherwise, may reach the wire"
+        )
+    }
+}
+
+/// Fix round 4, Fix 2: `anthropic_messages/provider.rs`'s bare-`api_key`
+/// fallback's catch-all `other =>` arm (SigV4/AzureEntra) has no regression
+/// proof for the two profiles that actually declare those auth kinds on
+/// this codec. Mirrors `conformance_openai_responses_batch.rs`'s
+/// `aws_open_responses_bare_api_key_fallback_fails_closed_for_sigv4` shape:
+/// no `CredentialProvider` supplied, `PanicsIfCalledTransport` so a
+/// regression fails by panic (an authorization header reaching `send`)
+/// rather than a soft assertion.
+#[tokio::test]
+async fn bedrock_anthropic_messages_bare_api_key_fallback_fails_closed_for_sigv4() {
+    use roundhouse_provider::{Provider, ProviderError, RequestCtx};
+
+    let profile = load("bedrock-anthropic-messages");
+    assert!(
+        matches!(profile.defaults.auth, AuthKind::SigV4 { .. }),
+        "test premise: bedrock-anthropic-messages must declare SigV4 auth, got {:?}",
+        profile.defaults.auth
+    );
+
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(PanicsIfCalledTransport),
+        api_key: "sk-ant-test-do-not-use".into(),
+        credentials: None,
+    };
+    let provider = AnthropicMessagesProfileProvider::new(profile);
+    match provider
+        .stream_chat(
+            &fixtures::single_turn_text("anthropic.claude-sonnet-5"),
+            &ctx,
+        )
+        .await
+    {
+        Err(err) => assert!(
+            matches!(err, ProviderError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        ),
+        Ok(_) => panic!("a SigV4-declared profile with no real credentials must fail closed"),
+    }
+}
+
+/// Same guarantee as above, for `microsoft-foundry` (`AzureEntra` auth).
+#[tokio::test]
+async fn microsoft_foundry_bare_api_key_fallback_fails_closed_for_azure_entra() {
+    use roundhouse_provider::{Provider, ProviderError, RequestCtx};
+
+    let profile = load("microsoft-foundry");
+    assert!(
+        matches!(profile.defaults.auth, AuthKind::AzureEntra { .. }),
+        "test premise: microsoft-foundry must declare AzureEntra auth, got {:?}",
+        profile.defaults.auth
+    );
+
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(PanicsIfCalledTransport),
+        api_key: "sk-ant-test-do-not-use".into(),
+        credentials: None,
+    };
+    let provider = AnthropicMessagesProfileProvider::new(profile);
+    match provider
+        .stream_chat(&fixtures::single_turn_text("claude-sonnet-5"), &ctx)
+        .await
+    {
+        Err(err) => assert!(
+            matches!(err, ProviderError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        ),
+        Ok(_) => panic!("an AzureEntra-declared profile with no real credentials must fail closed"),
+    }
+}
