@@ -3227,10 +3227,12 @@ name = "roundhouse-acp"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
+ "reqwest",
  "roundhouse-core",
  "roundhouse-proto",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 

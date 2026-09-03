@@ -16,6 +16,7 @@
 //! that loop is expected to call [`negotiate_response`] on the SDK's real
 //! `InitializeResponse` and act on the resulting [`AcpVersion`].
 
+use crate::peer_text::{escape_and_cap_peer_str, EscapedPeerStr};
 use agent_client_protocol::schema::v1::InitializeResponse;
 use std::collections::{HashMap, VecDeque};
 
@@ -55,10 +56,17 @@ struct HintKey {
     agent_version: String,
 }
 
+/// **Task C8 (fold-in item):** `agent_binary`/`agent_version` are peer-self-
+/// reported (via `InitializeResponse.agent_info`) — the same untrusted-text
+/// class `crate::peer_text` exists for. Bare `pub String` fields were
+/// reachable via this struct's derived `Debug`, which escapes control
+/// characters (`String`'s own `Debug` impl does that) but does not cap
+/// length, unlike [`EscapedPeerStr`]. `MAX_HINTS` below already bounds the
+/// *count* of distinct hints kept; this bounds the *size* of each one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VersionHint {
-    pub agent_binary: String,
-    pub agent_version: String,
+    pub agent_binary: EscapedPeerStr,
+    pub agent_version: EscapedPeerStr,
     pub observed: AcpVersion,
 }
 
@@ -104,9 +112,13 @@ impl VersionHintCache {
 }
 
 pub fn cache_hint(cache: &mut VersionHintCache, hint: VersionHint) {
+    // `HintKey` stays plain `String` internally (it's a private hashmap key,
+    // never exposed) — deliberately not widened to `EscapedPeerStr` just to
+    // match field-for-field, since that would need `EscapedPeerStr: Hash`,
+    // which nothing else in the crate requires yet.
     let key = HintKey {
-        agent_binary: hint.agent_binary,
-        agent_version: hint.agent_version,
+        agent_binary: hint.agent_binary.as_str().to_string(),
+        agent_version: hint.agent_version.as_str().to_string(),
     };
     if !cache.hints.contains_key(&key) {
         if cache.hints.len() >= MAX_HINTS {
@@ -124,11 +136,18 @@ pub fn lookup_hint(
     agent_binary: &str,
     agent_version: &str,
 ) -> Option<AcpVersion> {
+    // Task C8: `cache_hint` now keys off the *escaped* `VersionHint` fields
+    // (see its comment above) — a raw `&str` here must go through the same
+    // `escape_and_cap_peer_str` transform before key lookup, or an
+    // otherwise-matching (binary, version) pair would never hit, since
+    // `"x"` and `escape_and_cap_peer_str("x")` (`"\"x\""`) are different
+    // strings. `escape_and_cap_peer_str` is deterministic, so this and
+    // `cache_hint`'s key always agree for the same logical input.
     cache
         .hints
         .get(&HintKey {
-            agent_binary: agent_binary.to_string(),
-            agent_version: agent_version.to_string(),
+            agent_binary: escape_and_cap_peer_str(agent_binary).as_str().to_string(),
+            agent_version: escape_and_cap_peer_str(agent_version).as_str().to_string(),
         })
         .copied()
 }

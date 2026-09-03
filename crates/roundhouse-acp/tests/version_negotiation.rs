@@ -1,3 +1,4 @@
+use roundhouse_acp::peer_text::escape_and_cap_peer_str;
 use roundhouse_acp::version::{
     cache_hint, lookup_hint, negotiate, negotiate_response, AcpVersion, VersionHint,
     VersionHintCache,
@@ -19,8 +20,8 @@ fn observed_result_is_cached_as_a_hint_only_reused_to_skip_a_redundant_round() {
     cache_hint(
         &mut cache,
         VersionHint {
-            agent_binary: "claude-agent-acp".to_string(),
-            agent_version: "1.4.0".to_string(),
+            agent_binary: escape_and_cap_peer_str("claude-agent-acp"),
+            agent_version: escape_and_cap_peer_str("1.4.0"),
             observed: AcpVersion::V1,
         },
     );
@@ -44,8 +45,8 @@ fn hint_cache_stays_bounded_when_an_agent_self_reports_unbounded_distinct_versio
         cache_hint(
             &mut cache,
             VersionHint {
-                agent_binary: "self-reporting-agent".to_string(),
-                agent_version: format!("v{i}"),
+                agent_binary: escape_and_cap_peer_str("self-reporting-agent"),
+                agent_version: escape_and_cap_peer_str(&format!("v{i}")),
                 observed: AcpVersion::V1,
             },
         );
