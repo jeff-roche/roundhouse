@@ -314,7 +314,14 @@ fn build_endpoint_url(
 fn build_vertex_endpoint_url(base: &url::Url, model: &str) -> Result<url::Url, ProviderError> {
     let is_valid_model_id_char =
         |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@');
-    if model.is_empty() || !model.chars().all(is_valid_model_id_char) {
+    // Fix round 3 Fix 1: also reject a model id that is entirely `.`
+    // characters (".", "..", "...", ...), mirroring this codec's own
+    // non-Vertex `build_endpoint_url` guard. No abuse path exists today
+    // since the `:streamGenerateContent` suffix is never dropped, but this
+    // costs nothing and removes the dependency on that suffix always
+    // staying glued to `model`.
+    let all_dots = !model.is_empty() && model.chars().all(|c| c == '.');
+    if model.is_empty() || all_dots || !model.chars().all(is_valid_model_id_char) {
         // Close-out item 2 (this codec's own precedent): escape the
         // rejected id with `{:?}` rather than interpolating it raw --
         // having failed the allowlist, it may carry newlines or other
@@ -322,7 +329,8 @@ fn build_vertex_endpoint_url(base: &url::Url, model: &str) -> Result<url::Url, P
         // `events` row via `ProviderError`'s `Display`.
         return Err(ProviderError::Unsupported(format!(
             "model id {model:?} is not a valid Vertex publisher-model path segment (only ASCII \
-             alphanumerics, '.', '-', '_', '@' are permitted, and it may not be empty)"
+             alphanumerics, '.', '-', '_', '@' are permitted, and it may not be empty or all \
+             dots)"
         )));
     }
     let mut url = base.clone();
@@ -617,6 +625,29 @@ mod build_vertex_endpoint_url_tests {
             rendered.contains("\\n"),
             "expected the newline to appear escaped (via {{:?}}) in the message: {rendered:?}"
         );
+    }
+
+    /// Fix round 3 Fix 1: this codec's own non-Vertex `build_endpoint_url`
+    /// already rejects an all-dots model id (`.`, `..`, `...`) with an
+    /// explicit rationale -- this Vertex builder was missing the same guard.
+    /// `.` is in the allowlist, so `"."`/`".."` pass the character check
+    /// today; they are harmless only because the appended
+    /// `:streamGenerateContent` verb suffix keeps the segment from ever
+    /// being a literal dot-segment by itself. Per §15: this test must be run
+    /// and shown to fail (i.e. `.` and `..` are accepted) against the
+    /// unguarded code before the `all_dots` guard is added.
+    #[test]
+    fn rejects_an_all_dots_model_id() {
+        let base = url::Url::parse(
+            "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/google/models",
+        )
+        .unwrap();
+        for bad_model in [".", "..", "..."] {
+            assert!(
+                build_vertex_endpoint_url(&base, bad_model).is_err(),
+                "expected all-dots model id {bad_model:?} to be rejected"
+            );
+        }
     }
 }
 

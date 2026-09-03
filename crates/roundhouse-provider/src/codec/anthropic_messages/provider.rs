@@ -331,9 +331,18 @@ fn build_vertex_endpoint_url(base: &url::Url, model: &str) -> Result<url::Url, P
     // the re-run of every existing traversal case with `@` mixed in.
     let is_valid_model_id_char =
         |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@');
-    if model.is_empty() || !model.chars().all(is_valid_model_id_char) {
+    // Fix round 3 Fix 1: also reject a model id that is entirely `.`
+    // characters (".", "..", "...", ...), mirroring `google_genai`'s
+    // non-Vertex `build_endpoint_url` guard. No abuse path exists today
+    // since the `:streamRawPredict` suffix is never dropped, but this costs
+    // nothing and removes the dependency on that suffix always staying
+    // glued to `model`.
+    let all_dots = !model.is_empty() && model.chars().all(|c| c == '.');
+    if model.is_empty() || all_dots || !model.chars().all(is_valid_model_id_char) {
         return Err(ProviderError::Unsupported(format!(
-            "model id {model:?} is not a valid Vertex publisher-model path segment"
+            "model id {model:?} is not a valid Vertex publisher-model path segment (only ASCII \
+             alphanumerics, '.', '-', '_', '@' are permitted, and it may not be empty or all \
+             dots)"
         )));
     }
     let mut url = base.clone();
@@ -563,6 +572,30 @@ mod build_endpoint_url_tests {
                     "/v1/projects/p/locations/global/publishers/anthropic/models/{model}:streamRawPredict"
                 ),
                 "{model:?} must stay a literal path segment, not collapse via dot-segment removal"
+            );
+        }
+    }
+
+    /// Fix round 3 Fix 1: `google_genai`'s non-Vertex `build_endpoint_url`
+    /// already rejects an all-dots model id (`.`, `..`, `...`) with an
+    /// explicit rationale -- this Vertex builder (and its `google_genai`
+    /// Vertex sibling) was missing the same guard. `.` is in the allowlist,
+    /// so `"."`/`".."` pass the character check today; they are harmless
+    /// only because the appended `:streamRawPredict` verb suffix keeps the
+    /// segment from ever being a literal dot-segment by itself. Per §15:
+    /// this test must be run and shown to fail (i.e. `.` and `..` are
+    /// accepted) against the unguarded code before the `all_dots` guard is
+    /// added.
+    #[test]
+    fn vertex_url_rejects_an_all_dots_model_id() {
+        let base = url::Url::parse(
+            "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/anthropic/models",
+        )
+        .unwrap();
+        for bad_model in [".", "..", "..."] {
+            assert!(
+                build_vertex_endpoint_url(&base, bad_model).is_err(),
+                "expected all-dots model id {bad_model:?} to be rejected"
             );
         }
     }
