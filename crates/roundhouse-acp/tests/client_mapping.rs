@@ -191,6 +191,24 @@ fn no_two_arms_emit_the_same_payload_shape_the_no_forgery_invariant_is_enforced(
          representative to the vec! list above"
     );
 
+    // FIX round 4: the length assertion above checks *how many*
+    // representatives exist, not *which* variants they cover — so it is
+    // satisfied by copy-pasting a neighbouring `vec!` entry instead of
+    // writing the new variant's own representative. That repair leaves the
+    // new (possibly forgery-capable) arm entirely unmapped while the suite
+    // stays green, because a duplicated `UsageUpdate` maps to `None` and
+    // never reaches the uniqueness check below. Requiring the
+    // representatives to cover every DISTINCT variant closes that: a
+    // duplicate collapses in this HashSet and the count comes up short.
+    let distinct: HashSet<_> = representatives.iter().map(discriminant).collect();
+    assert_eq!(
+        distinct.len(),
+        ACP_SESSION_UPDATE_VARIANT_COUNT,
+        "all_representatives() must cover every DISTINCT AcpSessionUpdate variant — \
+         duplicating an existing variant's representative to satisfy the length \
+         assertion above leaves the new variant unmapped and untested"
+    );
+
     let mut seen = HashSet::new();
     let mut emitted_count = 0;
     for update in &representatives {

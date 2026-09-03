@@ -26,6 +26,23 @@ use roundhouse_core::{Delta, EventPayload, TaskOutput, Usage};
 /// narrow `{roundhouse-core, roundhouse-proto}` dependency set is a
 /// documented architectural property not worth spending a new dependency
 /// edge on when the count can be generated in-file.
+//
+// Supported variant syntax: braced (struct-like) variants ONLY. Unit
+// variants (`SessionEnded,`) and tuple variants (`SessionEnded(String),`)
+// do not match this macro's rule and fail to compile with an indirect
+// `no rules expected` error pointing here. Write a fieldless variant as
+// `SessionEnded {}` instead.
+//
+// **Do not "fix" such an error by hand-expanding this macro** — i.e. by
+// writing out the `pub enum AcpSessionUpdate { .. }` directly and
+// hand-writing `pub const ACP_SESSION_UPDATE_VARIANT_COUNT: usize = N;`
+// beside it. The whole point of generating that count from the same
+// variant list that declares the enum is that it cannot go stale. A
+// hand-written count is exactly the failure mode rounds 2-4 were spent
+// closing: `tests/client_mapping.rs`'s no-forgery guard asserts against
+// this constant, and a hand-maintained number silently keeps its old
+// value when a variant is added, letting a forgery-capable arm ship
+// untested with the suite green.
 macro_rules! acp_session_update_enum {
     (
         $(#[$enum_meta:meta])*
@@ -46,7 +63,7 @@ macro_rules! acp_session_update_enum {
         }
 
         /// Number of variants `AcpSessionUpdate` declares, derived
-        /// mechanically by [`acp_session_update_enum!`] from the enum
+        /// mechanically by `acp_session_update_enum!` from the enum
         /// definition itself — see that macro's doc for why a
         /// hand-maintained count (round 2's `EXPECTED_REPRESENTATIVE_COUNT`)
         /// failed to catch the cheap-repair attack it was meant to catch.
