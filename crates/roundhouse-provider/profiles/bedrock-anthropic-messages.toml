@@ -1,0 +1,54 @@
+# Bedrock "Mantle" — the REAL Anthropic Messages endpoint for new Claude
+# models on Amazon Bedrock (§9.2), NOT bedrock-converse.toml (Task 7, legacy
+# non-Claude, binary eventstream).
+#
+# Verified against Anthropic's own current docs (fetched 2026-09-02):
+# https://platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock
+#   "The endpoint follows the pattern
+#   https://bedrock-mantle.{region}.api.aws/anthropic/v1/messages. Unlike the
+#   InvokeModel-based integration, this endpoint uses standard SSE streaming
+#   and the same request body shape as Anthropic's first-party API."
+#   curl example:
+#     curl https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages \
+#       --aws-sigv4 "aws:amz:us-east-1:bedrock-mantle" \
+#       --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+#       -H "x-amz-security-token: $AWS_SESSION_TOKEN" \
+#       -H "content-type: application/json" \
+#       -H "anthropic-version: 2023-06-01" \
+#       -d '{"model": "anthropic.claude-opus-5", "max_tokens": 1024, ...}'
+#   (the "model" field IS present in the request body here, unlike Vertex --
+#   no per-profile body branch is needed for this profile.)
+#
+# DIVERGENCE FROM THE TASK BRIEF (both confirmed by the curl example's own
+# `--aws-sigv4` flag, whose value is "aws:amz:<region>:<service>"):
+#   1. base_url must include the `/anthropic` path segment
+#      (`https://bedrock-mantle.us-east-1.api.aws/anthropic`, with
+#      `/v1/messages` appended by the provider) -- the brief's sample base_url
+#      omitted it.
+#   2. The SigV4 service name is "bedrock-mantle", NOT "bedrock" (the legacy
+#      Converse/InvokeModel service name that bedrock-converse.toml uses).
+#      The brief's sample TOML used "bedrock", which would produce a SigV4
+#      signature AWS rejects for this endpoint. Corrected here.
+id = "bedrock-anthropic-messages"
+codec = "anthropic-messages"
+
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://bedrock-mantle.us-east-1.api.aws/anthropic"
+auth = { kind = "sigv4", service = "bedrock-mantle" }
+
+[[model]]
+match = ["anthropic.claude-*"]
+
+[errors]
+# The Bedrock Mantle docs state this endpoint uses "the same request body
+# shape as Anthropic's first-party API" over "standard SSE streaming" (as
+# opposed to bedrock-converse.toml's legacy Smithy restJson1 exception-header
+# scheme) -- taken at face value for error bodies too, the same
+# documented-compatibility-claim basis as microsoft-foundry.toml's identical
+# two entries (no live error body was captured against a real Bedrock Mantle
+# deployment in this task). Neither entry is `fatal`, the safe direction per
+# Ruling P106 if this inference turns out to be imprecise.
+"overloaded_error" = { disposition = "retry_backoff" }
+"rate_limit_error" = { disposition = "shed_concurrency" }

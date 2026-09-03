@@ -1,0 +1,86 @@
+# Vertex Anthropic — Claude models on Google Cloud's Agent Platform (Vertex AI).
+#
+# Endpoint/body shape verified against Anthropic's own current docs (fetched
+# 2026-09-02): https://platform.claude.com/docs/en/build-with-claude/claude-on-vertex-ai
+#   "The API for accessing Claude on Google Cloud's Agent Platform is nearly
+#   identical to the Messages API, with two key differences in request format:
+#   * On Agent Platform, model is not passed in the request body. Instead, it
+#     is specified in the Google Cloud endpoint URL.
+#   * On Agent Platform, anthropic_version is passed in the request body
+#     (rather than as a header), and must be set to the value
+#     vertex-2023-10-16."
+#   Global-endpoint curl example from that same page ("Global endpoints
+#   (recommended)... No pricing premium"):
+#     curl https://aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/global/publishers/anthropic/models/${MODEL_ID}:rawPredict \
+#       -H "Authorization: Bearer $(gcloud auth print-access-token)" ...
+#   `:rawPredict` is Vertex AI's non-streaming publisher-model verb;
+#   `:streamRawPredict` is its documented streaming sibling (e.g. Google's own
+#   method reference for the analogous `projects.locations.publishers.models`
+#   resource: docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/.../rawPredict
+#   and its streamRawPredict counterpart). This codec always sets `"stream":
+#   true` in the wire body (encode.rs), so the streaming verb is the one this
+#   profile's provider always calls.
+#
+# `AnthropicMessagesProfileProvider` (src/codec/anthropic_messages/
+# provider.rs) special-cases this ONE profile's id to (a) strip the
+# `encode_anthropic_messages`-emitted "model" key and inject
+# "anthropic_version": "vertex-2023-10-16" into the wire body, and (b) build
+# the "{base}/{model}:streamRawPredict" URL instead of the other five
+# profiles' uniform "{base}/v1/messages". This is a profile-IDENTITY branch
+# for wire envelope shape, not a credential-kind branch (REALITY-CORRECTIONS
+# §12b forbids only the latter) -- Vertex's request envelope genuinely
+# differs from the other five compat surfaces, confirmed above.
+#
+# DIVERGENCE FROM THE TASK BRIEF (reported per this task's process rules):
+# the brief's sample TOML used a region-pinned base_url
+# (us-east5-aiplatform.googleapis.com/.../locations/us-east5/...) and never
+# mentioned the model-not-in-body / anthropic_version-in-body / rawPredict
+# vs streamRawPredict distinctions at all. This profile uses the documented
+# "recommended" global endpoint instead and the provider implements the two
+# real body/URL differences.
+id = "vertex-anthropic"
+codec = "anthropic-messages"
+# google.rpc.Status's JSON mapping (AIP-193, https://google.aip.dev/193,
+# and https://cloud.google.com/apis/design/errors, both fetched 2026-09-02):
+# {"error":{"code":<int>,"message":<string>,"status":"<google.rpc.Code
+# name>"}} -- every Google Cloud REST API's error envelope, Vertex AI
+# included. The machine-readable enum lives at /error/status, NOT this
+# codec's default /error/type.
+error_pointer = "/error/status"
+
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+# Global endpoint (Google's own "recommended" default; no pricing premium).
+# Project-specific in reality -- this is the profile default, always
+# overridden per deployment via ROUNDHOUSE_VERTEX_ANTHROPIC_BASE_URL (§9.9).
+base_url = "https://aiplatform.googleapis.com/v1/projects/PROJECT_ID/locations/global/publishers/anthropic/models"
+# Vertex authenticates with a Google OAuth2 access token
+# (`Authorization: Bearer $(gcloud auth print-access-token)`) -- a
+# Bearer-shaped credential from this crate's point of view. How that token is
+# obtained/refreshed is a CredentialProvider implementation detail
+# (ctx.credentials), not something this profile encodes.
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["claude-*"]
+
+[errors]
+# AIP-193: "RESOURCE_EXHAUSTED: Some resource has been exhausted... perhaps a
+# per-user quota", HTTP mapping 429. Deliberately `shed_concurrency`, never
+# `fatal` (Ruling P106): Google's own definition covers ordinary rate/TPM
+# caps, not only permanent billing exhaustion, and this project never maps a
+# throttling-shaped code to fatal.
+"RESOURCE_EXHAUSTED" = { disposition = "shed_concurrency" }
+# AIP-193: "UNAVAILABLE: The service is currently unavailable... most likely
+# a transient condition" -- retryable.
+"UNAVAILABLE" = { disposition = "retry_backoff" }
+# PERMISSION_DENIED is a genuine, permanent IAM/authorization failure
+# (AIP-193, verbatim: "must not be used for rejections caused by exhausting
+# some resource" -- i.e. explicitly NOT a quota condition), so it is
+# deliberately left OUT of this table rather than guessed onto `fatal` with
+# an invented category. `ErrorEntry::error_kind` only maps `fatal` to
+# QuotaExhausted/ModelNotFound, and PERMISSION_DENIED is neither -- an entry
+# here would either be silently dropped by `error_profile()` (if uncategorized)
+# or assert a specific, wrong ProviderErrorKind (if force-categorized). Left
+# out, it falls through to `classify()`'s generic HTTP-status tier instead.

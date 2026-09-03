@@ -1,0 +1,41 @@
+# DeepInfra — its Anthropic-Messages-compatible endpoint (distinct from
+# deepinfra.toml, Task 11's openai-chat profile for the same vendor).
+#
+# Verified against DeepInfra's own current docs (fetched 2026-09-02):
+# https://docs.deepinfra.com/integrations/anthropic — base URL
+# "https://api.deepinfra.com/anthropic", endpoints "POST /anthropic/v1/
+# messages" and "POST /anthropic/v1/messages/count_tokens"; auth via
+# "Authorization: Bearer $DEEPINFRA_TOKEN" (or "x-api-key:
+# $DEEPINFRA_TOKEN").
+#
+# DIVERGENCE FROM THE TASK BRIEF: the brief's sample TOML used
+# `base_url = "https://api.deepinfra.com/v1/anthropic"` -- wrong path
+# ordering; the real base is `https://api.deepinfra.com/anthropic`, with
+# `/v1/messages` appended by the provider (this codec's uniform
+# "{base}/v1/messages" URL-building reproduces the confirmed
+# `/anthropic/v1/messages` path exactly). Corrected here.
+#
+# Note: DeepInfra also documents a dedicated `/anthropic/v1/messages/
+# count_tokens` endpoint -- out of scope for this task (every profile in
+# this batch leaves `Provider::count_tokens` as `Unsupported`, matching
+# every other Task 15 sibling and the brief's own sample code; wiring a real
+# count-tokens call is not asked for here and would be scope creep).
+id = "deepinfra-anthropic"
+codec = "anthropic-messages"
+
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://api.deepinfra.com/anthropic"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+# [errors] deliberately EMPTY (M1/M3 lesson): docs.deepinfra.com/integrations/
+# anthropic documents no error response shape or codes at all (fetched
+# 2026-09-02), and no other DeepInfra-published error-code reference for this
+# specific Anthropic-compat surface was found. An empty table with this
+# citation is a correct, evidenced outcome. `classify()` falls through to its
+# generic HTTP-status tier for every code from this profile.
+[errors]

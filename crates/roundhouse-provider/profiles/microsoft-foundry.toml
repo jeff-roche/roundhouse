@@ -1,0 +1,56 @@
+# Microsoft Foundry (Azure AI Foundry) — Claude models via Azure-hosted
+# endpoints.
+#
+# Verified against Anthropic's own current docs (fetched 2026-09-02):
+# https://platform.claude.com/docs/en/build-with-claude/claude-in-microsoft-foundry
+#   "Claude in Microsoft Foundry supports two authentication methods: API
+#   keys and Entra ID tokens. Both methods use Azure-hosted endpoints in the
+#   format https://{resource}.services.ai.azure.com/anthropic/v1/*."
+#   Entra ID example: "az account get-access-token --resource
+#   https://ai.azure.com" / Python: get_bearer_token_provider(
+#   DefaultAzureCredential(), "https://ai.azure.com/.default") used with
+#   "Authorization: Bearer {TOKEN}".
+#   "API responses from Claude in Microsoft Foundry follow the standard
+#   Claude API response format."
+#
+# DIVERGENCE FROM THE TASK BRIEF: the brief's sample TOML used
+# `scope = "https://cognitiveservices.azure.com/.default"` -- WRONG per the
+# doc above, which documents `https://ai.azure.com/.default` both in its
+# cURL example (`az account get-access-token --resource https://ai.azure.com`)
+# and its Python/Java token-provider examples. Corrected here. The brief also
+# used HTTP-status-shaped `[errors]` keys ("429"/"503"/"401"), which cannot
+# ever match: `classify()`'s code_table is matched against a body-derived
+# code at `error_pointer` (default /error/type), never against the HTTP
+# status directly (HTTP status only drives classify()'s separate, later
+# fallback tier) -- corrected to real Anthropic-native error `type` strings
+# below.
+id = "microsoft-foundry"
+codec = "anthropic-messages"
+
+[defaults]
+allow_raw_extra = false
+# §9.8 quirk this profile does NOT need to encode specially (nothing in this
+# codec proactively budgets off rate-limit headers either way -- already the
+# default), noted here only as documentation: Foundry's own troubleshooting
+# section states "Foundry does not include Anthropic's standard rate limit
+# headers... in responses. Manage rate limiting through Azure's monitoring
+# tools instead."
+params = { mode = "deny_list", fields = [] }
+base_url = "https://my-resource.services.ai.azure.com/anthropic"
+auth = { kind = "azure_entra", scope = "https://ai.azure.com/.default" }
+
+[[model]]
+match = ["claude-*"]
+
+[errors]
+# Foundry's own docs state its responses "follow the standard Claude API
+# response format" -- taken at face value for error bodies too (no live
+# error body was captured; a genuine Claude API key was not exercised
+# against a real Foundry deployment in this task, so this is a documented-
+# compatibility-claim inference, not a captured wire sample). Both codes
+# below reproduce Anthropic's own native `/error/type` vocabulary
+# (`errors.rs::ErrorProfile::anthropic_like()`'s same two entries), and
+# neither is `fatal` -- the safe direction per Ruling P106 if this inference
+# turns out to be imprecise.
+"overloaded_error" = { disposition = "retry_backoff" }
+"rate_limit_error" = { disposition = "shed_concurrency" }
