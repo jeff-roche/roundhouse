@@ -190,6 +190,23 @@ impl ReasoningControl {
         }
         Ok(())
     }
+
+    /// Fix round 3, Fix 2: `google_genai::encode::encode_generate_content`
+    /// calls `resolve_wire_value` for whichever `ReasoningControl` matches a
+    /// model, regardless of `kind` -- so that codec, unlike `cohere-v2`/
+    /// `openai-responses`, can legitimately declare any `value_type`. But a
+    /// Budget-kind control's wire field (`thinkingBudget`) is documented by
+    /// the vendor schema as a JSON *number*, not a string -- that is a fact
+    /// about THIS field, not about what the encoder generically consumes.
+    /// `build.rs` calls this for every `google-genai` profile's
+    /// `[[model]].reasoning` table: `true` means the control declares (or,
+    /// via `#[serde(default)]`, silently defaults to) `value_type =
+    /// "string"` for a Budget-kind control, which would build clean today
+    /// and then `resolve_wire_value` would emit a quoted string
+    /// (`"8192"`) where the API expects an integer.
+    pub fn google_genai_budget_kind_has_an_invalid_string_value_type(&self) -> bool {
+        self.kind == ReasoningKind::Budget && self.value_type == ReasoningValueType::String
+    }
 }
 
 /// §9.4's endpoint-preference mechanism (audit finding 3): which wire endpoint
@@ -382,5 +399,39 @@ mod reasoning_value_type_tests {
             WireValue::Number(100.0)
         );
         assert!(c.validate_value_type().is_ok());
+    }
+
+    /// Fix round 3, Fix 2 (§15 evidence for `build.rs`'s inverted
+    /// `google-genai` codec guard): the exact reachable shape the fix
+    /// brief names -- a Budget-kind control that omits `value_type`
+    /// (`#[serde(default)]` gives it `String`) -- must be flagged.
+    #[test]
+    fn budget_kind_with_the_default_string_value_type_is_flagged() {
+        let mut c = control(ReasoningValueType::String, &["0", "8192"]);
+        c.kind = ReasoningKind::Budget;
+        assert!(c.google_genai_budget_kind_has_an_invalid_string_value_type());
+    }
+
+    /// A Budget-kind control that correctly declares `value_type = "number"`
+    /// (what every shipped `google-genai` profile actually declares) must
+    /// NOT be flagged.
+    #[test]
+    fn budget_kind_with_a_number_value_type_is_not_flagged() {
+        let mut c = control(ReasoningValueType::Number, &["0", "8192"]);
+        c.kind = ReasoningKind::Budget;
+        assert!(!c.google_genai_budget_kind_has_an_invalid_string_value_type());
+    }
+
+    /// An Effort-kind control is never flagged by this check regardless of
+    /// `value_type` -- the vendor-schema fact this check encodes
+    /// ("thinkingBudget is a JSON number") is specific to Budget-kind
+    /// controls, not a blanket claim about every google-genai reasoning
+    /// control.
+    #[test]
+    fn effort_kind_is_never_flagged_regardless_of_value_type() {
+        let effort_string = control(ReasoningValueType::String, &["false", "true"]);
+        assert!(!effort_string.google_genai_budget_kind_has_an_invalid_string_value_type());
+        let effort_number = control(ReasoningValueType::Number, &["0", "1"]);
+        assert!(!effort_number.google_genai_budget_kind_has_an_invalid_string_value_type());
     }
 }

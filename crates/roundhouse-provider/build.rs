@@ -139,16 +139,47 @@ fn main() {
                         &path,
                         &control.field,
                     );
-                } else if parsed.codec != "google-genai"
-                    && control.value_type != reasoning::ReasoningValueType::String
-                {
+                } else if parsed.codec == "google-genai" {
+                    // Fix round 3, Fix 2 (inverted from the prior blanket
+                    // exemption -- see REALITY-CORRECTIONS §15 and the fix
+                    // brief for why a `kind == Budget` gate here, unlike a
+                    // gate on the panic below, is accurate): `google_genai`'s
+                    // `encode_generate_content` calls `resolve_wire_value`
+                    // for whichever `ReasoningControl` matches a model,
+                    // regardless of `kind`, so this codec CAN legitimately
+                    // declare any `value_type` (that's why the panic below
+                    // no longer applies to it at all). But a Budget-kind
+                    // control's wire field (`thinkingBudget`) is documented
+                    // by the vendor schema as a JSON *number*, not a
+                    // string -- that is a fact about THIS field, not about
+                    // what the encoder generically consumes. A profile that
+                    // declares (or, via `#[serde(default)]`, silently
+                    // defaults to) `value_type = "string"` for a
+                    // Budget-kind control builds clean today and then
+                    // `resolve_wire_value` emits a quoted string
+                    // (`"8192"`) where the API expects an integer -- the
+                    // exact accept-but-ignore fail-open shape Task 17
+                    // existed to remove, reintroduced one profile later
+                    // (demonstrated reachable by
+                    // `tests/google_genai_thinking_budget_type_test.rs`'s
+                    // `a_string_typed_control_genuinely_serializes_the_budget_as_a_quoted_string`).
+                    if control.google_genai_budget_kind_has_an_invalid_string_value_type() {
+                        panic!(
+                            "profile {path:?} declares a [[model]].reasoning control of kind = \
+                             \"budget\" but value_type is (or defaults to) \"string\" -- \
+                             google-genai's Budget-kind wire field (thinkingBudget) is \
+                             documented as a JSON number, and encode_generate_content routes it \
+                             through resolve_wire_value, so a String value_type here builds \
+                             clean and then silently emits a quoted string instead of a number. \
+                             Declare value_type = \"number\" (or \"bool\", if a future \
+                             Budget-kind field's wire type is genuinely boolean). This is the \
+                             §9.5 guarantee that a typo in a quirk profile is a BUILD error, not \
+                             a silent runtime gap"
+                        );
+                    }
+                } else if control.value_type != reasoning::ReasoningValueType::String {
                     // Round-8 review, M3, updated by Task 17 (Ruling P108):
-                    // `openai_chat::encode`'s `encode_openai_chat` and, as of
-                    // Task 17, `google_genai::encode`'s
-                    // `encode_generate_content` (its Budget-kind control
-                    // only — `EndpointMode::Interactions` never reads
-                    // `ReasoningControl`/`value_type` at all, see that
-                    // module's own doc comment) both call
+                    // `openai_chat::encode`'s `encode_openai_chat` calls
                     // `resolve_wire_value` (the `WireValue`-typed path).
                     // `cohere_v2` and `openai_responses` still call the
                     // untyped `resolve()`, so a `value_type` other than the
