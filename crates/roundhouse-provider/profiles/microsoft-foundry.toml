@@ -36,7 +36,16 @@ allow_raw_extra = false
 # headers... in responses. Manage rate limiting through Azure's monitoring
 # tools instead."
 params = { mode = "deny_list", fields = [] }
-base_url = "https://my-resource.services.ai.azure.com/anthropic"
+# Resource-specific in reality (`https://{resource}.services.ai.azure.com/anthropic`)
+# -- this is the profile DEFAULT (§9.9), always overridden per deployment via
+# ROUNDHOUSE_MICROSOFT_FOUNDRY_BASE_URL. The host below is deliberately an
+# RFC 6761 `.invalid` name rather than a real, third-party-registerable Azure
+# resource name: `services.ai.azure.com` is a live, globally-unique, first-come
+# namespace, so an earlier placeholder host here (`my-resource....`) could be
+# registered by anyone, and an operator who forgets to set the override env
+# var would silently send requests to whoever owns it. `.invalid` can never
+# resolve, so a missing override becomes a hard local failure instead.
+base_url = "https://resource-name.invalid/anthropic"
 auth = { kind = "azure_entra", scope = "https://ai.azure.com/.default" }
 
 [[model]]

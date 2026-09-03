@@ -19,8 +19,17 @@ allow_raw_extra = false
 params = { mode = "deny_list", fields = [] }
 # Customer-resource-specific in reality (`https://{resource}.openai.azure.com`)
 # -- this is the profile default; every real deployment overrides it via
-# ROUNDHOUSE_AZURE_OPENAI_BASE_URL (§9.9).
-base_url = "https://my-resource.openai.azure.com"
+# ROUNDHOUSE_AZURE_OPENAI_BASE_URL (§9.9). The host below is deliberately an
+# RFC 6761 `.invalid` name, not a real, third-party-registerable Azure
+# resource name: `openai.azure.com` is a live, globally-unique, first-come
+# namespace, and this profile's `header_key` auth (below) CAN be satisfied by
+# the bare-`api_key` fallback (unlike microsoft-foundry.toml's `azure_entra`,
+# which the fallback cannot express and so fails closed on its own). So an
+# operator who supplies an API key but forgets to set the override env var
+# would, with a real placeholder host, silently send the full request body
+# *and the API key itself* to whoever owns that resource name. `.invalid` can
+# never resolve, so a missing override becomes a hard local failure instead.
+base_url = "https://resource-name.invalid"
 # Azure supports both a static `api-key` header and Entra OAuth; the header-key
 # form is the default here since it needs no tenant/client-id setup to try.
 # Entra is reachable the same way every other profile's alternate credential
