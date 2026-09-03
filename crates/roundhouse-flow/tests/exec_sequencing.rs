@@ -1798,3 +1798,416 @@ fn step_outcome_debug_bounds_the_status_message_not_only_the_output() {
         status_debug.len()
     );
 }
+
+// ---- Fix round 4, item A (ruling P35): provenance's boundary is
+// `ExprContext`'s constructors, not the grammar. This test pins the
+// documented boundary so a future change to it is a red test rather than a
+// stale doc comment. ----
+
+#[test]
+fn a_credential_handed_in_as_inputs_or_vars_instead_of_secrets_is_not_tainted_and_logs_in_cleartext(
+) {
+    // Payload: the two markers ruling P35 records as executed. The run
+    // declares NO secrets at all, and instead carries the credentials in
+    // `inputs.carried` / `vars.carried`, which `Executor::new` binds through
+    // `set_public`. Neither mechanism can see them: provenance because the
+    // binding site asserted they are not secret, the whole-secret backstop
+    // because there is no declared secret to match.
+    let yaml = r#"
+name: mis-bound-credential
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: a
+    emit: { v: "${{ inputs.carried }}", w: "${{ vars.carried }}" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = RunContext {
+        inputs: serde_json::json!({"carried": "INPUTSCARRIEDSECRET"}),
+        vars: serde_json::json!({"carried": "VARSCARRIEDSECRET"}),
+        secrets: HashMap::new(),
+        run_id: roundhouse_flow::exec::RunId::new(),
+    };
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    exec.run_to_completion().unwrap();
+
+    let created = sink
+        .0
+        .iter()
+        .find(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .expect("the emit: step was persisted");
+    let logged = &created.payload_json["TaskCreated"]["input"]["Json"];
+    assert_eq!(
+        logged,
+        &serde_json::json!({"v": "INPUTSCARRIEDSECRET", "w": "VARSCARRIEDSECRET"}),
+        "the documented boundary: a credential bound through a root the caller marked \
+         non-secret reaches the log in cleartext"
+    );
+}
+
+#[test]
+fn the_whole_secret_backstop_covers_the_sub_case_where_a_mis_bound_value_equals_a_declared_secret()
+{
+    // The other half of the same boundary: if the SAME value is also
+    // declared under `secrets:`, the exact-match backstop finds it wherever
+    // it appears, including where it arrived through `inputs`. That is the
+    // only part of the mis-binding shape either mechanism covers, and it does
+    // not extend to a value merely *derived* from a mis-bound secret.
+    let yaml = r#"
+name: mis-bound-but-declared
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: a
+    emit: { v: "${{ inputs.carried }}", derived: "${{ slice(inputs.list, 0, 1) }}" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let mut secrets = HashMap::new();
+    secrets.insert("K".to_string(), "INPUTSCARRIEDSECRET".to_string());
+    let ctx = RunContext {
+        inputs: serde_json::json!({
+            "carried": "INPUTSCARRIEDSECRET",
+            "list": ["DERIVED-FROM-MISBOUND-0001", "x"],
+        }),
+        vars: serde_json::json!({}),
+        secrets,
+        run_id: roundhouse_flow::exec::RunId::new(),
+    };
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    exec.run_to_completion().unwrap();
+
+    let created = sink
+        .0
+        .iter()
+        .find(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .expect("the emit: step was persisted");
+    let logged = &created.payload_json["TaskCreated"]["input"]["Json"];
+    assert_eq!(
+        logged["v"],
+        redacted(),
+        "an exact match against a declared secret value IS caught by the backstop"
+    );
+    assert!(
+        logged["derived"]
+            .as_str()
+            .unwrap()
+            .contains("DERIVED-FROM-MISBOUND-0001"),
+        "…but a value only *derived* from the mis-bound root is caught by neither \
+         mechanism: {}",
+        logged["derived"]
+    );
+}
+
+// ---- Fix round 4, item C: the `when:` gate's one-bit channel, recorded
+// rather than closed. ----
+
+#[test]
+fn a_when_gate_records_whether_its_condition_read_secret_material() {
+    // Payload: step `gated` is gated on `${{ secrets.T == 'nope' }}` — a
+    // one-bit oracle on the secret, which decides whether the run emits two
+    // events or none. Step `open` is gated on `${{ inputs.go == 'yes' }}`,
+    // which reads nothing secret. Both run in one workflow so the flag is
+    // shown to be per-step, not per-run.
+    let yaml = r#"
+name: gate-taint
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: gated
+    when: "${{ secrets.T == 'nope' }}"
+    emit: { observed: "ran" }
+  - id: open
+    when: "${{ inputs.go == 'yes' }}"
+    emit: { observed: "ran" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(
+        serde_json::json!({"go": "yes"}),
+        "T",
+        "sk-gate-oracle-secret-0001",
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let gated = outcomes.iter().find(|o| o.step_id == "gated").unwrap();
+    let open = outcomes.iter().find(|o| o.step_id == "open").unwrap();
+
+    assert!(
+        matches!(gated.status, StepStatus::Skipped { .. }),
+        "the secret-derived condition is false, so the step is skipped — which is itself \
+         the one bit this flag exists to make legible"
+    );
+    assert!(
+        gated.gate_condition_was_secret_derived,
+        "a `when:` that read `secrets.*` must be recorded as such on the outcome"
+    );
+    assert!(
+        matches!(open.status, StepStatus::Completed),
+        "the clean condition is true, so that step runs"
+    );
+    assert!(
+        !open.gate_condition_was_secret_derived,
+        "a `when:` reading only `inputs.*` must not be recorded as secret-derived"
+    );
+}
+
+#[test]
+fn the_when_gates_branch_taken_is_a_one_bit_function_of_the_secret_and_is_observable() {
+    // The channel itself, executed, so the accepted-residual comment in
+    // `run_to_completion` is backed by a running assertion rather than by
+    // prose. Payload: the same workflow run twice against secrets differing
+    // only in their first byte (`Asecret-value-0001` vs `Bsecret-value-0001`),
+    // gated on `${{ contains(secrets.T, 'A') }}`.
+    let yaml = r#"
+name: gate-oracle
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: probe
+    when: "${{ contains(secrets.T, 'A') }}"
+    emit: { observed: "completed" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+
+    let mut observed = Vec::new();
+    for secret in ["Asecret-value-0001", "Bsecret-value-0001"] {
+        let mut sink = RecordingSink(Vec::new());
+        let ctx = secret_run_ctx(serde_json::json!({}), "T", secret);
+        let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+        let outcomes = exec.run_to_completion().unwrap();
+        let emitted = sink
+            .0
+            .iter()
+            .filter(|e| matches!(e.kind, TaskKind::Flow))
+            .count();
+        observed.push((
+            match &outcomes[0].status {
+                StepStatus::Completed => "completed",
+                StepStatus::Skipped { .. } => "skipped",
+                StepStatus::Failed { .. } => "failed",
+            },
+            emitted,
+        ));
+    }
+
+    assert_eq!(
+        observed,
+        vec![("completed", 2), ("skipped", 0)],
+        "one bit of the secret selects which fixed discriminant is written, and is \
+         observable from the event count alone with no reader step at all — accepted, \
+         not closed; see `run_to_completion`'s gate arm"
+    );
+}
+
+// ---- Fix round 4, item D: the taint bit survives the crate's public
+// boundary instead of being consumed inside `run_to_completion`. ----
+
+#[test]
+fn a_steps_output_taint_is_readable_on_the_public_step_outcome() {
+    // Payload: step `a` emits `{ body: "${{ secrets.T }}" }` (output derived
+    // from a secret); step `b` emits a literal `{ body: "ordinary" }` (not).
+    // Task 8's durability layer must persist step outputs, and this is the
+    // fact it would otherwise have to re-derive — a re-derivation that
+    // disagrees with this one is a leak.
+    let yaml = r#"
+name: outcome-taint
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: a
+    emit: { body: "${{ secrets.T }}" }
+  - id: b
+    emit: { body: "ordinary" }
+  - id: c
+    tool: shell
+    with: { cmd: ["echo", "${{ secrets.T }}"] }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "T", "sk-outcome-taint-0002");
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let a = outcomes.iter().find(|o| o.step_id == "a").unwrap();
+    let b = outcomes.iter().find(|o| o.step_id == "b").unwrap();
+    let c = outcomes.iter().find(|o| o.step_id == "c").unwrap();
+
+    assert!(
+        a.output_is_secret_derived,
+        "`output` really does carry the secret here: {:?}",
+        a.output
+    );
+    assert_eq!(a.output["body"], serde_json::json!("sk-outcome-taint-0002"));
+    assert!(!b.output_is_secret_derived);
+    assert!(
+        !c.output_is_secret_derived,
+        "a tool step's `output` is a fixed empty object, so it is not secret-derived \
+         even though its `with:` resolved a secret — this flag describes `output`, \
+         not the step"
+    );
+}
+
+// ---- Fix round 4, item E (orchestrator ruling): `interpolate_json` redacts
+// per substitution, like `interpolate`, not whole-leaf. ----
+
+#[test]
+fn only_the_substitution_is_replaced_in_a_with_field_the_surrounding_url_survives() {
+    // The ruling's own payload. Whole-leaf redaction logged this as
+    // `{"cmd":["curl","***"]}` — losing the entire URL, including which host
+    // was contacted, which is real operational and forensic loss for no
+    // security gain, because the substitution is whole-replaced either way.
+    let yaml = r#"
+name: per-substitution
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: fetch
+    tool: shell
+    with: { cmd: ["curl", "https://api.example.com/v1?token=${{ secrets.T }}&x=1"] }
+  - id: echo
+    emit: { cmd: ["curl", "https://api.example.com/v1?token=${{ secrets.T }}&x=1"] }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "T", "tok-SECRET-VALUE-12345");
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let shell = sink
+        .0
+        .iter()
+        .find(|e| matches!(e.kind, TaskKind::Shell))
+        .expect("the tool: step was persisted");
+    assert_eq!(
+        shell.payload_json["TaskCreated"]["input"]["Json"]["cmd"],
+        serde_json::json!(["curl", "https://api.example.com/v1?token=***&x=1"]),
+        "the surrounding literal template text survives; only the substitution is `***`"
+    );
+
+    // The substitution is still replaced WHOLE — never a substring
+    // find-and-replace over the output — and the real value still reaches
+    // dispatch, which is what the `emit:` twin shows.
+    let emitted = sink
+        .0
+        .iter()
+        .find(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .expect("the emit: step was persisted");
+    assert_eq!(
+        emitted.payload_json["TaskCreated"]["input"]["Json"]["cmd"],
+        serde_json::json!(["curl", "https://api.example.com/v1?token=***&x=1"])
+    );
+    let echo = outcomes.iter().find(|o| o.step_id == "echo").unwrap();
+    assert_eq!(
+        echo.output["cmd"],
+        serde_json::json!([
+            "curl",
+            "https://api.example.com/v1?token=tok-SECRET-VALUE-12345&x=1"
+        ]),
+        "…while the unredacted half still carries the real token to dispatch"
+    );
+}
+
+#[test]
+fn a_leaf_built_from_two_substitutions_redacts_only_the_secret_one() {
+    // Sharpens the previous test: a single leaf holding one clean and one
+    // secret substitution must keep the clean one intact. Payload:
+    // `"repo=${{ inputs.repo }} token=${{ secrets.T }} done"`.
+    let yaml = r#"
+name: mixed-leaf
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: a
+    emit: { line: "repo=${{ inputs.repo }} token=${{ secrets.T }} done" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(
+        serde_json::json!({"repo": "acme/widgets"}),
+        "T",
+        "tok-SECRET-VALUE-67890",
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let created = sink
+        .0
+        .iter()
+        .find(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .expect("the emit: step was persisted");
+    assert_eq!(
+        created.payload_json["TaskCreated"]["input"]["Json"]["line"],
+        serde_json::json!("repo=acme/widgets token=*** done")
+    );
+    assert_eq!(
+        outcomes[0].output["line"],
+        serde_json::json!("repo=acme/widgets token=tok-SECRET-VALUE-67890 done")
+    );
+}
+
+// ---- Fix round 4, item F: `steps['a']` is a typed failure, not a silent
+// `Null` that looks like a successful lookup. ----
+
+#[test]
+fn a_string_subscript_on_steps_fails_the_step_instead_of_emitting_null() {
+    // Payload: `emit: { probe: "${{ steps['a'].output.sec }}" }` — the exact
+    // shape from the security lens's retracted probe. Pre-fix the step
+    // completed and emitted the literal string `"null"`, so a wrong result
+    // was indistinguishable from a right one.
+    let yaml = r#"
+name: string-subscript
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: a
+    emit: { sec: "${{ secrets.T }}" }
+  - id: b
+    needs: [a]
+    emit: { probe: "${{ steps['a'].output.sec }}" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "T", "sk-subscript-probe-0003");
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let b = outcomes.iter().find(|o| o.step_id == "b").unwrap();
+    let message = match &b.status {
+        StepStatus::Failed { message } => message.clone(),
+        other => panic!("expected the step to fail loudly, got {other:?}"),
+    };
+    assert!(
+        message.contains("'a'") && message.contains("`[..]` indexes an array by position"),
+        "the failure must name the offending subscript and what to write instead: {message}"
+    );
+    assert!(
+        !message.contains("sk-subscript-probe-0003"),
+        "…and must never carry the value the expression was reaching for: {message}"
+    );
+    // Nothing was emitted for the failed step, so no `"null"` reached the log.
+    let flow_created = sink
+        .0
+        .iter()
+        .filter(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .count();
+    assert_eq!(flow_created, 1, "only step `a` emitted anything");
+}

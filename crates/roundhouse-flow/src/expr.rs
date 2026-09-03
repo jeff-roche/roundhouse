@@ -40,13 +40,26 @@
 //! Given that constraint, here is what this module itself does and does
 //! not do with whatever value it is handed:
 //!
-//! - **Can appear:** as the `Ok(Value)` returned by [`eval`], as text
-//!   substituted into the `Ok(String)` returned by [`interpolate`], and as
-//!   a leaf of the `Ok(Value)` returned by [`interpolate_json`] — that is
-//!   the whole point of evaluating `${{ secrets.GH_TOKEN }}`, to produce
-//!   the token for a caller to use (e.g. as an `env:` value). What the
-//!   *caller* then does with that returned value (log it, print it, put it
-//!   in a `Debug` derive somewhere) is outside this module's control.
+//! - **Can appear:** in the `Ok` half of all three public entry points —
+//!   [`eval`]/[`eval_delimited_expression`] return
+//!   [`Evaluated`] (`value` plus a `secret_derived` flag), [`interpolate`]
+//!   returns [`Interpolated<String>`](Interpolated) and [`interpolate_json`]
+//!   returns [`Interpolated<Value>`](Interpolated), each carrying **two**
+//!   renderings of one evaluation. A resolved secret appears in
+//!   `Evaluated::value` and in `Interpolated`'s
+//!   [`unredacted_for_dispatch`](Interpolated::unredacted_for_dispatch) half
+//!   — that is the whole point of evaluating `${{ secrets.GH_TOKEN }}`, to
+//!   produce the token for a caller to use (e.g. as an `env:` value). It
+//!   does **not** appear in `Interpolated`'s
+//!   [`redacted_for_logging`](Interpolated::redacted_for_logging) half, which
+//!   is what exists for the caller to log. What the *caller* then does with
+//!   the unredacted half (log it, print it, put it in a `Debug` derive
+//!   somewhere) is outside this module's control — the accessor names are the
+//!   only guard, and they are names, not enforcement.
+//!   (These are the real return types as of fix round 4. An earlier version
+//!   of this list said `eval`/`interpolate`/`interpolate_json` returned bare
+//!   `Value`/`String`/`Value`, which stopped being true when ruling P33's
+//!   dual rendering landed.)
 //! - **Cannot appear** in any [`ExprError`] variant, **including as a
 //!   derived byte offset.** Every error variant below carries only
 //!   source-expression text (the unparsed remainder, a function name, a
@@ -67,13 +80,50 @@
 //!   carries only a closed, four-way category.
 //! - **Cannot appear** in [`ExprContext`]'s `Debug` impl. `ExprContext`
 //!   deliberately does **not** derive `Debug` — it implements it by hand to
-//!   print only the sorted list of root names that have been `set`, never
-//!   their values, since this module cannot tell a resolved secret apart
-//!   from an ordinary `inputs.*` value once both are just
-//!   `HashMap<String, Value>` entries.
+//!   print only the sorted list of root names that have been bound, never
+//!   their values.
+//!
+//!   **The reason for that used to be stated wrongly, and the correction
+//!   matters (fix round 4, item A).** The old wording justified it on the
+//!   claim that this module "cannot tell a resolved secret apart from an
+//!   ordinary `inputs.*` value". Since ruling P33 that premise is false:
+//!   `ExprContext` records per-root provenance and *can* tell a
+//!   [`set_secret`](ExprContext::set_secret)-bound root apart from a
+//!   [`set_public`](ExprContext::set_public)-bound one. The conclusion is
+//!   unchanged — no values are printed — but for a different and weaker
+//!   reason: a root marked non-secret is only *asserted* to be non-secret by
+//!   whichever caller bound it (see the boundary section below), so
+//!   "provenance says clean" is not evidence that printing the value is safe.
+//!   Printing root names only needs no such assertion at all.
 //! - **No logging.** This module never calls `tracing`/`log`/`eprintln!`
 //!   anywhere, so there is no log-line leak surface *inside* `expr.rs`
 //!   itself to audit.
+//!
+//! # Provenance's true boundary is [`ExprContext`]'s constructors, not the grammar (ruling P35)
+//!
+//! Taint is complete *inside* the evaluator — every operation the grammar can
+//! perform is enumerated in the propagation table below, and each has a test.
+//! What taint cannot do is see how a value got into the context in the first
+//! place. **A secret bound through a root the caller marked non-secret is not
+//! tainted and logs in cleartext.** Executed end to end through
+//! `parse_workflow` -> `Executor::new` -> `run_to_completion`, with the
+//! credential handed in as `inputs`/`vars` rather than through `secrets`:
+//! `emit: { v: "${{ inputs.carried }}", w: "${{ vars.carried }}" }` logs
+//! `{"v":"INPUTSCARRIEDSECRET","w":"VARSCARRIEDSECRET"}`.
+//!
+//! `crate::exec`'s whole-secret backstop covers only the **sub-case** where
+//! such a value happens to equal a declared `secrets` entry *exactly* (an
+//! exact-match needle finds it wherever it appears). A value merely *derived*
+//! from a mis-bound secret — a field of it, a slice of it — is covered by
+//! neither mechanism.
+//!
+//! This is the honest boundary of the design, and it relocates the
+//! correctness argument: it rests on **every binding site choosing the right
+//! constructor**. That is why [`ExprContext::set_public`] is named as an
+//! assertion rather than being the plain, default-looking `set` it used to be,
+//! why binding a value of unknown provenance must use
+//! [`ExprContext::set_secret`], and why a rebinding can never *lower* a root's
+//! recorded provenance (see [`ExprContext::set_public`]).
 //!
 //! # Provenance-based redaction (ruling P33) — the complete propagation table
 //!
@@ -99,7 +149,7 @@
 //! |---|---|
 //! | string literal `'x'` / `"x"` | clean (workflow source text) |
 //! | number literal `12` | clean |
-//! | bare identifier bound by [`ExprContext::set`] | clean |
+//! | bare identifier bound by [`ExprContext::set_public`] | clean — *asserted* so by the binding site, not proven here (see the boundary section above) |
 //! | bare identifier bound by [`ExprContext::set_secret`] | **secret** |
 //! | bare identifier bound by [`ExprContext::set_with_secret_paths`] | **secret** — the whole object, secret sub-paths included, escapes |
 //! | unbound identifier (resolves to `Null`) | clean |
@@ -192,11 +242,11 @@
 //! whatever deserializes a `map.over` item or a webhook payload into the
 //! `serde_json::Value` this module receives already turns an escaped
 //! sequence in *that* source data into a real control byte before
-//! `ExprContext::set` ever runs, so freezing or removing `json()` would
-//! narrow this vector by exactly zero: `json()` can merely reach the same
-//! outcome from expression text the author typed directly, which is a
-//! smaller and more visible surface than attacker-controlled `map.over`
-//! data. The residual belongs on **whatever deserializes context data**
+//! [`ExprContext`]'s binding methods ever run, so freezing or removing
+//! `json()` would narrow this vector by exactly zero: `json()` can merely
+//! reach the same outcome from expression text the author typed directly,
+//! which is a smaller and more visible surface than attacker-controlled
+//! `map.over` data. The residual belongs on **whatever deserializes context data**
 //! (this module included, when `json()` is the one doing the decoding),
 //! and on **whatever sink consumes the resulting string**, not on `json()`
 //! alone.
@@ -283,10 +333,10 @@
 //! case-sensitively equal one of `RESERVED_EXPRESSION_ROOTS` (`secrets`,
 //! `steps`, `inputs`, `run`, `vars`, `env`) — it does **not** reject `Steps`
 //! or `STEPS`. That check is only sound if this evaluator is also
-//! case-sensitive when resolving a root name, because `ExprContext::set`
-//! and every identifier lookup in this module go through an ordinary
-//! `HashMap<String, Value>` keyed by the exact byte string parsed out of
-//! the expression (`parse_ident` copies bytes verbatim, no case-folding
+//! case-sensitive when resolving a root name, because `ExprContext`'s
+//! binding methods and every identifier lookup in this module go through an
+//! ordinary `HashMap<String, Value>` keyed by the exact byte string parsed
+//! out of the expression (`parse_ident` copies bytes verbatim, no case-folding
 //! anywhere in this file) — `"Steps"` and `"steps"` are two distinct,
 //! non-colliding keys. **Verdict: this evaluator is case-sensitive
 //! everywhere it looks up a name, so Task 3's case-sensitive check and this
@@ -485,15 +535,15 @@
 //! limit closes that gap for the one way this module can itself produce a
 //! `Value` from text it does not already have. **What remains open is data
 //! this module never constructed at all**: a deeply-nested `Value` handed
-//! to [`ExprContext::set`] by a caller — risk item 3 names `map.over`
+//! to [`ExprContext`] by a caller — risk item 3 names `map.over`
 //! external data (attacker-influenced) as exactly what could populate a
 //! context like this — still shares that `ExprContext`, and the value's
 //! own `Drop`, whenever it eventually runs on whatever thread holds it,
 //! pays the stack cost measured above regardless of what any expression
 //! did. Whatever deserializes that external data before calling
-//! `ExprContext::set` is where a real bound would have to live — a maximum
-//! nesting-depth check at deserialization time, before a `Value` this deep
-//! is ever constructed. Nothing in `roundhouse-flow` does that today, for
+//! binding it into an [`ExprContext`] is where a real bound would have to
+//! live — a maximum nesting-depth check at deserialization time, before a
+//! `Value` this deep is ever constructed. Nothing in `roundhouse-flow` does that today, for
 //! context data generally (not just `map.over`), and this module cannot
 //! add it without ceasing to be "a pure evaluator over a
 //! `serde_json::Value` context" — the value already has to exist before
@@ -570,6 +620,32 @@ pub enum ExprError {
          bare expression; found: {0:?}"
     )]
     NotADelimitedExpression(String),
+    /// Fix round 4, item F: a `[..]` subscript whose expression did not
+    /// evaluate to a non-negative whole number — `steps['a']`, `x[1.5]`,
+    /// `x[nosuchroot]`. This grammar's `[..]` subscripts an **array by
+    /// position** only; there is no string keying (that is what `.field` is
+    /// for), so string subscripting was never implemented. It used to
+    /// evaluate silently to `Null`, which is the shape that lets a wrong
+    /// result look like a right one: the security lens found this while
+    /// retracting one of its own probes as vacuous — the probe appeared to
+    /// show `***` only because `[idx]` unconditionally escalates an
+    /// unresolved `ValueProvenance::AbovePath` to secret, so it proved
+    /// nothing about taint, and the silent `Null` is what hid that.
+    ///
+    /// Carries the subscript's **source text** (bounded by
+    /// `MAX_ECHOED_FIELD_LEN`) and its byte position within the expression,
+    /// never the value it evaluated to — same rule every other variant here
+    /// follows, so a `${{ steps[secrets.T] }}` reports `secrets.T`, not the
+    /// secret.
+    #[error(
+        "the subscript {index_expression:?} at position {position} did not evaluate to a \
+         non-negative whole number; `[..]` indexes an array by position (use `.field` to read \
+         an object's member)"
+    )]
+    NonNumericIndex {
+        position: usize,
+        index_expression: String,
+    },
 }
 
 /// What kind of problem `json()`'s `serde_json::from_str` hit, **carrying
@@ -671,23 +747,63 @@ impl ExprContext {
     }
 
     /// Binds `name` as a root usable from an expression (`name.field`,
-    /// `name[0]`, or bare `name`), asserting that **nothing** reachable
-    /// through it is secret material. Overwrites any existing binding of the
-    /// same name, including its recorded provenance.
+    /// `name[0]`, or bare `name`), **asserting that nothing reachable through
+    /// it is secret material.**
     ///
-    /// **Forward hazard for whoever binds a new root.** This is the "clean"
-    /// constructor, and choosing it is a security assertion, not a default.
-    /// Task 6's `map.as` loop binding is the next new root: if the collection
+    /// # This method is named for the assertion it makes (ruling P35, fix round 4)
+    ///
+    /// It used to be called `set`, which made the non-secret path both the
+    /// plainly-named one and the one a reader reaches for by default, with the
+    /// assertion living only in this doc comment. Ruling P35 requires the
+    /// opposite: taint's correctness rests entirely on binding sites, so the
+    /// non-secret path has to be the one you cannot pick without saying so.
+    /// If you do not know a value's provenance, bind it with
+    /// [`Self::set_secret`] — over-redacting a log line is recoverable, and a
+    /// credential in the append-only `events` table is not.
+    ///
+    /// # A rebinding can never *lower* a root's provenance
+    ///
+    /// Calling this on a name previously bound through [`Self::set_secret`] or
+    /// [`Self::set_with_secret_paths`] replaces the **value** but keeps the
+    /// recorded provenance. Silently un-tainting a root used to be exactly
+    /// what this method did. Measured against the pre-fix code, and
+    /// reproduced by
+    /// `tests/expr.rs::a_public_rebinding_cannot_untaint_a_root_that_was_bound_as_secret`:
+    /// after `set_secret`, a following plain `set` on the same name returned
+    /// `secret_derived=false` with the value unchanged, so [`Evaluated`]'s
+    /// `Debug` — which exists specifically to print `***` — printed
+    /// `SECRETVALUE12345` in cleartext, because it trusts the flag. The next two callers of this API are
+    /// precisely the ones that would hit it: Task 6's `map.as` per-item
+    /// binding (rebinding one loop name per item) and Task 8 folding real tool
+    /// outputs into `steps.<id>.output`. It is the same silent-taint-loss
+    /// shape that had to be fixed at the step boundary in fix round 3, so it
+    /// is made **unrepresentable** here rather than documented again.
+    ///
+    /// **Accepted conservatism, stated rather than hidden:** monotonicity is
+    /// per *root name*, so a name that ever held secret material keeps
+    /// redacting for the life of the context even if a later binding of that
+    /// same name is genuinely clean (a `map.as` loop over a mixed collection
+    /// would be the shape). That over-redacts a log line; it does not corrupt
+    /// a dispatched value, which never consults provenance at all. Rebind
+    /// under a *different* name, or build a fresh [`ExprContext`], if a clean
+    /// binding must be readable in the log.
+    ///
+    /// # What monotonicity does NOT cover
+    ///
+    /// It only stops a *downgrade of a name already marked secret*. A **new**
+    /// name bound here for the first time is clean because you said so, and
+    /// nothing checks you. Concretely, for Task 6's `map.as`: if the collection
     /// being iterated was itself derived from a secret (`over:
-    /// "${{ json(secrets.K).items }}"`), each per-item binding must go
-    /// through [`Self::set_secret`], or taint stops at the loop boundary
+    /// "${{ json(secrets.K).items }}"`), the per-item binding is a fresh name
+    /// with no prior provenance, so it **must** go through
+    /// [`Self::set_secret`] — otherwise taint stops at the loop boundary
     /// exactly the way it stopped at the step boundary before
-    /// [`Self::set_with_secret_paths`] existed. Nothing in this type can
-    /// detect that mistake; the propagation table in the module doc comment
-    /// is where the rule is written down.
-    pub fn set(&mut self, name: &str, value: Value) {
+    /// [`Self::set_with_secret_paths`] existed. The rule is: propagate the
+    /// provenance of whatever the value was computed *from*
+    /// ([`Interpolated::is_secret_derived`]/[`Evaluated::secret_derived`] is
+    /// how you learn it), and choose `set_secret` when you cannot.
+    pub fn set_public(&mut self, name: &str, value: Value) {
         self.vars.insert(name.to_string(), value);
-        self.secret_provenance.remove(name);
     }
 
     /// Binds `name` as a root and marks **everything reachable through it**
@@ -696,6 +812,9 @@ impl ExprContext {
     /// tainted value is replaced in its entirety by `***` in the *logged*
     /// rendering [`interpolate`]/[`interpolate_json`] produce — never in the
     /// real value, which still reaches the dispatched task.
+    ///
+    /// This is also the correct choice for a value whose provenance the
+    /// binding site does not know (ruling P35).
     pub fn set_secret(&mut self, name: &str, value: Value) {
         self.vars.insert(name.to_string(), value);
         self.secret_provenance
@@ -716,18 +835,42 @@ impl ExprContext {
     /// along a prefix is tainted too, because this evaluator cannot tell
     /// which entry an arbitrary index expression selects. An empty
     /// `secret_paths`, or paths that are all empty, is exactly equivalent to
-    /// [`Self::set`].
+    /// [`Self::set_public`].
+    ///
+    /// Rebinding through this method **unions** the new paths with whatever
+    /// this root already had, and never lowers a root already marked
+    /// `RootProvenance::Whole` — see [`Self::set_public`]'s "A rebinding can
+    /// never *lower* a root's provenance" section, which this method obeys for
+    /// the same reason. `crate::exec::Executor::run_to_completion` rebinds
+    /// `steps` once per step with a monotonically growing path list, so the
+    /// union is exactly the list it passes; the rule matters for the callers
+    /// that come after it.
     pub fn set_with_secret_paths<I>(&mut self, name: &str, value: Value, secret_paths: I)
     where
         I: IntoIterator<Item = Vec<String>>,
     {
         self.vars.insert(name.to_string(), value);
-        let paths: Vec<Vec<String>> = secret_paths.into_iter().filter(|p| !p.is_empty()).collect();
-        if paths.is_empty() {
-            self.secret_provenance.remove(name);
-        } else {
-            self.secret_provenance
-                .insert(name.to_string(), RootProvenance::Paths(paths));
+        let mut paths: Vec<Vec<String>> =
+            secret_paths.into_iter().filter(|p| !p.is_empty()).collect();
+        match self.secret_provenance.get(name) {
+            // Already fully secret: a narrower statement cannot widen the
+            // clean set.
+            Some(RootProvenance::Whole) => {}
+            Some(RootProvenance::Paths(existing)) => {
+                for old in existing {
+                    if !paths.contains(old) {
+                        paths.push(old.clone());
+                    }
+                }
+                self.secret_provenance
+                    .insert(name.to_string(), RootProvenance::Paths(paths));
+            }
+            None => {
+                if !paths.is_empty() {
+                    self.secret_provenance
+                        .insert(name.to_string(), RootProvenance::Paths(paths));
+                }
+            }
         }
     }
 
@@ -778,10 +921,16 @@ enum PathVerdict {
 impl fmt::Debug for ExprContext {
     /// Deliberately does not print bound values — see the module doc
     /// comment's "Where a resolved secret can and cannot appear" section.
-    /// This context cannot tell a resolved secret apart from an ordinary
-    /// `inputs.*` value once both are just `Value`s in the same map, so it
-    /// never prints any of them; only the sorted set of root names bound so
-    /// far.
+    ///
+    /// **Corrected reasoning (fix round 4, item A).** This comment used to say
+    /// the context "cannot tell a resolved secret apart from an ordinary
+    /// `inputs.*` value". Since ruling P33 it can: its `secret_provenance` map
+    /// records which roots hold secret material. Printing values for the roots
+    /// provenance calls clean would still be wrong, because "clean" is an
+    /// assertion made by whoever bound the root, not a fact this type
+    /// established (ruling P35) — the executed counter-example is in the module
+    /// doc comment's boundary section. Printing only the sorted set of root
+    /// names depends on no assertion at all, so that is what this prints.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut roots: Vec<&str> = self.vars.keys().map(String::as_str).collect();
         roots.sort_unstable();
@@ -1418,13 +1567,28 @@ impl<'a> JsonTemplateSource<'a> {
 /// for why (ruling P20).
 ///
 /// Returns **both** renderings from one pass (ruling P33): see
-/// [`Interpolated`]. A leaf whose interpolation read a secret-marked root is
-/// replaced, whole, by the string [`REDACTION_PLACEHOLDER`] in the redacted
-/// rendering — the leaf granularity is deliberate, and is what the brief for
-/// this change specifies: a `with:` leaf is one field value, and replacing it
-/// entirely makes the redaction unmistakable to a reader instead of producing
-/// a plausible-looking partial value. Leaves that read no secret, object
-/// keys, and non-string leaves are byte-identical in both renderings.
+/// [`Interpolated`]. Redaction is **per substitution**, identical to
+/// [`interpolate`]'s own granularity: within a string leaf, only the text
+/// spliced in for a secret-derived `${{ }}` block becomes
+/// [`REDACTION_PLACEHOLDER`], and the leaf's surrounding literal template text
+/// is byte-identical in both renderings. Object keys and non-string leaves are
+/// likewise identical in both.
+///
+/// **This replaced whole-leaf redaction (fix round 4, item E).** Fix round 3
+/// replaced an entire tainted leaf with `***`, which is strictly less
+/// informative for no security gain, because the substitution itself is
+/// whole-replaced either way. Measured: `with: { cmd: ["curl",
+/// "https://api.example.com/v1?token=${{ secrets.T }}&x=1"] }` logged as
+/// `{"cmd":["curl","***"]}` — losing the whole URL, including which host was
+/// contacted, which is real operational and forensic loss — while the
+/// `interpolate` path already logged the equivalent prose case correctly as
+/// `"deploy using *** now"`. The two entry points now agree.
+///
+/// **The binding invariant is unchanged**: the substitution is replaced
+/// *whole*. This is never a substring find-and-replace over the rendered
+/// output — that mechanism is what ruling P33 abolished, and reintroducing it
+/// here would reintroduce the corruption of unrelated text it was abolished
+/// for.
 pub fn interpolate_json(
     value: JsonTemplateSource<'_>,
     ctx: &ExprContext,
@@ -1451,15 +1615,15 @@ fn interpolate_json_inner(
 ) -> Result<(Value, Value, bool), ExprError> {
     match value {
         Value::String(s) => {
+            // Per-substitution, exactly as [`interpolate`] itself renders
+            // (fix round 4, item E) — the leaf's surrounding literal text
+            // survives and only the spliced-in text of a secret-derived
+            // `${{ }}` block becomes `***`. `interpolate_inner` has already
+            // produced precisely that string; nothing further is done to it.
             let interpolated = interpolate_inner(s, ctx)?;
-            let redacted = if interpolated.secret_derived {
-                Value::String(REDACTION_PLACEHOLDER.to_string())
-            } else {
-                Value::String(interpolated.redacted)
-            };
             Ok((
                 Value::String(interpolated.unredacted),
-                redacted,
+                Value::String(interpolated.redacted),
                 interpolated.secret_derived,
             ))
         }
@@ -1672,13 +1836,27 @@ impl<'a> Parser<'a> {
             } else if self.peek() == Some(b'[') {
                 self.pos += 1;
                 self.skip_ws();
+                let idx_start = self.pos;
                 let (idx_val, idx_secret) = self.parse_ternary()?;
+                let idx_end = self.pos;
                 self.skip_ws();
                 if self.peek() != Some(b']') {
                     return Err(ExprError::UnexpectedToken(self.pos, "expected ']'".into()));
                 }
                 self.pos += 1;
-                v = index_array(v, idx_val.as_ref());
+                // Fix round 4, item F: a subscript that is not a non-negative
+                // whole number is a typed error, not a silent `Null`.
+                let index = match as_index(idx_val.as_ref()) {
+                    Some(i) => i,
+                    None => {
+                        let source = String::from_utf8_lossy(&self.s[idx_start..idx_end]);
+                        return Err(ExprError::NonNumericIndex {
+                            position: idx_start,
+                            index_expression: truncate_echoed_field(source.trim()),
+                        });
+                    }
+                };
+                v = index_array(v, index);
                 prov = if idx_secret || prov.is_secret_derived() {
                     ValueProvenance::Secret
                 } else {
@@ -2068,6 +2246,17 @@ fn index_field<'a>(v: Cow<'a, Value>, field: &str) -> Cow<'a, Value> {
 /// `Null` before this fix, not `2`. `as_f64()` works uniformly across all
 /// of `Number`'s internal representations, so this function goes through
 /// that instead and does the whole-number check itself.
+///
+/// **Its `None` is interpreted differently by its two callers (fix round 4,
+/// item F).** For a `[..]` subscript, [`Parser::parse_primary_chain`] turns it
+/// into [`ExprError::NonNumericIndex`] — a subscript that is not a number is a
+/// malformed expression, and returning `Null` for it made
+/// `steps['a'].output.x` silently dead rather than wrong-looking. For
+/// `slice()`'s optional bounds, [`call_function`] keeps treating `None` as
+/// "bound not supplied" and falls back to `0`/the array length, which is what
+/// makes `slice(a)` and `slice(a, 1)` legal calls at all; that behaviour is
+/// deliberately unchanged here, since tightening it would reject those two
+/// forms rather than catch a mistake.
 fn as_index(v: &Value) -> Option<usize> {
     let f = v.as_f64()?;
     if f.is_finite() && f >= 0.0 && f.fract() == 0.0 {
@@ -2077,17 +2266,21 @@ fn as_index(v: &Value) -> Option<usize> {
     }
 }
 
-/// Resolves `v[idx]`, borrow-preserving like [`index_field`] — see its doc
+/// Resolves `v[i]`, borrow-preserving like [`index_field`] — see its doc
 /// comment for why, including why the `Cow::Owned` arm below uses
 /// `Vec::swap_remove` (an O(1) move of the matched element, with the last
 /// element moved into its place, no clone of the element or of any sibling)
 /// rather than `a.get(i).cloned()`, which paid the same per-step
 /// whole-remaining-subtree clone cost `index_field` used to.
-fn index_array<'a>(v: Cow<'a, Value>, idx: &Value) -> Cow<'a, Value> {
-    let i = match as_index(idx) {
-        Some(i) => i,
-        None => return Cow::Owned(Value::Null),
-    };
+///
+/// Takes an already-validated `usize`, not a `Value` (fix round 4, item F):
+/// deciding that a subscript is not a number is [`Parser::parse_primary_chain`]'s
+/// job now, because that is where the source text and byte position needed for
+/// [`ExprError::NonNumericIndex`] are still in hand. An index that *is* a
+/// number but is out of range stays a `Null` here — that is an ordinary
+/// missing lookup, the same as a `.field` that is not present, not a malformed
+/// expression.
+fn index_array(v: Cow<'_, Value>, i: usize) -> Cow<'_, Value> {
     match v {
         Cow::Borrowed(Value::Array(a)) => match a.get(i) {
             Some(inner) => Cow::Borrowed(inner),

@@ -173,6 +173,47 @@ pub struct StepOutcome {
     pub step_id: String,
     pub output: Value,
     pub status: StepStatus,
+    /// Whether [`Self::output`] was computed by reading secret-marked material
+    /// — i.e. whether persisting or logging it requires a redacted stand-in.
+    ///
+    /// **Carried here rather than discarded (fix round 4, item D).**
+    /// [`Executor::dispatch_step`] used to return this alongside the outcome
+    /// as a bare `bool` that [`Executor::run_to_completion`] consumed
+    /// internally, handing its caller a `Vec<StepOutcome>` with no taint
+    /// information at all. Task 8's durability layer has to persist step
+    /// outputs to make runs resumable, so it would have had to **re-derive a
+    /// fact this executor already computed and threw away** — and a
+    /// re-derivation that disagrees with this one is a leak. The justification
+    /// for dropping it ("no caller outside this module needs it today") is the
+    /// same reasoning that lost taint at the step boundary in fix round 3.
+    ///
+    /// Note this is a property of `output`, not of the step: a `tool:`/`agent:`
+    /// step's `output` is a fixed empty object today, so it is `false` even
+    /// when the step's `with:`/`prompt` resolved a secret. The redaction of
+    /// *that* value already happened before it reached the sink.
+    pub output_is_secret_derived: bool,
+    /// Whether this step's `when:` condition was computed by reading
+    /// secret-marked material (fix round 4, item C). `false` for a step with
+    /// no `when:`, and `false` when the condition failed to evaluate — see
+    /// [`Executor::run_to_completion`]'s gate arm for what this records and
+    /// the channel it exists to make legible.
+    pub gate_condition_was_secret_derived: bool,
+}
+
+impl StepOutcome {
+    /// A step that did not run to completion: no output, so nothing derived
+    /// from a secret can be in it. `gate_condition_was_secret_derived` is
+    /// filled in by [`Executor::run_to_completion`], which is the only place
+    /// that has evaluated a `when:`.
+    fn failed(step_id: &str, message: String) -> Self {
+        StepOutcome {
+            step_id: step_id.to_string(),
+            output: Value::Null,
+            status: StepStatus::Failed { message },
+            output_is_secret_derived: false,
+            gate_condition_was_secret_derived: false,
+        }
+    }
 }
 
 impl fmt::Debug for StepOutcome {
@@ -215,6 +256,13 @@ impl fmt::Debug for StepOutcome {
             .field("step_id", &self.step_id)
             .field("output", &ValueShape(&self.output))
             .field("status", &self.status)
+            // Booleans, so they carry no content of their own beyond the one
+            // bit each already documented on the fields themselves.
+            .field("output_is_secret_derived", &self.output_is_secret_derived)
+            .field(
+                "gate_condition_was_secret_derived",
+                &self.gate_condition_was_secret_derived,
+            )
             .finish()
     }
 }
@@ -322,13 +370,22 @@ impl<'a> Executor<'a> {
         let mut ctx = ExprContext::new();
         // Finding 8: bind everything the expression language needs besides
         // `steps` (set fresh on every iteration inside `run_to_completion`).
-        ctx.set("inputs", run_ctx.inputs);
-        ctx.set("vars", run_ctx.vars);
-        // Fix round 3 (ruling P33): bound through `set_secret`, not `set`.
-        // That one call is what makes every value any expression computes by
-        // reading through `secrets` — a whole value, a field of a parsed JSON
-        // secret, its length, a comparison against it — log as `***` while
-        // still reaching the dispatched task for real.
+        ctx.set_public("inputs", run_ctx.inputs);
+        ctx.set_public("vars", run_ctx.vars);
+        // Fix round 3 (ruling P33): bound through `set_secret`, not the
+        // non-secret `set_public` the three roots above use. That one call is
+        // what makes every value any expression computes by reading through
+        // `secrets` — a whole value, a field of a parsed JSON secret, its
+        // length, a comparison against it — log as `***` while still reaching
+        // the dispatched task for real.
+        //
+        // The three `set_public` calls above are the assertions ruling P35
+        // makes load-bearing: `inputs`/`vars`/`run` are declared non-secret
+        // here, and a caller who routes a credential through `inputs` rather
+        // than `secrets` gets no taint on it. That boundary is pinned by
+        // `tests/exec_sequencing.rs`'s
+        // `a_credential_handed_in_as_inputs_or_vars_instead_of_secrets_is_not_tainted_and_logs_in_cleartext`
+        // so it is a red test, not a stale comment, if it ever changes.
         ctx.set_secret(
             "secrets",
             Value::Object(
@@ -339,7 +396,7 @@ impl<'a> Executor<'a> {
                     .collect(),
             ),
         );
-        ctx.set("run", serde_json::json!({ "id": run_id.to_string() }));
+        ctx.set_public("run", serde_json::json!({ "id": run_id.to_string() }));
         Ok(Executor {
             def,
             run_id,
@@ -422,6 +479,10 @@ impl<'a> Executor<'a> {
                     .map(|id| vec![id.clone(), "output".to_string()]),
             );
 
+            // Recorded on the outcome below (fix round 4, item C) so a later
+            // task can act on it without re-deriving it.
+            let mut gate_condition_was_secret_derived = false;
+
             if let Some(when) = &step.when {
                 // Fail-closed deviation from the plan's illustrative
                 // `unwrap_or(true)` — see this task's report, "Deviations
@@ -444,12 +505,61 @@ impl<'a> Executor<'a> {
                 match eval_delimited_expression(TemplateSource::from_workflow_file(when), &self.ctx)
                 {
                     Ok(cond) => {
-                        // Only `Bool(true)` runs the step. `cond.secret_derived`
-                        // is deliberately not consulted: what this branch
-                        // writes into `steps.<id>` is a fixed
-                        // `"skipped"`/`"completed"` discriminant and a fixed
-                        // reason string, never the condition's own value, so
-                        // no secret material can reach the log through it.
+                        // The condition's own *value* cannot reach the log
+                        // through this branch: all it writes into
+                        // `steps.<id>` is a fixed `"skipped"`/`"completed"`
+                        // discriminant and a fixed reason string.
+                        //
+                        // **That premise is true and the conclusion drawn from
+                        // it used to be false (fix round 4, item C).** The
+                        // earlier comment here concluded "so no secret material
+                        // can reach the log" — but *which* of the two fixed
+                        // strings gets written is a one-bit function of the
+                        // condition, and the condition may be
+                        // `${{ secrets.T == 'a' }}`.
+                        //
+                        // Executed here, and asserted by
+                        // `the_when_gates_branch_taken_is_a_one_bit_function_of_the_secret_and_is_observable`:
+                        // two runs of one gated step, against secrets differing
+                        // only in their first byte, produce
+                        // (`completed`, 2 events) and (`skipped`, 0 events) —
+                        // so the bit is readable from the event count alone,
+                        // with no reader step at all. The fix-round-3 security
+                        // lens measured the multi-bit extension of the same
+                        // shape (eight gate steps against
+                        // `T = "abXdeXghXXXXXXXX"` recording that secret's
+                        // exact character-presence pattern); that figure is
+                        // theirs, reproduced here only at one bit.
+                        //
+                        // The per-run ceiling is arithmetic, not a measurement:
+                        // `crate::parse::MAX_TOP_LEVEL_STEPS` is 500, so a run
+                        // admits at most 500 such steps and therefore at most
+                        // ~500 bits (~62 bytes), into a table that physically
+                        // rejects `UPDATE`/`DELETE`. Nothing was measured at
+                        // that size.
+                        //
+                        // **Accepted, not closed.** The only actor who can
+                        // build this channel is the workflow author, who
+                        // already has a designed full-bandwidth one: the
+                        // unredacted half of every interpolation is handed to
+                        // real dispatch, so `tool: shell` with
+                        // `${{ secrets.T }}` delivers the plaintext by design.
+                        // A covert 62-bytes-per-run side channel is not worth
+                        // paying for against an actor holding an overt
+                        // unlimited one.
+                        //
+                        // **The condition that upgrades this.** If §8.5's
+                        // per-step `permissions:` narrowing is ever meant to
+                        // make an author *less* privileged than the secrets
+                        // they may reference, this becomes the surviving
+                        // channel and stops being Minor. This module consults
+                        // `permissions:` nowhere today, so that does not hold
+                        // yet; whoever wires it must revisit this branch.
+                        //
+                        // What is recorded instead of acted on: the flag, so
+                        // the next task decides with a read rather than a
+                        // re-derivation.
+                        gate_condition_was_secret_derived = cond.secret_derived;
                         if !matches!(cond.value, Value::Bool(true)) {
                             let outcome = StepOutcome {
                                 step_id: step.id.clone(),
@@ -457,6 +567,8 @@ impl<'a> Executor<'a> {
                                 status: StepStatus::Skipped {
                                     reason: "when: evaluated false".into(),
                                 },
+                                output_is_secret_derived: false,
+                                gate_condition_was_secret_derived,
                             };
                             steps_context.insert(step.id.clone(), steps_context_entry(&outcome));
                             outcomes.push(outcome);
@@ -464,13 +576,16 @@ impl<'a> Executor<'a> {
                         }
                     }
                     Err(e) => {
-                        let outcome = StepOutcome {
-                            step_id: step.id.clone(),
-                            output: Value::Null,
-                            status: StepStatus::Failed {
-                                message: format!("evaluating `when:`: {e}"),
-                            },
-                        };
+                        // Residual, named rather than papered over: whether the
+                        // condition *failed to evaluate* is also a function of
+                        // the condition, and `ExprError` carries no taint flag
+                        // to record it with, so this stays `false`. The failure
+                        // path itself writes only a bounded, source-text-only
+                        // diagnostic (see `StepStatus`'s `Debug` impl), so no
+                        // secret *value* rides along; the missing bit is the
+                        // same one-bit shape accepted above.
+                        let outcome =
+                            StepOutcome::failed(&step.id, format!("evaluating `when:`: {e}"));
                         steps_context.insert(step.id.clone(), steps_context_entry(&outcome));
                         outcomes.push(outcome);
                         continue;
@@ -478,8 +593,9 @@ impl<'a> Executor<'a> {
                 }
             }
 
-            let (outcome, output_is_secret_derived) = self.dispatch_step(step);
-            if output_is_secret_derived {
+            let mut outcome = self.dispatch_step(step);
+            outcome.gate_condition_was_secret_derived = gate_condition_was_secret_derived;
+            if outcome.output_is_secret_derived {
                 secret_derived_steps.push(step.id.clone());
             }
             steps_context.insert(step.id.clone(), steps_context_entry(&outcome));
@@ -488,13 +604,13 @@ impl<'a> Executor<'a> {
         Ok(outcomes)
     }
 
-    /// Dispatches one step, returning its outcome and **whether the outcome's
-    /// `output` is secret-derived** — see [`Self::run_to_completion`]'s
-    /// `secret_derived_steps` for why that second value exists. It is
-    /// returned rather than added as a `StepOutcome` field because it
-    /// describes this executor's own bookkeeping, not the step's result; no
-    /// caller outside this module needs it today.
-    fn dispatch_step(&mut self, step: &StepDef) -> (StepOutcome, bool) {
+    /// Dispatches one step. The returned [`StepOutcome`] carries
+    /// [`StepOutcome::output_is_secret_derived`], which
+    /// [`Self::run_to_completion`] folds into `secret_derived_steps` to carry
+    /// taint across the step boundary — and which, since fix round 4 (item D),
+    /// also survives out of this crate rather than being consumed here, so
+    /// Task 8's durability layer reads the fact instead of re-deriving it.
+    fn dispatch_step(&mut self, step: &StepDef) -> StepOutcome {
         // Computed for every dispatch (matching this task's Interfaces
         // list) but not yet attached to anything persisted — see
         // `provenance::Provenance`'s own doc comment for why.
@@ -522,15 +638,9 @@ impl<'a> Executor<'a> {
                     {
                         Ok(v) => v,
                         Err(e) => {
-                            return (
-                                StepOutcome {
-                                    step_id: step.id.clone(),
-                                    output: Value::Null,
-                                    status: StepStatus::Failed {
-                                        message: format!("interpolating `with:`: {e}"),
-                                    },
-                                },
-                                false,
+                            return StepOutcome::failed(
+                                &step.id,
+                                format!("interpolating `with:`: {e}"),
                             );
                         }
                     };
@@ -565,29 +675,22 @@ impl<'a> Executor<'a> {
                 //
                 // `output` is a fixed empty object, so it is never
                 // secret-derived regardless of what `with:` contained.
-                (
-                    StepOutcome {
-                        step_id: step.id.clone(),
-                        output: serde_json::json!({}),
-                        status: StepStatus::Completed,
-                    },
-                    false,
-                )
+                StepOutcome {
+                    step_id: step.id.clone(),
+                    output: serde_json::json!({}),
+                    status: StepStatus::Completed,
+                    output_is_secret_derived: false,
+                    gate_condition_was_secret_derived: false,
+                }
             }
             StepBody::Agent { prompt, .. } => {
                 let resolved_prompt =
                     match interpolate(TemplateSource::from_workflow_file(prompt), &self.ctx) {
                         Ok(s) => s,
                         Err(e) => {
-                            return (
-                                StepOutcome {
-                                    step_id: step.id.clone(),
-                                    output: Value::Null,
-                                    status: StepStatus::Failed {
-                                        message: format!("interpolating `agent.prompt`: {e}"),
-                                    },
-                                },
-                                false,
+                            return StepOutcome::failed(
+                                &step.id,
+                                format!("interpolating `agent.prompt`: {e}"),
                             );
                         }
                     };
@@ -612,14 +715,13 @@ impl<'a> Executor<'a> {
                 // As in the `Tool` arm: real dispatch (Task 8) gets
                 // `resolved_prompt.into_unredacted_for_dispatch()`; `output`
                 // is a fixed empty object and never secret-derived.
-                (
-                    StepOutcome {
-                        step_id: step.id.clone(),
-                        output: serde_json::json!({}),
-                        status: StepStatus::Completed,
-                    },
-                    false,
-                )
+                StepOutcome {
+                    step_id: step.id.clone(),
+                    output: serde_json::json!({}),
+                    status: StepStatus::Completed,
+                    output_is_secret_derived: false,
+                    gate_condition_was_secret_derived: false,
+                }
             }
             StepBody::Emit { emit } => {
                 // Finding 2 fix: previously this arm only built an
@@ -635,15 +737,9 @@ impl<'a> Executor<'a> {
                     {
                         Ok(v) => v,
                         Err(e) => {
-                            return (
-                                StepOutcome {
-                                    step_id: step.id.clone(),
-                                    output: Value::Null,
-                                    status: StepStatus::Failed {
-                                        message: format!("interpolating `emit:`: {e}"),
-                                    },
-                                },
-                                false,
+                            return StepOutcome::failed(
+                                &step.id,
+                                format!("interpolating `emit:`: {e}"),
                             );
                         }
                     };
@@ -681,14 +777,13 @@ impl<'a> Executor<'a> {
                         usage: Usage::default(),
                     },
                 );
-                (
-                    StepOutcome {
-                        step_id: step.id.clone(),
-                        output: resolved.into_unredacted_for_dispatch(),
-                        status: StepStatus::Completed,
-                    },
+                StepOutcome {
+                    step_id: step.id.clone(),
+                    output: resolved.into_unredacted_for_dispatch(),
+                    status: StepStatus::Completed,
                     output_is_secret_derived,
-                )
+                    gate_condition_was_secret_derived: false,
+                }
             }
             StepBody::Report { report } => {
                 // Finding 2 fix (the audit's headline example): the
@@ -707,15 +802,9 @@ impl<'a> Executor<'a> {
                 ) {
                     Ok(v) => v,
                     Err(e) => {
-                        return (
-                            StepOutcome {
-                                step_id: step.id.clone(),
-                                output: Value::Null,
-                                status: StepStatus::Failed {
-                                    message: format!("interpolating `report:`: {e}"),
-                                },
-                            },
-                            false,
+                        return StepOutcome::failed(
+                            &step.id,
+                            format!("interpolating `report:`: {e}"),
                         );
                     }
                 };
@@ -747,41 +836,33 @@ impl<'a> Executor<'a> {
                         usage: Usage::default(),
                     },
                 );
-                (
-                    StepOutcome {
-                        step_id: step.id.clone(),
-                        output: resolved.into_unredacted_for_dispatch(),
-                        status: StepStatus::Completed,
-                    },
+                StepOutcome {
+                    step_id: step.id.clone(),
+                    output: resolved.into_unredacted_for_dispatch(),
+                    status: StepStatus::Completed,
                     output_is_secret_derived,
-                )
+                    gate_condition_was_secret_derived: false,
+                }
             }
             // Map/Gate/Call are dispatched by the specialized handlers added
             // in Tasks 6/7/11, which wrap this same `dispatch_step` for
             // their inner/leaf steps rather than duplicating sequencing
             // logic.
-            other => (
-                StepOutcome {
-                    step_id: step.id.clone(),
-                    output: Value::Null,
-                    status: StepStatus::Failed {
-                        // Fix round 1, item 8: this used to be
-                        // `format!("step kind {other:?} handled by a later
-                        // task")` — a full `{:?}` dump of the step body,
-                        // flowing through `steps_context_entry` into the
-                        // immutable log. The text is uninterpolated workflow
-                        // source, so no *resolved* secret escapes, but a
-                        // literal credential typed directly into a
-                        // `map`/`gate`/`call` body (e.g. `gate.form`,
-                        // `call.with`) would reach the log verbatim. Name only
-                        // the variant, never its contents.
-                        message: format!(
-                            "step kind `{}` handled by a later task",
-                            step_body_kind_name(other)
-                        ),
-                    },
-                },
-                false,
+            // Fix round 1, item 8: the message used to be
+            // `format!("step kind {other:?} handled by a later task")` — a
+            // full `{:?}` dump of the step body, flowing through
+            // `steps_context_entry` into the immutable log. The text is
+            // uninterpolated workflow source, so no *resolved* secret escapes,
+            // but a literal credential typed directly into a
+            // `map`/`gate`/`call` body (e.g. `gate.form`, `call.with`) would
+            // reach the log verbatim. Name only the variant, never its
+            // contents.
+            other => StepOutcome::failed(
+                &step.id,
+                format!(
+                    "step kind `{}` handled by a later task",
+                    step_body_kind_name(other)
+                ),
             ),
         }
     }

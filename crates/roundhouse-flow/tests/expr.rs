@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 
 fn ctx() -> ExprContext {
     let mut c = ExprContext::new();
-    c.set("inputs", json!({"repo": "acme/widgets", "max_prs": 10}));
-    c.set(
+    c.set_public("inputs", json!({"repo": "acme/widgets", "max_prs": 10}));
+    c.set_public(
         "steps",
         json!({
             "list_prs": { "output": [{"number": 1}, {"number": 2}, {"number": 3}] },
@@ -169,8 +169,8 @@ fn interpolate_json_walks_every_string_leaf_of_a_steps_with_block() {
 #[test]
 fn interpolating_an_object_or_array_value_renders_it_as_compact_json() {
     let mut c = ExprContext::new();
-    c.set("obj", json!({"a": 1, "b": [1, 2]}));
-    c.set("arr", json!([1, "two", null]));
+    c.set_public("obj", json!({"a": 1, "b": [1, 2]}));
+    c.set_public("arr", json!([1, "two", null]));
     assert_eq!(
         interpolate(TemplateSource::from_workflow_file("${{ obj }}"), &c)
             .unwrap()
@@ -293,7 +293,7 @@ fn integer_literals_compare_equal_to_context_data_regardless_of_number_represent
         json!(true)
     );
     let mut c = ctx();
-    c.set("float_one", json!(1.0));
+    c.set_public("float_one", json!(1.0));
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("float_one == 1"), &c)
             .unwrap()
@@ -344,7 +344,7 @@ fn unterminated_string_literal_inside_a_larger_expression_is_a_typed_error() {
 fn large_string_context_values_evaluate_without_error() {
     let mut c = ExprContext::new();
     let big = "x".repeat(200_000);
-    c.set("pr", json!({"title": big.clone()}));
+    c.set_public("pr", json!({"title": big.clone()}));
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("pr.title"), &c)
             .unwrap()
@@ -363,7 +363,7 @@ fn deeply_nested_context_values_are_indexed_by_direct_path_without_walking_the_w
         inner = json!({ "next": inner });
     }
     let mut c = ExprContext::new();
-    c.set("pr", inner);
+    c.set_public("pr", inner);
     let mut path = String::from("pr");
     for _ in 0..500 {
         path.push_str(".next");
@@ -379,7 +379,7 @@ fn deeply_nested_context_values_are_indexed_by_direct_path_without_walking_the_w
 #[test]
 fn non_ascii_context_values_round_trip_through_property_access_and_interpolation() {
     let mut c = ExprContext::new();
-    c.set(
+    c.set_public(
         "pr",
         json!({"title": "Fix \u{1F41B} in \u{00e9}migr\u{00e9} module — “quoted”"}),
     );
@@ -408,7 +408,7 @@ fn context_value_containing_the_expression_delimiter_itself_is_not_special() {
     // accessed via property access — this is not `interpolate`, so there
     // is nothing to substitute.
     let mut c = ExprContext::new();
-    c.set("pr", json!({"title": "look: ${{ secrets.GH_TOKEN }}"}));
+    c.set_public("pr", json!({"title": "look: ${{ secrets.GH_TOKEN }}"}));
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("pr.title"), &c)
             .unwrap()
@@ -445,8 +445,8 @@ fn a_literal_expression_delimiter_produced_by_one_substitution_does_not_feed_a_l
     // evaluated normally — proving the scan resumes in the original
     // template, not inside what was just written.
     let mut c = ExprContext::new();
-    c.set("a", json!("${{"));
-    c.set("b", json!("real"));
+    c.set_public("a", json!("${{"));
+    c.set_public("b", json!("real"));
     let out = interpolate(
         TemplateSource::from_workflow_file("${{ a }} then ${{ b }}"),
         &c,
@@ -531,7 +531,7 @@ fn an_open_quote_can_still_silently_absorb_a_later_block_when_the_forgery_looks_
     // over — see `find_closing_delimiter`'s doc comment for the full
     // reasoning and what closing it for real would require.
     let mut c = ExprContext::new();
-    c.set("real", json!("REAL_VALUE"));
+    c.set_public("real", json!("REAL_VALUE"));
     let out = interpolate(
         TemplateSource::from_workflow_file(
             "${{ 'oops }} filler ${{ real }} trailing' }} rest of template",
@@ -707,7 +707,7 @@ fn long_flat_expressions_over_the_borrowed_chain_path_do_not_show_quadratic_blow
             inner = json!({ "next": inner });
         }
         let mut c = ExprContext::new();
-        c.set("pr", inner);
+        c.set_public("pr", inner);
         let mut path = String::from("pr");
         for _ in 0..depth {
             path.push_str(".next");
@@ -756,7 +756,7 @@ fn long_flat_expressions_over_the_owned_chain_path_do_not_show_quadratic_blowup(
             inner = json!({ "next": inner, "pad": "x".repeat(200) });
         }
         let mut c = ExprContext::new();
-        c.set("pr", inner);
+        c.set_public("pr", inner);
         let mut path = String::from("default(missing, pr)");
         for _ in 0..depth {
             path.push_str(".next");
@@ -787,11 +787,11 @@ fn long_flat_expressions_over_the_owned_chain_path_do_not_show_quadratic_blowup(
 #[test]
 fn expr_context_debug_never_prints_bound_values() {
     let mut c = ExprContext::new();
-    c.set(
+    c.set_public(
         "secrets",
         json!({"GH_TOKEN": "super-secret-value-should-not-print"}),
     );
-    c.set("inputs", json!({"repo": "acme/widgets"}));
+    c.set_public("inputs", json!({"repo": "acme/widgets"}));
     let debug_output = format!("{c:?}");
     assert!(!debug_output.contains("super-secret-value-should-not-print"));
     assert!(!debug_output.contains("acme/widgets"));
@@ -803,7 +803,7 @@ fn expr_context_debug_never_prints_bound_values() {
 #[test]
 fn expr_error_never_embeds_a_context_value() {
     let mut c = ExprContext::new();
-    c.set(
+    c.set_public(
         "secrets",
         json!({"GH_TOKEN": "super-secret-value-should-not-print"}),
     );
@@ -914,7 +914,7 @@ fn json_error_never_carries_a_byte_offset_derived_from_the_argument_length() {
     // classified `Eof`) and "column 6" (the length of its leading numeric
     // run, classified `Syntax`) before this fix.
     let mut c = ExprContext::new();
-    c.set(
+    c.set_public(
         "secrets",
         json!({"a": "\"unterminated", "b": "12345abcdef"}),
     );
@@ -947,8 +947,8 @@ fn json_error_never_carries_a_byte_offset_derived_from_the_argument_length() {
 #[test]
 fn root_lookup_is_case_sensitive() {
     let mut c = ExprContext::new();
-    c.set("steps", json!({"real": true}));
-    c.set("Steps", json!({"shadow": true}));
+    c.set_public("steps", json!({"real": true}));
+    c.set_public("Steps", json!({"shadow": true}));
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("steps.real"), &c)
             .unwrap()
@@ -1047,7 +1047,7 @@ fn interpolate_json_associates_template_keys_with_values_by_key_not_by_iteration
     src.insert("beta".to_string(), json!("B-VALUE"));
 
     let mut ctx = ExprContext::new();
-    ctx.set("src", Value::Object(src));
+    ctx.set_public("src", Value::Object(src));
 
     let mut template = serde_json::Map::new();
     template.insert("beta_out".to_string(), json!("${{ src.beta }}"));
@@ -1227,5 +1227,200 @@ fn a_delimited_field_whose_inner_expression_calls_an_unknown_function_names_the_
     assert!(
         matches!(err, ExprError::UnknownFunction(ref f) if f == "not_a_real_function"),
         "expected UnknownFunction(\"not_a_real_function\"), got {err:?}"
+    );
+}
+
+// ---- Fix round 4, item B (ruling P35): the non-secret binding path is
+// self-announcing, and a rebinding can never lower a root's provenance. ----
+
+#[test]
+fn a_public_rebinding_cannot_untaint_a_root_that_was_bound_as_secret() {
+    // Payload: root `k` bound as `{"pw": "SECRETVALUE12345"}` through
+    // `set_secret`, then rebound to the IDENTICAL value through
+    // `set_public` — the exact sequence measured to un-taint before this
+    // fix. Pre-fix, `${{ k.pw }}` came back `secret_derived == false` with
+    // the value unchanged, so `Evaluated`'s `Debug` — which exists
+    // specifically to print `***` — printed `SECRETVALUE12345` in cleartext,
+    // because it trusts the flag. The next two callers of this API are
+    // Task 6's `map.as` per-item binding (which rebinds one loop name per
+    // item) and Task 8 folding tool outputs into `steps.<id>.output`.
+    let mut c = ExprContext::new();
+    c.set_secret("k", json!({"pw": "SECRETVALUE12345"}));
+    c.set_public("k", json!({"pw": "SECRETVALUE12345"}));
+
+    let evaluated = eval(ExpressionSource::from_workflow_file("k.pw"), &c).unwrap();
+    assert_eq!(
+        evaluated.value,
+        json!("SECRETVALUE12345"),
+        "the real value is unchanged — only the taint bit is at stake here"
+    );
+    assert!(
+        evaluated.secret_derived,
+        "a `set_public` rebinding must not lower a root already marked secret"
+    );
+
+    let rendered = format!("{evaluated:?}");
+    assert!(
+        !rendered.contains("SECRETVALUE12345"),
+        "Evaluated's Debug trusts the taint flag, so an un-tainted root leaks here: {rendered}"
+    );
+    assert!(
+        rendered.contains("***"),
+        "…and prints the placeholder instead"
+    );
+
+    // The same is true through the interpolation entry points, which is
+    // where the value actually reaches a log.
+    let interpolated =
+        interpolate(TemplateSource::from_workflow_file("pw=${{ k.pw }}"), &c).unwrap();
+    assert_eq!(interpolated.redacted_for_logging(), "pw=***");
+    assert_eq!(
+        interpolated.unredacted_for_dispatch(),
+        "pw=SECRETVALUE12345"
+    );
+}
+
+#[test]
+fn a_root_that_was_only_ever_bound_publicly_is_not_secret_derived() {
+    // The other direction, so the test above cannot pass by making
+    // everything secret. Payload: the same `{"pw": "SECRETVALUE12345"}`
+    // value, bound only through `set_public`, on a context that also holds a
+    // genuinely secret root under a DIFFERENT name — monotonicity is per
+    // root name, not per context.
+    let mut c = ExprContext::new();
+    c.set_secret("other", json!("a-real-secret-value"));
+    c.set_public("k", json!({"pw": "SECRETVALUE12345"}));
+
+    let evaluated = eval(ExpressionSource::from_workflow_file("k.pw"), &c).unwrap();
+    assert!(
+        !evaluated.secret_derived,
+        "a root the caller asserted is non-secret must stay readable in a log"
+    );
+    assert!(format!("{evaluated:?}").contains("SECRETVALUE12345"));
+}
+
+#[test]
+fn narrowing_a_roots_secret_paths_by_rebinding_unions_rather_than_replaces() {
+    // Payload: `steps` bound with `["a", "output"]` secret, then rebound
+    // with only `["b", "output"]` — a caller that forgot the earlier entry.
+    // Both must stay secret, because dropping `a` would silently un-taint
+    // `${{ steps.a.output.body }}` for every step after the rebinding.
+    let mut c = ExprContext::new();
+    c.set_with_secret_paths(
+        "steps",
+        json!({"a": {"output": {"body": "AAAA-SECRET"}}, "b": {"output": {"body": "BBBB-SECRET"}}}),
+        [vec!["a".to_string(), "output".to_string()]],
+    );
+    c.set_with_secret_paths(
+        "steps",
+        json!({"a": {"output": {"body": "AAAA-SECRET"}}, "b": {"output": {"body": "BBBB-SECRET"}}}),
+        [vec!["b".to_string(), "output".to_string()]],
+    );
+
+    for path in ["steps.a.output.body", "steps.b.output.body"] {
+        assert!(
+            eval(ExpressionSource::from_workflow_file(path), &c)
+                .unwrap()
+                .secret_derived,
+            "{path} must stay tainted after the narrowing rebinding"
+        );
+    }
+    // …and the narrowing still does not taint an undeclared sibling path.
+    assert!(
+        !eval(ExpressionSource::from_workflow_file("steps.a.status"), &c)
+            .unwrap()
+            .secret_derived,
+        "path precision is not sacrificed to monotonicity"
+    );
+}
+
+// ---- Fix round 4, item F: a non-numeric subscript is a typed error, not a
+// silent Null. ----
+
+#[test]
+fn a_string_subscript_is_a_typed_error_rather_than_silently_evaluating_to_null() {
+    // Payload: `steps['list_prs'].output` — the shape a reader who expects
+    // JS/Python-style string keying writes. `[..]` in this grammar indexes an
+    // array by position only, so this was never implemented; before this fix
+    // it evaluated to `Null` and the whole chain after it silently collapsed,
+    // which is what let a security probe of exactly this shape look like it
+    // proved something about taint when it proved nothing.
+    let err = eval(
+        ExpressionSource::from_workflow_file("steps['list_prs'].output"),
+        &ctx(),
+    )
+    .unwrap_err();
+    match &err {
+        ExprError::NonNumericIndex {
+            position,
+            index_expression,
+        } => {
+            assert_eq!(
+                index_expression, "'list_prs'",
+                "the SOURCE text, not the value"
+            );
+            assert_eq!(*position, 6, "the byte offset of the subscript expression");
+        }
+        other => panic!("expected NonNumericIndex, got {other:?}"),
+    }
+    assert!(
+        err.to_string()
+            .contains("`[..]` indexes an array by position"),
+        "the message must say what to write instead: {err}"
+    );
+}
+
+#[test]
+fn a_fractional_or_absent_subscript_is_the_same_typed_error() {
+    // Two more shapes that used to be silent `Null`s: a fractional index and
+    // a subscript naming a root that is not bound at all.
+    for (expr, expected_source) in [
+        ("inputs.max_prs[1.5]", "1.5"),
+        ("inputs.max_prs[nosuchroot]", "nosuchroot"),
+    ] {
+        let err = eval(ExpressionSource::from_workflow_file(expr), &ctx()).unwrap_err();
+        match err {
+            ExprError::NonNumericIndex {
+                index_expression, ..
+            } => assert_eq!(index_expression, expected_source),
+            other => panic!("expected NonNumericIndex for {expr}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_subscript_that_is_a_number_but_out_of_range_is_still_an_ordinary_null() {
+    // The boundary of item F: an out-of-range *numeric* index is a missing
+    // lookup, exactly like a `.field` that is not present, and stays `Null`.
+    // Only a subscript that is not a number at all is an error.
+    assert_eq!(
+        eval(
+            ExpressionSource::from_workflow_file("steps.list_prs.output[99]"),
+            &ctx()
+        )
+        .unwrap()
+        .value,
+        json!(null)
+    );
+}
+
+#[test]
+fn slice_bounds_still_tolerate_a_missing_or_non_numeric_argument() {
+    // `as_index`'s other caller is deliberately unchanged: `slice(a)` and
+    // `slice(a, 1)` are legal calls, and treating a missing bound as an error
+    // would reject them rather than catch a mistake.
+    let mut c = ExprContext::new();
+    c.set_public("a", json!([1, 2, 3, 4]));
+    assert_eq!(
+        eval(ExpressionSource::from_workflow_file("slice(a)"), &c)
+            .unwrap()
+            .value,
+        json!([1, 2, 3, 4])
+    );
+    assert_eq!(
+        eval(ExpressionSource::from_workflow_file("slice(a, 2)"), &c)
+            .unwrap()
+            .value,
+        json!([3, 4])
     );
 }
