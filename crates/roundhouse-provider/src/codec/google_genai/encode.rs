@@ -18,7 +18,9 @@ use crate::ir::{
     ChatRequest, ContentBlock, MessageRole as Role, ProviderError, ReasoningIntent, ToolChoice,
     ToolDef,
 };
-use crate::profile::{glob_match, ProfileReasoningError, ProviderProfile, ReasoningControl};
+use crate::profile::{
+    glob_match, ProfileReasoningError, ProviderProfile, ReasoningControl, WireValue,
+};
 
 /// Everything that can go wrong turning a `ChatRequest` into a wire body.
 /// Mirrors `openai_responses::encode::EncodeError`'s structural fix
@@ -264,6 +266,27 @@ fn encode_interactions_step(
     }
 }
 
+/// Converts a profile-typed [`WireValue`] into the `serde_json::Value` it
+/// belongs on the wire as. Mirrors `openai_chat::encode`'s
+/// `wire_value_to_json` (Fix round 7, K6's reference implementation), with
+/// one deliberate difference: `WireValue::Number` normalizes a whole-valued
+/// `f64` (every legal `thinkingBudget` entry -- `0`, `1024`, `8192`,
+/// `24576`) down to an `i64` before handing it to `json!`. Without this,
+/// `json!(1024.0_f64)` serializes as the JSON text `1024.0` -- a legal JSON
+/// number (satisfies "not a quoted string"), but not the `integer`-typed
+/// value `generate-content.md.txt`'s schema documents for `thinkingBudget`,
+/// and a strict-schema vendor could reject it. A genuinely fractional
+/// resolved value (which nothing in this codec's own `[[model]].reasoning`
+/// vocabulary ever produces) still round-trips through `json!(n)` unchanged.
+fn wire_value_to_json(value: WireValue) -> Value {
+    match value {
+        WireValue::String(s) => Value::String(s),
+        WireValue::Bool(b) => Value::Bool(b),
+        WireValue::Number(n) if n.fract() == 0.0 => json!(n as i64),
+        WireValue::Number(n) => json!(n),
+    }
+}
+
 fn encode_function_tool(tool: &ToolDef) -> Value {
     json!({
         "type": "function",
@@ -360,11 +383,26 @@ fn encode_generate_content(
         body["generationConfig"]["topP"] = json!(top_p);
     }
 
+    // Task 17 addendum SS1 (Ruling P108): `thinkingBudget` is a JSON
+    // *number* on the wire (verified: `generate-content.md.txt`'s
+    // `GenerationConfig.thinkingConfig` literal JSON representation declares
+    // it `integer`), so this now routes through `resolve_wire_value` (which
+    // returns the profile's typed `WireValue`, per the `value_type = "number"`
+    // both batch profiles declare) instead of hand-parsing the resolved
+    // string and silently defaulting an unparseable one to `0` -- `0` is
+    // thinking-OFF, so the old `.unwrap_or(0)` silently disabled reasoning on
+    // every request at an intent whose vocabulary/map entry didn't parse,
+    // with no error, warning, or log entry. A budget that cannot be resolved
+    // is now propagated as a hard `Err` via `?` (matching `EncodeError`'s
+    // `#[from] ProfileReasoningError` conversion), the same "fail closed, not
+    // silently open" posture `errors.rs:117-127` states for every other
+    // unencodable-content case in this codec.
     let intent = req.reasoning.intent.unwrap_or(ReasoningIntent::Off);
     if intent != ReasoningIntent::Off {
         if let Some(control) = reasoning_control_for(profile, &req.model.0) {
-            let budget: i64 = control.resolve(intent)?.parse().unwrap_or(0);
-            body["generationConfig"]["thinkingConfig"]["thinkingBudget"] = json!(budget);
+            let value = control.resolve_wire_value(intent)?;
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"] =
+                wire_value_to_json(value);
         }
     }
 

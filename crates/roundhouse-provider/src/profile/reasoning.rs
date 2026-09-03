@@ -158,9 +158,19 @@ impl ReasoningControl {
     /// [`WireValue`] this control's `value_type` declares. Used by
     /// `openai_chat::encode` (the shared codec whose profiles' reasoning
     /// wire shapes genuinely diverge -- see that module's `encode_openai_chat`
-    /// doc comment); every other codec's own `reasoning_control_for` still
-    /// calls bare `resolve()` directly (their wire values are all
-    /// vendor-documented strings today, verified per REALITY-CORRECTIONS).
+    /// doc comment) and, as of Task 17 (Ruling P108), by
+    /// `google_genai::encode_generate_content` for its Budget-kind control
+    /// (`thinkingBudget` is a genuine JSON *number* on the wire, not a
+    /// vendor-documented string -- hand-parsing it via bare `resolve()` and
+    /// defaulting an unparseable value to `0` silently disabled reasoning;
+    /// see that module's own doc comment on the fix). `cohere_v2` and
+    /// `openai_responses` still call bare `resolve()` directly -- no profile
+    /// gives either of them a non-string wire value today, so wiring them
+    /// through `resolve_wire_value` would be unevidenced churn (a recorded
+    /// Task 17 scoping decision, not an oversight). `google_genai`'s OTHER
+    /// reasoning path (`EndpointMode::Interactions`'s `thinking_level`) does
+    /// not go through `ReasoningControl`/this method at all -- it is a small,
+    /// hardcoded, spec-mandated enum, per that module's own documentation.
     pub fn resolve_wire_value(&self, intent: Intent) -> Result<WireValue, ProfileReasoningError> {
         let wire = self.resolve(intent)?;
         self.value_type.parse(wire)

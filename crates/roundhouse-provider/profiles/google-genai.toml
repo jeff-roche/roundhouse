@@ -29,6 +29,17 @@ match = ["gemini-3.0*"]
 [model.reasoning]
 kind = "budget"
 field = "/generationConfig/thinkingConfig/thinkingBudget"
+# Task 17 addendum SS1 (Ruling P108): `thinkingBudget` is a JSON *number* on
+# the wire (verified in `generate-content.md.txt`'s literal JSON
+# representation: `"thinkingBudget": integer`). `encode_generate_content`
+# now routes this control through `resolve_wire_value`, which types the
+# resolved value per this field -- without it (the pre-existing default,
+# `value_type = "string"`), the fix would have silently regressed this
+# already-shipped profile from emitting a JSON number to a quoted JSON
+# string. Declaring it here also makes `validate_value_type` (build.rs)
+# genuinely check every vocabulary/map entry parses as a number, closing the
+# "a vocabulary typo like `1024x` builds clean" gap the addendum describes.
+value_type = "number"
 vocabulary = ["0", "1024", "8192", "24576"]
 
 [model.reasoning.map]

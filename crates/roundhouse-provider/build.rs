@@ -139,24 +139,32 @@ fn main() {
                         &path,
                         &control.field,
                     );
-                } else if control.value_type != reasoning::ReasoningValueType::String {
-                    // Round-8 review, M3: only `openai_chat::encode`'s
-                    // `encode_openai_chat` calls `resolve_wire_value` (the
-                    // `WireValue`-typed path). `cohere_v2`, `google_genai`
-                    // and `openai_responses` all call the untyped `resolve()`
-                    // instead, so a `value_type` other than the default
-                    // `String` on any of their profiles would build clean
-                    // and then be silently ignored at request-encode time —
-                    // exactly the "typo in a quirk profile" §9.5 promises
-                    // turns into a BUILD error, not a silent runtime gap.
+                } else if parsed.codec != "google-genai"
+                    && control.value_type != reasoning::ReasoningValueType::String
+                {
+                    // Round-8 review, M3, updated by Task 17 (Ruling P108):
+                    // `openai_chat::encode`'s `encode_openai_chat` and, as of
+                    // Task 17, `google_genai::encode`'s
+                    // `encode_generate_content` (its Budget-kind control
+                    // only — `EndpointMode::Interactions` never reads
+                    // `ReasoningControl`/`value_type` at all, see that
+                    // module's own doc comment) both call
+                    // `resolve_wire_value` (the `WireValue`-typed path).
+                    // `cohere_v2` and `openai_responses` still call the
+                    // untyped `resolve()`, so a `value_type` other than the
+                    // default `String` on either of their profiles would
+                    // build clean and then be silently ignored at
+                    // request-encode time — exactly the "typo in a quirk
+                    // profile" §9.5 promises turns into a BUILD error, not a
+                    // silent runtime gap.
                     panic!(
                         "profile {path:?} declares a [[model]].reasoning value_type of \
                          {:?}, but its codec ({:?}) does not consume typed WireValue — only \
-                         openai-chat's encoder calls resolve_wire_value; every other codec \
-                         calls the untyped resolve(), so a non-String value_type here would \
-                         build clean and then be silently ignored. This is the §9.5 guarantee \
-                         that a typo in a quirk profile is a BUILD error, not a silent runtime \
-                         gap",
+                         openai-chat's and google-genai's encoders call resolve_wire_value; \
+                         cohere-v2 and openai-responses still call the untyped resolve(), so a \
+                         non-String value_type here would build clean and then be silently \
+                         ignored. This is the §9.5 guarantee that a typo in a quirk profile is \
+                         a BUILD error, not a silent runtime gap",
                         control.value_type, parsed.codec
                     );
                 }
