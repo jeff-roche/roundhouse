@@ -275,7 +275,21 @@ pub enum SelectionResolution {
     /// `options`. Unlike `Cancelled`, this is the peer's response naming
     /// something it was never offered — a protocol violation worth logging
     /// on its own, separately from a legitimate cancellation.
-    UnknownOptionId(PermissionOptionId),
+    ///
+    /// **Finding 2 (round-3 review):** this carries an already-escaped,
+    /// length-capped `String` — produced by [`escape_and_cap_option_id`] —
+    /// **not** the raw `PermissionOptionId`. `PermissionOptionId` derives
+    /// derive_more's `Display`, which writes its `Arc<str>` content
+    /// verbatim; this variant's own doc used to describe the id as "worth
+    /// logging on its own," and a caller that took that advice literally
+    /// with `format!("unknown option id: {id}")` would write attacker-
+    /// chosen bytes — newlines included — straight into an audit trail the
+    /// event log physically cannot `UPDATE` or `DELETE`. A peer answering
+    /// `session/request_permission` with an `option_id` containing
+    /// `"\n[audit] resolve_selection: Resolved(AllowOnce)"` could forge an
+    /// approval line that way. Carrying the escaped, capped form here makes
+    /// that unsafe formatting unreachable rather than merely discouraged.
+    UnknownOptionId(String),
     /// `options` itself is ambiguous (see [`ambiguous_option_ids`]) and
     /// cannot be trusted to resolve any id to a single kind — the same
     /// fail-closed refusal [`handle_request_permission`] applies before
@@ -316,12 +330,46 @@ pub fn resolve_selection(
         RequestPermissionOutcome::Selected(sel) => {
             match options.iter().find(|opt| opt.option_id == sel.option_id) {
                 Some(opt) => SelectionResolution::Resolved(opt.kind),
-                None => SelectionResolution::UnknownOptionId(sel.option_id.clone()),
+                None => {
+                    SelectionResolution::UnknownOptionId(escape_and_cap_option_id(&sel.option_id))
+                }
             }
         }
         RequestPermissionOutcome::Cancelled => SelectionResolution::Cancelled,
         _ => SelectionResolution::UnrecognizedOutcome,
     }
+}
+
+/// Maximum length, in bytes, of the `String` [`escape_and_cap_option_id`]
+/// returns. Enforced by that function's truncation step (verified by
+/// `escape_and_cap_option_id_truncates_at_the_cap_boundary` in this
+/// module's tests, which constructs an id long enough to exceed the cap and
+/// asserts the returned string's byte length is exactly this constant) —
+/// not merely documented as bounded.
+pub const UNKNOWN_OPTION_ID_MAX_LEN: usize = 128;
+
+/// Escapes control characters (notably newlines) out of a peer-controlled
+/// `option_id` and caps the result to at most [`UNKNOWN_OPTION_ID_MAX_LEN`]
+/// bytes, so the value is safe to interpolate directly into a log line —
+/// see [`SelectionResolution::UnknownOptionId`]'s doc for the attack this
+/// closes.
+///
+/// Escaping reuses `str`'s standard `Debug` formatting (`{:?}`) — the same
+/// escaping convention [`ambiguous_option_ids`]'s error messages already
+/// use elsewhere in this module — which wraps the text in quotes and
+/// escapes newlines, carriage returns, tabs, backslashes, quotes, and other
+/// control characters. Truncation happens after escaping, at a `char`
+/// boundary, so the result is always valid UTF-8.
+fn escape_and_cap_option_id(id: &PermissionOptionId) -> String {
+    let escaped = format!("{:?}", id.0.as_ref());
+    if escaped.len() <= UNKNOWN_OPTION_ID_MAX_LEN {
+        return escaped;
+    }
+    let mut end = UNKNOWN_OPTION_ID_MAX_LEN;
+    while end > 0 && !escaped.is_char_boundary(end) {
+        end -= 1;
+    }
+    escaped[..end].to_string()
 }
 
 /// A `ToolKind` extracted from a peer's `ToolCallUpdate`, wrapped rather
@@ -734,8 +782,46 @@ mod tests {
             RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("not-an-offered-id"));
         assert_eq!(
             resolve_selection(&options, &outcome),
-            SelectionResolution::UnknownOptionId(PermissionOptionId::new("not-an-offered-id"))
+            SelectionResolution::UnknownOptionId(format!("{:?}", "not-an-offered-id"))
         );
+    }
+
+    // ---- Finding 2 (round-3 review): escape_and_cap_option_id ----
+
+    #[test]
+    fn escape_and_cap_option_id_escapes_a_newline_rather_than_passing_it_through() {
+        // The exact attack Finding 2 describes: a peer-controlled id
+        // containing a newline (and a fake audit line) must not produce a
+        // newline in the string this crate hands to a caller that logs it.
+        let id = PermissionOptionId::new("x\n[audit] resolve_selection: Resolved(AllowOnce)");
+        let escaped = escape_and_cap_option_id(&id);
+        assert!(
+            !escaped.contains('\n'),
+            "escaped id must not contain a raw newline: {escaped:?}"
+        );
+        assert!(
+            escaped.contains("\\n"),
+            "escaped id must contain the escaped form: {escaped:?}"
+        );
+    }
+
+    #[test]
+    fn escape_and_cap_option_id_truncates_at_the_cap_boundary() {
+        // Truncation must actually happen at UNKNOWN_OPTION_ID_MAX_LEN, not
+        // merely be documented as bounded — this constructs an id whose
+        // escaped form is longer than the cap and asserts the returned
+        // string's byte length is exactly the cap.
+        let id = PermissionOptionId::new("a".repeat(UNKNOWN_OPTION_ID_MAX_LEN * 2));
+        let escaped = escape_and_cap_option_id(&id);
+        assert_eq!(escaped.len(), UNKNOWN_OPTION_ID_MAX_LEN);
+    }
+
+    #[test]
+    fn escape_and_cap_option_id_does_not_truncate_when_under_the_cap() {
+        let id = PermissionOptionId::new("short-id");
+        let escaped = escape_and_cap_option_id(&id);
+        assert_eq!(escaped, format!("{:?}", "short-id"));
+        assert!(escaped.len() < UNKNOWN_OPTION_ID_MAX_LEN);
     }
 
     #[test]

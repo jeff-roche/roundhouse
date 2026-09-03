@@ -1,58 +1,113 @@
 use roundhouse_core::{Delta, EventPayload, TaskOutput, Usage};
 
-/// A deliberately simplified LOCAL mirror of the shapes an ACP client
-/// eventually needs to turn into `EventPayload`s — not a 1:1 rename of any
-/// single real SDK type. It exists so this mapping is unit-testable without
-/// a live ACP connection, and so an SDK point release doesn't ripple through
-/// this crate's unit tests, only through the (not-yet-built) adapter that
-/// constructs this enum from the real wire types. Three things about that
-/// relationship are worth recording precisely, because it is easy to
-/// misdescribe:
+/// Declares an enum and, alongside it, a `pub const
+/// ACP_SESSION_UPDATE_VARIANT_COUNT: usize` mechanically derived from the
+/// same variant list — never hand-maintained.
 ///
-/// - `StateUpdateIdle` has **no** v1 counterpart. Under the pinned SDK's v1
-///   schema, end-of-turn is signalled by `PromptResponse.stop_reason` — a
-///   *response field* returned from the `session/prompt` call, not a
-///   `SessionUpdate` notification variant. It corresponds to v2's
-///   `IdleStateUpdate` (an actual notification variant there). A future v1
-///   adapter must therefore construct this variant from the prompt
-///   response it receives, not from a `session/update` notification like
-///   every other variant here.
-/// - The real v1 chunk notifications (`AgentMessageChunk`,
-///   `AgentThoughtChunk`) carry a `ContentChunk` wrapping a full
-///   `ContentBlock` enum (text, image, audio, resource, ...) plus an
-///   optional `message_id` — not a bare `String` as this enum's fields
-///   suggest. A real adapter must `match` on `ContentBlock` to extract (or
-///   reject) a text payload; that is not a field rename, it's a variant
-///   dispatch this mirror deliberately elides.
-/// - Building that real adapter — the code that consumes the pinned SDK's
-///   actual notification/response types and produces an `AcpSessionUpdate`
-///   — is daemon-owned integration work. No task in this subsystem builds
-///   it; this module only covers the pure `AcpSessionUpdate -> EventPayload`
-///   mapping once such an adapter (wherever it eventually lives) has
-///   already produced one of these values.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AcpSessionUpdate {
-    AgentMessageChunk {
-        text: String,
-    },
-    AgentThoughtChunk {
-        text: String,
-    },
-    ToolCallUpdate {
-        id: String,
-        status: String,
-        title: String,
-    },
-    PlanUpdate {
-        entries: Vec<String>,
-    },
-    StateUpdateIdle {
-        stop_reason: String,
-    },
-    UsageUpdate {
-        tokens: u64,
-        cost_usd: f64,
-    },
+/// **FIX-C (round-3 review), reopened by the security reviewer's own
+/// experiment:** a hand-written `const EXPECTED_REPRESENTATIVE_COUNT: usize
+/// = 6` in `tests/client_mapping.rs`, asserted against a hand-written
+/// `vec!` of representatives, does **not** catch the cheap repair (adding a
+/// new variant, then appending only `| NewVariant { .. }` to the
+/// `unreachable!` arm in `all_representatives()`) — both the constant and
+/// the `vec!` stay at their old values, so the guard's own length assertion
+/// is `assert_eq!(6, 6)` and passes vacuously. The reviewer proved this by
+/// execution: adding a seventh variant that duplicates `Delta::Text`,
+/// applying only the cheap repair, and watching the no-forgery test stay
+/// green with an exploitable duplicate-shape arm undetected.
+///
+/// A count derived from the enum definition itself closes that gap: the
+/// cheap repair no longer touches this macro invocation at all, so
+/// `ACP_SESSION_UPDATE_VARIANT_COUNT` still reflects the *true* variant
+/// count, and the test's `assert_eq!(all_representatives().len(),
+/// ACP_SESSION_UPDATE_VARIANT_COUNT)` goes red mechanically instead of
+/// relying on a maintainer reading a comment. Declarative macro, not
+/// `strum::EnumCount`, per the coordinator's binding ruling: this crate's
+/// narrow `{roundhouse-core, roundhouse-proto}` dependency set is a
+/// documented architectural property not worth spending a new dependency
+/// edge on when the count can be generated in-file.
+macro_rules! acp_session_update_enum {
+    (
+        $(#[$enum_meta:meta])*
+        pub enum $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident { $($field:ident : $ty:ty),* $(,)? }
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant { $($field: $ty),* }
+            ),*
+        }
+
+        /// Number of variants `AcpSessionUpdate` declares, derived
+        /// mechanically by [`acp_session_update_enum!`] from the enum
+        /// definition itself — see that macro's doc for why a
+        /// hand-maintained count (round 2's `EXPECTED_REPRESENTATIVE_COUNT`)
+        /// failed to catch the cheap-repair attack it was meant to catch.
+        pub const ACP_SESSION_UPDATE_VARIANT_COUNT: usize = [$(stringify!($variant)),*].len();
+    };
+}
+
+acp_session_update_enum! {
+    /// A deliberately simplified LOCAL mirror of the shapes an ACP client
+    /// eventually needs to turn into `EventPayload`s — not a 1:1 rename of any
+    /// single real SDK type. It exists so this mapping is unit-testable without
+    /// a live ACP connection, and so an SDK point release doesn't ripple through
+    /// this crate's unit tests, only through the (not-yet-built) adapter that
+    /// constructs this enum from the real wire types. Three things about that
+    /// relationship are worth recording precisely, because it is easy to
+    /// misdescribe:
+    ///
+    /// - `StateUpdateIdle` has **no** v1 counterpart. Under the pinned SDK's v1
+    ///   schema, end-of-turn is signalled by `PromptResponse.stop_reason` — a
+    ///   *response field* returned from the `session/prompt` call, not a
+    ///   `SessionUpdate` notification variant. It corresponds to v2's
+    ///   `IdleStateUpdate` (an actual notification variant there). A future v1
+    ///   adapter must therefore construct this variant from the prompt
+    ///   response it receives, not from a `session/update` notification like
+    ///   every other variant here.
+    /// - The real v1 chunk notifications (`AgentMessageChunk`,
+    ///   `AgentThoughtChunk`) carry a `ContentChunk` wrapping a full
+    ///   `ContentBlock` enum (text, image, audio, resource, ...) plus an
+    ///   optional `message_id` — not a bare `String` as this enum's fields
+    ///   suggest. A real adapter must `match` on `ContentBlock` to extract (or
+    ///   reject) a text payload; that is not a field rename, it's a variant
+    ///   dispatch this mirror deliberately elides.
+    /// - Building that real adapter — the code that consumes the pinned SDK's
+    ///   actual notification/response types and produces an `AcpSessionUpdate`
+    ///   — is daemon-owned integration work. No task in this subsystem builds
+    ///   it; this module only covers the pure `AcpSessionUpdate -> EventPayload`
+    ///   mapping once such an adapter (wherever it eventually lives) has
+    ///   already produced one of these values.
+    pub enum AcpSessionUpdate {
+        AgentMessageChunk {
+            text: String,
+        },
+        AgentThoughtChunk {
+            text: String,
+        },
+        ToolCallUpdate {
+            id: String,
+            status: String,
+            title: String,
+        },
+        PlanUpdate {
+            entries: Vec<String>,
+        },
+        StateUpdateIdle {
+            stop_reason: String,
+        },
+        UsageUpdate {
+            tokens: u64,
+            cost_usd: f64,
+        },
+    }
 }
 
 /// §10.2's mapping table, implemented as one pure function per update kind.

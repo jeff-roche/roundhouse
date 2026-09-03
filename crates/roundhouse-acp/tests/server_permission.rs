@@ -332,9 +332,10 @@ fn resolve_selection_distinguishes_cancelled_unknown_id_and_ambiguous_options() 
         RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("never-offered"));
     assert_eq!(
         resolve_selection(&offered, &unknown_id_outcome),
-        SelectionResolution::UnknownOptionId(
-            agent_client_protocol::schema::v1::PermissionOptionId::new("never-offered")
-        )
+        // Finding 2 (round-3 review): UnknownOptionId now carries an
+        // already-escaped String (str's Debug form), never the raw
+        // PermissionOptionId — see server::escape_and_cap_option_id.
+        SelectionResolution::UnknownOptionId(format!("{:?}", "never-offered"))
     );
 
     let ambiguous_options = vec![

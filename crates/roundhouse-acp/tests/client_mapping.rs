@@ -1,4 +1,6 @@
-use roundhouse_acp::client::mapping::{map_update, AcpSessionUpdate};
+use roundhouse_acp::client::mapping::{
+    map_update, AcpSessionUpdate, ACP_SESSION_UPDATE_VARIANT_COUNT,
+};
 use roundhouse_core::{Delta, EventPayload};
 use std::collections::HashSet;
 use std::mem::discriminant;
@@ -75,23 +77,6 @@ fn tool_call_update_with_embedded_newline_in_title_maps_to_none() {
     .is_none());
 }
 
-/// Number of `AcpSessionUpdate` variants [`all_representatives`] must return
-/// exactly one representative of.
-///
-/// **FIX-C (round-3 review):** the `match seed` tripwire below correctly
-/// fails to compile when `AcpSessionUpdate` grows a variant — but the
-/// *cheapest* fix to that compile error is appending
-/// `| AcpSessionUpdate::NewVariant { .. }` to the `unreachable!` arm alone,
-/// which makes the match compile again while the `vec!` list above it still
-/// returns the old, now-incomplete set of representatives — reopening the
-/// exact gap this guard exists to close, one level up. This constant is the
-/// second, visible thing a fixer must also update: the length assertion in
-/// `no_two_arms_emit_the_same_payload_shape_the_no_forgery_invariant_is_enforced`
-/// below checks `all_representatives().len()` against this constant, so a
-/// fixer who only edits the `unreachable!` arm gets a failing test telling
-/// them the `vec!` list still needs a new entry too.
-const EXPECTED_REPRESENTATIVE_COUNT: usize = 6;
-
 /// Matching a representative `seed` value through every `AcpSessionUpdate`
 /// variant with no wildcard arm makes adding a variant without extending
 /// this function a compile error (`non-exhaustive patterns`) — the same
@@ -130,14 +115,25 @@ fn all_representatives() -> Vec<AcpSessionUpdate> {
         // above) — these arms exist purely so the match has no wildcard,
         // which is what makes a future variant a compile error here.
         //
-        // FIX-C (round-3 review): if you are here because adding a new
-        // `AcpSessionUpdate` variant broke this match, adding
-        // `| AcpSessionUpdate::YourNewVariant { .. }` to this arm is NOT
-        // the fix by itself — it only silences the compiler. You must also
-        // add a representative of the new variant to the `vec!` list above,
-        // AND bump `EXPECTED_REPRESENTATIVE_COUNT` above to match. If you
-        // only edit this arm, the guard test's length assertion will catch
-        // the omission — that assertion exists specifically for this case.
+        // FIX-C round 2 (round-3 review) tried to guard the cheap repair
+        // (adding a new variant, then patching only this `unreachable!` arm
+        // with `| AcpSessionUpdate::YourNewVariant { .. }`, leaving the
+        // `vec!` list above stale) with a hand-written
+        // `EXPECTED_REPRESENTATIVE_COUNT` constant. The security reviewer
+        // proved by execution that this does NOT work: the cheap repair
+        // touches neither the constant nor the `vec!`, so both stay at
+        // their old value and the guard's length assertion passes
+        // vacuously. FIX-C round 3 replaced that hand-written constant with
+        // `ACP_SESSION_UPDATE_VARIANT_COUNT`, mechanically derived from the
+        // enum definition itself by `acp_session_update_enum!`
+        // (`src/client/mapping.rs`) — the cheap repair here cannot touch
+        // that macro invocation, so the derived count still reflects the
+        // true variant count and the length assertion below goes red for
+        // real. If you are here because adding a new `AcpSessionUpdate`
+        // variant broke this match, adding
+        // `| AcpSessionUpdate::YourNewVariant { .. }` to this arm is NOT the
+        // fix by itself — it only silences the compiler. You must also add
+        // a representative of the new variant to the `vec!` list above.
         AcpSessionUpdate::AgentThoughtChunk { .. }
         | AcpSessionUpdate::ToolCallUpdate { .. }
         | AcpSessionUpdate::PlanUpdate { .. }
@@ -187,11 +183,12 @@ fn no_two_arms_emit_the_same_payload_shape_the_no_forgery_invariant_is_enforced(
     let representatives = all_representatives();
     assert_eq!(
         representatives.len(),
-        EXPECTED_REPRESENTATIVE_COUNT,
+        ACP_SESSION_UPDATE_VARIANT_COUNT,
         "all_representatives() must return exactly one representative per AcpSessionUpdate \
-         variant — if you added a variant and only updated the match's unreachable! arm, \
-         you also need to add a representative to the vec! list and bump \
-         EXPECTED_REPRESENTATIVE_COUNT"
+         variant — ACP_SESSION_UPDATE_VARIANT_COUNT is derived mechanically from the enum \
+         definition in src/client/mapping.rs, so if you added a variant and only updated \
+         the match's unreachable! arm here, this assertion fails until you also add a \
+         representative to the vec! list above"
     );
 
     let mut seen = HashSet::new();
