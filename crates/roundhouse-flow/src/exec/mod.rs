@@ -421,11 +421,13 @@ pub struct StepOutcome {
 impl StepOutcome {
     /// A step that did not run to completion: no output, so nothing derived
     /// from a secret can be in it. `gate_condition_was_secret_derived` is
-    /// filled in by [`Executor::run_to_completion`], which is the only place
-    /// that has evaluated a `when:` — including its `Err` arm, which
-    /// deliberately overrides the `false` set here with `true` (fix round 5,
-    /// item 1). Do not read the `false` below as a statement about the gate;
-    /// it is only the placeholder for a caller that has not evaluated one.
+    /// filled in by whichever caller evaluated the gate —
+    /// [`Executor::run_to_completion`] or
+    /// [`map_step::Executor::dispatch_map_step`]'s inner loop — including the
+    /// `Err` arm, which deliberately overrides the `false` set here with
+    /// `true` (fix round 5, item 1). Do not read the `false` below as a
+    /// statement about the gate; it is only the placeholder for a caller
+    /// that has not evaluated one.
     fn failed(step_id: &str, message: String) -> Self {
         StepOutcome {
             step_id: step_id.to_string(),

@@ -388,8 +388,8 @@ impl<'a> Executor<'a> {
     /// round-1 design — not fix round 2's own reproduction of it, which
     /// independently measured 3.625 s at 32 MB on different hardware (same
     /// order of magnitude, same conclusion; the security lens's own
-    /// independent reproduction this round got 5.49 s, corroborating the
-    /// brief's figure over round 2's). Kept because it is still the right
+    /// independent reproduction in round 2's review got 5.49 s, corroborating
+    /// the brief's figure over round 2's). Kept because it is still the right
     /// order of magnitude for the design it describes, now correctly
     /// attributed rather than left to read as this section's own claim.
     ///
@@ -402,9 +402,9 @@ impl<'a> Executor<'a> {
     /// size. Confirms the row's own prose: flat within measurement noise
     /// across the whole 0-32 MB range, not merely "much smaller than the
     /// fix round 1 numbers." Independently corroborated by the security
-    /// lens's own reproduction this round: 6.7-9.0 ms at this same depth
-    /// (two levels of nesting), 16-19 ms at three levels, also flat across
-    /// 0-32 MB — this function does not measure the three-level case.
+    /// lens's own reproduction in round 2's review: 6.7-9.0 ms at this same
+    /// depth (two levels of nesting), 16-19 ms at three levels, also flat
+    /// across 0-32 MB — this function does not measure the three-level case.
     ///
     /// Nesting cost is now **O(1) per level** (one `HashMap` get plus one
     /// insert/remove pair, per level, independent of context size) instead of
@@ -768,8 +768,11 @@ impl<'a> Executor<'a> {
                             // step's own gate belongs on *this* step's
                             // outcome, not whatever `dispatch_step` fills the
                             // field with when `inner` is itself a nested
-                            // `map` (its own inner items' folded flag — see
-                            // below).
+                            // `map` (which is the unconditional `false`
+                            // placeholder at the bottom of this function — a
+                            // nested map's own inner taint travels on
+                            // `output_is_secret_derived`, folded on the next
+                            // line, not on this field).
                             let mut outcome = self.dispatch_step(inner);
                             outcome.gate_condition_was_secret_derived =
                                 gate_condition_was_secret_derived;
