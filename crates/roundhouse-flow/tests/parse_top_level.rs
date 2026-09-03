@@ -1,6 +1,7 @@
 use roundhouse_flow::parse::types::{Effect, IsolationDef, UnattendedEscalate};
 use roundhouse_flow::parse::{
-    parse_workflow, ParseError, MAX_LEADING_INDENT_CHARS, MAX_TOP_LEVEL_STEPS, MAX_YAML_BYTES,
+    parse_workflow, ParseError, MAX_EXPANDED_NODES, MAX_LEADING_INDENT_CHARS, MAX_TOP_LEVEL_STEPS,
+    MAX_YAML_BYTES,
 };
 
 const PR_REVIEW_YAML: &str = include_str!("fixtures/pr_review.yaml");
@@ -200,6 +201,39 @@ fn too_many_top_level_steps_is_rejected() {
 }
 
 #[test]
+fn a_syntax_error_is_reported_as_a_syntax_error_not_as_a_downstream_schema_error() {
+    // Task X1. `parse_workflow` returns the metered walk's `serde_yaml`
+    // error rather than continuing to the typed parse, which is what closes
+    // the "errors cheaply in the meter, parses expensively for real" bypass
+    // (ruling P52's second finding). Without a test that can see the
+    // difference, that change would be unverified — on every *legitimate*
+    // document the two paths agree, which is the whole point of the
+    // over-rejection sweep above.
+    //
+    // Payload: the same truncated flow mapping as
+    // `yaml_syntax_error_reports_a_line_and_column` — `unattended: {
+    // escalate: fail` with no closing brace, so the rest of the document is
+    // swallowed into the unterminated mapping.
+    //
+    // The typed parse blames the wrong thing: measured, it reports
+    // "permissions.unattended.escalate: unknown variant `fail steps`",
+    // a schema error caused by the syntax error rather than the syntax
+    // error itself. The metered walk hits the truncation first and reports
+    // "did not find expected ',' or '}'". So this assertion fails if the
+    // walk's error is ever passed over in favour of the typed parse's.
+    let yaml =
+        "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail\nsteps:\n  - id: s\n";
+    let err = parse_workflow(yaml).expect_err("malformed YAML must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("did not find expected"),
+        "expected the metered walk's syntax error, got {msg:?} — if this says \
+         \"unknown variant\" the walk's error is being discarded and the document is \
+         reaching the typed parse anyway, which is the bypass this rejects"
+    );
+}
+
+#[test]
 fn yaml_syntax_error_reports_a_line_and_column() {
     let yaml =
         "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail\nsteps:\n  - id: s\n";
@@ -218,13 +252,20 @@ fn rejects_pathological_flow_nesting_cheaply() {
     // not the library in isolation) to cost seconds once handed to
     // `serde_yaml`, growing highly non-linearly with size. The best-effort
     // pre-parse nesting scan rejects this shape before `serde_yaml` ever
-    // sees it, cheaply, whenever it understands the shape (fix round 3
-    // demoted this scan to best-effort defence in depth — `MAX_YAML_BYTES`,
-    // now 32 KiB, is the actual bound regardless of whether this scan
-    // catches a given payload; see
-    // `worst_case_bracket_nesting_at_the_byte_cap_is_bounded`). Bomb size
-    // kept well under the 32 KiB cap so this exercises the scan, not the
-    // cap.
+    // sees it, cheaply, whenever it understands the shape.
+    //
+    // P51 sweep, Task X1: this comment used to say "fix round 3 demoted
+    // this scan to best-effort defence in depth — `MAX_YAML_BYTES`, now
+    // 32 KiB, is the actual bound regardless of whether this scan catches a
+    // given payload; see `worst_case_bracket_nesting_at_the_byte_cap_is_
+    // bounded`". Three things wrong with it: the cap is 256 KiB, not 32
+    // KiB; the "actual bound" claim was retracted in fix round 4; and the
+    // test it named was renamed to
+    // `the_retracted_cap_claim_held_only_for_the_one_shape_it_measured`.
+    // The scan really is best-effort defence in depth, and the bracket-bomb
+    // shape it addresses lives in the tokenizing stage, which
+    // `MAX_EXPANDED_NODES` does NOT cover. Bomb size kept well under the
+    // byte cap so this exercises the scan, not the cap.
     let bomb = "[".repeat(300);
     let yaml = format!("{}bomb: {bomb}\n", minimal_header());
     assert!(
@@ -257,8 +298,7 @@ fn rejects_a_bracket_bomb_hidden_behind_an_apostrophe() {
     // character for the rest of the document, brackets included, was then
     // silently skipped. The round-2 fix dropped quote-tracking entirely, so
     // this specific shape must still be rejected (bomb size kept well
-    // under the 32 KiB cap from fix round 3, so this exercises the scan,
-    // not the cap).
+    // under `MAX_YAML_BYTES`, so this exercises the scan, not the cap).
     let bomb = "[".repeat(300);
     let yaml = format!("{}note: \"don't\"\nbomb: {bomb}\n", minimal_header());
     assert!(yaml.len() < MAX_YAML_BYTES);
@@ -366,9 +406,12 @@ fn the_retracted_cap_claim_held_only_for_the_one_shape_it_measured() {
     // quadratic, so raising the cap 32 KiB -> 256 KiB kept it cheap.
     //
     // What it does NOT show, and what round 3 wrongly generalised from it,
-    // is a bound on parse cost: see
-    // `ignored_reproduction_of_the_open_anchor_alias_fanout_dos` below, and
-    // the open finding in `parse/mod.rs`'s module doc comment.
+    // is a bound on parse cost. The anchor/alias half of that gap is closed
+    // (see `the_anchor_alias_fan_out_family_is_rejected_cheaply` below and
+    // `parse/mod.rs`'s history section); this shape's cost is in the
+    // *tokenizing* stage, which `MAX_EXPANDED_NODES` still does not cover,
+    // which is why this test remains a characterization rather than a
+    // bound.
     //
     // Fix round 5: the payload is a literal 32 KiB, deliberately NOT tied
     // to `MAX_YAML_BYTES`. Round 3's claim was made about 32 KiB, so 32 KiB
@@ -400,11 +443,13 @@ fn the_retracted_cap_claim_held_only_for_the_one_shape_it_measured() {
     );
 }
 
-/// Builds the open finding's attack payload: one anchored leaf list of
+/// Builds the historical attack payload: one anchored leaf list of
 /// `leaves` plain scalars, then `levels` levels each aliasing the previous
 /// one `fan` times. Every bracket is balanced, nesting is one level deep,
-/// and the alias count stays low — so none of this module's shape checks
-/// see anything unusual.
+/// and the alias count stays low — so none of `parse`'s *shape* checks see
+/// anything unusual. `MAX_EXPANDED_NODES` catches it because it does not
+/// look at shape at all: it counts the nodes the expansion actually
+/// produces.
 fn anchor_alias_fanout(leaves: usize, fan: usize, levels: usize) -> String {
     let mut yaml = String::from(
         "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n    bomb:\n",
@@ -430,35 +475,304 @@ fn anchor_alias_fanout(leaves: usize, fan: usize, levels: usize) -> String {
     yaml
 }
 
-#[test]
-#[ignore = "reproduces an OPEN, UNFIXED denial-of-service finding: burns seconds of CPU on purpose. Run with `cargo test -p roundhouse-flow --release -- --ignored`."]
-fn ignored_reproduction_of_the_open_anchor_alias_fanout_dos() {
-    // The executable record of the open finding in `parse/mod.rs`'s module
-    // doc comment. A ~2.3 KB document — SMALLER than the frozen §8.9
-    // fixture (2,271 B) — costs seconds of pinned CPU, and every bound this
-    // module enforces admits it: it is well under `MAX_YAML_BYTES`, its
-    // brackets are balanced at depth 1 (under `MAX_FLOW_NESTING_DEPTH`),
-    // and it declares one step.
-    //
-    // Measured in this environment, release build, via `parse_workflow`:
-    // 2,268 B -> 137 ms; 2,300 B -> 537 ms; 2,332 B -> 2.1 s;
-    // 2,364 B -> 8.1 s; 4,396 B -> 33.9 s. Doubling the document roughly
-    // quadruples the cost, which is the O(bytes^2) mechanism the module doc
-    // comment explains. This test uses the 2,332 B point.
-    let yaml = anchor_alias_fanout(1000, 4, 7);
-    assert!(yaml.len() < 3_000, "payload must stay tiny: {}", yaml.len());
-    assert!(yaml.len() < MAX_YAML_BYTES);
+/// Same fan-out, but every anchored level carries a YAML tag, so the
+/// metered walk can only reach it through `Visitor::visit_enum`.
+fn tagged_anchor_alias_fanout(leaves: usize, fan: usize, levels: usize) -> String {
+    anchor_alias_fanout(leaves, fan, levels).replace(": &a", ": !Thing &a")
+}
 
-    let start = std::time::Instant::now();
-    let _ = parse_workflow(&yaml);
-    let elapsed = start.elapsed();
+/// A generous ceiling for "the rejection did not itself cost what the
+/// attack used to cost". Measured through `parse_workflow`: every payload
+/// below is rejected in 7.8-21.6 ms release and 123-199 ms debug (debug is
+/// what `cargo test` builds), the 199 ms being the 260,364-byte member at
+/// the byte cap. 10 s is ~50x the slowest debug figure — chosen so
+/// a contended CI runner cannot turn a timing margin into a failure inside
+/// a test whose real subject is a security property, following the
+/// precedent in `the_retracted_cap_claim_held_only_for_the_one_shape_it_measured`.
+/// If this ever actually fires, the bound stopped working; that is a real
+/// finding, not a slow machine.
+const REJECTION_MUST_BE_CHEAP: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Rejects `yaml`, asserting it was the expansion ceiling that fired and
+/// that firing was cheap. Returns the elapsed time so callers can report it.
+fn assert_rejected_by_the_node_ceiling(label: &str, yaml: &str) -> std::time::Duration {
     assert!(
-        elapsed > std::time::Duration::from_millis(250),
-        "if this ever stops being expensive, the finding is fixed and this test (and the open \
-         finding in parse/mod.rs) should be retired; took {elapsed:?} for {} bytes",
+        yaml.len() <= MAX_YAML_BYTES,
+        "{label}: payload must stay under the byte cap so this exercises the node \
+         ceiling, not the cap ({} bytes)",
         yaml.len()
     );
+    let start = std::time::Instant::now();
+    let err = parse_workflow(yaml).expect_err("must be rejected");
+    let elapsed = start.elapsed();
+
+    match err {
+        ParseError::ExpandsTooManyNodes { actual_bytes, max } => {
+            assert_eq!(max, MAX_EXPANDED_NODES);
+            assert_eq!(actual_bytes, yaml.len());
+        }
+        other => panic!("{label}: expected ParseError::ExpandsTooManyNodes, got {other:?}"),
+    }
+    assert!(
+        elapsed < REJECTION_MUST_BE_CHEAP,
+        "{label}: rejection took {elapsed:?} for {} bytes — the point of the bound is \
+         that rejecting is cheap",
+        yaml.len()
+    );
+    elapsed
+}
+
+#[test]
+fn the_anchor_alias_fan_out_family_is_rejected_cheaply() {
+    // Task X1. This replaces `ignored_reproduction_of_the_open_anchor_alias
+    // _fanout_dos`, which asserted the parse took MORE than 250 ms and was
+    // `#[ignore]`d because it burned CPU on purpose. The property is now
+    // enforced on every `cargo test`.
+    //
+    // Payloads, not names: each row is
+    // `anchor_alias_fanout(leaves, fan, levels)` — one anchored flow
+    // sequence of `leaves` plain `x` scalars, then `levels` further
+    // sequences each aliasing the previous one `fan` times, inside one
+    // step's opaque body. Every bracket is balanced, nesting is one level
+    // deep, `MAX_YAML_BYTES` is nowhere near, and one step is declared, so
+    // no shape-based check in `parse` looks at any of them. The first five
+    // rows are exactly the sizes in `parse/mod.rs`'s history table, whose
+    // "before" costs were 123 ms, 137 ms, 2.1 s, 8.1 s and 33.9 s.
+    let cases = [
+        ("706 B", anchor_alias_fanout(100, 4, 12)),
+        ("2,268 B", anchor_alias_fanout(1000, 4, 5)),
+        ("2,332 B", anchor_alias_fanout(1000, 4, 7)),
+        ("2,364 B", anchor_alias_fanout(1000, 4, 8)),
+        ("4,396 B", anchor_alias_fanout(2016, 4, 8)),
+        // The security review's 32 KiB payload, which it measured at
+        // 287.8 s through the unfixed parser.
+        ("32 KiB", anchor_alias_fanout(16200, 4, 8)),
+        // Larger than anything previously measured: a member sized to sit
+        // just under the byte cap, so the byte cap cannot be what rejects it.
+        ("at the byte cap", anchor_alias_fanout(130_000, 4, 8)),
+    ];
+    for (label, yaml) in cases {
+        assert_rejected_by_the_node_ceiling(label, &yaml);
+    }
+}
+
+#[test]
+fn the_smallest_attack_payload_is_rejected_while_the_larger_frozen_fixture_parses() {
+    // The reason no byte cap could ever close this finding, made
+    // executable: the review's smallest expensive payload class is SMALLER
+    // than the frozen §8.9 fixture, so any threshold on `yaml.len()` that
+    // rejects the first also rejects the second.
+    //
+    // Payloads: `anchor_alias_fanout(1075, 4, 7)` at 2,482 bytes on one
+    // side (the closest constructible member to the review's 2,229 B
+    // figure), and `tests/fixtures/pr_review.yaml` at 2,271 bytes on the
+    // other. `MAX_EXPANDED_NODES` separates them by five orders of
+    // magnitude in the *other* unit: measured, the fixture expands to 236
+    // nodes and the attack passes 262,145 before the walk stops.
+    let attack = anchor_alias_fanout(1075, 4, 7);
+    assert_rejected_by_the_node_ceiling("2,482 B fan-out", &attack);
+
+    let def = parse_workflow(PR_REVIEW_YAML).expect("the frozen §8.9 fixture must still parse");
+    assert_eq!(def.name, "pr-review");
+    assert_eq!(def.steps.len(), 2);
+    assert!(
+        PR_REVIEW_YAML.len() < attack.len(),
+        "the point of this test is that the legitimate document is not the smaller one"
+    );
+}
+
+#[test]
+fn a_tag_wrapped_anchor_alias_fan_out_is_rejected() {
+    // Task X1, defect 2 of the orchestrator's audit (ruling P52). The draft
+    // this work inherited asserted, without testing it, that a tagged
+    // node's payload "is always a newtype variant in `serde_yaml`'s
+    // encoding". If that were wrong the metered walk would error at the tag
+    // and — under the draft's fail-open error path — wave the document
+    // through to a real parse whose `steps` field is a `serde_yaml::Value`
+    // and constructs `Value::Tagged` happily.
+    //
+    // Payload: `anchor_alias_fanout(1000, 4, 7)` with every anchor
+    // introduced as `!Thing &aN [...]` instead of `&aN [...]`, so the walk
+    // reaches every level through `visit_enum` rather than `visit_seq`.
+    // 2,388 bytes. Measured with no ceiling, the tagged form walks to
+    // 21,932,398 nodes against the untagged form's 21,874,150 — the tags
+    // are charged, not skipped.
+    let yaml = tagged_anchor_alias_fanout(1000, 4, 7);
+    assert!(
+        yaml.contains("!Thing &a0 ["),
+        "the payload must actually be tag-wrapped, or this test proves nothing: {}",
+        &yaml[..yaml.len().min(400)]
+    );
+    assert_rejected_by_the_node_ceiling("tag-wrapped fan-out", &yaml);
+}
+
+#[test]
+fn an_anchor_alias_fan_out_behind_a_cheaply_erroring_prefix_is_rejected() {
+    // Task X1, the general form of defect 2: a document that errors cheaply
+    // in the meter but parses expensively for real would bypass the ceiling
+    // entirely under a fail-open error path. `parse_workflow` therefore
+    // rejects on any `serde_yaml` error the walk reports rather than
+    // continuing.
+    //
+    // Payload: `anchor_alias_fanout(1000, 4, 7)` with `tag: !Weird\n`
+    // inserted as an earlier sibling field, so the walk meets a bare tagged
+    // null before it reaches the fan-out. 2,348 bytes. Measured with no
+    // ceiling, this walks to 21,874,154 nodes — four more than the
+    // un-prefixed form — i.e. the tagged null does not stop the walk, and
+    // the fan-out behind it is still counted.
+    let yaml =
+        anchor_alias_fanout(1000, 4, 7).replace("    bomb:\n", "    tag: !Weird\n    bomb:\n");
+    assert!(yaml.contains("tag: !Weird"));
+    assert_rejected_by_the_node_ceiling("fan-out behind a tagged null", &yaml);
+}
+
+#[test]
+fn the_metered_walk_rejects_a_fan_out_without_expanding_it() {
+    // Task X1. This is the regression detector for the one `serde_yaml`
+    // internal the bound depends on: that alias expansion is *demand
+    // driven*, so aborting the walk aborts the expansion. If a future
+    // 0.9.x expanded aliases while building the event list instead, the
+    // damage would be done before the first node is charged and this bound
+    // would meter a walk over an already-materialised bomb.
+    //
+    // There is no API to assert that property directly, so it is asserted
+    // by cost. Payload: `anchor_alias_fanout(1000, 4, 6)`, 2,300 bytes,
+    // whose full expansion is 5,468,304 nodes — measured by walking it with
+    // no ceiling, which is safe precisely because the counting visitor
+    // allocates nothing. Materialising it is not safe: the real parse of
+    // this document was measured at 367 ms and 555 MB resident, and the
+    // 2,332-byte member one level up exhausts a 2 GiB address space.
+    //
+    // Rejecting it must therefore cost far less than expanding it would.
+    // Measured: 7.9 ms release, 124 ms debug. The threshold is loose;
+    // an eager-expansion regression would blow past it by orders of
+    // magnitude, or die on memory first.
+    let yaml = anchor_alias_fanout(1000, 4, 6);
+    assert_eq!(
+        yaml.len(),
+        2_300,
+        "payload size is load-bearing for the figures above"
+    );
+    let elapsed = assert_rejected_by_the_node_ceiling("demand-driven expansion", &yaml);
+    assert!(
+        elapsed < REJECTION_MUST_BE_CHEAP,
+        "rejecting a 2,300-byte document whose expansion is 5.4M nodes took {elapsed:?}"
+    );
+}
+
+#[test]
+fn the_node_ceiling_leaves_room_for_any_alias_free_document_under_the_byte_cap() {
+    // Task X1. `MAX_EXPANDED_NODES`'s derivation, pinned so that raising
+    // `MAX_YAML_BYTES` without revisiting it fails here rather than
+    // silently starting to reject dense legitimate documents.
+    //
+    // The claim: the densest alias-free YAML spends at least two source
+    // bytes per node, so an alias-free document at the byte cap cannot
+    // reach a ceiling set at one node per admitted byte. Nothing can
+    // therefore be rejected by the node ceiling for being *large*; only for
+    // expanding beyond what its own bytes could have encoded directly.
+    //
+    // A `const` block, not a runtime `assert!`: both constants are
+    // compile-time, so this fails the build rather than a test run if a
+    // future change to `MAX_YAML_BYTES` outgrows the ceiling. (Clippy's
+    // `assertions_on_constants` asks for exactly this, and it is the
+    // stronger form anyway.)
+    const {
+        assert!(
+            MAX_EXPANDED_NODES >= MAX_YAML_BYTES,
+            "MAX_EXPANDED_NODES must be at least MAX_YAML_BYTES, or an alias-free \
+             document under the byte cap could be rejected by the node ceiling"
+        );
+    }
+
+    // And executed, not just asserted arithmetically. Payload: a single
+    // flow sequence of two-byte elements (`x,`) padded to 262,142 bytes —
+    // one byte under the cap, no anchors, no aliases. Measured: 131,042
+    // nodes, exactly 2.00x under the ceiling, walked in 15.7 ms and parsed
+    // in 21.0 ms (release).
+    let mut yaml = String::from(
+        "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n    bomb: [",
+    );
+    let elements = (MAX_YAML_BYTES - yaml.len() - 3) / 2;
+    for i in 0..elements {
+        if i > 0 {
+            yaml.push(',');
+        }
+        yaml.push('x');
+    }
+    yaml.push_str("]\n");
+    assert!(yaml.len() <= MAX_YAML_BYTES && yaml.len() > MAX_YAML_BYTES - 8);
+    assert!(!yaml.contains('&') && !yaml.contains('*'));
+
+    let def = parse_workflow(&yaml)
+        .expect("a maximally dense alias-free document under the byte cap must still parse");
+    assert_eq!(def.steps.len(), 1);
+}
+
+#[test]
+fn the_metered_walk_does_not_over_reject_legitimate_yaml_shapes() {
+    // Task X1. `parse_workflow` now rejects on any `serde_yaml` error the
+    // metered walk reports instead of passing the document to the typed
+    // parse. That closes the fail-open bypass, and its cost is
+    // over-rejection: a shape the walk's `deserialize_any` chokes on that
+    // the typed parse would have accepted.
+    //
+    // The walk accepts every YAML shape and produces no schema errors, so
+    // the risk is concentrated in YAML-level constructs. These are the
+    // constructs, as payloads: document markers, comments, an explicit
+    // null, a bare tagged node, a tagged null in value position, a `!!`
+    // standard tag, non-finite floats, a merge key, flow nesting one level
+    // under `serde_yaml`'s own 128-deep recursion guard, anchor reuse
+    // across steps, empty collections, both permission matcher kinds
+    // (which is the `#[serde(flatten)]` path), typed `inputs`, and
+    // `catch`/`finally`. Plus the frozen fixture and the alias-heavy prose
+    // prompt. Measured across this set: zero over-rejections.
+    let deep_but_legal = {
+        let mut y = format!("{}    d: ", minimal_header());
+        y.push_str(&"[".repeat(120));
+        y.push_str(&"]".repeat(120));
+        y.push('\n');
+        y
+    };
+    let anchor_reuse = {
+        let mut y = String::from(
+            "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n",
+        );
+        y.push_str("  - id: s0\n    with: &common { cwd: /tmp, timeout: 30 }\n");
+        for i in 1..200 {
+            y.push_str(&format!("  - id: s{i}\n    with: *common\n"));
+        }
+        y
+    };
+    let cases: Vec<(&str, String)> = vec![
+        ("frozen §8.9 fixture", PR_REVIEW_YAML.to_string()),
+        ("leading ---", format!("---\n{}", minimal_header())),
+        ("trailing ...", format!("{}...\n", minimal_header())),
+        ("comments", format!("# hi\n{}# bye\n", minimal_header())),
+        ("explicit null step", "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - ~\n".to_string()),
+        ("bare tagged step", "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - !Custom { id: s }\n".to_string()),
+        ("bare tagged null step", "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - !Empty\n".to_string()),
+        ("tagged null in value position", "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - { id: s, x: !Empty }\n".to_string()),
+        ("!!binary", "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - { id: s, b: !!binary \"aGk=\" }\n".to_string()),
+        (".nan / .inf", "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - { id: s, n: .nan, m: .inf }\n".to_string()),
+        ("merge key", "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n    a: &a { x: 1 }\n    b: { <<: *a, y: 2 }\n".to_string()),
+        ("120-deep flow nesting", deep_but_legal),
+        ("anchor reused across 200 steps", anchor_reuse),
+        ("empty collections", "name: t\nversion: 1\ninputs: {}\nsecrets: []\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n    e: []\n    f: {}\n".to_string()),
+        ("both matcher kinds (flatten path)", "name: t\nversion: 1\npermissions:\n  default: deny\n  rules:\n    - { http: { methods: [GET], hosts: [a.com] }, effect: allow }\n    - { shell: { program: cargo, args: [test] }, effect: allow }\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n".to_string()),
+        ("typed inputs", "name: t\nversion: 1\ninputs:\n  repo: { type: string, required: true }\n  n: { type: integer, default: 10 }\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n".to_string()),
+        ("catch and finally", "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: s\ncatch:\n  - id: c\nfinally:\n  - id: f\n".to_string()),
+    ];
+
+    for (label, yaml) in cases {
+        match parse_workflow(&yaml) {
+            Ok(_) => {}
+            Err(err) => panic!(
+                "{label}: a legitimate YAML shape was rejected after Task X1 made the \
+                 metered walk fail closed: {err:?}"
+            ),
+        }
+    }
 }
 
 #[test]
@@ -470,6 +784,11 @@ fn an_alias_heavy_prose_prompt_parses() {
     // `TooManyAliases` (measured: 140 "alias" tokens in 4,719 bytes). The
     // guard is gone; this pins that a real prompt parses, so a future
     // reader does not reintroduce the same shape of check.
+    //
+    // Task X1 added `MAX_EXPANDED_NODES`, which is deliberately not that
+    // shape: it counts nodes the deserializer produced, and a `prompt: |`
+    // block scalar is exactly one node however much markdown emphasis it
+    // contains. Measured: this document walks to 20 nodes.
     let mut prose = String::new();
     for i in 0..70 {
         prose.push_str(&format!(
@@ -530,8 +849,8 @@ fn known_false_positive_bracket_heavy_prompt_after_an_unbalanced_bracket() {
 
 #[test]
 fn the_byte_cap_and_the_step_cap_are_coherent() {
-    // Fix round 4 on Task 10: `MAX_YAML_BYTES` is no longer a security
-    // bound (see `parse/mod.rs`'s open finding); its remaining job is to
+    // Fix round 4 on Task 10: `MAX_YAML_BYTES` is not a security bound
+    // (see `parse/mod.rs`'s history section); its remaining job is to
     // refuse absurdly large documents, which means it must not be so tight
     // that `MAX_TOP_LEVEL_STEPS` is unreachable for realistic steps. At
     // 32 KiB it left ~65 bytes per step at the step limit — less than an
@@ -584,6 +903,14 @@ fn rejects_a_billion_laughs_style_alias_bomb() {
     // so this must fail fast with a parse error rather than hang or OOM —
     // proving that protection is real and reachable through this crate's
     // actual entry point, not just a property of the library in isolation.
+    //
+    // P51 sweep, Task X1: the guard still fires, but it now fires inside
+    // the metered walk rather than inside the typed parse — measured, the
+    // walk reaches `RepetitionLimitExceeded` after 40,062 nodes, well under
+    // `MAX_EXPANDED_NODES`, in 1.25 ms. `parse_workflow` returns that error
+    // rather than continuing, so the variant asserted below is unchanged.
+    // A `serde_yaml` error found by the walk is a rejection, never a
+    // "proceed anyway": see `parse/expansion.rs`'s doc comment.
     let yaml = "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n    bomb:\n      b0: &b0 [x, x, x, x, x]\n      b1: &b1 [*b0, *b0, *b0, *b0, *b0]\n      b2: &b2 [*b1, *b1, *b1, *b1, *b1]\n      b3: &b3 [*b2, *b2, *b2, *b2, *b2]\n      b4: &b4 [*b3, *b3, *b3, *b3, *b3]\n      b5: &b5 [*b4, *b4, *b4, *b4, *b4]\n      b6: [*b5, *b5, *b5, *b5, *b5]\n";
 
     assert!(

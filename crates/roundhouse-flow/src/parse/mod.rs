@@ -1,9 +1,11 @@
 //! YAML parsing of the top-level workflow definition (§8.9). Untrusted
 //! input: this module's job is to turn workflow-author-supplied YAML text
 //! into a typed [`WorkflowDef`] that fails closed on anything it doesn't
-//! recognise. **It does not bound the resources a hostile document can make
-//! the parser spend** — read the open finding below before wiring this to
-//! anything that accepts untrusted YAML.
+//! recognise. Anchor/alias expansion — the one resource a small hostile
+//! document could previously make the parser spend without limit — is
+//! bounded by [`MAX_EXPANDED_NODES`]; read the history section below,
+//! including the paragraph on what that bound does *not* cover, before
+//! wiring this to anything that accepts untrusted YAML.
 //!
 //! Step bodies are typed by [`steps`] (`StepDef`, `StepBody`,
 //! `steps::parse_step`), which this module hands each `WorkflowDef.steps` /
@@ -13,24 +15,23 @@
 //! each entry, and `steps::topological_order` to get a `needs:`-respecting
 //! run order.
 //!
-//! # OPEN, UNFIXED SECURITY FINDING: parse cost is unbounded
+//! # CLOSED (Task X1): the anchor/alias fan-out denial of service
 //!
-//! **`parse_workflow` has no bound on the CPU it will spend on a small,
-//! hostile document, and nothing in this module provides one.** This is a
-//! known, currently-unmitigated denial-of-service surface, recorded here
-//! rather than papered over. It is stated first because three earlier fix
-//! rounds on this module each shipped a claim that it *was* bounded, and
-//! each claim was falsified by measurement.
+//! Kept as history rather than deleted, because three fix rounds on this
+//! module each shipped a claim that parse cost *was* bounded and each was
+//! falsified by measurement. What follows is what the attack was, what
+//! bounds it now, and — stated as plainly as the rest — what that bound
+//! still does not cover.
 //!
 //! **The attack.** An anchor/alias fan-out: one large anchored leaf
 //! collection, then a handful of levels that each alias the previous level
 //! a few times. All brackets are balanced, nesting is one level deep, there
 //! is no oversized field and no deep recursion — so none of this module's
-//! shape-based checks look at it at all.
+//! shape-based checks looked at it at all.
 //!
-//! **Measured, release build, through the real `parse_workflow`** (leaf
-//! list of `n` plain scalars, fan 4, levels tuned to sit just under
-//! `serde_yaml`'s own repetition limit):
+//! **What it cost, measured release-build through the real
+//! `parse_workflow`** (leaf list of `n` plain scalars, fan 4, levels tuned
+//! to sit just under `serde_yaml`'s own repetition limit):
 //!
 //! | document size | parse cost |
 //! |---|---|
@@ -44,40 +45,95 @@
 //! 821 B → 489 ms, 1,525 B → 2.4 s, 2,229 B → 3.8 s, 5,749 B → 9.5 s and
 //! 32,768 B → **287.8 s**.
 //!
-//! **Why no byte cap closes this.** The 2,229-byte review payload is
-//! *smaller than the frozen §8.9 fixture* (2,271 B), so there is no cap
-//! that admits legitimate workflows and excludes the attack. The mechanism
-//! is quadratic in the document size, not linear: `serde_yaml` 0.9.34's
+//! **The finding was worse than CPU, which the original write-up missed.**
+//! Task X1 measured the same family's memory, in a child process under a
+//! 2 GiB `ulimit -v` so it could not take the host down: 2,268 B → 141 MB,
+//! 2,300 B → 555 MB, and 2,332 B → **allocation failure, exceeding a 2 GiB
+//! address space**. Uncapped, this family was twice observed by the kernel
+//! OOM killer at ~35 GiB resident while this very task was being measured.
+//! A document that OOMs a host is a materially worse finding than one that
+//! spins a core, and the earlier write-up above — CPU only — understated it.
+//!
+//! **Why no byte cap closes it.** The 2,229-byte review payload is *smaller
+//! than the frozen §8.9 fixture* (2,271 B), so there is no cap that admits
+//! legitimate workflows and excludes the attack. `serde_yaml` 0.9.34's
 //! alias guard is `jumpcount > events.len() * 100`
 //! (`serde_yaml-0.9.34/src/de.rs:478-480`) — a budget *proportional to the
 //! document*, not an absolute one — while the cost of each individual jump
-//! is itself proportional to the subtree that jump expands. Total work is
-//! therefore O(bytes) budget × O(bytes) per jump = **O(bytes²)**. Raising
-//! [`MAX_YAML_BYTES`] raises the attacker's jump budget and the price of
-//! spending each unit of it at the same time.
+//! is itself proportional to the subtree that jump expands, so raising
+//! [`MAX_YAML_BYTES`] raised the attacker's jump budget and the price of
+//! spending each unit of it at once. Underneath that guard the raw
+//! expansion is exponential: measured with the metered walk (which
+//! allocates nothing, so this is safe to run), the same family visits
+//! 5,026 → 21,048 → 85,134 → 341,476 → 1,366,842 → 5,468,304 nodes as the
+//! document grows 2,140 → 2,300 bytes, i.e. ×4 per 32 bytes of source.
 //!
-//! **What would actually bound it** (neither is implemented, and neither is
-//! this task's call to make):
-//! - **Parse out of process**, under `RLIMIT_CPU` or an external SIGKILL.
-//!   This reaches a real guarantee with no dependency change, and this
-//!   workspace already has `roundhouse-sandbox` for exactly this shape of
-//!   confinement.
-//! - **Replace the parser** with one that exposes a caller-controlled work
-//!   budget, so the cost ceiling is an input rather than an emergent
-//!   property of the document.
+//! **What bounds it now: [`MAX_EXPANDED_NODES`], enforced by
+//! `expansion::check_expansion` before `serde_yaml::from_str` is called.**
+//! The check walks the document with the real deserializer under a visitor
+//! that produces only a count, and aborts the walk — and with it the
+//! demand-driven expansion the walk is driving — the moment the count
+//! passes the ceiling. It does not predict the expansion; it incurs it
+//! under a meter and stops. Its unit is the real work unit rather than a
+//! proxy for it, which is exactly what the withdrawn `MAX_ALIAS_TOKENS`
+//! guard described in the next section was not. Read `src/parse/expansion.rs`'s
+//! module doc for the mechanism, the measured ratio between the metered
+//! walk and the subsequent real parse, and what a change in `serde_yaml`'s
+//! internals would break.
 //!
-//! **An in-process timeout is NOT a mitigation.** `serde_yaml::from_str`
-//! is a synchronous call into `unsafe-libyaml` with no cancellation points,
-//! so `tokio::task::spawn_blocking` plus a timeout only stops the *caller*
-//! waiting; the blocking thread keeps burning a core until the parse
-//! finishes on its own. That converts a stalled request into a leaked
-//! pinned core, which is worse, not better.
+//! Measured after the fix, release build, through the real
+//! `parse_workflow` — every payload from both tables above, plus a
+//! 260,364-byte member at the byte cap:
 //!
-//! **Nothing is exploitable today: `parse_workflow` has no production
-//! caller** — only this crate's own tests reach it. Whoever wires the first
+//! | document | before | after |
+//! |---|---|---|
+//! | 706 B fan-out | 123 ms | rejected in 7.8 ms |
+//! | 2,268 B fan-out | 137 ms | rejected in 7.9 ms |
+//! | 2,332 B fan-out | 2.1 s | rejected in 7.9 ms |
+//! | 4,396 B fan-out | 33.9 s | rejected in 8.0 ms |
+//! | 32,764 B fan-out | 287.8 s (review) | rejected in 9.4 ms |
+//! | 260,364 B fan-out | not previously measured | rejected in 19.5 ms |
+//!
+//! (Across repeated runs the rejection figures ranged 7.8-21.6 ms; the
+//! table gives one run. Debug builds — what `cargo test` produces — run
+//! 123-199 ms.) Peak resident memory for the whole rejection sweep stayed
+//! under 50 MB, against the ~35 GiB the same family reached unbounded.
+//!
+//! **What the bound does NOT cover, stated plainly:**
+//! - **Only the expansion stage.** Tokenizing the raw text into
+//!   `serde_yaml`'s event list happens first, is untouched by the ceiling,
+//!   and is bounded only by [`MAX_YAML_BYTES`] and the best-effort
+//!   [`nesting_depth_bound_violation`] scan below — neither of which is a
+//!   security boundary. The measured shape that gets past the scan (a run
+//!   of unclosed `[`) costs ~80 ms at 32 KiB and ~650 ms at 256 KiB.
+//! - **The observed walk-to-parse ratio is an observation, not a proof.**
+//!   Twelve admitted documents, six shaped to sit within 2% of the ceiling,
+//!   gave a worst ratio of 2.95 and a worst absolute real-parse cost of
+//!   24.5 ms. A future serde construct that re-visited the YAML *event
+//!   list* rather than an owned buffer would not be covered by those
+//!   numbers. See `src/parse/expansion.rs`'s doc comment.
+//! - **Nothing downstream of parsing.** A parsed workflow's dispatched-task
+//!   count is [`crate::caps`]'s problem (ruling P47).
+//!
+//! **An in-process timeout was never the answer and still is not.**
+//! `serde_yaml::from_str` is a synchronous call into `unsafe-libyaml` with
+//! no cancellation points, so `tokio::task::spawn_blocking` plus a timeout
+//! only stops the *caller* waiting; the blocking thread keeps burning a
+//! core until the parse finishes on its own. That converts a stalled
+//! request into a leaked pinned core, which is worse, not better. The two
+//! remedies an earlier version of this comment proposed — parsing out of
+//! process under `RLIMIT_CPU`, or replacing the parser with one exposing a
+//! caller-controlled work budget — remain the heavier options that would
+//! also cover the tokenizing stage. Neither was taken: the meter reaches
+//! the same place for the expansion stage without a process spawn per parse
+//! in a library crate, or a dependency change against a phase that pins
+//! versions deliberately.
+//!
+//! **Reachability, unchanged:** `parse_workflow` still has no production
+//! caller — only this crate's own tests reach it. Whoever wires the first
 //! real caller (a trigger, a job submission, an API endpoint that accepts
-//! workflow YAML) inherits this finding and must resolve it in that same
-//! change, because that is the change that makes it reachable.
+//! workflow YAML) inherits the *residual* above, which is smaller than what
+//! it inherited before but is not nothing.
 //!
 //! # Bounds this module does enforce, and exactly what each is worth
 //!
@@ -96,15 +152,18 @@
 //!   ruling in fix round 3 was built on it. It conflates the number of
 //!   jumps with the cost of a jump: the counter bounds how many jumps
 //!   happen, not how much each one expands, and each expands a subtree
-//!   whose size is itself proportional to the document. The real product
-//!   is quadratic — see the open finding above. See
+//!   whose size is itself proportional to the document. See
 //!   `rejects_a_billion_laughs_style_alias_bomb` in
-//!   `tests/parse_top_level.rs`, which exercises the guard directly.
+//!   `tests/parse_top_level.rs`, which exercises the guard directly —
+//!   though since Task X1 that payload is stopped by
+//!   [`MAX_EXPANDED_NODES`]'s walk, which reaches `serde_yaml`'s own
+//!   repetition limit at 40,062 nodes and reports it, rather than by the
+//!   typed parse.
 //!
-//!   **This module deliberately adds no alias check of its own.** Fix
-//!   round 4 shipped one (`MAX_ALIAS_TOKENS`, rejecting above 64 tokens
-//!   matching `*[A-Za-z0-9_-]`) as best-effort defence in depth; fix
-//!   round 5 removed it, because it turned out to cost more than it
+//!   **This module's alias check is a metered walk, not a count.** Fix
+//!   round 4 shipped a count (`MAX_ALIAS_TOKENS`, rejecting above 64
+//!   tokens matching `*[A-Za-z0-9_-]`) as best-effort defence in depth;
+//!   fix round 5 removed it, because it turned out to cost more than it
 //!   bought. It could not bound the attack — at a fixed 64 alias tokens,
 //!   cost spans over 3,000x purely by widening the anchored leaf list (10
 //!   leaves 9.6 ms, 100 leaves 160 ms, 1,000 leaves 4.26 s, 5,000 leaves
@@ -112,11 +171,13 @@
 //!   no threshold yields a ceiling. Meanwhile it rejected real workflows:
 //!   the pattern is also markdown emphasis, so a 4,719-byte `agent.prompt`
 //!   using `*word*` and `**bold**` in ordinary prose was rejected outright
-//!   (measured), as were `src/*rs` and `rm *tmp`. And a constant named
-//!   `MAX_ALIAS_TOKENS` checked before `serde_yaml` reads as "alias
-//!   fan-out is handled", which is the exact misreading this module has
-//!   been bitten by three times. The open finding above is more legible
-//!   without it.
+//!   (measured), as were `src/*rs` and `rm *tmp`. Task X1's
+//!   [`MAX_EXPANDED_NODES`] is deliberately not another count of that
+//!   kind: it counts nodes the deserializer actually produced while
+//!   following the aliases, so its unit cannot decouple from cost the way
+//!   an alias-token count did, and it cannot see a `*word*` in a block
+//!   scalar at all because a block scalar is one node. See the history
+//!   section above.
 //! - **Pathological nesting depth, materializing a Rust value:** bounded by
 //!   `serde_yaml`'s own `remaining_depth: 128` recursion guard
 //!   (`RecursionLimitExceeded`), on by default. **This guard applies only
@@ -183,10 +244,14 @@
 //!   It was true only for the one payload shape it was measured against (a
 //!   run of unclosed `[`, which really is linear-ish: 32 KiB of it costs
 //!   ~80 ms, 256 KiB ~650 ms). It was false in general: the anchor/alias
-//!   fan-out in the open finding above costs *minutes* well inside 32 KiB,
-//!   and the review measured 287.8 s at exactly the 32 KiB cap — roughly
-//!   190x the claimed ceiling. A byte cap is not a bound on parse cost and
-//!   this module no longer pretends otherwise.
+//!   fan-out in the history section above cost *minutes* well inside
+//!   32 KiB, and the review measured 287.8 s at exactly the 32 KiB cap —
+//!   roughly 190x the claimed ceiling. **A byte cap is not a bound on parse
+//!   cost, and that is still true**: what bounds the fan-out is
+//!   [`MAX_EXPANDED_NODES`], not [`MAX_YAML_BYTES`], and the shape measured
+//!   in this bullet — an unclosed-bracket run, whose cost is in the
+//!   tokenizer rather than in expansion — is still bounded by nothing but
+//!   the byte cap.
 //! - **Overall document size / "huge number of steps":** these are coarse
 //!   sanity bounds on absurd input — [`MAX_YAML_BYTES`] on the raw input
 //!   before it is handed to `serde_yaml`, and [`MAX_TOP_LEVEL_STEPS`] /
@@ -194,6 +259,7 @@
 //!   result's lists. **None of them is a security bound**, and the two
 //!   size-shaped ones interact on purpose: see [`MAX_YAML_BYTES`].
 
+mod expansion;
 pub mod steps;
 pub mod types;
 
@@ -204,10 +270,13 @@ use thiserror::Error;
 
 /// 256 KiB. **Not a security bound.** Fix round 3 set this to 32 KiB and
 /// called it "the real DoS bound"; that claim is retracted (see the module
-/// doc comment's open finding — a hostile document costs minutes of CPU at
-/// a fraction of even the old 32 KiB, so no cap can separate hostile from
-/// legitimate here). Its only remaining job is refusing to even look at an
-/// absurdly large document.
+/// doc comment's history section — the anchor/alias fan-out cost minutes of
+/// CPU at a fraction of even the old 32 KiB, so no cap could separate
+/// hostile from legitimate; [`MAX_EXPANDED_NODES`] is what separates them
+/// now, and it is a node count, not a byte count). This constant's only
+/// remaining job is refusing to even look at an absurdly large document —
+/// though it does now have one load-bearing side effect, since
+/// [`MAX_EXPANDED_NODES`] is derived from it.
 ///
 /// **Why 256 KiB and not 32 KiB.** 32 KiB was chosen as a security number
 /// and is far too tight as a sanity number: [`MAX_TOP_LEVEL_STEPS`] admits
@@ -225,17 +294,75 @@ use thiserror::Error;
 /// obviously-absurd input, neither is a security bound, and neither is
 /// tuned to be the one that fires.
 ///
-/// **What raising it costs, stated plainly:** because parse cost is
-/// O(bytes²) (see the open finding), 32 KiB -> 256 KiB multiplies the
-/// theoretical worst case by ~64x. That is acceptable only because this was
-/// never a bound: the review already measured 287.8 s at exactly 32 KiB, so
-/// the number being made larger was a number that already admitted an
-/// unusable-machine outcome. Nothing that mattered was traded away. The
-/// mitigations in the module doc comment are what change that, not this
-/// constant.
+/// **What raising it cost, stated plainly** (written when the raise
+/// happened, kept as history): because expansion cost was then O(bytes²),
+/// 32 KiB -> 256 KiB multiplied the theoretical worst case by ~64x. That
+/// was acceptable only because this was never a bound — the review had
+/// already measured 287.8 s at exactly 32 KiB, so the number being made
+/// larger already admitted an unusable-machine outcome.
+///
+/// **What raising it costs now.** Task X1 changed the relationship.
+/// [`MAX_EXPANDED_NODES`] is defined as this constant, and the metered
+/// walk's cost is linear in nodes (measured: 3.9 ms at 32,738 nodes,
+/// 15.7 ms at 131,042), so raising this cap now raises worst-case parse
+/// cost *linearly* rather than quadratically. Raising it still raises the
+/// admitted node ceiling in lockstep, which is deliberate — see
+/// [`MAX_EXPANDED_NODES`]'s derivation — but anyone raising it should
+/// re-measure rather than assume the linearity holds arbitrarily far.
 ///
 /// For scale: the frozen §8.9 fixture is 2,271 bytes.
 pub const MAX_YAML_BYTES: usize = 262_144;
+
+/// The maximum number of **expanded nodes** a workflow document may produce
+/// once its anchors and aliases are followed. This is the bound that closes
+/// the anchor/alias fan-out denial of service; see the module doc comment's
+/// history section for the attack and `src/parse/expansion.rs` for the
+/// mechanism that enforces it.
+///
+/// # Unit
+///
+/// One node is one value handed to a `serde::de::Visitor`: each scalar,
+/// each sequence, each mapping, and each mapping *key* counts one. An alias
+/// contributes the entire subtree it expands to, because the check follows
+/// it exactly as the real parse will. It is **not** a byte count, an alias
+/// count, or a nesting depth — the previous three attempts at this bound
+/// were each a proxy of that kind and each decoupled from the cost it was
+/// supposed to bound.
+///
+/// # Derivation of the number
+///
+/// It is an **absolute** ceiling — a constant, not a fraction of the
+/// document. Proportionality to the document was the defect in
+/// `serde_yaml`'s own `jumpcount > events.len() * 100` guard: it hands a
+/// larger attacker budget for a larger attack.
+///
+/// The number is `MAX_YAML_BYTES` — one admitted node per byte the byte cap
+/// admits — chosen so that **only alias amplification can trip it**. The
+/// densest alias-free YAML spends at least two source bytes per node (`x,`
+/// in a flow sequence), so an alias-free document at the byte cap yields at
+/// most about half this many: measured, a 262,142-byte `bomb: [x,x,…]`
+/// expands to 131,042 nodes, exactly 2.00x under. A document therefore
+/// cannot be rejected here for being large; it can only be rejected for
+/// expanding to more nodes than its own bytes could have encoded directly.
+/// That relationship is pinned by
+/// `the_node_ceiling_leaves_room_for_any_alias_free_document_under_the_byte_cap`
+/// in `tests/parse_top_level.rs`, so raising [`MAX_YAML_BYTES`] without
+/// revisiting this constant fails a test rather than silently starting to
+/// reject dense documents.
+///
+/// # What a document at this ceiling costs — measured, release build
+///
+/// Twelve documents admitted by the ceiling, six of them shaped to sit
+/// within 2% of it by different means: worst metered-walk cost 24.1 ms,
+/// worst subsequent real-parse cost 24.5 ms, worst peak-RSS growth across
+/// the real parse 36 MB. Every attack payload in the module doc comment's
+/// history table is rejected in 7.8–21.6 ms with the whole sweep peaking
+/// under 50 MB resident. The two-walk design means a *legitimate* document is
+/// walked twice: measured overhead is 0.07 ms on the frozen §8.9 fixture
+/// (2,271 B) and 15.7 ms — about +75% — on a maximally dense 256 KiB
+/// document, which is the worst case the byte cap allows.
+pub const MAX_EXPANDED_NODES: usize = MAX_YAML_BYTES;
+
 /// No real workflow needs hundreds of top-level steps — a `map` step
 /// already provides fan-out — so this bounds a maliciously (or
 /// accidentally) huge step list without constraining legitimate use. See
@@ -257,8 +384,11 @@ pub const MAX_FINALLY_HANDLERS: usize = 50;
 /// an ordinary workflow to hit this bound for a reason that isn't present
 /// in the actual document. This scan is best-effort, not a security
 /// boundary — and neither is [`MAX_YAML_BYTES`], which fix round 3 wrongly
-/// called "the real bound". Nothing in this module bounds parse cost; see
-/// the module doc comment's open finding.
+/// called "the real bound". The only bound on parse cost in this module is
+/// [`MAX_EXPANDED_NODES`], and it bounds the *expansion* stage only; the
+/// tokenizing stage this scan tries to help with is still bounded by
+/// nothing but the byte cap. See the module doc comment's history
+/// section.
 pub const MAX_FLOW_NESTING_DEPTH: usize = 256;
 /// Maximum leading-whitespace width (raw character count, not "levels") any
 /// one line may open with. Not a precise measure of block-style YAML
@@ -304,6 +434,11 @@ pub enum ParseError {
         "a line in the workflow YAML opens with {width} characters of leading whitespace, exceeding the {max}-character limit enforced before parsing"
     )]
     ExcessiveIndentWidth { width: usize, max: usize },
+
+    #[error(
+        "workflow YAML is only {actual_bytes} bytes but expands to more than {max} nodes once its anchors and aliases are followed; this is alias amplification, not size, and it is rejected before the document is deserialized (see this module's doc comment)"
+    )]
+    ExpandsTooManyNodes { actual_bytes: usize, max: usize },
 
     #[error("workflow YAML parse error: {0}")]
     Yaml(#[from] serde_yaml::Error),
@@ -378,6 +513,23 @@ pub fn parse_workflow(yaml: &str) -> Result<WorkflowDef, ParseError> {
         None => {}
     }
 
+    // Bound anchor/alias expansion BEFORE deserializing for real. This is
+    // the check that closes the fan-out denial of service; see the module
+    // doc comment's history section and `expansion`'s own. A `Malformed`
+    // verdict is returned rather than passed through to the real parse: any
+    // document that errors cheaply here but would parse expensively for
+    // real is otherwise a complete bypass of the ceiling.
+    match expansion::check_expansion(yaml, MAX_EXPANDED_NODES) {
+        expansion::Verdict::WithinBudget => {}
+        expansion::Verdict::OverBudget => {
+            return Err(ParseError::ExpandsTooManyNodes {
+                actual_bytes: yaml.len(),
+                max: MAX_EXPANDED_NODES,
+            });
+        }
+        expansion::Verdict::Malformed(err) => return Err(ParseError::Yaml(err)),
+    }
+
     let def: WorkflowDef = serde_yaml::from_str(yaml)?;
 
     if def.steps.len() > MAX_TOP_LEVEL_STEPS {
@@ -433,8 +585,11 @@ enum NestingViolation {
 /// doc comment claimed soundness properties that execution then falsified
 /// — see the module doc comment for the full history.) Fix round 3 said
 /// "the actual bound on untrusted-input cost is [`MAX_YAML_BYTES`]"; that
-/// is retracted too — there is no bound on parse cost anywhere in this
-/// module. This function exists only to reject the cases it happens to
+/// is retracted too. Task X1 added [`MAX_EXPANDED_NODES`], which does bound
+/// the expansion stage — but not this stage: nothing bounds the cost of
+/// tokenizing raw text into `serde_yaml`'s event list, which is what this
+/// function is a partial, best-effort palliative for. This function exists
+/// only to reject the cases it happens to
 /// understand cheaply, before paying `serde_yaml`'s cost on them; it is
 /// not claimed to catch everything, and a future crafted input finding a
 /// new way past it would not be a regression of any promise this function

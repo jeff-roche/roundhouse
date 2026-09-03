@@ -504,7 +504,9 @@
 //! say a length or argument-count cap cannot bound (an expression-length or
 //! argument-count cap would not bound the work either, since the
 //! multiplicand is the context size a `map.over` or webhook payload can make
-//! arbitrarily large — the same shape as the open Task 10 finding).
+//! arbitrarily large — the same shape as Task 10's anchor/alias parse-cost
+//! finding, which was closed in Task X1 by metering the real work unit
+//! rather than capping a proxy for it; see `parse/mod.rs`).
 //!
 //! **This is left open, not closed, and that is a deliberate choice, not an
 //! oversight.** Closing it in general requires an array literal to flow
@@ -593,11 +595,12 @@
 //! [`ExprError::ExpressionTooDeep`] once it would exceed the limit, rather
 //! than recursing further. This bound covers nesting-depth-driven
 //! recursion in this parser only. It says nothing about, and is not a
-//! restatement or extension of, the separate open finding in
-//! `parse/mod.rs` about `serde_yaml`'s own alias/anchor parse cost — that
-//! finding is about parsing YAML *text* into a `serde_yaml::Value` before
-//! any expression evaluation happens; this bound is about evaluating an
-//! expression *after* that YAML has already parsed successfully. Note also
+//! restatement or extension of, the separate `parse/mod.rs` finding about
+//! `serde_yaml`'s own alias/anchor parse cost (closed in Task X1 by
+//! `parse::MAX_EXPANDED_NODES`) — that finding is about parsing YAML *text*
+//! into a `serde_yaml::Value` before any expression evaluation happens;
+//! this bound is about evaluating an expression *after* that YAML has
+//! already parsed successfully. Note also
 //! that a deliberate stack-overflow reproduction was not attempted here —
 //! it would abort the test process running it, an unacceptable side effect
 //! for a shared test binary — so this bound is justified by the recursion

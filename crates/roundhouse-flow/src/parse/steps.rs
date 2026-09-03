@@ -251,9 +251,10 @@ pub const MAX_STEP_ID_LEN: usize = 128;
 /// Sanity bound on how many `needs:` entries one step may declare. Bounds
 /// [`topological_order`]'s own work (`O(steps + total needs entries)`) to a
 /// predictable multiple of the step count; not tied to, and making no claim
-/// about, the open YAML-parse-cost finding recorded in the parent module's
-/// doc comment — that finding is about `serde_yaml` parsing raw text, this
-/// is about graph size after parsing has already succeeded.
+/// about, the anchor/alias YAML-parse-cost finding recorded in the parent
+/// module's doc comment (closed in Task X1 by `parse::MAX_EXPANDED_NODES`)
+/// — that finding is about `serde_yaml` parsing raw text, this is about
+/// graph size after parsing has already succeeded.
 pub const MAX_NEEDS_PER_STEP: usize = 64;
 
 /// Sanity bound on a `worktree.base_ref` value's length ([`validate_git_ref`]).
@@ -1508,6 +1509,17 @@ impl From<StepDef> for StepDefWire {
 /// anything in this crate. All three are the executor's (Task 5) or a
 /// future recursive-validation pass's responsibility, not this function's
 /// — named here rather than left implicit.
+///
+/// **Nor does it bound anchor/alias expansion (Task X1).** It takes an
+/// already-materialized [`serde_yaml::Value`], so the expansion has already
+/// happened by the time it is called, and its own re-visiting constructs
+/// ([`MapIsolationWire`]'s `#[serde(untagged)]`, the `v.clone()` below) work
+/// on owned data rather than on `serde_yaml`'s event list — no alias is
+/// followed here at all. In this crate that `Value` can only have come from
+/// [`super::parse_workflow`], which applies [`super::MAX_EXPANDED_NODES`]
+/// before deserializing. A future caller that builds a `Value` from
+/// untrusted YAML by some other route inherits that bound's absence, and
+/// should go through `parse_workflow` rather than reaching here directly.
 ///
 /// Calls `StepDef::try_from` directly rather than
 /// `serde_yaml::from_value::<StepDef>(v)` so its errors stay a fully typed
