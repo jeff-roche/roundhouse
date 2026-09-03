@@ -22,7 +22,9 @@ fn ctx() -> ExprContext {
 #[test]
 fn property_access_and_indexing() {
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("inputs.repo"), &ctx()).unwrap(),
+        eval(ExpressionSource::from_workflow_file("inputs.repo"), &ctx())
+            .unwrap()
+            .value,
         json!("acme/widgets")
     );
     assert_eq!(
@@ -30,7 +32,8 @@ fn property_access_and_indexing() {
             ExpressionSource::from_workflow_file("steps.list_prs.output[0].number"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!(1)
     );
 }
@@ -42,7 +45,8 @@ fn ternary_and_len() {
             ExpressionSource::from_workflow_file("len(steps.review.output.findings) > 0"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!(true)
     );
     assert_eq!(
@@ -52,7 +56,8 @@ fn ternary_and_len() {
             ),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!("has findings")
     );
 }
@@ -64,7 +69,8 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
             ExpressionSource::from_workflow_file("slice(steps.list_prs.output, 0, 2)"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!([{"number":1},{"number":2}])
     );
     assert_eq!(
@@ -72,7 +78,8 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
             ExpressionSource::from_workflow_file("default(missing.field, 'fallback')"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!("fallback")
     );
     assert_eq!(
@@ -80,7 +87,8 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
             ExpressionSource::from_workflow_file("contains(inputs.repo, 'widgets')"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!(true)
     );
     assert_eq!(
@@ -88,7 +96,8 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
             ExpressionSource::from_workflow_file("flatten([[1,2],[3]])"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!([1, 2, 3])
     );
     assert_eq!(
@@ -96,7 +105,8 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
             ExpressionSource::from_workflow_file("json('{\"a\":1}')"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!({"a":1})
     );
     std::env::set_var("ROUNDHOUSE_TEST_VAR", "hello");
@@ -105,7 +115,8 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
             ExpressionSource::from_workflow_file("env('ROUNDHOUSE_TEST_VAR')"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!("hello")
     );
 }
@@ -118,7 +129,8 @@ fn interpolate_substitutes_expr_blocks_inside_a_larger_string() {
         ),
         &ctx(),
     )
-    .unwrap();
+    .unwrap()
+    .into_unredacted_for_dispatch();
     assert_eq!(out, "Review PR #1 in acme/widgets");
 }
 
@@ -135,7 +147,9 @@ fn interpolate_json_walks_every_string_leaf_of_a_steps_with_block() {
         "retries": 3,
         "headers": { "Accept": "application/vnd.github+json" }
     });
-    let resolved = interpolate_json(JsonTemplateSource::from_workflow_file(&with), &ctx()).unwrap();
+    let resolved = interpolate_json(JsonTemplateSource::from_workflow_file(&with), &ctx())
+        .unwrap()
+        .into_unredacted_for_dispatch();
     assert_eq!(
         resolved["url"],
         json!("https://api.github.com/repos/acme/widgets/pulls")
@@ -158,11 +172,15 @@ fn interpolating_an_object_or_array_value_renders_it_as_compact_json() {
     c.set("obj", json!({"a": 1, "b": [1, 2]}));
     c.set("arr", json!([1, "two", null]));
     assert_eq!(
-        interpolate(TemplateSource::from_workflow_file("${{ obj }}"), &c).unwrap(),
+        interpolate(TemplateSource::from_workflow_file("${{ obj }}"), &c)
+            .unwrap()
+            .into_unredacted_for_dispatch(),
         r#"{"a":1,"b":[1,2]}"#
     );
     assert_eq!(
-        interpolate(TemplateSource::from_workflow_file("${{ arr }}"), &c).unwrap(),
+        interpolate(TemplateSource::from_workflow_file("${{ arr }}"), &c)
+            .unwrap()
+            .into_unredacted_for_dispatch(),
         r#"[1,"two",null]"#
     );
 }
@@ -188,23 +206,33 @@ fn trailing_garbage_is_rejected() {
 #[test]
 fn comparisons_and_equality_operators_work() {
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("1 == 1"), &ctx()).unwrap(),
+        eval(ExpressionSource::from_workflow_file("1 == 1"), &ctx())
+            .unwrap()
+            .value,
         json!(true)
     );
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("1 != 2"), &ctx()).unwrap(),
+        eval(ExpressionSource::from_workflow_file("1 != 2"), &ctx())
+            .unwrap()
+            .value,
         json!(true)
     );
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("2 >= 2"), &ctx()).unwrap(),
+        eval(ExpressionSource::from_workflow_file("2 >= 2"), &ctx())
+            .unwrap()
+            .value,
         json!(true)
     );
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("1 <= 0"), &ctx()).unwrap(),
+        eval(ExpressionSource::from_workflow_file("1 <= 0"), &ctx())
+            .unwrap()
+            .value,
         json!(false)
     );
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("'a' == 'a'"), &ctx()).unwrap(),
+        eval(ExpressionSource::from_workflow_file("'a' == 'a'"), &ctx())
+            .unwrap()
+            .value,
         json!(true)
     );
 }
@@ -214,7 +242,9 @@ fn missing_root_and_missing_field_resolve_to_null_not_an_error() {
     // `default()`'s whole purpose depends on a missing path resolving to
     // Null rather than erroring.
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("missing"), &ctx()).unwrap(),
+        eval(ExpressionSource::from_workflow_file("missing"), &ctx())
+            .unwrap()
+            .value,
         json!(null)
     );
     assert_eq!(
@@ -222,7 +252,8 @@ fn missing_root_and_missing_field_resolve_to_null_not_an_error() {
             ExpressionSource::from_workflow_file("inputs.nonexistent"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!(null)
     );
     assert_eq!(
@@ -230,7 +261,8 @@ fn missing_root_and_missing_field_resolve_to_null_not_an_error() {
             ExpressionSource::from_workflow_file("inputs.nonexistent.deeper.still"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!(null)
     );
 }
@@ -238,7 +270,9 @@ fn missing_root_and_missing_field_resolve_to_null_not_an_error() {
 #[test]
 fn array_literal_and_nested_indexing() {
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("[1,2,3][1]"), &ctx()).unwrap(),
+        eval(ExpressionSource::from_workflow_file("[1,2,3][1]"), &ctx())
+            .unwrap()
+            .value,
         json!(2)
     );
 }
@@ -254,21 +288,28 @@ fn integer_literals_compare_equal_to_context_data_regardless_of_number_represent
             ExpressionSource::from_workflow_file("steps.list_prs.output[0].number == 1"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!(true)
     );
     let mut c = ctx();
     c.set("float_one", json!(1.0));
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("float_one == 1"), &c).unwrap(),
+        eval(ExpressionSource::from_workflow_file("float_one == 1"), &c)
+            .unwrap()
+            .value,
         json!(true)
     );
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("float_one != 1"), &c).unwrap(),
+        eval(ExpressionSource::from_workflow_file("float_one != 1"), &c)
+            .unwrap()
+            .value,
         json!(false)
     );
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("float_one == 2"), &c).unwrap(),
+        eval(ExpressionSource::from_workflow_file("float_one == 2"), &c)
+            .unwrap()
+            .value,
         json!(false)
     );
 }
@@ -305,7 +346,9 @@ fn large_string_context_values_evaluate_without_error() {
     let big = "x".repeat(200_000);
     c.set("pr", json!({"title": big.clone()}));
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("pr.title"), &c).unwrap(),
+        eval(ExpressionSource::from_workflow_file("pr.title"), &c)
+            .unwrap()
+            .value,
         json!(big)
     );
 }
@@ -326,7 +369,9 @@ fn deeply_nested_context_values_are_indexed_by_direct_path_without_walking_the_w
         path.push_str(".next");
     }
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file(&path), &c).unwrap(),
+        eval(ExpressionSource::from_workflow_file(&path), &c)
+            .unwrap()
+            .value,
         json!("bottom")
     );
 }
@@ -339,14 +384,17 @@ fn non_ascii_context_values_round_trip_through_property_access_and_interpolation
         json!({"title": "Fix \u{1F41B} in \u{00e9}migr\u{00e9} module — “quoted”"}),
     );
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("pr.title"), &c).unwrap(),
+        eval(ExpressionSource::from_workflow_file("pr.title"), &c)
+            .unwrap()
+            .value,
         json!("Fix \u{1F41B} in \u{00e9}migr\u{00e9} module — “quoted”")
     );
     let out = interpolate(
         TemplateSource::from_workflow_file("Title: ${{ pr.title }}"),
         &c,
     )
-    .unwrap();
+    .unwrap()
+    .into_unredacted_for_dispatch();
     assert_eq!(
         out,
         "Title: Fix \u{1F41B} in \u{00e9}migr\u{00e9} module — “quoted”"
@@ -362,7 +410,9 @@ fn context_value_containing_the_expression_delimiter_itself_is_not_special() {
     let mut c = ExprContext::new();
     c.set("pr", json!({"title": "look: ${{ secrets.GH_TOKEN }}"}));
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("pr.title"), &c).unwrap(),
+        eval(ExpressionSource::from_workflow_file("pr.title"), &c)
+            .unwrap()
+            .value,
         json!("look: ${{ secrets.GH_TOKEN }}")
     );
 }
@@ -382,7 +432,8 @@ fn interpolation_is_single_pass_and_does_not_re_evaluate_substituted_output() {
         TemplateSource::from_workflow_file(r#"payload: ${{ json('"${{ inputs.repo }}"') }}"#),
         &ctx(),
     )
-    .unwrap();
+    .unwrap()
+    .into_unredacted_for_dispatch();
     assert_eq!(out, "payload: ${{ inputs.repo }}");
 }
 
@@ -400,7 +451,8 @@ fn a_literal_expression_delimiter_produced_by_one_substitution_does_not_feed_a_l
         TemplateSource::from_workflow_file("${{ a }} then ${{ b }}"),
         &c,
     )
-    .unwrap();
+    .unwrap()
+    .into_unredacted_for_dispatch();
     assert_eq!(out, "${{ then real");
 }
 
@@ -422,7 +474,8 @@ fn text_with_no_delimiter_at_all_passes_through_unchanged() {
         TemplateSource::from_workflow_file("plain text, no expressions here"),
         &ctx(),
     )
-    .unwrap();
+    .unwrap()
+    .into_unredacted_for_dispatch();
     assert_eq!(out, "plain text, no expressions here");
 }
 
@@ -485,7 +538,8 @@ fn an_open_quote_can_still_silently_absorb_a_later_block_when_the_forgery_looks_
         ),
         &c,
     )
-    .unwrap();
+    .unwrap()
+    .into_unredacted_for_dispatch();
     // No error at all, and `real` was never evaluated: its own `${{ }}`
     // markers survive as literal characters inside the absorbed string,
     // exactly as if the whole first block had been one intentional
@@ -513,7 +567,9 @@ fn deeply_nested_array_literals_within_the_depth_limit_evaluate() {
         access.push_str("[0]");
     }
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file(&access), &ctx()).unwrap(),
+        eval(ExpressionSource::from_workflow_file(&access), &ctx())
+            .unwrap()
+            .value,
         json!(1)
     );
 }
@@ -657,7 +713,9 @@ fn long_flat_expressions_over_the_borrowed_chain_path_do_not_show_quadratic_blow
             path.push_str(".next");
         }
         min_elapsed(9, || {
-            let _ = eval(ExpressionSource::from_workflow_file(&path), &c).unwrap();
+            let _ = eval(ExpressionSource::from_workflow_file(&path), &c)
+                .unwrap()
+                .value;
         })
     }
 
@@ -704,7 +762,9 @@ fn long_flat_expressions_over_the_owned_chain_path_do_not_show_quadratic_blowup(
             path.push_str(".next");
         }
         min_elapsed(9, || {
-            let _ = eval(ExpressionSource::from_workflow_file(&path), &c).unwrap();
+            let _ = eval(ExpressionSource::from_workflow_file(&path), &c)
+                .unwrap()
+                .value;
         })
     }
 
@@ -788,7 +848,8 @@ fn env_function_reads_the_real_process_environment_documented_residual() {
             ExpressionSource::from_workflow_file("env('ROUNDHOUSE_TEST_ENV_RESIDUAL')"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!("process-wide-value")
     );
 }
@@ -801,7 +862,8 @@ fn env_function_returns_null_for_an_unset_variable() {
             ExpressionSource::from_workflow_file("env('ROUNDHOUSE_TEST_ENV_DEFINITELY_UNSET')"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!(null)
     );
 }
@@ -815,7 +877,8 @@ fn json_function_can_decode_escapes_into_control_characters_documented_residual(
         ExpressionSource::from_workflow_file(r#"json('"a\nb"')"#),
         &ctx(),
     )
-    .unwrap();
+    .unwrap()
+    .value;
     assert_eq!(out, json!("a\nb"));
     if let Value::String(s) = out {
         assert!(s.contains('\n'));
@@ -887,21 +950,29 @@ fn root_lookup_is_case_sensitive() {
     c.set("steps", json!({"real": true}));
     c.set("Steps", json!({"shadow": true}));
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("steps.real"), &c).unwrap(),
+        eval(ExpressionSource::from_workflow_file("steps.real"), &c)
+            .unwrap()
+            .value,
         json!(true)
     );
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("Steps.shadow"), &c).unwrap(),
+        eval(ExpressionSource::from_workflow_file("Steps.shadow"), &c)
+            .unwrap()
+            .value,
         json!(true)
     );
     // The two roots never collide: asking the "wrong-case" root for the
     // other's field resolves to Null, not a cross-read.
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("steps.shadow"), &c).unwrap(),
+        eval(ExpressionSource::from_workflow_file("steps.shadow"), &c)
+            .unwrap()
+            .value,
         json!(null)
     );
     assert_eq!(
-        eval(ExpressionSource::from_workflow_file("Steps.real"), &c).unwrap(),
+        eval(ExpressionSource::from_workflow_file("Steps.real"), &c)
+            .unwrap()
+            .value,
         json!(null)
     );
 }
@@ -934,7 +1005,8 @@ fn eval_requires_an_expression_source_not_a_bare_str() {
             ExpressionSource::from_workflow_file("env('ROUNDHOUSE_TEST_EVAL_TRUST_VAR')"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!("trusted-value")
     );
 }
@@ -943,81 +1015,74 @@ fn eval_requires_an_expression_source_not_a_bare_str() {
 // workspace-wide — the pinned ACP SDK enables it unconditionally, and
 // vendoring it out was considered and rejected. The old
 // `preserve_order_feature_is_off` test asserted the feature stayed off,
-// which would fail at merge on that approved decision — "the worst kind of
-// guard: a red build caused by an approved choice" (task-13-fix-2.md, item
-// 8). It is replaced here, not deleted: what it was actually protecting —
-// `index_field`'s O(1)-or-better `Map::remove` cost (see `expr.rs`'s doc
-// comment on `index_field`) — is unaffected by which backing `Map` uses
-// (security separately established serde_json 1.0.151 routes `remove` to
-// `swap_remove`, O(1), under `preserve_order`), so there is nothing left to
-// guard on that front. What DOES change is object key iteration order,
-// sorted -> insertion-ordered — and per STANDING.md's rule from this same
-// ruling, nothing may assert on serialized JSON text where key order
-// affects the result. This test instead pins the property that actually
-// matters: evaluation results and `interpolate_json` output are the same
-// regardless of the order keys were inserted into a `serde_json::Map`, by
-// comparing two contexts built with the identical keys/values in opposite
-// insertion order and asserting the *parsed* results are equal — never
-// comparing `to_string()` output, which is exactly the order-sensitive
-// comparison STANDING.md forbids. ----
+// which would fail at merge on that approved decision. Its fix-round-2
+// replacement, `evaluation_and_interpolation_do_not_depend_on_object_key_insertion_order`,
+// was then found VACUOUS (fix round 3, item 6): its payload was two
+// `serde_json::Map`s holding `z:1, a:2, m:3` inserted forward and reversed,
+// and with `preserve_order` OFF both are the same `BTreeMap` — measured
+// iteration order `["a","m","z"]` for both — so every `via_forward ==
+// via_reversed` assertion compared a value with itself; with `preserve_order`
+// ON, `Map` is an `IndexMap` whose `PartialEq` is order-independent by
+// definition. It could not fail on the property it named under either
+// setting.
+//
+// This is its replacement, and its property is genuinely observable: that
+// `interpolate_json` associates each *template* key with its own resolved
+// value — by key, never by position — when the template's keys are authored
+// in a different order from the context object's. Payload: a template
+// authored `{"beta_out": "${{ src.beta }}", "alpha_out": "${{ src.alpha }}",
+// "gamma_out": "${{ src.gamma }}"}` (b, a, g) against a context object
+// authored `{"alpha": "A-VALUE", "gamma": "G-VALUE", "beta": "B-VALUE"}`
+// (a, g, b) — three keys, three distinct values, and the two orderings
+// disagree at every position. An implementation that paired template keys
+// with resolved values by iteration position rather than by key produces a
+// different mapping and fails; the assertions are on the parsed structure,
+// never on `to_string()` output (STANDING.md, ruling P29). ----
 
 #[test]
-fn evaluation_and_interpolation_do_not_depend_on_object_key_insertion_order() {
-    let mut forward = serde_json::Map::new();
-    forward.insert("z".to_string(), json!(1));
-    forward.insert("a".to_string(), json!(2));
-    forward.insert("m".to_string(), json!(3));
+fn interpolate_json_associates_template_keys_with_values_by_key_not_by_iteration_position() {
+    let mut src = serde_json::Map::new();
+    src.insert("alpha".to_string(), json!("A-VALUE"));
+    src.insert("gamma".to_string(), json!("G-VALUE"));
+    src.insert("beta".to_string(), json!("B-VALUE"));
 
-    let mut reversed = serde_json::Map::new();
-    reversed.insert("m".to_string(), json!(3));
-    reversed.insert("a".to_string(), json!(2));
-    reversed.insert("z".to_string(), json!(1));
+    let mut ctx = ExprContext::new();
+    ctx.set("src", Value::Object(src));
 
-    let mut forward_ctx = ExprContext::new();
-    forward_ctx.set("obj", Value::Object(forward));
-    let mut reversed_ctx = ExprContext::new();
-    reversed_ctx.set("obj", Value::Object(reversed));
+    let mut template = serde_json::Map::new();
+    template.insert("beta_out".to_string(), json!("${{ src.beta }}"));
+    template.insert("alpha_out".to_string(), json!("${{ src.alpha }}"));
+    template.insert("gamma_out".to_string(), json!("${{ src.gamma }}"));
+    let template = Value::Object(template);
 
-    for field in ["z", "a", "m"] {
-        let path = format!("obj.{field}");
-        let via_forward = eval(ExpressionSource::from_workflow_file(&path), &forward_ctx).unwrap();
-        let via_reversed =
-            eval(ExpressionSource::from_workflow_file(&path), &reversed_ctx).unwrap();
-        assert_eq!(
-            via_forward, via_reversed,
-            "field `{field}` must evaluate identically regardless of the \
-             object's key insertion order"
-        );
-    }
+    let out = interpolate_json(JsonTemplateSource::from_workflow_file(&template), &ctx)
+        .unwrap()
+        .into_unredacted_for_dispatch();
 
-    // Same property through `interpolate_json`: the *values* assembled from
-    // a template must not depend on the source object's key insertion
-    // order, even though this test may not assert anything about the
-    // *emitted* object's own serialized key order (STANDING.md, ruling
-    // P29).
-    let template = json!({
-        "seen_z": "${{ obj.z }}",
-        "seen_a": "${{ obj.a }}",
-        "seen_m": "${{ obj.m }}",
-    });
-    let via_forward = interpolate_json(
-        JsonTemplateSource::from_workflow_file(&template),
-        &forward_ctx,
-    )
-    .unwrap();
-    let via_reversed = interpolate_json(
-        JsonTemplateSource::from_workflow_file(&template),
-        &reversed_ctx,
-    )
-    .unwrap();
     assert_eq!(
-        via_forward, via_reversed,
-        "interpolate_json's result must not depend on the source object's \
-         key insertion order"
+        out,
+        json!({"alpha_out": "A-VALUE", "beta_out": "B-VALUE", "gamma_out": "G-VALUE"}),
+        "each template key must carry its own resolved value regardless of the order either \
+         object's keys were authored in"
     );
-    assert_eq!(via_forward["seen_z"], json!("1"));
-    assert_eq!(via_forward["seen_a"], json!("2"));
-    assert_eq!(via_forward["seen_m"], json!("3"));
+
+    // The same property one level down, where a positional implementation
+    // has a second chance to go wrong: a nested object whose keys are in yet
+    // another order.
+    let mut nested = serde_json::Map::new();
+    nested.insert("gamma_out".to_string(), json!("${{ src.gamma }}"));
+    nested.insert("beta_out".to_string(), json!("${{ src.beta }}"));
+    let nested_template = json!({"inner": Value::Object(nested), "alpha_out": "${{ src.alpha }}"});
+    let nested_out = interpolate_json(
+        JsonTemplateSource::from_workflow_file(&nested_template),
+        &ctx,
+    )
+    .unwrap()
+    .into_unredacted_for_dispatch();
+    assert_eq!(
+        nested_out,
+        json!({"alpha_out": "A-VALUE", "inner": {"beta_out": "B-VALUE", "gamma_out": "G-VALUE"}}),
+    );
 }
 
 // ---- `7b441b4`'s bare-`}` tightening changes the `ExprError` variant a
@@ -1058,12 +1123,14 @@ fn a_lone_closing_brace_is_unterminated_not_unexpected_token() {
 fn a_delimited_boolean_expression_evaluates_to_a_typed_bool_not_a_string() {
     assert_eq!(
         eval_delimited_expression(TemplateSource::from_workflow_file("${{ 1 == 1 }}"), &ctx())
-            .unwrap(),
+            .unwrap()
+            .value,
         json!(true)
     );
     assert_eq!(
         eval_delimited_expression(TemplateSource::from_workflow_file("${{ 1 == 2 }}"), &ctx())
-            .unwrap(),
+            .unwrap()
+            .value,
         json!(false)
     );
 }
@@ -1076,7 +1143,8 @@ fn a_delimited_expression_using_a_property_chain_matches_the_documented_when_exa
             TemplateSource::from_workflow_file("${{ len(steps.review.output.findings) > 0 }}"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!(true)
     );
 }
@@ -1088,7 +1156,8 @@ fn a_delimited_expression_tolerates_surrounding_whitespace() {
             TemplateSource::from_workflow_file("  ${{ 1 == 1 }}  "),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!(true)
     );
 }
@@ -1103,7 +1172,8 @@ fn a_delimited_expression_with_a_quoted_double_brace_does_not_truncate_early() {
             TemplateSource::from_workflow_file("${{ contains('a}}b', '}}') }}"),
             &ctx()
         )
-        .unwrap(),
+        .unwrap()
+        .value,
         json!(true)
     );
 }

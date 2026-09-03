@@ -117,7 +117,7 @@ impl fmt::Debug for RunContext {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum StepStatus {
     Completed,
     /// Carries a message (the plan's own illustrative code uses this shape
@@ -131,6 +131,41 @@ pub enum StepStatus {
     Skipped {
         reason: String,
     },
+}
+
+impl fmt::Debug for StepStatus {
+    /// Hand-written (fix round 3) rather than derived, so that the
+    /// `message`/`reason` text is bounded by
+    /// [`MAX_STEPS_CONTEXT_ERROR_LEN`] wherever a `StepStatus` is printed —
+    /// not only where [`steps_context_entry`] builds the persisted
+    /// `steps.<id>.error`, which was the only place the bound applied before.
+    ///
+    /// Two things measured against the derived impl it replaces: a ~700-byte
+    /// `UnexpectedToken` payload reached a caller's `{:?}` untruncated, and a
+    /// credential typed literally into a workflow field (which
+    /// [`redact_with_needles`] cannot see, because it was never a
+    /// `secrets.*` value) reached it verbatim. Truncation does not make the
+    /// second case safe — it bounds it. **What a `StepStatus` message
+    /// carries** is this crate's own diagnostic text plus, for an evaluation
+    /// failure, a bounded prefix of the offending *workflow-source* field
+    /// (see [`crate::expr::ExprError`], every variant of which carries only
+    /// source-expression text). It never carries a resolved
+    /// `${{ secrets.* }}` value: no failure path in
+    /// [`Executor::dispatch_step`] formats an interpolation *result* into a
+    /// message.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StepStatus::Completed => f.write_str("Completed"),
+            StepStatus::Failed { message } => f
+                .debug_struct("Failed")
+                .field("message", &truncate_steps_context_error(message))
+                .finish(),
+            StepStatus::Skipped { reason } => f
+                .debug_struct("Skipped")
+                .field("reason", &truncate_steps_context_error(reason))
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -164,6 +199,17 @@ impl fmt::Debug for StepOutcome {
     /// calling into redaction. A bare `emit: "${{ secrets.X }}"` resolves to
     /// a `Value::String` leaf with no key to list, which is exactly why
     /// scalars print only their type, never their content.
+    ///
+    /// **`status` is bounded too (fix round 3).** An earlier version of this
+    /// impl printed `status` through its derived `Debug`, unbounded — the
+    /// doc comment above justified shape-only printing of `output` and said
+    /// nothing about `status`, which reads as a clearance for Task 8's
+    /// `tracing::debug!(?outcomes)`. It is not shape-only: it carries this
+    /// crate's diagnostic text and, for an evaluation failure, a bounded
+    /// prefix of the offending workflow-source field. What it does **not**
+    /// carry is a resolved `${{ secrets.* }}` value — no failure path formats
+    /// an interpolation result into a message. See [`StepStatus`]'s own
+    /// hand-written `Debug` impl, which is where the length bound now lives.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StepOutcome")
             .field("step_id", &self.step_id)
@@ -215,13 +261,24 @@ pub enum ExecutorError {
     /// secret's *name* (never its value) and its length, gives the operator
     /// that signal before any step dispatches, rather than after a
     /// credential is already in an unrecoverable log.
+    ///
+    /// Fix round 3: the secret's actual byte length is **not** reported, in
+    /// the message or as a field. It was, and that is a length oracle on a
+    /// credential — the same channel this crate already removed once when it
+    /// stopped rendering `serde_json`'s column number for a failed
+    /// `json(secrets.X)` (see [`crate::expr::JsonErrorCategory`]). Naming the
+    /// secret and the fixed minimum tells the operator everything they need;
+    /// they can measure their own secret. This error's eventual sink is
+    /// untraced — `Executor::new` has no caller outside this crate's tests
+    /// yet — so keeping the length costs an unbounded-audience disclosure for
+    /// no operator benefit.
     #[error(
-        "secret {name:?} is {len} bytes long, below the \
+        "secret {name:?} is shorter than the \
          {MIN_REDACTABLE_SECRET_LEN}-byte minimum this crate can safely use as a redaction \
          needle (see `redact_known_secrets`) — lengthen it, or accept that it will not be \
          scrubbed from persisted logs and remove it from this run's secrets"
     )]
-    SecretTooShortToRedact { name: String, len: usize },
+    SecretTooShortToRedact { name: String },
 }
 
 pub struct Executor<'a> {
@@ -246,10 +303,7 @@ impl<'a> Executor<'a> {
         // through unprotected — see `ExecutorError::SecretTooShortToRedact`.
         for (name, value) in &run_ctx.secrets {
             if value.len() < MIN_REDACTABLE_SECRET_LEN {
-                return Err(ExecutorError::SecretTooShortToRedact {
-                    name: name.clone(),
-                    len: value.len(),
-                });
+                return Err(ExecutorError::SecretTooShortToRedact { name: name.clone() });
             }
         }
         // Fix round 1, item 9: `run_id` used to be a separate constructor
@@ -270,7 +324,12 @@ impl<'a> Executor<'a> {
         // `steps` (set fresh on every iteration inside `run_to_completion`).
         ctx.set("inputs", run_ctx.inputs);
         ctx.set("vars", run_ctx.vars);
-        ctx.set(
+        // Fix round 3 (ruling P33): bound through `set_secret`, not `set`.
+        // That one call is what makes every value any expression computes by
+        // reading through `secrets` — a whole value, a field of a parsed JSON
+        // secret, its length, a comparison against it — log as `***` while
+        // still reaching the dispatched task for real.
+        ctx.set_secret(
             "secrets",
             Value::Object(
                 run_ctx
@@ -340,10 +399,28 @@ impl<'a> Executor<'a> {
         let order = topological_order(&step_defs)?;
         let mut outcomes = Vec::with_capacity(step_defs.len());
         let mut steps_context = serde_json::Map::new();
+        // Fix round 3 (ruling P33): taint has to survive a step boundary, not
+        // just an expression. The `Emit`/`Report` arms deliberately store
+        // their *unredacted* resolved value in `StepOutcome.output`, which
+        // `steps_context_entry` folds into `steps.<id>.output` — so a
+        // dependent's `${{ steps.a.output.body }}` reads secret material that
+        // was never itself a `secrets.*` lookup. Recording which step ids
+        // produced secret-derived output, and binding `steps` through
+        // `set_with_secret_paths`, is what carries the taint across that
+        // boundary; without it, provenance would stop at the first step and a
+        // *derived* leaf (one the whole-secret backstop cannot match) would
+        // reach the append-only log in cleartext from the second step on.
+        let mut secret_derived_steps: Vec<String> = Vec::new();
 
         for idx in order {
             let step = &step_defs[idx];
-            self.ctx.set("steps", Value::Object(steps_context.clone()));
+            self.ctx.set_with_secret_paths(
+                "steps",
+                Value::Object(steps_context.clone()),
+                secret_derived_steps
+                    .iter()
+                    .map(|id| vec![id.clone(), "output".to_string()]),
+            );
 
             if let Some(when) = &step.when {
                 // Fail-closed deviation from the plan's illustrative
@@ -367,7 +444,13 @@ impl<'a> Executor<'a> {
                 match eval_delimited_expression(TemplateSource::from_workflow_file(when), &self.ctx)
                 {
                     Ok(cond) => {
-                        if !matches!(cond, Value::Bool(true)) {
+                        // Only `Bool(true)` runs the step. `cond.secret_derived`
+                        // is deliberately not consulted: what this branch
+                        // writes into `steps.<id>` is a fixed
+                        // `"skipped"`/`"completed"` discriminant and a fixed
+                        // reason string, never the condition's own value, so
+                        // no secret material can reach the log through it.
+                        if !matches!(cond.value, Value::Bool(true)) {
                             let outcome = StepOutcome {
                                 step_id: step.id.clone(),
                                 output: Value::Null,
@@ -395,14 +478,23 @@ impl<'a> Executor<'a> {
                 }
             }
 
-            let outcome = self.dispatch_step(step);
+            let (outcome, output_is_secret_derived) = self.dispatch_step(step);
+            if output_is_secret_derived {
+                secret_derived_steps.push(step.id.clone());
+            }
             steps_context.insert(step.id.clone(), steps_context_entry(&outcome));
             outcomes.push(outcome);
         }
         Ok(outcomes)
     }
 
-    fn dispatch_step(&mut self, step: &StepDef) -> StepOutcome {
+    /// Dispatches one step, returning its outcome and **whether the outcome's
+    /// `output` is secret-derived** — see [`Self::run_to_completion`]'s
+    /// `secret_derived_steps` for why that second value exists. It is
+    /// returned rather than added as a `StepOutcome` field because it
+    /// describes this executor's own bookkeeping, not the step's result; no
+    /// caller outside this module needs it today.
+    fn dispatch_step(&mut self, step: &StepDef) -> (StepOutcome, bool) {
         // Computed for every dispatch (matching this task's Interfaces
         // list) but not yet attached to anything persisted — see
         // `provenance::Provenance`'s own doc comment for why.
@@ -430,16 +522,26 @@ impl<'a> Executor<'a> {
                     {
                         Ok(v) => v,
                         Err(e) => {
-                            return StepOutcome {
-                                step_id: step.id.clone(),
-                                output: Value::Null,
-                                status: StepStatus::Failed {
-                                    message: format!("interpolating `with:`: {e}"),
+                            return (
+                                StepOutcome {
+                                    step_id: step.id.clone(),
+                                    output: Value::Null,
+                                    status: StepStatus::Failed {
+                                        message: format!("interpolating `with:`: {e}"),
+                                    },
                                 },
-                            };
+                                false,
+                            );
                         }
                     };
-                let logged_with = redact_with_needles(&resolved_with, &self.redaction_needles);
+                // Ruling P33's dual rendering: `redacted_for_logging()` is the
+                // only half that may reach the sink; the backstop needles are
+                // applied on top of it for a credential the author pasted
+                // literally into the YAML, which no provenance can see.
+                let logged_with = redact_with_needles(
+                    resolved_with.redacted_for_logging(),
+                    &self.redaction_needles,
+                );
                 let kind = task_kind_for_tool(tool);
                 self.sink.emit(
                     task_id,
@@ -452,34 +554,48 @@ impl<'a> Executor<'a> {
                         input: TaskInput::Json(logged_with),
                     },
                 );
-                // Real dispatch delegates the (unredacted) `resolved_with`
-                // to `roundhouse-tools` via `roundhouse-engine`; this
-                // executor's job ends at emitting the task and folding its
-                // eventual `TaskCompleted` back into `steps.<id>.output` —
-                // wired in Task 8's durability layer, which owns the actual
-                // run loop.
-                StepOutcome {
-                    step_id: step.id.clone(),
-                    output: serde_json::json!({}),
-                    status: StepStatus::Completed,
-                }
+                // Real dispatch delegates
+                // `resolved_with.into_unredacted_for_dispatch()` — the real
+                // value, `${{ secrets.* }}` included — to `roundhouse-tools`
+                // via `roundhouse-engine`; this executor's job ends at
+                // emitting the task and folding its eventual `TaskCompleted`
+                // back into `steps.<id>.output` — wired in Task 8's
+                // durability layer, which owns the actual run loop. Until
+                // then the unredacted half is simply dropped here.
+                //
+                // `output` is a fixed empty object, so it is never
+                // secret-derived regardless of what `with:` contained.
+                (
+                    StepOutcome {
+                        step_id: step.id.clone(),
+                        output: serde_json::json!({}),
+                        status: StepStatus::Completed,
+                    },
+                    false,
+                )
             }
             StepBody::Agent { prompt, .. } => {
                 let resolved_prompt =
                     match interpolate(TemplateSource::from_workflow_file(prompt), &self.ctx) {
                         Ok(s) => s,
                         Err(e) => {
-                            return StepOutcome {
-                                step_id: step.id.clone(),
-                                output: Value::Null,
-                                status: StepStatus::Failed {
-                                    message: format!("interpolating `agent.prompt`: {e}"),
+                            return (
+                                StepOutcome {
+                                    step_id: step.id.clone(),
+                                    output: Value::Null,
+                                    status: StepStatus::Failed {
+                                        message: format!("interpolating `agent.prompt`: {e}"),
+                                    },
                                 },
-                            };
+                                false,
+                            );
                         }
                     };
+                // A prompt is prose, so the redacted rendering here keeps the
+                // surrounding literal template text and replaces only the
+                // spliced-in text of each secret-derived `${{ }}` block.
                 let logged_prompt = redact_with_needles(
-                    &serde_json::json!({"prompt": resolved_prompt}),
+                    &serde_json::json!({"prompt": resolved_prompt.redacted_for_logging()}),
                     &self.redaction_needles,
                 );
                 self.sink.emit(
@@ -493,11 +609,17 @@ impl<'a> Executor<'a> {
                         input: TaskInput::Json(logged_prompt),
                     },
                 );
-                StepOutcome {
-                    step_id: step.id.clone(),
-                    output: serde_json::json!({}),
-                    status: StepStatus::Completed,
-                }
+                // As in the `Tool` arm: real dispatch (Task 8) gets
+                // `resolved_prompt.into_unredacted_for_dispatch()`; `output`
+                // is a fixed empty object and never secret-derived.
+                (
+                    StepOutcome {
+                        step_id: step.id.clone(),
+                        output: serde_json::json!({}),
+                        status: StepStatus::Completed,
+                    },
+                    false,
+                )
             }
             StepBody::Emit { emit } => {
                 // Finding 2 fix: previously this arm only built an
@@ -513,13 +635,16 @@ impl<'a> Executor<'a> {
                     {
                         Ok(v) => v,
                         Err(e) => {
-                            return StepOutcome {
-                                step_id: step.id.clone(),
-                                output: Value::Null,
-                                status: StepStatus::Failed {
-                                    message: format!("interpolating `emit:`: {e}"),
+                            return (
+                                StepOutcome {
+                                    step_id: step.id.clone(),
+                                    output: Value::Null,
+                                    status: StepStatus::Failed {
+                                        message: format!("interpolating `emit:`: {e}"),
+                                    },
                                 },
-                            };
+                                false,
+                            );
                         }
                     };
                 // Fix round 1, item 1 (CRITICAL): this arm used to pass
@@ -533,7 +658,9 @@ impl<'a> Executor<'a> {
                 // is credential rotation, not deletion. `logged` is what
                 // reaches the sink; the unredacted `resolved` is kept only
                 // for `StepOutcome.output`, mirroring the Tool/Agent split.
-                let logged = redact_with_needles(&resolved, &self.redaction_needles);
+                let logged =
+                    redact_with_needles(resolved.redacted_for_logging(), &self.redaction_needles);
+                let output_is_secret_derived = resolved.is_secret_derived();
                 self.sink.emit(
                     task_id,
                     None,
@@ -554,11 +681,14 @@ impl<'a> Executor<'a> {
                         usage: Usage::default(),
                     },
                 );
-                StepOutcome {
-                    step_id: step.id.clone(),
-                    output: resolved,
-                    status: StepStatus::Completed,
-                }
+                (
+                    StepOutcome {
+                        step_id: step.id.clone(),
+                        output: resolved.into_unredacted_for_dispatch(),
+                        status: StepStatus::Completed,
+                    },
+                    output_is_secret_derived,
+                )
             }
             StepBody::Report { report } => {
                 // Finding 2 fix (the audit's headline example): the
@@ -577,13 +707,16 @@ impl<'a> Executor<'a> {
                 ) {
                     Ok(v) => v,
                     Err(e) => {
-                        return StepOutcome {
-                            step_id: step.id.clone(),
-                            output: Value::Null,
-                            status: StepStatus::Failed {
-                                message: format!("interpolating `report:`: {e}"),
+                        return (
+                            StepOutcome {
+                                step_id: step.id.clone(),
+                                output: Value::Null,
+                                status: StepStatus::Failed {
+                                    message: format!("interpolating `report:`: {e}"),
+                                },
                             },
-                        };
+                            false,
+                        );
                     }
                 };
                 // Fix round 1, item 1 (CRITICAL): same defect as `Emit`
@@ -591,7 +724,9 @@ impl<'a> Executor<'a> {
                 // *mandatory* per-run block, so an unredacted
                 // `${{ secrets.* }}` reference here was on every run's
                 // path, not just an author's optional notification block.
-                let logged = redact_with_needles(&resolved, &self.redaction_needles);
+                let logged =
+                    redact_with_needles(resolved.redacted_for_logging(), &self.redaction_needles);
+                let output_is_secret_derived = resolved.is_secret_derived();
                 self.sink.emit(
                     task_id,
                     None,
@@ -612,36 +747,42 @@ impl<'a> Executor<'a> {
                         usage: Usage::default(),
                     },
                 );
-                StepOutcome {
-                    step_id: step.id.clone(),
-                    output: resolved,
-                    status: StepStatus::Completed,
-                }
+                (
+                    StepOutcome {
+                        step_id: step.id.clone(),
+                        output: resolved.into_unredacted_for_dispatch(),
+                        status: StepStatus::Completed,
+                    },
+                    output_is_secret_derived,
+                )
             }
             // Map/Gate/Call are dispatched by the specialized handlers added
             // in Tasks 6/7/11, which wrap this same `dispatch_step` for
             // their inner/leaf steps rather than duplicating sequencing
             // logic.
-            other => StepOutcome {
-                step_id: step.id.clone(),
-                output: Value::Null,
-                status: StepStatus::Failed {
-                    // Fix round 1, item 8: this used to be
-                    // `format!("step kind {other:?} handled by a later
-                    // task")` — a full `{:?}` dump of the step body,
-                    // flowing through `steps_context_entry` into the
-                    // immutable log. The text is uninterpolated workflow
-                    // source, so no *resolved* secret escapes, but a
-                    // literal credential typed directly into a
-                    // `map`/`gate`/`call` body (e.g. `gate.form`,
-                    // `call.with`) would reach the log verbatim. Name only
-                    // the variant, never its contents.
-                    message: format!(
-                        "step kind `{}` handled by a later task",
-                        step_body_kind_name(other)
-                    ),
+            other => (
+                StepOutcome {
+                    step_id: step.id.clone(),
+                    output: Value::Null,
+                    status: StepStatus::Failed {
+                        // Fix round 1, item 8: this used to be
+                        // `format!("step kind {other:?} handled by a later
+                        // task")` — a full `{:?}` dump of the step body,
+                        // flowing through `steps_context_entry` into the
+                        // immutable log. The text is uninterpolated workflow
+                        // source, so no *resolved* secret escapes, but a
+                        // literal credential typed directly into a
+                        // `map`/`gate`/`call` body (e.g. `gate.form`,
+                        // `call.with`) would reach the log verbatim. Name only
+                        // the variant, never its contents.
+                        message: format!(
+                            "step kind `{}` handled by a later task",
+                            step_body_kind_name(other)
+                        ),
+                    },
                 },
-            },
+                false,
+            ),
         }
     }
 }
@@ -809,69 +950,60 @@ fn truncate_steps_context_error(text: &str) -> Cow<'_, str> {
 ///   secret at all ([`ExecutorError::SecretTooShortToRedact`]), so by the
 ///   time this function runs, every whole-secret value it is handed is
 ///   already known to be at least [`MIN_REDACTABLE_SECRET_LEN`] bytes long.
-///   The constant is retained here because it still gates the *derived*
-///   needles below (a JSON leaf extracted from a secret can be shorter than
-///   the secret itself, and construction-time rejection only inspects the
-///   whole secret value, not its parsed leaves).
+///   The constant is retained because [`redact_known_secrets`] is `pub` and
+///   any external caller can still hand it a short secret directly, without
+///   going through [`Executor::new`]'s rejection. It no longer gates
+///   anything derived: there is nothing derived left to gate (fix round 3).
 ///
-/// # A JSON-valued secret is redacted leaf-by-leaf, gated to sensitive key names (fix round 1 item 6 / ruling P27; narrowed fix round 2 item 4 / ruling P30)
+/// # This is a BACKSTOP, not the primary mechanism (ruling P33, fix round 3)
 ///
-/// Filed Minor by the reviewer; ruling P27 upgraded it to Important and
-/// required either a fix or a named, costed limitation. Fix round 1's first
-/// pass expanded the set of strings this function scans for: for every
-/// secret value that itself parses as JSON, every string leaf of that
-/// parsed value became a redaction needle. That closed the bypass —
-/// `${{ json(secrets.GCP_KEY).private_key }}` extracts one field, not equal
-/// to the whole secret string, and used to slip past the scan entirely
-/// (measured: a private key reached the `Tool` arm's log in cleartext) —
-/// but it over-corrected: a **real** GCP service-account key's JSON also
-/// contains public constants as *other* leaves (`"type":
-/// "service_account"`, `"token_uri": "https://oauth2.googleapis.com/token"`,
-/// `"project_id": "my-project-1234"`), and every one of those became a
-/// global find-and-replace needle too. Measured, 4 of 4 ordinary strings
-/// corrupted by those derived needles: `"this is a service_account for the
-/// team"` -> `"this is a *** for the team"`;
-/// `"https://storage.googleapis.com/public-bucket/x"` ->
-/// `"https://storage.***/public-bucket/x"`;
-/// `"https://accounts.google.com/o/oauth2/auth"` -> `"***"`; `"deploying
-/// my-project-1234 to staging"` -> `"deploying *** to staging"`. That is not
-/// cosmetic: the corrupted value goes into a log that cannot be rewritten,
-/// and what it erases is *which host a step actually contacted* — an
-/// incident responder reading `https://storage.***/...` cannot tell a
-/// legitimate bucket from an exfiltration endpoint (ruling P30).
+/// Redaction is now **provenance-based**, and it happens in
+/// `crate::expr`, not here: a value is replaced by `***` in the logged
+/// rendering because the expression that produced it read a root bound
+/// through [`crate::expr::ExprContext::set_secret`] — see that module's
+/// "Provenance-based redaction" section for the full propagation table.
+/// [`Executor::dispatch_step`] logs
+/// [`crate::expr::Interpolated::redacted_for_logging`] and this function only
+/// runs on top of that already-redacted rendering.
 ///
-/// **Ruling P30's fix (this round): only expand leaves reachable under a
-/// sensitive key name**, not every string leaf regardless of what field it
-/// sits under. [`is_sensitive_json_leaf_key`] lists the key names this
-/// walk treats as sensitive (`private_key`, `token`, `secret`, `password`,
-/// `client_secret`, and the handful of close variants named there); once
-/// the walk enters a subtree rooted at one of those keys, every string leaf
-/// under it (recursively, still subject to [`MIN_REDACTABLE_SECRET_LEN`])
-/// is collected — an ordinary key like `type`/`token_uri`/`project_id` is
-/// not sensitive by name, so its value is never added as a needle, and the
-/// four corrupted strings above stop being corrupted. `private_key` stays
-/// exactly as protected as fix round 1 left it, because `private_key` is
-/// itself one of the sensitive names. This still does not catch a
-/// non-string JSON leaf (numeric/boolean) for the same reason a numeric
-/// top-level secret isn't caught, and it does not catch a sensitive value
-/// sitting under a key name outside the list above — narrower coverage in
-/// exchange for not destroying unrelated forensic content, which is the
-/// trade ruling P30 asks for explicitly rather than leaving unscoped.
+/// **What is left for this function to catch, and why it stays:** taint
+/// cannot see a credential the workflow author **pasted literally into the
+/// YAML** — that text was never derived from a `secrets.*` lookup, so no
+/// provenance attaches to it. Exact-match needles for the whole declared
+/// secret values close exactly that case, and that needle set is *bounded and
+/// exact*: it is precisely what the operator declared, one string per secret.
 ///
-/// The cost of this fix: one `serde_json::from_str` attempt per secret per
-/// call (cheap — most secrets are not JSON and fail parsing immediately),
-/// plus a recursive walk of the parsed structure for the ones that are —
-/// unchanged in shape from fix round 1, just gated by key name during the
-/// walk rather than after it. See [`redaction_needles`]'s own doc comment
-/// for fix round 2, item 5's change to *when* this walk runs (once per run,
-/// not once per dispatched step) and the measured cost that fix removes.
+/// **What was deleted, and why.** Two earlier rounds expanded this needle set
+/// by parsing each JSON-valued secret and adding its string *leaves* as
+/// needles. Round 1 added every leaf, which turned a real GCP service-account
+/// key's public constants into global find-and-replace needles and corrupted
+/// 4 of 4 ordinary strings measured (`"deploying my-project-1234 to staging"`
+/// -> `"deploying *** to staging"`, and three more). Round 2 narrowed that to
+/// leaves under a list of credential-sounding key names, which then
+/// **under**-redacted 29 real credential field names measured end to end —
+/// including all three fields of the JSON `aws sts assume-role` returns.
+/// Both failures are the same failure: the set of credential field names in
+/// the world is unbounded, so any list of them is wrong in one direction or
+/// the other. The derived-leaf expansion is therefore deleted outright rather
+/// than tuned a third time; provenance covers every derived value the earlier
+/// lists were reaching for, without needing to name any of them. Keep
+/// bounded, delete unbounded.
+///
+/// **Consequence for [`MIN_REDACTABLE_SECRET_LEN`]:** it now gates only whole
+/// declared secrets, which [`Executor::new`] already rejects below the floor.
+/// The sub-floor *derived* leaf that used to slip through silently (a
+/// `{"password":"9182"}` field inside an accepted 44-byte secret) is covered
+/// by provenance instead, where no length floor applies at all — because a
+/// whole substitution is replaced, not a substring searched for.
 pub fn redact_known_secrets(value: &Value, secrets: &HashMap<String, String>) -> Value {
     let needles = redaction_needles(secrets);
     redact_with_needles(value, &needles)
 }
 
-/// A secret value (or a JSON-leaf extracted from one) shorter than this is
-/// never used as a redaction needle — see [`redact_known_secrets`]'s "What
+/// A declared secret value shorter than this is never used as a redaction
+/// needle (fix round 3: it is the *only* thing that can be a needle at all,
+/// the derived-leaf expansion having been deleted) — see
+/// [`redact_known_secrets`]'s "What
 /// this function does and does not catch" section for why, and
 /// [`ExecutorError::SecretTooShortToRedact`] for how a whole secret this
 /// short is now refused before a run ever starts (fix round 2, item 3).
@@ -880,142 +1012,33 @@ pub fn redact_known_secrets(value: &Value, secrets: &HashMap<String, String>) ->
 /// cause over-redaction; not derived from any formal analysis.
 const MIN_REDACTABLE_SECRET_LEN: usize = 8;
 
-/// Key names (case-insensitive) whose value — or, for an object/array
-/// value, every string leaf beneath it — [`collect_sensitive_string_leaves`]
-/// treats as a redaction needle when found inside a JSON-valued secret.
-/// Deliberately narrow (ruling P30, fix round 2 item 4): a name here is a
-/// commitment that *anything* nested under a key with this name is
-/// redaction-worthy, so the list stays limited to names that are
-/// specifically about holding credential material, not merely
-/// GCP/AWS/kubeconfig-shaped. See [`redact_known_secrets`]'s "A JSON-valued
-/// secret is redacted leaf-by-leaf" section for the over-redaction this
-/// list exists to avoid repeating.
-const SENSITIVE_JSON_LEAF_KEYS: &[&str] = &[
-    "private_key",
-    "privatekey",
-    "token",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "secret",
-    "client_secret",
-    "password",
-    "passwd",
-    "api_key",
-    "apikey",
-];
-
-/// Case-insensitive exact-name match against [`SENSITIVE_JSON_LEAF_KEYS`].
-/// Exact match, not substring — a substring match (`key.contains("token")`)
-/// would itself reintroduce a narrower version of the same over-redaction
-/// this list exists to close, e.g. flagging `token_uri` (a real GCP field
-/// whose *value* is an ordinary public endpoint) as sensitive merely
-/// because it contains "token".
-fn is_sensitive_json_leaf_key(key: &str) -> bool {
-    SENSITIVE_JSON_LEAF_KEYS
-        .iter()
-        .any(|k| key.eq_ignore_ascii_case(k))
-}
-
 /// Builds the flat list of strings [`redact_with_needles`] scans for: each
-/// secret's own whole-string value, plus — fix round 1, item 6, narrowed by
-/// fix round 2, item 4 (ruling P30) — every string leaf reachable under a
-/// [`is_sensitive_json_leaf_key`] key when the secret's value happens to
-/// parse as JSON. Both are filtered through [`MIN_REDACTABLE_SECRET_LEN`].
+/// secret's own whole-string value, and **nothing else** (ruling P33, fix
+/// round 3). The derived-leaf expansion this function used to perform — parse
+/// each JSON-valued secret, add some or all of its string leaves as needles —
+/// is deleted; see [`redact_known_secrets`]'s "This is a BACKSTOP" section
+/// for why both the broad and the narrow version of it were wrong, and where
+/// derived values are covered instead. The remaining set is one string per
+/// declared secret, filtered through [`MIN_REDACTABLE_SECRET_LEN`].
 ///
 /// **Fix round 2, item 5 (M-2): called once per run from [`Executor::new`],
-/// not once per dispatched step.** Pre-fix, `redact_known_secrets` (the
-/// public function above, still used by external callers of this module)
-/// rebuilt this list — reparsing every secret as JSON and re-walking the
-/// result — on every single call, i.e. once per dispatched step.
-/// Security's measurement, pre-fix (debug build): a 2,000-leaf,
-/// 97,781-byte secret redacted into a 50-arg payload cost 24.4ms per call
-/// versus 13.7us with the list pre-built (1,780x); a fixed 2,000-needle
-/// list scanned against a 54KB payload cost 63.3ms versus 30.4us (2,080x);
-/// end-to-end across 100 steps with a 500-leaf secret, 70.0ms versus 3.9ms
-/// hoisted (18x). `Executor` now calls this function exactly once, in
-/// [`Executor::new`], and reuses the resulting `Vec<String>` for every
-/// step's [`redact_with_needles`] call via its `redaction_needles` field —
-/// the needle list is invariant for the life of a run, so building it once
-/// per run rather than once per step is exact, not an approximation.
-/// Independently re-measured post-fix (release build, min of 7,
-/// `Instant::now`) with a 500-leaf secret: 100 sequential calls to the
-/// public `redact_known_secrets` (each rebuilding the list from scratch —
-/// the pre-fix per-step shape) cost 19.03ms total; a single call building
-/// the same list once cost 191.10us — roughly 99.6x less total build time
-/// for the same 100 redactions, consistent in direction and order of
-/// magnitude with security's pre-fix numbers above. A full 100-step
-/// `run_to_completion` against the same secret (parses the workflow YAML,
-/// dispatches every step, builds the needle list exactly once) completed in
-/// 8.89ms — cheaper than the 100 isolated rebuild-per-call calls alone,
-/// despite doing strictly more work end to end.
+/// not once per dispatched step.** That hoist is kept. Its measured payoff,
+/// however, was almost entirely about the JSON re-parse and leaf walk this
+/// round deleted: the pre-hoist figures recorded here (security, debug
+/// build — a 2,000-leaf, 97,781-byte secret costing 24.4ms per call versus
+/// 13.7us pre-built, 1,780x; and 70.0ms versus 3.9ms end to end over 100
+/// steps, 18x) are figures for code that no longer exists, and are retained
+/// only as the history of why the hoist happened. **What this function costs
+/// now is unmeasured** and is one `String` clone per declared secret; the
+/// hoist stays because it is still exact (the needle list is invariant for
+/// the life of a run) and costs nothing to keep, not because a current
+/// measurement justifies it.
 fn redaction_needles(secrets: &HashMap<String, String>) -> Vec<String> {
-    let mut needles = Vec::new();
-    for raw in secrets.values() {
-        if raw.len() >= MIN_REDACTABLE_SECRET_LEN {
-            needles.push(raw.clone());
-        }
-        if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
-            collect_sensitive_string_leaves(&parsed, &mut needles);
-        }
-    }
-    needles
-}
-
-/// Recursively collects every `Value::String` leaf reachable under a
-/// [`is_sensitive_json_leaf_key`] object key (that meets
-/// [`MIN_REDACTABLE_SECRET_LEN`]) into `out`. Used only to expand a
-/// JSON-valued secret into its component strings — see
-/// [`redaction_needles`] and, for why this is key-gated rather than
-/// unconditional, [`redact_known_secrets`]'s "A JSON-valued secret is
-/// redacted leaf-by-leaf" section (ruling P30).
-///
-/// Walks every object looking for a sensitive key; once one is found, every
-/// string leaf in the subtree rooted at that key's value is collected via
-/// [`collect_all_string_leaves`] — an object nested under a sensitive key
-/// does not need its *own* keys to also be individually sensitive (e.g.
-/// `"credentials": {"value": "..."}"` collects `"value"`'s string). A
-/// non-sensitive key's value is still recursed into, so a sensitive key
-/// nested deeper in the structure is still found.
-fn collect_sensitive_string_leaves(value: &Value, out: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for (k, v) in map {
-                if is_sensitive_json_leaf_key(k) {
-                    collect_all_string_leaves(v, out);
-                } else {
-                    collect_sensitive_string_leaves(v, out);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_sensitive_string_leaves(item, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Recursively collects every `Value::String` leaf of `value` (that meets
-/// [`MIN_REDACTABLE_SECRET_LEN`]) into `out`, unconditionally — the
-/// unfiltered walk [`collect_sensitive_string_leaves`] switches to once it
-/// has already established that `value` sits under a sensitive key.
-fn collect_all_string_leaves(value: &Value, out: &mut Vec<String>) {
-    match value {
-        Value::String(s) if s.len() >= MIN_REDACTABLE_SECRET_LEN => out.push(s.clone()),
-        Value::Array(items) => {
-            for item in items {
-                collect_all_string_leaves(item, out);
-            }
-        }
-        Value::Object(map) => {
-            for v in map.values() {
-                collect_all_string_leaves(v, out);
-            }
-        }
-        _ => {}
-    }
+    secrets
+        .values()
+        .filter(|raw| raw.len() >= MIN_REDACTABLE_SECRET_LEN)
+        .cloned()
+        .collect()
 }
 
 /// The actual recursive redaction walk, over a pre-built flat `needles`

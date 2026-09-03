@@ -922,12 +922,24 @@ fn a_secret_shorter_than_the_redaction_floor_is_rejected_at_construction() {
     let err = Executor::new(&def, &mut sink, ctx)
         .err()
         .expect("a 7-byte secret must be refused at construction, not silently unprotected");
-    if let ExecutorError::SecretTooShortToRedact { name, len } = err {
+    if let ExecutorError::SecretTooShortToRedact { name } = &err {
         assert_eq!(name, "SHORT");
-        assert_eq!(len, 7);
     } else {
         panic!("unexpected ExecutorError variant: {err:?}");
     }
+    // Fix round 3: the secret's own byte length is a length oracle on a
+    // credential and must appear neither as a field (checked by the
+    // destructuring above, which would not compile if `len` still existed)
+    // nor in the rendered message.
+    let rendered = err.to_string();
+    assert!(
+        !rendered.contains('7'),
+        "the rejection message must not report the secret's actual byte length: {rendered}"
+    );
+    assert!(
+        rendered.contains("SHORT") && rendered.contains('8'),
+        "it must still name the secret and the fixed minimum: {rendered}"
+    );
 }
 
 #[test]
@@ -943,12 +955,16 @@ fn a_secret_exactly_at_the_redaction_floor_is_accepted() {
     );
 }
 
-// ---- Fix round 2, item 4 (ruling P30): a JSON-valued secret's leaf
-// expansion is gated to sensitive key names, so it no longer corrupts
-// ordinary public constants that happen to be leaves of the same secret
-// (e.g. a real GCP service-account key's `type`/`token_uri`/`project_id`
-// fields) while still catching the actually-sensitive leaf
-// (`private_key`). ----
+// ---- No over-redaction of unrelated text. Written for fix round 2's
+// key-name gating (ruling P30) and KEPT UNCHANGED through fix round 3's move
+// to provenance (ruling P33), which deleted that gating entirely: this is
+// P30's original, legitimate concern and it must not regress. Under
+// provenance the four GCP public constants pass through because they were
+// never derived from a `secrets.*` lookup — they are literal `with:` text —
+// and the only remaining needle is the whole secret's own JSON string, which
+// none of them contains. The `private_key` half of the test now passes
+// because `json(secrets.GCP_KEY).private_key` read the secrets root, not
+// because `private_key` is a name anything recognises. ----
 
 #[test]
 fn json_secret_leaf_expansion_does_not_corrupt_unrelated_public_constants() {
@@ -1034,4 +1050,751 @@ steps:
              unmodified: expected {expected:?} in {ordinary_logged}"
         );
     }
+}
+
+// ============================================================================
+// Fix round 3 (ruling P33): redaction is PROVENANCE-based.
+//
+// A value is redacted in the logged rendering because of WHERE IT CAME FROM —
+// it was computed by reading `secrets.*` — never because of what a JSON key
+// it landed under happens to be called, and never because of how long it is.
+// The name-based `SENSITIVE_JSON_LEAF_KEYS` expansion is deleted; what stays
+// is one bounded backstop, exact-match needles for the whole declared secret
+// values, for a credential an author pasted literally into the YAML.
+//
+// Every test below drives the real public API end to end
+// (`parse_workflow` -> `Executor::new` -> `run_to_completion`) and asserts on
+// the emitted `EventPayload` and the returned `StepOutcome`, on parsed
+// structure rather than serialized JSON text (ruling P29).
+// ============================================================================
+
+/// Runs a one-step workflow whose `emit:` body is `{ probe: <field> }` and
+/// returns `(logged rendering of probe, real value of probe)` — the logged
+/// half read back out of the persisted `EventPayload::TaskCreated`, the real
+/// half out of `StepOutcome.output`, which is what a dependent step reads and
+/// what Task 8's durability layer hands onward.
+///
+/// Both halves come from ONE `run_to_completion`, so every test using this
+/// helper is inherently a dual-render test: it cannot pass by redacting the
+/// dispatched value too.
+fn probe_emit(field: &str, secrets: &[(&str, &str)]) -> (serde_json::Value, serde_json::Value) {
+    let yaml = format!(
+        "name: probe\nversion: 1\ninputs: {{}}\ndefaults: {{ isolation: worktree }}\n\
+         permissions: {{ default: deny, unattended: {{ escalate: fail }} }}\n\
+         steps:\n  - id: probe\n    emit: {{ probe: \"{field}\" }}\n"
+    );
+    let def =
+        parse_workflow(&yaml).unwrap_or_else(|e| panic!("probe YAML must parse: {e} ({yaml})"));
+    let mut sink = RecordingSink(Vec::new());
+    let mut secret_map = HashMap::new();
+    for (k, v) in secrets {
+        secret_map.insert((*k).to_string(), (*v).to_string());
+    }
+    let ctx = RunContext {
+        inputs: serde_json::json!({"clean": "ordinary-input-value"}),
+        vars: serde_json::json!({"list": [10, 11, 12]}),
+        secrets: secret_map,
+        run_id: roundhouse_flow::exec::RunId::new(),
+    };
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+    assert!(
+        matches!(outcomes[0].status, StepStatus::Completed),
+        "probe step must complete, got {:?}",
+        outcomes[0].status
+    );
+    let created = sink
+        .0
+        .iter()
+        .find(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .expect("the emit: step was persisted");
+    let logged = created.payload_json["TaskCreated"]["input"]["Json"]["probe"].clone();
+    let real = outcomes[0].output["probe"].clone();
+    (logged, real)
+}
+
+fn redacted() -> serde_json::Value {
+    serde_json::json!("***")
+}
+
+/// The exact 29 credential key names measured leaking in cleartext under the
+/// name-list design (fix round 2), plus the camelCase forms whose snake_case
+/// spellings were on the list. Under provenance the list is irrelevant — it
+/// is kept as a regression corpus, not as a mechanism.
+const CREDENTIAL_KEY_NAMES_THE_NAME_LIST_MISSED: &[&str] = &[
+    "AccessKeyId",
+    "SecretAccessKey",
+    "SessionToken",
+    "connection_string",
+    "ssh_private_key",
+    "credentials",
+    "credential",
+    "auth",
+    "authorization",
+    "bearer",
+    "signature",
+    "cert",
+    "secret_key",
+    "secretKey",
+    "session_token",
+    "sas_token",
+    "aws_secret_access_key",
+    "aws_session_token",
+    "secret_access_key",
+    "pwd",
+    "webhook_secret",
+    "signing_secret",
+    "signing_key",
+    "encryption_key",
+    "personal_access_token",
+    "oauth_token",
+    "client_key",
+    "client_email",
+    "certificate",
+];
+
+#[test]
+fn every_credential_key_name_the_name_list_missed_is_redacted_by_provenance() {
+    // Payload, per row: a JSON-valued secret `{"<key>": "MARKER-<key>-0001"}`
+    // and an `emit:` step whose only field is
+    // `${{ json(secrets.K).<key> }}`. The marker is never a substring of the
+    // whole-secret backstop needle in a way the needle can match (the needle
+    // is the entire JSON text), so a pass here is provenance doing the work,
+    // not the backstop.
+    for key in CREDENTIAL_KEY_NAMES_THE_NAME_LIST_MISSED {
+        let marker = format!("MARKER-{key}-0001");
+        let secret = serde_json::json!({ *key: marker.clone() }).to_string();
+        let (logged, real) = probe_emit(
+            &format!("${{{{ json(secrets.K).{key} }}}}"),
+            &[("K", &secret)],
+        );
+        assert_eq!(
+            logged,
+            redacted(),
+            "a credential under the key {key:?} must be redacted in the logged rendering"
+        );
+        assert_eq!(
+            real,
+            serde_json::json!(marker),
+            "…while the real value still reaches the dispatched step (key {key:?})"
+        );
+    }
+}
+
+#[test]
+fn the_key_name_key_alone_is_redacted_by_provenance() {
+    // Separated from the table above only because `key` is also the name of
+    // the secret binding in some real workflows and reads confusingly inline.
+    let secret = serde_json::json!({ "key": "MARKER-bare-key-0002" }).to_string();
+    let (logged, real) = probe_emit("${{ json(secrets.K).key }}", &[("K", &secret)]);
+    assert_eq!(logged, redacted());
+    assert_eq!(real, serde_json::json!("MARKER-bare-key-0002"));
+}
+
+#[test]
+fn the_camel_case_token_key_names_are_redacted_by_provenance() {
+    // `accessToken`/`refreshToken` — the camelCase spellings whose
+    // snake_case forms WERE on the deleted name list, which is exactly the
+    // shape that makes a name list unbounded.
+    for key in ["accessToken", "refreshToken"] {
+        let marker = format!("MARKER-{key}-0003");
+        let secret = serde_json::json!({ key: marker.clone() }).to_string();
+        let (logged, real) = probe_emit(
+            &format!("${{{{ json(secrets.K).{key} }}}}"),
+            &[("K", &secret)],
+        );
+        assert_eq!(logged, redacted(), "camelCase key {key:?} must redact");
+        assert_eq!(real, serde_json::json!(marker));
+    }
+}
+
+#[test]
+fn the_literal_aws_sts_assume_role_credential_blob_is_redacted_field_by_field() {
+    // Payload: the exact, unmodified JSON shape `aws sts assume-role`
+    // returns. None of its three field names matched the deleted name list,
+    // so all three leaked in cleartext under fix round 2.
+    let secret = serde_json::json!({
+        "AccessKeyId": "ASIAMARKERAKID0004",
+        "SecretAccessKey": "MARKER-SECRET-ACCESS-KEY-0004",
+        "SessionToken": "MARKER-SESSION-TOKEN-0004",
+    })
+    .to_string();
+    for (field, expected) in [
+        ("AccessKeyId", "ASIAMARKERAKID0004"),
+        ("SecretAccessKey", "MARKER-SECRET-ACCESS-KEY-0004"),
+        ("SessionToken", "MARKER-SESSION-TOKEN-0004"),
+    ] {
+        let (logged, real) = probe_emit(
+            &format!("${{{{ json(secrets.K).{field} }}}}"),
+            &[("K", &secret)],
+        );
+        assert_eq!(logged, redacted(), "STS field {field:?} must redact");
+        assert_eq!(real, serde_json::json!(expected));
+    }
+}
+
+#[test]
+fn a_credential_nested_under_a_non_sensitive_parent_is_redacted() {
+    // Payload: `{"Credentials": {"SecretAccessKey": "MARKER-NESTED-0005"}}` —
+    // the AWS `assume-role` envelope, where the outer key is not itself
+    // credential-shaped.
+    let secret =
+        serde_json::json!({"Credentials": {"SecretAccessKey": "MARKER-NESTED-0005"}}).to_string();
+    let (logged, real) = probe_emit(
+        "${{ json(secrets.K).Credentials.SecretAccessKey }}",
+        &[("K", &secret)],
+    );
+    assert_eq!(logged, redacted());
+    assert_eq!(real, serde_json::json!("MARKER-NESTED-0005"));
+}
+
+#[test]
+fn an_array_of_credential_objects_is_redacted_through_the_index() {
+    // Payload: the `.dockerconfigjson` shape — an array of objects, reached
+    // by index, then by field.
+    let secret = serde_json::json!({"auths": [{"password": "MARKER-DOCKERCFG-0006"}]}).to_string();
+    let (logged, real) = probe_emit(
+        "${{ json(secrets.K).auths[0].password }}",
+        &[("K", &secret)],
+    );
+    assert_eq!(logged, redacted());
+    assert_eq!(real, serde_json::json!("MARKER-DOCKERCFG-0006"));
+}
+
+#[test]
+fn a_top_level_json_array_secret_is_redacted_through_the_index() {
+    // Payload: a secret whose whole value is a JSON *array*. The deleted
+    // leaf walk dropped these entirely (its `_ => {}` arm had no object key
+    // above the leaf to test).
+    let secret = serde_json::json!(["MARKER-TOP-ARRAY-0007", "second"]).to_string();
+    let (logged, real) = probe_emit("${{ json(secrets.K)[0] }}", &[("K", &secret)]);
+    assert_eq!(logged, redacted());
+    assert_eq!(real, serde_json::json!("MARKER-TOP-ARRAY-0007"));
+}
+
+#[test]
+fn a_top_level_bare_string_secret_is_redacted() {
+    // Payload: a plain, non-JSON secret value referenced directly. Both
+    // provenance and the whole-value backstop cover this one; it is asserted
+    // because the brief names it as a shape that must not regress.
+    let (logged, real) = probe_emit(
+        "${{ secrets.K }}",
+        &[("K", "MARKER-BARE-STRING-SECRET-0008")],
+    );
+    assert_eq!(logged, redacted());
+    assert_eq!(real, serde_json::json!("MARKER-BARE-STRING-SECRET-0008"));
+}
+
+#[test]
+fn a_derived_leaf_shorter_than_the_redaction_floor_is_still_redacted() {
+    // The brief's item 3, verbatim: `{"password":"9182","token":"abcdefghij"}`
+    // is 44 bytes, so `Executor::new` accepts it, and pre-fix the run emitted
+    // `{"cmd":["9182","***"]}` — the 4-byte leaf below
+    // `MIN_REDACTABLE_SECRET_LEN` was silently unprotected. Provenance has no
+    // length floor at all: a whole substitution is replaced, not a substring
+    // searched for.
+    let secret = r#"{"password":"9182","token":"abcdefghij"}"#;
+    assert_eq!(secret.len(), 40, "the payload's own size, stated");
+    let yaml = r#"
+name: short-derived-leaf
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: a
+    emit:
+      cmd:
+        - "${{ json(secrets.K).password }}"
+        - "${{ json(secrets.K).token }}"
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "K", secret);
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let created = sink
+        .0
+        .iter()
+        .find(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .expect("the emit: step was persisted");
+    assert_eq!(
+        created.payload_json["TaskCreated"]["input"]["Json"]["cmd"],
+        serde_json::json!(["***", "***"]),
+        "both leaves redact, including the 4-byte one"
+    );
+    assert_eq!(
+        outcomes[0].output["cmd"],
+        serde_json::json!(["9182", "abcdefghij"]),
+        "…while the real values still reach the dispatched step"
+    );
+}
+
+#[test]
+fn the_real_value_reaches_dispatch_while_only_the_logged_copy_is_redacted() {
+    // The dual-render property, asserted in one test on one run, plus the
+    // cross-step propagation that makes it non-trivial.
+    //
+    // Payload: step `a` emits `{ body: "${{ json(secrets.K).password }}" }`
+    // for the secret `{"password":"9182"}`; step `b` reads back
+    // `${{ steps.a.output.body }}` (a value that was NEVER a `secrets.*`
+    // lookup of its own, and whose text the whole-secret backstop cannot
+    // match) and also `${{ steps.a.status }}` (which carries no secret
+    // material and must stay readable in the log).
+    let yaml = r#"
+name: dual-render
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: a
+    emit: { body: "${{ json(secrets.K).password }}" }
+  - id: b
+    needs: [a]
+    emit: { relayed: "${{ steps.a.output.body }}", upstream_status: "${{ steps.a.status }}" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "K", r#"{"password":"9182"}"#);
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let created: Vec<&serde_json::Value> = sink
+        .0
+        .iter()
+        .filter(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .map(|e| &e.payload_json["TaskCreated"]["input"]["Json"])
+        .collect();
+    assert_eq!(created.len(), 2, "both emit: steps were persisted");
+
+    // Step a: logged redacted, real value intact.
+    assert_eq!(created[0]["body"], redacted());
+    assert_eq!(outcomes[0].output["body"], serde_json::json!("9182"));
+
+    // Step b: the relayed value is still secret-derived across the step
+    // boundary — logged redacted — and STILL reaches dispatch for real. A
+    // test asserting only the log would pass if the dispatched value were
+    // redacted too, which would break every workflow that legitimately
+    // passes a secret from one step to the next.
+    assert_eq!(created[1]["relayed"], redacted());
+    assert_eq!(outcomes[1].output["relayed"], serde_json::json!("9182"));
+
+    // …and the taint is path-precise, not "the whole upstream step": the
+    // upstream step's status is not secret material and stays readable.
+    assert_eq!(
+        created[1]["upstream_status"],
+        serde_json::json!("completed")
+    );
+    assert_eq!(
+        outcomes[1].output["upstream_status"],
+        serde_json::json!("completed")
+    );
+}
+
+#[test]
+fn a_clean_step_output_read_by_a_dependent_is_not_redacted() {
+    // The other side of cross-step propagation: an upstream step whose
+    // output owes nothing to a secret must not be redacted downstream just
+    // because the run has secrets bound. Payload: step `a` emits a literal
+    // `{"body": "ordinary-upstream-value"}`, step `b` relays it.
+    let yaml = r#"
+name: clean-relay
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: a
+    emit: { body: "ordinary-upstream-value" }
+  - id: b
+    needs: [a]
+    emit: { relayed: "${{ steps.a.output.body }}" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "K", "an-unused-but-declared-secret");
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    exec.run_to_completion().unwrap();
+
+    let created: Vec<&serde_json::Value> = sink
+        .0
+        .iter()
+        .filter(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .map(|e| &e.payload_json["TaskCreated"]["input"]["Json"])
+        .collect();
+    assert_eq!(
+        created[1]["relayed"],
+        serde_json::json!("ordinary-upstream-value"),
+        "a clean upstream output must not be redacted downstream"
+    );
+}
+
+#[test]
+fn reading_the_whole_steps_root_or_a_whole_step_entry_is_redacted_when_it_contains_secret_material()
+{
+    // A prefix of a secret path still *contains* the secret material, so it
+    // is redacted. Payload: step `a` emits a secret-derived body; step `b`
+    // interpolates the bare `${{ steps }}` root and the bare
+    // `${{ steps.a }}` entry, both of which render the secret as JSON text.
+    let yaml = r#"
+name: prefix-of-a-secret-path
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: a
+    emit: { body: "${{ json(secrets.K).password }}" }
+  - id: b
+    needs: [a]
+    emit: { whole_root: "${{ steps }}", whole_entry: "${{ steps.a }}" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "K", r#"{"password":"9182"}"#);
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let created: Vec<&serde_json::Value> = sink
+        .0
+        .iter()
+        .filter(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .map(|e| &e.payload_json["TaskCreated"]["input"]["Json"])
+        .collect();
+    assert_eq!(created[1]["whole_root"], redacted());
+    assert_eq!(created[1]["whole_entry"], redacted());
+    // The real values still carry the secret, unredacted.
+    assert!(outcomes[1].output["whole_entry"]
+        .as_str()
+        .expect("whole_entry rendered as a string")
+        .contains("9182"));
+}
+
+/// One row per operation the frozen `${{ }}` grammar can perform — the
+/// enumeration the whole correctness argument of provenance-based redaction
+/// rests on (ruling P33: "its risk is bounded and enumerable"). A missed
+/// propagation path is a credential leak into an append-only table.
+///
+/// `logged_is_redacted == true` means the logged rendering must be exactly
+/// `"***"`; `false` means it must be exactly `real_rendering`.
+struct TaintRow {
+    operation: &'static str,
+    expr: &'static str,
+    /// A substring the *real*, dispatched value must still contain — the
+    /// other half of the dual-render property, checked on every row.
+    real_contains: &'static str,
+    logged_is_redacted: bool,
+}
+
+/// `secrets.K` for the table below. 66 bytes, so it clears
+/// `MIN_REDACTABLE_SECRET_LEN`; `n` is a number so it can be used as an
+/// index, and none of its leaves is 8+ bytes of text that the whole-value
+/// backstop could match, so every redaction below is provenance's doing.
+const TAINT_TABLE_JSON_SECRET: &str =
+    r#"{"nested":{"pw":"9182"},"arr":["alpha-marker","beta-marker"],"n":1}"#;
+/// `secrets.T` for the table below.
+const TAINT_TABLE_STRING_SECRET: &str = "sk-TOKEN-MARKER-0009";
+
+const TAINT_PROPAGATION_TABLE: &[TaintRow] = &[
+    TaintRow {
+        operation: "string literal",
+        expr: "${{ 'plain-literal' }}",
+        real_contains: "plain-literal",
+        logged_is_redacted: false,
+    },
+    TaintRow {
+        operation: "number literal",
+        expr: "${{ 42 }}",
+        real_contains: "42",
+        logged_is_redacted: false,
+    },
+    TaintRow {
+        operation: "identifier bound by set() (clean root)",
+        expr: "${{ inputs.clean }}",
+        real_contains: "ordinary-input-value",
+        logged_is_redacted: false,
+    },
+    TaintRow {
+        operation: "unbound identifier (resolves to Null)",
+        expr: "${{ nosuchroot }}",
+        real_contains: "null",
+        logged_is_redacted: false,
+    },
+    TaintRow {
+        operation: "identifier bound by set_secret() (bare secret root)",
+        expr: "${{ secrets }}",
+        real_contains: TAINT_TABLE_STRING_SECRET,
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: ".field on a secret root",
+        expr: "${{ secrets.T }}",
+        real_contains: TAINT_TABLE_STRING_SECRET,
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "chained .field.field through a secret",
+        expr: "${{ json(secrets.K).nested.pw }}",
+        real_contains: "9182",
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "[idx] on a secret value",
+        expr: "${{ json(secrets.K).arr[1] }}",
+        real_contains: "beta-marker",
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "[idx] on a CLEAN value with a SECRET index expression",
+        expr: "${{ vars.list[json(secrets.K).n] }}",
+        real_contains: "11",
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "[idx] on a clean value with a clean index",
+        expr: "${{ vars.list[1] }}",
+        real_contains: "11",
+        logged_is_redacted: false,
+    },
+    TaintRow {
+        operation: "function call: len() over a secret",
+        expr: "${{ len(secrets.T) }}",
+        real_contains: "20",
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "function call: default() selecting the secret argument",
+        expr: "${{ default(secrets.T, 'fallback') }}",
+        real_contains: TAINT_TABLE_STRING_SECRET,
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "function call: default() with a secret in a non-first argument",
+        expr: "${{ default(nosuchroot, secrets.T) }}",
+        real_contains: TAINT_TABLE_STRING_SECRET,
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "function call: contains() reading a secret (boolean oracle)",
+        expr: "${{ contains(secrets.T, 'sk-') }}",
+        real_contains: "true",
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "function call: slice() over an array literal holding a secret",
+        expr: "${{ slice([secrets.T, 'x'], 0, 1) }}",
+        real_contains: TAINT_TABLE_STRING_SECRET,
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "function call: flatten() over nested array literals holding a secret",
+        expr: "${{ flatten([[secrets.T]]) }}",
+        real_contains: TAINT_TABLE_STRING_SECRET,
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "function call: json() parsing a secret",
+        expr: "${{ json(secrets.K) }}",
+        real_contains: "9182",
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "function call with only clean arguments",
+        expr: "${{ len(inputs.clean) }}",
+        real_contains: "20",
+        logged_is_redacted: false,
+    },
+    TaintRow {
+        operation: "function call: env() — deliberately unchanged, and clean",
+        expr: "${{ env('ROUNDHOUSE_FLOW_DEFINITELY_UNSET_VARIABLE_XYZ') }}",
+        real_contains: "null",
+        logged_is_redacted: false,
+    },
+    TaintRow {
+        operation: "array literal containing a secret",
+        expr: "${{ [secrets.T, 'x'] }}",
+        real_contains: TAINT_TABLE_STRING_SECRET,
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "array literal with only clean elements",
+        expr: "${{ ['x', 'y'] }}",
+        real_contains: "\"y\"",
+        logged_is_redacted: false,
+    },
+    TaintRow {
+        operation: "comparison with a secret operand (one-bit oracle)",
+        expr: "${{ secrets.T == 'nope' }}",
+        real_contains: "false",
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "comparison with only clean operands",
+        expr: "${{ 1 == 1 }}",
+        real_contains: "true",
+        logged_is_redacted: false,
+    },
+    TaintRow {
+        operation: "ternary with a secret condition",
+        expr: "${{ secrets.T == 'nope' ? 'branch-a' : 'branch-b' }}",
+        real_contains: "branch-b",
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "ternary whose SELECTED branch is a secret",
+        expr: "${{ 1 == 1 ? secrets.T : 'branch-b' }}",
+        real_contains: TAINT_TABLE_STRING_SECRET,
+        logged_is_redacted: true,
+    },
+    TaintRow {
+        operation: "ternary whose UNTAKEN branch is a secret (precision, not a leak)",
+        expr: "${{ 1 == 1 ? 'branch-a' : secrets.T }}",
+        real_contains: "branch-a",
+        logged_is_redacted: false,
+    },
+];
+
+#[test]
+fn taint_propagates_through_every_operation_the_evaluator_can_perform() {
+    for row in TAINT_PROPAGATION_TABLE {
+        let (logged, real) = probe_emit(
+            row.expr,
+            &[
+                ("K", TAINT_TABLE_JSON_SECRET),
+                ("T", TAINT_TABLE_STRING_SECRET),
+            ],
+        );
+        let real_str = real.as_str().unwrap_or_else(|| {
+            panic!(
+                "{}: the probe field interpolates to a string; got {real}",
+                row.operation
+            )
+        });
+        assert!(
+            real_str.contains(row.real_contains),
+            "{}: the REAL dispatched value must be intact and contain {:?}; got {real_str:?} \
+             (expr {})",
+            row.operation,
+            row.real_contains,
+            row.expr
+        );
+        if row.logged_is_redacted {
+            assert_eq!(
+                logged,
+                redacted(),
+                "{}: taint must propagate — the logged rendering must be `***` (expr {})",
+                row.operation,
+                row.expr
+            );
+        } else {
+            assert_eq!(
+                logged, real,
+                "{}: nothing secret was read, so the logged rendering must equal the real one \
+                 (expr {})",
+                row.operation, row.expr
+            );
+        }
+    }
+}
+
+#[test]
+fn the_taint_propagation_table_covers_both_directions() {
+    // Guard against a future edit that quietly turns the table into an
+    // all-redacted (or all-clean) list, which would still pass the test above
+    // while proving nothing about precision.
+    let redacting = TAINT_PROPAGATION_TABLE
+        .iter()
+        .filter(|r| r.logged_is_redacted)
+        .count();
+    let clean = TAINT_PROPAGATION_TABLE.len() - redacting;
+    assert!(
+        redacting >= 14 && clean >= 8,
+        "the table must exercise both propagation and non-propagation: {redacting} redacting, \
+         {clean} clean"
+    );
+}
+
+#[test]
+fn a_credential_pasted_literally_into_the_workflow_yaml_is_still_caught_by_the_bounded_backstop() {
+    // The one thing provenance cannot see, and the reason the whole-value
+    // needle backstop stays (ruling P33). Payload: a `with:` block containing
+    // the secret's exact text as a literal, with no `${{ }}` anywhere — so
+    // nothing was derived from `secrets.*` and taint attaches to nothing.
+    let literal = "sk-literal-pasted-into-yaml-0010";
+    let yaml = r#"
+name: literal-paste
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: a
+    tool: shell
+    with: { cmd: ["echo", "sk-literal-pasted-into-yaml-0010"] }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "K", literal);
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    exec.run_to_completion().unwrap();
+
+    let created = sink
+        .0
+        .iter()
+        .find(|e| matches!(e.kind, TaskKind::Shell))
+        .expect("shell task was emitted");
+    assert_eq!(
+        created.payload_json["TaskCreated"]["input"]["Json"]["cmd"],
+        serde_json::json!(["echo", "***"]),
+        "the exact-match backstop for whole declared secret values must still fire"
+    );
+}
+
+#[test]
+fn step_outcome_debug_bounds_the_status_message_not_only_the_output() {
+    // Fix round 3, bundled Minor: `StepOutcome`'s hand-written `Debug`
+    // bounded `output` but printed `status` through its derived impl,
+    // unbounded — and Task 8's `tracing::debug!(?outcomes)` is the obvious
+    // thing to write. Payload: 5,000 `'Q'` bytes of trailing garbage inside a
+    // `${{ }}` block in a `with:` field, which produces an `UnexpectedToken`
+    // whose echoed remainder `expr.rs`'s own truncation does not touch.
+    let junk = "Q".repeat(5_000);
+    let mut yaml = String::from(
+        "name: overlong-status-message\nversion: 1\ninputs: {}\ndefaults: { isolation: \
+         worktree }\npermissions: { default: deny, unattended: { escalate: fail } \
+         }\nsteps:\n  - id: a\n    tool: shell\n    with: { cmd: [\"echo\", \"${{ 1 ",
+    );
+    yaml.push_str(&junk);
+    yaml.push_str(" }}\"] }\n");
+    let def = parse_workflow(&yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({}))).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let debug_output = format!("{:?}", outcomes[0]);
+    assert!(
+        debug_output.len() < 700,
+        "StepOutcome's Debug must bound `status`'s message, not only `output`: {} bytes",
+        debug_output.len()
+    );
+    assert!(
+        !debug_output.contains(&junk),
+        "the full 5,000-byte echoed remainder must not reach a caller's `{{:?}}`"
+    );
+    assert!(
+        debug_output.contains("5057 bytes total"),
+        "the truncation must still state the original message length: {debug_output}"
+    );
+
+    // The same bound applies when a `StepStatus` is printed on its own, not
+    // only through `StepOutcome` — `tracing::debug!(?outcome.status)` is just
+    // as easy to write.
+    let status_debug = format!("{:?}", outcomes[0].status);
+    assert!(
+        status_debug.len() < 700 && !status_debug.contains(&junk),
+        "StepStatus's own Debug must be bounded too: {} bytes",
+        status_debug.len()
+    );
 }

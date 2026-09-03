@@ -75,6 +75,54 @@
 //!   anywhere, so there is no log-line leak surface *inside* `expr.rs`
 //!   itself to audit.
 //!
+//! # Provenance-based redaction (ruling P33) — the complete propagation table
+//!
+//! A value is redacted in a **logged** rendering because of *where it came
+//! from*, never because of what a JSON key it landed under happens to be
+//! called and never because of how long it is. [`ExprContext::set_secret`]
+//! (and [`ExprContext::set_with_secret_paths`], for a root that holds secret
+//! material only at particular paths) marks a binding as secret; every
+//! evaluation that reads through such a binding produces a value flagged
+//! `secret_derived`, and [`interpolate`]/[`interpolate_json`] replace that
+//! value's substitution, **in its entirety**, with [`REDACTION_PLACEHOLDER`]
+//! in the redacted half of the [`Interpolated`] they return. The unredacted
+//! half is untouched and is what must reach the dispatched task.
+//!
+//! This replaced a list of "sensitive-looking" JSON key names, which
+//! under-redacted 29 real credential field names measured end to end. The
+//! decisive property of provenance is not tidiness — it is that **its risk is
+//! bounded and enumerable**: this grammar has a finite set of operations, and
+//! taint's behaviour through each of them is listed here and tested
+//! individually (`tests/exec_sequencing.rs`'s `TAINT_PROPAGATION_TABLE`).
+//!
+//! | operation | taint of the result |
+//! |---|---|
+//! | string literal `'x'` / `"x"` | clean (workflow source text) |
+//! | number literal `12` | clean |
+//! | bare identifier bound by [`ExprContext::set`] | clean |
+//! | bare identifier bound by [`ExprContext::set_secret`] | **secret** |
+//! | bare identifier bound by [`ExprContext::set_with_secret_paths`] | **secret** — the whole object, secret sub-paths included, escapes |
+//! | unbound identifier (resolves to `Null`) | clean |
+//! | `.field` on a secret value | **secret** |
+//! | `.field` walking a root with declared secret paths | **secret** once the walked path reaches or passes a declared path; clean once it provably diverges from every one; still undecided while it is a strict prefix of one |
+//! | `[idx]` on a secret value, or on a walk not yet clear of a declared path | **secret** (no static knowledge of which entry is selected) |
+//! | `[idx]` where the *index expression* is secret | **secret** (the subscript chooses which element escapes) |
+//! | array literal `[a, b]` | **secret** iff any element is |
+//! | any function call `f(a, b)` | **secret** iff any argument is, read or not |
+//! | comparison `a == b` (and `!=`, `<`, `<=`, `>`, `>=`) | **secret** iff either side is — the resulting `Bool` is a one-bit oracle on the secret |
+//! | ternary `c ? a : b` | **secret** iff `c` is, or iff the *selected* branch is; the untaken branch's value never appears in the result so its taint is not propagated |
+//! | `env('NAME')` with no secret argument | **clean** — see the section below; `env()` is a separately escalated, unowned surface and its behaviour is deliberately unchanged here |
+//!
+//! Two consequences worth stating plainly. First, this is **deliberately
+//! conservative**: a value merely *computed from* a secret (its length, a
+//! comparison against it, a slice of it) logs as `***` even though it is not
+//! the secret. That over-redaction is predictable and local to the
+//! substitution, unlike the global find-and-replace it replaces. Second, it
+//! **cannot see a credential an author pasted literally into workflow YAML** —
+//! that text never came from a secret binding. `crate::exec` keeps one
+//! bounded, exact-match backstop for precisely that case: the whole declared
+//! `secrets` values, and nothing derived from them.
+//!
 //! ## `env()` is a second, independent secret-exposure surface — AWAITING AN OWNER
 //!
 //! `env()` (§8.9's own required function, `docs/architecture/05-scheduling-and-workflows.md:295-296`)
@@ -579,29 +627,152 @@ impl From<serde_json::Error> for JsonErrorCategory {
     }
 }
 
+/// Which parts of a bound root hold secret material, for taint tracking —
+/// see [`ExprContext::set_secret`] and the module doc comment's
+/// "Provenance-based redaction" section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RootProvenance {
+    /// Every value reachable through this root is secret-derived (`secrets`).
+    Whole,
+    /// Only these field paths *within* this root are secret-derived, each a
+    /// non-empty sequence of field names (the executor's `steps` root, where
+    /// `["<step id>", "output"]` is secret because that step computed its
+    /// output from a secret, while `["<step id>", "status"]` is not). Never
+    /// empty — an empty set is stored as no entry at all.
+    Paths(Vec<Vec<String>>),
+}
+
 /// The evaluation context: a flat table of named roots (`inputs`, `steps`,
 /// `secrets`, a `map.as` loop binding, …), each an arbitrary
 /// `serde_json::Value`. Lookups are exact-byte-string, case-sensitive —
 /// see the module doc comment's "Case sensitivity" section for why that
 /// matters beyond style.
+///
+/// Alongside each binding the context records **whether that binding is
+/// secret material** (ruling P33). That flag is the only input to redaction:
+/// a value is redacted in a logged rendering because it was computed from a
+/// root marked secret here, never because of what a JSON key it landed under
+/// happens to be called. See the module doc comment's "Provenance-based
+/// redaction" section for the full propagation table.
 #[derive(Default, Clone)]
 pub struct ExprContext {
     vars: HashMap<String, Value>,
+    /// Roots (or parts of roots) whose values are secret material. A root
+    /// absent from this map is entirely clean.
+    secret_provenance: HashMap<String, RootProvenance>,
 }
 
 impl ExprContext {
     pub fn new() -> Self {
         Self {
             vars: HashMap::new(),
+            secret_provenance: HashMap::new(),
         }
     }
 
     /// Binds `name` as a root usable from an expression (`name.field`,
-    /// `name[0]`, or bare `name`). Overwrites any existing binding of the
-    /// same name.
+    /// `name[0]`, or bare `name`), asserting that **nothing** reachable
+    /// through it is secret material. Overwrites any existing binding of the
+    /// same name, including its recorded provenance.
+    ///
+    /// **Forward hazard for whoever binds a new root.** This is the "clean"
+    /// constructor, and choosing it is a security assertion, not a default.
+    /// Task 6's `map.as` loop binding is the next new root: if the collection
+    /// being iterated was itself derived from a secret (`over:
+    /// "${{ json(secrets.K).items }}"`), each per-item binding must go
+    /// through [`Self::set_secret`], or taint stops at the loop boundary
+    /// exactly the way it stopped at the step boundary before
+    /// [`Self::set_with_secret_paths`] existed. Nothing in this type can
+    /// detect that mistake; the propagation table in the module doc comment
+    /// is where the rule is written down.
     pub fn set(&mut self, name: &str, value: Value) {
         self.vars.insert(name.to_string(), value);
+        self.secret_provenance.remove(name);
     }
+
+    /// Binds `name` as a root and marks **everything reachable through it**
+    /// as secret material. This is how `secrets` is bound: every value any
+    /// expression computes by reading through this root is tainted, and any
+    /// tainted value is replaced in its entirety by `***` in the *logged*
+    /// rendering [`interpolate`]/[`interpolate_json`] produce — never in the
+    /// real value, which still reaches the dispatched task.
+    pub fn set_secret(&mut self, name: &str, value: Value) {
+        self.vars.insert(name.to_string(), value);
+        self.secret_provenance
+            .insert(name.to_string(), RootProvenance::Whole);
+    }
+
+    /// Binds `name` as a root of which only the listed **field paths** are
+    /// secret material. This is how the executor binds `steps`: a step whose
+    /// output was computed from a secret contributes the path
+    /// `["<its id>", "output"]`, so `${{ steps.<id>.output.body }}` is
+    /// tainted while `${{ steps.<id>.status }}` — a fixed
+    /// `"completed"`/`"failed"`/`"skipped"` discriminant that carries no
+    /// secret material — stays clean and readable in the log.
+    ///
+    /// Reading a *prefix* of a secret path (a bare `${{ steps }}`, or
+    /// `${{ steps.<id> }}`) yields an object that still contains the secret
+    /// material below it, so it is tainted. Indexing with `[..]` anywhere
+    /// along a prefix is tainted too, because this evaluator cannot tell
+    /// which entry an arbitrary index expression selects. An empty
+    /// `secret_paths`, or paths that are all empty, is exactly equivalent to
+    /// [`Self::set`].
+    pub fn set_with_secret_paths<I>(&mut self, name: &str, value: Value, secret_paths: I)
+    where
+        I: IntoIterator<Item = Vec<String>>,
+    {
+        self.vars.insert(name.to_string(), value);
+        let paths: Vec<Vec<String>> = secret_paths.into_iter().filter(|p| !p.is_empty()).collect();
+        if paths.is_empty() {
+            self.secret_provenance.remove(name);
+        } else {
+            self.secret_provenance
+                .insert(name.to_string(), RootProvenance::Paths(paths));
+        }
+    }
+
+    /// Classifies the field path `walked` (relative to `root`) against the
+    /// root's declared secret paths. Only consulted by [`Parser::narrow`],
+    /// and only for a root recorded as [`RootProvenance::Paths`].
+    ///
+    /// - a declared path is a **prefix of** `walked` — the walk has reached
+    ///   into (or exactly onto) secret material: secret;
+    /// - `walked` is a **strict prefix of** a declared path — the walk is
+    ///   still above the secret material, and a further `.field` decides:
+    ///   undetermined;
+    /// - neither: clean.
+    fn classify_path(&self, root: &str, walked: &[String]) -> PathVerdict {
+        let paths = match self.secret_provenance.get(root) {
+            Some(RootProvenance::Whole) => return PathVerdict::Secret,
+            Some(RootProvenance::Paths(paths)) => paths,
+            None => return PathVerdict::Clean,
+        };
+        let mut undetermined = false;
+        for declared in paths {
+            if declared.len() <= walked.len() {
+                if declared[..] == walked[..declared.len()] {
+                    return PathVerdict::Secret;
+                }
+            } else if declared[..walked.len()] == walked[..] {
+                undetermined = true;
+            }
+        }
+        if undetermined {
+            PathVerdict::Undetermined
+        } else {
+            PathVerdict::Clean
+        }
+    }
+}
+
+/// The three outcomes of [`ExprContext::classify_path`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathVerdict {
+    Clean,
+    Secret,
+    /// Still above the declared secret material — a further `.field` may
+    /// reach it, so nothing is decided yet.
+    Undetermined,
 }
 
 impl fmt::Debug for ExprContext {
@@ -676,8 +847,114 @@ impl<'a> ExpressionSource<'a> {
 /// for why (ruling P22). `eval` carries the identical P20 trust assertion
 /// that [`interpolate`]/[`interpolate_json`] carry: the three public entry
 /// points into this module are symmetric, not two guarded and one bare.
-pub fn eval(expr: ExpressionSource<'_>, ctx: &ExprContext) -> Result<Value, ExprError> {
-    eval_inner(expr.0, ctx)
+pub fn eval(expr: ExpressionSource<'_>, ctx: &ExprContext) -> Result<Evaluated, ExprError> {
+    let (value, secret_derived) = eval_inner(expr.0, ctx)?;
+    Ok(Evaluated {
+        value,
+        secret_derived,
+    })
+}
+
+/// The text a tainted substitution is replaced by in a *logged* rendering —
+/// see [`Interpolated`]. The substitution is replaced **in its entirety**;
+/// this is never used as the replacement half of a find-and-replace over
+/// surrounding text (ruling P33).
+pub const REDACTION_PLACEHOLDER: &str = "***";
+
+/// What [`eval`]/[`eval_delimited_expression`] produce: the expression's
+/// value, plus whether computing it read a root bound through
+/// [`ExprContext::set_secret`]/[`ExprContext::set_with_secret_paths`].
+///
+/// The fields are public because `eval` has no dual rendering to confuse —
+/// there is only one value, and `secret_derived` tells a caller whether
+/// putting it in a log needs a `***` stand-in. Callers that want the
+/// stand-in produced for them should use [`interpolate`]/[`interpolate_json`]
+/// and their [`Interpolated`] result instead.
+#[derive(Clone, PartialEq)]
+pub struct Evaluated {
+    pub value: Value,
+    pub secret_derived: bool,
+}
+
+impl fmt::Debug for Evaluated {
+    /// Prints `***` in place of a secret-derived value, for the same reason
+    /// [`ExprContext`]'s own `Debug` impl prints only root names: this type
+    /// is `pub` and a caller's `tracing::debug!`/`dbg!`/`expect` reaches it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("Evaluated");
+        if self.secret_derived {
+            s.field("value", &REDACTION_PLACEHOLDER);
+        } else {
+            s.field("value", &self.value);
+        }
+        s.field("secret_derived", &self.secret_derived).finish()
+    }
+}
+
+/// Both renderings of one interpolation, produced by a **single** evaluation
+/// pass (ruling P33).
+///
+/// - the **unredacted** rendering is the real result, and is what must reach
+///   the dispatched task — a workflow that legitimately passes
+///   `${{ secrets.GH_TOKEN }}` to a step's `env:` has to receive the token,
+///   not `***`;
+/// - the **redacted** rendering is the only thing that may be logged: every
+///   substitution whose value was computed from a secret-marked root is
+///   replaced, in its entirety, by [`REDACTION_PLACEHOLDER`]. Surrounding
+///   literal template text is untouched — there is no find-and-replace over
+///   the output anywhere in this module.
+///
+/// The two fields are private and reachable only through accessors named for
+/// what they are *for*, so that a `sink.emit(..., x.unredacted_for_dispatch())`
+/// reads as obviously wrong at the call site rather than as a plausible field
+/// access. `Debug` prints only the redacted rendering.
+#[derive(Clone)]
+pub struct Interpolated<T> {
+    unredacted: T,
+    redacted: T,
+    secret_derived: bool,
+}
+
+impl<T> Interpolated<T> {
+    /// The real, unredacted result — for handing to the dispatched task,
+    /// never for logging or persisting.
+    pub fn unredacted_for_dispatch(&self) -> &T {
+        &self.unredacted
+    }
+
+    /// The real, unredacted result, by value — see
+    /// [`Self::unredacted_for_dispatch`].
+    pub fn into_unredacted_for_dispatch(self) -> T {
+        self.unredacted
+    }
+
+    /// The rendering safe to log or persist: every secret-derived
+    /// substitution replaced whole by [`REDACTION_PLACEHOLDER`].
+    pub fn redacted_for_logging(&self) -> &T {
+        &self.redacted
+    }
+
+    /// The redacted rendering, by value — see [`Self::redacted_for_logging`].
+    pub fn into_redacted_for_logging(self) -> T {
+        self.redacted
+    }
+
+    /// Whether any substitution in this interpolation read a secret-marked
+    /// root, i.e. whether the two renderings actually differ.
+    pub fn is_secret_derived(&self) -> bool {
+        self.secret_derived
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for Interpolated<T> {
+    /// Prints the redacted rendering only — the unredacted one is exactly
+    /// what this type exists to keep out of logs.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Interpolated")
+            .field("redacted", &self.redacted)
+            .field("secret_derived", &self.secret_derived)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The recursive-descent implementation behind [`eval`]. Private and
@@ -687,7 +964,7 @@ pub fn eval(expr: ExpressionSource<'_>, ctx: &ExprContext) -> Result<Value, Expr
 /// call for each `${{ }}` block it finds — that inner text is already known
 /// trusted by construction, because it was sliced out of a template that
 /// itself only reached [`interpolate`] through a [`TemplateSource`].
-fn eval_inner(expr: &str, ctx: &ExprContext) -> Result<Value, ExprError> {
+fn eval_inner(expr: &str, ctx: &ExprContext) -> Result<(Value, bool), ExprError> {
     let mut p = Parser {
         s: expr.as_bytes(),
         pos: 0,
@@ -695,7 +972,7 @@ fn eval_inner(expr: &str, ctx: &ExprContext) -> Result<Value, ExprError> {
         ctx,
     };
     p.skip_ws();
-    let v = p.parse_ternary()?;
+    let (v, secret_derived) = p.parse_ternary()?;
     p.skip_ws();
     if p.pos != p.s.len() {
         return Err(ExprError::UnexpectedToken(p.pos, expr[p.pos..].to_string()));
@@ -705,7 +982,7 @@ fn eval_inner(expr: &str, ctx: &ExprContext) -> Result<Value, ExprError> {
     // to be materialized here regardless of how much of the evaluation
     // above stayed borrowed. See the module doc comment's "Cost" section
     // for what staying borrowed through here actually saves.
-    Ok(v.into_owned())
+    Ok((v.into_owned(), secret_derived))
 }
 
 /// Evaluates a whole workflow-file field that §8.9 documents as always
@@ -753,7 +1030,7 @@ fn eval_inner(expr: &str, ctx: &ExprContext) -> Result<Value, ExprError> {
 pub fn eval_delimited_expression(
     field: TemplateSource<'_>,
     ctx: &ExprContext,
-) -> Result<Value, ExprError> {
+) -> Result<Evaluated, ExprError> {
     let text = field.0.trim();
     let after_open = text
         .strip_prefix("${{")
@@ -766,7 +1043,11 @@ pub fn eval_delimited_expression(
             text,
         )));
     }
-    eval_inner(inner.trim(), ctx)
+    let (value, secret_derived) = eval_inner(inner.trim(), ctx)?;
+    Ok(Evaluated {
+        value,
+        secret_derived,
+    })
 }
 
 /// Bounds how much of the offending field's own text
@@ -845,23 +1126,59 @@ impl<'a> TemplateSource<'a> {
 ///
 /// Takes a [`TemplateSource`], not a bare `&str` — see its doc comment for
 /// why (ruling P20).
-pub fn interpolate(template: TemplateSource<'_>, ctx: &ExprContext) -> Result<String, ExprError> {
-    let mut out = String::new();
-    let mut rest = template.0;
+///
+/// Returns **both** renderings from one pass (ruling P33): see
+/// [`Interpolated`]. Only the text spliced in for a secret-derived
+/// substitution differs between them — the template's own literal text is
+/// byte-identical in both, because this function never searches the output
+/// for anything to replace.
+pub fn interpolate(
+    template: TemplateSource<'_>,
+    ctx: &ExprContext,
+) -> Result<Interpolated<String>, ExprError> {
+    interpolate_inner(template.0, ctx)
+}
+
+/// The implementation behind [`interpolate`], also called by
+/// [`interpolate_json_inner`] for each string leaf — private and
+/// untyped-by-`TemplateSource` for the same reason [`eval_inner`] is (the
+/// trust assertion belongs once, at the public entry point).
+fn interpolate_inner(template: &str, ctx: &ExprContext) -> Result<Interpolated<String>, ExprError> {
+    let mut unredacted = String::new();
+    let mut redacted = String::new();
+    let mut secret_derived = false;
+    let mut rest = template;
     while let Some(start) = rest.find("${{") {
-        out.push_str(&rest[..start]);
+        // Literal template text: identical in both renderings, always.
+        unredacted.push_str(&rest[..start]);
+        redacted.push_str(&rest[..start]);
         let after = &rest[start + 3..];
         let end = find_closing_delimiter(after).ok_or(ExprError::Unterminated)?;
         let inner = &after[..end];
-        let value = eval_inner(inner.trim(), ctx)?;
-        out.push_str(&value_to_string(&value));
+        // One evaluation, two renderings — never evaluate twice, which would
+        // both double the cost and risk the logged copy diverging from the
+        // dispatched one.
+        let (value, block_is_secret) = eval_inner(inner.trim(), ctx)?;
+        let text = value_to_string(&value);
+        unredacted.push_str(&text);
+        if block_is_secret {
+            secret_derived = true;
+            redacted.push_str(REDACTION_PLACEHOLDER);
+        } else {
+            redacted.push_str(&text);
+        }
         // Resume scanning strictly after the consumed `}}`, in the
         // *original* template — never re-scan `value`'s own text. This is
         // what makes substitution single-pass.
         rest = &after[end + 2..];
     }
-    out.push_str(rest);
-    Ok(out)
+    unredacted.push_str(rest);
+    redacted.push_str(rest);
+    Ok(Interpolated {
+        unredacted,
+        redacted,
+        secret_derived,
+    })
 }
 
 /// Finds the byte offset of the first `}}` in `s` that is not inside a
@@ -1099,11 +1416,25 @@ impl<'a> JsonTemplateSource<'a> {
 ///
 /// Takes a [`JsonTemplateSource`], not a bare `&Value` — see its doc comment
 /// for why (ruling P20).
+///
+/// Returns **both** renderings from one pass (ruling P33): see
+/// [`Interpolated`]. A leaf whose interpolation read a secret-marked root is
+/// replaced, whole, by the string [`REDACTION_PLACEHOLDER`] in the redacted
+/// rendering — the leaf granularity is deliberate, and is what the brief for
+/// this change specifies: a `with:` leaf is one field value, and replacing it
+/// entirely makes the redaction unmistakable to a reader instead of producing
+/// a plausible-looking partial value. Leaves that read no secret, object
+/// keys, and non-string leaves are byte-identical in both renderings.
 pub fn interpolate_json(
     value: JsonTemplateSource<'_>,
     ctx: &ExprContext,
-) -> Result<Value, ExprError> {
-    interpolate_json_inner(value.0, ctx)
+) -> Result<Interpolated<Value>, ExprError> {
+    let (unredacted, redacted, secret_derived) = interpolate_json_inner(value.0, ctx)?;
+    Ok(Interpolated {
+        unredacted,
+        redacted,
+        secret_derived,
+    })
 }
 
 /// The recursive implementation behind [`interpolate_json`]. Private and
@@ -1111,27 +1442,60 @@ pub fn interpolate_json(
 /// once, at the public entry point, not re-asserted (or re-checked) at every
 /// recursive step over a value this function itself already knows is
 /// trusted by construction.
-fn interpolate_json_inner(value: &Value, ctx: &ExprContext) -> Result<Value, ExprError> {
+///
+/// Returns `(unredacted, redacted, any_leaf_was_secret_derived)`.
+#[allow(clippy::type_complexity)]
+fn interpolate_json_inner(
+    value: &Value,
+    ctx: &ExprContext,
+) -> Result<(Value, Value, bool), ExprError> {
     match value {
-        Value::String(s) => Ok(Value::String(interpolate(
-            TemplateSource::from_workflow_file(s),
-            ctx,
-        )?)),
+        Value::String(s) => {
+            let interpolated = interpolate_inner(s, ctx)?;
+            let redacted = if interpolated.secret_derived {
+                Value::String(REDACTION_PLACEHOLDER.to_string())
+            } else {
+                Value::String(interpolated.redacted)
+            };
+            Ok((
+                Value::String(interpolated.unredacted),
+                redacted,
+                interpolated.secret_derived,
+            ))
+        }
         Value::Array(items) => {
-            let resolved: Result<Vec<Value>, ExprError> = items
-                .iter()
-                .map(|v| interpolate_json_inner(v, ctx))
-                .collect();
-            Ok(Value::Array(resolved?))
+            let mut unredacted = Vec::with_capacity(items.len());
+            let mut redacted = Vec::with_capacity(items.len());
+            let mut secret_derived = false;
+            for item in items {
+                let (u, r, s) = interpolate_json_inner(item, ctx)?;
+                unredacted.push(u);
+                redacted.push(r);
+                secret_derived |= s;
+            }
+            Ok((
+                Value::Array(unredacted),
+                Value::Array(redacted),
+                secret_derived,
+            ))
         }
         Value::Object(map) => {
-            let mut resolved = serde_json::Map::with_capacity(map.len());
+            let mut unredacted = serde_json::Map::with_capacity(map.len());
+            let mut redacted = serde_json::Map::with_capacity(map.len());
+            let mut secret_derived = false;
             for (k, v) in map {
-                resolved.insert(k.clone(), interpolate_json_inner(v, ctx)?);
+                let (u, r, s) = interpolate_json_inner(v, ctx)?;
+                unredacted.insert(k.clone(), u);
+                redacted.insert(k.clone(), r);
+                secret_derived |= s;
             }
-            Ok(Value::Object(resolved))
+            Ok((
+                Value::Object(unredacted),
+                Value::Object(redacted),
+                secret_derived,
+            ))
         }
-        other => Ok(other.clone()),
+        other => Ok((other.clone(), other.clone(), false)),
     }
 }
 
@@ -1140,6 +1504,35 @@ struct Parser<'a> {
     pos: usize,
     depth: usize,
     ctx: &'a ExprContext,
+}
+
+/// Where the value currently in hand came from, during a `.field`/`[idx]`
+/// chain. Collapses to a plain `bool` (`is_secret_derived`) the moment the
+/// chain ends — the three-state form exists only so that a root holding
+/// secret material at *some* paths (the executor's `steps`) can be narrowed
+/// before the taint decision is made.
+#[derive(Clone)]
+enum ValueProvenance<'a> {
+    /// Nothing read so far touched secret material.
+    Clean,
+    /// Computed from secret material.
+    Secret,
+    /// The chain is at `root` plus the field path walked so far, which is
+    /// still a strict prefix of at least one declared secret path. If the
+    /// chain ends here the object in hand still *contains* that secret
+    /// material, so this collapses to secret; a following `.field` resolves
+    /// it one way or the other.
+    AbovePath { root: &'a str, walked: Vec<String> },
+}
+
+impl ValueProvenance<'_> {
+    /// Collapses to the flag every other part of the evaluator threads. An
+    /// unresolved [`ValueProvenance::AbovePath`] collapses to **secret**: the
+    /// value escaping is an object that still contains the secret material
+    /// below it.
+    fn is_secret_derived(&self) -> bool {
+        !matches!(self, ValueProvenance::Clean)
+    }
 }
 
 impl<'a> Parser<'a> {
@@ -1159,7 +1552,7 @@ impl<'a> Parser<'a> {
     /// every form of nesting (`[`, `(`, `? :`) recurses back through — see
     /// the module doc comment's "Cost" section. Counts and bounds its own
     /// recursion depth via [`MAX_EXPR_DEPTH`] before doing any work.
-    fn parse_ternary(&mut self) -> Result<Cow<'a, Value>, ExprError> {
+    fn parse_ternary(&mut self) -> Result<(Cow<'a, Value>, bool), ExprError> {
         self.depth += 1;
         if self.depth > MAX_EXPR_DEPTH {
             self.depth -= 1;
@@ -1170,41 +1563,55 @@ impl<'a> Parser<'a> {
         result
     }
 
-    fn parse_ternary_inner(&mut self) -> Result<Cow<'a, Value>, ExprError> {
-        let cond = self.parse_comparison()?;
+    /// Taint rule for the ternary: the result is secret-derived if the
+    /// *condition* was (it chose which value escapes, so the result leaks a
+    /// bit about the secret) **or** if the branch actually selected was. The
+    /// untaken branch's taint is deliberately not propagated: its value does
+    /// not appear in the result at all, so it cannot leak through it. Note
+    /// both branches are still *evaluated* — see the module doc comment's
+    /// "A ternary evaluates both branches" section, which is a separate,
+    /// documented property this rule does not change.
+    fn parse_ternary_inner(&mut self) -> Result<(Cow<'a, Value>, bool), ExprError> {
+        let (cond, cond_secret) = self.parse_comparison()?;
         self.skip_ws();
         if self.peek() == Some(b'?') {
             self.pos += 1;
             self.skip_ws();
-            let then_v = self.parse_ternary()?;
+            let (then_v, then_secret) = self.parse_ternary()?;
             self.skip_ws();
             if self.peek() != Some(b':') {
                 return Err(ExprError::UnexpectedToken(self.pos, "expected ':'".into()));
             }
             self.pos += 1;
             self.skip_ws();
-            let else_v = self.parse_ternary()?;
+            let (else_v, else_secret) = self.parse_ternary()?;
             return Ok(if truthy(cond.as_ref()) {
-                then_v
+                (then_v, cond_secret || then_secret)
             } else {
-                else_v
+                (else_v, cond_secret || else_secret)
             });
         }
-        Ok(cond)
+        Ok((cond, cond_secret))
     }
 
-    fn parse_comparison(&mut self) -> Result<Cow<'a, Value>, ExprError> {
-        let lhs = self.parse_primary_chain()?;
+    /// Taint rule for a comparison: the resulting `Bool` is secret-derived if
+    /// either side was. The boolean carries a bit of the secret's content
+    /// (`${{ secrets.T == 'guess' }}` is an oracle), so it is redacted.
+    fn parse_comparison(&mut self) -> Result<(Cow<'a, Value>, bool), ExprError> {
+        let (lhs, lhs_secret) = self.parse_primary_chain()?;
         self.skip_ws();
         for (tok, op) in COMPARISON_OPS {
             if self.starts_with(tok) {
                 self.pos += tok.len();
                 self.skip_ws();
-                let rhs = self.parse_primary_chain()?;
-                return Ok(Cow::Owned(Value::Bool(op(lhs.as_ref(), rhs.as_ref()))));
+                let (rhs, rhs_secret) = self.parse_primary_chain()?;
+                return Ok((
+                    Cow::Owned(Value::Bool(op(lhs.as_ref(), rhs.as_ref()))),
+                    lhs_secret || rhs_secret,
+                ));
             }
         }
-        Ok(lhs)
+        Ok((lhs, lhs_secret))
     }
 
     /// Resolves a primary value followed by zero or more `.field`/`[idx]`
@@ -1243,44 +1650,98 @@ impl<'a> Parser<'a> {
     /// [`eval`]'s own top-level `.into_owned()` is the only place left that
     /// unconditionally clones, and it clones only the one final result
     /// `eval` actually returns.
-    fn parse_primary_chain(&mut self) -> Result<Cow<'a, Value>, ExprError> {
+    ///
+    /// **Taint rules for the chain** (ruling P33). `.field` narrows: on a
+    /// [`ValueProvenance::AbovePath`] it extends the walked path and
+    /// re-classifies it against the root's declared secret paths; on an
+    /// already-secret value it stays secret. `[idx]` cannot be narrowed —
+    /// this evaluator does not know statically which entry an arbitrary index
+    /// expression selects — so anywhere above a secret path it escalates to
+    /// secret, and it additionally inherits the taint of the *index
+    /// expression itself*, because a secret used as a subscript selects which
+    /// element escapes and therefore leaks through the chosen value.
+    fn parse_primary_chain(&mut self) -> Result<(Cow<'a, Value>, bool), ExprError> {
         self.skip_ws();
-        let mut v = self.parse_primary()?;
+        let (mut v, mut prov) = self.parse_primary()?;
         loop {
             if self.peek() == Some(b'.') {
                 self.pos += 1;
                 let ident = self.parse_ident();
                 v = index_field(v, &ident);
+                prov = self.narrow(prov, ident);
             } else if self.peek() == Some(b'[') {
                 self.pos += 1;
                 self.skip_ws();
-                let idx_val = self.parse_ternary()?;
+                let (idx_val, idx_secret) = self.parse_ternary()?;
                 self.skip_ws();
                 if self.peek() != Some(b']') {
                     return Err(ExprError::UnexpectedToken(self.pos, "expected ']'".into()));
                 }
                 self.pos += 1;
                 v = index_array(v, idx_val.as_ref());
+                prov = if idx_secret || prov.is_secret_derived() {
+                    ValueProvenance::Secret
+                } else {
+                    ValueProvenance::Clean
+                };
             } else {
                 break;
             }
         }
-        Ok(v)
+        let secret_derived = prov.is_secret_derived();
+        Ok((v, secret_derived))
     }
 
-    fn parse_primary(&mut self) -> Result<Cow<'a, Value>, ExprError> {
+    /// Applies one `.field` step to a chain's provenance — see
+    /// [`Self::parse_primary_chain`]'s doc comment.
+    fn narrow(&self, prov: ValueProvenance<'a>, field: String) -> ValueProvenance<'a> {
+        match prov {
+            ValueProvenance::Clean => ValueProvenance::Clean,
+            ValueProvenance::Secret => ValueProvenance::Secret,
+            ValueProvenance::AbovePath { root, mut walked } => {
+                walked.push(field);
+                match self.ctx.classify_path(root, &walked) {
+                    PathVerdict::Secret => ValueProvenance::Secret,
+                    PathVerdict::Clean => ValueProvenance::Clean,
+                    PathVerdict::Undetermined => ValueProvenance::AbovePath { root, walked },
+                }
+            }
+        }
+    }
+
+    /// **Taint rules for a primary** (ruling P33): a string or number literal
+    /// is source text the workflow author typed, so it is clean; an array
+    /// literal is secret-derived if any element is; a function call is
+    /// secret-derived if **any** argument is, whether or not that particular
+    /// function reads it (`default(secrets.T, 'x')` is redacted even when it
+    /// returns `'x'`, and `len(secrets.T)` is redacted because the length is
+    /// a property of the secret). A bare identifier takes its provenance from
+    /// how [`ExprContext`] bound that root; an unbound identifier resolves to
+    /// `Null` and is clean.
+    fn parse_primary(&mut self) -> Result<(Cow<'a, Value>, ValueProvenance<'a>), ExprError> {
         self.skip_ws();
         match self.peek() {
-            Some(b'\'') | Some(b'"') => self.parse_string_literal().map(Cow::Owned),
-            Some(c) if c.is_ascii_digit() => self.parse_number().map(Cow::Owned),
-            Some(b'[') => self.parse_array_literal().map(Cow::Owned),
+            Some(b'\'') | Some(b'"') => Ok((
+                Cow::Owned(self.parse_string_literal()?),
+                ValueProvenance::Clean,
+            )),
+            Some(c) if c.is_ascii_digit() => {
+                Ok((Cow::Owned(self.parse_number()?), ValueProvenance::Clean))
+            }
+            Some(b'[') => {
+                let (arr, secret) = self.parse_array_literal()?;
+                Ok((Cow::Owned(arr), provenance_from_flag(secret)))
+            }
             Some(c) if c.is_ascii_alphabetic() || c == b'_' => {
                 let ident = self.parse_ident();
                 self.skip_ws();
                 if self.peek() == Some(b'(') {
                     self.pos += 1;
-                    let args = self.parse_args()?;
-                    call_function(&ident, args).map(Cow::Owned)
+                    let (args, any_arg_secret) = self.parse_args()?;
+                    Ok((
+                        Cow::Owned(call_function(&ident, args)?),
+                        provenance_from_flag(any_arg_secret),
+                    ))
                 } else {
                     // The load-bearing borrow: a bare root/identifier
                     // resolves directly against `ctx`'s own storage with no
@@ -1289,10 +1750,24 @@ impl<'a> Parser<'a> {
                     // subsequent `.field`/`[idx]` step, instead of cloning
                     // at each one, is what makes a long property chain
                     // over context data linear rather than quadratic.
-                    Ok(match self.ctx.vars.get(&ident) {
+                    //
+                    // `get_key_value` rather than `get` on the provenance
+                    // map: the returned key borrows from `ctx` for `'a`,
+                    // which is what lets `AbovePath` name the root without
+                    // allocating.
+                    let value = match self.ctx.vars.get(&ident) {
                         Some(v) => Cow::Borrowed(v),
                         None => Cow::Owned(Value::Null),
-                    })
+                    };
+                    let prov = match self.ctx.secret_provenance.get_key_value(ident.as_str()) {
+                        Some((_, RootProvenance::Whole)) => ValueProvenance::Secret,
+                        Some((name, RootProvenance::Paths(_))) => ValueProvenance::AbovePath {
+                            root: name.as_str(),
+                            walked: Vec::new(),
+                        },
+                        None => ValueProvenance::Clean,
+                    };
+                    Ok((value, prov))
                 }
             }
             _ => Err(ExprError::UnexpectedToken(
@@ -1392,11 +1867,12 @@ impl<'a> Parser<'a> {
     /// measured coefficient, why it is left open rather than capped, and why
     /// closing it in general was judged not worth the risk of a third
     /// pervasive-Cow-threading change to this same module in one fix round.
-    fn parse_array_literal(&mut self) -> Result<Value, ExprError> {
+    fn parse_array_literal(&mut self) -> Result<(Value, bool), ExprError> {
         self.pos += 1; // '['
-        let items = self.parse_args_until(b']')?;
-        Ok(Value::Array(
-            items.into_iter().map(Cow::into_owned).collect(),
+        let (items, any_secret) = self.parse_args_until(b']')?;
+        Ok((
+            Value::Array(items.into_iter().map(Cow::into_owned).collect()),
+            any_secret,
         ))
     }
 
@@ -1409,20 +1885,25 @@ impl<'a> Parser<'a> {
     /// owned data from a chosen argument (`default` returning the one
     /// branch it picked) calls `Cow::into_owned()`, and only on that one
     /// argument.
-    fn parse_args(&mut self) -> Result<Vec<Cow<'a, Value>>, ExprError> {
+    fn parse_args(&mut self) -> Result<(Vec<Cow<'a, Value>>, bool), ExprError> {
         self.parse_args_until(b')')
     }
 
-    fn parse_args_until(&mut self, close: u8) -> Result<Vec<Cow<'a, Value>>, ExprError> {
+    /// Also reports whether **any** collected argument was secret-derived —
+    /// the taint a function call or array literal inherits from its inputs.
+    fn parse_args_until(&mut self, close: u8) -> Result<(Vec<Cow<'a, Value>>, bool), ExprError> {
         let mut args = Vec::new();
+        let mut any_secret = false;
         self.skip_ws();
         if self.peek() == Some(close) {
             self.pos += 1;
-            return Ok(args);
+            return Ok((args, any_secret));
         }
         loop {
             self.skip_ws();
-            args.push(self.parse_ternary()?);
+            let (arg, arg_secret) = self.parse_ternary()?;
+            args.push(arg);
+            any_secret |= arg_secret;
             self.skip_ws();
             match self.peek() {
                 Some(b',') => {
@@ -1440,7 +1921,18 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        Ok(args)
+        Ok((args, any_secret))
+    }
+}
+
+/// Lifts a collapsed taint flag back into a [`ValueProvenance`] — used where
+/// a construct (array literal, function call) has already reduced its inputs
+/// to a single flag and there is no root left to narrow.
+fn provenance_from_flag(secret: bool) -> ValueProvenance<'static> {
+    if secret {
+        ValueProvenance::Secret
+    } else {
+        ValueProvenance::Clean
     }
 }
 
