@@ -482,9 +482,13 @@ fn tagged_anchor_alias_fanout(leaves: usize, fan: usize, levels: usize) -> Strin
 
 /// A generous ceiling for "the rejection did not itself cost what the
 /// attack used to cost". Measured through `parse_workflow`: every payload
-/// below is rejected in 0.8-35.2 ms release and 6.3-302 ms debug (debug is
-/// what `cargo test` builds), the slowest being the 260,364-byte fan-out at
-/// the byte cap. 10 s is ~33x the slowest debug figure — chosen so
+/// below is rejected in **0.6-24.5 ms release and 3.8-216.4 ms debug**
+/// (debug is what `cargo test` builds), the slowest being the 260,364-byte
+/// fan-out at the byte cap. Re-measured at fix round 3 over every payload
+/// `parse/mod.rs`'s history tables name; the previous figures here (and the
+/// two other sites quoting them) predated the ceiling tightening, which cut
+/// the node budget and with it the rejection cost. 10 s is ~46x the slowest
+/// debug figure — chosen so
 /// a contended CI runner cannot turn a timing margin into a failure inside
 /// a test whose real subject is a security property, following the
 /// precedent in `the_retracted_cap_claim_held_only_for_the_one_shape_it_measured`.
@@ -697,13 +701,21 @@ fn a_long_plain_numeric_scalar_aliased_many_times_is_rejected() {
     // Task X1 fix round 2, the Critical this round exists for, and the
     // third distinct axis this bound has had to grow to cover.
     //
-    // `serde_yaml`'s `visit_untagged_scalar` hands the visitor a DECODED
-    // value — `visit_f64(self, v: f64)` — so the expansion meter charges a
-    // plain numeric scalar `NODE_WEIGHT_BYTES` whether its source token was
-    // 3 bytes or 250,000, while `parse_f64` re-runs an O(token) `dec2flt`
-    // scan on every alias expansion. No refinement of the meter's unit can
-    // see this; `MAX_PLAIN_NUMERIC_DIGIT_RUN` bounds it in the source
-    // instead.
+    // `serde_yaml` hands the visitor a DECODED value —
+    // `visit_f64(self, v: f64)` — so the expansion meter charges a numeric
+    // scalar `NODE_WEIGHT_BYTES` whether its source token was 3 bytes or
+    // 250,000, while `parse_f64` re-runs an O(token) `dec2flt` scan on every
+    // alias expansion. No refinement of the meter's unit can see this;
+    // `MAX_PLAIN_NUMERIC_DIGIT_RUN` bounds it in the source instead.
+    //
+    // **This test covers the PLAIN route only, and that is all the bound
+    // covers.** Fix round 2's version of this comment attributed the
+    // dispatch to `visit_untagged_scalar` alone, which is reached only for
+    // `ScalarStyle::Plain`; `visit_scalar` has its own core-tag dispatch
+    // above it (`de.rs:882-884`) with no style check, and that route is
+    // still open. See
+    // `the_core_tag_route_to_visit_f64_is_open_and_this_pins_which_syntaxes_reach_it`
+    // and the UNBOUNDED row in `parse/mod.rs`'s axis inventory.
     //
     // Payload: `a: &f 1.777…` with 131,000 fractional digits, aliased
     // 43,648 times as `b: [*f,*f,…]` — 262,048 bytes, every bracket
@@ -782,6 +794,76 @@ fn a_long_plain_numeric_scalar_aliased_many_times_is_rejected() {
         elapsed < REJECTION_MUST_BE_CHEAP,
         "the walk must not run at all on this payload; took {elapsed:?}"
     );
+}
+
+#[test]
+fn the_core_tag_route_to_visit_f64_is_open_and_this_pins_which_syntaxes_reach_it() {
+    // Task X1 fix round 3. A CHARACTERIZATION test for an axis this crate
+    // does not close, not a bound. `parse/mod.rs`'s axis inventory records
+    // "non-string scalar source length / decode CPU" as UNBOUNDED; this is
+    // the executable half of that row.
+    //
+    // Why it is open, in one sentence: `serde_yaml`'s `visit_scalar`
+    // (`de.rs:858-900`) dispatches a core-tagged scalar to `parse_f64` and
+    // `visit_f64` at `de.rs:882-884` with **no `ScalarStyle::Plain` check**,
+    // while the equivalent check does exist one branch below at `de.rs:891`
+    // for custom tags. So a double-quoted scalar whose digits are broken by
+    // escaped line continuations decodes to an arbitrarily long number while
+    // the source carries no long digit run, and
+    // `MAX_PLAIN_NUMERIC_DIGIT_RUN` — which reads source — cannot see it.
+    //
+    // What this test pins is the thing a fix would have to cover: FOUR
+    // distinct source syntaxes reach that branch, and none of the last three
+    // contains the text `!!float`. That is why a source-level scan for
+    // `!!float` was rejected as a remedy — catching all four means parsing
+    // `%TAG` directives, resolving tag handles and percent-decoding tag
+    // suffixes, i.e. implementing YAML tag resolution.
+    //
+    // Payloads are deliberately tiny (a 4-character number), so this test
+    // costs microseconds and never materialises anything: it asserts which
+    // ROUTE is taken, not that the route is expensive. The expense is
+    // measured out-of-band and recorded in the inventory.
+    let variants = [
+        ("shorthand", "!!float \"1.75\""),
+        ("verbatim tag", "!<tag:yaml.org,2002:float> \"1.75\""),
+        ("percent-encoded suffix", "!!fl%6Fat \"1.75\""),
+    ];
+    for (label, tagged) in variants {
+        let yaml = format!(
+            "name: t\nversion: 1\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n    a: {tagged}\n"
+        );
+        assert!(
+            !yaml.contains("!!float") || label == "shorthand",
+            "{label}: only the shorthand variant may contain the literal `!!float`, \
+             or this test is not demonstrating what it claims"
+        );
+        parse_workflow(&yaml).unwrap_or_else(|err| {
+            panic!(
+                "{label}: expected this to parse — it reaches `visit_f64` with a zero \
+                 charge, which is the open axis. It failed with {err:?}. If `serde_yaml` \
+                 has added the missing style check at de.rs:882, re-measure the decode \
+                 axis and update `parse/mod.rs`'s axis inventory, which may be closable."
+            )
+        });
+    }
+
+    // The `%TAG` handle form needs a directive, so it is built separately.
+    let with_directive = "%TAG !e! tag:yaml.org,2002:\n---\nname: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n    a: !e!float \"1.75\"\n";
+    assert!(!with_directive.contains("!!float"));
+    parse_workflow(with_directive)
+        .expect("a remapped tag handle reaches the same branch without the text `!!float`");
+
+    // And the contrast that makes the point: the SAME value plain, and the
+    // same value under a *custom* tag. The custom tag goes through
+    // `visit_enum` (`parse_tag` at de.rs:1193 returns Some for `!`-tags), so
+    // its payload lands on `visit_str` and is charged by length — which is
+    // why custom tags were never part of this hole.
+    for (label, scalar) in [("plain", "1.75"), ("custom tag", "!Thing \"1.75\"")] {
+        let yaml = format!(
+            "name: t\nversion: 1\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n    a: {scalar}\n"
+        );
+        parse_workflow(&yaml).unwrap_or_else(|_| panic!("{label} must still parse"));
+    }
 }
 
 #[test]
@@ -882,10 +964,12 @@ fn the_densest_alias_free_documents_under_the_byte_cap_still_parse() {
     //
     // Measured weights: 2,227,640 / 1,179,432 / 698,998 / 589,798 /
     // 250,198 against a 2,621,440 ceiling. The heaviest sits at 85.0% of
-    // it — fix round 2 tightened the ceiling from 4 MiB, which is what
-    // lowered the memory axis's worst case from 101 MB to 65.5 MB, and the
-    // margin is correspondingly thinner on purpose. Lowering the ceiling
-    // further, or raising `MAX_YAML_BYTES`, turns this test red.
+    // it — fix round 2 tightened the ceiling from 4 MiB, and fix round 3
+    // re-measured what that bought against the *maximising* shape rather
+    // than across two different ones: 159.1 MB at 4 MiB against 101.9 MB
+    // here. The margin is correspondingly thinner on purpose. Lowering the
+    // ceiling further, or raising `MAX_YAML_BYTES`, turns this test red;
+    // widening the ceiling trips the upper tripwire beside the derivation.
     let hdr = "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n    b: ";
     let dense = |open: &str, close: &str, unit: &str| -> String {
         let base = hdr.len() + open.len() + close.len() + 1;

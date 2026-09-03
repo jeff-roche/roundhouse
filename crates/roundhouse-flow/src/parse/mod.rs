@@ -82,24 +82,25 @@
 //! mechanism, what the weight does and does not imply about memory, and
 //! what a change in `serde_yaml`'s internals would break.
 //!
-//! Measured after the fix, release build, through the real
+//! Re-measured at **fix round 3** (captions name the round: with three
+//! fixes, "after the fix" is ambiguous), release build, through the real
 //! `parse_workflow` — every payload from both tables above, plus a
 //! 260,364-byte member at the byte cap:
 //!
 //! | document | before | after (release) |
 //! |---|---|---|
-//! | 706 B fan-out | 123 ms | rejected in 13.4 ms |
-//! | 2,268 B fan-out | 137 ms | rejected in 13.7 ms |
-//! | 2,332 B fan-out | 2.1 s | rejected in 13.6 ms |
-//! | 2,364 B fan-out | 8.1 s | rejected in 13.6 ms |
-//! | 4,396 B fan-out | 33.9 s | rejected in 13.9 ms |
-//! | 32,764 B fan-out | 287.8 s (review) | rejected in 16.1 ms |
-//! | 260,364 B fan-out | not previously measured | rejected in 35.2 ms |
-//! | 2,388 B tag-wrapped fan-out | not previously measured | rejected in 14.8 ms |
+//! | 706 B fan-out | 123 ms | rejected in 13.5 ms |
+//! | 2,268 B fan-out | 137 ms | rejected in 8.7 ms |
+//! | 2,332 B fan-out | 2.1 s | rejected in 8.7 ms |
+//! | 2,364 B fan-out | 8.1 s | rejected in 8.7 ms |
+//! | 4,396 B fan-out | 33.9 s | rejected in 8.8 ms |
+//! | 32,764 B fan-out | 287.8 s (review) | rejected in 10.7 ms |
+//! | 260,364 B fan-out | not previously measured | rejected in 24.5 ms |
+//! | 2,388 B tag-wrapped fan-out | not previously measured | rejected in 8.7 ms |
 //!
-//! Debug builds — what `cargo test` produces — run 213-302 ms on the same
-//! payloads. Process peak resident memory for the whole rejection sweep was
-//! 22 MB, against the ~35 GiB this family reached unbounded.
+//! Debug builds — what `cargo test` produces — run 3.8-216.4 ms across the
+//! full payload set. Process peak resident memory for the whole rejection
+//! sweep was 22 MB, against the ~35 GiB this family reached unbounded.
 //!
 //! ## The second attack: one large anchored scalar, aliased many times
 //!
@@ -115,10 +116,10 @@
 //! parse to **4,593 MB** resident; a 260,210-byte one hit allocation failure
 //! past a 2 GiB address space.
 //!
-//! | document | before (node-count unit) | after (byte-weight unit) |
+//! | document | before (node-count unit) | after (byte-weight unit, fix round 3) |
 //! |---|---|---|
-//! | 260,110 B, `K`=40,000 `L`=60,000 | admitted, 4,593 MB resident | rejected in 3.2 ms |
-//! | 130,110 B, `K`=2,000 `L`=120,000 | admitted | rejected in 0.8 ms |
+//! | 180,104 B, `K`=40,000 `L`=60,000 | admitted, 4,593 MB resident | rejected in 3.9 ms |
+//! | 126,104 B, `K`=2,000 `L`=120,000 | admitted | rejected in 1.1 ms |
 //! | 346,182 B, `K`=43,000 `L`=131,072 | admitted, allocation failure >2 GiB | rejected by [`MAX_YAML_BYTES`] |
 //!
 //! The lesson generalises past this module: **a meter whose unit omits an
@@ -142,38 +143,63 @@
 //!
 //! | cost axis | what bounds it | ceiling | measured worst | measured how |
 //! |---|---|---|---|---|
-//! | **Expansion CPU** — walking and re-walking aliased subtrees | [`MAX_EXPANDED_WEIGHT`], enforced during the walk that incurs it | 2,621,440 | 48.6 ms admitted (262,141 B `[x,x,…]`); 48.6 ms to reject (124,981 B nested float fan-out) | `parse_workflow` wall clock |
-//! | **Materialized memory** — `Value` tree the authorized parse builds | same weight budget, via the node budget `ceiling / NODE_WEIGHT_BYTES` = 327,680 | 2,621,440 | **65.5 MB** admitted, from a 15,817 B document (`[[x] x 3900]` aliased 38x) | `VmHWM`, one doc per child |
-//! | **Container allocation** — `Vec`/`IndexMap` capacity slack, ~292 B for a 1-element sequence | same weight budget; *under-priced*, a node is charged 8 where the parser may spend ~292 | 2,621,440 | same row as above — this is what makes memory's worst case a container shape rather than a scalar one | as above |
-//! | **Non-string scalar source length / decode CPU** — `parse_f64` re-scanning a long token on every alias expansion | [`MAX_PLAIN_NUMERIC_DIGIT_RUN`], a linear pre-scan; the meter is handed decoded values and structurally cannot see this | 512 digits, so a zero-charged token is ≤ 3x512+5 bytes | 41.9 ms admitted; 48.6 ms to reject. Before this bound: 1.67 s admitted, and 8.6 s burned *inside* the metered walk | `parse_workflow` wall clock, before/after |
-//! | **`flatten` re-buffering** — `PermissionRuleDefWire` buffering through serde `Content` and re-deserializing | weight budget; the re-visit is over an owned buffer, so it costs a constant multiple of already-expanded content | 2,621,440 | 21.4 ms, 14.2 MB (15,298 B document) | as above |
-//! | **Alias jump count** | `serde_yaml`'s own `jumpcount > events.len() * 100`, plus the weight budget | library-internal | the billion-laughs payload stops here, 1.4 ms | `parse_workflow` |
-//! | **Tokenizing raw text into the event list** | **UNBOUNDED.** [`MAX_YAML_BYTES`] caps the input; [`nesting_depth_bound_violation`] is best-effort and explicitly not a boundary | none | **427 ms and 45.7 MB** for 262,144 bytes of `[`, fed to `serde_yaml` directly with this crate's scan bypassed (51.4 ms at 32 KiB, 207 ms at 128 KiB — roughly linear for *this* shape, which is the only shape measured) | raw `serde_yaml::from_str` |
+//! | **Expansion CPU** — walking and re-walking aliased subtrees | [`MAX_EXPANDED_WEIGHT`], enforced during the walk that incurs it | 2,621,440 | 24.5 ms to reject (260,364 B fan-out at the byte cap); 48.6 ms admitted. **But see the numeric-decode row: per-node cost is not bounded, so neither is this in the worst case** | `parse_workflow` wall clock |
+//! | **Materialized memory** — the `Value` tree the authorized parse builds | same weight budget, via the node budget `ceiling / NODE_WEIGHT_BYTES` = 327,680 | 2,621,440 | **≥101.9 MB** admitted, from a **15,106-byte** document. Worst shape: one-element sequences nested 110 deep, 67 of them, aliased 43x — what caps it is `serde_yaml`'s own ~128 recursion limit, not any constant of ours | `VmHWM`, one doc per child |
+//! | **Container allocation** — `Vec`/`IndexMap` capacity slack, ~288 B for a 1-element `Vec` charged 8 | same weight budget; *under-priced*, and the under-pricing compounds with depth | 2,621,440 | same row as above — this is why the memory maximiser is a deep container shape rather than a scalar one | as above |
+//! | **Non-string scalar source length / decode CPU** | **UNBOUNDED.** [`MAX_PLAIN_NUMERIC_DIGIT_RUN`] covers the *plain* route only; the core-tag route (`!!float` on a non-plain scalar, `de.rs:882-884`, no style check) reaches `visit_f64` with a decoded token of any length, and the source carries no long digit run | none | **5,960 ms admitted** (168,727 B, `!!float` + escaped line continuations + alias nesting); **2,648 ms burned inside the metered walk** on a variant that is then rejected | `parse_workflow` wall clock, one doc per child |
+//! | **`flatten` re-buffering** — `PermissionRuleDefWire` buffering through serde `Content` | weight budget; the re-visit is over an owned buffer, so a constant multiple of already-expanded content | 2,621,440 | 21.4 ms, 14.2 MB (15,298 B document) | as above |
+//! | **Alias jump count** | `serde_yaml`'s own `jumpcount > events.len() * 100`, plus the weight budget | library-internal | the billion-laughs payload stops here, 1.2 ms | `parse_workflow` |
+//! | **Tokenizing raw text into the event list** | **UNBOUNDED.** [`MAX_YAML_BYTES`] caps the input; [`nesting_depth_bound_violation`] is best-effort and explicitly not a boundary. **It is also what currently hides the worst case** — the shape below is only reachable in practice because that scan happens to reject deep bracket runs, so anyone relaxing [`MAX_FLOW_NESTING_DEPTH`] unblocks it | none | **427 ms and 45.7 MB** for 262,144 bytes of `[`, fed to `serde_yaml` directly with this crate's scan bypassed (51.4 ms at 32 KiB, 207 ms at 128 KiB — roughly linear for *this* shape, the only one measured) | raw `serde_yaml::from_str` |
 //! | **Downstream of parsing** — tasks a parsed workflow dispatches | **not this module.** [`crate::caps`] (ruling P47) | n/a | n/a | n/a |
 //!
-//! **How the axis list was arrived at, stated so it can be checked rather
-//! than trusted.** For the expansion stage it is a closed enumeration, not
-//! a brainstorm: every unit of work `serde_yaml` performs during the walk
-//! is attributable to one visitor callback, and the callbacks reachable
-//! from `deserialize_any` are exactly those in its `match` (`visit_enum`,
-//! `visit_seq`, `visit_map`, `visit_none`) plus those `visit_scalar` /
-//! `visit_untagged_scalar` dispatch to (`visit_unit`, `visit_bool`,
-//! `visit_u64`/`i64`/`u128`/`i128`, `visit_f64`, `visit_str`). Reading the
-//! work each performs before calling back gives the scalar rows above:
-//! `str::from_utf8` is O(token) for *every* scalar, and is paid for because
-//! a token is either ≤5 bytes (bool/null literals), ≤~42 bytes (integer,
-//! `from_str_radix` short-circuits on overflow), length-capped (float, by
-//! the digit-run bound), or charged its length (`visit_str`). That
-//! enumeration is why the float row exists — it was derived, not stumbled
-//! on.
+//! Figures are as of the fix-round-3 commit unless a row says otherwise.
 //!
-//! For the stages *outside* the walk — tokenizing before it, `flatten` and
+//! ## The two open rows, and the one remedy that closes both
+//!
+//! Both unbounded rows are unbounded for the same structural reason: the
+//! cost is incurred **outside the window this crate can meter**. Tokenizing
+//! happens before any visitor runs; the numeric decode happens inside
+//! `serde_yaml` on a value the visitor is handed already decoded. Neither is
+//! reachable by refining the meter's unit — that was tried three times, and
+//! each refinement was correct for the surface examined and blind to an
+//! adjacent one.
+//!
+//! **Recommended remedy for both: parse out of process under `RLIMIT_CPU`**
+//! (remedy (B) from the original task). It bounds wall-clock and memory for
+//! the whole pipeline regardless of which stage spends them, which is
+//! precisely the property an in-process meter cannot have. `roundhouse-sandbox`
+//! exists for this confinement. Owner: whoever wires the first production
+//! caller, because that is the change that makes any of this reachable —
+//! `parse_workflow` still has no caller outside this crate.
+//!
+//! Interim lever if either needs to be smaller before then: lower
+//! [`MAX_YAML_BYTES`]. It is the only input both stages scale with.
+//!
+//! ## How the axis list was arrived at
+//!
+//! For the expansion stage it is a closed enumeration of the visitor
+//! callbacks `serde_yaml` can invoke, with the source provenance given on
+//! [`MAX_PLAIN_NUMERIC_DIGIT_RUN`] (crate version and line numbers, so it can
+//! be re-checked when the dependency moves).
+//!
+//! **Fix round 2's version of this paragraph claimed the same thing and was
+//! wrong, in the most instructive direction.** It named the right surface —
+//! `visit_scalar` *and* `visit_untagged_scalar` — and then reasoned only
+//! about the second, so it missed `visit_scalar`'s own core-tag dispatch. It
+//! then concluded that "a fourth omitted axis would most likely live outside
+//! the walk". The fourth omission was **inside** the walk, in the surface
+//! that paragraph called closed. The lesson recorded rather than paraphrased:
+//! naming a surface is not examining it, and an enumeration that cannot be
+//! re-checked against numbered source lines is not one.
+//!
+//! For the stages outside the walk — tokenizing before it, `flatten` and
 //! `Value` construction after it — there is no equivalent closed argument.
 //! Those rows are enumerated and measured, which per P18 is an observation
-//! and not a proof. **The honest summary: the expansion stage's axes are
-//! derived from a closed callback surface; the pipeline stages' axes are
-//! the ones I could identify and measure, and a fourth omitted axis would
-//! most likely live there.**
+//! and not a proof. **Where a fifth omission would live is not something this
+//! comment should guess at again**; what it can say is that four have now
+//! been found, three of them inside the walk, and that the two open rows are
+//! open because of *where the cost is spent*, not because of which unit
+//! measures it.
 //!
 //! **An in-process timeout was never the answer and still is not.**
 //! `serde_yaml::from_str` is a synchronous call into `unsafe-libyaml` with
@@ -383,65 +409,102 @@ use thiserror::Error;
 pub const MAX_YAML_BYTES: usize = 262_144;
 
 /// Maximum run of consecutive ASCII digits allowed anywhere in the raw
-/// source. This is the one bound that does **not** live in the expansion
-/// meter, because the axis it covers is structurally invisible there.
+/// source. **This bounds one route to the numeric-decode axis, not the
+/// axis.** The axis itself is recorded as UNBOUNDED in this module's axis
+/// inventory; read that row before relying on this constant for anything.
 ///
 /// # The axis, and why the meter cannot see it
 ///
-/// `serde_yaml`'s `visit_untagged_scalar` hands a *decoded* value to the
-/// visitor: `visit_f64(self, v: f64)` gets an `f64`, not the token it came
-/// from. So the meter charges a plain `1.7777…` the same
-/// [`expansion::NODE_WEIGHT_BYTES`] whether the token was 3 bytes or
-/// 250,511, while `parse_f64`'s `unpositive.parse::<f64>()` re-runs an
-/// O(token) `dec2flt` scan on **every alias expansion**. Measured on
-/// `77d6008`, through the real `parse_workflow`: a 262,048-byte document
-/// admitted and cost 1.67 s, and a 255,541-byte one burned **8.6 s inside
-/// the metered walk** before that walk's own ceiling rejected it. Quoting
-/// the same number routes it to `visit_str`, which charges its length —
-/// two characters changed the verdict.
+/// `serde_yaml` hands the visitor a *decoded* value: `visit_f64(self, v: f64)`
+/// gets an `f64`, not the token it came from. So the expansion meter charges
+/// a numeric scalar [`expansion::NODE_WEIGHT_BYTES`] whether its source token
+/// was 3 bytes or 250,000, while `parse_f64`'s `unpositive.parse::<f64>()`
+/// re-runs an O(token) `dec2flt` scan on **every alias expansion**.
 ///
-/// No refinement of the meter's unit can reach this, so this bound runs
-/// where source lengths are still visible: a linear pre-scan of the raw
-/// text.
+/// # The full dispatch, with provenance
 ///
-/// # Why a digit run is a sound proxy, without modelling YAML
+/// Read from `serde_yaml-0.9.34+deprecated/src/de.rs`. Line numbers are
+/// given so this can be re-checked when the dependency moves; fix round 2's
+/// version of this comment reasoned only about `visit_untagged_scalar` and
+/// missed the branch below, which is the defect this section exists to stop
+/// recurring.
 ///
-/// This scan knows nothing about quoting, comments, block scalars or flow
-/// context — deliberately, because a text scan that must model YAML to
-/// protect a YAML parser is the shape this module has had bypassed three
-/// times (see [`nesting_depth_bound_violation`]). It needs no such
-/// knowledge, because the argument is about `serde_yaml`'s decoders rather
-/// than about YAML syntax. Enumerating every path in
-/// `visit_untagged_scalar` that reaches a visitor method charged zero
-/// payload:
+/// `deserialize_any` (`de.rs:1205+`) routes a scalar event two ways:
 ///
-/// - `parse_null` and `parse_bool` compare against fixed string literals
-///   (`null`/`Null`/`NULL`/`~`, `true`/`True`/`TRUE`/`false`/…), so a token
-///   reaching `visit_unit`/`visit_bool` is at most 5 bytes. Bounded already.
-/// - `visit_int` goes through `from_str_radix`, which fails on overflow
-///   past 39 decimal or 32 hex digits and short-circuits there, so a token
-///   reaching `visit_u64`/`visit_i64`/`visit_u128`/`visit_i128` is at most
-///   ~42 bytes and costs O(42) to reject. Bounded already. A longer
-///   integer-looking token falls through to `parse_f64` (decimal) or to
-///   `visit_str` (hex/octal, which `f64::from_str` rejects), and
-///   `visit_str` charges its length.
-/// - `parse_f64` is the only remaining path, and after its fixed
-///   `.inf`/`.nan` literals it is `unpositive.parse::<f64>()` filtered by
-///   `is_finite()`. A token that `f64::from_str` accepts and that is not
-///   one of those literals is a decimal float:
-///   `[+-]? digits [. digits] [(e|E) [+-] digits]`.
+/// 1. **`parse_tag` (`de.rs:1193-1203`) returns `Some`** — true only for a
+///    tag whose resolved form starts with `!`, i.e. a *custom* tag like
+///    `!Thing`. Then `visit_enum` is called, `tagged_already` becomes true,
+///    and the payload lands on `visit_str`, charged by length. Safe.
+/// 2. **Otherwise `visit_scalar` (`de.rs:858-900`)**, whose dispatch is:
+///    - `de.rs:862` — `str::from_utf8(&scalar.value)`, O(token), for *every*
+///      scalar, on the **decoded** bytes.
+///    - `de.rs:871-890` — if the scalar carries a **core tag** and
+///      `tagged_already` is false: `Tag::BOOL` → `parse_bool`; `Tag::INT` →
+///      `visit_int`; **`Tag::FLOAT` (`de.rs:882-884`) → `parse_f64` then
+///      `visit_f64`, with NO style check**; `Tag::NULL` → `parse_null`.
+///    - `de.rs:891` — custom `!`-tags, and here a style check *does* exist
+///      (`scalar.style == ScalarStyle::Plain`). The missing check one branch
+///      above is the hole.
+///    - `de.rs:894` — plain untagged scalars → `visit_untagged_scalar`
+///      (`de.rs:1118-1147`), whose own dispatch is `parse_null` / `parse_bool`
+///      / `visit_int` / `parse_f64` / `visit_str`.
+///    - otherwise → `visit_borrowed_str` / `visit_str`, charged by length.
 ///
-/// A decimal float therefore contains **at most three maximal runs of ASCII
-/// digits** (integer part, fraction, exponent) plus at most five non-digit
-/// characters (`+`/`-`, `.`, `e`/`E`, `+`/`-`). So if the longest digit run
-/// in the whole document is `R`, no token reaching a zero-charged visitor
-/// method is longer than `3R + 5`. Capping `R` caps that length.
+/// So a token can reach a zero-charged visitor method by **two** routes: the
+/// plain route (2, last bullet) and the **core-tag route** (2, `Tag::FLOAT`).
 ///
-/// The scan over-approximates unconditionally — it counts digit runs inside
-/// comments, quoted scalars and block-scalar bodies, none of which reach a
-/// numeric decoder at all — so its only failure direction is
-/// over-rejection, and it cannot be desynchronised by content the way a
-/// quote- or block-scalar-aware scan can.
+/// # What this constant covers: the plain route, soundly
+///
+/// On the plain route the token *is* its source text, and the argument is
+/// about `serde_yaml`'s decoders rather than YAML syntax, so no modelling of
+/// quoting or block scalars is needed:
+///
+/// - `parse_null` (`de.rs:925`) and `parse_bool` (`de.rs:932`) compare
+///   against fixed literals, so those tokens are ≤5 bytes.
+/// - `visit_int` (`de.rs:1101`) goes through `from_str_radix`, which fails on
+///   overflow past 39 decimal / 32 hex digits **and short-circuits there**,
+///   so those tokens are ≤~42 bytes and cost O(42) to reject.
+/// - `parse_f64` (`de.rs:1066`) is the only remaining path, and after its
+///   fixed `.inf`/`.nan` literals it is `parse::<f64>()` filtered by
+///   `is_finite()`. A token it accepts is a decimal float
+///   `[+-]? digits [. digits] [(e|E) [+-] digits]` — **at most three maximal
+///   ASCII-digit runs** plus at most five non-digit characters.
+///
+/// So on the plain route, if the longest digit run is `R`, no zero-charged
+/// token exceeds `3R + 5`. The scan over-approximates unconditionally (it
+/// counts runs inside comments, quoted scalars and block-scalar bodies that
+/// never reach a decoder), so its only failure direction is over-rejection.
+///
+/// # What it does NOT cover: the core-tag route
+///
+/// On the core-tag route the token is the **decoded** value, so the source
+/// need contain no long digit run at all: a double-quoted scalar with
+/// escaped line continuations decodes to an arbitrarily long number while
+/// every source-visible digit run stays short. Measured: `!!float` on such a
+/// scalar, alias-amplified, is admitted and costs **5,960 ms** for a
+/// 168,727-byte document, and a variant one notch over the ceiling burns
+/// **2,648 ms inside the metered walk** before being rejected.
+///
+/// **Scanning the source for `!!float` cannot close this**, and that was
+/// established by execution rather than argument. All four of these reach
+/// `Tag::FLOAT`, none contains the text `!!float`:
+///
+/// ```text
+/// !!float "1.75"                                        (shorthand)
+/// !<tag:yaml.org,2002:float> "1.75"                     (verbatim)
+/// %TAG !e! tag:yaml.org,2002:\n---\n!e!float "1.75"      (remapped handle)
+/// !!fl%6Fat "1.75"                                      (percent-encoded suffix)
+/// ```
+///
+/// A scan that caught all four would have to parse `%TAG` directives,
+/// resolve tag handles and percent-decode tag suffixes — that is
+/// implementing YAML tag resolution, which is the "re-derive YAML semantics
+/// to protect a YAML parser" shape [`nesting_depth_bound_violation`] records
+/// being bypassed by three times. The alternative — making the tagged branch
+/// route through `visit_str` — is not available either: `tagged_already` is
+/// set inside `serde_yaml` by `EnumAccess`, and `parse_tag` decides the route
+/// before this crate's visitor is consulted, so there is no interception
+/// point.
 ///
 /// # Why 512
 ///
@@ -449,9 +512,16 @@ pub const MAX_YAML_BYTES: usize = 262_144;
 /// digits, so no numerically meaningful literal needs more than ~40. 512 is
 /// an order of magnitude above that, and it is digits *only*: a run of `-`
 /// in a `# ----` comment separator, a hex digest, a base64 blob and a
-/// dotted version chain all break the run at their first non-digit and are
-/// unaffected. What it costs is stated with what it buys, in the axis
-/// inventory in this module's doc comment.
+/// dotted version chain all break the run at their first non-digit.
+///
+/// # Why it is kept even though the axis is open
+///
+/// It bounds the plain route completely and cheaply, and the plain route is
+/// the one an ordinary document reaches without an explicit tag. It is kept
+/// on that basis and no other — **it does not reduce the axis's worst case**,
+/// which an attacker reaches through the core-tag route regardless. That is
+/// stated here because a constant with a name like this reading as "handled"
+/// is exactly the misreading that retired `MAX_ALIAS_TOKENS`.
 pub const MAX_PLAIN_NUMERIC_DIGIT_RUN: usize = 512;
 
 /// The maximum **expanded byte weight** a workflow document may produce once
@@ -506,8 +576,14 @@ pub const MAX_PLAIN_NUMERIC_DIGIT_RUN: usize = 512;
 /// `B * (NODE_WEIGHT_BYTES + 1)` = **2,359,296** at today's constants —
 /// **90.0% of this ceiling, a 10.0% margin**. Fix round 2 tightened the
 /// ceiling from 4 MiB to this, because the margin is what sets the node
-/// budget and therefore the memory axis: at 4 MiB the worst admitted
-/// document measured 101 MB, at 2.5 MiB it measures 65.5 MB. The margin is
+/// budget and therefore the memory axis. Round 2 justified that with a
+/// 101 MB -> 65.5 MB comparison across two *different* shapes, which was not
+/// a valid comparison; fix round 3 re-measured the same maximising shape
+/// (one-element sequences nested 110 deep, aliased) at both values:
+/// **159.1 MB at 4 MiB against 101.9 MB at 2,621,440**, a 36% reduction
+/// scaling as the algebra predicts. So the tightening did buy something,
+/// though less than round 2 claimed and against a worse absolute number than
+/// round 2 knew. The margin is
 /// deliberately small and the `const` assert below is what makes that safe
 /// — an over-tight ceiling fails the build rather than silently rejecting
 /// legitimate documents.
@@ -533,16 +609,19 @@ pub const MAX_PLAIN_NUMERIC_DIGIT_RUN: usize = 512;
 /// directly is only that expanded scalar bytes are at most this ceiling and
 /// node count at most `ceiling / NODE_WEIGHT_BYTES` = 327,680. What *that*
 /// costs was measured, one document per child process under an 8 GiB
-/// `ulimit -v`: **worst admitted end-to-end cost 48.6 ms, worst peak RSS
-/// 65.5 MB**, over every shape probed including all three attack families.
+/// `ulimit -v`: **worst admitted peak RSS ≥101.9 MB**, from a 15,106-byte
+/// document whose shape is one-element sequences nested 110 deep, aliased.
 /// About 52 MB of that is inherent — the densest alias-free document that
-/// `parse_workflow` actually accepts measures 51.6 MB on its own — so the
-/// observed worst is 1.27x a floor that only lowering [`MAX_YAML_BYTES`]
-/// could move. See `src/parse/expansion.rs`'s table, its two stated
-/// qualifications, and the axis inventory in this module's doc comment.
+/// `parse_workflow` actually accepts measures 51.6 MB on its own. The
+/// ≥ is not decoration: fix rounds 2 and 3 each published a worst case that
+/// the next reviewer beat by finding a shape that had not been probed
+/// (36 MB, then 65.5 MB, now 101.9 MB), so treat this as the worst *found*
+/// and see the axis inventory for which rows are open.
 ///
 /// Rejection is cheap: every attack payload in the module doc comment's
-/// history tables is rejected in 8.0-27.5 ms release, with process peak RSS of
+/// history tables is rejected in 0.6-24.5 ms release (3.8-216.4 ms debug),
+/// re-measured at fix round 3 across every payload the tables name, with
+/// process peak RSS of
 /// 3.7-9.3 MB. The two-walk design means a legitimate document is walked
 /// twice: measured overhead is 0.07 ms on the frozen §8.9 fixture (2,271 B)
 /// and 21.9 ms on a maximally dense 256 KiB document, the worst case the
@@ -556,6 +635,23 @@ pub const MAX_EXPANDED_WEIGHT: usize = 2_621_440;
 // inequality rather than a tautology — raising MAX_YAML_BYTES to 512 KiB
 // fails this at compile time. `the_densest_alias_free_documents_under_the_byte_cap_still_parse`
 // in `tests/parse_top_level.rs` is the behavioural half of the same guard.
+// Upper tripwire. The assert below bounds the ceiling from *below* only, so
+// the whole upper half of the argument — that the ceiling is small enough for
+// the memory axis's worst case to stay where it was measured — was unguarded,
+// and widening it back to 4 MiB stayed green across the crate. This asserts
+// no memory number, and it is not a proof of anything: it is a tripwire for
+// attention, so that widening the ceiling has to be a deliberate two-line
+// edit landing next to the derivation it invalidates. Measured, same
+// maximising shape (one-element sequences nested 110 deep, aliased): 101.9 MB
+// at 2,621,440 against 159.1 MB at 4 MiB.
+const _: () = assert!(
+    MAX_EXPANDED_WEIGHT <= 2_621_440,
+    "MAX_EXPANDED_WEIGHT was widened: the memory figures in this module's axis \
+     inventory were measured at 2,621,440 and scale roughly linearly with it. \
+     Re-measure the deep-container maximiser and update the inventory in the \
+     same change."
+);
+
 const _: () = assert!(
     MAX_YAML_BYTES * (expansion::NODE_WEIGHT_BYTES + 1) <= MAX_EXPANDED_WEIGHT,
     "MAX_EXPANDED_WEIGHT is too small for MAX_YAML_BYTES: an alias-free document at \

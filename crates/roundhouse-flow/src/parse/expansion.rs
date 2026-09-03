@@ -104,7 +104,8 @@
 //!
 //! | admitted document | bytes | weight | end-to-end | peak RSS |
 //! |---|---|---|---|---|
-//! | `[[x] x 3900]` aliased 38x | 15,817 | 2,586,219 | 39.3 ms | **65.5 MB** |
+//! | one-element seqs nested 110 deep, 67 of them, aliased 43x | 15,106 | — | 46.1 ms | **≥101.9 MB** |
+//! | `[[x] x 3900]` aliased 38x | 15,817 | 2,586,219 | 39.3 ms | 65.0 MB |
 //! | `[[x] x 2000]` aliased 74x | 8,325 | 2,550,807 | 39.5 ms | 64.2 MB |
 //! | `[[x],[x],…]` alias-free at the byte cap | 262,139 | 1,113,902 | 44.7 ms | 51.6 MB |
 //! | `[x,x,…]` alias-free at the byte cap | 262,141 | 1,179,423 | 48.6 ms | 34.5 MB |
@@ -112,7 +113,12 @@
 //! | longest admitted plain float aliased 87,000x | 261,616 | 696,215 | 41.9 ms | 28.5 MB |
 //! | `permissions.rules[]` args aliased (flatten path) | 15,298 | 1,829,715 | 21.4 ms | 14.2 MB |
 //!
-//! **Worst observed for an admitted document: 65.5 MB and 48.6 ms.**
+//! **Worst observed for an admitted document: ≥101.9 MB and 48.6 ms.** The
+//! maximiser is deep one-element containers, because every nesting level is
+//! another `Vec` at capacity 4 (~288 B) charged `NODE_WEIGHT_BYTES`; what
+//! caps it is `serde_yaml`'s own ~128 recursion limit, not any constant of
+//! ours. Fix round 2 published 65.5 MB here from a depth-2 shape and a
+//! review beat it by 1.55x with a depth-110 one.
 //!
 //! Two honest qualifications, in the P18 sense:
 //!
@@ -160,7 +166,7 @@
 //! any construct its author did not list, so this file does not make one.
 //!
 //! What is claimed instead is the measured table above: for every admitted
-//! document probed, the end-to-end cost was at most 48.6 ms and 65.5 MB. The
+//! document probed, the end-to-end cost was at most 48.6 ms and 101.9 MB. The
 //! construct that broke the enumeration (`flatten`) re-visits an owned
 //! `Content` buffer rather than the YAML event list, so it costs a constant
 //! multiple of already-expanded content; the same is true of `steps.rs`'s
@@ -292,10 +298,15 @@ pub(super) enum Verdict {
 /// ceiling fired, because `serde_yaml` re-ran an O(250,000) `dec2flt` scan
 /// for each expansion of one long plain numeric scalar and this function
 /// charged 8 bytes for each. Per-node work is bounded only because
-/// [`super::MAX_PLAIN_NUMERIC_DIGIT_RUN`] now caps the one token class that
-/// reaches a zero-charged visitor method with unbounded length; with that
-/// gate in front, the same construction is rejected in 48.6 ms. See
-/// [`super`]'s axis inventory.
+/// [`super::MAX_PLAIN_NUMERIC_DIGIT_RUN`] caps that token class on the
+/// **plain** route, and with that gate in front the plain construction is
+/// rejected in 0.6 ms. It does **not** cap the core-tag route
+/// (`!!float` on a non-plain scalar), which reaches `visit_f64` with a
+/// decoded token of any length: measured 5,960 ms admitted, and 2,648 ms
+/// burned in this function on a variant that is then rejected. **Per-node
+/// work is therefore still not bounded**, and this function's cost is not
+/// either. That axis is recorded as UNBOUNDED in [`super`]'s axis
+/// inventory, with the remedy that would close it.
 pub(super) fn check_expansion(yaml: &str, max: usize) -> Verdict {
     let weighed = Cell::new(0usize);
     let over_budget = Cell::new(false);
