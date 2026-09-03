@@ -51,22 +51,40 @@
 //! precisely this module's failure history. There is one unit, and it is
 //! the quantity that drives the cost.
 //!
-//! ## What [`NODE_WEIGHT_BYTES`] is for, and why it is 8
+//! ## What [`NODE_WEIGHT_BYTES`] is for, and why raising it is not the lever
 //!
 //! It stops a node from ever being free, which is what keeps the *count* of
 //! nodes bounded as well as their content: an aliased empty collection
 //! charges nothing but `NODE_WEIGHT_BYTES`, so it cannot be expanded
 //! without limit. A weight budget `C` therefore bounds two things at once —
-//! total expanded scalar bytes at `C`, and node count at
-//! `C / NODE_WEIGHT_BYTES`.
+//! total expanded scalar bytes at `C`, and node count at `C / w`.
 //!
-//! 8 is near the minimum of the two: raising it inflates the scalar budget
-//! (which is what the ceiling must cover for an alias-free document, so the
-//! ceiling rises with it), while lowering it inflates the node budget. With
-//! the ceiling scaled to keep the densest alias-free document admitted, the
-//! worst-case product is flattest around 8-12 for this workspace's
-//! `size_of::<serde_yaml::Value>() == 72`. It is a charge-model tuning
-//! constant, not a measurement of anything.
+//! The arithmetic, inlined so a maintainer can reproduce it rather than
+//! take it on trust. Write `B` = [`super::MAX_YAML_BYTES`], `w` =
+//! `NODE_WEIGHT_BYTES`, and `α` = the margin the ceiling carries over the
+//! derived alias-free bound, so `C = α·B·(w+1)`. Then:
+//!
+//! ```text
+//! node budget   = C / w = α·B·(w+1)/w
+//! scalar budget = C     = α·B·(w+1)
+//! ```
+//!
+//! The node budget is `α·B·(1 + 1/w)`, which for any `w ≥ 8` is within 12%
+//! of `α·B` — **it barely depends on `w` at all**, because the ceiling has
+//! to rise with `w` to keep admitting alias-free documents. Raising `w`
+//! from 8 to 32 moves the node budget by 9% and multiplies the scalar
+//! budget by 3.7. So `w` is not the lever for the memory axis; `α` and `B`
+//! are, and this round tightened `α` from 1.78 to 1.11.
+//!
+//! An earlier version of this comment claimed `w = 8-12` was a minimum
+//! derived from `size_of::<serde_yaml::Value>() == 72`. That analysis used
+//! the size of a `Value` and ignored `Vec`/`IndexMap` capacity slack: a
+//! one-element `Vec<Value>` allocates capacity 4, so the real cost of a
+//! single-element sequence node is nearer 292 bytes than 72, and a review
+//! measured 153 MB admitted where this file predicted 60. The minimum is
+//! real but it is shallow — the curve `α·B·(w+1)·(292/w + 1)` varies by
+//! under 4% across `w = 8…24` — which is the same conclusion by a better
+//! route: `w` is not where the memory number comes from.
 //!
 //! # What weight actually implies for memory — measured, not derived
 //!
@@ -76,46 +94,47 @@
 //! memory as well as CPU". That was a non-sequitur: the reasoning under it
 //! was about the *meter's* own heap use, which is genuinely independent of
 //! expansion and says nothing whatever about the memory of the parse the
-//! meter authorizes. It is recorded here because a wrong bound is a bug,
-//! and a wrong bound the doc asserts is correct — on the exact axis two
-//! kernel OOM kills made salient while this was being built — is worse.
+//! meter authorizes.
 //!
-//! What weight ≤ [`super::MAX_EXPANDED_WEIGHT`] implies **directly** is
-//! only the two budgets above. What that costs in real memory and time was
-//! measured, in isolated child processes under a 6 GiB `ulimit -v`, one
-//! document per process so the peak is attributable:
+//! What weight ≤ [`super::MAX_EXPANDED_WEIGHT`] implies **directly** is only
+//! the two budgets above: expanded scalar bytes at the ceiling, and node
+//! count at `ceiling / NODE_WEIGHT_BYTES` = 327,680. What *that* costs was
+//! measured, one document per child process under an 8 GiB `ulimit -v` so
+//! each peak is attributable to one payload:
 //!
-//! | admitted document | bytes | nodes | weight | real parse | peak RSS |
-//! |---|---|---|---|---|---|
-//! | 100-element list aliased 4,600x | 14,105 | 464,720 | 4,177,921 | 36.2 ms | **60.4 MB** |
-//! | 1,000-element list aliased 460x | 3,485 | 461,480 | 4,152,901 | 31.6 ms | 51.5 MB |
-//! | 2,000-element list aliased 230x | 4,795 | 462,250 | 4,160,061 | 30.8 ms | 51.5 MB |
-//! | densest alias-free `{a,a,…}` at the byte cap | 262,144 | 262,070 | 2,227,640 | 18.4 ms | 42.8 MB |
-//! | densest alias-free `[x,x,…]` at the byte cap | 262,144 | 131,044 | 1,179,432 | 20.9 ms | 34.5 MB |
-//! | 100,000-byte scalar aliased 40x | 100,310 | 101 | 4,100,869 | 1.1 ms | 7.9 MB |
-//! | `permissions.rules[]` args aliased (flatten path) | 15,298 | 182,720 | 1,829,715 | 14.6 ms | 14.0 MB |
+//! | admitted document | bytes | weight | end-to-end | peak RSS |
+//! |---|---|---|---|---|
+//! | `[[x] x 3900]` aliased 38x | 15,817 | 2,586,219 | 39.3 ms | **65.5 MB** |
+//! | `[[x] x 2000]` aliased 74x | 8,325 | 2,550,807 | 39.5 ms | 64.2 MB |
+//! | `[[x],[x],…]` alias-free at the byte cap | 262,139 | 1,113,902 | 44.7 ms | 51.6 MB |
+//! | `[x,x,…]` alias-free at the byte cap | 262,141 | 1,179,423 | 48.6 ms | 34.5 MB |
+//! | 60,000-byte scalar aliased 40x | 60,224 | 2,460,535 | 2.1 ms | 6.2 MB |
+//! | longest admitted plain float aliased 87,000x | 261,616 | 696,215 | 41.9 ms | 28.5 MB |
+//! | `permissions.rules[]` args aliased (flatten path) | 15,298 | 1,829,715 | 21.4 ms | 14.2 MB |
 //!
-//! **Worst observed for an admitted document: 60.4 MB and 36.2 ms**, across
-//! every shape probed including the two families that broke earlier
-//! versions. Against the 4,593 MB the previous unit admitted, that is a 76x
-//! reduction on the measured worst case.
+//! **Worst observed for an admitted document: 65.5 MB and 48.6 ms.**
 //!
 //! Two honest qualifications, in the P18 sense:
 //!
 //! 1. **This is an observation over shapes probed, not a proof of a
-//!    constant.** The previous version's equivalent table said 36 MB and a
-//!    security lens then found 4,593 MB, so this sentence is load-bearing.
-//!    What is different now is that the falsifying family — amplifying
-//!    scalar bytes — is the one the unit charges, so it is no longer
-//!    invisible to the meter; but "the one I did not think of" remains the
-//!    standing risk, and the numbers above are evidence, not a guarantee.
-//! 2. **About 43 MB of that worst case is inherent, not a tuning choice.**
-//!    The ceiling must admit the densest legitimate alias-free document at
-//!    the byte cap, which is 262,070 nodes and measures 42.8 MB on its own.
-//!    No ceiling that admits `MAX_YAML_BYTES` of legitimate YAML can get
-//!    the worst case much below that. The observed worst is ~1.4x that
-//!    floor. Driving it lower means lowering [`super::MAX_YAML_BYTES`], not
-//!    changing this unit.
+//!    constant.** Two previous versions of this table were falsified by the
+//!    next reviewer — 36 MB became 4,593 MB when a large aliased scalar was
+//!    tried, and 60.4 MB became 153 MB when one-element containers were.
+//!    Assume this one will be too. What is different is not confidence but
+//!    method: the axes are now enumerated explicitly in [`super`]'s axis
+//!    inventory, so a reviewer can attack a named row rather than having to
+//!    guess what was left out.
+//! 2. **About 52 MB of that worst case is inherent, not a tuning choice.**
+//!    The ceiling must admit the densest alias-free document the byte cap
+//!    allows, and the densest one `parse_workflow` actually *accepts* —
+//!    `[[x],[x],…]` filled to 262,139 bytes — measures 51.6 MB on its own.
+//!    (An earlier version cited `{a,a,…}` at 42.8 MB here. That document is
+//!    denser in nodes but `serde_yaml` rejects it for duplicate keys, so it
+//!    was the wrong exemplar: it bounds the *derivation*, not the memory
+//!    floor.) The observed worst is 1.27x that floor, so aliasing buys an
+//!    attacker about 27% over what a legitimate document at the byte cap
+//!    already costs. Driving the floor lower means lowering
+//!    [`super::MAX_YAML_BYTES`], not changing this unit.
 //!
 //! ## The meter's own footprint
 //!
@@ -124,10 +143,8 @@
 //! shared references, and `str::len()` copies nothing. So the *meter* costs
 //! `O(1)` heap however far the document would expand — which is what lets
 //! it meter a payload it must never materialize. Measured on the rejection
-//! path: a 2,332-byte fan-out is rejected with process peak RSS at 3.7 MB,
-//! and the 260,110-byte aliased-scalar payload at 9.3 MB (essentially the
-//! source string itself). This says nothing about the authorized parse; see
-//! the table above for that.
+//! path: a 2,332-byte fan-out is rejected with process peak RSS at 3.6 MB.
+//! This says nothing about the authorized parse; see the table above.
 //!
 //! # Why this bounds the subsequent real parse too — measured, not argued
 //!
@@ -143,7 +160,7 @@
 //! any construct its author did not list, so this file does not make one.
 //!
 //! What is claimed instead is the measured table above: for every admitted
-//! document probed, the real parse cost at most 36.2 ms and 60.4 MB. The
+//! document probed, the end-to-end cost was at most 48.6 ms and 65.5 MB. The
 //! construct that broke the enumeration (`flatten`) re-visits an owned
 //! `Content` buffer rather than the YAML event list, so it costs a constant
 //! multiple of already-expanded content; the same is true of `steps.rs`'s
@@ -264,11 +281,21 @@ pub(super) enum Verdict {
 /// it.
 ///
 /// **The walk stops as soon as the running total passes `max`.** It never
-/// completes the expansion of a document that exceeds the ceiling, so the
-/// work this function performs is bounded by `max` regardless of the input,
-/// and it allocates nothing per node while doing it (`str::len()` copies
-/// nothing). See this module's doc comment for what that does and does not
-/// imply about the memory of the parse it then authorizes.
+/// completes the expansion of a document that exceeds the ceiling, and it
+/// allocates nothing per node while doing it (`str::len()` copies nothing).
+///
+/// **What that bounds is the number of nodes walked, not the work — those
+/// are the same thing only if per-node work is bounded.** An earlier
+/// version of this comment said "the work this function performs is bounded
+/// by `max` regardless of the input", and a security review falsified it:
+/// a 255,541-byte payload burned **8.6 s inside this function** before the
+/// ceiling fired, because `serde_yaml` re-ran an O(250,000) `dec2flt` scan
+/// for each expansion of one long plain numeric scalar and this function
+/// charged 8 bytes for each. Per-node work is bounded only because
+/// [`super::MAX_PLAIN_NUMERIC_DIGIT_RUN`] now caps the one token class that
+/// reaches a zero-charged visitor method with unbounded length; with that
+/// gate in front, the same construction is rejected in 48.6 ms. See
+/// [`super`]'s axis inventory.
 pub(super) fn check_expansion(yaml: &str, max: usize) -> Verdict {
     let weighed = Cell::new(0usize);
     let over_budget = Cell::new(false);
@@ -302,16 +329,30 @@ struct ExpansionMeter<'a> {
 }
 
 impl ExpansionMeter<'_> {
-    /// Charges one node: [`NODE_WEIGHT_BYTES`] plus `payload_bytes` (a
-    /// scalar's length, or zero for a container or a non-string scalar,
-    /// whose source form is a handful of bytes the node weight already
-    /// covers). Returns `Err` — which unwinds the whole walk, and with it
-    /// the expansion driving it — once the ceiling is passed.
+    /// Charges one node: [`NODE_WEIGHT_BYTES`] plus `payload_bytes` — a
+    /// scalar's length, or zero for a container or a scalar `serde_yaml`
+    /// decoded before handing it over. Returns `Err` — which unwinds the
+    /// whole walk, and with it the expansion driving it — once the ceiling
+    /// is passed.
     ///
-    /// `saturating_add` rather than `+`: `payload_bytes` is attacker-chosen
-    /// and the running total is charged once per alias expansion, so the
-    /// sum can genuinely overflow `usize` on a 32-bit target. Saturating
-    /// keeps that in the rejecting direction; wrapping would not.
+    /// **Zero for a decoded scalar is not "its source was small".** An
+    /// earlier version of this comment justified it that way — "a
+    /// non-string scalar, whose source form is a handful of bytes the node
+    /// weight already covers" — and that premise was false for floats:
+    /// `parse_f64` accepts a token of any length. It is true for the other
+    /// decoded kinds (bool and null are fixed literals, integers overflow
+    /// `from_str_radix` past ~42 digits), and it is made true for floats by
+    /// [`super::MAX_PLAIN_NUMERIC_DIGIT_RUN`] gating the source before this
+    /// function ever runs. The charge is zero because the length is bounded
+    /// elsewhere, not because it is small here.
+    ///
+    /// `saturating_add` rather than `+`: defence in depth, not a reachable
+    /// threat. At the real call site `max` is [`super::MAX_EXPANDED_WEIGHT`]
+    /// behind a [`super::MAX_YAML_BYTES`] gate, so the total is checked and
+    /// the walk aborted long before `usize` could overflow on any target.
+    /// The saturation is kept because it costs nothing and keeps a future
+    /// caller passing a larger `max` in the rejecting direction, but the
+    /// claim is only that — not that overflow can occur today.
     ///
     /// The `over_budget` flag exists because this error has to be
     /// distinguishable from `serde_yaml`'s own: both arrive at
