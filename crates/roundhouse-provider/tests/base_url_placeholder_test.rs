@@ -181,6 +181,18 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         reason: "real Google Vertex AI platform host",
     },
     AllowlistEntry {
+        file: "vertex-gemini.toml",
+        host: "aiplatform.googleapis.com",
+        reason: "real Google Vertex AI platform host (Task 17, same host family as \
+                 vertex-anthropic.toml)",
+    },
+    AllowlistEntry {
+        file: "gemini-generate-content-legacy.toml",
+        host: "generativelanguage.googleapis.com",
+        reason: "real Google Generative Language API host, same host as google-genai.toml \
+                 (Task 17: a separate profile for EndpointMode::GenerateContent)",
+    },
+    AllowlistEntry {
         file: "qwen-anthropic.toml",
         host: "dashscope-intl.aliyuncs.com",
         reason: "real Alibaba DashScope (Qwen) API host",

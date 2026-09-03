@@ -81,7 +81,29 @@ impl Provider for GoogleGenAiProvider {
                 resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
                     |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
                 )?;
-            let endpoint_url = build_endpoint_url(&base_url, self.mode, &req.model.0)?;
+            // Task 17: `vertex-gemini`'s request envelope (not its content
+            // shape -- `encode_generate_content` needs no changes) genuinely
+            // diverges from `EndpointMode::GenerateContent`'s otherwise-
+            // uniform URL shape. Verified (search corroborated, not a raw
+            // fetch -- see `vertex-gemini.toml`'s own citation): Vertex's
+            // real REST path is `{base}/{model}:streamGenerateContent
+            // ?alt=sse`, where `base` already carries the full
+            // `.../publishers/google/models` resource path and NO `v1beta`
+            // segment -- neither of which this function's hardcoded
+            // `"{base_path}/v1beta/models/{model}:streamGenerateContent"`
+            // produces. Mirrors `anthropic_messages::provider`'s identical
+            // `is_vertex` profile-identity branch for `vertex-anthropic`
+            // (REALITY-CORRECTIONS §12b: this is a wire-envelope
+            // profile-identity branch, not a credential-kind branch --
+            // every profile's auth still flows through the single
+            // `ctx.credentials.apply(..)` call below, or the bare-`api_key`
+            // Bearer fallback every other Bearer profile in this codec
+            // already uses).
+            let endpoint_url = if self.profile.id == "vertex-gemini" {
+                build_vertex_endpoint_url(&base_url, &req.model.0)?
+            } else {
+                build_endpoint_url(&base_url, self.mode, &req.model.0)?
+            };
 
             let mut http_req = HttpRequest {
                 method: "POST".to_string(),
@@ -258,6 +280,55 @@ fn build_endpoint_url(
             url.query_pairs_mut().append_pair("alt", "sse");
         }
     }
+    Ok(url)
+}
+
+/// Builds Vertex Gemini's `{base}/{model}:streamGenerateContent?alt=sse` --
+/// a completely different REST resource shape than
+/// [`build_endpoint_url`]'s `GenerateContent` branch. `base` is expected to
+/// already carry Vertex's full `.../publishers/google/models` resource path
+/// (see `vertex-gemini.toml`'s `base_url`), so this appends only the
+/// `{model}:streamGenerateContent` verb-suffixed segment plus `?alt=sse` --
+/// never `/v1beta/models/{model}...` the way first-party's `build_endpoint_url`
+/// does (Vertex's real path has no `v1beta` segment at all: verified,
+/// `.../v1/projects/{project}/locations/{location}/publishers/google/models/
+/// {model}:streamGenerateContent`, corroborated search result, cited in
+/// `vertex-gemini.toml`).
+///
+/// Mirrors `anthropic_messages::provider::build_vertex_endpoint_url`'s
+/// allowlist exactly, including its fix-round-2 Fix 7 rationale for
+/// permitting `@`: `url::Url::set_path` parses per-scheme (backslash becomes
+/// a path separator for special schemes) and then applies WHATWG
+/// dot-segment removal, so a DENYLIST of "dangerous" characters is one
+/// missed character away from a path-traversal bypass that pops real path
+/// segments off `base` -- this codec's own `build_endpoint_url` had exactly
+/// that defect before fix-round-2 G1. An ALLOWLIST has no such gap. `@` is
+/// permitted (unlike `build_endpoint_url`'s first-party allowlist) because
+/// Vertex publisher-model ids can be `@`-versioned (the same convention
+/// Anthropic's Vertex Claude ids use, e.g. `claude-sonnet-4-5@20250929`);
+/// adding it does not reopen the traversal bypass since `@` only ever lands
+/// inside a path SEGMENT (`Url::set_path` operates purely on the
+/// already-parsed `Url`'s path component and cannot promote a segment to
+/// userinfo/host), and `:` -- needed to actually construct a
+/// `user:pass@host`-shaped userinfo -- remains excluded.
+fn build_vertex_endpoint_url(base: &url::Url, model: &str) -> Result<url::Url, ProviderError> {
+    let is_valid_model_id_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@');
+    if model.is_empty() || !model.chars().all(is_valid_model_id_char) {
+        // Close-out item 2 (this codec's own precedent): escape the
+        // rejected id with `{:?}` rather than interpolating it raw --
+        // having failed the allowlist, it may carry newlines or other
+        // control bytes, and this string can reach a physically-immutable
+        // `events` row via `ProviderError`'s `Display`.
+        return Err(ProviderError::Unsupported(format!(
+            "model id {model:?} is not a valid Vertex publisher-model path segment (only ASCII \
+             alphanumerics, '.', '-', '_', '@' are permitted, and it may not be empty)"
+        )));
+    }
+    let mut url = base.clone();
+    let base_path = url.path().strip_suffix('/').unwrap_or(url.path());
+    url.set_path(&format!("{base_path}/{model}:streamGenerateContent"));
+    url.query_pairs_mut().append_pair("alt", "sse");
     Ok(url)
 }
 
@@ -450,6 +521,92 @@ mod build_endpoint_url_tests {
     fn the_rejection_message_escapes_a_newline_in_the_model_id_rather_than_interpolating_it_raw() {
         let base = url::Url::parse("https://generativelanguage.googleapis.com").unwrap();
         let err = build_endpoint_url(&base, EndpointMode::GenerateContent, "gemini\nadmin")
+            .expect_err("a model id containing a newline must be rejected");
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains('\n'),
+            "the rejection message must not contain a raw, unescaped newline: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\\n"),
+            "expected the newline to appear escaped (via {{:?}}) in the message: {rendered:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod build_vertex_endpoint_url_tests {
+    use super::build_vertex_endpoint_url;
+
+    #[test]
+    fn builds_the_real_vertex_stream_generate_content_shape_with_alt_sse() {
+        let base = url::Url::parse(
+            "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/google/models",
+        )
+        .unwrap();
+        let url = build_vertex_endpoint_url(&base, "gemini-3.0-pro").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/google/models/gemini-3.0-pro:streamGenerateContent?alt=sse"
+        );
+    }
+
+    /// Vertex publisher-model ids can be `@`-versioned (the same convention
+    /// `vertex-anthropic`'s allowlist accepts for Claude ids) -- confirms
+    /// this allowlist doesn't over-reject the real shape it exists to
+    /// permit.
+    #[test]
+    fn accepts_an_at_versioned_model_id() {
+        let base = url::Url::parse(
+            "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/google/models",
+        )
+        .unwrap();
+        let url = build_vertex_endpoint_url(&base, "gemini-2.5-flash@001").unwrap();
+        assert!(
+            url.as_str()
+                .ends_with("/gemini-2.5-flash@001:streamGenerateContent?alt=sse"),
+            "got {}",
+            url.as_str()
+        );
+    }
+
+    /// Same fix-round-2 G1 concern this codec's own `build_endpoint_url`
+    /// tests document: an ALLOWLIST, not a denylist of `/`/`..`/`%`. `\` is
+    /// a path separator for special schemes, and the parser strips
+    /// tab/LF/CR before parsing (so a tab-separated `.` + `.` reassembles
+    /// into a literal `..` segment) -- both bypass a denylist that only
+    /// checks for `/`, `..`, `%` as raw substrings but are rejected outright
+    /// by this character allowlist.
+    #[test]
+    fn rejects_a_path_traversal_shaped_model_id() {
+        let base = url::Url::parse(
+            "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/google/models",
+        )
+        .unwrap();
+        for bad_model in [
+            "../v1/projects/other-proj/locations/global/publishers/google/models/admin",
+            "foo/bar",
+            "%2e%2e/admin",
+            "gemini-3.0-pro/../../admin",
+            "foo\\bar",
+            ".\t.\\admin",
+            "",
+            "user:pass@evil.example.com",
+        ] {
+            assert!(
+                build_vertex_endpoint_url(&base, bad_model).is_err(),
+                "expected model id {bad_model:?} to be rejected"
+            );
+        }
+    }
+
+    /// A rejected id may carry control bytes; the rejection message must
+    /// escape it (`{:?}`), not interpolate it raw, since `ProviderError`'s
+    /// `Display` can reach a persisted event row.
+    #[test]
+    fn the_rejection_message_escapes_a_newline_in_the_model_id_rather_than_interpolating_it_raw() {
+        let base = url::Url::parse("https://aiplatform.googleapis.com").unwrap();
+        let err = build_vertex_endpoint_url(&base, "gemini\nadmin")
             .expect_err("a model id containing a newline must be rejected");
         let rendered = err.to_string();
         assert!(
