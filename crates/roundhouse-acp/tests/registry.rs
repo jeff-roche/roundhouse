@@ -21,10 +21,24 @@
 //!   fails closed even for an agent that is, in fact, in the registry and
 //!   not quarantined. Tests that want a successful resolution must
 //!   therefore seed the quarantine cache (possibly empty) explicitly.
+//!
+//! **Fix round 1 (coordinator review):**
+//! - Item 3 flipped `resolve_distribution`'s preference order: a
+//!   `sha256`-bearing `Binary` for the current platform is now preferred
+//!   over `Npx`/`Uvx`, not the other way around —
+//!   `resolve_launch_prefers_a_checksum_pinned_binary_over_npx_when_an_agent_publishes_both`
+//!   (renamed from `..._prefers_npx_over_binary_...`) now asserts the
+//!   opposite outcome from before.
+//! - Item 6 made [`roundhouse_acp::registry::LaunchConfig`]'s payload
+//!   private — every assertion that used to construct a `LaunchConfig::Npx {
+//!   .. }` / `LaunchConfig::Binary { .. }` literal and compare it with
+//!   `assert_eq!` now reads the resolved value back through its accessor
+//!   methods (`is_npx()`, `package()`, `args()`, `env()`, `target()`,
+//!   `archive()`, `sha256()`, `cmd()`) instead.
 
 use roundhouse_acp::registry::{
-    BinaryTarget, Distribution, LaunchConfig, PackageDistribution, Quarantine, Registry,
-    RegistryAgent, RegistryCache, ResolveError,
+    BinaryTarget, Distribution, PackageDistribution, Quarantine, Registry, RegistryAgent,
+    RegistryCache, ResolveError,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -84,14 +98,10 @@ fn resolve_launch_reads_from_the_registry_not_a_hardcoded_table() {
     let launch = cache
         .resolve_launch("codex")
         .expect("codex is in the fetched registry and not quarantined");
-    assert_eq!(
-        launch,
-        LaunchConfig::Npx {
-            package: "@openai/codex-acp".to_string(),
-            args: vec!["acp".to_string()],
-            env: BTreeMap::new(),
-        }
-    );
+    assert!(launch.is_npx());
+    assert_eq!(launch.package(), Some("@openai/codex-acp"));
+    assert_eq!(launch.args(), &["acp".to_string()]);
+    assert_eq!(launch.env(), &BTreeMap::new());
 
     let err = cache
         .resolve_launch("some-agent-not-in-the-registry")
@@ -189,12 +199,17 @@ fn resolve_launch_rejects_a_quarantined_agent_even_though_it_is_in_the_registry(
 }
 
 #[test]
-fn resolve_launch_prefers_npx_over_binary_when_an_agent_publishes_both() {
-    // Ruling-contradicting real data, discovered against the live index:
+fn resolve_launch_prefers_a_checksum_pinned_binary_over_npx_when_an_agent_publishes_both() {
+    // Fix round 1, Item 3: real data, discovered against the live index —
     // `kilo` and `sigit` publish both `binary` and `npx` distribution
-    // simultaneously. This models that shape directly and asserts the
-    // resolver's documented preference (npx/uvx over binary, since those
-    // avoid a download-and-verify step) rather than guessing.
+    // simultaneously, and both publish a full `sha256`-bearing binary map.
+    // This models that exact shape and asserts the resolver now prefers the
+    // checksum-pinned binary over the unverified, install-script-executing
+    // `npx` channel — the reverse of this test's original assertion, which
+    // preferred `npx` (the coordinator's review found that order inverted
+    // the actual integrity argument: a `Binary` with no `sha256` is refused
+    // as unverifiable two lines below where `npx`, which carries no digest
+    // at all, was unconditionally preferred).
     let dir = tempfile::tempdir().unwrap();
     let cache = RegistryCache::new(
         dir.path().join("registry.json"),
@@ -234,14 +249,19 @@ fn resolve_launch_prefers_npx_over_binary_when_an_agent_publishes_both() {
     cache.store_quarantine(&empty_quarantine()).unwrap();
 
     let launch = cache.resolve_launch("kilo").unwrap();
-    assert_eq!(
-        launch,
-        LaunchConfig::Npx {
-            package: "@kilocode/cli@7.5.9".to_string(),
-            args: vec!["acp".to_string()],
-            env: BTreeMap::new(),
-        }
+    assert!(
+        launch.is_binary(),
+        "expected the checksum-pinned binary to be preferred over npx"
     );
+    assert_eq!(launch.target(), Some(target));
+    assert_eq!(
+        launch.archive(),
+        Some("https://example.invalid/kilo.tar.gz")
+    );
+    assert_eq!(launch.sha256(), Some("a".repeat(64).as_str()));
+    assert_eq!(launch.cmd(), Some("./kilo"));
+    assert_eq!(launch.args(), &[] as &[String]);
+    assert_eq!(launch.env(), &BTreeMap::new());
 }
 
 #[test]
@@ -281,17 +301,16 @@ fn resolve_launch_resolves_a_binary_only_agent_for_the_current_platform() {
     cache.store_quarantine(&empty_quarantine()).unwrap();
 
     let launch = cache.resolve_launch("binary-only-agent").unwrap();
+    assert!(launch.is_binary());
+    assert_eq!(launch.target(), Some(target));
     assert_eq!(
-        launch,
-        LaunchConfig::Binary {
-            target: target.to_string(),
-            archive: "https://example.invalid/agent.tar.gz".to_string(),
-            sha256: Some("b".repeat(64)),
-            cmd: "./agent".to_string(),
-            args: vec!["serve".to_string()],
-            env: BTreeMap::new(),
-        }
+        launch.archive(),
+        Some("https://example.invalid/agent.tar.gz")
     );
+    assert_eq!(launch.sha256(), Some("b".repeat(64).as_str()));
+    assert_eq!(launch.cmd(), Some("./agent"));
+    assert_eq!(launch.args(), &["serve".to_string()]);
+    assert_eq!(launch.env(), &BTreeMap::new());
 }
 
 #[test]
@@ -481,4 +500,89 @@ fn binary_target_deserialization_rejects_an_unknown_field() {
     let json = r#"{"archive": "https://x", "cmd": "./x", "unexpected": 1}"#;
     let result: Result<BinaryTarget, _> = serde_json::from_str(json);
     assert!(result.is_err());
+}
+
+// ---- Item 4: launch fields (package/cmd/env) must be validated, not just id ----
+
+#[test]
+fn distribution_deserialization_rejects_an_npx_package_with_a_leading_dash() {
+    // The brief's own concrete example: `npx <package>` consumes a
+    // leading-`-` string as its own flag, not a package name.
+    let json = r#"{"npx": {"package": "--node-options=--require=/tmp/x.js"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a package name npx would consume as a flag must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_an_absolute_binary_cmd() {
+    let json = r#"{"binary": {"linux-x86_64": {"archive": "https://x", "cmd": "/bin/sh"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "an absolute cmd must be rejected");
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_binary_cmd_that_traverses_out_of_the_extraction_directory(
+) {
+    let json =
+        r#"{"binary": {"linux-x86_64": {"archive": "https://x", "cmd": "../../etc/passwd"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a cmd containing a `..` segment must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_forbidden_env_key_on_npx() {
+    let json = r#"{"npx": {"package": "x", "env": {"LD_PRELOAD": "/tmp/evil.so"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "LD_PRELOAD must be rejected");
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_forbidden_env_key_on_a_binary_target() {
+    let json = r#"{"binary": {"linux-x86_64": {"archive": "https://x", "cmd": "./agent", "env": {"NODE_OPTIONS": "--require=/tmp/x.js"}}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "NODE_OPTIONS must be rejected");
+}
+
+#[test]
+fn distribution_deserialization_accepts_real_live_shapes_with_a_relative_windows_style_cmd() {
+    // Real upstream value: `./bin\devin.exe` — mixed separator, still
+    // relative, no `..` segment. Item 4's validation must not be so strict
+    // it rejects real, currently-listed registry entries.
+    let json =
+        r#"{"binary": {"windows-x86_64": {"archive": "https://x", "cmd": "./bin\\devin.exe"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_ok(),
+        "a real relative windows-style cmd must not be rejected: {result:?}"
+    );
+}
+
+// ---- Item 7(a): resolve_launch must resolve using a stale registry cache,
+// not only a fresh one ----
+
+#[test]
+fn resolve_launch_resolves_using_a_stale_registry_cache_not_only_a_fresh_one() {
+    // Pins Ruling C-P13(e): resolve_launch must call
+    // load_cached_allow_stale, not load_cached — a mutation swapping the two
+    // passed the rest of this module's suite because every other
+    // resolve_launch test uses a cache whose TTL has not yet elapsed.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(0), // zero TTL: the entry reads as stale immediately
+    );
+    cache.store(&sample_registry()).unwrap();
+    cache.store_quarantine(&empty_quarantine()).unwrap();
+
+    let launch = cache
+        .resolve_launch("codex")
+        .expect("a stale-but-present registry cache must still resolve, per C-P13(e)");
+    assert!(launch.is_npx());
 }
