@@ -43,15 +43,46 @@ fn qwen_limit_requests_classifies_as_rate_limited() {
 }
 
 #[test]
-fn qwen_insufficient_quota_classifies_as_quota_exhausted_not_rate_limited() {
-    // Same real HTTP status (429) as limit_requests -- only the profile's
-    // own `/error/code` table distinguishes the two.
+fn qwen_insufficient_quota_is_not_in_the_table_and_falls_back_to_retryable_rate_limited() {
+    // Ruling P106: DashScope's "429-Throttling.AllocationQuota" (compat-mode
+    // code `insufficient_quota`) is a throughput cap, not a permanent billing
+    // block -- the vendor code name says "Throttling", and Alibaba's own
+    // error docs give the remedy as adjusting call rate / requesting a
+    // temporary TPM increase. A `fatal`/QuotaExhausted entry for this code
+    // was an unevidenced guess and a behavioural regression versus the
+    // pre-entry fallback, so it was removed from qwen.toml rather than
+    // reclassified.
     let error_profile = load("qwen").error_profile();
+
+    // Part 1: prove the table is genuinely silent on this code -- not
+    // merely agreeing by coincidence with whatever classify() returns below.
+    // This assertion is false the instant the entry is re-added under any
+    // disposition, which is the whole point.
+    assert!(
+        !error_profile.code_table.contains_key("insufficient_quota"),
+        "the qwen profile's [errors] table must not classify insufficient_quota -- \
+         see the comment above that key's deliberate absence in qwen.toml"
+    );
+
+    // Part 2: with the table silent, the SAME real HTTP status (429) that
+    // limit_requests uses above now hits the HTTP-429 fallback tier in
+    // classify(), which is RateLimited -- restoring the pre-entry behaviour.
     let body = qwen_body("insufficient_quota");
     let classified = classify(&error_profile, 429, &body, &http::HeaderMap::new());
     assert!(
-        matches!(classified, ProviderError::QuotaExhausted),
-        "expected QuotaExhausted, got {classified:?}"
+        matches!(classified, ProviderError::RateLimited { .. }),
+        "expected RateLimited via the HTTP-429 fallback tier, got {classified:?}"
+    );
+
+    // Part 3: assert the property that actually matters -- retry.rs will
+    // retry this, not just that the enum variant happens to be RateLimited.
+    // QuotaExhausted (the old, wrong classification) is Fatal in
+    // retry::disposition; RateLimited never is.
+    assert_ne!(
+        roundhouse_provider::retry::disposition(&classified),
+        roundhouse_provider::retry::Disposition::Fatal,
+        "insufficient_quota must be retryable now that the qwen profile's error \
+         table does not classify it as QuotaExhausted"
     );
 }
 

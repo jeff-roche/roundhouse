@@ -28,7 +28,9 @@ codec = "openai-chat"
 # separated group is the compatible-mode value (matching the live-observed
 # `invalid_api_key` for "401-InvalidApiKey/invalid_api_key"), the
 # PascalCase/dotted member is the native-API value this profile does not
-# use.
+# use. (See the `[errors]` table below for why `insufficient_quota`
+# specifically -- despite appearing in this naming discussion -- is not
+# listed as a code-table entry.)
 error_pointer = "/error/code"
 
 [defaults]
@@ -68,5 +70,17 @@ max = "true"
 
 [errors]
 "limit_requests" = { disposition = "shed_concurrency" }
-"insufficient_quota" = { disposition = "fatal", category = "quota" }
+# Ruling P106: "insufficient_quota" (DashScope's "429-Throttling.
+# AllocationQuota") is deliberately LEFT OUT of this table. The vendor code
+# name says "Throttling", and Alibaba Cloud's own error-code reference gives
+# the remedy as adjusting the calling strategy or requesting a temporary TPM
+# increase -- that is a throughput cap, not a permanent billing block. A
+# previous version of this table classified it as `fatal`/quota, which was an
+# unevidenced guess and a behavioural regression: before that entry existed,
+# the code fell through to the HTTP-429 default (RateLimited, retried); the
+# `fatal` entry turned a transient condition into a permanent one. Leaving
+# the entry out restores that retryable fallback and asserts nothing this
+# phase cannot evidence. Do NOT "helpfully" re-add this entry -- see
+# `tests/profile_errors_wiring_batch_c_test.rs`'s
+# `qwen_insufficient_quota_is_not_in_the_table_and_falls_back_to_retryable_rate_limited`.
 "model_not_supported" = { disposition = "fatal", category = "model_not_found" }
