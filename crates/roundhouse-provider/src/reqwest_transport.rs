@@ -1,5 +1,12 @@
 //! The one real, network-backed [`HttpTransport`] — and, per §9.10, the one
-//! place in the workspace allowed to construct a `reqwest::Client`.
+//! place *provider adapters* construct a `reqwest::Client`: no codec/adapter
+//! in this crate builds one directly, all going through [`ReqwestTransport`]
+//! instead. It is not the only construction site in the workspace —
+//! `roundhouse-tools`'s `HttpTaskExecutor::via_proxy` (`crates/
+//! roundhouse-tools/src/http.rs`) is a second, deliberate one for the
+//! `roundhouse-tools` HTTP-task domain, pre-existing since Phase 2 and
+//! already documented at its own call site as a second construction site
+//! that must not drift on the safety-relevant settings.
 
 use std::time::Duration;
 

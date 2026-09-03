@@ -10,8 +10,10 @@
 //! deliberately doesn't derive `Deserialize` so that guarantee can't be
 //! bypassed via `serde_json` either). Phase 1 adds the first real adapter
 //! and the first real transport — `AnthropicMessagesProvider` over
-//! `ReqwestTransport`, the one sanctioned `reqwest::Client` construction
-//! site per §9.10 — and the remaining provider families are Phase 6 work.
+//! `ReqwestTransport`, the sanctioned `reqwest::Client` construction site
+//! for provider adapters per §9.10 (a second, unrelated site exists in
+//! `roundhouse-tools` for the HTTP-task domain) — and the remaining
+//! provider families are Phase 6 work.
 //! See `docs/architecture/02-system-architecture.md` §5.2 and
 //! `06-provider-abstraction.md`.
 #![forbid(unsafe_code)]

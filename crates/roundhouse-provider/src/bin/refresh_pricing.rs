@@ -6,9 +6,11 @@
 //! "runtime refresh is opt-in and never blocks a request").
 //!
 //! Uses `ReqwestTransport` rather than constructing its own `reqwest::Client`
-//! — per this phase's REALITY-CORRECTIONS §12f, `ReqwestTransport` is "the
-//! one sanctioned `reqwest::Client` construction site per §9.10," and a
-//! second construction site here would make that claim false.
+//! — per this phase's REALITY-CORRECTIONS §12f, `ReqwestTransport` is the
+//! sanctioned `reqwest::Client` construction site for provider adapters
+//! per §9.10 (see this phase's fix-round-4 correction to §12f for the
+//! second, unrelated construction site in `roundhouse-tools`), and a second
+//! construction site here would make that narrower claim false too.
 
 use futures::StreamExt;
 use roundhouse_provider::pricing::PricingSnapshot;
