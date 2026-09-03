@@ -1937,12 +1937,31 @@ impl LaunchConfig {
 /// Both fields are registry-controlled text fetched from a third party.
 /// `id` has been validated against the schema's `^[a-z][a-z0-9-]*$` pattern
 /// on every path that turns fetched bytes into a [`RegistryAgent`] (see its
-/// `TryFrom` impl), so it holds no control characters. `name` has **not**
-/// been validated or escaped — it is `RegistryAgent::name` verbatim, free-form
-/// display text upstream, and this crate does not narrow it. Route it through
-/// [`escape_and_cap_peer_str`] before it reaches a log line, an audit trail,
-/// or any terminal rendering, exactly as this crate does with every other
-/// piece of peer text.
+/// `TryFrom` impl), so it holds no control characters. `name` is
+/// **untrusted, unescaped, uncapped registry text** — `RegistryAgent::name`
+/// verbatim, free-form display text upstream that this crate does not
+/// narrow. Measured: a registry `name` of
+/// `"\u{1b}[31mFORGED\n[audit] ok"` reaches `list_agents()[0].name` with its
+/// raw ESC and raw newline intact, bounded only by `MAX_RESPONSE_BYTES`. A
+/// caller must route it through [`escape_and_cap_peer_str`] (or an
+/// equivalent) before it reaches a log line, an audit trail, or any
+/// terminal rendering, exactly as this crate does with every other piece of
+/// peer text.
+///
+/// This is carried into daemon integration rather than fixed here — not
+/// escaped in the type itself. Escaping is not the obstacle: a
+/// `Display`-safe escaper that neutralizes `Cc` and `Cf` control characters
+/// and caps length, without the surrounding quotes that
+/// `escape_and_cap_peer_str`'s `format!("{:?}")` adds, would satisfy both
+/// the safety and the display goal, and this wave removed every sanctioned
+/// public route to a raw [`RegistryAgent`], so there is no longer a raw
+/// sibling for an unescaped `name` here to stay consistent with. The real
+/// reason is that [`AgentSummary`] needs a second addition at daemon
+/// integration: [`RegistryCache::list_agents`] currently gives a listing UI
+/// no way to know an agent is quarantined short of a network round trip or
+/// a per-agent [`RegistryCache::resolve_launch`] probe. Designing the
+/// escaping and the quarantine signal together, against a real caller,
+/// should produce a better type than designing either one blind now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSummary {
     pub id: String,
@@ -2668,12 +2687,29 @@ impl RegistryCache {
     /// inner field and in [`LaunchConfig`]'s private payload.
     ///
     /// What is *not* closed, disclosed rather than claimed away: [`Registry`]
-    /// and its fields stay `pub` (out-of-crate tests build one and
-    /// [`Self::store`] takes one), and `Registry: Deserialize` is public, so a
-    /// caller that reads the cache file itself and parses it reaches the same
-    /// data. That path is strictly longer than `resolve_launch` — it needs the
-    /// cache path, its own I/O, and its own parse — which is the opposite of
-    /// the shape that made this method a hazard.
+    /// and its fields stay `pub` (out-of-crate tests build one), and
+    /// [`Self::store`] — which takes a `&Registry` and is `pub` — writes
+    /// whatever it is given straight into the file this method (and
+    /// [`Self::resolve_launch`] behind it) reads back. So a caller with
+    /// access to this API can build a `Registry` literal carrying arbitrary
+    /// launch data and push it into the cache.
+    ///
+    /// **The injection is closed by construction, not by caller
+    /// cooperation.** [`Self::store`] only serializes to disk; every read
+    /// path, including this one, comes back through `Registry`'s own
+    /// tolerant `Deserialize`, which re-runs [`Distribution`]'s
+    /// `TryFrom<RawDistribution>` impl — and, through it,
+    /// [`validate_package_distribution`] / [`validate_binary_target`] — on
+    /// every entry, dropping any that fails.
+    /// Probed directly: storing an agent `evil` with
+    /// `npx.package = "/tmp/evil; rm -rf /"` and then calling
+    /// `resolve_launch("evil")` yields `Err(NotInRegistry)` (the entry never
+    /// survives deserialize); storing `npx.package = "legit-pkg@1.0.0"`
+    /// instead yields `Ok(..)` with that same already-valid package. So this
+    /// residual grants a caller *read* access only, to data that has already
+    /// passed every deserialize-time validator this module has — the
+    /// opposite of the shape that made this method a hazard in the first
+    /// place (a shorter path to *unvalidated* data).
     pub(crate) fn load_cached(&self) -> Option<Registry> {
         read_cached_json(&self.registry_path, Some(self.ttl))
     }

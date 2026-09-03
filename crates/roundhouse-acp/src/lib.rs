@@ -4,10 +4,17 @@
 //! format other editors and agents already use.
 //!
 //! Phase 5, Subsystem C landed this crate's contents. It is a library of
-//! protocol-shaped pieces with no I/O and no live connection of its own:
-//! driving an actual ACP session — spawning or attaching to a peer, running
-//! the JSON-RPC loop, owning sessions — is daemon integration work, and this
-//! crate depends only on `roundhouse-core` and `roundhouse-proto`.
+//! protocol-shaped pieces with no ACP connection of its own: driving an
+//! actual ACP session — spawning or attaching to a peer, running the
+//! JSON-RPC loop, owning sessions — is daemon integration work. That does
+//! not mean the crate is I/O-free: [`registry`]'s only job is fetching a
+//! third-party install index over HTTPS and persisting it to an on-disk
+//! cache, and that is this crate's I/O, in full — nothing outside
+//! `registry` touches the network or the filesystem. And "depends only on
+//! `roundhouse-core` and `roundhouse-proto`" is true solely of this crate's
+//! *internal* dependency set: it also pulls in `agent-client-protocol`,
+//! `serde`, `serde_json`, `thiserror`, and `reqwest` (see `Cargo.toml` for
+//! why each is a tracked deviation from the frozen crate dependency table).
 //!
 //! What is here, by module:
 //!
@@ -35,8 +42,11 @@
 //! - [`mcp_over_acp`] — the in-process MCP tool registry a v2 ACP client
 //!   serves over the existing channel; the transport half is daemon work.
 //! - [`registry`] — the real `agentclientprotocol/registry` install index:
-//!   fetch, cache, quarantine, and `resolve_launch`, the only route to an
-//!   agent's launch configuration.
+//!   fetch, cache, quarantine, and `resolve_launch`, the only route that
+//!   applies the quarantine gate, the `sha256` requirement, the platform
+//!   check, and the `UnverifiableBinary` refusal to an agent's launch
+//!   configuration. A disclosed residual remains open around it — see
+//!   [`registry::RegistryCache::load_cached`]'s doc.
 //! - [`peer_text`] — the crate's untrusted-text discipline: everything a
 //!   peer or the registry controls is escaped and length-capped into an
 //!   `EscapedPeerStr` before it can reach a log line or an error message.
