@@ -307,7 +307,18 @@ fn build_endpoint_url(base: &url::Url) -> url::Url {
 /// verb (`:streamRawPredict`) is the one this provider always calls, never
 /// the unary `:rawPredict` Anthropic's own curl example demonstrates.
 fn build_vertex_endpoint_url(base: &url::Url, model: &str) -> Result<url::Url, ProviderError> {
-    if model.is_empty() || model.contains(['/', '\n', '\r']) {
+    // Allowlist, not a denylist: `Url::set_path` parses per-scheme (backslash
+    // becomes a path separator for special schemes like https) and then
+    // applies WHATWG dot-segment removal, so any denylist of "dangerous"
+    // characters is one missed character away from a path-traversal bypass
+    // that pops real path segments off `base` -- see the
+    // `vertex_url_rejects_a_backslash_shaped_model_id` regression test below,
+    // which failed against a `['/', '\n', '\r']` denylist that missed `\`.
+    // Vertex publisher-model ids are restricted to this character set in
+    // practice; anything outside it is rejected rather than interpreted.
+    let is_valid_model_id_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    if model.is_empty() || !model.chars().all(is_valid_model_id_char) {
         return Err(ProviderError::Unsupported(format!(
             "model id {model:?} is not a valid Vertex publisher-model path segment"
         )));
@@ -432,6 +443,34 @@ mod build_endpoint_url_tests {
         assert!(build_vertex_endpoint_url(&base, "").is_err());
         assert!(build_vertex_endpoint_url(&base, "a/../b").is_err());
         assert!(build_vertex_endpoint_url(&base, "a\nb").is_err());
+    }
+
+    /// §15 evidence: the guard above (`.contains(['/', '\n', '\r'])`) denylists
+    /// characters and misses backslash. `Url::set_path` parses a backslash as a
+    /// path separator for special schemes and then applies WHATWG dot-segment
+    /// removal, so a backslash-shaped model id can pop real path components off
+    /// the base URL and redirect the request to an arbitrary path on the same
+    /// host, carrying the caller's bearer token. This test must be run and shown
+    /// to fail against the unfixed guard before the guard is changed to an
+    /// allowlist.
+    #[test]
+    fn vertex_url_rejects_a_backslash_shaped_model_id() {
+        let base = url::Url::parse(
+            "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/anthropic/models",
+        )
+        .unwrap();
+        assert!(
+            build_vertex_endpoint_url(&base, "a\\b").is_err(),
+            "a backslash must not be treated as a path separator"
+        );
+        assert!(
+            build_vertex_endpoint_url(&base, "..\\..\\..\\..\\..\\..\\v1beta1\\evil").is_err(),
+            "backslash dot-segments must not pop real path components"
+        );
+        assert!(
+            build_vertex_endpoint_url(&base, "%2e%2e\\%2e%2e\\zzz").is_err(),
+            "percent-encoded dot-segments combined with backslashes must not pop path components"
+        );
     }
 }
 
