@@ -20,13 +20,16 @@
 //!   the delimited `${{ }}` form, none uses a bare one, and
 //!   `Executor::run_to_completion`'s own `when:` handling already made this
 //!   call for the identical field shape (fix round 1, item 4).
-//! - **Per-item binding uses [`Evaluated::derive`] plus a fresh, per-item
-//!   `ExprContext`, not `ExprContext::get`/`set`-based restore.** See
-//!   [`Executor::dispatch_map_step`]'s own doc comment for the full
-//!   reasoning (ruling P40/R-1, R-2, R-2b). This crate therefore does not
-//!   add the `ExprContext::get` accessor the plan's Step 3 lists — nothing
-//!   in this diff needs to read a binding back, since the outer context is
-//!   never mutated in place. Left out per YAGNI, not by oversight.
+//! - **Per-item binding uses [`Evaluated::derive`], not the plan's
+//!   `ExprContext::get`/`set`-based restore.** See [`Executor::dispatch_map_step`]'s
+//!   own doc comment for the full reasoning (ruling P40/R-1, R-2). This
+//!   crate therefore does not add the `ExprContext::get` accessor the plan's
+//!   Step 3 lists. **Fix round 1 changed *how* the per-item context is
+//!   managed** (originally a fresh clone per item; now one clone per `map`
+//!   step, mutated in place per item and restored once at the end) — see
+//!   `dispatch_map_step`'s own doc comment, "Fix round 1" section, for why
+//!   the original per-item-clone design was itself a defect, not just a
+//!   style choice.
 //! - **`map.isolation`/`base_ref` (the "worktree fan-out" the plan's own
 //!   title names) is out of scope for this diff, structurally, not by
 //!   omission.** `dispatch_map_step` below never reads `StepBody::Map`'s
@@ -51,12 +54,51 @@ use crate::expr::{eval_delimited_expression, TemplateSource};
 use crate::parse::steps::{parse_step, OnItemError, StepDef};
 use serde_json::Value;
 
+/// Hard, closed-fail cap on a single `map` step's item count (fix round 1,
+/// item 3). See [`Executor::dispatch_map_step`]'s own doc comment,
+/// "`MAX_MAP_ITEMS`", for what this bounds and — importantly — what it does
+/// not (the product across nested `map`s). 2,000 is chosen to sit
+/// comfortably above any realistic single-level fan-out this crate's own
+/// examples reach for (mapping over PRs, files, webhook line items) while
+/// keeping this crate's own measured cost — after fix round 1's clone hoist
+/// (see `dispatch_map_step`'s own doc comment for the full table) — at
+/// **3.15 ms for exactly 2,000 items**, release build, one trivial `emit`
+/// inner step, versus the 620 ms a mere 2,500 items cost *before* that fix.
+/// Not derived from a formal analysis; a round number in the same order of
+/// magnitude as `ResourceCaps::default().max_tool_calls` (2,000), the
+/// closest existing precedent for "how many discrete units of work is a
+/// lot, for this crate."
+pub const MAX_MAP_ITEMS: usize = 2_000;
+
 /// A run's remaining resource budget as `map` sees it. Real, live tracking
 /// against actual task consumption is Task 8's durability layer's job (it
 /// owns the run-level ledger); this crate's job is to divide whatever
 /// `total_remaining` it is handed.
 pub struct MapBudget {
     pub total_remaining: ResourceCaps,
+}
+
+impl MapBudget {
+    /// A [`MapBudget`] that enforces **nothing** — `total_remaining` is
+    /// [`ResourceCaps::default`], not sourced from any real run-level
+    /// ledger. Fix round 1, item 3: `Executor::dispatch_map_step` used to
+    /// construct `MapBudget { total_remaining: ResourceCaps::default() }`
+    /// inline, which reads exactly like a real, intentional budget — a
+    /// placeholder that looks like an allowance is worse than one that
+    /// admits it isn't one. This constructor exists so that call site says
+    /// so explicitly and is greppable.
+    ///
+    /// **Task 8 must replace this call site with a `MapBudget` built from
+    /// the run's actual remaining budget** once real admission-time
+    /// enforcement exists. Until then, [`split_budget`]'s output
+    /// (`per_item_caps`, handed to `run_item`) is real and meaningful as an
+    /// *allocation* — it is only the *ceiling it is allocated from* that is
+    /// fake.
+    pub fn unenforced_placeholder() -> MapBudget {
+        MapBudget {
+            total_remaining: ResourceCaps::default(),
+        }
+    }
 }
 
 /// One item's result once its inner steps have run.
@@ -106,6 +148,14 @@ pub struct MapRunResult {
 /// bounded concurrent dispatcher once Task 8's durability layer owns actual
 /// task admission; nothing today gives a caller a live signal to parallelise
 /// against.
+///
+/// **`max_parallel` bounds nothing today (fix round 1, "also record").** A
+/// workflow declaring `map.max_parallel: 20` runs its items fully
+/// sequentially, not "at most 20 concurrently" — the field is accepted and
+/// threaded through unread. This is a residual, documented here precisely so
+/// a future reader does not mistake `max_parallel` for a working concurrency
+/// *ceiling*: today it is neither a floor nor a ceiling, because nothing
+/// reads it at all.
 ///
 /// **Never drops an item.** Every element of `items` produces exactly one
 /// [`ItemOutcome`] in [`MapRunResult::outcomes`], in order — §8.9's explicit
@@ -204,53 +254,125 @@ impl<'a> Executor<'a> {
     /// inner steps via the same [`Executor::dispatch_step`] sequencing every
     /// other step kind uses.
     ///
-    /// # Per-item binding: `Evaluated::derive` into a fresh `ExprContext` (ruling P40, R-1/R-2/R-2b)
+    /// # Per-item binding: `Evaluated::derive`, one clone per MAP STEP not per item (ruling P40/P44/P45, R-1/R-2)
     ///
     /// `over:` is evaluated **once**, via [`eval_delimited_expression`],
     /// producing one [`crate::expr::Evaluated`] over the whole collection —
     /// this crate has no operation that evaluates one collection element
     /// independently, so every item necessarily inherits the same
-    /// `secret_derived` flag the *collection* carries. Binding one item
+    /// `secret_derived` flag the *collection* carries (ruling P45: this is
+    /// accepted, not a defect — see [`crate::expr::ExprContext::set_public`]'s
+    /// own doc comment for the accepted 500-item figure). Binding one item
     /// therefore cannot go through `ExprContext::set_secret`/`set_public`
     /// (both require the caller to *assert* a taint it does not actually
     /// know per element) or through a hand-built `Evaluated` (exactly the
-    /// re-assertion-by-the-back-door ruling P37 exists to remove, and the
-    /// hazard R-1/ruling P40 named as this task's blocking pre-work). Instead:
+    /// re-assertion-by-the-back-door ruling P37 exists to remove). Instead:
+    /// [`crate::expr::Evaluated::derive`] produces a per-item `Evaluated`
+    /// whose `secret_derived` is read off the collection's own evaluation,
+    /// and it is bound with `ExprContext::set_from`, which propagates rather
+    /// than re-asserts (ruling P37).
     ///
-    /// 1. [`crate::expr::Evaluated::derive`] (this task's R-1 pre-work, on
-    ///    `Evaluated` itself) produces a per-item `Evaluated` whose
-    ///    `secret_derived` is read off the collection's own evaluation —
-    ///    there is no parameter through which a caller could lower it.
-    /// 2. That per-item `Evaluated` is bound with `ExprContext::set_from`,
-    ///    which propagates rather than re-asserts (ruling P37).
-    /// 3. The binding happens on a **fresh clone** of the context as it
-    ///    stood before this map step started — not on `self.ctx` in place —
-    ///    and inner steps run against that clone; `self.ctx` is restored
-    ///    (unchanged) after every item.
+    /// # Fix round 1: the original per-item `ExprContext` clone was itself the defect (item 3)
     ///
-    /// Step 3 is R-2b's requirement, taken deliberately: `ExprContext`
-    /// provenance is monotone per root **name** and irreversible for the
-    /// life of the context (see `ExprContext::set_public`'s own doc comment).
-    /// A single, shared context rebinding `as_name` in place would let one
-    /// secret-derived item (or, since every item in *this* map shares one
-    /// taint flag, one secret-derived `map` step) permanently poison every
-    /// later use of that same name — including a *different* `map` step
-    /// later in the same workflow that happens to reuse the same `as:`. A
-    /// fresh clone per item, forked from the pre-map context rather than
-    /// chained from the previous item, makes that impossible by
-    /// construction: nothing survives from one item's context to the next,
-    /// or from this `map` step to whatever runs after it. This also means
-    /// this task does not need `ExprContext::get`/a save-and-restore-by-name
-    /// dance (the plan's Step 3) — cloning the whole context and swapping it
-    /// back after each item is both simpler and the actually-required fix.
+    /// The first landed version cloned a **fresh** `ExprContext` for every
+    /// item, forked from the pre-map context. That closed the *cross-step*
+    /// poisoning hazard (see below) but, because `ExprContext::clone` deep-
+    /// clones every bound root including `inputs`/`vars`/`secrets`/`steps`,
+    /// made this function's cost **O(items × context size)** — measured,
+    /// release build, one trivial `emit` inner step: 2,500 items → 620 ms;
+    /// 10,000 → 15.6 s; 20,000 → **148.7 s**. Attributed by a controlled
+    /// experiment (items fixed at 2,000, varying only an `inputs.pad` string
+    /// no expression references): 0 KB → 22.5 ms; 8 MB → 396.2 ms — the
+    /// per-item clone re-copies context data no expression in the map even
+    /// reads. Nested `map`s multiply this: three nested `map` steps over one
+    /// input array, k=100 items each level, produced **2,000,000 events**
+    /// from a 580-byte workflow in 4.4 s.
     ///
-    /// Measured: `tests/map_step.rs`'s
+    /// **The fix: one `ExprContext` clone per `map` STEP, not per item.**
+    /// `self.ctx` is cloned exactly once, into `saved_outer_ctx`, before the
+    /// item loop begins. For every item, `self.ctx` itself (not a fresh
+    /// clone) is mutated in place via `set_from(as_name, &item_evaluated)` —
+    /// an O(1)-ish `HashMap` insert, not a deep clone — then the item's inner
+    /// steps dispatch against `self.ctx` directly. After the *whole* `run_map`
+    /// call finishes (every item processed), `self.ctx` is restored to
+    /// `saved_outer_ctx` in a single move.
+    ///
+    /// **Why this is still correct against R-2b's cross-step poisoning
+    /// hazard**, even though `self.ctx` is now mutated directly rather than
+    /// swapped for a fresh clone per item: `ExprContext` provenance is
+    /// monotone per root **name** and irreversible for the life of the
+    /// context, but *within one `map` step* every item shares the exact same
+    /// `secret_derived` bit (the paragraph above) — so repeatedly calling
+    /// `set_from(as_name, ..)` with a *constant* taint level across all
+    /// items of this map cannot mis-escalate or mis-lower anything; the
+    /// first call sets `as_name`'s provenance to the collection's own level,
+    /// every later call in the same map step is a no-op on provenance and
+    /// only updates the *value*. What still must not leak is this map
+    /// step's taint surviving into a **different** step (a later `map` reusing
+    /// the same `as:` name, or any other step) — that is exactly what
+    /// restoring `self.ctx = saved_outer_ctx` once, after the whole map
+    /// finishes, prevents: nothing this map step did to `as_name`'s
+    /// provenance is visible on `self.ctx` once `dispatch_map_step` returns.
+    ///
+    /// Measured, same payload as before the fix, confirming the property
+    /// still holds under the new design: `tests/map_step.rs`'s
     /// `a_secret_derived_maps_as_name_does_not_poison_a_later_clean_maps_use_of_the_same_as_name`
-    /// runs two `map` steps in one workflow, both `as: item`, the first over
-    /// a secret-derived collection and the second over a genuinely clean
-    /// one — the second map's items log in cleartext, confirming the fresh-
-    /// context design actually closes the poisoning path rather than merely
-    /// arguing it does.
+    /// — two `map` steps, both `as: item`, the first over a secret-derived
+    /// collection, the second over a genuinely clean one — the second map's
+    /// items still log in cleartext, not `***`.
+    ///
+    /// **Re-measured after the fix (ruling P18 — a cost claim needs a
+    /// measurement in the diff), release build, through
+    /// [`Executor::run_to_completion`], one trivial `emit` inner step, same
+    /// shape as the pre-fix table above but at and below [`MAX_MAP_ITEMS`]
+    /// (added by this same fix round — see below):**
+    ///
+    /// | items | events | elapsed |
+    /// |---|---|---|
+    /// | 500 | 1,000 | 876 µs |
+    /// | 1,000 | 2,000 | 1.53 ms |
+    /// | 2,000 | 4,000 | 3.15 ms |
+    ///
+    /// Roughly linear (each doubling of items costs ~2x, not ~4x+), and 2,000
+    /// items now completes in low-single-digit milliseconds versus the
+    /// pre-fix 2,500-item figure of 620 ms — a large constant-factor
+    /// improvement at comparable scale, consistent with removing the
+    /// per-item deep clone rather than merely trimming it.
+    ///
+    /// The `inputs.pad` attribution, repeated at a fixed 2,000 items: 0 B →
+    /// 2.63 ms; 1 MB → 2.57 ms; 8 MB → 4.13 ms — **flat**, not the pre-fix
+    /// 0 KB → 22.5 ms / 8 MB → 396.2 ms scaling. The residual ~1.5 ms growth
+    /// at 8 MB is exactly the *one* remaining clone (`saved_outer_ctx`,
+    /// taken once per map step) doing its one, now-unavoidable, O(context
+    /// size) unit of work — no longer multiplied by item count.
+    ///
+    /// Also confirmed: dispatching above [`MAX_MAP_ITEMS`] fails closed
+    /// *before* doing the expensive work, not after — 2,001 items: 209 µs;
+    /// 20,000 items: 6.8 ms (dominated by the harness building the input
+    /// array itself, not by this function, which never iterates it).
+    ///
+    /// # `MAX_MAP_ITEMS`: an explicit, closed-fail item-count cap (fix round 1, item 3)
+    ///
+    /// The clone fix above removes the *quadratic* term but not the
+    /// *unbounded* one: nothing before fix round 1 stopped `over:` from
+    /// yielding an arbitrarily large array (data-driven — a webhook payload,
+    /// a `map.over` expression reading `inputs`/`steps`), and nested `map`s
+    /// still multiply item counts across levels. `MAX_TOP_LEVEL_STEPS` (500,
+    /// `crate::parse::mod`) bounds a *workflow-authored* quantity; a `map`
+    /// item count is *data-driven* and needs its own bound for the same
+    /// reason. [`MAX_MAP_ITEMS`] fails the step **closed** (not silently
+    /// truncated) before any item is dispatched. This bounds one
+    /// `dispatch_map_step` call; it does **not** bound the *product* across
+    /// nested `map`s (a 3-level nest at the cap could still multiply to the
+    /// cap cubed) — that requires a *run-level* dispatched-task counter this
+    /// crate does not have and Task 8's admission ledger
+    /// (`ResourceCaps::max_tasks`) is the eventual owner of, per
+    /// [`MapBudget::unenforced_placeholder`]'s own doc comment.
+    ///
+    /// Not a hazard, confirmed by fix round 1's security lens rather than
+    /// assumed: recursion depth. `serde_yaml` rejects ≥64 nested `map`
+    /// levels at parse time; depth ≤48 executes cleanly with no stack
+    /// overflow. No additional guard added for that here.
     ///
     /// # `map.over`'s own residual (ROUND 2 carry-forward item 3, measured, not assumed)
     ///
@@ -268,8 +390,8 @@ impl<'a> Executor<'a> {
     /// `tests/map_step.rs`'s
     /// `an_unterminated_quote_can_merge_map_over_into_a_string_but_the_array_type_check_fails_it_closed`):
     /// `over: "${{ 'oops }} filler ${{ inputs.prs }} trailing' }}"` merges
-    /// exactly as `expr.rs` predicts — `over_evaluated.value` is
-    /// `Value::String("oops }} filler ${{ inputs.prs }} trailing")`, and
+    /// exactly as `expr.rs` predicts — `over_evaluated.value()` is
+    /// `&Value::String("oops }} filler ${{ inputs.prs }} trailing")`, and
     /// `inputs.prs` is never evaluated — and the step below fails with
     /// `` `map.over` must evaluate to an array, got a string `` rather than
     /// iterating zero times, one time over the string, or any other silent
@@ -281,6 +403,42 @@ impl<'a> Executor<'a> {
     /// `expr.rs`'s own doc comment already states is open by design (the
     /// grammar has no escape mechanism) and which no type check downstream
     /// can distinguish from an intentional array.
+    ///
+    /// # An item's own inner-step failure could be erased by a later inner step (fix round 1, item 4 — CLOSED)
+    ///
+    /// The first landed version tracked only `last`, the most recently
+    /// dispatched inner step's outcome, unconditionally overwritten by every
+    /// subsequent inner step regardless of status. So a **non-final** inner
+    /// step's failure was silently replaced by whatever the *following*
+    /// inner step returned — measured: 3 items, 2 inner steps each, the
+    /// *first* inner step failing, both `on_item_error: collect` and
+    /// `fail_fast` reported `map status=Completed`, every item
+    /// `status=completed`, zero collected errors. `fail_fast` never stopped
+    /// dispatching further items; `collect` gathered nothing; the map
+    /// reported full success — exactly the distinction this task exists to
+    /// establish, defeated.
+    ///
+    /// **Why the three `on_item_error` tests that shipped with this function
+    /// did not catch it, which matters more than the bug itself:** all three
+    /// drove [`run_map`] directly with a synthetic `run_item` closure — none
+    /// went through this function at all. They validated the *loop*
+    /// (`run_map`'s own `should_stop`/`collected_errors` logic, which was and
+    /// is correct) in isolation from the thing that actually *populates* an
+    /// `ItemOutcome` from a real item's inner steps. A test exercising only
+    /// the helper cannot see a defect that lives in the caller.
+    ///
+    /// **The fix:** an item fails as soon as **any** inner step fails — the
+    /// inner loop below breaks immediately on the first `StepStatus::Failed`,
+    /// keeping that failure as the item's `ItemOutcome`, rather than
+    /// continuing to the next inner step and letting it overwrite `last`.
+    /// Non-failing inner steps (`Completed`/`Skipped`) still update `last` in
+    /// sequence as before — only a `Failed` status stops the inner loop.
+    /// Pinned by two integration tests **through this function**, not
+    /// `run_map` directly, per the lesson above: `tests/map_step.rs`'s
+    /// `on_item_error_collect_through_dispatch_map_step_gathers_a_non_final_inner_step_failure`
+    /// and
+    /// `on_item_error_fail_fast_through_dispatch_map_step_stops_at_a_non_final_inner_step_failure`,
+    /// both with the failure in the **first** of two inner steps.
     pub(crate) fn dispatch_map_step(
         &mut self,
         step_id: &str,
@@ -297,7 +455,7 @@ impl<'a> Executor<'a> {
                     return StepOutcome::failed(step_id, format!("evaluating `map.over`: {e}"));
                 }
             };
-        let items: Vec<Value> = match &over_evaluated.value {
+        let items: Vec<Value> = match over_evaluated.value() {
             Value::Array(items) => items.clone(),
             other => {
                 return StepOutcome::failed(
@@ -310,6 +468,20 @@ impl<'a> Executor<'a> {
             }
         };
 
+        // Fix round 1, item 3: an explicit, closed-fail bound on a
+        // data-driven quantity — see this function's own doc comment,
+        // "`MAX_MAP_ITEMS`", for what this does and does not bound.
+        if items.len() > MAX_MAP_ITEMS {
+            return StepOutcome::failed(
+                step_id,
+                format!(
+                    "`map.over` yielded {} items, exceeding the {MAX_MAP_ITEMS}-item limit for a \
+                     single `map` step",
+                    items.len()
+                ),
+            );
+        }
+
         let inner_steps: Vec<StepDef> = match inner_step_yaml.iter().map(parse_step).collect() {
             Ok(v) => v,
             Err(e) => {
@@ -317,15 +489,16 @@ impl<'a> Executor<'a> {
             }
         };
 
-        let mut budget = MapBudget {
-            // The real remaining run-level budget is threaded in by Task 8's
-            // durability layer, which owns the run-level ledger — see this
-            // module's own doc comment. A fresh default at least gives
-            // `split_budget` a real, non-degenerate value to divide today.
-            total_remaining: ResourceCaps::default(),
-        };
+        let mut budget = MapBudget::unenforced_placeholder();
 
-        let base_ctx = self.ctx.clone();
+        // Fix round 1, item 3: exactly one clone of the whole context for
+        // this entire map step, not one per item — see this function's own
+        // doc comment, "Fix round 1: the original per-item `ExprContext`
+        // clone was itself the defect", for the measured cost this replaces
+        // and why mutating `self.ctx` in place per item (rather than
+        // swapping in a fresh clone) is still correct against R-2b's
+        // cross-step poisoning hazard.
+        let saved_outer_ctx = self.ctx.clone();
         // Fix-round-3-style step-boundary taint: if any item's own inner
         // steps produced secret-derived output, or the collection itself was
         // secret-derived, the map step's *own* aggregate output
@@ -334,7 +507,7 @@ impl<'a> Executor<'a> {
         // same reasoning `Executor::run_to_completion` already applies at
         // the top-level step boundary (see its own `secret_derived_steps`
         // comment).
-        let mut any_item_secret_derived = over_evaluated.secret_derived;
+        let mut any_item_secret_derived = over_evaluated.secret_derived();
 
         let result = run_map(
             items,
@@ -343,24 +516,36 @@ impl<'a> Executor<'a> {
             &mut budget,
             |item, _item_caps| {
                 let item_evaluated = over_evaluated.derive(item.clone());
-                let mut item_ctx = base_ctx.clone();
-                item_ctx.set_from(as_name, &item_evaluated);
+                self.ctx.set_from(as_name, &item_evaluated);
 
-                let saved = std::mem::replace(&mut self.ctx, item_ctx);
                 let mut last = ItemOutcome::Completed(Value::Null);
                 for inner in &inner_steps {
                     let outcome = self.dispatch_step(inner);
                     any_item_secret_derived |= outcome.output_is_secret_derived;
-                    last = match outcome.status {
-                        StepStatus::Failed { message } => ItemOutcome::Failed(message),
-                        StepStatus::Skipped { reason } => ItemOutcome::Skipped { reason },
-                        StepStatus::Completed => ItemOutcome::Completed(outcome.output),
-                    };
+                    match outcome.status {
+                        // Fix round 1, item 4: an item fails as soon as ANY
+                        // inner step fails — stop dispatching this item's
+                        // remaining inner steps and keep the failure, rather
+                        // than letting a later inner step's success
+                        // overwrite it. See this function's own doc comment
+                        // for the measured fail-open payload this replaces.
+                        StepStatus::Failed { message } => {
+                            last = ItemOutcome::Failed(message);
+                            break;
+                        }
+                        StepStatus::Skipped { reason } => {
+                            last = ItemOutcome::Skipped { reason };
+                        }
+                        StepStatus::Completed => {
+                            last = ItemOutcome::Completed(outcome.output);
+                        }
+                    }
                 }
-                self.ctx = saved;
                 last
             },
         );
+
+        self.ctx = saved_outer_ctx;
 
         StepOutcome {
             step_id: step_id.to_string(),

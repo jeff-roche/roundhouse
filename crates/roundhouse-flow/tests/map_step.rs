@@ -7,10 +7,43 @@
 //! always returns `true`, which cannot produce a skip at all, and its call
 //! site borrows the same `budget` both as `&mut` into `run_map` and
 //! immutably inside the closure, which does not borrow-check).
+//!
+//! # Fix round 1 sweep: three of these tests drove `run_map` directly, not `dispatch_map_step`
+//!
+//! `run_budget_exhaustion_is_cooperative_and_skips_are_recorded_not_dropped`,
+//! `on_item_error_collect_gathers_failures_onto_the_maps_own_output_while_continue_does_not`,
+//! and `fail_fast_stops_dispatching_after_the_first_failure_and_records_the_rest_as_skipped`
+//! all construct a synthetic `run_item` closure and call [`run_map`]
+//! directly — none goes through `Executor`/`dispatch_map_step`. That is
+//! exactly the shape fix round 1's security lens identified as the reason
+//! the fail-open `on_item_error` defect (item 4) shipped undetected: these
+//! tests validate `run_map`'s own loop logic (`should_stop`/
+//! `collected_errors`), which was and is correct, in isolation from the code
+//! that actually *populates* an `ItemOutcome` from a real item's inner
+//! steps. They remain valid coverage of `run_map` itself and are kept
+//! un-migrated (`run_map`'s loop-level contract is still worth testing
+//! directly) — but the two new tests below,
+//! `on_item_error_collect_through_dispatch_map_step_gathers_a_non_final_inner_step_failure`
+//! and
+//! `on_item_error_fail_fast_through_dispatch_map_step_stops_at_a_non_final_inner_step_failure`,
+//! are the ones that actually pin the fixed behavior, because only they
+//! exercise the real caller.
+//!
+//! # `isolation: worktree` in these YAML fixtures is not exercised (fix round 1, "also record")
+//!
+//! Every workflow YAML below declares `defaults: { isolation: worktree }`
+//! because `parse_workflow` requires *some* isolation default — it is not a
+//! claim that worktree isolation is created or checked anywhere in this
+//! test file. `map_step.rs`'s own module doc comment already states this
+//! plainly (`map.isolation`/`base_ref` are out of scope for this crate); this
+//! note exists so a green run of this file is never mistaken for evidence
+//! that isolation is exercised.
 
 use roundhouse_core::TaskKind;
 use roundhouse_flow::caps::ResourceCaps;
-use roundhouse_flow::exec::map_step::{run_map, split_budget, ItemOutcome, MapBudget};
+use roundhouse_flow::exec::map_step::{
+    run_map, split_budget, ItemOutcome, MapBudget, MAX_MAP_ITEMS,
+};
 use roundhouse_flow::exec::{Executor, RunContext, StepStatus, TaskSink};
 use roundhouse_flow::parse::parse_workflow;
 use roundhouse_flow::parse::steps::OnItemError;
@@ -512,5 +545,187 @@ steps:
         real_echoed.contains("s1"),
         "the real value handed to the dispatched task must still contain the item content: \
          {real_echoed}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Fix round 1 tests.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_map_over_exceeding_max_map_items_fails_closed_before_dispatching_any_item() {
+    // Fix round 1, item 3: attacker-/data-controlled `over:` fan-out was
+    // unbounded. Payload: MAX_MAP_ITEMS + 1 items, each a trivial number, no
+    // secret material — purely a count check.
+    let yaml = r#"
+name: too-many-items
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: fan_out
+    map:
+      over: "${{ inputs.items }}"
+      as: item
+      on_item_error: continue
+    steps:
+      - id: noop
+        emit: { v: 1 }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let items: Vec<serde_json::Value> = (0..(MAX_MAP_ITEMS + 1))
+        .map(|i| serde_json::json!(i))
+        .collect();
+    let ctx = run_ctx(serde_json::json!({"items": items}));
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    match &outcomes[0].status {
+        StepStatus::Failed { message } => {
+            assert!(
+                message.contains("exceeding") && message.contains(&MAX_MAP_ITEMS.to_string()),
+                "got: {message}"
+            );
+        }
+        other => panic!("expected the map step to fail closed above MAX_MAP_ITEMS, got {other:?}"),
+    }
+    assert!(
+        sink.0.is_empty(),
+        "no item is ever dispatched once the cap is exceeded — the check runs before the loop"
+    );
+}
+
+#[test]
+fn on_item_error_collect_through_dispatch_map_step_gathers_a_non_final_inner_step_failure() {
+    // Fix round 1, item 4 (the real defect): `last` used to be
+    // unconditionally overwritten by every inner step dispatched for an
+    // item, so a failure in a NON-FINAL inner step was silently erased by
+    // whichever inner step ran after it. This test drives the real
+    // `Executor`/`dispatch_map_step` path — not `run_map` directly with a
+    // synthetic closure — which is the point (see this file's own module
+    // doc comment: the three tests that drive `run_map` directly could not
+    // have caught this).
+    //
+    // Payload: 3 items, 2 inner steps each. The FIRST inner step
+    // (`doomed`) always fails (an undefined function reference —
+    // deterministic, independent of any future task landing). The SECOND
+    // inner step (`after`) would trivially succeed if ever reached.
+    let yaml = r#"
+name: fail-not-final-collect
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: fan_out
+    map:
+      over: "${{ inputs.items }}"
+      as: item
+      on_item_error: collect
+    steps:
+      - id: doomed
+        emit: { v: "${{ nope_this_function_does_not_exist(1) }}" }
+      - id: after
+        emit: { v: "should never run" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = run_ctx(serde_json::json!({"items": [1, 2, 3]}));
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let output = &outcomes[0].output;
+    let items = output["items"]
+        .as_array()
+        .expect("map output has an `items` array");
+    assert_eq!(items.len(), 3);
+    for (i, item) in items.iter().enumerate() {
+        assert_eq!(
+            item["status"],
+            serde_json::json!("failed"),
+            "item {i}'s first inner step must fail the item, not be erased: {item:?}"
+        );
+    }
+    let collected = output["collected_errors"]
+        .as_array()
+        .expect("map output has a `collected_errors` array");
+    assert_eq!(
+        collected.len(),
+        3,
+        "collect gathers every item's failure onto the map step's own output, \
+         even though the failure is in the first of two inner steps"
+    );
+    assert!(
+        sink.0.is_empty(),
+        "`doomed` fails before ever calling sink.emit, and `after` must never dispatch for \
+         any item — the inner loop breaks at the first failing inner step"
+    );
+}
+
+#[test]
+fn on_item_error_fail_fast_through_dispatch_map_step_stops_at_a_non_final_inner_step_failure() {
+    // Same payload shape as the `collect` test above, `on_item_error:
+    // fail_fast` instead. Before the fix: `fail_fast` never stopped
+    // dispatching further items, because every item's `doomed` failure was
+    // erased by `after`'s success, so `run_map` never saw an
+    // `ItemOutcome::Failed` to act on at all.
+    let yaml = r#"
+name: fail-not-final-fail-fast
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: fan_out
+    map:
+      over: "${{ inputs.items }}"
+      as: item
+      on_item_error: fail_fast
+    steps:
+      - id: doomed
+        emit: { v: "${{ nope_this_function_does_not_exist(1) }}" }
+      - id: after
+        emit: { v: "should never run" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = run_ctx(serde_json::json!({"items": [1, 2, 3]}));
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let output = &outcomes[0].output;
+    let items = output["items"]
+        .as_array()
+        .expect("map output has an `items` array");
+    assert_eq!(
+        items.len(),
+        3,
+        "every item still gets an entry, even though only the first ever ran"
+    );
+    assert_eq!(
+        items[0]["status"],
+        serde_json::json!("failed"),
+        "item 0's first inner step fails the item"
+    );
+    assert_eq!(
+        items[1]["status"],
+        serde_json::json!("skipped"),
+        "fail_fast stops dispatching after item 0's failure — item 1 is recorded skipped, \
+         not dropped"
+    );
+    assert_eq!(items[2]["status"], serde_json::json!("skipped"));
+    let collected = output["collected_errors"]
+        .as_array()
+        .expect("map output has a `collected_errors` array");
+    assert!(
+        collected.is_empty(),
+        "fail_fast never collects — only `collect` does"
+    );
+    assert!(
+        sink.0.is_empty(),
+        "no event is ever emitted: item 0's `doomed` fails before emitting, `after` never runs, \
+         and items 1-2 never dispatch at all"
     );
 }

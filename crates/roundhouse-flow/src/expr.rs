@@ -148,13 +148,14 @@
 //! this module returned — [`ExprContext::set_from`] reads the provenance off
 //! that producer, so the binding site never asserts anything. Propagate, do not
 //! re-assert. [`ProvenanceCarrier`] is sealed, which closes the set of carriers
-//! to those two types — but sealing the trait alone would not have made "the
-//! producer says clean" unforgeable, since [`Evaluated`]'s fields are public:
-//! a caller could still build one saying whatever it likes. See
-//! [`ProvenanceCarrier`] and [`Evaluated`]'s own doc comments for the
-//! `#[non_exhaustive]` plus [`Evaluated::derive`] pre-work that closes that
-//! (ruling P40, Task 14) — and, precisely, what it closes for an external
-//! crate versus what it leaves to in-crate convention.
+//! to those two types — but sealing the trait alone does not make "the
+//! producer says clean" unforgeable. [`Evaluated`]'s `value`/`secret_derived`
+//! are now private (ruling P44, correcting P40's original, unachievable
+//! "cannot lower taint" demand), which closes the naive clone-and-mutate
+//! forgery from outside this crate — but not [`Evaluated::derive`] called on
+//! the wrong source, and not [`ExprContext::set_public`]'s own accepted
+//! assertion. See [`ProvenanceCarrier`] and [`Evaluated`]'s own doc comments
+//! for the full, precise accounting of what is and is not closed.
 //!
 //! # Provenance-based redaction (ruling P33) — the complete propagation table
 //!
@@ -832,35 +833,35 @@ impl ExprContext {
     /// there is nothing to know at the binding site: the flag is read off
     /// [`ProvenanceCarrier`] rather than passed in.
     ///
-    /// # What the seal does and does not buy
+    /// # What the seal does and does not buy (ruling P44, correcting an earlier version of this section)
     ///
     /// [`ProvenanceCarrier`] is sealed, so no *foreign* type can implement it:
     /// the set of carriers is closed to [`Evaluated`] and
     /// [`Interpolated<Value>`](Interpolated). That is the whole of it. It does
-    /// **not**, by itself, authenticate the provenance inside a carrier —
-    /// before Task 14's blocking pre-work (ruling P40), [`Evaluated`] had
-    /// public fields and no `#[non_exhaustive]`, so a caller in *any* crate
-    /// could build one with whatever `secret_derived` it liked and hand it
-    /// here:
+    /// **not**, by itself, authenticate the provenance inside a carrier.
+    /// Before Task 14, [`Evaluated`] had public fields and no
+    /// `#[non_exhaustive]`, so a caller in *any* crate could build one with
+    /// whatever `secret_derived` it liked and hand it here — the naive
+    /// struct-literal forgery. **An earlier version of this section claimed
+    /// `#[non_exhaustive]` alone closed that for an external caller. It did
+    /// not**: with fields still `pub`, an out-of-tree crate could still
+    /// `real.clone()` then assign `.secret_derived = false` directly — no
+    /// struct-expression involved, so `#[non_exhaustive]` (which only blocks
+    /// that syntax) never engaged. Measured: this compiles and leaks from
+    /// outside the crate, reproducing the fix-round-5 leak byte-for-byte.
     ///
-    /// ```text
-    /// let real = eval(ExpressionSource::from_workflow_file("secrets.T"), &ctx)?;
-    /// let forged = Evaluated { value: real.value.clone(), secret_derived: false };
-    /// ctx.set_from("item", &forged);   // binds the secret as clean
-    /// ```
-    ///
-    /// [`Evaluated`] is now `#[non_exhaustive]`, which closes this for a
-    /// caller **outside** this crate — struct-literal syntax is a compile
-    /// error there. It does **not** close it for a struct literal written
-    /// **inside** `roundhouse-flow` itself (Rust's visibility model draws the
-    /// line at the crate boundary, not at "outside this function"); what
-    /// closes the in-crate half is [`Evaluated::derive`], the only
-    /// *convenient* way inside this crate to produce a per-item [`Evaluated`]
-    /// with `secret_derived` read off a real producer rather than typed by
-    /// hand. State this precisely, per this module's own standard for not
-    /// overclaiming what a seal enforces (see [`Evaluated`]'s own doc
-    /// comment for the identical point stated once more, beside the type it
-    /// is about).
+    /// **What actually closes the external route:** `value`/`secret_derived`
+    /// are now **private**, so `eval`/[`eval_delimited_expression`]/
+    /// [`Evaluated::derive`] are the only places that can name a
+    /// `secret_derived` value at all — there is no field to clone-and-mutate
+    /// from outside this crate. What this still does **not** close, and
+    /// cannot by this design: `clean.derive(secret_value)` (nothing can check
+    /// that the value passed to `derive` is actually reachable from the
+    /// `Evaluated` it is called on) and [`Self::set_public`] (still an
+    /// assertion, never verified). See [`Evaluated`]'s own doc comment for
+    /// the full accounting — this module's own standard is to state exactly
+    /// what a mechanism enforces rather than implying a seal where one of
+    /// three routes remains open.
     ///
     /// # It binds a whole producer; per-item derivation goes through `Evaluated::derive`
     ///
@@ -879,9 +880,9 @@ impl ExprContext {
     ///
     /// The producer's **unredacted** value — see
     /// [`ProvenanceCarrier::provenance_value`] for why binding `***` would be
-    /// wrong. This clones that value; the cost of the clone is unmeasured, and
-    /// this method has no callers in this crate yet (see the note below), so
-    /// no workload here exercises it.
+    /// wrong. This clones that value; the cost of the clone is unmeasured
+    /// beyond `crate::exec::map_step`'s own per-item context-clone cost (a
+    /// distinct, measured cost — see `dispatch_map_step`'s doc comment).
     ///
     /// # Interaction with monotonicity, and the one thing it does not fix
     ///
@@ -890,19 +891,27 @@ impl ExprContext {
     /// It does **not** rescue a name from the per-root-name conservatism
     /// described on [`Self::set_public`] — a loop that binds one name per item
     /// still escalates that name permanently the first time an item is
-    /// tainted.
+    /// tainted, **for the life of whichever `ExprContext` it is called on**.
+    /// Ruling P45 records the sharpest form of this: since `map.over` is
+    /// evaluated once, every item in one `map` step shares one taint bit
+    /// regardless of which `ExprContext` (shared or per-item) `set_from`
+    /// binds it into — this is not a monotonicity artifact to be fixed, it is
+    /// collection-granularity taint, accepted. See [`Self::set_public`]'s own
+    /// doc comment for the full accounting and the measured figure.
     ///
-    /// # No callers here yet, deliberately
+    /// # Callers (Task 14, landed)
     ///
-    /// As of fix round 5 nothing in `crate::exec` binds an `Evaluated` or an
-    /// `Interpolated<Value>` into a context: `inputs`/`vars` come from
-    /// [`crate::exec::RunContext`], `run.id` is literal, `secrets` is
-    /// `set_secret` by construction, and `steps` goes through
-    /// [`Self::set_with_secret_paths`], which is strictly *more* precise than
-    /// this (per-step paths rather than a whole root) and so is deliberately
-    /// not migrated. This exists because Tasks 14-21 — `map`'s per-item
-    /// binding first — are about to write exactly the binding sites the ruling
-    /// is about, and the API they write against is the one that ships now.
+    /// `crate::exec::map_step::Executor::dispatch_map_step` is this method's
+    /// first real caller: it evaluates `over:` once, calls
+    /// [`Evaluated::derive`] once per item, and binds the result with this
+    /// method into a **fresh, per-item** `ExprContext` (see that function's
+    /// own doc comment for why per-item rather than the shared run context).
+    /// `inputs`/`vars`/`run.id`/`secrets` still bind through
+    /// [`Self::set_public`]/[`Self::set_secret`] directly (none of them has a
+    /// producer to read), and `steps` still goes through
+    /// [`Self::set_with_secret_paths`], strictly more precise than this
+    /// (per-step paths rather than a whole root) and so deliberately not
+    /// migrated.
     pub fn set_from<P: ProvenanceCarrier>(&mut self, name: &str, produced: &P) {
         let value = produced.provenance_value().clone();
         if produced.provenance_is_secret_derived() {
@@ -968,31 +977,46 @@ impl ExprContext {
     /// a suggestion: there is no way to undo the escalation afterwards, by
     /// design.
     ///
-    /// The scale of the consequence, as reported by the fix-round-4 review
-    /// (not measured at the time — Task 6/14's `map` did not exist yet):
-    /// a 500-item `map` in which item 1 carries a credential produces 500
-    /// fully-redacted log lines, *including the item names* — one tainted
-    /// item costs the observability of the other 499, **if every item is
-    /// bound into the same, shared `ExprContext` by rebinding one name in
-    /// place**. The `steps` root is unaffected, because
-    /// [`Self::set_with_secret_paths`] keeps it per-step precise rather than
-    /// whole-root.
+    /// The scale of the consequence (ruling P45, correcting fix round 1's own
+    /// over-narrow framing of this figure): a 500-item `map` in which only
+    /// item 1 carries a credential produces 500 fully-redacted log lines,
+    /// *including every item's name* — one tainted item costs the
+    /// observability of the other 499. **This figure is unconditional under
+    /// collection-granularity taint, not contingent on any particular binding
+    /// strategy.** An earlier version of this paragraph qualified it with "if
+    /// every item is bound into the same, shared `ExprContext` by rebinding
+    /// one name in place", which reads as "the landed `map` design avoids
+    /// this" — measured, by execution, that it does not: `map.over` is
+    /// evaluated **once** ([`eval_delimited_expression`]), producing a single
+    /// [`Evaluated`] whose `secret_derived` bit is then propagated to every
+    /// element by [`Evaluated::derive`], regardless of which `ExprContext`
+    /// each element is later bound into. There is no per-element evaluation
+    /// in this crate to give any one item a taint bit independent of the
+    /// others', so this is not a bug in `crate::exec::map_step`'s binding
+    /// strategy — it is the inherent cost of taint being tracked per
+    /// *collection*, not per *element*. **This is accepted, over- not
+    /// under-redaction**, and the `steps` root is unaffected regardless,
+    /// because [`Self::set_with_secret_paths`] keeps it per-step precise
+    /// rather than whole-root.
     ///
-    /// **Task 14 (`map`, landed) does not rebind `as_name` in place on a
-    /// shared context, precisely to avoid this.** `crate::exec::map_step`'s
+    /// **What `crate::exec::map_step`'s fresh-`ExprContext`-per-item design
+    /// actually fixes — a different, real problem, not this one.**
     /// `dispatch_map_step` clones a fresh `ExprContext` per item from the
     /// context as it stood *before* the map step started, binds that one
     /// item into the clone, runs the item's inner steps against it, and
-    /// discards the clone — so a name's taint from one item, or from one
-    /// `map` step, can never survive to poison a *different* map step (or a
-    /// later top-level step) that happens to reuse the same `as:` name.
-    /// Measured end to end (two `map` steps in one workflow, both `as:
-    /// item`, the first's `over:` secret-derived, the second's genuinely
-    /// clean): `tests/map_step.rs`'s
+    /// discards the clone — so a name's taint from **one `map` step** can
+    /// never survive to poison a **different** `map` step (or a later
+    /// top-level step) that happens to reuse the same `as:` name. It does
+    /// **not**, and structurally cannot, give item 2 of a 500-item map a
+    /// taint bit independent of item 1's — both come from the same one
+    /// `Evaluated` the collection produced. Measured end to end (two `map`
+    /// steps in one workflow, both `as: item`, the first's `over:`
+    /// secret-derived, the second's genuinely clean):
+    /// `tests/map_step.rs`'s
     /// `a_secret_derived_maps_as_name_does_not_poison_a_later_clean_maps_use_of_the_same_as_name`
-    /// — the second map's items log in cleartext, not `***`, which is
-    /// exactly the property this method's own monotonicity would have broken
-    /// had `dispatch_map_step` rebound `self.ctx` directly instead.
+    /// — the second map's items log in cleartext, not `***`. That is the
+    /// property this design closes: poisoning is bounded to *within* one
+    /// `map` step's own collection, never across steps.
     ///
     /// What this conservatism cannot do is corrupt a dispatched value, which
     /// never consults provenance at all; it costs log readability only.
@@ -1228,45 +1252,100 @@ pub const REDACTION_PLACEHOLDER: &str = "***";
 /// value, plus whether computing it read a root bound through
 /// [`ExprContext::set_secret`]/[`ExprContext::set_with_secret_paths`].
 ///
-/// The fields are public because `eval` has no dual rendering to confuse —
-/// there is only one value, and `secret_derived` tells a caller whether
-/// putting it in a log needs a `***` stand-in. Callers that want the
-/// stand-in produced for them should use [`interpolate`]/[`interpolate_json`]
-/// and their [`Interpolated`] result instead.
+/// Fields are private, reachable only through [`Self::value`]/
+/// [`Self::into_value`]/[`Self::secret_derived`] — see the "What this design
+/// closes, and what it does not" section below for exactly why (ruling P44).
+/// Callers that want a redacted-for-logging stand-in produced for them
+/// should use [`interpolate`]/[`interpolate_json`] and their [`Interpolated`]
+/// result instead.
 ///
-/// # `#[non_exhaustive]` (ruling P40, Task 14's blocking pre-work)
+/// # `#[non_exhaustive]` plus private fields — what this design closes, and what it does not (ruling P44, correcting P40)
 ///
-/// Fields stay `pub` — field *reads* are deliberate, per the paragraph
-/// above — but the type is `#[non_exhaustive]` so a crate outside this one
-/// cannot use struct-literal syntax to build one. Before this, an external
-/// caller of [`ExprContext::set_from`] could write
-/// `Evaluated { value: real.value.clone(), secret_derived: false }` — a
-/// forgery, not a propagation, one token from binding a secret as clean.
-/// `#[non_exhaustive]` closes exactly that: **external** construction. It
-/// does **not** stop a struct literal written inside *this* crate — Rust's
-/// visibility model draws the line at the crate boundary, not at "outside
-/// this function" — so [`Self::derive`] closes the in-crate half by being
-/// the only *convenient* way to produce a correctly-tainted derived value;
-/// nothing here makes an in-crate hand-built literal a compile error. State
-/// this precisely rather than overclaiming: see this module's own account of
-/// what a rename (`set` → `set_public`) versus real enforcement each buy,
-/// two ruling revisions up (P35 then P37) — the pattern this comment is
-/// careful not to repeat a third time.
+/// **P40 asked for a constructor that "cannot lower taint" and treated that
+/// as an enforcement boundary. That property does not exist, and shipping
+/// exactly what P40 asked for proved it by execution (ruling P44).** From an
+/// out-of-tree crate, with the type as it shipped in Task 14 (`#[non_exhaustive]`,
+/// but `value`/`secret_derived` still `pub`), both of these compiled and
+/// leaked, reproducing the fix-round-5 leak byte-for-byte:
+///
+/// ```text
+/// let mut f = real.clone(); f.secret_derived = false;   // clone, then mutate a pub field
+/// clean.derive(real.value.clone())                       // derive from an UNRELATED clean Evaluated
+/// ```
+///
+/// `#[non_exhaustive]` blocks *struct-expression* syntax from outside this
+/// crate — that closes only the most naive forgery
+/// (`Evaluated { value: .., secret_derived: false }`) and nothing else, because
+/// with public fields a caller can still `clone()` a real value and then
+/// **assign** to the field directly (no struct-expression involved at all).
+///
+/// **What actually closes that route:** the fields are now private. `eval`,
+/// [`eval_delimited_expression`], and [`Self::derive`] are the only places in
+/// this crate that can name a `secret_derived` value, so from outside this
+/// crate there is no field to clone-and-mutate.
+///
+/// **What remains open, stated plainly rather than implied closed (this is
+/// the corrected, weaker property P44 asks for):**
+/// - **`clean.derive(secret_value)`** — [`Self::derive`] cannot express "this
+///   `value` came from `self`"; nothing checks that the `Value` passed in is
+///   actually reachable from the `Evaluated` `derive` is called on, because
+///   nothing *could* check that — it is an arbitrary caller-supplied `Value`
+///   by design (that is what lets `map` derive a per-item `Evaluated` from a
+///   whole-collection one in the first place). The only property `derive`
+///   can and does guarantee is **output taint = source taint** — never that
+///   the output value is actually derived from the source value. Calling
+///   `derive` on the *wrong* (differently-tainted) `Evaluated` still produces
+///   a wrongly-tainted result; nothing in this type stops that.
+/// - **[`ExprContext::set_public`]** — ruling P35's accepted escape hatch for
+///   genuinely literal data remains exactly what it always was: an assertion
+///   the binding site makes, not something this type can verify.
+///
+/// Private fields therefore close **one of three** external routes to a
+/// mislabeled taint, not all three. [`Self::derive`] is a **convenience for
+/// propagation, not an enforcement boundary** — it exists so a caller who
+/// *does* have the right source `Evaluated` does not have to hand-build one
+/// and get `secret_derived` wrong by a typo; it cannot stop a caller who
+/// deliberately or mistakenly calls it on the wrong source. Do not read this
+/// section as "the forgery hole is closed" — it narrows the surface, it does
+/// not seal it. (This is the fourth time this phase a ruling's stated
+/// enforcement claim needed correcting after review — see the P33 amendment,
+/// P35, and P37's own history of the identical pattern with `set`/`set_public`
+/// — and the third time it was *my own* ruling, per P44's own admission.)
 #[non_exhaustive]
 #[derive(Clone, PartialEq)]
 pub struct Evaluated {
-    pub value: Value,
-    pub secret_derived: bool,
+    value: Value,
+    secret_derived: bool,
 }
 
 impl Evaluated {
+    /// The expression's own value. Borrowed — see [`Self::into_value`] for
+    /// the owned form, and [`ProvenanceCarrier::provenance_value`] for why a
+    /// caller reading this must never write it to a log or persisted field
+    /// without also checking [`Self::secret_derived`].
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+
+    /// The expression's own value, by value — see [`Self::value`].
+    pub fn into_value(self) -> Value {
+        self.value
+    }
+
+    /// Whether computing [`Self::value`] read a root bound through
+    /// [`ExprContext::set_secret`]/[`ExprContext::set_with_secret_paths`]
+    /// (directly, or by [`Self::derive`] propagation from such a value).
+    pub fn secret_derived(&self) -> bool {
+        self.secret_derived
+    }
+
     /// Derives a new [`Evaluated`] for a value computed **from this one** —
-    /// an element of `self.value` when it is an array, a field of it, or any
-    /// other value whose provenance genuinely traces back to this producer.
-    /// `secret_derived` is carried forward from `self` and there is no way
-    /// to call this and get a *lower* taint out than `self` already carries:
-    /// the method has exactly one source of provenance to read (`self`), and
-    /// reads it unconditionally.
+    /// an element of `self.value()` when it is an array, a field of it, or
+    /// any other value whose provenance genuinely traces back to this
+    /// producer. `secret_derived` is carried forward from `self` and there
+    /// is no way to call this and get a *lower* taint out than `self`
+    /// already carries: the method has exactly one source of provenance to
+    /// read (`self`), and reads it unconditionally.
     ///
     /// # Why this exists (ruling P40; R-1/R-2 of Task 14's brief)
     ///
@@ -1281,6 +1360,19 @@ impl Evaluated {
     /// item. Calling this method instead makes that mistake impossible to
     /// make *by omission*: there is no `secret_derived` parameter to get
     /// wrong, because the only value in scope is the one already on `self`.
+    ///
+    /// # What this does NOT and cannot guarantee (ruling P44)
+    ///
+    /// This method has no way to check that `value` is actually reachable
+    /// from `self.value()` — it is *any* caller-supplied [`Value`], by
+    /// design (that is exactly what lets `map` derive a per-item value out
+    /// of a whole-collection one). The only property it can and does
+    /// enforce is **output `secret_derived` = source `secret_derived`**. A
+    /// caller that calls this on the wrong source (a clean `Evaluated` when
+    /// the real value came from a secret one) still gets a wrongly-tainted
+    /// result — this method is a propagation convenience, not proof the
+    /// value passed in actually came from `self`. See [`Evaluated`]'s own
+    /// doc comment for the full accounting of what is and is not closed.
     pub fn derive(&self, value: Value) -> Evaluated {
         Evaluated {
             value,
@@ -1387,19 +1479,24 @@ impl<T: fmt::Debug> fmt::Debug for Interpolated<T> {
 /// and adding a producer means implementing this here, beside the evaluator
 /// that computes the flag.
 ///
-/// # What it does not enforce
+/// # What it does not enforce (ruling P44)
 ///
 /// The seal closes the set of carrier *types*; by itself it would not
-/// authenticate the provenance *inside* one. Before ruling P40's Task 14
-/// pre-work, [`Evaluated`] had public fields and no `#[non_exhaustive]`, so
-/// a caller in any crate could construct one with any `secret_derived` it
-/// chose and pass it to [`ExprContext::set_from`] — re-assertion by the back
-/// door, through a type the seal permitted. [`Evaluated`] is now
-/// `#[non_exhaustive]`, which turns that struct literal into a compile error
-/// **outside this crate**; [`Evaluated::derive`] is what makes the correct
-/// in-crate construction the convenient one (see [`Evaluated`]'s own doc
-/// comment for exactly what the attribute does and does not close — it does
-/// not make an in-crate hand-built literal impossible, only unnecessary).
+/// authenticate the provenance *inside* one. Before Task 14, [`Evaluated`]
+/// had public fields and no `#[non_exhaustive]`, so a caller in any crate
+/// could construct one with any `secret_derived` it chose and pass it to
+/// [`ExprContext::set_from`] — re-assertion by the back door, through a type
+/// the seal permitted. `#[non_exhaustive]` alone did **not** close that for
+/// an external caller, contrary to what an earlier version of this section
+/// claimed: with fields still `pub`, `real.clone()` then a direct field
+/// assignment bypasses `#[non_exhaustive]` entirely (it only blocks
+/// struct-*expression* syntax). What actually closes it is that
+/// `value`/`secret_derived` are now **private** — `eval`/
+/// `eval_delimited_expression`/[`Evaluated::derive`] are the only places that
+/// can name a `secret_derived` value. This narrows, but does not seal:
+/// `clean.derive(secret_value)` and [`ExprContext::set_public`] remain open
+/// routes that no type-level mechanism here can close (see [`Evaluated`]'s
+/// own doc comment for the full accounting).
 ///
 /// [`Interpolated<String>`](Interpolated) is left out on purpose rather than by
 /// oversight: [`Self::provenance_value`] returns a *borrow*, and a

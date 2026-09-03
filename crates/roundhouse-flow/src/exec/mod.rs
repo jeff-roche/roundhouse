@@ -574,8 +574,8 @@ impl<'a> Executor<'a> {
                         // What is recorded instead of acted on: the flag, so
                         // the next task decides with a read rather than a
                         // re-derivation.
-                        gate_condition_was_secret_derived = cond.secret_derived;
-                        if !matches!(cond.value, Value::Bool(true)) {
+                        gate_condition_was_secret_derived = cond.secret_derived();
+                        if !matches!(cond.value(), Value::Bool(true)) {
                             let outcome = StepOutcome {
                                 step_id: step.id.clone(),
                                 output: Value::Null,

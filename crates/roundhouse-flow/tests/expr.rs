@@ -24,7 +24,8 @@ fn property_access_and_indexing() {
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("inputs.repo"), &ctx())
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!("acme/widgets")
     );
     assert_eq!(
@@ -33,7 +34,8 @@ fn property_access_and_indexing() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!(1)
     );
 }
@@ -46,7 +48,8 @@ fn ternary_and_len() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!(true)
     );
     assert_eq!(
@@ -57,7 +60,8 @@ fn ternary_and_len() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!("has findings")
     );
 }
@@ -70,7 +74,8 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!([{"number":1},{"number":2}])
     );
     assert_eq!(
@@ -79,7 +84,8 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!("fallback")
     );
     assert_eq!(
@@ -88,7 +94,8 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!(true)
     );
     assert_eq!(
@@ -97,7 +104,8 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!([1, 2, 3])
     );
     assert_eq!(
@@ -106,7 +114,8 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!({"a":1})
     );
     std::env::set_var("ROUNDHOUSE_TEST_VAR", "hello");
@@ -116,7 +125,8 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!("hello")
     );
 }
@@ -208,31 +218,36 @@ fn comparisons_and_equality_operators_work() {
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("1 == 1"), &ctx())
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(true)
     );
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("1 != 2"), &ctx())
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(true)
     );
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("2 >= 2"), &ctx())
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(true)
     );
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("1 <= 0"), &ctx())
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(false)
     );
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("'a' == 'a'"), &ctx())
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(true)
     );
 }
@@ -244,7 +259,8 @@ fn missing_root_and_missing_field_resolve_to_null_not_an_error() {
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("missing"), &ctx())
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(null)
     );
     assert_eq!(
@@ -253,7 +269,8 @@ fn missing_root_and_missing_field_resolve_to_null_not_an_error() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!(null)
     );
     assert_eq!(
@@ -262,7 +279,8 @@ fn missing_root_and_missing_field_resolve_to_null_not_an_error() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!(null)
     );
 }
@@ -272,7 +290,8 @@ fn array_literal_and_nested_indexing() {
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("[1,2,3][1]"), &ctx())
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(2)
     );
 }
@@ -289,7 +308,8 @@ fn integer_literals_compare_equal_to_context_data_regardless_of_number_represent
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!(true)
     );
     let mut c = ctx();
@@ -297,19 +317,22 @@ fn integer_literals_compare_equal_to_context_data_regardless_of_number_represent
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("float_one == 1"), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(true)
     );
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("float_one != 1"), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(false)
     );
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("float_one == 2"), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(false)
     );
 }
@@ -348,7 +371,8 @@ fn large_string_context_values_evaluate_without_error() {
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("pr.title"), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(big)
     );
 }
@@ -371,7 +395,8 @@ fn deeply_nested_context_values_are_indexed_by_direct_path_without_walking_the_w
     assert_eq!(
         eval(ExpressionSource::from_workflow_file(&path), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!("bottom")
     );
 }
@@ -386,7 +411,8 @@ fn non_ascii_context_values_round_trip_through_property_access_and_interpolation
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("pr.title"), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!("Fix \u{1F41B} in \u{00e9}migr\u{00e9} module — “quoted”")
     );
     let out = interpolate(
@@ -412,7 +438,8 @@ fn context_value_containing_the_expression_delimiter_itself_is_not_special() {
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("pr.title"), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!("look: ${{ secrets.GH_TOKEN }}")
     );
 }
@@ -569,7 +596,8 @@ fn deeply_nested_array_literals_within_the_depth_limit_evaluate() {
     assert_eq!(
         eval(ExpressionSource::from_workflow_file(&access), &ctx())
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(1)
     );
 }
@@ -715,7 +743,8 @@ fn long_flat_expressions_over_the_borrowed_chain_path_do_not_show_quadratic_blow
         min_elapsed(9, || {
             let _ = eval(ExpressionSource::from_workflow_file(&path), &c)
                 .unwrap()
-                .value;
+                .value()
+                .clone();
         })
     }
 
@@ -764,7 +793,8 @@ fn long_flat_expressions_over_the_owned_chain_path_do_not_show_quadratic_blowup(
         min_elapsed(9, || {
             let _ = eval(ExpressionSource::from_workflow_file(&path), &c)
                 .unwrap()
-                .value;
+                .value()
+                .clone();
         })
     }
 
@@ -849,7 +879,8 @@ fn env_function_reads_the_real_process_environment_documented_residual() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!("process-wide-value")
     );
 }
@@ -863,7 +894,8 @@ fn env_function_returns_null_for_an_unset_variable() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!(null)
     );
 }
@@ -878,7 +910,8 @@ fn json_function_can_decode_escapes_into_control_characters_documented_residual(
         &ctx(),
     )
     .unwrap()
-    .value;
+    .value()
+    .clone();
     assert_eq!(out, json!("a\nb"));
     if let Value::String(s) = out {
         assert!(s.contains('\n'));
@@ -952,13 +985,15 @@ fn root_lookup_is_case_sensitive() {
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("steps.real"), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(true)
     );
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("Steps.shadow"), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(true)
     );
     // The two roots never collide: asking the "wrong-case" root for the
@@ -966,13 +1001,15 @@ fn root_lookup_is_case_sensitive() {
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("steps.shadow"), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(null)
     );
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("Steps.real"), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(null)
     );
 }
@@ -1006,7 +1043,8 @@ fn eval_requires_an_expression_source_not_a_bare_str() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!("trusted-value")
     );
 }
@@ -1124,13 +1162,15 @@ fn a_delimited_boolean_expression_evaluates_to_a_typed_bool_not_a_string() {
     assert_eq!(
         eval_delimited_expression(TemplateSource::from_workflow_file("${{ 1 == 1 }}"), &ctx())
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(true)
     );
     assert_eq!(
         eval_delimited_expression(TemplateSource::from_workflow_file("${{ 1 == 2 }}"), &ctx())
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(false)
     );
 }
@@ -1144,7 +1184,8 @@ fn a_delimited_expression_using_a_property_chain_matches_the_documented_when_exa
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!(true)
     );
 }
@@ -1157,7 +1198,8 @@ fn a_delimited_expression_tolerates_surrounding_whitespace() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!(true)
     );
 }
@@ -1173,7 +1215,8 @@ fn a_delimited_expression_with_a_quoted_double_brace_does_not_truncate_early() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!(true)
     );
 }
@@ -1250,12 +1293,12 @@ fn a_public_rebinding_cannot_untaint_a_root_that_was_bound_as_secret() {
 
     let evaluated = eval(ExpressionSource::from_workflow_file("k.pw"), &c).unwrap();
     assert_eq!(
-        evaluated.value,
+        evaluated.value().clone(),
         json!("SECRETVALUE12345"),
         "the real value is unchanged — only the taint bit is at stake here"
     );
     assert!(
-        evaluated.secret_derived,
+        evaluated.secret_derived(),
         "a `set_public` rebinding must not lower a root already marked secret"
     );
 
@@ -1293,7 +1336,7 @@ fn a_root_that_was_only_ever_bound_publicly_is_not_secret_derived() {
 
     let evaluated = eval(ExpressionSource::from_workflow_file("k.pw"), &c).unwrap();
     assert!(
-        !evaluated.secret_derived,
+        !evaluated.secret_derived(),
         "a root the caller asserted is non-secret must stay readable in a log"
     );
     assert!(format!("{evaluated:?}").contains("SECRETVALUE12345"));
@@ -1321,7 +1364,7 @@ fn narrowing_a_roots_secret_paths_by_rebinding_unions_rather_than_replaces() {
         assert!(
             eval(ExpressionSource::from_workflow_file(path), &c)
                 .unwrap()
-                .secret_derived,
+                .secret_derived(),
             "{path} must stay tainted after the narrowing rebinding"
         );
     }
@@ -1329,7 +1372,7 @@ fn narrowing_a_roots_secret_paths_by_rebinding_unions_rather_than_replaces() {
     assert!(
         !eval(ExpressionSource::from_workflow_file("steps.a.status"), &c)
             .unwrap()
-            .secret_derived,
+            .secret_derived(),
         "path precision is not sacrificed to monotonicity"
     );
 }
@@ -1399,7 +1442,8 @@ fn a_subscript_that_is_a_number_but_out_of_range_is_still_an_ordinary_null() {
             &ctx()
         )
         .unwrap()
-        .value,
+        .value()
+        .clone(),
         json!(null)
     );
 }
@@ -1414,13 +1458,15 @@ fn slice_bounds_still_tolerate_a_missing_or_non_numeric_argument() {
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("slice(a)"), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!([1, 2, 3, 4])
     );
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("slice(a, 2)"), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!([3, 4])
     );
 }
@@ -1450,20 +1496,23 @@ fn a_secret_derived_producer_cannot_be_bound_as_clean_through_set_from() {
         &c,
     )
     .unwrap();
-    assert_eq!(produced.value, json!("sk-propagated-secret-0011"));
-    assert!(produced.secret_derived, "the producer knows it is tainted");
+    assert_eq!(produced.value().clone(), json!("sk-propagated-secret-0011"));
+    assert!(
+        produced.secret_derived(),
+        "the producer knows it is tainted"
+    );
 
     c.set_from("item", &produced);
 
     let read_back = eval(ExpressionSource::from_workflow_file("item"), &c).unwrap();
     assert_eq!(
-        read_back.value,
+        read_back.value().clone(),
         json!("sk-propagated-secret-0011"),
         "`set_from` binds the real value — a dependent reading this root must get the \
          token, not the placeholder"
     );
     assert!(
-        read_back.secret_derived,
+        read_back.secret_derived(),
         "…and it is still secret-derived: `set_from` read that off the producer, so the \
          binding site had nothing to assert and nothing to get wrong"
     );
@@ -1493,7 +1542,7 @@ fn a_clean_producer_bound_through_set_from_stays_readable_in_the_log() {
     c.set_public("inputs", json!({"repo": "acme/widgets"}));
 
     let produced = eval(ExpressionSource::from_workflow_file("inputs.repo"), &c).unwrap();
-    assert!(!produced.secret_derived);
+    assert!(!produced.secret_derived());
     c.set_from("item", &produced);
 
     let interpolated =
@@ -1531,14 +1580,14 @@ fn set_from_an_interpolated_json_binds_the_unredacted_value_and_carries_its_tain
 
     let read_back = eval(ExpressionSource::from_workflow_file("resolved.url"), &c).unwrap();
     assert_eq!(
-        read_back.value,
+        read_back.value().clone(),
         json!("https://api.example.com/v1?token=tok-INTERP-SECRET-0013&x=1"),
         "`set_from` must bind the UNREDACTED rendering — binding `***` would corrupt \
          every downstream step's real value, and the redacted half is re-derived at \
          render time from the provenance carried across here"
     );
     assert!(
-        read_back.secret_derived,
+        read_back.secret_derived(),
         "…and the taint comes across with it"
     );
 
@@ -1561,13 +1610,17 @@ fn set_from_cannot_lower_a_root_already_marked_secret() {
     c.set_secret("item", json!("SECRETVALUE12345"));
 
     let clean = eval(ExpressionSource::from_workflow_file("'literal'"), &c).unwrap();
-    assert!(!clean.secret_derived);
+    assert!(!clean.secret_derived());
     c.set_from("item", &clean);
 
     let read_back = eval(ExpressionSource::from_workflow_file("item"), &c).unwrap();
-    assert_eq!(read_back.value, json!("literal"), "the value is replaced");
+    assert_eq!(
+        read_back.value().clone(),
+        json!("literal"),
+        "the value is replaced"
+    );
     assert!(
-        read_back.secret_derived,
+        read_back.secret_derived(),
         "…but the name keeps the provenance it earned: `set_from` routes a clean \
          producer through `set_public`, which is monotone"
     );
@@ -1625,7 +1678,8 @@ fn default_cannot_rescue_a_failed_subscript_and_a_numeric_string_index_does_not_
     assert_eq!(
         eval(ExpressionSource::from_workflow_file("inputs.arr[1]"), &c)
             .unwrap()
-            .value,
+            .value()
+            .clone(),
         json!(20),
         "so the two payloads above fail on the subscript's *type*, not on indexing itself"
     );
