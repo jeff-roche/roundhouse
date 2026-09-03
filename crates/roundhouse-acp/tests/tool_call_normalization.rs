@@ -2,8 +2,24 @@
 // is a `ToolCallUpdate`, which has no tool-name field at all. This exercises
 // `normalize_tool_call_for_policy`'s fail-closed behavior against the real
 // SDK type from outside the crate.
+//
+// FIX round 4 (Item 1) applies to all three `tool_call_id` assertions below.
+// Fix round 2 wrote them as `format!("{:?}", "tc-N")` — an *independent*
+// restatement of what escaping is supposed to produce. Fix round 3 rewrote
+// them as `escape_and_cap_peer_str("tc-N")`, i.e. a call to the very function
+// under test, so expected and actual mutate together and neither assertion
+// could still see a regression in the escaping itself.
+//
+// Measured in a scratch copy for this round, not inferred: with a mutation
+// replacing `escape_and_cap_peer_str`'s `format!("{value:?}")` by
+// `value.to_string()` (escaping removed, cap kept), the 3e985f6 versions of
+// this file and of `tests/server_permission.rs` reported 0 failures each; with
+// the round-4 versions, the same mutation reports 3 failures here and 1 there
+// — the four assertions the round-3 review identified as having gone blind.
+// Each site now destructures the error (which still pins the variant) and
+// compares the payload — through `EscapedPeerStr`'s public `as_str` accessor
+// — against a literal statement of the escaped form.
 use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
-use roundhouse_acp::peer_text::escape_and_cap_peer_str;
 use roundhouse_acp::server::{normalize_tool_call_for_policy, AcpToolKindClaim, PermissionError};
 
 #[test]
@@ -48,16 +64,15 @@ fn fails_closed_when_raw_input_is_absent_rather_than_substituting_an_empty_objec
     // and could bypass any policy rule that classifies on argument content.
     let update = ToolCallUpdate::new("tc-2", ToolCallUpdateFields::new().kind(ToolKind::Execute));
     let err = normalize_tool_call_for_policy(&update).expect_err("rawInput was never supplied");
-    assert_eq!(
-        err,
-        // FIX round 2 (Item 4): tool_call_id is peer-controlled and now
-        // routed through the crate's escape-and-cap helper (same discipline
-        // as option_id), so the expected value is the escaped form (`str`'s
-        // `Debug` output), not the raw id.
-        PermissionError::MissingRawInput {
-            tool_call_id: escape_and_cap_peer_str("tc-2")
-        }
-    );
+    // FIX round 2 (Item 4): tool_call_id is peer-controlled and routed
+    // through the crate's escape-and-cap helper (same discipline as
+    // option_id), so the expected value is the escaped form (`str`'s `Debug`
+    // output), not the raw id — stated here as a literal, not by calling the
+    // helper (see this file's header, FIX round 4).
+    let PermissionError::MissingRawInput { tool_call_id } = err else {
+        panic!("expected MissingRawInput, got {err:?}");
+    };
+    assert_eq!(tool_call_id.as_str(), format!("{:?}", "tc-2"));
 }
 
 #[test]
@@ -82,12 +97,10 @@ fn fails_closed_when_kind_is_absent() {
         ToolCallUpdateFields::new().raw_input(serde_json::json!({})),
     );
     let err = normalize_tool_call_for_policy(&update).expect_err("kind was never supplied");
-    assert_eq!(
-        err,
-        PermissionError::UnidentifiableTool {
-            tool_call_id: escape_and_cap_peer_str("tc-4")
-        }
-    );
+    let PermissionError::UnidentifiableTool { tool_call_id } = err else {
+        panic!("expected UnidentifiableTool, got {err:?}");
+    };
+    assert_eq!(tool_call_id.as_str(), format!("{:?}", "tc-4"));
 }
 
 #[test]
@@ -106,10 +119,8 @@ fn fails_closed_when_kind_is_other_even_if_title_looks_informative() {
     );
     let err = normalize_tool_call_for_policy(&update)
         .expect_err("kind was Other; title must not be used as a fallback identifier");
-    assert_eq!(
-        err,
-        PermissionError::UnidentifiableTool {
-            tool_call_id: escape_and_cap_peer_str("tc-5")
-        }
-    );
+    let PermissionError::UnidentifiableTool { tool_call_id } = err else {
+        panic!("expected UnidentifiableTool, got {err:?}");
+    };
+    assert_eq!(tool_call_id.as_str(), format!("{:?}", "tc-5"));
 }

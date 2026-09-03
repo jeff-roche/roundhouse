@@ -8,7 +8,6 @@
 use agent_client_protocol::schema::v1::{
     PermissionOption, PermissionOptionKind, RequestPermissionOutcome, SelectedPermissionOutcome,
 };
-use roundhouse_acp::peer_text::escape_and_cap_peer_str;
 use roundhouse_acp::server::{
     handle_request_permission, resolve_selection, selected_option_id, AcpServer, PermissionError,
     PolicyEngineLike, PolicyOutcome, SelectionResolution,
@@ -331,15 +330,26 @@ fn resolve_selection_distinguishes_cancelled_unknown_id_and_ambiguous_options() 
 
     let unknown_id_outcome =
         RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("never-offered"));
-    assert_eq!(
-        resolve_selection(&offered, &unknown_id_outcome),
-        // Finding 2 (round-3 review): UnknownOptionId now carries an
-        // already-escaped, already-capped EscapedPeerStr (fix round 3,
-        // Ruling C-P69), never the raw PermissionOptionId — see
-        // crate::peer_text::escape_and_cap_peer_str (moved out of
-        // server::mod in fix round 2, Item 5).
-        SelectionResolution::UnknownOptionId(escape_and_cap_peer_str("never-offered"))
-    );
+    // Finding 2 (round-3 review): UnknownOptionId carries an already-escaped,
+    // already-capped EscapedPeerStr (fix round 3, Ruling C-P69), never the raw
+    // PermissionOptionId.
+    //
+    // FIX round 4 (Item 1): this assertion used to write the expected value as
+    // `escape_and_cap_peer_str("never-offered")` — a call to the function under
+    // test, so expected and actual moved together and the assertion could no
+    // longer see a regression in the escaping itself. Measured in a scratch
+    // copy for this round: with a mutation removing the escaping step from
+    // `escape_and_cap_peer_str`, the 3e985f6 version of this file reported 0
+    // failures; the version below reports 1. The variant is still pinned (by
+    // the destructuring); the payload is now compared, through the public
+    // `as_str` accessor, against an independent literal statement of the
+    // escaped form. `tests/tool_call_normalization.rs` carries the other three
+    // sites and its header records the same measurement.
+    let resolution = resolve_selection(&offered, &unknown_id_outcome);
+    let SelectionResolution::UnknownOptionId(unknown_id) = resolution else {
+        panic!("expected UnknownOptionId, got {resolution:?}");
+    };
+    assert_eq!(unknown_id.as_str(), format!("{:?}", "never-offered"));
 
     let ambiguous_options = vec![
         PermissionOption::new("dup", "Allow", PermissionOptionKind::AllowOnce),

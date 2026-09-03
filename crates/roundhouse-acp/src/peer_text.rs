@@ -108,6 +108,48 @@ impl std::fmt::Display for EscapedPeerStr {
     /// to use directly (`{value}`) wherever code that held the pre-newtype
     /// bare `String` needed `{value:?}` to escape it itself. The escaping
     /// already happened at construction time.
+    ///
+    /// # `f.write_str`, deliberately, not `f.pad`
+    ///
+    /// **Consequence first: format specifiers are silently ignored, not
+    /// rejected.** A caller writing `{id:>30}` gets no alignment, no
+    /// padding, no truncation and no error — just the contents. That is
+    /// surprising enough to state plainly, and it is pinned by
+    /// `escaped_peer_str_rendering_ignores_width_fill_and_precision_specifiers`
+    /// in this module's tests, because before fix round 4 (Item 3) nothing in
+    /// the crate did: a mutation swapping this `write_str` for `f.pad` passed
+    /// every test.
+    ///
+    /// The reason is **not** that a format spec could under-escape this
+    /// value. It could not: `self.0` is already `str`'s `Debug` output, so it
+    /// contains no raw control characters for any spec to expose, and neither
+    /// `f.pad` nor `write_str` can put any back. The reason is length.
+    ///
+    /// `f.pad` honours `{:width$}` with a width computed at **runtime**. A
+    /// caller deriving that width from peer-influenced data would reopen
+    /// exactly the unbounded-log-inflation hazard [`PEER_STR_MAX_LEN`] exists
+    /// to close, and would do it *after* the cap, where nothing in this
+    /// module can see it. Measured on rustc 1.97.1, against this type's own
+    /// shape (inner value `"abcd"`, 6 bytes):
+    ///
+    /// | runtime width | `f.pad` emits | `f.write_str` emits |
+    /// |---------------|---------------|---------------------|
+    /// | 100           | 100 bytes     | 6 bytes             |
+    /// | 65535         | 65535 bytes   | 6 bytes             |
+    ///
+    /// `write_str` makes that inflation structurally impossible rather than
+    /// merely discouraged.
+    ///
+    /// **A hazard this choice does *not* close, recorded so nobody assumes it
+    /// does:** a runtime width of exactly `65536` panics with `Formatting
+    /// argument out of range`, and a panic while rendering an audit line is
+    /// worse than either rendering. Measured, that panic is raised by the
+    /// formatting machinery while resolving the width argument, *before* any
+    /// `Display::fmt` is entered — verified with a `Display` impl that logs
+    /// on entry and never logged. So it happens identically with `write_str`
+    /// and with `f.pad`; it is a hazard of `{id:width$}` at the call site, not
+    /// a difference between the two impls, and it is not part of the
+    /// justification for this one.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
@@ -122,6 +164,11 @@ impl std::fmt::Debug for EscapedPeerStr {
     /// `mcp_over_acp::DuplicateToolName`'s previous hand-written `Debug` impl
     /// (it passed an already-escaped `String` to `debug_struct::field`,
     /// which applies `{:?}` again).
+    ///
+    /// Uses `f.write_str` rather than `f.pad` for the same reason the
+    /// [`Display`](std::fmt::Display) impl above does — see its doc for the
+    /// measurement, and note the same consequence: format specifiers are
+    /// silently ignored here too.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
@@ -303,5 +350,29 @@ mod tests {
         let escaped = escape_and_cap_peer_str("x\ny");
         assert_eq!(format!("{escaped}"), format!("{escaped:?}"));
         assert_eq!(format!("{escaped}"), escaped.as_str());
+    }
+
+    #[test]
+    fn escaped_peer_str_rendering_ignores_width_fill_and_precision_specifiers() {
+        // FIX round 4 (Item 3): the defence against a caller inflating an
+        // already-capped value back to arbitrary length is this type's use of
+        // `f.write_str` rather than `f.pad` — and until now nothing pinned
+        // it. Measured: a mutation swapping `write_str` for `f.pad` passed
+        // every test in this crate.
+        //
+        // These are spec-insensitivity assertions, stated at the same layer
+        // as the guarantee: whatever format spec a caller writes, the
+        // rendering is exactly the contents. `f.pad` honours both specs and
+        // would fail here — an `X`-filled width of 200 pads well past
+        // PEER_STR_MAX_LEN (measured: 200 bytes out for a 6-byte value),
+        // and a precision of 3 truncates below it.
+        let x = escape_and_cap_peer_str("abcd");
+        assert_eq!(format!("{x:X<200}"), format!("{x}"));
+        assert_eq!(format!("{x:.3}"), format!("{x}"));
+        // `Debug` is a separate impl making the same `write_str` choice for
+        // the same reason, so it is pinned the same way rather than left as
+        // the next unpinned copy of this decision.
+        assert_eq!(format!("{x:X<200?}"), format!("{x:?}"));
+        assert_eq!(format!("{x:.3?}"), format!("{x:?}"));
     }
 }

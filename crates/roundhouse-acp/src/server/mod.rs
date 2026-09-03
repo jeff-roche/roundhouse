@@ -93,10 +93,27 @@ pub enum PermissionError {
     /// requires ids to be unique or non-empty. Offered options with an
     /// empty or duplicated `option_id` are refused before any selection is
     /// attempted; see [`ambiguous_option_ids`].
+    ///
+    /// **Fix round 4 (Item 2):** `reason` used to be a bare `String` that
+    /// embedded a peer-controlled `option_id`. It was safe, but only
+    /// *contractually* — safe because its one constructor
+    /// (`ambiguous_option_ids`) happened to escape and cap the id first.
+    /// That is exactly the property ruling C-P69 replaced with a structural
+    /// one at the crate's other three peer-text sites, and leaving one site
+    /// on the old convention is how `mcp_over_acp::DuplicateToolName`
+    /// shipped its gap in the first place. The field cannot simply become an
+    /// [`EscapedPeerStr`], because the text is *composite* — a fixed message
+    /// plus the escaped id — so it is now [`AmbiguousReason`], a closed enum
+    /// whose only peer-controlled payload is an [`EscapedPeerStr`] and whose
+    /// message text lives in its own `Display` impl. There is no longer any
+    /// way to put unescaped peer bytes in this field.
     #[error(
         "offered PermissionOptions for tool {tool:?} are ambiguous and cannot be trusted to bind a decision to a single option: {reason}"
     )]
-    AmbiguousOptions { tool: String, reason: String },
+    AmbiguousOptions {
+        tool: String,
+        reason: AmbiguousReason,
+    },
 
     /// SEC-2 (round-2 review): [`normalize_tool_call_for_policy`] refuses a
     /// `ToolCallUpdate` with no `rawInput` rather than substituting `{}`,
@@ -148,6 +165,50 @@ pub enum PermissionError {
     UnidentifiableTool { tool_call_id: EscapedPeerStr },
 }
 
+/// Why an offered `PermissionOption` list cannot be trusted to bind a
+/// decision to a single option — the payload of
+/// [`PermissionError::AmbiguousOptions`], produced by
+/// `ambiguous_option_ids`.
+///
+/// **Fix round 4 (Item 2).** This replaces a `reason: String` whose safety was
+/// contractual: it held peer-controlled text that was escaped and capped
+/// only because its single constructor remembered to do so. Making the
+/// message text a `Display` impl over a closed enum moves that from
+/// convention to construction — the only peer-controlled data any variant can
+/// carry is an [`EscapedPeerStr`], which cannot be built except through
+/// [`escape_and_cap_peer_str`]. A doc note saying "always escape this before
+/// putting it here" was explicitly rejected as the fix, since a doc note is
+/// what ruling C-P69 replaced everywhere else in this crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmbiguousReason {
+    /// Some offered option's `option_id` is the empty string, so naming it
+    /// back in a `Selected` response would name nothing. Carries no payload:
+    /// the empty id has no content worth reporting.
+    EmptyOptionId,
+    /// The carried `option_id` is offered by more than one `PermissionOption`,
+    /// so a `Selected` response naming it does not pick out a single option.
+    /// Peer-controlled, hence [`EscapedPeerStr`] rather than `String`.
+    DuplicateOptionId(EscapedPeerStr),
+}
+
+impl std::fmt::Display for AmbiguousReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyOptionId => {
+                f.write_str("an offered PermissionOption has an empty option_id")
+            }
+            // `{id}` is `EscapedPeerStr`'s `Display`, which writes its
+            // already-escaped, already-capped contents verbatim.
+            Self::DuplicateOptionId(id) => {
+                write!(
+                    f,
+                    "option_id {id} is offered by more than one PermissionOption"
+                )
+            }
+        }
+    }
+}
+
 fn find_option(
     options: &[PermissionOption],
     kind: PermissionOptionKind,
@@ -172,26 +233,29 @@ fn find_option(
 /// allow. Refusing ambiguous input outright, before ever selecting, closes
 /// that off.
 ///
-/// **FIX round 4:** the duplicate-id reason embeds a peer-controlled
-/// `option_id`, so it goes through `escape_and_cap_peer_str` rather than an
-/// ad-hoc `{:?}`. The `{:?}` alone escaped correctly but bounded nothing: a
-/// peer sharing one multi-megabyte duplicate id across two offered options
-/// inflated every log line that renders the resulting
-/// `PermissionError::AmbiguousOptions`, with further amplification from
-/// `\u{...}` escape expansion. Same escaping, plus the
-/// [`crate::peer_text::PEER_STR_MAX_LEN`] cap this module already applies one
-/// function away.
-fn ambiguous_option_ids(options: &[PermissionOption]) -> Option<String> {
+/// **FIX round 4 (Item 2, superseding an earlier round's note):** the
+/// duplicate-id reason embeds a peer-controlled `option_id`, so it goes
+/// through [`escape_and_cap_peer_str`] rather than an ad-hoc `{:?}`. The
+/// `{:?}` alone escaped correctly but bounded nothing: a peer sharing one
+/// multi-megabyte duplicate id across two offered options inflated every log
+/// line that renders the resulting `PermissionError::AmbiguousOptions`, with
+/// further amplification from `\u{...}` escape expansion. Same escaping, plus
+/// the [`crate::peer_text::PEER_STR_MAX_LEN`] cap.
+///
+/// This function no longer renders that message itself. It returns an
+/// [`AmbiguousReason`] — which owns the message text in its `Display` impl and
+/// can only carry peer bytes as an [`EscapedPeerStr`] — so the escape-and-cap
+/// step is no longer something this function has to remember to perform.
+fn ambiguous_option_ids(options: &[PermissionOption]) -> Option<AmbiguousReason> {
     let mut seen: HashSet<&PermissionOptionId> = HashSet::new();
     for opt in options {
         if opt.option_id.0.is_empty() {
-            return Some("an offered PermissionOption has an empty option_id".to_string());
+            return Some(AmbiguousReason::EmptyOptionId);
         }
         if !seen.insert(&opt.option_id) {
-            return Some(format!(
-                "option_id {} is offered by more than one PermissionOption",
-                escape_and_cap_peer_str(opt.option_id.0.as_ref())
-            ));
+            return Some(AmbiguousReason::DuplicateOptionId(escape_and_cap_peer_str(
+                opt.option_id.0.as_ref(),
+            )));
         }
     }
     None
@@ -767,7 +831,16 @@ mod tests {
         )];
         let err = handle_request_permission(&server, "shell", &serde_json::json!({}), &options)
             .expect_err("an empty option_id must be refused");
-        assert!(matches!(err, PermissionError::AmbiguousOptions { .. }));
+        // FIX round 4 (Item 2): `reason` is a typed AmbiguousReason now, so
+        // this pins *which* ambiguity was detected rather than only that some
+        // ambiguity was.
+        assert!(matches!(
+            err,
+            PermissionError::AmbiguousOptions {
+                reason: AmbiguousReason::EmptyOptionId,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -792,12 +865,14 @@ mod tests {
 
     #[test]
     fn ambiguous_options_reason_caps_an_over_long_duplicate_option_id() {
-        // FIX round 4: the duplicate-id reason embeds a peer-controlled
-        // option_id. `{:?}` escaped it but bounded nothing, so a peer could
-        // inflate every log line rendering this error by duplicating one
-        // very long id. Routing through escape_and_cap_peer_str caps it,
-        // matching the discipline SelectionResolution::UnknownOptionId
-        // already follows.
+        // FIX round 4 (Item 2): the duplicate-id reason embeds a
+        // peer-controlled option_id. `{:?}` escaped it but bounded nothing, so
+        // a peer could inflate every log line rendering this error by
+        // duplicating one very long id. The id is now carried as an
+        // EscapedPeerStr inside AmbiguousReason::DuplicateOptionId, so the
+        // escape-and-cap is structural rather than something this construction
+        // site has to remember; this asserts the rendered message that reaches
+        // a log line is bounded accordingly.
         let long_id = "z".repeat(PEER_STR_MAX_LEN * 50);
         let policy = FakePolicy(PolicyOutcome {
             decision: PolicyDecision::Allow,
@@ -822,17 +897,26 @@ mod tests {
         let PermissionError::AmbiguousOptions { reason, .. } = err else {
             panic!("expected AmbiguousOptions, got {err:?}");
         };
+        let AmbiguousReason::DuplicateOptionId(ref duplicated) = reason else {
+            panic!("expected DuplicateOptionId, got {reason:?}");
+        };
         assert!(
-            !reason.contains(&long_id),
-            "the full peer-controlled id must not appear verbatim in the reason"
+            duplicated.as_str().len() <= PEER_STR_MAX_LEN,
+            "the carried option_id must be capped, got {} bytes",
+            duplicated.as_str().len()
         );
-        // The reason is a fixed sentence plus the capped id, so its length
-        // is bounded by that sentence plus PEER_STR_MAX_LEN — far
+        let rendered = reason.to_string();
+        assert!(
+            !rendered.contains(&long_id),
+            "the full peer-controlled id must not appear verbatim in the rendered reason"
+        );
+        // The rendered reason is a fixed sentence plus the capped id, so its
+        // length is bounded by that sentence plus PEER_STR_MAX_LEN — far
         // below the id's own length.
         assert!(
-            reason.len() < PEER_STR_MAX_LEN + 64,
-            "reason must be bounded by the cap plus the fixed message, got {} bytes",
-            reason.len()
+            rendered.len() < PEER_STR_MAX_LEN + 64,
+            "rendered reason must be bounded by the cap plus the fixed message, got {} bytes",
+            rendered.len()
         );
     }
 
