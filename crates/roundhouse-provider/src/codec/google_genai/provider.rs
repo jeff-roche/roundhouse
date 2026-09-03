@@ -135,8 +135,31 @@ impl Provider for GoogleGenAiProvider {
                     })?;
             } else {
                 match &self.profile.defaults.auth {
+                    // An empty or whitespace-only `api_key` must fail
+                    // closed, not silently send a header-shaped-but-
+                    // credential-less `x-goog-api-key: ` that only earns a
+                    // remote 401 -- matches `openai_chat`'s/`cohere_v2`'s/
+                    // `anthropic_messages`'s/`azure_openai`'s identical
+                    // guard for their own auth kinds.
+                    AuthKind::HeaderKey { .. } if ctx.api_key.trim().is_empty() => {
+                        return Err(ProviderError::Unsupported(
+                            "google-genai codec requires a non-empty api_key (or a \
+                             CredentialProvider) for header_key auth"
+                                .into(),
+                        ));
+                    }
                     AuthKind::HeaderKey { header } => {
                         http_req.headers.push((header.clone(), ctx.api_key.clone()));
+                    }
+                    // Same guarantee for the `Bearer` arm (`vertex-gemini`'s
+                    // auth kind) -- an empty/whitespace-only `api_key` must
+                    // not become a bare `Authorization: Bearer `.
+                    AuthKind::Bearer if ctx.api_key.trim().is_empty() => {
+                        return Err(ProviderError::Unsupported(
+                            "google-genai codec requires a non-empty api_key (or a \
+                             CredentialProvider) for Bearer auth"
+                                .into(),
+                        ));
                     }
                     AuthKind::Bearer => {
                         http_req.headers.push((

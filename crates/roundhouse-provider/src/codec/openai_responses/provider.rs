@@ -184,6 +184,18 @@ impl Provider for OpenAiResponsesProvider {
                             format!("Bearer {}", ctx.api_key),
                         ));
                     }
+                    // Same guarantee as the `Bearer` arm above, for
+                    // `HeaderKey` auth. No `openai-responses` profile
+                    // declares `header_key` today, so this arm is
+                    // unreachable in practice, but it must not silently
+                    // no-op if that ever changes.
+                    AuthKind::HeaderKey { .. } if ctx.api_key.trim().is_empty() => {
+                        return Err(ProviderError::Unsupported(
+                            "openai-responses codec requires a non-empty api_key for \
+                             header_key auth and no CredentialProvider was supplied"
+                                .into(),
+                        ));
+                    }
                     AuthKind::HeaderKey { header } => {
                         http_req.headers.push((header.clone(), ctx.api_key.clone()));
                     }

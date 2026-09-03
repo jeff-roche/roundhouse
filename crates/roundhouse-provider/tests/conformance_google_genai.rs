@@ -23,6 +23,14 @@ fn fixture_profile() -> ProviderProfile {
     toml::from_str(include_str!("../profiles/google-genai.toml")).unwrap()
 }
 
+/// Loads a sibling profile by name -- used by the empty-`api_key` guard
+/// tests below to exercise the `AuthKind::Bearer` arm (`vertex-gemini.toml`)
+/// as well as this file's default `HeaderKey` profile.
+fn load(name: &str) -> ProviderProfile {
+    let path = format!("{}/profiles/{name}.toml", env!("CARGO_MANIFEST_DIR"));
+    toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
 fn cassette_path(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("testdata/cassettes/google_genai")
@@ -450,5 +458,55 @@ async fn generate_content_mode_error_429_cassette_classifies_via_the_status_rema
     assert!(
         matches!(err, ProviderError::RateLimited { .. }),
         "expected RateLimited via the HTTP-status default tier, got {err:?}"
+    );
+}
+
+/// Fix round 4, Fix 1: an empty `api_key` with no `CredentialProvider` must
+/// fail closed BEFORE any transport call for the `AuthKind::HeaderKey` arm
+/// (this profile's `x-goog-api-key`), not silently send a header-shaped-
+/// but-credential-less `x-goog-api-key: ` that only earns a remote 401.
+/// Uses a transport that panics on `send` -- if this failed to fail closed,
+/// it would panic there instead of returning the expected
+/// `ProviderError::Unsupported`.
+#[tokio::test]
+async fn empty_api_key_with_no_credential_provider_fails_closed_header_key() {
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(PanicsIfCalledTransport),
+        api_key: String::new(),
+        credentials: None,
+    };
+    let provider = GoogleGenAiProvider::new(fixture_profile(), EndpointMode::Interactions);
+    let err = expect_err(
+        provider
+            .stream_chat(&fixtures::single_turn_text(), &ctx)
+            .await,
+    );
+    assert!(
+        matches!(err, ProviderError::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
+}
+
+/// Same guarantee as above, for the `AuthKind::Bearer` arm -- `vertex-gemini`
+/// is the codec's one Bearer profile (`vertex-gemini.toml`'s
+/// `auth = { kind = "bearer" }`).
+#[tokio::test]
+async fn empty_api_key_with_no_credential_provider_fails_closed_bearer() {
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(PanicsIfCalledTransport),
+        api_key: String::new(),
+        credentials: None,
+    };
+    let provider = GoogleGenAiProvider::new(load("vertex-gemini"), EndpointMode::GenerateContent);
+    let err = expect_err(
+        provider
+            .stream_chat(&fixtures::single_turn_text(), &ctx)
+            .await,
+    );
+    assert!(
+        matches!(err, ProviderError::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
     );
 }
