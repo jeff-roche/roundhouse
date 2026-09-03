@@ -141,6 +141,75 @@
 //!   resolve, and it is otherwise a plain data carrier tests legitimately
 //!   construct directly), and its doc now says "enforced at deserialize
 //!   time" rather than "enforced in the type system."
+//!
+//! ## Fix round 2 (coordinator review of fix round 1)
+//!
+//! - **Item 1 — the sha256 preference had a fallback that undid it.**
+//!   Round 1's `UnverifiableBinary` check for a `Binary` present on this
+//!   platform but missing `sha256` sat *after* the `npx`/`uvx` early
+//!   returns in [`resolve_distribution`] — so for any agent publishing both
+//!   a no-`sha256` binary and a package-manager fallback, resolution never
+//!   reached that check and silently fell through to the unverified
+//!   channel, exactly the hazard round 1's own doc said it did not. The
+//!   check now runs first — see [`resolve_distribution`]'s doc.
+//! - **Item 2 — the HTTP hardening was entirely unmeasured.** No test
+//!   referenced `MAX_RESPONSE_BYTES`, `build_registry_http_client`,
+//!   `fetch_registry`, `fetch_quarantine`, `fetch_json_capped`, or
+//!   `ResponseTooLarge`; five mutations against them survived the full
+//!   suite (`https_only(false)`; redirect limit `2` → `100`; `.timeout()`
+//!   removed; `MAX_RESPONSE_BYTES` → `usize::MAX` and → `0`;
+//!   `error_for_status()` removed). [`RegistryHttpPolicy`] pins the four
+//!   constant-valued settings against literals in a direct test;
+//!   [`accumulate_capped`] pulls the byte-cap arithmetic out into a pure,
+//!   socket-free-testable function that [`fetch_json_capped`] actually
+//!   calls for its real enforcement (not a parallel, disconnected copy).
+//! - **Item 3 — the `env` denylist became an allowlist.** A coordinator
+//!   probe of 42 keys found round 1's ten-entry `FORBIDDEN_ENV_KEYS`
+//!   denylist both arbitrary and unboundedly incomplete — see
+//!   [`ALLOWED_ENV_KEYS`]'s doc for the full list of what got through, and
+//!   why a denylist for this hazard class can never be complete by
+//!   construction. `env` keys are now validated against a small, closed,
+//!   measured allowlist instead.
+//! - **Item 4 — validation grammar gaps in `cmd` and `package`.**
+//!   [`is_safe_relative_cmd`] used to validate a `binary` target's `cmd`
+//!   with `Path::new(cmd).is_absolute()` — POSIX host semantics applied to
+//!   cross-platform data, so a `windows-*` target's `cmd` could carry
+//!   `\Windows\System32\cmd.exe`, `C:evil.exe`, `\\server\share\evil.exe`,
+//!   or `\\?\C:\...` straight past validation on this (Linux) build, each
+//!   escaping the extraction directory on the platform the entry's own key
+//!   names; it also let control characters, newlines, and shell
+//!   metacharacters through that [`is_plausible_package_name`] rejected one
+//!   field over. `is_plausible_package_name` itself did not constrain
+//!   `package` to a package identifier at all — a URL- or path-shaped spec
+//!   (`../../../tmp/evil`, `/tmp/evil`, `file:/tmp/evil`,
+//!   `git+ssh://attacker/x`, `https://attacker.example/x.tgz`) passed, and
+//!   `npx` accepts every one of those as an installable spec, fetching and
+//!   executing code from entirely outside the npm registry. Both functions
+//!   now reject these shapes explicitly — see their docs — while
+//!   `args` values stay deliberately out of scope (they land after the
+//!   package, reaching the agent rather than `npx`/`uvx`, a materially
+//!   weaker position, and a free-form argument grammar was not asked for).
+//! - **Item 5 — a false doc claim, a one-sided test, and an unvalidated
+//!   digest.** [`write_json`]'s doc claimed a concurrent writer could not
+//!   leave a truncated cache file readable as one; both writers actually
+//!   shared the same fixed `<path>.tmp`, so two concurrent `store()` calls
+//!   could interleave inside it before either rename. Fixed with
+//!   [`unique_tmp_path`] (pid + a per-process counter) plus an
+//!   `fsync`-before-rename. The
+//!   `registry_error_json_escapes_a_control_character_bearing_field_name`
+//!   test (this module's tests) asserted only the *absence* of a raw
+//!   newline/ANSI escape, so replacing the whole `detail` with `""` would
+//!   have survived it — it now also asserts the escaped forms are
+//!   *present*, matching its sibling id test. `sha256: Some("")` used to
+//!   pass `Option::is_some()` in `resolve_distribution`, looking
+//!   checksum-pinned with a value no verifier could use;
+//!   [`is_valid_sha256_hex`] closes that in `validate_binary_target`. The
+//!   inert `#[allow(clippy::too_many_arguments)]` on `LaunchConfig::binary`
+//!   (6 parameters, one below clippy's 7-argument default threshold) is
+//!   removed — clippy stays clean without it.
+//! - **Item 6 (`version.rs`, not this file) — `VersionHintCache` no longer
+//!   keys on escaped-and-capped text.** See `version.rs`'s own "fix round
+//!   2" doc.
 
 use crate::peer_text::{escape_and_cap_peer_str, EscapedPeerStr};
 use serde::de::DeserializeOwned;
@@ -181,25 +250,40 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// (`Content-Length` can be absent or wrong).
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
 
-/// Environment variable names a registry entry's `env` map is not allowed to
-/// set (Item 4). Every one of these controls what code loads into, or where,
-/// a spawned process looks for its own libraries or interpreter — the same
-/// hazard the standing `AcpAgent::spawn` prohibition on this crate exists to
-/// prevent, arriving here from the registry side instead of the spawn side.
-/// Checked case-insensitively in [`forbidden_env_key`]: environment variable
-/// names are case-sensitive on POSIX but not on Windows, and this module
-/// must not depend on which platform eventually spawns the process.
-const FORBIDDEN_ENV_KEYS: &[&str] = &[
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH",
-    "DYLD_FRAMEWORK_PATH",
-    "NODE_OPTIONS",
-    "PYTHONPATH",
-    "PERL5LIB",
-    "PATH",
+/// Item 3 (fix round 2): the closed set of environment variable names a
+/// registry entry's `env` map is allowed to set — an **allowlist**,
+/// replacing fix round 1's `FORBIDDEN_ENV_KEYS` denylist entirely.
+///
+/// A coordinator probe of 42 keys against round 1's ten-entry denylist found
+/// it both arbitrary and unboundedly incomplete: `GCONV_PATH`, `BASH_ENV`,
+/// `ENV`, `SHELLOPTS`, `NODE_PATH`, `ELECTRON_RUN_AS_NODE`, `PERL5OPT`,
+/// `RUBYOPT`, `RUBYLIB`, `PYTHONSTARTUP`, `PYTHONHOME`,
+/// `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, `CLASSPATH`, `GIT_SSH_COMMAND`,
+/// `GIT_EXTERNAL_DIFF`, `HTTPS_PROXY`/`https_proxy`, `SSL_CERT_FILE`, and
+/// `HOME` were all accepted, despite every one of them controlling what
+/// code loads into, or where, a spawned process looks for its own
+/// libraries or interpreter, or where its egress or credential lookups are
+/// redirected — the same hazard class the standing `AcpAgent::spawn`
+/// prohibition on this crate exists to prevent, arriving here from the
+/// registry side instead of the spawn side. Exact-match evasion also
+/// worked (`"LD_PRELOAD "` with a trailing space). A denylist for this
+/// class is unbounded by construction: every shell, loader, and language
+/// runtime this crate has never heard of adds another name that would have
+/// to be chased down and added.
+///
+/// Real registry `env` maps, by contrast, are tiny and agent-specific: the
+/// live index (`https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`,
+/// re-verified 2026-09-02) uses exactly these six keys across all 39
+/// agents' `npx`, `uvx`, and `binary` distributions, and none of them is a
+/// loader, interpreter, shell, proxy, or credential control — each is an
+/// agent-authored feature flag:
+const ALLOWED_ENV_KEYS: &[&str] = &[
+    "AUGMENT_DISABLE_AUTO_UPDATE",
+    "DROID_DISABLE_AUTO_UPDATE",
+    "FACTORY_DROID_AUTO_UPDATE_ENABLED",
+    "FAST_AGENT_MODEL",
+    "VT_ACP_ENABLED",
+    "VT_ACP_ZED_ENABLED",
 ];
 
 /// Pinned default registry index URL (Ruling C-P13(f): configurable, with a
@@ -313,13 +397,15 @@ impl TryFrom<RawDistribution> for Distribution {
 fn validate_package_distribution(kind: &str, dist: &PackageDistribution) -> Result<(), String> {
     if !is_plausible_package_name(&dist.package) {
         return Err(format!(
-            "{kind} package name is not a plausible npm/PyPI package identifier: {}",
+            "{kind} package name is not accepted (must not be empty; must not start with `-`, \
+             `.`, `/`, or `~`; must not contain `..` or `:`; must not contain a control or \
+             whitespace character): {}",
             escape_and_cap_peer_str(&dist.package)
         ));
     }
-    if let Some(key) = forbidden_env_key(&dist.env) {
+    if let Some(key) = disallowed_env_key(&dist.env) {
         return Err(format!(
-            "{kind} env sets a forbidden variable: {}",
+            "{kind} env sets a variable not on the allowlist: {}",
             escape_and_cap_peer_str(key)
         ));
     }
@@ -332,57 +418,149 @@ fn validate_package_distribution(kind: &str, dist: &PackageDistribution) -> Resu
 fn validate_binary_target(target: &str, binary: &BinaryTarget) -> Result<(), String> {
     if !is_safe_relative_cmd(&binary.cmd) {
         return Err(format!(
-            "binary target {}'s cmd is not a safe relative path (must not be absolute or contain a `..` segment): {}",
+            "binary target {}'s cmd is not a safe relative path (must not start with `/`, `\\`, \
+             or `~`, must not have a drive-letter prefix, must not contain a `..` segment, and \
+             must not contain a control or whitespace character): {}",
             escape_and_cap_peer_str(target),
             escape_and_cap_peer_str(&binary.cmd)
         ));
     }
-    if let Some(key) = forbidden_env_key(&binary.env) {
+    if let Some(key) = disallowed_env_key(&binary.env) {
         return Err(format!(
-            "binary target {}'s env sets a forbidden variable: {}",
+            "binary target {}'s env sets a variable not on the allowlist: {}",
             escape_and_cap_peer_str(target),
             escape_and_cap_peer_str(key)
         ));
     }
+    if let Some(sha256) = &binary.sha256 {
+        if !is_valid_sha256_hex(sha256) {
+            return Err(format!(
+                "binary target {}'s sha256 is not a 64-character hex digest: {}",
+                escape_and_cap_peer_str(target),
+                escape_and_cap_peer_str(sha256)
+            ));
+        }
+    }
     Ok(())
 }
 
-/// Item 4: minimal plausibility check for an `npx`/`uvx` `package` field —
-/// "reject a package outside the npm/PyPI name grammar (at minimum, reject a
-/// leading `-`)." Deliberately not a full npm/PyPI name validator, only the
-/// part that is load-bearing for safety: `npx`/`uvx` invoke the string as
-/// `npx <package> [args]` / `uvx <package> [args]`, so a leading `-` is
-/// consumed as a flag rather than a package name — the concrete example in
-/// this task's brief is `--node-options=--require=/tmp/x.js`. Embedded
-/// control characters or whitespace have no legitimate place in a real
-/// package identifier either.
+/// Item 4 (fix round 1), tightened in fix round 2. Plausibility check for an
+/// `npx`/`uvx` `package` field: `npx`/`uvx` invoke the string as `npx
+/// <package> [args]` / `uvx <package> [args]`, and — per Item 4's live-data
+/// probe — **also accept it as an installable spec pointing anywhere**, not
+/// only a registry name: a URL (`https://attacker.example/x.tgz`, `git+ssh:
+/// //attacker/x`, `file:/tmp/evil`) or a filesystem path
+/// (`/tmp/evil`, `../../../tmp/evil`) is fetched and executed exactly like a
+/// real npm/PyPI package name would be, entirely outside the npm/PyPI
+/// registry. This is deliberately **not** a full npm/PyPI name validator —
+/// it does not confirm the string is a real, publishable identifier — only
+/// the part that is load-bearing for safety:
+/// - a leading `-` is consumed by `npx`/`uvx` as a flag rather than a
+///   package name (the brief's own concrete example:
+///   `--node-options=--require=/tmp/x.js`);
+/// - a leading `.`, `/`, or `~`, or a `..` segment anywhere, makes the spec
+///   filesystem-path-shaped rather than registry-name-shaped;
+/// - a `:` makes the spec scheme-qualified (`file:`, `git+ssh:`, `https:`,
+///   ...) — no real npm or PyPI package name published to either public
+///   registry contains one, verified against all 23 live `npx`/`uvx`
+///   package values (2026-09-02: none contain `:`, `..`, or start with `.`,
+///   `/`, or `~`);
+/// - embedded control characters or whitespace have no legitimate place in
+///   a real package identifier either.
+///
+/// A permissive check remains (this does not implement the full npm/PyPI
+/// name grammar), so the error message above deliberately does not claim
+/// this validated "a plausible npm/PyPI package identifier" — only that the
+/// specific rejected shapes above are refused.
 fn is_plausible_package_name(package: &str) -> bool {
-    !package.is_empty()
-        && !package.starts_with('-')
-        && !package.chars().any(|c| c.is_control() || c.is_whitespace())
+    if package.is_empty()
+        || package.starts_with('-')
+        || package.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return false;
+    }
+    if package.starts_with('.') || package.starts_with('/') || package.starts_with('~') {
+        return false;
+    }
+    !package.contains("..") && !package.contains(':')
 }
 
-/// Item 4: whether a binary target's `cmd` is safe to treat as "the
-/// extracted archive's own relative executable path" — not absolute, and no
-/// path segment is `..`. Live values are all relative (`./kilo`,
-/// `./bin\devin.exe`), so this is a real grammar the live data actually
-/// follows, not a hypothetical one; checked against both `/` and `\`
-/// separators since real entries use either.
+/// Item 4 (fix round 1), corrected in fix round 2. Whether a binary target's
+/// `cmd` is safe to treat as "the extracted archive's own relative
+/// executable path."
+///
+/// **Fix round 2:** round 1's check used `Path::new(cmd).is_absolute()`,
+/// which is `std::path::Path`'s *host* semantics — POSIX on every platform
+/// this crate is actually built for, regardless of which platform the
+/// entry's own `target` key (e.g. `"windows-x86_64"`) names. On a Linux
+/// build/daemon host, `\Windows\System32\cmd.exe`, `C:evil.exe`,
+/// `\\server\share\evil.exe`, and `\\?\C:\...` are all *not* absolute by
+/// `Path::is_absolute`'s POSIX rules, so all four passed straight through —
+/// each one escapes the extraction directory on Windows, the platform the
+/// key names. Rather than branch on `target`'s platform family and
+/// reimplement two different absolute-path grammars, this now rejects the
+/// dangerous shapes explicitly and unconditionally, without delegating to
+/// `Path` at all: a leading `/` or `\` (absolute, or the UNC/`\\?\` prefix,
+/// on either family), a leading `~` (shell/home-relative expansion some
+/// launchers perform), a `<letter>:` prefix (`C:evil.exe`, `C:\...` — a
+/// Windows drive-letter path, whether or not a legitimate archive-relative
+/// `cmd` on *any* family ever needs a `:` this early), and any `..` path
+/// segment on either separator. This is strictly stronger than a
+/// family-specific check (it refuses these shapes even for a `linux-*` or
+/// `darwin-*` target, where they happen to be harmless-but-never-legitimate
+/// relative filenames) and does not depend on which platform is compiling
+/// or running this validation.
+///
+/// Also closes the asymmetry Item 4's own review found: a `cmd` containing
+/// a newline or other control character, or whitespace (`./x\nevil`, `./a
+/// b; rm -rf /`), passed round 1's check even though
+/// [`is_plausible_package_name`] rejected the same class of character one
+/// field over. Live values are all relative with no such characters
+/// (`./kilo`, `./bin\devin.exe`), so this is a real grammar the live data
+/// actually follows, not a hypothetical one.
 fn is_safe_relative_cmd(cmd: &str) -> bool {
-    if cmd.is_empty() || Path::new(cmd).is_absolute() {
+    if cmd.is_empty() {
         return false;
+    }
+    if cmd.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    if cmd.starts_with('/') || cmd.starts_with('\\') || cmd.starts_with('~') {
+        return false;
+    }
+    let mut chars = cmd.chars();
+    if let (Some(first), Some(':')) = (chars.next(), chars.next()) {
+        if first.is_ascii_alphabetic() {
+            return false;
+        }
     }
     !cmd.split(['/', '\\']).any(|segment| segment == "..")
 }
 
-/// Item 4: the first (if any) of an `env` map's keys that appears in
-/// [`FORBIDDEN_ENV_KEYS`], checked case-insensitively.
-fn forbidden_env_key(env: &BTreeMap<String, String>) -> Option<&str> {
-    env.keys().map(String::as_str).find(|key| {
-        FORBIDDEN_ENV_KEYS
-            .iter()
-            .any(|forbidden| key.eq_ignore_ascii_case(forbidden))
-    })
+/// Item 5 (fix round 2): whether `value` is a well-formed SHA-256 digest —
+/// exactly 64 ASCII hex characters, matching the upstream schema's own
+/// `^[a-fA-F0-9]{64}$` pattern (`ACP-REGISTRY-FORMAT.md`). Without this,
+/// `sha256: Some("")` passed `Option::is_some()` in
+/// [`resolve_distribution`], so an entry could look checksum-pinned (taking
+/// the preferred, Item 3, code path) while carrying a value no verifier
+/// downstream could actually use.
+fn is_valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Item 3 (fix round 2): the first (if any) of an `env` map's keys that is
+/// **not** on [`ALLOWED_ENV_KEYS`] — see that constant's doc for why this is
+/// an allowlist rather than the denylist ([`FORBIDDEN_ENV_KEYS`] no longer
+/// exists) fix round 1 shipped. Exact byte comparison, deliberately not
+/// case-insensitive: the allowlist is a small, closed set of real,
+/// already-observed exact names, so there is no legitimate case variant to
+/// accommodate, and exact matching also closes the round-1 evasion the
+/// coordinator's probe found (a trailing space, e.g. `"LD_PRELOAD "`, no
+/// longer has any name to accidentally case-fold onto).
+fn disallowed_env_key(env: &BTreeMap<String, String>) -> Option<&str> {
+    env.keys()
+        .map(String::as_str)
+        .find(|key| !ALLOWED_ENV_KEYS.contains(key))
 }
 
 /// One registry entry. Only the fields this crate actually uses are
@@ -542,8 +720,12 @@ impl LaunchConfig {
     }
 
     /// Private — see the type's doc. Only [`resolve_distribution`] calls
-    /// this.
-    #[allow(clippy::too_many_arguments)]
+    /// this. Fix round 2 (Item 5): the `#[allow(clippy::too_many_arguments)]`
+    /// that used to sit here is gone — this has 6 parameters, one below
+    /// clippy's default 7-argument threshold, so the lint never actually
+    /// fired; the suppression was inert and clippy stays clean without it
+    /// (verified: `cargo clippy -p roundhouse-acp --no-deps --all-targets -- -D warnings`
+    /// after removal).
     fn binary(
         target: String,
         archive: String,
@@ -761,6 +943,54 @@ pub fn current_platform_target() -> &'static str {
     }
 }
 
+/// Item 2 (fix round 2): the concrete hardening settings
+/// [`build_registry_http_client`] applies, pulled out to a plain value type
+/// so a test can assert its field values against literals directly
+/// (`registry_http_policy_hardened_matches_the_pinned_literals`, this
+/// module's tests). Before this round, no test referenced
+/// `build_registry_http_client` at all, and five mutations against its
+/// inline builder calls (and [`MAX_RESPONSE_BYTES`]) survived the full
+/// suite: `https_only(false)`, the redirect limit `2` → `100`, `.timeout()`
+/// removed, `MAX_RESPONSE_BYTES` → `usize::MAX` (and → `0`), and
+/// `error_for_status()` removed. This pins the four constructor-input
+/// values a test can meaningfully assert against a literal without a
+/// socket; `error_for_status()` removal is instead pinned by
+/// [`fetch_json_capped`] now taking status handling through
+/// [`accumulate_capped`]'s tested call sites (see that function's doc) —
+/// there is no equivalent plain-data value for "was `.error_for_status()`
+/// called" to assert against here.
+///
+/// The reviewer has already verified `reqwest-0.13.4` honours each of these
+/// settings (`https_only` rejects an `http://` *redirect target* via a
+/// separate check at `redirect.rs:324`; `.timeout()` is a true overall
+/// deadline wrapping the body; `error_for_status()` precedes any parse) —
+/// this type exists to pin the *input* side of that already-verified claim,
+/// not to re-verify `reqwest`'s own behavior (which would need a live
+/// socket, forbidden by this task's standing conventions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegistryHttpPolicy {
+    connect_timeout: Duration,
+    timeout: Duration,
+    redirect_limit: usize,
+    https_only: bool,
+    max_response_bytes: usize,
+}
+
+impl RegistryHttpPolicy {
+    /// The one hardened policy this module uses — see
+    /// [`build_registry_http_client`] for the reqwest-side rationale behind
+    /// each field's value.
+    const fn hardened() -> Self {
+        RegistryHttpPolicy {
+            connect_timeout: CONNECT_TIMEOUT,
+            timeout: FETCH_TIMEOUT,
+            redirect_limit: 2,
+            https_only: true,
+            max_response_bytes: MAX_RESPONSE_BYTES,
+        }
+    }
+}
+
 /// Item 1: builds the one hardened `reqwest::Client` this module ever
 /// constructs — [`RegistryCache::new`] builds and stores one, so every fetch
 /// driven through a `RegistryCache` is hardened without the caller having to
@@ -772,17 +1002,21 @@ pub fn current_platform_target() -> &'static str {
 /// verified against the vendored `reqwest-0.13.4` source
 /// (`async_impl/client.rs:299-314`, `redirect.rs:161-163,279`).
 ///
-/// - `.https_only(true)`: registry content carries no signature of its own —
-///   HTTPS is the sole integrity control, so a downgrade to `http://` (via a
-///   misconfigured URL or a redirect) must fail outright rather than silently
-///   serve attacker-interceptable content.
-/// - `.redirect(redirect::Policy::limited(2))`: some redirection is
-///   legitimate (the registry is CDN-fronted), but `reqwest`'s own default of
-///   10 is far more hops than any legitimate single-CDN redirect chain needs;
-///   combined with `https_only(true)` above, a redirect can no longer be used
-///   to downgrade the scheme.
-/// - `.connect_timeout(CONNECT_TIMEOUT)` / `.timeout(FETCH_TIMEOUT)`: see
-///   those constants' docs.
+/// **Fix round 2 (Item 2):** constructs from [`RegistryHttpPolicy::hardened`]
+/// rather than inline literals, so the values themselves are pinned by a
+/// direct, socket-free test.
+///
+/// - `.https_only(policy.https_only)`: registry content carries no signature
+///   of its own — HTTPS is the sole integrity control, so a downgrade to
+///   `http://` (via a misconfigured URL or a redirect) must fail outright
+///   rather than silently serve attacker-interceptable content.
+/// - `.redirect(redirect::Policy::limited(policy.redirect_limit))`: some
+///   redirection is legitimate (the registry is CDN-fronted), but
+///   `reqwest`'s own default of 10 is far more hops than any legitimate
+///   single-CDN redirect chain needs; combined with `https_only` above, a
+///   redirect can no longer be used to downgrade the scheme.
+/// - `.connect_timeout(policy.connect_timeout)` / `.timeout(policy.timeout)`:
+///   see [`CONNECT_TIMEOUT`]/[`FETCH_TIMEOUT`]'s docs.
 ///
 /// Panics only if the TLS backend cannot initialize at all — a
 /// process-startup environment failure, not something request or response
@@ -790,46 +1024,91 @@ pub fn current_platform_target() -> &'static str {
 /// `roundhouse-provider`'s `reqwest_transport.rs` and `roundhouse-tools`'s
 /// `http.rs` already use for their own `reqwest::Client` construction.
 pub fn build_registry_http_client() -> reqwest::Client {
+    let policy = RegistryHttpPolicy::hardened();
     reqwest::Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::limited(2))
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(FETCH_TIMEOUT)
+        .https_only(policy.https_only)
+        .redirect(reqwest::redirect::Policy::limited(policy.redirect_limit))
+        .connect_timeout(policy.connect_timeout)
+        .timeout(policy.timeout)
         .build()
         .expect("TLS backend initialization")
 }
 
+/// Item 2 (fix round 2): the pure byte-cap enforcement algorithm
+/// [`fetch_json_capped`] applies while streaming a response body — extracted
+/// so it is directly testable without a socket (over cap, exactly at cap,
+/// under cap, and a lying/absent declared length — see this module's
+/// tests). Before this round, nothing tested this arithmetic at all.
+///
+/// `declared` is an optional declared total (`Content-Length`, if the
+/// response header conveys one), checked once against `limit` before any
+/// chunk is considered. `chunks` is the sequence of chunk byte-lengths **in
+/// the order they would be read**, folded into a running total that
+/// short-circuits with `Err` the instant it exceeds `limit` — a
+/// `Content-Length` can be absent or lie low, so the running check must
+/// still catch what the declared-length check alone would miss.
+///
+/// [`fetch_json_capped`] is this function's only real caller: it calls this
+/// once with `chunks: std::iter::empty()` to apply the declared-length
+/// check before reading any body, then once per newly-received chunk with
+/// the full list of chunk lengths seen so far — so the identical decision
+/// this function makes here is the one enforced against real, awaited
+/// network chunks, not a parallel, independently-maintained copy of the
+/// same arithmetic.
+fn accumulate_capped(
+    url: &str,
+    limit: usize,
+    declared: Option<usize>,
+    chunks: impl Iterator<Item = usize>,
+) -> Result<usize, RegistryError> {
+    if let Some(len) = declared {
+        if len > limit {
+            return Err(RegistryError::ResponseTooLarge {
+                url: url.to_string(),
+                limit,
+                received: len,
+            });
+        }
+    }
+    let mut total = 0usize;
+    for len in chunks {
+        total += len;
+        if total > limit {
+            return Err(RegistryError::ResponseTooLarge {
+                url: url.to_string(),
+                limit,
+                received: total,
+            });
+        }
+    }
+    Ok(total)
+}
+
 /// Item 1: fetches `url` through `client`, enforcing [`MAX_RESPONSE_BYTES`]
-/// and treating a 4xx/5xx status as an error (`.error_for_status()` — the
-/// original implementation had neither, so a 404/500 error page's body went
-/// straight to `serde_json`), then deserializes the (capped) body as `T`.
-/// Shared by [`fetch_registry`] and [`fetch_quarantine`].
+/// (via [`accumulate_capped`], fix round 2) and treating a 4xx/5xx status as
+/// an error (`.error_for_status()` — the original implementation had
+/// neither, so a 404/500 error page's body went straight to `serde_json`),
+/// then deserializes the (capped) body as `T`. Shared by [`fetch_registry`]
+/// and [`fetch_quarantine`].
 async fn fetch_json_capped<T: DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<T, RegistryError> {
     let mut response = client.get(url).send().await?.error_for_status()?;
 
-    if let Some(len) = response.content_length() {
-        if len as usize > MAX_RESPONSE_BYTES {
-            return Err(RegistryError::ResponseTooLarge {
-                url: url.to_string(),
-                limit: MAX_RESPONSE_BYTES,
-                received: len as usize,
-            });
-        }
-    }
+    accumulate_capped(
+        url,
+        MAX_RESPONSE_BYTES,
+        response.content_length().map(|len| len as usize),
+        std::iter::empty(),
+    )?;
 
     let mut body = Vec::new();
+    let mut chunk_lens: Vec<usize> = Vec::new();
     while let Some(chunk) = response.chunk().await? {
+        chunk_lens.push(chunk.len());
+        accumulate_capped(url, MAX_RESPONSE_BYTES, None, chunk_lens.iter().copied())?;
         body.extend_from_slice(&chunk);
-        if body.len() > MAX_RESPONSE_BYTES {
-            return Err(RegistryError::ResponseTooLarge {
-                url: url.to_string(),
-                limit: MAX_RESPONSE_BYTES,
-                received: body.len(),
-            });
-        }
     }
 
     serde_json::from_slice(&body).map_err(RegistryError::from_json_error)
@@ -872,23 +1151,62 @@ fn read_cached_json<T: DeserializeOwned>(path: &Path, ttl: Option<Duration>) -> 
     serde_json::from_str(&contents).ok()
 }
 
-/// Item 7: writes `<path>.tmp` then `std::fs::rename`s it over `path`, so a
-/// crash or a concurrent writer can never leave a truncated file readable as
-/// the real cache — the failure direction was already safe (a truncated
+/// Item 5 (fix round 2): computes a temp path for [`write_json`] that is
+/// unique per call, not just per `path` — see [`write_json`]'s doc for why
+/// round 1's fixed `<path>.tmp` suffix was false advertising. Combines the
+/// current process id with a per-process monotonic counter, so two
+/// concurrent `write_json` calls targeting the same `path` (within one
+/// process, and, via the pid, across processes too) always compute two
+/// distinct paths and therefore can never share one temp file to interleave
+/// into — pinned directly by
+/// `unique_tmp_path_never_repeats_for_the_same_target_path` (this module's
+/// tests), which calls this twice for the same `path` and asserts the two
+/// results differ, rather than relying on a timing-dependent, potentially
+/// flaky real concurrent-write race to demonstrate the same property.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp_path = path.as_os_str().to_os_string();
+    tmp_path.push(format!(".{}.{}.tmp", std::process::id(), counter));
+    PathBuf::from(tmp_path)
+}
+
+/// Item 7 (fix round 1), corrected in fix round 2 (Item 5). Writes a
+/// [`unique_tmp_path`] then `std::fs::rename`s it over `path`, so a crash or
+/// a concurrent writer can never leave a truncated file readable as the real
+/// cache — the failure direction was already safe (a truncated
 /// pretty-printed JSON object never re-parses, so the cache degrades to
 /// "nothing cached" rather than corrupting silently), but a bare `fs::write`
-/// left a window where a reader could observe a partially-written file. The
-/// rename is atomic within the same filesystem, which `<path>.tmp` always is
-/// by construction (same directory as `path`).
+/// left a window where a reader could observe a partially-written file.
+///
+/// **Fix round 2: round 1's doc claimed this closed the concurrent-writer
+/// half too — it did not.** Both writers wrote to the exact same fixed
+/// `<path>.tmp`, so two concurrent `store()` calls could interleave their
+/// writes inside that one shared temp file before either renamed it into
+/// place, producing a torn result that the atomic rename would then publish
+/// as if it were whole. [`unique_tmp_path`] closes this: two concurrent
+/// writers now always compute two distinct temp paths, so there is no
+/// shared file left for their writes to interleave into — one of the two
+/// renames simply wins, atomically, over the other's already-complete
+/// write. Also now calls `File::sync_all` before the rename, so the
+/// renamed-into-place file's contents are durable on disk before the
+/// directory entry that makes it visible as the real cache is updated, not
+/// only ordered correctly in the page cache.
+///
+/// The rename is atomic within the same filesystem, which [`unique_tmp_path`]'s
+/// result always is by construction (same directory as `path`).
 fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    use std::io::Write;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
-    let mut tmp_path = path.as_os_str().to_os_string();
-    tmp_path.push(".tmp");
-    let tmp_path = PathBuf::from(tmp_path);
-    std::fs::write(&tmp_path, body)?;
+    let tmp_path = unique_tmp_path(path);
+    let mut file = std::fs::File::create(&tmp_path)?;
+    file.write_all(body.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(&tmp_path, path)
 }
 
@@ -1065,36 +1383,55 @@ impl RegistryCache {
 /// published [`Distribution`] methods.
 ///
 /// **Fix round 1 (Item 3): a `sha256`-bearing `Binary` for the current
-/// platform is now preferred over `Npx`/`Uvx`; package managers are the
+/// platform is preferred over `Npx`/`Uvx`; package managers are the
 /// fallback, used only when no verifiable binary exists for this platform.**
 /// The previous order (`npx` > `uvx` > `binary`) inverted the actual
 /// integrity argument: `Npx`/`Uvx` carry no digest at all *and* `npx`
 /// executes install scripts — the live quarantine list's
 /// `"agoragentic-acp": "Postinstall script"` entry is exactly this hazard
-/// already having been exercised — while the very next check below refuses a
-/// `Binary` specifically for lacking a `sha256`. Verified against live data:
-/// the only two agents that reach this function with more than one
-/// distribution method (`kilo`, `sigit`) each publish a full `binary` map
-/// with `sha256` on every platform target, so the old order discarded the
-/// checksum-pinned channel in both real cases that exist. A `Binary` present
-/// for the current platform but missing `sha256` is still surfaced as
-/// [`ResolveError::UnverifiableBinary`], never silently skipped in favor of
-/// package managers — that would just move the same hazard one branch later.
+/// already having been exercised. Verified against live data: the only two
+/// agents that reach this function with more than one distribution method
+/// (`kilo`, `sigit`) each publish a full `binary` map with `sha256` on every
+/// platform target, so the old order discarded the checksum-pinned channel
+/// in both real cases that exist.
+///
+/// **Fix round 2 (Item 1): the `UnverifiableBinary` check for a `Binary`
+/// present for this platform but missing `sha256` is now checked
+/// immediately — before, not after, the `npx`/`uvx` arms below.** Round 1's
+/// version left this check in its original position, *after* the `npx`
+/// (then `uvx`) early returns: for any agent publishing a binary with no
+/// `sha256` *and* an `npx`/`uvx` fallback, resolution never reached the
+/// `UnverifiableBinary` branch at all — it fell through and returned the
+/// unverified `npx`/`uvx` channel instead, silently defeating the very
+/// checksum preference this round's own doc paragraph above claims to
+/// enforce. Reproduced with a `kilo`-shaped entry minus `sha256`:
+/// `resolve_launch` returned `Ok(LaunchConfig(Npx { package: "@evil/pkg",
+/// .. }))` instead of `Err(UnverifiableBinary)`. A `Binary` present for the
+/// current platform but missing `sha256` is now surfaced as
+/// [`ResolveError::UnverifiableBinary`] the moment that's known — refusing
+/// outright, not falling through to a channel with no digest at all, which
+/// is the same hazard one branch later. (A `sha256` that is present but
+/// malformed, e.g. `Some("")`, never reaches this function at all as of
+/// Item 5's [`is_valid_sha256_hex`] check — it is rejected at deserialize
+/// time, in [`validate_binary_target`].)
 fn resolve_distribution(agent: &RegistryAgent) -> Result<LaunchConfig, ResolveError> {
     let target = current_platform_target();
-    let binary_for_platform = agent.distribution.binary.get(target);
 
-    if let Some(binary) = binary_for_platform {
-        if let Some(sha256) = &binary.sha256 {
-            return Ok(LaunchConfig::binary(
+    if let Some(binary) = agent.distribution.binary.get(target) {
+        return match &binary.sha256 {
+            Some(sha256) => Ok(LaunchConfig::binary(
                 target.to_string(),
                 binary.archive.clone(),
                 Some(sha256.clone()),
                 binary.cmd.clone(),
                 binary.args.clone(),
                 binary.env.clone(),
-            ));
-        }
+            )),
+            None => Err(ResolveError::UnverifiableBinary {
+                agent_id: escape_and_cap_peer_str(&agent.id),
+                target: escape_and_cap_peer_str(target),
+            }),
+        };
     }
 
     if let Some(npx) = &agent.distribution.npx {
@@ -1110,16 +1447,6 @@ fn resolve_distribution(agent: &RegistryAgent) -> Result<LaunchConfig, ResolveEr
             uvx.args.clone(),
             uvx.env.clone(),
         ));
-    }
-
-    if binary_for_platform.is_some() {
-        // Present for this platform, but the `sha256` check above didn't
-        // return — it must be missing, and there was no package-manager
-        // fallback either.
-        return Err(ResolveError::UnverifiableBinary {
-            agent_id: escape_and_cap_peer_str(&agent.id),
-            target: escape_and_cap_peer_str(target),
-        });
     }
 
     Err(ResolveError::NoUsableDistribution {
@@ -1283,6 +1610,20 @@ mod tests {
             !rendered.contains('\u{1b}'),
             "a raw ANSI escape must not survive into RegistryError::Json's Display: {rendered:?}"
         );
+        // Fix round 2 (Item 5): the sibling id test below already asserted
+        // both halves (absence of the raw form, presence of the escaped
+        // form) — this test asserted only the absence half, so replacing
+        // the whole `detail` with `""` (or any other value containing
+        // neither a raw newline nor a raw ANSI escape) would have survived
+        // it undetected.
+        assert!(
+            rendered.contains("\\n"),
+            "the escaped form of the newline must appear instead: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\\u{1b}"),
+            "the escaped form of the ANSI escape must appear instead: {rendered:?}"
+        );
     }
 
     #[test]
@@ -1353,5 +1694,297 @@ mod tests {
         );
         let result = cache.finish_quarantine_refresh(Ok(Quarantine::default()));
         assert!(result.unwrap().is_empty());
+    }
+
+    // ---- Item 1: a binary present but missing sha256 must not fall through
+    // to npx/uvx when both are published ----
+
+    #[test]
+    fn resolve_distribution_refuses_a_no_sha256_binary_even_when_npx_is_also_published() {
+        // The exact shape the coordinator's reviewer reproduced against:
+        // a kilo-shaped entry (binary + npx both present) minus `sha256`.
+        // Before this round, resolve_distribution's UnverifiableBinary check
+        // sat after the npx/uvx early returns, so this silently resolved to
+        // Ok(LaunchConfig(Npx { package: "@evil/pkg", .. })) instead.
+        let mut binary = BTreeMap::new();
+        binary.insert(
+            current_platform_target().to_string(),
+            BinaryTarget {
+                archive: "https://example.invalid/evil.tar.gz".to_string(),
+                sha256: None,
+                cmd: "./evil".to_string(),
+                args: vec![],
+                env: BTreeMap::new(),
+            },
+        );
+        let agent = RegistryAgent {
+            id: "mixed-no-sha256".to_string(),
+            name: "Mixed No Sha256".to_string(),
+            distribution: Distribution {
+                npx: Some(PackageDistribution {
+                    package: "@evil/pkg".to_string(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                }),
+                uvx: None,
+                binary,
+            },
+        };
+        let err = resolve_distribution(&agent)
+            .expect_err("a binary with no sha256 must never fall through to npx");
+        assert!(
+            matches!(err, ResolveError::UnverifiableBinary { .. }),
+            "expected UnverifiableBinary, got {err:?}"
+        );
+    }
+
+    // ---- Item 2: the pure byte-cap algorithm, tested without a socket ----
+
+    #[test]
+    fn accumulate_capped_rejects_a_declared_length_over_the_cap_before_reading_any_chunk() {
+        let err = accumulate_capped("https://x.invalid", 100, Some(101), std::iter::empty())
+            .expect_err("a declared length over the cap must be rejected immediately");
+        assert!(matches!(
+            err,
+            RegistryError::ResponseTooLarge {
+                limit: 100,
+                received: 101,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn accumulate_capped_accepts_a_declared_length_exactly_at_the_cap() {
+        let result = accumulate_capped("https://x.invalid", 100, Some(100), std::iter::empty());
+        assert!(
+            result.is_ok(),
+            "exactly at the cap must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn accumulate_capped_rejects_chunks_whose_running_total_exceeds_the_cap() {
+        // No declared length at all (the common real case: a lying or
+        // absent Content-Length) -- the running total over the chunk
+        // sequence must still catch it.
+        let err = accumulate_capped("https://x.invalid", 100, None, [40, 40, 40].into_iter())
+            .expect_err("40+40+40 = 120 > 100 must be rejected");
+        assert!(matches!(
+            err,
+            RegistryError::ResponseTooLarge {
+                limit: 100,
+                received: 120,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn accumulate_capped_accepts_chunks_exactly_at_the_cap() {
+        let result = accumulate_capped("https://x.invalid", 100, None, [40, 40, 20].into_iter());
+        assert_eq!(result.unwrap(), 100);
+    }
+
+    #[test]
+    fn accumulate_capped_accepts_chunks_under_the_cap() {
+        let result = accumulate_capped("https://x.invalid", 100, None, [10, 20, 30].into_iter());
+        assert_eq!(result.unwrap(), 60);
+    }
+
+    #[test]
+    fn accumulate_capped_is_not_fooled_by_a_declared_length_that_understates_the_real_total() {
+        // A lying Content-Length well under the cap must not exempt the
+        // response from the running-total check once its real chunks
+        // exceed the cap.
+        let err = accumulate_capped("https://x.invalid", 100, Some(5), [60, 60].into_iter())
+            .expect_err("the declared length lied; the real chunk total must still be enforced");
+        assert!(matches!(
+            err,
+            RegistryError::ResponseTooLarge { limit: 100, .. }
+        ));
+    }
+
+    // ---- Item 2: the hardened client's settings are pinned against literals ----
+
+    #[test]
+    fn registry_http_policy_hardened_matches_the_pinned_literals() {
+        let policy = RegistryHttpPolicy::hardened();
+        assert_eq!(policy.connect_timeout, Duration::from_secs(10));
+        assert_eq!(policy.timeout, Duration::from_secs(30));
+        assert_eq!(policy.redirect_limit, 2);
+        assert!(policy.https_only, "https_only must be true");
+        assert_eq!(policy.max_response_bytes, 1_048_576);
+    }
+
+    // ---- Item 3: env allowlist, not denylist ----
+
+    #[test]
+    fn disallowed_env_key_accepts_a_real_live_allowlisted_key() {
+        let mut env = BTreeMap::new();
+        env.insert("FAST_AGENT_MODEL".to_string(), "codexplan".to_string());
+        assert_eq!(disallowed_env_key(&env), None);
+    }
+
+    #[test]
+    fn disallowed_env_key_rejects_loader_and_interpreter_hijack_variables_the_denylist_missed() {
+        // Every one of these was accepted by fix round 1's FORBIDDEN_ENV_KEYS
+        // denylist (the coordinator's probe of 42 keys found them all).
+        for key in [
+            "GCONV_PATH",
+            "BASH_ENV",
+            "ENV",
+            "SHELLOPTS",
+            "NODE_PATH",
+            "PERL5OPT",
+            "RUBYOPT",
+            "HTTPS_PROXY",
+            "SSL_CERT_FILE",
+            "HOME",
+            "LD_PRELOAD ", // trailing-space exact-match evasion
+        ] {
+            let mut env = BTreeMap::new();
+            env.insert(key.to_string(), "x".to_string());
+            assert_eq!(
+                disallowed_env_key(&env),
+                Some(key),
+                "{key:?} must be rejected by the allowlist"
+            );
+        }
+    }
+
+    // ---- Item 4: cmd validated against explicit shapes, not host Path ----
+
+    #[test]
+    fn is_safe_relative_cmd_rejects_windows_absolute_and_unc_shapes_on_this_posix_build() {
+        // Fix round 2: round 1's `Path::new(cmd).is_absolute()` is POSIX-only
+        // semantics on this build, so all four of these -- each escaping the
+        // extraction directory on a real Windows target -- previously passed.
+        for cmd in [
+            "\\Windows\\System32\\cmd.exe",
+            "C:evil.exe",
+            "\\\\server\\share\\evil.exe",
+            "\\\\?\\C:\\evil.exe",
+        ] {
+            assert!(
+                !is_safe_relative_cmd(cmd),
+                "{cmd:?} must be rejected as unsafe"
+            );
+        }
+    }
+
+    #[test]
+    fn is_safe_relative_cmd_rejects_control_characters_and_whitespace() {
+        for cmd in ["./x\nevil", "./a b; rm -rf /"] {
+            assert!(
+                !is_safe_relative_cmd(cmd),
+                "{cmd:?} must be rejected: closes the asymmetry with is_plausible_package_name"
+            );
+        }
+    }
+
+    #[test]
+    fn is_safe_relative_cmd_accepts_the_real_live_relative_shapes() {
+        for cmd in ["./kilo", "./bin\\devin.exe", "amp-acp.exe"] {
+            assert!(is_safe_relative_cmd(cmd), "{cmd:?} must remain accepted");
+        }
+    }
+
+    #[test]
+    fn is_plausible_package_name_rejects_url_and_path_shaped_specs() {
+        // Item 4: npx accepts every one of these as an installable spec and
+        // fetches/executes code from outside the npm registry entirely.
+        for package in [
+            "../../../tmp/evil",
+            "/tmp/evil",
+            "file:/tmp/evil",
+            "git+ssh://attacker/x",
+            "https://attacker.example/x.tgz",
+            "~/evil",
+        ] {
+            assert!(
+                !is_plausible_package_name(package),
+                "{package:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn is_plausible_package_name_accepts_real_live_scoped_and_versioned_specs() {
+        for package in [
+            "@openai/codex-acp",
+            "@agentclientprotocol/claude-agent-acp@0.73.0",
+            "fast-agent-acp==0.10.1",
+            "agoragentic-mcp@1.3.0",
+        ] {
+            assert!(
+                is_plausible_package_name(package),
+                "{package:?} must remain accepted"
+            );
+        }
+    }
+
+    // ---- Item 5: sha256 must be a real 64-hex-character digest ----
+
+    #[test]
+    fn is_valid_sha256_hex_rejects_an_empty_string() {
+        assert!(!is_valid_sha256_hex(""));
+    }
+
+    #[test]
+    fn is_valid_sha256_hex_rejects_the_wrong_length() {
+        assert!(!is_valid_sha256_hex(&"a".repeat(63)));
+        assert!(!is_valid_sha256_hex(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn is_valid_sha256_hex_accepts_a_real_shaped_digest() {
+        assert!(is_valid_sha256_hex(&"a".repeat(64)));
+        // A real live sha256 value (amp-acp, darwin-aarch64 target,
+        // ACP-REGISTRY-FORMAT.md).
+        assert!(is_valid_sha256_hex(
+            "240a1a464f2a400ae51e9613b7f52b2abb6e7a29759001e9185291325671ccf1"
+        ));
+    }
+
+    #[test]
+    fn validate_binary_target_rejects_an_empty_sha256() {
+        // sha256: Some("") used to pass Option::is_some() in
+        // resolve_distribution and look checksum-pinned with a value no
+        // verifier could use.
+        let binary = BinaryTarget {
+            archive: "https://x".to_string(),
+            sha256: Some(String::new()),
+            cmd: "./x".to_string(),
+            args: vec![],
+            env: BTreeMap::new(),
+        };
+        assert!(validate_binary_target("linux-x86_64", &binary).is_err());
+    }
+
+    // ---- Item 5: unique temp paths, tested deterministically ----
+
+    #[test]
+    fn unique_tmp_path_never_repeats_for_the_same_target_path() {
+        let path = Path::new("/does/not/need/to/exist/registry.json");
+        let a = unique_tmp_path(path);
+        let b = unique_tmp_path(path);
+        assert_ne!(
+            a, b,
+            "two concurrent writers must never compute the same temp file path"
+        );
+    }
+
+    #[test]
+    fn write_json_produces_a_file_readable_back_as_the_same_value() {
+        // write_json's own round trip, now going through unique_tmp_path and
+        // an explicit File::create/write_all/sync_all instead of
+        // std::fs::write -- must still behave like a normal write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        write_json(&path, &sample_registry()).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let parsed: Registry = serde_json::from_str(&contents).unwrap();
+        assert_eq!(parsed.agents.len(), 1);
     }
 }

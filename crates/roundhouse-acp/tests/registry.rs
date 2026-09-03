@@ -35,6 +35,26 @@
 //!   `assert_eq!` now reads the resolved value back through its accessor
 //!   methods (`is_npx()`, `package()`, `args()`, `env()`, `target()`,
 //!   `archive()`, `sha256()`, `cmd()`) instead.
+//!
+//! **Fix round 2 (coordinator review of fix round 1):**
+//! - Item 1: `resolve_launch_refuses_a_no_sha256_binary_even_when_npx_is_also_published`
+//!   is new — the mixed (binary + npx) shape with `sha256` absent, which
+//!   round 1 never tested (every existing mixed-shape test carried
+//!   `sha256`), reproducing exactly what let a no-`sha256` binary silently
+//!   fall through to `npx`.
+//! - Item 3/4: new `distribution_deserialization_*` tests for the env
+//!   allowlist and the `cmd`/`package` grammar gaps — see each test's own
+//!   comment.
+//! - Standing conventions ("tests must be able to fail"):
+//!   `resolve_launch_prefers_a_checksum_pinned_binary_over_npx_when_an_agent_publishes_both`
+//!   and `resolve_launch_resolves_a_binary_only_agent_for_the_current_platform`
+//!   used to build their expected `target` value by *calling*
+//!   `current_platform_target` — the same function `resolve_launch` calls
+//!   internally — making `assert_eq!(launch.target(), Some(target))`
+//!   tautological (a bug in that function's match arms would make both call
+//!   sites agree on the same wrong value). Both now use
+//!   [`expected_current_platform_target`], an independent copy of the same
+//!   OS/ARCH match, so a mismatch is actually detectable.
 
 use roundhouse_acp::registry::{
     BinaryTarget, Distribution, PackageDistribution, Quarantine, Registry, RegistryAgent,
@@ -42,6 +62,30 @@ use roundhouse_acp::registry::{
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
+
+/// Standing conventions ("tests must be able to fail"): independently
+/// re-derives the expected platform target string from
+/// `std::env::consts::OS`/`ARCH`, duplicating
+/// `roundhouse_acp::registry::current_platform_target`'s own match arms
+/// rather than *calling* that function. Two tests below used to build their
+/// expected value with `let target = current_platform_target();` and then
+/// assert the resolved `LaunchConfig` echoed that same value back --
+/// tautological, since [`roundhouse_acp::registry::resolve_launch`] calls
+/// that identical function internally: a bug in its match arms (e.g. two
+/// swapped branches) would make both call sites agree with each other on
+/// the same wrong string, and no test using that pattern could ever catch
+/// it. This copy is independent, so it doesn't.
+fn expected_current_platform_target() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-aarch64",
+        ("macos", "x86_64") => "darwin-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("linux", "x86_64") => "linux-x86_64",
+        ("windows", "aarch64") => "windows-aarch64",
+        ("windows", "x86_64") => "windows-x86_64",
+        _ => "unsupported",
+    }
+}
 
 fn npx_agent(id: &str, package: &str) -> RegistryAgent {
     RegistryAgent {
@@ -216,7 +260,10 @@ fn resolve_launch_prefers_a_checksum_pinned_binary_over_npx_when_an_agent_publis
         dir.path().join("quarantine.json"),
         Duration::from_secs(3600),
     );
-    let target = roundhouse_acp::registry::current_platform_target();
+    // Standing conventions: `target` is derived independently of
+    // `current_platform_target`, not by calling it — see
+    // `expected_current_platform_target`'s doc.
+    let target = expected_current_platform_target();
     let mut binary = BTreeMap::new();
     binary.insert(
         target.to_string(),
@@ -265,7 +312,13 @@ fn resolve_launch_prefers_a_checksum_pinned_binary_over_npx_when_an_agent_publis
 }
 
 #[test]
-fn resolve_launch_resolves_a_binary_only_agent_for_the_current_platform() {
+fn resolve_launch_refuses_a_no_sha256_binary_even_when_npx_is_also_published() {
+    // Fix round 2, Item 1: the exact shape the coordinator's reviewer
+    // reproduced -- a kilo-shaped entry (binary + npx both present) minus
+    // `sha256`. Round 1's UnverifiableBinary check sat after the npx/uvx
+    // early returns in resolve_distribution, so this resolved to
+    // `Ok(LaunchConfig(Npx { package: "@evil/pkg", .. }))` instead of
+    // failing closed.
     let dir = tempfile::tempdir().unwrap();
     let cache = RegistryCache::new(
         dir.path().join("registry.json"),
@@ -273,6 +326,57 @@ fn resolve_launch_resolves_a_binary_only_agent_for_the_current_platform() {
         Duration::from_secs(3600),
     );
     let target = roundhouse_acp::registry::current_platform_target();
+    let mut binary = BTreeMap::new();
+    binary.insert(
+        target.to_string(),
+        BinaryTarget {
+            archive: "https://example.invalid/evil.tar.gz".to_string(),
+            sha256: None,
+            cmd: "./evil".to_string(),
+            args: vec![],
+            env: BTreeMap::new(),
+        },
+    );
+    let agent = RegistryAgent {
+        id: "kilo-no-sha256".to_string(),
+        name: "Kilo No Sha256".to_string(),
+        distribution: Distribution {
+            npx: Some(PackageDistribution {
+                package: "@evil/pkg".to_string(),
+                args: vec![],
+                env: BTreeMap::new(),
+            }),
+            uvx: None,
+            binary,
+        },
+    };
+    cache
+        .store(&Registry {
+            agents: vec![agent],
+        })
+        .unwrap();
+    cache.store_quarantine(&empty_quarantine()).unwrap();
+
+    let err = cache
+        .resolve_launch("kilo-no-sha256")
+        .expect_err("a binary with no sha256 must never fall through to npx");
+    assert!(
+        matches!(err, ResolveError::UnverifiableBinary { .. }),
+        "expected UnverifiableBinary, got {err:?}"
+    );
+}
+
+#[test]
+fn resolve_launch_resolves_a_binary_only_agent_for_the_current_platform() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    // Standing conventions: independently re-derived, not called — see
+    // `expected_current_platform_target`'s doc.
+    let target = expected_current_platform_target();
     let mut binary = BTreeMap::new();
     binary.insert(
         target.to_string(),
@@ -549,6 +653,27 @@ fn distribution_deserialization_rejects_a_forbidden_env_key_on_a_binary_target()
     assert!(result.is_err(), "NODE_OPTIONS must be rejected");
 }
 
+// ---- Fix round 2, Item 3: env allowlist ----
+
+#[test]
+fn distribution_deserialization_accepts_a_real_live_allowlisted_env_key() {
+    let json = r#"{"uvx": {"package": "fast-agent-acp==0.10.1", "env": {"FAST_AGENT_MODEL": "codexplan"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_ok(),
+        "a real live allowlisted env key must not be rejected: {result:?}"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_loader_hijack_variable_the_round_1_denylist_missed() {
+    // GCONV_PATH: a classic glibc dynamic-loader hijack, absent from fix
+    // round 1's FORBIDDEN_ENV_KEYS denylist.
+    let json = r#"{"npx": {"package": "x", "env": {"GCONV_PATH": "/tmp/evil"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "GCONV_PATH must be rejected");
+}
+
 #[test]
 fn distribution_deserialization_accepts_real_live_shapes_with_a_relative_windows_style_cmd() {
     // Real upstream value: `./bin\devin.exe` — mixed separator, still
@@ -560,6 +685,86 @@ fn distribution_deserialization_accepts_real_live_shapes_with_a_relative_windows
     assert!(
         result.is_ok(),
         "a real relative windows-style cmd must not be rejected: {result:?}"
+    );
+}
+
+// ---- Fix round 2, Item 4: cmd validated against explicit shapes, not host Path ----
+
+#[test]
+fn distribution_deserialization_rejects_a_windows_absolute_cmd_on_a_windows_target() {
+    // `Path::new(cmd).is_absolute()` (fix round 1's check) is POSIX-only on
+    // this (Linux) build, so a `windows-x86_64` target's cmd carrying a
+    // Windows absolute path used to pass straight through, escaping the
+    // extraction directory on the platform this entry's own key names.
+    let json = r#"{"binary": {"windows-x86_64": {"archive": "https://x", "cmd": "\\Windows\\System32\\cmd.exe"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "a Windows absolute cmd must be rejected");
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_windows_drive_letter_cmd() {
+    let json = r#"{"binary": {"windows-x86_64": {"archive": "https://x", "cmd": "C:evil.exe"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "a drive-letter cmd must be rejected");
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_unc_path_cmd() {
+    let json = r#"{"binary": {"windows-x86_64": {"archive": "https://x", "cmd": "\\\\server\\share\\evil.exe"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "a UNC-path cmd must be rejected");
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_cmd_containing_a_newline() {
+    let json = r#"{"binary": {"linux-x86_64": {"archive": "https://x", "cmd": "./x\nevil"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a cmd containing a raw newline must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_cmd_containing_shell_metacharacters_via_whitespace() {
+    let json =
+        r#"{"binary": {"linux-x86_64": {"archive": "https://x", "cmd": "./a b; rm -rf /"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a cmd containing whitespace/shell metacharacters must be rejected"
+    );
+}
+
+// ---- Fix round 2, Item 4: package constrained to a package identifier ----
+
+#[test]
+fn distribution_deserialization_rejects_a_url_shaped_npx_package() {
+    let json = r#"{"npx": {"package": "https://attacker.example/x.tgz"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a URL-shaped package spec must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_path_traversal_shaped_npx_package() {
+    let json = r#"{"npx": {"package": "../../../tmp/evil"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a path-traversal-shaped package spec must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_git_ssh_shaped_uvx_package() {
+    let json = r#"{"uvx": {"package": "git+ssh://attacker/x"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a git+ssh-scheme package spec must be rejected"
     );
 }
 

@@ -16,7 +16,7 @@
 //! that loop is expected to call [`negotiate_response`] on the SDK's real
 //! `InitializeResponse` and act on the resulting [`AcpVersion`].
 
-use crate::peer_text::{escape_and_cap_peer_str, EscapedPeerStr};
+use crate::peer_text::EscapedPeerStr;
 use agent_client_protocol::schema::v1::InitializeResponse;
 use std::collections::{HashMap, VecDeque};
 
@@ -63,6 +63,26 @@ struct HintKey {
 /// characters (`String`'s own `Debug` impl does that) but does not cap
 /// length, unlike [`EscapedPeerStr`]. `MAX_HINTS` below already bounds the
 /// *count* of distinct hints kept; this bounds the *size* of each one.
+///
+/// **Fix round 2 (Item 6): these escaped, capped fields are for display
+/// only — [`cache_hint`] does not key the cache on them.** It used to: the
+/// cache key was built from `EscapedPeerStr::as_str()` (escaped *and*
+/// capped to [`crate::peer_text::PEER_STR_MAX_LEN`] bytes), so two distinct
+/// `(agent_binary, agent_version)` identities that happened to share their
+/// first 128 escaped bytes collided into the same cache slot —
+/// `lookup_hint` could then return a stale hint observed for a *different*
+/// agent identity, silently, which is a wrong answer, not merely a lost
+/// one (contradicting this module's own doc above: "losing a hint... costs
+/// one redundant negotiation round, nothing more"). [`cache_hint`] and
+/// [`lookup_hint`] now take the raw `agent_binary`/`agent_version` strings
+/// directly and key on those — the same "key on the raw identity, escape
+/// only for display" split `mcp_over_acp::InProcessMcpServer::register`
+/// already establishes for tool names in this crate (its `BTreeMap` key is
+/// the raw `String`; `escape_and_cap_peer_str` is applied only when
+/// building the `DuplicateToolName` error's rendered message). This struct
+/// keeps its escaped fields because a future caller logging *which* hint
+/// was cached/reused still needs a safe-to-render form of the identity —
+/// only the cache's own identity/lookup logic must not use it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VersionHint {
     pub agent_binary: EscapedPeerStr,
@@ -111,14 +131,25 @@ impl VersionHintCache {
     }
 }
 
-pub fn cache_hint(cache: &mut VersionHintCache, hint: VersionHint) {
-    // `HintKey` stays plain `String` internally (it's a private hashmap key,
-    // never exposed) — deliberately not widened to `EscapedPeerStr` just to
-    // match field-for-field, since that would need `EscapedPeerStr: Hash`,
-    // which nothing else in the crate requires yet.
+/// Fix round 2 (Item 6): `agent_binary`/`agent_version` are the **raw**
+/// identity to key the cache on — see [`VersionHint`]'s doc for why this
+/// changed from keying off `hint`'s escaped fields. `hint.observed` is the
+/// only part of `hint` this function actually stores; its
+/// `agent_binary`/`agent_version` fields exist for a caller that wants a
+/// safe-to-render copy of the identity alongside the raw one, not for this
+/// function's own bookkeeping. `HintKey` stays plain `String` internally
+/// (it's a private hashmap key, never exposed) — deliberately not widened
+/// to `EscapedPeerStr` just to match field-for-field, since that would need
+/// `EscapedPeerStr: Hash`, which nothing else in the crate requires yet.
+pub fn cache_hint(
+    cache: &mut VersionHintCache,
+    agent_binary: &str,
+    agent_version: &str,
+    hint: VersionHint,
+) {
     let key = HintKey {
-        agent_binary: hint.agent_binary.as_str().to_string(),
-        agent_version: hint.agent_version.as_str().to_string(),
+        agent_binary: agent_binary.to_string(),
+        agent_version: agent_version.to_string(),
     };
     if !cache.hints.contains_key(&key) {
         if cache.hints.len() >= MAX_HINTS {
@@ -131,23 +162,25 @@ pub fn cache_hint(cache: &mut VersionHintCache, hint: VersionHint) {
     cache.hints.insert(key, hint.observed);
 }
 
+/// Fix round 2 (Item 6): keys directly on the **raw** `agent_binary`/
+/// `agent_version` — no escaping, matching [`cache_hint`]'s key exactly.
+/// Before this round, this routed both parameters through
+/// `escape_and_cap_peer_str` first, which is what caused two distinct
+/// identities sharing an escaped-and-capped 128-byte prefix to collide into
+/// the same slot (see [`VersionHint`]'s doc) — escaping was never necessary
+/// for a `HashMap` key in the first place, since exact byte equality is all
+/// a key needs, and it actively discarded the exactness a raw `String`
+/// already had.
 pub fn lookup_hint(
     cache: &VersionHintCache,
     agent_binary: &str,
     agent_version: &str,
 ) -> Option<AcpVersion> {
-    // Task C8: `cache_hint` now keys off the *escaped* `VersionHint` fields
-    // (see its comment above) — a raw `&str` here must go through the same
-    // `escape_and_cap_peer_str` transform before key lookup, or an
-    // otherwise-matching (binary, version) pair would never hit, since
-    // `"x"` and `escape_and_cap_peer_str("x")` (`"\"x\""`) are different
-    // strings. `escape_and_cap_peer_str` is deterministic, so this and
-    // `cache_hint`'s key always agree for the same logical input.
     cache
         .hints
         .get(&HintKey {
-            agent_binary: escape_and_cap_peer_str(agent_binary).as_str().to_string(),
-            agent_version: escape_and_cap_peer_str(agent_version).as_str().to_string(),
+            agent_binary: agent_binary.to_string(),
+            agent_version: agent_version.to_string(),
         })
         .copied()
 }
