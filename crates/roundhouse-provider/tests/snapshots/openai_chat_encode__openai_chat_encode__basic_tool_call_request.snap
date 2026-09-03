@@ -3,42 +3,43 @@ source: crates/roundhouse-provider/tests/openai_chat_encode.rs
 expression: body
 ---
 {
-  "max_tokens": 1024,
+  "model": "gpt-5.4",
   "messages": [
     {
-      "content": "You are a careful coding agent.",
-      "role": "system"
+      "role": "system",
+      "content": "You are a careful coding agent."
     },
     {
-      "content": "Read main.rs",
-      "role": "user"
+      "role": "user",
+      "content": "Read main.rs"
     },
     {
-      "content": null,
       "role": "assistant",
+      "content": null,
       "tool_calls": [
         {
-          "function": {
-            "arguments": "{\"path\":\"main.rs\"}",
-            "name": "read"
-          },
           "id": "call_1",
-          "type": "function"
+          "type": "function",
+          "function": {
+            "name": "read",
+            "arguments": "{\"path\":\"main.rs\"}"
+          }
         }
       ]
     }
   ],
-  "model": "gpt-5.4",
   "stream": true,
-  "tool_choice": "auto",
   "tools": [
     {
+      "type": "function",
       "function": {
-        "description": "Read a file",
         "name": "read",
+        "description": "Read a file",
         "parameters": {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "title": "ReadParams",
           "description": "Test params struct for the \"read\" tool.",
+          "type": "object",
           "properties": {
             "path": {
               "type": "string"
@@ -46,12 +47,11 @@ expression: body
           },
           "required": [
             "path"
-          ],
-          "title": "ReadParams",
-          "type": "object"
+          ]
         }
-      },
-      "type": "function"
+      }
     }
-  ]
+  ],
+  "tool_choice": "auto",
+  "max_tokens": 1024
 }
