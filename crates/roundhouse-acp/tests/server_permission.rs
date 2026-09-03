@@ -8,6 +8,7 @@
 use agent_client_protocol::schema::v1::{
     PermissionOption, PermissionOptionKind, RequestPermissionOutcome, SelectedPermissionOutcome,
 };
+use roundhouse_acp::peer_text::escape_and_cap_peer_str;
 use roundhouse_acp::server::{
     handle_request_permission, resolve_selection, selected_option_id, AcpServer, PermissionError,
     PolicyEngineLike, PolicyOutcome, SelectionResolution,
@@ -333,10 +334,11 @@ fn resolve_selection_distinguishes_cancelled_unknown_id_and_ambiguous_options() 
     assert_eq!(
         resolve_selection(&offered, &unknown_id_outcome),
         // Finding 2 (round-3 review): UnknownOptionId now carries an
-        // already-escaped String (str's Debug form), never the raw
-        // PermissionOptionId — see crate::peer_text::escape_and_cap_peer_str
-        // (moved out of server::mod in fix round 2, Item 5).
-        SelectionResolution::UnknownOptionId(format!("{:?}", "never-offered"))
+        // already-escaped, already-capped EscapedPeerStr (fix round 3,
+        // Ruling C-P69), never the raw PermissionOptionId — see
+        // crate::peer_text::escape_and_cap_peer_str (moved out of
+        // server::mod in fix round 2, Item 5).
+        SelectionResolution::UnknownOptionId(escape_and_cap_peer_str("never-offered"))
     );
 
     let ambiguous_options = vec![

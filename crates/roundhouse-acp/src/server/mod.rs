@@ -27,7 +27,7 @@
 //! up the required kind" — [`ambiguous_option_ids`], the `Ask`-never-
 //! `RejectAlways` restriction, refusing to select an unmatched kind — exists
 //! because of that, not out of general caution.
-use crate::peer_text::escape_and_cap_peer_str;
+use crate::peer_text::{escape_and_cap_peer_str, EscapedPeerStr};
 use agent_client_protocol::schema::v1::{
     PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
     SelectedPermissionOutcome, ToolCallUpdate, ToolKind,
@@ -114,10 +114,22 @@ pub enum PermissionError {
     /// why the display format above interpolates it with `{tool_call_id}`
     /// (plain `Display`) rather than `{tool_call_id:?}`: re-applying `Debug`
     /// to an already-`Debug`-escaped string would double-escape it.
+    ///
+    /// **Fix round 3 (Coordinator ruling C-P69):** that "already escaped"
+    /// promise used to be enforced only by convention — this field was a
+    /// bare `pub String`, so nothing prevented a future construction site
+    /// from placing a raw, unescaped `String` here, and nothing made a
+    /// mutation of the `{tool_call_id}` format spec back to something
+    /// unsafe visible except a reviewer catching it by eye (which round 2's
+    /// mutation-testing exercise proved does not reliably happen — see
+    /// `peer_text`'s tests). The field type is now [`EscapedPeerStr`],
+    /// whose private inner field makes "already escaped and capped"
+    /// structural: there is no way to construct one without going through
+    /// [`escape_and_cap_peer_str`].
     #[error(
         "ToolCallUpdate {tool_call_id} has no rawInput; substituting an empty object would be indistinguishable from a real empty-args call and could bypass policy rules that classify on argument content"
     )]
-    MissingRawInput { tool_call_id: String },
+    MissingRawInput { tool_call_id: EscapedPeerStr },
 
     /// SEC-2 (round-2 review): [`normalize_tool_call_for_policy`] refuses a
     /// `ToolCallUpdate` whose `kind` is absent or `ToolKind::Other` — see
@@ -127,11 +139,13 @@ pub enum PermissionError {
     /// **`tool_call_id` is peer-controlled (fix round 2, Item 4):** same
     /// escape-and-cap discipline as [`MissingRawInput`](Self::MissingRawInput)
     /// above, and the same reason this field is interpolated with
-    /// `{tool_call_id}` rather than `{tool_call_id:?}`.
+    /// `{tool_call_id}` rather than `{tool_call_id:?}`. Fix round 3
+    /// (Coordinator ruling C-P69): same [`EscapedPeerStr`] structural
+    /// guarantee as `MissingRawInput` above.
     #[error(
         "ToolCallUpdate {tool_call_id} does not identify a tool: `kind` is missing or ToolKind::Other (the wire default and the deserialization fallback for any kind this SDK version doesn't recognize), and `title` is agent-authored free text, never used as a tool identifier"
     )]
-    UnidentifiableTool { tool_call_id: String },
+    UnidentifiableTool { tool_call_id: EscapedPeerStr },
 }
 
 fn find_option(
@@ -319,7 +333,7 @@ pub enum SelectionResolution {
     /// on its own, separately from a legitimate cancellation.
     ///
     /// **Finding 2 (round-3 review):** this carries an already-escaped,
-    /// length-capped `String` — produced by `escape_and_cap_peer_str` —
+    /// length-capped value — produced by `escape_and_cap_peer_str` —
     /// **not** the raw `PermissionOptionId`. `PermissionOptionId` derives
     /// derive_more's `Display`, which writes its `Arc<str>` content
     /// verbatim; this variant's own doc used to describe the id as "worth
@@ -332,19 +346,22 @@ pub enum SelectionResolution {
     /// approval line that way. Carrying the escaped, capped form here makes
     /// that unsafe formatting unreachable rather than merely discouraged.
     ///
-    /// **Invariant on this `String` (FIX round 4):** it is a bare `String`
-    /// rather than a newtype marking "already escaped and capped," so the
-    /// invariant is recorded here instead of in the type. The value is
-    /// *always* the output of `escape_and_cap_peer_str` — escaped via
-    /// `str`'s `Debug` formatting (so it is quoted, and control characters
-    /// appear only in their escaped `\n` / `\u{...}` forms) and truncated to
-    /// at most [`crate::peer_text::PEER_STR_MAX_LEN`] bytes. `resolve_selection` is
-    /// the single construction site in this crate today, which is why a
-    /// newtype would only add unused public surface for a mistake with
-    /// nowhere to go. **Any future second construction site must preserve
-    /// that invariant** — never place a raw `PermissionOptionId`, or any
-    /// other unescaped peer-controlled string, into this variant.
-    UnknownOptionId(String),
+    /// **Invariant on this value, now structural (fix round 3, Coordinator
+    /// ruling C-P69):** FIX round 4 originally recorded this as a bare
+    /// `String` invariant ("this is always the output of
+    /// `escape_and_cap_peer_str`") rather than a newtype, on the premise
+    /// that `resolve_selection` was the single construction site in this
+    /// crate and a newtype would only add unused public surface. **That
+    /// premise no longer holds** — fix round 2 added a second peer-text
+    /// construction site (`tool_call_id` on `PermissionError`) and this
+    /// same round adds a third (`mcp_over_acp::DuplicateToolName`'s
+    /// rejected name), with C8's remote JSON agent registry queued next to
+    /// add more of the same untrusted-text class. The field type is now
+    /// [`EscapedPeerStr`] (`crate::peer_text`), whose private inner field
+    /// makes "already escaped and capped" a property the type system
+    /// enforces rather than a comment a future construction site could
+    /// silently violate.
+    UnknownOptionId(EscapedPeerStr),
     /// `options` itself is ambiguous (see [`ambiguous_option_ids`]) and
     /// cannot be trusted to resolve any id to a single kind — the same
     /// fail-closed refusal [`handle_request_permission`] applies before
@@ -860,7 +877,7 @@ mod tests {
             RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("not-an-offered-id"));
         assert_eq!(
             resolve_selection(&options, &outcome),
-            SelectionResolution::UnknownOptionId(format!("{:?}", "not-an-offered-id"))
+            SelectionResolution::UnknownOptionId(escape_and_cap_peer_str("not-an-offered-id"))
         );
     }
 
@@ -938,9 +955,27 @@ mod tests {
         );
         let err = normalize_tool_call_for_policy(&missing_raw_input)
             .expect_err("rawInput was never supplied");
+        // Fix round 3 (Item 3): assert on the *rendered* Display message,
+        // not just the field. EscapedPeerStr's private inner field makes
+        // "already escaped" structural for the field itself — and, as a
+        // side effect, `EscapedPeerStr`'s `Debug` is deliberately identical
+        // to its `Display`, so a spec typo like `{tool_call_id:?}` is now a
+        // no-op rather than a double-escape. What field-only assertions
+        // still cannot see is a regression in the *one* place still allowed
+        // to construct an `EscapedPeerStr` — `escape_and_cap_peer_str`
+        // itself, if a future edit there stopped escaping. Rendering the
+        // whole message end to end is what catches that class of mistake
+        // (demonstrated in this task's report: a scratch mutation removing
+        // the escaping step inside `escape_and_cap_peer_str` makes this
+        // exact assertion fail).
+        assert!(
+            !err.to_string().contains('\n'),
+            "rendered MissingRawInput message must not contain a raw newline: {err}"
+        );
         let PermissionError::MissingRawInput { tool_call_id } = err else {
             panic!("expected MissingRawInput, got {err:?}");
         };
+        let tool_call_id = tool_call_id.as_str();
         assert!(
             !tool_call_id.contains('\n'),
             "escaped tool_call_id must not contain a raw newline: {tool_call_id:?}"
@@ -957,9 +992,14 @@ mod tests {
         );
         let err =
             normalize_tool_call_for_policy(&unidentifiable).expect_err("kind was never supplied");
+        assert!(
+            !err.to_string().contains('\n'),
+            "rendered UnidentifiableTool message must not contain a raw newline: {err}"
+        );
         let PermissionError::UnidentifiableTool { tool_call_id } = err else {
             panic!("expected UnidentifiableTool, got {err:?}");
         };
+        let tool_call_id = tool_call_id.as_str();
         assert!(
             !tool_call_id.contains('\n'),
             "escaped tool_call_id must not contain a raw newline: {tool_call_id:?}"
@@ -984,7 +1024,7 @@ mod tests {
             // (same discipline as option_id), so the expected value is the
             // escaped form, not the raw id.
             PermissionError::MissingRawInput {
-                tool_call_id: format!("{:?}", "tc-2")
+                tool_call_id: escape_and_cap_peer_str("tc-2")
             }
         );
     }
@@ -1014,7 +1054,7 @@ mod tests {
         assert_eq!(
             err,
             PermissionError::UnidentifiableTool {
-                tool_call_id: format!("{:?}", "tc-4")
+                tool_call_id: escape_and_cap_peer_str("tc-4")
             }
         );
     }
@@ -1036,7 +1076,7 @@ mod tests {
         assert_eq!(
             err,
             PermissionError::UnidentifiableTool {
-                tool_call_id: format!("{:?}", "tc-5")
+                tool_call_id: escape_and_cap_peer_str("tc-5")
             }
         );
     }

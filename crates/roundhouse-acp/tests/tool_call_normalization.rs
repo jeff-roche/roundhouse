@@ -3,6 +3,7 @@
 // `normalize_tool_call_for_policy`'s fail-closed behavior against the real
 // SDK type from outside the crate.
 use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields, ToolKind};
+use roundhouse_acp::peer_text::escape_and_cap_peer_str;
 use roundhouse_acp::server::{normalize_tool_call_for_policy, AcpToolKindClaim, PermissionError};
 
 #[test]
@@ -54,7 +55,7 @@ fn fails_closed_when_raw_input_is_absent_rather_than_substituting_an_empty_objec
         // as option_id), so the expected value is the escaped form (`str`'s
         // `Debug` output), not the raw id.
         PermissionError::MissingRawInput {
-            tool_call_id: format!("{:?}", "tc-2")
+            tool_call_id: escape_and_cap_peer_str("tc-2")
         }
     );
 }
@@ -84,7 +85,7 @@ fn fails_closed_when_kind_is_absent() {
     assert_eq!(
         err,
         PermissionError::UnidentifiableTool {
-            tool_call_id: format!("{:?}", "tc-4")
+            tool_call_id: escape_and_cap_peer_str("tc-4")
         }
     );
 }
@@ -108,7 +109,7 @@ fn fails_closed_when_kind_is_other_even_if_title_looks_informative() {
     assert_eq!(
         err,
         PermissionError::UnidentifiableTool {
-            tool_call_id: format!("{:?}", "tc-5")
+            tool_call_id: escape_and_cap_peer_str("tc-5")
         }
     );
 }

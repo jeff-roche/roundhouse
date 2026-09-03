@@ -28,7 +28,7 @@
 //! nothing in this file actually requires the `acp-v2` feature to compile or
 //! run.
 
-use crate::peer_text::escape_and_cap_peer_str;
+use crate::peer_text::{escape_and_cap_peer_str, EscapedPeerStr};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -55,21 +55,46 @@ pub trait McpOverAcpTool: Send + Sync {
 /// `Box<dyn McpOverAcpTool>` has no `Debug` impl, so this type cannot derive
 /// `Debug` — see the manual impl below, which prints the escaped, capped
 /// name (never the rejected tool itself, which has nothing safe to print).
+///
+/// **Fix round 3 (Item 1/4):** `name` is now [`EscapedPeerStr`] rather than
+/// a bare `String`, fixing two defects the round-3 review found in this
+/// type specifically:
+///
+/// - `Display` (from `#[error("... {name:?}")]`, the old format) escaped
+///   via `{:?}` but applied **no cap** — unlike every other peer-controlled
+///   string this crate formats. `Display` is the path a real caller
+///   actually uses (`?` into `anyhow`/`color-eyre`, `%err` in `tracing`), so
+///   the uncapped half of the escape-and-cap discipline never actually ran
+///   for this type. Since `name` is now always the *already* escaped-and-
+///   capped output of [`escape_and_cap_peer_str`], the `#[error(...)]`
+///   string below interpolates it with plain `{name}`, matching
+///   `PermissionError::MissingRawInput`/`UnidentifiableTool`'s convention
+///   (`server::mod`) — and is capped, because the value already is.
+/// - The hand-written `Debug` impl below used to call
+///   `escape_and_cap_peer_str(&self.name)` on a `name: String` that was
+///   *already* the tool's raw, unescaped name — so `Debug` escaped it once,
+///   correctly. Once `name` itself became pre-escaped (this round), that
+///   same call would have escaped it a **second** time (`debug_struct::field`
+///   applies `{:?}` to whatever it's handed), producing `name:
+///   "\"echo\""` instead of `name: "echo"`. The impl below now hands
+///   `&self.name` straight to `.field(..)`, relying on
+///   [`EscapedPeerStr`]'s own `Debug` impl (which — deliberately, for this
+///   exact reason — writes its contents verbatim rather than re-escaping).
 #[derive(thiserror::Error)]
-#[error("a tool is already registered under the name {name:?}")]
+#[error("a tool is already registered under the name {name}")]
 pub struct DuplicateToolName {
-    pub name: String,
+    pub name: EscapedPeerStr,
     pub rejected: Box<dyn McpOverAcpTool>,
 }
 
 impl fmt::Debug for DuplicateToolName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `name` is the tool's own self-reported name — peer/implementation
-        // controlled, per this module's own `register` doc — so it is
-        // routed through the same escape-and-cap discipline as every other
-        // peer-controlled string this crate formats, for consistency.
+        // `name` is already escaped and capped (see the struct doc above) —
+        // handing it straight to `.field(..)` relies on `EscapedPeerStr`'s
+        // own `Debug` impl not re-escaping it, avoiding the double-escaping
+        // defect this round fixed.
         f.debug_struct("DuplicateToolName")
-            .field("name", &escape_and_cap_peer_str(&self.name))
+            .field("name", &self.name)
             .finish_non_exhaustive()
     }
 }
@@ -122,7 +147,7 @@ impl InProcessMcpServer {
         let name = tool.name().to_string();
         match self.tools.entry(name.clone()) {
             Entry::Occupied(_) => Err(DuplicateToolName {
-                name,
+                name: escape_and_cap_peer_str(&name),
                 rejected: tool,
             }),
             Entry::Vacant(slot) => {

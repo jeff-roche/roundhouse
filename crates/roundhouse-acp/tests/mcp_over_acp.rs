@@ -4,6 +4,7 @@
 //! `cargo test --workspace` as well as `--features acp-v2`.
 
 use roundhouse_acp::mcp_over_acp::{InProcessMcpServer, McpOverAcpTool};
+use roundhouse_acp::peer_text::{escape_and_cap_peer_str, PEER_STR_MAX_LEN};
 use serde_json::json;
 
 struct EchoTool;
@@ -77,12 +78,11 @@ fn call_tool_escapes_and_caps_a_hostile_unknown_tool_name() {
         !err.contains('\n'),
         "unknown-tool error must not contain a raw newline: {err:?}"
     );
-    // The crate's escape-and-cap helper bounds the escaped name to 128
-    // bytes (`crate::peer_text::PEER_STR_MAX_LEN`, not reachable from this
-    // external test crate — restated as a literal here); "unknown tool "
-    // (13 bytes) is the only other contribution to this message's length.
+    // Fix round 3 (ruling C-P71): `peer_text::PEER_STR_MAX_LEN` is public
+    // again, so this assertion references the constant directly instead of
+    // hardcoding the literal `128` and silently decoupling from it.
     assert!(
-        err.len() <= "unknown tool ".len() + 128,
+        err.len() <= "unknown tool ".len() + PEER_STR_MAX_LEN,
         "unknown-tool error must be bounded by the cap plus the fixed \
          prefix, got {} bytes: {err:?}",
         err.len()
@@ -106,7 +106,10 @@ fn register_rejects_a_duplicate_name_instead_of_silently_shadowing_it() {
     let rejected = server
         .register(Box::new(ImposterEchoTool))
         .expect_err("registering a second tool under the same name must be rejected");
-    assert_eq!(rejected.name, "echo");
+    // Fix round 3: `rejected.name` is now `EscapedPeerStr` (Ruling C-P69),
+    // so the expected value is what `escape_and_cap_peer_str` produces for
+    // "echo" (the quoted, `Debug`-escaped form), not the bare `&str`.
+    assert_eq!(rejected.name, escape_and_cap_peer_str("echo"));
     assert_eq!(rejected.rejected.name(), "echo");
     // The error is now a real std::error::Error — Debug, Display, `?`, and
     // `.unwrap()`/`.expect()` all work, unlike the old `Box<dyn
@@ -131,5 +134,52 @@ fn register_rejects_a_duplicate_name_instead_of_silently_shadowing_it() {
         result,
         json!({"echoed": "hi"}),
         "call_tool must still dispatch to the original tool, not the rejected imposter"
+    );
+}
+
+/// A tool whose `name()` is supplied by the test, so a single struct can
+/// stand in for both the original and the colliding registration below.
+struct NamedTool(String);
+impl McpOverAcpTool for NamedTool {
+    fn name(&self) -> &str {
+        &self.0
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({})
+    }
+    fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(json!({}))
+    }
+}
+
+#[test]
+fn duplicate_tool_name_display_is_escaped_and_capped() {
+    // Fix round 3 (Item 3): `register_rejects_a_duplicate_name_...` above
+    // only exercises the short name "echo", which would not have caught a
+    // missing cap — `DuplicateToolName`'s `Display` used to escape via
+    // `{name:?}` but apply no cap at all (Item 4's finding) before
+    // `EscapedPeerStr` made that structurally impossible. This registers
+    // two tools under one hostile name (a fake audit line plus padding well
+    // past the cap) and asserts the rejection's *rendered* `Display`
+    // message is both newline-free and length-bounded.
+    let hostile_name = format!("x\n[audit] register: ok{}", "z".repeat(500));
+    let mut server = InProcessMcpServer::new();
+    server
+        .register(Box::new(NamedTool(hostile_name.clone())))
+        .expect("first registration must succeed");
+
+    let rejected = server
+        .register(Box::new(NamedTool(hostile_name)))
+        .expect_err("registering a second tool under the same hostile name must be rejected");
+
+    let rendered = rejected.to_string();
+    assert!(
+        !rendered.contains('\n'),
+        "rendered DuplicateToolName message must not contain a raw newline: {rendered:?}"
+    );
+    assert!(
+        rendered.len() <= "a tool is already registered under the name ".len() + PEER_STR_MAX_LEN,
+        "rendered message must be bounded by the cap plus the fixed prefix, got {} bytes: {rendered:?}",
+        rendered.len()
     );
 }
