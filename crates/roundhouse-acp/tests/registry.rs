@@ -66,6 +66,17 @@
 //!   registry's deserialize, only that one entry is dropped.
 //!   `one_agent_with_an_env_key_outside_the_allowlist_does_not_take_down_its_siblings`
 //!   is new — the coordinator's exact 3-agent reproduction.
+//!
+//! **Fix round 4 (coordinator review of fix round 3):**
+//! - Item 1: `resolve_launch_refuses_an_id_a_shadow_entry_shares_rather_than_resolving_either`
+//!   is new — round 3's per-entry tolerance let a second entry re-using a
+//!   dropped entry's `id` become the resolution, inheriting its clean,
+//!   non-quarantined status. It writes the cache file as raw JSON on purpose:
+//!   a `Registry` struct literal bypasses the deserialize path where the
+//!   deduplication lives.
+//! - Item 3: `distribution_deserialization_rejects_an_npx_package_that_is_an_archive_file_spec`
+//!   is new — npm's `file` spec syntax (`/[.](?:tgz|tar.gz|tar)$/i`), the one
+//!   shape round 3's grammar still admitted.
 
 use roundhouse_acp::registry::{
     BinaryTarget, Distribution, PackageDistribution, Quarantine, Registry, RegistryAgent,
@@ -645,6 +656,77 @@ fn one_agent_with_an_env_key_outside_the_allowlist_does_not_take_down_its_siblin
     );
 }
 
+// ---- Item 1 (fix round 4): a duplicate id must resolve to Err, not to
+// either colliding entry ----
+
+#[test]
+fn resolve_launch_refuses_an_id_a_shadow_entry_shares_rather_than_resolving_either() {
+    // The hole round 3's per-entry tolerance opened, end to end. The
+    // legitimate `claude-code` entry is first and carries a `env` flag this
+    // crate has not allowlisted -- exactly the scenario per-entry tolerance
+    // was introduced to survive -- so it is dropped. Round 3 then let the
+    // second, attacker-authored entry with the *same* id become the match,
+    // inheriting the victim id's clean, non-quarantined status: the
+    // coordinator measured `resolve_launch("claude-code")` returning
+    // `Ok(Npx { package: "attacker-controlled-pkg@9.9.9", .. })`. Neither
+    // entry may resolve now.
+    //
+    // Written as a raw cache file rather than through `store`, because a
+    // `Registry` struct literal bypasses the deserialize path where the
+    // deduplication lives -- this must exercise what a real cached document
+    // does.
+    let dir = tempfile::tempdir().unwrap();
+    let registry_path = dir.path().join("registry.json");
+    std::fs::write(
+        &registry_path,
+        r#"{
+            "agents": [
+                {
+                    "id": "claude-code",
+                    "name": "Claude Agent",
+                    "distribution": {"npx": {
+                        "package": "@agentclientprotocol/claude-agent-acp@0.73.0",
+                        "env": {"NEW_UPSTREAM_FEATURE_FLAG": "1"}
+                    }}
+                },
+                {
+                    "id": "claude-code",
+                    "name": "Claude Agent",
+                    "distribution": {"npx": {"package": "attacker-controlled-pkg@9.9.9"}}
+                },
+                {"id": "codex", "name": "Codex", "distribution": {"npx": {"package": "@openai/codex-acp"}}}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let cache = RegistryCache::new(
+        registry_path,
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    // A non-empty quarantine that does *not* list `claude-code` -- the
+    // reproduction's own conditions, so the refusal below cannot be the
+    // quarantine gate firing for some other reason.
+    let mut quarantine = Quarantine::default();
+    quarantine.insert("some-other-agent".to_string(), "unrelated".to_string());
+    cache.store_quarantine(&quarantine).unwrap();
+
+    let err = cache
+        .resolve_launch("claude-code")
+        .expect_err("a shadowed id must fail closed, not resolve to either colliding entry");
+    assert!(
+        matches!(err, ResolveError::NotInRegistry { .. }),
+        "expected NotInRegistry, got {err:?}"
+    );
+
+    // The collision must not have taken out the unrelated entry.
+    let codex = cache
+        .resolve_launch("codex")
+        .expect("an entry with a unique id is unaffected by another id's collision");
+    assert_eq!(codex.package(), Some("@openai/codex-acp"));
+}
+
 #[test]
 fn package_distribution_deserialization_rejects_an_unknown_field() {
     let json = r#"{"package": "x", "extra_unexpected_field": true}"#;
@@ -858,6 +940,54 @@ fn distribution_deserialization_accepts_a_real_live_scoped_package_with_one_slas
         result.is_ok(),
         "a real @scope/name package spec must remain accepted: {result:?}"
     );
+}
+
+// ---- Item 3 (fix round 4): npm's `file` spec syntax ----
+
+#[test]
+fn distribution_deserialization_rejects_an_npx_package_that_is_an_archive_file_spec() {
+    // npm's own npm-package-arg types anything matching
+    // /[.](?:tgz|tar.gz|tar)$/i as a `file` spec -- resolved relative to the
+    // working directory, entirely outside the npm registry, and needing none
+    // of the markers rounds 2 and 3 rejected. The last case is round 3's own
+    // `@scope/name` allowance acting as the carrier.
+    for package in [
+        "evil.tgz",
+        "evil.tar.gz",
+        "evil.tar",
+        "EVIL.TGZ",
+        "pkg@evil.tgz",
+        "@scope/name@evil.tgz",
+    ] {
+        let json = format!(r#"{{"npx": {{"package": "{package}"}}}}"#);
+        let result: Result<Distribution, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "the archive-file spec {package:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn distribution_deserialization_still_accepts_every_live_package_value() {
+    // The full set of `package` values on the live index
+    // (ACP-REGISTRY-FORMAT.md, verified 2026-09-01/2026-09-02) across all
+    // three distribution kinds -- Item 3's new suffix rule and the
+    // non-empty-scope/name rule must not have cost any of them.
+    for package in [
+        "@agentclientprotocol/claude-agent-acp@0.73.0",
+        "@google/gemini-cli@0.58.0",
+        "@openai/codex-acp",
+        "agoragentic-mcp@1.3.0",
+        "fast-agent-acp==0.10.1",
+    ] {
+        let json = format!(r#"{{"npx": {{"package": "{package}"}}}}"#);
+        let result: Result<Distribution, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_ok(),
+            "the live package value {package:?} must remain accepted: {result:?}"
+        );
+    }
 }
 
 // ---- Item 7(a): resolve_launch must resolve using a stale registry cache,

@@ -109,8 +109,10 @@
 //! - **Item 4 — launch fields are now validated, not just `id`.**
 //!   `package`, `cmd`, and `env` all reach a future command line; `id` never
 //!   does. See [`is_plausible_package_name`], [`is_safe_relative_cmd`], and
-//!   [`forbidden_env_key`] plus their call sites in
-//!   `TryFrom<RawDistribution>`.
+//!   [`disallowed_env_key`] plus their call sites in
+//!   `TryFrom<RawDistribution>`. (This last link said `forbidden_env_key`
+//!   until fix round 4 — the denylist-era name of a function fix round 2
+//!   replaced; it referred to nothing that exists.)
 //! - **Item 5 — an empty quarantine fetch can no longer permanently disarm
 //!   quarantine.** [`RegistryCache::finish_quarantine_refresh`] refuses to
 //!   overwrite a non-empty cached quarantine list with an empty freshly
@@ -248,9 +250,11 @@
 //!   cache, no operator-visible signal. [`Registry`] now has a hand-written
 //!   `Deserialize` impl that deserializes `agents` element-wise via
 //!   [`partition_registry_agents`], keeping every entry that validates and
-//!   dropping the rest individually, each with an `eprintln!` warning naming
-//!   the dropped entry's `id` (or `"<no id>"` if even that could not be
-//!   read) — never silently. This is the *type's* own `Deserialize`, so it
+//!   dropping the rest individually, each with a warning naming the dropped
+//!   entry's `id` (or `"<no id>"` if even that could not be read) — never
+//!   silently. (Round 3 emitted those warnings with `eprintln!`; fix round 4,
+//!   Item 2 below, returns them instead.) This is the *type's* own
+//!   `Deserialize`, so it
 //!   applies uniformly to a fresh fetch (via [`parse_registry_tolerant`],
 //!   used by [`fetch_registry`] so its warnings can be surfaced) and to an
 //!   ordinary cache-file read. Per-field validation itself is unchanged and
@@ -290,6 +294,79 @@
 //!   client; a `pub` caller could otherwise pass an unhardened
 //!   `reqwest::Client::new()` and silently lose `https_only`, the redirect
 //!   limit, and both timeouts.
+//!
+//! ## Fix round 4 (coordinator review of fix round 3)
+//!
+//! - **Item 1 — round 3's per-entry tolerance opened an id-shadowing hole,
+//!   now closed.** [`Registry`] has no duplicate-id rejection and
+//!   [`RegistryCache::resolve_launch`] is first-match-wins. Before round 3, a
+//!   document containing an invalid entry failed `Vec<RegistryAgent>`
+//!   deserialization wholesale, so resolution failed closed; after it, the
+//!   invalid entry was dropped and a later entry re-using the same `id`
+//!   silently became the match — inheriting the victim id's clean,
+//!   non-quarantined status, because the quarantine gate is keyed on `id`,
+//!   not on the resolved package. Reproduced end to end against round 3's
+//!   committed code, with a non-empty quarantine cached and `claude-code` not
+//!   quarantined: `resolve_launch("claude-code")` returned
+//!   `Ok(LaunchConfig(Npx { package: "attacker-controlled-pkg@9.9.9", .. }))`
+//!   after the legitimate `@agentclientprotocol/claude-agent-acp@0.73.0`
+//!   entry was dropped for carrying an unrecognized `env` flag — the exact
+//!   scenario per-entry tolerance was introduced to handle.
+//!   [`partition_registry_agents`] now dedupes through a
+//!   `BTreeMap<String, RegistryAgent>` and, on a collision, keeps **neither**
+//!   entry — failing closed rather than letting drop order decide.
+//! - **Item 2 — no `eprintln!`/`println!` anywhere in this crate's `src/`.**
+//!   Round 3 printed one line per dropped entry from inside [`Registry`]'s
+//!   `Deserialize` impl and [`fetch_registry`]. Measured by the coordinator
+//!   against a body sized to sit *inside* [`MAX_RESPONSE_BYTES`] (1,048,570
+//!   bytes): 349,521 warnings, 41,243,478 bytes written to stderr, the whole
+//!   ~41 MB `Vec<String>` materialized on the heap before a single line was
+//!   printed (89.5 ms to parse, 213.7 ms to emit) — ~39x amplification of a
+//!   response the size cap deliberately permits, re-emitted on *every*
+//!   `resolve_launch`, because that path re-parses the cache file on each
+//!   call. `eprintln!` also panics if the write fails (verified: stderr on a
+//!   closed pipe exits 101), which in the `Deserialize` position is a panic
+//!   inside a pure operation with no `Result` path for it; and a library
+//!   embedded in-process by `roundhouse-daemon` must not write to a stream
+//!   the daemon owns and shares with the `round` TUI. [`Registry`]'s
+//!   `Deserialize` is now silent; [`fetch_registry`] and
+//!   [`RegistryCache::refresh_registry`] **return** the warnings as
+//!   [`RegistryRefresh`]'s `warnings` field, bounded by
+//!   [`MAX_REPORTED_DROP_WARNINGS`] plus one remainder line.
+//! - **Item 3 — the package grammar was one npm syntax short.**
+//!   `npm-package-arg`, npm's own classifier, types any spec matching
+//!   `/[.](?:tgz|tar.gz|tar)$/i` as a `file` spec — needing no `/`, `:`, `#`,
+//!   or leading `.`/`/`/`~`, so nothing in round 3's grammar saw `evil.tgz`,
+//!   `pkg@evil.tgz`, or `@scope/name@evil.tgz` (that last one carried in by
+//!   round 3's own `@scope/name` allowance). [`is_archive_file_spec`] rejects
+//!   that suffix. The brief asked for the check to run per `@`-separated
+//!   part; it runs once over the whole string instead, which catches exactly
+//!   the same set — `npa` anchors its own file test at the end of the
+//!   trailing part, always a suffix of the whole — and a per-part loop was
+//!   written, measured as dead (mutating it away left the suite green), and
+//!   removed. See [`is_archive_file_spec`]'s doc.
+//!   [`is_plausible_package_name`]'s `@scope/name` rule now also requires
+//!   both sides non-empty, so `"@scope/"` and `"@/"` no longer pass as
+//!   "plausible" — the doc claimed npm's scoped grammar and the code only
+//!   counted the `/`.
+//! - **Item 4 — two false claims on security assertions, corrected.**
+//!   (a) [`ensure_success_status`]'s doc and `RegistryError::BadStatus`'s
+//!   claimed that removing the call site "now kills this function's own
+//!   dedicated tests"; it did not — the suite passed, and only
+//!   `clippy -D warnings`' dead-code lint caught it, a catch that evaporates
+//!   as soon as a second caller exists. [`begin_capped_read`] is now the
+//!   directly-tested seam performing the check, and its call site in
+//!   [`fetch_capped_bytes`] is load-bearing (it returns the running byte
+//!   total the read loop counts from, so deleting it does not compile); what
+//!   remains inspection-only is disclosed rather than claimed. The status
+//!   logic itself is unchanged and correct. (b)
+//!   [`partition_registry_agents`]'s doc said
+//!   "`RegistryAgent`/`Distribution`'s `deny_unknown_fields` structs are
+//!   unchanged by this round". [`RegistryAgent`] has no `deny_unknown_fields`
+//!   at all — deliberately, so that the live fields this crate does not model
+//!   do not fail every real entry — so unknown *entry-level* keys are in fact
+//!   tolerated, and the strictness comes from elsewhere. Reworded to name
+//!   what actually enforces it.
 
 use crate::peer_text::{escape_and_cap_peer_str, EscapedPeerStr};
 use serde::de::DeserializeOwned;
@@ -479,8 +556,9 @@ fn validate_package_distribution(kind: &str, dist: &PackageDistribution) -> Resu
         return Err(format!(
             "{kind} package name is not accepted (must not be empty; must not start with `-`, \
              `.`, `/`, or `~`; must not contain `..`, `:`, or `#`; must not contain a control or \
-             whitespace character; a `/` is only accepted as the single separator of a leading \
-             `@scope/name`): {}",
+             whitespace character; must not end with `.tgz`, `.tar.gz`, or `.tar`; a `/` is only \
+             accepted as the single separator of a leading `@scope/name` with both sides \
+             non-empty): {}",
             escape_and_cap_peer_str(&dist.package)
         ));
     }
@@ -566,10 +644,29 @@ fn validate_binary_target(target: &str, binary: &BinaryTarget) -> Result<(), Str
 /// `@` and has exactly one `/` (`@openai/codex-acp`,
 /// `@agentclientprotocol/claude-agent-acp@0.73.0`, `@google/gemini-cli@0.58.0`).
 ///
+/// **Fix round 4 (Item 3): npm's *file* spec syntax, the one shape still
+/// missing.** `npm-package-arg` — npm's own spec classifier — types any spec
+/// matching `/[.](?:tgz|tar.gz|tar)$/i` as a `file`, with no `/`, `:`, `#`,
+/// or leading `.`/`/`/`~` required, so nothing above saw it: `evil.tgz`,
+/// `evil.tar.gz`, `evil.tar`, `EVIL.TGZ`, `pkg@evil.tgz`, and
+/// `@scope/name@evil.tgz` all passed, the last of them carried in by round
+/// 3's own `@scope/name` allowance. [`is_archive_file_spec`] now rejects that
+/// suffix — see its doc for why one whole-string check, not a per-part loop,
+/// is exactly what `npa` does. Verified this rejects no real data: every live
+/// `package` value
+/// (`ACP-REGISTRY-FORMAT.md`) still validate — see
+/// `is_plausible_package_name_accepts_real_live_scoped_and_versioned_specs`.
+///
+/// Also fixed in round 4: `"@scope/"` (empty name) and `"@/"` (empty scope)
+/// used to pass, because the `@scope/name` rule only counted the `/`. Neither
+/// is a security issue — neither is an installable spec at all — but the doc
+/// above claims npm's scoped-package grammar, so the code now checks that
+/// much of it.
+///
 /// A permissive check remains (this does not implement the full npm/PyPI
-/// name grammar), so the error message above deliberately does not claim
-/// this validated "a plausible npm/PyPI package identifier" — only that the
-/// specific rejected shapes above are refused.
+/// name grammar), so the error message in [`validate_package_distribution`]
+/// deliberately does not claim this validated "a plausible npm/PyPI package
+/// identifier" — only that the specific rejected shapes above are refused.
 fn is_plausible_package_name(package: &str) -> bool {
     if package.is_empty()
         || package.starts_with('-')
@@ -583,15 +680,67 @@ fn is_plausible_package_name(package: &str) -> bool {
     if package.contains("..") || package.contains(':') || package.contains('#') {
         return false;
     }
+    // Item 3 (fix round 4): npm's own `npm-package-arg` classifies any spec
+    // ending in `.tgz`/`.tar.gz`/`.tar` (case-insensitively) as a `file`
+    // spec, needing none of the markers rejected above. `npa` anchors that
+    // test at the end of the trailing `@`-separated part, which is always a
+    // suffix of the whole string, so one suffix check over the whole string
+    // catches `evil.tgz`, `pkg@evil.tgz`, and `@scope/name@evil.tgz` alike --
+    // see is_archive_file_spec's doc for why the per-part loop this replaced
+    // was dead code.
+    if is_archive_file_spec(package) {
+        return false;
+    }
     if package.contains('/') {
         // Item 1 (fix round 3): a `/` is legal only as the single separator
         // of a leading `@scope/name` — every other shape (npm/npx's bare
-        // `user/repo` GitHub shorthand included) is rejected.
-        if !package.starts_with('@') || package.matches('/').count() != 1 {
+        // `user/repo` GitHub shorthand included) is rejected. Item 3 (fix
+        // round 4): and neither side of that separator may be empty, so
+        // `@scope/` and `@/` no longer pass as "plausible".
+        let Some(after_at) = package.strip_prefix('@') else {
+            return false;
+        };
+        let mut parts = after_at.splitn(3, '/');
+        let scope = parts.next().unwrap_or("");
+        let name = parts.next().unwrap_or("");
+        if scope.is_empty() || name.is_empty() || parts.next().is_some() {
             return false;
         }
     }
     true
+}
+
+/// Item 3 (fix round 4): whether `spec` is an npm *file* spec — a string
+/// ending in `.tgz`, `.tar.gz`, or `.tar`, case-insensitively, matching npm's
+/// own `npm-package-arg` classifier (`/[.](?:tgz|tar.gz|tar)$/i`). Such a
+/// spec resolves to a local tarball relative to the working directory rather
+/// than to anything in the npm registry, and needs none of the markers
+/// [`is_plausible_package_name`]'s other rules look for — no `/`, `:`, `#`,
+/// or leading `.`/`/`/`~` — so nothing else in that grammar saw it.
+///
+/// The blast radius is narrower than the GitHub shorthand round 3 closed (a
+/// `file` spec is cwd-relative, and `/` and `..` are already rejected, so
+/// exploiting it needs an attacker-controlled file already sitting at
+/// `<cwd>/<name>.tgz`), but it is the same "resolves outside the registry"
+/// class, so it is refused rather than reasoned about.
+///
+/// **Checked against the whole spec, not each `@`-separated part.** The round
+/// 4 brief asked for the latter so that `pkg@evil.tgz` and
+/// `@scope/name@evil.tgz` would be caught. They are — but by the whole-string
+/// check alone, because `npa` anchors its own file test at the end of the
+/// *trailing* `@`-separated part, which is by construction a suffix of the
+/// whole string. A per-part loop was written first and then removed: mutating
+/// it away left the entire suite passing (every case it could fire on, the
+/// whole-string check had already rejected), which is the definition of dead
+/// code. Matching `npa` exactly also avoids over-rejecting: `evil.tgz@1.0.0`
+/// is *not* a file spec to npm — it is the registry package named `evil.tgz`
+/// at version `1.0.0`, resolved inside the registry like any other — and the
+/// per-part version refused it for no safety gain.
+fn is_archive_file_spec(spec: &str) -> bool {
+    let lowered = spec.to_ascii_lowercase();
+    [".tgz", ".tar.gz", ".tar"]
+        .iter()
+        .any(|suffix| lowered.ends_with(suffix))
 }
 
 /// Item 4 (fix round 1), corrected in fix round 2. Whether a binary target's
@@ -744,9 +893,31 @@ fn is_valid_agent_id(id: &str) -> bool {
 /// [`RegistryCache::finish_registry_refresh`] falls back to the stale cache
 /// on any parse error, this was a silent, cumulative failure mode: every
 /// refresh after the first upstream `env` addition not yet allowlisted would
-/// keep serving an ever-staler cache with no operator-visible signal beyond
-/// [`fetch_registry`]'s new per-entry `eprintln!` warnings (see
-/// [`parse_registry_tolerant`]).
+/// keep serving an ever-staler cache with no operator-visible signal.
+///
+/// **Fix round 4 (Item 2): this `Deserialize` impl is silent.** Round 3 had
+/// it `eprintln!` one line per dropped entry. A library must not write to a
+/// stream it does not own (this crate is embedded in-process by
+/// `roundhouse-daemon`, which shares stderr with the `round` TUI and owns the
+/// logging), `eprintln!` *panics* if the write fails — a panic reachable from
+/// inside a `Deserialize` impl, which has no `Result` path for it — and,
+/// because [`RegistryCache::resolve_launch`] re-reads and re-parses the cache
+/// file on every single call, the output repeated on every resolve.
+/// Per-entry *tolerance* is unchanged; only the printing is gone. The one
+/// call site that can usefully surface warnings — [`fetch_registry`], reached
+/// through [`RegistryCache::refresh_registry`] — now **returns** them
+/// (bounded, see [`MAX_REPORTED_DROP_WARNINGS`]) as part of
+/// [`RegistryRefresh`], so the decision to log belongs to the daemon that
+/// owns the logging.
+///
+/// **Fix round 4 (Item 1): `agents` is deduplicated by `id`, dropping *every*
+/// entry that shares a colliding id.** See [`partition_registry_agents`].
+/// Note that `agents` stays a `pub Vec`, so a `Registry` built directly by
+/// struct literal (as this module's and `tests/registry.rs`'s own tests
+/// legitimately do) can still contain duplicate ids — the deduplication is
+/// enforced on the deserialize path, which is the only way registry-supplied
+/// bytes become a `Registry`, not in the type system. Same disclosure shape,
+/// and same reason, as [`Distribution`]'s.
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct Registry {
     pub agents: Vec<RegistryAgent>,
@@ -767,13 +938,35 @@ impl<'de> Deserialize<'de> for Registry {
         D: serde::Deserializer<'de>,
     {
         let raw = RawRegistryTolerant::deserialize(deserializer)?;
-        let (agents, warnings) = partition_registry_agents(raw.agents);
-        for warning in &warnings {
-            eprintln!("roundhouse-acp: {warning}");
-        }
+        // Item 2 (fix round 4): the warnings are deliberately discarded here
+        // rather than printed -- see this type's doc. `fetch_registry` is the
+        // path that returns them to a caller that can log them.
+        let (agents, _warnings) = partition_registry_agents(raw.agents);
         Ok(Registry { agents })
     }
 }
+
+/// Item 2 (fix round 4): the maximum number of individually-named per-entry
+/// drop warnings [`partition_registry_agents`] will build, before it stops
+/// building them and counts the remainder into a single trailing
+/// `"... and N more registry agent entries dropped"` line instead.
+///
+/// **Why a cap at all.** Round 3 built one warning `String` per dropped
+/// entry, unbounded. Measured by the coordinator against a response sized to
+/// sit *inside* [`MAX_RESPONSE_BYTES`] (1,048,570 bytes): 349,521 warnings,
+/// ~41 MB of `Vec<String>` held on the heap at once — ~39x amplification of a
+/// body the size cap deliberately permits.
+///
+/// **Why 8.** The realistic case this tolerance exists for (round 3, Item 3)
+/// is upstream adding a field or `env` flag this crate has not allowlisted
+/// yet, which drops a handful of entries out of the 39 the live index carries
+/// (measured 2026-09-01/2026-09-02, `ACP-REGISTRY-FORMAT.md`); 8 names every
+/// one of them individually in that case, and in the pathological case caps
+/// the output at 9 strings regardless of input size. It is deliberately far
+/// below the point where a human reads the output as a list rather than a
+/// flood. `partition_registry_agents_caps_its_warnings_and_reports_the_remainder`
+/// (this module's tests) measures the resulting bound directly.
+const MAX_REPORTED_DROP_WARNINGS: usize = 8;
 
 /// Item 3 (fix round 3): the pure, per-entry decision behind [`Registry`]'s
 /// `Deserialize` impl above — factored out so it is directly testable
@@ -787,41 +980,150 @@ impl<'de> Deserialize<'de> for Registry {
 /// by its own `id` field when the payload is well-formed enough to read one
 /// (falling back to the literal `"<no id>"` for a payload malformed enough
 /// that even `id` cannot be read as a string) — an entry is never silently
-/// dropped without a warning that says why and, where possible, which.
-/// **Does not silently drop an unrecognized key inside a valid-looking
-/// entry**: `RegistryAgent`/`Distribution`'s `deny_unknown_fields` structs
-/// are unchanged by this round, so a single unrecognized field still fails
-/// that one entry's own validation (and is then dropped, with a warning) —
-/// this function only narrows the *blast radius* of a per-entry failure
-/// from "the whole registry" to "this one entry," never widens what counts
-/// as valid.
+/// dropped without a warning that says why and, where possible, which —
+/// subject to this round's [`MAX_REPORTED_DROP_WARNINGS`] cap, past which
+/// entries are counted into a single remainder line instead of named.
+///
+/// Per-field validation itself is unchanged and stays exactly as strict as it
+/// was: an unrecognized key inside an entry's `distribution` object, or
+/// inside one of the three per-shape structs that carry
+/// `#[serde(deny_unknown_fields)]` (`RawDistribution`,
+/// [`PackageDistribution`], [`BinaryTarget`]), still fails that one entry, as
+/// do the `id` pattern and every launch-field check. Unrecognized keys at an
+/// *entry's own* top level are ignored rather than fatal: [`RegistryAgent`]
+/// deliberately has no `deny_unknown_fields`, so that the live fields this
+/// crate does not model (`version`, `description`, `repository`, `authors`,
+/// `license`, `license_url`, `icon`) do not fail every real entry — see its
+/// doc. This function only narrows the *blast radius* of a per-entry failure
+/// from "the whole registry" to "this one entry," never widens what counts as
+/// valid. (**Fix round 4, Item 4(b):** round 3's version of this paragraph
+/// attributed the strictness to `RegistryAgent`/`Distribution`'s
+/// `deny_unknown_fields`. `RegistryAgent` has none — `:678` says so
+/// explicitly — and unknown *entry-level* keys are in fact tolerated, so both
+/// the reason and, for that one position, the claim were wrong.)
+///
+/// **Fix round 4 (Item 1): entries whose `id` collides are *all* dropped.**
+/// [`Registry`] has no duplicate-id rejection and
+/// [`RegistryCache::resolve_launch`] is first-match-wins, so round 3's
+/// per-entry tolerance opened an id-shadowing hole: before it, one invalid
+/// entry failed the whole document and resolution failed closed; after it,
+/// the invalid entry was dropped individually and a *later* entry re-using
+/// the same `id` silently became the match — inheriting the victim id's
+/// clean, non-quarantined status, because the quarantine gate is keyed on
+/// `id`, not on the resolved package. Reproduced end to end against round 3's
+/// committed code: a document whose legitimate `claude-code` entry carried an
+/// unrecognized `env` flag (exactly the scenario per-entry tolerance was
+/// introduced to survive) and whose second, attacker-authored `claude-code`
+/// entry was valid resolved to `Ok(LaunchConfig(Npx { package:
+/// "attacker-controlled-pkg@9.9.9", .. }))`. Keeping the *first* entry
+/// instead would only move the hole — drop order would still decide — so on a
+/// collision **neither** entry survives and both count as dropped: fail
+/// closed, matching this module's posture everywhere else.
+///
+/// The collision is keyed on the id each element **claims in its raw JSON**,
+/// not on the id of an element that validated. That distinction is the whole
+/// fix: in the reported attack the victim is precisely the element that
+/// *fails* validation, so a duplicate check over survivors alone would never
+/// see the collision at all (verified — a survivors-only version of this
+/// function still resolved to the attacker's entry, and
+/// `partition_registry_agents_drops_both_entries_that_share_an_id` fails
+/// against it). An element whose `id` is absent or is not a JSON string
+/// cannot claim an id and so cannot poison one; it simply fails validation on
+/// its own.
+///
+/// **Fix round 4 (Item 2): the warning list is bounded** at
+/// [`MAX_REPORTED_DROP_WARNINGS`] individually-named entries plus at most one
+/// remainder line. Past the cap no per-entry `String` is built at all (not
+/// built and then truncated), so neither the returned `Vec` nor the transient
+/// allocations behind it can be inflated by a large hostile document.
+///
+/// The returned agents are ordered by `id` (a consequence of the `BTreeMap`
+/// the deduplication uses), not in document order. Nothing depends on the
+/// order: the only reader, [`RegistryCache::resolve_launch`], looks entries up
+/// by exact `id`, which this function has just made unique.
 fn partition_registry_agents(
     raw_agents: Vec<serde_json::Value>,
 ) -> (Vec<RegistryAgent>, Vec<String>) {
-    let mut agents = Vec::with_capacity(raw_agents.len());
-    let mut warnings = Vec::new();
+    // Keyed on the id each element *claims* in its raw JSON, not on the id of
+    // an element that successfully validated: the reported attack's victim
+    // entry is the one that fails validation, so a map of survivors alone
+    // would never see the collision at all. `None` marks an id that has been
+    // claimed but yields no usable entry -- invalid, or collided.
+    let mut by_id: BTreeMap<String, Option<RegistryAgent>> = BTreeMap::new();
+    let mut warnings: Vec<String> = Vec::new();
+    // Entries dropped, and how many of those an emitted warning accounts for.
+    // These differ because one collision warning covers two entries, and
+    // because the cap stops warnings being emitted at all.
+    let mut dropped = 0usize;
+    let mut reported = 0usize;
+
     for value in raw_agents {
-        let id_hint = value
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .map(|id| escape_and_cap_peer_str(id).to_string())
-            .unwrap_or_else(|| "<no id>".to_string());
-        match serde_json::from_value::<RegistryAgent>(value) {
-            Ok(agent) => agents.push(agent),
-            Err(err) => warnings.push(format!(
-                "dropping registry agent entry {id_hint}: {}",
-                RegistryError::from_json_error(err)
-            )),
+        // Item 2 (fix round 4): only build the (escaped, allocating) warning
+        // while there is still room to report one -- past the cap nothing is
+        // built at all, rather than built and then truncated.
+        let reportable = warnings.len() < MAX_REPORTED_DROP_WARNINGS;
+        let claimed_id = value.get("id").and_then(serde_json::Value::as_str);
+
+        if let Some(claimed_id) = claimed_id {
+            if let Some(slot) = by_id.get_mut(claimed_id) {
+                // Item 1 (fix round 4): a second element claiming an id some
+                // earlier element already claimed. Neither survives.
+                let displaced = slot.take().is_some();
+                dropped += if displaced { 2 } else { 1 };
+                if reportable {
+                    reported += if displaced { 2 } else { 1 };
+                    warnings.push(format!(
+                        "dropping registry agent entry {}: duplicate id -- another entry in this \
+                         document already claims it, so no entry with it is used (letting drop \
+                         order decide would let a later entry shadow an earlier one)",
+                        escape_and_cap_peer_str(claimed_id)
+                    ));
+                }
+                continue;
+            }
+        }
+
+        match RegistryAgent::deserialize(&value) {
+            Ok(agent) => {
+                by_id.insert(agent.id.clone(), Some(agent));
+            }
+            Err(err) => {
+                dropped += 1;
+                if reportable {
+                    reported += 1;
+                    let id_hint = claimed_id
+                        .map(|id| escape_and_cap_peer_str(id).to_string())
+                        .unwrap_or_else(|| "<no id>".to_string());
+                    warnings.push(format!(
+                        "dropping registry agent entry {id_hint}: {}",
+                        RegistryError::from_json_error(err)
+                    ));
+                }
+                // Poison the id so a later element cannot claim it (the whole
+                // point of Item 1: the victim entry is the invalid one).
+                if let Some(claimed_id) = claimed_id {
+                    by_id.insert(claimed_id.to_string(), None);
+                }
+            }
         }
     }
-    (agents, warnings)
+
+    if dropped > reported {
+        let remainder = dropped - reported;
+        warnings.push(format!(
+            "... and {remainder} more registry agent entries dropped"
+        ));
+    }
+    (by_id.into_values().flatten().collect(), warnings)
 }
 
 /// Item 3 (fix round 3): parses `bytes` into a [`Registry`] with the same
 /// element-wise tolerance as [`Registry`]'s `Deserialize` impl, but also
-/// returns a warning per dropped entry — used by [`fetch_registry`], the one
-/// call site that can usefully surface those warnings (via `eprintln!`) to
-/// an operator. A malformed top-level document (not valid JSON at all, or
+/// returns the (bounded — see [`MAX_REPORTED_DROP_WARNINGS`]) drop warnings —
+/// used by [`fetch_registry`], the one path that can usefully hand those
+/// warnings back to a caller that owns a log to put them in (fix round 4,
+/// Item 2: round 3 printed them here with `eprintln!` instead).
+/// A malformed top-level document (not valid JSON at all, or
 /// missing `agents` entirely) still fails outright — this only narrows the
 /// blast radius of a single *element's* failure, never tolerates a
 /// structurally broken response.
@@ -1119,11 +1421,19 @@ pub enum RegistryError {
     /// suite, because nothing pinned the enforcement itself, only trusted a
     /// citation of `reqwest-0.13.4`'s own source. [`ensure_success_status`]
     /// is a pure, socket-free-testable reimplementation of the same check,
-    /// and this variant is now the one it constructs — removing the real
-    /// call site (in [`fetch_capped_bytes`]) now kills
-    /// `ensure_success_status`'s own dedicated tests. `url` is the
-    /// caller-supplied fetch URL, not registry-derived text, so — like
-    /// `ResponseTooLarge` — it is not routed through `EscapedPeerStr`.
+    /// and this variant is now the one it constructs.
+    ///
+    /// **Fix round 4 (Item 4(a)):** round 3's doc here added that "removing
+    /// the real call site (in [`fetch_capped_bytes`]) now kills
+    /// `ensure_success_status`'s own dedicated tests." That was false —
+    /// removing the call site left the whole suite passing, caught only by
+    /// `clippy -D warnings`' dead-code lint. See [`ensure_success_status`]'s
+    /// own doc for what round 4 does about it and what stays
+    /// inspection-only.
+    ///
+    /// `url` is the caller-supplied fetch URL, not registry-derived text,
+    /// so — like `ResponseTooLarge` — it is not routed through
+    /// `EscapedPeerStr`.
     #[error("http {status} response from {url}")]
     BadStatus { url: String, status: u16 },
 }
@@ -1342,14 +1652,30 @@ fn accumulate_capped(
 
 /// Item 4(a) (fix round 3): a pure, socket-free-testable reimplementation of
 /// `reqwest::Response::error_for_status()`'s status check — whether `status`
-/// is a 4xx or 5xx HTTP status code. `.error_for_status()?` folded straight
-/// into a single line's `?` operator is indistinguishable, in a diff, from
-/// any of the other fallible calls on that line; removing it survived the
-/// full test suite before this round, with the only evidence it was still
-/// enforced being a citation of the vendored `reqwest-0.13.4` source.
-/// [`fetch_capped_bytes`] calls this against the real, awaited response
-/// status, so removing that call site now kills this function's own
-/// dedicated tests.
+/// is at or above 400. `.error_for_status()?` folded straight into a single
+/// line's `?` operator is indistinguishable, in a diff, from any of the other
+/// fallible calls on that line; removing it survived the full test suite
+/// before round 3, with the only evidence it was still enforced being a
+/// citation of the vendored `reqwest-0.13.4` source. This is very slightly
+/// stricter than what it replaced: `error_for_status` rejects 4xx and 5xx,
+/// while `>= 400` also rejects the nonsense 600..=999 range a peer could
+/// still put on the wire.
+///
+/// **Fix round 4 (Item 4(a)): round 3's doc here claimed "removing that call
+/// site now kills this function's own dedicated tests." It did not** —
+/// removing the call site left the whole suite passing, and the only thing
+/// that caught it was `clippy -D warnings`' dead-code lint, which stops
+/// catching it the moment a second caller exists. What is true now:
+/// [`begin_capped_read`] is the (socket-free, directly tested) seam that
+/// performs this check, so removing the check *from that function* does kill
+/// `begin_capped_read_rejects_a_4xx_or_5xx_status_before_reading_a_body`; and
+/// removing [`begin_capped_read`]'s own call site in [`fetch_capped_bytes`]
+/// does not compile, because the running byte total it returns is what the
+/// body-read loop counts from. What no test in this crate can observe,
+/// because it would need a live socket (forbidden by this task's standing
+/// conventions), is that the `status` handed to [`begin_capped_read`] is the
+/// real awaited response's — that one link is inspection-only, and is
+/// disclosed here rather than claimed as tested.
 fn ensure_success_status(url: &str, status: u16) -> Result<(), RegistryError> {
     if status >= 400 {
         Err(RegistryError::BadStatus {
@@ -1359,6 +1685,26 @@ fn ensure_success_status(url: &str, status: u16) -> Result<(), RegistryError> {
     } else {
         Ok(())
     }
+}
+
+/// Item 4(a) (fix round 4): the pure, socket-free prelude to a capped body
+/// read — everything [`fetch_capped_bytes`] can decide from a response's
+/// status line and headers alone, before a single body byte is read.
+///
+/// Rejects a >= 400 status ([`ensure_success_status`]) and then a declared
+/// `Content-Length` over the cap ([`accumulate_capped`]), in that order: a
+/// 404 error page is not worth measuring. Returns the running byte total the
+/// caller's read loop continues from (always 0 today — no body bytes have
+/// been seen yet — but returned rather than assumed so the call site is
+/// load-bearing and cannot be deleted without a compile error).
+fn begin_capped_read(
+    url: &str,
+    status: u16,
+    declared: Option<usize>,
+    limit: usize,
+) -> Result<usize, RegistryError> {
+    ensure_success_status(url, status)?;
+    accumulate_capped(url, limit, declared, 0, std::iter::empty())
 }
 
 /// Item 1: fetches `url` through `client`, enforcing the size cap (via
@@ -1395,14 +1741,12 @@ fn ensure_success_status(url: &str, status: u16) -> Result<(), RegistryError> {
 async fn fetch_capped_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, RegistryError> {
     let max_response_bytes = RegistryHttpPolicy::hardened().max_response_bytes;
     let mut response = client.get(url).send().await?;
-    ensure_success_status(url, response.status().as_u16())?;
 
-    let mut total = accumulate_capped(
+    let mut total = begin_capped_read(
         url,
-        max_response_bytes,
+        response.status().as_u16(),
         response.content_length().map(|len| len as usize),
-        0,
-        std::iter::empty(),
+        max_response_bytes,
     )?;
 
     let mut body = Vec::new();
@@ -1433,6 +1777,35 @@ async fn fetch_json_capped<T: DeserializeOwned>(
     serde_json::from_slice(&body).map_err(RegistryError::from_json_error)
 }
 
+/// Item 2 (fix round 4): what a registry refresh yields — the registry
+/// itself, plus the bounded list of warnings for the entries that were
+/// dropped on the way ([`partition_registry_agents`]).
+///
+/// Round 3 wrote those warnings straight to stderr with `eprintln!` from
+/// inside [`fetch_registry`] and [`Registry`]'s `Deserialize` impl. Returning
+/// them instead removes three problems at once: this crate is embedded
+/// in-process by `roundhouse-daemon`, which shares stderr with the `round`
+/// TUI and owns the logging (a library must not write to a stream it does not
+/// own, and `eprintln!` output is unfilterable, unstructured, and unrateable
+/// by the daemon that does); `eprintln!` *panics* if the write fails
+/// (verified: a binary whose stderr is a closed pipe exits 101), which in the
+/// `Deserialize` position was a panic inside a pure operation with no
+/// `Result` path for it; and the print was unbounded in count. The caller —
+/// `roundhouse-daemon`, at the point it calls
+/// [`RegistryCache::refresh_registry`] — decides where these go.
+///
+/// Every warning string is already peer-text-escaped at construction
+/// ([`escape_and_cap_peer_str`] over both the `id` and the parser detail), so
+/// it carries no raw control characters, ANSI escapes, or unbounded length
+/// into whatever sink the caller picks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegistryRefresh {
+    pub registry: Registry,
+    /// At most [`MAX_REPORTED_DROP_WARNINGS`] individually-named entries plus
+    /// one `"... and N more registry agent entries dropped"` remainder line.
+    pub warnings: Vec<String>,
+}
+
 /// §10.3: "Consume it rather than hardcoding agent launch configs." Fetches
 /// the real registry over HTTP through `client` — see
 /// [`build_registry_http_client`] for the hardening this requires, and
@@ -1443,6 +1816,11 @@ async fn fetch_json_capped<T: DeserializeOwned>(
 /// no longer drops every other agent — see that function's doc, and
 /// [`Registry`]'s own `Deserialize` impl (which applies the identical
 /// tolerance to a cache read, not just a fresh fetch).
+///
+/// **Fix round 4 (Item 2): returns [`RegistryRefresh`], not a bare
+/// [`Registry`]** — round 3 printed the per-entry drop warnings here with
+/// `eprintln!`; they are now handed back to the caller. See
+/// [`RegistryRefresh`]'s doc.
 ///
 /// Ruling C-P11: `async`, using reqwest's default async client — never
 /// `reqwest::blocking` (this crate has no `blocking` feature enabled; see
@@ -1457,13 +1835,10 @@ async fn fetch_json_capped<T: DeserializeOwned>(
 pub(crate) async fn fetch_registry(
     client: &reqwest::Client,
     url: &str,
-) -> Result<Registry, RegistryError> {
+) -> Result<RegistryRefresh, RegistryError> {
     let body = fetch_capped_bytes(client, url).await?;
     let (registry, warnings) = parse_registry_tolerant(&body)?;
-    for warning in &warnings {
-        eprintln!("roundhouse-acp: {warning}");
-    }
-    Ok(registry)
+    Ok(RegistryRefresh { registry, warnings })
 }
 
 /// Fetches the quarantine list over HTTP through `client`. Same rationale as
@@ -1615,7 +1990,16 @@ impl RegistryCache {
     /// fresh fetch fails", implemented for real rather than only claimed in
     /// a doc comment). Only returns `Err` when the fetch failed *and* there
     /// is no cached copy — fresh or stale — to fall back to.
-    pub async fn refresh_registry(&self, url: &str) -> Result<Registry, RegistryError> {
+    ///
+    /// **Fix round 4 (Item 2):** returns a [`RegistryRefresh`], whose
+    /// `warnings` field carries the bounded per-entry drop warnings for the
+    /// caller to log. Round 3 printed them from inside this crate with
+    /// `eprintln!`; see [`RegistryRefresh`]'s doc for why that had to go. The
+    /// stale-cache fallback path returns no warnings: the cache read goes
+    /// through [`Registry`]'s own (silent) `Deserialize`, and re-reporting
+    /// drops from a document fetched on some earlier run would attribute them
+    /// to this refresh.
+    pub async fn refresh_registry(&self, url: &str) -> Result<RegistryRefresh, RegistryError> {
         self.finish_registry_refresh(fetch_registry(&self.client, url).await)
     }
 
@@ -1625,14 +2009,20 @@ impl RegistryCache {
     /// fetch itself.
     fn finish_registry_refresh(
         &self,
-        fetched: Result<Registry, RegistryError>,
-    ) -> Result<Registry, RegistryError> {
+        fetched: Result<RegistryRefresh, RegistryError>,
+    ) -> Result<RegistryRefresh, RegistryError> {
         match fetched {
-            Ok(registry) => {
-                self.store(&registry)?;
-                Ok(registry)
+            Ok(refresh) => {
+                self.store(&refresh.registry)?;
+                Ok(refresh)
             }
-            Err(err) => self.load_cached_allow_stale().ok_or(err),
+            Err(err) => self
+                .load_cached_allow_stale()
+                .map(|registry| RegistryRefresh {
+                    registry,
+                    warnings: Vec::new(),
+                })
+                .ok_or(err),
         }
     }
 
@@ -1835,12 +2225,12 @@ mod tests {
         cache.store(&sample_registry()).unwrap();
 
         let result = cache.finish_registry_refresh(Err(synthetic_fetch_failure()));
-        assert_eq!(
-            result
-                .expect("must fall back to the stale cache")
-                .agents
-                .len(),
-            1
+        let refresh = result.expect("must fall back to the stale cache");
+        assert_eq!(refresh.registry.agents.len(), 1);
+        assert!(
+            refresh.warnings.is_empty(),
+            "the stale-cache path reports no warnings of its own: {:?}",
+            refresh.warnings
         );
     }
 
@@ -1868,9 +2258,17 @@ mod tests {
             dir.path().join("quarantine.json"),
             Duration::from_secs(3600),
         );
-        let result = cache.finish_registry_refresh(Ok(sample_registry()));
-        assert!(result.is_ok());
+        let result = cache.finish_registry_refresh(Ok(RegistryRefresh {
+            registry: sample_registry(),
+            warnings: vec!["dropping registry agent entry x: synthetic".to_string()],
+        }));
+        let refresh = result.expect("a successful fetch must be stored and returned");
         assert_eq!(cache.load_cached().unwrap().agents.len(), 1);
+        assert_eq!(
+            refresh.warnings,
+            vec!["dropping registry agent entry x: synthetic".to_string()],
+            "Item 2 (fix round 4): the fetch's warnings must reach the caller, not stderr"
+        );
     }
 
     #[test]
@@ -2351,12 +2749,17 @@ mod tests {
 
     #[test]
     fn is_plausible_package_name_accepts_real_live_scoped_and_versioned_specs() {
+        // Every `package` string in ACP-REGISTRY-FORMAT.md: the five concrete
+        // live values, plus the two FORMAT.md schema examples. Fix round 4
+        // (Item 3) must not have cost any of them.
         for package in [
             "@openai/codex-acp",
             "@agentclientprotocol/claude-agent-acp@0.73.0",
             "@google/gemini-cli@0.58.0",
             "fast-agent-acp==0.10.1",
             "agoragentic-mcp@1.3.0",
+            "@scope/package",
+            "package-name",
         ] {
             assert!(
                 is_plausible_package_name(package),
@@ -2514,5 +2917,254 @@ mod tests {
             .expect("a single invalid entry must not fail the whole registry's deserialize");
         assert_eq!(registry.agents.len(), 1);
         assert_eq!(registry.agents[0].id, "good");
+    }
+
+    // ---- Item 1 (fix round 4): a colliding id drops *every* entry with it ----
+
+    #[test]
+    fn partition_registry_agents_drops_both_entries_that_share_an_id() {
+        // The round-3 hole, at the unit level: entry 1 is the legitimate
+        // `claude-code`, dropped for an env flag this crate has not
+        // allowlisted (the exact scenario per-entry tolerance exists for);
+        // entry 2 is a valid, attacker-authored entry re-using the same id.
+        // Round 3 kept entry 2. Neither may survive.
+        let raw_agents = vec![
+            serde_json::json!({
+                "id": "claude-code",
+                "name": "Claude Agent",
+                "distribution": {"npx": {
+                    "package": "@agentclientprotocol/claude-agent-acp@0.73.0",
+                    "env": {"NEW_UPSTREAM_FEATURE_FLAG": "1"}
+                }}
+            }),
+            serde_json::json!({
+                "id": "claude-code",
+                "name": "Claude Agent",
+                "distribution": {"npx": {"package": "attacker-controlled-pkg@9.9.9"}}
+            }),
+        ];
+        let (agents, warnings) = partition_registry_agents(raw_agents);
+        assert!(
+            agents.is_empty(),
+            "a shadowing entry must not inherit the victim id: {agents:?}"
+        );
+        assert_eq!(warnings.len(), 2, "one drop per entry: {warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("duplicate id")),
+            "the collision must be reported as such: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn partition_registry_agents_drops_all_three_entries_that_share_an_id() {
+        // The two-entry case removes the stored entry; a third must not then
+        // slip into the vacated slot.
+        let entry = |package: &str| {
+            serde_json::json!({
+                "id": "shadowed",
+                "name": "N",
+                "distribution": {"npx": {"package": package}}
+            })
+        };
+        let (agents, warnings) =
+            partition_registry_agents(vec![entry("a"), entry("b"), entry("c")]);
+        assert!(agents.is_empty(), "{agents:?}");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+    }
+
+    #[test]
+    fn partition_registry_agents_keeps_distinct_ids_when_another_pair_collides() {
+        // The collision must not take out unrelated entries -- dropping
+        // everything would be fail-closed but useless.
+        let raw_agents = vec![
+            serde_json::json!({
+                "id": "alpha", "name": "A", "distribution": {"npx": {"package": "a"}}
+            }),
+            serde_json::json!({
+                "id": "dup", "name": "D", "distribution": {"npx": {"package": "d1"}}
+            }),
+            serde_json::json!({
+                "id": "dup", "name": "D", "distribution": {"npx": {"package": "d2"}}
+            }),
+            serde_json::json!({
+                "id": "beta", "name": "B", "distribution": {"npx": {"package": "b"}}
+            }),
+        ];
+        let (agents, warnings) = partition_registry_agents(raw_agents);
+        let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "beta"]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    #[test]
+    fn registry_deserialize_drops_both_entries_that_share_an_id() {
+        // The type's own Deserialize, i.e. what an ordinary cache-file read
+        // goes through -- not only the pure helper.
+        let json = r#"{
+            "agents": [
+                {"id": "claude-code", "name": "C", "distribution": {"npx": {
+                    "package": "@agentclientprotocol/claude-agent-acp@0.73.0",
+                    "env": {"NEW_UPSTREAM_FEATURE_FLAG": "1"}
+                }}},
+                {"id": "claude-code", "name": "C", "distribution": {"npx": {
+                    "package": "attacker-controlled-pkg@9.9.9"
+                }}}
+            ]
+        }"#;
+        let registry: Registry = serde_json::from_str(json).unwrap();
+        assert!(registry.agents.is_empty(), "{:?}", registry.agents);
+    }
+
+    // ---- Item 2 (fix round 4): the warning list is bounded ----
+
+    #[test]
+    fn partition_registry_agents_caps_its_warnings_and_reports_the_remainder() {
+        // Round 3 built one String per dropped entry, unbounded: the
+        // coordinator measured 349,521 warnings / ~41 MB of Vec<String> from
+        // a body sized to fit inside MAX_RESPONSE_BYTES. This measures the
+        // replacement's bound directly. 20,000 entries is well past the cap
+        // and fast enough for a debug-profile test; the id is 1,000
+        // characters so per-warning length is exercised too (escape_and_cap
+        // caps it at PEER_STR_MAX_LEN).
+        const ENTRIES: usize = 20_000;
+        let long_bad_id = "A".repeat(1_000); // uppercase => fails ^[a-z][a-z0-9-]*$
+        let raw_agents: Vec<serde_json::Value> = (0..ENTRIES)
+            .map(|_| {
+                serde_json::json!({
+                    "id": long_bad_id,
+                    "name": "N",
+                    "distribution": {"npx": {"package": "p"}}
+                })
+            })
+            .collect();
+
+        let (agents, warnings) = partition_registry_agents(raw_agents);
+
+        assert!(agents.is_empty());
+        // MAX_REPORTED_DROP_WARNINGS (8) named entries + 1 remainder line.
+        // Stated as an independent literal, not recomputed from the constant.
+        assert_eq!(
+            warnings.len(),
+            9,
+            "the warning list must not grow with the input: {} entries produced {} warnings",
+            ENTRIES,
+            warnings.len()
+        );
+        assert!(
+            warnings[8].contains("and 19992 more registry agent entries dropped"),
+            "the remainder line must account for every unnamed drop: {:?}",
+            warnings[8]
+        );
+        // Measured bound (the quantitative-claim rule): each named warning
+        // carries at most two PEER_STR_MAX_LEN-capped (128-byte) escaped
+        // fragments plus fixed prose. Measured on exactly this input:
+        // 2,668 bytes total across the 9 strings, from 20,000 dropped entries
+        // whose ids are 1,000 characters each. The same input through round
+        // 3's uncapped shape (`reportable = true`) produced 20,000 warnings.
+        let total_bytes: usize = warnings.iter().map(String::len).sum();
+        assert!(
+            total_bytes < 4096,
+            "the whole warning list must stay small: {total_bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn registry_deserialize_is_silent_while_the_fetch_path_still_reports_drops() {
+        // Item 2 (fix round 4): tolerance and reporting are now separate.
+        // The same document must deserialize (silently, discarding warnings)
+        // through Registry's Deserialize and *also* yield warnings through
+        // the path fetch_registry uses -- so removing the reporting from
+        // parse_registry_tolerant does not merely look like the intended
+        // silence.
+        let body = br#"{
+            "agents": [
+                {"id": "good", "name": "G", "distribution": {"npx": {"package": "g"}}},
+                {"id": "bad", "name": "B", "distribution": {}}
+            ]
+        }"#;
+        let registry: Registry = serde_json::from_slice(body).unwrap();
+        assert_eq!(registry.agents.len(), 1);
+
+        let (also_registry, warnings) = parse_registry_tolerant(body).unwrap();
+        assert_eq!(also_registry, registry, "same tolerance, both ways in");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("bad"), "{warnings:?}");
+    }
+
+    // ---- Item 3 (fix round 4): npm's `file` spec syntax ----
+
+    #[test]
+    fn is_plausible_package_name_rejects_npm_archive_file_specs() {
+        // npm-package-arg classifies each of these as a `file` spec via
+        // /[.](?:tgz|tar.gz|tar)$/i -- no `/`, `:`, `#`, or leading
+        // `.`/`/`/`~` needed, so none of the earlier rules saw them. The
+        // last two show the check must run against each `@`-separated part,
+        // and that round 3's `@scope/name` allowance was itself a carrier.
+        for package in [
+            "evil.tgz",
+            "evil.tar.gz",
+            "evil.tar",
+            "EVIL.TGZ",
+            "Evil.Tar.Gz",
+            "pkg@evil.tgz",
+            "@scope/name@evil.tgz",
+        ] {
+            assert!(
+                !is_plausible_package_name(package),
+                "{package:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn is_plausible_package_name_rejects_an_empty_scope_or_name() {
+        // Not a security hole -- neither is an installable spec -- but the
+        // doc claims npm's scoped-package grammar, and round 3's code only
+        // counted the `/`.
+        for package in ["@scope/", "@/", "@/name"] {
+            assert!(
+                !is_plausible_package_name(package),
+                "{package:?} must be rejected"
+            );
+        }
+    }
+
+    // ---- Item 4(a) (fix round 4): the status check has a real seam ----
+
+    #[test]
+    fn begin_capped_read_rejects_a_4xx_or_5xx_status_before_reading_a_body() {
+        for status in [400u16, 404, 418, 500, 503, 599] {
+            let err = begin_capped_read("https://x.invalid", status, Some(10), 1_000)
+                .expect_err("a >= 400 status must not begin a body read");
+            assert!(
+                matches!(err, RegistryError::BadStatus { status: s, .. } if s == status),
+                "{status} produced {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn begin_capped_read_accepts_a_success_status_and_starts_the_total_at_zero() {
+        let total = begin_capped_read("https://x.invalid", 200, Some(10), 1_000)
+            .expect("a 200 with a small declared length must begin the read");
+        assert_eq!(total, 0, "no body bytes have been counted yet");
+    }
+
+    #[test]
+    fn begin_capped_read_rejects_an_oversized_declared_length_on_a_success_status() {
+        // The status check must not have displaced the declared-length check.
+        let err = begin_capped_read("https://x.invalid", 200, Some(1_001), 1_000)
+            .expect_err("a declared length over the cap must fail before any body is read");
+        assert!(
+            matches!(
+                err,
+                RegistryError::ResponseTooLarge {
+                    limit: 1_000,
+                    received: 1_001,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 }
