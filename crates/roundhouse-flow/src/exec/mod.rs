@@ -6,9 +6,10 @@
 //! against an empty [`ExprContext`], so `${{ inputs.* }}` etc. silently
 //! resolved to `Null` rather than erroring).
 //!
-//! Only `tool`/`agent`/`emit`/`report` step bodies are dispatched here.
-//! `map`/`gate`/`call` are specialized handlers Tasks 6/7/11 build on top of
-//! [`Executor::dispatch_step`], not duplicated sequencing logic.
+//! `tool`/`agent`/`emit`/`report`/`map` step bodies are dispatched here (`map`
+//! via [`Executor::dispatch_map_step`], defined in [`map_step`], Task
+//! 14/B6). `gate`/`call` remain specialized handlers Tasks 7/11 build on top
+//! of [`Executor::dispatch_step`], not duplicated sequencing logic.
 //!
 //! # Ruling P23 — establishing trust at the parse boundary: **rejected for this task**
 //!
@@ -42,6 +43,7 @@
 //! require; it just doesn't make the boundary unbypassable by construction
 //! the way a typed `parse` output would.
 
+pub mod map_step;
 pub mod provenance;
 pub use provenance::{Provenance, RunId};
 
@@ -888,20 +890,38 @@ impl<'a> Executor<'a> {
                     gate_condition_was_secret_derived: false,
                 }
             }
-            // Map/Gate/Call are dispatched by the specialized handlers added
-            // in Tasks 6/7/11, which wrap this same `dispatch_step` for
-            // their inner/leaf steps rather than duplicating sequencing
-            // logic.
+            // Task 14/B6: real `map` dispatch — evaluates `over:`, binds the
+            // `as:` item variable per item, and recursively runs the inner
+            // steps via this same `dispatch_step`. See
+            // `map_step::Executor::dispatch_map_step`'s own doc comment for
+            // the full provenance/budget reasoning.
+            //
+            // (`dispatch_step` matches on `&step.body`, so match ergonomics
+            // already bind `over`/`r#as`/`max_parallel`/`on_item_error`/
+            // `steps` as references here — `&String`/`u32`/`OnItemError`/
+            // `&Vec<serde_yaml::Value>` — which coerce to `&str`/
+            // `&[serde_yaml::Value]` at the call site below with no further
+            // `&` needed; `max_parallel`/`on_item_error` are `Copy`.)
+            StepBody::Map {
+                over,
+                r#as,
+                max_parallel,
+                on_item_error,
+                steps,
+                ..
+            } => self.dispatch_map_step(&step.id, over, r#as, *max_parallel, *on_item_error, steps),
+            // Gate/Call are dispatched by the specialized handlers added in
+            // Tasks 7/11, which wrap this same `dispatch_step` for their
+            // inner/leaf steps rather than duplicating sequencing logic.
             // Fix round 1, item 8: the message used to be
             // `format!("step kind {other:?} handled by a later task")` — a
             // full `{:?}` dump of the step body, flowing through
             // `steps_context_entry` into the immutable log. The text is
             // uninterpolated workflow source, so no *resolved* secret escapes,
-            // but a literal credential typed directly into a
-            // `map`/`gate`/`call` body (e.g. `gate.form`, `call.with`) would
-            // reach the log verbatim. Name only the variant, never its
-            // contents.
-            other => StepOutcome::failed(
+            // but a literal credential typed directly into a `gate`/`call`
+            // body (e.g. `gate.form`, `call.with`) would reach the log
+            // verbatim. Name only the variant, never its contents.
+            other @ (StepBody::Gate { .. } | StepBody::Call { .. }) => StepOutcome::failed(
                 &step.id,
                 format!(
                     "step kind `{}` handled by a later task",
