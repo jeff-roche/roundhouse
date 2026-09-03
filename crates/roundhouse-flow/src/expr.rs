@@ -147,8 +147,11 @@
 //! has a **producer** — an [`Evaluated`] or an [`Interpolated<Value>`](Interpolated)
 //! this module returned — [`ExprContext::set_from`] reads the provenance off
 //! that producer, so the binding site never asserts anything. Propagate, do not
-//! re-assert. [`ProvenanceCarrier`] is sealed to the evaluator's own output
-//! types precisely so that "the producer says clean" cannot be forged.
+//! re-assert. [`ProvenanceCarrier`] is sealed, which closes the set of carriers
+//! to those two types — but it does not make "the producer says clean"
+//! unforgeable: [`Evaluated`]'s fields are public, so a caller can still build
+//! one saying whatever it likes. See [`ProvenanceCarrier`] for the boundary and
+//! the Task 14 pre-work that closes it (ruling P40).
 //!
 //! # Provenance-based redaction (ruling P33) — the complete propagation table
 //!
@@ -823,10 +826,39 @@ impl ExprContext {
     /// and an author who does not know a value's provenance will reach for
     /// `set_public` because it is the only one that lets them proceed without
     /// knowing (ruling P37's own diagnosis of the fix-round-4 rename). Here
-    /// there is nothing to know: the flag is read off
-    /// [`ProvenanceCarrier`], which is **sealed** to the evaluator's own output
-    /// types, so a caller cannot substitute a source of provenance that merely
-    /// claims to be clean.
+    /// there is nothing to know at the binding site: the flag is read off
+    /// [`ProvenanceCarrier`] rather than passed in.
+    ///
+    /// # What the seal does and does not buy
+    ///
+    /// [`ProvenanceCarrier`] is sealed, so no *foreign* type can implement it:
+    /// the set of carriers is closed to [`Evaluated`] and
+    /// [`Interpolated<Value>`](Interpolated). That is the whole of it. It does
+    /// **not** authenticate the provenance inside a carrier — [`Evaluated`] has
+    /// public fields and no `#[non_exhaustive]`, so a caller in any crate can
+    /// build one with whatever `secret_derived` it likes and hand it here:
+    ///
+    /// ```text
+    /// let real = eval(ExpressionSource::from_workflow_file("secrets.T"), &ctx)?;
+    /// let forged = Evaluated { value: real.value.clone(), secret_derived: false };
+    /// ctx.set_from("item", &forged);   // binds the secret as clean
+    /// ```
+    ///
+    /// Closing that needs `#[non_exhaustive]` on [`Evaluated`] plus a
+    /// derivation constructor that carries `secret_derived` forward and cannot
+    /// lower it. Neither exists yet: both are **deferred to Task 14 as blocking
+    /// pre-work before the first `set_from` call site** (ruling P40). Until
+    /// then the seal narrows the set of carrier *types* and nothing more.
+    ///
+    /// # It binds a whole producer; there is no sub-value derivation
+    ///
+    /// `set_from` takes one carrier and binds one name from it. This crate has
+    /// no operation that derives a carrier for a *sub-value* — an element of an
+    /// evaluated array, a field of an evaluated object. So a per-item binder
+    /// (Task 14's `map.as`) cannot use `set_from` as it stands without
+    /// hand-building an [`Evaluated`] around the element, which is
+    /// re-assertion, precisely the thing ruling P37 exists to remove. That is
+    /// the honest boundary of P37 as shipped.
     ///
     /// # What it binds
     ///
@@ -1259,12 +1291,27 @@ impl<T: fmt::Debug> fmt::Debug for Interpolated<T> {
 /// It is implemented for [`Evaluated`] and for
 /// [`Interpolated<Value>`](Interpolated) — the two of this module's three
 /// return shapes that already hold a `Value` a caller could bind — and it is
-/// **sealed**, so it cannot be implemented anywhere else. That is deliberate,
-/// and it is the enforcement the ruling asks for: if any type could implement
-/// this, a caller could hand `set_from` a hand-rolled struct answering `false`,
-/// which is exactly the re-assertion the whole mechanism exists to remove.
-/// Adding a producer therefore means implementing this here, beside the
-/// evaluator that computes the flag.
+/// **sealed**.
+///
+/// # What the seal enforces
+///
+/// Exactly one thing: no type outside this crate can implement it. An external
+/// crate that tries gets `E0277: the trait bound 'Liar: expr::sealed::Sealed'
+/// is not satisfied`. So the set of carriers is closed to the two types above,
+/// and adding a producer means implementing this here, beside the evaluator
+/// that computes the flag.
+///
+/// # What it does not enforce
+///
+/// The seal closes the set of carrier *types*; it does not authenticate the
+/// provenance *inside* one. [`Evaluated`] has public fields and no
+/// `#[non_exhaustive]`, so a caller in any crate can construct one with any
+/// `secret_derived` it chooses and pass it to
+/// [`ExprContext::set_from`] — re-assertion by the back door, through a type
+/// the seal permits. Making the flag unforgeable needs `#[non_exhaustive]` on
+/// [`Evaluated`] plus a derivation constructor that carries `secret_derived`
+/// forward and cannot lower it; both are **deferred to Task 14 as blocking
+/// pre-work before the first `set_from` call site** (ruling P40).
 ///
 /// [`Interpolated<String>`](Interpolated) is left out on purpose rather than by
 /// oversight: [`Self::provenance_value`] returns a *borrow*, and a
