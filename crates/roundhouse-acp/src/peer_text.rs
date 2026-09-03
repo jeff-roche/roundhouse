@@ -50,6 +50,12 @@
 /// tool name (fix round 3) — general to any peer-controlled string this
 /// crate escapes for safe logging, not specific to permission options.
 ///
+/// **Scope (final fix wave, Item 5).** This bounds the strings that are
+/// actually routed through [`escape_and_cap_peer_str`], at the call sites
+/// that route them — it is not a crate-wide property of peer text. Peer- or
+/// registry-derived strings that reach a sink without calling that function
+/// are not capped by anything here.
+///
 /// **Public again as of fix round 3 (ruling C-P71):** it was `pub` as
 /// `UNKNOWN_OPTION_ID_MAX_LEN` before round 2's rename made it
 /// `pub(crate)`, which forced an out-of-crate integration test
@@ -126,11 +132,16 @@ impl std::fmt::Display for EscapedPeerStr {
     /// `f.pad` nor `write_str` can put any back. The reason is length.
     ///
     /// `f.pad` honours `{:width$}` with a width computed at **runtime**. A
-    /// caller deriving that width from peer-influenced data would reopen
-    /// exactly the unbounded-log-inflation hazard [`PEER_STR_MAX_LEN`] exists
-    /// to close, and would do it *after* the cap, where nothing in this
-    /// module can see it. Measured on rustc 1.97.1, against this type's own
-    /// shape (inner value `"abcd"`, 6 bytes):
+    /// caller deriving that width from peer-influenced data would reopen the
+    /// log-inflation hazard [`PEER_STR_MAX_LEN`] exists to close, *after* the
+    /// cap, where nothing in this module can see it. The reopened hazard is
+    /// bounded, not unbounded: `core::fmt` carries the width as a `u16`, so
+    /// the ceiling is 65535 bytes per rendering — the value the table below
+    /// measures, and the largest width that renders at all (65536 panics; see
+    /// the note after the table). 65535 bytes from a 6-byte value is still a
+    /// ~10,900x inflation the cap was meant to prevent, which is why the
+    /// choice stands; it is just not an unbounded one. Measured on rustc
+    /// 1.97.1, against this type's own shape (inner value `"abcd"`, 6 bytes):
     ///
     /// | runtime width | `f.pad` emits | `f.write_str` emits |
     /// |---------------|---------------|---------------------|
@@ -181,8 +192,14 @@ impl std::fmt::Debug for EscapedPeerStr {
 /// `server::SelectionResolution::UnknownOptionId`'s doc for the attack this
 /// closes.
 ///
+/// The cap and the escaping apply to the value this function returns, at the
+/// call sites that call it — **not** to peer text crate-wide (final fix wave,
+/// Item 5). A peer- or registry-derived string that never passes through here
+/// is neither escaped nor bounded by [`PEER_STR_MAX_LEN`]; the discipline is
+/// available to every such string, and is enforced only where it is used.
+///
 /// **Ruling C-P54 (fix round 1):** generalized from `&PermissionOptionId` to
-/// `&str` so that any peer-controlled string in this crate can be routed
+/// `&str` so that any peer-controlled string in this crate *can* be routed
 /// through the same discipline — not only a `PermissionOptionId`. The first
 /// caller outside `option_id` handling was
 /// `mcp_over_acp::InProcessMcpServer::call_tool`'s "unknown tool" error,

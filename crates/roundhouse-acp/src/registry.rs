@@ -385,7 +385,7 @@
 //!   `Ok(LaunchConfig(Npx { .. }))` end to end. [`is_npm_url_safe_spec`] now
 //!   requires an allowlisted character set, applied to `npx` **only** —
 //!   [`is_plausible_package_name`] is shared with `uvx`, whose live value
-//!   `fast-agent-acp==0.10.1` legitimately uses `=`, so the kind-awareness
+//!   `fast-agent-acp==0.10.1` legitimately uses `==`, so the kind-awareness
 //!   lives in [`validate_package_distribution`] and `kind` became the
 //!   [`PackageKind`] enum so a call-site typo cannot silently disable it.
 //! - **Item 2 — round 4's bounded-allocation claim was measurably false, and
@@ -423,6 +423,57 @@
 //!   now a recorded decision.** See [`partition_registry_agents`].
 //! - **Item 6 — a positive control** for the `evil.tgz@1.0.0` acceptance
 //!   round 4's rationale argued for and never pinned.
+//!
+//! # Final fix wave (whole-branch review, before merge)
+//!
+//! - **Item 1 — the package grammar's last two `fromFile` syntaxes, plus a
+//!   uvx twin.** Round 5 closed the URL-unsafe *character* route into npa's
+//!   directory-install branch; a leading `.` on the **name** side of a scoped
+//!   spec (`@scope/.evil-pkg` → `<cwd>/@scope/.evil-pkg`, `@scope/.` →
+//!   `<cwd>/@scope`) and a leading `.` in the **version** part (`codex@.evil`
+//!   → `<cwd>/.evil`; `codex@.` → `<cwd>` itself, the daemon's own working
+//!   directory) both remained, the latter through a different npa branch
+//!   (`isFileSpec`) that needs neither a `/` nor an invalid name. The version
+//!   part is split at the **first** `@` past a leading scope `@`, matching
+//!   npa's own `nameEndsAt`; `pkg@.a@` is the input that separates that from
+//!   a last-`@` split, and it is now a regression case. On the `uvx` side, a
+//!   `/` is rejected outright: pip treats any spec containing one as a
+//!   filesystem path (measured against `uv` offline), and `@scope/name` — an
+//!   npm concept — was reaching that branch through the shared grammar. See
+//!   [`is_plausible_package_name`] and [`PackageKind::rejects_path_separator`].
+//! - **Item 2 — `archive` had no owner.** [`validate_binary_target`] checked
+//!   `cmd`, `env` and `sha256` and never touched `archive`, so a registry
+//!   entry could name a plaintext `http://` URL, a link-local address, or a
+//!   `file:`/`ftp:` scheme and resolve cleanly into
+//!   [`LaunchConfig::archive`] — the URL this module's own doc says the
+//!   daemon will download. `sha256` does not cover it (same author, and it
+//!   says nothing about the request the daemon is induced to make). See
+//!   [`is_downloadable_archive_url`], including what it deliberately does not
+//!   claim.
+//! - **Item 3 — [`LaunchConfig`] guarded the wrapper, not the data.** Its
+//!   private payload (round 1, Item 6) proves a `LaunchConfig` came from
+//!   [`RegistryCache::resolve_launch`]; it never proved the launch data the
+//!   daemon uses did, because `RegistryCache::load_cached` handed out the
+//!   whole [`Registry`] — `pub` all the way down to `cmd`, `archive`,
+//!   `package` and `env` — with no quarantine gate, no platform check and no
+//!   `sha256` requirement. `load_cached`/`load_cached_allow_stale` are now
+//!   `pub(crate)` and [`RegistryRefresh`]'s `registry` field with them;
+//!   [`RegistryCache::list_agents`] serves the one legitimate out-of-crate
+//!   need ([`AgentSummary`]: id and name, nothing else) and
+//!   [`RegistryCache::has_fresh_cache`] serves the other (should I refresh?).
+//!   See [`RegistryCache::load_cached`]'s doc for the argument and for what
+//!   this deliberately does not close.
+//! - **Item 5 — accumulated doc corrections.** [`is_npm_url_safe_spec`]'s
+//!   "all four concrete `npx` values" listed three (the fourth documented
+//!   concrete value is the `uvx` one), and said that `uvx` value "uses `=`"
+//!   where it uses `==`; `peer_text`'s cap docs read as a crate-wide
+//!   discipline and now say where they apply; that module's `Display` doc
+//!   called a reopened hazard "unbounded" where its own table measures a
+//!   65535-byte ceiling; and the redundant `#[cfg(feature = "acp-v2")]` on
+//!   `schema::v2::open_enum`'s `From<SdkStopReason>` impl (inside a tree
+//!   already gated at `lib.rs`) is gone. `lib.rs`'s header, which still
+//!   announced this crate as a Phase 0 stub with "no real ACP client/server",
+//!   is rewritten (Item 4).
 
 use crate::peer_text::{escape_and_cap_peer_str, EscapedPeerStr};
 use serde::de::DeserializeOwned;
@@ -610,7 +661,7 @@ impl TryFrom<RawDistribution> for Distribution {
 /// `"uvx"` purely to make the error message say which. It is now a type
 /// because round 5 makes one of the `package` rules *kind-specific*
 /// ([`is_npm_url_safe_spec`] applies to `npx` only, because the live `uvx`
-/// value `fast-agent-acp==0.10.1` legitimately uses `=`). With a `&str`, a
+/// value `fast-agent-acp==0.10.1` legitimately uses `==`). With a `&str`, a
 /// typo at a call site (`"npm"`, `"Npx"`) would silently disable a security
 /// check and still compile; with this enum a new distribution kind is a
 /// compile error at the `match` below instead.
@@ -638,6 +689,38 @@ impl PackageKind {
             PackageKind::Uvx => false,
         }
     }
+
+    /// Whether a `/` anywhere in this kind's `package` is fatal. **`uvx`
+    /// only.**
+    ///
+    /// pip's own requirement parser treats a spec as a path — not a PyPI
+    /// name — on the strength of a `/` alone (`_looks_like_path` returns true
+    /// for any string containing one), and `uv` follows it. Measured offline
+    /// against `uv 0.12.9` in this worktree, with a directory planted at
+    /// `<cwd>/@scope/name` carrying a `pyproject.toml` for a project named
+    /// `planted`:
+    ///
+    /// ```text
+    /// $ uv pip install --no-deps --dry-run --offline '@scope/name'
+    /// Resolved 1 package in 2ms
+    ///  + planted @ file:///…/uvtest/@scope/name
+    /// ```
+    ///
+    /// `@scope/name` is an *npm* concept with no meaning on the `uvx` branch,
+    /// and [`is_plausible_package_name`] is shared between the two kinds, so
+    /// until this rule the npm scoped-name allowance carried straight over to
+    /// `uvx` and turned into a local-directory install. Neither `uvx` value
+    /// `ACP-REGISTRY-FORMAT.md` documents contains a `/`
+    /// (`fast-agent-acp==0.10.1` at `:412`, `package-name` at `:48`).
+    ///
+    /// Not applied to `npx`, where `@scope/name` is the real scoped-package
+    /// grammar the live index actually uses.
+    fn rejects_path_separator(self) -> bool {
+        match self {
+            PackageKind::Npx => false,
+            PackageKind::Uvx => true,
+        }
+    }
 }
 
 /// Item 4: validates the two launch fields a `PackageDistribution` exposes
@@ -652,10 +735,22 @@ fn validate_package_distribution(
     if !is_plausible_package_name(&dist.package) {
         return Err(format!(
             "{kind_name} package name is not accepted (must not be empty; must not start with \
-             `-`, `.`, `/`, or `~`; must not contain `..`, `:`, or `#`; must not contain a \
-             control or whitespace character; must not end with `.tgz`, `.tar.gz`, or `.tar`; a \
-             `/` is only accepted as the single separator of a leading `@scope/name` with both \
-             sides non-empty): {}",
+             `-`, `.`, `/`, or `~`; must not contain `..`, `:`, `#`, or a `.` immediately after a \
+             `/`; must not contain a control or whitespace character; must not end with `.tgz`, \
+             `.tar.gz`, or `.tar`; the version part after the first `@` past a leading scope `@` \
+             must not start with `.`; a `/` is only accepted as the single separator of a leading \
+             `@scope/name` with both sides non-empty): {}",
+            escape_and_cap_peer_str(&dist.package)
+        ));
+    }
+    // Final fix wave (Item 1c): `/` is a *path* separator to pip -- see
+    // `PackageKind::rejects_path_separator`. An `@scope/name` spec is an npm
+    // concept with no meaning on this branch, and no live `uvx` value contains
+    // a `/` (`fast-agent-acp==0.10.1`, `package-name`).
+    if kind.rejects_path_separator() && dist.package.contains('/') {
+        return Err(format!(
+            "{kind_name} package name must not contain `/` (pip treats any spec containing a `/` \
+             as a filesystem path, so it installs from a local directory instead of PyPI): {}",
             escape_and_cap_peer_str(&dist.package)
         ));
     }
@@ -665,7 +760,7 @@ fn validate_package_distribution(
     // The `@scope/name` rule above only checks non-empty sides and a single
     // `/`, so every scoped-*looking* spec carrying a URL-unfriendly character
     // walked straight through. `npx`-only: `uvx`'s live
-    // `fast-agent-acp==0.10.1` legitimately uses `=`.
+    // `fast-agent-acp==0.10.1` legitimately uses `==`.
     if kind.requires_npm_url_safe_spec() && !is_npm_url_safe_spec(&dist.package) {
         return Err(format!(
             "{kind_name} package name is not accepted (every character must be one of \
@@ -687,6 +782,17 @@ fn validate_package_distribution(
 /// platform key (e.g. `"linux-x86_64"`), included in the error message and
 /// escaped like any other registry-controlled string.
 fn validate_binary_target(target: &str, binary: &BinaryTarget) -> Result<(), String> {
+    // Final fix wave (Item 2): `archive` was the one launch field with no
+    // owner -- see `is_downloadable_archive_url`.
+    if !is_downloadable_archive_url(&binary.archive) {
+        return Err(format!(
+            "binary target {}'s archive is not an accepted download URL (must start with \
+             `https://`, must not contain `..`, and must not contain a control or whitespace \
+             character): {}",
+            escape_and_cap_peer_str(target),
+            escape_and_cap_peer_str(&binary.archive)
+        ));
+    }
     if !is_safe_relative_cmd(&binary.cmd) {
         return Err(format!(
             "binary target {}'s cmd is not a safe relative path (must not start with `/`, `\\`, \
@@ -794,7 +900,61 @@ fn validate_binary_target(target: &str, binary: &BinaryTarget) -> Result<(), Str
 /// additionally be npm-URL-safe — see [`is_npm_url_safe_spec`], which is
 /// applied by [`validate_package_distribution`] rather than here, because
 /// this function is shared with `uvx` and the live `uvx` value
-/// `fast-agent-acp==0.10.1` legitimately uses `=`.
+/// `fast-agent-acp==0.10.1` legitimately uses `==`.
+///
+/// **Final fix wave (Item 1): two more members of round 5's own
+/// directory-install class, and the delimiter that decides one of them.**
+/// Round 5 closed the URL-unsafe *character* route into `npa`'s `fromFile`
+/// branch; two syntaxes in the same class remained, both measured with npm
+/// 11.16.0's bundled `npm-package-arg` 13.0.2:
+///
+/// - **A leading `.` on the name side of a scoped spec.**
+///   `validate-npm-package-name` rejects "name cannot start with a period",
+///   so `npa` routes to `fromFile`. The `starts_with('.')` test above tested
+///   the *whole* string, which here begins `@`, so it never fired:
+///   `@scope/.evil-pkg` → `type=directory registry=false
+///   fetchSpec=<cwd>/@scope/.evil-pkg`, and `@scope/.` → `<cwd>/@scope`. Now
+///   rejected by refusing a `.` immediately after a `/`.
+/// - **A leading `.` in the version part** — a *different* `npa` branch,
+///   `isFileSpec` (`npa.js:95`, `isPosixFile =
+///   /^(?:[.]|~[/]|[/]|[a-zA-Z]:)/`) applied to the post-`@` part, needing
+///   neither a `/` nor an invalid name: `codex@.evil` →
+///   `fetchSpec=<cwd>/.evil`, `@scope/name@.evil` → the same, and `codex@.`
+///   → `fetchSpec=<cwd>` itself, the daemon's own working directory, with no
+///   planted artifact required at all.
+///
+/// The version part is taken at the **first** `@` past a leading scope `@`,
+/// not the last, because that is where `npa` itself splits
+/// (`nameEndsAt = arg[0] === '@' ? arg.slice(1).indexOf('@') + 1 :
+/// arg.indexOf('@')`). `pkg@.a@` is the input that separates the two: `npa`
+/// reads its version part as `.a@` (measured: `type=directory
+/// fetchSpec=<cwd>/.a@`), a last-`@` split reads it as `""`. Over a
+/// coordinator sweep of 18,339 specs against npm's own classifier both
+/// delimiters accept the same 14,957 specs, but the last-`@` split leaves 72
+/// non-registry survivors and the first-`@` split leaves 0. Reproduced
+/// independently here on a 14,263-spec corpus, each spec run through this
+/// crate's real `Distribution` deserialize path and classified by
+/// `npm-package-arg` 13.0.2: **first-`@` accepts 460 specs, of which 0 are
+/// anything `npa` resolves to a non-registry target; last-`@` accepts 395, of
+/// which 120 are** (`pkg@.a@`, `pkg@.a@b`, `name@.a@`, … each
+/// `type=directory fetchSpec=<cwd>/.a@`). The two accepted sets are not
+/// nested — 195 specs are accepted only under first-`@`, and every one of
+/// those is a spec `npa` itself resolves inside the registry or refuses
+/// outright, which is the point: this split is the one `npa` performs.
+/// `is_plausible_package_name_rejects_a_leading_dot_in_the_version_part`
+/// pins `pkg@.a@` specifically, so a `rsplit_once` implementation fails it.
+///
+/// `isPosixFile` has three more alternatives besides the leading `.` —
+/// `~/`, `/`, and `<letter>:` — and all three were already refused, by the
+/// `/` rule below and the `:` rule above: `codex@/abs`, `codex@~/x` and
+/// `@scope/name@~/x` all carry a `/` that is not a leading `@scope/` (or a
+/// second one), and `codex@C:\x` carries a `:`. The sweep above included
+/// those version parts and found no survivor.
+///
+/// The `/`-as-path-separator hazard on the *`uvx`* branch is handled by
+/// [`PackageKind::rejects_path_separator`] in
+/// [`validate_package_distribution`], not here, for the same reason
+/// [`is_npm_url_safe_spec`] is: this function is shared between both kinds.
 ///
 /// A permissive check remains (this does not implement the full npm/PyPI
 /// name grammar), so the error message in [`validate_package_distribution`]
@@ -823,6 +983,43 @@ fn is_plausible_package_name(package: &str) -> bool {
     // was dead code.
     if is_archive_file_spec(package) {
         return false;
+    }
+    // Item 1(a) (final fix wave): a `.` on the *name* side of a scoped spec.
+    // `validate-npm-package-name` rejects "name cannot start with a period",
+    // so `npa` routes the whole spec to `fromFile` -- a local directory
+    // install. The `starts_with('.')` test above cannot see it: the string
+    // starts with `@`. Measured with npm 11.16.0's bundled npm-package-arg
+    // 13.0.2, cwd `<cwd>`:
+    //   @scope/.evil-pkg -> type=directory registry=false
+    //                       fetchSpec=<cwd>/@scope/.evil-pkg
+    //   @scope/.         -> type=directory registry=false fetchSpec=<cwd>/@scope
+    if package.contains("/.") {
+        return false;
+    }
+    // Item 1(b) (final fix wave): a `.` at the start of the *version* part.
+    // This is a different npa branch -- `isFileSpec` (`npa.js:95`,
+    // `isPosixFile = /^(?:[.]|~[/]|[/]|[a-zA-Z]:)/`) applied to the post-`@`
+    // part -- which needs no `/` and no invalid name, so nothing above saw it:
+    //   codex@.evil       -> type=directory fetchSpec=<cwd>/.evil
+    //   codex@.           -> type=directory fetchSpec=<cwd>   (the daemon's own
+    //                        working directory, no planted artifact needed)
+    //   @scope/name@.evil -> type=directory fetchSpec=<cwd>/.evil
+    //
+    // **The delimiter is load-bearing: the FIRST `@` past a leading scope
+    // `@`, not the last.** `npa` splits an unscoped spec at its first `@`
+    // (`nameEndsAt = arg[0] === '@' ? arg.slice(1).indexOf('@') + 1 :
+    // arg.indexOf('@')`), so `pkg@.a@`'s version part is `.a@` -- measured
+    // `type=directory fetchSpec=<cwd>/.a@` -- while a `rsplit_once('@')`
+    // implementation reads that same spec's version part as `""` and lets it
+    // through. Measured over a 14,263-spec corpus run through this crate's
+    // real deserialize path and classified by npa: first-`@` accepts 460
+    // specs with 0 non-registry survivors, last-`@` accepts 395 with 120.
+    // See this function's doc for the full A/B.
+    let body = package.strip_prefix('@').unwrap_or(package);
+    if let Some((_, version)) = body.split_once('@') {
+        if version.starts_with('.') {
+            return false;
+        }
     }
     if package.contains('/') {
         // Item 1 (fix round 3): a `/` is legal only as the single separator
@@ -920,18 +1117,24 @@ fn is_archive_file_spec(spec: &str) -> bool {
 /// **What this also rejects, disclosed rather than claimed away.** npm's
 /// *semver-range* syntax after the `@` — `pkg@^1.0.0`, `pkg@>=1`,
 /// `pkg@1 || 2` — uses `^`, `<`, `>`, `=`, `|` and spaces, none of which are
-/// in this set, so those specs are refused too. No live value uses one: all
-/// four concrete `npx` values in `ACP-REGISTRY-FORMAT.md` pin an exact version
-/// (`@agentclientprotocol/claude-agent-acp@0.73.0`, `@google/gemini-cli@0.58.0`,
-/// `agoragentic-mcp@1.3.0`) or none at all, and the schema's own placeholders
-/// (`@scope/package`, `package-name`) use neither. Refusing a range is
+/// in this set, so those specs are refused too. No documented value uses one:
+/// the three concrete `npx` values in `ACP-REGISTRY-FORMAT.md` each pin an
+/// exact version (`@agentclientprotocol/claude-agent-acp@0.73.0`,
+/// `@google/gemini-cli@0.58.0`, `agoragentic-mcp@1.3.0`), the one concrete
+/// `uvx` value (`fast-agent-acp==0.10.1`) is not subject to this rule at all,
+/// and the schema's own placeholders (`@scope/package` for `npx`,
+/// `package-name` for `uvx`) use neither. (Final fix wave, Item 5: this said
+/// "all four concrete `npx` values" and then listed three — the fourth
+/// documented concrete value is the `uvx` one.) Refusing a range is
 /// fail-closed — a rejected entry is dropped, never launched — and consistent
 /// with this module's posture everywhere else; if upstream ever publishes a
 /// range this is where to revisit it.
 ///
 /// Not applied to `uvx`: the live value `fast-agent-acp==0.10.1`
-/// (`ACP-REGISTRY-FORMAT.md:412`) uses `=`, PyPI's own pin syntax, and `uvx`
-/// has no npm directory-install routing for this to protect against.
+/// (`ACP-REGISTRY-FORMAT.md:412`) uses `==`, PyPI's own pin syntax, and `uvx`
+/// has no npm directory-install routing for this to protect against. (`uvx`'s
+/// own path hazard — a `/` — is rejected by
+/// [`PackageKind::rejects_path_separator`] instead.)
 fn is_npm_url_safe_spec(spec: &str) -> bool {
     spec.chars().all(|c| {
         c.is_ascii_alphanumeric()
@@ -940,6 +1143,53 @@ fn is_npm_url_safe_spec(spec: &str) -> bool {
                 '.' | '_' | '~' | '!' | '*' | '\'' | '(' | ')' | '-' | '@' | '/'
             )
     })
+}
+
+/// Final fix wave (Item 2): whether a binary target's `archive` is a URL the
+/// daemon may be asked to download.
+///
+/// **`archive` was the one launch field with no owner.**
+/// [`validate_binary_target`] checked `cmd`, the `env` keys, and `sha256`,
+/// and never touched `archive` — a bare `pub String` passing straight through
+/// [`resolve_distribution`] into [`LaunchConfig::archive`], which this
+/// module's own doc says the daemon will download. Every test in this crate
+/// happened to use an `https://…` value and nothing pinned the scheme, so a
+/// registry entry carrying `http://attacker.example/x.tar.gz` (plaintext,
+/// MITM-able), `http://169.254.169.254/latest/meta-data/` (a request issued
+/// from the daemon's network position), or a `file:`/`ftp:` scheme resolved
+/// cleanly.
+///
+/// `sha256` does not cover this. It is supplied by the same registry entry,
+/// so it is integrity against the *transport*, not against the entry's
+/// author, and it says nothing at all about the request the daemon is
+/// induced to make before any digest is computed.
+///
+/// The three rules, and exactly what each one is worth:
+/// - **`https://` prefix, ASCII-exact.** Refuses every other scheme, plaintext
+///   `http://` included. `HTTPS://` is refused too: every `archive` value
+///   `ACP-REGISTRY-FORMAT.md` actually enumerates — amp-acp's five release
+///   URLs at `:410` and the schema's own placeholder at `:36` — is lowercase
+///   `https://`, and failing closed on an unusual-cased scheme is the same
+///   posture as everywhere else here. (That file reports 18 agents publishing
+///   a `binary` distribution but enumerates one of them, so this is what the
+///   reference document contains, not a claim about all 18.)
+/// - **No `..`.** A path-traversal shape has no place in a release URL, and
+///   the daemon may well use the URL's last segment as a filename.
+/// - **No control or whitespace characters.** Same rule, same reason, as
+///   [`is_plausible_package_name`] and [`is_safe_relative_cmd`] one field
+///   over: these forge log lines and split anything that parses the value
+///   line-wise.
+///
+/// **What this does not do, stated rather than implied.** It does not parse
+/// the URL, and it constrains the scheme and shape only — not the
+/// destination. `https://169.254.169.254/…` still passes here, so this is not
+/// an SSRF control; where the daemon is allowed to connect is the daemon's
+/// egress policy to enforce (`roundhouse-net`), not something a string check
+/// in this crate can decide.
+fn is_downloadable_archive_url(archive: &str) -> bool {
+    archive.starts_with("https://")
+        && !archive.contains("..")
+        && !archive.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
 /// Item 4 (fix round 1), corrected in fix round 2. Whether a binary target's
@@ -1672,6 +1922,33 @@ impl LaunchConfig {
     }
 }
 
+/// What [`RegistryCache::list_agents`] returns for one cached agent: the two
+/// fields a caller listing available agents needs, and none of the launch
+/// data.
+///
+/// **Final fix wave (Item 3).** This type exists so that "show me what's
+/// available" no longer has to go through
+/// [`RegistryCache::load_cached`] and receive every agent's whole
+/// [`Distribution`] — `archive`, `cmd`, `package`, `env` and all — as a
+/// by-product. Reading launch data now requires
+/// [`RegistryCache::resolve_launch`], which is the only path that applies the
+/// quarantine gate, the platform check and the `sha256` requirement.
+///
+/// Both fields are registry-controlled text fetched from a third party.
+/// `id` has been validated against the schema's `^[a-z][a-z0-9-]*$` pattern
+/// on every path that turns fetched bytes into a [`RegistryAgent`] (see its
+/// `TryFrom` impl), so it holds no control characters. `name` has **not**
+/// been validated or escaped — it is `RegistryAgent::name` verbatim, free-form
+/// display text upstream, and this crate does not narrow it. Route it through
+/// [`escape_and_cap_peer_str`] before it reaches a log line, an audit trail,
+/// or any terminal rendering, exactly as this crate does with every other
+/// piece of peer text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSummary {
+    pub id: String,
+    pub name: String,
+}
+
 /// Why [`RegistryCache::resolve_launch`] did not resolve to a [`LaunchConfig`].
 ///
 /// Every variant that carries registry- or quarantine-derived text carries
@@ -2147,9 +2424,21 @@ async fn fetch_json_capped<T: DeserializeOwned>(
 /// ([`escape_and_cap_peer_str`] over both the `id` and the parser detail), so
 /// it carries no raw control characters, ANSI escapes, or unbounded length
 /// into whatever sink the caller picks.
+///
+/// **Final fix wave (Item 3): the `registry` field is `pub(crate)`.** It was
+/// `pub` on a type returned by the `pub`
+/// [`RegistryCache::refresh_registry`], which made it a second, equally short
+/// route to every agent's launch data — the same hole
+/// [`RegistryCache::load_cached`]'s doc describes, arriving through the
+/// refresh path instead of the read path. A caller that wants to see what a
+/// refresh produced calls [`RegistryCache::list_agents`] afterwards: by the
+/// time `refresh_registry` returns, the registry it fetched has already been
+/// stored (and on the stale-fallback path, the cache it fell back to is what
+/// `list_agents` reads anyway). `warnings` stays `pub` — that is the whole
+/// point of returning this type rather than printing from inside the crate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegistryRefresh {
-    pub registry: Registry,
+    pub(crate) registry: Registry,
     /// At most [`MAX_REPORTED_DROP_WARNINGS`] individually-named entries plus
     /// one `"... and N more registry agent entries dropped"` remainder line.
     pub warnings: Vec<String>,
@@ -2304,20 +2593,100 @@ impl RegistryCache {
         }
     }
 
+    /// Whether a cached registry exists *and* is younger than this cache's
+    /// TTL — i.e. whether the caller may skip a [`Self::refresh_registry`]
+    /// round-trip for now.
+    ///
+    /// **Final fix wave (Item 3).** This is the one thing the TTL is for.
+    /// [`Self::resolve_launch`]'s doc already said so: staleness "only ever
+    /// gates whether [`Self::load_cached`] considers the data 'fresh enough to
+    /// skip a re-fetch', a decision that belongs to the caller deciding
+    /// whether to call [`Self::refresh_registry`]". Narrowing `load_cached` to
+    /// `pub(crate)` would otherwise have taken that decision out of the
+    /// caller's reach along with the launch data it should never have been
+    /// bundled with; this returns the answer without the data.
+    pub fn has_fresh_cache(&self) -> bool {
+        self.load_cached().is_some()
+    }
+
+    /// Every cached agent's id and display name, for a caller listing what is
+    /// available — and **nothing else**. See [`AgentSummary`], and
+    /// [`Self::load_cached`] for why this exists rather than handing the
+    /// caller the whole [`Registry`].
+    ///
+    /// Reads the cache regardless of TTL freshness, matching
+    /// [`Self::resolve_launch`] rather than [`Self::load_cached`]: an agent
+    /// this method lists is exactly an agent `resolve_launch` will consider,
+    /// so a stale cache cannot produce a list whose entries then fail to
+    /// resolve for a reason the caller never asked about. An empty `Vec` when
+    /// nothing has ever been cached is not distinguished from an empty
+    /// registry — a lister has nothing to do in either case, and
+    /// `resolve_launch` (which *does* distinguish, via
+    /// [`ResolveError::NotInRegistry`]) is where that difference matters.
+    pub fn list_agents(&self) -> Vec<AgentSummary> {
+        self.load_cached_allow_stale()
+            .map(|registry| {
+                registry
+                    .agents
+                    .into_iter()
+                    .map(|agent| AgentSummary {
+                        id: agent.id,
+                        name: agent.name,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The registry as cached on disk, or `None` if nothing has been stored
     /// yet or the stored copy is older than this cache's TTL. Use
     /// [`Self::load_cached_allow_stale`] to read the cached copy regardless
     /// of age.
-    pub fn load_cached(&self) -> Option<Registry> {
+    ///
+    /// **Final fix wave (Item 3): `pub` → `pub(crate)`, with
+    /// [`Self::list_agents`] added for the one thing an out-of-crate caller
+    /// legitimately wanted it for.** [`LaunchConfig`]'s private payload
+    /// (fix round 1, Item 6) guarantees only that *a value of type
+    /// `LaunchConfig` came from [`Self::resolve_launch`]* — it never
+    /// guaranteed that the launch data the daemon uses did, because the data
+    /// is `pub` all the way down and this method handed it out:
+    /// `cache.load_cached()?.agents[i].distribution.binary["linux-x86_64"].cmd`
+    /// reached every launch field with no quarantine gate, no `sha256`
+    /// requirement, no platform check and no
+    /// [`ResolveError::UnverifiableBinary`] refusal — every control the five
+    /// C8 fix rounds built.
+    ///
+    /// The reason that is a real hazard rather than a theoretical one is that
+    /// the unsafe path was the *shorter* one: the daemon has a legitimate
+    /// reason to call this (listing id and name for the TUI), it received the
+    /// whole [`Distribution`] along with them, and
+    /// `.distribution.npx.as_ref()?.package` is less work than threading a
+    /// second `resolve_launch(id)` call through — with nothing in the type
+    /// names, the method names, or the compiler to distinguish the two. A doc
+    /// warning here would have repeated the mistake this crate has already
+    /// corrected twice, in [`crate::peer_text::EscapedPeerStr`]'s private
+    /// inner field and in [`LaunchConfig`]'s private payload.
+    ///
+    /// What is *not* closed, disclosed rather than claimed away: [`Registry`]
+    /// and its fields stay `pub` (out-of-crate tests build one and
+    /// [`Self::store`] takes one), and `Registry: Deserialize` is public, so a
+    /// caller that reads the cache file itself and parses it reaches the same
+    /// data. That path is strictly longer than `resolve_launch` — it needs the
+    /// cache path, its own I/O, and its own parse — which is the opposite of
+    /// the shape that made this method a hazard.
+    pub(crate) fn load_cached(&self) -> Option<Registry> {
         read_cached_json(&self.registry_path, Some(self.ttl))
     }
 
     /// The registry as cached on disk regardless of age — even if the TTL
-    /// has elapsed. [`Self::resolve_launch`] and [`Self::finish_registry_refresh`]
-    /// (via [`Self::refresh_registry`]) both use this: a registry entry that
-    /// is merely old is still far more useful than refusing to resolve at
-    /// all (Ruling C-P13(e)).
-    pub fn load_cached_allow_stale(&self) -> Option<Registry> {
+    /// has elapsed. [`Self::resolve_launch`], [`Self::list_agents`] and
+    /// [`Self::finish_registry_refresh`] (via [`Self::refresh_registry`]) all
+    /// use this: a registry entry that is merely old is still far more useful
+    /// than refusing to resolve at all (Ruling C-P13(e)).
+    ///
+    /// `pub` → `pub(crate)` in the final fix wave (Item 3) for the same reason
+    /// as [`Self::load_cached`] — see its doc.
+    pub(crate) fn load_cached_allow_stale(&self) -> Option<Registry> {
         read_cached_json(&self.registry_path, None)
     }
 
@@ -3096,6 +3465,60 @@ mod tests {
         }
     }
 
+    // ---- Final fix wave (Item 1): the last two `fromFile` syntaxes ----
+
+    #[test]
+    fn is_plausible_package_name_rejects_a_leading_dot_after_the_scope_separator() {
+        // Measured with npm 11.16.0's bundled npm-package-arg 13.0.2:
+        // `@scope/.evil-pkg` -> type=directory registry=false
+        // fetchSpec=<cwd>/@scope/.evil-pkg; `@scope/.` -> <cwd>/@scope. The
+        // whole-string `starts_with('.')` rule above cannot see either: both
+        // start with `@`.
+        for package in ["@scope/.evil-pkg", "@scope/."] {
+            assert!(
+                !is_plausible_package_name(package),
+                "{package:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn is_plausible_package_name_rejects_a_leading_dot_in_the_version_part() {
+        // npa's `isFileSpec` branch against the post-`@` part. `codex@.`
+        // resolves to `<cwd>` itself -- the daemon's own working directory,
+        // needing no planted artifact at all.
+        //
+        // `pkg@.a@` is the one input that separates a first-`@` split from a
+        // last-`@` one: npa reads its version part as `.a@` (measured:
+        // type=directory fetchSpec=<cwd>/.a@), `rsplit_once('@')` reads `""`.
+        // Mutating `split_once` to `rsplit_once` fails this assertion and no
+        // other in this crate.
+        for package in ["codex@.evil", "codex@.", "@scope/name@.evil", "pkg@.a@"] {
+            assert!(
+                !is_plausible_package_name(package),
+                "{package:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_package_distribution_rejects_a_slash_only_on_the_uvx_branch() {
+        // pip's `_looks_like_path` returns true for any string containing a
+        // `/`; measured offline against uv 0.12.9 with a directory planted at
+        // <cwd>/@scope/name, `uv pip install --no-deps --dry-run --offline
+        // '@scope/name'` resolved `planted @ file:///.../@scope/name`. The
+        // same string under npx is npm's real scoped grammar and must stay
+        // accepted -- asserting both directions on one string pins the
+        // kind-awareness, not the separator.
+        let dist = PackageDistribution {
+            package: "@scope/name".to_string(),
+            args: vec![],
+            env: BTreeMap::new(),
+        };
+        assert!(validate_package_distribution(PackageKind::Uvx, &dist).is_err());
+        assert!(validate_package_distribution(PackageKind::Npx, &dist).is_ok());
+    }
+
     #[test]
     fn is_plausible_package_name_accepts_the_package_values_the_format_doc_enumerates() {
         // Fix round 5 (Item 4): round 4 called this "every `package` string in
@@ -3200,6 +3623,73 @@ mod tests {
             env: BTreeMap::new(),
         };
         assert!(validate_binary_target("linux-x86_64", &binary).is_err());
+    }
+
+    // ---- Final fix wave (Item 2): `archive` ----
+
+    fn binary_target_with_archive(archive: &str) -> BinaryTarget {
+        BinaryTarget {
+            archive: archive.to_string(),
+            sha256: None,
+            cmd: "./x".to_string(),
+            args: vec![],
+            env: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn validate_binary_target_rejects_an_archive_that_is_not_an_https_url() {
+        for archive in [
+            "http://attacker.example/x.tar.gz",
+            "http://169.254.169.254/latest/meta-data/",
+            "file:///etc/passwd",
+            "ftp://attacker.example/x.tar.gz",
+            "//attacker.example/x.tar.gz",
+            "HTTPS://example.invalid/x.tar.gz",
+            "https://example.invalid/a/../../x.tar.gz",
+            "https://example.invalid/x .tar.gz",
+            "https://example.invalid/x\ny.tar.gz",
+            "",
+        ] {
+            assert!(
+                validate_binary_target("linux-x86_64", &binary_target_with_archive(archive))
+                    .is_err(),
+                "{archive:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_binary_target_escapes_the_offending_archive_rather_than_interpolating_it_raw() {
+        // Same discipline, and same failure mode, as the `id` and JSON-detail
+        // escape sites: `archive` is third-party HTTP-fetched text reaching a
+        // rendered sink.
+        let err = validate_binary_target(
+            "linux-x86_64",
+            &binary_target_with_archive("http://x\n\u{1b}[31mFORGED"),
+        )
+        .expect_err("a plaintext, control-character-bearing archive must be rejected");
+        assert!(
+            !err.contains('\n') && !err.contains('\u{1b}'),
+            "no raw control character may reach the message: {err:?}"
+        );
+        assert!(
+            err.contains("\\n") && err.contains("\\u{1b}"),
+            "the escaped forms must actually be present: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_binary_target_accepts_a_real_live_archive_url() {
+        // amp-acp, darwin-aarch64 (ACP-REGISTRY-FORMAT.md:410).
+        assert!(validate_binary_target(
+            "darwin-aarch64",
+            &binary_target_with_archive(
+                "https://github.com/tao12345666333/amp-acp/releases/download/v0.9.0/\
+                 amp-acp-darwin-aarch64.tar.gz"
+            )
+        )
+        .is_ok());
     }
 
     // ---- Item 5: unique temp paths, tested deterministically ----

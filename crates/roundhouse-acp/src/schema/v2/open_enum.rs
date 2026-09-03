@@ -133,7 +133,6 @@ const UNMAPPED_SDK_VARIANT_SENTINEL: &str = "_roundhouse_unmapped";
 /// anything about the real SDK type) or an SDK upgrade actually adding one;
 /// neither is available here, so per the task instruction, this is stated
 /// rather than faked with a test.
-#[cfg(feature = "acp-v2")]
 impl From<agent_client_protocol::schema::v2::StopReason> for StopReason {
     fn from(value: agent_client_protocol::schema::v2::StopReason) -> Self {
         use agent_client_protocol::schema::v2::StopReason as SdkStopReason;

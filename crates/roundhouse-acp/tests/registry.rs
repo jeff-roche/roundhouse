@@ -202,20 +202,40 @@ fn resolve_launch_reads_from_the_registry_not_a_hardcoded_table() {
 
 #[test]
 fn cache_round_trips_through_disk() {
+    // Final fix wave (Item 3): expressed through `list_agents`, because
+    // `load_cached`/`load_cached_allow_stale` are `pub(crate)` now -- an
+    // out-of-crate caller can see *which* agents are cached without being
+    // handed each one's launch data along with them. This test would not
+    // compile against the old `load_cached` route being the only one.
     let dir = tempfile::tempdir().unwrap();
     let cache = RegistryCache::new(
         dir.path().join("registry.json"),
         dir.path().join("quarantine.json"),
         Duration::from_secs(3600),
     );
-    assert!(cache.load_cached().is_none(), "nothing fetched yet");
+    assert!(cache.list_agents().is_empty(), "nothing fetched yet");
     cache.store(&sample_registry()).unwrap();
-    let loaded = cache.load_cached().expect("just stored");
-    assert_eq!(loaded.agents.len(), 2);
+    let listed = cache.list_agents();
+    // Literal restatement of what `sample_registry` stores, in the `BTreeMap`
+    // order `partition_registry_agents` imposes on a parsed document -- not
+    // recomputed from `sample_registry()` itself.
+    assert_eq!(
+        listed
+            .iter()
+            .map(|a| (a.id.as_str(), a.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("claude-acp", "claude-acp"), ("codex", "Codex")]
+    );
 }
 
 #[test]
-fn load_cached_returns_none_once_the_ttl_has_elapsed_but_allow_stale_still_returns_it() {
+fn a_zero_ttl_cache_reads_as_not_fresh_but_still_lists_and_resolves() {
+    // Final fix wave (Item 3): the TTL's one purpose -- telling the caller
+    // whether it may skip a refresh -- survives `load_cached`'s narrowing, via
+    // `has_fresh_cache`. `list_agents` deliberately does *not* honour the TTL,
+    // matching `resolve_launch` (see
+    // `resolve_launch_resolves_using_a_stale_registry_cache_not_only_a_fresh_one`):
+    // a listed agent is exactly an agent that will resolve.
     let dir = tempfile::tempdir().unwrap();
     // Zero TTL: the entry is stale the instant it's written.
     let cache = RegistryCache::new(
@@ -223,18 +243,36 @@ fn load_cached_returns_none_once_the_ttl_has_elapsed_but_allow_stale_still_retur
         dir.path().join("quarantine.json"),
         Duration::from_secs(0),
     );
+    assert!(
+        !cache.has_fresh_cache(),
+        "no cache at all must not read as fresh"
+    );
     cache.store(&sample_registry()).unwrap();
     assert!(
-        cache.load_cached().is_none(),
+        !cache.has_fresh_cache(),
         "a zero-TTL entry must already read as stale"
     );
     assert_eq!(
-        cache
-            .load_cached_allow_stale()
-            .expect("stale entry must still be readable explicitly")
-            .agents
-            .len(),
-        2
+        cache.list_agents().len(),
+        2,
+        "a stale entry must still be listable"
+    );
+}
+
+#[test]
+fn a_live_ttl_cache_reads_as_fresh() {
+    // The other side of `has_fresh_cache`'s boundary: without this, mutating
+    // it to `false` passes the zero-TTL test above.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    cache.store(&sample_registry()).unwrap();
+    assert!(
+        cache.has_fresh_cache(),
+        "an entry written inside the TTL must read as fresh"
     );
 }
 
@@ -1097,4 +1135,165 @@ fn resolve_launch_resolves_using_a_stale_registry_cache_not_only_a_fresh_one() {
         .resolve_launch("codex")
         .expect("a stale-but-present registry cache must still resolve, per C-P13(e)");
     assert!(launch.is_npx());
+}
+
+// ---- Final fix wave, Item 1: the two remaining `fromFile` syntaxes, and
+// the uvx path separator ----
+
+#[test]
+fn distribution_deserialization_rejects_a_leading_dot_on_the_name_side_of_a_scoped_spec() {
+    // `validate-npm-package-name` rejects "name cannot start with a period",
+    // so npa routes these to `fromFile`. Round 5's `starts_with('.')` test
+    // could not see them: the string starts with `@`. Measured with npm
+    // 11.16.0's bundled npm-package-arg 13.0.2:
+    //   @scope/.evil-pkg -> type=directory registry=false
+    //                       fetchSpec=<cwd>/@scope/.evil-pkg
+    //   @scope/.         -> type=directory registry=false fetchSpec=<cwd>/@scope
+    for package in ["@scope/.evil-pkg", "@scope/."] {
+        let json = format!(r#"{{"npx": {{"package": "{package}"}}}}"#);
+        let result: Result<Distribution, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "the directory spec {package:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_leading_dot_in_the_version_part() {
+    // A different npa branch from the one above: `isFileSpec` (npa.js:95,
+    // `isPosixFile = /^(?:[.]|~[/]|[/]|[a-zA-Z]:)/`) applied to the post-`@`
+    // part, needing neither a `/` nor an invalid name. Measured:
+    //   codex@.evil       -> type=directory fetchSpec=<cwd>/.evil
+    //   codex@.           -> type=directory fetchSpec=<cwd>   (the daemon's own
+    //                        working directory -- no planted artifact needed)
+    //   @scope/name@.evil -> type=directory fetchSpec=<cwd>/.evil
+    //   pkg@.a@           -> type=directory fetchSpec=<cwd>/.a@
+    //
+    // `pkg@.a@` is the case that pins the *delimiter*: npa splits an unscoped
+    // spec at its FIRST `@`, so its version part is `.a@`, while an
+    // implementation splitting at the last `@` reads `""` and accepts it. This
+    // test fails against `rsplit_once('@')` and passes against
+    // `split_once('@')`; nothing else in this suite distinguishes the two.
+    for package in ["codex@.evil", "codex@.", "@scope/name@.evil", "pkg@.a@"] {
+        let json = format!(r#"{{"npx": {{"package": "{package}"}}}}"#);
+        let result: Result<Distribution, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "the directory spec {package:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_slash_in_a_uvx_package_but_not_an_npx_one() {
+    // pip's `_looks_like_path` returns true for any string containing a `/`,
+    // and uv follows it: measured offline against uv 0.12.9 with a directory
+    // planted at <cwd>/@scope/name,
+    //   uv pip install --no-deps --dry-run --offline '@scope/name'
+    //     + planted @ file:///.../@scope/name
+    // `@scope/name` is an npm concept with no meaning on the uvx branch.
+    // Asserting both kinds on the *same* string pins the kind-awareness rather
+    // than the separator.
+    let uvx: Result<Distribution, _> =
+        serde_json::from_str(r#"{"uvx": {"package": "@scope/name"}}"#);
+    assert!(
+        uvx.is_err(),
+        "a `/` in a uvx package is a path separator and must be rejected: {uvx:?}"
+    );
+    let npx: Result<Distribution, _> =
+        serde_json::from_str(r#"{"npx": {"package": "@scope/name"}}"#);
+    assert!(
+        npx.is_ok(),
+        "the same string under npx is npm's real scoped grammar: {npx:?}"
+    );
+}
+
+// ---- Final fix wave, Item 2: `archive` ----
+
+#[test]
+fn distribution_deserialization_rejects_a_binary_archive_that_is_not_an_https_url() {
+    // `archive` reached `LaunchConfig::archive()` -- the URL the daemon is
+    // told to download -- with no validation at all. Every case here resolved
+    // cleanly before this wave.
+    for archive in [
+        "http://attacker.example/x.tar.gz",
+        "http://169.254.169.254/latest/meta-data/",
+        "file:///etc/passwd",
+        "ftp://attacker.example/x.tar.gz",
+        "//attacker.example/x.tar.gz",
+        "https://example.invalid/a/../../x.tar.gz",
+        "https://example.invalid/x .tar.gz",
+        "https://example.invalid/x\ny.tar.gz",
+        "",
+    ] {
+        let json = serde_json::json!({
+            "binary": {"linux-x86_64": {"archive": archive, "cmd": "./x"}}
+        });
+        let result: Result<Distribution, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "the archive URL {archive:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn distribution_deserialization_accepts_the_documented_archive_values() {
+    // amp-acp's five live release URLs (ACP-REGISTRY-FORMAT.md:410) and the
+    // schema example's own placeholder shape -- Item 2 must not cost any of
+    // them.
+    for archive in [
+        "https://github.com/tao12345666333/amp-acp/releases/download/v0.9.0/amp-acp-darwin-aarch64.tar.gz",
+        "https://github.com/tao12345666333/amp-acp/releases/download/v0.9.0/amp-acp-darwin-x86_64.tar.gz",
+        "https://github.com/tao12345666333/amp-acp/releases/download/v0.9.0/amp-acp-linux-aarch64.tar.gz",
+        "https://github.com/tao12345666333/amp-acp/releases/download/v0.9.0/amp-acp-linux-x86_64.tar.gz",
+        "https://github.com/tao12345666333/amp-acp/releases/download/v0.9.0/amp-acp-windows-x86_64.zip",
+    ] {
+        let json = serde_json::json!({
+            "binary": {"linux-x86_64": {"archive": archive, "cmd": "./amp-acp"}}
+        });
+        let result: Result<Distribution, _> = serde_json::from_value(json);
+        assert!(
+            result.is_ok(),
+            "the live archive URL {archive:?} must remain accepted: {result:?}"
+        );
+    }
+}
+
+// ---- Final fix wave, Item 3: launch data is reachable only through
+// `resolve_launch` ----
+
+#[test]
+fn listing_agents_yields_ids_and_names_without_any_launch_data() {
+    // `AgentSummary` carries exactly two fields, so a lister cannot receive
+    // `package`/`archive`/`cmd`/`env` as a by-product of listing -- which is
+    // how `load_cached` handed every C8 control (quarantine, platform,
+    // sha256) a way around itself. This test is the positive half; the
+    // structural half is that `load_cached`/`load_cached_allow_stale` are
+    // `pub(crate)` and so unnameable from this file at all.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    cache.store(&sample_registry()).unwrap();
+
+    let summaries = cache.list_agents();
+    assert_eq!(summaries.len(), 2);
+    let codex = summaries
+        .iter()
+        .find(|a| a.id == "codex")
+        .expect("codex is in the stored registry");
+    assert_eq!(codex.name, "Codex");
+    // The launch data for that same agent is reachable only by resolving it,
+    // which is gated: with no quarantine cached at all, it fails closed.
+    let err = cache
+        .resolve_launch("codex")
+        .expect_err("no quarantine cache -> fail closed, even for a listed agent");
+    assert!(
+        matches!(err, ResolveError::QuarantineUnavailable),
+        "expected QuarantineUnavailable, got {err:?}"
+    );
 }
