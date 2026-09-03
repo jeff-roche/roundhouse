@@ -461,14 +461,40 @@ impl McpExecutor {
     }
 }
 
-/// Mirrors `roundhouse-policy`'s (private) `approval::params_digest`: the
-/// digest is over the `TaskParams`' `Debug` representation, so a grant
-/// recorded against this executor's `AwaitingApproval` suspension can be
-/// matched against one recorded by the policy engine's own approval flow.
-/// If that helper is ever made public, this mirror should be replaced by a
-/// call to it.
+/// Mirrors `roundhouse-policy`'s (private) `approval::params_digest`
+/// **exactly**, including the recursive JSON-key-sorting canonicalization
+/// — see that function's doc comment for why `Debug` formatting alone is
+/// no longer order-independent once `serde_json`'s `preserve_order`
+/// feature is forced on workspace-wide. A grant recorded against this
+/// executor's `AwaitingApproval` suspension must match one recorded by the
+/// policy engine's own approval flow, so any change here must be mirrored
+/// there too. If that helper is ever made public, this mirror should be
+/// replaced by a call to it.
 fn params_digest(params: &TaskParams) -> [u8; 32] {
-    *blake3::hash(format!("{params:?}").as_bytes()).as_bytes()
+    let value = serde_json::to_value(params).expect("TaskParams serialization cannot fail");
+    let canonical = canonicalize_json(value);
+    let bytes =
+        serde_json::to_vec(&canonical).expect("canonicalized value serialization cannot fail");
+    *blake3::hash(&bytes).as_bytes()
+}
+
+/// Recursively sorts JSON object keys so two values that differ only in
+/// object-key insertion order serialize identically. Mirrors
+/// `roundhouse-policy::approval::canonicalize_json` — keep both in sync.
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<String, serde_json::Value> = map
+                .into_iter()
+                .map(|(k, v)| (k, canonicalize_json(v)))
+                .collect();
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(canonicalize_json).collect())
+        }
+        other => other,
+    }
 }
 
 #[async_trait]

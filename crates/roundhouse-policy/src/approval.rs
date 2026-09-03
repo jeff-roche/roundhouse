@@ -438,6 +438,42 @@ fn now_ts() -> Timestamp {
     Timestamp::from_unix_nanos(nanos)
 }
 
+/// Hashes `params` via its **canonicalized** JSON encoding, not `Debug`
+/// formatting: `TaskParams::Mcp.args` is an arbitrary caller-supplied
+/// `serde_json::Value`, and with `serde_json`'s `preserve_order` feature
+/// forced on workspace-wide (the pinned ACP SDK requires it), a
+/// `Value::Object`'s `Debug`/`Serialize` order reflects insertion order,
+/// not a sorted one. Two semantically identical MCP tool calls whose JSON
+/// arguments were built with keys in a different order would then digest
+/// differently, breaking this function's whole purpose: matching a
+/// re-submitted request against a previously recorded grant. Recursively
+/// sorting object keys before hashing restores the order-independence a
+/// `BTreeMap`-backed `Value` gave for free before that feature was forced
+/// on. Mirrored verbatim in `roundhouse-mcp::executor::params_digest` —
+/// keep both in sync, since a grant recorded by one must match a digest
+/// computed by the other.
 fn params_digest(params: &TaskParams) -> [u8; 32] {
-    *blake3::hash(format!("{params:?}").as_bytes()).as_bytes()
+    let value = serde_json::to_value(params).expect("TaskParams serialization cannot fail");
+    let canonical = canonicalize_json(value);
+    let bytes =
+        serde_json::to_vec(&canonical).expect("canonicalized value serialization cannot fail");
+    *blake3::hash(&bytes).as_bytes()
+}
+
+/// Recursively sorts JSON object keys so two values that differ only in
+/// object-key insertion order serialize identically.
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<String, serde_json::Value> = map
+                .into_iter()
+                .map(|(k, v)| (k, canonicalize_json(v)))
+                .collect();
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(canonicalize_json).collect())
+        }
+        other => other,
+    }
 }

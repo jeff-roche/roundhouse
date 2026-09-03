@@ -107,6 +107,82 @@ async fn ask_decision_persists_as_suspended_awaiting_approval_and_survives_a_fre
     );
 }
 
+/// Merge-time fallout fix (`preserve_order` forced on workspace-wide by the
+/// pinned ACP SDK — see `approval::params_digest`'s doc comment): two MCP
+/// tool calls whose `args` JSON is semantically identical but built with
+/// object keys in a different order must still produce the same
+/// `params_digest`, or a re-submitted request would never match a
+/// previously recorded grant. Before `preserve_order` was forced on, this
+/// held for free because `serde_json::Value::Object` was `BTreeMap`-backed
+/// (always sorted); now it requires the explicit canonicalization this
+/// test pins.
+#[tokio::test]
+async fn params_digest_is_independent_of_json_key_insertion_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir.path().join("events.db")).await.unwrap();
+    let writer = spawn_writer(store).await;
+    let registry = ApprovalRegistry::new();
+
+    let args_a = serde_json::json!({ "path": "main.rs", "recursive": true });
+    // Same key/value pairs, inserted in a different order — `json!` builds
+    // an `IndexMap` (under `preserve_order`) in the literal's own order, so
+    // this is a real insertion-order difference, not just a formatting one.
+    let args_b: serde_json::Value = {
+        let mut map = serde_json::Map::new();
+        map.insert("recursive".into(), serde_json::json!(true));
+        map.insert("path".into(), serde_json::json!("main.rs"));
+        serde_json::Value::Object(map)
+    };
+    assert_ne!(
+        format!("{args_a:?}"),
+        format!("{args_b:?}"),
+        "test setup bug: the two Values must differ in Debug output for this test to prove anything"
+    );
+
+    let session_id = SessionId::new();
+    let mut digests = Vec::new();
+    for args in [args_a, args_b] {
+        let task_id = TaskId::new();
+        writer
+            .append(RUNNER.record_task_created(
+                session_id,
+                0,
+                now_ts(),
+                task_id,
+                TaskKind::Mcp,
+                None,
+                Origin::Model,
+                TaskInput::Text("mcp tool call".into()),
+                1,
+            ))
+            .await
+            .unwrap();
+        let params = TaskParams::Mcp {
+            server: ServerId("fs-server".into()),
+            tool: "read".into(),
+            args,
+        };
+        suspend_for_approval(
+            &writer, &RUNNER, &registry, session_id, task_id, None, &params,
+        )
+        .await
+        .unwrap();
+        digests.push(
+            registry
+                .list()
+                .into_iter()
+                .find(|p| p.task_id == task_id)
+                .unwrap()
+                .params_digest,
+        );
+    }
+
+    assert_eq!(
+        digests[0], digests[1],
+        "params_digest must be order-independent over JSON object keys"
+    );
+}
+
 #[test]
 fn grant_is_generalised_downward_never_broader_than_the_originating_task() {
     let params = TaskParams::Fs {

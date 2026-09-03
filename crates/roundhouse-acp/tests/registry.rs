@@ -1,0 +1,1299 @@
+//! Task C8 (G7 part 2): consuming `agentclientprotocol/registry` instead of
+//! a hardcoded launch-config table.
+//!
+//! Deliberately deviates from the task brief's literal test bodies where the
+//! coordinator's rulings (`ACP-REGISTRY-FORMAT.md`, Ruling C-P13 in
+//! particular) override it:
+//! - `distribution` is modeled as a struct of the three real shapes
+//!   (`npx`/`uvx`/`binary`), not the brief's flattened `{command, args}` —
+//!   verified against the live index, two real agents (`kilo`, `sigit`)
+//!   publish *both* `binary` and `npx` simultaneously, so a strictly
+//!   mutually-exclusive enum at the per-agent field would reject real data.
+//!   `resolve_launch` is what returns the single, mutually-exclusive
+//!   `LaunchConfig` enum the ruling asks for.
+//! - `resolve_launch` returns `Result<LaunchConfig, ResolveError>`, not
+//!   `Option<LaunchConfig>` — `Option` cannot distinguish "not in the
+//!   registry" from "quarantined" from "matched, but the only distribution
+//!   is an unverifiable binary", and Ruling C-P13(c)/(d) requires those to
+//!   be surfaced distinctly rather than all collapsing to `None`.
+//! - Resolution is gated on a cached quarantine list being present at all
+//!   (Ruling C-P13(d)): with no quarantine cache on disk, `resolve_launch`
+//!   fails closed even for an agent that is, in fact, in the registry and
+//!   not quarantined. Tests that want a successful resolution must
+//!   therefore seed the quarantine cache (possibly empty) explicitly.
+//!
+//! **Fix round 1 (coordinator review):**
+//! - Item 3 flipped `resolve_distribution`'s preference order: a
+//!   `sha256`-bearing `Binary` for the current platform is now preferred
+//!   over `Npx`/`Uvx`, not the other way around —
+//!   `resolve_launch_prefers_a_checksum_pinned_binary_over_npx_when_an_agent_publishes_both`
+//!   (renamed from `..._prefers_npx_over_binary_...`) now asserts the
+//!   opposite outcome from before.
+//! - Item 6 made [`roundhouse_acp::registry::LaunchConfig`]'s payload
+//!   private — every assertion that used to construct a `LaunchConfig::Npx {
+//!   .. }` / `LaunchConfig::Binary { .. }` literal and compare it with
+//!   `assert_eq!` now reads the resolved value back through its accessor
+//!   methods (`is_npx()`, `package()`, `args()`, `env()`, `target()`,
+//!   `archive()`, `sha256()`, `cmd()`) instead.
+//!
+//! **Fix round 2 (coordinator review of fix round 1):**
+//! - Item 1: `resolve_launch_refuses_a_no_sha256_binary_even_when_npx_is_also_published`
+//!   is new — the mixed (binary + npx) shape with `sha256` absent, which
+//!   round 1 never tested (every existing mixed-shape test carried
+//!   `sha256`), reproducing exactly what let a no-`sha256` binary silently
+//!   fall through to `npx`.
+//! - Item 3/4: new `distribution_deserialization_*` tests for the env
+//!   allowlist and the `cmd`/`package` grammar gaps — see each test's own
+//!   comment.
+//! - Standing conventions ("tests must be able to fail"):
+//!   `resolve_launch_prefers_a_checksum_pinned_binary_over_npx_when_an_agent_publishes_both`
+//!   and `resolve_launch_resolves_a_binary_only_agent_for_the_current_platform`
+//!   used to build their expected `target` value by *calling*
+//!   `current_platform_target` — the same function `resolve_launch` calls
+//!   internally — making `assert_eq!(launch.target(), Some(target))`
+//!   tautological (a bug in that function's match arms would make both call
+//!   sites agree on the same wrong value). Both now use
+//!   [`expected_current_platform_target`], an independent copy of the same
+//!   OS/ARCH match, so a mismatch is actually detectable.
+//!
+//! **Fix round 3 (coordinator review of fix round 2):**
+//! - Item 1: three new `distribution_deserialization_*` tests for npm/npx's
+//!   schemeless GitHub shorthand (`user/repo`, `user/repo#branch`), plus a
+//!   positive control for the real `@scope/name` shape.
+//! - Item 3: `agent_id_pattern_is_enforced_at_deserialize_time` (renamed
+//!   `..._per_entry_not_for_the_whole_registry`) now asserts the *opposite*
+//!   outcome from before — a single invalid entry no longer fails the whole
+//!   registry's deserialize, only that one entry is dropped.
+//!   `one_agent_with_an_env_key_outside_the_allowlist_does_not_take_down_its_siblings`
+//!   is new — the coordinator's exact 3-agent reproduction.
+//!
+//! **Fix round 4 (coordinator review of fix round 3):**
+//! - Item 1: `resolve_launch_refuses_an_id_a_shadow_entry_shares_rather_than_resolving_either`
+//!   is new — round 3's per-entry tolerance let a second entry re-using a
+//!   dropped entry's `id` become the resolution, inheriting its clean,
+//!   non-quarantined status. It writes the cache file as raw JSON on purpose:
+//!   a `Registry` struct literal bypasses the deserialize path where the
+//!   deduplication lives.
+//! - Item 3: `distribution_deserialization_rejects_an_npx_package_that_is_an_archive_file_spec`
+//!   is new — npm's `file` spec syntax (`/[.](?:tgz|tar.gz|tar)$/i`), the one
+//!   shape round 3's grammar still admitted.
+//!
+//! **Fix round 5 (coordinator review of fix round 4):**
+//! - Item 1: `distribution_deserialization_rejects_scoped_looking_npm_directory_specs`
+//!   and `distribution_deserialization_keeps_the_npm_charset_rule_off_the_uvx_field`
+//!   are new — npm's `fromFile` *directory*-install route, the third syntax
+//!   the grammar was short, and the pin that the fix stays `npx`-only so the
+//!   live `uvx` `==` pin syntax survives.
+//! - Item 1/4: `distribution_deserialization_still_accepts_every_live_package_value`
+//!   is renamed `..._still_accepts_the_documented_package_values` and
+//!   corrected twice over — it asserted `fast-agent-acp==0.10.1` (a **uvx**
+//!   value per `ACP-REGISTRY-FORMAT.md:412`) under `"npx"`, and it described
+//!   its list as "the full set of `package` values on the live index" when
+//!   that document enumerates six values out of the 39 entries it reports,
+//!   and contains no `@openai/codex-acp` at all.
+//! - `sample_registry`'s `codex` fixture keeps `@openai/codex-acp` as a
+//!   *fixture* package string. It is not attested as a live registry value
+//!   anywhere in this workspace's reference set (the attested codex spec is
+//!   `@agentclientprotocol/codex-acp`, `ACP-SDK-API.md:449`); nothing in
+//!   these tests depends on it being real, only on it being a well-formed
+//!   scoped name.
+
+use roundhouse_acp::registry::{
+    BinaryTarget, Distribution, PackageDistribution, Quarantine, Registry, RegistryAgent,
+    RegistryCache, ResolveError,
+};
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+/// Standing conventions ("tests must be able to fail"): independently
+/// re-derives the expected platform target string from
+/// `std::env::consts::OS`/`ARCH`, duplicating
+/// `roundhouse_acp::registry::current_platform_target`'s own match arms
+/// rather than *calling* that function. Two tests below used to build their
+/// expected value with `let target = current_platform_target();` and then
+/// assert the resolved `LaunchConfig` echoed that same value back --
+/// tautological, since [`roundhouse_acp::registry::resolve_launch`] calls
+/// that identical function internally: a bug in its match arms (e.g. two
+/// swapped branches) would make both call sites agree with each other on
+/// the same wrong string, and no test using that pattern could ever catch
+/// it. This copy is independent, so it doesn't.
+fn expected_current_platform_target() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-aarch64",
+        ("macos", "x86_64") => "darwin-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("linux", "x86_64") => "linux-x86_64",
+        ("windows", "aarch64") => "windows-aarch64",
+        ("windows", "x86_64") => "windows-x86_64",
+        _ => "unsupported",
+    }
+}
+
+fn npx_agent(id: &str, package: &str) -> RegistryAgent {
+    RegistryAgent {
+        id: id.to_string(),
+        name: id.to_string(),
+        distribution: Distribution {
+            npx: Some(PackageDistribution {
+                package: package.to_string(),
+                args: vec![],
+                env: BTreeMap::new(),
+            }),
+            uvx: None,
+            binary: BTreeMap::new(),
+        },
+    }
+}
+
+fn sample_registry() -> Registry {
+    Registry {
+        agents: vec![
+            npx_agent("claude-acp", "@agentclientprotocol/claude-agent-acp@0.73.0"),
+            RegistryAgent {
+                id: "codex".to_string(),
+                name: "Codex".to_string(),
+                distribution: Distribution {
+                    npx: Some(PackageDistribution {
+                        package: "@openai/codex-acp".to_string(),
+                        args: vec!["acp".to_string()],
+                        env: BTreeMap::new(),
+                    }),
+                    uvx: None,
+                    binary: BTreeMap::new(),
+                },
+            },
+        ],
+    }
+}
+
+fn empty_quarantine() -> Quarantine {
+    Quarantine::default()
+}
+
+#[test]
+fn resolve_launch_reads_from_the_registry_not_a_hardcoded_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    cache.store(&sample_registry()).unwrap();
+    cache.store_quarantine(&empty_quarantine()).unwrap();
+
+    let launch = cache
+        .resolve_launch("codex")
+        .expect("codex is in the fetched registry and not quarantined");
+    assert!(launch.is_npx());
+    assert_eq!(launch.package(), Some("@openai/codex-acp"));
+    assert_eq!(launch.args(), &["acp".to_string()]);
+    assert_eq!(launch.env(), &BTreeMap::new());
+
+    let err = cache
+        .resolve_launch("some-agent-not-in-the-registry")
+        .expect_err(
+            "no fallback to a hardcoded table — an unlisted agent simply isn't resolvable this way",
+        );
+    assert!(
+        matches!(err, ResolveError::NotInRegistry { .. }),
+        "expected NotInRegistry, got {err:?}"
+    );
+}
+
+#[test]
+fn cache_round_trips_through_disk() {
+    // Final fix wave (Item 3): expressed through `list_agents`, because
+    // `load_cached`/`load_cached_allow_stale` are `pub(crate)` now -- an
+    // out-of-crate caller can see *which* agents are cached without being
+    // handed each one's launch data along with them. This test would not
+    // compile against the old `load_cached` route being the only one.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    assert!(cache.list_agents().is_empty(), "nothing fetched yet");
+    cache.store(&sample_registry()).unwrap();
+    let listed = cache.list_agents();
+    // Literal restatement of what `sample_registry` stores, in the `BTreeMap`
+    // order `partition_registry_agents` imposes on a parsed document -- not
+    // recomputed from `sample_registry()` itself.
+    assert_eq!(
+        listed
+            .iter()
+            .map(|a| (a.id.as_str(), a.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("claude-acp", "claude-acp"), ("codex", "Codex")]
+    );
+}
+
+#[test]
+fn a_zero_ttl_cache_reads_as_not_fresh_but_still_lists_and_resolves() {
+    // Final fix wave (Item 3): the TTL's one purpose -- telling the caller
+    // whether it may skip a refresh -- survives `load_cached`'s narrowing, via
+    // `has_fresh_cache`. `list_agents` deliberately does *not* honour the TTL,
+    // matching `resolve_launch` (see
+    // `resolve_launch_resolves_using_a_stale_registry_cache_not_only_a_fresh_one`):
+    // a listed agent is exactly an agent that will resolve.
+    let dir = tempfile::tempdir().unwrap();
+    // Zero TTL: the entry is stale the instant it's written.
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(0),
+    );
+    assert!(
+        !cache.has_fresh_cache(),
+        "no cache at all must not read as fresh"
+    );
+    cache.store(&sample_registry()).unwrap();
+    assert!(
+        !cache.has_fresh_cache(),
+        "a zero-TTL entry must already read as stale"
+    );
+    assert_eq!(
+        cache.list_agents().len(),
+        2,
+        "a stale entry must still be listable"
+    );
+}
+
+#[test]
+fn a_live_ttl_cache_reads_as_fresh() {
+    // The other side of `has_fresh_cache`'s boundary: without this, mutating
+    // it to `false` passes the zero-TTL test above.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    cache.store(&sample_registry()).unwrap();
+    assert!(
+        cache.has_fresh_cache(),
+        "an entry written inside the TTL must read as fresh"
+    );
+}
+
+#[test]
+fn resolve_launch_fails_closed_when_the_quarantine_list_has_never_been_cached() {
+    // Ruling C-P13(d): "If the quarantine list cannot be fetched AND no
+    // cached copy exists, resolve_launch fails closed rather than resolving
+    // unquarantined." Even a perfectly good, unquarantined registry entry
+    // must not resolve while there is no quarantine data at all on disk.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    cache.store(&sample_registry()).unwrap();
+    // Deliberately never calling cache.store_quarantine(..).
+
+    let err = cache
+        .resolve_launch("codex")
+        .expect_err("must fail closed with no quarantine cache present, not silently resolve");
+    assert!(
+        matches!(err, ResolveError::QuarantineUnavailable),
+        "expected QuarantineUnavailable, got {err:?}"
+    );
+}
+
+#[test]
+fn resolve_launch_rejects_a_quarantined_agent_even_though_it_is_in_the_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    cache.store(&sample_registry()).unwrap();
+    let mut quarantine = Quarantine::default();
+    quarantine.insert("codex".to_string(), "Timeout after 120s".to_string());
+    cache.store_quarantine(&quarantine).unwrap();
+
+    let err = cache
+        .resolve_launch("codex")
+        .expect_err("a quarantined agent must not resolve, even though it is in the registry");
+    assert!(
+        matches!(err, ResolveError::Quarantined { .. }),
+        "expected Quarantined, got {err:?}"
+    );
+}
+
+#[test]
+fn resolve_launch_prefers_a_checksum_pinned_binary_over_npx_when_an_agent_publishes_both() {
+    // Fix round 1, Item 3: real data, discovered against the live index —
+    // `kilo` and `sigit` publish both `binary` and `npx` distribution
+    // simultaneously, and both publish a full `sha256`-bearing binary map.
+    // This models that exact shape and asserts the resolver now prefers the
+    // checksum-pinned binary over the unverified, install-script-executing
+    // `npx` channel — the reverse of this test's original assertion, which
+    // preferred `npx` (the coordinator's review found that order inverted
+    // the actual integrity argument: a `Binary` with no `sha256` is refused
+    // as unverifiable two lines below where `npx`, which carries no digest
+    // at all, was unconditionally preferred).
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    // Standing conventions: `target` is derived independently of
+    // `current_platform_target`, not by calling it — see
+    // `expected_current_platform_target`'s doc.
+    let target = expected_current_platform_target();
+    let mut binary = BTreeMap::new();
+    binary.insert(
+        target.to_string(),
+        BinaryTarget {
+            archive: "https://example.invalid/kilo.tar.gz".to_string(),
+            sha256: Some("a".repeat(64)),
+            cmd: "./kilo".to_string(),
+            args: vec![],
+            env: BTreeMap::new(),
+        },
+    );
+    let agent = RegistryAgent {
+        id: "kilo".to_string(),
+        name: "Kilo".to_string(),
+        distribution: Distribution {
+            npx: Some(PackageDistribution {
+                package: "@kilocode/cli@7.5.9".to_string(),
+                args: vec!["acp".to_string()],
+                env: BTreeMap::new(),
+            }),
+            uvx: None,
+            binary,
+        },
+    };
+    cache
+        .store(&Registry {
+            agents: vec![agent],
+        })
+        .unwrap();
+    cache.store_quarantine(&empty_quarantine()).unwrap();
+
+    let launch = cache.resolve_launch("kilo").unwrap();
+    assert!(
+        launch.is_binary(),
+        "expected the checksum-pinned binary to be preferred over npx"
+    );
+    assert_eq!(launch.target(), Some(target));
+    assert_eq!(
+        launch.archive(),
+        Some("https://example.invalid/kilo.tar.gz")
+    );
+    assert_eq!(launch.sha256(), Some("a".repeat(64).as_str()));
+    assert_eq!(launch.cmd(), Some("./kilo"));
+    assert_eq!(launch.args(), &[] as &[String]);
+    assert_eq!(launch.env(), &BTreeMap::new());
+}
+
+#[test]
+fn resolve_launch_refuses_a_no_sha256_binary_even_when_npx_is_also_published() {
+    // Fix round 2, Item 1: the exact shape the coordinator's reviewer
+    // reproduced -- a kilo-shaped entry (binary + npx both present) minus
+    // `sha256`. Round 1's UnverifiableBinary check sat after the npx/uvx
+    // early returns in resolve_distribution, so this resolved to
+    // `Ok(LaunchConfig(Npx { package: "@evil/pkg", .. }))` instead of
+    // failing closed.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    let target = roundhouse_acp::registry::current_platform_target();
+    let mut binary = BTreeMap::new();
+    binary.insert(
+        target.to_string(),
+        BinaryTarget {
+            archive: "https://example.invalid/evil.tar.gz".to_string(),
+            sha256: None,
+            cmd: "./evil".to_string(),
+            args: vec![],
+            env: BTreeMap::new(),
+        },
+    );
+    let agent = RegistryAgent {
+        id: "kilo-no-sha256".to_string(),
+        name: "Kilo No Sha256".to_string(),
+        distribution: Distribution {
+            npx: Some(PackageDistribution {
+                package: "@evil/pkg".to_string(),
+                args: vec![],
+                env: BTreeMap::new(),
+            }),
+            uvx: None,
+            binary,
+        },
+    };
+    cache
+        .store(&Registry {
+            agents: vec![agent],
+        })
+        .unwrap();
+    cache.store_quarantine(&empty_quarantine()).unwrap();
+
+    let err = cache
+        .resolve_launch("kilo-no-sha256")
+        .expect_err("a binary with no sha256 must never fall through to npx");
+    assert!(
+        matches!(err, ResolveError::UnverifiableBinary { .. }),
+        "expected UnverifiableBinary, got {err:?}"
+    );
+}
+
+#[test]
+fn resolve_launch_resolves_a_binary_only_agent_for_the_current_platform() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    // Standing conventions: independently re-derived, not called — see
+    // `expected_current_platform_target`'s doc.
+    let target = expected_current_platform_target();
+    let mut binary = BTreeMap::new();
+    binary.insert(
+        target.to_string(),
+        BinaryTarget {
+            archive: "https://example.invalid/agent.tar.gz".to_string(),
+            sha256: Some("b".repeat(64)),
+            cmd: "./agent".to_string(),
+            args: vec!["serve".to_string()],
+            env: BTreeMap::new(),
+        },
+    );
+    let agent = RegistryAgent {
+        id: "binary-only-agent".to_string(),
+        name: "Binary Only".to_string(),
+        distribution: Distribution {
+            npx: None,
+            uvx: None,
+            binary,
+        },
+    };
+    cache
+        .store(&Registry {
+            agents: vec![agent],
+        })
+        .unwrap();
+    cache.store_quarantine(&empty_quarantine()).unwrap();
+
+    let launch = cache.resolve_launch("binary-only-agent").unwrap();
+    assert!(launch.is_binary());
+    assert_eq!(launch.target(), Some(target));
+    assert_eq!(
+        launch.archive(),
+        Some("https://example.invalid/agent.tar.gz")
+    );
+    assert_eq!(launch.sha256(), Some("b".repeat(64).as_str()));
+    assert_eq!(launch.cmd(), Some("./agent"));
+    assert_eq!(launch.args(), &["serve".to_string()]);
+    assert_eq!(launch.env(), &BTreeMap::new());
+}
+
+#[test]
+fn resolve_launch_surfaces_a_binary_with_no_sha256_as_unverifiable_not_none() {
+    // Ruling C-P13(c): "A Binary entry with no sha256 MUST be surfaced as
+    // unverifiable rather than silently resolved." `sha256` is genuinely
+    // optional in the upstream schema, and on the live index several real
+    // agents (e.g. `cursor`, `devin`, `junie`) ship binary targets with no
+    // `sha256` at all.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    let target = roundhouse_acp::registry::current_platform_target();
+    let mut binary = BTreeMap::new();
+    binary.insert(
+        target.to_string(),
+        BinaryTarget {
+            archive: "https://example.invalid/no-checksum.tar.gz".to_string(),
+            sha256: None,
+            cmd: "./no-checksum".to_string(),
+            args: vec![],
+            env: BTreeMap::new(),
+        },
+    );
+    let agent = RegistryAgent {
+        id: "unverifiable-agent".to_string(),
+        name: "Unverifiable".to_string(),
+        distribution: Distribution {
+            npx: None,
+            uvx: None,
+            binary,
+        },
+    };
+    cache
+        .store(&Registry {
+            agents: vec![agent],
+        })
+        .unwrap();
+    cache.store_quarantine(&empty_quarantine()).unwrap();
+
+    let err = cache
+        .resolve_launch("unverifiable-agent")
+        .expect_err("a binary with no sha256 must not silently resolve");
+    assert!(
+        matches!(err, ResolveError::UnverifiableBinary { .. }),
+        "expected UnverifiableBinary, got {err:?}"
+    );
+}
+
+#[test]
+fn resolve_launch_reports_no_usable_distribution_when_only_a_foreign_platform_binary_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    let current = roundhouse_acp::registry::current_platform_target();
+    let foreign = [
+        "darwin-aarch64",
+        "darwin-x86_64",
+        "linux-aarch64",
+        "linux-x86_64",
+        "windows-aarch64",
+        "windows-x86_64",
+    ]
+    .into_iter()
+    .find(|t| *t != current)
+    .unwrap();
+    let mut binary = BTreeMap::new();
+    binary.insert(
+        foreign.to_string(),
+        BinaryTarget {
+            archive: "https://example.invalid/foreign.tar.gz".to_string(),
+            sha256: Some("c".repeat(64)),
+            cmd: "./foreign".to_string(),
+            args: vec![],
+            env: BTreeMap::new(),
+        },
+    );
+    let agent = RegistryAgent {
+        id: "foreign-only-agent".to_string(),
+        name: "Foreign Only".to_string(),
+        distribution: Distribution {
+            npx: None,
+            uvx: None,
+            binary,
+        },
+    };
+    cache
+        .store(&Registry {
+            agents: vec![agent],
+        })
+        .unwrap();
+    cache.store_quarantine(&empty_quarantine()).unwrap();
+
+    let err = cache.resolve_launch("foreign-only-agent").unwrap_err();
+    assert!(
+        matches!(err, ResolveError::NoUsableDistribution { .. }),
+        "expected NoUsableDistribution, got {err:?}"
+    );
+}
+
+#[test]
+fn registry_deserialization_tolerates_unknown_top_level_and_extension_keys() {
+    // Ruling C-P13(a): the live index does not validate against its own
+    // `registry.schema.json` (top-level `extensions` vs `additionalProperties:
+    // false`) — a strict validator would reject every real fetch. Verified
+    // directly against the live index 2026-09-02: its top-level keys are
+    // exactly {version, agents, extensions}.
+    let json = r#"{
+        "version": "1.0.0",
+        "extensions": [],
+        "some_future_sibling_key": {"anything": true},
+        "agents": [
+            {
+                "id": "claude-acp",
+                "name": "Claude Agent",
+                "version": "0.73.0",
+                "description": "ACP wrapper for Anthropic's Claude",
+                "repository": "https://github.com/agentclientprotocol/claude-agent-acp",
+                "authors": ["Anthropic"],
+                "license": "proprietary",
+                "distribution": {
+                    "npx": {"package": "@agentclientprotocol/claude-agent-acp@0.73.0"}
+                },
+                "icon": "https://cdn.agentclientprotocol.com/registry/v1/latest/claude-acp.svg"
+            }
+        ]
+    }"#;
+    let registry: Registry =
+        serde_json::from_str(json).expect("must tolerate unknown sibling keys");
+    assert_eq!(registry.agents.len(), 1);
+    assert_eq!(registry.agents[0].id, "claude-acp");
+}
+
+#[test]
+fn distribution_deserialization_rejects_an_unknown_key() {
+    let json = r#"{"npx": {"package": "x"}, "docker": {"image": "y"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "an unrecognized distribution key must be rejected, not silently dropped"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_an_empty_object() {
+    let json = r#"{}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "distribution must have at least one of npx/uvx/binary"
+    );
+}
+
+#[test]
+fn agent_id_pattern_is_enforced_per_entry_not_for_the_whole_registry() {
+    // Fix round 3 (Item 3): Registry.agents deserializes element-wise now --
+    // an invalid id no longer fails the whole array's deserialize, it drops
+    // just that one entry. A single invalid agent used to make this whole
+    // document fail to parse at all (asserted here before this round); now
+    // the invalid entry is dropped and its valid sibling survives.
+    let json = r#"{
+        "agents": [
+            {
+                "id": "Not_Valid!",
+                "name": "Bad",
+                "distribution": {"npx": {"package": "x"}}
+            },
+            {
+                "id": "good-agent",
+                "name": "Good",
+                "distribution": {"npx": {"package": "x"}}
+            }
+        ]
+    }"#;
+    let registry: Registry = serde_json::from_str(json)
+        .expect("a single invalid agent entry must not fail deserialization of the whole registry");
+    assert_eq!(
+        registry.agents.len(),
+        1,
+        "the entry with an id not matching ^[a-z][a-z0-9-]*$ must be dropped, not accepted"
+    );
+    assert_eq!(registry.agents[0].id, "good-agent");
+}
+
+#[test]
+fn one_agent_with_an_env_key_outside_the_allowlist_does_not_take_down_its_siblings() {
+    // The coordinator's exact reproduction: three agents, one using a
+    // hypothetical future upstream env flag not yet on ALLOWED_ENV_KEYS.
+    // Before this round, zero of the three survived deserialization -- not
+    // two.
+    let json = r#"{
+        "agents": [
+            {"id": "agent-a", "name": "A", "distribution": {"npx": {"package": "a"}}},
+            {
+                "id": "agent-b",
+                "name": "B",
+                "distribution": {
+                    "npx": {"package": "b", "env": {"NEW_UPSTREAM_FEATURE_FLAG": "1"}}
+                }
+            },
+            {"id": "agent-c", "name": "C", "distribution": {"npx": {"package": "c"}}}
+        ]
+    }"#;
+    let registry: Registry = serde_json::from_str(json)
+        .expect("valid siblings must still deserialize even though one entry is invalid");
+    let ids: Vec<&str> = registry.agents.iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["agent-a", "agent-c"],
+        "agent-b (the invalid entry) must be dropped; agent-a and agent-c must both survive"
+    );
+}
+
+// ---- Item 1 (fix round 4): a duplicate id must resolve to Err, not to
+// either colliding entry ----
+
+#[test]
+fn resolve_launch_refuses_an_id_a_shadow_entry_shares_rather_than_resolving_either() {
+    // The hole round 3's per-entry tolerance opened, end to end. The
+    // legitimate `claude-code` entry is first and carries a `env` flag this
+    // crate has not allowlisted -- exactly the scenario per-entry tolerance
+    // was introduced to survive -- so it is dropped. Round 3 then let the
+    // second, attacker-authored entry with the *same* id become the match,
+    // inheriting the victim id's clean, non-quarantined status: the
+    // coordinator measured `resolve_launch("claude-code")` returning
+    // `Ok(Npx { package: "attacker-controlled-pkg@9.9.9", .. })`. Neither
+    // entry may resolve now.
+    //
+    // Written as a raw cache file rather than through `store`, because a
+    // `Registry` struct literal bypasses the deserialize path where the
+    // deduplication lives -- this must exercise what a real cached document
+    // does.
+    let dir = tempfile::tempdir().unwrap();
+    let registry_path = dir.path().join("registry.json");
+    std::fs::write(
+        &registry_path,
+        r#"{
+            "agents": [
+                {
+                    "id": "claude-code",
+                    "name": "Claude Agent",
+                    "distribution": {"npx": {
+                        "package": "@agentclientprotocol/claude-agent-acp@0.73.0",
+                        "env": {"NEW_UPSTREAM_FEATURE_FLAG": "1"}
+                    }}
+                },
+                {
+                    "id": "claude-code",
+                    "name": "Claude Agent",
+                    "distribution": {"npx": {"package": "attacker-controlled-pkg@9.9.9"}}
+                },
+                {"id": "codex", "name": "Codex", "distribution": {"npx": {"package": "@openai/codex-acp"}}}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let cache = RegistryCache::new(
+        registry_path,
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    // A non-empty quarantine that does *not* list `claude-code` -- the
+    // reproduction's own conditions, so the refusal below cannot be the
+    // quarantine gate firing for some other reason.
+    let mut quarantine = Quarantine::default();
+    quarantine.insert("some-other-agent".to_string(), "unrelated".to_string());
+    cache.store_quarantine(&quarantine).unwrap();
+
+    let err = cache
+        .resolve_launch("claude-code")
+        .expect_err("a shadowed id must fail closed, not resolve to either colliding entry");
+    assert!(
+        matches!(err, ResolveError::NotInRegistry { .. }),
+        "expected NotInRegistry, got {err:?}"
+    );
+
+    // The collision must not have taken out the unrelated entry.
+    let codex = cache
+        .resolve_launch("codex")
+        .expect("an entry with a unique id is unaffected by another id's collision");
+    assert_eq!(codex.package(), Some("@openai/codex-acp"));
+}
+
+#[test]
+fn package_distribution_deserialization_rejects_an_unknown_field() {
+    let json = r#"{"package": "x", "extra_unexpected_field": true}"#;
+    let result: Result<PackageDistribution, _> = serde_json::from_str(json);
+    assert!(result.is_err());
+}
+
+#[test]
+fn binary_target_deserialization_rejects_an_unknown_field() {
+    let json = r#"{"archive": "https://x", "cmd": "./x", "unexpected": 1}"#;
+    let result: Result<BinaryTarget, _> = serde_json::from_str(json);
+    assert!(result.is_err());
+}
+
+// ---- Item 4: launch fields (package/cmd/env) must be validated, not just id ----
+
+#[test]
+fn distribution_deserialization_rejects_an_npx_package_with_a_leading_dash() {
+    // The brief's own concrete example: `npx <package>` consumes a
+    // leading-`-` string as its own flag, not a package name.
+    let json = r#"{"npx": {"package": "--node-options=--require=/tmp/x.js"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a package name npx would consume as a flag must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_an_absolute_binary_cmd() {
+    let json = r#"{"binary": {"linux-x86_64": {"archive": "https://x", "cmd": "/bin/sh"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "an absolute cmd must be rejected");
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_binary_cmd_that_traverses_out_of_the_extraction_directory(
+) {
+    let json =
+        r#"{"binary": {"linux-x86_64": {"archive": "https://x", "cmd": "../../etc/passwd"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a cmd containing a `..` segment must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_forbidden_env_key_on_npx() {
+    let json = r#"{"npx": {"package": "x", "env": {"LD_PRELOAD": "/tmp/evil.so"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "LD_PRELOAD must be rejected");
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_forbidden_env_key_on_a_binary_target() {
+    let json = r#"{"binary": {"linux-x86_64": {"archive": "https://x", "cmd": "./agent", "env": {"NODE_OPTIONS": "--require=/tmp/x.js"}}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "NODE_OPTIONS must be rejected");
+}
+
+// ---- Fix round 2, Item 3: env allowlist ----
+
+#[test]
+fn distribution_deserialization_accepts_a_real_live_allowlisted_env_key() {
+    let json = r#"{"uvx": {"package": "fast-agent-acp==0.10.1", "env": {"FAST_AGENT_MODEL": "codexplan"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_ok(),
+        "a real live allowlisted env key must not be rejected: {result:?}"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_loader_hijack_variable_the_round_1_denylist_missed() {
+    // GCONV_PATH: a classic glibc dynamic-loader hijack, absent from fix
+    // round 1's FORBIDDEN_ENV_KEYS denylist.
+    let json = r#"{"npx": {"package": "x", "env": {"GCONV_PATH": "/tmp/evil"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "GCONV_PATH must be rejected");
+}
+
+#[test]
+fn distribution_deserialization_accepts_real_live_shapes_with_a_relative_windows_style_cmd() {
+    // Real upstream value: `./bin\devin.exe` — mixed separator, still
+    // relative, no `..` segment. Item 4's validation must not be so strict
+    // it rejects real, currently-listed registry entries.
+    let json =
+        r#"{"binary": {"windows-x86_64": {"archive": "https://x", "cmd": "./bin\\devin.exe"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_ok(),
+        "a real relative windows-style cmd must not be rejected: {result:?}"
+    );
+}
+
+// ---- Fix round 2, Item 4: cmd validated against explicit shapes, not host Path ----
+
+#[test]
+fn distribution_deserialization_rejects_a_windows_absolute_cmd_on_a_windows_target() {
+    // `Path::new(cmd).is_absolute()` (fix round 1's check) is POSIX-only on
+    // this (Linux) build, so a `windows-x86_64` target's cmd carrying a
+    // Windows absolute path used to pass straight through, escaping the
+    // extraction directory on the platform this entry's own key names.
+    let json = r#"{"binary": {"windows-x86_64": {"archive": "https://x", "cmd": "\\Windows\\System32\\cmd.exe"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "a Windows absolute cmd must be rejected");
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_windows_drive_letter_cmd() {
+    let json = r#"{"binary": {"windows-x86_64": {"archive": "https://x", "cmd": "C:evil.exe"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "a drive-letter cmd must be rejected");
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_unc_path_cmd() {
+    let json = r#"{"binary": {"windows-x86_64": {"archive": "https://x", "cmd": "\\\\server\\share\\evil.exe"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "a UNC-path cmd must be rejected");
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_cmd_containing_a_newline() {
+    let json = r#"{"binary": {"linux-x86_64": {"archive": "https://x", "cmd": "./x\nevil"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a cmd containing a raw newline must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_cmd_containing_shell_metacharacters_via_whitespace() {
+    let json =
+        r#"{"binary": {"linux-x86_64": {"archive": "https://x", "cmd": "./a b; rm -rf /"}}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a cmd containing whitespace/shell metacharacters must be rejected"
+    );
+}
+
+// ---- Fix round 2, Item 4: package constrained to a package identifier ----
+
+#[test]
+fn distribution_deserialization_rejects_a_url_shaped_npx_package() {
+    let json = r#"{"npx": {"package": "https://attacker.example/x.tgz"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a URL-shaped package spec must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_path_traversal_shaped_npx_package() {
+    let json = r#"{"npx": {"package": "../../../tmp/evil"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a path-traversal-shaped package spec must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_git_ssh_shaped_uvx_package() {
+    let json = r#"{"uvx": {"package": "git+ssh://attacker/x"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a git+ssh-scheme package spec must be rejected"
+    );
+}
+
+// ---- Item 1 (fix round 3): npm/npx's schemeless GitHub shorthand ----
+
+#[test]
+fn distribution_deserialization_rejects_an_npm_github_shorthand_npx_package() {
+    // npx resolves a bare `user/repo` as a GitHub tarball -- fetched and
+    // executed exactly like a real npm package, entirely outside the npm
+    // registry, with no provenance and no takedown path. Round 2 closed the
+    // `git+ssh://` scheme-qualified form of this same capability but not
+    // this schemeless one.
+    let json = r#"{"npx": {"package": "attacker/evil-repo"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a bare user/repo GitHub-shorthand package spec must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_an_npm_github_shorthand_with_a_commit_pin() {
+    let json = r#"{"npx": {"package": "attacker/evil-repo#branch"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a #commit-ish-pinned GitHub-shorthand package spec must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_accepts_a_real_live_scoped_package_with_one_slash() {
+    // A `/` must remain accepted as the single separator of a leading
+    // `@scope/name` -- the real, live shape this crate must not break.
+    let json = r#"{"npx": {"package": "@agentclientprotocol/claude-agent-acp@0.73.0"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_ok(),
+        "a real @scope/name package spec must remain accepted: {result:?}"
+    );
+}
+
+// ---- Item 3 (fix round 4): npm's `file` spec syntax ----
+
+#[test]
+fn distribution_deserialization_rejects_an_npx_package_that_is_an_archive_file_spec() {
+    // npm's own npm-package-arg types anything matching
+    // /[.](?:tgz|tar.gz|tar)$/i as a `file` spec -- resolved relative to the
+    // working directory, entirely outside the npm registry, and needing none
+    // of the markers rounds 2 and 3 rejected. The last case is round 3's own
+    // `@scope/name` allowance acting as the carrier.
+    for package in [
+        "evil.tgz",
+        "evil.tar.gz",
+        "evil.tar",
+        "EVIL.TGZ",
+        "pkg@evil.tgz",
+        "@scope/name@evil.tgz",
+    ] {
+        let json = format!(r#"{{"npx": {{"package": "{package}"}}}}"#);
+        let result: Result<Distribution, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "the archive-file spec {package:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn distribution_deserialization_still_accepts_the_documented_package_values() {
+    // Fix round 5 (Item 1 and Item 4) corrects two errors in the round-4
+    // version of this test.
+    //
+    // (a) It asserted every value under `"npx"`, including
+    //     `fast-agent-acp==0.10.1` -- which ACP-REGISTRY-FORMAT.md:412 records
+    //     as a *uvx* value, PyPI's `==` pin syntax. Under the npx charset rule
+    //     Item 1 adds, that fixture is not merely mislabelled, it is wrong:
+    //     `=` is not a character npm accepts in a registry name. Each value is
+    //     now asserted under the kind the reference document actually gives it.
+    //
+    // (b) It called this "the full set of `package` values on the live index".
+    //     It is not: ACP-REGISTRY-FORMAT.md reports the index carrying 39
+    //     entries (`:405-407`) while enumerating six `package` strings, and it
+    //     contains no `@openai/codex-acp` -- no `openai` or `codex` occurs in
+    //     that file at all beyond fast-agent's unrelated
+    //     `FAST_AGENT_MODEL: "codexplan"`. These six are what the document
+    //     enumerates; nothing here claims to be exhaustive of what is live.
+    let documented: [(&str, &str); 6] = [
+        ("npx", "agoragentic-mcp@1.3.0"),
+        ("npx", "@agentclientprotocol/claude-agent-acp@0.73.0"),
+        ("npx", "@google/gemini-cli@0.58.0"),
+        ("npx", "@scope/package"),
+        ("uvx", "fast-agent-acp==0.10.1"),
+        ("uvx", "package-name"),
+    ];
+    for (kind, package) in documented {
+        let json = format!(r#"{{"{kind}": {{"package": "{package}"}}}}"#);
+        let result: Result<Distribution, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_ok(),
+            "the documented {kind} package value {package:?} must remain accepted: {result:?}"
+        );
+    }
+}
+
+// ---- Item 1 (fix round 5): npm's `fromFile` directory-install route ----
+
+#[test]
+fn distribution_deserialization_rejects_scoped_looking_npm_directory_specs() {
+    // npm-package-arg routes a spec to `fromFile` -- a local *directory*
+    // install, registry=false, fetchSpec=<cwd>/<spec> -- whenever it has
+    // slashes and validate-npm-package-name rejects the name, which it does
+    // for any name where encodeURIComponent(x) !== x. Round 4's `@scope/name`
+    // rule (non-empty sides, one `/`) let 89 such forms through, measured
+    // against npm's own classifier over an 889-string sweep; end to end they
+    // produced Ok(LaunchConfig(Npx { package: "@scope/na$me" })). A sample
+    // spanning the character classes and all three positions.
+    for package in [
+        "@scope/na$me",
+        "@scope/naéme",
+        "@sc%ope/name",
+        "@scope/name+",
+        "@scope/na\\\\me",
+        "@scope/na;me",
+        "@scope/na|me",
+        "@scope/na`me",
+    ] {
+        let json = format!(r#"{{"npx": {{"package": "{package}"}}}}"#);
+        let result: Result<Distribution, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "the npm directory spec {package:?} must be rejected: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn distribution_deserialization_keeps_the_npm_charset_rule_off_the_uvx_field() {
+    // The rule is npx-only on purpose: the live uvx value uses `=`. Asserting
+    // both directions on the *same* string is what makes this a pin on the
+    // kind-awareness rather than on the charset.
+    let uvx: Result<Distribution, _> =
+        serde_json::from_str(r#"{"uvx": {"package": "fast-agent-acp==0.10.1"}}"#);
+    assert!(
+        uvx.is_ok(),
+        "the live uvx value must remain accepted: {uvx:?}"
+    );
+    let npx: Result<Distribution, _> =
+        serde_json::from_str(r#"{"npx": {"package": "fast-agent-acp==0.10.1"}}"#);
+    assert!(
+        npx.is_err(),
+        "the same string under npx must be rejected -- `=` is not npm-URL-safe: {npx:?}"
+    );
+}
+
+// ---- Item 7(a): resolve_launch must resolve using a stale registry cache,
+// not only a fresh one ----
+
+#[test]
+fn resolve_launch_resolves_using_a_stale_registry_cache_not_only_a_fresh_one() {
+    // Pins Ruling C-P13(e): resolve_launch must call
+    // load_cached_allow_stale, not load_cached — a mutation swapping the two
+    // passed the rest of this module's suite because every other
+    // resolve_launch test uses a cache whose TTL has not yet elapsed.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(0), // zero TTL: the entry reads as stale immediately
+    );
+    cache.store(&sample_registry()).unwrap();
+    cache.store_quarantine(&empty_quarantine()).unwrap();
+
+    let launch = cache
+        .resolve_launch("codex")
+        .expect("a stale-but-present registry cache must still resolve, per C-P13(e)");
+    assert!(launch.is_npx());
+}
+
+// ---- Final fix wave, Item 1: the two remaining `fromFile` syntaxes, and
+// the uvx path separator ----
+
+#[test]
+fn distribution_deserialization_rejects_a_leading_dot_on_the_name_side_of_a_scoped_spec() {
+    // `validate-npm-package-name` rejects "name cannot start with a period",
+    // so npa routes these to `fromFile`. Round 5's `starts_with('.')` test
+    // could not see them: the string starts with `@`. Measured with npm
+    // 11.16.0's bundled npm-package-arg 13.0.2:
+    //   @scope/.evil-pkg -> type=directory registry=false
+    //                       fetchSpec=<cwd>/@scope/.evil-pkg
+    //   @scope/.         -> type=directory registry=false fetchSpec=<cwd>/@scope
+    for package in ["@scope/.evil-pkg", "@scope/."] {
+        let json = format!(r#"{{"npx": {{"package": "{package}"}}}}"#);
+        let result: Result<Distribution, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "the directory spec {package:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_leading_dot_in_the_version_part() {
+    // A different npa branch from the one above: `isFileSpec` (npa.js:95,
+    // `isPosixFile = /^(?:[.]|~[/]|[/]|[a-zA-Z]:)/`) applied to the post-`@`
+    // part, needing neither a `/` nor an invalid name. Measured:
+    //   codex@.evil       -> type=directory fetchSpec=<cwd>/.evil
+    //   codex@.           -> type=directory fetchSpec=<cwd>   (the daemon's own
+    //                        working directory -- no planted artifact needed)
+    //   @scope/name@.evil -> type=directory fetchSpec=<cwd>/.evil
+    //   pkg@.a@           -> type=directory fetchSpec=<cwd>/.a@
+    //
+    // `pkg@.a@` is the case that pins the *delimiter*: npa splits an unscoped
+    // spec at its FIRST `@`, so its version part is `.a@`, while an
+    // implementation splitting at the last `@` reads `""` and accepts it. This
+    // test fails against `rsplit_once('@')` and passes against
+    // `split_once('@')`; nothing else in this suite distinguishes the two.
+    for package in ["codex@.evil", "codex@.", "@scope/name@.evil", "pkg@.a@"] {
+        let json = format!(r#"{{"npx": {{"package": "{package}"}}}}"#);
+        let result: Result<Distribution, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "the directory spec {package:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn distribution_deserialization_rejects_a_slash_in_a_uvx_package_but_not_an_npx_one() {
+    // pip's `_looks_like_path` returns true for any string containing a `/`,
+    // and uv follows it: measured offline against uv 0.12.9 with a directory
+    // planted at <cwd>/@scope/name,
+    //   uv pip install --no-deps --dry-run --offline '@scope/name'
+    //     + planted @ file:///.../@scope/name
+    // `@scope/name` is an npm concept with no meaning on the uvx branch.
+    // Asserting both kinds on the *same* string pins the kind-awareness rather
+    // than the separator.
+    let uvx: Result<Distribution, _> =
+        serde_json::from_str(r#"{"uvx": {"package": "@scope/name"}}"#);
+    assert!(
+        uvx.is_err(),
+        "a `/` in a uvx package is a path separator and must be rejected: {uvx:?}"
+    );
+    let npx: Result<Distribution, _> =
+        serde_json::from_str(r#"{"npx": {"package": "@scope/name"}}"#);
+    assert!(
+        npx.is_ok(),
+        "the same string under npx is npm's real scoped grammar: {npx:?}"
+    );
+}
+
+// ---- Final fix wave, Item 2: `archive` ----
+
+#[test]
+fn distribution_deserialization_rejects_a_binary_archive_that_is_not_an_https_url() {
+    // `archive` reached `LaunchConfig::archive()` -- the URL the daemon is
+    // told to download -- with no validation at all. Every case here resolved
+    // cleanly before this wave.
+    for archive in [
+        "http://attacker.example/x.tar.gz",
+        "http://169.254.169.254/latest/meta-data/",
+        "file:///etc/passwd",
+        "ftp://attacker.example/x.tar.gz",
+        "//attacker.example/x.tar.gz",
+        "https://example.invalid/a/../../x.tar.gz",
+        "https://example.invalid/x .tar.gz",
+        "https://example.invalid/x\ny.tar.gz",
+        "",
+    ] {
+        let json = serde_json::json!({
+            "binary": {"linux-x86_64": {"archive": archive, "cmd": "./x"}}
+        });
+        let result: Result<Distribution, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "the archive URL {archive:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn distribution_deserialization_accepts_the_documented_archive_values() {
+    // amp-acp's five live release URLs (ACP-REGISTRY-FORMAT.md:410) and the
+    // schema example's own placeholder shape -- Item 2 must not cost any of
+    // them.
+    for archive in [
+        "https://github.com/tao12345666333/amp-acp/releases/download/v0.9.0/amp-acp-darwin-aarch64.tar.gz",
+        "https://github.com/tao12345666333/amp-acp/releases/download/v0.9.0/amp-acp-darwin-x86_64.tar.gz",
+        "https://github.com/tao12345666333/amp-acp/releases/download/v0.9.0/amp-acp-linux-aarch64.tar.gz",
+        "https://github.com/tao12345666333/amp-acp/releases/download/v0.9.0/amp-acp-linux-x86_64.tar.gz",
+        "https://github.com/tao12345666333/amp-acp/releases/download/v0.9.0/amp-acp-windows-x86_64.zip",
+    ] {
+        let json = serde_json::json!({
+            "binary": {"linux-x86_64": {"archive": archive, "cmd": "./amp-acp"}}
+        });
+        let result: Result<Distribution, _> = serde_json::from_value(json);
+        assert!(
+            result.is_ok(),
+            "the live archive URL {archive:?} must remain accepted: {result:?}"
+        );
+    }
+}
+
+// ---- Final fix wave, Item 3: launch data is reachable only through
+// `resolve_launch` ----
+
+#[test]
+fn listing_agents_yields_ids_and_names_without_any_launch_data() {
+    // `AgentSummary` carries exactly two fields, so a lister cannot receive
+    // `package`/`archive`/`cmd`/`env` as a by-product of listing -- which is
+    // how `load_cached` handed every C8 control (quarantine, platform,
+    // sha256) a way around itself. This test is the positive half; the
+    // structural half is that `load_cached`/`load_cached_allow_stale` are
+    // `pub(crate)` and so unnameable from this file at all.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = RegistryCache::new(
+        dir.path().join("registry.json"),
+        dir.path().join("quarantine.json"),
+        Duration::from_secs(3600),
+    );
+    cache.store(&sample_registry()).unwrap();
+
+    let summaries = cache.list_agents();
+    assert_eq!(summaries.len(), 2);
+    let codex = summaries
+        .iter()
+        .find(|a| a.id == "codex")
+        .expect("codex is in the stored registry");
+    assert_eq!(codex.name, "Codex");
+    // The launch data for that same agent is reachable only by resolving it,
+    // which is gated: with no quarantine cached at all, it fails closed.
+    let err = cache
+        .resolve_launch("codex")
+        .expect_err("no quarantine cache -> fail closed, even for a listed agent");
+    assert!(
+        matches!(err, ResolveError::QuarantineUnavailable),
+        "expected QuarantineUnavailable, got {err:?}"
+    );
+}
