@@ -324,3 +324,124 @@ async fn bedrock_anthropic_messages_is_conformant() {
         .await
         .assert_green();
 }
+
+/// A transport that forwards to a real `CassetteTransport` but first
+/// records the exact headers the request carried -- `CassetteTransport::
+/// send` itself ignores `_req` entirely and replays the same recorded body
+/// regardless, so nothing in the conformance harness above can observe what
+/// `SigV4Credential::apply` actually signed. Mirrors `openai_chat_provider_
+/// test.rs`'s identical `RecordingTransport` helper.
+struct RecordingTransport {
+    inner: roundhouse_provider::CassetteTransport,
+    captured_headers: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl roundhouse_provider::HttpTransport for RecordingTransport {
+    fn send<'a>(
+        &'a self,
+        req: HttpRequest,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<roundhouse_provider::HttpResponseStream, roundhouse_provider::TransportError>,
+    > {
+        *self.captured_headers.lock().unwrap() = req.headers.clone();
+        self.inner.send(req)
+    }
+}
+
+/// Fix-round-2 Fix 8: fix-round-1's fix made `test_sigv4_credentials` read
+/// `service` from the profile's own `AuthKind::SigV4 { service }` instead of
+/// a hand-written literal -- a real change, but not one that would have
+/// caught the regression it was written for. `CassetteTransport::send`
+/// (`src/cassette.rs`) ignores its request and replays regardless, and
+/// nothing in this file ever inspected the produced `authorization` header
+/// -- so reverting `bedrock-anthropic-messages.toml`'s `service` back to the
+/// historical wrong literal `"bedrock"` (the regression this whole mechanism
+/// exists to catch) would leave every test in this file green.
+///
+/// This test asserts on something derived from the produced `authorization`
+/// header instead: it drives `stream_chat` through `RecordingTransport`,
+/// then parses the signed SigV4 header's `Credential=<key>/<date>/<region>/
+/// <service>/aws4_request` scope and asserts the `<service>` segment equals
+/// a HARDCODED expected value -- REALITY-CORRECTIONS §15 rule 3: an earlier
+/// draft of this test read the expected value from
+/// `profile.defaults.auth`'s own `service` field, which made it a tautology
+/// (both "expected" and "actual" trace back to the same, possibly-reverted,
+/// TOML field) -- confirmed hollow by reverting the TOML to `"bedrock"` and
+/// watching that draft stay green. `"bedrock-mantle"` is hardcoded here
+/// instead, matching Task 15's own corrected value (the `bedrock-mantle.
+/// {region}.api.aws` host this profile's `base_url` uses, distinct from
+/// `bedrock-converse.toml`'s `bedrock-runtime` host), so this test can only
+/// pass if the profile's ACTUAL, LIVE declared value still matches what it
+/// is supposed to be, not merely whatever it currently says.
+///
+/// Confirmed by reverting `bedrock-anthropic-messages.toml`'s `service` to
+/// `"bedrock"` and re-running: see this task's report for the paired
+/// RED/GREEN transcript (the revert is not present in this commit -- it
+/// would ship a wrong profile value; only its evidence is).
+#[tokio::test]
+async fn bedrock_anthropic_messages_sigv4_header_scope_matches_declared_service() {
+    use roundhouse_provider::{ChunkStrategy, Provider, RequestCtx};
+
+    const EXPECTED_SERVICE: &str = "bedrock-mantle";
+
+    let profile = load("bedrock-anthropic-messages");
+    // Premise check only -- deliberately does NOT assert the service VALUE
+    // (that would make this a second copy of the same tautology the final
+    // assertion below exists to avoid). It only confirms the profile still
+    // declares SigV4 at all, so a `credentials()` call below has something
+    // to sign with.
+    assert!(
+        matches!(&profile.defaults.auth, AuthKind::SigV4 { .. }),
+        "test premise: bedrock-anthropic-messages must declare SigV4 auth, got {:?}",
+        profile.defaults.auth
+    );
+
+    let cassette = roundhouse_provider::CassetteTransport::from_file(
+        &cassette_path("bedrock-anthropic-messages", "text.cassette"),
+        ChunkStrategy::WholeBody,
+    )
+    .expect("text.cassette must parse");
+    let transport = Arc::new(RecordingTransport {
+        inner: cassette,
+        captured_headers: std::sync::Mutex::new(Vec::new()),
+    });
+
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: transport.clone(),
+        api_key: String::new(),
+        credentials: Some(test_sigv4_credentials(&profile)),
+    };
+    let provider = AnthropicMessagesProfileProvider::new(profile);
+    provider
+        .stream_chat(
+            &fixtures::single_turn_text("anthropic.claude-sonnet-5"),
+            &ctx,
+        )
+        .await
+        .expect("must succeed against the text cassette");
+
+    let headers = transport.captured_headers.lock().unwrap();
+    let auth = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.as_str())
+        .expect("SigV4 signing must produce an authorization header");
+
+    // "AWS4-HMAC-SHA256 Credential=<key>/<date>/<region>/<service>/aws4_request, ..."
+    let scope_segment = auth
+        .split("Credential=")
+        .nth(1)
+        .and_then(|s| s.split(',').next())
+        .unwrap_or_else(|| panic!("authorization header {auth:?} has no Credential=... segment"));
+    let service_in_scope = scope_segment
+        .split('/')
+        .nth(3)
+        .unwrap_or_else(|| panic!("Credential scope {scope_segment:?} has no <service> segment"));
+    assert_eq!(
+        service_in_scope, EXPECTED_SERVICE,
+        "signed Credential scope {scope_segment:?} does not carry the expected service \
+         {EXPECTED_SERVICE:?} -- authorization header was {auth:?}"
+    );
+}
