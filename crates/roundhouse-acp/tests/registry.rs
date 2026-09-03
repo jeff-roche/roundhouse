@@ -77,6 +77,26 @@
 //! - Item 3: `distribution_deserialization_rejects_an_npx_package_that_is_an_archive_file_spec`
 //!   is new — npm's `file` spec syntax (`/[.](?:tgz|tar.gz|tar)$/i`), the one
 //!   shape round 3's grammar still admitted.
+//!
+//! **Fix round 5 (coordinator review of fix round 4):**
+//! - Item 1: `distribution_deserialization_rejects_scoped_looking_npm_directory_specs`
+//!   and `distribution_deserialization_keeps_the_npm_charset_rule_off_the_uvx_field`
+//!   are new — npm's `fromFile` *directory*-install route, the third syntax
+//!   the grammar was short, and the pin that the fix stays `npx`-only so the
+//!   live `uvx` `==` pin syntax survives.
+//! - Item 1/4: `distribution_deserialization_still_accepts_every_live_package_value`
+//!   is renamed `..._still_accepts_the_documented_package_values` and
+//!   corrected twice over — it asserted `fast-agent-acp==0.10.1` (a **uvx**
+//!   value per `ACP-REGISTRY-FORMAT.md:412`) under `"npx"`, and it described
+//!   its list as "the full set of `package` values on the live index" when
+//!   that document enumerates six values out of the 39 entries it reports,
+//!   and contains no `@openai/codex-acp` at all.
+//! - `sample_registry`'s `codex` fixture keeps `@openai/codex-acp` as a
+//!   *fixture* package string. It is not attested as a live registry value
+//!   anywhere in this workspace's reference set (the attested codex spec is
+//!   `@agentclientprotocol/codex-acp`, `ACP-SDK-API.md:449`); nothing in
+//!   these tests depends on it being real, only on it being a well-formed
+//!   scoped name.
 
 use roundhouse_acp::registry::{
     BinaryTarget, Distribution, PackageDistribution, Quarantine, Registry, RegistryAgent,
@@ -969,25 +989,90 @@ fn distribution_deserialization_rejects_an_npx_package_that_is_an_archive_file_s
 }
 
 #[test]
-fn distribution_deserialization_still_accepts_every_live_package_value() {
-    // The full set of `package` values on the live index
-    // (ACP-REGISTRY-FORMAT.md, verified 2026-09-01/2026-09-02) across all
-    // three distribution kinds -- Item 3's new suffix rule and the
-    // non-empty-scope/name rule must not have cost any of them.
+fn distribution_deserialization_still_accepts_the_documented_package_values() {
+    // Fix round 5 (Item 1 and Item 4) corrects two errors in the round-4
+    // version of this test.
+    //
+    // (a) It asserted every value under `"npx"`, including
+    //     `fast-agent-acp==0.10.1` -- which ACP-REGISTRY-FORMAT.md:412 records
+    //     as a *uvx* value, PyPI's `==` pin syntax. Under the npx charset rule
+    //     Item 1 adds, that fixture is not merely mislabelled, it is wrong:
+    //     `=` is not a character npm accepts in a registry name. Each value is
+    //     now asserted under the kind the reference document actually gives it.
+    //
+    // (b) It called this "the full set of `package` values on the live index".
+    //     It is not: ACP-REGISTRY-FORMAT.md reports the index carrying 39
+    //     entries (`:405-407`) while enumerating six `package` strings, and it
+    //     contains no `@openai/codex-acp` -- no `openai` or `codex` occurs in
+    //     that file at all beyond fast-agent's unrelated
+    //     `FAST_AGENT_MODEL: "codexplan"`. These six are what the document
+    //     enumerates; nothing here claims to be exhaustive of what is live.
+    let documented: [(&str, &str); 6] = [
+        ("npx", "agoragentic-mcp@1.3.0"),
+        ("npx", "@agentclientprotocol/claude-agent-acp@0.73.0"),
+        ("npx", "@google/gemini-cli@0.58.0"),
+        ("npx", "@scope/package"),
+        ("uvx", "fast-agent-acp==0.10.1"),
+        ("uvx", "package-name"),
+    ];
+    for (kind, package) in documented {
+        let json = format!(r#"{{"{kind}": {{"package": "{package}"}}}}"#);
+        let result: Result<Distribution, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_ok(),
+            "the documented {kind} package value {package:?} must remain accepted: {result:?}"
+        );
+    }
+}
+
+// ---- Item 1 (fix round 5): npm's `fromFile` directory-install route ----
+
+#[test]
+fn distribution_deserialization_rejects_scoped_looking_npm_directory_specs() {
+    // npm-package-arg routes a spec to `fromFile` -- a local *directory*
+    // install, registry=false, fetchSpec=<cwd>/<spec> -- whenever it has
+    // slashes and validate-npm-package-name rejects the name, which it does
+    // for any name where encodeURIComponent(x) !== x. Round 4's `@scope/name`
+    // rule (non-empty sides, one `/`) let 89 such forms through, measured
+    // against npm's own classifier over an 889-string sweep; end to end they
+    // produced Ok(LaunchConfig(Npx { package: "@scope/na$me" })). A sample
+    // spanning the character classes and all three positions.
     for package in [
-        "@agentclientprotocol/claude-agent-acp@0.73.0",
-        "@google/gemini-cli@0.58.0",
-        "@openai/codex-acp",
-        "agoragentic-mcp@1.3.0",
-        "fast-agent-acp==0.10.1",
+        "@scope/na$me",
+        "@scope/naéme",
+        "@sc%ope/name",
+        "@scope/name+",
+        "@scope/na\\\\me",
+        "@scope/na;me",
+        "@scope/na|me",
+        "@scope/na`me",
     ] {
         let json = format!(r#"{{"npx": {{"package": "{package}"}}}}"#);
         let result: Result<Distribution, _> = serde_json::from_str(&json);
         assert!(
-            result.is_ok(),
-            "the live package value {package:?} must remain accepted: {result:?}"
+            result.is_err(),
+            "the npm directory spec {package:?} must be rejected: {result:?}"
         );
     }
+}
+
+#[test]
+fn distribution_deserialization_keeps_the_npm_charset_rule_off_the_uvx_field() {
+    // The rule is npx-only on purpose: the live uvx value uses `=`. Asserting
+    // both directions on the *same* string is what makes this a pin on the
+    // kind-awareness rather than on the charset.
+    let uvx: Result<Distribution, _> =
+        serde_json::from_str(r#"{"uvx": {"package": "fast-agent-acp==0.10.1"}}"#);
+    assert!(
+        uvx.is_ok(),
+        "the live uvx value must remain accepted: {uvx:?}"
+    );
+    let npx: Result<Distribution, _> =
+        serde_json::from_str(r#"{"npx": {"package": "fast-agent-acp==0.10.1"}}"#);
+    assert!(
+        npx.is_err(),
+        "the same string under npx must be rejected -- `=` is not npm-URL-safe: {npx:?}"
+    );
 }
 
 // ---- Item 7(a): resolve_launch must resolve using a stale registry cache,

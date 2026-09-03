@@ -341,10 +341,12 @@
 //!   round 3's own `@scope/name` allowance). [`is_archive_file_spec`] rejects
 //!   that suffix. The brief asked for the check to run per `@`-separated
 //!   part; it runs once over the whole string instead, which catches exactly
-//!   the same set — `npa` anchors its own file test at the end of the
-//!   trailing part, always a suffix of the whole — and a per-part loop was
-//!   written, measured as dead (mutating it away left the suite green), and
-//!   removed. See [`is_archive_file_spec`]'s doc.
+//!   the same set, and a per-part loop was written, measured as dead
+//!   (mutating it away left the suite green), and removed. (Round 4
+//!   justified that by saying `npa` "anchors its own file test at the end of
+//!   the trailing part" — false; `npa` has two `isFileType` tests and the one
+//!   that fires is against the *leading* part. Corrected in round 5, Item 4;
+//!   the decision itself stands.) See [`is_archive_file_spec`]'s doc.
 //!   [`is_plausible_package_name`]'s `@scope/name` rule now also requires
 //!   both sides non-empty, so `"@scope/"` and `"@/"` no longer pass as
 //!   "plausible" — the doc claimed npm's scoped grammar and the code only
@@ -367,6 +369,60 @@
 //!   do not fail every real entry — so unknown *entry-level* keys are in fact
 //!   tolerated, and the strictness comes from elsewhere. Reworded to name
 //!   what actually enforces it.
+//!
+//! # Fix round 5 (review of the round-4 diff)
+//!
+//! - **Item 1 — the package grammar was a *third* npm syntax short.**
+//!   `npm-package-arg` routes a spec to `fromFile` — a local **directory**
+//!   install, `registry=false`, `fetchSpec=<cwd>/<spec>` — whenever the spec
+//!   has slashes and `validate-npm-package-name` rejects the name, and that
+//!   validator rejects any name where `encodeURIComponent(x) !== x`. Round 4's
+//!   `@scope/name` rule only required non-empty sides and a single `/`, so
+//!   every scoped-*looking* spec containing a URL-unfriendly character passed:
+//!   measured over an 889-string sweep against npm's own classifier, **89
+//!   forms survived**, e.g. `@scope/na$me`, `@scope/naéme`, `@sc%ope/name`,
+//!   `@scope/name+`, `@scope/na\me`, each of which round 4 turned into
+//!   `Ok(LaunchConfig(Npx { .. }))` end to end. [`is_npm_url_safe_spec`] now
+//!   requires an allowlisted character set, applied to `npx` **only** —
+//!   [`is_plausible_package_name`] is shared with `uvx`, whose live value
+//!   `fast-agent-acp==0.10.1` legitimately uses `=`, so the kind-awareness
+//!   lives in [`validate_package_distribution`] and `kind` became the
+//!   [`PackageKind`] enum so a call-site typo cannot silently disable it.
+//! - **Item 2 — round 4's bounded-allocation claim was measurably false, and
+//!   the allocation is now actually bounded.** Round 4 said no transient
+//!   allocation behind the warning list could be inflated by a large hostile
+//!   document; [`partition_registry_agents`]'s `by_id` map is exactly such an
+//!   allocation, retaining a key and a slot per distinct *claimed* id
+//!   (poisoned ids included) — measured at +26.3 MB peak RSS, ~416 bytes per
+//!   id, on a body sized to sit inside [`MAX_RESPONSE_BYTES`]. The claim is
+//!   reworded to state only what it bounds, and
+//!   [`MAX_REGISTRY_AGENT_ENTRIES`] now rejects an oversized document outright
+//!   so `by_id` is bounded by construction; what stays unbounded (the
+//!   `Vec<serde_json::Value>` `serde_json` materializes before this crate sees
+//!   it) is disclosed rather than claimed away.
+//! - **Item 3 — the "no stderr writes" invariant is pinned by a test.** Round
+//!   4 removed every write and reported that no dependency-free test could
+//!   catch a re-added one. That was wrong: `roundhouse-core`'s
+//!   `no_io_no_async.rs` is exactly that pattern, and a reviewer confirmed the
+//!   gap by mutating `Registry::deserialize` to re-add an `eprintln!` with the
+//!   suite still green. `tests/no_stdio_writes.rs` now walks this crate's
+//!   `src/` and fails on `eprintln!`/`println!`/`eprint!`/`print!`/`dbg!`
+//!   outside doc comments.
+//! - **Item 4 — four false or stale claims in shipped comments, corrected.**
+//!   `npa("evil.tgz@1.0.0")` throws `EINVALIDTAGNAME` rather than resolving as
+//!   a registry package (accepting it is still safe — npm denies, it does not
+//!   install — so only the reason changed); `npa`'s file test that fires here
+//!   is against the *leading* `@`-part, not the trailing one; `"@scope/"` and
+//!   `"@/"` **are** installable directory specs (`<cwd>/@scope`, `<cwd>/@`),
+//!   not "not installable at all" — that wrong premise is what hid Item 1 for
+//!   a round; and the "every live `package` value, from
+//!   `ACP-REGISTRY-FORMAT.md`" claims were not sourced from that file, which
+//!   enumerates six values and contains no `@openai/codex-acp` at all. See
+//!   [`is_plausible_package_name`] and [`is_archive_file_spec`].
+//! - **Item 5 — the availability lever the round-4 collision rule creates is
+//!   now a recorded decision.** See [`partition_registry_agents`].
+//! - **Item 6 — a positive control** for the `evil.tgz@1.0.0` acceptance
+//!   round 4's rationale argued for and never pinned.
 
 use crate::peer_text::{escape_and_cap_peer_str, EscapedPeerStr};
 use serde::de::DeserializeOwned;
@@ -532,10 +588,10 @@ impl TryFrom<RawDistribution> for Distribution {
             return Err("distribution must have at least one of npx, uvx, or binary".to_string());
         }
         if let Some(npx) = &raw.npx {
-            validate_package_distribution("npx", npx)?;
+            validate_package_distribution(PackageKind::Npx, npx)?;
         }
         if let Some(uvx) = &raw.uvx {
-            validate_package_distribution("uvx", uvx)?;
+            validate_package_distribution(PackageKind::Uvx, uvx)?;
         }
         for (target, binary) in &raw.binary {
             validate_binary_target(target, binary)?;
@@ -548,23 +604,79 @@ impl TryFrom<RawDistribution> for Distribution {
     }
 }
 
+/// Which packaging ecosystem a [`PackageDistribution`] belongs to.
+///
+/// **Fix round 5 (Item 1):** this was a `kind: &str` carrying `"npx"` or
+/// `"uvx"` purely to make the error message say which. It is now a type
+/// because round 5 makes one of the `package` rules *kind-specific*
+/// ([`is_npm_url_safe_spec`] applies to `npx` only, because the live `uvx`
+/// value `fast-agent-acp==0.10.1` legitimately uses `=`). With a `&str`, a
+/// typo at a call site (`"npm"`, `"Npx"`) would silently disable a security
+/// check and still compile; with this enum a new distribution kind is a
+/// compile error at the `match` below instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageKind {
+    Npx,
+    Uvx,
+}
+
+impl PackageKind {
+    /// The name used in error messages — the same two literals the previous
+    /// `&str` parameter carried, so the rendered errors are unchanged.
+    fn as_str(self) -> &'static str {
+        match self {
+            PackageKind::Npx => "npx",
+            PackageKind::Uvx => "uvx",
+        }
+    }
+
+    /// Whether this kind's `package` must additionally be
+    /// [`is_npm_url_safe_spec`]. `npx` only — see [`is_npm_url_safe_spec`].
+    fn requires_npm_url_safe_spec(self) -> bool {
+        match self {
+            PackageKind::Npx => true,
+            PackageKind::Uvx => false,
+        }
+    }
+}
+
 /// Item 4: validates the two launch fields a `PackageDistribution` exposes
-/// that actually reach a future command line (`package`, `env`) — `kind` is
-/// `"npx"` or `"uvx"`, used only to make the error message say which.
-fn validate_package_distribution(kind: &str, dist: &PackageDistribution) -> Result<(), String> {
+/// that actually reach a future command line (`package`, `env`) — `kind`
+/// selects the `npx`-only rule (fix round 5, Item 1) and names the offending
+/// field in the error message.
+fn validate_package_distribution(
+    kind: PackageKind,
+    dist: &PackageDistribution,
+) -> Result<(), String> {
+    let kind_name = kind.as_str();
     if !is_plausible_package_name(&dist.package) {
         return Err(format!(
-            "{kind} package name is not accepted (must not be empty; must not start with `-`, \
-             `.`, `/`, or `~`; must not contain `..`, `:`, or `#`; must not contain a control or \
-             whitespace character; must not end with `.tgz`, `.tar.gz`, or `.tar`; a `/` is only \
-             accepted as the single separator of a leading `@scope/name` with both sides \
-             non-empty): {}",
+            "{kind_name} package name is not accepted (must not be empty; must not start with \
+             `-`, `.`, `/`, or `~`; must not contain `..`, `:`, or `#`; must not contain a \
+             control or whitespace character; must not end with `.tgz`, `.tar.gz`, or `.tar`; a \
+             `/` is only accepted as the single separator of a leading `@scope/name` with both \
+             sides non-empty): {}",
+            escape_and_cap_peer_str(&dist.package)
+        ));
+    }
+    // Item 1 (fix round 5): npm routes a spec to a local *directory* install
+    // whenever it has a `/` and `validate-npm-package-name` rejects the name,
+    // and that validator rejects any name where `encodeURIComponent(x) != x`.
+    // The `@scope/name` rule above only checks non-empty sides and a single
+    // `/`, so every scoped-*looking* spec carrying a URL-unfriendly character
+    // walked straight through. `npx`-only: `uvx`'s live
+    // `fast-agent-acp==0.10.1` legitimately uses `=`.
+    if kind.requires_npm_url_safe_spec() && !is_npm_url_safe_spec(&dist.package) {
+        return Err(format!(
+            "{kind_name} package name is not accepted (every character must be one of \
+             `A-Z a-z 0-9 . _ ~ ! * ' ( ) -` or the `@`/`/` separators; anything else makes npm \
+             treat the spec as a local directory install rather than a registry name): {}",
             escape_and_cap_peer_str(&dist.package)
         ));
     }
     if let Some(key) = disallowed_env_key(&dist.env) {
         return Err(format!(
-            "{kind} env sets a variable not on the allowlist: {}",
+            "{kind_name} env sets a variable not on the allowlist: {}",
             escape_and_cap_peer_str(key)
         ));
     }
@@ -622,9 +734,13 @@ fn validate_binary_target(target: &str, binary: &BinaryTarget) -> Result<(), Str
 ///   filesystem-path-shaped rather than registry-name-shaped;
 /// - a `:` makes the spec scheme-qualified (`file:`, `git+ssh:`, `https:`,
 ///   ...) — no real npm or PyPI package name published to either public
-///   registry contains one, verified against all 23 live `npx`/`uvx`
-///   package values (2026-09-02: none contain `:`, `..`, or start with `.`,
-///   `/`, or `~`);
+///   registry contains one. (Fix round 5, Item 4 corrects the sourcing round 2
+///   gave here: it said "verified against all 23 live `npx`/`uvx` package
+///   values". `ACP-REGISTRY-FORMAT.md` reports the *counts* 21 `npx` + 2 `uvx`
+///   at `:405-407` but enumerates only six `package` strings; the 23 individual
+///   values were never in any document available to this crate, so what was
+///   actually checked is those six — none of which contains `:` or `..` or
+///   starts with `.`, `/`, or `~`.)
 /// - a `#` fragment — `npx`/`npm install` accepts `#commit-ish` on a
 ///   GitHub-shorthand spec to pin an arbitrary commit; no real registry
 ///   package name contains one;
@@ -639,10 +755,15 @@ fn validate_binary_target(target: &str, binary: &BinaryTarget) -> Result<(), Str
 /// capability as the `git+ssh://` shape round 2 already rejected — one
 /// syntax removed. A `/` is now legal **only** as the single separator of a
 /// leading `@scope/name` (npm's real scoped-package grammar); every other
-/// `/` is rejected outright. Verified this rejects no real data: every live
-/// `package` value in `ACP-REGISTRY-FORMAT.md` containing a `/` starts with
-/// `@` and has exactly one `/` (`@openai/codex-acp`,
-/// `@agentclientprotocol/claude-agent-acp@0.73.0`, `@google/gemini-cli@0.58.0`).
+/// `/` is rejected outright. Verified this rejects no real data — with the
+/// sourcing corrected in fix round 5 (Item 4): `ACP-REGISTRY-FORMAT.md` is not
+/// a dump of the live index, it enumerates **six** `package` values (four
+/// concrete: `agoragentic-mcp@1.3.0` and `fast-agent-acp==0.10.1` at `:411-412`,
+/// `@agentclientprotocol/claude-agent-acp@0.73.0` at `:432` and
+/// `@google/gemini-cli@0.58.0` at `:451`; plus two schema placeholders,
+/// `@scope/package` and `package-name`, at `:44` and `:48`) out of the 39
+/// entries it reports the index carrying. Of those six, every one containing a
+/// `/` starts with `@` and has exactly one `/`.
 ///
 /// **Fix round 4 (Item 3): npm's *file* spec syntax, the one shape still
 /// missing.** `npm-package-arg` — npm's own spec classifier — types any spec
@@ -651,17 +772,29 @@ fn validate_binary_target(target: &str, binary: &BinaryTarget) -> Result<(), Str
 /// `evil.tar.gz`, `evil.tar`, `EVIL.TGZ`, `pkg@evil.tgz`, and
 /// `@scope/name@evil.tgz` all passed, the last of them carried in by round
 /// 3's own `@scope/name` allowance. [`is_archive_file_spec`] now rejects that
-/// suffix — see its doc for why one whole-string check, not a per-part loop,
-/// is exactly what `npa` does. Verified this rejects no real data: every live
-/// `package` value
-/// (`ACP-REGISTRY-FORMAT.md`) still validate — see
-/// `is_plausible_package_name_accepts_real_live_scoped_and_versioned_specs`.
+/// suffix — see its doc for why one whole-string check, not a per-part loop.
+/// Verified this rejects no real data: all six `package` values
+/// `ACP-REGISTRY-FORMAT.md` enumerates still validate — see
+/// `is_plausible_package_name_accepts_the_package_values_the_format_doc_enumerates`.
 ///
 /// Also fixed in round 4: `"@scope/"` (empty name) and `"@/"` (empty scope)
-/// used to pass, because the `@scope/name` rule only counted the `/`. Neither
-/// is a security issue — neither is an installable spec at all — but the doc
-/// above claims npm's scoped-package grammar, so the code now checks that
-/// much of it.
+/// used to pass, because the `@scope/name` rule only counted the `/`.
+///
+/// **Fix round 5 (Item 4): the reason round 4 gave for that was false, and
+/// the false reason is what hid Item 1.** Round 4 wrote that neither string
+/// "is a security issue — neither is an installable spec at all." Both *are*
+/// installable specs: `npa("@scope/")` classifies as `type=directory
+/// registry=false fetchSpec=<cwd>/@scope`, and `npa("@/")` as `<cwd>/@` — the
+/// same local-directory-install route Item 1 closes. Rejecting them was right;
+/// reasoning about them as "not installable" is what stopped anyone asking
+/// what *else* npm routes to `fromFile`, and left the other 89 members of that
+/// class unexamined for a whole round. See [`is_npm_url_safe_spec`].
+///
+/// **Fix round 5 (Item 1):** on the `npx` branch only, every character must
+/// additionally be npm-URL-safe — see [`is_npm_url_safe_spec`], which is
+/// applied by [`validate_package_distribution`] rather than here, because
+/// this function is shared with `uvx` and the live `uvx` value
+/// `fast-agent-acp==0.10.1` legitimately uses `=`.
 ///
 /// A permissive check remains (this does not implement the full npm/PyPI
 /// name grammar), so the error message in [`validate_package_distribution`]
@@ -726,21 +859,87 @@ fn is_plausible_package_name(package: &str) -> bool {
 ///
 /// **Checked against the whole spec, not each `@`-separated part.** The round
 /// 4 brief asked for the latter so that `pkg@evil.tgz` and
-/// `@scope/name@evil.tgz` would be caught. They are — but by the whole-string
-/// check alone, because `npa` anchors its own file test at the end of the
-/// *trailing* `@`-separated part, which is by construction a suffix of the
-/// whole string. A per-part loop was written first and then removed: mutating
+/// `@scope/name@evil.tgz` would be caught. They are — by the whole-string
+/// check alone. A per-part loop was written first and then removed: mutating
 /// it away left the entire suite passing (every case it could fire on, the
 /// whole-string check had already rejected), which is the definition of dead
-/// code. Matching `npa` exactly also avoids over-rejecting: `evil.tgz@1.0.0`
-/// is *not* a file spec to npm — it is the registry package named `evil.tgz`
-/// at version `1.0.0`, resolved inside the registry like any other — and the
-/// per-part version refused it for no safety gain.
+/// code. That decision stands; **fix round 5 (Item 4) corrects the two
+/// statements round 4 used to justify it**, both of which were wrong:
+///
+/// - Round 4 said `npa` "anchors its own file test at the end of the trailing
+///   `@`-separated part." `npa` has **two** `isFileType` tests, and the one
+///   that fires on these specs is applied in `npa()` to the **leading** part
+///   (the name side of the final `@` split), not the trailing version side.
+///   The removed loop is still dead and the whole-string check still catches
+///   the same set — a suffix check over the whole string subsumes a suffix
+///   check over the trailing part either way — but the mechanism named here
+///   was not npm's.
+/// - Round 4 said `evil.tgz@1.0.0` "is *not* a file spec to npm — it is the
+///   registry package named `evil.tgz` at version `1.0.0`, resolved inside the
+///   registry like any other." Measured: `npa("evil.tgz@1.0.0")` **throws
+///   `EINVALIDTAGNAME`**; it resolves to nothing at all. Accepting it here is
+///   still correct and still safe — npm errors out rather than installing
+///   anything, which is denial, not execution — so the code is unchanged, but
+///   the stated reason was false.
+///   `is_plausible_package_name_accepts_evil_tgz_with_a_version_suffix`
+///   (this module's tests) is the positive control for that acceptance
+///   (fix round 5, Item 6), which round 4 argued for and never pinned.
 fn is_archive_file_spec(spec: &str) -> bool {
     let lowered = spec.to_ascii_lowercase();
     [".tgz", ".tar.gz", ".tar"]
         .iter()
         .any(|suffix| lowered.ends_with(suffix))
+}
+
+/// Item 1 (fix round 5): whether every character of `spec` is one npm will
+/// accept in a *registry* package name — `A-Z a-z 0-9 . _ ~ ! * ' ( ) -` —
+/// plus the two structural separators `@` (scope prefix / version separator)
+/// and `/` (scope separator). **`npx` only** — see
+/// [`PackageKind::requires_npm_url_safe_spec`].
+///
+/// **The third file-spec syntax the grammar was still short.** `npm-package-arg`
+/// routes a spec to `fromFile` — a local **directory** install, `registry:
+/// false`, `fetchSpec: <cwd>/<spec>` — whenever the spec has slashes *and*
+/// `validate-npm-package-name` rejects the name; and that validator rejects
+/// any name for which `encodeURIComponent(x) !== x`. Round 4's `@scope/name`
+/// rule only required both sides non-empty and exactly one `/`, so every
+/// scoped-*looking* spec carrying a URL-unfriendly character passed it.
+/// Measured over an 889-string sweep against npm's own classifier, **89 forms
+/// survived** round 4 — spanning double-quote, dollar, percent, ampersand,
+/// plus, comma, semicolon, less-than, equals, greater-than, question mark,
+/// open/close square bracket, backslash, caret, backtick, open/close brace,
+/// pipe, and any non-ASCII character, appearing in the scope, in the name, or
+/// on either boundary.
+/// Five of the 89, each verified as `type=directory registry=false
+/// fetchSpec=<cwd>/<spec>` by `npa`, and each of which round 4 turned into
+/// `Ok(LaunchConfig(Npx { .. }))` end to end:
+/// `@scope/na$me`, `@scope/naéme`, `@sc%ope/name`, `@scope/name+`,
+/// `@scope/na\me`. An allowlist is used rather than a denylist precisely
+/// because the surviving set was a denylist's blind spot both previous rounds.
+///
+/// **What this also rejects, disclosed rather than claimed away.** npm's
+/// *semver-range* syntax after the `@` — `pkg@^1.0.0`, `pkg@>=1`,
+/// `pkg@1 || 2` — uses `^`, `<`, `>`, `=`, `|` and spaces, none of which are
+/// in this set, so those specs are refused too. No live value uses one: all
+/// four concrete `npx` values in `ACP-REGISTRY-FORMAT.md` pin an exact version
+/// (`@agentclientprotocol/claude-agent-acp@0.73.0`, `@google/gemini-cli@0.58.0`,
+/// `agoragentic-mcp@1.3.0`) or none at all, and the schema's own placeholders
+/// (`@scope/package`, `package-name`) use neither. Refusing a range is
+/// fail-closed — a rejected entry is dropped, never launched — and consistent
+/// with this module's posture everywhere else; if upstream ever publishes a
+/// range this is where to revisit it.
+///
+/// Not applied to `uvx`: the live value `fast-agent-acp==0.10.1`
+/// (`ACP-REGISTRY-FORMAT.md:412`) uses `=`, PyPI's own pin syntax, and `uvx`
+/// has no npm directory-install routing for this to protect against.
+fn is_npm_url_safe_spec(spec: &str) -> bool {
+    spec.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '.' | '_' | '~' | '!' | '*' | '\'' | '(' | ')' | '-' | '@' | '/'
+            )
+    })
 }
 
 /// Item 4 (fix round 1), corrected in fix round 2. Whether a binary target's
@@ -941,7 +1140,13 @@ impl<'de> Deserialize<'de> for Registry {
         // Item 2 (fix round 4): the warnings are deliberately discarded here
         // rather than printed -- see this type's doc. `fetch_registry` is the
         // path that returns them to a caller that can log them.
-        let (agents, _warnings) = partition_registry_agents(raw.agents);
+        // Item 2 (fix round 5): an oversized document is refused here too, not
+        // only on the `fetch_registry` path -- this impl is the other way
+        // registry-supplied bytes become a `Registry`. `RegistryError`'s
+        // `Display` for this variant is two numbers and fixed prose, no
+        // registry-controlled text, so it is safe to hand to `Error::custom`.
+        let (agents, _warnings) =
+            partition_registry_agents(raw.agents).map_err(serde::de::Error::custom)?;
         Ok(Registry { agents })
     }
 }
@@ -967,6 +1172,79 @@ impl<'de> Deserialize<'de> for Registry {
 /// flood. `partition_registry_agents_caps_its_warnings_and_reports_the_remainder`
 /// (this module's tests) measures the resulting bound directly.
 const MAX_REPORTED_DROP_WARNINGS: usize = 8;
+
+/// Item 2 (fix round 5): the maximum number of elements a registry document's
+/// `agents` array may declare. Past it the **whole document** is rejected with
+/// [`RegistryError::TooManyAgentEntries`], before a single element is examined.
+///
+/// **Why a cap at all.** Round 4 capped the warning list and then claimed "the
+/// transient allocations behind it" were capped too. They were not:
+/// [`partition_registry_agents`]'s `by_id` map retains a key and a slot per
+/// distinct *claimed* id, poisoned ids included. The coordinator's controlled
+/// A/B (see [`partition_registry_agents`]'s doc for the full table) measured
+/// +26.3 MB of peak RSS — ~416 bytes per distinct claimed id — for a body
+/// deliberately sized to sit inside [`MAX_RESPONSE_BYTES`], purely from
+/// claiming distinct ids. This cap makes `by_id` hold at most
+/// `MAX_REGISTRY_AGENT_ENTRIES` keys by construction, i.e. at most about
+/// 4096 x 416 B ~ 1.7 MB, independent of body size.
+///
+/// **Measured before and after, on one machine, by this round.** The
+/// coordinator's A/B was reproduced here rather than cited: same body shape
+/// (1,048,550 bytes, 66,228 elements, key `"id"` vs key `"zz"`), release
+/// profile, peak RSS read from the process's own `/proc/self/status` `VmHWM`
+/// after building the body (3.9 MB) and again after the deserialize.
+///
+/// | | peak RSS | over body-only | wall |
+/// |---|---|---|---|
+/// | round 4, elements claim a distinct id | 64,332 kB | 60,388 kB | 41.1 ms |
+/// | round 4, same elements claim no id | 37,412 kB | 33,444 kB | 18.1 ms |
+/// | round 5 (this cap), distinct id | 37,256 kB | 33,292 kB | 12.9 ms |
+/// | round 5 (this cap), no id | 37,432 kB | 33,448 kB | 14.4 ms |
+///
+/// The round-4 rows reproduce the coordinator's numbers (60,332 kB / 33,432 kB)
+/// to within noise, and the id-attributable cost to the byte: 26,920 kB over
+/// 66,228 distinct ids is 416 bytes each. With the cap, the two round-5 rows
+/// are equal — claiming distinct ids buys the attacker nothing, which is the
+/// whole point — and wall time falls by ~28 ms because nothing past the count
+/// check runs.
+///
+/// **What the cap does not fix, and this round does not claim it does.** The
+/// ~33 MB that remains in every row is the `Vec<serde_json::Value>`
+/// `serde_json` materializes for `agents` *before* this crate can count it —
+/// ~32x the body, inherent to parsing into owned values, bounded only by
+/// [`MAX_RESPONSE_BYTES`]. Peak RSS for a 1 MiB hostile body is therefore
+/// still ~37 MB after this fix; what is gone is the *extra* 27 MB an attacker
+/// could add on top of it for free.
+///
+/// **Why 4096, and the trade it makes.** The live index carries 39 agents
+/// (`ACP-REGISTRY-FORMAT.md:405-407`), so this is ~105x headroom over what
+/// upstream actually publishes. The trade is real and is recorded here rather
+/// than left emergent: this is a whole-document rejection, so anyone who could
+/// land ~4,057 additional entries in the upstream registry could deny the
+/// whole registry rather than one agent. That is a strictly higher bar than
+/// the single-entry denial [`partition_registry_agents`]'s collision rule
+/// already grants, requires effectively owning the upstream document, and
+/// fails closed (no launch config is produced) rather than open. Truncating to
+/// the first 4096 entries instead was rejected: it would let an attacker push
+/// legitimate entries out by prepending junk, with a *partially* working
+/// registry as the visible result.
+///
+/// **Where it applies, and one place it could bite.** Both ways
+/// registry-supplied bytes become a [`Registry`] go through
+/// [`partition_registry_agents`], so both are covered. The on-disk cache
+/// cannot reach the cap on its own: [`RegistryCache::store`] serializes only
+/// the deduped survivors of a document that already passed it. A caller that
+/// built a `Registry` struct literal with more than the cap's worth of agents
+/// and stored it would write a file it could not read back —
+/// [`RegistryCache::load_cached`] would return `None` and resolution would
+/// fail closed. No such caller exists (the field is `pub` for tests, same
+/// disclosure as [`Registry`]'s own), and the failure direction is the safe
+/// one, but it is stated rather than left to be discovered.
+///
+/// `registry_deserialize_rejects_a_document_over_the_agent_entry_cap`
+/// and `partition_registry_agents_accepts_a_document_exactly_at_the_agent_entry_cap`
+/// (this module's tests) pin both sides of the boundary.
+const MAX_REGISTRY_AGENT_ENTRIES: usize = 4096;
 
 /// Item 3 (fix round 3): the pure, per-entry decision behind [`Registry`]'s
 /// `Deserialize` impl above — factored out so it is directly testable
@@ -1031,11 +1309,62 @@ const MAX_REPORTED_DROP_WARNINGS: usize = 8;
 /// cannot claim an id and so cannot poison one; it simply fails validation on
 /// its own.
 ///
+/// **Fix round 5 (Item 5): the availability lever this creates, recorded as a
+/// decision rather than left emergent.** Keeping neither entry means anyone
+/// who can land a *single* element in the upstream registry document can deny
+/// any agent by id, cheaply and without needing that element to be valid: a
+/// 48-byte `{"id":"codex","name":"N","distribution":{}}` poisons `codex`, and
+/// so does a perfectly *valid* duplicate of the legitimate entry — which
+/// pre-round-4 first-match-wins made harmless. This is accepted as the right
+/// trade against id-shadowing (a denied agent is a launch that does not
+/// happen; a shadowed agent is attacker-chosen code that does), and it is
+/// strictly narrower than pre-round-3 behaviour, where one bad entry took down
+/// the whole document. It is written down here because it is a real capability
+/// this rule grants and nothing else in this module's threat discussion covers
+/// it. [`MAX_REGISTRY_AGENT_ENTRIES`] records the one remaining
+/// whole-document denial and why its bar is much higher.
+///
 /// **Fix round 4 (Item 2): the warning list is bounded** at
 /// [`MAX_REPORTED_DROP_WARNINGS`] individually-named entries plus at most one
-/// remainder line. Past the cap no per-entry `String` is built at all (not
-/// built and then truncated), so neither the returned `Vec` nor the transient
-/// allocations behind it can be inflated by a large hostile document.
+/// remainder line. Past the cap no per-entry warning `String` is built at all
+/// (not built and then truncated), so the returned `Vec<String>` cannot be
+/// inflated by a large hostile document —
+/// `partition_registry_agents_caps_its_warnings_and_reports_the_remainder`
+/// measures it at 9 strings / under 4096 bytes total regardless of input size.
+///
+/// **Fix round 5 (Item 2): round 4's version of that claim went further than
+/// the code did, and was measurably wrong.** It said "neither the returned
+/// `Vec` nor *the transient allocations behind it*" could be inflated. `by_id`
+/// below is exactly such a transient allocation, and it retains one key and
+/// one slot per **distinct claimed id** — including ids that only ever
+/// poisoned. Controlled A/B by the coordinator, two byte-identical
+/// 1,048,550-byte bodies with identical entry counts (66,228), differing only
+/// in whether each element's key is `"id"` or `"zz"`, release build, measured
+/// through the public `Registry` deserialize:
+///
+/// | body | peak RSS delta | wall |
+/// |---|---|---|
+/// | elements claiming a distinct id | 60,332 kB (58.9x body) | 42.5 ms |
+/// | identical elements claiming no id | 33,432 kB (32.6x body) | 22.3 ms |
+///
+/// Attributable to `by_id`: +26.3 MB, ~416 bytes per distinct claimed id, plus
+/// ~20 ms. Round 5 reproduced that A/B independently before acting on it
+/// (26,920 kB / 416 bytes per id / +23 ms, within noise of the above) and
+/// records both the before and after numbers under
+/// [`MAX_REGISTRY_AGENT_ENTRIES`]. Round 5 bounds it: a document declaring
+/// more than
+/// [`MAX_REGISTRY_AGENT_ENTRIES`] elements is rejected outright, before any
+/// element is examined, so `by_id` holds at most that many keys by
+/// construction. See that constant for the cap's value, the availability
+/// trade it makes, and the post-fix measurement.
+///
+/// What remains *unbounded* by this function, stated rather than claimed away:
+/// the `Vec<serde_json::Value>` that `serde_json` materializes for `agents`
+/// before this function is called at all. That is the 32.6x/33,432 kB baseline
+/// row above, it is inherent to parsing the document into owned values, and
+/// the only thing capping it is [`MAX_RESPONSE_BYTES`] on the body itself.
+/// The entry cap cannot help there — the count is only knowable once the
+/// `Vec` exists.
 ///
 /// The returned agents are ordered by `id` (a consequence of the `BTreeMap`
 /// the deduplication uses), not in document order. Nothing depends on the
@@ -1043,7 +1372,15 @@ const MAX_REPORTED_DROP_WARNINGS: usize = 8;
 /// by exact `id`, which this function has just made unique.
 fn partition_registry_agents(
     raw_agents: Vec<serde_json::Value>,
-) -> (Vec<RegistryAgent>, Vec<String>) {
+) -> Result<(Vec<RegistryAgent>, Vec<String>), RegistryError> {
+    // Item 2 (fix round 5): bound `by_id` by refusing an oversized document
+    // outright, before a single element is examined.
+    if raw_agents.len() > MAX_REGISTRY_AGENT_ENTRIES {
+        return Err(RegistryError::TooManyAgentEntries {
+            received: raw_agents.len(),
+            limit: MAX_REGISTRY_AGENT_ENTRIES,
+        });
+    }
     // Keyed on the id each element *claims* in its raw JSON, not on the id of
     // an element that successfully validated: the reported attack's victim
     // entry is the one that fails validation, so a map of survivors alone
@@ -1114,7 +1451,7 @@ fn partition_registry_agents(
             "... and {remainder} more registry agent entries dropped"
         ));
     }
-    (by_id.into_values().flatten().collect(), warnings)
+    Ok((by_id.into_values().flatten().collect(), warnings))
 }
 
 /// Item 3 (fix round 3): parses `bytes` into a [`Registry`] with the same
@@ -1130,7 +1467,7 @@ fn partition_registry_agents(
 fn parse_registry_tolerant(bytes: &[u8]) -> Result<(Registry, Vec<String>), RegistryError> {
     let raw: RawRegistryTolerant =
         serde_json::from_slice(bytes).map_err(RegistryError::from_json_error)?;
-    let (agents, warnings) = partition_registry_agents(raw.agents);
+    let (agents, warnings) = partition_registry_agents(raw.agents)?;
     Ok((Registry { agents }, warnings))
 }
 
@@ -1436,6 +1773,18 @@ pub enum RegistryError {
     /// `EscapedPeerStr`.
     #[error("http {status} response from {url}")]
     BadStatus { url: String, status: u16 },
+    /// Item 2 (fix round 5): the document's `agents` array declared more than
+    /// [`MAX_REGISTRY_AGENT_ENTRIES`] elements, so the whole document is
+    /// refused before any element is examined — see that constant for why the
+    /// bound exists, what it measures, and the availability trade it makes.
+    ///
+    /// Both fields are plain counts computed on this side, not
+    /// registry-supplied text, so — like `ResponseTooLarge` — neither is
+    /// routed through `EscapedPeerStr`. That also makes this variant's
+    /// `Display` safe to hand to `serde::de::Error::custom` on [`Registry`]'s
+    /// `Deserialize` path.
+    #[error("registry document declares {received} agent entries, over the {limit}-entry cap")]
+    TooManyAgentEntries { received: usize, limit: usize },
 }
 
 impl RegistryError {
@@ -2748,22 +3097,53 @@ mod tests {
     }
 
     #[test]
-    fn is_plausible_package_name_accepts_real_live_scoped_and_versioned_specs() {
-        // Every `package` string in ACP-REGISTRY-FORMAT.md: the five concrete
-        // live values, plus the two FORMAT.md schema examples. Fix round 4
-        // (Item 3) must not have cost any of them.
+    fn is_plausible_package_name_accepts_the_package_values_the_format_doc_enumerates() {
+        // Fix round 5 (Item 4): round 4 called this "every `package` string in
+        // ACP-REGISTRY-FORMAT.md: the five concrete live values, plus the two
+        // schema examples", and listed `@openai/codex-acp` among them. That
+        // file contains no `openai` and no `codex` at all (its one `codex`-ish
+        // string is fast-agent's unrelated `FAST_AGENT_MODEL: "codexplan"`),
+        // and it enumerates *six* values, not seven: four concrete
+        // (`:411-412`, `:432`, `:451`) plus two schema placeholders (`:44`,
+        // `:48`). It is also not a dump of the live index -- it reports 39
+        // entries and shows six values -- so "every live value" was never
+        // something this test could assert. These six are what the reference
+        // document actually contains; fix round 4 (Item 3) and fix round 5
+        // (Item 1) must not have cost any of them.
         for package in [
-            "@openai/codex-acp",
+            "agoragentic-mcp@1.3.0",
+            "fast-agent-acp==0.10.1",
             "@agentclientprotocol/claude-agent-acp@0.73.0",
             "@google/gemini-cli@0.58.0",
-            "fast-agent-acp==0.10.1",
-            "agoragentic-mcp@1.3.0",
             "@scope/package",
             "package-name",
         ] {
             assert!(
                 is_plausible_package_name(package),
                 "{package:?} must remain accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn is_plausible_package_name_accepts_the_two_codex_specs_the_reference_docs_carry() {
+        // Kept separate from the test above because these two have different
+        // provenance and the round-4 comment conflated them.
+        // `@agentclientprotocol/codex-acp` is attested: ACP-SDK-API.md:449
+        // records the SDK's own hardcoded `AcpAgent::codex()` shelling out to
+        // `npx -y @agentclientprotocol/codex-acp@latest`.
+        // `@openai/codex-acp` is *not* attested anywhere in this workspace's
+        // reference set -- it is retained only as additional scoped-name shape
+        // coverage, and no claim is made here that it is a live registry
+        // value. Neither may be rejected by Item 1's charset rule.
+        for package in ["@agentclientprotocol/codex-acp", "@openai/codex-acp"] {
+            assert!(
+                is_plausible_package_name(package),
+                "{package:?} must remain accepted"
+            );
+            assert!(
+                is_npm_url_safe_spec(package),
+                "{package:?} must remain accepted by the npx charset rule"
             );
         }
     }
@@ -2870,7 +3250,7 @@ mod tests {
                 }
             }),
         ];
-        let (agents, warnings) = partition_registry_agents(raw_agents);
+        let (agents, warnings) = partition_registry_agents(raw_agents).unwrap();
         assert_eq!(
             agents.len(),
             1,
@@ -2890,7 +3270,7 @@ mod tests {
             "name": "no id field at all",
             "distribution": {"npx": {"package": "x"}}
         })];
-        let (agents, warnings) = partition_registry_agents(raw_agents);
+        let (agents, warnings) = partition_registry_agents(raw_agents).unwrap();
         assert!(agents.is_empty());
         assert_eq!(warnings.len(), 1);
         assert!(
@@ -2943,7 +3323,7 @@ mod tests {
                 "distribution": {"npx": {"package": "attacker-controlled-pkg@9.9.9"}}
             }),
         ];
-        let (agents, warnings) = partition_registry_agents(raw_agents);
+        let (agents, warnings) = partition_registry_agents(raw_agents).unwrap();
         assert!(
             agents.is_empty(),
             "a shadowing entry must not inherit the victim id: {agents:?}"
@@ -2967,7 +3347,7 @@ mod tests {
             })
         };
         let (agents, warnings) =
-            partition_registry_agents(vec![entry("a"), entry("b"), entry("c")]);
+            partition_registry_agents(vec![entry("a"), entry("b"), entry("c")]).unwrap();
         assert!(agents.is_empty(), "{agents:?}");
         assert_eq!(warnings.len(), 2, "{warnings:?}");
     }
@@ -2990,7 +3370,7 @@ mod tests {
                 "id": "beta", "name": "B", "distribution": {"npx": {"package": "b"}}
             }),
         ];
-        let (agents, warnings) = partition_registry_agents(raw_agents);
+        let (agents, warnings) = partition_registry_agents(raw_agents).unwrap();
         let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(ids, vec!["alpha", "beta"]);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -3022,11 +3402,15 @@ mod tests {
         // Round 3 built one String per dropped entry, unbounded: the
         // coordinator measured 349,521 warnings / ~41 MB of Vec<String> from
         // a body sized to fit inside MAX_RESPONSE_BYTES. This measures the
-        // replacement's bound directly. 20,000 entries is well past the cap
-        // and fast enough for a debug-profile test; the id is 1,000
-        // characters so per-warning length is exercised too (escape_and_cap
-        // caps it at PEER_STR_MAX_LEN).
-        const ENTRIES: usize = 20_000;
+        // replacement's bound directly. 4,096 entries is 512x past the
+        // warning cap and fast enough for a debug-profile test; the id is
+        // 1,000 characters so per-warning length is exercised too
+        // (escape_and_cap caps it at PEER_STR_MAX_LEN). Fix round 5 (Item 2)
+        // lowered this from 20,000: MAX_REGISTRY_AGENT_ENTRIES now refuses a
+        // document declaring more than 4,096 elements, so 4,096 is both the
+        // largest input this function will ever see and the exact boundary
+        // value it must still accept.
+        const ENTRIES: usize = 4_096;
         let long_bad_id = "A".repeat(1_000); // uppercase => fails ^[a-z][a-z0-9-]*$
         let raw_agents: Vec<serde_json::Value> = (0..ENTRIES)
             .map(|_| {
@@ -3038,7 +3422,7 @@ mod tests {
             })
             .collect();
 
-        let (agents, warnings) = partition_registry_agents(raw_agents);
+        let (agents, warnings) = partition_registry_agents(raw_agents).unwrap();
 
         assert!(agents.is_empty());
         // MAX_REPORTED_DROP_WARNINGS (8) named entries + 1 remainder line.
@@ -3051,21 +3435,89 @@ mod tests {
             warnings.len()
         );
         assert!(
-            warnings[8].contains("and 19992 more registry agent entries dropped"),
+            warnings[8].contains("and 4088 more registry agent entries dropped"),
             "the remainder line must account for every unnamed drop: {:?}",
             warnings[8]
         );
         // Measured bound (the quantitative-claim rule): each named warning
         // carries at most two PEER_STR_MAX_LEN-capped (128-byte) escaped
         // fragments plus fixed prose. Measured on exactly this input:
-        // 2,668 bytes total across the 9 strings, from 20,000 dropped entries
+        // 2,667 bytes total across the 9 strings, from 4,096 dropped entries
         // whose ids are 1,000 characters each. The same input through round
-        // 3's uncapped shape (`reportable = true`) produced 20,000 warnings.
+        // 3's uncapped shape (`reportable = true`) produced 4,096 warnings.
         let total_bytes: usize = warnings.iter().map(String::len).sum();
         assert!(
             total_bytes < 4096,
             "the whole warning list must stay small: {total_bytes} bytes"
         );
+    }
+
+    // ---- Item 2 (fix round 5): `by_id` is bounded too, not just the
+    // warning list ----
+
+    #[test]
+    fn partition_registry_agents_accepts_a_document_exactly_at_the_agent_entry_cap() {
+        // The cap is inclusive: 4,096 entries must still be processed
+        // normally. Stated as an independent literal rather than
+        // MAX_REGISTRY_AGENT_ENTRIES, so a mutation of the constant fails
+        // here rather than silently moving the boundary with the test.
+        let raw_agents: Vec<serde_json::Value> = (0..4_096)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("agent-{i}"),
+                    "name": "N",
+                    "distribution": {"npx": {"package": "p"}}
+                })
+            })
+            .collect();
+        let (agents, warnings) = partition_registry_agents(raw_agents)
+            .expect("a document exactly at the cap must be accepted");
+        assert_eq!(agents.len(), 4_096, "{} survivors", agents.len());
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn partition_registry_agents_rejects_a_document_one_entry_over_the_cap() {
+        // One past the boundary, and the elements are the *cheapest possible*
+        // -- `null` is not even an object -- so this pins the count check as
+        // happening before any per-element work, not as a side effect of
+        // validation failing.
+        let raw_agents: Vec<serde_json::Value> = vec![serde_json::Value::Null; 4_097];
+        let err = partition_registry_agents(raw_agents)
+            .expect_err("a document over the cap must be rejected outright");
+        assert!(
+            matches!(
+                err,
+                RegistryError::TooManyAgentEntries {
+                    received: 4_097,
+                    limit: 4_096
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn registry_deserialize_rejects_a_document_over_the_agent_entry_cap() {
+        // The bound must hold on the `Deserialize` path too -- that is the
+        // other way registry-supplied bytes become a `Registry`, and the path
+        // the coordinator's A/B measured `by_id`'s +26.3 MB through. Before
+        // this round it returned Ok with an arbitrarily large `by_id` behind
+        // it.
+        let body = format!(r#"{{"agents": [{}]}}"#, vec!["null"; 4_097].join(","));
+        let result: Result<Registry, _> = serde_json::from_str(&body);
+        let err = result.expect_err("an oversized document must not deserialize");
+        assert!(
+            err.to_string().contains("over the 4096-entry cap"),
+            "the error must say why: {err}"
+        );
+
+        // ...and one element fewer is fine, so the rejection is the cap and
+        // not some unrelated parse failure of this body shape.
+        let ok_body = format!(r#"{{"agents": [{}]}}"#, vec!["null"; 4_096].join(","));
+        let registry: Registry = serde_json::from_str(&ok_body)
+            .expect("a document at the cap must still deserialize (tolerantly)");
+        assert!(registry.agents.is_empty(), "{:?}", registry.agents);
     }
 
     #[test]
@@ -3097,9 +3549,14 @@ mod tests {
     fn is_plausible_package_name_rejects_npm_archive_file_specs() {
         // npm-package-arg classifies each of these as a `file` spec via
         // /[.](?:tgz|tar.gz|tar)$/i -- no `/`, `:`, `#`, or leading
-        // `.`/`/`/`~` needed, so none of the earlier rules saw them. The
-        // last two show the check must run against each `@`-separated part,
-        // and that round 3's `@scope/name` allowance was itself a carrier.
+        // `.`/`/`/`~` needed, so none of the earlier rules saw them. Fix
+        // round 5 (Item 4): round 4's comment here said "the last two show
+        // the check must run against each `@`-separated part" -- stale, and
+        // an invitation to reintroduce the per-part loop round 4
+        // deliberately removed as dead code. What the last two actually show
+        // is that the whole-string suffix check already covers a trailing
+        // archive name, and that round 3's `@scope/name` allowance was itself
+        // a carrier.
         for package in [
             "evil.tgz",
             "evil.tar.gz",
@@ -3118,14 +3575,125 @@ mod tests {
 
     #[test]
     fn is_plausible_package_name_rejects_an_empty_scope_or_name() {
-        // Not a security hole -- neither is an installable spec -- but the
-        // doc claims npm's scoped-package grammar, and round 3's code only
-        // counted the `/`.
+        // Fix round 5 (Item 4): round 4's comment here called these "not a
+        // security hole -- neither is an installable spec". Both are.
+        // `npa("@scope/")` classifies as type=directory registry=false
+        // fetchSpec=<cwd>/@scope, and `npa("@/")` as <cwd>/@ -- the same
+        // local-directory-install route Item 1 closes for the other 89 forms.
+        // Rejecting them was right; the reason was wrong, and believing it is
+        // what stopped anyone asking what else npm routes to `fromFile`.
         for package in ["@scope/", "@/", "@/name"] {
             assert!(
                 !is_plausible_package_name(package),
                 "{package:?} must be rejected"
             );
+        }
+    }
+
+    // ---- Item 6 (fix round 5): the positive control for the deviation
+    // is_archive_file_spec's doc argues for ----
+
+    #[test]
+    fn is_plausible_package_name_accepts_evil_tgz_with_a_version_suffix() {
+        // `is_archive_file_spec`'s doc cites this exact string as the case
+        // that motivates checking the whole spec rather than each
+        // `@`-separated part: a per-part check would reject it, and the
+        // whole-string check accepts it. Round 4 argued that and pinned
+        // nothing, so the rationale for a security-relevant deviation had no
+        // test behind it. Accepting it is safe for a reason round 5 had to
+        // correct: `npa("evil.tgz@1.0.0")` does not resolve to a registry
+        // package as round 4 claimed, it throws EINVALIDTAGNAME -- npm denies
+        // rather than installs, so nothing is fetched or executed either way.
+        assert!(is_plausible_package_name("evil.tgz@1.0.0"));
+        // And it must survive the full npx-side validation, not just this one
+        // predicate -- otherwise the deviation is moot in practice.
+        assert!(validate_package_distribution(
+            PackageKind::Npx,
+            &PackageDistribution {
+                package: "evil.tgz@1.0.0".to_string(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+            },
+        )
+        .is_ok());
+    }
+
+    // ---- Item 1 (fix round 5): npm's `fromFile` directory-install route ----
+
+    #[test]
+    fn npx_package_rejects_the_scoped_looking_directory_specs_that_survived_round_4() {
+        // Every one of these was measured as `type=directory registry=false
+        // fetchSpec=<cwd>/<spec>` by npm's own npm-package-arg, and every one
+        // passed round 4's `@scope/name` rule (non-empty sides, exactly one
+        // `/`) end to end into Ok(LaunchConfig(Npx { .. })). They are a
+        // sample of the 89 forms an 889-string sweep found surviving, one per
+        // position (name, scope, boundary) and spanning the character classes
+        // involved.
+        for package in [
+            "@scope/na$me",
+            "@scope/naéme",
+            "@sc%ope/name",
+            "@scope/name+",
+            "@scope/na\\me",
+            "@scope/na\"me",
+            "@scope/na&me",
+            "@scope/na,me",
+            "@scope/na;me",
+            "@scope/na<me",
+            "@scope/na=me",
+            "@scope/na>me",
+            "@scope/na?me",
+            "@scope/na[me",
+            "@scope/na]me",
+            "@scope/na^me",
+            "@scope/na`me",
+            "@scope/na{me",
+            "@scope/na|me",
+            "@scope/na}me",
+        ] {
+            let dist = PackageDistribution {
+                package: package.to_string(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+            };
+            assert!(
+                validate_package_distribution(PackageKind::Npx, &dist).is_err(),
+                "the npm directory spec {package:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn the_npm_charset_rule_is_npx_only_so_the_live_uvx_pin_syntax_survives() {
+        // `is_plausible_package_name` is shared with uvx, and the live uvx
+        // value uses PyPI's `==` pin syntax (ACP-REGISTRY-FORMAT.md:412). If
+        // Item 1's charset rule were applied to both kinds it would reject
+        // real data, so this pins the asymmetry in both directions.
+        let dist = PackageDistribution {
+            package: "fast-agent-acp==0.10.1".to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+        };
+        assert!(
+            validate_package_distribution(PackageKind::Uvx, &dist).is_ok(),
+            "the live uvx value must remain accepted"
+        );
+        assert!(
+            validate_package_distribution(PackageKind::Npx, &dist).is_err(),
+            "the same string under npx must be rejected: `=` is not npm-URL-safe"
+        );
+    }
+
+    #[test]
+    fn is_npm_url_safe_spec_accepts_the_full_npm_unreserved_set_and_separators() {
+        // The allowlist restated independently of the implementation: the
+        // characters `encodeURIComponent` leaves untouched, plus the two
+        // structural separators npm's scoped/versioned grammar needs.
+        assert!(is_npm_url_safe_spec("@AZaz09/-._~!*'()@AZaz09"));
+        // ...and one rejection per class the sweep found, so a mutation that
+        // widens the set to "any ASCII" or "any non-control" fails here.
+        for spec in ["a b", "a%b", "a+b", "a$b", "aé", "a\\b", "a=b", "a^b"] {
+            assert!(!is_npm_url_safe_spec(spec), "{spec:?} must be rejected");
         }
     }
 
