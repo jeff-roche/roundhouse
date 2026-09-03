@@ -14,7 +14,7 @@ use crate::errors::classify;
 use crate::ir::{
     Capabilities, ChatRequest, ChatStream, ModelId, Plan, ProviderError, RequestCtx, TokenCount,
 };
-use crate::profile::ProviderProfile;
+use crate::profile::{AuthKind, ProviderProfile};
 use crate::provider_trait::{BoxFut, Provider};
 use crate::transport::HttpRequest;
 
@@ -119,14 +119,34 @@ impl Provider for OpenAiResponsesProvider {
 
             // REALITY-CORRECTIONS §6: prefer the real `CredentialProvider`
             // mechanism when present, falling back to the Phase 1 bare
-            // `api_key` path (a plain bearer header) when it is not. No
-            // `Provider` impl anywhere in this phase matches on which
-            // concrete credential kind it was given -- `apply` alone decides.
+            // `api_key` path when it is not. No `Provider` impl anywhere in
+            // this phase matches on which concrete credential kind it was
+            // GIVEN (`ctx.credentials`'s kind) -- `apply` alone decides that.
+            // This `else` branch is different: it matches on the profile's
+            // own DECLARED `auth` kind, the same shape every sibling codec in
+            // this crate uses (`openai_chat`, `azure_provider`, `cohere_v2`,
+            // `anthropic_messages`, `google_genai`) so a bare `api_key`
+            // string is only ever used where it can actually express the
+            // declared scheme.
             //
-            // Not in scope (fix-round-1, filed for Task 16): this fallback
-            // hardcodes the `Bearer` scheme and never checks the resolved
-            // URL is `https`, both fine for `api.openai.com` but worth
-            // revisiting once this codec is reused for arbitrary gateways.
+            // Fix-round-2 Fix 1 (security): resolved. Until this fix, this
+            // branch unconditionally wrote a Bearer header regardless of the
+            // profile's declared auth kind -- the only fallback in this
+            // crate without this match. `aws-open-responses.toml` declares
+            // `auth = { kind = "sigv4", ... }`, and the sole production
+            // `RequestCtx` always has `credentials: None` with `api_key`
+            // sourced from `ANTHROPIC_API_KEY`, so selecting that profile
+            // would have sent the operator's Anthropic key, as a Bearer
+            // token, to a real AWS host. See
+            // `aws_open_responses_bare_api_key_fallback_fails_closed_for_sigv4`
+            // in `tests/conformance_openai_responses_batch.rs` for the
+            // fail-closed proof.
+            //
+            // Fix-round-2 Fix 6: the `https`-only half of the old deferral
+            // comment here was already moot -- `ReqwestTransport::new()` sets
+            // `https_only(true)` (`reqwest_transport.rs`), so an `http://`
+            // base-URL override fails closed at the transport regardless of
+            // this match. Only the auth-kind half was ever live.
             if let Some(credentials) = &ctx.credentials {
                 let cred_ctx = crate::credential::CredentialCtx {
                     provider_id: &self.profile.id,
@@ -145,10 +165,44 @@ impl Provider for OpenAiResponsesProvider {
                         ProviderError::Transport(redact_transport_error_text(&e.to_string()))
                     })?;
             } else {
-                http_req.headers.push((
-                    "authorization".to_string(),
-                    format!("Bearer {}", ctx.api_key),
-                ));
+                match &self.profile.defaults.auth {
+                    // Fix-round-2 Fix 2: an empty/whitespace-only api_key
+                    // must fail locally rather than emit a bare
+                    // `Authorization: Bearer ` and let the vendor's remote
+                    // 401 be the caller's first signal -- matches every
+                    // sibling codec's identical guard.
+                    AuthKind::Bearer if ctx.api_key.trim().is_empty() => {
+                        return Err(ProviderError::Unsupported(
+                            "openai-responses codec requires a non-empty api_key for bearer \
+                             auth and no CredentialProvider was supplied"
+                                .into(),
+                        ));
+                    }
+                    AuthKind::Bearer => {
+                        http_req.headers.push((
+                            "authorization".to_string(),
+                            format!("Bearer {}", ctx.api_key),
+                        ));
+                    }
+                    AuthKind::HeaderKey { header } => {
+                        http_req.headers.push((header.clone(), ctx.api_key.clone()));
+                    }
+                    // SigV4/AzureEntra need the real `CredentialProvider`
+                    // (signing/token-exchange logic no bare api_key string
+                    // can express) -- a silent Bearer header here would send
+                    // the request UNAUTHENTICATED (or, worse, authenticated
+                    // as an entirely different principal) rather than
+                    // failing it locally. A missing credential must fail
+                    // closed, not become a remote request the caller has to
+                    // notice went out wrong.
+                    AuthKind::SigV4 { .. } | AuthKind::AzureEntra { .. } => {
+                        return Err(ProviderError::Unsupported(format!(
+                            "openai-responses codec has no CredentialProvider and its bare \
+                             api_key fallback cannot express {:?} auth",
+                            self.profile.defaults.auth
+                        )));
+                    }
+                }
             }
 
             // Fix-round-1 C5: the reviewer traced a real leak through this

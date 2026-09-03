@@ -48,11 +48,16 @@ fn cassette_path(id: &str, name: &str) -> PathBuf {
 }
 
 /// A real `SigV4Credential` (fixed, obviously-fake test key material) --
-/// `aws-open-responses` has no bare-`api_key` fallback that can sign an AWS
-/// request (REALITY-CORRECTIONS §12b: SigV4 "applying" a credential IS
-/// signing it), so the conformance run for that one profile must supply
-/// one. Matches `conformance_anthropic_messages_batch.rs`'s/
-/// `conformance_bedrock_converse.rs`'s identical precedent.
+/// `aws-open-responses` declares `auth = { kind = "sigv4", ... }`, and
+/// (fix-round-2 Fix 1) the bare-`api_key` fallback now fails closed with
+/// `ProviderError::Unsupported` for a SigV4-declared profile rather than
+/// silently sending an unsigned `Authorization: Bearer` header, so the
+/// conformance run for this one profile must supply a real credential to
+/// reach the transport at all. Matches
+/// `conformance_anthropic_messages_batch.rs`'s/
+/// `conformance_bedrock_converse.rs`'s identical precedent. See
+/// `aws_open_responses_bare_api_key_fallback_fails_closed_for_sigv4` below
+/// for the fail-closed proof itself.
 ///
 /// `service` is read from the profile's own declared `AuthKind::SigV4 {
 /// service }` rather than a hand-written literal, so the profile's declared
@@ -211,6 +216,114 @@ async fn databricks_is_conformant() {
 #[tokio::test]
 async fn aws_open_responses_is_conformant() {
     run::<AwsOpenResponsesSubject>().await.assert_green();
+}
+
+/// A transport that panics if `send` is ever called -- proves a request is
+/// rejected before any network I/O is attempted (mirrors
+/// `conformance_google_genai.rs`'s identical helper). Used below to prove
+/// that no `authorization` header of any kind -- Bearer included -- is ever
+/// produced for a SigV4-declared profile lacking real credentials: if the
+/// fallback pushed a header and reached `HttpTransport::send`, this
+/// transport's panic would fail the test for exactly that reason.
+struct PanicsIfCalledTransport;
+
+impl roundhouse_provider::HttpTransport for PanicsIfCalledTransport {
+    fn send<'a>(
+        &'a self,
+        _req: roundhouse_provider::HttpRequest,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<roundhouse_provider::HttpResponseStream, roundhouse_provider::TransportError>,
+    > {
+        panic!(
+            "stream_chat must reject a SigV4-declared profile's bare api_key fallback \
+             before ever calling HttpTransport::send -- no authorization header, Bearer \
+             or otherwise, may reach the wire"
+        )
+    }
+}
+
+/// Fix-round-2 Fix 1 (security, IMPORTANT). Until this fix,
+/// `OpenAiResponsesProvider::stream_chat`'s bare-`api_key` fallback (the
+/// branch taken whenever `ctx.credentials` is `None`) unconditionally wrote
+/// `Authorization: Bearer <ctx.api_key>` regardless of the profile's
+/// declared `auth` kind -- unlike every sibling codec in this crate, it had
+/// no `match &self.profile.defaults.auth`. `aws-open-responses.toml`
+/// declares `auth = { kind = "sigv4", service = "bedrock" }`, and the sole
+/// production `RequestCtx` (`roundhouse-daemon/src/main.rs`) always has
+/// `credentials: None` with `api_key` sourced from `ANTHROPIC_API_KEY` --
+/// so selecting this profile in production would have sent the operator's
+/// Anthropic key, as a Bearer token, to a real, resolvable AWS host
+/// (`bedrock-runtime.us-east-1.amazonaws.com`).
+///
+/// This test proves the fallback now fails closed: `ProviderError::
+/// Unsupported` before `HttpTransport::send` is ever called, so no
+/// `authorization` header -- Bearer or otherwise -- is ever produced. The
+/// `PanicsIfCalledTransport` makes "no header reaches the wire" a structural
+/// guarantee rather than a header-string assertion: the header is pushed
+/// onto the request immediately before `send` is called in the unfixed
+/// code, so "the request never reaches `send`" and "no header is ever
+/// produced for that request" are the same fact here.
+#[tokio::test]
+async fn aws_open_responses_bare_api_key_fallback_fails_closed_for_sigv4() {
+    use roundhouse_provider::{Provider, ProviderError, RequestCtx};
+
+    let profile = load("aws-open-responses");
+    assert!(
+        matches!(profile.defaults.auth, AuthKind::SigV4 { .. }),
+        "test premise: aws-open-responses must declare SigV4 auth, got {:?}",
+        profile.defaults.auth
+    );
+
+    let req = fixtures::single_turn_text("openai.gpt-oss-120b");
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(PanicsIfCalledTransport),
+        api_key: "sk-ant-test-do-not-use".into(),
+        credentials: None,
+    };
+    let provider = OpenAiResponsesProvider::new(profile);
+    // `ChatStream` (the `Ok` payload) does not implement `Debug`, so this
+    // cannot be `.expect_err(..)` -- match explicitly instead.
+    match provider.stream_chat(&req, &ctx).await {
+        Err(err) => assert!(
+            matches!(err, ProviderError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        ),
+        Ok(_) => panic!("a SigV4-declared profile with no real credentials must fail closed"),
+    }
+}
+
+/// Fix-round-2 Fix 2: a Bearer-declared profile (`vercel`) with an empty
+/// `api_key` and no `CredentialProvider` must also fail closed rather than
+/// emit a bare `Authorization: Bearer ` that only earns a remote 401 --
+/// matches `openai_chat_provider_test.rs`'s identical sibling test.
+#[tokio::test]
+async fn vercel_empty_api_key_with_no_credential_provider_fails_closed() {
+    use roundhouse_provider::{Provider, ProviderError, RequestCtx};
+
+    let profile = load("vercel");
+    assert!(
+        matches!(profile.defaults.auth, AuthKind::Bearer),
+        "test premise: vercel must declare bearer auth, got {:?}",
+        profile.defaults.auth
+    );
+
+    let req = fixtures::single_turn_text("openai/gpt-5.4");
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: Arc::new(PanicsIfCalledTransport),
+        api_key: String::new(),
+        credentials: None,
+    };
+    let provider = OpenAiResponsesProvider::new(profile);
+    match provider.stream_chat(&req, &ctx).await {
+        Err(err) => assert!(
+            matches!(err, ProviderError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        ),
+        Ok(_) => panic!("an empty api_key with no credential provider must fail closed"),
+    }
 }
 
 /// These three tests prove each corrected `error_pointer` is actually
