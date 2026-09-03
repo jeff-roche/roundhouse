@@ -1,0 +1,5 @@
+200
+content-type: text/event-stream
+
+data: {"type":"ping"}
+

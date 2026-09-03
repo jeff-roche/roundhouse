@@ -1,0 +1,13 @@
+200
+content-type: text/event-stream
+
+data: {"id":"f4a3d8d8-44f1-7fd1-ab33-58f1070631fd","type":"message-start","delta":{"message":{"role":"assistant"}}}
+
+data: {"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}}
+
+data: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"Partial answer before"}}}}
+
+data: {"type":"content-end","index":0}
+
+data: {"type":"message-end","delta":{"finish_reason":"ERROR"}}
+

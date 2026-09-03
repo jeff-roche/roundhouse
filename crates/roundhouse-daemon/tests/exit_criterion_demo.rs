@@ -46,6 +46,7 @@ async fn human_runs_round_starts_a_session_watches_an_edit_and_sees_it_over_the_
             trace_id: None,
             transport: Arc::new(NoopTransport),
             api_key: "test".into(),
+            credentials: None,
         },
     };
 

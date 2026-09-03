@@ -1,0 +1,9 @@
+# Cohere v2 chat `finish_reason` enum values, fetched from
+# https://docs.cohere.com/reference/chat on 2026-09-02. The full, real,
+# documented set -- 6 values.
+COMPLETE
+STOP_SEQUENCE
+MAX_TOKENS
+TOOL_CALL
+ERROR
+TIMEOUT

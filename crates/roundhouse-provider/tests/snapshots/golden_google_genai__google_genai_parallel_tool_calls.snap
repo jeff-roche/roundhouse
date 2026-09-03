@@ -1,0 +1,41 @@
+---
+source: crates/roundhouse-provider/tests/golden_google_genai.rs
+expression: "enc(&req, EndpointMode::Interactions)"
+---
+{
+  "model": "gemini-3.0-pro",
+  "input": [
+    {
+      "type": "user_input",
+      "content": [
+        {
+          "type": "text",
+          "text": "Weather and time in Tokyo?"
+        }
+      ]
+    }
+  ],
+  "stream": true,
+  "tools": [
+    {
+      "type": "function",
+      "name": "get_weather",
+      "description": "Get the current weather",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "NoParams",
+        "type": "object"
+      }
+    },
+    {
+      "type": "function",
+      "name": "get_time",
+      "description": "Get the current time",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "NoParams",
+        "type": "object"
+      }
+    }
+  ]
+}

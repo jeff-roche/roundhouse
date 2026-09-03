@@ -1,0 +1,16 @@
+id = "cerebras"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = false
+# Cerebras does not support n (multiple completions per request).
+params = { mode = "deny_list", fields = ["n"] }
+base_url = "https://api.cerebras.ai/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"too_many_requests_error" = { disposition = "shed_concurrency" }
+"internal_server_error"   = { disposition = "retry_backoff" }
+"invalid_request_error"   = { disposition = "fatal", category = "quota" }

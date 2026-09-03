@@ -1,0 +1,19 @@
+200
+content-type: text/event-stream
+
+data: {"id":"e3f2c7c7-33f0-6ec0-9a22-47f0969520fc","type":"message-start","delta":{"message":{"role":"assistant"}}}
+
+data: {"type":"content-start","index":0,"delta":{"message":{"content":{"type":"thinking","thinking":""}}}}
+
+data: {"type":"content-delta","index":0,"delta":{"message":{"content":{"thinking":"Assume sqrt(2) = p/q in lowest terms."}}}}
+
+data: {"type":"content-end","index":0}
+
+data: {"type":"content-start","index":1,"delta":{"message":{"content":{"type":"text","text":""}}}}
+
+data: {"type":"content-delta","index":1,"delta":{"message":{"content":{"text":"Therefore sqrt(2) is irrational."}}}}
+
+data: {"type":"content-end","index":1}
+
+data: {"type":"message-end","delta":{"finish_reason":"COMPLETE","usage":{"billed_units":{"input_tokens":15,"output_tokens":40},"tokens":{"input_tokens":15,"output_tokens":40}}}}
+

@@ -17,6 +17,14 @@ const EXPECTED_MEMBERS: &[&str] = &[
     "crates/roundhouse-secrets",
     "crates/roundhouse-sandbox",
     "crates/roundhouse-provider",
+    // `crates/roundhouse-conformance` below is a deliberate, authorized
+    // addition (Phase 6 Task 3) — the shared provider-adapter conformance
+    // suite (§9.10), now an official row in the architecture doc's crate
+    // table (`docs/architecture/02-system-architecture.md` §5.2), not an
+    // accidental extra member. A prior version of that table carried this
+    // row before the crate existed and had it removed pending Task 3; this
+    // re-adds it now that the crate is real.
+    "crates/roundhouse-conformance",
     "crates/roundhouse-tools",
     "crates/roundhouse-mcp",
     "crates/roundhouse-acp",
@@ -92,6 +100,17 @@ const EXPECTED_EDGES: &[(&str, &[&str])] = &[
     ),
     ("roundhouse-sandbox", &["roundhouse-core"]),
     ("roundhouse-provider", &["roundhouse-core"]),
+    // Deliberate, authorized addition (Phase 6 Task 3): the shared
+    // provider-adapter conformance suite (§9.10) depends on
+    // `roundhouse-provider` for the `Provider`/IR types it exercises and on
+    // `roundhouse-core` for `Usage` (which is not re-exported from
+    // `roundhouse-provider`'s crate root). `roundhouse-provider` only
+    // *dev*-depends back (see its own Cargo.toml comment), so this edge
+    // stays acyclic.
+    (
+        "roundhouse-conformance",
+        &["roundhouse-core", "roundhouse-provider"],
+    ),
     (
         "roundhouse-tools",
         &[
@@ -129,9 +148,20 @@ const EXPECTED_EDGES: &[(&str, &[&str])] = &[
         ],
     ),
     ("roundhouse-config", &[]),
+    // `roundhouse-provider` below is a deliberate, authorized addition
+    // (Phase 6 Task 2) — the six concrete `CredentialProvider`
+    // implementations (§9.9) live here and implement
+    // `roundhouse_provider::credential::CredentialProvider` directly;
+    // acyclic because this crate already reaches `roundhouse-provider`
+    // transitively through the `roundhouse-store` edge below.
     (
         "roundhouse-secrets",
-        &["roundhouse-config", "roundhouse-core", "roundhouse-store"],
+        &[
+            "roundhouse-config",
+            "roundhouse-core",
+            "roundhouse-provider",
+            "roundhouse-store",
+        ],
     ),
     (
         "roundhouse-flow",

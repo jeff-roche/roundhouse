@@ -1,0 +1,7 @@
+200
+content-type: text/event-stream
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"4"}]},"index":0}]}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"."}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":3,"cachedContentTokenCount":0,"totalTokenCount":12}}
+

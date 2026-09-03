@@ -325,7 +325,8 @@ pub struct ChatRequest {
 
 use crate::transport::HttpTransport;
 
-/// Request context carrying the trace ID, HTTP transport, and API key.
+/// Request context carrying the trace ID, HTTP transport, API key, and
+/// (Phase 6) an optional `CredentialProvider`.
 ///
 /// Does not derive `Default` or `Debug` because `Arc<dyn HttpTransport>` does not implement
 /// either trait — a transport must be provided explicitly at construction.
@@ -334,8 +335,18 @@ pub struct RequestCtx {
     pub trace_id: Option<String>,
     /// HTTP transport implementation (may be real network or test cassette).
     pub transport: std::sync::Arc<dyn HttpTransport>,
-    /// API key for the provider. Simplified for Phase 1; §9.9's `Secret<String>`/`CredentialProvider` lands in Phase 2.
+    /// API key for the provider. Phase 1's original, simplified credential
+    /// path — kept working untouched. New Phase 6 codecs prefer
+    /// `credentials` when `Some` and fall back to this field when `None`.
     pub api_key: String,
+    /// §9.9's real `CredentialProvider` mechanism (bearer, header-key, OAuth
+    /// refresh, Azure Entra, exec-command, SigV4). `None` for every existing
+    /// construction site — `Option` so adding this field is mechanical
+    /// everywhere `RequestCtx` is already built. The six concrete,
+    /// secret-holding implementations live in `roundhouse-secrets` (this
+    /// crate cannot depend on it — see `credential` module doc comment);
+    /// this field only ever holds the trait object.
+    pub credentials: Option<std::sync::Arc<dyn crate::credential::CredentialProvider>>,
 }
 
 #[derive(Debug, Clone)]

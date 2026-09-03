@@ -1,0 +1,29 @@
+# llama.cpp — self-hosted OpenAI-compatible server (`llama-server`), default
+# port 8080 (stable, long-documented llama.cpp default).
+id = "llama-cpp"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = true
+params = { mode = "allow_all", fields = [] }
+base_url = "http://localhost:8080/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+# Round-8 review, M1/M2: "slot_unavailable" never appears in llama.cpp's
+# real error body. llama.cpp's server (`examples/server`) returns
+# `{"status": "no slot available", "slots_idle": N, "slots_processing": N}`
+# when out of capacity — note `status` here is a STRING field distinct from
+# the HTTP status line, not `error.type`. Critically, this response arrives
+# at HTTP 200 by default; only a caller-supplied `fail_on_no_slot` query
+# parameter (which this codec does not set) makes the server send it at
+# 503 instead. A code_table entry keyed on this field would therefore
+# either never fire (default 200 case, indistinguishable from a genuine
+# completion at the classify() layer, which is only invoked on non-2xx)
+# or depend on this codec opting into a query parameter it doesn't
+# currently send — a real fix would need to change the request, not just
+# this table. Rather than build that speculatively, this table stays
+# deliberately empty; the HTTP-status fallback tier still handles the
+# `fail_on_no_slot`+503 case as a generic (if less specific) Server error.
+[errors]

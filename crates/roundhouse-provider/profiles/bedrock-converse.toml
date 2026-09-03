@@ -1,0 +1,68 @@
+# AWS Bedrock's Converse API (stable, long-published; not spec-gated per
+# §9.4 -- only openai-responses/google-genai are), targeting the legacy
+# non-Claude model families it fronts. Verified against the fetched real
+# AWS API Reference pages for `Converse`/`ConverseStream` (see
+# `src/codec/bedrock_converse/mod.rs`'s module doc comment for the fetch
+# record). Unlike every other codec in this crate, the response is
+# `application/vnd.amazon.eventstream` -- binary length-prefixed framing,
+# not SSE.
+id = "bedrock-converse"
+codec = "bedrock-converse"
+
+[defaults]
+allow_raw_extra = false
+# Region-specific in reality; this is the profile DEFAULT (§9.9) -- a caller
+# targeting another region sets ROUNDHOUSE_BEDROCK_CONVERSE_BASE_URL.
+base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
+
+[defaults.params]
+mode = "allow_only"
+fields = ["temperature", "top_p", "max_tokens", "stop_sequences"]
+
+# The AWS service name SigV4 signs against comes from this field, not a
+# hardcoded string (REALITY-CORRECTIONS §12b) -- `SigV4Credential` is
+# constructed with whatever this profile declares.
+[defaults.auth]
+kind = "sigv4"
+service = "bedrock"
+
+# meta.llama4 deliberately has NO `[[model]]` entry at all: it has no
+# reasoning control on this wire format (Bedrock's base Converse schema has
+# no generic reasoning field for a "legacy" non-Claude model -- only
+# `additionalModelRequestFields`, which is per-model and unverified for any
+# specific model in this profile's scope), which is what makes an
+# Unsupported return on `reasoning.intent` a profile-justified fact rather
+# than a hardcoded branch.
+
+[errors."ThrottlingException"]
+disposition = "shed_concurrency"
+
+[errors."ModelErrorException"]
+disposition = "retry_backoff"
+
+[errors."AccessDeniedException"]
+disposition = "fatal"
+category = "quota"
+
+# Fix-round-1 H7: of the 5 real in-band `ConverseStreamOutput` exceptions
+# this codec recognizes (`decode.rs`'s `KNOWN_EXCEPTION_SHAPES`), only
+# `ThrottlingException` had an entry above -- the other three all reach
+# `stream_chat`'s caller as an `Err` (§13b item 4 was already satisfied), but
+# with no matching table entry `classify` fell through to its HTTP-status
+# default tier keyed on `response.status` (200, since these arrive in-band
+# after a successful connection), landing on `BadRequest { status: 200 }` --
+# permanently fatal for conditions AWS itself documents as retryable
+# (`InternalServerException`: HTTP 500; `ServiceUnavailableException`: HTTP
+# 503; `ModelStreamErrorException`: HTTP 424, all from the fetched
+# `ConverseStream` "Errors" section). `ValidationException` (HTTP 400, a
+# request AWS already rejected on shape) is correctly left with no entry --
+# `classify`'s fallback tier already lands it on the equally-non-retryable
+# `BadRequest`, which is the right disposition for it.
+[errors."InternalServerException"]
+disposition = "retry_backoff"
+
+[errors."ServiceUnavailableException"]
+disposition = "retry_backoff"
+
+[errors."ModelStreamErrorException"]
+disposition = "retry_backoff"

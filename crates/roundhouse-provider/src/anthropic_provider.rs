@@ -2,6 +2,7 @@
 //! built by bridging Task 9's pure encoder and Task 10's pure decoder across
 //! whatever [`HttpTransport`](crate::HttpTransport) `RequestCtx` carries.
 
+use crate::audit::redact_transport_error_text;
 use crate::codec::anthropic_messages::{
     decode_anthropic_messages_stream, encode_anthropic_messages,
 };
@@ -162,11 +163,23 @@ impl Provider for AnthropicMessagesProvider {
             // shape is `Transport(String)`), so the conversion is explicit.
             // `TransportError`'s `Display` never includes request headers, so
             // the API key cannot ride along here.
-            let response = ctx
-                .transport
-                .send(http_req)
-                .await
-                .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            //
+            // Fix round 6, J4: `base_url` is only ever set by `::new()` today
+            // (a fixed, non-secret literal), so this sink has no live
+            // exposure -- but the field is `pub`, and its own doc comment
+            // above (`base_url`'s field doc) says the §9.9
+            // `ROUNDHOUSE_<PROVIDER>_BASE_URL` override "will set this field",
+            // at which point a gateway URL carrying credentials in its query
+            // string or userinfo would flow straight into a
+            // `TransportError::Io`'s `Display` (`reqwest`'s error text embeds
+            // the full request URL) and then onto a physically-immutable
+            // `events` row. Routed through the same `redact_transport_error_text`
+            // every other codec's transport-error sinks use, so the guarantee
+            // holds structurally before that override ever lands, not only
+            // once someone remembers to add it then.
+            let response = ctx.transport.send(http_req).await.map_err(|e| {
+                ProviderError::Transport(redact_transport_error_text(&e.to_string()))
+            })?;
 
             // "Is it 2xx", not "is it below 400". A 3xx would otherwise be
             // handed to the SSE decoder, which skips every frame it cannot

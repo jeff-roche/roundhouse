@@ -1,0 +1,7 @@
+200
+content-type: text/event-stream
+
+data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_5","status":"in_progress"}}
+
+data: {"type":"response.failed","sequence_number":2,"response":{"id":"resp_5","status":"failed","error":{"code":"server_error","message":"the model encountered an error while generating a response"}}}
+

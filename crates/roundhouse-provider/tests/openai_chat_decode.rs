@@ -23,7 +23,9 @@ async fn decodes_streaming_tool_call_into_block_events() {
         .await
         .unwrap();
 
-    let events = decode_openai_chat_stream(resp.body).await;
+    let events = decode_openai_chat_stream(resp.body)
+        .await
+        .expect("must decode successfully");
 
     assert!(matches!(
         events[0],
@@ -74,4 +76,72 @@ async fn decodes_streaming_tool_call_into_block_events() {
         stop_order, start_order,
         "BlockStop must preserve BlockStart's first-seen order"
     );
+}
+
+/// Fix round 1, P1: `Delta` previously had no `content` field at all, so a
+/// plain-text (no tool calls) streaming response decoded to ZERO content
+/// blocks -- `decode_openai_chat_stream` is the sole codec decoder in this
+/// workspace that read `delta.tool_calls` but never `delta.content`. This
+/// pins the fix: text deltas are keyed through the same `DeltaKeyer` used
+/// for tool calls, but via a non-numeric sentinel (`"content"`) so it can
+/// never collide with a tool-call's stringified integer index (the exact
+/// keyer-namespace collision that silently dropped a tool call in
+/// `cohere_v2` two tasks ago).
+#[tokio::test]
+async fn decodes_streaming_text_content_into_block_events() {
+    let sse_bytes = include_bytes!("fixtures/openai_chat_text_content.sse").to_vec();
+    let transport = CassetteTransport {
+        status: 200,
+        headers: vec![],
+        body: sse_bytes,
+        chunk_size: 11,
+    };
+
+    let resp = transport
+        .send(HttpRequest {
+            method: "POST".into(),
+            url: "https://api.openai.com/v1/chat/completions".into(),
+            headers: vec![],
+            body: vec![],
+        })
+        .await
+        .unwrap();
+
+    let events = decode_openai_chat_stream(resp.body)
+        .await
+        .expect("must decode successfully");
+
+    assert!(matches!(
+        events[0],
+        StreamEvent::BlockStart {
+            index: 0,
+            kind: BlockKind::Text
+        }
+    ));
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::BlockDelta {
+                index: 0,
+                delta: BlockDelta::Text(t),
+            } => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "Hello, world!");
+    assert!(matches!(events.last(), Some(StreamEvent::MessageStop)));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        StreamEvent::UsageDelta {
+            input_tokens: Some(9),
+            output_tokens: Some(3),
+            ..
+        }
+    )));
+    // Exactly one BlockStop, for the text block, and it comes before MessageStop.
+    let stop_count = events
+        .iter()
+        .filter(|e| matches!(e, StreamEvent::BlockStop { index: 0 }))
+        .count();
+    assert_eq!(stop_count, 1);
 }

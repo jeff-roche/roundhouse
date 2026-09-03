@@ -1,0 +1,5 @@
+---
+source: crates/roundhouse-provider/tests/golden_bedrock_converse.rs
+expression: err.to_string()
+---
+unsupported: bedrock-converse codec does not encode Opaque blocks

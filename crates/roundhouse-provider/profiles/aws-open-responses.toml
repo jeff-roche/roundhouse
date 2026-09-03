@@ -1,0 +1,73 @@
+# AWS Bedrock — its OpenAI-Responses-compatible endpoint on the
+# `bedrock-runtime` host, distinct from both bedrock-converse.toml (Task 7,
+# legacy non-Claude, binary eventstream, InvokeModel/Converse) and
+# bedrock-anthropic-messages.toml (Task 15, the Anthropic-native Messages
+# API on the separate `bedrock-mantle` host) -- §9.2's "AWS" appears a third
+# time in the Open Responses backer list, this wire format.
+#
+# Verified against AWS's own current docs (fetched 2026-09-02):
+# https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html
+#   "Amazon Bedrock provides the OpenAI Responses API on both the
+#   bedrock-runtime and bedrock-mantle endpoints ... For new applications,
+#   we recommend the bedrock-runtime endpoint" -- this profile uses that
+#   recommended endpoint, matching the brief.
+#   "OPENAI_BASE_URL=\"https://bedrock-runtime.<your-region>.amazonaws.com/openai/v1\""
+#   and "Make a POST request to /v1/responses" (relative to that base) --
+#   base_url below plus this codec's "responses" path-append (provider.rs)
+#   reproduces ".../openai/v1/responses" exactly.
+# https://docs.aws.amazon.com/bedrock/latest/userguide/endpoints.html
+#   "Authentication does not grant access by itself. Whether you use SigV4
+#   or a Bedrock API key, the associated IAM principal must have permission
+#   for the required action" -- confirms SigV4 IS a real, supported
+#   authentication path for this endpoint (not only the Bedrock-API-key/
+#   Bearer path the "getting started" examples lead with), so the brief's
+#   choice of SigV4 auth is valid, not merely a legacy-pattern copy-paste.
+#
+# SigV4 service name: "bedrock" is kept (matching the brief) because this
+# profile's base_url is the SAME bedrock-runtime.{region}.amazonaws.com host
+# bedrock-converse.toml already uses with SigV4 service = "bedrock" -- unlike
+# Task 15's bedrock-anthropic-messages.toml, which targets the DIFFERENT
+# bedrock-mantle.{region}.api.aws host and needed the corrected service name
+# "bedrock-mantle" for exactly that reason. Same host, same signing scope.
+#
+# Fix-round-2 Fix 5, INFERRED AND UNCONFIRMED (same caveat class as
+# NVIDIA's above): the AWS docs cited above confirm SigV4 is *a* valid,
+# supported authentication path for bedrock-runtime generically -- they do
+# not confirm "bedrock" specifically is the correct SigV4 signing service
+# name for THIS surface (bedrock-runtime's /openai/v1 path). The value here
+# is inferred from host-family consistency with bedrock-converse.toml, not
+# independently verified against AWS's SigV4 service-name reference for the
+# /openai/v1 surface itself.
+#
+# [errors] TABLE LEFT EMPTY, REPORTED: this task's research could not
+# confirm the JSON error-body shape this specific endpoint (bedrock-runtime's
+# /openai/v1 surface) actually returns. Two conflicting signals were found:
+# the endpoint is marketed as OpenAI-SDK-drop-in-compatible (which would
+# imply an OpenAI-shaped {"error": {"type", "message"}} body), but a
+# real-world compatibility complaint (repost.aws "Bedrock Mantle Responses
+# API is incompatible with official OpenAI .NET SDK", title only accessible
+# -- the body returned 403 to this task's fetch) and a secondary summary
+# both suggest Bedrock's classic Smithy exception convention
+# (ThrottlingException etc., carried in the x-amzn-ErrorType HTTP HEADER,
+# not the JSON body) may leak through instead. `classify()`
+# (crate::errors::classify) only ever inspects the JSON body via
+# error_pointer -- it has no header-reading path -- so if the header-based
+# convention is what this endpoint actually uses, an [errors] table keyed on
+# AWS exception names (as the brief's sample TOML has) would be silently
+# unreachable regardless of what error_pointer names, which is exactly the
+# "decorative [errors] table" this project's process rules forbid. Left
+# empty rather than guess; classify()'s HTTP-status fallback tier still
+# covers 429/5xx.
+id = "aws-open-responses"
+codec = "openai-responses"
+
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"
+auth = { kind = "sigv4", service = "bedrock" }
+
+[[model]]
+match = ["*"]
+
+[errors]

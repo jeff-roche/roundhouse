@@ -1,0 +1,38 @@
+id = "moonshot"
+codec = "openai-chat"
+
+[defaults]
+allow_raw_extra = false
+base_url = "https://api.moonshot.ai/v1"
+
+[defaults.params]
+mode = "allow_only"
+fields = ["max_output_tokens", "stop"]
+
+[defaults.auth]
+kind = "bearer"
+
+[[model]]
+match = ["kimi-k3*"]
+
+[model.reasoning]
+kind = "effort"
+field = "/reasoning_effort"
+vocabulary = ["none", "low", "medium", "high"]
+
+[model.reasoning.map]
+off = "none"
+low = "low"
+medium = "medium"
+high = "high"
+max = "high"
+
+[errors.engine_overloaded_error]
+disposition = "retry_backoff"
+
+[errors.rate_limit_reached_error]
+disposition = "shed_concurrency"
+
+[errors.exceeded_current_quota_error]
+disposition = "fatal"
+category = "quota"

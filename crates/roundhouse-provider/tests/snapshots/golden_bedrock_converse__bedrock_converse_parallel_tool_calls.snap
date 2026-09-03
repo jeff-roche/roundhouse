@@ -1,0 +1,46 @@
+---
+source: crates/roundhouse-provider/tests/golden_bedrock_converse.rs
+expression: "encode(&req, &fixture_profile())"
+---
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "text": "Weather and time in Tokyo?"
+        }
+      ]
+    }
+  ],
+  "toolConfig": {
+    "tools": [
+      {
+        "toolSpec": {
+          "name": "get_weather",
+          "description": "Get the current weather",
+          "inputSchema": {
+            "json": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "title": "NoParams",
+              "type": "object"
+            }
+          }
+        }
+      },
+      {
+        "toolSpec": {
+          "name": "get_time",
+          "description": "Get the current time",
+          "inputSchema": {
+            "json": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "title": "NoParams",
+              "type": "object"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

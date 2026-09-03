@@ -1,0 +1,63 @@
+# OpenAI first-party, on the `openai-chat` codec: the DEGRADED path (§9.2).
+# `openai-responses.toml` (Task 5) is the PREFERRED endpoint for the same
+# provider; `endpoint_preference` below is what makes that fact data instead
+# of a hardcoded branch in a `Provider` impl (audit finding 3, §9.4).
+#
+# §9.2 (frozen, docs/architecture/06-provider-abstraction.md): "From GPT-5.4,
+# OpenAI Chat Completions is a degraded path for frontier OpenAI models (no
+# tool calling above `reasoning_effort: none`) — force the Responses wire
+# instead." That is a house-authored, forward-looking design note about a
+# not-yet-released model family, not a claim checkable against OpenAI's
+# published API reference today — there is no external spec value to verify
+# it against the way `finish_reason`/event-type strings are verified
+# elsewhere in this phase (REALITY-CORRECTIONS §13b item 1). What IS checked
+# here: `EndpointKind`'s `responses`/`chat` tags and the `[[model]].reasoning`
+# shape both match the already-shipped, already-verified `openai-responses`
+# (Task 5) and `openai-chat` (Tasks 7/8/10) codecs unchanged — this profile
+# adds no new wire-value matching logic of its own.
+id = "openai"
+codec = "openai-chat"
+
+[defaults]
+allow_raw_extra = false
+base_url = "https://api.openai.com/v1"
+
+[defaults.params]
+mode = "deny_list"
+fields = []
+
+[defaults.auth]
+kind = "bearer"
+
+# Frontier models: Chat Completions is available but degraded (no tool
+# calling above `reasoning_effort: none`), so Responses is listed first and
+# non-degraded, Chat second and degraded — resolved by
+# `resolve_endpoint_preference` (Task 4), never a per-provider `if` branch.
+[[model]]
+match = ["gpt-5.4*", "gpt-5*"]
+
+[[model.endpoint_preference]]
+endpoint = "responses"
+degraded = false
+
+[[model.endpoint_preference]]
+endpoint = "chat"
+degraded = true
+
+# Legacy, non-frontier models: Chat Completions never lost tool-calling for
+# these, so there is no preferred/degraded pair to express — Chat is simply
+# the normal (and only) path, hence no `endpoint_preference` entries at all
+# (`#[serde(default)]` on `ModelEntry::endpoint_preference` makes the empty
+# list the correct, not-an-omission, encoding of that fact).
+[[model]]
+match = ["gpt-4*", "gpt-3.5*"]
+
+[errors.rate_limit_exceeded]
+disposition = "shed_concurrency"
+
+[errors.server_error]
+disposition = "retry_backoff"
+
+[errors.insufficient_quota]
+disposition = "fatal"
+category = "quota"

@@ -1,0 +1,20 @@
+---
+source: crates/roundhouse-provider/tests/golden_openai_responses.rs
+expression: "encode(&req,\n&fixture_profile()).expect(\"encode must succeed for this fixture profile\")"
+---
+{
+  "model": "gpt-5.4",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "こんにちは 🌍 — café naïve"
+        }
+      ]
+    }
+  ],
+  "stream": true
+}

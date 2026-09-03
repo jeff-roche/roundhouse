@@ -1,0 +1,13 @@
+200
+content-type: text/event-stream
+
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"item_1","type":"function_call","call_id":"call_1","name":"get_weather","arguments":"","status":"in_progress"}}
+
+data: {"type":"response.function_call_arguments.delta","sequence_number":2,"item_id":"item_1","output_index":0,"delta":"{\"city\":"}
+
+data: {"type":"response.function_call_arguments.delta","sequence_number":3,"item_id":"item_1","output_index":0,"delta":"\"Tokyo\"}"}
+
+data: {"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"id":"item_1","type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Tokyo\"}","status":"completed"}}
+
+data: {"type":"response.completed","sequence_number":5,"response":{"id":"resp_2","status":"completed","usage":{"input_tokens":20,"output_tokens":8,"total_tokens":28,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}
+

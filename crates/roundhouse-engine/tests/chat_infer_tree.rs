@@ -145,6 +145,7 @@ async fn chat_turn_spawns_one_infer_child_task_and_returns_content() {
         trace_id: None,
         transport: Arc::new(NoopTransport),
         api_key: "test".into(),
+        credentials: None,
     };
     let session_id = SessionId::new();
     let request = ChatRequest {

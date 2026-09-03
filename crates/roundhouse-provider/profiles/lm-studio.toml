@@ -1,0 +1,29 @@
+# LM Studio — local OpenAI-compatible server, default port 1234 (stable,
+# long-documented LM Studio default). A local dev tool: unknown fields
+# shouldn't hard-fail, so allow_raw_extra/allow_all.
+id = "lm-studio"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = true
+params = { mode = "allow_all", fields = [] }
+base_url = "http://localhost:1234/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+# Round-8 review, M1/M2: "model_not_loaded" never appears in LM Studio's
+# real error body, and mapping "no model loaded" to `category = "quota"`
+# was doubly wrong — it isn't a billing condition at all, it's an operator
+# forgetting to load a model. LM Studio's real "no model loaded" response
+# (reproduced verbatim from a live server, cited in community bug reports
+# against `lmstudio-ai/lmstudio-bug-tracker`) is
+# `{"error":{"message":"No models loaded. Please load a model in the
+# developer page or use the 'lms load' command.","type":
+# "invalid_request_error","param":"model","code":null}}` — `code` is
+# `null` and `type` is the same generic `"invalid_request_error"` bucket
+# every other 400 validation failure uses, so there is no field that
+# distinguishes this condition from any other malformed request. An empty
+# table is the correct, honest outcome: nothing in the body carries a
+# stable, distinct signal to key a code_table entry on.
+[errors]

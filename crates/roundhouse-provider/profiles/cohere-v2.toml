@@ -1,0 +1,65 @@
+# Cohere v2/chat -- a stable, well-documented, non-spec-gated surface (Task
+# 8's own brief text). Verified against the real, fetched Cohere API
+# reference (docs.cohere.com/reference/chat and /reference/chat-stream) on
+# 2026-09-02 -- see `src/codec/cohere_v2/mod.rs`'s module doc comment for the
+# fetch record and `tests/cohere_v2_wire_literal_tripwire.rs` for the vendored
+# literal lists the decoder's matched strings are checked against.
+#
+# REALITY-CORRECTIONS §12d: the task brief's own "Interfaces" line says this
+# codec consumes `HeaderKeyCredential`, but that is wrong -- this TOML (the
+# authoritative source per REALITY-CORRECTIONS' own framing) declares
+# `auth = { kind = "bearer" }`, matching Cohere's real `Authorization: Bearer
+# <key>` scheme (verified: the fetched reference's auth section names
+# `Authorization: BEARER <API_KEY>`, not a custom header).
+id = "cohere-v2"
+codec = "cohere-v2"
+
+[defaults]
+allow_raw_extra = false
+base_url = "https://api.cohere.com/v2"
+auth = { kind = "bearer" }
+
+[defaults.params]
+mode = "allow_only"
+fields = ["temperature", "p", "k", "max_tokens", "stop_sequences"]
+
+[[model]]
+match = ["command-a-reasoning*"]
+
+[model.reasoning]
+kind = "effort"
+field = "/thinking/type"
+vocabulary = ["disabled", "enabled"]
+
+[model.reasoning.map]
+off = "disabled"
+low = "enabled"
+medium = "enabled"
+high = "enabled"
+max = "enabled"
+
+# Fix round 1, L5 (reverses the original "ship the three brief-provided
+# entries as documented no-ops" decision): this table is deliberately EMPTY.
+#
+# Verified (docs.cohere.com/reference/errors, fetched 2026-09-02): Cohere's
+# real error bodies carry only a plain `{"message": "..."}` string -- no
+# machine-readable error-code/type discriminator field exists anywhere on the
+# wire. The task brief's three entries here (`too_many_requests` ->
+# shed_concurrency, `internal_error` -> retry_backoff, `invalid_api_key` ->
+# fatal/quota) can therefore never actually match a real response body's
+# `/error/type` in `crate::errors::classify` -- there is no such field on
+# this wire format for them to match against.
+#
+# An inert table that LOOKS configured is worse than an empty one: the next
+# reader reasonably assumes a 401 yields `QuotaExhausted` (what
+# `invalid_api_key -> fatal/quota` was plainly written to produce), and it
+# cannot -- silently. `error_429`/`error_500` classify correctly regardless,
+# entirely via `classify`'s HTTP-status fallback tier (429/5xx retryable,
+# 400/401/402/404 fatal -- confirmed against the fetched errors reference; in
+# particular, billing exhaustion is Cohere's real HTTP 402, so the
+# retry-forever trap `errors.rs`'s own doc comment warns about, a permanent
+# quota failure arriving as a retryable 429, does not fire here). No
+# disposition above was actually wrong -- only harmlessly unreachable -- but
+# "harmlessly unreachable and looks load-bearing" is exactly the shape that
+# misleads the next reader, so the entries are deleted rather than kept as
+# documented no-ops.

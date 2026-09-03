@@ -1,0 +1,5 @@
+---
+source: crates/roundhouse-provider/tests/golden_bedrock_converse.rs
+expression: err.to_string()
+---
+unsupported: bedrock-converse toolConfig has no mechanism to forbid tool use (ToolChoice::None has no member in the real ToolChoice union: only auto/any/tool exist)

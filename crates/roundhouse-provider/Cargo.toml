@@ -9,6 +9,10 @@ workspace = true
 
 [dependencies]
 bytes = { workspace = true }
+# `src/bin/refresh_pricing.rs` (Phase 6 Task 9) is the only user of this —
+# every other error path in this crate's library code is a typed
+# `thiserror` enum, not `color_eyre::Result`.
+color-eyre = { workspace = true }
 futures = "0.3"
 http = "1.5.0"
 regex = "1.13.1"
@@ -25,7 +29,64 @@ thiserror = { workspace = true }
 # breaker/AIMD-concurrency machinery), not just in tests.
 tokio = { workspace = true }
 tracing = { workspace = true }
+# §9.5: quirk profiles are TOML, one file per provider under `profiles/`,
+# deserialized both by `build.rs` (compile-time validation) and at runtime by
+# `load_profile()` in `lib.rs` — so this is a normal dependency, not a
+# dev-dependency (see the mirrored entry under [build-dependencies] below).
+toml = "0.8"
+# Used by `credential::base_url::resolve_base_url` and
+# `credential::host_only::record_base_url_override` (§9.9) to parse/derive a
+# host from a base-URL string. Already present transitively via `reqwest`;
+# declared explicitly since this crate's own public API returns `url::Url`.
+url = "2.5"
+# The `sigv4-eventstream` transport shim (`src/transport/eventstream.rs`,
+# Phase 6 Task 7): `bedrock-converse`'s response is
+# `application/vnd.amazon.eventstream` -- binary length-prefixed framing with
+# CRC32 checksums -- rather than SSE. AWS's own published implementation of
+# that framing, not hand-rolled: aws-smithy-eventstream's
+# `MessageFrameDecoder`/`read_message_from`/`write_message_to` own every byte
+# of prelude parsing, header decoding, and checksum verification;
+# aws-smithy-types supplies the `Message`/`Header`/`HeaderValue` types those
+# functions operate on.
+aws-smithy-eventstream = "0.60"
+aws-smithy-types = "1.2"
+
+[build-dependencies]
+# `build.rs` parses every `profiles/*.toml` at compile time with the same
+# schema types the runtime uses, so a typo in a profile is a build error
+# (§9.5) rather than a production 400. Cargo resolves build-dependencies
+# independently of [dependencies], so this needs its own entry even though
+# `toml`/`serde`/`thiserror` are already normal dependencies above.
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2.0.20"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
 tokio = { version = "1.53", features = ["full", "test-util"] }
+# Dev-dependency only, per the Phase 6 Task 2 ruling: `roundhouse-secrets`
+# holds the six concrete `CredentialProvider` implementations (bearer,
+# header-key, OAuth refresh, Azure Entra, exec-command, SigV4) per the
+# frozen crate table (`docs/architecture/02-system-architecture.md` §5.2),
+# which this crate's own tests construct to exercise `ctx.credentials`
+# end-to-end. `roundhouse-provider` cannot take this as a normal dependency
+# — `roundhouse-secrets -> roundhouse-store -> roundhouse-provider` already
+# exists, so that would be a cycle. A dev-dependency cycle is legal in
+# Cargo (dev-deps are excluded from the normal build graph); do not move
+# this out of `[dev-dependencies]`.
+roundhouse-secrets = { path = "../roundhouse-secrets" }
+# Dev-dependency only, per Phase 6 Task 3's dependency-direction ruling: the
+# shared conformance test library depends on this crate for real (the
+# `Provider` trait and IR types every case exercises); this crate takes it
+# back only here, so Tasks 5-17's own `tests/*_conformance.rs` files can call
+# `roundhouse_conformance::run::<S>()`. A dev-dependency cycle is legal in
+# Cargo (dev-deps are excluded from the normal build graph); do not move this
+# out of `[dev-dependencies]`.
+roundhouse-conformance = { path = "../roundhouse-conformance" }
+walkdir = "2.5"
+# Note: `tests/credential_test.rs`'s `provider_manifest_never_depends_on_secrecy`
+# parses this crate's own Cargo.toml as TOML (not a text scan — B2,
+# fix-round-2) to catch dotted-key and renamed-dependency forms a
+# line-oriented scan would miss. It uses the `toml` crate declared under
+# [dependencies] above (Task 4 promoted it from dev-only once profiles/
+# needed it at runtime too) — no separate dev-dependency entry needed.

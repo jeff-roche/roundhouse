@@ -1,0 +1,95 @@
+# Gemini first-party API, legacy generateContent/streamGenerateContent
+# surface (`EndpointMode::GenerateContent`) -- §9.2: "generateContent
+# (legacy but supported)." Same host and auth as `google-genai.toml`
+# (first-party's default, Interactions-mode) profile, but a SEPARATE profile
+# id so a caller can construct `GoogleGenAiProvider::new(profile,
+# EndpointMode::GenerateContent)` explicitly, and so its `[errors]` table
+# can carry the legacy surface's real (different) error vocabulary rather
+# than sharing `google-genai.toml`'s Interactions-API-specific one. Per
+# REALITY-CORRECTIONS §12e / `docs/decisions/2026-08-27-google-genai-spec-
+# verification.md`'s own "Known gap": `GoogleGenAiProvider` has no
+# production wiring anywhere in this workspace that selects an
+# `EndpointMode` from a profile id today -- this profile is a data record
+# of "this profile's provider should be constructed with GenerateContent
+# mode," for whichever future config-selection wiring reads it (Task 6's own
+# scope note: `roundhouse-daemon`/`roundhouse-engine` do not reference
+# `google_genai` yet).
+#
+# DIVERGENCE FROM THE TASK BRIEF (reported per this task's process rules):
+# the brief's sample TOML set `base_url =
+# "https://generativelanguage.googleapis.com/v1beta"`. That is wrong for
+# this codec's `build_endpoint_url`, which for `EndpointMode::GenerateContent`
+# unconditionally builds `"{base_path}/v1beta/models/{model}:
+# streamGenerateContent"` (verified in `provider.rs`, and exercised by
+# `conformance_google_genai.rs`'s existing
+# `generate_content_mode_error_429_cassette_classifies_via_the_status_remap_branch`
+# test against `google-genai.toml`, which uses the bare host). Pre-appending
+# `/v1beta` here would have produced a double
+# `.../v1beta/v1beta/models/{model}:streamGenerateContent` path. This
+# profile instead uses the bare host, exactly like `google-genai.toml`.
+id = "gemini-generate-content-legacy"
+codec = "google-genai"
+
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://generativelanguage.googleapis.com"
+# `x-goog-api-key: $GEMINI_API_KEY` -- confirmed directly from a curl code
+# sample in the fetched Interactions API OpenAPI JSON's `Function` schema
+# (see the decision doc's "Auth" section), and this is the same header the
+# legacy REST surface documents for API-key auth. Matches
+# `google-genai.toml`'s identical auth exactly.
+auth = { kind = "header_key", header = "x-goog-api-key" }
+
+[[model]]
+match = ["gemini-3.0*"]
+
+# Task 17 addendum SS1 (Ruling P108): `thinkingBudget` is a JSON *number* on
+# the wire (verified, `generate-content.md.txt`'s literal JSON
+# representation: `"thinkingBudget": integer`) -- declaring `value_type =
+# "number"` here routes the resolved value through `resolve_wire_value`
+# (typed) instead of the deleted `.unwrap_or(0)` hand-parse, so a vocabulary
+# typo becomes a build error and a runtime resolution failure becomes a hard
+# `Err`, never a silent `thinkingBudget: 0`. Identical table to
+# `google-genai.toml`'s (this is the same surface, GenerateContent mode) and
+# to `vertex-gemini.toml`'s (same content shape, different envelope).
+[model.reasoning]
+kind = "budget"
+field = "/generationConfig/thinkingConfig/thinkingBudget"
+value_type = "number"
+vocabulary = ["0", "1024", "8192", "24576"]
+
+[model.reasoning.map]
+off = "0"
+low = "1024"
+medium = "8192"
+high = "24576"
+max = "24576"
+
+# `docs/decisions/2026-08-27-google-genai-spec-verification.md`'s own
+# finding: the legacy `generateContent`/`streamGenerateContent` surface's
+# error envelope is the long-standing, corroborated-but-not-directly-fetched
+# `google.rpc.Status` shape (`{"error": {"code": <int>, "message": <str>,
+# "status": "<UPPER_SNAKE>"}}`) -- the CLASSIC UPPER_SNAKE `google.rpc.Code`
+# vocabulary, NOT the lowercase snake_case Interactions-API-specific one
+# `google-genai.toml`'s own `[errors]` table uses. `error_pointer` is left
+# at its default `/error/type`: `provider.rs`'s `remap_error_body_for_classify`
+# already normalizes this surface's `/error/status` string onto `/error/type`
+# before `classify()` runs (verified directly against a real legacy 429
+# cassette by this codec's own `remaps_the_generate_content_error_429_cassette_
+# body_to_the_real_status` test), so a custom `error_pointer` here would look
+# at the wrong (already-remapped) field.
+[errors]
+# AIP-193: "RESOURCE_EXHAUSTED: Some resource has been exhausted... perhaps a
+# per-user quota", HTTP mapping 429 -- an ordinary rate/TPM cap, never
+# `fatal` (Ruling P106).
+"RESOURCE_EXHAUSTED" = { disposition = "shed_concurrency" }
+# AIP-193: "UNAVAILABLE: The service is currently unavailable... most likely
+# a transient condition" -- retryable.
+"UNAVAILABLE" = { disposition = "retry_backoff" }
+# PERMISSION_DENIED is deliberately left OUT, matching `vertex-gemini.toml`'s
+# (and `vertex-anthropic.toml`'s) identical decision for the identical
+# vocabulary -- AIP-193 states it "must not be used for rejections caused by
+# exhausting some resource," so mapping it to `category = "quota"` would
+# assert a wrong `ProviderErrorKind`. Left out, it falls through to
+# `classify()`'s generic HTTP-status tier instead.

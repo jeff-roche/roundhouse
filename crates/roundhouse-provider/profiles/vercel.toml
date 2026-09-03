@@ -1,0 +1,56 @@
+# Vercel AI Gateway — its OpenAI-Responses-compatible endpoint.
+#
+# Verified against Vercel's own current docs (fetched 2026-09-02):
+# https://vercel.com/docs/ai-gateway/sdks-and-apis/responses
+#   "## Base URL
+#   https://ai-gateway.vercel.sh/v1"
+#   "## Authentication
+#   API key: Use your AI Gateway API key with the Authorization: Bearer
+#   <token> header"
+#   "## Error response format ... {"error": {"type": "invalid_request_error",
+#   "message": "..."}}" -- this codec's default error_pointer (/error/type)
+#   is correct as-is, no override needed.
+#
+# DIVERGENCE FROM THE TASK BRIEF: the brief's sample base_url was
+# "https://gateway.ai.vercel.app/v1" -- not a real Vercel AI Gateway host
+# (vercel.com/docs/ai-gateway consistently documents ai-gateway.vercel.sh,
+# both in the SDKs & APIs overview page and the Responses-API-specific page
+# above). Corrected here.
+id = "vercel"
+codec = "openai-responses"
+
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://ai-gateway.vercel.sh/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+# 429, "rate_limit_exceeded": vercel.com/docs/ai-gateway/sdks-and-apis/
+# responses documents "429 Too Many Requests - Rate limit exceeded" as a
+# common error code, and a Vercel community report (community.vercel.com
+# "AI Gateway with BYOK: Free Credits Error and Rate Limit Question", fetched
+# 2026-09-02) confirms the literal error identifier: "The API responds with
+# a 429 status code and a rate_limit_exceeded error when your recent usage
+# has drawn down your allowance." Never fatal (Ruling P106): this is
+# throughput throttling, not a permanent condition.
+"rate_limit_exceeded" = { disposition = "shed_concurrency" }
+# 402, "quota_for_entity_exceeded": a genuine, permanent billing exhaustion
+# (not a throughput cap), confirmed via two independent Vercel community
+# reports (community.vercel.com "AI Gateway requests blocked despite
+# purchased AI Gateway credit and payment method" and "AI Gateway usage has
+# been blocked", fetched 2026-09-02), both quoting the identical literal
+# body shape: {"error": {"message": "Project budget exceeded. ...", "type":
+# "quota_for_entity_exceeded"}}. Unlike rate_limit_exceeded above, this is a
+# hard spend-limit stop, not throttling -- fatal/quota is the correct
+# mapping.
+"quota_for_entity_exceeded" = { disposition = "fatal", category = "quota" }
+# The brief's "upstream_error" and "invalid_api_key" entries are dropped:
+# neither string could be confirmed as the literal error.type value Vercel's
+# AI Gateway actually returns (only prose HTTP-status descriptions were
+# found for those conditions, e.g. "401 Unauthorized - Invalid or missing
+# authentication"), so including them would be exactly the "decorative
+# [errors] table" this project's process rules forbid.

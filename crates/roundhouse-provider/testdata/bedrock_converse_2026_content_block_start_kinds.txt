@@ -1,0 +1,11 @@
+# The full `ContentBlockStart` union (response-side streaming open event),
+# fetched verbatim from
+# https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ContentBlockStart.html
+# (fetched 2026-09-02): 3 members -- notably NO `text` or `reasoningContent`
+# member exists at all (this codec's `mod.rs` doc comment, divergence 2:
+# those two block kinds have no `contentBlockStart` event on the wire).
+# `decode.rs` recognizes `toolUse`; `image`/`toolResult` starts have no IR
+# equivalent and are skipped but are still vendored here in full.
+image
+toolResult
+toolUse

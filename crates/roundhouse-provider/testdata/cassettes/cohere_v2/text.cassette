@@ -1,0 +1,15 @@
+200
+content-type: text/event-stream
+
+data: {"id":"29f14a5a-11de-4cae-9800-25e4747408ea","type":"message-start","delta":{"message":{"role":"assistant"}}}
+
+data: {"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}}
+
+data: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"4"}}}}
+
+data: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"."}}}}
+
+data: {"type":"content-end","index":0}
+
+data: {"type":"message-end","delta":{"finish_reason":"COMPLETE","usage":{"billed_units":{"input_tokens":9,"output_tokens":3},"tokens":{"input_tokens":9,"output_tokens":3}}}}
+

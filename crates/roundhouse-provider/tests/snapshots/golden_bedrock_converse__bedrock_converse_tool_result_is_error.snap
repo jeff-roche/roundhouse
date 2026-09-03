@@ -1,0 +1,24 @@
+---
+source: crates/roundhouse-provider/tests/golden_bedrock_converse.rs
+expression: body
+---
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "toolResult": {
+            "toolUseId": "call_1",
+            "content": [
+              {
+                "text": "permission denied"
+              }
+            ],
+            "status": "error"
+          }
+        }
+      ]
+    }
+  ]
+}

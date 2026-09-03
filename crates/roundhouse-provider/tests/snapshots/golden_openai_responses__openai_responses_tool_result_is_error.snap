@@ -1,0 +1,15 @@
+---
+source: crates/roundhouse-provider/tests/golden_openai_responses.rs
+expression: body
+---
+{
+  "model": "gpt-5.4",
+  "input": [
+    {
+      "type": "function_call_output",
+      "call_id": "call_1",
+      "output": "permission denied"
+    }
+  ],
+  "stream": true
+}

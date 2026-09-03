@@ -1,0 +1,20 @@
+---
+source: crates/roundhouse-provider/tests/golden_openai_responses.rs
+expression: body
+---
+{
+  "model": "gpt-5.4",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Hello."
+        }
+      ]
+    }
+  ],
+  "stream": true
+}

@@ -1,0 +1,14 @@
+# Cohere v2 chat-stream SSE event `type` values, fetched from
+# https://docs.cohere.com/reference/chat-stream on 2026-09-02.
+# The full, real, documented set -- 11 values.
+message-start
+content-start
+content-delta
+content-end
+citation-start
+citation-end
+tool-plan-delta
+tool-call-start
+tool-call-delta
+tool-call-end
+message-end

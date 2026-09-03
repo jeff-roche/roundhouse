@@ -1,0 +1,16 @@
+---
+source: crates/roundhouse-provider/tests/golden_bedrock_converse.rs
+expression: "encode(&req, &fixture_profile())"
+---
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "text": "こんにちは 🌍 — café naïve"
+        }
+      ]
+    }
+  ]
+}

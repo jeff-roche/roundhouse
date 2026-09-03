@@ -1,0 +1,29 @@
+# Ollama — self-hosted OpenAI-compatible /v1 surface, default port 11434
+# (stable, long-documented Ollama default). §9.4 gates the bespoke
+# `ollama-native` codec as conditional and unneeded so far; this profile
+# targets Ollama's OpenAI-compat surface via the already-frozen
+# `openai-chat` codec.
+id = "ollama"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = true
+params = { mode = "allow_all", fields = [] }
+base_url = "http://localhost:11434/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+# Round-8 review, M1/M2: "model_not_found" mapped to `category = "quota"`
+# was doubly wrong — a missing model is not a billing condition. Verified
+# against Ollama's own source (github.com/ollama/ollama, `openai/openai.go`
+# `NewError`): the real, nested (default-pointer-compatible) shape is
+# `{"error":{"message":...,"type":"invalid_request_error"|"not_found_error"
+# |"api_error","param":...,"code":...}}` — only three `type` buckets exist
+# for the whole OpenAI-compat surface: 400 -> "invalid_request_error",
+# 404 -> "not_found_error", everything else -> "api_error". The correct
+# key is "not_found_error" (not "model_not_found", which never appears),
+# and it maps to `category = "model_not_found"` (the mapping `error_kind()`
+# actually recognizes), not "quota".
+[errors]
+"not_found_error" = { disposition = "fatal", category = "model_not_found" }

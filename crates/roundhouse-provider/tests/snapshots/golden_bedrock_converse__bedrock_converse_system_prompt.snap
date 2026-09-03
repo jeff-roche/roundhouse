@@ -1,0 +1,21 @@
+---
+source: crates/roundhouse-provider/tests/golden_bedrock_converse.rs
+expression: body
+---
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "text": "Hello."
+        }
+      ]
+    }
+  ],
+  "system": [
+    {
+      "text": "You are a careful assistant."
+    }
+  ]
+}

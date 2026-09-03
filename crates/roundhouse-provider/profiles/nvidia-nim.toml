@@ -1,0 +1,37 @@
+# NVIDIA NIM — hosted OpenAI-compatible catalog of third-party open models.
+# Verified against docs.api.nvidia.com/nim/reference/llm-apis (fetched live
+# 2026-09): base_url `https://integrate.api.nvidia.com` with endpoint
+# `/v1/chat/completions`, i.e. base_url `https://integrate.api.nvidia.com/v1`.
+# Bearer auth is NVIDIA's universal, well-documented pattern for
+# integrate.api.nvidia.com/build.nvidia.com (the fetched page's excerpt did
+# not itself carry an auth section). NIM hosts many different underlying
+# models with no single vendor-specific request quirk, so this is a plain
+# pass-through profile.
+id = "nvidia-nim"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://integrate.api.nvidia.com/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+# Round-8 review, M1/M2: the previous table's keys ("429"/"503"/"401") were
+# HTTP status codes placed in a slot meant to hold `error.type` *values* --
+# NIM's real error body has no `error` object at all. Confirmed both live
+# (community-reproduced responses against integrate.api.nvidia.com) and
+# from the same 429 seen in this crate's own earlier authoring pass: NIM
+# returns RFC 7807-shaped problem details, e.g.
+# `{"status":429,"title":"Too Many Requests"}`,
+# `{"status":401,"title":"Unauthorized","detail":"..."}`,
+# `{"status":404,"title":"Not Found","detail":"..."}`. `title` is always
+# the exact HTTP reason phrase for `status` (`"Too Many Requests"` for 429,
+# `"Unauthorized"` for 401, `"Not Found"` for 404) -- it carries zero
+# information `classify()` doesn't already have from the raw HTTP status,
+# so there is no vendor-specific billing-vs-rate-limit distinction to
+# recover here (unlike OpenAI's insufficient_quota-on-429 case). An empty
+# table is the correct, honest outcome for this vendor -- not omitted
+# oversight, but confirmed absence of a matchable signal.
+[errors]
