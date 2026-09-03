@@ -55,6 +55,17 @@
 //!   sites agree on the same wrong value). Both now use
 //!   [`expected_current_platform_target`], an independent copy of the same
 //!   OS/ARCH match, so a mismatch is actually detectable.
+//!
+//! **Fix round 3 (coordinator review of fix round 2):**
+//! - Item 1: three new `distribution_deserialization_*` tests for npm/npx's
+//!   schemeless GitHub shorthand (`user/repo`, `user/repo#branch`), plus a
+//!   positive control for the real `@scope/name` shape.
+//! - Item 3: `agent_id_pattern_is_enforced_at_deserialize_time` (renamed
+//!   `..._per_entry_not_for_the_whole_registry`) now asserts the *opposite*
+//!   outcome from before — a single invalid entry no longer fails the whole
+//!   registry's deserialize, only that one entry is dropped.
+//!   `one_agent_with_an_env_key_outside_the_allowlist_does_not_take_down_its_siblings`
+//!   is new — the coordinator's exact 3-agent reproduction.
 
 use roundhouse_acp::registry::{
     BinaryTarget, Distribution, PackageDistribution, Quarantine, Registry, RegistryAgent,
@@ -575,20 +586,62 @@ fn distribution_deserialization_rejects_an_empty_object() {
 }
 
 #[test]
-fn agent_id_pattern_is_enforced_at_deserialize_time() {
+fn agent_id_pattern_is_enforced_per_entry_not_for_the_whole_registry() {
+    // Fix round 3 (Item 3): Registry.agents deserializes element-wise now --
+    // an invalid id no longer fails the whole array's deserialize, it drops
+    // just that one entry. A single invalid agent used to make this whole
+    // document fail to parse at all (asserted here before this round); now
+    // the invalid entry is dropped and its valid sibling survives.
     let json = r#"{
         "agents": [
             {
                 "id": "Not_Valid!",
                 "name": "Bad",
                 "distribution": {"npx": {"package": "x"}}
+            },
+            {
+                "id": "good-agent",
+                "name": "Good",
+                "distribution": {"npx": {"package": "x"}}
             }
         ]
     }"#;
-    let result: Result<Registry, _> = serde_json::from_str(json);
-    assert!(
-        result.is_err(),
-        "an id not matching ^[a-z][a-z0-9-]*$ must be rejected"
+    let registry: Registry = serde_json::from_str(json)
+        .expect("a single invalid agent entry must not fail deserialization of the whole registry");
+    assert_eq!(
+        registry.agents.len(),
+        1,
+        "the entry with an id not matching ^[a-z][a-z0-9-]*$ must be dropped, not accepted"
+    );
+    assert_eq!(registry.agents[0].id, "good-agent");
+}
+
+#[test]
+fn one_agent_with_an_env_key_outside_the_allowlist_does_not_take_down_its_siblings() {
+    // The coordinator's exact reproduction: three agents, one using a
+    // hypothetical future upstream env flag not yet on ALLOWED_ENV_KEYS.
+    // Before this round, zero of the three survived deserialization -- not
+    // two.
+    let json = r#"{
+        "agents": [
+            {"id": "agent-a", "name": "A", "distribution": {"npx": {"package": "a"}}},
+            {
+                "id": "agent-b",
+                "name": "B",
+                "distribution": {
+                    "npx": {"package": "b", "env": {"NEW_UPSTREAM_FEATURE_FLAG": "1"}}
+                }
+            },
+            {"id": "agent-c", "name": "C", "distribution": {"npx": {"package": "c"}}}
+        ]
+    }"#;
+    let registry: Registry = serde_json::from_str(json)
+        .expect("valid siblings must still deserialize even though one entry is invalid");
+    let ids: Vec<&str> = registry.agents.iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["agent-a", "agent-c"],
+        "agent-b (the invalid entry) must be dropped; agent-a and agent-c must both survive"
     );
 }
 
@@ -765,6 +818,45 @@ fn distribution_deserialization_rejects_a_git_ssh_shaped_uvx_package() {
     assert!(
         result.is_err(),
         "a git+ssh-scheme package spec must be rejected"
+    );
+}
+
+// ---- Item 1 (fix round 3): npm/npx's schemeless GitHub shorthand ----
+
+#[test]
+fn distribution_deserialization_rejects_an_npm_github_shorthand_npx_package() {
+    // npx resolves a bare `user/repo` as a GitHub tarball -- fetched and
+    // executed exactly like a real npm package, entirely outside the npm
+    // registry, with no provenance and no takedown path. Round 2 closed the
+    // `git+ssh://` scheme-qualified form of this same capability but not
+    // this schemeless one.
+    let json = r#"{"npx": {"package": "attacker/evil-repo"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a bare user/repo GitHub-shorthand package spec must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_rejects_an_npm_github_shorthand_with_a_commit_pin() {
+    let json = r#"{"npx": {"package": "attacker/evil-repo#branch"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "a #commit-ish-pinned GitHub-shorthand package spec must be rejected"
+    );
+}
+
+#[test]
+fn distribution_deserialization_accepts_a_real_live_scoped_package_with_one_slash() {
+    // A `/` must remain accepted as the single separator of a leading
+    // `@scope/name` -- the real, live shape this crate must not break.
+    let json = r#"{"npx": {"package": "@agentclientprotocol/claude-agent-acp@0.73.0"}}"#;
+    let result: Result<Distribution, _> = serde_json::from_str(json);
+    assert!(
+        result.is_ok(),
+        "a real @scope/name package spec must remain accepted: {result:?}"
     );
 }
 
