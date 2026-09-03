@@ -986,3 +986,164 @@ steps:
          restore"
     );
 }
+
+// ---------------------------------------------------------------------
+// Fix round 3 tests.
+// ---------------------------------------------------------------------
+
+#[test]
+fn an_inner_steps_secret_derived_gate_taints_the_maps_own_output_even_when_the_items_output_does_not(
+) {
+    // Fix round 3, item 1 (the working gap this round exists to close): an
+    // inner step's `when:` gate WAS evaluated correctly (fix round 2 closed
+    // the fail-open dispatch bug) but the resulting
+    // `gate_condition_was_secret_derived` flag was computed and thrown away
+    // — lost at the `ItemOutcome` boundary on every arm, and hard-coded
+    // `false` on the map's own returned `StepOutcome`. So a downstream step
+    // reading `${{ steps.<map_id>.output }}` had no idea the map's dispatch
+    // decisions were secret-derived, even though the crate's own
+    // `when:`-gate doc comment (`evaluate_when_gate`, `crate::exec::mod`)
+    // states that which branch a gate takes is itself a one-bit function of
+    // the secret.
+    //
+    // Payload: `guarded`'s own `when: "${{ secrets.K == 'yesyesyesyes' }}"`
+    // reads a secret; `K = "yesyesyesyes"` makes the gate TRUE, so the step
+    // dispatches. Its own emitted value ("clean-value-not-derived-from-K")
+    // is a fixed literal, NOT built from `secrets.*` — deliberately, to
+    // isolate this test to the *gate's* taint rather than the item's
+    // *output* taint (which `map_output_taint_survives_the_step_boundary_...`
+    // above already covers). A downstream step reads
+    // `${{ steps.fan_out.output }}`.
+    let yaml = r#"
+name: map-inner-gate-taint
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: fan_out
+    map:
+      over: "${{ inputs.items }}"
+      as: item
+      on_item_error: continue
+    steps:
+      - id: guarded
+        when: "${{ secrets.K == 'yesyesyesyes' }}"
+        emit: { v: "clean-value-not-derived-from-K" }
+  - id: downstream
+    needs: [fan_out]
+    emit: { echoed: "${{ steps.fan_out.output }}" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({"items": [1]}), "K", "yesyesyesyes");
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let fan_out = outcomes.iter().find(|o| o.step_id == "fan_out").unwrap();
+    assert!(
+        matches!(fan_out.status, StepStatus::Completed),
+        "the gate is true, so the guarded step dispatches and the item completes"
+    );
+    let items = fan_out.output["items"]
+        .as_array()
+        .expect("map output has an `items` array");
+    assert_eq!(
+        items[0]["output"]["v"],
+        serde_json::json!("clean-value-not-derived-from-K"),
+        "the item's own OUTPUT is not secret-derived — isolating this test to the gate"
+    );
+    assert!(
+        fan_out.output_is_secret_derived,
+        "the guarded step's `when:` read `secrets.K`, so the map's own aggregate output \
+         must be recorded as secret-derived even though no item's OUTPUT was — before this \
+         round's fix, `dispatch_map_step` folded only `output_is_secret_derived` into its \
+         aggregate, never `gate_condition_was_secret_derived`, so this flag stayed false"
+    );
+
+    let flow_created: Vec<&serde_json::Value> = sink
+        .0
+        .iter()
+        .filter(|e| matches!(e.kind, TaskKind::Flow) && e.payload_json.get("TaskCreated").is_some())
+        .map(|e| &e.payload_json["TaskCreated"]["input"]["Json"])
+        .collect();
+    assert_eq!(
+        flow_created.len(),
+        2,
+        "`guarded`'s one item, then `downstream`"
+    );
+    assert_eq!(
+        flow_created[1]["echoed"],
+        serde_json::json!("***"),
+        "the map's aggregate taint survives the step boundary, so `downstream` reading \
+         `${{{{ steps.fan_out.output }}}}` is redacted in the log, exactly as \
+         `map_output_taint_survives_the_step_boundary_so_a_downstream_step_reading_it_is_redacted` \
+         already establishes for item-output taint"
+    );
+}
+
+#[test]
+fn an_inner_gate_that_fails_to_evaluate_because_of_a_secret_taints_the_maps_own_output() {
+    // Fix round 3, item 1, the fail-closed arm this crate's posture depends
+    // on (fix round 5, item 1 — `evaluate_when_gate`'s `Err` arm deliberately
+    // FORCES `gate_condition_was_secret_derived = true`, because an
+    // evaluation failure's taint is unknown and ruling P35 says treat
+    // unknown as secret-derived). Before this round's fix, that forced
+    // `true` was thrown away identically to the `Decided`/`true`-condition
+    // case above.
+    //
+    // Payload, identical in shape to
+    // `tests/exec_sequencing.rs`'s
+    // `a_when_that_fails_to_evaluate_because_of_the_secrets_content_records_the_gate_as_secret_derived`,
+    // nested under a `map` instead of at top level:
+    // `when: "${{ inputs.arr[json(secrets.K).idx] }}"`, `inputs.arr = [true,
+    // false]`, `K = {"idx":"not-a-number"}` — the subscript fails to
+    // evaluate only because of what the secret said.
+    let yaml = r#"
+name: map-inner-gate-eval-failure-taint
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: fan_out
+    map:
+      over: "${{ inputs.items }}"
+      as: item
+      on_item_error: continue
+    steps:
+      - id: guarded
+        when: "${{ inputs.arr[json(secrets.K).idx] }}"
+        emit: { v: "clean-value-not-derived-from-K" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(
+        serde_json::json!({"items": [1], "arr": [true, false]}),
+        "K",
+        r#"{"idx":"not-a-number"}"#,
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    let fan_out = outcomes.iter().find(|o| o.step_id == "fan_out").unwrap();
+    let items = fan_out.output["items"]
+        .as_array()
+        .expect("map output has an `items` array");
+    assert_eq!(
+        items[0]["status"],
+        serde_json::json!("failed"),
+        "the un-evaluable subscript fails the item closed: {:?}",
+        items[0]
+    );
+    assert!(
+        fan_out.output_is_secret_derived,
+        "an inner gate that fails to evaluate because of the secret's content forces \
+         `gate_condition_was_secret_derived = true` (fix round 5, item 1); that must fold \
+         into the map's own aggregate too, not just the true-condition dispatch case above"
+    );
+    assert!(
+        sink.0.is_empty(),
+        "the guarded step never dispatches — its own gate never evaluated to true"
+    );
+}

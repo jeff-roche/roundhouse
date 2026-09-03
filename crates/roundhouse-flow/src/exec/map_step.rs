@@ -294,13 +294,18 @@ impl<'a> Executor<'a> {
     ///    place per item, restored once after. Fixed the flat (non-nested)
     ///    case (2,000 items: 3.15 ms) but a nested `map` is dispatched once
     ///    per enclosing item, so the **clone count is the product of
-    ///    enclosing item counts** — fix round 2 measured `map(2000) ->
-    ///    map(1) -> emit`, identical 4,000 events as a flat 2,000-item map, a
-    ///    32 MB unreferenced `inputs.pad`: flat **4.83 ms**, nested **5.366
-    ///    s** — 1,111× for the same event count. A fix-round-1 doc section
-    ///    stated the flat measurement's "no longer multiplied by item count"
-    ///    conclusion unconditionally, which was false the moment nesting was
-    ///    tried.
+    ///    enclosing item counts** — `map(2000) -> map(1) -> emit`, identical
+    ///    4,000 events as a flat 2,000-item map, a 32 MB unreferenced
+    ///    `inputs.pad`: flat **4.83 ms**, nested **5.366 s** — 1,111× for the
+    ///    same event count (fix round 3 correction: measured for
+    ///    `task-14-fix-2.md`'s own brief, not fix round 2's own reproduction
+    ///    of this now-replaced design, which independently got 3.625 s at
+    ///    32 MB on different hardware — same order of magnitude, same
+    ///    conclusion; the security lens's own independent reproduction this
+    ///    round got 5.49 s, corroborating the brief's figure over round 2's
+    ///    own run). A fix-round-1 doc section stated the flat measurement's
+    ///    "no longer multiplied by item count" conclusion unconditionally,
+    ///    which was false the moment nesting was tried.
     /// 3. **Fix round 2 (current): snapshot and restore the *one root*
     ///    `as_name`, not the whole context.** [`crate::expr::ExprContext::snapshot_root`]/
     ///    [`crate::expr::ExprContext::restore_root`] capture and revert one
@@ -358,7 +363,7 @@ impl<'a> Executor<'a> {
     /// secret-derived collection, the second over a genuinely clean one —
     /// the second map's items still log in cleartext, not `***`.
     ///
-    /// # Re-measured after fix round 2 (ruling P18)
+    /// # Re-measured after fix round 2, attribution corrected and the missing number filled in by fix round 3 (ruling P18/P46)
     ///
     /// Release build, through [`Executor::run_to_completion`], one trivial
     /// `emit` inner step. Flat case, same shape as fix round 1's own table
@@ -375,8 +380,31 @@ impl<'a> Executor<'a> {
     ///
     /// | pad | 0 B | 1 MB | 8 MB | 32 MB |
     /// |---|---|---|---|---|
-    /// | nested, fix round 1 (whole-context clone per call) | 23.9 ms | 50.8 ms | 353.8 ms | **5.366 s** |
-    /// | nested, fix round 2 (snapshot/restore one root) | flat regardless of `pad` — no clone of `inputs` occurs at any nesting level |
+    /// | nested, fix round 1 (whole-context clone per call)¹ | 23.9 ms | 50.8 ms | 353.8 ms | **5.366 s** |
+    /// | nested, fix round 2 (snapshot/restore one root)² | 7.1 ms | 7.5 ms | 8.5 ms | **7.3 ms** |
+    ///
+    /// ¹ **Fix round 3 correction (ruling P18/P46):** these four numbers are
+    /// `task-14-fix-2.md`'s own brief measurement of the *replaced*, fix
+    /// round-1 design — not fix round 2's own reproduction of it, which
+    /// independently measured 3.625 s at 32 MB on different hardware (same
+    /// order of magnitude, same conclusion; the security lens's own
+    /// independent reproduction this round got 5.49 s, corroborating the
+    /// brief's figure over round 2's). Kept because it is still the right
+    /// order of magnitude for the design it describes, now correctly
+    /// attributed rather than left to read as this section's own claim.
+    ///
+    /// ² **Fix round 3's own measurement, filling in what this row
+    /// previously left as prose only** ("flat regardless of `pad` — no
+    /// clone of `inputs` occurs at any nesting level," true but with no
+    /// number attached, which is exactly the gap ruling P18 exists to close)
+    /// — release build, min of 3 runs each after a warm-up run, through
+    /// [`Executor::run_to_completion`], identical 4,000 events at every pad
+    /// size. Confirms the row's own prose: flat within measurement noise
+    /// across the whole 0-32 MB range, not merely "much smaller than the
+    /// fix round 1 numbers." Independently corroborated by the security
+    /// lens's own reproduction this round: 6.7-9.0 ms at this same depth
+    /// (two levels of nesting), 16-19 ms at three levels, also flat across
+    /// 0-32 MB — this function does not measure the three-level case.
     ///
     /// Nesting cost is now **O(1) per level** (one `HashMap` get plus one
     /// insert/remove pair, per level, independent of context size) instead of
@@ -553,6 +581,59 @@ impl<'a> Executor<'a> {
     /// and
     /// `a_when_that_fails_to_evaluate_on_an_inner_step_fails_closed_and_never_dispatches`.
     ///
+    /// # An inner step's own `gate_condition_was_secret_derived` was discarded — CLOSED (fix round 3, item 1)
+    ///
+    /// Fix round 2 above made every inner step's `when:` gate get
+    /// *evaluated* through [`evaluate_when_gate`], closing the fail-open
+    /// dispatch bug. It did not make the resulting
+    /// [`StepOutcome::gate_condition_was_secret_derived`] flag go anywhere:
+    /// on the `Decided` arm the flag *was* set on that inner step's own
+    /// `StepOutcome`, but [`ItemOutcome`] — what the closure below actually
+    /// returns per item — has no field for it, so it was dropped at every
+    /// item boundary; on the `Proceed` arm the flag from `evaluate_when_gate`
+    /// was never even read (`GateDecision::Proceed { .. }`). This function's
+    /// own returned `StepOutcome` then hard-coded
+    /// `gate_condition_was_secret_derived: false` unconditionally (see below)
+    /// — a `false` that meant nothing was ever measured, not that nothing
+    /// was secret-derived. That is the same `unwrap_or(false)` shape
+    /// [`evaluate_when_gate`]'s own `Err` arm (`crate::exec::mod`) was
+    /// written specifically to keep a future consumer from reaching — this
+    /// function was that consumer, shipped.
+    ///
+    /// Measured, `${{ secrets.K == 'yesyesyesyes' }}` guarding a step whose
+    /// own output is not secret-derived, `K = "yesyesyesyes"` (gate true, so
+    /// the inner step actually dispatches): the identical step at the top
+    /// level records `gate_condition_was_secret_derived: true` on its own
+    /// outcome; through a `map`, before this fix, nothing on the map path
+    /// recorded it at all — the map's own `output_is_secret_derived` stayed
+    /// `false` too, since it only ever folded in *output* taint. Second
+    /// payload, the fail-closed arm this crate's posture depends on:
+    /// `when: "${{ inputs.arr[json(secrets.K).idx] }}"` with
+    /// `K = {"idx":"not-a-number"}` — the subscript fails to evaluate only
+    /// because of what the secret said, `evaluate_when_gate`'s `Err` arm
+    /// deliberately forces `true` (fix round 5, item 1), and before this fix
+    /// that forced `true` was thrown away identically.
+    ///
+    /// **The fix:** fold the flag into the same aggregate
+    /// `any_item_secret_derived` already accumulates
+    /// [`StepOutcome::output_is_secret_derived`] into, per item, on both
+    /// `GateDecision` arms — not a new field on [`ItemOutcome`] (which has no
+    /// way to distinguish "this item's gate was secret-derived" from "this
+    /// item's output was", and does not need to: both mean the same thing to
+    /// a caller deciding whether `${{ steps.<map_id>.output }}` needs
+    /// redaction downstream). `any_item_secret_derived` already feeds
+    /// [`Self`]'s own `output_is_secret_derived` below, so folding the gate
+    /// flag in there is what makes it a real record rather than a discarded
+    /// one. It deliberately does **not** touch this function's own
+    /// `gate_condition_was_secret_derived: false` — see the doc comment on
+    /// that field, below, for why that hard-coded value is a distinct,
+    /// correct placeholder rather than the same bug.
+    ///
+    /// Pinned by `tests/map_step.rs`'s
+    /// `an_inner_steps_secret_derived_gate_taints_the_maps_own_output_even_when_the_items_output_does_not`
+    /// and
+    /// `an_inner_gate_that_fails_to_evaluate_because_of_a_secret_taints_the_maps_own_output`.
+    ///
     /// # The map's own aggregate status is unconditionally `Completed` — recorded, not fixed here (fix round 2, item 5)
     ///
     /// The `StepOutcome` this function returns always carries
@@ -650,7 +731,11 @@ impl<'a> Executor<'a> {
         // reading `${{ steps.<map_id>.output }}` must be tainted too — the
         // same reasoning `Executor::run_to_completion` already applies at
         // the top-level step boundary (see its own `secret_derived_steps`
-        // comment).
+        // comment). Fix round 3, item 1: this variable also folds in every
+        // inner step's own `gate_condition_was_secret_derived`, on both
+        // `GateDecision` arms — see the loop below and this function's own
+        // doc comment, "An inner step's own `gate_condition_was_secret_derived`
+        // was discarded".
         let mut any_item_secret_derived = over_evaluated.secret_derived();
 
         let result = run_map(
@@ -672,9 +757,33 @@ impl<'a> Executor<'a> {
                     // silently ignored".
                     let outcome = match evaluate_when_gate(inner, &self.ctx) {
                         GateDecision::Decided(outcome) => outcome,
-                        GateDecision::Proceed { .. } => self.dispatch_step(inner),
+                        GateDecision::Proceed {
+                            gate_condition_was_secret_derived,
+                        } => {
+                            // Fix round 3, item 1: mirror
+                            // `Executor::run_to_completion`'s own
+                            // `outcome.gate_condition_was_secret_derived = ...`
+                            // assignment (`crate::exec::mod`) — the flag
+                            // `evaluate_when_gate` computed for *this* inner
+                            // step's own gate belongs on *this* step's
+                            // outcome, not whatever `dispatch_step` fills the
+                            // field with when `inner` is itself a nested
+                            // `map` (its own inner items' folded flag — see
+                            // below).
+                            let mut outcome = self.dispatch_step(inner);
+                            outcome.gate_condition_was_secret_derived =
+                                gate_condition_was_secret_derived;
+                            outcome
+                        }
                     };
                     any_item_secret_derived |= outcome.output_is_secret_derived;
+                    // Fix round 3, item 1: fold this inner step's own
+                    // `when:` gate taint into the map's aggregate too, not
+                    // just its output taint — see this function's own doc
+                    // comment, "An inner step's own
+                    // `gate_condition_was_secret_derived` was discarded",
+                    // for why this is fail-safe rather than cosmetic.
+                    any_item_secret_derived |= outcome.gate_condition_was_secret_derived;
                     match outcome.status {
                         // Fix round 1, item 4: an item fails as soon as ANY
                         // inner step fails — stop dispatching this item's
@@ -712,6 +821,19 @@ impl<'a> Executor<'a> {
             // status is unconditionally `Completed`".
             status: StepStatus::Completed,
             output_is_secret_derived: any_item_secret_derived,
+            // This is the map STEP'S OWN gate — whether *this* `map` step's
+            // own `when:` (if it has one) read secret material — not a
+            // record of its inner items' gates; those are folded into
+            // `output_is_secret_derived` above (fix round 3, item 1), the
+            // only field this function has that can carry an aggregate.
+            // `false` here is a placeholder identical in kind to
+            // `StepOutcome::failed`'s own (`crate::exec::mod`): the only
+            // callers of this function — `Executor::run_to_completion` and,
+            // when this `map` is itself nested inside an enclosing one,
+            // `dispatch_map_step`'s own inner loop above — always overwrite
+            // this field immediately after calling `dispatch_step`, from
+            // *their* `evaluate_when_gate` call on *this* step. Do not read
+            // the `false` below as a statement about this map's own gate.
             gate_condition_was_secret_derived: false,
         }
     }

@@ -144,16 +144,31 @@ pub(crate) fn evaluate_when_gate(step: &StepDef, ctx: &ExprContext) -> GateDecis
             // `crate::parse::MAX_TOP_LEVEL_STEPS` is 500, so a run admits at
             // most 500 such *top-level* steps and therefore at most ~500 bits
             // (~62 bytes) through this route alone, into a table that
-            // physically rejects `UPDATE`/`DELETE`. **This ceiling is now
-            // shared with `map`** (fix round 2): a `map` inner step also
-            // reaches this function, and `MAX_MAP_ITEMS` (2,000 per `map`
-            // step) is a *larger* per-call ceiling than the top-level one,
-            // and per ruling P47 is not bounded at all across nesting levels
-            // — so the arithmetic bound stated here no longer holds for the
-            // `map`-reached call sites; see
-            // `map_step::Executor::dispatch_map_step`'s own doc comment for
-            // the current, larger figure. Nothing was measured at either
-            // size for this specific one-bit channel.
+            // physically rejects `UPDATE`/`DELETE`. **Reachability of this
+            // function is now shared with `map`** (fix round 2): a `map`
+            // inner step's own `when:` gate is evaluated through this exact
+            // function too, at up to `MAX_MAP_ITEMS` (2,000) inner-step
+            // evaluations per `map` step *call* — a larger per-call ceiling
+            // than the top-level one, and per ruling P47 not bounded at all
+            // across nesting levels — so the arithmetic bound stated above
+            // does not hold for `map`-reached call sites.
+            //
+            // **What the two call sites do with the result differs, though
+            // (fix round 3, item 1/2 — corrected from an earlier, broader
+            // claim this comment made).** `Executor::run_to_completion` keeps
+            // this function's per-step `gate_condition_was_secret_derived` as
+            // a per-step record (see its own use of the flag below).
+            // `map_step::Executor::dispatch_map_step` does not: it folds
+            // *every* inner step's flag, across *every* item, into ONE
+            // aggregate boolean on the map's own `output_is_secret_derived`
+            // — see that function's own doc comment, "An inner step's own
+            // `gate_condition_was_secret_derived` was discarded", for why. So
+            // the one-bit-per-gate accounting this comment describes is not
+            // extended to `map`'s inner steps as individually observable
+            // bits by this round's fix — only collapsed to one bit for the
+            // whole `map` step, which is a *smaller*, not larger, channel per
+            // step than the arithmetic bound above assumes. Nothing was
+            // measured at either size for this specific one-bit channel.
             //
             // **Accepted, not closed.** The only actor who can build this
             // channel is the workflow author, who already has a designed
