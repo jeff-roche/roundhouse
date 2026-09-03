@@ -19,6 +19,17 @@
 //! and a stale allowlist entry (one that no longer matches any profile's
 //! actual `base_url` host) fails the build too, so the list cannot rot into
 //! blanket permission.
+//!
+//! Fix round 4, Fix 4: the host check alone left the schema doc comment's
+//! "never a placeholder" promise only half enforced -- `vertex-anthropic.
+//! toml` and `vertex-gemini.toml` both carry a literal `PROJECT_ID` segment
+//! in the URL *path* (host is real Google infrastructure; no squatting risk,
+//! the failure mode is a 403 from a real Google endpoint, and the
+//! placeholder is intentional and documented on both profiles' own
+//! `base_url` comments). The test below now also scans every path segment
+//! for the all-caps-with-underscores shape (`[A-Z_]{4,}`) a placeholder like
+//! `PROJECT_ID` takes, via its own allowlist with the same
+//! cannot-silently-rot discipline as the host allowlist above it.
 
 use roundhouse_provider::profile::ProviderProfile;
 use std::path::Path;
@@ -224,11 +235,57 @@ const ALLOWLIST: &[AllowlistEntry] = &[
     },
 ];
 
-/// Fix-round-2 Fix 3: every profile's `base_url` host is either a known,
-/// real vendor/local-runtime host (individually allowlisted with a reason)
-/// or ends in `.invalid` (the mechanically-recognizable placeholder
-/// convention). A profile whose host is neither -- e.g. a first-come-
-/// registerable `my-resource.<vendor>` guess -- fails this test.
+/// One profile file whose `base_url` *path* carries an intentional,
+/// documented placeholder segment (all-caps-with-underscores, e.g.
+/// `PROJECT_ID`) -- as opposed to the *host* allowlist above, which is
+/// about hosts that could be squatted. A path placeholder carries no
+/// squatting risk (the host is already a real, known vendor host, verified
+/// by the host check above); it exists only so the schema doc comment's
+/// "never a placeholder" promise stays mechanically enforced rather than
+/// silently half-true.
+struct PathPlaceholderAllowlistEntry {
+    /// Filename under `profiles/`, e.g. `"vertex-anthropic.toml"`.
+    file: &'static str,
+    /// The exact path segment, e.g. `"PROJECT_ID"`.
+    segment: &'static str,
+    /// Why this placeholder is intentional and documented, not an oversight.
+    reason: &'static str,
+}
+
+const PATH_PLACEHOLDER_ALLOWLIST: &[PathPlaceholderAllowlistEntry] = &[
+    PathPlaceholderAllowlistEntry {
+        file: "vertex-anthropic.toml",
+        segment: "PROJECT_ID",
+        reason: "Vertex's project id is deployment-specific and cannot be known ahead of \
+                 time; this profile's base_url comment documents it as always overridden \
+                 via ROUNDHOUSE_VERTEX_ANTHROPIC_BASE_URL. Host is real Google \
+                 infrastructure -- no squatting risk, failure mode is a real 403.",
+    },
+    PathPlaceholderAllowlistEntry {
+        file: "vertex-gemini.toml",
+        segment: "PROJECT_ID",
+        reason: "Same intentional, documented placeholder as vertex-anthropic.toml (Task \
+                 17, same host family) -- see that entry's reason.",
+    },
+];
+
+/// `[A-Z_]{4,}` -- the shape a placeholder path segment like `PROJECT_ID`
+/// takes: long enough (4+ chars) that a real short uppercase path token
+/// (there are none among today's profiles, but e.g. a hypothetical `V1`
+/// version segment) can't false-positive.
+fn looks_like_a_placeholder_path_segment(segment: &str) -> bool {
+    segment.len() >= 4 && segment.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+}
+
+/// Fix-round-2 Fix 3 (host), extended by fix round 4 Fix 4 (path): every
+/// profile's `base_url` host is either a known, real vendor/local-runtime
+/// host (individually allowlisted with a reason) or ends in `.invalid` (the
+/// mechanically-recognizable placeholder convention) -- and every path
+/// segment shaped like a placeholder (`[A-Z_]{4,}`, e.g. `PROJECT_ID`) is
+/// either absent or individually allowlisted with a reason. A profile whose
+/// host is neither known-real nor `.invalid` -- e.g. a first-come-
+/// registerable `my-resource.<vendor>` guess -- fails this test, and so does
+/// an un-allowlisted placeholder-shaped path segment.
 #[test]
 fn every_profile_base_url_host_is_a_known_vendor_host_or_dot_invalid() {
     for entry in ALLOWLIST {
@@ -239,9 +296,18 @@ fn every_profile_base_url_host_is_a_known_vendor_host_or_dot_invalid() {
             entry.host
         );
     }
+    for entry in PATH_PLACEHOLDER_ALLOWLIST {
+        assert!(
+            !entry.reason.is_empty(),
+            "PATH_PLACEHOLDER_ALLOWLIST entry for {} (segment {:?}) must state why it's exempt",
+            entry.file,
+            entry.segment
+        );
+    }
 
     let profiles_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
     let mut used = vec![false; ALLOWLIST.len()];
+    let mut path_used = vec![false; PATH_PLACEHOLDER_ALLOWLIST.len()];
     let mut violations = Vec::new();
     let mut checked = 0usize;
 
@@ -275,21 +341,38 @@ fn every_profile_base_url_host_is_a_known_vendor_host_or_dot_invalid() {
         });
         checked += 1;
 
-        if host.ends_with(".invalid") {
-            continue;
+        if !host.ends_with(".invalid") {
+            match ALLOWLIST
+                .iter()
+                .enumerate()
+                .find(|(_, a)| a.file == file_name && a.host == host)
+            {
+                Some((idx, _)) => used[idx] = true,
+                None => violations.push(format!(
+                    "{file_name}: base_url host {host:?} is neither `.invalid` nor in \
+                     ALLOWLIST -- if this is a real vendor host, add it with a reason; if \
+                     it is a placeholder, use a `.invalid` host instead"
+                )),
+            }
         }
 
-        match ALLOWLIST
-            .iter()
-            .enumerate()
-            .find(|(_, a)| a.file == file_name && a.host == host)
-        {
-            Some((idx, _)) => used[idx] = true,
-            None => violations.push(format!(
-                "{file_name}: base_url host {host:?} is neither `.invalid` nor in ALLOWLIST \
-                 -- if this is a real vendor host, add it with a reason; if it is a \
-                 placeholder, use a `.invalid` host instead"
-            )),
+        for segment in url.path_segments().into_iter().flatten() {
+            if !looks_like_a_placeholder_path_segment(segment) {
+                continue;
+            }
+            match PATH_PLACEHOLDER_ALLOWLIST
+                .iter()
+                .enumerate()
+                .find(|(_, a)| a.file == file_name && a.segment == segment)
+            {
+                Some((idx, _)) => path_used[idx] = true,
+                None => violations.push(format!(
+                    "{file_name}: base_url path segment {segment:?} looks like a placeholder \
+                     ([A-Z_]{{4,}}) but is not in PATH_PLACEHOLDER_ALLOWLIST -- if this is an \
+                     intentional, documented placeholder, add it with a reason; otherwise fix \
+                     the path"
+                )),
+            }
         }
     }
 
@@ -300,8 +383,7 @@ fn every_profile_base_url_host_is_a_known_vendor_host_or_dot_invalid() {
 
     assert!(
         violations.is_empty(),
-        "found profile base_url host(s) that are neither `.invalid` nor explicitly \
-         allowlisted:\n{}",
+        "found profile base_url host/path placeholder violation(s):\n{}",
         violations.join("\n")
     );
 
@@ -315,5 +397,18 @@ fn every_profile_base_url_host_is_a_known_vendor_host_or_dot_invalid() {
         stale.is_empty(),
         "ALLOWLIST entries that no longer match any profile's actual base_url host \
          (stale -- the host changed, or the profile was renamed/removed): {stale:?}"
+    );
+
+    let stale_path: Vec<&str> = PATH_PLACEHOLDER_ALLOWLIST
+        .iter()
+        .zip(&path_used)
+        .filter(|(_, used)| !**used)
+        .map(|(a, _)| a.file)
+        .collect();
+    assert!(
+        stale_path.is_empty(),
+        "PATH_PLACEHOLDER_ALLOWLIST entries that no longer match any profile's actual \
+         base_url path (stale -- the path changed, or the profile was renamed/removed): \
+         {stale_path:?}"
     );
 }
