@@ -29,6 +29,14 @@
 # nothing in this task exercises a live NVIDIA credential either way -- but
 # it should be treated as unverified-and-likely-nonfunctional against the
 # real vendor until someone confirms otherwise with a live key.
+#
+# Fix-round-2 Fix 4: this is not a dead end. A self-hosted NIM microservice
+# deployment (the docs.nvidia.com reference above, run as your own container
+# rather than against the hosted integrate.api.nvidia.com catalog) DOES
+# serve POST /v1/responses -- point this profile at one by setting
+# ROUNDHOUSE_NVIDIA_OPEN_RESPONSES_BASE_URL to that deployment's base URL
+# (§9.9's `ROUNDHOUSE_<PROVIDER>_BASE_URL` override, keyed off this
+# profile's own `id` above).
 id = "nvidia-open-responses"
 codec = "openai-responses"
 

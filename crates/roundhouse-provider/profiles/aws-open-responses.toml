@@ -30,6 +30,15 @@
 # bedrock-mantle.{region}.api.aws host and needed the corrected service name
 # "bedrock-mantle" for exactly that reason. Same host, same signing scope.
 #
+# Fix-round-2 Fix 5, INFERRED AND UNCONFIRMED (same caveat class as
+# NVIDIA's above): the AWS docs cited above confirm SigV4 is *a* valid,
+# supported authentication path for bedrock-runtime generically -- they do
+# not confirm "bedrock" specifically is the correct SigV4 signing service
+# name for THIS surface (bedrock-runtime's /openai/v1 path). The value here
+# is inferred from host-family consistency with bedrock-converse.toml, not
+# independently verified against AWS's SigV4 service-name reference for the
+# /openai/v1 surface itself.
+#
 # [errors] TABLE LEFT EMPTY, REPORTED: this task's research could not
 # confirm the JSON error-body shape this specific endpoint (bedrock-runtime's
 # /openai/v1 surface) actually returns. Two conflicting signals were found:
