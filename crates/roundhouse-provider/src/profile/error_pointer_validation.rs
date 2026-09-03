@@ -28,6 +28,21 @@ use std::path::Path;
 /// This check only catches the class of typo `deny_unknown_fields` and
 /// `value_type` already catch for their own fields: a malformed pointer that
 /// would silently never match anything, ever, for any body.
+///
+/// The empty-segment check below is purely syntactic: it splits `pointer` on
+/// `/` and never performs RFC 6901 unescaping (`~1` -> `/`, `~0` -> `~`)
+/// before checking each segment for emptiness. This differs from
+/// `codec::openai_chat::encode::set_json_pointer` elsewhere in this crate,
+/// which *is* escaping-aware (it unescapes each segment before using it to
+/// index into the JSON tree) — a reader coming from that function might
+/// reasonably assume this one behaves the same way; it does not. The gap is
+/// harmless at the current scope: every profile's `error_pointer` across all
+/// 24 profiles is one or two plain, unescaped segments (e.g. `/error/code`),
+/// so no real pointer here ever contains a literal `~` or needs a `~1`-
+/// escaped `/` inside a segment. This was measured, not missed — if a future
+/// profile ever needs an escaped segment, this check (and `classify`'s use of
+/// `serde_json::Value::pointer`, which *does* unescape) would need revisiting
+/// together.
 pub fn validate_error_pointer(profile_path: &Path, pointer: &str) {
     let Some(stripped) = pointer.strip_prefix('/') else {
         panic!(
