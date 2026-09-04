@@ -80,11 +80,37 @@ pub enum RetryPolicyError {
 /// M2). Generous relative to `RetryDef`'s own fixture value of 3.
 pub const MAX_ATTEMPTS: u32 = 20;
 
+/// Why [`parse_duration_str`] rejected a duration string, with no field
+/// name welded on.
+///
+/// Split out of [`RetryPolicyError`] by Task 15 (B7), which needs the same
+/// parser for a `gate:` step's `timeout:` and for
+/// `permissions.unattended.deadline` — neither of which is a retry field,
+/// so neither can honestly report itself as a `RetryPolicyError`. The
+/// `field`-carrying [`RetryPolicyError::InvalidDuration`] /
+/// [`RetryPolicyError::DurationOverflow`] variants are unchanged and still
+/// what [`retry_policy_from_def`] returns; [`resolve_duration`] maps this
+/// type onto them.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum DurationParseError {
+    #[error(
+        "not a valid duration — expected a non-negative integer followed by one of h/m/s/d (e.g. \"10s\", \"5m\")"
+    )]
+    Invalid,
+    #[error("overflows when converted to seconds")]
+    Overflow,
+}
+
 /// Minimal, strict parser for the subset of duration text used in workflow
 /// YAML: a non-negative integer followed by exactly one unit character
 /// (`s`, `m`, `h`, `d`), no surrounding content, no sign, no fractional
 /// part. Deliberately local and small rather than a general duration
 /// parser — this crate's workflow YAML never needs anything richer.
+///
+/// **This is the crate's only duration parser, deliberately.** Ruling P65
+/// #5: a second one would mean a gate's `timeout: "10 s"` and a retry's
+/// `base: "10 s"` could disagree about the same text. `pub(crate)` so
+/// [`crate::hitl`] reaches it rather than growing a copy.
 ///
 /// Fix round 1 on Task 10 (finding M1/M2): an earlier version of this
 /// function accepted any text, using unrecognised or malformed input
@@ -94,34 +120,27 @@ pub const MAX_ATTEMPTS: u32 = 20;
 /// e.g. `"999999999999999999h"`). This version rejects anything that
 /// isn't exactly the strict shape above, and uses `checked_mul` so an
 /// overflowing value is a rejection rather than a silently wrapped one.
-fn parse_duration_str(field: &'static str, s: &str) -> Result<Duration, RetryPolicyError> {
-    let invalid = || RetryPolicyError::InvalidDuration {
-        field,
-        value: s.to_string(),
-    };
+pub(crate) fn parse_duration_str(s: &str) -> Result<Duration, DurationParseError> {
     if s.is_empty() {
-        return Err(invalid());
+        return Err(DurationParseError::Invalid);
     }
     let mut chars = s.chars();
-    let unit = chars.next_back().ok_or_else(invalid)?;
+    let unit = chars.next_back().ok_or(DurationParseError::Invalid)?;
     let digits = chars.as_str();
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(invalid());
+        return Err(DurationParseError::Invalid);
     }
-    let n: u64 = digits.parse().map_err(|_| invalid())?;
+    let n: u64 = digits.parse().map_err(|_| DurationParseError::Invalid)?;
     let multiplier: u64 = match unit {
         'h' => 3600,
         'm' => 60,
         's' => 1,
         'd' => 86400,
-        _ => return Err(invalid()),
+        _ => return Err(DurationParseError::Invalid),
     };
     let secs = n
         .checked_mul(multiplier)
-        .ok_or_else(|| RetryPolicyError::DurationOverflow {
-            field,
-            value: s.to_string(),
-        })?;
+        .ok_or(DurationParseError::Overflow)?;
     Ok(Duration::from_secs(secs))
 }
 
@@ -147,7 +166,16 @@ fn resolve_duration(
     match raw {
         None => Ok(default),
         Some(s) => {
-            let parsed = parse_duration_str(field, s)?;
+            let parsed = parse_duration_str(s).map_err(|err| match err {
+                DurationParseError::Invalid => RetryPolicyError::InvalidDuration {
+                    field,
+                    value: s.to_string(),
+                },
+                DurationParseError::Overflow => RetryPolicyError::DurationOverflow {
+                    field,
+                    value: s.to_string(),
+                },
+            })?;
             if parsed.is_zero() {
                 Err(RetryPolicyError::ZeroDuration {
                     field,

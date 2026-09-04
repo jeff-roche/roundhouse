@@ -11,6 +11,7 @@
 pub mod caps;
 pub mod exec;
 pub mod expr;
+pub mod hitl;
 pub mod job;
 pub mod parse;
 pub mod retry;
