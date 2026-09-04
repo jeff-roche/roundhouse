@@ -364,17 +364,51 @@ impl Job {
 /// fixed-algorithm hash).
 ///
 /// Determinism of the JSON encoding itself — not just the hash algorithm —
-/// is also required: struct fields always serialize in their declared
-/// order, and this workspace's `serde_json` is used with no
-/// `preserve_order` feature anywhere in the dependency graph, so
-/// `serde_json::Value::Object` (used by `InputSchema`'s embedded JSON
-/// Schema) is backed by a `BTreeMap` and serializes any two
-/// structurally-equal values identically regardless of the key insertion
-/// order used to build them. Both properties are enforced by tests in
-/// `tests/job.rs`, not just asserted here.
+/// is also required: struct fields (`SessionTemplate`, `Body`) always
+/// serialize in their declared order via `#[derive(Serialize)]`, and
+/// `InputSchema`'s embedded JSON Schema — an arbitrary, user-supplied
+/// `serde_json::Value` — is canonicalized by [`canonicalize_json`] before
+/// hashing: every `Value::Object` it contains, at any nesting depth, has
+/// its keys explicitly re-sorted (lexicographically, by `String`'s `Ord`)
+/// into a fresh `Map` before serialization. The resulting byte stream
+/// therefore depends only on the value's *structure*, never on the key
+/// insertion order used to build it, and never on which `Map` backing
+/// (a sorted `BTreeMap`, or an insertion-ordered map) `serde_json`'s
+/// `preserve_order` feature happens to select for a given build — this
+/// function does not rely on, or assert anything about, which of those
+/// this workspace's Cargo feature unification currently chooses. Both
+/// properties are enforced by tests in `tests/job.rs`, not just asserted
+/// here.
 pub fn content_hash(job: &JobVersion) -> String {
-    let canonical = serde_json::to_vec(&(&job.template, &job.body, &job.input_schema.0))
+    let canonical_schema = canonicalize_json(&job.input_schema.0);
+    let canonical = serde_json::to_vec(&(&job.template, &job.body, &canonical_schema))
         .expect("JobVersion's fields are always JSON-serializable");
     let digest = Sha256::digest(&canonical);
     format!("sha256:{digest:x}")
+}
+
+/// Return a `Value` equal to `value` but with every `Object`'s keys
+/// re-inserted in sorted order, recursively, at every nesting depth
+/// (including inside arrays). This makes the value's JSON *encoding*
+/// canonical by construction: two structurally-equal `Value`s produce this
+/// same sorted-key encoding regardless of the order their objects' keys
+/// were originally inserted in, and regardless of whether the `Map`
+/// `serde_json` uses under the hood is a `BTreeMap` or an insertion-ordered
+/// map (i.e. regardless of the `preserve_order` feature).
+fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut sorted = serde_json::Map::new();
+            for key in keys {
+                sorted.insert(key.clone(), canonicalize_json(&map[key]));
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonicalize_json).collect())
+        }
+        other => other.clone(),
+    }
 }

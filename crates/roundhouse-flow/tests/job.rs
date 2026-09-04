@@ -480,3 +480,86 @@ fn equal_content_hashes_the_same_regardless_of_how_it_was_built() {
         "equal content must hash the same no matter how it was constructed"
     );
 }
+
+#[test]
+fn content_hash_is_invariant_under_key_order_nested_two_levels_below_the_schema_root() {
+    // `equal_content_hashes_the_same_regardless_of_how_it_was_built` (above) reorders keys
+    // in the schema's own top-level object and in the map one level below it. This test
+    // isolates reordering that happens *only* deeper than that — the schema root and the
+    // map directly under it are built with identical insertion order in both variants;
+    // only the object nested two levels below `properties.repo`, and `repo`'s own object,
+    // have their key insertion order reversed. A fix that canonicalizes only the
+    // outermost object (or only the first level of nesting) would pass the test above
+    // while still failing this one.
+    let job_id = JobId::new();
+
+    let schema_a = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "repo": {
+                "type": "object",
+                "properties": { "owner": { "type": "string" }, "name": { "type": "string" } }
+            }
+        }
+    });
+
+    // Deepest map (properties.repo.properties): insert "name" before "owner" —
+    // reversed from schema_a's "owner", "name" order.
+    let mut owner_name_reversed = serde_json::Map::new();
+    owner_name_reversed.insert("name".to_string(), serde_json::json!({ "type": "string" }));
+    owner_name_reversed.insert("owner".to_string(), serde_json::json!({ "type": "string" }));
+
+    // `repo`'s own map: insert "properties" before "type" — reversed from schema_a's
+    // "type", "properties" order.
+    let mut repo_reversed = serde_json::Map::new();
+    repo_reversed.insert(
+        "properties".to_string(),
+        serde_json::Value::Object(owner_name_reversed),
+    );
+    repo_reversed.insert("type".to_string(), serde_json::json!("object"));
+
+    // The map holding `repo`, and the schema root itself, are built in the SAME
+    // insertion order as schema_a ("repo" alone; "type" then "properties") — only the
+    // deeper maps above differ.
+    let mut outer_properties = serde_json::Map::new();
+    outer_properties.insert("repo".to_string(), serde_json::Value::Object(repo_reversed));
+
+    let mut schema_b_map = serde_json::Map::new();
+    schema_b_map.insert("type".to_string(), serde_json::json!("object"));
+    schema_b_map.insert(
+        "properties".to_string(),
+        serde_json::Value::Object(outer_properties),
+    );
+    let schema_b = serde_json::Value::Object(schema_b_map);
+
+    assert_eq!(
+        schema_a, schema_b,
+        "sanity check: these two Values are equal despite differing construction order"
+    );
+
+    let v_a = JobVersion::new(
+        job_id,
+        1,
+        template(),
+        Body::Prompt {
+            template: "hello".to_string(),
+        },
+        InputSchema(schema_a),
+    );
+    let v_b = JobVersion::new(
+        job_id,
+        1,
+        template(),
+        Body::Prompt {
+            template: "hello".to_string(),
+        },
+        InputSchema(schema_b),
+    );
+
+    assert_eq!(
+        content_hash(&v_a),
+        content_hash(&v_b),
+        "equal content must hash the same even when only a deeply-nested object's key \
+         insertion order differs"
+    );
+}
