@@ -70,6 +70,31 @@ use serde_json::Value;
 /// magnitude as `ResourceCaps::default().max_tool_calls` (2,000), the
 /// closest existing precedent for "how many discrete units of work is a
 /// lot, for this crate."
+///
+/// # A parse-time ceiling interacts with this, and it is not in this file
+///
+/// An `over:` list written **inline in the workflow YAML** is also subject to
+/// [`crate::parse::MAX_INTEGER_SCALAR_VISITS`] (65,536) and
+/// [`crate::parse::MAX_FLOAT_SCALAR_VISITS`] (5,041), which cap how many
+/// numbers one document may make the parser decode. This cap and those are
+/// independent: 2,000 items here is a *runtime* fan-out bound, and those are
+/// *parse-time* bounds on the whole file.
+///
+/// What that means in practice, measured (fix round 5):
+///
+/// - **Integer ids: not a constraint you can reach.** The largest
+///   map-over-ids workflow [`crate::parse::MAX_YAML_BYTES`] admits at all is
+///   18 steps x 2,000 six-digit ids = 36,001 integers in 253,952 bytes, and
+///   65,536 is 1.82x that. The byte cap binds first.
+/// - **Float items: reachable.** More than 5,041 float items across a file's
+///   inline `over:` lists is refused at parse time — roughly two and a half
+///   full 2,000-item lists. A third list of floats will not parse, and the
+///   error is `TooManyNumericScalars`.
+///
+/// This note exists because fix round 4 shipped a single numeric ceiling of
+/// 5,041 that refused a 42 KB alias-free workflow of three map steps over
+/// 2,000 numeric ids — a shape this constant blesses — and the author would
+/// have had no reason to look in `parse` for why.
 pub const MAX_MAP_ITEMS: usize = 2_000;
 
 /// A run's remaining resource budget as `map` sees it. Real, live tracking

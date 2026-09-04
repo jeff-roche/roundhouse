@@ -263,49 +263,67 @@ use serde::de::{
 pub const NODE_WEIGHT_BYTES: usize = 8;
 
 /// Extra weight charged for a scalar `serde_yaml` hands over **already
-/// decoded** — a number — on top of [`NODE_WEIGHT_BYTES`]. This is what
-/// bounds the numeric-decode axis.
+/// decoded as a float**, on top of [`NODE_WEIGHT_BYTES`]. With
+/// [`INTEGER_SCALAR_WEIGHT_BYTES`] this is what bounds the numeric-decode
+/// axis.
 ///
 /// # Why a flat charge closes an axis the meter cannot see
 ///
 /// The visitor is handed an `f64`, never the token it came from, so the
 /// meter cannot price a numeric scalar by its length. Rounds 2 and 3 both
 /// attacked that by trying to *identify* the route the long token arrives
-/// on — a source pre-scan ([`super::MAX_PLAIN_NUMERIC_DIGIT_RUN`]) and then
-/// an attempt to intercept the dispatch. The first is bypassable (at least
-/// eight tag spellings reach the same branch), the second has no
+/// on — a source pre-scan, then an attempt to intercept the dispatch. The
+/// first was bypassable by at least eight tag spellings, the second has no
 /// interception point in `serde_yaml` 0.9.34, and round 3 concluded from
 /// those two failures that the axis was unclosable in-process.
 ///
-/// **That conclusion was wrong, and the reason is worth stating.** Both
-/// attempts were about identifying *which route* a token arrives on.
-/// Pricing does not need to know: every route — plain, `!!float`,
-/// `!<tag:yaml.org,2002:float>`, a remapped `%TAG` handle, a
-/// percent-encoded suffix — converges on the same handful of visitor
-/// callbacks. Charging there is route-independent by construction, and
-/// stays correct for routes nobody has enumerated yet.
+/// **That conclusion was wrong.** Both attempts were about identifying
+/// *which route* a token arrives on. Pricing does not need to know: every
+/// route converges on the same handful of visitor callbacks. Charging there
+/// is route-independent by construction, and a security review established
+/// that the property holds one level stronger than first claimed — at the
+/// **serde trait level**, since `visit_i8`/`i16`/`i32` forward to
+/// `visit_i64` and `visit_f32` to `visit_f64`, so no numeric arrival misses
+/// the charge even if `serde_yaml` changes the width it decodes to.
 ///
 /// # The bound
 ///
 /// A decoded scalar can never be longer than the source it came from
 /// (escapes shrink: `\u0037` is six source bytes and one decoded byte;
-/// block folding replaces a newline with a space; nothing grows). So the
-/// source length of any one token is capped by [`super::MAX_YAML_BYTES`],
-/// and the only unbounded factor was *how many times* a decode happens.
-/// Charging `NODE_WEIGHT_BYTES + NUMERIC_SCALAR_WEIGHT_BYTES` per numeric
-/// visit caps that count at
-/// [`super::MAX_NUMERIC_SCALAR_VISITS`], so total numeric-decode work is at
-/// most that many scans of at most `MAX_YAML_BYTES` bytes:
+/// block folding replaces a newline with a space; nothing grows). So one
+/// token's length is capped by [`super::MAX_YAML_BYTES`], and the only
+/// unbounded factor was *how many times* a decode happens. Charging caps
+/// that count at [`super::MAX_FLOAT_SCALAR_VISITS`].
 ///
-/// ```text
-/// visits    <= MAX_EXPANDED_WEIGHT / (NODE_WEIGHT_BYTES + NUMERIC_SCALAR_WEIGHT_BYTES)
-///           =  2,621,440 / 520  =  5,041
-/// decode    <= 5,041 * 262,144  =  1.32 GB of `dec2flt`/`from_str_radix` scanning
-/// ```
+/// # Floats and integers are charged differently, and only one is load-bearing
 ///
-/// Measured against that bound rather than assumed: see
-/// [`super::MAX_NUMERIC_SCALAR_VISITS`] for the value's derivation, the
-/// tradeoff curve, and the over-rejection sweep.
+/// Floats carry the expensive decode: `dec2flt` is O(token), and measurably
+/// worse when the digits sit in the **exponent** rather than the mantissa,
+/// because it parses mantissa digits eight at a time via `try_parse_8digits`
+/// but the exponent byte-at-a-time. Measured on the same 174 KB document
+/// with the same digit count: 383.8 ms with the digits in the exponent
+/// against 94.9 ms in the mantissa, **4.0x**.
+///
+/// Integers are charged [`INTEGER_SCALAR_WEIGHT_BYTES`], eight times less,
+/// because charging them what floats cost bought no bound and caused
+/// essentially all of the over-rejection — see that constant. **The division
+/// of what is guaranteed from what is merely sized:**
+///
+/// - **Guaranteed regardless of `serde_yaml`'s behaviour:** every arrival at
+///   a decoded-numeric callback is charged, so the *count* of decodes is
+///   capped. That is what makes the bound route-independent, and it does not
+///   rest on any argument about the library's internals.
+/// - **Sized by an argument about those internals:** *how small* the integer
+///   charge can safely be. Today no integer route performs an O(token)
+///   decode that succeeds — a long `!!int` fails closed (measured: rejected
+///   in 4.1 ms), and a plain leading-zero digit string is diverted to
+///   `visit_str` by `digits_but_not_number` and charged its length. If that
+///   ever changed, the integer charge would still bound the count, but the
+///   product of count and token length would need re-sizing.
+///
+/// That division is deliberate: the route-dependent reasoning this module
+/// has had falsified four times is confined to the *tuning*, never to the
+/// safety property.
 ///
 /// # Failure direction
 ///
@@ -313,15 +331,48 @@ pub const NODE_WEIGHT_BYTES: usize = 8;
 /// fewer, so this cannot introduce an under-rejection. Verified rather than
 /// assumed: every payload the suite rejected before this charge is still
 /// rejected, and the over-rejection it does introduce is a cap on numeric
-/// scalars per document, measured and pinned by
-/// `a_numeric_heavy_but_realistic_workflow_still_parses` in
-/// `tests/parse_top_level.rs`.
-pub const NUMERIC_SCALAR_WEIGHT_BYTES: usize = 512;
+/// scalars per document, measured and pinned in `tests/parse_top_level.rs`.
+pub const FLOAT_SCALAR_WEIGHT_BYTES: usize = 512;
+
+/// Extra weight charged for a scalar `serde_yaml` hands over **already
+/// decoded as an integer**, on top of [`NODE_WEIGHT_BYTES`]. Eight times
+/// smaller than [`FLOAT_SCALAR_WEIGHT_BYTES`], and the reason is measured.
+///
+/// # Why integers are cheap to admit and expensive to over-charge
+///
+/// Charging integers at the float rate bought no bound and caused
+/// essentially all of the over-rejection. Measured: with both at 512, a
+/// **42,384-byte, alias-free** workflow of three `map` steps over 2,000
+/// numeric record ids each — a shape this crate explicitly blesses, since
+/// [`crate::caps::MAX_MAP_ITEMS`] is 2,000 and
+/// [`super::MAX_TOP_LEVEL_STEPS`] is 500 — was **rejected**, while the
+/// exponent maximiser's rejection cost was unchanged to within a few
+/// percent.
+///
+/// # The value, derived against the corpus rather than chosen
+///
+/// The binding corpus case is the largest `map`-over-ids workflow the byte
+/// cap admits at all: measured, **18 map steps x 2,000 six-digit ids =
+/// 36,001 integer scalars in 253,952 bytes**, one step short of exceeding
+/// [`super::MAX_YAML_BYTES`]. 32 gives
+/// [`super::MAX_INTEGER_SCALAR_VISITS`] = 65,536 admitted integer visits,
+/// **1.82x** that worst realistic document. 64 would have left only 1.1%
+/// headroom over it, which is not a margin.
+///
+/// What it still refuses: an integer table denser than about four source
+/// bytes per integer — `[1,1,1,…]` at the byte cap holds ~131,000 and is
+/// rejected. That is a data blob rather than a workflow shape, but it is a
+/// real narrowing and is stated as one.
+pub const INTEGER_SCALAR_WEIGHT_BYTES: usize = 32;
 
 /// What [`check_expansion`] found. Every variant is a decision
 /// [`super::parse_workflow`] acts on directly; there is no "proceed anyway"
 /// case.
 pub(super) enum Verdict {
+    /// The ceiling was passed and the dominant cost was decoded numbers, so
+    /// the caller can say which limit an author actually hit rather than
+    /// talking about anchors and aliases. `kind` is `"float"` or `"integer"`.
+    TooManyNumericScalars { kind: &'static str, max: usize },
     /// The walk completed and stayed at or under the ceiling.
     WithinBudget,
     /// The walk was stopped by the ceiling. How far over the document would
@@ -354,32 +405,59 @@ pub(super) enum Verdict {
 /// ceiling fired, because `serde_yaml` re-ran an O(250,000) `dec2flt` scan
 /// for each expansion of one long plain numeric scalar and this function
 /// charged 8 bytes for each. Per-node work is bounded only because
-/// [`super::MAX_PLAIN_NUMERIC_DIGIT_RUN`] caps that token class on the
-/// **plain** route, and fix round 4 closed the remaining routes by charging
-/// the numeric visitor callbacks themselves
-/// ([`NUMERIC_SCALAR_WEIGHT_BYTES`]), which is route-independent. Rounds 2
-/// and 3 measured this shape at 5,960 ms admitted with 2,648 ms burned in
-/// this function; round 4 found a worse variant still (a pad list lifting
-/// `serde_yaml`'s jump budget) at **9,304.7 ms admitted**, and with the
-/// charge in place the same payload is **rejected in 91.2 ms**. Per-node
-/// work is now bounded: see [`super::MAX_NUMERIC_SCALAR_VISITS`] and
-/// [`super`]'s axis inventory.
+/// Fix round 4 closed this by charging the numeric visitor callbacks
+/// themselves ([`FLOAT_SCALAR_WEIGHT_BYTES`],
+/// [`INTEGER_SCALAR_WEIGHT_BYTES`]), which is route-independent. Successive
+/// rounds each published a worst case the next reviewer beat — 5,960 ms,
+/// then 9,304.7 ms — because each pinned a *mantissa* payload; the
+/// maximiser puts the digits in the exponent and measures **~13.7 s
+/// admitted**. With the charge in place the worst admitted document is
+/// **1,603.3 ms**. Per-node work is now bounded: see
+/// [`super::MAX_FLOAT_SCALAR_VISITS`] and [`super`]'s axis inventory.
 pub(super) fn check_expansion(yaml: &str, max: usize) -> Verdict {
     let weighed = Cell::new(0usize);
     let over_budget = Cell::new(false);
+    let floats = Cell::new(0usize);
+    let integers = Cell::new(0usize);
     let meter = ExpansionMeter {
         weighed: &weighed,
         over_budget: &over_budget,
+        floats: &floats,
+        integers: &integers,
         max,
     };
 
     match meter.deserialize(serde_yaml::Deserializer::from_str(yaml)) {
         Ok(()) => Verdict::WithinBudget,
         Err(err) => {
-            if over_budget.get() {
-                Verdict::OverBudget
+            if !over_budget.get() {
+                return Verdict::Malformed(err);
+            }
+            // Which limit did the author actually hit? The budget is one
+            // number, so this is a diagnosis rather than a separate check:
+            // if the numeric visits alone would have exhausted it, say so,
+            // because "too many numbers" is actionable and "expands past a
+            // weight ceiling" is not for a document with no anchors in it.
+            let float_ceiling = max / (NODE_WEIGHT_BYTES + FLOAT_SCALAR_WEIGHT_BYTES);
+            let integer_ceiling = max / (NODE_WEIGHT_BYTES + INTEGER_SCALAR_WEIGHT_BYTES);
+            // A 90% threshold, not equality: the walk aborts as soon as the
+            // budget is gone, and a real document spends some of it on the
+            // containers and keys around the numbers, so the numeric count
+            // lands just short of its own ceiling. This is a diagnosis for
+            // the message only — the rejection itself is the weight budget,
+            // and misdiagnosing which limit dominated cannot admit anything.
+            if floats.get() * 10 >= float_ceiling * 9 {
+                Verdict::TooManyNumericScalars {
+                    kind: "float",
+                    max: float_ceiling,
+                }
+            } else if integers.get() * 10 >= integer_ceiling * 9 {
+                Verdict::TooManyNumericScalars {
+                    kind: "integer",
+                    max: integer_ceiling,
+                }
             } else {
-                Verdict::Malformed(err)
+                Verdict::OverBudget
             }
         }
     }
@@ -393,6 +471,10 @@ pub(super) fn check_expansion(yaml: &str, max: usize) -> Verdict {
 struct ExpansionMeter<'a> {
     weighed: &'a Cell<usize>,
     over_budget: &'a Cell<bool>,
+    /// Counted only so [`check_expansion`] can name which limit was hit.
+    /// The bound is the weight budget; these are for the error message.
+    floats: &'a Cell<usize>,
+    integers: &'a Cell<usize>,
     max: usize,
 }
 
@@ -411,15 +493,15 @@ impl ExpansionMeter<'_> {
     ///   bytes the node weight already covers." False for floats —
     ///   `parse_f64` accepts a token of any length.
     /// - Round 2/3: "the charge is zero because the length is bounded
-    ///   elsewhere, by [`super::MAX_PLAIN_NUMERIC_DIGIT_RUN`] gating the
-    ///   source." Also false: that gate reads *source* and covers only the
-    ///   plain route, while `!!float` on a quoted scalar decodes to an
-    ///   arbitrarily long token from a source with no long digit run. That
-    ///   claim survived round 3's retraction sweep **on this function**,
-    ///   which is the first place a reader who distrusts the constant
-    ///   looks.
+    ///   elsewhere, by a digit-run scan over the source." Also false: that
+    ///   gate read *source* and covered only the plain route, while
+    ///   `!!float` on a quoted scalar decodes to an arbitrarily long token
+    ///   from a source with no long digit run. That claim survived round 3's
+    ///   retraction sweep **on this function**, which is the first place a
+    ///   reader who distrusts the constant looks. The scan itself was
+    ///   deleted in round 5, measured at 1.3% of the worst case.
     ///
-    /// Numeric visits now charge [`NUMERIC_SCALAR_WEIGHT_BYTES`] on top of
+    /// Numeric visits now charge [`FLOAT_SCALAR_WEIGHT_BYTES`] on top of
     /// [`NODE_WEIGHT_BYTES`], which bounds *how many* decodes happen rather
     /// than how long each one is — the length being already capped by
     /// [`super::MAX_YAML_BYTES`], since a decoded scalar cannot exceed its
@@ -469,7 +551,7 @@ impl<'de> Visitor<'de> for ExpansionMeter<'_> {
         f.write_str("any YAML node")
     }
 
-    /// Not charged [`NUMERIC_SCALAR_WEIGHT_BYTES`], unlike the numeric
+    /// Not charged [`FLOAT_SCALAR_WEIGHT_BYTES`], unlike the numeric
     /// visits below: `parse_bool` and `parse_null` (`de.rs:932`, `de.rs:925`)
     /// compare against fixed string literals, so their decode is O(1) after
     /// a length check however long the source token is, and a long token
@@ -480,19 +562,24 @@ impl<'de> Visitor<'de> for ExpansionMeter<'_> {
         self.charge(0)
     }
     fn visit_i64<E: de::Error>(self, _: i64) -> Result<(), E> {
-        self.charge(NUMERIC_SCALAR_WEIGHT_BYTES)
+        self.integers.set(self.integers.get() + 1);
+        self.charge(INTEGER_SCALAR_WEIGHT_BYTES)
     }
     fn visit_i128<E: de::Error>(self, _: i128) -> Result<(), E> {
-        self.charge(NUMERIC_SCALAR_WEIGHT_BYTES)
+        self.integers.set(self.integers.get() + 1);
+        self.charge(INTEGER_SCALAR_WEIGHT_BYTES)
     }
     fn visit_u64<E: de::Error>(self, _: u64) -> Result<(), E> {
-        self.charge(NUMERIC_SCALAR_WEIGHT_BYTES)
+        self.integers.set(self.integers.get() + 1);
+        self.charge(INTEGER_SCALAR_WEIGHT_BYTES)
     }
     fn visit_u128<E: de::Error>(self, _: u128) -> Result<(), E> {
-        self.charge(NUMERIC_SCALAR_WEIGHT_BYTES)
+        self.integers.set(self.integers.get() + 1);
+        self.charge(INTEGER_SCALAR_WEIGHT_BYTES)
     }
     fn visit_f64<E: de::Error>(self, _: f64) -> Result<(), E> {
-        self.charge(NUMERIC_SCALAR_WEIGHT_BYTES)
+        self.floats.set(self.floats.get() + 1);
+        self.charge(FLOAT_SCALAR_WEIGHT_BYTES)
     }
 
     /// The length is the whole point of this unit: a scalar reached through
@@ -507,6 +594,10 @@ impl<'de> Visitor<'de> for ExpansionMeter<'_> {
     fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<(), E> {
         self.charge(v.len())
     }
+    /// Uncharged for the same reason as [`Self::visit_bool`]: `parse_null`
+    /// (`de.rs:925`) compares against four fixed literals, so its decode is
+    /// O(1) after a length check however long the source token, and a long
+    /// token under `!!null` fails closed with `invalid_value`.
     fn visit_unit<E: de::Error>(self) -> Result<(), E> {
         self.charge(0)
     }

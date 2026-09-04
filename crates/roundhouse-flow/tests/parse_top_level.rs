@@ -1,7 +1,7 @@
 use roundhouse_flow::parse::types::{Effect, IsolationDef, UnattendedEscalate};
 use roundhouse_flow::parse::{
-    parse_workflow, ParseError, MAX_EXPANDED_WEIGHT, MAX_LEADING_INDENT_CHARS,
-    MAX_PLAIN_NUMERIC_DIGIT_RUN, MAX_TOP_LEVEL_STEPS, MAX_YAML_BYTES,
+    parse_workflow, ParseError, MAX_EXPANDED_WEIGHT, MAX_FLOAT_SCALAR_VISITS,
+    MAX_INTEGER_SCALAR_VISITS, MAX_LEADING_INDENT_CHARS, MAX_TOP_LEVEL_STEPS, MAX_YAML_BYTES,
 };
 
 const PR_REVIEW_YAML: &str = include_str!("fixtures/pr_review.yaml");
@@ -492,8 +492,14 @@ fn tagged_anchor_alias_fanout(leaves: usize, fan: usize, levels: usize) -> Strin
 /// a contended CI runner cannot turn a timing margin into a failure inside
 /// a test whose real subject is a security property, following the
 /// precedent in `the_retracted_cap_claim_held_only_for_the_one_shape_it_measured`.
-/// If this ever actually fires, the bound stopped working; that is a real
-/// finding, not a slow machine.
+/// **The timing half of these assertions is not the guard, and fix round 5
+/// stopped pretending otherwise.** At a 10 s threshold against rejections
+/// that measure in tens of milliseconds, it cannot detect a 100x regression;
+/// what does the work is `expect_err` and the asserted error variant. The
+/// threshold is kept as a liveness check — it catches a rejection that hangs
+/// rather than one that merely got slower — and is deliberately loose so a
+/// contended runner cannot turn a timing margin into a failure inside a test
+/// whose real subject is a security property.
 const REJECTION_MUST_BE_CHEAP: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Rejects `yaml`, asserting it was the expansion ceiling that fired and
@@ -671,133 +677,6 @@ fn the_metered_walk_rejects_a_fan_out_without_expanding_it() {
     );
 }
 
-/// One anchored plain float of `digits` fractional digits, aliased `k`
-/// times inside a step body (a raw `serde_yaml::Value`, so nothing is typed
-/// away and the real parse would materialise all of it). `quoted` decides
-/// whether the anchored scalar carries quotes, which is the only difference
-/// between the two halves of the A/B below.
-fn aliased_float(digits: usize, k: usize, quoted: bool) -> String {
-    let num = format!("1.{}", "7".repeat(digits));
-    let anchored = if quoted {
-        format!("&f \"{num}\"")
-    } else {
-        format!("&f {num}")
-    };
-    let mut y = format!(
-        "name: t\nversion: 1\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n    a: {anchored}\n    b: ["
-    );
-    for i in 0..k {
-        if i > 0 {
-            y.push(',');
-        }
-        y.push_str("*f");
-    }
-    y.push_str("]\n");
-    y
-}
-
-#[test]
-fn a_long_plain_numeric_scalar_aliased_many_times_is_rejected() {
-    // Task X1 fix round 2, the Critical this round exists for, and the
-    // third distinct axis this bound has had to grow to cover.
-    //
-    // `serde_yaml` hands the visitor a DECODED value —
-    // `visit_f64(self, v: f64)` — so the expansion meter charges a numeric
-    // scalar `NODE_WEIGHT_BYTES` whether its source token was 3 bytes or
-    // 250,000, while `parse_f64` re-runs an O(token) `dec2flt` scan on every
-    // alias expansion. No refinement of the meter's unit can see this;
-    // `MAX_PLAIN_NUMERIC_DIGIT_RUN` bounds it in the source instead.
-    //
-    // **This test covers the PLAIN route only, and that is all the bound
-    // covers.** Fix round 2's version of this comment attributed the
-    // dispatch to `visit_untagged_scalar` alone, which is reached only for
-    // `ScalarStyle::Plain`; `visit_scalar` has its own core-tag dispatch
-    // above it (`de.rs:882-884`) with no style check, and that route is
-    // a different route, which fix round 4 closed at the visitor rather
-    // than in the source. See
-    // `every_tag_spelling_that_reaches_a_decoded_numeric_visit_is_charged`
-    // and `a_pad_list_amplified_tagged_numeric_is_rejected` for that route,
-    // and `parse/mod.rs`'s axis inventory for which rows remain open.
-    //
-    // Payload: `a: &f 1.777…` with 131,000 fractional digits, aliased
-    // 43,648 times as `b: [*f,*f,…]` — 262,048 bytes, every bracket
-    // balanced, one step, no nesting. Measured on `77d6008`: ADMITTED,
-    // 838.8 ms in the metered walk plus 831.0 ms in the real parse.
-    let attack = aliased_float(131_000, 43_648, false);
-    assert!(
-        attack.len() <= MAX_YAML_BYTES,
-        "payload must stay under the byte cap: {} bytes",
-        attack.len()
-    );
-    let start = std::time::Instant::now();
-    let err = parse_workflow(&attack).expect_err("must be rejected");
-    let elapsed = start.elapsed();
-    assert!(
-        matches!(err, ParseError::NumericTokenTooLong { .. }),
-        "expected the digit-run bound to fire, got {err:?}"
-    );
-    assert!(
-        elapsed < REJECTION_MUST_BE_CHEAP,
-        "rejection took {elapsed:?}"
-    );
-
-    // The A/B that made the axis visible: the SAME document with two quote
-    // characters added routes the scalar to `visit_str`, which charges its
-    // length, so the expansion meter catches it. Both must be rejected —
-    // before this round only the quoted one was.
-    let quoted = aliased_float(131_000, 43_648, true);
-    let err = parse_workflow(&quoted).expect_err("must be rejected");
-    assert!(
-        matches!(
-            err,
-            ParseError::ExpandsTooLarge { .. } | ParseError::NumericTokenTooLong { .. }
-        ),
-        "expected the quoted twin to be rejected too, got {err:?}"
-    );
-
-    // And the shape that made the meter's own work unbounded: one level of
-    // alias nesting drives the expansion count to the weight budget while
-    // 60,000 padding scalars inflate `events.len()` so `serde_yaml`'s
-    // repetition guard does not bind first. Measured on `77d6008`: rejected,
-    // but only after burning 8,630 ms *inside* the metered walk.
-    let mut nested = format!(
-        "name: t\nversion: 1\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n    f: &f 1.{}\n    p: [",
-        "7".repeat(131_072)
-    );
-    for i in 0..60_000 {
-        if i > 0 {
-            nested.push(',');
-        }
-        nested.push('q');
-    }
-    nested.push_str("]\n    a: &a [");
-    for i in 0..724 {
-        if i > 0 {
-            nested.push(',');
-        }
-        nested.push_str("*f");
-    }
-    nested.push_str("]\n    c: [");
-    for i in 0..724 {
-        if i > 0 {
-            nested.push(',');
-        }
-        nested.push_str("*a");
-    }
-    nested.push_str("]\n");
-    let start = std::time::Instant::now();
-    let err = parse_workflow(&nested).expect_err("must be rejected");
-    let elapsed = start.elapsed();
-    assert!(
-        matches!(err, ParseError::NumericTokenTooLong { .. }),
-        "expected the digit-run bound to fire before the walk starts, got {err:?}"
-    );
-    assert!(
-        elapsed < REJECTION_MUST_BE_CHEAP,
-        "the walk must not run at all on this payload; took {elapsed:?}"
-    );
-}
-
 /// Records which `Visitor` method `serde_yaml` dispatches a scalar to. This
 /// is the machinery fix round 3 built as a throwaway probe and did not ship,
 /// which is why that round's test could only assert "it parses" — an
@@ -816,6 +695,12 @@ impl<'de> serde::de::Visitor<'de> for RouteProbe {
     }
     fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
         Ok("visit_i64")
+    }
+    fn visit_u128<E: serde::de::Error>(self, _: u128) -> Result<Self::Value, E> {
+        Ok("visit_u128")
+    }
+    fn visit_i128<E: serde::de::Error>(self, _: i128) -> Result<Self::Value, E> {
+        Ok("visit_i128")
     }
     fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
         Ok("visit_bool")
@@ -867,7 +752,7 @@ fn every_tag_spelling_that_reaches_a_decoded_numeric_visit_is_charged() {
     //
     // Why the route matters: a scalar reaching `visit_f64`/`visit_u64` is
     // handed a DECODED value, so its source length is invisible to the
-    // expansion meter. `NUMERIC_SCALAR_WEIGHT_BYTES` prices those callbacks
+    // expansion meter. The visitor charges price those callbacks
     // precisely because the set of source spellings that reach them is open
     // — at least eight are known — and pricing the arrival does not require
     // enumerating them.
@@ -886,11 +771,14 @@ fn every_tag_spelling_that_reaches_a_decoded_numeric_visit_is_charged() {
     for (label, src) in numeric_spellings {
         let route = route_of(src);
         assert!(
-            route == "visit_f64" || route == "visit_u64" || route == "visit_i64",
+            matches!(
+                route.as_str(),
+                "visit_f64" | "visit_u64" | "visit_i64" | "visit_u128" | "visit_i128"
+            ),
             "{label} ({src:?}) routed to {route}, not a decoded-numeric visit. \
              If `serde_yaml` has added the `ScalarStyle::Plain` check at de.rs:882 that \
              this whole family exists because of, this is the signal: re-read \
-             `MAX_PLAIN_NUMERIC_DIGIT_RUN`'s dispatch enumeration and the axis inventory, \
+             `FLOAT_SCALAR_WEIGHT_BYTES`'s dispatch notes and the axis inventory, \
              both of which describe a hole that may no longer exist."
         );
     }
@@ -913,92 +801,229 @@ fn every_tag_spelling_that_reaches_a_decoded_numeric_visit_is_charged() {
     }
 }
 
-#[test]
-fn a_pad_list_amplified_tagged_numeric_is_rejected() {
-    // Task X1 fix round 4, and the shape that has found this class every
-    // time: a PAD LIST. `serde_yaml`'s alias budget is
-    // `jumpcount > events.len() * 100`, so padding the event list with cheap
-    // scalars raises the jump budget until the *weight* ceiling binds
-    // instead of the jump guard. Round 3 measured this family without the
-    // pad and published 5,960 ms; with the pad it is 9,304.7 ms admitted —
-    // the fourth consecutive published worst case on this task beaten by the
-    // next reviewer, and the reason this payload is now pinned in CI.
-    //
-    // Payload, 189,327 bytes: `f: &f !!float "1.<129,000 sevens, broken
-    // every 60 chars by an escaped line continuation>"`, then a 20,000-entry
-    // pad list of one-character scalars to lift the jump budget, then
-    // `a: &a [*f x 500]` and `c: [*a x 500]` — 250,000 expansions of a
-    // 129,000-digit decoded token. The `!!float` tag defeats
-    // `MAX_PLAIN_NUMERIC_DIGIT_RUN` (the source has no digit run over 60);
-    // the pad list defeats `serde_yaml`'s own repetition guard.
-    //
-    // Measured: ADMITTED at 9,304.7 ms with `charge(0)`; rejected in 91.2 ms
-    // once numeric visits are charged `NUMERIC_SCALAR_WEIGHT_BYTES`. 102x.
-    let mut num = String::from("1.");
-    for i in 0..129_000 {
-        if i > 0 && i % 60 == 0 {
+/// One anchored `!!float` whose digits sit in the **exponent**, folded every
+/// 512 characters by escaped line continuations, aliased `n * m` times with a
+/// `pad`-entry list to lift `serde_yaml`'s jump budget. This is the
+/// maximiser: the exponent placement costs 4.0x the mantissa placement for
+/// the same digits, because `dec2flt` parses mantissa digits eight at a time
+/// via `try_parse_8digits` and the exponent byte-at-a-time.
+fn exponent_maximiser(digits: usize, pad: usize, n: usize, m: usize) -> String {
+    let mut num = String::from("1.5e-");
+    for i in 0..digits {
+        if i > 0 && i % 512 == 0 {
             num.push_str("\\\n      ");
         }
-        num.push('7');
+        num.push('9');
     }
-    let mut yaml = format!(
+    let mut y = format!(
         "name: t\nversion: 1\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n    f: &f !!float \"{num}\"\n    p: ["
     );
-    for i in 0..20_000 {
+    for i in 0..pad {
         if i > 0 {
-            yaml.push(',');
+            y.push(',');
         }
-        yaml.push('q');
+        y.push('q');
     }
-    yaml.push_str("]\n    a: &a [");
-    for i in 0..500 {
+    y.push_str("]\n    a: &a [");
+    for i in 0..n {
         if i > 0 {
-            yaml.push(',');
+            y.push(',');
         }
-        yaml.push_str("*f");
+        y.push_str("*f");
     }
-    yaml.push_str("]\n    c: [");
-    for i in 0..500 {
+    y.push_str("]\n    c: [");
+    for i in 0..m {
         if i > 0 {
-            yaml.push(',');
+            y.push(',');
         }
-        yaml.push_str("*a");
+        y.push_str("*a");
     }
-    yaml.push_str("]\n");
+    y.push_str("]\n");
+    y
+}
 
+#[test]
+fn the_exponent_maximiser_is_rejected() {
+    // Task X1 fix round 5. This replaces
+    // `a_pad_list_amplified_tagged_numeric_is_rejected`, which pinned a
+    // *mantissa* payload — the fifth consecutive round in which a published
+    // worst case was beaten by the next reviewer, and every time because the
+    // pinned shape was not the maximiser.
+    //
+    // Two things make this shape worse than the one it replaces, both
+    // measured on the same 174 KB document with the same digit count:
+    //
+    //   digits in the exponent  383.8 ms      digits in the mantissa  94.9 ms
+    //
+    // a 4.0x difference, because `dec2flt` parses mantissa digits eight at a
+    // time and the exponent one at a time; and folding the continuation
+    // every 512 characters rather than every 60 cuts the escape overhead so
+    // more of the byte budget is digits.
+    //
+    // Payload: `f: &f !!float "1.5e-<129,000 nines, folded every 512>"`,
+    // a 20,000-entry pad list to lift `serde_yaml`'s jump budget
+    // (`jumpcount > events.len() * 100`) so the weight ceiling binds
+    // instead, then 250,000 alias expansions. 174,146 bytes.
+    //
+    // Measured: rejected in 383.8 ms. The `!!float` tag is what makes this
+    // route invisible to any source scan — the source has no digit run
+    // longer than 512 — which is why the bound lives at the visitor.
+    let yaml = exponent_maximiser(129_000, 20_000, 500, 500);
     assert!(
         yaml.len() <= MAX_YAML_BYTES,
         "payload must stay under the byte cap: {} bytes",
         yaml.len()
     );
-    // The two guards this payload is built to walk past, asserted rather
-    // than described, so the test fails loudly if a future change makes it
-    // stop being the adversarial shape it is named for.
-    assert!(
-        !yaml.contains(&"7".repeat(MAX_PLAIN_NUMERIC_DIGIT_RUN + 1)),
-        "the payload must carry no digit run over the digit-run bound, or it is not \
-         testing the route that bound cannot see"
-    );
-
     let start = std::time::Instant::now();
     let err = parse_workflow(&yaml).expect_err("must be rejected");
     let elapsed = start.elapsed();
     assert!(
-        matches!(err, ParseError::ExpandsTooLarge { .. }),
-        "expected the expansion ceiling to fire via the numeric-visit charge, got {err:?}"
+        matches!(
+            err,
+            ParseError::ExpandsTooLarge { .. } | ParseError::TooManyNumericScalars { .. }
+        ),
+        "expected the float-visit charge to fire, got {err:?}"
     );
-    assert!(
-        elapsed < REJECTION_MUST_BE_CHEAP,
-        "rejecting 250,000 expansions of a 129,000-digit token took {elapsed:?}"
-    );
+    assert!(elapsed < REJECTION_MUST_BE_CHEAP, "took {elapsed:?}");
+}
+
+#[test]
+fn every_numeric_callback_is_charged() {
+    // Task X1 fix round 5. A security review found that reverting
+    // `visit_u64`/`visit_i64`/`visit_u128`/`visit_i128` to `charge(0)` left
+    // the whole suite green — four of the five numeric callbacks were
+    // mutation-survivable. This is the defence-in-depth test that
+    // the deleted digit-run scan's removal was spent on: where that
+    // constant covered one route, this covers every callback.
+    //
+    // Method: build a document with `n` numeric scalars of the given kind
+    // and nothing else of size, then check that the count at which it flips
+    // from admitted to rejected tracks that kind's derived ceiling. If a
+    // callback stops being charged, its kind admits far more than its
+    // ceiling and the assertion fires.
+    //
+    // Payloads are alias-free flow sequences, so this costs milliseconds and
+    // materialises nothing large.
+    let seq = |item: &str, n: usize| -> String {
+        let mut y = String::from(
+            "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n    v: [",
+        );
+        for i in 0..n {
+            if i > 0 {
+                y.push(',');
+            }
+            y.push_str(item);
+        }
+        y.push_str("]\n");
+        y
+    };
+
+    // `1.5` reaches visit_f64; `7` reaches visit_u64; `-7` reaches
+    // visit_i64. u128/i128 are reached only by values outside i64/u64 range,
+    // which `serde_yaml::Value` cannot hold, so they are covered by
+    // `every_tag_spelling_that_reaches_a_decoded_numeric_visit_is_charged`'s
+    // route assertions instead — noted rather than silently skipped.
+    for (kind, item, ceiling) in [
+        ("float", "1.5", MAX_FLOAT_SCALAR_VISITS),
+        ("unsigned integer", "7", MAX_INTEGER_SCALAR_VISITS),
+        ("signed integer", "-7", MAX_INTEGER_SCALAR_VISITS),
+    ] {
+        // Just under the ceiling: admitted.
+        let under = seq(item, ceiling - 100);
+        assert!(
+            under.len() < MAX_YAML_BYTES,
+            "{kind}: probe document must fit under the byte cap"
+        );
+        parse_workflow(&under).unwrap_or_else(|e| {
+            panic!(
+                "{kind}: {} items must be admitted, got {e:?}",
+                ceiling - 100
+            )
+        });
+
+        // Comfortably over it: rejected, and rejected for being numeric
+        // rather than for anything to do with anchors.
+        let over = seq(item, ceiling + ceiling / 4);
+        if over.len() < MAX_YAML_BYTES {
+            match parse_workflow(&over) {
+                Err(ParseError::TooManyNumericScalars { .. })
+                | Err(ParseError::ExpandsTooLarge { .. }) => {}
+                other => panic!(
+                    "{kind}: {} items must be rejected — if this admits, that callback is no \
+                     longer charged and the numeric-decode axis is reopened for it. Got {other:?}",
+                    ceiling + ceiling / 4
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn map_steps_over_lists_of_numeric_ids_still_parse() {
+    // Task X1 fix round 5, and the finding that set the integer charge.
+    //
+    // `caps::MAX_MAP_ITEMS` is 2,000 and `MAX_TOP_LEVEL_STEPS` is 500, so
+    // this crate explicitly blesses map steps over 2,000-item lists. Fix
+    // round 4 charged integers at the float rate, and a **42,384-byte,
+    // alias-free** workflow of three such steps over numeric record ids was
+    // refused as `ExpandsTooLarge` — an error about anchors and aliases, on
+    // a document containing neither. That falsified round 4's claim that its
+    // constant sat "one notch below the first corpus-breaking value".
+    //
+    // Payload: `map` steps whose `over:` is a flow sequence of 2,000
+    // six-digit ids. Measured with the split charge: 3 steps (6,001 integer
+    // scalars, 42,384 B) admitted in 1.2 ms; the largest such workflow the
+    // byte cap admits at all is 18 steps (36,001 scalars, 253,952 B), which
+    // is what `MAX_INTEGER_SCALAR_VISITS` was derived against.
+    let map_ids = |steps: usize| -> String {
+        let mut y = String::from(
+            "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n",
+        );
+        for s in 0..steps {
+            y.push_str(&format!("  - id: m{s}\n    map:\n      over: ["));
+            for i in 0..2_000 {
+                if i > 0 {
+                    y.push(',');
+                }
+                y.push_str(&(100_000 + i).to_string());
+            }
+            y.push_str(
+                "]\n      as: item\n      steps:\n        - id: inner\n          tool: shell\n",
+            );
+        }
+        y
+    };
+
+    for steps in [1usize, 3, 18] {
+        let yaml = map_ids(steps);
+        assert!(
+            yaml.len() <= MAX_YAML_BYTES,
+            "{steps} map steps is {} bytes, over the byte cap",
+            yaml.len()
+        );
+        assert!(
+            !yaml.contains('&') && !yaml.contains('*'),
+            "the payload must be alias-free, or it is not testing the numeric charge"
+        );
+        let def = parse_workflow(&yaml).unwrap_or_else(|e| {
+            panic!(
+                "{steps} map steps over 2,000 numeric ids ({} bytes, {} integer scalars) must \
+                 parse — this is a shape MAX_MAP_ITEMS blesses. Got {e:?}",
+                yaml.len(),
+                steps * 2_000 + 1
+            )
+        });
+        assert_eq!(def.steps.len(), steps);
+    }
 }
 
 #[test]
 fn a_numeric_heavy_but_realistic_workflow_still_parses() {
     // Task X1 fix round 4. The over-rejection direction of
-    // `NUMERIC_SCALAR_WEIGHT_BYTES`, which is a genuine narrowing: charging
-    // numeric visits caps a document at `MAX_NUMERIC_SCALAR_VISITS` (5,041)
-    // of them, and nothing before this round capped that.
+    // the visitor charges, which is a genuine narrowing: charging numeric
+    // visits caps a document at `MAX_FLOAT_SCALAR_VISITS` (5,041) floats and
+    // `MAX_INTEGER_SCALAR_VISITS` (65,536) integers, and nothing before
+    // round 4 capped either.
     //
     // Payload: a deliberately numeric-maximal but realistic workflow —
     // `MAX_TOP_LEVEL_STEPS` (500) steps, each carrying `timeout: 30`,
@@ -1037,69 +1062,6 @@ fn a_numeric_heavy_but_realistic_workflow_still_parses() {
 }
 
 #[test]
-fn ordinary_numeric_content_is_not_rejected_by_the_digit_run_bound() {
-    // The over-rejection direction of `MAX_PLAIN_NUMERIC_DIGIT_RUN`. The
-    // scan counts digit runs anywhere in the source, including inside
-    // comments, quoted scalars and block-scalar bodies that never reach a
-    // numeric decoder, so its cost has to be paid in false positives and
-    // measured rather than asserted away.
-    //
-    // Payloads: every numeric shape a real workflow plausibly carries —
-    // timeouts and retry counts, a `u64`-sized literal at 20 digits, the
-    // same 39-digit value as a quoted string (unquoted it is rejected by
-    // `serde_yaml::Value`, which has no `u128` variant — unrelated to this
-    // bound, and the quoted form is the better test here anyway because a
-    // long digit run inside a string is exactly the over-rejection this
-    // scan risks), a
-    // float with a full 17-significant-digit mantissa and an exponent, a
-    // dotted version chain, an ISO timestamp, an IPv4 address, a 64-char
-    // hex digest, a base64 blob, a `# ----` comment rule 200 dashes long,
-    // and 4,000 consecutive small integers in a flow sequence. None has a
-    // run of 512 consecutive digits; the separators (`.`, `-`, `,`, `:`,
-    // and the non-digit letters of hex and base64) break every run.
-    let digest = "3b1f".repeat(16);
-    let base64 = "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHRlc3Q".repeat(20);
-    let dashes = "-".repeat(200);
-    let mut ints = String::new();
-    for i in 0..4_000 {
-        if i > 0 {
-            ints.push(',');
-        }
-        ints.push_str(&(i % 1000).to_string());
-    }
-    let yaml = format!(
-        "name: t\nversion: 1\n# {dashes}\npermissions:\n  unattended: {{ escalate: park, deadline: 12h, on_timeout: deny }}\nsteps:\n  - id: s\n    timeout: 30\n    retries: 3\n    big: 18446744073709551615\n    bigger_as_text: \"340282366920938463463374607431768211455\"\n    precise: 1.7976931348623157e308\n    tiny: -1.2345678901234567e-300\n    version: 1.2.3.4.5.6.7.8.9\n    when: 2026-09-03T12:34:56.789012Z\n    addr: 192.168.100.200\n    digest: {digest}\n    blob: {base64}\n    ints: [{ints}]\n"
-    );
-    assert!(yaml.len() < MAX_YAML_BYTES);
-
-    let def =
-        parse_workflow(&yaml).expect("ordinary numeric content must not trip the digit-run bound");
-    assert_eq!(def.steps.len(), 1);
-
-    // And the bound really is where the comment says it is: one digit more
-    // than the limit, in an inert position (a comment), is rejected. This
-    // is the documented over-rejection, pinned so it is visible rather than
-    // discovered.
-    let over = format!(
-        "name: t\nversion: 1\n# {}\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n",
-        "7".repeat(MAX_PLAIN_NUMERIC_DIGIT_RUN + 1)
-    );
-    match parse_workflow(&over).expect_err("one digit over the limit must be rejected") {
-        ParseError::NumericTokenTooLong { run, max } => {
-            assert_eq!(max, MAX_PLAIN_NUMERIC_DIGIT_RUN);
-            assert_eq!(run, MAX_PLAIN_NUMERIC_DIGIT_RUN + 1);
-        }
-        other => panic!("expected NumericTokenTooLong, got {other:?}"),
-    }
-    // Exactly at the limit still parses, so the boundary is where it says.
-    let at = format!(
-        "name: t\nversion: 1\n# {}\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n",
-        "7".repeat(MAX_PLAIN_NUMERIC_DIGIT_RUN)
-    );
-    parse_workflow(&at).expect("exactly at the limit must still parse");
-}
-
-#[test]
 fn the_densest_alias_free_documents_under_the_byte_cap_still_parse() {
     // Task X1 fix round 1. This is the behavioural half of
     // `MAX_EXPANDED_WEIGHT`'s derivation; the arithmetic half is the `const`
@@ -1118,13 +1080,15 @@ fn the_densest_alias_free_documents_under_the_byte_cap_still_parse() {
     // for being *large* — only for amplifying.
     //
     // **Fix round 4 narrowed that claim and this is where it is recorded.**
-    // Charging numeric visits (`NUMERIC_SCALAR_WEIGHT_BYTES`) caps a
-    // document at `MAX_NUMERIC_SCALAR_VISITS` = 5,041 numeric scalars, so
+    // Charging numeric visits caps a document at `MAX_FLOAT_SCALAR_VISITS`
+    // = 5,041 floats and `MAX_INTEGER_SCALAR_VISITS` = 65,536 integers, so
     // the property now reads: no alias-free document under the byte cap is
-    // rejected *unless it carries more than 5,041 numeric scalars*. The
-    // reachable case is a numeric data table inlined into a workflow —
-    // `t: [0,1,2,…]` filled to the byte cap holds ~131,000 integers and is
-    // now refused, measured. That is a real behaviour change, in the
+    // rejected *unless it carries more numbers than those ceilings allow*.
+    // Fix round 5 split the two after a review showed the single ceiling
+    // refused a 42 KB alias-free workflow of three `map` steps over 2,000
+    // numeric ids — see `map_steps_over_lists_of_numeric_ids_still_parse`.
+    // What remains refused is a denser table: `t: [0,1,2,…]` at the byte cap
+    // holds ~131,000 integers, measured. That is a real behaviour change, in the
     // over-rejection direction, and it is the price of closing the
     // numeric-decode axis; see `a_numeric_heavy_but_realistic_workflow_still_parses`
     // for the corpus check that chose the constant. None of the five shapes
