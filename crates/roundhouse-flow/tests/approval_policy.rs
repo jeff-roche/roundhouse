@@ -23,16 +23,28 @@ fn preapproved_bundle_only_approves_its_own_declared_rules() {
     // §6.4: "There is no 'unattended = auto-approve'; you write a
     // Preapproved bundle and it is a reviewable artifact" — i.e. only rules
     // the bundle explicitly names are approved, everything else still blocks.
+    //
+    // Two entries, and the second one is probed as well as the first (P92):
+    // a bundle of one cannot tell a scan that stops after position 1 from a
+    // scan that reads the whole list.
     let policy = ApprovalPolicy::Preapproved {
         bundle: PreapprovedBundle {
             name: "nightly-lint-bundle".to_string(),
             version: 1,
-            approved_rule_ids: vec!["shell:cargo-test".to_string()],
+            approved_rule_ids: vec![
+                "shell:cargo-test".to_string(),
+                "shell:cargo-clippy".to_string(),
+            ],
         },
     };
     assert_eq!(
         evaluate_unattended_approval(&policy, "shell:cargo-test"),
         ApprovalOutcome::Approved
+    );
+    assert_eq!(
+        evaluate_unattended_approval(&policy, "shell:cargo-clippy"),
+        ApprovalOutcome::Approved,
+        "the bundle approves every id it names, not merely the first one"
     );
     assert_eq!(
         evaluate_unattended_approval(&policy, "shell:git-push"),
@@ -106,17 +118,18 @@ fn notify_applies_on_timeout_when_no_response_arrives() {
 #[test]
 fn interactive_in_an_unattended_run_blocks_rather_than_pending_on_nothing() {
     let outcome = evaluate_unattended_approval(&ApprovalPolicy::Interactive, "shell:git-push");
+    // The `assert_eq!` is the whole test. An `assert_ne!` against
+    // `PendingNotify` alongside it would be an assertion that cannot fail —
+    // the equality above already settles every other variant — and this
+    // task's brief was specifically about a test body that cannot fail, so
+    // the reason it would have carried is written here instead: PendingNotify
+    // is only resolvable via `resolve_notify_timeout`, which needs an
+    // `on_timeout` that `Interactive` does not carry.
     assert_eq!(
         outcome,
         ApprovalOutcome::Blocked,
         "an unattended Interactive run has no human to interact with; PendingNotify here has no \
          sink to answer it and no timeout to fire, i.e. a permanent hang"
-    );
-    assert_ne!(
-        outcome,
-        ApprovalOutcome::PendingNotify,
-        "PendingNotify is only resolvable via resolve_notify_timeout, which needs an on_timeout \
-         Interactive does not carry"
     );
 }
 
@@ -157,9 +170,17 @@ approved_rule_ids:
 
 /// A misspelled key in a security artifact must be a load error, not a
 /// silently ignored field — the crate-wide `deny_unknown_fields` stance in
-/// `parse::types`, applied to the one document this module owns. Without it,
-/// `aproved_rule_ids:` loads as a bundle that approves nothing while reading
-/// in review as a bundle that approves two rules.
+/// `parse::types`, applied to the one document this module owns.
+///
+/// What the derive buys here is the *better error*, not the only error.
+/// `approved_rule_ids` is required with no `#[serde(default)]`, so
+/// `aproved_rule_ids:` already fails to load without `deny_unknown_fields` —
+/// but it fails as ``missing field `approved_rule_ids` ``, naming the key the
+/// author did *not* type. With the derive, the error names the key they did,
+/// which is the difference between a reviewer finding the typo and a reviewer
+/// re-reading a document that looks correct. (Giving the field a
+/// `#[serde(default)]` would make the weaker sentence true and trade a load
+/// error for a silently empty allowlist — the wrong direction for a grant.)
 #[test]
 fn a_bundle_with_a_misspelled_key_is_rejected_rather_than_silently_emptied() {
     let doc = "
@@ -200,31 +221,40 @@ approved_rule_ids: []
 /// rather than trimmed at match time: normalising here would widen what the
 /// reviewed strings mean (see
 /// `a_rule_id_that_merely_resembles_an_approved_one_is_not_approved`).
+///
+/// The offending entry sits *second*, behind a well-formed one, so the
+/// fixture pins that validation runs over the whole list rather than only
+/// position 1 (P92).
 #[test]
 fn a_bundle_rule_id_with_surrounding_whitespace_is_rejected() {
     let doc = "
 name: nightly-lint-bundle
 version: 1
 approved_rule_ids:
-  - \"shell:cargo-test \"
+  - shell:cargo-test
+  - \"shell:cargo-clippy \"
 ";
     let err = serde_yaml::from_str::<PreapprovedBundle>(doc)
         .expect_err("an untrimmed rule id must be rejected");
     let message = err.to_string();
     assert!(
-        message.contains("shell:cargo-test "),
+        message.contains("shell:cargo-clippy "),
         "the error must quote what the author wrote, got: {message}"
     );
 }
 
 /// An empty rule id would approve a caller that passes `""` as its rule id,
 /// which is a broken caller rather than an authored grant.
+///
+/// Second entry again, and for the same reason: with a single-entry fixture,
+/// a validation loop truncated to `.take(1)` passes (P92).
 #[test]
 fn a_bundle_with_an_empty_rule_id_is_rejected() {
     let doc = "
 name: nightly-lint-bundle
 version: 1
 approved_rule_ids:
+  - shell:cargo-test
   - ''
 ";
     let err = serde_yaml::from_str::<PreapprovedBundle>(doc)
