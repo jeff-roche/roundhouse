@@ -813,7 +813,7 @@ fn a_gate_step_parks_the_run_and_resuming_it_answers_the_gate() {
          \x20 - id: after\n\
          \x20   needs: [approve]\n\
          \x20   when: \"${{ steps.approve.output.approve }}\"\n\
-         \x20   emit: { shipped: true }\n",
+         \x20   emit: { shipped: \"${{ steps.before.output.a }}\" }\n",
     ))
     .expect("fixture parses");
 
@@ -879,6 +879,16 @@ fn a_gate_step_parks_the_run_and_resuming_it_answers_the_gate() {
         "an already-completed step is re-driven, not re-run"
     );
     assert_eq!(step_row(&conn, run_id, "after").0, StepRunState::Completed);
+    assert_eq!(
+        steps
+            .iter()
+            .find(|s| s.step_id == "after")
+            .expect("the dependent ran")
+            .output["shipped"],
+        "1",
+        "the dependent read `before`'s output back out of the row the first \
+         pass checkpointed — which is what makes a park resumable at all"
+    );
     assert_eq!(sink.reports().len(), 1);
 }
 
@@ -1545,7 +1555,10 @@ fn a_re_drive_honours_every_kind_of_finished_row_and_re_runs_the_rest() {
         &finished(
             "beta",
             StepRunState::Completed,
-            Some((serde_json::json!({"token": "sk-a-real-credential"}), true)),
+            Some((
+                serde_json::json!({"token": "leaf-parsed-out-of-the-secret"}),
+                true,
+            )),
         ),
     )
     .unwrap();
@@ -1576,9 +1589,15 @@ fn a_re_drive_honours_every_kind_of_finished_row_and_re_runs_the_rest() {
     let mut sink = RecordingSink::default();
     let mut host = FakeHost::new();
     let mut run_ctx = ctx(run_id);
-    run_ctx
-        .secrets
-        .insert("TOKEN".into(), "sk-a-real-credential".into());
+    // A declared secret that is **not** the value on the row. `beta`'s stored
+    // output is a *derived leaf* — the shape the whole-secret needle backstop
+    // structurally cannot match (`redact_known_secrets`'s own doc: it matches
+    // whole declared values, nothing else) — so the only thing that can keep
+    // it out of the log is the taint flag surviving the restart.
+    run_ctx.secrets.insert(
+        "TOKEN".into(),
+        "{\"leaf\":\"sk-the-whole-declared-secret\"}".into(),
+    );
     let outcome = run_workflow(
         &mut conn,
         &def,
@@ -1623,12 +1642,14 @@ fn a_re_drive_honours_every_kind_of_finished_row_and_re_runs_the_rest() {
         reader.output["from_alpha"], "1",
         "a re-driven output is readable"
     );
-    assert_eq!(reader.output["saw"], "sk-a-real-credential");
+    assert_eq!(reader.output["saw"], "leaf-parsed-out-of-the-secret");
     let logged = format!("{:?}", sink.emitted);
     assert!(
-        !logged.contains("sk-a-real-credential"),
+        !logged.contains("leaf-parsed-out-of-the-secret"),
         "taint recorded on the row must survive the restart, or a value the \
-         first pass redacted reaches the log in cleartext on the second: {logged}"
+         first pass redacted reaches the log in cleartext on the second — and \
+         the needle backstop cannot help, because a derived leaf is not a \
+         declared secret: {logged}"
     );
 }
 
