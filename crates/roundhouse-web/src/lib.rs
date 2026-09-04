@@ -393,6 +393,43 @@ fn api_router(bind: &lan_auth::BindConfig) -> axum::Router<AppState> {
 /// The status is unchanged from what the asset fallback produced for the same
 /// path, so this is not a behaviour change for a client; only *which* layer
 /// answers, and therefore whether the answer is gated.
+///
+/// # `/api/` — exactly one trailing slash — does not reach this
+///
+/// [`build_router`] nests at `/api`, and `axum::Router::nest` registers
+/// `prefix` and `prefix/{*rest}`: **not** `prefix + "/"`. Only `nest_service`
+/// registers all three. `matchit` 0.8.4 backtracks, so `/api/` walks to the
+/// intermediate `/` node under `api`, finds no value there, and falls back to
+/// the **root catch-all** — [`assets::serve_asset`], outside the gate.
+///
+/// It really is that one path and not a prefix rule, which is worth stating
+/// because the near-misses read as though they should escape too and do not.
+/// Every one of these is asserted in the boundary test named below:
+///
+/// ```text
+/// "/api"        -> gated       "/api/runs"    -> gated
+/// "/api/"       -> serve_asset "/api/no-such" -> gated
+/// "/api//"      -> gated       "/api/./runs"  -> gated
+/// ```
+///
+/// `/api//` matches `/api/{*rest}` with a `rest` of `/`, and `matchit`
+/// normalises no dot segment, so `/api/./runs` is simply a path no route
+/// matches.
+///
+/// The consequence today is nil: `serve_asset` rejects the empty path segment
+/// and answers a bare `404`, and ruling P85 already accepts the ungated asset
+/// surface. What was wrong is that the invariant above was one path short of
+/// true and nothing measured the gap.
+/// `tests/lan_auth.rs::the_gate_is_on_api_and_the_asset_surface_is_ungated`
+/// now pins both statuses — `/api` `401`, `/api/` `404` — so the day
+/// `serve_asset` answers that path with something else, a test says so.
+///
+/// The three repairs are all worse: nesting at `"/api/"` is lateral (bare
+/// `/api` then falls to the asset router); `nest_service` registers all three
+/// but needs the inner router to be a `Service`, which a `Router<AppState>` is
+/// not until `with_state` — inverting the nest-before-`with_state` rule above;
+/// and a path-prefix test in the middleware is the loose textual form ruling
+/// P85 rules out.
 async fn api_not_found() -> axum::response::Response {
     use axum::response::IntoResponse;
     (

@@ -1219,8 +1219,23 @@ async fn an_update_whose_payload_names_another_session_ends_the_stream_with_stre
 /// client that mistypes an endpoint has to see the mistake, not a 200 with a
 /// page of HTML that fails later as an opaque JSON parse error.
 ///
-/// **Mutation killed:** widening `assets::is_client_route` to treat `/api/...`
-/// as a client route — the status becomes 200 with the shell's `text/html`.
+/// **Mutation killed:** changing the status `roundhouse_web`'s `api_not_found`
+/// answers with — every path here is now that fallback's, so its `404` is
+/// exactly what this asserts.
+///
+/// **A claim this test used to make and no longer can, recorded because it was
+/// wrong for one round rather than deleted.** It said it killed "widening
+/// `assets::is_client_route` to treat `/api/...` as a client route". That was
+/// true when an unrouted `/api` path fell through to the asset router. Since
+/// `api_router` gained its own fallback (ruling P88 §A) no `/api` path reaches
+/// `serve_asset` at all, so that mutation cannot change any status here. The
+/// mutation is still killed — by
+/// `tests/assets.rs::an_unknown_asset_path_is_a_404_rather_than_a_silent_index_html_fallback`
+/// and `::a_malformed_w_route_is_not_treated_as_a_client_route`, which probe
+/// paths the asset router does still own. It simply is not killed *here*, and a
+/// mutation table is worth nothing if its rows drift from the composition they
+/// were measured against (ruling P81 §1).
+///
 /// (Nesting the SSE router at `/` is *not* a usable mutation: `axum` panics in
 /// `build_router` itself — "Nesting at the root is no longer supported. Use
 /// merge instead." — taking 12 of the 15 tests down at once, measured. That is

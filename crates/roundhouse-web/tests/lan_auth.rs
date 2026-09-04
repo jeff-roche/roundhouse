@@ -562,6 +562,19 @@ async fn the_gate_is_on_api_and_the_asset_surface_is_ungated() {
         format!("/api/sessions/{SESSION_ID}/events"),
         "/api/runs".to_string(),
         "/api/no-such-route".to_string(),
+        // The nest's own path. `Router::nest("/api", …)` registers `/api` and
+        // `/api/{*rest}`, and this is the first of those — so the gate reaches
+        // the bare prefix as well as everything under it.
+        "/api".to_string(),
+        // The two near-misses of the trailing-slash case below, measured
+        // rather than assumed: **both** of these are inside the gate. `/api//`
+        // matches `/api/{*rest}` with a `rest` of `/`, and `matchit` does not
+        // normalise a dot segment, so `/api/./runs` is a path no route matches
+        // rather than a spelling of `/api/runs`. Only the single trailing
+        // slash escapes, which is what makes it a quirk of `matchit`'s
+        // backtracking and not a prefix rule.
+        "/api//".to_string(),
+        "/api/./runs".to_string(),
     ] {
         let (router, _) = lan_router(dir.path());
         assert_eq!(
@@ -570,6 +583,28 @@ async fn the_gate_is_on_api_and_the_asset_surface_is_ungated() {
             "{uri} is under the gated nest and must be refused without the token"
         );
     }
+
+    // …and the one path that is *not*, measured rather than assumed.
+    //
+    // `Router::nest` registers `prefix` and `prefix/{*rest}` — **not**
+    // `prefix + "/"`; only `nest_service` registers all three. `matchit` 0.8.4
+    // backtracks, so `/api/` walks to the intermediate `/` node under `api`,
+    // finds no value there, and falls back to the **root catch-all**, which is
+    // `serve_asset` — outside the gate.
+    //
+    // Consequence today is nil, and that is why this is an assertion rather
+    // than a fix: `serve_asset` rejects the empty path segment and answers a
+    // bare `404` with no body of ours, and ruling P85 already accepts the
+    // ungated asset surface. What was wrong was that "the gate covers the
+    // nest" was one path short of true with nothing measuring the gap. Pinned
+    // here, so the day `serve_asset` answers `/api/` with anything but a bare
+    // 404 — a redirect, the SPA shell, a listing — this test says so.
+    let (router, _) = lan_router(dir.path());
+    assert_eq!(
+        status_of(router, get("/api/")).await,
+        StatusCode::NOT_FOUND,
+        "exactly one trailing slash falls to the ungated asset fallback; it must stay a bare 404"
+    );
 }
 
 #[tokio::test]
