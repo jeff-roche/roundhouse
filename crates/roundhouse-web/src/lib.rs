@@ -199,7 +199,14 @@ impl ApiPoolPermits {
     /// The caller holds the returned value for as long as it holds a pool
     /// connection — which is why it is an owned permit and not a borrowed one:
     /// the handler's future outlives any borrow of the state.
-    pub(crate) fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    ///
+    /// **Private, not `pub(crate)`.** Its one caller is
+    /// [`AppState::store_connection`], immediately below, and a permit is of no
+    /// use to anything else: taking one without then taking a connection bounds
+    /// nothing, and taking a connection without one is the failure the bound
+    /// exists to prevent. Keeping it here is what makes the two a single act
+    /// rather than two a handler is trusted to perform in order.
+    fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         std::sync::Arc::clone(&self.0).try_acquire_owned().ok()
     }
 }
@@ -230,6 +237,109 @@ impl std::fmt::Debug for ApiPoolPermits {
         f.debug_tuple("ApiPoolPermits")
             .field(&self.0.available_permits())
             .finish()
+    }
+}
+
+impl AppState {
+    /// A store connection **and** the permit bounding it, in one act — the only
+    /// way anything in this crate reaches the pool.
+    ///
+    /// # Why this is a method and not three lines in a handler
+    ///
+    /// The bound in [`ApiPoolPermits`] is only worth what it covers, and what it
+    /// covered when it landed was *one handler that remembered to take a
+    /// permit*. Nothing stopped the next one calling `state.store.pool.get()`
+    /// directly and holding a connection outside the bound; D6 adds four more
+    /// `/api` endpoints, so "the next one" is imminent.
+    ///
+    /// This is the same move [`api_router`] made for the gate (ruling P88 §A):
+    /// make the safe act and the *only* act the same one. `try_acquire` is
+    /// private to this module, so a permit cannot be taken separately, and the
+    /// connection comes back already wearing it — there is no ordering for a
+    /// handler to get wrong and no step for it to skip.
+    ///
+    /// Rejected, recorded so they are not re-derived: a doc note on
+    /// [`AppState::store`] (ruling P88 §A *is* the record of a doc note not
+    /// holding); a `tower` layer over `/api` (it would bound the SSE stream too,
+    /// and those connections are long-lived, so the layer would shed the stream
+    /// surface); and bounding inside `roundhouse_store::StorePool` (the bound is
+    /// an API-side policy, and the event-log writer must stay unbounded — it is
+    /// the thing being protected).
+    ///
+    /// # The two `503`s, and why their order is not arbitrary
+    ///
+    /// A router with no store never touches the pool, so a store-less server
+    /// must not shed requests it was never going to run a query for. The store
+    /// check therefore runs **first**, and both answers are `503` with different
+    /// bodies: "no store is attached" is a misconfiguration an operator can act
+    /// on, "at the concurrency bound" is load. `tests/runs.rs::
+    /// a_store_less_router_names_the_missing_store_and_not_the_bound` pins the
+    /// order.
+    ///
+    /// A missing store is a `503` rather than an empty list because an empty
+    /// inbox is a real and reassuring answer — see [`runs`]'s handler.
+    pub(crate) async fn store_connection(
+        &self,
+    ) -> Result<StoreConnection, axum::response::Response> {
+        use axum::response::IntoResponse;
+
+        let unavailable = |reason: &str| {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                api_error(reason),
+            )
+                .into_response()
+        };
+
+        let Some(store) = self.store.as_ref() else {
+            return Err(unavailable("no store is attached to this server"));
+        };
+        let Some(permit) = self.api_pool_permits.try_acquire() else {
+            return Err(unavailable(
+                "this API is at its concurrency bound; retry shortly (the store's connections are \
+                 shared with the event log's writer)",
+            ));
+        };
+
+        // `_error` is discarded rather than rendered, for the reason
+        // `runs::internal_error` states: a pool error can carry the database
+        // path, and this response goes to whoever asked.
+        match store.pool.get().await {
+            Ok(connection) => Ok(StoreConnection {
+                connection,
+                _permit: permit,
+            }),
+            Err(_error) => Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                api_error("this API failed while acquiring a store connection"),
+            )
+                .into_response()),
+        }
+    }
+}
+
+/// A checked-out store connection that owns the permit bounding it.
+///
+/// Constructible only by [`AppState::store_connection`], which is the point: a
+/// connection cannot exist in this crate without the permit that accounts for
+/// it, so the bound cannot be bypassed by forgetting a step.
+///
+/// **Field order is the drop order and is load-bearing.** Struct fields drop in
+/// declaration order, so the connection goes back to the pool *before* the
+/// permit is released. The other order would let a waiting request take the
+/// freed permit and then block inside `pool.get()` on a connection that has not
+/// been returned yet — bounding the permits but not the wait, which is the
+/// failure this whole mechanism exists to prevent.
+pub(crate) struct StoreConnection {
+    connection: roundhouse_store::PooledConnection,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl std::ops::Deref for StoreConnection {
+    type Target = roundhouse_store::PooledConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
     }
 }
 

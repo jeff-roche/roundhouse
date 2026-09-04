@@ -419,7 +419,7 @@ async fn the_runs_route_reports_a_missing_store_rather_than_an_empty_inbox() {
 ///
 /// Parsed rather than string-matched because the whole point of `/api`'s error
 /// shape is that a client can `res.json()` a failure the same way it does a
-/// success — see `runs::error_body`.
+/// success — see the crate's `api_error`, which is where that shape is spelled.
 async fn json_body(response: axum::http::Response<Body>) -> serde_json::Value {
     let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
@@ -485,6 +485,10 @@ async fn a_router_with_a_real_store_answers_an_empty_inbox_as_an_empty_list() {
 #[tokio::test]
 async fn a_request_over_the_pool_bound_is_shed_rather_than_left_to_queue() {
     let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    // The store is opened and never queried: it exists only to get past the
+    // store check, which runs first. With `permits: 0` the request is shed
+    // before `pool.get()` is ever called, and with `store: None` it would be
+    // answered "no store attached" — the other 503, not the one under test.
     let state = AppState {
         store: Some(store(&dir).await),
         api_pool_permits: roundhouse_web::ApiPoolPermits::new(0),

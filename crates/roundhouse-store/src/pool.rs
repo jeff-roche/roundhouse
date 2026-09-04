@@ -97,6 +97,19 @@ pub struct StorePool {
     pub pool: deadpool_sqlite::Pool,
 }
 
+/// One connection checked out of a [`StorePool`], returned to the pool when it
+/// drops.
+///
+/// A re-export rather than a new type: it *is* `deadpool_sqlite::Object`, and
+/// naming it here is what lets a caller store a checked-out connection in a
+/// struct of its own without declaring a `deadpool-sqlite` edge. Phase 5 Task
+/// 34's fix round added it for `roundhouse_web::StoreConnection`, which pairs a
+/// connection with the semaphore permit bounding it so that the two cannot be
+/// obtained separately (ruling P93 §B); that crate deliberately names neither
+/// `rusqlite` nor `deadpool` (see its manifest), and `interact`'s closure
+/// parameter is inferred, so this alias is the whole surface it needs.
+pub type PooledConnection = deadpool_sqlite::Object;
+
 /// The `post_create` hook shared by [`open`] and [`open_pool`] — every pooled
 /// connection this crate hands out, migrated or not, gets the same three
 /// pragmas. Extracted (fix round 2) so there is exactly one place that sets

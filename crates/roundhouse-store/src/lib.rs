@@ -35,6 +35,10 @@ pub use txn::begin_immediate;
 // Task 1 exports
 pub use pool::{open, StoreError, StorePool, MIGRATIONS};
 
+// Phase 5 Task 34 (fix round 2): a name for a checked-out connection, so a
+// caller can hold one in a struct without declaring a `deadpool-sqlite` edge.
+pub use pool::PooledConnection;
+
 // Task 2 exports
 pub use writer::{serialize_payload, spawn_writer, EventWriter};
 

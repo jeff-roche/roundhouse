@@ -206,7 +206,7 @@ impl From<RunSummary> for RunSummaryJson {
 /// needs you"), and it must never be what "this daemon has no database attached"
 /// looks like. `503` says the surface is not ready, which is what is true.
 ///
-/// # The permit, and why it is taken *after* the store check
+/// # The connection and the permit, which this handler never sees apart
 ///
 /// This handler is the first request-triggered consumer of the pool
 /// `roundhouse_store::writer` appends events through, and it holds one
@@ -215,28 +215,17 @@ impl From<RunSummary> for RunSummaryJson {
 /// see [`crate::ApiPoolPermits`], which is the bound and carries the whole
 /// argument (ruling P93 §B).
 ///
-/// The order matters and is not arbitrary: a router with no store never touches
-/// the pool, so taking a permit before finding that out would let a
-/// store-less server shed requests it was never going to run a query for. Both
-/// answers are `503`, and their bodies are what distinguish them.
+/// It does not take the connection and the permit itself.
+/// [`crate::AppState::store_connection`] is the only way to reach the pool from
+/// this crate, and what it hands back already holds its permit — so this
+/// handler cannot acquire them in the wrong order, or take one without the
+/// other, because it never sees them apart. That method also owns the "no store
+/// attached" and "at the bound" answers, both `503` with different bodies; its
+/// docs say why the store check comes first.
 async fn list_runs(State(state): State<crate::AppState>) -> Response {
-    let Some(store) = state.store else {
-        return unavailable("no store is attached to this server");
-    };
-
-    // Held until this function returns, which is exactly as long as the
-    // connection below is held. `_permit` and not `_`: the latter drops it
-    // immediately and the bound would count nothing.
-    let Some(_permit) = state.api_pool_permits.try_acquire() else {
-        return unavailable(
-            "the runs inbox is at its concurrency bound; retry shortly (the store's connections \
-             are shared with the event log's writer)",
-        );
-    };
-
-    let connection = match store.pool.get().await {
+    let connection = match state.store_connection().await {
         Ok(connection) => connection,
-        Err(error) => return internal_error("acquiring a store connection", &error),
+        Err(response) => return response,
     };
 
     // The query is synchronous and lives in `roundhouse-flow`; `interact` is
@@ -259,11 +248,6 @@ async fn list_runs(State(state): State<crate::AppState>) -> Response {
             .collect::<Vec<_>>(),
     )
     .into_response()
-}
-
-/// A `503` — this surface is not ready — with `reason` in the JSON body.
-fn unavailable(reason: &str) -> Response {
-    (StatusCode::SERVICE_UNAVAILABLE, crate::api_error(reason)).into_response()
 }
 
 /// A `500` whose body names the stage but **not** the underlying error.
