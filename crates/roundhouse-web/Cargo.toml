@@ -21,6 +21,38 @@ roundhouse-proto = { path = "../roundhouse-proto" }
 # `xtask/tests/workspace_shape.rs`'s exact-set assertion, both in the same
 # commit as this line — that test's failure message requires it.
 roundhouse-core = { path = "../roundhouse-core" }
+# Task 34 (Phase 5, Subsystem D5): §8.6's Runs inbox. Ruling P86 puts the query
+# and the fingerprint diffing in `roundhouse-flow` — which already owns
+# `WorkflowRun`, `Report`, `previous_run_for_binding` and `diff_findings`, and
+# already has the `roundhouse-store` edge the `tasks`/`events` tables belong to
+# — rather than letting this leaf crate hand-write SQL against another crate's
+# private schema with no compile-time link to it. So this edge is what replaces
+# a `rusqlite` edge, not what adds to one: **there is no `rusqlite` here and no
+# SQL anywhere in this crate.**
+roundhouse-flow = { path = "../roundhouse-flow" }
+# Task 34: `StorePool`, the one field D5 adds to `AppState`.
+#
+# Only the pool *type* is needed here — the query itself is
+# `roundhouse_flow::runs::load_run_summaries`, and the handler reaches the
+# connection through `deadpool`'s `interact`, whose closure parameter is
+# inferred, so this crate never names `rusqlite::Connection` either.
+#
+# `roundhouse_store::StorePool` rather than a hand-rolled
+# `Arc<Mutex<rusqlite::Connection>>` (which is what this task's plan specified):
+# `pool.rs`'s own comment records that `open_pool` was once found to be a
+# second, hook-free pool constructor that silently skipped all three
+# per-connection pragmas, and was fixed by routing both constructors through one
+# `post_create` hook. A bare `Connection` opened in here would be the third such
+# path and would skip them again.
+#
+# TRACKED DEVIATION from §5.2's original `roundhouse-web` row, both of these,
+# authorised by ruling P9 ("`roundhouse-web` may depend on `roundhouse-flow`,
+# `roundhouse-core`, and `roundhouse-store`") — same style and same procedure as
+# the `roundhouse-core` edge above: recorded in §5.2 of
+# `docs/architecture/02-system-architecture.md` and in
+# `xtask/tests/workspace_shape.rs`'s exact-set assertion, both in the same
+# commit as these lines.
+roundhouse-store = { path = "../roundhouse-store" }
 # Task 30 (Phase 5, Subsystem D1): the inbound HTTP server framework for the
 # web UI. Chosen over hand-rolled `hyper` or `actix-web` because it is written
 # by the `tokio`/`hyper` team (no ecosystem-fit risk against the workspace's
@@ -78,6 +110,11 @@ futures-util = { version = "=0.3.34", default-features = false }
 # Task 31: serialises the `roundhouse_proto::ClientEvent` payload into each
 # SSE frame's `data:` field.
 serde_json = { workspace = true }
+# Task 34 (D5): `#[derive(Serialize)]` for `runs::RunSummaryJson`, the wire
+# shape of `GET /api/runs`. `serde_json` above brings `serde` in transitively
+# but not its `derive` macro, which is a separate feature this crate now needs
+# in its own right. Workspace-pinned, like every other `serde` in the tree.
+serde = { workspace = true }
 # Task 31: parses the session UUID out of a `Last-Event-ID` value and out of
 # the URL path. `SessionId` exposes `from_uuid`, not `FromStr`, so the `Uuid`
 # has to be parsed here.

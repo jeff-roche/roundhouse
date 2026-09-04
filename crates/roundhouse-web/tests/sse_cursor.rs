@@ -184,7 +184,13 @@ async fn stream(
 
     // Task 33 added the bind argument. Loopback: these are cursor tests, and
     // the loopback bind is the one that puts no gate in front of the stream.
-    let response = build_router(AppState { sse: hub.clone() }, &BindConfig::loopback())
+    // Task 34 added the `store` field. `None`: these are SSE cursor tests and
+    // touch no store — see `AppState`'s docs for why that field is an `Option`.
+    let state = AppState {
+        sse: hub.clone(),
+        store: None,
+    };
+    let response = build_router(state, &BindConfig::loopback())
         .oneshot(request)
         .await
         .expect("router is infallible");

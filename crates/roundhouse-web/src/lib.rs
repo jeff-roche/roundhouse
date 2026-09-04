@@ -12,7 +12,10 @@
 //! the one condition §11.3 gives it. See [`sse`]. Task 33 (D4) added the rest
 //! of §11.3's access scope: the opt-in LAN bind and its shared per-device
 //! token, in [`lan_auth`], layered onto the `/api` nest by [`build_router`] —
-//! which records why it is *not* layered over the whole router.
+//! which records why it is *not* layered over the whole router. Task 34 (D5)
+//! added the second API route, §8.6's Runs inbox, in [`runs`] — and with it the
+//! single `api_router` registration point every later API route goes through,
+//! so that adding a route and being gated are one act (ruling P88 §A).
 //! **This crate still binds no listener and starts no server**, and nothing
 //! links it yet — so [`lan_auth::BindConfig::bind_addr`] has no caller.
 //!
@@ -37,6 +40,7 @@
 
 pub mod assets;
 pub mod lan_auth;
+pub mod runs;
 pub mod sse;
 
 pub use assets::{asset_router, WebAssets};
@@ -69,6 +73,28 @@ pub fn api_version() -> roundhouse_proto::ApiVersion {
 /// without either one carrying per-instance identity. It is also why D3's ring
 /// lives behind the hub's own interior mutability rather than being a `&mut`
 /// field here: this type is cloned per request and can hold no exclusive state.
+///
+/// D5 added the second field under the same three constraints, which is what
+/// makes it an `Option` and what makes it a [`roundhouse_store::StorePool`]
+/// rather than a connection:
+///
+/// - **`Default`** rules out anything without one, which a bare
+///   `rusqlite::Connection` (or an `Arc<Mutex<…>>` of one) has no way to
+///   provide. An `Option` carries a `Default` naturally, and a router built
+///   without a store answering "no store configured" is honest — see
+///   [`runs`]'s handler for why that answer is a `503` and not an empty list.
+/// - **`Debug`** holds because `deadpool_sqlite::Pool` implements it (checked,
+///   not assumed: it needs `Manager: Debug` and `Manager::Type: Debug`, and
+///   `rusqlite::Connection`'s `Debug` supplies the second), so
+///   `roundhouse_store::StorePool` can derive it.
+/// - **`Clone`** is `Pool`'s reference-counted handle clone, so cloning
+///   `AppState` per request shares one pool rather than making another.
+///
+/// Opening a bare connection inside this crate instead would be the **third**
+/// pool-construction path in this workspace, and `roundhouse-store`'s `pool.rs`
+/// records that the second one was found silently skipping all three
+/// `post_create` pragmas (`synchronous`, `busy_timeout`, `secure_delete`) until
+/// both constructors were routed through one hook.
 #[derive(Clone, Debug, Default)]
 pub struct AppState {
     /// Per-session fan-out of appended events to open SSE connections, and the
@@ -76,6 +102,14 @@ pub struct AppState {
     /// into it yet** — see [`sse`]'s module docs, which also record that it
     /// performs no redaction.
     pub sse: sse::SseHub,
+    /// The daemon's store, when there is one. `None` is a router with no
+    /// database behind it — every router in this crate's own test suite, and
+    /// whatever a caller builds before it has opened one.
+    ///
+    /// **Nothing in this workspace constructs an `AppState` with a store in it
+    /// yet**, because nothing links this crate at all; see this module's docs
+    /// for what wiring the daemon up costs.
+    pub store: Option<roundhouse_store::StorePool>,
 }
 
 /// The single router a future daemon listener would mount.
@@ -198,7 +232,7 @@ pub fn build_router(state: AppState, bind: &lan_auth::BindConfig) -> axum::Route
 /// what pins "the gate covers the nest" rather than "the gate covers the routes
 /// that happened to exist when the test was written".
 fn api_router() -> axum::Router<AppState> {
-    sse::router().fallback(api_not_found)
+    sse::router().merge(runs::router()).fallback(api_not_found)
 }
 
 /// `404` for an `/api` path that matches no API route.

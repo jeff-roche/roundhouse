@@ -520,8 +520,15 @@ async fn the_gate_is_on_api_and_the_asset_surface_is_ungated() {
     // and the next API route added outside `roundhouse_web::api_router` would
     // be served ungated with this test still green. A `401` for a path that
     // matches nothing is what says the gate is on the **nest**.
+    //
+    // `/api/runs` is here because it is the *second* API route (ruling P88 §A),
+    // and the one whose ungated form would have served workflow-run data to an
+    // unauthenticated LAN peer. Note it must be `401` and not its own `503` for
+    // "no store": the gate runs before the handler, so a gate that missed this
+    // route would show through as the handler's answer.
     for uri in [
         format!("/api/sessions/{SESSION_ID}/events"),
+        "/api/runs".to_string(),
         "/api/no-such-route".to_string(),
     ] {
         let (router, _) = lan_router(dir.path());

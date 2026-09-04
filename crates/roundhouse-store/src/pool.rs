@@ -81,6 +81,18 @@ pub enum StoreError {
 /// to call `.get().await` for connection acquisition. Each pooled connection is configured to
 /// use SQLite's Write-Ahead Logging (WAL) mode for improved concurrency and `synchronous=NORMAL`
 /// for reasonable durability-vs-performance trade-offs (via post_create hook).
+///
+/// `Clone` and `Debug` are both `deadpool_sqlite::Pool`'s own (Phase 5 Task 34).
+/// `Pool` is documented as "can be cloned and transferred across thread
+/// boundaries and uses reference counting for its internal state", so a clone is
+/// another handle to the *same* pool, never a second pool — which matters here
+/// specifically, because this file records that a second pool constructor was
+/// once found silently skipping all three `post_create` pragmas. `Debug` is
+/// derived so a handle can live in a `#[derive(Debug)]` struct
+/// (`roundhouse_web::AppState`, whose `Debug` is load-bearing for its own
+/// tests); it renders the pool's status and the connections' database paths,
+/// and no row content.
+#[derive(Debug, Clone)]
 pub struct StorePool {
     pub pool: deadpool_sqlite::Pool,
 }
