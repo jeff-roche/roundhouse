@@ -19,7 +19,8 @@
 
 use roundhouse_core::{PolicyDecision, SessionId, SuspendReason, TaskId};
 use roundhouse_flow::hitl::{
-    AwaitingHuman, Escalate, Escalation, HitlError, HumanWaitSource, UncheckedOnTimeout,
+    AwaitingHuman, Escalate, Escalation, HitlError, HumanWaitSource, RunPolicyNarrowing,
+    UncheckedOnTimeout,
 };
 use roundhouse_flow::parse::steps::{parse_step, StepBody};
 use roundhouse_flow::parse::types::{OnTimeout, RetryDef, UnattendedDef, UnattendedEscalate};
@@ -437,8 +438,14 @@ fn reading_an_unchecked_on_timeout_as_a_decision_requires_supplying_the_run_time
     // downgrading `approve` to `deny`; nothing else carries a precondition,
     // so nothing else moves in either direction.
     let approve = UncheckedOnTimeout::new(OnTimeout::Approve);
-    assert_eq!(approve.resolve(false), OnTimeout::Deny);
-    assert_eq!(approve.resolve(true), OnTimeout::Approve);
+    assert_eq!(
+        approve.resolve(RunPolicyNarrowing::NotNarrower),
+        OnTimeout::Deny
+    );
+    assert_eq!(
+        approve.resolve(RunPolicyNarrowing::NarrowerThanJobDefault),
+        OnTimeout::Approve
+    );
     // ...while the written value is still available for *rendering* the wait
     // ("approves on timeout"), which is what `as_written` is named for.
     assert_eq!(approve.as_written(), &OnTimeout::Approve);
@@ -449,9 +456,42 @@ fn reading_an_unchecked_on_timeout_as_a_decision_requires_supplying_the_run_time
         OnTimeout::Default("${{ inputs.fallback }}".to_string()),
     ] {
         let wrapped = UncheckedOnTimeout::new(unconditioned.clone());
-        assert_eq!(wrapped.resolve(false), unconditioned, "{unconditioned:?}");
-        assert_eq!(wrapped.resolve(true), unconditioned, "{unconditioned:?}");
+        assert_eq!(
+            wrapped.resolve(RunPolicyNarrowing::NotNarrower),
+            unconditioned,
+            "{unconditioned:?}"
+        );
+        assert_eq!(
+            wrapped.resolve(RunPolicyNarrowing::NarrowerThanJobDefault),
+            unconditioned,
+            "{unconditioned:?}"
+        );
     }
+}
+
+#[test]
+fn unchecked_on_timeout_serializes_as_an_object_naming_its_own_caveat_rather_than_a_bare_string() {
+    // M-1: `#[serde(transparent)]` (removed) made the wire form
+    // byte-identical to a bare `OnTimeout` (`"approve"`), so a hand-rolled
+    // consumer with its own `on_timeout: OnTimeout` field would deserialize
+    // it silently and successfully, re-opening in serialized form exactly
+    // what wrapping the Rust type closed. Asserting the parsed structure
+    // (P29), not the JSON text.
+    let approve = UncheckedOnTimeout::new(OnTimeout::Approve);
+    let value = serde_json::to_value(&approve).unwrap();
+    assert_eq!(value, serde_json::json!({"unchecked": "approve"}));
+
+    // A hand-rolled consumer type standing in for a boundary that does not
+    // carry `UncheckedOnTimeout` at all (the web UI, an ACP bridge, a park
+    // record) — its bare `OnTimeout` field must fail to deserialize this
+    // wire form rather than silently accepting it.
+    #[derive(serde::Deserialize)]
+    struct NaiveConsumer {
+        #[allow(dead_code)]
+        on_timeout: OnTimeout,
+    }
+    let wire = serde_json::json!({"on_timeout": value});
+    assert!(serde_json::from_value::<NaiveConsumer>(wire).is_err());
 }
 
 #[test]

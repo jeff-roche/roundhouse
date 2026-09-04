@@ -124,9 +124,37 @@ pub enum HumanWaitSource {
 /// constructor here at all — the Phase 3 MCP call site is expected to build
 /// one by hand, so anything enforced only inside a constructor is
 /// bypassable.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(transparent)]
+///
+/// **The Rust-side obligation does not survive serialization on its own.**
+/// A `#[serde(transparent)]` (or any newtype-transparent) wire form is
+/// byte-identical to a bare [`OnTimeout`] — `"approve"`, not
+/// `{"approve": ...}` — so a hand-rolled consumer that deserializes into a
+/// bare `OnTimeout` field (the web UI, an ACP bridge, a park/event record:
+/// none of them carry this Rust type) reads it back and grants exactly what
+/// [`resolve`](Self::resolve) exists to gate, with no compile-time barrier
+/// at all. Dropping `Deserialize` only closed the read-back path *inside
+/// this crate*; it closed nothing for a consumer with its own type.
+///
+/// So the wire form names its own caveat instead of matching `OnTimeout`'s:
+/// `{"unchecked": <value>}`. That shape is *useless* to a consumer that
+/// naively deserializes into a bare `OnTimeout` — it is an object where
+/// `OnTimeout`'s wire form is a string, so the naive read fails loudly
+/// instead of succeeding silently — and it puts a name at the call site
+/// (`unchecked`) for a renderer author to go find this type's doc comment.
+#[derive(Debug, Clone, PartialEq)]
 pub struct UncheckedOnTimeout(OnTimeout);
+
+impl Serialize for UncheckedOnTimeout {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("unchecked", &self.0)?;
+        map.end()
+    }
+}
 
 impl UncheckedOnTimeout {
     /// Wraps a document's `on_timeout` without checking anything. Public
@@ -140,13 +168,14 @@ impl UncheckedOnTimeout {
     /// §8.11's precondition as resolved by the caller — the executor, which
     /// holds the run's effective policy and the job default.
     ///
-    /// `false` downgrades `Approve` to `Deny` (fail closed, §8.5 point 5);
-    /// `Deny`, `Fail` and `Default` carry no precondition and pass through
-    /// unchanged either way.
-    pub fn resolve(&self, run_policy_narrower_than_job_default: bool) -> OnTimeout {
-        match &self.0 {
-            OnTimeout::Approve if !run_policy_narrower_than_job_default => OnTimeout::Deny,
-            written => written.clone(),
+    /// [`RunPolicyNarrowing::NotNarrower`] downgrades `Approve` to `Deny`
+    /// (fail closed, §8.5 point 5); `Deny`, `Fail` and `Default` carry no
+    /// precondition and pass through unchanged regardless of which variant
+    /// is supplied.
+    pub fn resolve(&self, run_policy: RunPolicyNarrowing) -> OnTimeout {
+        match (&self.0, run_policy) {
+            (OnTimeout::Approve, RunPolicyNarrowing::NotNarrower) => OnTimeout::Deny,
+            (written, _) => written.clone(),
         }
     }
 
@@ -156,6 +185,28 @@ impl UncheckedOnTimeout {
     pub fn as_written(&self) -> &OnTimeout {
         &self.0
     }
+}
+
+/// §8.11's `on_timeout: approve` precondition, stated as a fact
+/// [`resolve`](UncheckedOnTimeout::resolve)'s caller must assert in words.
+///
+/// Not a `bool`: a `bool` parameter is a literal any caller can supply
+/// without having computed anything, and the fail-*open* literal (`true`)
+/// is exactly as easy to write as the fail-closed one — a future caller
+/// (Task 17's executor) that has not yet built the narrowing comparison
+/// still compiles with `resolve(true)`, and gets the same escalation this
+/// module exists to gate, now wearing the appearance of a discharged
+/// obligation. Naming the two states means writing either one requires
+/// typing the fact, and `grep -rn NarrowerThanJobDefault` finds every site
+/// that asserts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunPolicyNarrowing {
+    /// The run's bound policy is narrower than the job's configured
+    /// default — §8.11's stated precondition for honoring `approve`.
+    NarrowerThanJobDefault,
+    /// The precondition does not hold (including "not yet computed"):
+    /// `approve` is downgraded to `deny`.
+    NotNarrower,
 }
 
 /// §8.11's one mechanism: a task waiting on a human, carrying the
@@ -251,6 +302,21 @@ fn permission_approval_fields() -> serde_json::Map<String, serde_json::Value> {
 /// prototype semantics on this side — so this is a consumer-side hazard: the
 /// renderer must not assign author keys onto a JS object it later reads
 /// properties from. Recorded here so the web UI brief inherits it.
+///
+/// **Two more inherited obligations, same reason.**
+/// - A consumer must NOT resolve approval from the mere presence of an
+///   `approve` key in a submitted form. `form_schema`'s `properties` names
+///   are author-controlled (a `gate:` step can call a field anything,
+///   including `approve`, without it meaning what the permission-escalation
+///   path's synthesized `approve` boolean means) and presence says nothing
+///   about the schema's declared `type`; keying off the field name alone
+///   fabricates a decision the author's schema never made.
+/// - An author-declared `approve` field of a non-boolean JSON-Schema `type`
+///   (e.g. `{"type": "string"}`) is renderer chrome the author chose to
+///   label `approve` — it is not the boolean [`UncheckedOnTimeout`] gates,
+///   and reading it as a yes/no answer is the same category of mistake as
+///   trusting the wire form of `on_timeout` without going through
+///   [`UncheckedOnTimeout::resolve`].
 fn form_schema(
     title: &str,
     fields: &serde_json::Map<String, serde_json::Value>,
