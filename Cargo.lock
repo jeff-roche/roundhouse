@@ -3924,10 +3924,15 @@ name = "roundhouse-web"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
+ "roundhouse-core",
  "roundhouse-proto",
  "rust-embed",
+ "serde_json",
+ "thiserror 2.0.20",
  "tokio",
  "tower",
+ "uuid",
 ]
 
 [[package]]

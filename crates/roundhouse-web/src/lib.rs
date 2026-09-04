@@ -4,9 +4,10 @@
 //!
 //! Task 30 (Phase 5, Subsystem D1) fills in the crate's entry seam: an
 //! `axum::Router` serving the `rust-embed`-embedded client from
-//! `assets/dist/`, with §11.1's SPA fallback. That is the whole scope —
-//! **this crate binds no listener and starts no server**, and nothing links it
-//! yet.
+//! `assets/dist/`, with §11.1's SPA fallback. Task 31 (D2) added the first
+//! API route: §11.3's SSE stream, with `Last-Event-ID` carrying the
+//! `(session_id, seq)` cursor — see [`sse`]. **This crate still binds no
+//! listener and starts no server**, and nothing links it yet.
 //!
 //! Wiring it up is a separate, later piece of work, and it is not free: it has
 //! to add the `roundhouse-daemon -> roundhouse-web` Cargo edge, update
@@ -27,39 +28,49 @@
 #![forbid(unsafe_code)]
 
 pub mod assets;
+pub mod sse;
 
 pub use assets::{asset_router, WebAssets};
 
 /// The wire-protocol version this crate's API speaks, shared with every other
 /// client of `roundhouse-proto`.
 ///
-/// **Do not delete this as unused.** `xtask/tests/exit_criterion.rs` asserts a
-/// required Cargo edge `roundhouse-web -> roundhouse-proto`, and this is the
-/// only place in the crate that uses `roundhouse_proto`. Removing it makes the
-/// dependency look dead, and dropping the dependency fails that test. Keep it
-/// until a Subsystem D task gives the crate a real `roundhouse-proto` use
-/// site — which D2 onwards will, since the API routers speak those wire types.
+/// Task 30 marked this "do not delete as unused", because it was then the
+/// only use of `roundhouse_proto` in the crate and `xtask/tests/
+/// exit_criterion.rs` asserts a required `roundhouse-web -> roundhouse-proto`
+/// Cargo edge. **That prediction is now fulfilled and the note is relaxed:**
+/// `sse::SessionUpdate` carries a `roundhouse_proto::ClientEvent` as the
+/// payload of every SSE frame, so the dependency is load-bearing on its own.
+/// This function stays because clients need to negotiate a wire version, not
+/// because deleting it would break a test.
 pub fn api_version() -> roundhouse_proto::ApiVersion {
     roundhouse_proto::ApiVersion::CURRENT
 }
 
 /// Shared state handed to every route in [`build_router`].
 ///
-/// Empty today: D1 serves only static embedded assets, which need no state.
-/// It exists as the seam the later Subsystem D tasks add their fields to (an
-/// SSE hub, the store handle) so that adding one is a field, not a change to
-/// every handler signature in the crate. That the seam actually carries state
-/// to a handler is checked by
-/// `tests/assets.rs::a_handler_taking_app_state_composes_with_the_asset_router`,
-/// not just asserted here.
+/// D1 created this empty, as the seam later Subsystem D tasks add their fields
+/// to; D2 added the first one. `Clone + Debug + Default` is load-bearing, not
+/// incidental: `axum` clones the state per request, and
+/// `tests/assets.rs::a_handler_taking_app_state_composes_with_the_asset_router`
+/// formats it with `{state:?}` and compares against a separately constructed
+/// `AppState::default()` — which holds because
+/// `tokio::sync::broadcast::Sender`'s `Debug` is the constant string
+/// `"broadcast::Sender"`, carrying no per-instance identity.
 #[derive(Clone, Debug, Default)]
-pub struct AppState {}
+pub struct AppState {
+    /// Fan-out of appended events to open SSE connections. **Nothing in this
+    /// workspace publishes into it yet** — see [`sse`]'s module docs.
+    pub sse: sse::SseHub,
+}
 
 /// The single router a future daemon listener would mount.
 ///
-/// Today it is the asset router plus the shared state. Later Subsystem D tasks
-/// `.nest()` their API routers here, **ahead of** the asset fallback, so that
-/// an `/api/...` path never falls through to the `index.html` shell.
+/// The asset router plus [`sse::router`] nested at `/api`, plus the shared
+/// state. `axum` matches registered routes before a `fallback`, so nesting is
+/// what puts `/api/sessions/{id}/events` **ahead of** the asset fallback and
+/// stops it falling through to the `index.html` shell. An `/api/...` path with
+/// no route still reaches the asset fallback, which 404s it.
 ///
 /// **Nest before `with_state`, not after.** `with_state` applies the state to
 /// the routes registered up to that point and turns the result into a
@@ -71,5 +82,7 @@ pub struct AppState {}
 /// compiles exactly that composition, so this stops being prose the moment it
 /// stops being true.
 pub fn build_router(state: AppState) -> axum::Router {
-    assets::asset_router().with_state(state)
+    assets::asset_router()
+        .nest("/api", sse::router())
+        .with_state(state)
 }

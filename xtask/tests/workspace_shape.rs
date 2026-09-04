@@ -204,7 +204,13 @@ const EXPECTED_EDGES: &[(&str, &[&str])] = &[
     ),
     ("roundhouse-tui", &["roundhouse-proto"]),
     ("roundhouse-cli", &["roundhouse-proto", "roundhouse-tui"]),
-    ("roundhouse-web", &["roundhouse-proto"]),
+    // Phase 5 Task 31 (Subsystem D2): `roundhouse-core` is a deliberate,
+    // tracked deviation from this table's original `proto`-only row for
+    // `roundhouse-web`, authorised by ruling P9. §11.3's SSE cursor is
+    // `(session_id, seq)` and `SessionId` lives in `roundhouse-core`;
+    // `roundhouse-proto` uses it without re-exporting it. See
+    // `crates/roundhouse-web/Cargo.toml`'s own comment on the edge.
+    ("roundhouse-web", &["roundhouse-core", "roundhouse-proto"]),
     ("roundhouse-net", &["roundhouse-core", "roundhouse-store"]),
 ];
 
