@@ -1,5 +1,5 @@
 error[E0616]: field `inner` of struct `BoundedStore` is private
-  --> tests/ui/bounded_store_pool_is_unreachable.rs:14:23
+  --> tests/ui/bounded_store_pool_is_unreachable.rs:19:23
    |
-14 |     let _pool = store.inner;
+19 |     let _pool = store.inner;
    |                       ^^^^^ private field

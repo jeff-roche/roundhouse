@@ -48,6 +48,7 @@
 #![forbid(unsafe_code)]
 
 pub mod assets;
+mod bounded;
 mod host_guard;
 pub mod interaction;
 pub mod lan_auth;
@@ -55,6 +56,17 @@ pub mod runs;
 pub mod sse;
 
 pub use assets::{asset_router, WebAssets};
+/// The pool wrapper and its bound, re-exported so callers still name them
+/// `roundhouse_web::BoundedStore` and `roundhouse_web::ApiPoolPermits`.
+///
+/// **The module is private and these two are `pub use`d, rather than the module
+/// being `pub`.** That is the fix's shape, not a formatting preference: what
+/// makes [`BoundedStore`]'s private field mean anything is that its defining
+/// module has no descendants (ruling P98), and a `pub mod` invites the next
+/// person to add one. `tests/bounded_reach.rs` is what actually holds the line;
+/// this is the signpost pointing at it.
+pub use bounded::{ApiPoolPermits, BoundedStore};
+pub(crate) use bounded::{ConnectionRefusal, StoreConnection};
 
 /// The wire-protocol version this crate's API speaks, shared with every other
 /// client of `roundhouse-proto`.
@@ -133,177 +145,6 @@ pub struct AppState {
     pub api_pool_permits: ApiPoolPermits,
 }
 
-/// The store pool with its `Pool` handle **out of reach**, so that
-/// [`AppState::store_connection`] is not merely the convenient way to take a
-/// connection but the only expressible one.
-///
-/// # Why a newtype rather than a doc note
-///
-/// [`AppState::store_connection`] exists because a handler that called
-/// `state.store.pool.get()` directly would hold a connection outside
-/// [`ApiPoolPermits`]' bound, and its docs say so. But [`AppState::store`] is
-/// `pub` — as it must be, since a future `roundhouse-daemon` constructs the
-/// state by struct literal — and a `pub` field of type
-/// [`roundhouse_store::StorePool`] hands every handler in this crate, and every
-/// caller outside it, a `deadpool` `Pool` with a public `get`. The bound was
-/// therefore held by nobody reaching for it, which is the same "invariant that
-/// holds because nothing has tested it yet" shape ruling P88 §A is about, and
-/// D6 adds four more `/api` handlers.
-///
-/// Wrapping the field is what makes it structural: `pool` is private to this
-/// module, so `store_connection` (immediately below, in this same module) can
-/// read it and **nothing else in this crate can**, whatever the field
-/// visibility on [`AppState`] says. Moving `AppState` into its own module would
-/// buy the same property at the cost of a module and an import churn across the
-/// crate; this buys it in one field.
-///
-/// [`new`](Self::new) is the whole public surface: a caller supplies a pool and
-/// gets back something it can only hand to [`AppState`]. There is deliberately
-/// no accessor — an `fn pool(&self)` would restore exactly what the private
-/// field removes.
-#[derive(Clone, Debug)]
-pub struct BoundedStore {
-    /// **Private, and that is the entire point of this type.** Read only by
-    /// [`AppState::store_connection`], which pairs it with a permit.
-    ///
-    /// Named `inner` rather than `pool` so that the one expression that reaches
-    /// through it reads `store.inner.pool.get()` — the outer name says "this is
-    /// the wrapper being unwrapped", and the inner one is
-    /// [`roundhouse_store::StorePool`]'s own field.
-    inner: roundhouse_store::StorePool,
-}
-
-impl BoundedStore {
-    /// Puts `pool` behind the bound.
-    ///
-    /// The only constructor, and it takes the pool by value: whoever opened the
-    /// store keeps their own clone if they want one (`StorePool` is a
-    /// reference-counted handle), but the clone *inside* an [`AppState`] is not
-    /// reachable through it.
-    pub fn new(pool: roundhouse_store::StorePool) -> Self {
-        Self { inner: pool }
-    }
-}
-
-/// A bound on how many API requests may hold a store connection at once,
-/// **shedding** rather than queueing when it is reached.
-///
-/// # The failure this exists to prevent
-///
-/// [`runs::router`]'s handler is the first thing in this workspace that takes a
-/// [`roundhouse_store::StorePool`] connection *on request*, and the pool it
-/// takes from is the one `roundhouse_store::writer` appends events through.
-/// Measured, not assumed: `deadpool` 0.13.1's default `max_size` is
-/// `CPU_COUNT * 2` (`deadpool::util::get_default_pool_max_size`) and
-/// `Timeouts::default()` sets **no wait timeout**, and `roundhouse_store::open`
-/// overrides neither. One `GET /api/runs` holds its connection for up to
-/// `1 + 3 × MAX_INBOX_RUNS` queries.
-///
-/// So `CPU_COUNT * 2` concurrent requests — from an unauthenticated loopback
-/// caller, a paired LAN device, or `HEAD` requests that pay the whole cost and
-/// take no body — hold every connection in the pool, and every other caller,
-/// **including an event append**, waits forever. Ruling P93 §B.
-///
-/// # Why a semaphore, and why `try_acquire`
-///
-/// Three alternatives were measured and rejected there, recorded so they are
-/// not re-derived:
-///
-/// - **Setting `Timeouts.wait` in `roundhouse_store::open`** is one line, and
-///   it converts the writer's benign wait under contention into a hard
-///   `PoolTimeout` on the **write** path. That is worse than the problem.
-/// - **`tokio::time::timeout` around `pool.get()`** bounds how long *one*
-///   handler waits, not how many connections concurrent handlers already hold.
-///   It misses the mechanism.
-/// - **`tower::ConcurrencyLimitLayer`** queues rather than sheds, converting
-///   starvation into unbounded queueing, and drags `tower` out of
-///   dev-dependencies.
-///
-/// `try_acquire_owned` is what makes this shed: over the bound, the request is
-/// answered `503` immediately instead of joining a queue with no end. That
-/// matches [`runs`]'s existing convention, where `503` means "this surface is
-/// not ready" rather than "your request is wrong".
-///
-/// # The default, and why it is a fraction rather than a constant
-///
-/// The pool's size is a function of the CPU count, so a fixed number would be
-/// most of the pool on a small machine and a rounding error on a large one. The
-/// default is a quarter of `deadpool`'s own default `max_size` — see
-/// [`ApiPoolPermits::default`] — with a floor of one, so a single-core machine
-/// can still answer.
-///
-/// `Default` is what [`AppState`] needs and is also what a caller should
-/// normally use. [`ApiPoolPermits::new`] exists for a caller that has measured
-/// something better, and for tests that need the shed path deterministically.
-#[derive(Clone)]
-pub struct ApiPoolPermits(std::sync::Arc<tokio::sync::Semaphore>);
-
-impl ApiPoolPermits {
-    /// A bound of exactly `permits` concurrent store-holding API requests.
-    ///
-    /// `0` is legal and means "shed everything", which is the only way to
-    /// exercise the shed path without racing a real pool.
-    pub fn new(permits: usize) -> Self {
-        Self(std::sync::Arc::new(tokio::sync::Semaphore::new(permits)))
-    }
-
-    /// What is left of the bound.
-    ///
-    /// Public because the bound's *size* is otherwise unmeasurable from
-    /// outside, and it is a claim worth measuring: `tests/runs.rs::
-    /// the_default_bound_is_well_below_the_pools_own_max_size` reads this and
-    /// compares it against `pool.status().max_size`, which is the property
-    /// [`Default`] exists to have rather than a number it happens to produce.
-    pub fn available_permits(&self) -> usize {
-        self.0.available_permits()
-    }
-
-    /// The permit for one request, or `None` if the bound is reached.
-    ///
-    /// The caller holds the returned value for as long as it holds a pool
-    /// connection — which is why it is an owned permit and not a borrowed one:
-    /// the handler's future outlives any borrow of the state.
-    ///
-    /// **Private, not `pub(crate)`.** Its one caller is
-    /// [`AppState::store_connection`], immediately below, and a permit is of no
-    /// use to anything else: taking one without then taking a connection bounds
-    /// nothing, and taking a connection without one is the failure the bound
-    /// exists to prevent. Keeping it here is what makes the two a single act
-    /// rather than two a handler is trusted to perform in order.
-    fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        std::sync::Arc::clone(&self.0).try_acquire_owned().ok()
-    }
-}
-
-impl Default for ApiPoolPermits {
-    /// A quarter of `deadpool`'s default `max_size` of `CPU_COUNT * 2`, floored
-    /// at one.
-    ///
-    /// The CPU count comes from `std::thread::available_parallelism`, which is
-    /// not literally the `num_cpus::get()` `deadpool` uses: in a cgroup-limited
-    /// container the std answer is the *smaller* of the two, which lowers this
-    /// bound and never raises it past its intended fraction. That is the
-    /// direction to be wrong in.
-    fn default() -> Self {
-        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-        Self::new((cpus / 2).max(1))
-    }
-}
-
-impl std::fmt::Debug for ApiPoolPermits {
-    /// Hand-written because [`AppState`] derives `Debug` and
-    /// `tests/assets.rs::a_handler_taking_app_state_composes_with_the_asset_router`
-    /// compares two independently constructed `AppState::default()` renderings.
-    /// A derived `Debug` here would print `tokio::sync::Semaphore`'s internals,
-    /// which are not part of this type's meaning; the number of permits still
-    /// free is.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("ApiPoolPermits")
-            .field(&self.0.available_permits())
-            .finish()
-    }
-}
-
 impl AppState {
     /// A store connection **and** the permit bounding it, in one act — the only
     /// way anything in this crate reaches the pool.
@@ -317,17 +158,20 @@ impl AppState {
     /// `/api` endpoints, so "the next one" is imminent.
     ///
     /// This is the same move [`api_router`] made for the gate (ruling P88 §A):
-    /// make the safe act and the *only* act the same one. `try_acquire` is
-    /// private to this module, so a permit cannot be taken separately, and the
+    /// make the safe act and the *only* act the same one. The permit is taken
+    /// inside [`BoundedStore::connection`], beside the pool it bounds, so the
     /// connection comes back already wearing it — there is no ordering for a
     /// handler to get wrong and no step for it to skip.
     ///
-    /// **`state.store.pool.get()` is now a compile error**, which the paragraph
-    /// above could only ask for. [`AppState::store`] holds a [`BoundedStore`],
-    /// whose pool is private to this module — so this method is not the
-    /// preferred route to the pool from a handler, it is the only one that
-    /// exists. See [`BoundedStore`] for why the field was left `pub` and the
-    /// *type* changed instead.
+    /// **Both `state.store.pool.get()` and `state.store.inner.pool.get()` are
+    /// compile errors from here**, which the paragraph above could only ask for.
+    /// This method does not read the pool; it delegates to
+    /// [`BoundedStore::connection`], which lives in the same **leaf** module as
+    /// the private field and is the only expression in the crate that unwraps
+    /// it. That the module is a leaf is the whole guarantee — see
+    /// [`BoundedStore`], and ruling P98 for the version of this method that
+    /// claimed the property while `lib.rs` still held the field, where "private"
+    /// meant "readable from every handler module in the crate".
     ///
     /// Rejected, recorded so they are not re-derived: a doc note on
     /// [`AppState::store`] (ruling P88 §A *is* the record of a doc note not
@@ -365,52 +209,22 @@ impl AppState {
         let Some(store) = self.store.as_ref() else {
             return Err(unavailable("no store is attached to this server"));
         };
-        let Some(permit) = self.api_pool_permits.try_acquire() else {
-            return Err(unavailable(
+
+        // The pool error is not carried out of `connection` at all, for the
+        // reason `runs::internal_error` states: a pool error can carry the
+        // database path, and this response goes to whoever asked.
+        match store.connection(&self.api_pool_permits).await {
+            Ok(connection) => Ok(connection),
+            Err(ConnectionRefusal::AtBound) => Err(unavailable(
                 "this API is at its concurrency bound; retry shortly (the store's connections are \
                  shared with the event log's writer)",
-            ));
-        };
-
-        // `_error` is discarded rather than rendered, for the reason
-        // `runs::internal_error` states: a pool error can carry the database
-        // path, and this response goes to whoever asked.
-        match store.inner.pool.get().await {
-            Ok(connection) => Ok(StoreConnection {
-                connection,
-                _permit: permit,
-            }),
-            Err(_error) => Err((
+            )),
+            Err(ConnectionRefusal::PoolFailed) => Err((
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 api_error("this API failed while acquiring a store connection"),
             )
                 .into_response()),
         }
-    }
-}
-
-/// A checked-out store connection that owns the permit bounding it.
-///
-/// Constructible only by [`AppState::store_connection`], which is the point: a
-/// connection cannot exist in this crate without the permit that accounts for
-/// it, so the bound cannot be bypassed by forgetting a step.
-///
-/// **Field order is the drop order and is load-bearing.** Struct fields drop in
-/// declaration order, so the connection goes back to the pool *before* the
-/// permit is released. The other order would let a waiting request take the
-/// freed permit and then block inside `pool.get()` on a connection that has not
-/// been returned yet — bounding the permits but not the wait, which is the
-/// failure this whole mechanism exists to prevent.
-pub(crate) struct StoreConnection {
-    connection: roundhouse_store::PooledConnection,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-impl std::ops::Deref for StoreConnection {
-    type Target = roundhouse_store::PooledConnection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.connection
     }
 }
 

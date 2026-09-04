@@ -238,6 +238,10 @@ roundhouse-flow = { path = "../roundhouse-flow", features = ["test-util"] }
 # property of what does *not* compile, so it has no runtime test and no
 # mutation can score it — see that file's docs.
 #
+# It is **only** the out-of-crate direction: `trybuild` compiles each case as its
+# own crate. The intra-crate direction — the one rulings P96 §C and P98 are about
+# — needs no dependency at all and lives in `tests/bounded_reach.rs`.
+#
 # `"1"` and not an exact `=` pin, unlike every dependency above: `trybuild` is
 # already declared at `"1"` by `roundhouse-core`, `roundhouse-net` and
 # `roundhouse-secrets`, and a narrower requirement here would fragment the
