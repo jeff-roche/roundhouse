@@ -514,12 +514,23 @@ async fn the_gate_is_on_api_and_the_asset_surface_is_ungated() {
         );
     }
 
-    let (router, _) = lan_router(dir.path());
-    assert_eq!(
-        status_of(router, get(&format!("/api/sessions/{SESSION_ID}/events"))).await,
-        StatusCode::UNAUTHORIZED,
-        "the SSE stream is under the gated nest and must be refused without the token"
-    );
+    // Every `/api` path, not just the ones that exist. The unrouted path is the
+    // load-bearing one on this side (ruling P88 §A): a gate that covered only
+    // the routes `sse::router` happens to register would answer `404` there,
+    // and the next API route added outside `roundhouse_web::api_router` would
+    // be served ungated with this test still green. A `401` for a path that
+    // matches nothing is what says the gate is on the **nest**.
+    for uri in [
+        format!("/api/sessions/{SESSION_ID}/events"),
+        "/api/no-such-route".to_string(),
+    ] {
+        let (router, _) = lan_router(dir.path());
+        assert_eq!(
+            status_of(router, get(&uri)).await,
+            StatusCode::UNAUTHORIZED,
+            "{uri} is under the gated nest and must be refused without the token"
+        );
+    }
 }
 
 #[tokio::test]

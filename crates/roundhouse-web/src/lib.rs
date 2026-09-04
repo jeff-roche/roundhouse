@@ -80,11 +80,12 @@ pub struct AppState {
 
 /// The single router a future daemon listener would mount.
 ///
-/// The asset router plus [`sse::router`] nested at `/api`, plus the shared
+/// The asset router plus `api_router` nested at `/api`, plus the shared
 /// state. `axum` matches registered routes before a `fallback`, so nesting is
 /// what puts `/api/sessions/{id}/events` **ahead of** the asset fallback and
 /// stops it falling through to the `index.html` shell. An `/api/...` path with
-/// no route still reaches the asset fallback, which 404s it.
+/// no route is 404ed by `api_router`'s own fallback rather than by the asset
+/// router's — see `api_not_found` for why that distinction is the gate's.
 ///
 /// **Nest before `with_state`, not after.** `with_state` applies the state to
 /// the routes registered up to that point and turns the result into a
@@ -104,10 +105,20 @@ pub struct AppState {
 /// [`lan_auth::BindConfig`] for why that decision and the token are one value.
 ///
 /// When [`lan_auth::BindConfig::gate`] yields a gate it is layered onto
-/// [`sse::router`] **before** that router is nested. So the gated set is
-/// `/api/...` and the ungated set is "whatever [`assets::asset_router`] serves"
-/// — **by construction**, not by a path-prefix string test on the outer router,
-/// which is the loose form that drifts the moment a route is added.
+/// `api_router` **before** that router is nested. So the gated set is exactly
+/// what `api_router` registers, and the ungated set is "whatever
+/// [`assets::asset_router`] serves" — not a path-prefix string test on the outer
+/// router, which is the loose form that drifts the moment a route is added.
+///
+/// **What constructs that, precisely, is `api_router` being the only place an
+/// API route is registered** — see its docs, which is where the invariant lives
+/// and where a new route goes. An earlier version of this paragraph said the
+/// gated set was `/api/...` "by construction" while the construction actually
+/// guaranteed only "whatever [`sse::router`] registers". Those coincided because
+/// there was exactly one API router, and a set with one element makes a poor
+/// invariant (ruling P88 §A): the very next task added a second API route, and
+/// adding it the obvious way — a second `.nest("/api", …)` on the chain below —
+/// would have served it **ungated** with no test in the suite failing.
 ///
 /// ## The whole-surface gate was tried first, and it does not work
 ///
@@ -150,13 +161,63 @@ pub struct AppState {
 /// zero-configuration router has no authentication code in its request path at
 /// all.
 pub fn build_router(state: AppState, bind: &lan_auth::BindConfig) -> axum::Router {
+    // Every API route is registered inside `api_router`, and therefore inside
+    // this expression, where the gate is applied. **A new API router is merged
+    // into `api_router`; it is never added to the outer chain below.** A second
+    // `.nest("/api", …)` down there would sit outside this `match` and would be
+    // served ungated (ruling P88 §A).
     let api = match bind.gate() {
-        None => sse::router(),
-        Some(gate) => sse::router().layer(axum::middleware::from_fn_with_state(
+        None => api_router(),
+        Some(gate) => api_router().layer(axum::middleware::from_fn_with_state(
             gate,
             lan_auth::require_lan_token,
         )),
     };
 
     assets::asset_router().nest("/api", api).with_state(state)
+}
+
+/// **The single registration point for every API route in this crate**, nested
+/// at `/api` and gated by [`build_router`].
+///
+/// Being the *only* such point is the security property, not an organisational
+/// one (ruling P88 §A). [`build_router`] gates whatever this function returns,
+/// so a route added here is gated by the same act that adds it. A route added
+/// any other way — most plausibly a second `.nest("/api", …)` on
+/// [`build_router`]'s outer chain — lands **outside** the gate, serving session
+/// and workflow-run data to an unauthenticated LAN peer, and the existing
+/// boundary test would not notice, because it can only probe paths it knows
+/// about.
+///
+/// So: **a new API route goes in this function.** `merge` for another
+/// `Router<AppState>` of top-level API paths, `nest` for a prefixed group. Both
+/// keep it inside the returned value, which is the only thing that matters.
+///
+/// `tests/lan_auth.rs::the_gate_is_on_api_and_the_asset_surface_is_ungated`
+/// asserts `401` on an `/api` path that matches **no** route at all, which is
+/// what pins "the gate covers the nest" rather than "the gate covers the routes
+/// that happened to exist when the test was written".
+fn api_router() -> axum::Router<AppState> {
+    sse::router().fallback(api_not_found)
+}
+
+/// `404` for an `/api` path that matches no API route.
+///
+/// **The point of it is the `401` it makes possible, not the `404`.** Without a
+/// fallback of its own, a nested `axum::Router` hands an unmatched request back
+/// to the outer router's fallback — [`assets::serve_asset`], which 404s it —
+/// and it does so *outside* the gate [`build_router`] layered onto this router.
+/// The gate would then cover exactly the paths [`api_router`] had registered at
+/// the moment it was written, which is precisely the "invariant that holds
+/// because a set has one element" ruling P88 §A is about. With this fallback the
+/// `/api` nest answers every path under it, so the gate covers the **nest**, and
+/// `tests/lan_auth.rs::the_gate_is_on_api_and_the_asset_surface_is_ungated` can
+/// assert that by probing a path no route will ever match.
+///
+/// The status is unchanged from what the asset fallback produced for the same
+/// path, so this is not a behaviour change for a client; only *which* layer
+/// answers, and therefore whether the answer is gated.
+async fn api_not_found() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (axum::http::StatusCode::NOT_FOUND, "no such API route\n").into_response()
 }
