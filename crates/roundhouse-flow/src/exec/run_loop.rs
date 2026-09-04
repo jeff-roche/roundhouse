@@ -674,6 +674,17 @@ impl<H: WorkflowHost> Loop<'_, H> {
             // Ruling P108 §C, discharged: the `map` split is taken from the
             // run's real remaining ceiling, read at the moment the step starts
             // — §8.9's own words for when it is taken.
+            //
+            // **Sourced, not yet enforced, and this slice's mutation sweep
+            // measured exactly that.** `map_step::run_map` computes
+            // `split_budget(&budget.total_remaining, n)` and hands the result
+            // to a closure that binds it `_item_caps`; nothing reads it. So
+            // mutating this line away survives at zero test failures, and the
+            // honest reading is that the *sourcing* half of P108 §C is done
+            // and the *enforcement* half is per-item admission — which belongs
+            // with `map`'s worktree fan-out, deferred out of B12 entirely by
+            // ruling P77 §C. Kept rather than deleted because the value is now
+            // real and correct, and the consumer arrives with fan-out.
             executor.map_budget = Some(MapBudget::from_run_ledger(
                 self.conn,
                 self.run_id,
