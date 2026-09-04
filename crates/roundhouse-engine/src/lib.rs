@@ -20,6 +20,19 @@
 pub mod agent_spawn;
 pub mod break_glass;
 
+/// §7.7's depth/fan-out/team-size constants and their predicates, re-exported
+/// verbatim from `roundhouse-bus`.
+///
+/// `roundhouse-engine` already depends on `roundhouse-bus` and enforces these
+/// on every sub-agent spawn ([`agent_spawn`]). Crates whose §5.2 dependency
+/// row grants `engine` but not `bus` — `roundhouse-flow`'s is
+/// `core, engine, store` — need the *same* constants to bound the `call:`
+/// chain, which §8.12 makes a chain of nested Sessions exactly as sub-agent
+/// spawning is. Re-exporting over the `flow -> engine` edge §5.2 already
+/// grants means one definition rather than two ceilings that agree only by
+/// coincidence (ruling P76 §2).
+pub use roundhouse_bus::limits;
+
 mod chat;
 pub mod compact;
 mod context;

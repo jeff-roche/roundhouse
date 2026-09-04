@@ -1,17 +1,21 @@
 //! §8.12's composition primitives (Task 19, B11): the `call:` budget
-//! transfer, the recursion-depth bound, and workflow-as-tool registration.
+//! transfer, the recursion-depth and fan-out bounds, and workflow-as-tool
+//! registration.
 //!
 //! # What this module is, and what it is not
 //!
-//! Three pure, testable, callable primitives — [`draw_child_budget`] /
-//! [`refund_child_budget`], [`child_call_depth`], and [`register_as_tool`].
+//! Four pure, testable, callable primitives — [`draw_child_budget`] /
+//! [`refund_child_budget`], [`child_call_depth`], [`admit_child_call`], and
+//! [`register_as_tool`].
 //! **Nothing calls them yet.** Composition's *run loop* — creating the child
 //! `workflow_run`, writing
 //! [`WorkflowRun::parent_run_id`](crate::durability::WorkflowRun::parent_run_id),
 //! creating the child Session, emitting §8.12's `agent`-kind task standing
-//! for the call, and calling all three of these — is **Task 20 (B12)**'s,
+//! for the call, and calling all four of these — is **Task 20 (B12)**'s,
 //! and [`crate::exec::Executor::dispatch_step`]'s `StepBody::Call` arm stays
-//! a stub until then.
+//! a stub until then. Task 20 also owns *sourcing* the two numbers the bounds
+//! take: see [`MAX_CALL_DEPTH`]'s "What Task 20 must supply", which is about
+//! the **session** chain and not the `parent_run_id` chain.
 //!
 //! This is the same primitive/run-loop split the three preceding tasks used:
 //! Task 16 (B8) landed the durable state machine with no run loop, Task 17
@@ -96,14 +100,31 @@
 //!    recorded reasoning, not a provider limit this task verified. A
 //!    `workflow:<name>` is subject to no such bound here.
 //!
-//! Whether a workflow may shadow an MCP tool is a policy question for the
-//! bridge's owner, not something this module should answer unilaterally by
-//! picking a mangling.
+//! 4. **Workflow-vs-workflow collides before MCP ever enters it.** The tool
+//!    name is `workflow:<WorkflowDef.name>`, and nothing makes that name
+//!    unique: two different jobs whose bodies both declare `name: pr-review`
+//!    both register as `workflow:pr-review`. The job's own identity
+//!    ([`crate::job::JobVersion`]'s `JobId`/version) does not appear in the
+//!    name at all. Which one a model reaches, and whether the second
+//!    registration should be refused or should disambiguate, is the same
+//!    bridge owner's decision.
+//! 5. **`WorkflowDef.name` is unbounded and unfiltered, and flows into a
+//!    model-facing field.** [`crate::parse::parse_workflow`] applies no length
+//!    limit and no character filter to `name:`, so whatever a workflow author
+//!    writes there — including newlines, or a megabyte of text — reaches
+//!    [`WorkflowToolRegistration::name`] verbatim. This module deliberately
+//!    does not sanitize it (picking a mangling is the decision above), but it
+//!    is recorded here rather than left for the bridge to discover.
+//!
+//! Whether a workflow may shadow an MCP tool, or another workflow, is a policy
+//! question for the bridge's owner, not something this module should answer
+//! unilaterally by picking a mangling.
 
 use crate::caps::ResourceCaps;
 use crate::job::JobVersion;
 use crate::parse::types::{InputDef, InputType};
 use crate::parse::{parse_workflow, ParseError};
+use roundhouse_engine::limits;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -115,26 +136,42 @@ use thiserror::Error;
 
 /// Hard, closed-fail cap on how deep a chain of `call:` sub-workflows may
 /// nest. The root run is depth 0; each `call:` produces a child one deeper,
-/// so this permits at most four nested child runs beneath a root.
+/// so this permits at most `MAX_CALL_DEPTH` nested child runs beneath a root
+/// — four, at §7.7's current number.
 ///
-/// # Why this exists at all
+/// # This is §7.7's existing constant, not a second ceiling
 ///
-/// **Before this constant, nothing in the workspace bounded workflow
-/// recursion.** `call:` targets are resolved neither at parse time nor at run
-/// time, so `call: self` parses without complaint.
-/// [`crate::parse::MAX_FLOW_NESTING_DEPTH`] is unrelated (it bounds YAML
-/// flow-collection nesting in raw text and its own doc says it is not a bound
-/// on parse cost), and [`crate::exec::map_step::MAX_MAP_ITEMS`] bounds
-/// **one** `map` call and says so explicitly — the product across nested
-/// `map`s is not bounded by it. §8.12 mandates the fix in one clause,
-/// *"Recursion depth and fan-out budget enforced at admission"*, and this is
-/// the recursion-depth half of it.
+/// It is [`roundhouse_engine::limits::MAX_DEPTH`] widened from `u8` to `u32` —
+/// **one definition, aliased, not a copy** — so §7.7's number cannot drift
+/// between this predicate and `roundhouse_engine::agent_spawn`'s
+/// `check_depth`, which has enforced it on every sub-agent spawn since Phase
+/// 4. `roundhouse-flow` cannot depend on `roundhouse-bus` (§5.2's row for this
+/// crate is `core, engine, store`), so the constant is reached over the
+/// `flow -> engine` edge §5.2 does grant, via a `pub use
+/// roundhouse_bus::limits;` in `roundhouse-engine`'s `lib.rs`.
 ///
-/// # Why 4, specifically — and which part of that is inference
+/// An earlier version of this constant was a local literal `4` justified as
+/// *"nothing in the workspace bounded workflow recursion"*. That was false as
+/// stated (ruling P76): `roundhouse-bus/src/limits.rs` already carried this
+/// exact number under the identical §7.7 citation, so what landed was the
+/// second of the two ceilings the next section explicitly rejects. What was
+/// true, and is what this predicate adds, is that nothing bounded the `call:`
+/// chain specifically — because [`crate::exec::Executor::dispatch_step`]'s
+/// `StepBody::Call` arm never resolved a target at all, so `call: self` parses
+/// and would recurse without complaint.
+///
+/// The two neighbouring bounds remain unrelated:
+/// [`crate::parse::MAX_FLOW_NESTING_DEPTH`] bounds YAML flow-collection
+/// nesting in raw text and its own doc says it is not a bound on parse cost,
+/// and [`crate::exec::map_step::MAX_MAP_ITEMS`] bounds **one** `map` call and
+/// says so explicitly.
+///
+/// # Why the sub-agent limit is the right one — and which part is inference
 ///
 /// **§8.12 names no number for `call:` depth.** The number comes from §7.7
 /// (`docs/architecture/04-messaging-and-teams.md`), which does: *"**Depth
-/// limit** 4 (inherited +1 per spawn)"*, for sub-agent spawning.
+/// limit** 4 (inherited +1 per spawn). **Fan-out** ≤8 direct children per
+/// session, ≤32 live sessions per team."*
 ///
 /// The step from there to here is an **inference, not a quotation**. §8.12
 /// invokes §7.7 by name for the *budget* model only (*"following §7.7's
@@ -145,42 +182,61 @@ use thiserror::Error;
 /// spawning, which is the point."* A `call:` chain and a sub-agent chain are
 /// therefore the same chain of nested Sessions, and two different ceilings
 /// over one chain would mean the effective limit depends on which noun the
-/// author reached for. One ceiling, 4, is the choice; the frozen doc did not
-/// make it for this case.
+/// author reached for. One ceiling is the choice; the frozen doc did not make
+/// it for this case.
 ///
 /// # What this bounds, and what it does not — arithmetic, not measurement
 ///
-/// This bounds **depth**. It does **not** bound total work, and the numbers
-/// say so plainly: with this constant at 4 and
-/// [`MAX_MAP_ITEMS`](crate::exec::map_step::MAX_MAP_ITEMS) at 2,000, a
-/// workflow that maps over 2,000 items and calls a workflow that maps over
-/// 2,000 items, four deep, is `2000^4` = 1.6x10^13 leaf runs. That is
-/// arithmetic over two constants, not a measurement.
+/// This bounds **depth**: the exponent, not the base. §8.12's clause is
+/// *"Recursion depth and fan-out budget enforced at admission"*, and §7.7
+/// gives fan-out in two forms, only one of which is a count:
 ///
-/// The half that bounds total work is [`draw_child_budget`]: every `call:`
-/// withdraws from the parent's remaining pool, so a subtree's total spend is
-/// capped by the root's grant no matter how wide it fans. **That half is not
-/// enforced yet** — the ledger it would draw against is
-/// [`crate::exec::map_step::MapBudget::unenforced_placeholder`], and the
-/// admission chokepoint is Task 20's (see [`ResourceCaps`]'s own doc
-/// comment). So today: depth is bounded by a real predicate as soon as
-/// anyone threads a depth counter through it; fan-out is bounded by
-/// arithmetic that no ledger yet feeds.
+/// - **Fan-out as a count** — §7.7's *"≤8 direct children per session"*. That
+///   is [`admit_child_call`] / [`MAX_DIRECT_CHILD_CALLS`], landed alongside
+///   this and bounding the base. Without it, a `map` over
+///   [`MAX_MAP_ITEMS`](crate::exec::map_step::MAX_MAP_ITEMS) = 2,000 items
+///   each issuing one `call:` is 2,000 direct children at depth 1 for which
+///   `child_call_depth(0)` returns `Ok(1)` every time, and the widest tree
+///   four deep is `2000^4` = 1.6x10^13 leaf runs. With both bounds it is
+///   `8^4` = 4,096. Arithmetic over the constants, not a measurement.
+/// - **Fan-out as a budget pool** — §7.7's transfer model, which is
+///   [`draw_child_budget`]: every `call:` withdraws from the parent's
+///   remaining pool, so a subtree's total *spend* is capped by the root's
+///   grant. **That half is not enforced yet** — the ledger it would draw
+///   against is [`crate::exec::map_step::MapBudget::unenforced_placeholder`],
+///   and the admission chokepoint is Task 20's (see [`ResourceCaps`]'s own doc
+///   comment).
 ///
-/// **Not measured:** no `call:` chain of any depth has been executed, because
-/// [`crate::exec::Executor::dispatch_step`]'s `StepBody::Call` arm is a stub.
-/// Nothing here is a claim about runtime cost. [`child_call_depth`] itself is
-/// one saturating add and one comparison, with no allocation and no I/O; that
-/// is a description of the code, not a benchmark.
+/// **Not measured:** no `call:` chain of any depth or width has been executed,
+/// because the `StepBody::Call` arm is a stub, and neither predicate has a
+/// caller. Nothing here is a claim about runtime cost. Each of
+/// [`child_call_depth`] and [`admit_child_call`] is one saturating add and one
+/// comparison, with no allocation and no I/O; that is a description of the
+/// code, not a benchmark.
 ///
-/// # What Task 20 must supply
+/// # What Task 20 must supply: the SESSION depth, not a `parent_run_id` walk
 ///
-/// A parent's depth. `workflow_run` has no depth column, but it does have
-/// `parent_run_id` (store migration 0006), so depth is derivable by walking
-/// that chain — at a cost of one row read per level, which is why a stored
-/// column may still be the better answer. Either way the decision is Task
-/// 20's; this predicate takes the number rather than sourcing it.
-pub const MAX_CALL_DEPTH: u32 = 4;
+/// The number handed to [`child_call_depth`] must be the **same number**
+/// `roundhouse_engine::agent_spawn` takes as its `parent_depth`: how deep the
+/// parent's *Session* sits in the session tree. It must **not** be a
+/// workflow-run depth derived by walking
+/// [`WorkflowRun::parent_run_id`](crate::durability::WorkflowRun::parent_run_id),
+/// which an earlier version of this comment told Task 20 to do.
+///
+/// Why (ruling P76 §1): those are two independent counters over one session
+/// tree. §8.12's `call:` creates a child Session, so a sub-agent already at
+/// session depth 3 that starts a workflow run would begin its `call:` chain at
+/// run-depth 0 and be granted four more — **session depth 7 against §7.7's
+/// limit of 4, with `check_depth` and `child_call_depth` both returning `Ok`
+/// at every step.** Counting the session chain in both predicates closes that;
+/// counting two chains cannot, however carefully each is implemented.
+///
+/// `workflow_run` carries no session-depth column today. Sourcing the number
+/// is Task 20's, since the child `Session` it creates is both where the number
+/// comes from and where the incremented one goes; this predicate takes the
+/// number rather than sourcing it. `u8` widens into `u32` losslessly, so a
+/// caller holding `agent_spawn`'s depth passes it through unchanged.
+pub const MAX_CALL_DEPTH: u32 = limits::MAX_DEPTH as u32;
 
 /// Why a `call:` was refused before it created anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -218,6 +274,87 @@ pub fn child_call_depth(parent_depth: u32) -> Result<u32, CallDepthError> {
 }
 
 // ---------------------------------------------------------------------------
+// The fan-out bound
+// ---------------------------------------------------------------------------
+
+/// Hard, closed-fail cap on how many direct `call:` children one run may have.
+///
+/// [`roundhouse_engine::limits::MAX_FAN_OUT`] — the *same* constant aliased,
+/// for the same reason [`MAX_CALL_DEPTH`] is: §7.7 gives depth and fan-out in
+/// **one sentence** (*"**Depth limit** 4 (inherited +1 per spawn). **Fan-out**
+/// ≤8 direct children per session, ≤32 live sessions per team."*), §8.12's
+/// `call:` creates a child Session exactly as a sub-agent spawn does, and
+/// `roundhouse_engine::agent_spawn` already enforces this number on the other
+/// half of the same session tree. Quoting the first clause and leaving the
+/// second is how the larger of the two factors stayed open (ruling P76 §3).
+///
+/// # Why this bound is the load-bearing one
+///
+/// [`MAX_CALL_DEPTH`] bounds the exponent; this bounds the base. See
+/// [`MAX_CALL_DEPTH`]'s "What this bounds, and what it does not" for the
+/// `2000^4` vs `8^4` arithmetic, which is arithmetic over constants rather
+/// than a measurement of anything.
+///
+/// # §7.7's third clause is not bounded here
+///
+/// *"≤32 live sessions per team"* is [`roundhouse_engine::limits::MAX_TEAM_SIZE`]
+/// and this crate cannot enforce it: team membership lives in
+/// `roundhouse-bus`'s roster, which `roundhouse-flow` cannot read (§5.2).
+/// `agent_spawn` checks it via `check_team_size` on every spawn, so whichever
+/// caller actually creates a `call:`'s child Session inherits that check with
+/// it — this is a note about where the clause is enforced, not a claim that
+/// this module enforces it.
+pub const MAX_DIRECT_CHILD_CALLS: u32 = limits::MAX_FAN_OUT;
+
+/// Why a `call:` was refused before it created anything — the width half,
+/// [`CallDepthError`] being the depth half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CallFanOutError {
+    #[error(
+        "`call:` refused: a run with {existing_direct_children} direct `call:` children would \
+         have {attempted}, exceeding the maximum of {max} direct children per run"
+    )]
+    TooWide {
+        existing_direct_children: u32,
+        attempted: u32,
+        max: u32,
+    },
+}
+
+/// The direct-child count a `call:` would bring its parent run to, or
+/// [`CallFanOutError::TooWide`] if that exceeds [`MAX_DIRECT_CHILD_CALLS`].
+///
+/// Mirrors `roundhouse_engine::agent_spawn`'s `check_fan_out` call exactly:
+/// the number checked is the count **after** this `call:` would succeed, so a
+/// run with 7 existing direct children admits an 8th and a run with 8 does not
+/// admit a 9th.
+///
+/// Fail-closed in both directions, the same shape as [`child_call_depth`]: a
+/// count already at or past the ceiling is refused, and the increment
+/// **saturates** rather than wrapping, so a corrupt or hostile `u32::MAX`
+/// count cannot roll over to 0 and hand back a fresh fan-out budget.
+/// (`u32::MAX` saturates to `u32::MAX`, which exceeds
+/// [`MAX_DIRECT_CHILD_CALLS`], so it is refused — pinned by
+/// `a_direct_child_count_at_the_integer_ceiling_is_refused_rather_than_wrapping_to_zero`.)
+///
+/// **What Task 20 must supply:** how many direct `call:` children the parent
+/// run *already* has, counted over the same session tree
+/// [`child_call_depth`]'s depth is counted over — `agent_spawn`'s
+/// `parent_direct_children`, not a per-`map`-item tally that resets. This
+/// predicate takes the number rather than sourcing it.
+pub fn admit_child_call(existing_direct_children: u32) -> Result<u32, CallFanOutError> {
+    let attempted = existing_direct_children.saturating_add(1);
+    if attempted > MAX_DIRECT_CHILD_CALLS {
+        return Err(CallFanOutError::TooWide {
+            existing_direct_children,
+            attempted,
+            max: MAX_DIRECT_CHILD_CALLS,
+        });
+    }
+    Ok(attempted)
+}
+
+// ---------------------------------------------------------------------------
 // The budget transfer
 // ---------------------------------------------------------------------------
 
@@ -234,7 +371,9 @@ pub fn child_call_depth(parent_depth: u32) -> Result<u32, CallDepthError> {
 /// the root never granted. Passing the grant back in means the unspent amount
 /// is **computed** (`grant - spent`, floored at zero) rather than trusted.
 ///
-/// Three properties follow from the type, not from caller discipline:
+/// Three properties follow from the type rather than from caller discipline —
+/// all three **per token**, none of them per subtree (see the parent-identity
+/// residual below for exactly what that excludes):
 ///
 /// - **Not `Clone`, and consumed by value.** A grant can be refunded exactly
 ///   once. Double-refunding a retried `call:` is a compile error, not a
@@ -246,6 +385,22 @@ pub fn child_call_depth(parent_depth: u32) -> Result<u32, CallDepthError> {
 ///   value that can be persisted and re-loaded can be re-minted, and the
 ///   whole point of this type is that it cannot be. See "residual" below for
 ///   what that costs.
+///
+/// # Residual: the token names an amount, not a parent
+///
+/// [`refund_child_budget`] takes any `&mut ResourceCaps`, so
+/// `draw_child_budget(&mut a, ..)` followed by
+/// `refund_child_budget(&mut b, token, ..)` inflates `b`'s pool with budget
+/// that left `a`'s. The three properties above hold for each token
+/// individually and say nothing about *which* subtree a token returns to; the
+/// §8.12 invariant they support is per-subtree, and that half is still caller
+/// discipline.
+///
+/// Closing it at the type level needs an identity [`ResourceCaps`] does not
+/// carry, and one that survives a daemon restart — which this deliberately
+/// non-`Deserialize` token cannot, for the same reason the park residual below
+/// exists. **Named, not closed; owner Task 20 (B12)**, which owns the run loop
+/// and is therefore the single call site that pairs a draw with its refund.
 ///
 /// # `#[must_use]`, and what dropping one means
 ///
@@ -328,6 +483,24 @@ impl ChildBudget {
 /// `now` is a parameter everywhere), so it cannot decrement a window by
 /// elapsed time. Task 20 owns the run loop and therefore owns keeping
 /// `parent_remaining`'s timeouts honest between calls.
+///
+/// # Residual: the pool a `call:` inside a `map` draws against replicates
+/// three run-level ceilings
+///
+/// [`split_budget`](crate::exec::map_step::split_budget) divides
+/// `max_cost_usd`, `max_tokens`, `max_tool_calls` and `max_bytes_written`
+/// across a `map`'s items, but passes `max_tasks`, `max_subagents` and
+/// `max_escalations` through unchanged via `..total.clone()` — deliberately,
+/// on the reasoning in its own comment that a nested spawn or escalation is
+/// rare enough that the run-level cap is the meaningful per-item ceiling.
+/// Once a `call:` draws against one of those per-item pools, those three
+/// fields are a **replicated run-level ceiling rather than a share of the
+/// run's**: 2,000 map items each carrying the whole run's `max_subagents`.
+/// `split_budget`'s own doc already anticipates the collision (*"would be a
+/// transfer out of this same pool, not an independent allocation"*).
+/// Reconciling the two is **Task 20 (B12)**'s, as the first task with a run
+/// loop that can drive a `call:` from inside a `map`; nothing here can, since
+/// the `StepBody::Call` arm is a stub. Named, not closed.
 ///
 /// # Hostile `f64` input
 ///
@@ -413,15 +586,37 @@ pub fn draw_child_budget(
 /// The *"refunded on completion"* half of §8.12's transfer model: whatever
 /// the child did not spend of its grant flows back into the parent's pool.
 ///
-/// `spent` is the child's measured consumption. The refund is
-/// `grant - spent`, floored at zero per field — never `spent` itself and
-/// never a caller-supplied "unspent" figure, so no call site can return more
-/// than [`draw_child_budget`] took out. A child reporting a spend larger than
-/// its grant, or an unusable one (`NaN`, negative, infinite), refunds
-/// **nothing**: the safe direction.
+/// The refund is `grant - spent`, floored at zero per field — never `spent`
+/// itself and never a caller-supplied "unspent" figure, so no call site can
+/// return more than [`draw_child_budget`] took out. A child reporting a spend
+/// larger than its grant, or an unusable one (`NaN`, negative, infinite),
+/// refunds **nothing**: the safe direction.
 ///
-/// The three `Duration`s are absent from the refund because they were never
-/// withdrawn — see [`draw_child_budget`].
+/// # Who measures `spent`
+///
+/// **The parent side, from outside the child run** — Phase 2's cost
+/// accounting, which observes the child's actual consumption. Never a figure
+/// originating *in* the child run, and never one derived from a model's
+/// output. §8.12's invariant (*"a workflow subtree can never spend more than
+/// its root was given"*) reduces entirely to `spent` being truthful: every
+/// fail-closed guard in this module is about the *shape* of the number, and
+/// none of them can tell an honest small spend from a self-reported one. A
+/// child that reports `0` is refunded its entire grant, correctly, by this
+/// function.
+///
+/// # `spent` is a measurement typed as a ceiling
+///
+/// `&ResourceCaps` is a ceilings type, and this parameter is a measurement.
+/// It is reused rather than given a type of its own because the seven
+/// countables line up field for field and this is the only call site — but the
+/// mismatch has two visible consequences worth stating:
+///
+/// - **Only the seven countables are read.** `spent`'s three `Duration`s are
+///   accepted and ignored, because the timeouts were clamped rather than
+///   withdrawn — see [`draw_child_budget`].
+/// - A caller that passes the *grant* itself as `spent` refunds exactly
+///   nothing, silently. That is the safe direction of the invariant, but it is
+///   indistinguishable here from a child that really did spend everything.
 pub fn refund_child_budget(
     parent_remaining: &mut ResourceCaps,
     drawn: ChildBudget,
@@ -429,7 +624,19 @@ pub fn refund_child_budget(
 ) {
     let grant = drawn.caps;
 
-    parent_remaining.max_cost_usd += refund_f64(grant.max_cost_usd, spent.max_cost_usd);
+    // The `.max(0.0)` is the same normalisation the draw applies, on the same
+    // field, for the same reason: `f64::max` returns the non-`NaN` operand, so
+    // a `parent_remaining.max_cost_usd` that arrives `NaN` or negative is
+    // normalised *down* to an empty pool instead of surviving the refund.
+    // Without it a `NaN` parent stays `NaN` — the fail-open the rest of this
+    // module exists to avoid — since `NaN + anything` is `NaN`. The draw
+    // normalises the pool it is handed, so a poisoned value can only reach
+    // here by arriving between the two calls, which is exactly what Task 20's
+    // run loop makes possible: it threads one `parent_remaining` across a
+    // child run's whole lifetime.
+    parent_remaining.max_cost_usd = (parent_remaining.max_cost_usd
+        + refund_f64(grant.max_cost_usd, spent.max_cost_usd))
+    .max(0.0);
     parent_remaining.max_tokens = parent_remaining
         .max_tokens
         .saturating_add(grant.max_tokens.saturating_sub(spent.max_tokens));
@@ -549,9 +756,12 @@ pub fn register_as_tool(
 /// Keys are emitted in **sorted** order and `required` is a sorted array.
 /// `WorkflowDef.inputs` is a `HashMap`, whose iteration order is randomised
 /// per process, so an unsorted rendering would produce a schema that differs
-/// shape-to-shape between daemon restarts once `serde_json`'s
-/// `preserve_order` is on (ruling P29) — and a tool schema that is not
-/// stable is not cacheable or hashable. Pinned by
+/// shape-to-shape between daemon restarts. `serde_json`'s `preserve_order`
+/// **is on today** — `agent-client-protocol` 2.0.0 enables it and Cargo's
+/// feature unification applies it workspace-wide, which ruling P29 accepted —
+/// so `Map`'s iteration order is insertion order, not sorted order, and this
+/// function's insertion order is the schema's key order. A tool schema that is
+/// not stable is not cacheable or hashable. Pinned by
 /// `required_input_names_are_emitted_in_a_deterministic_sorted_order`.
 ///
 /// `required` is omitted entirely when no input is required, rather than

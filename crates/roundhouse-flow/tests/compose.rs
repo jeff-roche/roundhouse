@@ -1,14 +1,14 @@
 //! Task 19 (B11): composition primitives — the `call:` budget transfer, the
-//! recursion-depth bound, and workflow-as-tool registration.
+//! recursion-depth and fan-out bounds, and workflow-as-tool registration.
 //!
 //! These test the primitives only. Nothing here drives a run: Task 20 (B12)
-//! owns composition's run loop and is the caller that will wire all three.
+//! owns composition's run loop and is the caller that will wire all four.
 
 use roundhouse_core::JobId;
 use roundhouse_flow::caps::ResourceCaps;
 use roundhouse_flow::compose::{
-    child_call_depth, draw_child_budget, refund_child_budget, register_as_tool, CallDepthError,
-    MAX_CALL_DEPTH,
+    admit_child_call, child_call_depth, draw_child_budget, refund_child_budget, register_as_tool,
+    CallDepthError, CallFanOutError, MAX_CALL_DEPTH, MAX_DIRECT_CHILD_CALLS,
 };
 use roundhouse_flow::job::{Body, InputSchema, JobVersion, SessionTemplate};
 use roundhouse_flow::parse::parse_workflow;
@@ -388,9 +388,149 @@ fn an_unusable_reported_spend_refunds_nothing() {
     }
 }
 
+#[test]
+fn a_non_finite_or_negative_parent_pool_is_normalised_down_by_the_refund_not_left_poisoned() {
+    // Every other hostile-value test above varies the *request* or the
+    // *spend* against a healthy parent. This varies the parent itself — the
+    // operand `refund_child_budget` writes back to. Without the `.max(0.0)`
+    // on the refund line, `parent += refund` leaves a `NaN` parent `NaN` and a
+    // negative parent negative, which is the fail-open the draw side already
+    // closes.
+    //
+    // The pool is poisoned *after* the draw deliberately: the draw's own
+    // `.max(0.0)` normalises the parent it is handed, so the only way a
+    // poisoned pool reaches the refund is by arriving between the two calls —
+    // which is exactly the situation Task 20's run loop creates, since it
+    // threads one `parent_remaining` across a child run's whole lifetime and
+    // other code (a spend deduction, a rehydration from a durable row) writes
+    // that field in between.
+    for hostile in [f64::NAN, -12.5] {
+        let mut parent = ResourceCaps {
+            max_cost_usd: 10.0,
+            ..ResourceCaps::default()
+        };
+        let drawn = draw_child_budget(
+            &mut parent,
+            &ResourceCaps {
+                max_cost_usd: 4.0,
+                ..ResourceCaps::default()
+            },
+        );
+        assert_eq!(parent.max_cost_usd, 6.0);
+
+        parent.max_cost_usd = hostile;
+        refund_child_budget(
+            &mut parent,
+            drawn,
+            &ResourceCaps {
+                max_cost_usd: 1.0,
+                ..ResourceCaps::default()
+            },
+        );
+        assert_eq!(
+            parent.max_cost_usd, 0.0,
+            "a {hostile} pool is normalised down to empty, symmetric with the draw"
+        );
+        assert!(parent.max_cost_usd.is_finite());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The recursion bound (ruling P75 §B)
 // ---------------------------------------------------------------------------
+
+#[test]
+fn the_two_ceilings_are_section_7_7s_and_are_one_definition_not_a_local_copy() {
+    // Ruling P76 §2: an earlier version of this module carried a local `4`
+    // beside `roundhouse-bus`'s existing `MAX_DEPTH = 4` — two ceilings over
+    // one session chain, agreeing only by coincidence. These are now `pub
+    // const` aliases of the bus's constants, reached over the `flow -> engine`
+    // edge, so a change to §7.7's numbers moves both predicates at once.
+    assert_eq!(
+        MAX_CALL_DEPTH,
+        u32::from(roundhouse_engine::limits::MAX_DEPTH)
+    );
+    assert_eq!(
+        MAX_DIRECT_CHILD_CALLS,
+        roundhouse_engine::limits::MAX_FAN_OUT
+    );
+    // And the values §7.7 actually states: "Depth limit 4 (inherited +1 per
+    // spawn). Fan-out <=8 direct children per session".
+    assert_eq!(MAX_CALL_DEPTH, 4);
+    assert_eq!(MAX_DIRECT_CHILD_CALLS, 8);
+}
+
+#[test]
+fn direct_call_fan_out_is_bounded_and_the_bound_fails_closed() {
+    // The count checked is the count *after* the call would succeed, matching
+    // `roundhouse_engine::agent_spawn`'s `check_fan_out(parent_direct_children
+    // + 1)`. A run with no children admits one; a run with 7 admits an 8th.
+    assert_eq!(admit_child_call(0), Ok(1));
+    assert_eq!(admit_child_call(7), Ok(8));
+
+    // At the ceiling: a run that already has 8 direct `call:` children does
+    // not get a 9th.
+    assert_eq!(
+        admit_child_call(8),
+        Err(CallFanOutError::TooWide {
+            existing_direct_children: 8,
+            attempted: 9,
+            max: MAX_DIRECT_CHILD_CALLS
+        })
+    );
+    // And the `map`-over-2,000-items shape ruling P76 §3 names: the 2,000th
+    // `call:` in a map is refused, rather than every one of them being
+    // admitted at depth 1.
+    assert_eq!(
+        admit_child_call(1_999),
+        Err(CallFanOutError::TooWide {
+            existing_direct_children: 1_999,
+            attempted: 2_000,
+            max: MAX_DIRECT_CHILD_CALLS
+        })
+    );
+}
+
+#[test]
+fn a_direct_child_count_at_the_integer_ceiling_is_refused_rather_than_wrapping_to_zero() {
+    // Saturating, not wrapping: `u32::MAX + 1` must not become 0 and hand back
+    // a fresh fan-out budget. Same closed-fail shape as
+    // `a_parent_depth_at_the_integer_ceiling_is_refused_rather_than_wrapping_to_zero`.
+    assert_eq!(
+        admit_child_call(u32::MAX),
+        Err(CallFanOutError::TooWide {
+            existing_direct_children: u32::MAX,
+            attempted: u32::MAX,
+            max: MAX_DIRECT_CHILD_CALLS
+        })
+    );
+}
+
+#[test]
+fn depth_and_fan_out_together_bound_the_subtree_where_depth_alone_did_not() {
+    // The concrete escape ruling P76 §3 names, in the diff's own numbers. With
+    // only the depth predicate, a run may have any number of direct children
+    // at depth 1 — `child_call_depth(0)` returns `Ok(1)` for all 2,000 items
+    // of a maximal `map`, so the widest admissible tree is `2000^4`. With both
+    // predicates the base is bounded too, and the tree is at most `8^4`.
+    let mut widest_admissible_children = 0u32;
+    while admit_child_call(widest_admissible_children).is_ok() {
+        widest_admissible_children += 1;
+    }
+    assert_eq!(widest_admissible_children, MAX_DIRECT_CHILD_CALLS);
+
+    let mut deepest_admissible_depth = 0u32;
+    while let Ok(next) = child_call_depth(deepest_admissible_depth) {
+        deepest_admissible_depth = next;
+    }
+    assert_eq!(deepest_admissible_depth, MAX_CALL_DEPTH);
+
+    assert_eq!(
+        widest_admissible_children.pow(deepest_admissible_depth),
+        4_096,
+        "8^4 — arithmetic over the two constants, not a measurement of any run"
+    );
+}
 
 #[test]
 fn call_depth_is_bounded_and_the_bound_fails_closed() {
@@ -534,7 +674,8 @@ steps:
         props.keys().cloned().collect::<Vec<_>>(),
         vec!["uniform", "victor", "whiskey", "xray", "yankee", "zulu"],
         "property keys are inserted in sorted order too, so the schema is \
-         byte-identical run to run once `preserve_order` is on (ruling P29)"
+         byte-identical run to run — `preserve_order` is on today (ruling \
+         P29), which makes this insertion order the serialized key order"
     );
 }
 
