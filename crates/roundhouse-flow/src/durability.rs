@@ -210,6 +210,34 @@ pub enum DurabilityError {
     /// names neither the field nor the writer that stored it.
     #[error("run {run_id} was inserted with {amount} as max_cost_usd, which is not usable")]
     UnusableCostAmount { run_id: RunId, amount: f64 },
+    /// A run carrying a [`WorkflowRun::parent_run_id`] was refused because its
+    /// draw against that parent was refused — so the child row was **not**
+    /// created and the whole insert rolled back.
+    ///
+    /// This is ruling P114 §A's invariant as an error: *no `workflow_run` row
+    /// carrying a `parent_run_id` is committed without a draw in the same
+    /// transaction.* [`insert_run_row`] draws through
+    /// [`crate::ledger::draw_child_run_within`] inside its caller's
+    /// transaction, and this variant is what the caller sees when the parent
+    /// cannot cover the child's grant, is not `Running`, or has no recorded
+    /// caps of its own.
+    ///
+    /// **Distinguishable on purpose** (ruling P113): *"this retry needs $40 and
+    /// the root has $12 — raise the ceiling or accept the failure"* is
+    /// actionable, where a silent grant or a silent truncation is a control
+    /// that reports success while doing nothing. The refusal's own reason
+    /// travels as the `source`, so a caller can tell `CapsExceeded` from
+    /// `NotAdmitting` from `CapsNotRecorded` without re-querying.
+    ///
+    /// `Box`ed because [`crate::ledger::LedgerError`] carries a
+    /// `Durability(DurabilityError)` variant of its own, and the two types
+    /// would otherwise be infinitely sized.
+    #[error("run {run_id} could not draw its grant from its parent run")]
+    ChildDrawRefused {
+        run_id: RunId,
+        #[source]
+        source: Box<crate::ledger::LedgerError>,
+    },
 }
 
 /// §8.10 tier 2's crash-recovery classification of a step.
@@ -943,6 +971,14 @@ pub struct RecoveredRun {
 /// `roundhouse_store::begin_immediate` (never a hand-rolled
 /// `BEGIN IMMEDIATE`/`COMMIT` pair, which has no rollback on the `?` between
 /// them and would strand the write lock).
+///
+/// **A run carrying a [`WorkflowRun::parent_run_id`] draws its grant from that
+/// parent in this same transaction**, and the insert is refused with
+/// [`DurabilityError::ChildDrawRefused`] if the draw is — see
+/// [`insert_run_row`]'s invariant comment and ruling P114 §A. That applies to
+/// every caller of this function, not only to the `call:` arm: this is `pub`,
+/// and a caller-supplied `parent_run_id` plus `caps` minted a grant at every
+/// site before the invariant existed.
 pub fn insert_workflow_run(
     conn: &mut Connection,
     run: &WorkflowRun,
@@ -1051,6 +1087,31 @@ fn insert_run_row(conn: &Connection, run: &WorkflowRun) -> Result<(), Durability
             caps_json,
         ],
     )?;
+    // Ruling P114 §A's invariant, enforced at the one statement that writes a
+    // `workflow_run` row: **no row carrying a `parent_run_id` is committed
+    // without a draw in the same transaction.** `conn` is the caller's
+    // transaction (`insert_workflow_run`'s or `fork_run`'s), so a refused draw
+    // rolls the child row back with it rather than leaving a `Running` child
+    // spending against a grant nobody was charged for.
+    //
+    // Stating it as the invariant rather than as "the fork draws" is what
+    // makes it cover `call:` before that path has a production caller — the
+    // whole point of P114's correction to P113. Both creators reach it here
+    // and neither can opt out.
+    //
+    // **`run.started_at` is the draw's instant**, not a second parameter: a
+    // child's grant is drawn when the child is created, and that value is
+    // already in the row. A separate `now` could disagree with it — the same
+    // argument `fork_run`'s (now removed) `refunded_at` stamp made for using
+    // `fork.started_at`.
+    if run.parent_run_id.is_some() {
+        crate::ledger::draw_child_run_within(conn, run.id, run.started_at).map_err(|source| {
+            DurabilityError::ChildDrawRefused {
+                run_id: run.id,
+                source: Box::new(source),
+            }
+        })?;
+    }
     Ok(())
 }
 
@@ -1395,26 +1456,40 @@ fn transition(
 /// deletes a `workflow_run` row, so the property cannot lapse between the two
 /// calls. Re-querying it here would be an unreachable branch.
 ///
-/// # The fork is stamped `refunded_at` at creation, and that is a budget fix
+/// # A fork of a child run **draws**, and the `refunded_at` stamp it used to carry is gone
 ///
 /// A fork copies `parent_run_id` **and** `caps` from the run it forks, and its
 /// own `spent_*` accumulators start at zero — which made it satisfy every
 /// precondition of [`crate::ledger::refund_child_run`]: a parent, a terminal
 /// state (in due course), an unstamped `refunded_at`, a recorded grant.
-/// Measured before this stamp existed: **one draw of 100 produced two refunds**
-/// — one for the original and one for the fork — and a parent holding 500
-/// tokens of unrelated spend recorded 400 afterwards. Not phantom credit but
-/// **real spend erased**, and floors at zero do not stop it; they only stop the
+/// Measured before B12b's fix: **one draw of 100 produced two refunds** — one
+/// for the original and one for the fork — and a parent holding 500 tokens of
+/// unrelated spend recorded 400 afterwards. Not phantom credit but **real
+/// spend erased**, and floors at zero do not stop it; they only stop the
 /// counter going negative (rulings P109 §A, P110).
 ///
-/// Stamping here puts the fact **in the row** rather than in the reader: this
-/// fork's grant was never drawn *here*, so there is nothing to return, and the
-/// value used is `fork.started_at` — the fork's own creation instant, which is
-/// the `now` its caller passed — rather than a second parameter that could
-/// disagree with it. The refusal of a child whose *draw* was never recorded is
-/// the general leg and lives in `ledger::refund_child_run`
-/// (`workflow_run.drawn_at`); this stamp is the specific one, and each covers a
-/// case the other does not.
+/// B12b's contained fix was to stamp the fork `refunded_at` at creation, on the
+/// grounds that its grant was never drawn here so there is nothing to return.
+/// **That stamp is removed**, because the premise stopped being true: ruling
+/// P113 rules that a retry *draws from the parent like any other child*, and
+/// P114 §B records that the two are not additive —
+/// [`crate::ledger::draw_child_run_within`] refuses a stamped run with
+/// `AlreadySettled`, so the stamp had to come out before a fork could draw.
+///
+/// **Removing a guard that currently reads as the fix looks alarming and is
+/// not**, and the reason is `drawn_at`: with the stamp gone, a fork whose draw
+/// is forgotten or refused still has `drawn_at IS NULL`, and
+/// [`crate::ledger::refund_child_run`] still refuses it with
+/// `DrawNotRecorded`. The Critical cannot reopen through that route. And the
+/// draw is not something this function has to remember to do — it happens
+/// inside [`insert_run_row`], in this transaction, for every parented row (see
+/// that function's invariant comment), so a refused draw rolls the whole fork
+/// back and [`crate::control::retry_from_step`] reports
+/// [`DurabilityError::ChildDrawRefused`] rather than a fork that spends
+/// against an uncharged budget.
+///
+/// A fork of a **root** run (no `parent_run_id`, which is every fork in the
+/// tree today) draws nothing and is unaffected.
 pub(crate) fn fork_run(
     conn: &mut Connection,
     fork: &WorkflowRun,
@@ -1422,10 +1497,6 @@ pub(crate) fn fork_run(
 ) -> Result<(), DurabilityError> {
     let txn = roundhouse_store::begin_immediate(conn)?;
     insert_run_row(&txn, fork)?;
-    txn.execute(
-        "UPDATE workflow_run SET refunded_at = ?1 WHERE id = ?2",
-        params![fork.started_at.as_unix_nanos(), fork.id.to_string()],
-    )?;
     for step in inherited {
         write_step_row(&txn, fork.id, step)?;
     }

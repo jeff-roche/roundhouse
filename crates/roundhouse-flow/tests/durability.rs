@@ -416,9 +416,17 @@ fn step_output_debug_never_prints_a_leaf_value() {
 /// **absolute** instant, written by Task 17.
 #[test]
 fn awaiting_until_parent_run_and_forked_from_run_round_trip() {
+    use roundhouse_flow::caps::ResourceCaps;
+
     let mut conn = open_test_db();
     let binding_id = BindingId::new();
-    let parent = a_run(RunId::new(), Some(binding_id), 1_000);
+    let mut parent = a_run(RunId::new(), Some(binding_id), 1_000);
+    // Both sides carry a grant, because the child below carries a
+    // `parent_run_id` and B12c refuses to commit such a row without a draw in
+    // the same transaction (ruling P114 §A). A child with no recorded grant
+    // has nothing to draw, and one whose parent has none has nowhere to draw
+    // from — both are `ChildDrawRefused`, which is the fail-closed direction.
+    parent.caps = Some(ResourceCaps::default());
     insert_workflow_run(&mut conn, &parent).unwrap();
 
     // Terminal, not `AwaitingHuman`: `insert_run_row`'s fix-round-1 guard
@@ -436,6 +444,7 @@ fn awaiting_until_parent_run_and_forked_from_run_round_trip() {
     child.awaiting_until = Some(Timestamp::from_unix_nanos(9_000_000_000));
     child.trigger_event_id = Some(42);
     child.ended_at = Some(Timestamp::from_unix_nanos(2_500));
+    child.caps = Some(ResourceCaps::default());
     insert_workflow_run(&mut conn, &child).unwrap();
 
     let read_back = recover_run(&conn, child.id).unwrap().run;

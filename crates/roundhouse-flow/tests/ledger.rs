@@ -16,8 +16,9 @@ use roundhouse_flow::durability::{
 use roundhouse_flow::exec::map_step::MapBudget;
 use roundhouse_flow::exec::RunId;
 use roundhouse_flow::ledger::{
-    active_elapsed, admit_call_from_run, admit_spend, draw_child_run, parked_runs_past_hold_cap,
-    refund_child_run, remaining_caps, run_ledger, wall_elapsed, LedgerError, Spend,
+    active_elapsed, admit_call_from_run, admit_spend, admit_spend_during_finally, draw_child_run,
+    parked_runs_past_hold_cap, refund_child_run, remaining_caps, run_ledger, wall_elapsed,
+    LedgerError, Spend,
 };
 use rusqlite::Connection;
 use std::time::Duration;
@@ -918,28 +919,48 @@ fn no_state_but_running_admits_a_call_either() {
 // §8.12's refund, re-derived from rows
 // ---------------------------------------------------------------------------
 
-/// Seeds a child of a parent, and **draws** its grant so the parent is really
-/// charged — which is what makes the child refundable. Before `drawn_at`
-/// existed this helper did the draw by hand as a bare `admit_spend`, and a row
-/// that merely *looked* like a child (a parent id and a grant, which
-/// `retry_from_step`'s fork copies) was refundable too.
+/// Seeds a child of a parent. The **insert is the draw** (ruling P114 §A's
+/// invariant, B12c): `insert_run_row` charges the parent through
+/// `draw_child_run_within` in the insert's own transaction, so no separate
+/// call is needed and the child's `started_at` is the draw's instant.
+///
+/// Before `drawn_at` existed this helper did the draw by hand as a bare
+/// `admit_spend`, and a row that merely *looked* like a child (a parent id and
+/// a grant, which `retry_from_step`'s fork copies) was refundable too.
 fn a_parent_and_child(conn: &mut Connection, child_grant: ResourceCaps) -> (RunId, RunId) {
     let parent = a_seeded_run(conn);
     let mut child = a_run(RunId::new(), Some(1), Some(child_grant));
     child.parent_run_id = Some(parent);
+    child.started_at = at_secs(1);
     let child = seed(conn, &child);
-    draw_child_run(conn, child, at_secs(1)).expect("the draw charges the parent the whole grant");
     (parent, child)
 }
 
 /// A child row with a parent and a grant but **no draw** — the shape a fork
-/// has, built here without one so the ledger's own refusal can be tested
-/// without reaching for `control::retry_from_step`.
+/// had before ruling P113, and the shape a row written before B12c still has.
+///
+/// **No writer in the crate can produce it any more**, which is the invariant
+/// working: `insert_run_row` draws for every parented row it commits. So it is
+/// reconstructed here by hand — clearing the child's stamp and rewinding the
+/// parent's accumulators to the zero they held before the insert charged them
+/// — exactly as a hand-edited or pre-B12c row would read. That is the same
+/// read-back-leg discipline `from_sql_str`'s unrecognised-discriminant tests
+/// use: the guard has to hold against a row the current writer cannot write.
 fn an_undrawn_child(conn: &mut Connection, child_grant: ResourceCaps) -> (RunId, RunId) {
-    let parent = a_seeded_run(conn);
-    let mut child = a_run(RunId::new(), Some(1), Some(child_grant));
-    child.parent_run_id = Some(parent);
-    let child = seed(conn, &child);
+    let (parent, child) = a_parent_and_child(conn, child_grant);
+    conn.execute(
+        "UPDATE workflow_run SET drawn_at = NULL WHERE id = ?1",
+        [child.to_string()],
+    )
+    .expect("clear the child's draw stamp");
+    conn.execute(
+        "UPDATE workflow_run
+            SET spent_tokens = 0, spent_cost_usd = 0, spent_tasks = 0, spent_tool_calls = 0,
+                spent_subagents = 0, spent_bytes_written = 0, spent_escalations = 0
+          WHERE id = ?1",
+        [parent.to_string()],
+    )
+    .expect("rewind the parent's accumulators to before the draw");
     (parent, child)
 }
 
@@ -1519,5 +1540,256 @@ fn a_wall_clock_that_overflows_i64_saturates_rather_than_wrapping_to_no_elapsed_
             })
         ),
         "and the wall window is what refuses it, before the active one does; got {refused:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Ruling P114 §A's invariant: no `workflow_run` row carrying a `parent_run_id`
+// is committed without a draw in the same transaction
+// ---------------------------------------------------------------------------
+
+/// Counts the `workflow_run` rows for one id, so a refusal can be shown to
+/// have left **nothing** behind rather than a row whose draw merely failed.
+fn row_count(conn: &Connection, run_id: RunId) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM workflow_run WHERE id = ?1",
+        [run_id.to_string()],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+/// The invariant as the happy path: the insert *is* the draw, stamped with the
+/// child's own `started_at`, and the parent is charged before the transaction
+/// commits.
+///
+/// Stated as the invariant rather than as "the fork draws" because the
+/// spend-direction hole was never fork-specific (ruling P114 §A):
+/// `insert_workflow_run` with a caller-supplied `parent_run_id` and `caps`
+/// minted a grant at **every** site, and `call:` would have done exactly what
+/// the fork did the moment it had a production caller.
+#[test]
+fn inserting_a_parented_row_draws_its_grant_from_the_parent_in_the_same_transaction() {
+    let mut conn = open_test_db();
+    let parent = a_seeded_run(&mut conn);
+    assert_eq!(run_ledger(&conn, parent).unwrap().spent, Spend::ZERO);
+
+    let mut child = a_run(RunId::new(), Some(1), Some(a_small_grant()));
+    child.parent_run_id = Some(parent);
+    child.started_at = at_secs(7);
+    insert_workflow_run(&mut conn, &child).expect("the child fits its parent's grant");
+
+    assert_eq!(
+        run_ledger(&conn, parent).unwrap().spent,
+        Spend::for_grant(&a_small_grant()),
+        "the parent is charged the child's whole grant by the insert itself"
+    );
+    assert_eq!(
+        run_ledger(&conn, child.id).unwrap().drawn_at,
+        Some(at_secs(7)),
+        "and the stamp is the child's own creation instant, not a second parameter"
+    );
+}
+
+/// The refusal, in the three shapes it takes — and in every one of them the
+/// child row must be **absent**, not present-but-uncharged. A committed child
+/// that is `Running` and spends anyway is exactly what ruling P114 §B says a
+/// non-composing draw would leave behind.
+#[test]
+fn a_parented_row_whose_draw_is_refused_leaves_no_row_at_all() {
+    // 1. The parent's grant cannot cover the child's.
+    {
+        let mut conn = open_test_db();
+        let parent = a_seeded_run(&mut conn);
+        let mut child = a_run(
+            RunId::new(),
+            Some(1),
+            Some(ResourceCaps {
+                max_tokens: a_grant().max_tokens + 1,
+                ..a_small_grant()
+            }),
+        );
+        child.parent_run_id = Some(parent);
+        let refused = insert_workflow_run(&mut conn, &child);
+        let Err(DurabilityError::ChildDrawRefused { source, .. }) = refused else {
+            panic!("an uncoverable grant must be refused, got {refused:?}");
+        };
+        assert!(
+            matches!(
+                *source,
+                LedgerError::CapsExceeded {
+                    field: "max_tokens",
+                    ..
+                }
+            ),
+            "and the reason names what ran out, got {source:?}"
+        );
+        assert_eq!(row_count(&conn, child.id), 0);
+        assert_eq!(run_ledger(&conn, parent).unwrap().spent, Spend::ZERO);
+    }
+
+    // 2. The child records no grant of its own, so there is nothing to draw.
+    {
+        let mut conn = open_test_db();
+        let parent = a_seeded_run(&mut conn);
+        let mut child = a_run(RunId::new(), Some(1), None);
+        child.parent_run_id = Some(parent);
+        let refused = insert_workflow_run(&mut conn, &child);
+        assert!(
+            matches!(
+                refused,
+                Err(DurabilityError::ChildDrawRefused { ref source, .. })
+                    if matches!(**source, LedgerError::CapsNotRecorded { .. })
+            ),
+            "got {refused:?}"
+        );
+        assert_eq!(row_count(&conn, child.id), 0);
+    }
+
+    // 3. The parent is not admitting new work — §8.13's cancel, reached
+    //    through child creation rather than through a task.
+    {
+        let mut conn = open_test_db();
+        let parent = a_seeded_run(&mut conn);
+        transition_run(&mut conn, parent, RunState::Cancelling, at_secs(1)).unwrap();
+        let mut child = a_run(RunId::new(), Some(1), Some(a_small_grant()));
+        child.parent_run_id = Some(parent);
+        let refused = insert_workflow_run(&mut conn, &child);
+        assert!(
+            matches!(
+                refused,
+                Err(DurabilityError::ChildDrawRefused { ref source, .. })
+                    if matches!(**source, LedgerError::NotAdmitting {
+                        state: RunState::Cancelling, ..
+                    })
+            ),
+            "a cancelling run must not acquire new children; got {refused:?}"
+        );
+        assert_eq!(row_count(&conn, child.id), 0);
+    }
+}
+
+/// A **root** run is unaffected: it has no parent to draw from, and refusing
+/// one would make the invariant unsatisfiable for the first run of any tree.
+#[test]
+fn a_row_with_no_parent_is_inserted_without_any_draw() {
+    let mut conn = open_test_db();
+    let root = a_seeded_run(&mut conn);
+    assert_eq!(run_ledger(&conn, root).unwrap().drawn_at, None);
+    assert_eq!(run_ledger(&conn, root).unwrap().spent, Spend::ZERO);
+}
+
+// ---------------------------------------------------------------------------
+// §8.13's one exemption: `finally:` runs during `Cancelling`
+// ---------------------------------------------------------------------------
+
+/// §8.13 requires *both* *"refuse new task admission"* **and** *"run
+/// `finally:`"* of one cancel, so an exemption is unavoidable. This is its
+/// exact width: `Cancelling` admits a `finally:` step and nothing else admits
+/// anything extra.
+#[test]
+fn a_finally_step_is_admitted_while_cancelling_and_an_ordinary_step_is_not() {
+    let mut conn = open_test_db();
+    let run_id = a_seeded_run(&mut conn);
+    transition_run(&mut conn, run_id, RunState::Cancelling, at_secs(1)).unwrap();
+
+    let ordinary = admit_spend(&mut conn, run_id, &a_spend_of(10, 0.0), at_secs(2));
+    assert!(
+        matches!(
+            ordinary,
+            Err(LedgerError::NotAdmitting {
+                state: RunState::Cancelling,
+                ..
+            })
+        ),
+        "a cancel still refuses new task admission; got {ordinary:?}"
+    );
+    assert_eq!(
+        run_ledger(&conn, run_id).unwrap().spent.tokens,
+        0,
+        "and the refusal records nothing"
+    );
+
+    admit_spend_during_finally(&mut conn, run_id, &a_spend_of(10, 0.0), at_secs(3))
+        .expect("a cleanup step runs: a cancel that skips `finally:` is not a cancel");
+    assert_eq!(run_ledger(&conn, run_id).unwrap().spent.tokens, 10);
+}
+
+/// The exemption is scoped to the one clause that forces it. A `finally:`
+/// block does not resurrect a paused, parked or ended run — those are not
+/// states §8.13's sentence is about.
+#[test]
+fn the_finally_exemption_does_not_extend_to_any_other_non_running_state() {
+    for target in [
+        RunState::Paused,
+        RunState::AwaitingHuman,
+        RunState::Completed,
+        RunState::Failed,
+    ] {
+        let mut conn = open_test_db();
+        let run_id = a_seeded_run(&mut conn);
+        transition_run(&mut conn, run_id, target, at_secs(1)).unwrap();
+
+        let refused =
+            admit_spend_during_finally(&mut conn, run_id, &a_spend_of(1, 0.0), at_secs(2));
+        assert!(
+            matches!(refused, Err(LedgerError::NotAdmitting { state, .. }) if state == target),
+            "{target:?} must refuse a `finally:` step too, got {refused:?}"
+        );
+    }
+
+    // `Cancelled` is reachable only through `Cancelling`, so it needs its own
+    // two-step fixture rather than the loop's single transition.
+    let mut conn = open_test_db();
+    let run_id = a_seeded_run(&mut conn);
+    transition_run(&mut conn, run_id, RunState::Cancelling, at_secs(1)).unwrap();
+    transition_run(&mut conn, run_id, RunState::Cancelled, at_secs(2)).unwrap();
+    let refused = admit_spend_during_finally(&mut conn, run_id, &a_spend_of(1, 0.0), at_secs(3));
+    assert!(
+        matches!(
+            refused,
+            Err(LedgerError::NotAdmitting {
+                state: RunState::Cancelled,
+                ..
+            })
+        ),
+        "the drain has finished, so `finally:` has already run; got {refused:?}"
+    );
+}
+
+/// **A `call:` inside `finally:` is not exempt.** There is no
+/// `admit_call_from_run` twin of `admit_spend_during_finally`, and this is the
+/// property that absence buys: cleanup that spawns an unbounded subtree of
+/// child runs and child Sessions is not cleanup, and cancel must converge.
+#[test]
+fn a_call_is_never_exempt_from_the_cancel_refusal_however_it_is_reached() {
+    let mut conn = open_test_db();
+    let parent = a_seeded_run(&mut conn);
+    transition_run(&mut conn, parent, RunState::Cancelling, at_secs(1)).unwrap();
+
+    // Depth 0 with no children: every §7.7 bound would admit this call, so the
+    // only thing that can refuse it is the run's state.
+    let refused = admit_call_from_run(&conn, parent, 0);
+    assert!(
+        matches!(
+            refused,
+            Err(LedgerError::NotAdmitting {
+                state: RunState::Cancelling,
+                ..
+            })
+        ),
+        "got {refused:?}"
+    );
+
+    // And the other half of a `call:` — creating the child run — is refused
+    // too, so neither leg of it can be reached from a `finally:` block.
+    let mut child = a_run(RunId::new(), Some(1), Some(a_small_grant()));
+    child.parent_run_id = Some(parent);
+    assert!(
+        matches!(
+            insert_workflow_run(&mut conn, &child),
+            Err(DurabilityError::ChildDrawRefused { .. })
+        ),
+        "a cancelling run must not acquire a child through any route"
     );
 }

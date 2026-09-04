@@ -46,10 +46,16 @@
 //!   admission"* describes, but the thing that calls it once per task is the
 //!   run loop's.
 //! - [`draw_child_run`] and [`refund_child_run`] are §8.12's transfer, both
-//!   halves of it, over rows. **Neither has a production caller**: the `call:`
-//!   step that creates a child run and the completion that returns its grant
-//!   are both the run loop's (B12c). B12b's job was to make the pair
-//!   *symmetric* — see [`draw_child_run`] for what the missing half cost.
+//!   halves of it, over rows. B12b's job was to make the pair *symmetric* —
+//!   see [`draw_child_run`] for what the missing half cost. **B12c wired the
+//!   draw**, and not where either slice expected: not at a `call:` arm, but at
+//!   [`crate::durability`]'s `insert_run_row`, so that ruling P114 §A's
+//!   invariant — *no `workflow_run` row carrying a `parent_run_id` is
+//!   committed without a draw in the same transaction* — holds for every
+//!   creator of a child row rather than for the one this slice happened to
+//!   build. The **refund** still has no production caller: returning a child's
+//!   grant on completion is the run loop's, and today only the `call:` arm
+//!   creates a child run whose completion it could observe.
 //! - [`crate::exec::map_step::MapBudget::from_run_ledger`] sources a `map`'s
 //!   budget from [`remaining_caps`], but the `map` dispatch arm still builds
 //!   [`crate::exec::map_step::MapBudget::unenforced_placeholder`], because
@@ -630,10 +636,56 @@ pub fn admit_spend(
     requested: &Spend,
     now: Timestamp,
 ) -> Result<ResourceCaps, LedgerError> {
+    admit(conn, run_id, requested, now, Admission::Ordinary)
+}
+
+/// [`admit_spend`] for a step of the workflow's `finally:` block — the **one**
+/// exemption from the `Cancelling` refusal, ruled in B12c's brief against
+/// §8.13.
+///
+/// §8.13 requires *both* *"refuse new task admission"* **and** *"run
+/// `finally:`"* of one cancel, so an exemption is unavoidable and the only
+/// question is where it lives. It lives in [`ensure_admitting`], once, which is
+/// why this is a second entry point rather than a second predicate: a cancel
+/// that skips cleanup is worse than one that does a little work, and two
+/// chokepoints disagreeing about run state is the defect ruling P109 §C
+/// already had to fix here.
+///
+/// **A `call:` inside `finally:` is deliberately not exempt.** There is no
+/// `admit_call_from_run` twin of this function: a `call:` creates a child run
+/// *and* a child Session — an unbounded subtree — and cancel must converge.
+/// Cleanup that spawns a workflow is not cleanup.
+pub fn admit_spend_during_finally(
+    conn: &mut Connection,
+    run_id: RunId,
+    requested: &Spend,
+    now: Timestamp,
+) -> Result<ResourceCaps, LedgerError> {
+    admit(conn, run_id, requested, now, Admission::FinallyBlock)
+}
+
+fn admit(
+    conn: &mut Connection,
+    run_id: RunId,
+    requested: &Spend,
+    now: Timestamp,
+    admission: Admission,
+) -> Result<ResourceCaps, LedgerError> {
     let txn = roundhouse_store::begin_immediate(conn)?;
-    let remaining = admit_spend_within(&txn, run_id, requested, now)?;
+    let remaining = admit_spend_within(&txn, run_id, requested, now, admission)?;
     txn.commit()?;
     Ok(remaining)
+}
+
+/// Which of §8.13's two conflicting clauses a spend is being admitted under —
+/// see [`admit_spend_during_finally`] and [`ensure_admitting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// A step of `steps:` or `catch:`, or a `call:` anywhere: refused by every
+    /// state but `Running`.
+    Ordinary,
+    /// A step of `finally:`, which §8.13 requires to run during a cancel.
+    FinallyBlock,
 }
 
 /// [`admit_spend`] without a transaction of its own, so [`draw_child_run`] can
@@ -645,9 +697,10 @@ fn admit_spend_within(
     run_id: RunId,
     requested: &Spend,
     now: Timestamp,
+    admission: Admission,
 ) -> Result<ResourceCaps, LedgerError> {
     let ledger = read_ledger(txn, run_id)?;
-    ensure_admitting(&ledger)?;
+    ensure_admitting(&ledger, admission)?;
 
     let caps = ledger
         .caps
@@ -687,7 +740,14 @@ fn admit_spend_within(
     }
 
     let cost_total = ledger.spent.cost_usd + requested.cost_usd;
-    if !cost_total.is_finite() {
+    // `is_usable_cost_usd`, not a bare `is_finite()` (ruling P114 §C): both
+    // operands were checked with the shared predicate three lines up, so this
+    // sum cannot be negative today — a negative total would need a negative
+    // stored `spent_cost_usd`, which migration 0008's column `CHECK` blocks.
+    // It uses the shared predicate anyway because the crate's own claim is
+    // that there is *one* definition of a usable dollar figure, and a fourth
+    // site spelling it differently is how that claim stops being true.
+    if !is_usable_cost_usd(cost_total) {
         return Err(LedgerError::UnusableCostAmount {
             run_id,
             amount: cost_total,
@@ -799,16 +859,35 @@ fn admit_spend_within(
 /// misbehaving run `Cancelling` and it keeps spawning children, each starting
 /// `Running` and admitting freely.
 ///
-/// # The open question this predicate now holds exactly once
+/// # The one exemption, written here because there is one predicate (B12c)
 ///
-/// **Does a `finally:` block's own work run during `Cancelling`?** §8.13 says
-/// `finally:` runs *and* that admission is refused, and it does not say how a
-/// `finally:` step executes without being admitted. This function does not
-/// resolve that — deliberately. It concentrates the tension in one place, so
-/// whoever resolves it (the run loop, B12c) writes **one exemption in one
-/// predicate** rather than two that must be remembered together.
-fn ensure_admitting(ledger: &RunLedger) -> Result<(), LedgerError> {
-    if ledger.state != RunState::Running {
+/// **Does a `finally:` block's own work run during `Cancelling`?** §8.13
+/// requires *both* *"refuse new task admission"* **and** *"run `finally:`"* of
+/// the same cancel, so an exemption is unavoidable; B12b concentrated the
+/// tension here so that whoever resolved it would write **one** exemption
+/// rather than two that must be remembered together. This is it:
+/// [`Admission::FinallyBlock`] is admitted from `Cancelling` and from nothing
+/// else it would otherwise be refused from.
+///
+/// - **`Cancelling` only.** A `finally:` block does not resurrect a `Paused`,
+///   `AwaitingHuman` or terminal run: those are not the state §8.13's sentence
+///   is about, and a run that has ended has ended. The exemption is exactly as
+///   wide as the clause that forces it.
+/// - **`call:` is never exempt.** [`admit_call_from_run`] passes
+///   [`Admission::Ordinary`] unconditionally. A `call:` creates a child run
+///   *and* a child Session — an unbounded subtree — and cancel must converge;
+///   cleanup that spawns a workflow is not cleanup.
+fn ensure_admitting(ledger: &RunLedger, admission: Admission) -> Result<(), LedgerError> {
+    let admits = match ledger.state {
+        RunState::Running => true,
+        RunState::Cancelling => admission == Admission::FinallyBlock,
+        RunState::Paused
+        | RunState::AwaitingHuman
+        | RunState::Completed
+        | RunState::Failed
+        | RunState::Cancelled => false,
+    };
+    if !admits {
         return Err(LedgerError::NotAdmitting {
             run_id: ledger.run_id,
             state: ledger.state,
@@ -929,7 +1008,9 @@ pub fn admit_call_from_run(
     parent_direct_children: u32,
 ) -> Result<u32, LedgerError> {
     let ledger = read_ledger(conn, parent_run_id)?;
-    ensure_admitting(&ledger)?;
+    // `Ordinary`, never `FinallyBlock`: a `call:` inside a `finally:` block is
+    // not exempt from the cancel refusal — see [`ensure_admitting`].
+    ensure_admitting(&ledger, Admission::Ordinary)?;
     let parent_depth = ledger
         .session_depth
         .ok_or(LedgerError::SessionDepthNotRecorded {
@@ -965,20 +1046,56 @@ pub fn admit_call_from_run(
 /// spend passes. So a parent with $1 left cannot start two children each
 /// promised $1, and a parent that is `Cancelling` cannot be drawn from at all.
 ///
-/// # Not yet called by anything
+/// # Where it is called from (B12c)
 ///
-/// The run loop is B12c's (see this module's *"What this module is NOT"*), and
-/// so is the call site that draws when a `call:` step creates a child run.
-/// B12b supplies the operation, the column and the refusal; **B12c calls it**
-/// — recorded as an obligation in ruling P109 §B alongside the two in P108
-/// §C/§D.
+/// **Not from a run loop arm, and deliberately so.** Ruling P114 §A restated
+/// P113's fork-shaped obligation as an invariant over the *class*:
+///
+/// > No `workflow_run` row carrying a `parent_run_id` is committed without a
+/// > draw in the same transaction.
+///
+/// So the call site is [`crate::durability`]'s `insert_run_row` — the one
+/// statement that writes a `workflow_run` row at all — through
+/// [`draw_child_run_within`], which shares that statement's transaction. Every
+/// creator of a parented row therefore draws by construction: the `call:` arm,
+/// `control::retry_from_step`'s fork, and any future caller of
+/// [`crate::durability::insert_workflow_run`] alike. A fork-only fix would
+/// have closed the instance and left the class, which is the mistake P109 §B
+/// corrected on the refund side.
+///
+/// This function remains `pub` as the standalone, after-the-fact draw for a
+/// child row that already exists — which, given the invariant above, means a
+/// row written before it existed.
 pub fn draw_child_run(
     conn: &mut Connection,
     child_run_id: RunId,
     now: Timestamp,
 ) -> Result<Spend, LedgerError> {
     let txn = roundhouse_store::begin_immediate(conn)?;
-    let child = read_ledger(&txn, child_run_id)?;
+    let draw = draw_child_run_within(&txn, child_run_id, now)?;
+    txn.commit()?;
+    Ok(draw)
+}
+
+/// [`draw_child_run`] without a transaction of its own, so that a child run's
+/// `INSERT` and its draw against the parent land in **one** transaction.
+///
+/// # Why the split had to happen before the call site could exist (ruling P114 §B)
+///
+/// [`draw_child_run`] opens its own `BEGIN IMMEDIATE`, and so does every
+/// creator of a run row. Called in sequence rather than composed, a **refused**
+/// draw leaves a committed child row that is `Running` and spends anyway —
+/// which defeats the "refused with a distinguishable error" half of ruling
+/// P113 and leaves a retry reporting success against an uncharged budget. The
+/// shape is the one B12b already applied to
+/// [`admit_spend`]/[`admit_spend_within`]; `&Connection` works for both
+/// because `rusqlite::Transaction` derefs to it.
+pub(crate) fn draw_child_run_within(
+    txn: &Connection,
+    child_run_id: RunId,
+    now: Timestamp,
+) -> Result<Spend, LedgerError> {
+    let child = read_ledger(txn, child_run_id)?;
 
     let parent_run_id = child.parent_run_id.ok_or(LedgerError::NotAChildRun {
         run_id: child_run_id,
@@ -989,9 +1106,15 @@ pub fn draw_child_run(
             at,
         });
     }
-    // A run already stamped `refunded_at` is settled — `durability::fork_run`
-    // stamps one at creation. Drawing for it would charge the parent a grant
-    // `refund_child_run` could then never give back.
+    // A run already stamped `refunded_at` is settled: drawing for it would
+    // charge the parent a grant `refund_child_run` could then never give back.
+    //
+    // `durability::fork_run` used to stamp one at creation, which made this
+    // refusal fire on every fork and is why the stamp had to come **out**
+    // before a fork could draw (ruling P114 §B). Removing it is safe because
+    // `drawn_at` replaced what it was defending: with the stamp gone, a fork
+    // whose draw was forgotten or refused still has `drawn_at IS NULL`, and
+    // `refund_child_run` still refuses it with `DrawNotRecorded`.
     if let Some(at) = child.refunded_at {
         return Err(LedgerError::AlreadySettled {
             run_id: child_run_id,
@@ -1003,12 +1126,11 @@ pub fn draw_child_run(
     })?;
 
     let draw = Spend::for_grant(grant);
-    admit_spend_within(&txn, parent_run_id, &draw, now)?;
+    admit_spend_within(txn, parent_run_id, &draw, now, Admission::Ordinary)?;
     txn.execute(
         "UPDATE workflow_run SET drawn_at = ?1 WHERE id = ?2",
         params![now.as_unix_nanos(), child_run_id.to_string()],
     )?;
-    txn.commit()?;
     Ok(draw)
 }
 
@@ -1049,13 +1171,17 @@ pub fn draw_child_run(
 ///
 /// # The draw check comes before the `refunded_at` check, deliberately
 ///
-/// A fork satisfies both refusals — it has no `drawn_at` *and*
-/// `durability::fork_run` stamps its `refunded_at` at creation — and *"no
-/// draw was recorded"* is the fact that explains why, where *"already refunded
-/// at its own creation instant"* reads as though a refund had happened. The
-/// two guards cover different cases and neither is redundant: `drawn_at`
+/// The two guards cover different cases and neither is redundant: `drawn_at`
 /// catches every child that was never charged for, `refunded_at` catches the
 /// second refund of one that was.
+///
+/// Until B12c, a fork satisfied **both** refusals: it had no `drawn_at` *and*
+/// `durability::fork_run` stamped its `refunded_at` at creation. The stamp is
+/// gone (a fork now draws like any other child, ruling P113), so `drawn_at` is
+/// the guard that carries that case alone — which is why the order matters and
+/// why *"no draw was recorded"* is the better diagnosis of the two: *"already
+/// refunded at its own creation instant"* read as though a refund had
+/// happened.
 pub fn refund_child_run(
     conn: &mut Connection,
     child_run_id: RunId,

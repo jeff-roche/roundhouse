@@ -379,40 +379,38 @@ pub fn retry_from_step(
         // which is ruling P76 §1's escape reached through retry.
         session_depth: original.run.session_depth,
         // Also inherited — and the fork's own `spent_*` accumulators start at
-        // zero, so **a fork is a fresh ceiling, not a continuation of the
-        // original's remaining budget**. That is the usable reading: charging
-        // a fork the original's spend would make a retry-from-step of an
-        // expensive run fail immediately, which is the one thing retry exists
-        // to avoid.
+        // zero, so **a fork asks for a fresh ceiling, not a continuation of
+        // the original's remaining budget**. That is the usable reading:
+        // charging a fork the original's spend would make a retry-from-step of
+        // an expensive run fail immediately, which is the one thing retry
+        // exists to avoid.
         //
-        // What that costs, stated correctly (this comment previously said
-        // *"n retries cost n grants"*, which is the **opposite** of what the
-        // ledger does — ruling P110):
+        // **Asks for, and is charged for.** Ruling P113 settles what B12b
+        // could only name: a fork of a *child* run draws that fresh grant from
+        // its parent through the same chokepoint every other child passes, and
+        // the retry is refused with a distinguishable error
+        // (`DurabilityError::ChildDrawRefused`) when the parent cannot cover
+        // it. Nothing here has to remember to do that — `durability::fork_run`
+        // routes through `insert_run_row`, which draws for **any** row
+        // carrying a `parent_run_id`, in the fork's own transaction (ruling
+        // P114 §A's invariant). So:
         //
-        // - **A retry costs the parent's ledger nothing.** No draw is
-        //   recorded for a fork, so `workflow_run.drawn_at` stays `NULL` and
-        //   nothing is charged to `parent_run_id`. The fork simply spends
-        //   against a grant no one paid for. §8.12's *"a workflow subtree can
-        //   never spend more than its root was given"* therefore does **not**
-        //   hold across a fork, and n retries overshoot it by n grants —
-        //   which is a real ceiling on nothing, but it is the fork's spending
-        //   that is unbounded, not the parent's charge.
-        // - **A fork cannot be refunded**, which is the half that was
-        //   actively dangerous. It copies `parent_run_id` and `caps` and
-        //   starts unspent, so once it reached a terminal state — which a
-        //   retried run does like any other — it satisfied, before B12b's fix
-        //   round, every precondition of
-        //   `ledger::refund_child_run` and credited the parent a grant nobody
-        //   drew — measured at one draw producing two refunds, and erasing
-        //   500 tokens of the parent's real, unrelated spend down to 400.
-        //   `durability::fork_run` now stamps `refunded_at` at creation and
-        //   `refund_child_run` refuses a child with no `drawn_at`.
+        // - §8.12's *"a workflow subtree can never spend more than its root
+        //   was given"* holds across a fork. It did not before: n retries
+        //   overshot it by n grants, because no draw was ever recorded.
+        // - **A fork can be refunded again**, and correctly, because a draw
+        //   now stands behind it. Before B12b it could be refunded with *no*
+        //   draw behind it — measured at one draw producing two refunds, and
+        //   erasing 500 tokens of the parent's real, unrelated spend down to
+        //   400 (rulings P109 §A, P110). B12b's contained fix stamped the fork
+        //   `refunded_at` at creation; B12c removes that stamp, because a run
+        //   that draws is a run that has something to give back, and
+        //   `refund_child_run`'s `DrawNotRecorded` refusal is what keeps the
+        //   original defect closed if a draw is ever missed.
         //
-        // Named here rather than discovered: §8.13 says nothing about a
-        // fork's budget, and this is an inference. The open policy question —
-        // whether a retry should draw from the parent like any other child
-        // run, via `ledger::draw_child_run` — belongs with whoever gives
-        // `retry_from_step` an authorisation path.
+        // A fork of a **root** run — every fork in the tree today, since
+        // nothing yet writes `parent_run_id` — draws nothing and is
+        // unaffected.
         caps: original.run.caps.clone(),
     };
     fork_run(conn, &fork, &inherited)?;
