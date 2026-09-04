@@ -58,6 +58,12 @@ fn preapproved_bundle_only_approves_its_own_declared_rules() {
 /// widening — case folding, prefix matching, globbing — would approve strings
 /// the reviewer of the bundle never read. Pinned here so "no normalisation"
 /// is a test rather than a claim in a comment.
+///
+/// `""` is deliberately *not* in this list, though it once was: it is now
+/// refused by the blank-`rule_id` guard before the scan runs, so including it
+/// here would credit exact matching with a rejection a different mechanism
+/// makes. `a_blank_rule_id_is_never_approved_even_by_a_hand_built_bundle_carrying_one`
+/// owns that case.
 #[test]
 fn a_rule_id_that_merely_resembles_an_approved_one_is_not_approved() {
     let policy = ApprovalPolicy::Preapproved {
@@ -72,7 +78,6 @@ fn a_rule_id_that_merely_resembles_an_approved_one_is_not_approved() {
         "shell:cargo-test --all",
         "SHELL:CARGO-TEST",
         "shell:cargo-test\n",
-        "",
     ] {
         assert_eq!(
             evaluate_unattended_approval(&policy, near_miss),
