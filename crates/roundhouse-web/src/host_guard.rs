@@ -187,9 +187,7 @@ pub(crate) async fn require_expected_host(
 fn forbidden() -> Response {
     (
         StatusCode::FORBIDDEN,
-        crate::runs::error_body(
-            "this API answers only to the host it is bound to; check the Host header",
-        ),
+        crate::api_error("this API answers only to the host it is bound to; check the Host header"),
     )
         .into_response()
 }

@@ -441,11 +441,29 @@ fn api_router(bind: &lan_auth::BindConfig) -> axum::Router<AppState> {
 /// not until `with_state` — inverting the nest-before-`with_state` rule above;
 /// and a path-prefix test in the middleware is the loose textual form ruling
 /// P85 rules out.
+/// **Every error body under `/api` is `{"error": "…"}`.** The one place that
+/// shape is spelled, and it lives here rather than in a route's module because
+/// it is a property of the namespace [`api_router`] defines, not of any one
+/// endpoint.
+///
+/// `GET /api/runs` answers `application/json` on success, so a client doing
+/// `res.json()` on a failure used to get a parse error where a reason belonged —
+/// and D6 adds four more endpoints to this namespace next, which is what makes
+/// now the cheapest moment to decide it. Used by this fallback, by
+/// [`lan_auth`]'s `401`, by `host_guard`'s `403` and by [`runs`]'s `503`/`500`.
+///
+/// The text is a sentence for a person reading a console; the **status** is what
+/// a client branches on. Nothing derived from an error's `Display` reaches it —
+/// see `runs::internal_error` for why that matters.
+pub(crate) fn api_error(reason: &str) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({ "error": reason }))
+}
+
 async fn api_not_found() -> axum::response::Response {
     use axum::response::IntoResponse;
     (
         axum::http::StatusCode::NOT_FOUND,
-        runs::error_body("no such API route"),
+        api_error("no such API route"),
     )
         .into_response()
 }

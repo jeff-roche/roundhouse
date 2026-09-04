@@ -263,7 +263,7 @@ async fn list_runs(State(state): State<crate::AppState>) -> Response {
 
 /// A `503` — this surface is not ready — with `reason` in the JSON body.
 fn unavailable(reason: &str) -> Response {
-    (StatusCode::SERVICE_UNAVAILABLE, error_body(reason)).into_response()
+    (StatusCode::SERVICE_UNAVAILABLE, crate::api_error(reason)).into_response()
 }
 
 /// A `500` whose body names the stage but **not** the underlying error.
@@ -276,24 +276,9 @@ fn unavailable(reason: &str) -> Response {
 fn internal_error(stage: &str, _error: &dyn std::fmt::Display) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        error_body(&format!("the runs inbox failed while {stage}")),
+        crate::api_error(&format!("the runs inbox failed while {stage}")),
     )
         .into_response()
-}
-
-/// Every error body under `/api` is `{"error": "…"}`.
-///
-/// **The convention is set here because it is cheapest here.** `GET /api/runs`
-/// answers `application/json` on success, so a client doing `res.json()` on a
-/// failure used to get a parse error instead of a reason — and D6 adds four
-/// more endpoints to this namespace next. One shape, decided once.
-///
-/// The text is for a person reading a console, so it stays a sentence rather
-/// than a machine-readable code; the **status** is what a client branches on.
-/// Nothing derived from an error's `Display` reaches it — see
-/// [`internal_error`].
-pub(crate) fn error_body(reason: &str) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "error": reason }))
 }
 
 /// The Runs routes, merged into [`crate::build_router`]'s single API router.
