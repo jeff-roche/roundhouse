@@ -398,13 +398,31 @@ fn api_router(bind: &lan_auth::BindConfig) -> axum::Router<AppState> {
 /// extractor rejection that route catches rather than lets `axum` answer in
 /// plain text, which is what keeps the claim true for a route taking a body.
 ///
-/// **One exception, named rather than left to be discovered:** [`sse`]'s two
-/// `400`s (an unparsable path segment, an unusable `Last-Event-ID`) predate
-/// this function and still answer plain text. They are reachable, so the
-/// sentence above is a convention this crate now holds everywhere except
-/// there. Converting them is a behaviour change to a shipped route with its own
-/// test assertions and belongs to whoever next touches [`sse`], not to a
-/// drive-by.
+/// # One exception, and it is scheduled rather than merely named
+///
+/// [`sse`] predates this function and still answers **plain text** on its
+/// rejection paths. They are reachable, so the sentence above is a convention
+/// this crate holds everywhere except there — and a client doing `res.json()`
+/// on an SSE open that was refused gets a parse error where a reason belongs,
+/// which is exactly what this function exists to prevent.
+///
+/// **Three sites, all in `sse.rs`'s `stream_session_events` and its helper**,
+/// listed so that whoever picks this up does not have to find them:
+///
+/// 1. the unparsable path segment — `"session id is not a UUID\n"`;
+/// 2. the cursor that names another session —
+///    `"Last-Event-ID names a different session than the URL\n"`;
+/// 3. `cursor_rejected`, which renders any [`sse::CursorError`] as
+///    `format!("{error}\n")`.
+///
+/// Each becomes `(status, api_error(reason))`. **What makes it a change and not
+/// a rename** is that all three are shipped behaviour with their own assertions
+/// in `tests/sse_cursor.rs` — which today assert the `400` and the absence of a
+/// `text/event-stream` content type, and *not* the body, so the conversion is
+/// expected to be status-compatible and the assertions should be extended to the
+/// `{"error": …}` shape in the same change. It is deliberately not done here: it
+/// is a drive-by rewrite of a route this task does not otherwise touch, and
+/// ruling P89 §A is the record of why those go wrong.
 ///
 /// The text is a sentence for a person reading a console; the **status** is what
 /// a client branches on. Nothing derived from an error's `Display` reaches it —

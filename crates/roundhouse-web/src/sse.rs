@@ -170,6 +170,18 @@
 //! what the client is owed, and answers with the same `resync_required`. The
 //! client refetches a snapshot instead of silently jumping its `Last-Event-ID`
 //! across the missing range.
+//!
+//! # Open residual: this module's three `400`s are the `/api` namespace's only
+//! plain-text error bodies
+//!
+//! [`crate::api_error`] states that every error under `/api` is
+//! `{"error": …}`, and every other route holds it. This one predates that
+//! function, and its three rejection paths — `stream_session_events`'s
+//! unparsable path segment and its "names a different session" cursor, plus
+//! `cursor_rejected` for every [`CursorError`] — still answer plain text, so a
+//! client doing `res.json()` on a refused stream open gets a parse error where
+//! a reason belongs. **Whoever next touches this module converts them**;
+//! [`crate::api_error`] carries the site list and what the change costs.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
