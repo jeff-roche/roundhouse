@@ -309,17 +309,21 @@ fn extract_report_json(payload: &str) -> Option<serde_json::Value> {
 /// fresh [`SessionId`], so the event `seq` is always `1` and no caller has to
 /// track one.
 ///
-/// # Its relationship to the finer helpers in this crate's own `tests/runs.rs`
+/// # Its relationship to the finer helper below
 ///
-/// Named rather than left for a reader to trip over: that file has
-/// `completed_run` / `seed_report_task` / `seed_report`, and these `INSERT`s are
-/// the same rows. They are **not** folded into this one and should not be.
-/// Those tests seed a `TaskOutput::Text`, a hand-written malformed payload, and
-/// two `Report` tasks in *one* session at different `seq`s (§8.13's
-/// retry-from-step case) — none of which this signature can express, and all of
-/// which are the negative cases that file exists for. This is the "one ordinary
-/// completed run" shape, which is all an out-of-crate caller can want, and it is
-/// deliberately the only shape exported.
+/// This is the "one ordinary completed run" shape — a run row plus its report —
+/// and it is the only shape an out-of-crate caller can want, which is why it is
+/// the coarse one. The negative cases this crate's own `tests/runs.rs` needs (a
+/// `TaskOutput::Text`, a hand-written malformed payload, two `Report` tasks in
+/// *one* session at different `seq`s for §8.13's retry-from-step case) are not
+/// expressible through this signature — but they are all expressible through
+/// [`seed_report_task`], which is exactly parameterised on those axes.
+///
+/// An earlier version of this paragraph said the two sets of `INSERT`s were
+/// deliberately unfolded because the finer shapes could not be expressed. That
+/// answered the wrong question: the obstacle was **directional** — the helper
+/// lived in a test target, and `src/` cannot call into one. Moving it here
+/// removed it, and this function now writes its task and event rows through it.
 ///
 /// Ruling L7, exactly as [`crate::durability::open_test_db`] states it: gated
 /// behind `cfg(test)` / the `test-util` feature so daemon code can never reach
@@ -333,7 +337,7 @@ pub fn seed_completed_run_with_report(
     started_at_nanos: i64,
     report: &Report,
 ) -> RunId {
-    use roundhouse_core::{EventPayload, JobId, TaskId, TaskOutput, Timestamp, Usage};
+    use roundhouse_core::{JobId, TaskOutput, Timestamp};
 
     use crate::durability::{insert_workflow_run, RunState, WorkflowRun};
 
@@ -362,27 +366,67 @@ pub fn seed_completed_run_with_report(
     };
     insert_workflow_run(conn, &run).expect("a fresh run row inserts");
 
-    // Plain `INSERT`s and not `roundhouse_store`'s async `EventWriter`: what
-    // these rows exist for is a **read**, and the writer would only add a
-    // runtime. Every column the real schema requires is supplied explicitly, so
-    // a migration adding another `NOT NULL` column breaks this rather than
-    // silently passing.
+    seed_report_task(conn, run.session_id, 1, TaskOutput::Json(json));
+
+    run.id
+}
+
+/// Test-only helper: one completed `Report` task in `session_id` at `seq`,
+/// carrying `output` — the `tasks` row and the `TaskCompleted` event row that
+/// [`load_report`] joins across.
+///
+/// # Why the `output` is a parameter and the kind is not
+///
+/// The three axes the negative cases vary are the session, the `seq` and the
+/// output — a `TaskOutput::Text`, a hand-written malformed payload, or two
+/// reports in one session at different `seq`s (§8.13's retry-from-step case).
+/// The task *kind* is not one of them: every caller here is seeding a `Report`,
+/// which is what [`load_report`]'s `t.kind = ?` predicate selects on, and a
+/// caller wanting a different kind is testing that predicate rather than using
+/// this. `tests/runs.rs` has exactly one such case and writes its own rows.
+///
+/// # It lives in `src/` because that is the only direction that works
+///
+/// It was written in this crate's `tests/runs.rs`, which meant
+/// [`seed_completed_run_with_report`] could not call it — a `src/` module cannot
+/// reach into a test target — so the same two `INSERT`s were written twice. The
+/// obstacle was directional, not expressive, and moving the helper is what
+/// removes it.
+///
+/// Plain `INSERT`s and not `roundhouse_store`'s async `EventWriter`: what these
+/// rows exist for is a **read**, and the writer would only add a runtime. Every
+/// column the real schema requires is supplied explicitly, so a migration adding
+/// another `NOT NULL` column breaks this rather than silently passing.
+///
+/// Ruling L7, same gate and same reason as [`seed_completed_run_with_report`]
+/// above: these rows have no legal transition history, so daemon code must never
+/// be able to reach for them.
+#[cfg(any(test, feature = "test-util"))]
+pub fn seed_report_task(
+    conn: &Connection,
+    session_id: SessionId,
+    seq: i64,
+    output: roundhouse_core::TaskOutput,
+) {
+    use roundhouse_core::{EventPayload, TaskId, Usage};
+
     let task_id = TaskId::new();
     conn.execute(
         "INSERT INTO tasks (task_id, session_id, kind, state, parent, created_seq, updated_seq)
-         VALUES (?1, ?2, ?3, 'Completed', NULL, 1, 1)",
+         VALUES (?1, ?2, ?3, 'Completed', NULL, ?4, ?4)",
         rusqlite::params![
             task_id.to_string(),
-            run.session_id.to_string(),
+            session_id.to_string(),
             // Written exactly as `tasks_view::task_kind_as_sql_str` writes it,
             // which is what `report_task_kind` above reads back.
             report_task_kind(),
+            seq
         ],
     )
     .expect("a Report task row inserts");
 
     let payload = roundhouse_store::serialize_payload(&EventPayload::TaskCompleted {
-        output: TaskOutput::Json(json),
+        output,
         usage: Usage {
             input_tokens: 0,
             output_tokens: 0,
@@ -393,12 +437,10 @@ pub fn seed_completed_run_with_report(
 
     conn.execute(
         "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v)
-         VALUES (?1, 1, 0, ?2, ?3, 1)",
-        rusqlite::params![run.session_id.to_string(), task_id.to_string(), payload],
+         VALUES (?1, ?2, 0, ?3, ?4, 1)",
+        rusqlite::params![session_id.to_string(), seq, task_id.to_string(), payload],
     )
     .expect("an event row inserts");
-
-    run.id
 }
 
 #[cfg(test)]

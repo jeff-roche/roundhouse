@@ -23,7 +23,7 @@ use roundhouse_core::{
 use roundhouse_flow::durability::{insert_workflow_run, open_test_db, RunState, WorkflowRun};
 use roundhouse_flow::exec::RunId;
 use roundhouse_flow::report::FindingStatus;
-use roundhouse_flow::runs::{load_run_summaries, RunsError, MAX_INBOX_RUNS};
+use roundhouse_flow::runs::{load_run_summaries, seed_report_task, RunsError, MAX_INBOX_RUNS};
 use rusqlite::{params, Connection};
 
 /// A completed run. `ended_at` is `Some` because `insert_workflow_run` refuses
@@ -71,44 +71,6 @@ fn report_json(headline: &str, findings: &[(&str, &str)]) -> serde_json::Value {
         "cost": { "usd": 0.0, "tokens": 0 },
         "findings": findings,
     })
-}
-
-/// Writes a completed `Report` task into `session_id` at `seq`: the `tasks`
-/// cache row the join looks up, and the `TaskCompleted` event the report is
-/// read out of. The payload is produced by `roundhouse_store::serialize_payload`
-/// from a real `EventPayload`, not hand-written, so the externally-tagged shape
-/// the query walks is the one the writer actually produces.
-fn seed_report_task(conn: &Connection, session_id: SessionId, seq: i64, output: TaskOutput) {
-    let task_id = TaskId::new();
-    conn.execute(
-        "INSERT INTO tasks (task_id, session_id, kind, state, parent, created_seq, updated_seq)
-         VALUES (?1, ?2, ?3, 'Completed', NULL, ?4, ?4)",
-        params![
-            task_id.to_string(),
-            session_id.to_string(),
-            // Written exactly as `tasks_view::task_kind_as_sql_str` writes it.
-            format!("{:?}", TaskKind::Report),
-            seq
-        ],
-    )
-    .expect("a Report task row inserts");
-
-    let payload = roundhouse_store::serialize_payload(&EventPayload::TaskCompleted {
-        output,
-        usage: Usage {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-        },
-    })
-    .expect("an EventPayload serializes");
-
-    conn.execute(
-        "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v)
-         VALUES (?1, ?2, 0, ?3, ?4, 1)",
-        params![session_id.to_string(), seq, task_id.to_string(), payload],
-    )
-    .expect("an event row inserts");
 }
 
 fn seed_report(conn: &Connection, session_id: SessionId, seq: i64, report: serde_json::Value) {
