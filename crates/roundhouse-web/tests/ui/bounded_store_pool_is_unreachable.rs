@@ -12,9 +12,9 @@ fn main() {
     let state = roundhouse_web::AppState::default();
     let store = state.store.expect("this never runs; the line below must not compile");
 
-    // The pool is private to `roundhouse-web`'s `bounded` module, so
-    // `AppState::store_connection` — which delegates to the one function in that
-    // module that unwraps it, and which pairs it with a permit — is the only way
-    // to reach a connection.
+    // The pool is private to `roundhouse-web`'s `bounded` module, and
+    // `AppState::store_connection` is `pub(crate)`. So out here the answer is
+    // not "only through the permitted path" — it is that no path reaches a
+    // connection at all. The permitted-path claim is in-crate, and is P101's.
     let _pool = store.inner;
 }

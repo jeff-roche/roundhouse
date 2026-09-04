@@ -70,8 +70,8 @@
 ///   privacy is the defining module *and its descendants*. This module declares
 ///   no `mod`, so it has no descendants and no other module in the crate can
 ///   read it. `tests/bounded_reach.rs` fails if either half changes.
-/// - **The method path.** `StoreConnection` (`pub(crate)`, so not linked — it
-///   is below this page) `Deref`s **past**
+/// - **The method path.** `StoreConnection` — `pub(crate)`, so it has no public
+///   page to link to — `Deref`s **past**
 ///   [`roundhouse_store::PooledConnection`] rather than to it, so `deadpool`'s
 ///   `Object::pool` back-reference — which would hand a permitted connection's
 ///   holder the whole pool, needing no dependency and never naming `inner` — is
