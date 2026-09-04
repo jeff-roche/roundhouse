@@ -211,7 +211,12 @@
 //!
 //! # What this does NOT bound
 //!
-//! **Only the expansion stage.** Loading the raw text into the event list
+//! **Only the expansion stage — and not even all of that.** *Within* the
+//! expansion stage what the ceiling bounds is the number of nodes walked, not
+//! the work each node costs: see `check_expansion`'s doc, and
+//! [`FLOAT_SCALAR_WEIGHT_BYTES`]' residual section for the integer document
+//! that is admitted after 9,435.7 ms while using two-thirds of the visit
+//! ceiling. *Outside* it, loading the raw text into the event list
 //! (tokenizing/scanning) happens before any visitor runs and is untouched
 //! by the ceiling. That cost is addressed — partially, best-effort, and
 //! explicitly not as a security boundary — by
@@ -307,7 +312,10 @@ pub const NODE_WEIGHT_BYTES: usize = 8;
 /// because it parses mantissa digits eight at a time via `try_parse_8digits`
 /// but the exponent byte-at-a-time. Measured on the same 174 KB document
 /// with the same digit count: 383.8 ms with the digits in the exponent
-/// against 94.9 ms in the mantissa, **4.0x**.
+/// against 97.6 ms in the mantissa, **3.9x**. (Round 5 published this
+/// mantissa payload as both 94.9 ms here and 97.6 ms in
+/// [`super::MAX_FLOAT_SCALAR_VISITS`]' table; 97.6 ms is the figure its report
+/// and commit message carry, so the two now agree on it.)
 ///
 /// Integers are charged [`INTEGER_SCALAR_WEIGHT_BYTES`], sixteen times less,
 /// because charging them what floats cost bought no bound and caused
@@ -338,8 +346,9 @@ pub const NODE_WEIGHT_BYTES: usize = 8;
 /// here rather than described — the next reader should be able to re-check it
 /// without re-running anything:
 ///
-/// `serde_yaml-0.9.34/src/de.rs:944-967` tries the `0x` / `0o` / `0b` radix
-/// branches at the **top** of `parse_unsigned_int`. `digits_but_not_number`
+/// `serde_yaml-0.9.34/src/de.rs:945-968` tries the `0x` / `0o` / `0b` radix
+/// branches at the **top** of `parse_unsigned_int` (`:944` is the
+/// `strip_prefix('+')` line immediately above them). `digits_but_not_number`
 /// is consulted only at `de.rs:972`, *after* all three, immediately before
 /// the base-10 path — and it additionally requires every byte after the
 /// leading `0` to be an ASCII digit (`de.rs:1092-1097`), which `0x000…01` is
@@ -377,10 +386,13 @@ pub const NODE_WEIGHT_BYTES: usize = 8;
 ///
 /// **This is a known, accepted residual (ruling P63), decided by the project
 /// owner against the orchestrator's recommendation — not an oversight and not
-/// a bound nobody got round to tightening.** It is covered by the same
+/// a bound nobody got round to tightening.** It *would* be covered by the same
 /// out-of-process `RLIMIT_CPU` remedy [`super`]'s axis inventory names for its
-/// still-open tokenizing row. See that inventory's integer row for the full
-/// method, the rejection-side cost, and what reopening it would mean.
+/// still-open tokenizing row — **recommended, not implemented**: nothing in
+/// this workspace applies an `RLIMIT_CPU` to a parse today, and that section
+/// is headed "Recommended remedy" with an owner for exactly that reason. See
+/// that inventory's integer row for the full method, the rejection-side cost,
+/// and what reopening it would mean.
 ///
 /// # Failure direction
 ///
@@ -485,8 +497,10 @@ pub(super) enum Verdict {
 /// then 9,304.7 ms — because each pinned a *mantissa* payload; the
 /// maximiser puts the digits in the exponent and measures **~13.7 s
 /// admitted**. With the float charge in place the worst admitted **float**
-/// document measures **1,519.1 ms** (re-measured fix round 6, 249,582 B; fix
-/// round 5 published 1,603.3 ms for the same family at 259,742 B).
+/// document measures **1,519.1 ms** (measured fix round 6 against a retuned
+/// 249,582 B shape; fix round 5 published 1,603.3 ms for the same family at
+/// 259,742 B, but *that tuning does not reproduce* — see
+/// [`super::MAX_FLOAT_SCALAR_VISITS`]' table).
 ///
 /// **Per-node work is still not bounded, and saying it was is what round 5
 /// got wrong.** The charge caps the *count* of decodes, not the cost of one,
