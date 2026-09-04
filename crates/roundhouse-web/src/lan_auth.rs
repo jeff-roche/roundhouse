@@ -463,17 +463,20 @@ fn read_token_file(path: &Path) -> io::Result<String> {
 ///
 /// # Why this is split out rather than inlined
 ///
-/// **So the uid refusal has a test at all.** A `cargo test` run has exactly one
-/// uid, and the file it reads is one it just created, so the end-to-end path
-/// through [`read_token_file`] can never reach the uid branch: there is no way
-/// to make a test process own a file it does not own. That branch was
-/// consequently the one hole in this module's mutation table — deleting it
-/// killed nothing. As a free function over three integers the *predicate* is
-/// reachable with `uid = getuid() + 1`, which is what
-/// `a_token_file_owned_by_another_uid_is_refused` does. What stays untestable
-/// is only the wiring — that [`read_token_file`] passes `meta.uid()` and not
-/// something else — and that is one line in view of its caller rather than a
-/// branch buried three checks deep.
+/// **So the uid refusal is reachable at values no real file supplies.** A
+/// `cargo test` run has exactly one uid and cannot make itself own a file it
+/// does not own, so it cannot *manufacture* a fixture for the uid branch. As a
+/// free function over three integers the *predicate* is reachable with
+/// `uid = getuid().wrapping_add(1)`, which is what
+/// `a_token_file_owned_by_another_uid_is_refused` does.
+///
+/// **The wiring — that [`read_token_file`] passes `meta.uid()` and not the
+/// process's own uid — is tested too, and an earlier version of this comment
+/// wrongly said it could not be.** It confused "a fixture cannot be created"
+/// with "no fixture exists": `/etc/passwd` is owned by another uid on every
+/// non-root run, and pointing [`read_token_file`] straight at it exercises the
+/// whole path. See `read_token_file_judges_the_files_owner_and_not_the_processes`
+/// (ruling P88 §B).
 ///
 /// The messages deliberately carry no path: they are written to be read with
 /// the file name prefixed by the caller, which is the only frame that knows it.
@@ -861,5 +864,64 @@ mod tests {
     #[test]
     fn a_token_file_this_daemon_wrote_passes_every_check() {
         check_token_metadata(our_uid(), 0o600, 64).expect("0600, ours, 64 bytes is the good case");
+    }
+
+    /// The uid **wiring**: that [`read_token_file`] hands
+    /// [`check_token_metadata`] the *file's* owner and not the process's.
+    ///
+    /// # This was called untestable by three readers, and the reasoning error is worth keeping
+    ///
+    /// [`check_token_metadata`]'s own doc says the wiring "stays untestable",
+    /// and ruling P88 §B records that the implementer, the code review and the
+    /// adjudicator all agreed. All three accepted the true premise — *a test
+    /// cannot make this process own a file it does not own* — and never asked
+    /// the adjacent question: **does a suitable file already exist?** The
+    /// constraint was on *manufacturing* the fixture; it was read as a
+    /// constraint on *having* one.
+    ///
+    /// `/etc/passwd` is that fixture: uid 0, mode `0644`, a regular file,
+    /// world-readable, present on every Linux and macOS box. [`read_token_file`]
+    /// is not restricted to files a test created, so it can simply be pointed at
+    /// it. The mutation this kills is passing `getuid()` where `meta.uid()`
+    /// belongs, which turns the check into the tautology
+    /// `getuid() == getuid()` — under it, execution falls through to the mode
+    /// check and the refusal becomes *"permissions too open"*. Asserting on
+    /// **which** refusal fires is therefore the whole test; asserting merely
+    /// that it is refused would pass under the mutation.
+    ///
+    /// Two things this deliberately does not do. It does not read `/etc/passwd`
+    /// — the refusal comes before the read, which is the point. And it does not
+    /// replace [`a_token_file_owned_by_another_uid_is_refused`]: that one covers
+    /// the *predicate* at `u32::MAX` and other values no real file supplies.
+    ///
+    /// Guarded for root, which owns `/etc/passwd` and would take the
+    /// mode branch legitimately — the same refusal the mutation produces, so the
+    /// assertion would be vacuous rather than wrong. On a distro where
+    /// `/etc/passwd` is a symlink the `O_NOFOLLOW` open returns `ELOOP` and this
+    /// fails loudly, which is the acceptable direction: a clear failure, never a
+    /// wrong pass.
+    #[test]
+    fn read_token_file_judges_the_files_owner_and_not_the_processes() {
+        if our_uid() == 0 {
+            // Running as root: root owns `/etc/passwd`, so the uid check passes
+            // legitimately and the mode check refuses — indistinguishable from
+            // the mutation this test exists to kill.
+            return;
+        }
+        let foreign = Path::new("/etc/passwd");
+        assert!(
+            foreign.exists(),
+            "this test needs a readable regular file owned by another uid; /etc/passwd is the \
+             portable one and it is missing"
+        );
+
+        let error = read_token_file(foreign)
+            .expect_err("a token file owned by another uid is refused by the real read path");
+        assert!(
+            error.to_string().contains("not owned by the current user"),
+            "the uid refusal must come from the FILE's owner: a check reading the process's own \
+             uid is the tautology `getuid() == getuid()`, falls through, and refuses with \
+             `permissions too open` instead. Got: {error}"
+        );
     }
 }
