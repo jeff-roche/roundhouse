@@ -54,13 +54,15 @@ pub fn api_version() -> roundhouse_proto::ApiVersion {
 /// incidental: `axum` clones the state per request, and
 /// `tests/assets.rs::a_handler_taking_app_state_composes_with_the_asset_router`
 /// formats it with `{state:?}` and compares against a separately constructed
-/// `AppState::default()` — which holds because
-/// `tokio::sync::broadcast::Sender`'s `Debug` is the constant string
-/// `"broadcast::Sender"`, carrying no per-instance identity.
+/// `AppState::default()` — which holds because [`sse::SseHub`]'s `Debug` is its
+/// capacity plus its per-session channel map, and that map is **empty until
+/// something subscribes**. Two default hubs therefore format identically
+/// without either one carrying per-instance identity.
 #[derive(Clone, Debug, Default)]
 pub struct AppState {
-    /// Fan-out of appended events to open SSE connections. **Nothing in this
-    /// workspace publishes into it yet** — see [`sse`]'s module docs.
+    /// Per-session fan-out of appended events to open SSE connections.
+    /// **Nothing in this workspace publishes into it yet** — see [`sse`]'s
+    /// module docs, which also record that it performs no redaction.
     pub sse: sse::SseHub,
 }
 

@@ -12,6 +12,10 @@
 //! Each endpoint test names, in its doc comment, the mutation it kills. The
 //! report for this task carries the same list with the observed failure for
 //! each one, so "this test can fail" is a measurement rather than a claim.
+//! Per ruling P81 the sweep is re-run against the file as it ships — a table
+//! measured against a different revision of the suite invites a reader to
+//! discount it — and a mutation that fails to compile, panics at router
+//! construction, or kills every test is a broken build rather than evidence.
 
 use std::time::Duration;
 
@@ -111,6 +115,20 @@ fn publish(hub: &SseHub, update: SessionUpdate) {
     );
 }
 
+/// Publishes for another session **without** asserting the receiver count.
+///
+/// Deliberate, and the reason is measured rather than assumed: under the
+/// mutation that reverts the hub to one process-global channel, the count is 1,
+/// so a strict helper aborts the test *there* — and the assertions about what
+/// reached the body, which are the point of
+/// `another_sessions_events_never_appear_in_this_sessions_stream`, never run. A
+/// leak would then be reported as a receiver-count mismatch rather than as the
+/// leak it is. The count property is asserted where it can be reached, at the
+/// end of `a_burst_on_another_session_does_not_lag_this_sessions_stream`.
+fn publish_ignoring_receiver_count(hub: &SseHub, update: SessionUpdate) {
+    let _ = hub.publish(update);
+}
+
 struct Streamed {
     status: StatusCode,
     headers: HeaderMap,
@@ -121,9 +139,12 @@ struct Streamed {
 ///
 /// Ordering is load-bearing: the request is dispatched **first**, because the
 /// handler is what subscribes to the hub; then `publish` runs; then the last
-/// `SseHub` handle is dropped, which closes the broadcast channel so the
-/// stream terminates and the body can be collected. Without that drop an SSE
-/// body never ends.
+/// `SseHub` handle is dropped. The hub owns the map that owns every session's
+/// sender, so that drop closes the channels and every stream ends, letting the
+/// body be collected. Without it an SSE body never ends — which is also why
+/// `SessionSubscription` holds only a `Weak` back-reference to that map: a
+/// strong one would keep its own sender alive and the close would never
+/// arrive.
 ///
 /// The header is passed as **bytes**, not `&str`, so a test can send a value
 /// that is a legal HTTP header but not valid ASCII text — the `to_str()`
@@ -156,7 +177,7 @@ async fn stream(
 
     publish(&hub);
     // The router's own clone was dropped when `oneshot`'s temporary went out
-    // of scope above; this is the last sender.
+    // of scope above; this is the last hub handle.
     drop(hub);
 
     // A bug that leaves a sender alive would hang here rather than fail, so
@@ -306,11 +327,23 @@ async fn every_emitted_event_id_is_the_generated_cursor_for_its_own_event() {
     );
 }
 
-/// The stream is per-session. A hub is one process-wide broadcast, so without
-/// a session filter every client would receive every session's events.
+/// The stream is per-session, and after this task's fix round that is the
+/// hub's **map key**, not a filter: an update for another session has no
+/// channel to reach this subscriber through.
 ///
-/// **Mutation killed:** dropping the `update.session_id == session` check —
-/// the other session's three frames appear in the body.
+/// **Mutation killed:** the pre-fix shape — one process-global
+/// `broadcast::Sender` for every session, *and* `Filter::accepts`'s
+/// `update.session_id == self.session_id` check removed. The other session's
+/// three frames interleave into the body, measured.
+///
+/// **Stated honestly as a two-part mutation.** Neither half kills this test
+/// alone, and both were run: removing only the filter check leaves it green
+/// (the map key already routes), and making the channel global while keeping
+/// the filter leaves it green too (the filter catches what the key no longer
+/// does). That is precisely what "belt and braces" means in `Filter`'s doc
+/// comment — one of the two is redundant at any time, but which one is
+/// redundant is a property of the hub, not of the filter. The report's sweep
+/// records all three measurements.
 #[tokio::test]
 async fn another_sessions_events_never_appear_in_this_sessions_stream() {
     let hub = SseHub::new();
@@ -319,7 +352,7 @@ async fn another_sessions_events_never_appear_in_this_sessions_stream() {
 
     let streamed = stream(hub, &events_uri(mine), None, |hub| {
         for seq in 0..3 {
-            publish(hub, text_event(theirs, seq, "not mine"));
+            publish_ignoring_receiver_count(hub, text_event(theirs, seq, "not mine"));
             publish(hub, text_event(mine, seq, "mine"));
         }
     })
@@ -514,14 +547,168 @@ async fn a_subscriber_that_falls_behind_is_told_resync_required_rather_than_hand
     );
 }
 
+/// The reason the hub is keyed by session rather than filtered per connection.
+///
+/// A burst on one session must not cost an **idle** session its stream. Under a
+/// single process-global channel, every session's traffic passes through every
+/// connection's receiver slot, so this session — which has produced one event —
+/// would be pushed past the buffer by another session's five and be told
+/// `resync_required` having missed nothing of its own. Worse, the
+/// `dropped_events` count it would be handed is a measure of *the other
+/// session's* traffic.
+///
+/// **Mutation killed:** replacing the per-session map with one shared
+/// `broadcast::Sender` (the pre-fix shape), whether or not `Filter`'s session
+/// check is kept — the filter runs after the buffer has already overrun. The
+/// body becomes a single `resync_required` frame carrying a count of events
+/// this client was never entitled to know about, instead of the one frame this
+/// session actually produced.
+///
+/// The receiver counts are collected during the publish and asserted **after**
+/// the body, deliberately: asserting them inline would abort the test at the
+/// first flood publish under that mutation, and the body assertions — which are
+/// what actually show the coupling — would never run.
+#[tokio::test]
+async fn a_burst_on_another_session_does_not_lag_this_sessions_stream() {
+    // Two slots, so five events on the other session would overrun a shared
+    // buffer several times over.
+    let hub = SseHub::with_capacity(2);
+    let mine = SessionId::new();
+    let theirs = SessionId::new();
+    let mut receiver_counts = Vec::new();
+
+    let streamed = stream(hub, &events_uri(mine), None, |hub| {
+        for seq in 0..5 {
+            receiver_counts.push(hub.publish(text_event(theirs, seq, "flood")));
+        }
+        receiver_counts.push(hub.publish(text_event(mine, 0, "mine")));
+    })
+    .await;
+
+    assert_eq!(streamed.status, StatusCode::OK);
+    let frames = parse_frames(&streamed.body);
+    assert!(
+        frames.iter().all(|frame| frame.event.is_none()),
+        "an idle session's stream must carry no resync_required; body was:\n{}",
+        streamed.body
+    );
+    assert_eq!(
+        frame_ids(&streamed.body),
+        vec![format!("{mine}:0")],
+        "this session produced exactly one event and must receive exactly it"
+    );
+    assert_eq!(
+        receiver_counts,
+        vec![0, 0, 0, 0, 0, 1],
+        "the other session has no open stream, so its five updates must reach nobody; \
+         only this session's single update has a receiver"
+    );
+}
+
+/// The map entry is dropped with its last reader.
+///
+/// `GET /api/sessions/{any-uuid}/events` creates a channel for whatever session
+/// id it is given, and the id need not name a session that exists. If the
+/// entries outlived their subscribers, a client could grow the map by one entry
+/// per request, indefinitely.
+///
+/// **Mutation killed:** deleting `impl Drop for SessionSubscription` (or
+/// weakening its `receiver_count() <= 1` to `== 0`, which never holds while the
+/// dropping receiver still counts itself). The final assertion sees 1.
+#[tokio::test]
+async fn a_sessions_channel_is_dropped_with_its_last_subscriber() {
+    let hub = SseHub::new();
+    let session = SessionId::new();
+    assert_eq!(hub.tracked_sessions(), 0, "a fresh hub tracks nothing");
+
+    {
+        let _first = hub.subscribe(session);
+        assert_eq!(hub.tracked_sessions(), 1);
+
+        let _second = hub.subscribe(session);
+        assert_eq!(
+            hub.tracked_sessions(),
+            1,
+            "two streams on one session share one channel"
+        );
+
+        let _other = hub.subscribe(SessionId::new());
+        assert_eq!(
+            hub.tracked_sessions(),
+            2,
+            "a second session, a second entry"
+        );
+    }
+
+    assert_eq!(
+        hub.tracked_sessions(),
+        0,
+        "every entry must go when its last subscriber does: the session id in the \
+         URL is client-chosen and need not exist"
+    );
+}
+
+/// `SessionUpdate.session_id` routes the update and stamps the cursor; the
+/// `ClientEvent::TaskEvent` inside it carries a session id of its own. If they
+/// disagree, the wrapper is not describing its payload — and a publisher that
+/// built the wrapper from a subscription key rather than from the payload would
+/// deliver one session's event into another session's stream, labelled with
+/// that stream's cursor. Neither side could see it.
+///
+/// So the disagreement ends the stream loudly instead.
+///
+/// **Mutation killed:** removing the equality check in `encode` — the frame is
+/// emitted as a normal event with `id: <mine>:0`, carrying a payload whose own
+/// `session_id` is another session's, and both assertions below fail.
+#[tokio::test]
+async fn an_update_whose_payload_names_another_session_ends_the_stream_with_stream_error() {
+    let hub = SseHub::new();
+    let mine = SessionId::new();
+    let theirs = SessionId::new();
+
+    let streamed = stream(hub, &events_uri(mine), None, |hub| {
+        // Routed to `mine` — this stream's own key — but describing `theirs`.
+        let mut mislabelled = text_event(theirs, 0, "not mine");
+        mislabelled.session_id = mine;
+        publish(hub, mislabelled);
+        publish(hub, text_event(mine, 1, "never reached"));
+    })
+    .await;
+
+    assert_eq!(streamed.status, StatusCode::OK);
+    let frames = parse_frames(&streamed.body);
+    assert_eq!(
+        frames.len(),
+        1,
+        "the stream_error frame is terminal; body was:\n{}",
+        streamed.body
+    );
+    assert_eq!(
+        frames[0].event.as_deref(),
+        Some("stream_error"),
+        "a mismatched routing key must not be emitted as a normal frame; body was:\n{}",
+        streamed.body
+    );
+    assert_eq!(frames[0].id, None, "a failed frame carries no resume point");
+    assert!(
+        !streamed.body.contains(&theirs.to_string()),
+        "the error must not name the session the client was not entitled to; body was:\n{}",
+        streamed.body
+    );
+}
+
 /// The API subtree and the SPA fallback must not blur into each other. An
 /// `/api/...` path with no route is a 404, not the `index.html` shell: a
 /// client that mistypes an endpoint has to see the mistake, not a 200 with a
 /// page of HTML that fails later as an opaque JSON parse error.
 ///
-/// **Mutation killed:** nesting the SSE router at `/` instead of `/api`, or
-/// widening `assets::is_client_route` to treat `/api/...` as a client route —
-/// the status becomes 200 with the shell's `text/html`.
+/// **Mutation killed:** widening `assets::is_client_route` to treat `/api/...`
+/// as a client route — the status becomes 200 with the shell's `text/html`.
+/// (Nesting the SSE router at `/` is *not* a usable mutation: `axum` panics in
+/// `build_router` itself — "Nesting at the root is no longer supported. Use
+/// merge instead." — taking 12 of the 15 tests down at once, measured. That is
+/// a broken build, not a killed mutant. Ruling P81: a mutation counts only if
+/// it leaves the suite runnable and kills a proper subset.)
 #[tokio::test]
 async fn an_api_path_with_no_route_is_a_404_rather_than_the_spa_shell() {
     for path in [
@@ -554,14 +741,31 @@ async fn an_api_path_with_no_route_is_a_404_rather_than_the_spa_shell() {
 /// path parse error — the status becomes 200.
 #[tokio::test]
 async fn a_path_session_id_that_is_not_a_uuid_is_rejected() {
-    for path in ["/api/sessions/not-a-uuid/events", "/api/sessions//events"] {
-        let streamed = stream(SseHub::new(), path, None, |_| {}).await;
-        assert_ne!(
-            streamed.status,
-            StatusCode::OK,
-            "{path} names no session and must not open a stream"
-        );
-    }
+    // Reaches the handler, which rejects it: the exact status is this module's
+    // to get right, so it is asserted exactly.
+    let streamed = stream(
+        SseHub::new(),
+        "/api/sessions/not-a-uuid/events",
+        None,
+        |_| {},
+    )
+    .await;
+    assert_eq!(
+        streamed.status,
+        StatusCode::BAD_REQUEST,
+        "an unparsable session id must be refused by the handler"
+    );
+
+    // An empty segment never reaches the handler at all — `matchit` does not
+    // match it, so the answer comes from the asset fallback. What this module
+    // owes here is only that no stream opens; the status is another layer's
+    // decision and asserting it would pin behaviour this file does not own.
+    let streamed = stream(SseHub::new(), "/api/sessions//events", None, |_| {}).await;
+    assert_ne!(
+        streamed.status,
+        StatusCode::OK,
+        "an empty session segment names no session and must not open a stream"
+    );
 }
 
 // ── the cursor functions on their own ────────────────────────────────────
