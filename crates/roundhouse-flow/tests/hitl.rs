@@ -37,6 +37,10 @@ fn gate_fields(yaml: &str) -> (String, serde_json::Value, String, OnTimeout) {
         form,
         timeout,
         on_timeout,
+        // Task 17's `hold_workspace` is a parking concern, not a human-wait
+        // one: `AwaitingHuman` is source-independent and identical whether
+        // the worktree is held, so nothing in this file reads it.
+        ..
     } = step.body
     else {
         panic!("expected a gate step");

@@ -595,6 +595,57 @@ fn gate_on_timeout_approve_parses_without_checking_its_run_time_precondition() {
     assert_eq!(*on_timeout, OnTimeout::Approve);
 }
 
+// -- Task 17 (B9): §8.11's `hold_workspace`, a defaulted bool. ------------
+
+#[test]
+fn a_gate_omitting_hold_workspace_defaults_to_releasing_the_worktree() {
+    let s = step("id: a\ngate: { title: t, timeout: 1h, on_timeout: deny }");
+    let StepBody::Gate { hold_workspace, .. } = &s.body else {
+        panic!("expected Gate step");
+    };
+    assert!(
+        !hold_workspace,
+        "§8.11 releases the worktree unless `hold_workspace: true`"
+    );
+}
+
+#[test]
+fn a_gate_may_declare_hold_workspace_true() {
+    // Before Task 17 added the field this was a hard parse error:
+    // `GateBodyDef` is `#[serde(deny_unknown_fields)]`, so the attribute
+    // §8.11 documents was unwritable and the TTL rule unreachable.
+    let s = step("id: a\ngate: { title: t, timeout: 1h, on_timeout: deny, hold_workspace: true }");
+    let StepBody::Gate { hold_workspace, .. } = &s.body else {
+        panic!("expected Gate step");
+    };
+    assert!(hold_workspace);
+}
+
+#[test]
+fn a_non_boolean_hold_workspace_is_rejected_rather_than_coerced() {
+    let err = try_step(
+        "id: a\ngate: { title: t, timeout: 1h, on_timeout: deny, hold_workspace: \"yes\" }",
+    )
+    .unwrap_err();
+    assert!(matches!(err, ParseError::Yaml(_)), "err was: {err:?}");
+}
+
+#[test]
+fn hold_workspace_survives_a_step_serialize_deserialize_round_trip() {
+    // `StepDef` is `#[serde(into = "StepDefWire")]`, so its own `Serialize`
+    // goes back through the wire shape its `Deserialize` expects. Asserting
+    // on the parsed structure, not on serialized text (ruling P29).
+    let s = step("id: a\ngate: { title: t, timeout: 1h, on_timeout: deny, hold_workspace: true }");
+    let round_tripped: StepDef =
+        serde_yaml::from_str(&serde_yaml::to_string(&s).expect("StepDef serializes"))
+            .expect("its own output re-parses");
+    assert_eq!(round_tripped, s);
+    let StepBody::Gate { hold_workspace, .. } = &round_tripped.body else {
+        panic!("expected Gate step");
+    };
+    assert!(hold_workspace);
+}
+
 // -- M3: `map.as` gets the same charset/length rule as a step id, plus ---
 // -- a reserved-expression-root check. ------------------------------------
 

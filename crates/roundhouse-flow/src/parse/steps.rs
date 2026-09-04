@@ -1105,6 +1105,28 @@ struct GateBodyDef {
     form: serde_json::Value,
     timeout: String,
     on_timeout: OnTimeout,
+    /// §8.11's `hold_workspace: true` — keep the run's worktree across the
+    /// park instead of releasing it, for a TTL that *"defaults to the
+    /// enclosing gate's own `timeout`"*.
+    ///
+    /// Added by Task 17 (B9) as a deliberate scope addition its plan does
+    /// not list. This struct is `#[serde(deny_unknown_fields)]`, so before
+    /// this field existed a workflow writing the attribute §8.11 documents
+    /// got a hard parse error, and [`crate::parking::resolve_hold_ttl`]'s
+    /// whole TTL rule was unreachable from a document. Unlike §8.10's
+    /// `on_crash:` — the same class of gap, deferred to Task 20 because that
+    /// task owns crash policy — nothing later owns this one, so deferring it
+    /// would orphan it.
+    ///
+    /// A defaulted `bool` and nothing more: this parser is hardened
+    /// untrusted-input code with three rounds of fix history behind it, and
+    /// a `bool` with a `#[serde(default)]` adds no parsing surface (no new
+    /// variants, no new string domain, no cross-field rule). Whether holding
+    /// the worktree is *permitted* is not asked here — the release itself is
+    /// the caller's, since this crate cannot touch a worktree at all (see
+    /// [`crate::parking`]'s module doc).
+    #[serde(default)]
+    hold_workspace: bool,
 }
 
 /// The as-written-in-YAML shape of an entire step: every field `StepDef`
@@ -1184,6 +1206,10 @@ pub enum StepBody {
         form: serde_json::Value,
         timeout: String,
         on_timeout: OnTimeout,
+        /// §8.11: hold the worktree across the park rather than releasing
+        /// it. Consumed by [`crate::parking::park`]; see [`GateBodyDef`] for
+        /// why this field is parsed by Task 17 rather than deferred.
+        hold_workspace: bool,
     },
     Call {
         workflow: String,
@@ -1381,6 +1407,7 @@ impl TryFrom<StepDefWire> for StepDef {
                     form: g.form,
                     timeout: g.timeout,
                     on_timeout: g.on_timeout,
+                    hold_workspace: g.hold_workspace,
                 }
             }
             "call" => StepBody::Call {
@@ -1469,12 +1496,14 @@ impl From<StepDef> for StepDefWire {
                 form,
                 timeout,
                 on_timeout,
+                hold_workspace,
             } => {
                 wire.gate = Some(GateBodyDef {
                     title,
                     form,
                     timeout,
                     on_timeout,
+                    hold_workspace,
                 });
             }
             StepBody::Call { workflow, with } => {

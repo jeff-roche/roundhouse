@@ -32,7 +32,10 @@
 //!
 //! - **Actual parking** — the implicit `checkpoint` task, `hold_workspace`
 //!   TTL, the 7-day reaper, and writing [`WorkflowRun::awaiting_until`] —
-//!   **Task 17 (B9)**.
+//!   **Task 17 (B9)**, since landed as [`crate::parking`]. The run loop that
+//!   *decides* to park, and the deadline registration/cancellation that
+//!   `awaiting_until` feeds, are still Task 20 (B12) and daemon work
+//!   respectively.
 //! - **The run loop itself**: `catch:`/stop-on-failure, task admission, `map`
 //!   process spawn / `max_parallel`, the run-level budget ledger, and
 //!   cancel/pause/resume/retry-from-step — **Task 20 (B12)**. Writing
@@ -300,7 +303,12 @@ pub enum RunState {
 }
 
 impl RunState {
-    fn as_sql_str(self) -> &'static str {
+    /// `pub(crate)` rather than private: [`crate::parking`] owns §8.11's park
+    /// write (`state = 'awaiting_human'` together with
+    /// [`WorkflowRun::awaiting_until`]) and must name the same discriminant
+    /// text this module reads back, rather than repeating the string
+    /// literal.
+    pub(crate) fn as_sql_str(self) -> &'static str {
         match self {
             RunState::Running => "running",
             RunState::Paused => "paused",

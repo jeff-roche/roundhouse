@@ -48,10 +48,14 @@
 //!   and have no human-wait source; `tests/hitl.rs` pins the whole mapping
 //!   with an exhaustive `match`, so a sixth core variant is a build break
 //!   rather than a stale comment.) The persistence side is already there.
-//! - **No parking.** Releasing the worker slot, the implicit `checkpoint`
-//!   task, `hold_workspace`'s TTL and the 7-day reaper are Task 17's, and
-//!   `exec::Executor`'s `StepBody::Gate` arm is still the
-//!   "handled by a later task" stub.
+//! - **No parking.** The implicit `checkpoint` task, `hold_workspace`'s TTL
+//!   and the 7-day reaper are Task 17's, since landed as
+//!   [`crate::parking`] — which is also where this module's relative
+//!   `timeout_after` becomes the absolute `workflow_run.awaiting_until`.
+//!   Releasing the worker slot and the provider connection is owned by
+//!   neither module (see [`crate::parking`]'s module doc for who), and
+//!   `exec::Executor`'s `StepBody::Gate` arm is still the "handled by a
+//!   later task" stub.
 //! - **No dependency on `roundhouse-policy`.** Ruling P7: [`Escalate`] is a
 //!   type this crate owns, built over `roundhouse_core::PolicyDecision`.
 //!   §5.2's row for `roundhouse-flow` is `core, engine, store` and stays
