@@ -1402,10 +1402,11 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// Returning a [`ReportPersisted`] is what lets [`finish_run`] be called
     /// at all, so there is no path from here to a terminal state that skips
     /// this function.
-    /// (continued) An authored report's document is **emitted here**, not at
-    /// its own step — [`super::ReportEmission`] says why, and it is what lets
-    /// the `run_state` annotation below be the run's real terminal state
-    /// rather than a guess made before `finally:` ran.
+    ///
+    /// An authored report's document is **emitted here**, not at its own step
+    /// — [`super::ReportEmission`] says why, and it is what lets the
+    /// `run_state` annotation carry the run's real terminal state rather than
+    /// a guess made before `finally:` ran.
     fn ensure_report(
         &mut self,
         executor: &mut Executor<'_>,

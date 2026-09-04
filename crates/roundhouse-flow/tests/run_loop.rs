@@ -44,6 +44,11 @@ fn at(seconds: i64) -> Timestamp {
 #[derive(Default)]
 struct RecordingSink {
     emitted: Vec<(TaskKind, EventPayload)>,
+    /// The `TaskId` each entry of `emitted` was emitted under, kept in step
+    /// with it. Separate rather than a third tuple element so the many
+    /// `format!("{:?}", sink.emitted)` leak assertions keep reading as a list
+    /// of what was logged.
+    task_ids: Vec<TaskId>,
 }
 
 impl RecordingSink {
@@ -57,8 +62,39 @@ impl RecordingSink {
             .collect()
     }
 
-    /// The one report document that reached the log, as JSON.
+    /// The one report document that reached the log, as JSON — and, on the
+    /// way, that it reached the log as a **whole task**.
+    ///
+    /// §4.2's tasks are event-sourced: a `TaskCompleted` with no matching
+    /// `TaskCreated` is an orphan completion in a table that physically
+    /// rejects `UPDATE`/`DELETE`, and nothing downstream could say what kind
+    /// of task completed or when it began. Asserted here, once, rather than in
+    /// each of the dozen tests that call this.
     fn the_report(&self) -> Value {
+        let created: Vec<TaskId> = self
+            .emitted
+            .iter()
+            .zip(&self.task_ids)
+            .filter(|((kind, payload), _)| {
+                *kind == TaskKind::Report && matches!(payload, EventPayload::TaskCreated { .. })
+            })
+            .map(|(_, id)| *id)
+            .collect();
+        let completed: Vec<TaskId> = self
+            .emitted
+            .iter()
+            .zip(&self.task_ids)
+            .filter(|((kind, payload), _)| {
+                *kind == TaskKind::Report && matches!(payload, EventPayload::TaskCompleted { .. })
+            })
+            .map(|(_, id)| *id)
+            .collect();
+        assert_eq!(
+            created, completed,
+            "every report task is created and completed, under one id: \
+             created {created:?}, completed {completed:?}"
+        );
+
         let reports = self.reports();
         assert_eq!(
             reports.len(),
@@ -88,6 +124,7 @@ impl TaskSink for RecordingSink {
         kind: TaskKind,
         payload: EventPayload,
     ) {
+        self.task_ids.push(_task_id);
         self.emitted.push((kind, payload));
     }
 }
@@ -2885,4 +2922,91 @@ fn a_report_step_skipped_by_its_own_when_gate_is_not_re_rendered_into_existence(
         "run completed: 2 steps",
         "the synthesised headline, not the author's `never written`"
     );
+}
+
+/// The **matched-against** half of the restore (P99 rule 4): the checkpoint
+/// scan iterates every finished row, and the row it must match is the
+/// `report:` step's — not merely "some row is `Completed`".
+///
+/// Two passes, and on the second the report step is skipped by its own
+/// `when:`. A restore keyed on any completed row would set
+/// `report_completed_before` from `work`'s pass-one row and then **re-render
+/// the report step the author's condition skipped**, manufacturing an
+/// `Authored` report for a document the run never asked for. Caught by nothing
+/// in the single-pass fixtures, because there is no earlier row in them at
+/// all.
+#[test]
+fn the_restore_matches_the_report_steps_own_row_and_not_merely_some_completed_row() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: work\n\
+         \x20   emit: { a: 1 }\n\
+         \x20 - id: approve\n\
+         \x20   needs: [work]\n\
+         \x20   gate:\n\
+         \x20     title: \"ok?\"\n\
+         \x20     form: { approve: { type: boolean } }\n\
+         \x20     timeout: 1h\n\
+         \x20     on_timeout: deny\n\
+         \x20 - id: report\n\
+         \x20   needs: [approve]\n\
+         \x20   when: \"${{ false }}\"\n\
+         \x20   report:\n\
+         \x20     outcome: changed\n\
+         \x20     severity: low\n\
+         \x20     headline: never written\n\
+         \x20     needs_human: false\n\
+         \x20     cost: { usd: 0.0, tokens: 0 }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+
+    let first = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("pass one drives");
+    assert!(matches!(first, RunOutcome::Parked(_)));
+    assert_eq!(
+        step_row(&conn, run_id, "work").0,
+        StepRunState::Completed,
+        "so pass two starts with a completed row that is NOT the report step's"
+    );
+
+    let second = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(20),
+        Some(GateAnswer {
+            step_id: "approve".into(),
+            output: serde_json::json!({ "approve": true }),
+        }),
+    )
+    .expect("pass two drives");
+    let RunOutcome::Terminal { report, state, .. } = second else {
+        panic!("the gate was answered");
+    };
+    assert_eq!(state, RunState::Completed);
+    assert_eq!(step_row(&conn, run_id, "report").0, StepRunState::Skipped);
+    assert_eq!(
+        report,
+        ReportOrigin::Synthesised,
+        "the author's own `when:` skipped the report step, and an earlier \
+         step's completed row must not be mistaken for the report step's"
+    );
+    assert_eq!(sink.reports().len(), 1, "across both passes");
+    assert_eq!(sink.the_report()["synthesised_by"], "run_loop");
 }
