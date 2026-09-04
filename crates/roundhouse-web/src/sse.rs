@@ -42,14 +42,19 @@
 //!   re-reads the same ring and carries on. Falling behind is recoverable, not
 //!   terminal.
 //! - **`resync_required` has exactly one producer**, the `resync_required`
-//!   frame builder,
-//!   emitted for exactly one condition — §11.3's *"the cursor is older than the
-//!   ring's tail"* — reached from those two paths. One event name, one payload
-//!   shape. D2 emitted it for `Lagged` as well, with a different payload,
-//!   because it had no ring to recover from; it now has one.
+//!   frame builder, emitted for exactly one condition — *the events the client
+//!   still needs are older than the oldest the server can offer*. That is
+//!   §11.3's *"the cursor is older than the ring's tail"* wherever the ring has
+//!   a tail, and [`Connection::deliver`]'s seq discontinuity where it does not.
+//!   One event name, one payload shape. D2 emitted it for `Lagged` as well,
+//!   with a different payload, because it had no ring to recover from; it now
+//!   has one.
 //!
 //! What the ring does **not** do is outlive its session's subscribers: the map
-//! entry is pruned with the last one (residual 5).
+//! entry is pruned with the last one (residual 5). Which is why the third path
+//! exists: a session that stopped being watched has an empty ring, so a gap
+//! opened while nobody was subscribed has no tail to be older than, and is
+//! caught at delivery instead.
 //!
 //! # What this module is *not*
 //!
@@ -59,6 +64,28 @@
 //! publish site**: a secret that reaches [`SseHub::publish`] is a secret this
 //! module streams to a browser. The writer named in residual 1 below owns that,
 //! and this note is here so it is not discovered afterwards.
+//!
+//! It is **not an authentication or authorization boundary either**, and the
+//! two notes belong together because the second one decides how much the first
+//! one costs. `stream_session_events` performs no authentication and no
+//! authorization: it parses the path segment as a UUID, checks the cursor names
+//! the same session, and subscribes. **The session id in the URL is a name, not
+//! a capability** — knowing one is sufficient to open its stream, and
+//! [`parse_last_event_id`]'s own note already says the cursor carries no
+//! authority. The task that binds a listener to this endpoint — the same one
+//! residual 1 names — owns authn/authz, and until it exists this crate has no
+//! caller identity to check anything against.
+//!
+//! **What the ring changes about that is the blast radius, not the defect.**
+//! Before it, a caller who learned a session UUID received only events
+//! published from that moment on. Now the same caller is replayed up to
+//! [`Retention::ring_events`] entries / [`Retention::ring_bytes`] of that
+//! session's **history** — which, since this module serialises verbatim, may
+//! include anything unredacted the publish site let through. An unauthenticated
+//! read yields history, not only future events. The mitigation that is actually
+//! in place is narrow and worth stating exactly: history exists only while the
+//! session is *already being watched* (residual 5), because a session with no
+//! subscriber has no ring.
 //!
 //! # Residuals — named here, not solved here
 //!
@@ -71,22 +98,28 @@
 //! `tests/sse_cursor.rs`, which is exactly the seam a future writer fills —
 //! but that is a test calling it, not the daemon.
 //!
-//! **2. The hub's memory cost is `entries × event size`, not `entries`.**
-//! `EventPayload` has unbounded inline variants —
+//! **2. The hub's memory cost is `entries × event size`, and only the ring's
+//! share of it is bounded.** `EventPayload` has unbounded inline variants —
 //! `TaskCompleted { output: TaskOutput::Text(String) }`,
 //! `TaskOutput::Json(serde_json::Value)`, `Note { text }` — none of which this
 //! module truncates, and the ring retains them **unconditionally from the first
 //! publish**, where the live queue only retains while a subscriber is behind.
-//! D3 answers that with two things rather than a note: every update is shared
+//! D3 narrows this rather than closing it. What it does: every update is shared
 //! as one `Arc` between the ring and every live queue slot, so the fan-out is
-//! reference counts rather than copies; and [`Retention::ring_bytes`] bounds
-//! the ring by **serialised bytes as well as entries**. What is bounded is
-//! stated exactly on `Ring::push`, including the one case that exceeds the
-//! budget by construction. **A publisher of large task output should still
-//! prefer `TaskOutput::Blob`**, which is a `BlobRef` rather than the bytes.
-//! Real event sizes remain unsampled (P18) — nothing publishes into the hub
-//! yet — so the byte budget is a ceiling that was chosen, not one that was
-//! measured against a workload.
+//! reference counts rather than copies, and [`Retention::ring_bytes`] bounds
+//! **the ring** by serialised bytes as well as entries (stated exactly on
+//! `Ring::push`, including the one case that exceeds the budget by
+//! construction). What it does **not** do: bound the broadcast, which retains
+//! up to [`Retention::live_queue`] payloads for a stalled client outside that
+//! accounting — so the per-session worst case is
+//! `live_queue · E + max(ring_bytes, E)`, not `ring_bytes`.
+//! [`Retention::ring_bytes`] carries the arithmetic and names the two things
+//! that would close it: a maximum event size at the publish site (or a
+//! publisher that uses `TaskOutput::Blob`, a `BlobRef` rather than the bytes),
+//! and a refactor to a single retainer. Neither is done here, and real event
+//! sizes remain unsampled (P18) — nothing publishes into the hub yet — so the
+//! byte budget is a ceiling that was chosen, not one measured against a
+//! workload.
 //!
 //! **3. Three resume boundaries are indistinguishable from a working idle
 //! stream.** All three open a `200` that emits only keep-alives: a cursor at
@@ -105,6 +138,19 @@
 //! over the whole log. This endpoint does not read the store at all; recorded
 //! for the task that does.
 //!
+//! **The converse of residual 3 must be qualified, not carried forward.** D2
+//! could say this endpoint was no existence oracle, because every outcome
+//! looked like an idle stream. That is no longer true in one direction: a
+//! `resync_required` at connect time tells an unauthenticated caller, in a
+//! single request, that the named session **is being watched right now and has
+//! produced at least `oldest_retained` events** — a live session distinguished
+//! from "nothing here", plus a lower bound on its traffic. The frame's payload
+//! is not the problem and is not changed: `{resume_from, oldest_retained}` is
+//! exactly what a client needs, both numbers are this session's own, and the
+//! alternative — a gap with no marker — is worse. It is the **authn gap named
+//! above** that makes it a disclosure, and it is recorded here so the next
+//! reader does not repeat D2's unqualified claim.
+//!
 //! **5. The ring lives exactly as long as its session's last subscriber.** The
 //! map entry — channel and ring together — is created on the first subscribe
 //! and pruned when the last subscription drops, because an endpoint reachable
@@ -117,6 +163,13 @@
 //! Serving those needs the store (residual 4), and the same task owns both.
 //! Until then the honest boundary is: **the ring replays a gap in a session
 //! that stayed watched, not a gap in one that did not.**
+//!
+//! What it does do for the unwatched case is **say so**. That gap has no tail
+//! to be older than — the ring is empty — so [`Ring::replay_since`] cannot see
+//! it; [`Connection::deliver`] catches it at the first event that skips past
+//! what the client is owed, and answers with the same `resync_required`. The
+//! client refetches a snapshot instead of silently jumping its `Last-Event-ID`
+//! across the missing range.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
@@ -246,7 +299,10 @@ pub struct SessionUpdate {
 /// construction, because every value the queue drops is one the ring has
 /// already evicted. Two independent `pub const`s with nothing tying them are
 /// the shape in which that relation gets broken silently, so the relation is
-/// asserted where the numbers are chosen — see [`SseHub::with_retention`].
+/// asserted where the numbers are chosen — see [`SseHub::with_retention`],
+/// which is also where the half of it an assertion **cannot** reach is stated:
+/// `ring_bytes` is a second way to shrink the ring below `live_queue`, and it
+/// depends on an event size no constructor knows.
 ///
 /// # Where §11.3's 4096 lives
 ///
@@ -262,12 +318,38 @@ pub struct Retention {
     /// task may fall behind the publisher before its receiver is bumped and
     /// the gap has to be recovered from the ring.
     ///
-    /// **256, and this number is a policy choice rather than a measurement**
+    /// **64, and this number is a policy choice rather than a measurement**
     /// (P18): no workload has been observed to establish how far a real
     /// subscriber falls behind. What is load-bearing is only that it is well
-    /// below `ring_events`, so that a bumped receiver has a wide band in which
-    /// the ring can still cover it. `tokio` rounds the capacity up to a power
-    /// of two, so a power of two is what is written here.
+    /// below `ring_events` **and** that `ring_bytes / live_queue` leaves room
+    /// for a realistic event, because that quotient — not `ring_events` — is
+    /// what actually decides whether a bumped receiver can be recovered. See
+    /// [`SseHub::with_retention`], where the relation is asserted as far as it
+    /// can be. `tokio` rounds the capacity up to a power of two, so a power of
+    /// two is what is written here.
+    ///
+    /// # Why 64 rather than 256
+    ///
+    /// 256 was the first choice, and it fails at this type's own defaults. The
+    /// derived headroom was `1 MiB / 256 = 4 KiB per event`, and a 4096-char
+    /// `Delta::Text` measures **4305 bytes** retained
+    /// (`a_retained_updates_size_is_its_serialised_payload_plus_the_fixed_wrapper`)
+    /// — over budget. A receiver that lagged by a full live queue of events
+    /// that size could not be recovered from the ring at all: the byte bound
+    /// had already evicted them. The recovery path this module is built around
+    /// was dead for the shipped hub, which
+    /// `the_default_retention_recovers_a_full_live_queue_of_realistic_events`
+    /// now pins.
+    ///
+    /// 64 puts the headroom at **16 KiB per event**, ~3.8x the measured 4305.
+    ///
+    /// **The same change bounds something else**, which is why it is one
+    /// constant and not two: a `tokio::sync::broadcast` slot holds its value
+    /// until every receiver live at send time consumes it, so a stalled client
+    /// retains up to `live_queue` payloads outside the ring's accounting. That
+    /// worst case falls from `256·E` to `64·E`. The recovery band and the
+    /// broadcast's retention are two views of this number; see
+    /// [`Retention::ring_bytes`] for the whole memory picture.
     pub live_queue: usize,
     /// §11.3's "ring buffer of the last 4096 events per session", in entries.
     pub ring_events: usize,
@@ -281,10 +363,9 @@ pub struct Retention {
     /// session's entry takes an arbitrary UUID with no authentication.
     ///
     /// **1 MiB, also a policy ceiling rather than a measurement** (P18): it is
-    /// 256 bytes per entry at §11.3's full 4096, and it is the number that
-    /// decides whether a hundred concurrent streams cost ~100 MiB or ~800 MiB.
-    /// Real event sizes in this workspace have not been sampled — nothing
-    /// publishes into the hub yet (residual 1) — so there is nothing to sample.
+    /// 256 bytes per entry at §11.3's full 4096. Real event sizes in this
+    /// workspace have not been sampled — nothing publishes into the hub yet
+    /// (residual 1) — so there is nothing to sample.
     ///
     /// The bound is enforced **after** the push, and never leaves the ring
     /// empty (see `Ring::push`). The consequence is deliberate and worth
@@ -292,13 +373,60 @@ pub struct Retention {
     /// `ring_events`, so a reconnecting client is more likely to be told
     /// `resync_required`. That is §11.3's own answer to a tail miss, and it is
     /// a visible signal rather than a silent gap.
+    ///
+    /// # What this bound does **not** cover
+    ///
+    /// It bounds **the ring**, not the session. Every update is one `Arc`
+    /// shared between the ring and every live queue slot, which makes the
+    /// fan-out reference counts rather than copies — but sharing means the
+    /// ceiling is set by the **larger** retainer, and only one of the two is
+    /// byte-bounded. `tokio::sync::broadcast` holds a slot's value until every
+    /// receiver live at send time has consumed it, so a stalled client keeps up
+    /// to [`Retention::live_queue`] payloads alive, and the ring's byte
+    /// eviction can drop those same entries while the broadcast still holds
+    /// them — putting them outside this figure's accounting entirely.
+    ///
+    /// So, per session, with `E` the largest published event:
+    ///
+    /// ```text
+    /// worst case  ~=  live_queue * E  +  max(ring_bytes, E)
+    /// ```
+    ///
+    /// At the defaults that is `64 * E + max(1 MiB, E)`. It reduces to
+    /// "~1 MiB per session" only while `E <= ring_bytes / live_queue`, which at
+    /// the defaults is 16 KiB — chosen against a measured 4305-byte event
+    /// (see [`Retention::live_queue`]), and **not** a bound anything enforces.
+    /// A single 4 MiB `TaskOutput::Json` makes it ~260 MiB for one session.
+    ///
+    /// # Two residuals, unowned
+    ///
+    /// Both are named here rather than in a ledger because neither is solved,
+    /// and the sentence above is only true within them:
+    ///
+    /// **A. Nothing caps `E`.** The bound that would make the arithmetic above
+    /// collapse to a constant is a **maximum event size at the publish site** —
+    /// reject or truncate an oversized update before it reaches
+    /// [`SseHub::publish`] — or a publisher that uses `TaskOutput::Blob`, which
+    /// carries a `BlobRef` rather than the bytes. This module cannot impose
+    /// either: it has no publisher (residual 1), and declining an update here
+    /// would put a hole in the ring (see `Ring::push`). **Owner: whichever
+    /// Subsystem D task writes the publisher.**
+    ///
+    /// **B. The end state is one retainer, not two.** Make the ring the sole
+    /// holder of payloads and let the broadcast carry only a wake-up — a `u64`
+    /// seq, or `()` — with `Connection::next` reading the payload back out of
+    /// the ring by seq. Every byte then lives in the one bounded structure, the
+    /// worst case really is `max(ring_bytes, E)`, and `Lagged` stops being an
+    /// interesting event at all, because the ring already answers it. That is a
+    /// refactor of this module's two-structure design, not a correction to it;
+    /// it is named as the target so the next change to this file starts there.
     pub ring_bytes: usize,
 }
 
 impl Default for Retention {
     fn default() -> Self {
         Self {
-            live_queue: 256,
+            live_queue: 64,
             ring_events: 4096,
             ring_bytes: 1024 * 1024,
         }
@@ -389,8 +517,17 @@ impl Ring {
     /// evicts every other one — but never more than the ring holds, and each entry
     /// is evicted at most once, so the eviction loop cannot outrun the pushes that
     /// fed it.
-    fn push(&mut self, update: Arc<SessionUpdate>) {
-        let bytes = retained_bytes(&update);
+    ///
+    /// `bytes` is taken as an argument rather than measured here, so that
+    /// [`retained_bytes`] — which walks the whole serialised payload — runs
+    /// **outside** the ring's lock. Under the lock it would cost one full
+    /// serialisation pass per publish while every other publisher for that
+    /// session waits, and [`SseHub::publish`] deliberately holds that lock
+    /// across the send as well. The caller must pass `retained_bytes(&update)`
+    /// for the same update; the value is then stored rather than recomputed on
+    /// eviction, so both ends of the accounting are the same number (see
+    /// [`Retained`]).
+    fn push(&mut self, update: Arc<SessionUpdate>, bytes: usize) {
         self.bytes = self.bytes.saturating_add(bytes);
         self.retained.push_back(Retained { update, bytes });
 
@@ -511,17 +648,25 @@ pub enum Replay {
 /// cannot undo, because by the time the filter runs the damage is done:
 ///
 /// - **Availability coupling.** A burst on session B pushes an *idle* session
-///   A's subscriber past the buffer, so A's stream ends in `resync_required`
-///   having produced no events of its own. With several tabs open, one busy
-///   session resyncs all of them at once.
-/// - **A cross-session side channel.** `RecvError::Lagged(n)` counts the
-///   messages *this receiver* skipped **across all sessions**, and
-///   `resync_required` reports that count to the client — so a client watching
-///   one session could infer the traffic volume of others.
+///   A's subscriber past the buffer. A then has to recover a gap it did not
+///   cause — from a ring that also holds B's events, so B's traffic decides
+///   whether A's own is still there. With several tabs open, one busy session
+///   degrades all of them at once.
+/// - **Cross-session delivery, one `==` away.** Every session's payload would
+///   physically reach every connection's receiver, with a `Filter` comparison
+///   the only thing between it and the wire.
 ///
 /// Keying the map by session makes cross-session delivery structurally
-/// impossible rather than one `==` away, gives each session its own capacity,
-/// and makes the lag count honest: it counts only this session's events.
+/// impossible rather than one `==` away, and gives each session its own
+/// capacity — its own live queue and its own ring, so neither one's occupancy
+/// is a function of another session's traffic.
+///
+/// (D2 also argued this from `RecvError::Lagged(n)`, which counts what a
+/// receiver skipped **across all sessions** and which D2's `resync_required`
+/// reported to the client as `dropped_events`. That half no longer applies:
+/// the count is not reported and `_dropped` is unused — the resync payload is
+/// two of this session's own seqs. The two reasons above are the ones that
+/// survive.)
 ///
 /// An entry exists only while some subscriber holds it. [`SessionSubscription`]
 /// removes its session's entry on drop once it is the last reader, so a client
@@ -562,11 +707,31 @@ impl SseHub {
     /// than left to `broadcast::channel`'s own assertion inside a lazily
     /// created channel, where they would be a panic in a request handler.
     ///
+    /// # The recovery band, and the half of it this assertion cannot reach
+    ///
     /// The ordering assertion is the whole reason [`Retention`] is one type:
-    /// every value the live queue drops must still be in the ring, or a
+    /// every value the live queue drops should still be in the ring, or a
     /// lagging subscriber is unrecoverable by construction and the recovery
     /// path is dead code that looks alive. Equality is permitted and gives a
-    /// recovery band of exactly zero — the default is 16x apart.
+    /// recovery band of exactly zero — the default is 64x apart.
+    ///
+    /// **But `live_queue <= ring_events` constrains only the *entry*
+    /// dimension.** The ring has a second bound, [`Retention::ring_bytes`],
+    /// which can shrink it below `live_queue` entries with nothing here
+    /// noticing — and it did, at this type's own first defaults, where
+    /// `1 MiB / 256` left 4 KiB per event against a measured 4305-byte one.
+    /// So, precisely:
+    ///
+    /// - The **entry** bound preserves the band, and is asserted below.
+    /// - The **byte** bound can shrink it, and is *not* asserted, because
+    ///   whether it does depends on the size of events this hub has not seen.
+    /// - The derived headroom is **`ring_bytes / live_queue`** — 16 KiB at the
+    ///   defaults — and that is the number a reader should check against their
+    ///   own workload, not `ring_events`.
+    ///
+    /// Nothing here can check the second bullet, since it needs an event size.
+    /// `the_default_retention_recovers_a_full_live_queue_of_realistic_events`
+    /// checks it for the configuration that actually ships.
     pub fn with_retention(retention: Retention) -> Self {
         let Retention {
             live_queue,
@@ -590,8 +755,9 @@ impl SseHub {
                 .checked_next_power_of_two()
                 .is_some_and(|rounded| rounded <= ring_events),
             "SseHub live_queue ({live_queue}, which tokio rounds up to a power of two) must not \
-             exceed ring_events ({ring_events}), or a lagging subscriber can never be recovered \
-             from the ring"
+             exceed ring_events ({ring_events}), or a lagging subscriber cannot be recovered from \
+             the ring by entry count alone — the byte bound can still shrink the band below it, \
+             which is not checkable here"
         );
         Self {
             retention,
@@ -636,6 +802,13 @@ impl SseHub {
     /// keeping dropped-value destructors out of it. The ring's own eviction
     /// runs destructors under this lock regardless, and correctness of ordering
     /// is worth more than where a `Drop` runs.)
+    ///
+    /// Since that lock is held across two operations, what runs **inside** it is
+    /// kept to the two: [`retained_bytes`] walks the whole serialised payload,
+    /// so it is measured here, before the lock, and handed to `Ring::push`. A
+    /// publish for a session with N connections would otherwise cost one full
+    /// serialisation pass for the ring plus N for the frames, with the first of
+    /// them blocking every other publisher for that session.
     pub fn publish(&self, update: SessionUpdate) -> usize {
         let Some(channel) = self.session_channel(update.session_id) else {
             return 0;
@@ -643,8 +816,9 @@ impl SseHub {
         // One allocation, shared by the ring and by every live queue slot: the
         // fan-out is reference counts, not copies of the payload.
         let update = Arc::new(update);
+        let bytes = retained_bytes(&update);
         let mut ring = channel.ring.lock().unwrap_or_else(PoisonError::into_inner);
-        ring.push(Arc::clone(&update));
+        ring.push(Arc::clone(&update), bytes);
         channel.tx.send(update).unwrap_or(0)
     }
 
@@ -893,6 +1067,21 @@ fn cursor_rejected(error: CursorError) -> Response {
 /// single monotonic allocator (`COALESCE(MAX(seq), -1) + 1`, `writer.rs:171`)
 /// does not. Recorded because it is a real constraint on the publisher
 /// residual 1 calls for, and it is invisible from the client side.
+///
+/// # The publisher's contract, in full — both clauses
+///
+/// Together with [`Connection::deliver`]'s gap check, this module requires two
+/// things of whatever eventually publishes into the hub:
+///
+/// 1. **Seqs are allocated in order, per session.** Out-of-order allocation
+///    loses an event here, silently (above).
+/// 2. **Every allocated seq is published into the hub.** A publisher that
+///    forwarded only some event kinds would leave holes, and every hole is a
+///    `resync_required` at [`Connection::deliver`] — a client that resyncs
+///    forever rather than one that misses events, but unusable either way.
+///
+/// Both are invisible from the client side, and neither is enforceable from
+/// this crate, which has no publisher to check (residual 1).
 #[derive(Debug, Clone, Copy)]
 struct Filter {
     session_id: SessionId,
@@ -931,7 +1120,10 @@ struct Connection {
 /// What a connection has next.
 enum Next {
     Update(Arc<SessionUpdate>),
-    /// §11.3's tail miss. Terminal.
+    /// The events the client still needs are older than the oldest the server
+    /// can offer — §11.3's tail miss, or the delivery-time discontinuity
+    /// [`Connection::deliver`] describes, which is the same condition where the
+    /// ring is empty and so has no tail to compare against. Terminal.
     Resync {
         resume_from: u64,
         oldest_retained: u64,
@@ -941,6 +1133,61 @@ enum Next {
 }
 
 impl Connection {
+    /// Emit `update`, discard it as one this connection does not want, or
+    /// report the gap it reveals.
+    ///
+    /// # The gap check, and why it is here rather than at the ring
+    ///
+    /// `resume_from` is *the next seq this connection still owes the client*.
+    /// An accepted update whose seq is **greater** than it means every seq in
+    /// between was never delivered — the client's next `Last-Event-ID` would
+    /// jump the gap with nothing in the stream marking it, which is precisely
+    /// what the [`SseHub`] docs call *"the opposite of §11.3's contract"*.
+    ///
+    /// Checking it **at delivery** rather than at the ring is what makes the
+    /// check total. [`Ring::replay_since`] can only compare a cursor against
+    /// what the ring *holds*; it cannot see a gap opened by events that were
+    /// published while nobody was subscribed, because those left no trace
+    /// anywhere ([`SseHub::publish`] with no entry is a no-op — residual 5). A
+    /// client whose tab closed, whose session's entry was therefore pruned, and
+    /// which reconnects after the daemon appended more events, finds an **empty
+    /// ring** — no tail, so no tail miss — and would otherwise be taken live at
+    /// the next event with the intervening ones silently gone. Here that
+    /// arrives as the same `resync_required` a tail miss produces, from the same
+    /// two numbers, because it is the same condition generalised: *the events
+    /// the client still needs are older than the oldest the server can offer.*
+    /// The same check also covers a byte eviction that outran a live cursor
+    /// mid-stream, which no ring-side test can reach.
+    ///
+    /// It does **not** resync a client that has simply caught up: a client that
+    /// resynced, snapshotted at seq 26 and reconnected at `resume_from = 27`
+    /// receives seq 27 as an ordinary frame even though the ring is empty,
+    /// because 27 is not greater than 27. Only an actual discontinuity fires.
+    ///
+    /// # What it costs: a tightened contract on the publisher
+    ///
+    /// The publisher's obligation grows from *"seqs are allocated in order per
+    /// session"* to **"...and every allocated seq is published into the hub"**.
+    /// A publisher that filtered event kinds — forwarding `TaskCompleted` but
+    /// not `TaskDelta`, say — would leave holes in the seq sequence and this
+    /// check would fire on every one of them, resyncing the client constantly.
+    /// It belongs beside [`Filter`]'s existing constraint on seq *ordering*,
+    /// and both clauses are stated together there. It is the price of detecting
+    /// a gap the server cannot otherwise see.
+    fn deliver(&mut self, update: Arc<SessionUpdate>) -> Option<Next> {
+        if !self.filter.accepts(&update) {
+            return None;
+        }
+        if update.seq > self.filter.resume_from {
+            return Some(Next::Resync {
+                resume_from: self.filter.resume_from,
+                oldest_retained: update.seq,
+            });
+        }
+        self.filter.advance_past(update.seq);
+        Some(Next::Update(update))
+    }
+
     /// The next thing to emit, having already dealt with everything that is not
     /// one: duplicates, another session's updates, and a lag the ring can cover.
     ///
@@ -951,21 +1198,17 @@ impl Connection {
     async fn next(&mut self) -> Next {
         loop {
             if let Some(update) = self.pending.pop_front() {
-                if !self.filter.accepts(&update) {
-                    continue;
+                match self.deliver(update) {
+                    Some(next) => return next,
+                    None => continue,
                 }
-                self.filter.advance_past(update.seq);
-                return Next::Update(update);
             }
 
             match self.rx.recv().await {
-                Ok(update) => {
-                    if !self.filter.accepts(&update) {
-                        continue;
-                    }
-                    self.filter.advance_past(update.seq);
-                    return Next::Update(update);
-                }
+                Ok(update) => match self.deliver(update) {
+                    Some(next) => return next,
+                    None => continue,
+                },
                 // Bumped out of the live queue. The missing range is
                 // everything from this connection's resume point on, and the
                 // ring is asked for exactly that — the same question a
@@ -1138,14 +1381,17 @@ fn stream_error(message: &str) -> Event {
 
 /// §11.3's `resync_required`, and **the only place it is produced**.
 ///
-/// One condition reaches it, the one §11.3 names: the events the client still
-/// needs are older than the ring's tail. Both paths that can discover it — a
-/// reconnect whose cursor arrives too late, and a subscriber whose lag outran
-/// the ring — ask [`Ring::replay_since`] the same question and land here with
-/// the same two numbers. D2 also emitted this name for `Lagged`, with a
-/// `{"dropped_events": n}` payload, because it had no ring to recover from;
-/// keeping both would have been one client-visible signal with two meanings and
-/// two shapes.
+/// One condition reaches it — *the events the client still needs are older than
+/// the oldest the server can offer* — which is §11.3's *"the cursor is older
+/// than the ring's tail"* wherever a tail exists, and
+/// [`Connection::deliver`]'s seq discontinuity where one does not. Three paths
+/// discover it: a reconnect whose cursor arrives too late, a subscriber whose
+/// lag outran the ring (both via [`Ring::replay_since`]), and a delivered
+/// update that skips ahead of what this connection still owes. All three land
+/// here with the same two numbers and the same payload shape. D2 also emitted
+/// this name for `Lagged`, with a `{"dropped_events": n}` payload, because it
+/// had no ring to recover from; keeping both would have been one client-visible
+/// signal with two meanings and two shapes.
 ///
 /// The payload states the two ends of the gap. How many events were lost is
 /// `oldest_retained - resume_from`, and it is **not** a third field: a second
@@ -1212,6 +1458,15 @@ mod tests {
         })
     }
 
+    /// `Ring::push` takes the size as an argument so that measuring it happens
+    /// outside the ring's lock (see [`SseHub::publish`]). These tests are the
+    /// only other caller, and they must pair the same two values the publisher
+    /// does — hence one helper rather than the measurement repeated per push.
+    fn push(ring: &mut Ring, update: Arc<SessionUpdate>) {
+        let bytes = retained_bytes(&update);
+        ring.push(update, bytes);
+    }
+
     /// The byte counter counts what a serialiser would write, byte for byte —
     /// so the budget is compared against the payload's real serialised size and
     /// not against a guess at it.
@@ -1247,13 +1502,13 @@ mod tests {
 
         let mut ring = ring(3, usize::MAX);
         for seq in 0..3 {
-            ring.push(update(session_id, seq, "delta"));
+            push(&mut ring, update(session_id, seq, "delta"));
         }
         assert_eq!(ring.retained.len(), 3);
         assert_eq!(ring.bytes, one * 3, "three equal-sized updates");
 
         // Past the entry bound: the oldest goes, and its bytes go with it.
-        ring.push(update(session_id, 3, "delta"));
+        push(&mut ring, update(session_id, 3, "delta"));
         assert_eq!(ring.retained.len(), 3);
         assert_eq!(ring.bytes, one * 3);
         assert_eq!(
@@ -1274,7 +1529,7 @@ mod tests {
 
         let mut ring = ring(4096, budget);
         for seq in 0..10 {
-            ring.push(update(session_id, seq, &payload));
+            push(&mut ring, update(session_id, seq, &payload));
         }
 
         assert_eq!(
@@ -1300,7 +1555,7 @@ mod tests {
         let mut ring = ring(4096, 1024);
 
         for seq in 0..3 {
-            ring.push(update(session_id, seq, &payload));
+            push(&mut ring, update(session_id, seq, &payload));
         }
 
         assert_eq!(ring.retained.len(), 1, "never evicted down to nothing");
@@ -1334,7 +1589,7 @@ mod tests {
         let session_id = SessionId::new();
         let mut ring = ring(4096, usize::MAX);
         for seq in 0..5 {
-            ring.push(update(session_id, seq, "delta"));
+            push(&mut ring, update(session_id, seq, "delta"));
         }
 
         let seqs = |replay| match replay {

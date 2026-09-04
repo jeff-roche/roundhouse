@@ -140,6 +140,15 @@ struct Streamed {
     body: String,
 }
 
+/// A runaway-body valve for `to_bytes`, not an assertion: no test's meaning
+/// depends on it, and every test that cares about how much was emitted asserts
+/// on the frames instead.
+///
+/// It has to sit above the largest body any test here collects, which is
+/// `the_default_retention_recovers_a_full_live_queue_of_realistic_events` —
+/// 65 events of 4096 characters, **measured at ~280 KiB** of frames.
+const MAX_COLLECTED_BODY: usize = 2 * 1024 * 1024;
+
 /// Drives the real router end to end.
 ///
 /// Ordering is load-bearing: the request is dispatched **first**, because the
@@ -189,11 +198,11 @@ async fn stream(
     // the wait is bounded and reported as a failure instead.
     let body = tokio::time::timeout(
         Duration::from_secs(10),
-        axum::body::to_bytes(response.into_body(), 64 * 1024),
+        axum::body::to_bytes(response.into_body(), MAX_COLLECTED_BODY),
     )
     .await
     .expect("the SSE stream must terminate once every sender is dropped")
-    .expect("body fits in 64 KiB");
+    .expect("body fits in MAX_COLLECTED_BODY");
 
     Streamed {
         status,
@@ -823,6 +832,203 @@ async fn the_rings_byte_bound_evicts_where_its_entry_bound_would_not() {
             .map(|seq| format!("{session}:{seq}"))
             .collect::<Vec<_>>(),
         "12 KiB of events fit a 1 MiB ring and must all be replayed"
+    );
+}
+
+/// A gap that opened while **nobody was subscribed** is signalled, not jumped.
+///
+/// This is the one case the ring cannot see. A session with no subscriber has
+/// no entry, so `publish` is a no-op and retains nothing — there is no tail for
+/// a cursor to be older than. `Ring::replay_since` therefore answers an empty
+/// ring with "nothing missed", correctly, and the discontinuity is caught one
+/// layer later: the first delivered event whose seq is past what this
+/// connection still owes the client.
+///
+/// Without that check the client is handed a **silent gap**: status 200, no
+/// `resync_required`, a body containing only seq 5, and a `Last-Event-ID` that
+/// jumps `:1` -> `:5` with nothing in the protocol saying seq 2, 3 and 4 ever
+/// existed.
+///
+/// **Mutations killed:** (a) removing the `update.seq > self.filter.resume_from`
+/// arm from `Connection::deliver` — the body becomes a single ordinary frame
+/// with `id: <session>:5` and no `event:` field, which is the silent jump
+/// itself; (b) answering an empty ring with `resync_required` instead (rejected
+/// as ruling P83's mutation M7) — that fires on a *first* connection to a fresh
+/// entry too, and
+/// `an_absent_last_event_id_streams_from_seq_zero_rather_than_treating_zero_as_a_sentinel`
+/// fails alongside this one, which is how the pair pins "only a real
+/// discontinuity resyncs".
+#[tokio::test]
+async fn a_gap_opened_while_nobody_was_subscribed_is_a_resync_rather_than_a_silent_jump() {
+    let hub = SseHub::new();
+    let session = SessionId::new();
+
+    // The first tab sees seq 0 and 1, then closes. Being the session's last
+    // subscriber, it takes the entry — channel and ring — with it.
+    {
+        let _tab = hub.subscribe(session);
+        for (seq, text) in [(0, "zeroth"), (1, "first")] {
+            publish(&hub, text_event(session, seq, text));
+        }
+    }
+    assert_eq!(
+        hub.tracked_sessions(),
+        0,
+        "the closed tab was the last subscriber, so the ring went with it"
+    );
+
+    // The daemon keeps appending while no stream is open. With no entry there
+    // is nothing to publish into: these reach nobody and are retained nowhere.
+    for seq in 2..5 {
+        assert_eq!(
+            hub.publish(text_event(session, seq, "nobody was listening")),
+            0,
+            "a session with no subscriber has neither a channel nor a ring"
+        );
+    }
+
+    // The tab reopens at the last cursor it actually saw, and the next event
+    // the daemon appends arrives on the new stream.
+    let resume_from = format_event_id(&Cursor {
+        session_id: session,
+        seq: 1,
+    });
+    let streamed = stream(
+        hub,
+        &events_uri(session),
+        Some(resume_from.as_bytes()),
+        |hub| publish(hub, text_event(session, 5, "after the gap")),
+    )
+    .await;
+
+    assert_eq!(streamed.status, StatusCode::OK);
+    let frames = parse_frames(&streamed.body);
+    assert_eq!(
+        frames.len(),
+        1,
+        "the resync is terminal, and seq 5 is not delivered as though nothing were \
+         missing; body was:\n{}",
+        streamed.body
+    );
+    assert_eq!(
+        frames[0].event.as_deref(),
+        Some("resync_required"),
+        "seq 5 arriving where seq 2 was owed is a gap, not an ordinary frame; body was:\n{}",
+        streamed.body
+    );
+    assert_eq!(frames[0].id, None);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            frames[0].data.as_deref().expect("a stated payload")
+        )
+        .expect("JSON"),
+        // The client holds seq 1, so it still needs seq 2; the oldest the
+        // server can offer is the seq 5 that just arrived.
+        serde_json::json!({ "resume_from": 2, "oldest_retained": 5 }),
+    );
+}
+
+/// A client that resynced and caught up is **not** resynced again, even though
+/// its session's ring is empty.
+///
+/// The pair to the test above, and the reason the check is on a seq
+/// discontinuity rather than on "the ring is empty". A client that took the
+/// resync, refetched a snapshot through seq 25 and reconnected at `:25` is owed
+/// seq 26 — so seq 26 arriving is continuity, not a gap, and it must be
+/// delivered as an ordinary frame. Otherwise every recovered client resyncs
+/// forever.
+///
+/// **Mutation killed:** answering an empty ring with `resync_required` (ruling
+/// P83's M7) — the body becomes one `resync_required` frame instead of the two
+/// ordinary frames asserted here.
+#[tokio::test]
+async fn a_client_that_reconnects_exactly_where_it_left_off_is_not_resynced_by_an_empty_ring() {
+    let hub = SseHub::new();
+    let session = SessionId::new();
+
+    let resume_from = format_event_id(&Cursor {
+        session_id: session,
+        seq: 25,
+    });
+    let streamed = stream(
+        hub,
+        &events_uri(session),
+        Some(resume_from.as_bytes()),
+        |hub| {
+            for (seq, text) in [(26, "next"), (27, "and the one after")] {
+                publish(hub, text_event(session, seq, text));
+            }
+        },
+    )
+    .await;
+
+    assert_eq!(streamed.status, StatusCode::OK);
+    assert!(
+        parse_frames(&streamed.body)
+            .iter()
+            .all(|frame| frame.event.is_none()),
+        "seq 26 is exactly what a client holding seq 25 is owed; body was:\n{}",
+        streamed.body
+    );
+    assert_eq!(
+        frame_ids(&streamed.body),
+        vec![format!("{session}:26"), format!("{session}:27")],
+    );
+}
+
+/// The recovery band has to hold **at the retention that actually ships**.
+///
+/// `live_queue <= ring_events` is asserted in `SseHub::with_retention`, but it
+/// constrains only the entry dimension: `ring_bytes` can shrink the ring below
+/// `live_queue` entries with nothing noticing. At the first defaults it did —
+/// `1 MiB / 256` left 4 KiB per event against a 4305-byte measured one — so a
+/// receiver bumped by a full live queue of realistic events could not be
+/// recovered from the ring at all, and the whole recovery path was dead for
+/// `SseHub::new()`.
+///
+/// So this test takes `Retention::default()` **verbatim** and derives its own
+/// size from it: one more event than the live queue holds, which bumps the
+/// receiver by construction, each carrying a 4096-character `Delta::Text` —
+/// the same payload size `sse.rs`'s own byte-accounting unit test measures at
+/// 4305 bytes retained. Every one of them must come back.
+///
+/// **Mutation killed:** `live_queue: 256` (the first default). `published`
+/// becomes 257, the ring's byte bound evicts the oldest 14 entries at
+/// 257 x 4305 = 1,106,385 bytes against a 1 MiB budget, and the body becomes a
+/// single `resync_required` frame carrying
+/// `{"resume_from": 0, "oldest_retained": 14}` instead of 65 event frames.
+/// Measured, not reasoned. Nothing else in the suite changes, because every
+/// other test that pins a lag boundary sets `live_queue` explicitly.
+#[tokio::test]
+async fn the_default_retention_recovers_a_full_live_queue_of_realistic_events() {
+    let published = Retention::default().live_queue + 1;
+    let realistic = "x".repeat(4096);
+    let hub = SseHub::new();
+    let session = SessionId::new();
+
+    let streamed = stream(hub, &events_uri(session), None, |hub| {
+        for seq in 0..published as u64 {
+            publish(hub, text_event(session, seq, &realistic));
+        }
+    })
+    .await;
+
+    assert_eq!(streamed.status, StatusCode::OK);
+    assert!(
+        parse_frames(&streamed.body)
+            .iter()
+            .all(|frame| frame.event.is_none()),
+        "the shipped hub must recover its own live queue from its own ring; \
+         body was {} bytes and began:\n{}",
+        streamed.body.len(),
+        &streamed.body[..streamed.body.len().min(512)],
+    );
+    assert_eq!(
+        frame_ids(&streamed.body),
+        (0..published as u64)
+            .map(|seq| format!("{session}:{seq}"))
+            .collect::<Vec<_>>(),
+        "every event the default live queue dropped must still be in the default ring"
     );
 }
 
