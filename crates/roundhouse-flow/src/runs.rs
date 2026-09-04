@@ -168,6 +168,16 @@ pub fn load_run_summaries(conn: &Connection, limit: usize) -> Result<Vec<RunSumm
     Ok(summaries)
 }
 
+/// The statement [`load_report`] runs.
+///
+/// A named constant so the query-plan test can ask SQLite about **the string
+/// the code executes**, rather than about a copy of it that could drift.
+const LOAD_REPORT_SQL: &str = "SELECT e.payload
+           FROM events e
+           JOIN tasks t ON t.task_id = e.task_id
+          WHERE t.session_id = ?1 AND t.kind = ?2
+          ORDER BY e.seq DESC";
+
 /// The report a run's session persisted, or `None` if it has none yet.
 ///
 /// Takes the newest `TaskCompleted`-with-JSON event of any `Report` task in the
@@ -194,20 +204,25 @@ pub fn load_run_summaries(conn: &Connection, limit: usize) -> Result<Vec<RunSumm
 /// materialises and sorts it before yielding anything: the first row is not
 /// cheap because it is first. What is true, and is the part that matters, is
 /// that the sorted set is **bounded to this session's `Report`-task events** by
-/// the two index searches above — not to the session's whole log — and a session
-/// has a handful of those. The cost is fine; the mechanism was described wrongly.
+/// the two index searches and the `kind` predicate — not to the session's whole
+/// log — and a session has a handful of those. (The searches alone bound it to
+/// the session's tasks and their events; `t.kind = ?2` has no index and is a
+/// plain filter, which is the part that narrows it to `Report`.) The cost is
+/// fine; the mechanism was described wrongly.
+///
+/// That plan is now **asserted** rather than quoted:
+/// `tests::the_report_query_sorts_through_a_temp_b_tree` runs
+/// `EXPLAIN QUERY PLAN` over [`LOAD_REPORT_SQL`] against the same migrations
+/// and fails if the `USE TEMP B-TREE` line goes away. A future migration adding
+/// an index that serves this `ORDER BY` would make the paragraph above wrong,
+/// and it should be a failing test rather than prose nobody re-measures — which
+/// is exactly what happened to the claim this replaced.
 fn load_report(
     conn: &Connection,
     session_id: SessionId,
     run_id: RunId,
 ) -> Result<Option<Report>, RunsError> {
-    let mut stmt = conn.prepare(
-        "SELECT e.payload
-           FROM events e
-           JOIN tasks t ON t.task_id = e.task_id
-          WHERE t.session_id = ?1 AND t.kind = ?2
-          ORDER BY e.seq DESC",
-    )?;
+    let mut stmt = conn.prepare(LOAD_REPORT_SQL)?;
     let mut rows = stmt.query(rusqlite::params![
         session_id.to_string(),
         report_task_kind()
@@ -253,6 +268,41 @@ fn extract_report_json(payload: &str) -> Option<serde_json::Value> {
 mod tests {
     use super::*;
     use roundhouse_core::{EventPayload, TaskOutput, Usage};
+
+    /// [`load_report`]'s cost paragraph quotes a plan; this is what keeps the
+    /// quote true. The claim that matters is the **negative** one — no index
+    /// serves `ORDER BY e.seq DESC` over the join, so SQLite sorts the joined
+    /// rowset — and `USE TEMP B-TREE` is how that shows up in the plan.
+    ///
+    /// Asserted against the real migrations through
+    /// [`crate::durability::open_test_db`], not against a hand-built schema:
+    /// the plan is a function of which indexes exist, so a fixture with
+    /// different indexes would measure a different database. A migration that
+    /// added a serving index would fail here, which is the point — the previous
+    /// version of that paragraph was an unmeasured inference, and replacing it
+    /// with a more specific unmeasured one would have been the same mistake
+    /// with better prose.
+    #[test]
+    fn the_report_query_sorts_through_a_temp_b_tree() {
+        let conn = crate::durability::open_test_db();
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {LOAD_REPORT_SQL}"))
+            .expect("the report query prepares against the real schema");
+        let plan: Vec<String> = stmt
+            .query_map(rusqlite::params![None::<String>, None::<String>], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("EXPLAIN QUERY PLAN yields rows")
+            .collect::<Result<_, _>>()
+            .expect("every plan row has a detail column");
+        let plan = plan.join("\n");
+
+        assert!(
+            plan.contains("USE TEMP B-TREE"),
+            "load_report's doc comment says the joined rowset is sorted rather than walked in \
+             index order; the plan now says:\n{plan}"
+        );
+    }
 
     /// The contract of §2 of this module's docs, checked against the real type
     /// rather than against a hand-written JSON string: whatever
