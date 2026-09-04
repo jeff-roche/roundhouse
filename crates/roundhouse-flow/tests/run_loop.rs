@@ -2809,3 +2809,80 @@ fn a_findings_title_is_bounded_even_when_the_step_message_that_produced_it_is_no
          {title:?}"
     );
 }
+
+/// The other two members of "the author declared a `report:` but there is no
+/// document": it **failed**, and its own `when:` **skipped** it. With the emit
+/// deferred, both must fall through to the synthesised producer — §8.6 still
+/// owes the run exactly one report, and it must not be an empty or invented
+/// stand-in for the author's.
+///
+/// (Before this round the failed case was guarded by a second flag in
+/// `record`, which the mutation sweep showed no test could distinguish once
+/// the document became the gate. The flag is gone; these two tests are what
+/// hold the gate.)
+#[test]
+fn a_report_step_that_fails_leaves_the_run_the_synthesised_report_not_a_missing_one() {
+    let (conn, run_id, sink, _, result) = drive(
+        "steps:\n\
+         \x20 - id: report\n\
+         \x20   report:\n\
+         \x20     outcome: not_a_real_outcome\n\
+         \x20     severity: low\n\
+         \x20     headline: invalid\n\
+         \x20     needs_human: false\n\
+         \x20     cost: { usd: 0.0, tokens: 0 }\n",
+        10,
+    );
+    let RunOutcome::Terminal { state, report, .. } = result.expect("the run drives") else {
+        panic!("no gate");
+    };
+    assert_eq!(
+        state,
+        RunState::Failed,
+        "an invalid `report:` fails its step"
+    );
+    assert_eq!(
+        report,
+        ReportOrigin::Synthesised,
+        "no document was produced, so the second producer runs"
+    );
+    assert_eq!(step_row(&conn, run_id, "report").0, StepRunState::Failed);
+    let document = sink.the_report();
+    assert_eq!(document["synthesised_by"], "run_loop");
+    assert_eq!(document["run_state"], "failed");
+}
+
+#[test]
+fn a_report_step_skipped_by_its_own_when_gate_is_not_re_rendered_into_existence() {
+    let (conn, run_id, sink, _, result) = drive(
+        "steps:\n\
+         \x20 - id: work\n\
+         \x20   emit: { a: 1 }\n\
+         \x20 - id: report\n\
+         \x20   needs: [work]\n\
+         \x20   when: \"${{ false }}\"\n\
+         \x20   report:\n\
+         \x20     outcome: changed\n\
+         \x20     severity: low\n\
+         \x20     headline: never written\n\
+         \x20     needs_human: false\n\
+         \x20     cost: { usd: 0.0, tokens: 0 }\n",
+        10,
+    );
+    let RunOutcome::Terminal { state, report, .. } = result.expect("the run drives") else {
+        panic!("no gate");
+    };
+    assert_eq!(state, RunState::Completed);
+    assert_eq!(step_row(&conn, run_id, "report").0, StepRunState::Skipped);
+    assert_eq!(
+        report,
+        ReportOrigin::Synthesised,
+        "a step the author's own `when:` skipped did not write a report, and \
+         the loop must not run it anyway to manufacture one"
+    );
+    assert_eq!(
+        sink.the_report()["headline"],
+        "run completed: 2 steps",
+        "the synthesised headline, not the author's `never written`"
+    );
+}

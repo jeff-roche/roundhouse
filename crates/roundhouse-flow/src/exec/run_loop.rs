@@ -429,8 +429,8 @@ pub fn run_workflow<H: WorkflowHost>(
         steps_context: serde_json::Map::new(),
         secret_derived_steps: Vec::new(),
         outcomes: Vec::new(),
-        authored_report: None,
         report_step,
+        report_completed_before: false,
         finished_before: finished_step_rows(&recovered.steps),
         gate_answer: resume,
     };
@@ -661,15 +661,19 @@ struct Loop<'c, H: WorkflowHost> {
     steps_context: serde_json::Map<String, Value>,
     secret_derived_steps: Vec<String>,
     outcomes: Vec<StepOutcome>,
-    /// The id of the `report:` step that completed, whether on **this** pass
-    /// or an earlier one — see [`Loop::seed_context_from_checkpoints`] for why
-    /// the second half matters.
-    authored_report: Option<String>,
-    /// The workflow's one `report:` step, if it declares one. Kept so a
-    /// re-drive whose report step is already checkpointed can still produce
-    /// the document (`ensure_report` re-renders it); `run_workflow`'s §8.6
-    /// pre-check has already established there is at most one.
+    /// The workflow's one `report:` step, if it declares one — `run_workflow`'s
+    /// §8.6 pre-check has already established there is at most one.
+    ///
+    /// The `StepDef` itself and not just an id, because a re-drive whose
+    /// report step is already checkpointed has to **re-render** the document;
+    /// see [`Loop::ensure_report`].
     report_step: Option<StepDef>,
+    /// Whether that step's row already says `Completed` from an earlier pass.
+    ///
+    /// The other half of "did the author write a report", and the half
+    /// `finished_before` hides — see
+    /// [`Loop::seed_context_from_checkpoints`].
+    report_completed_before: bool,
     finished_before: HashMap<String, WorkflowStepRun>,
     gate_answer: Option<GateAnswer>,
 }
@@ -720,7 +724,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
                     .as_ref()
                     .is_some_and(|step| step.id == row.step_id)
             {
-                self.authored_report = Some(row.step_id.clone());
+                self.report_completed_before = true;
             }
             let (status, output) = match row.state {
                 StepRunState::Completed => (
@@ -956,11 +960,6 @@ impl<H: WorkflowHost> Loop<'_, H> {
     fn record(&mut self, step: &StepDef, outcome: StepOutcome) -> Result<(), RunLoopError> {
         if outcome.output_is_secret_derived {
             self.secret_derived_steps.push(step.id.clone());
-        }
-        if matches!(step.body, StepBody::Report { .. })
-            && matches!(outcome.status, StepStatus::Completed)
-        {
-            self.authored_report = Some(step.id.clone());
         }
         self.steps_context
             .insert(step.id.clone(), steps_context_entry(&outcome));
@@ -1412,47 +1411,48 @@ impl<H: WorkflowHost> Loop<'_, H> {
         executor: &mut Executor<'_>,
         state: RunState,
     ) -> Result<ReportPersisted, RunLoopError> {
-        let Some(step_id) = self.authored_report.clone() else {
+        let Some(step) = self.report_step.clone() else {
             return self.synthesise_report(executor, state);
         };
 
+        // **The document is the gate, not the step's status.** With the emit
+        // deferred, "the author wrote a report" and "there is a report
+        // document to emit" are the same fact, and reading it off the slot
+        // rather than off a second flag is what keeps them from disagreeing —
+        // a `report:` step that failed, or that its `when:` skipped, leaves
+        // the slot empty and falls through to synthesis with no special case
+        // anywhere.
         let document = match take_deferred_report(executor) {
             Some(document) => Some(document),
-            // The report step completed on an **earlier** pass, so
-            // `finished_before` skipped it this time and the executor holds
-            // nothing. Re-render it: `report:` is an interpolation of workflow
-            // source against a context this loop has already rebuilt from the
-            // checkpoint rows, and the redaction that makes it safe to persist
-            // needs live provenance that the stored (unredacted) step output
-            // cannot supply.
+            // Nothing ran it on this pass. If its row says it completed on an
+            // earlier one, re-render: `report:` is an interpolation of
+            // workflow source against a context this loop has already rebuilt
+            // from the checkpoint rows, and the redaction that makes it safe
+            // to persist needs live provenance the stored (unredacted) step
+            // output cannot supply.
             //
             // Deliberately dispatched **here** rather than by un-skipping the
             // step in `run_phase`: that would re-admit it against the budget
             // and re-evaluate its `when:`, letting a condition that reads
             // differently now change a control-flow decision that already
             // happened ([`StepRunState::Skipped`]'s own argument).
-            None => {
-                let step = self
-                    .report_step
-                    .clone()
-                    .expect("authored_report is only ever set from report_step");
+            None if self.report_completed_before => {
                 self.bind_steps_context(executor);
                 executor.dispatch_step(&step);
                 take_deferred_report(executor)
             }
+            None => None,
         };
 
         match document {
             Some(document) => {
                 persist_report(executor, document, state)
                     .map_err(RunLoopError::AnnotatedReportInvalid)?;
-                Ok(ReportPersisted(ReportOrigin::Authored { step_id }))
+                Ok(ReportPersisted(ReportOrigin::Authored { step_id: step.id }))
             }
-            // Re-rendering failed (its `${{ }}` no longer resolves, or the
-            // document no longer validates). §8.6 still owes this run a
-            // report, so the second producer runs — the one case where a
-            // terminal run's report is `Synthesised` despite the workflow
-            // having authored one.
+            // The `report:` step failed, was skipped by its own `when:`, never
+            // ran, or re-rendered into something that no longer validates.
+            // §8.6 still owes this run a report, so the second producer runs.
             None => self.synthesise_report(executor, state),
         }
     }
