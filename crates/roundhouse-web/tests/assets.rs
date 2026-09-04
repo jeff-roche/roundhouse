@@ -389,15 +389,21 @@ async fn a_handler_taking_app_state_composes_with_the_asset_router() {
 
 #[tokio::test]
 async fn build_router_serves_the_same_assets_as_the_bare_asset_router() {
-    let response = roundhouse_web::build_router(roundhouse_web::AppState::default())
-        .oneshot(
-            Request::builder()
-                .uri("/w/default/inbox")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .expect("router is infallible");
+    // Task 33 added the bind argument. Loopback here because this test is about
+    // asset routing, and the loopback bind is the one with no gate in front of
+    // it — `tests/lan_auth.rs` is where the gated variant is exercised.
+    let response = roundhouse_web::build_router(
+        roundhouse_web::AppState::default(),
+        &roundhouse_web::lan_auth::BindConfig::loopback(),
+    )
+    .oneshot(
+        Request::builder()
+            .uri("/w/default/inbox")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .expect("router is infallible");
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_bytes(response).await, embedded_index_html());

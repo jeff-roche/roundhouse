@@ -27,6 +27,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use roundhouse_core::{Delta, EventPayload, SessionId};
 use roundhouse_proto::ClientEvent;
+use roundhouse_web::lan_auth::BindConfig;
 use roundhouse_web::sse::{
     format_event_id, parse_last_event_id, Cursor, Retention, SessionUpdate, SseHub,
 };
@@ -181,7 +182,9 @@ async fn stream(
     }
     let request = builder.body(Body::empty()).expect("request builds");
 
-    let response = build_router(AppState { sse: hub.clone() })
+    // Task 33 added the bind argument. Loopback: these are cursor tests, and
+    // the loopback bind is the one that puts no gate in front of the stream.
+    let response = build_router(AppState { sse: hub.clone() }, &BindConfig::loopback())
         .oneshot(request)
         .await
         .expect("router is infallible");

@@ -9,17 +9,21 @@
 //! `(session_id, seq)` cursor. Task 32 (D3) added the rest of §11.3 — the
 //! per-session ring the cursor is answered from, inside the same hub, so a
 //! reconnecting client's gap is replayed and `resync_required` is left naming
-//! the one condition §11.3 gives it. See [`sse`]. **This crate still binds no
-//! listener and starts no server**, and nothing links it yet.
+//! the one condition §11.3 gives it. See [`sse`]. Task 33 (D4) added the rest
+//! of §11.3's access scope: the opt-in LAN bind and its shared per-device
+//! token, in [`lan_auth`], layered over the whole router by [`build_router`].
+//! **This crate still binds no listener and starts no server**, and nothing
+//! links it yet — so [`lan_auth::BindConfig::bind_addr`] has no caller.
 //!
 //! Wiring it up is a separate, later piece of work, and it is not free: it has
 //! to add the `roundhouse-daemon -> roundhouse-web` Cargo edge, update
 //! `xtask/tests/workspace_shape.rs`'s exact-set assertion on the daemon's
 //! dependencies, and update §5.2's daemon row in
 //! `docs/architecture/02-system-architecture.md` — all three in one commit, or
-//! the workspace-shape test fails. It also cannot happen before the
-//! loopback-vs-LAN binding policy (§11.3) exists, and `roundhouse-daemon`'s
-//! `main.rs` has no long-running accept loop to hang a listener off yet.
+//! the workspace-shape test fails. The loopback-vs-LAN binding policy (§11.3)
+//! that used to block it now exists — see [`lan_auth`] — but
+//! `roundhouse-daemon`'s `main.rs` still has no long-running accept loop to
+//! hang a listener off.
 //!
 //! Per ruling P10 the assets ship in the **daemon** binary: `roundhouse-web`
 //! links into `roundhouse-daemon`, and `round daemon` (in `roundhouse-cli`)
@@ -31,6 +35,7 @@
 #![forbid(unsafe_code)]
 
 pub mod assets;
+pub mod lan_auth;
 pub mod sse;
 
 pub use assets::{asset_router, WebAssets};
@@ -89,8 +94,36 @@ pub struct AppState {
 /// `tests/assets.rs::a_handler_taking_app_state_composes_with_the_asset_router`
 /// compiles exactly that composition, so this stops being prose the moment it
 /// stops being true.
-pub fn build_router(state: AppState) -> axum::Router {
-    assets::asset_router()
+///
+/// # The LAN gate goes on last, and covers everything
+///
+/// `bind` is taken by value-reference rather than defaulted because the caller
+/// must *make* the loopback-vs-LAN decision to get a router at all; there is no
+/// signature here that quietly serves the LAN ungated. See
+/// [`lan_auth::BindConfig`] for why that decision and the token are one value.
+///
+/// When [`lan_auth::BindConfig::gate`] yields a gate it is applied as a single
+/// `.layer(...)` **after** `with_state`, not nested before it. That is
+/// deliberate and it is the opposite of the nesting rule above, because it is
+/// solving the opposite problem: `.layer` on the finished `Router<()>` wraps
+/// every route registered up to that point, which here means **the `/api` SSE
+/// routes and the embedded-asset fallback alike**. A gate mounted only on the
+/// nested `/api` router would leave the client shell, and every embedded asset,
+/// readable by an unauthenticated LAN peer. One gate, whole surface.
+///
+/// The layer is absent — not merely inert — on the loopback path, so the
+/// zero-configuration router has no authentication code in its request path at
+/// all.
+pub fn build_router(state: AppState, bind: &lan_auth::BindConfig) -> axum::Router {
+    let router = assets::asset_router()
         .nest("/api", sse::router())
-        .with_state(state)
+        .with_state(state);
+
+    match bind.gate() {
+        None => router,
+        Some(gate) => router.layer(axum::middleware::from_fn_with_state(
+            gate,
+            lan_auth::require_lan_token,
+        )),
+    }
 }

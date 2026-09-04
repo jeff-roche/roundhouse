@@ -91,6 +91,54 @@ serde_json = { workspace = true }
 uuid = "=1.26.0"
 # Task 31: `CursorError`'s `Display`, which is what the `400` body says.
 thiserror = { workspace = true }
+# Task 33 (Phase 5, Subsystem D4): the four pieces §11.3's shared LAN token
+# needs. All four are already resolved in `Cargo.lock`, so none of them fetches
+# a new crate or adds a graph node — the declarations only make edges this
+# crate already builds against explicit.
+#
+# `getrandom`: the token's 32 bytes, straight from the OS CSPRNG. Deliberately
+# NOT `rand`: `roundhouse-provider` declares `rand = "0.9"` and the lockfile
+# also carries 0.8 and 0.10, so reaching for `rand` here means picking a major
+# and explaining why this crate's is the right one. `getrandom` is the layer
+# underneath all of them, is the entire surface a token needs, and has no
+# userspace generator state to reason about. Net-new as a *declared*
+# dependency, so it gets a §5.3 additions-table row. The `std` feature is
+# required, not cosmetic: without it `getrandom::Error` implements neither
+# `std::error::Error` nor the OS-error lookup its `Display` uses, so a failure
+# to draw entropy would neither convert into `io::Error` nor say what went
+# wrong. It is purely additive — it adds impls, no code path and no crate — so
+# feature unification with the graph's other `getrandom` users is a no-op for
+# them.
+#
+# `subtle`: constant-time comparison of the presented token. Already in
+# `Cargo.lock` at 2.6.1, declared by nobody until now. The alternative is a
+# hand-rolled `fold(0, |acc, (x, y)| acc | (x ^ y)) == 0`, which is
+# constant-time only for as long as LLVM chooses not to branch on it — nothing
+# in that source says it must not. Net-new as a declared dependency; §5.3 row.
+#
+# `hex`: the token's on-disk and on-the-wire encoding. §5.3's additions table
+# already lists `hex` (for Phase 6's SigV4 signing) and `roundhouse-secrets`
+# already declares it at `0.4`; this pulls the same 0.4.3 forward a phase, so
+# it needs no new row.
+#
+# `rustix` (`process`, `fs`): `process` for `getuid()`, for the owner check on
+# the token file and the state dir — `#![forbid(unsafe_code)]` rules out
+# calling `libc::getuid` directly, and there is no std API. Same crate, same
+# feature, same reason as `roundhouse-secrets`'
+# `read_permission_checked_file`, so no new row either. `fs` is for
+# `OFlags::NOFOLLOW`'s numeric value, which differs per platform and which
+# `lan_auth`'s token read passes to `OpenOptions::custom_flags`; `libc` is not
+# a dependency of this crate and adding one for a single constant would be the
+# worse trade.
+#
+# Exact `=` pins throughout, for the reason stated on `axum` above: §5.3's pin
+# discipline is "never track to latest", and a soft range is what that forbids.
+# Each pin is the version already resolved in `Cargo.lock`, so pinning here
+# cannot move anyone else's resolution.
+getrandom = { version = "=0.3.4", features = ["std"] }
+subtle = "=2.6.1"
+hex = "=0.4.3"
+rustix = { version = "=1.1.4", features = ["process", "fs"] }
 
 [dev-dependencies]
 # Task 30: `ServiceExt::oneshot` drives the router in-process, so the tests
@@ -102,3 +150,9 @@ tower = { version = "=0.5.3", features = ["util"] }
 # Task 30 declared `tokio` here as a dev-only dependency. Task 31 (D2) moved
 # it to `[dependencies]`: see the comment on that line for why the "a router
 # is data" reasoning stopped holding.
+# Task 33 (D4): `tests/lan_auth.rs` needs a real directory to put a real
+# `0600` token file in, since the whole control is filesystem behaviour that a
+# mock would assert nothing about. Same `=3.27.0` pin `roundhouse-cli` uses,
+# rather than the `"3"` range seven other crates use, for the exact-pin reason
+# stated throughout this manifest.
+tempfile = "=3.27.0"
