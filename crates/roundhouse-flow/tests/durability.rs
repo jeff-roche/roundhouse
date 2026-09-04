@@ -1003,3 +1003,94 @@ fn a_transition_returns_the_state_it_displaced() {
         RunState::Cancelling
     );
 }
+
+// ---------------------------------------------------------------------------
+// B12b: the two caller-supplied ledger columns
+// ---------------------------------------------------------------------------
+
+/// Both facts a run's creator knows, round-tripped through the row — and both
+/// absent on a second run in the same database, which is what a row written
+/// before migration 0008 looks like. Two runs rather than one, so a reader
+/// that returned a constant for either column would fail on one of them.
+#[test]
+fn a_runs_session_depth_and_caps_grant_round_trip_and_so_does_their_absence() {
+    use roundhouse_flow::caps::ResourceCaps;
+
+    let mut conn = open_test_db();
+    let grant = ResourceCaps {
+        max_tokens: 777,
+        max_cost_usd: 1.25,
+        ..ResourceCaps::default()
+    };
+
+    let recorded = RunId::new();
+    let mut run = a_run(recorded, None, 100);
+    run.session_depth = Some(3);
+    run.caps = Some(grant.clone());
+    insert_workflow_run(&mut conn, &run).expect("insert");
+
+    let unrecorded = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(unrecorded, None, 200)).expect("insert");
+
+    let loaded = recover_run(&conn, recorded).unwrap().run;
+    assert_eq!(loaded.session_depth, Some(3));
+    assert_eq!(loaded.caps, Some(grant));
+
+    let loaded = recover_run(&conn, unrecorded).unwrap().run;
+    assert_eq!(loaded.session_depth, None);
+    assert_eq!(
+        loaded.caps, None,
+        "an unrecorded grant reads back as unrecorded, never as the default"
+    );
+}
+
+/// The read-back leg of the `caps_json` column, which deliberately carries no
+/// `CHECK` of its own: a `json_valid()` constraint would bind the schema to
+/// SQLite's JSON1 extension being present in every future build, which is the
+/// same shape of hazard as ruling P104's `ADD CONSTRAINT`.
+#[test]
+fn a_caps_column_that_is_not_a_resource_caps_is_refused_on_read() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 100)).expect("insert");
+    conn.execute(
+        "UPDATE workflow_run SET caps_json = '{\"max_tokens\": \"not a number\"}' WHERE id = ?1",
+        rusqlite::params![run_id.to_string()],
+    )
+    .unwrap();
+
+    assert!(
+        matches!(
+            recover_run(&conn, run_id),
+            Err(DurabilityError::MalformedStoredCaps { .. })
+        ),
+        "a stored grant this crate cannot read is an error, not an empty budget"
+    );
+}
+
+/// Migration 0008's `CHECK` is the insert-time leg; this is the read-back leg,
+/// reached by disabling the constraint the way a hand-edited database or a
+/// pre-`CHECK` row would.
+#[test]
+fn a_stored_session_depth_outside_u32_is_refused_on_read_rather_than_clamped() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 100)).expect("insert");
+    conn.pragma_update(None, "ignore_check_constraints", true)
+        .expect("the CHECK can be suspended to plant the row it exists to reject");
+    conn.execute(
+        "UPDATE workflow_run SET session_depth = 4294967296 WHERE id = ?1",
+        rusqlite::params![run_id.to_string()],
+    )
+    .expect("the planted row is written only because the CHECK is suspended");
+    conn.pragma_update(None, "ignore_check_constraints", false)
+        .unwrap();
+
+    assert!(
+        matches!(
+            recover_run(&conn, run_id),
+            Err(DurabilityError::SessionDepthOutOfRange { stored: 4294967296 })
+        ),
+        "clamping would turn a corrupt row into a depth decision"
+    );
+}

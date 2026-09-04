@@ -661,3 +661,71 @@ fn a_fork_carries_each_map_item_row_across_separately() {
         "each item keeps its own output rather than one overwriting the other"
     );
 }
+
+/// B12b: a fork sits where the run it forked sat in the session tree, so its
+/// own `call:` chain is bounded from the same depth. Recomputing the fork's
+/// depth as `0` would hand a deep run a fresh four levels on every retry —
+/// ruling P76 §1's escape reached through retry-from-step instead of through
+/// the wrong counter.
+#[test]
+fn a_fork_inherits_the_originals_session_depth_and_grant_but_not_its_spend() {
+    use roundhouse_flow::caps::ResourceCaps;
+    use roundhouse_flow::ledger::{run_ledger, Spend};
+
+    let mut conn = open_test_db();
+    let original = RunId::new();
+    let grant = ResourceCaps {
+        max_tokens: 900,
+        ..ResourceCaps::default()
+    };
+    let mut run = a_run(original, SessionId::new());
+    run.session_depth = Some(2);
+    run.caps = Some(grant.clone());
+    insert_workflow_run(&mut conn, &run).expect("insert the run row");
+    for (step_id, value) in [
+        ("checkout", serde_json::json!({"sha": "abc"})),
+        ("build", serde_json::json!({"artifact": "app.tar"})),
+    ] {
+        checkpoint_step(&mut conn, &completed_step(original, step_id, value)).unwrap();
+    }
+    roundhouse_flow::ledger::admit_spend(
+        &mut conn,
+        original,
+        &Spend {
+            tokens: 400,
+            ..Spend::ZERO
+        },
+        at(1_000),
+    )
+    .expect("the original spends some of its grant");
+    transition_run(&mut conn, original, RunState::Failed, at(5_000)).unwrap();
+
+    let forked = retry_from_step(
+        &mut conn,
+        original,
+        "build",
+        &["checkout", "build"],
+        SessionId::new(),
+        at(6_000),
+    )
+    .expect("a failed run can be retried from a step");
+
+    let fork = run_ledger(&conn, forked.new_run_id).unwrap();
+    assert_eq!(
+        fork.session_depth,
+        Some(2),
+        "same place in the session tree"
+    );
+    assert_eq!(fork.caps, Some(grant));
+    assert_eq!(
+        fork.spent,
+        Spend::ZERO,
+        "a fork is a fresh grant, not a continuation of the original's remaining budget — \
+         charging it the original's spend would make retrying an expensive run fail immediately"
+    );
+    assert_eq!(
+        run_ledger(&conn, original).unwrap().spent.tokens,
+        400,
+        "and the original's own ledger is untouched: a fork is never a rewrite"
+    );
+}

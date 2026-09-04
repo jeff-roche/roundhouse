@@ -736,3 +736,142 @@ fn park_then_cancel_clears_the_stale_awaiting_until_deadline() {
         "leaving AwaitingHuman must clear the deadline the park wrote"
     );
 }
+
+// ---------------------------------------------------------------------------
+// B12b: the park's durable half — `parked_at`, `hold_until`, `parked_nanos`
+// ---------------------------------------------------------------------------
+
+/// Before migration 0008, [`WorkspaceDisposition::HoldUntil`] was the *only*
+/// place the hold instant existed, so a daemon that restarted mid-hold had no
+/// way to learn which worktrees it still owed a teardown to. Both arms are
+/// covered here, because "no hold" has to be a fact about the row (`NULL`) and
+/// not merely an absence of one.
+#[test]
+fn a_held_workspace_writes_its_instant_to_the_row_and_a_released_one_writes_none() {
+    for hold_workspace in [true, false] {
+        let session_id = SessionId::new();
+        let (mut conn, run_id) = a_running_run(session_id);
+        let step =
+            gate_step("id: approve\ngate: { title: 'Ship it?', timeout: 24h, on_timeout: deny }");
+        let awaiting = awaiting_from_gate(&step);
+        let now = Timestamp::from_unix_nanos(500 * NANOS_PER_SEC);
+        let mut cp = FakeCheckpointer::new();
+
+        let result = park(&mut conn, run_id, &awaiting, hold_workspace, now, &mut cp)
+            .expect("park succeeds");
+        let ledger = roundhouse_flow::ledger::run_ledger(&conn, run_id).expect("the row is there");
+
+        match result.workspace {
+            WorkspaceDisposition::HoldUntil(instant) => assert_eq!(
+                ledger.hold_until,
+                Some(instant),
+                "the directive and the column must be the same instant, not two"
+            ),
+            WorkspaceDisposition::Release => assert_eq!(ledger.hold_until, None),
+        }
+        assert_eq!(
+            ledger.parked_at,
+            Some(now),
+            "every park stamps its start, held workspace or not"
+        );
+    }
+}
+
+/// The reaper's clock is the park's *start*, and a run that re-drives its own
+/// park must not restart it — otherwise §8.11's cap, enforced *"regardless of
+/// what any individual gate specifies"*, is evaded by a run that simply keeps
+/// re-parking. This is the durable sibling of
+/// `a_re_driven_park_never_gets_a_fresh_window_it_moves_only_by_the_now_the_caller_supplied`,
+/// which pins the same property for the *wait's* deadline — and the two move
+/// differently on purpose.
+#[test]
+fn a_re_driven_park_moves_the_wait_deadline_but_leaves_the_parks_start_alone() {
+    let session_id = SessionId::new();
+    let (mut conn, run_id) = a_running_run(session_id);
+    let step = gate_step("id: approve\ngate: { title: 'Ship it?', timeout: 1h, on_timeout: deny }");
+    let awaiting = awaiting_from_gate(&step);
+    let mut cp = FakeCheckpointer::new();
+
+    let first = Timestamp::from_unix_nanos(1_000 * NANOS_PER_SEC);
+    park(&mut conn, run_id, &awaiting, true, first, &mut cp).expect("the first park succeeds");
+    let much_later = Timestamp::from_unix_nanos(500_000 * NANOS_PER_SEC);
+    park(&mut conn, run_id, &awaiting, true, much_later, &mut cp).expect("a re-park succeeds");
+
+    let ledger = roundhouse_flow::ledger::run_ledger(&conn, run_id).unwrap();
+    assert_eq!(
+        ledger.parked_at,
+        Some(first),
+        "the park's start is where the reaper's seven days are measured from"
+    );
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.awaiting_until,
+        Some(Timestamp::from_unix_nanos(
+            (500_000 + 3_600) * NANOS_PER_SEC
+        )),
+        "the wait's own deadline does move, by exactly the delta the caller supplied"
+    );
+    assert_eq!(
+        ledger.hold_until,
+        Some(Timestamp::from_unix_nanos(
+            (500_000 + 3_600) * NANOS_PER_SEC
+        )),
+        "and so does the hold, which is derived from the same window"
+    );
+}
+
+/// Leaving a park banks its duration and clears **both** deadlines and the
+/// park's start together. A stale `hold_until` on a resumed run is a directive
+/// to keep a worktree the run is using again.
+#[test]
+fn resuming_a_parked_run_banks_the_stretch_and_clears_every_park_column() {
+    let session_id = SessionId::new();
+    let (mut conn, run_id) = a_running_run(session_id);
+    let step = gate_step("id: approve\ngate: { title: 'Ship it?', timeout: 1h, on_timeout: deny }");
+    let awaiting = awaiting_from_gate(&step);
+    let mut cp = FakeCheckpointer::new();
+
+    park(
+        &mut conn,
+        run_id,
+        &awaiting,
+        true,
+        Timestamp::from_unix_nanos(1_000 * NANOS_PER_SEC),
+        &mut cp,
+    )
+    .expect("park succeeds");
+    transition_run(
+        &mut conn,
+        run_id,
+        RunState::Running,
+        Timestamp::from_unix_nanos(1_250 * NANOS_PER_SEC),
+    )
+    .expect("a gate's answer releases the park");
+
+    let ledger = roundhouse_flow::ledger::run_ledger(&conn, run_id).unwrap();
+    assert_eq!(ledger.parked_at, None);
+    assert_eq!(ledger.hold_until, None);
+    assert_eq!(
+        ledger.parked_nanos,
+        250 * NANOS_PER_SEC as u64,
+        "the closed stretch is banked at the one edge where a park ends"
+    );
+}
+
+/// The saturating edge the `reaper_cutoff` rewrite introduced on the *other*
+/// side: a `now` earlier than the cap itself. The old form computed
+/// `now - parked_at`; the new one computes `now - CAP` and compares. Both
+/// must say "not expired", and the new one must not wrap into a bound that
+/// matches every row.
+#[test]
+fn a_now_earlier_than_the_cap_itself_reaps_nothing_and_does_not_wrap() {
+    let now = Timestamp::from_unix_nanos(NANOS_PER_SEC);
+    assert!(!reaper_cutoff(Timestamp::from_unix_nanos(0), now));
+    assert!(!reaper_cutoff(
+        Timestamp::from_unix_nanos(NANOS_PER_SEC),
+        now
+    ));
+    assert!(!reaper_cutoff(
+        Timestamp::from_unix_nanos(i64::MIN),
+        Timestamp::from_unix_nanos(i64::MIN)
+    ));
+}

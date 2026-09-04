@@ -599,27 +599,36 @@ fn run_session_id(conn: &Connection, run_id: RunId) -> Result<SessionId, ParkErr
 /// are exactly the pair of legs ruling P72 warns about; one function feeding
 /// both is what stops them drifting a nanosecond apart.
 pub fn reaper_cutoff(parked_at: Timestamp, now: Timestamp) -> bool {
-    parked_at.as_unix_nanos() <= reaper_cutoff_instant(now)
+    reaper_cutoff_instant(now).is_some_and(|cutoff| parked_at.as_unix_nanos() <= cutoff)
 }
 
-/// The most recent park start that [`reaper_cutoff`] still calls expired:
-/// `now - `[`SYSTEM_WIDE_HOLD_CAP`], saturating.
+/// The most recent park start [`reaper_cutoff`] still calls expired:
+/// `now - `[`SYSTEM_WIDE_HOLD_CAP`], or `None` when no such instant is
+/// representable.
 ///
 /// `pub(crate)` because it is a query bound, not a predicate: the only caller
 /// outside this module is [`crate::ledger::parked_runs_past_hold_cap`], which
 /// binds it as the `parked_at <= ?` parameter of an index seek.
 ///
-/// **Equivalent to the subtraction it replaces for every value the schema can
-/// hold**, which is what makes the rewrite above safe: migration 0008's
-/// `CHECK (parked_at IS NULL OR parked_at >= 0)` means `parked_at` is never
-/// negative, and for a non-negative `parked_at`, `now - parked_at >= CAP` and
-/// `parked_at <= now - CAP` agree — including at both saturating edges (a
-/// `now` smaller than the cap saturates this toward `i64::MIN`, which no
-/// non-negative `parked_at` is `<=`, matching the old form's "elapsed is
-/// under the cap"; a `parked_at` in the future exceeds this instant, matching
-/// the old form's saturating zero). `tests/parking.rs` pins the agreement on
-/// both sides of the boundary rather than leaving it to this paragraph.
-pub(crate) fn reaper_cutoff_instant(now: Timestamp) -> i64 {
-    now.as_unix_nanos()
-        .saturating_sub(SYSTEM_WIDE_HOLD_CAP_NANOS)
+/// # Why `Option`, and not a saturating `i64`
+///
+/// This has to be **exactly** equivalent to the `now - parked_at >= CAP` it
+/// replaced, or the rewrite has quietly changed a rule instead of factoring
+/// it. A saturating version is not: at `now == i64::MIN` it yields `i64::MIN`,
+/// which `parked_at == i64::MIN` satisfies, so a park of zero length would be
+/// reported expired — the fail-*open* direction, and the opposite of what the
+/// old subtraction (`0 >= CAP`, false) said. A `checked_sub` returning `None`
+/// reproduces the old answer for every input pair, including both extremes:
+/// `now = i64::MAX, parked_at = i64::MIN` is expired under both, and every
+/// `now` within a cap's width of `i64::MIN` expires nothing under both.
+///
+/// The divergence was found by a test written for the rewrite, not reasoned
+/// about — an earlier version of this function saturated, and its doc
+/// asserted equivalence "for every value the schema can hold", which was true
+/// (migration 0008's `CHECK` keeps `parked_at` non-negative) and beside the
+/// point, since [`reaper_cutoff`] is `pub` and takes any two instants.
+/// `tests/parking.rs`'s `a_now_earlier_than_the_cap_itself_reaps_nothing_and_does_not_wrap`
+/// is the pin.
+pub(crate) fn reaper_cutoff_instant(now: Timestamp) -> Option<i64> {
+    now.as_unix_nanos().checked_sub(SYSTEM_WIDE_HOLD_CAP_NANOS)
 }

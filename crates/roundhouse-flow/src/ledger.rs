@@ -947,13 +947,21 @@ pub fn parked_runs_past_hold_cap(
     conn: &Connection,
     now: Timestamp,
 ) -> Result<Vec<RunId>, LedgerError> {
+    // `None` means no instant a cap's width before `now` is representable, so
+    // no park can have lasted that long — the same answer
+    // [`crate::parking::reaper_cutoff`] gives for every `parked_at` at such a
+    // `now`, and the reason that function returns an `Option` rather than
+    // saturating.
+    let Some(cutoff) = reaper_cutoff_instant(now) else {
+        return Ok(Vec::new());
+    };
     let mut stmt = conn.prepare(
         "SELECT id FROM workflow_run
           WHERE parked_at IS NOT NULL AND parked_at <= ?1
           ORDER BY parked_at ASC, id ASC",
     )?;
     let ids: Vec<String> = stmt
-        .query_map(params![reaper_cutoff_instant(now)], |row| row.get(0))?
+        .query_map(params![cutoff], |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
     ids.into_iter()
         .map(|text| {
