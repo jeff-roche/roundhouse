@@ -335,6 +335,139 @@ CREATE TABLE workflow_step_run (
 ) STRICT;
 "#;
 
+/// Phase 5, Subsystem B, B12b (ruling P77's split of Task 20): the
+/// **run-level ledger** on `workflow_run` — the durable half of four things
+/// the tree had only in memory or not at all. Ruling P4 again: the columns
+/// live here, not in a per-crate `roundhouse-flow/migrations/*.sql` file that
+/// would never reach the daemon's actual database. `roundhouse_flow::ledger`
+/// (with `durability` and `parking`) is the only reader and writer.
+///
+/// # `ADD COLUMN` only, and why that is a rule rather than a preference
+///
+/// Every statement below is `ALTER TABLE … ADD COLUMN` or `CREATE INDEX`.
+/// **`ALTER TABLE … ADD CONSTRAINT … CHECK (…)` is not used, although it
+/// works** — measured on the bundled SQLite: it is accepted, lands in
+/// `sqlite_master` as a genuine table-level constraint, and is enforced. It is
+/// nonetheless not `ALTER TABLE` syntax (which covers only `RENAME TABLE`,
+/// `RENAME COLUMN`, `ADD COLUMN` and `DROP COLUMN`); it survives only because
+/// `ADD COLUMN` textually appends the column-def to the stored `CREATE TABLE`
+/// and that clause happens to re-parse in table-constraint position. A
+/// migration that works on today's parser and is rejected by a future one
+/// means **existing installs keep working while fresh installs fail** —
+/// divergence visible only to new users, long after the change — and
+/// `rusqlite` is `features = ["bundled"]`, so a routine dependency bump is
+/// exactly what would move the parser. Ruling P104.
+/// `xtask/tests/no_alter_table_add_constraint.rs` is the enforcement leg, so
+/// this paragraph cannot decay into advice.
+///
+/// **Per-column `CHECK`s are real `ADD COLUMN` syntax** and are used freely
+/// below. What they cannot express is a *cross-column* invariant — e.g.
+/// `state <> 'completed' OR ended_at IS NOT NULL`, which `durability`'s
+/// `insert_run_row` and `transition` both enforce in Rust. Adding that leg to
+/// the schema needs the 12-step create-copy-drop-rename rebuild, which is a
+/// materially riskier migration than the `ADD COLUMN`s around it and is its
+/// own task, not a rider here.
+///
+/// # The four facts these columns make durable
+///
+/// 1. **`parked_at`** — when the run's *current* park began.
+///    `parking::reaper_cutoff(parked_at, now)` has existed since Task 17 with
+///    **no durable source for its first argument anywhere in the schema**
+///    (ruling P72): `started_at` is the run's start, not its park time,
+///    `workflow_step_run` has no timestamp column, and
+///    `WorkspaceDisposition::HoldUntil` is an in-process value. Written when a
+///    run enters `awaiting_human` and **preserved across a re-park**, so
+///    re-driving a park cannot reset the 7-day clock; cleared when the run
+///    leaves. `workflow_run_parked_idx` is the reaper query's index.
+/// 2. **`hold_until`** — the workspace hold's absolute, already-clamped
+///    deadline, the durable half of §8.11's `hold_workspace` TTL. It and
+///    `parked_at` are the two legs `parking::resolve_hold_ttl` describes: the
+///    clamp records the intended expiry, and `parked_at` is the independent
+///    backstop that bounds a hold whose deadline was never cancelled.
+/// 3. **`parked_nanos`** — accumulated *completed* park time, which with
+///    `parked_at` and `started_at` yields §8.4's active elapsed time
+///    (`run_active_timeout` *"excludes `AwaitingHuman`"*). An in-memory
+///    tracker would be lost on the first daemon restart, which is precisely
+///    the multi-day park it exists to measure.
+/// 4. **`session_depth`, `caps_json`, the seven `spent_*` accumulators and
+///    `refunded_at`** — §8.12's budget transfer and §7.7's recursion bound,
+///    both of which must survive a restart. `session_depth` is the depth of
+///    the run's **Session** in the session tree, the same number
+///    `roundhouse_engine::agent_spawn` takes as `parent_depth` — deliberately
+///    **not** a run depth derived from `parent_run_id`, because those are two
+///    independent counters over one tree and a sub-agent at session depth 3
+///    starting a run would begin its `call:` chain at run-depth 0 and be
+///    granted four more (ruling P76 §1).
+///
+/// # Which columns are nullable, and why that is the fail-closed direction
+///
+/// `session_depth` and `caps_json` are nullable **with no default**, and a
+/// `NULL` means *unknown*, which every reader in `roundhouse_flow::ledger`
+/// refuses rather than substitutes. The alternative — `NOT NULL DEFAULT 0` /
+/// a serialized `ResourceCaps` literal baked into this immutable string —
+/// would have every row written before this migration silently claim to be a
+/// depth-0 root with a full budget: the fail-*open* answer for exactly the
+/// rows the schema knows least about, and (for the caps) a default that would
+/// drift from `ResourceCaps::default()` the moment either changed.
+///
+/// The accumulators are the opposite case and are `NOT NULL DEFAULT 0`: zero
+/// is the *exact* value for a run that has recorded no spend and no completed
+/// park, not a stand-in for an unknown one.
+///
+/// `refunded_at` is the durable twin of `compose::ChildBudget`'s
+/// consumed-by-value token: it stamps a child run whose unspent grant has been
+/// returned to its parent, so a second refund cannot mint budget the root
+/// never granted. That a run with no `parent_run_id` can never be refunded is
+/// a cross-column rule and therefore lives in Rust (`ledger::refund_child_run`),
+/// per the `ADD CONSTRAINT` section above.
+///
+/// # `spent_cost_usd` is `REAL`, and the column is not the whole guard
+///
+/// It matches `ResourceCaps::max_cost_usd`'s `f64` (see that type's recorded
+/// deviation from §8.4's `Decimal`). Measured on the bundled SQLite: a `NaN`
+/// bound to this column is stored as `NULL` and therefore rejected by
+/// `NOT NULL`, but **`+inf` satisfies `CHECK (spent_cost_usd >= 0)` and is
+/// stored**. `ledger::admit_spend` refuses non-finite dollars in Rust for that
+/// reason; the `CHECK` bounds the sign, not the finiteness.
+const MIGRATION_0008_WORKFLOW_RUN_LEDGER: &str = r#"
+ALTER TABLE workflow_run ADD COLUMN parked_at INTEGER
+    CHECK (parked_at IS NULL OR parked_at >= 0);
+ALTER TABLE workflow_run ADD COLUMN hold_until INTEGER
+    CHECK (hold_until IS NULL OR hold_until >= 0);
+ALTER TABLE workflow_run ADD COLUMN parked_nanos INTEGER NOT NULL DEFAULT 0
+    CHECK (parked_nanos >= 0);
+
+ALTER TABLE workflow_run ADD COLUMN session_depth INTEGER
+    CHECK (session_depth IS NULL OR (session_depth >= 0 AND session_depth <= 4294967295));
+
+ALTER TABLE workflow_run ADD COLUMN caps_json TEXT;
+ALTER TABLE workflow_run ADD COLUMN spent_tokens INTEGER NOT NULL DEFAULT 0
+    CHECK (spent_tokens >= 0);
+ALTER TABLE workflow_run ADD COLUMN spent_cost_usd REAL NOT NULL DEFAULT 0.0
+    CHECK (spent_cost_usd >= 0);
+ALTER TABLE workflow_run ADD COLUMN spent_tasks INTEGER NOT NULL DEFAULT 0
+    CHECK (spent_tasks >= 0);
+ALTER TABLE workflow_run ADD COLUMN spent_tool_calls INTEGER NOT NULL DEFAULT 0
+    CHECK (spent_tool_calls >= 0);
+ALTER TABLE workflow_run ADD COLUMN spent_subagents INTEGER NOT NULL DEFAULT 0
+    CHECK (spent_subagents >= 0);
+ALTER TABLE workflow_run ADD COLUMN spent_bytes_written INTEGER NOT NULL DEFAULT 0
+    CHECK (spent_bytes_written >= 0);
+ALTER TABLE workflow_run ADD COLUMN spent_escalations INTEGER NOT NULL DEFAULT 0
+    CHECK (spent_escalations >= 0);
+ALTER TABLE workflow_run ADD COLUMN refunded_at INTEGER
+    CHECK (refunded_at IS NULL OR refunded_at >= 0);
+
+-- The reaper's index (ruling P69 §2 lists "a reaper index" among the cheap,
+-- ADD COLUMN-shaped gaps). Partial, because a run that is not parked can
+-- never be an answer to `ledger::parked_runs_past_hold_cap`, and that query is
+-- `parked_at <= ?cutoff` — the cutoff computed once in Rust from
+-- `parking::SYSTEM_WIDE_HOLD_CAP` so the constant is not restated in SQL.
+CREATE INDEX workflow_run_parked_idx
+    ON workflow_run (parked_at)
+    WHERE parked_at IS NOT NULL;
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_0001_INITIAL_SCHEMA),
@@ -344,5 +477,6 @@ pub fn migrations() -> Migrations<'static> {
         M::up(MIGRATION_0005_ATTENTION_INDEX),
         M::up(MIGRATION_0006_TRIGGER_EVENT),
         M::up(MIGRATION_0007_WORKFLOW_RUN),
+        M::up(MIGRATION_0008_WORKFLOW_RUN_LEDGER),
     ])
 }
