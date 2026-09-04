@@ -42,7 +42,28 @@
 
 /// The store pool with its `Pool` handle **out of reach**, so that
 /// [`BoundedStore::connection`] is not merely the convenient way to take a
-/// connection but the only expressible one.
+/// connection.
+///
+/// # What makes that structural, and where it stops
+///
+/// Stated as the two mechanisms rather than as "the only way", because this
+/// type has now claimed totality twice and been wrong twice — rulings P98 and
+/// P101, once for each of these:
+///
+/// - **The field path.** `inner` is private to `crate::bounded`, and Rust
+///   privacy is the defining module *and its descendants*. This module declares
+///   no `mod`, so it has no descendants and no other module in the crate can
+///   read it. `tests/bounded_reach.rs` fails if either half changes.
+/// - **The method path.** [`StoreConnection`] `Deref`s **past**
+///   [`roundhouse_store::PooledConnection`] rather than to it, so `deadpool`'s
+///   `Object::pool` back-reference — which would hand a permitted connection's
+///   holder the whole pool, needing no dependency and never naming `inner` — is
+///   not re-exposed. Also pinned in `tests/bounded_reach.rs`.
+///
+/// **Where it stops:** an `fn pool(&self)` accessor added to *this file* would
+/// restore the reach, and no test in this crate would fail. That residual is
+/// disclosed rather than guarded, deliberately — see `tests/compile_fail.rs`
+/// and ruling P100, which rejected a `grep` for the signature as fail-open.
 ///
 /// # Why a newtype rather than a doc note
 ///
@@ -64,11 +85,8 @@
 /// [`new`](Self::new) and [`connection`](Self::connection) are the whole
 /// surface: a caller supplies a pool and gets back something it can only hand to
 /// [`crate::AppState`], and the one thing it can then ask for is a connection
-/// that already holds its permit. There is deliberately no accessor — an
-/// `fn pool(&self)` here would restore exactly what the private field removes,
-/// and unlike the field itself **that would not be caught by any test in this
-/// crate** (see `tests/compile_fail.rs`, which says so rather than claiming
-/// otherwise).
+/// that already holds its permit. There is deliberately no accessor, for the
+/// reason "where it stops" gives above.
 #[derive(Clone, Debug)]
 pub struct BoundedStore {
     /// **Private to this leaf module, and that is the entire point of this
@@ -277,7 +295,37 @@ pub(crate) struct StoreConnection {
 }
 
 impl std::ops::Deref for StoreConnection {
-    type Target = roundhouse_store::PooledConnection;
+    /// **One level past [`roundhouse_store::PooledConnection`], and that is the
+    /// point** — ruling P101.
+    ///
+    /// Deref'ing to `PooledConnection` itself re-exposed that type's whole
+    /// inherent API, and `deadpool` 0.13.1 puts a back-reference to the pool in
+    /// it: `pub fn pool(this: &Self) -> Option<Pool<M>>`
+    /// (`deadpool/src/managed/object.rs`). So
+    /// `PooledConnection::pool(&conn).unwrap().get().await` minted an unbounded
+    /// connection from a legitimately permitted one — ruling P93 §B's writer
+    /// starvation, reopened through a path that never names `inner` and that no
+    /// field-privacy check can see. Compiled, not recalled: that expression
+    /// built with exit 0 from `runs.rs` before this line changed.
+    ///
+    /// Naming the target *structurally* rather than writing the type out is
+    /// deliberate. `<PooledConnection as Deref>::Target` is
+    /// `deadpool_sync::SyncWrapper<rusqlite::Connection>`, and spelling that out
+    /// would need two dependencies this crate does not have and must not grow —
+    /// ruling P86 removed the `rusqlite` edge on purpose. The projection needs
+    /// neither.
+    ///
+    /// What survives is what handlers actually use: [`crate::runs::list_runs`]
+    /// calls only `.interact`, which is an inherent method of `SyncWrapper`
+    /// (`deadpool-sync` 0.2.0) and so is reached in one deref step from here
+    /// instead of two. `PooledConnection::pool(&conn)` is now `E0308`.
+    ///
+    /// (Ruling P101 attributes `.interact` to "`deadpool_sqlite::Connection`,
+    /// not `Object`". Those are the same type — `deadpool_sqlite::Connection` is
+    /// a type alias for `Object`, which is `deadpool::managed::Object<Manager>`.
+    /// The remedy is right for a different reason than the one given: `.interact`
+    /// is not on either of those names but on the `Deref` target they share.)
+    type Target = <roundhouse_store::PooledConnection as std::ops::Deref>::Target;
 
     fn deref(&self) -> &Self::Target {
         &self.connection

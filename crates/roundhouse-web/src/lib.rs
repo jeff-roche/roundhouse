@@ -146,8 +146,16 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// A store connection **and** the permit bounding it, in one act — the only
-    /// way anything in this crate reaches the pool.
+    /// A store connection **and** the permit bounding it, in one act.
+    ///
+    /// Every reach for the pool that a handler module can *express* goes
+    /// through here, and [`BoundedStore`] carries the two mechanisms that make
+    /// that so — a pool field private to a leaf module, and a
+    /// [`StoreConnection`] that does not re-expose `deadpool`'s
+    /// `Object::pool`. It is deliberately not stated as "the only way": that
+    /// sentence stood here through two rounds and was false both times
+    /// (rulings P98 and P101), and [`BoundedStore`] also records the one
+    /// residual that is disclosed rather than closed.
     ///
     /// # Why this is a method and not three lines in a handler
     ///
@@ -163,15 +171,23 @@ impl AppState {
     /// connection comes back already wearing it — there is no ordering for a
     /// handler to get wrong and no step for it to skip.
     ///
-    /// **Both `state.store.pool.get()` and `state.store.inner.pool.get()` are
-    /// compile errors from here**, which the paragraph above could only ask for.
-    /// This method does not read the pool; it delegates to
+    /// Three expressions a handler might write are compile errors from here,
+    /// and each was compiled rather than recalled:
+    ///
+    /// - `state.store.pool.get()` — `E0616`, the field is not `pub`.
+    /// - `state.store.inner.pool.get()` — `E0616`. `inner` is private to
+    ///   `bounded`, and the crate root is that module's *parent*, not its
+    ///   descendant. Ruling P98 is the round where this one compiled.
+    /// - `PooledConnection::pool(&connection).unwrap().get()` on what this
+    ///   method returns — `E0308`, since [`StoreConnection`] no longer `Deref`s
+    ///   to the type that owns `pool`. Ruling P101 is the round where *this* one
+    ///   compiled, from `runs.rs`, with exit 0.
+    ///
+    /// This method reads none of them: it delegates to
     /// [`BoundedStore::connection`], which lives in the same **leaf** module as
     /// the private field and is the only expression in the crate that unwraps
-    /// it. That the module is a leaf is the whole guarantee — see
-    /// [`BoundedStore`], and ruling P98 for the version of this method that
-    /// claimed the property while `lib.rs` still held the field, where "private"
-    /// meant "readable from every handler module in the crate".
+    /// it. See [`BoundedStore`] for what those two mechanisms cover and what
+    /// they do not.
     ///
     /// Rejected, recorded so they are not re-derived: a doc note on
     /// [`AppState::store`] (ruling P88 §A *is* the record of a doc note not

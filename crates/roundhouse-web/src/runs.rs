@@ -216,12 +216,15 @@ impl From<RunSummary> for RunSummaryJson {
 /// argument (ruling P93 §B).
 ///
 /// It does not take the connection and the permit itself.
-/// [`crate::AppState::store_connection`] is the only way to reach the pool from
-/// this crate, and what it hands back already holds its permit — so this
-/// handler cannot acquire them in the wrong order, or take one without the
-/// other, because it never sees them apart. That method also owns the "no store
-/// attached" and "at the bound" answers, both `503` with different bodies; its
-/// docs say why the store check comes first.
+/// [`crate::AppState::store_connection`] hands back one that already holds its
+/// permit — so this handler cannot acquire them in the wrong order, or take one
+/// without the other, because it never sees them apart. Nor can it reach around
+/// them: neither the pool field nor `deadpool`'s `Object::pool` is expressible
+/// from this module, which [`crate::BoundedStore`] states as the two mechanisms
+/// it is rather than as a claim about every possible route — that claim was
+/// made here and was false (rulings P98, P101). `store_connection` also owns the
+/// "no store attached" and "at the bound" answers, both `503` with different
+/// bodies; its docs say why the store check comes first.
 async fn list_runs(State(state): State<crate::AppState>) -> Response {
     let connection = match state.store_connection().await {
         Ok(connection) => connection,
