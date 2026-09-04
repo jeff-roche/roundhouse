@@ -200,6 +200,17 @@ pub enum RunLoopError {
     /// malformed `timeout:`, a `form:` that is not an object.
     #[error(transparent)]
     Hitl(#[from] HitlError),
+    /// The run could not be started because its [`super::RunContext`] carries
+    /// a secret this crate cannot safely use as a redaction needle.
+    ///
+    /// A run-level configuration fault, not a workflow one, and the reason it
+    /// is a distinct variant rather than folded into a general "could not
+    /// start": [`super::ExecutorError::SecretTooShortToRedact`] is the refusal
+    /// that keeps a credential out of an append-only log, and an operator
+    /// reading a run that failed needs to be told *that*, by name, rather than
+    /// something about a report.
+    #[error(transparent)]
+    Executor(#[from] super::ExecutorError),
 }
 
 /// A human's answer to the gate a run is parked on, supplied to
@@ -377,13 +388,9 @@ pub fn run_workflow<H: WorkflowHost>(
         ensure_gate_step(&main, answer)?;
     }
 
-    let mut executor = Executor::new(def, sink, run_ctx).map_err(|e| {
-        // `Executor::new`'s only refusal is a secret too short to redact,
-        // which is a run-level configuration fault and not a workflow one.
-        // Surfaced as a parse-shaped error because there is nowhere better and
-        // its `Display` says exactly what is wrong.
-        RunLoopError::SynthesisedReportInvalid(e.to_string())
-    })?;
+    // `Executor::new`'s only refusal is a secret too short to redact, which is
+    // a run-level configuration fault — see `RunLoopError::Executor`.
+    let mut executor = Executor::new(def, sink, run_ctx)?;
 
     let mut run = Loop {
         conn,
@@ -924,7 +931,12 @@ impl<H: WorkflowHost> Loop<'_, H> {
                     "a `gate:` step cannot park a run from a `{}` block: the run is already ending",
                     match phase {
                         Phase::Catch => "catch:",
-                        _ => "finally:",
+                        Phase::Finally => "finally:",
+                        // Unreachable: the guard above is `phase != Main`.
+                        // Written out rather than left to a `_` arm so that a
+                        // fourth phase is a compile error here, not a step
+                        // failure that blames the wrong block.
+                        Phase::Main => "steps:",
                     }
                 ),
             )));

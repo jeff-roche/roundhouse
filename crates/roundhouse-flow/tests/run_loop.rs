@@ -2171,3 +2171,41 @@ fn a_settled_child_cannot_be_drawn_for_again() {
         "and the refusal charges nothing on its way to refusing"
     );
 }
+
+/// A secret too short for this crate to use as a redaction needle refuses the
+/// **run**, by name. Before B12c it was reported as a report-validation
+/// failure, which tells an operator nothing about the credential that is
+/// actually the problem.
+#[test]
+fn a_secret_too_short_to_redact_refuses_the_run_and_says_so() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow("steps:\n \x20- id: a\n \x20  emit: { a: 1 }\n")).unwrap();
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.secrets.insert("TINY".into(), "abc".into());
+
+    let result = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(2),
+        None,
+    );
+    let Err(RunLoopError::Executor(e)) = result else {
+        panic!("a short secret must refuse the run, got {result:?}");
+    };
+    let rendered = e.to_string();
+    assert!(rendered.contains("TINY"), "it names the secret: {rendered}");
+    assert!(!rendered.contains("abc"), "and never its value: {rendered}");
+    assert!(sink.emitted.is_empty(), "nothing ran");
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::Running,
+        "and the run is untouched"
+    );
+}
