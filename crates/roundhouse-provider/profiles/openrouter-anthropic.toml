@@ -1,0 +1,35 @@
+# OpenRouter — its Anthropic-Messages-compatible endpoint (distinct from
+# openrouter.toml, Task 10's openai-chat profile for the same vendor — §9.4
+# lists OpenRouter under three codecs).
+#
+# Verified against OpenRouter's own current docs (fetched 2026-09-02):
+# https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-a-message
+# — "POST /messages" at "https://openrouter.ai/api/v1" (base_url below is
+# chosen as "https://openrouter.ai/api" so this provider's uniform
+# "{base}/v1/messages" URL-building reproduces that exact endpoint).
+# https://openrouter.ai/docs/api_reference/errors-and-debugging — documents,
+# specifically for the "/api/v1/messages endpoint" (this profile's own
+# endpoint), that its internal error types map onto Anthropic-native
+# `/error/type` strings: `rate_limit_exceeded -> "rate_limit_error"`,
+# `provider_overloaded -> "overloaded_error"`, `payment_required ->
+# "billing_error"`, `authentication -> "authentication_error"`.
+id = "openrouter-anthropic"
+codec = "anthropic-messages"
+
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://openrouter.ai/api"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"rate_limit_error" = { disposition = "shed_concurrency" }
+"overloaded_error" = { disposition = "retry_backoff" }
+# "The account or API key has insufficient credits" -- a genuine, permanent
+# billing block, not a throughput cap (unlike RESOURCE_EXHAUSTED-shaped
+# codes elsewhere in this batch), so `fatal`/`quota` is the correct mapping
+# here, not a Ruling P106 violation.
+"billing_error" = { disposition = "fatal", category = "quota" }

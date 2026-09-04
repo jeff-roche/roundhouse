@@ -1,0 +1,85 @@
+# Z.ai (Zhipu GLM) — direct vendor API.
+#
+# Corrected against the plan brief after live verification against
+# docs.z.ai/api-reference/llm/chat-completion (fetched 2026-09): the
+# `thinking` object's `type` field is a binary `"enabled"`/`"disabled"`
+# switch, NOT a graduated effort vocabulary — the brief's design put the
+# graduated vocabulary there. The real graduated control is a *separate*
+# top-level `reasoning_effort` parameter:
+#   - glm-5.3 / glm-5.3-flash: exactly ["low", "high", "max"] (3 values,
+#     matching §9.5's own "glm-5.3: 3 values" claim — the value COUNT the
+#     plan predicted was right, the field name was wrong).
+#   - glm-5.2 and above: the full ["max", "xhigh", "high", "medium", "low",
+#     "minimal", "none"] (7 values, matching "glm-5.2: 7 values").
+# This profile's ReasoningControl targets `/reasoning_effort` for both
+# entries, not `/thinking/type`.
+id = "zai"
+codec = "openai-chat"
+# Round-8 review, M1/M2: the previous table's "1301" -> retry_backoff entry
+# was wrong on top of being unreachable. Verified live two ways: a direct
+# curl against `api.z.ai/api/paas/v4/chat/completions` (2026-09) with a bad
+# key returned `{"error":{"code":"401","message":"token expired or
+# incorrect"}}` — confirming the real shape is nested with `code`+`message`
+# but no `type` key at all, so `error_pointer` must be `/error/code`, not
+# the default `/error/type` (which can never resolve here). The actual
+# numeric codes come from `docs.z.ai/api-reference/api-code` (fetched
+# 2026-09), which documents:
+#   - 1302: "Rate limit reached for requests" (429)
+#   - 1305: "The service may be temporarily overloaded, please try again
+#     later" (429) — a capacity condition, not a per-caller rate limit;
+#     mapped to retry_backoff (Overloaded) rather than shed_concurrency.
+#   - 1113: "Insufficient balance or no resource package" (429) — a
+#     permanent billing condition arriving on the SAME HTTP status as a
+#     genuine rate limit, exactly the OpenAI insufficient_quota shape
+#     `errors.rs`'s module doc calls out as the reason this table exists.
+#   - 1301: "potentially unsafe or sensitive content" (400, a content-policy
+#     rejection) — not retryable and not a quota condition, so it maps to
+#     none of the four `ProviderErrorKind` variants and is intentionally
+#     omitted rather than guessed (per fix-round-1 E1's precedent).
+error_pointer = "/error/code"
+
+[defaults]
+allow_raw_extra = false
+base_url = "https://api.z.ai/api/paas/v4"
+
+[defaults.params]
+mode = "deny_list"
+fields = []
+
+[defaults.auth]
+kind = "bearer"
+
+[[model]]
+match = ["glm-5.3*"]
+
+[model.reasoning]
+kind = "effort"
+field = "/reasoning_effort"
+vocabulary = ["low", "high", "max"]
+
+[model.reasoning.map]
+off = "low"
+low = "low"
+medium = "high"
+high = "high"
+max = "max"
+
+[[model]]
+match = ["glm-5.2*"]
+
+[model.reasoning]
+kind = "effort"
+field = "/reasoning_effort"
+vocabulary = ["max", "xhigh", "high", "medium", "low", "minimal", "none"]
+
+[model.reasoning.map]
+off = "none"
+low = "low"
+medium = "medium"
+high = "high"
+max = "max"
+
+[errors]
+"1302" = { disposition = "shed_concurrency" }
+"1305" = { disposition = "retry_backoff" }
+"1113" = { disposition = "fatal", category = "quota" }

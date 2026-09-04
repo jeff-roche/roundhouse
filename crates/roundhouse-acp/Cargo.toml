@@ -10,3 +10,39 @@ workspace = true
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-proto = { path = "../roundhouse-proto" }
+# Deliberate, tracked deviation from the frozen crate dependency table
+# (`docs/architecture/02-system-architecture.md` §5.2): this crate's whole purpose is
+# speaking the Agent Client Protocol, which requires the pinned `agent-client-protocol`
+# SDK (exact version per the Phase 5 plan's §5.3 pin list). This is a third-party crate
+# edge, not another `roundhouse-*` path dependency, so it does not widen this crate's
+# internal-crate dependency set (still `{core, proto}` only).
+agent-client-protocol = "=2.0.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Ruling C-P12 (Task C8): declared directly with `version = "0.13.4"`, NOT via
+# `workspace = true` — `reqwest` is not in `[workspace.dependencies]` (two other
+# crates, roundhouse-provider and roundhouse-tools, already declare it the same
+# way, each pinning 0.13.4 independently). This is a crate-edge deviation from
+# the frozen dependency table (`docs/architecture/02-system-architecture.md`
+# §5.2), tracked here for the eventual merge alongside the `agent-client-protocol`
+# deviation above.
+#
+# Deliberately no `blocking` feature: `registry::fetch_registry`/`fetch_quarantine`
+# are `async fn` using reqwest's default async client (Ruling C-P11). This crate's
+# real consumer is `roundhouse-daemon`, which is tokio-based, and
+# `reqwest::blocking` panics when called from inside a tokio runtime. Enabling
+# `blocking` would also, through workspace feature unification, push a
+# background runtime thread into roundhouse-provider and roundhouse-tools, which
+# neither asked for.
+reqwest = { version = "0.13.4" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Forwards to the SDK's own `unstable_protocol_v2` feature so that
+# `agent_client_protocol::schema::v2` actually exists when this feature is enabled —
+# without this forwarding, enabling `acp-v2` on this crate alone would enable nothing on
+# the dependency and the v2 schema module would never be reachable.
+acp-v2 = ["agent-client-protocol/unstable_protocol_v2"]

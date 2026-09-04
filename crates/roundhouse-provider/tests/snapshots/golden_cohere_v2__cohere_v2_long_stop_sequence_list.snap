@@ -1,0 +1,66 @@
+---
+source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
+expression: body
+---
+{
+  "model": "command-a-03-2026",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello."
+    }
+  ],
+  "stream": true,
+  "stop_sequences": [
+    "STOP_0",
+    "STOP_1",
+    "STOP_2",
+    "STOP_3",
+    "STOP_4",
+    "STOP_5",
+    "STOP_6",
+    "STOP_7",
+    "STOP_8",
+    "STOP_9",
+    "STOP_10",
+    "STOP_11",
+    "STOP_12",
+    "STOP_13",
+    "STOP_14",
+    "STOP_15",
+    "STOP_16",
+    "STOP_17",
+    "STOP_18",
+    "STOP_19",
+    "STOP_20",
+    "STOP_21",
+    "STOP_22",
+    "STOP_23",
+    "STOP_24",
+    "STOP_25",
+    "STOP_26",
+    "STOP_27",
+    "STOP_28",
+    "STOP_29",
+    "STOP_30",
+    "STOP_31",
+    "STOP_32",
+    "STOP_33",
+    "STOP_34",
+    "STOP_35",
+    "STOP_36",
+    "STOP_37",
+    "STOP_38",
+    "STOP_39",
+    "STOP_40",
+    "STOP_41",
+    "STOP_42",
+    "STOP_43",
+    "STOP_44",
+    "STOP_45",
+    "STOP_46",
+    "STOP_47",
+    "STOP_48",
+    "STOP_49"
+  ]
+}

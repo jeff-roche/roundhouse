@@ -1,0 +1,13 @@
+# Vendored from `interactions.openapi.json`'s `InteractionSseEventInteraction`
+# schema (the partial resource nested in `interaction.completed`/
+# `interaction.created` events) -- its real `status` `enum` values. Note this
+# is a SEPARATE, shorter vocabulary than the full `Interaction`/
+# `CreateModelInteractionParams.status` enum (which also has
+# `budget_exceeded`/`queued`) -- the streaming lifecycle partial resource only
+# ever reports these six.
+in_progress
+requires_action
+completed
+failed
+cancelled
+incomplete

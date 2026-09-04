@@ -1,0 +1,4 @@
+429
+content-type: application/json
+
+{"error":{"code":"rate_limit_exceeded","message":"You have exceeded your per-minute request limit. Wait and retry with exponential backoff."}}

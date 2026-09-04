@@ -11,7 +11,7 @@ use crate::{pool::StorePool, StoreError};
 
 pub(crate) enum WriteCmd {
     Append {
-        event: Event,
+        event: Box<Event>,
         reply: oneshot::Sender<Result<u64, StoreError>>,
     },
     AppendBatch {
@@ -98,7 +98,7 @@ pub async fn spawn_writer(store: StorePool) -> EventWriter {
             match cmd {
                 WriteCmd::Append { event, reply } => {
                     let redactor = redactor_for_task.load_full();
-                    let result = append_one(&store, event, &redactor).await;
+                    let result = append_one(&store, *event, &redactor).await;
                     let _ = reply.send(result);
                 }
                 WriteCmd::AppendBatch { events, reply } => {
@@ -445,7 +445,10 @@ impl EventWriter {
     pub async fn append(&self, event: Event) -> Result<u64, StoreError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(WriteCmd::Append { event, reply })
+            .send(WriteCmd::Append {
+                event: Box::new(event),
+                reply,
+            })
             .await
             .map_err(|_| StoreError::Interact("writer task shut down".into()))?;
         rx.await

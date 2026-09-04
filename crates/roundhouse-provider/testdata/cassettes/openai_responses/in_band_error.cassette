@@ -1,0 +1,7 @@
+200
+content-type: text/event-stream
+
+data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_7","status":"in_progress"}}
+
+data: {"type":"error","sequence_number":2,"error":{"type":"rate_limit_exceeded","code":null,"message":"rate limit exceeded mid-stream","param":null}}
+

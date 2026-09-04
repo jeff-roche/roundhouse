@@ -1,0 +1,93 @@
+# Qwen — DashScope OpenAI-compat mode (international endpoint).
+#
+# base_url and the enable_thinking parameter are DashScope's long-
+# established, widely-documented international-region values; live fetches
+# attempted during this task returned mutually inconsistent domains (see
+# profile_test_openai_chat_batch_c.rs's module doc for the detail) and never
+# confirmed a workable static alternative, so the brief's values are kept
+# here rather than replaced with unreliable fetch output.
+id = "qwen"
+codec = "openai-chat"
+# Round-8 review, M1/M2: the previous table's three keys
+# (Throttling.RateQuota/InternalError/InvalidApiKey) are native DashScope
+# REST-API error codes, not what this profile's OpenAI-*compatible-mode*
+# endpoint actually returns — a real mismatch independent of the pointer
+# bug. Confirmed two ways: (1) a live curl against
+# `dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions`
+# (2026-09) with a bad key returned the OpenAI-shaped
+# `{"error":{"message":"Incorrect API key provided...","type":
+# "invalid_request_error","param":null,"code":"invalid_api_key"},
+# "request_id":"..."}` — `type` is the same coarse bucket for many
+# unrelated 4xxs, so the fine-grained code lives at `/error/code`, not the
+# default `/error/type`; (2) Alibaba Cloud's own error-code reference
+# (`alibabacloud.com/help/en/model-studio/error-code`, fetched 2026-09)
+# lists each condition as "<status>-<native code>/<compat-mode code>",
+# explicitly separating the two surfaces, e.g. "429-Throttling.RateQuota/
+# LimitRequests/limit_requests" and "429-Throttling.AllocationQuota/
+# insufficient_quota" — the lowercase snake_case member of each slash-
+# separated group is the compatible-mode value (matching the live-observed
+# `invalid_api_key` for "401-InvalidApiKey/invalid_api_key"), the
+# PascalCase/dotted member is the native-API value this profile does not
+# use. (See the `[errors]` table below for why `insufficient_quota`
+# specifically -- despite appearing in this naming discussion -- is not
+# listed as a code-table entry.)
+error_pointer = "/error/code"
+
+[defaults]
+allow_raw_extra = false
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+
+[defaults.params]
+mode = "deny_list"
+fields = []
+
+[defaults.auth]
+kind = "bearer"
+
+[[model]]
+match = ["qwen3*"]
+
+[model.reasoning]
+kind = "effort"
+field = "/enable_thinking"
+# Fix round 7, K6: DashScope documents `enable_thinking` as a JSON boolean,
+# not a string -- without `value_type`, this control's resolved wire value
+# ("false"/"true") is emitted as the JSON *string* "true", which is a
+# protocol violation the gateway may silently ignore rather than reject
+# (thinking stays off with no error). No live Qwen endpoint was reachable
+# to confirm this against a real response; this cassette proves the
+# codec's own self-consistency (it emits a real boolean), not a verified
+# live behavior change.
+value_type = "bool"
+vocabulary = ["false", "true"]
+
+[model.reasoning.map]
+off = "false"
+low = "true"
+medium = "true"
+high = "true"
+max = "true"
+
+[errors]
+"limit_requests" = { disposition = "shed_concurrency" }
+# Ruling P106: "insufficient_quota" (DashScope's "429-Throttling.
+# AllocationQuota") is deliberately LEFT OUT of this table. The vendor code
+# name says "Throttling", and Alibaba Cloud's own error-code reference gives
+# the remedy as adjusting the calling strategy or requesting a temporary TPM
+# increase -- that is a throughput cap, not a permanent billing block. This
+# disposition is an inference from Alibaba Cloud's error-code reference plus
+# the vendor code's own "Throttling" naming, NOT something observed against a
+# live throttled response -- no billable Qwen key existed on this phase to
+# trigger a real 429-Throttling.AllocationQuota and capture its body. (This
+# is separate from the "confirmed two ways" claim above the `error_pointer`
+# setting, which is about the /error/code pointer location itself,
+# established against a live bad-key 401 -- that claim stands on its own.)
+# A previous version of this table classified it as `fatal`/quota, which was an
+# unevidenced guess and a behavioural regression: before that entry existed,
+# the code fell through to the HTTP-429 default (RateLimited, retried); the
+# `fatal` entry turned a transient condition into a permanent one. Leaving
+# the entry out restores that retryable fallback and asserts nothing this
+# phase cannot evidence. Do NOT "helpfully" re-add this entry -- see
+# `tests/profile_errors_wiring_batch_c_test.rs`'s
+# `qwen_insufficient_quota_is_not_in_the_table_and_falls_back_to_retryable_rate_limited`.
+"model_not_supported" = { disposition = "fatal", category = "model_not_found" }

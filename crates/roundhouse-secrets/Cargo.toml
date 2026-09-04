@@ -11,8 +11,50 @@ workspace = true
 roundhouse-config = { path = "../roundhouse-config" }
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-store = { path = "../roundhouse-store" }
+# Deliberate, tracked deviation from the frozen crate dependency table
+# (`docs/architecture/02-system-architecture.md` §5.2, which does not list this
+# edge explicitly): Phase 6 Task 2 assigns the six concrete `CredentialProvider`
+# implementations (§9.9 — bearer, header-key, OAuth refresh, Azure Entra,
+# exec-command, SigV4) to this crate, and every one of them implements
+# `roundhouse_provider::credential::CredentialProvider` and mutates a
+# `roundhouse_provider::HttpRequest` in place. This is acyclic: this crate
+# already reaches `roundhouse-provider` transitively through `roundhouse-store`
+# (`roundhouse-store` depends directly on `roundhouse-provider` — see that
+# crate's own tracked-deviation comment), so adding the direct edge here does
+# not create a new dependency cycle, only a shorter path to a target already
+# reachable. `roundhouse-provider` takes this crate back only as a
+# `[dev-dependencies]` entry (see its Cargo.toml), which is legal in Cargo
+# precisely because dev-dependency edges are excluded from the normal build
+# graph.
+roundhouse-provider = { path = "../roundhouse-provider" }
 thiserror = { workspace = true }
 secrecy = "0.10.3"
+# `credential::exec_command::ExecCommandCredential` (spawns a helper process)
+# and `credential::oauth_refresh::OAuthRefreshCredential` (its single-flight
+# cache mutex) use `tokio::process`/`tokio::sync::Mutex` as production code,
+# not just in tests. `process` isn't in the workspace default feature set, so
+# it's added here on top of the shared `workspace = true` features.
+tokio = { workspace = true, features = ["process"] }
+# `credential::oauth_refresh::OAuthRefreshCredential::apply` collects the
+# token endpoint's streamed `HttpResponseStream` body before parsing it as
+# JSON.
+futures = "0.3"
+# `credential::oauth_refresh`'s `OAuthTokenResponse` and the client-credentials
+# request body it builds.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# SigV4 signing math (`credential::sigv4::sign`, §9.9).
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+# `credential::sigv4::sign`'s `now: chrono::DateTime<chrono::Utc>` parameter,
+# and OAuth-refresh/token-cache expiry bookkeeping.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Parses the host/path/query out of a `roundhouse_provider::HttpRequest`'s URL
+# for SigV4 canonical-request construction. Already present transitively via
+# `roundhouse-provider` -> `reqwest`; declared explicitly since it's used
+# directly here.
+url = "2.5"
 # Exact-pinned, not a caret requirement: this crate's `KeyringBackend` DI
 # seam (resolve.rs) was designed against 4.1.6-specific internal behavior
 # — `keyring::Entry::new` installs a real, process-global credential
@@ -33,8 +75,12 @@ rustix = { version = "1.1", features = ["process"] }
 tempfile = "3"
 once_cell = "1"
 trybuild = "1"
-tokio = { workspace = true }
-# Only needed by tests/ui/secret_serde_serialize.rs's trybuild compile-fail
-# case (proving `Secret` has no reachable `Serialize` impl) — no production
-# code in this crate uses serde/serde_json.
-serde_json = { workspace = true }
+# `tests/credential_test.rs`'s fake `HttpTransport`s build `HttpResponseStream`
+# bodies directly. `tokio`'s `macros`/`rt-multi-thread` features (needed for
+# `#[tokio::test]`) are already pulled in via `[dependencies]`'s
+# `workspace = true`.
+bytes = { workspace = true }
+# `credential`'s own ratchet test (Phase 6 Task 2) walks `src/credential/` and
+# asserts exact `expose_secret_for_provider_call(` call-site counts and the
+# absence of raw-exposure patterns.
+walkdir = "2.5"

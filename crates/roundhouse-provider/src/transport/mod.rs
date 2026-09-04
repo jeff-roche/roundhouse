@@ -3,6 +3,25 @@ use futures::future::BoxFuture;
 use futures::stream::{self, Stream};
 use std::pin::Pin;
 
+/// The `sigv4-eventstream` transport shim (§9.4, Phase 6 Task 7): decodes
+/// AWS's binary `application/vnd.amazon.eventstream` framing, the one wire
+/// format in this crate that isn't SSE (Bedrock's legacy non-Claude
+/// `ConverseStream` responses). `pub`, not `pub(crate)`, so
+/// `codec::bedrock_converse` — a sibling module, not a child of `transport`
+/// — can reach it via `crate::transport::eventstream::EventStreamDecoder`;
+/// `transport` itself stays a crate-private `mod` in `lib.rs`; see that
+/// declaration's doc comment for why that's still visible everywhere in this
+/// crate.
+pub mod eventstream;
+
+/// The `azure-deployment-routing` transport shim (§9.4, Phase 6 Task 14):
+/// pure URL construction for Azure OpenAI's deployment-name-based routing.
+/// `pub`, not `pub(crate)`, for the same reason as `eventstream` above
+/// (`transport` itself stays a crate-private `mod` in `lib.rs`) — re-exported
+/// at the crate root (`lib.rs`) so external test crates can reach it despite
+/// `transport` being private.
+pub mod azure_deployment_routing;
+
 /// HTTP request to be sent via `HttpTransport`.
 pub struct HttpRequest {
     /// HTTP method (e.g., "GET", "POST").

@@ -1,0 +1,5 @@
+429
+content-type: application/json
+x-amzn-errortype: ThrottlingException
+
+{"message":"Too many requests, please wait before retrying."}

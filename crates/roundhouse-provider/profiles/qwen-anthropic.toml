@@ -1,0 +1,49 @@
+# Qwen — DashScope's Anthropic-Messages-compatible endpoint (distinct from
+# qwen.toml, Task 12's openai-chat-compat profile for the same provider —
+# §9.4 lists Qwen under BOTH codecs).
+#
+# Verified against two independent, current DashScope/QwenCloud sources
+# (fetched 2026-09-02):
+#   https://docs.qwencloud.com/api-reference/chat/anthropic — "POST
+#   /apps/anthropic/v1/messages at https://dashscope-intl.aliyuncs.com/apps/
+#   anthropic" ... "Pass your Model Studio API key in either the x-api-key
+#   header or the Authorization: Bearer header."
+#   https://www.alibabacloud.com/help/en/model-studio/anthropic-api-messages
+#   — same base path (/apps/anthropic), same "x-api-key or Authorization:
+#   Bearer" auth statement, confirmed for the intl/Singapore/Frankfurt/
+#   Virginia/Tokyo regional variants (all share the /apps/anthropic path,
+#   differing only in host).
+#
+# DIVERGENCE FROM THE TASK BRIEF: the brief's sample TOML used
+# `base_url = "https://dashscope-intl.aliyuncs.com/api/v1/anthropic"`, which
+# does not match either source above -- the real path is `/apps/anthropic`,
+# not `/api/v1/anthropic`. Corrected here.
+id = "qwen-anthropic"
+codec = "anthropic-messages"
+
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://dashscope-intl.aliyuncs.com/apps/anthropic"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["qwen3*"]
+
+# [errors] deliberately EMPTY (M1/M3 lesson): the only DashScope error codes
+# this task found documented (Throttling.RateQuota, Throttling.AllocationQuota,
+# InternalError, InvalidApiKey, ModelNotFound -- docs.qwencloud.com/
+# api-reference/preparation/error-messages, fetched 2026-09-02) are DashScope's
+# NATIVE REST-API codes. The sibling qwen.toml (openai-chat-compat) profile's
+# own, already-reviewed comment proves these native codes do NOT match what a
+# DIFFERENT DashScope compat surface actually returns on the wire (a live
+# fetch against its OpenAI-compat endpoint returned the OpenAI-shaped
+# `invalid_api_key`, not the native `InvalidApiKey`) -- and this task found no
+# equivalent live-captured or vendor-documented error shape specifically for
+# the Anthropic-compat surface (`/apps/anthropic/v1/messages`) to confirm
+# whether it re-emits DashScope-native codes, OpenAI-compat-mode codes, or its
+# own Anthropic-native `/error/type` vocabulary. An empty table with this
+# citation is a correct, evidenced outcome per this task's process rules --
+# not a guess in any direction. `classify()` falls through to its generic
+# HTTP-status tier for every code from this profile.
+[errors]

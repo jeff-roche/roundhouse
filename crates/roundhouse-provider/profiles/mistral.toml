@@ -1,0 +1,36 @@
+# Mistral — direct vendor API. Verified against docs.mistral.ai/api/
+# (fetched live 2026-09): base_url and Bearer auth confirmed verbatim. No
+# vendor-specific request quirk found; plain pass-through profile.
+# Round-8 review, M1/M2: the previous table's three keys
+# (rate_limit_exceeded/service_unavailable/invalid_api_key) never appear in
+# Mistral's real error body and were matched against the wrong pointer.
+# Verified live against docs.mistral.ai/resources/error-glossary (fetched
+# 2026-09): every error is a FLAT object (no nested "error" wrapper) --
+# `{"object":"error","message":...,"type":...,"param":...,"code":...}` --
+# so `error_pointer` must be `/type`, not the default `/error/type`. The
+# glossary's own `type` enum has exactly four values:
+# authentication_error/invalid_request_error/rate_limit_error/server_error.
+# There is no distinct "quota"/"insufficient balance" type documented
+# anywhere on that page (searched for "credit"/"balance"/"insufficient"
+# with no hits) -- `authentication_error` means "your API key is wrong",
+# not "you're out of quota", and asserting QuotaExhausted for it would be
+# the exact wrong-specific-guess E1 already rejects, so it is deliberately
+# omitted rather than reusing the old (fabricated) "invalid_api_key" entry.
+# `server_error` covers the 500/502/503/504 family per that same page --
+# `retry_backoff` turns `classify()`'s otherwise-generic `Server{status}`
+# into `Overloaded`, which is what a status-code-only fallback cannot know.
+id = "mistral"
+codec = "openai-chat"
+error_pointer = "/type"
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://api.mistral.ai/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"rate_limit_error" = { disposition = "shed_concurrency" }
+"server_error" = { disposition = "retry_backoff" }

@@ -31,7 +31,7 @@ pub enum ClientEvent {
     TaskEvent {
         session_id: SessionId,
         task_id: Option<TaskId>,
-        payload: EventPayload,
+        payload: Box<EventPayload>,
     },
     Ack {
         api_version: ApiVersion,

@@ -1,0 +1,14 @@
+# The full `ContentBlockDelta` union (response-side streaming delta), fetched
+# verbatim from
+# https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ContentBlockDelta.html
+# (fetched 2026-09-02): 6 members total. `decode.rs` recognizes `text`,
+# `toolUse`, and `reasoningContent`; `citation`/`image`/`toolResult` deltas
+# have no IR equivalent and are skipped, but are still vendored here in full
+# per REALITY-CORRECTIONS §13b ("vendor full enums, not just the values you
+# use").
+citation
+image
+reasoningContent
+text
+toolResult
+toolUse

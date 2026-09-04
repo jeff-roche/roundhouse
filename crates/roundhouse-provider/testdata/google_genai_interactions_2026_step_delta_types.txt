@@ -1,0 +1,26 @@
+# Vendored from `interactions.openapi.json` -- every `StepDeltaData` oneOf
+# member's real `type` `const` value.
+arguments_delta
+audio
+code_execution_call
+code_execution_result
+document
+file_search_call
+file_search_result
+function_result
+google_maps_call
+google_maps_result
+google_search_call
+google_search_result
+image
+mcp_server_tool_call
+mcp_server_tool_result
+processing_call
+processing_result
+text
+text_annotation_delta
+thought_signature
+thought_summary
+url_context_call
+url_context_result
+video

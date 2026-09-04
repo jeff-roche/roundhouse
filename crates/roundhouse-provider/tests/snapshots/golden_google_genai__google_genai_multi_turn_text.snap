@@ -1,0 +1,37 @@
+---
+source: crates/roundhouse-provider/tests/golden_google_genai.rs
+expression: "enc(&req, EndpointMode::Interactions)"
+---
+{
+  "model": "gemini-3.0-pro",
+  "input": [
+    {
+      "type": "user_input",
+      "content": [
+        {
+          "type": "text",
+          "text": "What is the capital of France?"
+        }
+      ]
+    },
+    {
+      "type": "model_output",
+      "content": [
+        {
+          "type": "text",
+          "text": "Paris."
+        }
+      ]
+    },
+    {
+      "type": "user_input",
+      "content": [
+        {
+          "type": "text",
+          "text": "And its population?"
+        }
+      ]
+    }
+  ],
+  "stream": true
+}

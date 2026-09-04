@@ -1,0 +1,51 @@
+This directory vendors data fetched from two third-party sources, both MIT
+licensed per docs/decisions/2026-08-27-dataset-licensing-gate.md. Neither
+source file carries a license header of its own (JSON has no comment syntax),
+so this NOTICE file discharges the MIT license's requirement to retain the
+copyright and permission notice in copies of the software.
+
+--------------------------------------------------------------------------
+
+models_dev_snapshot.json
+  Source:  https://models.dev/api.json
+  Repo:    https://github.com/anomalyco/models.dev
+  License: https://raw.githubusercontent.com/anomalyco/models.dev/dev/LICENSE
+  Fetched: 2026-09-02
+
+  Copyright (c) 2025 models.dev
+
+--------------------------------------------------------------------------
+
+litellm_pricing_snapshot.json
+  Source:  https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+  Repo:    https://github.com/BerriAI/litellm
+  License: https://raw.githubusercontent.com/BerriAI/litellm/main/LICENSE
+  Fetched: 2026-09-02
+
+  Copyright (c) 2023 Berri AI
+
+  This file lives at the repository root, outside the `enterprise/`
+  directory, which is licensed separately (see the repo's own LICENSE file)
+  and is not used by this project.
+
+--------------------------------------------------------------------------
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.

@@ -1,0 +1,4 @@
+429
+content-type: application/json
+
+{"error":{"type":"rate_limit_exceeded","message":"You have hit the rate limit. Please retry after backing off."}}

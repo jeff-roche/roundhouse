@@ -1,0 +1,8 @@
+# The full `ReasoningContentBlockDelta` union, fetched verbatim from
+# https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ReasoningContentBlockDelta.html
+# (fetched 2026-09-02): 3 members. `decode.rs` recognizes `text` and
+# `signature`; `redactedContent` (opaque base64 data with no IR field to
+# carry it) is skipped but still vendored here in full.
+redactedContent
+signature
+text

@@ -1,0 +1,18 @@
+---
+source: crates/roundhouse-provider/tests/golden_cohere_v2.rs
+expression: body
+---
+{
+  "model": "command-a-03-2026",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a careful assistant."
+    },
+    {
+      "role": "user",
+      "content": "Hello."
+    }
+  ],
+  "stream": true
+}

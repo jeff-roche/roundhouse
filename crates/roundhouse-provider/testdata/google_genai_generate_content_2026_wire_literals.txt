@@ -1,0 +1,94 @@
+# Fix-round-1 F4: vendored field names and enum values for the legacy
+# generateContent/streamGenerateContent surface, extracted from the fetched
+# `https://ai.google.dev/api/generate-content.md.txt`'s literal "JSON
+# representation" code blocks and enum tables (never from prose), plus
+# `https://ai.google.dev/api/caching.md.txt`'s FunctionCallingConfig/Mode
+# section for `allowedFunctionNames`/tool-choice mode values -- see
+# docs/decisions/2026-08-27-google-genai-spec-verification.md Divergence 1
+# and fix-round-1 F4 for why `caching.md.txt`, not `generate-content.md.txt`,
+# is the correct citation for that second group.
+#
+# Field names (Content, Part, FunctionCall, FunctionResponse, Tool,
+# FunctionDeclaration, the GenerationConfig/ThinkingConfig subset this codec
+# sets, Candidate, PromptFeedback, UsageMetadata):
+contents
+parts
+role
+text
+thought
+thoughtSignature
+functionCall
+name
+args
+id
+functionResponse
+response
+tools
+functionDeclarations
+description
+parameters
+toolConfig
+generationConfig
+maxOutputTokens
+stopSequences
+temperature
+topP
+thinkingConfig
+thinkingBudget
+systemInstruction
+candidates
+content
+finishReason
+promptFeedback
+blockReason
+usageMetadata
+promptTokenCount
+candidatesTokenCount
+cachedContentTokenCount
+# `Content.role` values (verified: "Must be either 'user' or 'model'"):
+user
+model
+# `FunctionResponse.response` is caller's-choice-of-key; "output"/"error" are
+# this codec's own convention (the fetched doc's own note: "if the function
+# call failed... the response can have an error key"), not spec-mandated
+# field names -- included here anyway since they ARE the literals the code
+# matches on, and neither is a real risk of being spec-wrong (they're chosen
+# by us, not read off the wire).
+output
+error
+# `FunctionCallingConfig`/`Mode` (`caching.md.txt`) -- full enum, not just
+# the two values this codec currently sends, per fix-round-1 F10's lesson
+# (don't vendor only the current subset of a closed enum):
+functionCallingConfig
+allowedFunctionNames
+mode
+MODE_UNSPECIFIED
+AUTO
+ANY
+NONE
+VALIDATED
+# `FinishReason` -- full enum (`generate-content.md.txt`):
+STOP
+MAX_TOKENS
+SAFETY
+RECITATION
+LANGUAGE
+OTHER
+BLOCKLIST
+PROHIBITED_CONTENT
+SPII
+MALFORMED_FUNCTION_CALL
+IMAGE_SAFETY
+IMAGE_PROHIBITED_CONTENT
+IMAGE_OTHER
+NO_IMAGE
+IMAGE_RECITATION
+UNEXPECTED_TOOL_CALL
+TOO_MANY_TOOL_CALLS
+MISSING_THOUGHT_SIGNATURE
+MALFORMED_RESPONSE
+ESCALATION
+FINISH_REASON_UNSPECIFIED
+# `BlockReason` -- full enum (`generate-content.md.txt`); several values
+# overlap with FinishReason above and are not repeated:
+BLOCK_REASON_UNSPECIFIED

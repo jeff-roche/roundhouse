@@ -8,6 +8,7 @@ members = [
     "crates/roundhouse-secrets",
     "crates/roundhouse-sandbox",
     "crates/roundhouse-provider",
+    "crates/roundhouse-conformance",
     "crates/roundhouse-tools",
     "crates/roundhouse-mcp",
     "crates/roundhouse-acp",

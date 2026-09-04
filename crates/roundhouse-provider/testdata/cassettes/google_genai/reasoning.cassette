@@ -1,0 +1,21 @@
+200
+content-type: text/event-stream
+
+data: {"event_type":"interaction.created","interaction":{"id":"int_4","model":"gemini-3.0-pro","status":"in_progress"}}
+
+data: {"event_type":"step.start","index":0,"step":{"type":"thought"}}
+
+data: {"event_type":"step.delta","index":0,"delta":{"type":"thought_summary","content":{"type":"text","text":"Assume sqrt(2) is rational and derive a contradiction."}}}
+
+data: {"event_type":"step.delta","index":0,"delta":{"type":"thought_signature","signature":"c2lnbmF0dXJlLWJhc2U2NA=="}}
+
+data: {"event_type":"step.stop","index":0}
+
+data: {"event_type":"step.start","index":1,"step":{"type":"model_output"}}
+
+data: {"event_type":"step.delta","index":1,"delta":{"type":"text","text":"sqrt(2) is irrational because assuming otherwise leads to a contradiction in lowest-terms fractions."}}
+
+data: {"event_type":"step.stop","index":1}
+
+data: {"event_type":"interaction.completed","interaction":{"id":"int_4","model":"gemini-3.0-pro","status":"completed","usage":{"total_input_tokens":14,"total_output_tokens":40,"total_cached_tokens":0,"total_thought_tokens":22,"total_tokens":76}}}
+

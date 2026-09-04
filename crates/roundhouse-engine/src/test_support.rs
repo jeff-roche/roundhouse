@@ -31,6 +31,7 @@ pub fn sample_ctx() -> RequestCtx {
         trace_id: None,
         transport: Arc::new(NoopTransport),
         api_key: "test".into(),
+        credentials: None,
     }
 }
 

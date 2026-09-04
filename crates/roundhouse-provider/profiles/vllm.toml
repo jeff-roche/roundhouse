@@ -1,0 +1,32 @@
+# vLLM — self-hosted OpenAI-compatible server, default port 8000 (stable,
+# long-documented vLLM `vllm serve` default).
+id = "vllm"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = true
+params = { mode = "allow_all", fields = [] }
+base_url = "http://localhost:8000/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+# Round-8 review, M1/M2: "engine_busy" never appears in vLLM's real error
+# body. Verified against vLLM's current source (github.com/vllm-project/
+# vllm, `vllm/entrypoints/serve/engine/protocol.py` — `ErrorResponse {
+# error: ErrorInfo }`, `ErrorInfo { message, type, param, code: int }` — a
+# genuinely OpenAI-shaped nested body, so the default `error_pointer`
+# (`/error/type`) already resolves correctly, no override needed). The
+# real "engine is at capacity" condition is `QueueOverflowError`/
+# `MaxQueuedTokensError` (`vllm/exceptions.py`), both a
+# `GracefulHTTPError` mapped by `create_error_response`
+# (`.../exception_handling/error_response.py`) to
+# `type: HTTPStatus(503).phrase` — i.e. the literal string
+# `"Service Unavailable"` — confirmed directly against vLLM's own test
+# suite (`tests/v1/engine/test_admission_control.py::
+# test_custom_graceful_error_maps_to_its_status`: `resp.error.type ==
+# HTTPStatus.SERVICE_UNAVAILABLE.phrase`). This is exactly the admission-
+# control "capacity, not your fault" condition `ProviderErrorKind::
+# Overloaded` documents.
+[errors]
+"Service Unavailable" = { disposition = "retry_backoff" }

@@ -1,0 +1,11 @@
+200
+content-type: text/event-stream
+
+data: {"choices":[{"delta":{"role":"assistant","content":"2"}}]}
+
+data: {"choices":[{"delta":{"content":" + 2 = 4"}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":6}}
+
+data: [DONE]
+

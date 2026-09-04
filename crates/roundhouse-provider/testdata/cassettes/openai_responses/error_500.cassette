@@ -1,0 +1,4 @@
+500
+content-type: text/html
+
+<html><head><title>502 Bad Gateway</title></head><body><center><h1>500 Internal Server Error</h1></center><hr><center>openai-responses-edge</center></body></html>

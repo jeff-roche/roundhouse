@@ -1,0 +1,58 @@
+# Databricks — Model Serving's OpenAI-Responses-compatible endpoint.
+#
+# Verified against Databricks' own current docs (fetched 2026-09-02):
+# https://docs.databricks.com/aws/en/machine-learning/model-serving/query-openai-responses
+#   curl example: "https://<workspace_host>.databricks.com/serving-endpoints/responses"
+#   -- fixed path /serving-endpoints/responses, workspace-host-specific base.
+# https://docs.databricks.com/api/workspace/errors (same fetch date):
+#   standard error body shape "{\"error_code\": \"NOT_FOUND\", \"message\":
+#   \"...\"}" -- a TOP-LEVEL error_code field, not this codec's default
+#   nested /error/type. Documented error_code values include
+#   RESOURCE_EXHAUSTED (429, "A rate limit or resource quota was exceeded"),
+#   TEMPORARILY_UNAVAILABLE (503, transient), INTERNAL_ERROR (500,
+#   "unexpected error ... on the Databricks side"), and PERMISSION_DENIED
+#   (403, "caller is not authorized").
+# Bearer auth confirmed for /serving-endpoints/* against a real Databricks
+# personal-access-token example (learn.microsoft.com/en-us/azure/databricks/
+# machine-learning/model-serving/query-route-optimization, same fetch date):
+# "Authorization: Bearer <token>".
+#
+# DIVERGENCES FROM THE TASK BRIEF, REPORTED:
+#   1. base_url: workspace-specific in reality (the docs above literally
+#      show "<workspace_host>" as a placeholder); the brief's sample host
+#      "my-workspace.cloud.databricks.com" is replaced with the same RFC
+#      6761 `.invalid` placeholder pattern microsoft-foundry.toml/
+#      azure-openai.toml/vertex-anthropic.toml already established for a
+#      per-deployment host, always overridden via
+#      ROUNDHOUSE_DATABRICKS_BASE_URL (§9.9).
+#   2. error_pointer: the codec's default (/error/type) cannot resolve
+#      against Databricks' real, confirmed top-level error_code shape --
+#      corrected to /error_code.
+#   3. [errors] table: "REQUEST_LIMIT_EXCEEDED" (the brief's key) does not
+#      appear in Databricks' own documented error_code enum -- the real,
+#      evidenced code for this condition is RESOURCE_EXHAUSTED. "INTERNAL_
+#      ERROR" is confirmed real and kept. "PERMISSION_DENIED" is confirmed
+#      real but, per this codebase's own established precedent
+#      (vertex-anthropic.toml's identical treatment of google.rpc.Code's
+#      PERMISSION_DENIED), is a genuine authorization failure, not a quota
+#      condition -- mapping it to category = "quota" would be a wrong
+#      specific, not an imprecision, so it is omitted here rather than
+#      guessed; classify()'s HTTP-status fallback tier (403 -> BadRequest)
+#      still handles it.
+id = "databricks"
+codec = "openai-responses"
+error_pointer = "/error_code"
+
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://workspace-host.invalid/serving-endpoints"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"RESOURCE_EXHAUSTED" = { disposition = "shed_concurrency" }
+"TEMPORARILY_UNAVAILABLE" = { disposition = "retry_backoff" }
+"INTERNAL_ERROR" = { disposition = "retry_backoff" }

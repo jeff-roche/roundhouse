@@ -1,0 +1,11 @@
+# The full `ConverseStreamMetadataEvent` field set, fetched verbatim from the
+# "metadata" object in the `ConverseStream` Response Syntax at
+# https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html
+# (fetched 2026-09-02). `decode.rs`'s `decode_event`'s `"metadata"` arm reads
+# `usage`; `metrics`/`performanceConfig`/`serviceTier`/`trace` have no IR
+# equivalent and are not read, but are vendored here in full.
+metrics
+performanceConfig
+serviceTier
+trace
+usage

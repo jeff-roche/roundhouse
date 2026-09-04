@@ -1,0 +1,11 @@
+# The 3 real `:message-type` header values, fetched verbatim from
+# https://smithy.io/2.0/aws/amazon-eventstream.html (fetched 2026-09-02):
+# "event" (a modeled event, `:event-type` names the union member),
+# "exception" (a modeled error, `:exception-type` names the shape), "error"
+# (the protocol's own generic/unmodeled error, `:error-code`/`:error-message`
+# headers carry the detail). `decode.rs`'s `terminal_failure` matches on
+# "exception" and "error"; "event" is the fall-through default handled by
+# `decode_event` instead.
+event
+exception
+error

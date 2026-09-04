@@ -1,0 +1,16 @@
+id = "groq"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = false
+# Groq's real API restriction: logprobs is not supported on chat completions.
+params = { mode = "deny_list", fields = ["logprobs"] }
+base_url = "https://api.groq.com/openai/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"rate_limit_exceeded" = { disposition = "shed_concurrency" }
+"internal_server_error" = { disposition = "retry_backoff" }
+"invalid_api_key"       = { disposition = "fatal", category = "quota" }

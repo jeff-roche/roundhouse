@@ -132,6 +132,7 @@ async fn main() -> color_eyre::Result<()> {
                     trace_id: None,
                     transport: Arc::new(ReqwestTransport::new()),
                     api_key,
+                    credentials: None,
                 },
             ),
             None => (
@@ -142,6 +143,7 @@ async fn main() -> color_eyre::Result<()> {
                     trace_id: None,
                     transport: Arc::new(NoopTransport),
                     api_key: "demo".into(),
+                    credentials: None,
                 },
             ),
         };

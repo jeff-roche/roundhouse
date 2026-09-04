@@ -3,62 +3,56 @@ source: crates/roundhouse-provider/tests/anthropic_messages_encode.rs
 expression: body
 ---
 {
-  "max_tokens": 2048,
-  "messages": [
-    {
-      "content": [
-        {
-          "text": "Edit main.rs",
-          "type": "text"
-        }
-      ],
-      "role": "user"
-    },
-    {
-      "content": [
-        {
-          "signature": "sig-abc123",
-          "thinking": "I should read the file first.",
-          "type": "thinking"
-        },
-        {
-          "id": "toolu_1",
-          "input": {
-            "path": "main.rs"
-          },
-          "name": "read",
-          "type": "tool_use"
-        }
-      ],
-      "role": "assistant"
-    }
-  ],
   "model": "claude-sonnet-5",
-  "output_config": {
-    "effort": "medium"
-  },
-  "stream": true,
   "system": [
     {
+      "type": "text",
+      "text": "You are a careful coding agent.",
       "cache_control": {
         "type": "ephemeral"
-      },
-      "text": "You are a careful coding agent.",
-      "type": "text"
+      }
     }
   ],
-  "thinking": {
-    "type": "adaptive"
-  },
-  "tool_choice": {
-    "type": "auto"
-  },
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Edit main.rs"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "I should read the file first.",
+          "signature": "sig-abc123"
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_1",
+          "name": "read",
+          "input": {
+            "path": "main.rs"
+          }
+        }
+      ]
+    }
+  ],
+  "max_tokens": 2048,
+  "stream": true,
   "tools": [
     {
+      "name": "read",
       "description": "Read a file",
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "ReadParams",
         "description": "Test params struct for the \"read\" tool.",
+        "type": "object",
         "properties": {
           "path": {
             "type": "string"
@@ -66,11 +60,17 @@ expression: body
         },
         "required": [
           "path"
-        ],
-        "title": "ReadParams",
-        "type": "object"
-      },
-      "name": "read"
+        ]
+      }
     }
-  ]
+  ],
+  "tool_choice": {
+    "type": "auto"
+  },
+  "thinking": {
+    "type": "adaptive"
+  },
+  "output_config": {
+    "effort": "medium"
+  }
 }

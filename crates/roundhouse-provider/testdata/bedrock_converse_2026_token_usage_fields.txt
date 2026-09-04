@@ -1,0 +1,12 @@
+# The full `TokenUsage` field set, fetched verbatim from
+# https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_TokenUsage.html
+# (fetched 2026-09-02). `decode.rs`'s `decode_usage` reads `inputTokens`,
+# `outputTokens`, and `cacheReadInputTokens`; `totalTokens`,
+# `cacheWriteInputTokens`, and `cacheDetails` have no `roundhouse_core::Usage`
+# field to carry them and are not read, but are vendored here in full.
+cacheDetails
+cacheReadInputTokens
+cacheWriteInputTokens
+inputTokens
+outputTokens
+totalTokens

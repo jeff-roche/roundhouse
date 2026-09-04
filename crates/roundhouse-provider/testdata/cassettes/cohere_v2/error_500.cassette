@@ -1,0 +1,4 @@
+500
+content-type: application/json
+
+{"message":"internal server error, please contact support if this persists"}

@@ -1,0 +1,10 @@
+# The full set of eventstream protocol reserved header names, fetched
+# verbatim from https://smithy.io/2.0/aws/amazon-eventstream.html (fetched
+# 2026-09-02). `decode.rs`'s `header_str(message, "<name>")` calls only ever
+# read one of these.
+:message-type
+:event-type
+:exception-type
+:content-type
+:error-code
+:error-message

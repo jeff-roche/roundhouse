@@ -1,0 +1,15 @@
+id = "fireworks"
+codec = "openai-chat"
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+base_url = "https://api.fireworks.ai/inference/v1"
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["*"]
+
+[errors]
+"too_many_requests" = { disposition = "shed_concurrency" }
+"server_error"       = { disposition = "retry_backoff" }
+"invalid_api_key"    = { disposition = "fatal", category = "quota" }

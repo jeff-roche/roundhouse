@@ -1,0 +1,16 @@
+---
+source: crates/roundhouse-provider/tests/golden_google_genai.rs
+expression: legacy
+---
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "What is 2+2?"
+        }
+      ]
+    }
+  ]
+}

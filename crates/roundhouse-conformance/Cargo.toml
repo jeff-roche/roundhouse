@@ -1,0 +1,25 @@
+[package]
+name = "roundhouse-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The one real, forward dependency edge (load-bearing, §13.3): this crate
+# houses the shared conformance harness that Tasks 5-17's provider adapters
+# are reviewed against; `roundhouse-provider` only ever *dev*-depends back
+# (see its own Cargo.toml comment), which is what keeps this edge acyclic.
+roundhouse-provider = { path = "../roundhouse-provider" }
+# `checks::check_usage_invariants` runs over `roundhouse_core::Usage` (§14b
+# of REALITY-CORRECTIONS: Usage is a core type, not re-exported from
+# `roundhouse-provider`'s crate root) — a direct, acyclic edge since
+# `roundhouse-core` has no dependencies of its own.
+roundhouse-core = { path = "../roundhouse-core" }
+futures = "0.3"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["full", "test-util"] }

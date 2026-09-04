@@ -1,0 +1,130 @@
+# Vertex Gemini -- Google's own Gemini models on Vertex AI (Google Cloud),
+# via the classic Publisher-Model `generateContent`/`streamGenerateContent`
+# REST surface -- NOT the Interactions API. Both were checked as primary
+# sources allow:
+#
+#   - The Interactions API (`EndpointMode::Interactions`, `google-genai.toml`'s
+#     default surface) is NOT available on Vertex AI as of this profile's
+#     fetch date. Verified against a Google AI developer forum thread
+#     (https://discuss.ai.google.dev/t/is-interactions-api-available-in-vertexai/114356,
+#     fetched 2026-09-02): "No, the Interaction API is not currently
+#     available in Vertex AI" -- a July 2026 follow-up in that same thread
+#     confirms it still isn't. The Interactions API's own REST reference
+#     (https://ai.google.dev/api/interactions-api, fetched 2026-09-02)
+#     exclusively documents `generativelanguage.googleapis.com`, with no
+#     Vertex/`aiplatform.googleapis.com` variant anywhere on the page.
+#     DIVERGENCE FROM THE TASK BRIEF (reported per this task's process
+#     rules): a first search-engine-synthesized summary claimed the
+#     Interactions API was GA on Vertex by June 2026; both direct primary-
+#     source fetches above directly contradict that summary, so this profile
+#     follows the fetched primary sources, not the synthesized summary.
+#   - The classic `generateContent`/`streamGenerateContent` surface IS real
+#     and current on Vertex, corroborated by a search-engine summary of
+#     Google's own Vertex AI REST reference (fetched 2026-09-02) giving the
+#     verbatim curl shape:
+#       curl -X POST -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+#         https://${API_ENDPOINT}/v1/projects/${PROJECT_ID}/locations/${LOCATION}/publishers/google/models/${MODEL_ID}:streamGenerateContent \
+#         -d '{"contents": {"role": "USER", "parts": {"text": "..."}}}'
+#     -- `v1`, not `v1beta`; publisher `google`; no `/v1beta/models/`
+#     prefix the way first-party's URL adds. `google_genai/provider.rs`'s
+#     `build_endpoint_url` hardcodes exactly that first-party-shaped prefix
+#     for `EndpointMode::GenerateContent`, which is wrong for this host, so
+#     `stream_chat` branches on this profile's id (`self.profile.id ==
+#     "vertex-gemini"`) to call a dedicated `build_vertex_endpoint_url`
+#     instead -- mirrors `anthropic_messages::provider`'s identical
+#     `is_vertex` branch for `vertex-anthropic` (Task 15).
+#   - `?alt=sse` is required for SSE framing on this surface too (this
+#     codec's shared `decode_generate_content_stream` unconditionally parses
+#     via `SseStream::from_bytes_stream`) -- corroborated by multiple search
+#     results, including a bug report titled "vertex-gemini transformer
+#     missing ?alt=sse for streaming" describing exactly this failure mode
+#     when the parameter is omitted.
+#   - The global endpoint (`locations/global` in the URL, host
+#     `aiplatform.googleapis.com` with no region prefix) is Google's own
+#     documented option for Gemini models on Vertex, corroborated by a
+#     search-engine summary of Google Cloud's own endpoint-locations
+#     documentation (fetched 2026-09-02): "the global endpoint
+#     (aiplatform.googleapis.com) is recommended for a consistent API call
+#     and more robust design" for applications deployed across multiple
+#     regions. This profile uses it, matching `vertex-anthropic.toml`'s own
+#     choice of the (Anthropic-specific) global-endpoint recommendation.
+#
+# `encode_generate_content` needs no changes for this profile: its wire body
+# (`contents[].parts[]`, no `model` field -- model always travels in the URL
+# on both this surface and first-party's) is already correct for Vertex.
+# Only the endpoint URL differs, handled entirely in `provider.rs`.
+id = "vertex-gemini"
+codec = "google-genai"
+
+[defaults]
+allow_raw_extra = false
+params = { mode = "deny_list", fields = [] }
+# Global endpoint (Google's documented "recommended" option -- see citation
+# above). Project-specific in reality -- this is the profile default,
+# overridden per deployment via ROUNDHOUSE_VERTEX_GEMINI_BASE_URL (§9.9).
+# Ends at ".../publishers/google/models" (no trailing model id): the model
+# id and ":streamGenerateContent" verb are appended by
+# `build_vertex_endpoint_url` at request time.
+base_url = "https://aiplatform.googleapis.com/v1/projects/PROJECT_ID/locations/global/publishers/google/models"
+# Vertex authenticates with a Google OAuth2 access token
+# (`Authorization: Bearer $(gcloud auth print-access-token)`) -- a
+# Bearer-shaped credential from this crate's point of view, exactly like
+# `vertex-anthropic.toml`. How the token is obtained/refreshed is a
+# CredentialProvider implementation detail (ctx.credentials), not something
+# this profile encodes. `google_genai/provider.rs`'s auth guard already
+# handles Bearer via the bare-`api_key` fallback -- no guard change needed.
+auth = { kind = "bearer" }
+
+[[model]]
+match = ["gemini-3.0*"]
+
+# Task 17 addendum SS1 (Ruling P108): `thinkingBudget` is a JSON *number* on
+# the wire (verified, `generate-content.md.txt`'s literal JSON
+# representation), so `value_type = "number"` is declared here (routed
+# through `resolve_wire_value`, not bare `resolve().parse().unwrap_or(0)` --
+# see `encode.rs`'s doc comment on the fix). This is the same table
+# `google-genai.toml` already declares for `EndpointMode::GenerateContent`;
+# Vertex speaks the same legacy wire content shape (only the envelope
+# differs), so the same reasoning control applies unchanged.
+[model.reasoning]
+kind = "budget"
+field = "/generationConfig/thinkingConfig/thinkingBudget"
+value_type = "number"
+vocabulary = ["0", "1024", "8192", "24576"]
+
+[model.reasoning.map]
+off = "0"
+low = "1024"
+medium = "8192"
+high = "24576"
+max = "24576"
+
+# google.rpc.Status's JSON mapping (AIP-193, https://google.aip.dev/193, and
+# https://cloud.google.com/apis/design/errors) -- every Google Cloud REST
+# API's error envelope, Vertex AI included, matching `vertex-anthropic.toml`'s
+# established treatment of the identical vocabulary. `error_pointer` is left
+# at its default `/error/type`: this codec's `remap_error_body_for_classify`
+# (provider.rs) already normalizes BOTH the Interactions-shaped `/error/code`
+# string and the legacy/Vertex google.rpc.Status `/error/status` string onto
+# `/error/type` before `classify()` ever runs, so declaring a custom
+# `error_pointer` here would look at the ALREADY-remapped body and miss --
+# `remap_error_body_for_classify`'s own output shape is the actual contract,
+# not this profile's `error_pointer` field, for this one codec specifically.
+[errors]
+# AIP-193: "RESOURCE_EXHAUSTED: Some resource has been exhausted... perhaps a
+# per-user quota", HTTP mapping 429. Deliberately `shed_concurrency`, never
+# `fatal` (Ruling P106): this is an ordinary rate/TPM cap, not permanent
+# billing exhaustion.
+"RESOURCE_EXHAUSTED" = { disposition = "shed_concurrency" }
+# AIP-193: "UNAVAILABLE: The service is currently unavailable... most likely
+# a transient condition" -- retryable.
+"UNAVAILABLE" = { disposition = "retry_backoff" }
+# PERMISSION_DENIED is deliberately left OUT of this table, matching
+# `vertex-anthropic.toml`'s identical decision for the identical vocabulary:
+# AIP-193 states verbatim that PERMISSION_DENIED "must not be used for
+# rejections caused by exhausting some resource" -- i.e. it is explicitly
+# NOT a quota condition, so mapping it to `category = "quota"` (the brief's
+# sample TOML did this) would assert a specific, wrong `ProviderErrorKind`.
+# Left out, it falls through to `classify()`'s generic HTTP-status tier
+# instead, matching `ErrorEntry::error_kind`'s own "honest about not
+# knowing, rather than confidently wrong" posture (REALITY-CORRECTIONS §14g).

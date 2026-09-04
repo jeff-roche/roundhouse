@@ -1,0 +1,19 @@
+200
+content-type: text/event-stream
+
+data: {"id":"c1f0a5a5-11de-4cae-9800-25e4747408ea","type":"message-start","delta":{"message":{"role":"assistant"}}}
+
+data: {"type":"tool-plan-delta","delta":{"message":{"tool_plan":"I will check the weather in Tokyo."}}}
+
+data: {"type":"tool-call-start","index":0,"delta":{"message":{"tool_calls":{"id":"get_weather_j3f0adww9pmr","type":"function","function":{"name":"get_weather","arguments":""}}}}}
+
+data: {"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{"function":{"arguments":"{\"locat"}}}}}
+
+data: {"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{"function":{"arguments":"ion\": \"T"}}}}}
+
+data: {"type":"tool-call-delta","index":0,"delta":{"message":{"tool_calls":{"function":{"arguments":"okyo\"}"}}}}}
+
+data: {"type":"tool-call-end","index":0}
+
+data: {"type":"message-end","delta":{"finish_reason":"TOOL_CALL","usage":{"billed_units":{"input_tokens":20,"output_tokens":12},"tokens":{"input_tokens":20,"output_tokens":12}}}}
+
