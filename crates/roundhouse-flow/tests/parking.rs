@@ -363,6 +363,31 @@ fn park_with_hold_workspace_returns_an_absolute_hold_deadline_not_a_relative_ttl
 }
 
 #[test]
+fn holding_a_workspace_for_a_wait_with_no_window_uses_the_72h_fallback() {
+    // The `DEFAULT_HOLD_TTL` arm reached through `park` rather than through
+    // `resolve_hold_ttl` alone. `timeout_after: None` is an elicitation, the
+    // one source that can produce it.
+    let session_id = SessionId::new();
+    let (mut conn, run_id) = a_running_run(session_id);
+    let step = gate_step("id: approve\ngate: { title: 'Ship it?', timeout: 1h, on_timeout: deny }");
+    let mut awaiting = awaiting_from_gate(&step);
+    awaiting.timeout_after = None;
+    let now = Timestamp::from_unix_nanos(0);
+    let mut cp = FakeCheckpointer::new();
+
+    let result = park(&mut conn, run_id, &awaiting, true, now, &mut cp).expect("park succeeds");
+
+    assert_eq!(
+        result.workspace,
+        WorkspaceDisposition::HoldUntil(Timestamp::from_unix_nanos(72 * 3600 * NANOS_PER_SEC))
+    );
+    assert_eq!(
+        result.awaiting_until, None,
+        "the fallback bounds the workspace hold, not the wait — the wait still has no deadline"
+    );
+}
+
+#[test]
 fn a_held_workspace_never_outlives_the_seven_day_cap_even_when_the_gate_asks_for_a_month() {
     let session_id = SessionId::new();
     let (mut conn, run_id) = a_running_run(session_id);

@@ -127,7 +127,15 @@ pub const DEFAULT_HOLD_TTL: Duration = Duration::from_secs(72 * 3600);
 /// quantities.
 pub const SYSTEM_WIDE_HOLD_CAP: Duration = Duration::from_secs(7 * 86400);
 
-const SYSTEM_WIDE_HOLD_CAP_NANOS: i64 = 7 * 86_400 * 1_000_000_000;
+/// [`SYSTEM_WIDE_HOLD_CAP`] in the unit [`reaper_cutoff`] compares in.
+///
+/// **Derived, not restated**, so the two cannot drift apart into a clamp and
+/// a reaper that disagree — the failure mode the "two legs of the same rule"
+/// note on [`resolve_hold_ttl`] describes. `as_secs()` loses nothing here
+/// because [`SYSTEM_WIDE_HOLD_CAP`] is a whole number of seconds
+/// (`Duration::from_secs`), and a value large enough to make this multiply
+/// overflow would be a compile error rather than a wrap.
+const SYSTEM_WIDE_HOLD_CAP_NANOS: i64 = SYSTEM_WIDE_HOLD_CAP.as_secs() as i64 * 1_000_000_000;
 
 /// A handle to the restore point §8.11's implicit `checkpoint` task
 /// produces. Opaque text, because the shape belongs to whoever implements
