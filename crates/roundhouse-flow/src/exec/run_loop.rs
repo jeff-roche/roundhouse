@@ -952,6 +952,44 @@ impl<H: WorkflowHost> Loop<'_, H> {
             self.now,
             self.host,
         )?;
+        // §8.11's *"an `AwaitingHuman` task with a JSON-Schema form that TUI
+        // and web render from the same schema"* — put in the log, because
+        // otherwise **nobody is ever asked**. `parking::park` reads only the
+        // wait's deadline; the title and form it is handed go nowhere, so
+        // without this emit a parked run is a run waiting on a prompt that was
+        // never shown. (Found by this slice's mutation sweep: removing the
+        // title's redaction survived, because the redacted title reached no
+        // observer at all.)
+        //
+        // `TaskKind::Flow`, for the reason the `emit:` arm records for its own
+        // choice: §4.2's frozen table has no `AwaitingHuman` kind, and `Flow`
+        // is this crate's general workflow-bookkeeping kind. Adding one is a
+        // frozen-contract amendment, not a run loop's call.
+        //
+        // `AwaitingHuman` is `Serialize` and deliberately not `Deserialize`,
+        // so that a park record cannot be stored as this struct and re-derived
+        // with a fresh window on every resume. Serialising it *into the log for
+        // rendering* is the sanctioned direction of that rule, not an
+        // exception to it: what a resume reads back is the absolute
+        // `workflow_run.awaiting_until`, never this payload.
+        let form_task = TaskId::new();
+        let awaiting_payload = serde_json::to_value(&awaiting).unwrap_or(Value::Null);
+        executor.sink.emit(
+            form_task,
+            None,
+            TaskKind::Flow,
+            EventPayload::TaskCreated {
+                kind: TaskKind::Flow,
+                parent: None,
+                origin: Origin::System,
+                input: TaskInput::Json(serde_json::json!({
+                    "awaiting_human": awaiting_payload,
+                    "step_id": step.id,
+                    "checkpoint": parked.checkpoint_ref.0,
+                })),
+            },
+        );
+
         // The step's row records that it is waiting, not that it finished: a
         // `Running` row is what §8.10 tier 2 reclassifies as `Indeterminate`
         // for an `Effectful` step after a crash, and a gate is `Idempotent`

@@ -1337,3 +1337,793 @@ fn the_loop_refuses_to_drive_a_paused_run() {
     );
     assert!(sink.emitted.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Mutation-sweep round 2: the shapes no fixture above builds
+//
+// Ruling P113's carry-forward — *"when several guards survive together, look
+// for the single state none of the fixtures construct rather than writing a
+// test per guard"* — applies twice here. Twenty-five survivors reduced to four
+// shapes: **two failing steps in one run** (S1/S4), **a re-drive with more
+// than one finished row and rows of every finished kind** (D2/D4/D5/D6/D7/D8/
+// Q4/Q5), **a boundary-exact countable ceiling** (A2/A3/A4), and **a child
+// whose grant is clamped in a field the default would not clamp** (C7/C8).
+// ---------------------------------------------------------------------------
+
+/// **Two failures in one run**, one non-fatal and one fatal, in that order.
+/// Every fixture above had exactly one failing step, so a report that listed
+/// only the first finding — or headlined the last failure rather than the
+/// first — was indistinguishable from a correct one.
+#[test]
+fn a_report_lists_every_failure_and_headlines_the_first() {
+    let (conn, run_id, sink, _, result) = drive(
+        "steps:\n\
+         \x20 - id: first_failure\n\
+         \x20   emit: \"${{ no_such_fn(1) }}\"\n\
+         \x20   continue_on_error: true\n\
+         \x20 - id: second_failure\n\
+         \x20   needs: [first_failure]\n\
+         \x20   emit: \"${{ also_missing(2) }}\"\n",
+        10,
+    );
+    let RunOutcome::Terminal { state, .. } = result.expect("the run drives") else {
+        panic!("no gate");
+    };
+    assert_eq!(state, RunState::Failed, "the second failure is fatal");
+    assert_eq!(
+        step_row(&conn, run_id, "first_failure").0,
+        StepRunState::Failed
+    );
+    assert_eq!(
+        step_row(&conn, run_id, "second_failure").0,
+        StepRunState::Failed
+    );
+
+    let report = sink.the_report();
+    let findings = report["findings"].as_array().expect("findings is an array");
+    assert_eq!(
+        findings.len(),
+        2,
+        "every failure is a finding, not just the first or the last: {report}"
+    );
+    assert_eq!(findings[0]["id"], "first_failure");
+    assert_eq!(findings[1]["id"], "second_failure");
+    assert_eq!(
+        report["headline"], "run failed at step `first_failure`",
+        "the headline names the first failure — the one that started the trouble"
+    );
+}
+
+/// A message this crate builds itself, carrying a literal an author typed into
+/// the YAML, reaching the synthesised report. Unlike the `report:`-step fixture
+/// above — whose message is built from an *already needle-redacted* value by
+/// the `Report` dispatch arm — this text is assembled inside the run loop from
+/// raw workflow source, so `synthesise_report`'s own redaction is the only
+/// thing standing between it and the append-only log.
+#[test]
+fn the_synthesised_reports_own_redaction_is_what_scrubs_a_message_it_built_itself() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n \x20- id: sub\n \x20  call: sk-pasted-into-the-yaml\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx
+        .secrets
+        .insert("TOKEN".into(), "sk-pasted-into-the-yaml".into());
+
+    run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(2),
+        None,
+    )
+    .unwrap();
+
+    let rendered = sink.the_report().to_string();
+    assert!(
+        !rendered.contains("sk-pasted-into-the-yaml"),
+        "the run loop's own \"does not resolve to a job\" message quotes the \
+         workflow name verbatim; got {rendered}"
+    );
+    assert!(rendered.contains("***"), "got {rendered}");
+}
+
+/// The synthesised report is validated **before** it is emitted, and the check
+/// is not unfalsifiable: a hand-edited `spent_cost_usd` of `+inf` — which
+/// migration 0008's `CHECK (spent_cost_usd >= 0)` admits and stores (ruling
+/// P108 §B) — serialises as JSON `null`, so `cost.usd` is not a number and the
+/// report is refused rather than written permanently into a table that
+/// physically rejects `UPDATE`/`DELETE`.
+#[test]
+fn a_synthesised_report_that_would_not_validate_is_refused_rather_than_emitted() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    // `9e999` is stored as `+inf`: the column CHECK sees `>= 0` and passes it.
+    conn.execute(
+        "UPDATE workflow_run SET spent_cost_usd = 9e999 WHERE id = ?1",
+        [run_id.to_string()],
+    )
+    .expect("the column CHECK admits +inf");
+
+    let def = parse_workflow(&workflow("steps:\n \x20- id: a\n \x20  emit: { a: 1 }\n")).unwrap();
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let result = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(2),
+        None,
+    );
+    assert!(
+        matches!(result, Err(RunLoopError::SynthesisedReportInvalid(_))),
+        "got {result:?}"
+    );
+    assert!(
+        sink.reports().is_empty(),
+        "and nothing malformed reached the append-only log"
+    );
+    assert!(
+        !recover_run(&conn, run_id).unwrap().run.state.is_terminal(),
+        "nor was the run marked terminal without one"
+    );
+}
+
+/// **The re-drive shape no fixture built**: a resumed run whose history holds
+/// *two* completed rows (one carrying secret-derived output), a `Skipped` row,
+/// a `Failed` row, and a `map`-item row. Eight guards survived together
+/// because every earlier fixture had exactly one finished row, of one kind,
+/// with an output nothing read.
+#[test]
+fn a_re_drive_honours_every_kind_of_finished_row_and_re_runs_the_rest() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: alpha\n\
+         \x20   emit: { a: 1 }\n\
+         \x20 - id: beta\n\
+         \x20   emit: { b: 2 }\n\
+         \x20 - id: gamma\n\
+         \x20   emit: { c: 3 }\n\
+         \x20 - id: delta\n\
+         \x20   emit: { d: 4 }\n\
+         \x20 - id: reader\n\
+         \x20   needs: [alpha, beta, gamma, delta]\n\
+         \x20   emit: { saw: \"${{ steps.beta.output.token }}\", from_alpha: \"${{ steps.alpha.output.a }}\" }\n",
+    ))
+    .expect("fixture parses");
+
+    let finished = |step_id: &str, state: StepRunState, output: Option<(Value, bool)>| {
+        roundhouse_flow::durability::WorkflowStepRun {
+            run_id,
+            step_id: step_id.to_string(),
+            attempt: 1,
+            item_index: None,
+            disposition: roundhouse_flow::durability::StepDisposition::Pure,
+            state,
+            first_task_seq: None,
+            last_task_seq: None,
+            output: output.map(|(value, tainted)| {
+                roundhouse_flow::durability::StepOutput::from_outcome(
+                    &roundhouse_flow::exec::StepOutcome {
+                        step_id: step_id.to_string(),
+                        output: value,
+                        status: roundhouse_flow::exec::StepStatus::Completed,
+                        output_is_secret_derived: tainted,
+                        gate_condition_was_secret_derived: false,
+                    },
+                )
+            }),
+            error: None,
+        }
+    };
+    // Two completed rows, so a `.take(1)`/`.skip(1)` on the finished map is
+    // visible from either end; `beta`'s output is secret-derived.
+    roundhouse_flow::durability::checkpoint_step(
+        &mut conn,
+        &finished(
+            "alpha",
+            StepRunState::Completed,
+            Some((serde_json::json!({"a": 1}), false)),
+        ),
+    )
+    .unwrap();
+    roundhouse_flow::durability::checkpoint_step(
+        &mut conn,
+        &finished(
+            "beta",
+            StepRunState::Completed,
+            Some((serde_json::json!({"token": "sk-a-real-credential"}), true)),
+        ),
+    )
+    .unwrap();
+    // Finished, but not completed: a skip must stay skipped rather than have
+    // its `when:` re-evaluated.
+    roundhouse_flow::durability::checkpoint_step(
+        &mut conn,
+        &finished("gamma", StepRunState::Skipped, None),
+    )
+    .unwrap();
+    // Not finished: a failed step re-runs, because §8.10 tier 2 exists to
+    // re-decide those rather than inherit them.
+    roundhouse_flow::durability::checkpoint_step(
+        &mut conn,
+        &finished("delta", StepRunState::Failed, None),
+    )
+    .unwrap();
+    // A `map` item's row, which is not a top-level step's however finished it
+    // looks: `reader` must still run.
+    let mut item_row = finished(
+        "reader",
+        StepRunState::Completed,
+        Some((serde_json::json!({}), false)),
+    );
+    item_row.item_index = Some(0);
+    roundhouse_flow::durability::checkpoint_step(&mut conn, &item_row).unwrap();
+
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx
+        .secrets
+        .insert("TOKEN".into(), "sk-a-real-credential".into());
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    )
+    .expect("the run re-drives");
+
+    let RunOutcome::Terminal { state, steps, .. } = outcome else {
+        panic!("no gate");
+    };
+    assert_eq!(state, RunState::Completed);
+    let ran: Vec<&str> = steps.iter().map(|s| s.step_id.as_str()).collect();
+    assert!(
+        !ran.contains(&"alpha"),
+        "a completed row is not re-run: {ran:?}"
+    );
+    assert!(!ran.contains(&"beta"), "nor is the second one: {ran:?}");
+    assert!(!ran.contains(&"gamma"), "nor is a skipped one: {ran:?}");
+    assert!(ran.contains(&"delta"), "a failed row re-runs: {ran:?}");
+    assert!(
+        ran.contains(&"reader"),
+        "a `map` item's row is not a top-level step's: {ran:?}"
+    );
+    assert_eq!(
+        step_row(&conn, run_id, "gamma").0,
+        StepRunState::Skipped,
+        "and the skip is still a skip"
+    );
+
+    // The dependent read both completed outputs back out of the rows, and the
+    // taint on `beta`'s survived the restart rather than being re-derived.
+    let reader = steps
+        .iter()
+        .find(|s| s.step_id == "reader")
+        .expect("the reader ran");
+    assert_eq!(
+        reader.output["from_alpha"], "1",
+        "a re-driven output is readable"
+    );
+    assert_eq!(reader.output["saw"], "sk-a-real-credential");
+    let logged = format!("{:?}", sink.emitted);
+    assert!(
+        !logged.contains("sk-a-real-credential"),
+        "taint recorded on the row must survive the restart, or a value the \
+         first pass redacted reaches the log in cleartext on the second: {logged}"
+    );
+}
+
+/// Taint across a step boundary **within one run**: the run loop keeps its own
+/// `secret_derived_steps` fold, so `steps.<id>.output` read by a later step is
+/// tainted even though it was never itself a `secrets.*` lookup (ruling P33's
+/// property, at this loop's own boundary rather than `run_to_completion`'s).
+#[test]
+fn taint_crosses_a_step_boundary_inside_the_run_loop_too() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: source\n\
+         \x20   emit: { body: \"${{ secrets.TOKEN }}\" }\n\
+         \x20 - id: sink_step\n\
+         \x20   needs: [source]\n\
+         \x20   emit: { relayed: \"${{ steps.source.output.body }}\" }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx
+        .secrets
+        .insert("TOKEN".into(), "sk-derived-leaf-value".into());
+
+    run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(2),
+        None,
+    )
+    .unwrap();
+
+    let logged = format!("{:?}", sink.emitted);
+    assert!(
+        !logged.contains("sk-derived-leaf-value"),
+        "a derived leaf must not reach the log in cleartext: {logged}"
+    );
+}
+
+/// A step's crash disposition is derived from its real kind, not stamped a
+/// constant — §8.10 tier 2 reclassifies an `Effectful` step found `Running`
+/// after a crash, and every step reading `Pure` would silently re-run
+/// side effects.
+#[test]
+fn each_steps_row_records_the_disposition_its_kind_derives() {
+    let (conn, run_id, _, _, _) = drive(
+        "steps:\n\
+         \x20 - id: safe\n\
+         \x20   tool: read\n\
+         \x20   with: { path: x }\n\
+         \x20 - id: risky\n\
+         \x20   tool: shell\n\
+         \x20   with: { cmd: [ls] }\n",
+        10,
+    );
+    let recovered = recover_run(&conn, run_id).unwrap();
+    let by_id = |id: &str| {
+        recovered
+            .steps
+            .iter()
+            .find(|s| s.step_id == id)
+            .unwrap()
+            .disposition
+    };
+    assert_eq!(
+        by_id("safe"),
+        roundhouse_flow::durability::StepDisposition::Pure
+    );
+    assert_eq!(
+        by_id("risky"),
+        roundhouse_flow::durability::StepDisposition::Effectful
+    );
+}
+
+/// **A boundary-exact countable ceiling**, which is the only fixture shape
+/// that can tell "charged one" from "charged none" or "charged always". Every
+/// earlier fixture had a ceiling roomy enough that any of the three passed.
+#[test]
+fn the_per_step_charge_is_one_tool_call_for_a_tool_step_and_none_for_the_rest() {
+    // A ceiling of zero tool calls: two `emit:` steps must both run, because
+    // neither is a `tool:` step.
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    let mut run = a_run(run_id, SessionId::new());
+    run.caps = Some(ResourceCaps {
+        max_tool_calls: 0,
+        ..a_grant()
+    });
+    insert_workflow_run(&mut conn, &run).unwrap();
+    let def = parse_workflow(&workflow(
+        "steps:\n \x20- id: a\n \x20  emit: { a: 1 }\n \x20- id: b\n \x20  emit: { b: 2 }\n",
+    ))
+    .unwrap();
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .unwrap();
+    let RunOutcome::Terminal { state, .. } = outcome else {
+        panic!("no gate")
+    };
+    assert_eq!(
+        state,
+        RunState::Completed,
+        "a non-tool step must not be charged a tool call"
+    );
+
+    // A ceiling of exactly one: the first `tool:` step fits and the second
+    // does not.
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    let mut run = a_run(run_id, SessionId::new());
+    run.caps = Some(ResourceCaps {
+        max_tool_calls: 1,
+        ..a_grant()
+    });
+    insert_workflow_run(&mut conn, &run).unwrap();
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: a\n\
+         \x20   tool: read\n\
+         \x20   with: { path: x }\n\
+         \x20 - id: b\n\
+         \x20   needs: [a]\n\
+         \x20   tool: read\n\
+         \x20   with: { path: y }\n",
+    ))
+    .unwrap();
+    let mut sink = RecordingSink::default();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .unwrap();
+    let RunOutcome::Terminal { state, .. } = outcome else {
+        panic!("no gate")
+    };
+    assert_eq!(state, RunState::Failed);
+    assert_eq!(step_row(&conn, run_id, "a").0, StepRunState::Completed);
+    let (_, error) = step_row(&conn, run_id, "b");
+    assert!(
+        error.is_some_and(|e| e.contains("max_tool_calls")),
+        "a tool step is charged exactly one tool call"
+    );
+}
+
+/// The same shape for §7.7's sub-agent countable: a `call:` is a sub-agent
+/// spawn by §8.12's own description, so a run with none left cannot make one.
+#[test]
+fn a_call_is_charged_a_subagent_so_a_run_with_none_left_cannot_make_one() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    let mut run = a_run(run_id, SessionId::new());
+    run.caps = Some(ResourceCaps {
+        max_subagents: 0,
+        ..a_grant()
+    });
+    insert_workflow_run(&mut conn, &run).unwrap();
+
+    let def = parse_workflow(&workflow(
+        "steps:\n \x20- id: sub\n \x20  call: child-flow\n",
+    ))
+    .unwrap();
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new().resolving("child-flow");
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .unwrap();
+    let RunOutcome::Terminal { state, .. } = outcome else {
+        panic!("no gate")
+    };
+    assert_eq!(state, RunState::Failed);
+    let (_, error) = step_row(&conn, run_id, "sub");
+    assert!(
+        error.is_some_and(|e| e.contains("max_subagents")),
+        "a `call:` must be charged a sub-agent"
+    );
+    assert!(
+        host.sessions_created.is_empty(),
+        "and nothing is created for a call admission refused"
+    );
+}
+
+/// **A child grant clamped in a field the default would not clamp.** Every
+/// earlier `call:` fixture had a parent whose remaining ceiling was *below*
+/// `ResourceCaps::default()` in every field a test asserted, so asking for the
+/// default and asking for the remainder produced the same clamped answer.
+/// `max_cost_usd` is the discriminator: the fixture parent grants $100, the
+/// default is $10.
+///
+/// Two runs, not two steps of one: the first child draws the parent's whole
+/// remainder, so a second `call:` in the same run is refused by its own
+/// sub-agent admission before it can measure anything.
+#[test]
+fn a_childs_grant_is_the_parents_remainder_clamped_and_not_a_default() {
+    fn child_grant_for(body: &str) -> ResourceCaps {
+        let mut conn = open_test_db();
+        let (run_id, _) = seed_run(&mut conn);
+        let def = parse_workflow(&workflow(body)).expect("fixture parses");
+        let mut sink = RecordingSink::default();
+        let mut host = FakeHost::new().resolving("child-flow");
+        let outcome = run_workflow(
+            &mut conn,
+            &def,
+            run_id,
+            &mut sink,
+            &mut host,
+            ctx(run_id),
+            at(10),
+            None,
+        )
+        .expect("the run drives");
+        let RunOutcome::Terminal { state, steps, .. } = outcome else {
+            panic!("no gate")
+        };
+        assert_eq!(state, RunState::Completed, "the call is funded");
+        let id: RunId = steps[0].output["run_id"]
+            .as_str()
+            .expect("the call step's output is the child's handle")
+            .parse()
+            .map(RunId::from_uuid)
+            .unwrap();
+        run_ledger(&conn, id).unwrap().caps.unwrap()
+    }
+
+    assert_eq!(
+        child_grant_for("steps:\n \x20- id: sub\n \x20  call: child-flow\n").max_cost_usd,
+        100.0,
+        "with no `caps:` block the child asks for the parent's remainder \
+         ($100), not `ResourceCaps::default()`'s $10"
+    );
+    assert_eq!(
+        child_grant_for(
+            "steps:\n \x20- id: sub\n \x20  call: child-flow\n \x20  caps: { max_cost_usd: 500.0 }\n"
+        )
+        .max_cost_usd,
+        100.0,
+        "and a step asking for $500 is clamped to the $100 its parent has — \
+         never granted the figure it asked for"
+    );
+}
+
+/// A `call:`'s `with:` block reaches the parent's log through the same needle
+/// backstop every other dispatch arm uses, so a credential typed literally
+/// into the YAML — which no provenance can see — cannot ride along.
+#[test]
+fn a_calls_with_block_is_needle_redacted_on_its_way_into_the_parents_log() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: sub\n\
+         \x20   call: child-flow\n\
+         \x20   with: { token: sk-typed-straight-in }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new().resolving("child-flow");
+    let mut run_ctx = ctx(run_id);
+    run_ctx
+        .secrets
+        .insert("TOKEN".into(), "sk-typed-straight-in".into());
+    run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    )
+    .unwrap();
+
+    let logged = format!("{:?}", sink.emitted);
+    assert!(!logged.contains("sk-typed-straight-in"), "got {logged}");
+    assert!(logged.contains("***"), "got {logged}");
+}
+
+/// A gate answer names one gate, not whichever gate the loop reaches first.
+/// With two gates in one run, an answer for the second must not release the
+/// first.
+#[test]
+fn a_gate_answer_releases_only_the_gate_it_names() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: first_gate\n\
+         \x20   gate:\n\
+         \x20     title: \"first?\"\n\
+         \x20     form: { ok: { type: boolean } }\n\
+         \x20     timeout: 1h\n\
+         \x20     on_timeout: deny\n\
+         \x20 - id: second_gate\n\
+         \x20   needs: [first_gate]\n\
+         \x20   gate:\n\
+         \x20     title: \"second?\"\n\
+         \x20     form: { ok: { type: boolean } }\n\
+         \x20     timeout: 1h\n\
+         \x20     on_timeout: deny\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        Some(GateAnswer {
+            step_id: "second_gate".into(),
+            output: serde_json::json!({ "ok": true }),
+        }),
+    )
+    .expect("the run drives");
+
+    assert!(
+        matches!(outcome, RunOutcome::Parked(_)),
+        "the first gate has no answer, so it parks: {outcome:?}"
+    );
+    assert_eq!(
+        step_row(&conn, run_id, "first_gate").0,
+        StepRunState::Running,
+        "and it is the first gate that is waiting, not the second"
+    );
+}
+
+/// §8.11's *"an `AwaitingHuman` task with a JSON-Schema form that TUI and web
+/// render from the same schema"*: the park puts the form in the log, or nobody
+/// is ever asked. The gate's `title:` is interpolated workflow source, so it
+/// goes through the same needle backstop as every other value this crate logs.
+#[test]
+fn a_park_puts_the_redacted_form_in_the_log_so_a_human_can_be_asked() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: approve\n\
+         \x20   gate:\n\
+         \x20     title: \"ship sk-in-the-prompt-text?\"\n\
+         \x20     form: { approve: { type: boolean } }\n\
+         \x20     timeout: 1h\n\
+         \x20     on_timeout: deny\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx
+        .secrets
+        .insert("TOKEN".into(), "sk-in-the-prompt-text".into());
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    )
+    .expect("the run parks");
+    assert!(matches!(outcome, RunOutcome::Parked(_)));
+
+    let logged = format!("{:?}", sink.emitted);
+    assert!(
+        logged.contains("awaiting_human"),
+        "the form must reach the log, or the human has nothing to answer: {logged}"
+    );
+    assert!(
+        logged.contains("approve"),
+        "and it must carry the form's own fields: {logged}"
+    );
+    assert!(
+        !logged.contains("sk-in-the-prompt-text"),
+        "a credential pasted into the gate's title must not ride along: {logged}"
+    );
+    assert!(logged.contains("***"), "got {logged}");
+}
+
+/// The door check is not redundant with admission. A run with nothing to
+/// admit — no `steps:`, no `finally:` — would otherwise be driven straight to
+/// a terminal state, emitting a report for a run an operator had paused.
+#[test]
+fn a_paused_run_with_nothing_to_admit_is_still_refused_at_the_door() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    roundhouse_flow::control::pause(&mut conn, run_id, at(1)).unwrap();
+
+    let def = parse_workflow(&workflow("steps: []\n")).expect("an empty step list parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let result = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(2),
+        None,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(RunLoopError::RunNotDrivable {
+                state: RunState::Paused,
+                ..
+            })
+        ),
+        "got {result:?}"
+    );
+    assert!(
+        sink.emitted.is_empty(),
+        "no report is written for a run the operator paused"
+    );
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::Paused
+    );
+}
+
+/// `draw_child_run`'s `AlreadySettled` guard, reached from the one shape the
+/// invariant makes rare: a child that has already been refunded. Nothing else
+/// in the suite constructs a settled run and then asks to draw for it.
+#[test]
+fn a_settled_child_cannot_be_drawn_for_again() {
+    use roundhouse_flow::ledger::{draw_child_run, refund_child_run, LedgerError};
+
+    let mut conn = open_test_db();
+    let (parent, _) = seed_run(&mut conn);
+    let child_id = RunId::new();
+    let mut child = a_run(child_id, SessionId::new());
+    child.parent_run_id = Some(parent);
+    child.session_depth = Some(1);
+    child.caps = Some(ResourceCaps {
+        max_tokens: 100,
+        ..a_grant()
+    });
+    child.started_at = at(1);
+    insert_workflow_run(&mut conn, &child).expect("the insert draws");
+    transition_run(&mut conn, child_id, RunState::Completed, at(2)).unwrap();
+    refund_child_run(&mut conn, child_id, at(3)).expect("the draw refunds once");
+
+    let spent_after_refund = run_ledger(&conn, parent).unwrap().spent;
+    // Clear the draw stamp so `AlreadyDrawn` cannot be the guard that fires:
+    // what is under test is that a **settled** run is refused.
+    conn.execute(
+        "UPDATE workflow_run SET drawn_at = NULL WHERE id = ?1",
+        [child_id.to_string()],
+    )
+    .unwrap();
+
+    let refused = draw_child_run(&mut conn, child_id, at(4));
+    assert!(
+        matches!(refused, Err(LedgerError::AlreadySettled { .. })),
+        "drawing for a settled run would charge the parent a grant the refund \
+         can never give back; got {refused:?}"
+    );
+    assert_eq!(
+        run_ledger(&conn, parent).unwrap().spent,
+        spent_after_refund,
+        "and the refusal charges nothing on its way to refusing"
+    );
+}
