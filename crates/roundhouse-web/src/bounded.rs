@@ -18,20 +18,27 @@
 //! is what this file is: it declares no `mod` of its own, and
 //! `tests/bounded_reach.rs` fails if it ever does.
 //!
-//! # And the expression that unwraps the field lives here too
+//! # And the expression that unwraps the field lives here too — it has to
 //!
-//! Moving the type alone would have moved the code and kept the hole: if
-//! [`crate::AppState::store_connection`] had stayed in `lib.rs` performing the
-//! `self.inner.pool.get()`, `lib.rs` would be this module's **parent** — which
-//! is not a descendant, so it could no longer read the field, but the *sibling*
-//! handler modules would still be descendants of `lib.rs` and the interesting
-//! reach would depend on where the crate root sits in the tree rather than on
-//! this module being a leaf. The rule this file follows is simpler and does not
-//! need that argument: **the field and the one function that touches it are in
-//! the same leaf module**, and `store_connection` delegates.
+//! P98's addendum warns that moving the type alone would move the code and keep
+//! the hole, because `lib.rs` would then be this module's *parent* and could
+//! still read the field. **Compiled rather than assumed, and it is the other way
+//! round:** a parent is not a descendant, so the crate root cannot read it
+//! either. `state.store.as_ref().unwrap().inner.pool.get()` written in `lib.rs`
+//! is `error[E0616]`, exactly as it is from `runs.rs`.
 //!
-//! `grep '\.inner\b' crates/roundhouse-web/src` therefore returns hits in this
-//! file only.
+//! That makes the arrangement stronger than the warning assumed rather than more
+//! fragile: the split it describes **does not compile**, so the one expression
+//! that unwraps the field lives beside the field by construction and not because
+//! someone remembered the rule. [`crate::AppState::store_connection`] delegates
+//! to [`BoundedStore::connection`] below and never names the pool.
+//!
+//! `BoundedStore::inner` is consequently named in this file and nowhere else in
+//! the crate — which follows from the two properties above and is **not**
+//! something a `grep` shows: `grep '\.inner\b'` over `src/` also matches
+//! `lan_auth::BindConfig`, which has an `inner` field of its own, three times.
+//! `tests/bounded_reach.rs` checks the properties instead, and says why the grep
+//! is not the test.
 
 /// The store pool with its `Pool` handle **out of reach**, so that
 /// [`BoundedStore::connection`] is not merely the convenient way to take a
