@@ -262,6 +262,62 @@ use serde::de::{
 /// doc comment for why 8 and what it trades against.
 pub const NODE_WEIGHT_BYTES: usize = 8;
 
+/// Extra weight charged for a scalar `serde_yaml` hands over **already
+/// decoded** — a number — on top of [`NODE_WEIGHT_BYTES`]. This is what
+/// bounds the numeric-decode axis.
+///
+/// # Why a flat charge closes an axis the meter cannot see
+///
+/// The visitor is handed an `f64`, never the token it came from, so the
+/// meter cannot price a numeric scalar by its length. Rounds 2 and 3 both
+/// attacked that by trying to *identify* the route the long token arrives
+/// on — a source pre-scan ([`super::MAX_PLAIN_NUMERIC_DIGIT_RUN`]) and then
+/// an attempt to intercept the dispatch. The first is bypassable (at least
+/// eight tag spellings reach the same branch), the second has no
+/// interception point in `serde_yaml` 0.9.34, and round 3 concluded from
+/// those two failures that the axis was unclosable in-process.
+///
+/// **That conclusion was wrong, and the reason is worth stating.** Both
+/// attempts were about identifying *which route* a token arrives on.
+/// Pricing does not need to know: every route — plain, `!!float`,
+/// `!<tag:yaml.org,2002:float>`, a remapped `%TAG` handle, a
+/// percent-encoded suffix — converges on the same handful of visitor
+/// callbacks. Charging there is route-independent by construction, and
+/// stays correct for routes nobody has enumerated yet.
+///
+/// # The bound
+///
+/// A decoded scalar can never be longer than the source it came from
+/// (escapes shrink: `\u0037` is six source bytes and one decoded byte;
+/// block folding replaces a newline with a space; nothing grows). So the
+/// source length of any one token is capped by [`super::MAX_YAML_BYTES`],
+/// and the only unbounded factor was *how many times* a decode happens.
+/// Charging `NODE_WEIGHT_BYTES + NUMERIC_SCALAR_WEIGHT_BYTES` per numeric
+/// visit caps that count at
+/// [`super::MAX_NUMERIC_SCALAR_VISITS`], so total numeric-decode work is at
+/// most that many scans of at most `MAX_YAML_BYTES` bytes:
+///
+/// ```text
+/// visits    <= MAX_EXPANDED_WEIGHT / (NODE_WEIGHT_BYTES + NUMERIC_SCALAR_WEIGHT_BYTES)
+///           =  2,621,440 / 520  =  5,041
+/// decode    <= 5,041 * 262,144  =  1.32 GB of `dec2flt`/`from_str_radix` scanning
+/// ```
+///
+/// Measured against that bound rather than assumed: see
+/// [`super::MAX_NUMERIC_SCALAR_VISITS`] for the value's derivation, the
+/// tradeoff curve, and the over-rejection sweep.
+///
+/// # Failure direction
+///
+/// Charging *more* can only cause more documents to be rejected, never
+/// fewer, so this cannot introduce an under-rejection. Verified rather than
+/// assumed: every payload the suite rejected before this charge is still
+/// rejected, and the over-rejection it does introduce is a cap on numeric
+/// scalars per document, measured and pinned by
+/// `a_numeric_heavy_but_realistic_workflow_still_parses` in
+/// `tests/parse_top_level.rs`.
+pub const NUMERIC_SCALAR_WEIGHT_BYTES: usize = 512;
+
 /// What [`check_expansion`] found. Every variant is a decision
 /// [`super::parse_workflow`] acts on directly; there is no "proceed anyway"
 /// case.
@@ -299,14 +355,15 @@ pub(super) enum Verdict {
 /// for each expansion of one long plain numeric scalar and this function
 /// charged 8 bytes for each. Per-node work is bounded only because
 /// [`super::MAX_PLAIN_NUMERIC_DIGIT_RUN`] caps that token class on the
-/// **plain** route, and with that gate in front the plain construction is
-/// rejected in 0.6 ms. It does **not** cap the core-tag route
-/// (`!!float` on a non-plain scalar), which reaches `visit_f64` with a
-/// decoded token of any length: measured 5,960 ms admitted, and 2,648 ms
-/// burned in this function on a variant that is then rejected. **Per-node
-/// work is therefore still not bounded**, and this function's cost is not
-/// either. That axis is recorded as UNBOUNDED in [`super`]'s axis
-/// inventory, with the remedy that would close it.
+/// **plain** route, and fix round 4 closed the remaining routes by charging
+/// the numeric visitor callbacks themselves
+/// ([`NUMERIC_SCALAR_WEIGHT_BYTES`]), which is route-independent. Rounds 2
+/// and 3 measured this shape at 5,960 ms admitted with 2,648 ms burned in
+/// this function; round 4 found a worse variant still (a pad list lifting
+/// `serde_yaml`'s jump budget) at **9,304.7 ms admitted**, and with the
+/// charge in place the same payload is **rejected in 91.2 ms**. Per-node
+/// work is now bounded: see [`super::MAX_NUMERIC_SCALAR_VISITS`] and
+/// [`super`]'s axis inventory.
 pub(super) fn check_expansion(yaml: &str, max: usize) -> Verdict {
     let weighed = Cell::new(0usize);
     let over_budget = Cell::new(false);
@@ -346,16 +403,29 @@ impl ExpansionMeter<'_> {
     /// whole walk, and with it the expansion driving it — once the ceiling
     /// is passed.
     ///
-    /// **Zero for a decoded scalar is not "its source was small".** An
-    /// earlier version of this comment justified it that way — "a
-    /// non-string scalar, whose source form is a handful of bytes the node
-    /// weight already covers" — and that premise was false for floats:
-    /// `parse_f64` accepts a token of any length. It is true for the other
-    /// decoded kinds (bool and null are fixed literals, integers overflow
-    /// `from_str_radix` past ~42 digits), and it is made true for floats by
-    /// [`super::MAX_PLAIN_NUMERIC_DIGIT_RUN`] gating the source before this
-    /// function ever runs. The charge is zero because the length is bounded
-    /// elsewhere, not because it is small here.
+    /// **A decoded scalar's `payload_bytes` is not zero, and the history of
+    /// this comment is why the constant beside it exists.** Two earlier
+    /// versions justified a zero charge here, and both were false:
+    ///
+    /// - Round 1: "a non-string scalar, whose source form is a handful of
+    ///   bytes the node weight already covers." False for floats —
+    ///   `parse_f64` accepts a token of any length.
+    /// - Round 2/3: "the charge is zero because the length is bounded
+    ///   elsewhere, by [`super::MAX_PLAIN_NUMERIC_DIGIT_RUN`] gating the
+    ///   source." Also false: that gate reads *source* and covers only the
+    ///   plain route, while `!!float` on a quoted scalar decodes to an
+    ///   arbitrarily long token from a source with no long digit run. That
+    ///   claim survived round 3's retraction sweep **on this function**,
+    ///   which is the first place a reader who distrusts the constant
+    ///   looks.
+    ///
+    /// Numeric visits now charge [`NUMERIC_SCALAR_WEIGHT_BYTES`] on top of
+    /// [`NODE_WEIGHT_BYTES`], which bounds *how many* decodes happen rather
+    /// than how long each one is — the length being already capped by
+    /// [`super::MAX_YAML_BYTES`], since a decoded scalar cannot exceed its
+    /// source. Containers and `visit_str` are unchanged: `visit_str` is
+    /// charged its real length, and a container carries no payload of its
+    /// own.
     ///
     /// `saturating_add` rather than `+`: defence in depth, not a reachable
     /// threat. At the real call site `max` is [`super::MAX_EXPANDED_WEIGHT`]
@@ -399,23 +469,30 @@ impl<'de> Visitor<'de> for ExpansionMeter<'_> {
         f.write_str("any YAML node")
     }
 
+    /// Not charged [`NUMERIC_SCALAR_WEIGHT_BYTES`], unlike the numeric
+    /// visits below: `parse_bool` and `parse_null` (`de.rs:932`, `de.rs:925`)
+    /// compare against fixed string literals, so their decode is O(1) after
+    /// a length check however long the source token is, and a long token
+    /// under `!!bool`/`!!null` fails closed with `invalid_value`. Charging
+    /// them would buy nothing and would over-reject a document full of
+    /// booleans or nulls.
     fn visit_bool<E: de::Error>(self, _: bool) -> Result<(), E> {
         self.charge(0)
     }
     fn visit_i64<E: de::Error>(self, _: i64) -> Result<(), E> {
-        self.charge(0)
+        self.charge(NUMERIC_SCALAR_WEIGHT_BYTES)
     }
     fn visit_i128<E: de::Error>(self, _: i128) -> Result<(), E> {
-        self.charge(0)
+        self.charge(NUMERIC_SCALAR_WEIGHT_BYTES)
     }
     fn visit_u64<E: de::Error>(self, _: u64) -> Result<(), E> {
-        self.charge(0)
+        self.charge(NUMERIC_SCALAR_WEIGHT_BYTES)
     }
     fn visit_u128<E: de::Error>(self, _: u128) -> Result<(), E> {
-        self.charge(0)
+        self.charge(NUMERIC_SCALAR_WEIGHT_BYTES)
     }
     fn visit_f64<E: de::Error>(self, _: f64) -> Result<(), E> {
-        self.charge(0)
+        self.charge(NUMERIC_SCALAR_WEIGHT_BYTES)
     }
 
     /// The length is the whole point of this unit: a scalar reached through

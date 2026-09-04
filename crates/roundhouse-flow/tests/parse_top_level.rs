@@ -713,9 +713,11 @@ fn a_long_plain_numeric_scalar_aliased_many_times_is_rejected() {
     // dispatch to `visit_untagged_scalar` alone, which is reached only for
     // `ScalarStyle::Plain`; `visit_scalar` has its own core-tag dispatch
     // above it (`de.rs:882-884`) with no style check, and that route is
-    // still open. See
-    // `the_core_tag_route_to_visit_f64_is_open_and_this_pins_which_syntaxes_reach_it`
-    // and the UNBOUNDED row in `parse/mod.rs`'s axis inventory.
+    // a different route, which fix round 4 closed at the visitor rather
+    // than in the source. See
+    // `every_tag_spelling_that_reaches_a_decoded_numeric_visit_is_charged`
+    // and `a_pad_list_amplified_tagged_numeric_is_rejected` for that route,
+    // and `parse/mod.rs`'s axis inventory for which rows remain open.
     //
     // Payload: `a: &f 1.777…` with 131,000 fractional digits, aliased
     // 43,648 times as `b: [*f,*f,…]` — 262,048 bytes, every bracket
@@ -796,74 +798,242 @@ fn a_long_plain_numeric_scalar_aliased_many_times_is_rejected() {
     );
 }
 
+/// Records which `Visitor` method `serde_yaml` dispatches a scalar to. This
+/// is the machinery fix round 3 built as a throwaway probe and did not ship,
+/// which is why that round's test could only assert "it parses" — an
+/// assertion every variant satisfies, including the ones that prove nothing.
+struct RouteProbe;
+impl<'de> serde::de::Visitor<'de> for RouteProbe {
+    type Value = &'static str;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any YAML node")
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok("visit_f64")
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok("visit_u64")
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok("visit_i64")
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok("visit_bool")
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok("visit_unit")
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok("visit_str")
+    }
+    fn visit_enum<A: serde::de::EnumAccess<'de>>(self, data: A) -> Result<Self::Value, A::Error> {
+        use serde::de::VariantAccess;
+        let (_, v) = data.variant_seed(RouteSeed)?;
+        v.newtype_variant_seed(RouteSeed)?;
+        Ok("visit_enum")
+    }
+}
+#[derive(Clone, Copy)]
+struct RouteSeed;
+impl<'de> serde::de::DeserializeSeed<'de> for RouteSeed {
+    type Value = &'static str;
+    fn deserialize<D: serde::de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(RouteProbe)
+    }
+}
+
+/// Which visitor method a bare scalar document lands on.
+fn route_of(scalar_source: &str) -> String {
+    use serde::de::DeserializeSeed;
+    match RouteSeed.deserialize(serde_yaml::Deserializer::from_str(scalar_source)) {
+        Ok(route) => route.to_string(),
+        Err(e) => format!("Err({})", &e.to_string()[..e.to_string().len().min(40)]),
+    }
+}
+
 #[test]
-fn the_core_tag_route_to_visit_f64_is_open_and_this_pins_which_syntaxes_reach_it() {
-    // Task X1 fix round 3. A CHARACTERIZATION test for an axis this crate
-    // does not close, not a bound. `parse/mod.rs`'s axis inventory records
-    // "non-string scalar source length / decode CPU" as UNBOUNDED; this is
-    // the executable half of that row.
+fn every_tag_spelling_that_reaches_a_decoded_numeric_visit_is_charged() {
+    // Task X1 fix round 4. This replaces
+    // `the_core_tag_route_to_visit_f64_is_open_and_this_pins_which_syntaxes
+    // _reach_it`, whose only functional assertion was that each variant
+    // *parses* — which plain, custom-tag, `!!str` and ordinary strings all
+    // do. If `serde_yaml` had added the missing style check at de.rs:882,
+    // every variant would have routed to `visit_str` and that test would
+    // have stayed green, the opposite of what its failure message promised.
     //
-    // Why it is open, in one sentence: `serde_yaml`'s `visit_scalar`
-    // (`de.rs:858-900`) dispatches a core-tagged scalar to `parse_f64` and
-    // `visit_f64` at `de.rs:882-884` with **no `ScalarStyle::Plain` check**,
-    // while the equivalent check does exist one branch below at `de.rs:891`
-    // for custom tags. So a double-quoted scalar whose digits are broken by
-    // escaped line continuations decodes to an arbitrarily long number while
-    // the source carries no long digit run, and
-    // `MAX_PLAIN_NUMERIC_DIGIT_RUN` — which reads source — cannot see it.
+    // This one asserts the ROUTE, using a `Visitor` that records which
+    // `visit_*` fires. Payloads are bare scalars of four characters, so the
+    // whole test costs microseconds and materialises nothing.
     //
-    // What this test pins is the thing a fix would have to cover: FOUR
-    // distinct source syntaxes reach that branch, and none of the last three
-    // contains the text `!!float`. That is why a source-level scan for
-    // `!!float` was rejected as a remedy — catching all four means parsing
-    // `%TAG` directives, resolving tag handles and percent-decoding tag
-    // suffixes, i.e. implementing YAML tag resolution.
-    //
-    // Payloads are deliberately tiny (a 4-character number), so this test
-    // costs microseconds and never materialises anything: it asserts which
-    // ROUTE is taken, not that the route is expensive. The expense is
-    // measured out-of-band and recorded in the inventory.
-    let variants = [
-        ("shorthand", "!!float \"1.75\""),
+    // Why the route matters: a scalar reaching `visit_f64`/`visit_u64` is
+    // handed a DECODED value, so its source length is invisible to the
+    // expansion meter. `NUMERIC_SCALAR_WEIGHT_BYTES` prices those callbacks
+    // precisely because the set of source spellings that reach them is open
+    // — at least eight are known — and pricing the arrival does not require
+    // enumerating them.
+    let numeric_spellings = [
+        ("plain", "1.75"),
+        ("core-tag shorthand", "!!float \"1.75\""),
         ("verbatim tag", "!<tag:yaml.org,2002:float> \"1.75\""),
         ("percent-encoded suffix", "!!fl%6Fat \"1.75\""),
+        (
+            "remapped %TAG handle",
+            "%TAG !e! tag:yaml.org,2002:\n---\n!e!float \"1.75\"",
+        ),
+        ("single-quoted core tag", "!!float '1.75'"),
+        ("core-tag int, quoted", "!!int \"175\""),
     ];
-    for (label, tagged) in variants {
-        let yaml = format!(
-            "name: t\nversion: 1\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n    a: {tagged}\n"
-        );
+    for (label, src) in numeric_spellings {
+        let route = route_of(src);
         assert!(
-            !yaml.contains("!!float") || label == "shorthand",
-            "{label}: only the shorthand variant may contain the literal `!!float`, \
-             or this test is not demonstrating what it claims"
+            route == "visit_f64" || route == "visit_u64" || route == "visit_i64",
+            "{label} ({src:?}) routed to {route}, not a decoded-numeric visit. \
+             If `serde_yaml` has added the `ScalarStyle::Plain` check at de.rs:882 that \
+             this whole family exists because of, this is the signal: re-read \
+             `MAX_PLAIN_NUMERIC_DIGIT_RUN`'s dispatch enumeration and the axis inventory, \
+             both of which describe a hole that may no longer exist."
         );
-        parse_workflow(&yaml).unwrap_or_else(|err| {
-            panic!(
-                "{label}: expected this to parse — it reaches `visit_f64` with a zero \
-                 charge, which is the open axis. It failed with {err:?}. If `serde_yaml` \
-                 has added the missing style check at de.rs:882, re-measure the decode \
-                 axis and update `parse/mod.rs`'s axis inventory, which may be closable."
-            )
-        });
     }
 
-    // The `%TAG` handle form needs a directive, so it is built separately.
-    let with_directive = "%TAG !e! tag:yaml.org,2002:\n---\nname: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n    a: !e!float \"1.75\"\n";
-    assert!(!with_directive.contains("!!float"));
-    parse_workflow(with_directive)
-        .expect("a remapped tag handle reaches the same branch without the text `!!float`");
-
-    // And the contrast that makes the point: the SAME value plain, and the
-    // same value under a *custom* tag. The custom tag goes through
-    // `visit_enum` (`parse_tag` at de.rs:1193 returns Some for `!`-tags), so
-    // its payload lands on `visit_str` and is charged by length — which is
-    // why custom tags were never part of this hole.
-    for (label, scalar) in [("plain", "1.75"), ("custom tag", "!Thing \"1.75\"")] {
-        let yaml = format!(
-            "name: t\nversion: 1\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n    a: {scalar}\n"
+    // The contrast. These must NOT reach a decoded-numeric visit, because
+    // they are charged by length instead — which is why they were never part
+    // of the hole and why charging the numeric callbacks does not
+    // over-reject them.
+    for (label, src, expected) in [
+        ("quoted string", "\"1.75\"", "visit_str"),
+        ("custom tag", "!Thing \"1.75\"", "visit_enum"),
+        ("explicit !!str", "!!str \"1.75\"", "visit_str"),
+        ("plain text", "hello", "visit_str"),
+    ] {
+        assert_eq!(
+            route_of(src),
+            expected,
+            "{label} ({src:?}) must route to {expected}"
         );
-        parse_workflow(&yaml).unwrap_or_else(|_| panic!("{label} must still parse"));
     }
+}
+
+#[test]
+fn a_pad_list_amplified_tagged_numeric_is_rejected() {
+    // Task X1 fix round 4, and the shape that has found this class every
+    // time: a PAD LIST. `serde_yaml`'s alias budget is
+    // `jumpcount > events.len() * 100`, so padding the event list with cheap
+    // scalars raises the jump budget until the *weight* ceiling binds
+    // instead of the jump guard. Round 3 measured this family without the
+    // pad and published 5,960 ms; with the pad it is 9,304.7 ms admitted —
+    // the fourth consecutive published worst case on this task beaten by the
+    // next reviewer, and the reason this payload is now pinned in CI.
+    //
+    // Payload, 189,327 bytes: `f: &f !!float "1.<129,000 sevens, broken
+    // every 60 chars by an escaped line continuation>"`, then a 20,000-entry
+    // pad list of one-character scalars to lift the jump budget, then
+    // `a: &a [*f x 500]` and `c: [*a x 500]` — 250,000 expansions of a
+    // 129,000-digit decoded token. The `!!float` tag defeats
+    // `MAX_PLAIN_NUMERIC_DIGIT_RUN` (the source has no digit run over 60);
+    // the pad list defeats `serde_yaml`'s own repetition guard.
+    //
+    // Measured: ADMITTED at 9,304.7 ms with `charge(0)`; rejected in 91.2 ms
+    // once numeric visits are charged `NUMERIC_SCALAR_WEIGHT_BYTES`. 102x.
+    let mut num = String::from("1.");
+    for i in 0..129_000 {
+        if i > 0 && i % 60 == 0 {
+            num.push_str("\\\n      ");
+        }
+        num.push('7');
+    }
+    let mut yaml = format!(
+        "name: t\nversion: 1\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n    f: &f !!float \"{num}\"\n    p: ["
+    );
+    for i in 0..20_000 {
+        if i > 0 {
+            yaml.push(',');
+        }
+        yaml.push('q');
+    }
+    yaml.push_str("]\n    a: &a [");
+    for i in 0..500 {
+        if i > 0 {
+            yaml.push(',');
+        }
+        yaml.push_str("*f");
+    }
+    yaml.push_str("]\n    c: [");
+    for i in 0..500 {
+        if i > 0 {
+            yaml.push(',');
+        }
+        yaml.push_str("*a");
+    }
+    yaml.push_str("]\n");
+
+    assert!(
+        yaml.len() <= MAX_YAML_BYTES,
+        "payload must stay under the byte cap: {} bytes",
+        yaml.len()
+    );
+    // The two guards this payload is built to walk past, asserted rather
+    // than described, so the test fails loudly if a future change makes it
+    // stop being the adversarial shape it is named for.
+    assert!(
+        !yaml.contains(&"7".repeat(MAX_PLAIN_NUMERIC_DIGIT_RUN + 1)),
+        "the payload must carry no digit run over the digit-run bound, or it is not \
+         testing the route that bound cannot see"
+    );
+
+    let start = std::time::Instant::now();
+    let err = parse_workflow(&yaml).expect_err("must be rejected");
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(err, ParseError::ExpandsTooLarge { .. }),
+        "expected the expansion ceiling to fire via the numeric-visit charge, got {err:?}"
+    );
+    assert!(
+        elapsed < REJECTION_MUST_BE_CHEAP,
+        "rejecting 250,000 expansions of a 129,000-digit token took {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_numeric_heavy_but_realistic_workflow_still_parses() {
+    // Task X1 fix round 4. The over-rejection direction of
+    // `NUMERIC_SCALAR_WEIGHT_BYTES`, which is a genuine narrowing: charging
+    // numeric visits caps a document at `MAX_NUMERIC_SCALAR_VISITS` (5,041)
+    // of them, and nothing before this round capped that.
+    //
+    // Payload: a deliberately numeric-maximal but realistic workflow —
+    // `MAX_TOP_LEVEL_STEPS` (500) steps, each carrying `timeout: 30`,
+    // `retries: 3` and a `with: { a: 1, b: 2.5 }` block, plus `version` and
+    // one numeric input default. That is 4 numerics per step + 2 = **2,002
+    // numeric scalars**, against a ceiling of 5,041 — 2.5x headroom.
+    // Measured: admitted in 4.8 ms.
+    //
+    // This is what chose C. The sweep, same 189,327-byte attack payload,
+    // release, one document per child:
+    //
+    //   C=64   visits<=36,408  attack rejected in 638.9 ms  this doc ADMITTED
+    //   C=512  visits<= 5,041  attack rejected in  91.8 ms  this doc ADMITTED
+    //   C=2048 visits<= 1,275  attack rejected in  26.1 ms  this doc REJECTED
+    //   C=8192 visits<=   319  attack rejected in   9.6 ms  this doc REJECTED
+    //
+    // C=2048 is where a realistic workflow starts being refused, so C=512 is
+    // one notch below the first value that breaks the corpus, not an
+    // arbitrary round number.
+    let mut yaml = String::from(
+        "name: t\nversion: 1\ninputs:\n  n: { type: integer, default: 10 }\npermissions:\n  unattended: { escalate: fail }\nsteps:\n",
+    );
+    for i in 0..MAX_TOP_LEVEL_STEPS {
+        yaml.push_str(&format!(
+            "  - id: s{i}\n    tool: shell\n    timeout: 30\n    retries: 3\n    with: {{ a: 1, b: 2.5 }}\n"
+        ));
+    }
+    assert!(yaml.len() < MAX_YAML_BYTES);
+    let def = parse_workflow(&yaml)
+        .expect("a realistic numeric-heavy workflow must not trip the numeric-visit ceiling");
+    assert_eq!(def.steps.len(), MAX_TOP_LEVEL_STEPS);
+
+    // And the frozen §8.9 fixture, which is the real corpus: 10 numeric
+    // scalars, three orders of magnitude under the ceiling.
+    parse_workflow(PR_REVIEW_YAML).expect("the frozen fixture must still parse");
 }
 
 #[test]
@@ -946,6 +1116,19 @@ fn the_densest_alias_free_documents_under_the_byte_cap_still_parse() {
     // The claim being guarded: no alias-free document under the byte cap
     // may be rejected by the expansion ceiling, so nothing is ever rejected
     // for being *large* — only for amplifying.
+    //
+    // **Fix round 4 narrowed that claim and this is where it is recorded.**
+    // Charging numeric visits (`NUMERIC_SCALAR_WEIGHT_BYTES`) caps a
+    // document at `MAX_NUMERIC_SCALAR_VISITS` = 5,041 numeric scalars, so
+    // the property now reads: no alias-free document under the byte cap is
+    // rejected *unless it carries more than 5,041 numeric scalars*. The
+    // reachable case is a numeric data table inlined into a workflow —
+    // `t: [0,1,2,…]` filled to the byte cap holds ~131,000 integers and is
+    // now refused, measured. That is a real behaviour change, in the
+    // over-rejection direction, and it is the price of closing the
+    // numeric-decode axis; see `a_numeric_heavy_but_realistic_workflow_still_parses`
+    // for the corpus check that chose the constant. None of the five shapes
+    // below is numeric, so all five still parse.
     //
     // Payloads, each padded to within a few bytes of `MAX_YAML_BYTES`, with
     // no `&` or `*` anywhere:
