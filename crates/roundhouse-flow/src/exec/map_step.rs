@@ -99,7 +99,9 @@ pub const MAX_MAP_ITEMS: usize = 2_000;
 
 /// A run's remaining resource budget as `map` sees it. This crate's job is to
 /// divide whatever `total_remaining` it is handed; the run-level ledger that
-/// produces a real one is [`crate::ledger`] (B12b).
+/// produces a real one is [`crate::ledger`] (B12b), and the caller that reads
+/// it is [`crate::exec::run_loop`] (B12c).
+#[derive(Debug, Clone, PartialEq)]
 pub struct MapBudget {
     pub total_remaining: ResourceCaps,
 }
@@ -134,24 +136,27 @@ impl MapBudget {
     /// admits it isn't one. This constructor exists so that call site says
     /// so explicitly and is greppable.
     ///
-    /// # The ledger now exists; this call site still cannot use it (B12b)
+    /// # What still reaches this constructor, now that B12c has wired the real one
     ///
-    /// [`Self::from_run_ledger`] above is the real sourcing, and it is built
-    /// and tested. [`Executor::dispatch_map_step`] nonetheless still calls
-    /// **this** constructor, for a structural reason and not an omission:
-    /// [`Executor`] holds a `WorkflowDef`, a `TaskSink` and an `ExprContext`,
-    /// and **no [`rusqlite::Connection`]**. Giving it one means threading a
-    /// database handle (or a `ResourceCaps` read from one before the run
-    /// starts) through `Executor::new` and every dispatch arm — which is the
-    /// run loop's own plumbing, and the run loop is **B12c**. Ruling P77 §C
-    /// draws that line, and this is what it looks like from inside `map`.
+    /// [`Executor::dispatch_map_step`] uses whatever
+    /// [`crate::exec::run_loop`] set on the executor before dispatching the
+    /// step — a [`Self::from_run_ledger`] value, read at the moment the `map`
+    /// starts, which is §8.9's own words for when the split is taken. This
+    /// constructor is the fallback for an [`Executor`] that has **no run
+    /// behind it at all**: `Executor::new` builds one from a `WorkflowDef`, a
+    /// `TaskSink` and a `RunContext` with no `workflow_run` row anywhere, and
+    /// there is no ledger to source from because there is no run to source it
+    /// from. That path is this crate's own tests and
+    /// `examples/measure_dual_render.rs`; a real run goes through
+    /// [`crate::exec::run_loop::run_workflow`].
     ///
-    /// **The swap B12c makes is one line here**, plus wherever it decides the
-    /// connection lives:
-    /// `MapBudget::from_run_ledger(conn, self.run_id, now)?`.
-    /// Until then, [`split_budget`]'s output (`per_item_caps`, handed to
-    /// `run_item`) is real and meaningful as an *allocation* — it is only the
-    /// *ceiling it is allocated from* that is still fake.
+    /// The reason the swap could not happen in B12b stands recorded, because
+    /// it explains the shape: [`Executor`] held no [`rusqlite::Connection`],
+    /// and it still does not. B12c did not give it one — a run loop that holds
+    /// `&mut Connection` and an executor that holds `&Connection` cannot
+    /// coexist — it hands the executor the **value** the connection would have
+    /// produced, which is also what makes "at the moment the map starts"
+    /// literal rather than approximate.
     pub fn unenforced_placeholder() -> MapBudget {
         MapBudget {
             total_remaining: ResourceCaps::default(),
@@ -772,7 +777,15 @@ impl<'a> Executor<'a> {
             }
         };
 
-        let mut budget = MapBudget::unenforced_placeholder();
+        // B12c (ruling P108 §C): the run loop sets this from
+        // `MapBudget::from_run_ledger` before every step it dispatches, so a
+        // `map` inside a real run divides the run's **actual** remaining
+        // ceiling. An `Executor` with no run behind it has no ledger to read
+        // and falls back to the honest placeholder — see its doc.
+        let mut budget = self
+            .map_budget
+            .clone()
+            .unwrap_or_else(MapBudget::unenforced_placeholder);
 
         // Fix round 2, item 2/3: snapshot ONE root's binding, not the whole
         // context — see this function's own doc comment, "Why binding onto

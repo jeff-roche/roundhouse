@@ -58,6 +58,7 @@
 
 pub mod map_step;
 pub mod provenance;
+pub mod run_loop;
 pub use provenance::{Provenance, RunId};
 
 /// The result of evaluating one step's `when:` gate (Task 14 fix round 2,
@@ -574,6 +575,23 @@ pub struct Executor<'a> {
     // step — see `redaction_needles`'s own doc comment for what this
     // replaces and the measured cost of not doing so.
     redaction_needles: Vec<String>,
+    /// The run's remaining ceiling as of the step about to be dispatched, set
+    /// by [`run_loop::run_workflow`] from
+    /// [`map_step::MapBudget::from_run_ledger`] before each dispatch (ruling
+    /// P108 §C's obligation).
+    ///
+    /// **A value, not a `Connection`** — see
+    /// [`map_step::MapBudget::unenforced_placeholder`]'s doc for why the
+    /// obligation is discharged this way: a run loop holding
+    /// `&mut Connection` and an executor holding `&Connection` cannot coexist,
+    /// and §8.9 asks for the split to be taken *"at the moment the map
+    /// starts"*, which is what a per-dispatch value is and what a stored
+    /// handle would only approximate.
+    ///
+    /// `None` for an [`Executor::new`] with no `workflow_run` row behind it:
+    /// there is no ledger to read, and `dispatch_map_step` falls back to the
+    /// placeholder that says so.
+    map_budget: Option<map_step::MapBudget>,
 }
 
 impl<'a> Executor<'a> {
@@ -639,6 +657,7 @@ impl<'a> Executor<'a> {
             sink,
             ctx,
             redaction_needles,
+            map_budget: None,
         })
     }
 
@@ -1035,15 +1054,31 @@ impl<'a> Executor<'a> {
                 steps,
                 ..
             } => self.dispatch_map_step(&step.id, over, r#as, *max_parallel, *on_item_error, steps),
-            // Gate/Call are dispatched by the specialized handlers **Task 20
-            // (B12)** adds, which wrap this same `dispatch_step` for their
-            // inner/leaf steps rather than duplicating sequencing logic.
-            // (Corrected from "Tasks 7/11" by Task 19 under ruling P75 §A —
-            // see this module's doc comment. Their primitives exist:
-            // `crate::parking` for the park, `crate::compose` for the `call:`
-            // budget draw/refund, `MAX_CALL_DEPTH` and the workflow-as-tool
-            // shape. What is missing in both cases is the run loop that would
-            // call them, which is why these arms are still stubs.)
+            // **`gate:` and `call:` are handled by [`run_loop`], not here**
+            // (B12c). Both need a `workflow_run` row and a `&mut Connection`
+            // — a park is a durable state transition plus a checkpoint, and a
+            // `call:` creates a child run, draws its budget and refunds it —
+            // and `Executor` deliberately holds neither (see `map_budget`'s
+            // doc). The run loop therefore intercepts these two bodies before
+            // it reaches this function, rather than this function acquiring a
+            // database handle it would hold for the whole run.
+            //
+            // Reaching this arm means a `gate:` or `call:` was dispatched with
+            // **no run behind it**, and there are exactly two such callers:
+            //
+            // 1. `Executor::run_to_completion`, the in-memory sequencer, which
+            //    has no run row at all.
+            // 2. `map_step::dispatch_map_step`'s inner-step loop, for a
+            //    `gate:` or `call:` nested inside a `map`. §8.9's own reference
+            //    workflow nests a `gate:` that way, so this is a real shape
+            //    that is refused rather than an impossible one — and it is
+            //    refused for a structural reason, not an omission: a park is a
+            //    transition of *the run*, and one run cannot be parked
+            //    per-item; a nested `call:` needs the per-item budget pool
+            //    whose ceilings ruling P77 §C defers along with `map`'s
+            //    worktree fan-out. Both belong with whoever gives `map` real
+            //    fan-out.
+            //
             // Fix round 1, item 8: the message used to be
             // `format!("step kind {other:?} handled by a later task")` — a
             // full `{:?}` dump of the step body, flowing through
@@ -1055,7 +1090,8 @@ impl<'a> Executor<'a> {
             other @ (StepBody::Gate { .. } | StepBody::Call { .. }) => StepOutcome::failed(
                 &step.id,
                 format!(
-                    "step kind `{}` handled by a later task",
+                    "step kind `{}` needs a run loop: it is dispatched by \
+                     `run_loop::run_workflow`, never by a bare executor or from inside a `map`",
                     step_body_kind_name(other)
                 ),
             ),
