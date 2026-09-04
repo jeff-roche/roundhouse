@@ -9,3 +9,42 @@ workspace = true
 
 [dependencies]
 roundhouse-proto = { path = "../roundhouse-proto" }
+# Task 30 (Phase 5, Subsystem D1): the inbound HTTP server framework for the
+# web UI. Chosen over hand-rolled `hyper` or `actix-web` because it is written
+# by the `tokio`/`hyper` team (no ecosystem-fit risk against the workspace's
+# pinned tokio 1.53) and needs zero non-tokio runtime glue. §5.3 pins no
+# inbound server framework, so this is a net-new addition; it is recorded in
+# the §5.3 additions table in `docs/architecture/02-system-architecture.md`.
+# Exact `=` pin, not a `0.8` range: §5.3's pin discipline is "never track to
+# latest", and a soft range is precisely what that forbids.
+axum = "=0.8.4"
+# Task 30 (Phase 5, Subsystem D1): compiles `assets/dist/` into the library, so
+# the web client ships inside the daemon binary rather than as files the
+# operator has to deploy alongside it (P10 — `roundhouse-web` links into
+# `roundhouse-daemon`).
+#
+# `debug-embed` is REQUIRED, not a convenience: without it `rust-embed` reads
+# from the filesystem in debug builds, and `cargo test` is a debug build — the
+# embedding this crate exists to do would never be exercised by its own tests.
+# `mime-guess` gives `EmbeddedFile::metadata().mimetype()`, the content type
+# recorded at embed time; taking it from `rust-embed` avoids declaring
+# `mime_guess` a second time as a direct dependency for what this crate
+# already provides.
+#
+# Net-new addition, so the same exact-`=` pin discipline applies regardless of
+# which task introduces it (`roundhouse-cli/Cargo.toml`): pinned to the
+# current 8.12.0 rather than a `8` range.
+rust-embed = { version = "=8.12.0", features = ["debug-embed", "mime-guess"] }
+
+[dev-dependencies]
+# Task 30: `ServiceExt::oneshot` drives the router in-process, so the tests
+# exercise the real `axum::Router` without binding a socket. Not a normal
+# dependency — building a router needs no `tower` surface of our own. Already
+# in the lockfile at 0.5.3 as a transitive dependency; pinned to that exact
+# version so this declaration cannot drift the resolution.
+tower = { version = "=0.5.3", features = ["util"] }
+# Task 30: the tests are `#[tokio::test]`s and need an executor. Deliberately
+# dev-only, mirroring `roundhouse-sched`'s split — a router is data, and this
+# crate builds one without ever starting a runtime. Whoever wires a listener
+# into `roundhouse-daemon` brings their own runtime with them.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

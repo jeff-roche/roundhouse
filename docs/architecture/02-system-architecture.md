@@ -148,7 +148,8 @@ research pass — pin versions before the phase that needs them starts:**
 
 | Need | Choice | Used by | Rationale |
 |---|---|---|---|
-| Web framework | `axum` | Phase 5 (`roundhouse-web`) | Inbound HTTP/SSE server for the web UI; explicitly requested by the design (§11.3) but never added to this table. |
+| Web framework | `axum` | Phase 5 (`roundhouse-web`) | Inbound HTTP/SSE server for the web UI; explicitly requested by the design (§11.3) but never added to this table. Pinned `=0.8.4`. |
+| Web client embedding | `rust-embed` | Phase 5 (`roundhouse-web`) | Compiles the web client's build output into the library so it ships inside the binary that links `roundhouse-web` rather than as files deployed alongside it. Pinned `=8.12.0`, with `debug-embed` (without it, debug builds — including `cargo test` — read from the filesystem and never exercise the embedding) and `mime-guess` (content types recorded at embed time, so no second direct `mime_guess` dependency). |
 | Snapshot testing | `insta` | Phase 1 (golden snapshots for the first two codecs), Phase 6 (`roundhouse-provider` conformance suite for the remaining ~23 profiles) | The golden-codec-snapshot mechanism §9.10 assumes; needed as soon as the first codec exists, not deferred to Phase 6. |
 | AWS signing | `hmac` + `sha2` + `hex` | Phase 6 (`bedrock-converse` codec) | SigV4 request signing. |
 | AWS eventstream | `aws-smithy-eventstream` + `aws-smithy-types` | Phase 6 (`bedrock-converse` codec) | Bedrock's legacy Converse API is a binary eventstream, not SSE. |
