@@ -177,14 +177,23 @@ fn a_non_object_body_names_its_own_shape() {
 /// character and panics. Picking a multi-byte character is not enough; it has to
 /// be one whose width does not divide the bound.
 ///
-/// # And the truncation keeps the bound, not a token prefix
+/// # Three assertions about the cut itself, one per way of getting it wrong
 ///
-/// The last assertion is what stops `chars().take(1)` passing. The sweep's
-/// mutations of `MAX_ECHOED` cannot see that one: the constant appears in
+/// The `MAX_ECHOED` mutations cannot reach any of them: the constant appears in
 /// *both* the `chars().count() <= MAX_ECHOED` guard and the `take`, so changing
-/// it moves them together and the three assertions above hold at any value. A
-/// mutation that decouples the take from the constant does not, and only an
-/// assertion about *how much* survived the cut can tell them apart.
+/// it moves them together and everything above holds at any value. Each of these
+/// pins a different property of the cut, and each was found by asking P99's
+/// fourth-rule question of the *iterated* side of `value.chars()`:
+///
+/// - **how much** survives — `chars().take(1)` keeps the shape of a bounded
+///   echo while quoting a token prefix;
+/// - **where it starts** — `chars().skip(1).take(…)` keeps the length and drops
+///   the first character of the typo the echo exists to show, which a filler of
+///   one repeated character cannot see;
+/// - **what the bound counts** — a guard reading `value.len()` calls thirty `€`
+///   (ninety bytes, thirty characters) over the bound and marks it truncated
+///   when nothing was cut, which is a lie about the caller's own input in a
+///   message whose entire job is to show it back.
 #[test]
 fn a_rejected_value_is_echoed_back_bounded_and_on_a_char_boundary() {
     let render = |repeats: usize| {
@@ -214,6 +223,26 @@ fn a_rejected_value_is_echoed_back_bounded_and_on_a_char_boundary() {
         long.matches('€').count() > 10,
         "a truncated value keeps the bound's worth of the caller's text, not a token prefix; \
          got {long}"
+    );
+
+    // What survives is a *prefix*: it starts where the caller's value starts.
+    // A filler of one repeated character cannot see this, which is why the
+    // value is marked at its head.
+    let marked = parse_interaction(&json!({ "kind": format!("Zebra{}", "€".repeat(1_000)) }))
+        .expect_err("a run of '€' behind a word is not one of the four")
+        .to_string();
+    assert!(
+        marked.contains("'Zebra€"),
+        "the echo starts where the caller's value starts; got {marked}"
+    );
+
+    // The bound counts characters, not bytes. Thirty '€' is ninety bytes and
+    // thirty characters, so a byte-counting guard marks it truncated when
+    // nothing was cut.
+    let under = render(30);
+    assert!(
+        !under.contains('…'),
+        "a value inside the bound must not be marked as truncated; got {under}"
     );
 }
 
