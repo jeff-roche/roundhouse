@@ -86,6 +86,18 @@ pub(crate) enum AllowedHosts {
     /// `Host: evil.com`, which is not an IP literal and is refused here. A
     /// cross-origin `fetch` to a bare IP is not rebinding at all and is stopped
     /// by the absent CORS headers.
+    ///
+    /// **And a second reason, which does not depend on the first** (ruling P94
+    /// addendum): this variant is structurally unreachable without the LAN
+    /// token. [`crate::lan_auth::BindConfig::allowed_hosts`] yields it only
+    /// under `Bind::Lan`, `BindConfig::gate` returns `Some` for **every**
+    /// `Bind::Lan`, and `BindConfig::lan` cannot be constructed without a
+    /// `LanToken`. So the loosest arm of this check is never the ungated arm,
+    /// and admitting it cannot weaken the loopback property at all — loopback
+    /// never reaches it. The argument above rests on
+    /// [`is_ip_literal`]'s name/literal discrimination being exact; this one
+    /// holds even if that discrimination were buggy, which is what makes it the
+    /// better of the two to lead with.
     AnyIpLiteral,
 }
 
