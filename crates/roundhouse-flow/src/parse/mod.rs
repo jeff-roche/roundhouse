@@ -137,30 +137,42 @@
 //! was closable. All four were found by asking "is it bounded?", a question
 //! with no falsifiable negative. This table replaces that question. Every
 //! row is attackable on its own, and **a missing row is the defect this
-//! exists to prevent** — so the row worth reading hardest is the one that
-//! still says *unbounded*, and the second-hardest is any row that recently
-//! stopped saying it.
+//! exists to prevent** — so the rows worth reading hardest are the ones that
+//! still say *unbounded*, and the next-hardest is any row that recently
+//! stopped saying it. **A fifth round then had to change a row back**: the
+//! non-string-scalar row claimed [`MAX_INTEGER_SCALAR_VISITS`] bounded the
+//! integer half when it bounds only the count of decodes. So both directions
+//! of error have now happened here, which is why "what bounds it" is a column
+//! and not a sentence.
 //!
 //! All figures release build, end to end through [`parse_workflow`], one
-//! document per child process under an 8 GiB `ulimit -v` so each peak is
-//! attributable to one payload.
+//! document per child process under a `ulimit -v` ceiling so each peak is
+//! attributable to one payload — 8 GiB for the fix-round-5 figures, 16 GiB
+//! for fix round 6's.
 //!
 //! | cost axis | what bounds it | ceiling | measured worst | measured how |
 //! |---|---|---|---|---|
-//! | **Expansion CPU** — walking and re-walking aliased subtrees | [`MAX_EXPANDED_WEIGHT`], enforced during the walk that incurs it | 2,621,440 | 24.5 ms to reject a 260,364 B fan-out at the byte cap; **1,603.3 ms admitted** for the exponent maximiser, the worst admitted document found | `parse_workflow` wall clock, one doc per child |
+//! | **Expansion CPU** — walking and re-walking aliased subtrees | [`MAX_EXPANDED_WEIGHT`], enforced during the walk that incurs it | 2,621,440 | 24.5 ms to reject a 260,364 B fan-out at the byte cap; **9,435.7 ms admitted** for the integer maximiser of the row below, which is the worst admitted document found. (Fix round 5 published 1,603.3 ms here from the *float* maximiser; that figure is real and re-measured at 1,519.1 ms, but it was never the worst — see the two decode rows) | `parse_workflow` wall clock, one doc per child |
 //! | **Materialized memory** — the `Value` tree the authorized parse builds | same weight budget, via the node budget `ceiling / NODE_WEIGHT_BYTES` = 327,680 | 2,621,440 | **≥101.9 MB** admitted, from a **15,106-byte** document. Worst shape: one-element sequences nested 110 deep, 67 of them, aliased 43x — what caps it is `serde_yaml`'s own ~128 recursion limit, not any constant of ours | `VmHWM`, one doc per child |
 //! | **Container allocation** — `Vec`/`IndexMap` capacity slack, ~288 B for a 1-element `Vec` charged 8 | same weight budget; *under-priced*, and the under-pricing compounds with depth | 2,621,440 | same row as above — this is why the memory maximiser is a deep container shape rather than a scalar one | as above |
-//! | **Non-string scalar source length / decode CPU** — `dec2flt` / `from_str_radix` re-scanning a long token on every alias expansion | [`MAX_FLOAT_SCALAR_VISITS`] and [`MAX_INTEGER_SCALAR_VISITS`], via charges at the visitor. Route-independent at the *serde trait* level: `visit_f32` forwards to `visit_f64` and `visit_i8`/`i16`/`i32` to `visit_i64`, so no numeric arrival misses the charge even if `serde_yaml` changes width | 5,041 float visits, 65,536 integer; float decode ≤ 5,041 × [`MAX_YAML_BYTES`] = 1.32 GB | **admitted: 1,603.3 ms** (259,742 B exponent maximiser, tuned just under the ceiling). Same family before the charge: **18,318.9 ms** burned on a 257,442 B document before `serde_yaml`'s own repetition guard stopped it — **≈11.4x**. Rejection is the cheap case at 383.8 ms | `parse_workflow` wall clock, one doc per child |
+//! | **Float decode CPU** — `dec2flt` re-scanning a long token on every alias expansion | [`MAX_FLOAT_SCALAR_VISITS`], via a charge at `visit_f64`. Route-independent at the *serde trait* level: `visit_f32` forwards to `visit_f64`, so no float arrival misses the charge even if `serde_yaml` changes width. **The charge caps the count of decodes, not the cost of one** | 5,041 float visits; the count cap and the byte cap together permit 5,041 × [`MAX_YAML_BYTES`] = 1.32 GB of `dec2flt` scanning | **admitted: 1,519.1 ms** (249,582 B exponent maximiser — `!!float` with 245,000 digits in the exponent, aliased 4,970x, tuned just under the ceiling; fix round 5 published 1,603.3 ms for the same family at 259,742 B). Same family before the charge: **18,318.9 ms** burned on a 257,442 B document before `serde_yaml`'s own repetition guard stopped it. Rejection *is* the cheap case here: 353–750 ms across four rejected tunings | `parse_workflow` wall clock, one doc per child under `ulimit -v 16777216` |
+//! | **Integer decode CPU** — `from_str_radix` re-scanning a long token on every alias expansion | **[`MAX_YAML_BYTES`] only — *not* [`MAX_INTEGER_SCALAR_VISITS`].** The charge caps the *count* of integer decodes at 65,536 and prices no part of the per-decode cost, which is O(token). The maximiser spends 43,674 of those 65,536 visits, so **the charge never fires**; what limits the attacker is the byte cap, and the work it admits is quadratic in it (`~B²/12` scanned bytes per walk, and there are two walks). The count cap and the byte cap together permit 65,536 × [`MAX_YAML_BYTES`] = **17.2 GB** of `from_str_radix` scanning — a ceiling in the absence of a bound, not a bound. **This is an ACCEPTED RESIDUAL under ruling P63**, decided by the project owner against the orchestrator's recommendation, and covered by the same out-of-process `RLIMIT_CPU` remedy named below for the tokenizing row | none that binds | **admitted: 9,435.7 ms** (re-runs 8,821.4 / 9,312.1 / 9,431.1), 262,143 B, peak RSS 13.5 MB. Shape: one anchored `0x` + 131,019 zeros + `1` integer token aliased 43,673x in a flat flow sequence inside one step. The `0x` prefix is what matters — `serde_yaml`'s radix branches sit *above* its `digits_but_not_number` diversion, so the token decodes successfully instead of being diverted to `visit_str`; see [`expansion::FLOAT_SCALAR_WEIGHT_BYTES`]. **Rejection is NOT the cheap case on this axis**, unlike floats: the same token aliased 18,710x as *top-level steps* costs **3,747.7 ms** before `TooManySteps` fires, because that check runs after both walks | `parse_workflow` wall clock, one doc per child under `ulimit -v 16777216`, with the live constants printed from inside the test binary (P60) |
 //! | **`flatten` re-buffering** — `PermissionRuleDefWire` buffering through serde `Content` | weight budget; the re-visit is over an owned buffer, so a constant multiple of already-expanded content | 2,621,440 | 21.4 ms, 14.2 MB (15,298 B document) | as above |
 //! | **Alias jump count** | `serde_yaml`'s own `jumpcount > events.len() * 100`, plus the weight budget | library-internal | the billion-laughs payload stops here, 1.2 ms | `parse_workflow` |
 //! | **Tokenizing raw text into the event list** | **UNBOUNDED.** [`MAX_YAML_BYTES`] caps the input; [`nesting_depth_bound_violation`] is best-effort and explicitly not a boundary. **It is also what currently hides the worst case** — the shape below is only reachable in practice because that scan happens to reject deep bracket runs, so anyone relaxing [`MAX_FLOW_NESTING_DEPTH`] unblocks it | none | **427 ms and 45.7 MB** for 262,144 bytes of `[`, fed to `serde_yaml` directly with this crate's scan bypassed (51.4 ms at 32 KiB, 207 ms at 128 KiB — roughly linear for *this* shape, the only one measured) | raw `serde_yaml::from_str` |
 //! | **Downstream of parsing** — tasks a parsed workflow dispatches | **not this module.** [`crate::caps`] (ruling P47) | n/a | n/a | n/a |
 //!
-//! Figures are as of the fix-round-5 commit and were measured against the
-//! **exponent maximiser** (see [`MAX_FLOAT_SCALAR_VISITS`]) unless a row
-//! says otherwise. Earlier rounds measured mantissa-placed digits and
-//! published figures that were low every time; the shape a figure was
-//! measured against is part of the figure.
+//! The two decode rows and the Expansion CPU row were re-measured at **fix
+//! round 6**; the remaining rows carry fix-round-5 figures. The shape a figure
+//! was measured against is part of the figure, so every row names one.
+//!
+//! **Round 5's version of these rows had a single "non-string scalar" row
+//! covering both floats and integers, and it named
+//! [`MAX_INTEGER_SCALAR_VISITS`] as what bounds the integer half.** That was
+//! the "wrong what-bounds-it" defect this inventory exists to catch — worse
+//! than a missing row, because it tells the next engineer to stop looking. The
+//! integer half is bounded by the byte cap and nothing else; the rows are now
+//! split so each is attackable on its own.
 //!
 //! ## The structural doubling, which no in-process meter can see
 //!
@@ -178,11 +190,13 @@
 //! walk) or the out-of-process remedy below, which bounds the process
 //! regardless of how many walks happen inside it.
 //!
-//! ## The one open row, and the remedy for it
+//! ## The two open rows, and the remedy for both
 //!
-//! **Fix round 3 published this section with *two* open rows and said the
-//! numeric-decode axis could not be closed in-process. That was wrong, and
-//! the way it was wrong is the most useful thing on this page.** Two
+//! **Fix round 3 published this section with two open rows and said the
+//! numeric-decode axis could not be closed in-process. Fix round 5 published
+//! it with one, claiming the numeric axis closed. Both were wrong, in
+//! opposite directions, and the pair is the most useful thing on this page.**
+//! Round 3's error first. Two
 //! remedies had been tried and disproved — a source pre-scan
 //! (a digit-run source scan, since deleted) and intercepting `serde_yaml`'s
 //! dispatch — and "unclosable" was concluded from those two failures. But
@@ -203,6 +217,21 @@
 //! close this" tells the next engineer to stop looking, which is why it is
 //! the one kind of row that has to clear a higher bar than the others.
 //!
+//! **Round 5's error, which is the reason there are two open rows again.**
+//! Pricing the callback *does* work, and it capped the *count* of decodes as
+//! claimed. What round 5 then wrote — that per-decode work was therefore
+//! bounded — does not follow, and the sentence it rested on
+//! (`expansion.rs`'s "no integer route performs an O(token) decode that
+//! succeeds") was false as a matter of `serde_yaml`'s source. The
+//! **integer decode row is open**: see it for the mechanism, the measured
+//! 9,435.7 ms admitted document, and ruling **P63**, under which the project
+//! owner looked at that number, priced it against shrinking
+//! [`MAX_YAML_BYTES`] and [`MAX_TOP_LEVEL_STEPS`], and **accepted it**. It is
+//! open in the inventory sense — nothing bounds it but the byte cap — and
+//! closed in the decision sense. Do not reopen it by looking for a seventh
+//! in-process bound; reopen it, if at all, by revisiting the product question
+//! of how large a workflow document may be.
+//!
 //! **Tokenizing remains genuinely open**, and for a different reason than
 //! the one round 3 gave for both: its cost is incurred *before any visitor
 //! runs*, so there is no callback to price. There is no analogous third
@@ -218,7 +247,13 @@
 //! `parse_workflow` still has no caller outside this crate.
 //!
 //! Interim lever if either needs to be smaller before then: lower
-//! [`MAX_YAML_BYTES`]. It is the only input both stages scale with.
+//! [`MAX_YAML_BYTES`]. It is the only input both stages scale with, and the
+//! integer row scales with it *quadratically* — the maximiser's work is
+//! `~B²/12` per walk — so it is a disproportionately effective lever there.
+//! It is also a product limit on how large a workflow file may be, and would
+//! need [`MAX_TOP_LEVEL_STEPS`] lowered with it to keep the coherence argument
+//! below intact; that pairing is why P63 declined it rather than why it would
+//! not work.
 //!
 //! ## How the axis list was arrived at
 //!
@@ -226,7 +261,17 @@
 //! callbacks `serde_yaml` can invoke, with the source provenance given on
 //! [`expansion::FLOAT_SCALAR_WEIGHT_BYTES`], and at the serde trait level
 //! rather than only at `serde_yaml`'s dispatch — which is what makes the
-//! enumeration's completeness stop mattering for this axis.
+//! enumeration's completeness stop mattering for *which callbacks get
+//! charged*.
+//!
+//! **That completeness argument never covered *how much* to charge, and
+//! round 5 treated it as if it had.** Knowing that every numeric arrival is
+//! priced says nothing about what the arrival cost to produce; that lives in
+//! `serde_yaml`'s decoders, not in the callback surface. Round 5 sized the
+//! integer charge from a claim about those decoders that was false, and the
+//! closed enumeration above did not and could not catch it. The fifth
+//! omission was therefore not a missing callback but a missing *factor* in an
+//! existing row.
 //!
 //! **Fix round 2's version of this paragraph claimed the same thing and was
 //! wrong, in the most instructive direction.** It named the right surface —
@@ -241,13 +286,16 @@
 //! For the stages outside the walk — tokenizing before it, `flatten` and
 //! `Value` construction after it — there is no equivalent closed argument.
 //! Those rows are enumerated and measured, which per P18 is an observation
-//! and not a proof. **Where a fifth omission would live is not something this
-//! comment should guess at again**; what it can say is that four have now
-//! been found, three of them inside the walk, and that the one remaining
-//! open row is open because of *where the cost is spent* — before any
-//! callback exists to price — rather than because of which unit measures
-//! it. That distinction is load-bearing: it is exactly what round 3 got
-//! wrong when it generalised from two failed remedies to "unclosable".
+//! and not a proof. **Where a sixth omission would live is not something this
+//! comment should guess at again** — round 2 guessed "outside the walk" and
+//! the next one was inside it. What it can say is that five have now been
+//! found, four of them inside the walk, and that the two remaining open rows
+//! are open for different reasons: tokenizing because of *where* the cost is
+//! spent (before any callback exists to price), the integer decode because a
+//! priced callback still says nothing about what the decode behind it cost.
+//! Neither is open because of which unit measures it, and that distinction is
+//! load-bearing: collapsing it is exactly what round 3 got wrong when it
+//! generalised from two failed remedies to "unclosable".
 //!
 //! **An in-process timeout was never the answer and still is not.**
 //! `serde_yaml::from_str` is a synchronous call into `unsafe-libyaml` with
@@ -297,10 +345,13 @@
 //!   real.
 //!
 //!   **This module's alias check is a metered walk, not a count.** Fix
-//!   round 4 shipped a count (`MAX_ALIAS_TOKENS`, rejecting above 64
-//!   tokens matching `*[A-Za-z0-9_-]`) as best-effort defence in depth;
-//!   fix round 5 removed it, because it turned out to cost more than it
-//!   bought. It could not bound the attack — at a fixed 64 alias tokens,
+//!   round 4 **on Task 10** shipped a count (`MAX_ALIAS_TOKENS`, rejecting
+//!   above 64 tokens matching `*[A-Za-z0-9_-]`) as best-effort defence in
+//!   depth; fix round 5 **on Task 10** removed it, because it turned out to
+//!   cost more than it bought. (Task numbers, because Task X1 has its own
+//!   rounds 4 and 5 and they did different things — round 4 there added the
+//!   numeric-visit charge, round 5 split it. See [`MAX_FLOW_NESTING_DEPTH`]
+//!   and `an_alias_heavy_prose_prompt_parses` for the same convention.) It could not bound the attack — at a fixed 64 alias tokens,
 //!   cost spans over 3,000x purely by widening the anchored leaf list (10
 //!   leaves 9.6 ms, 100 leaves 160 ms, 1,000 leaves 4.26 s, 5,000 leaves
 //!   29.3 s), so alias count and parse cost are close to independent and
@@ -561,11 +612,15 @@ pub const MAX_YAML_BYTES: usize = 262_144;
 /// (36 MB, then 65.5 MB, now 101.9 MB), so treat this as the worst *found*
 /// and see the axis inventory for which rows are open.
 ///
-/// Rejection is cheap: every attack payload in the module doc comment's
-/// history tables is rejected in 0.6-24.5 ms release (3.8-216.4 ms debug),
-/// re-measured at fix round 3 across every payload the tables name, with
-/// process peak RSS of
-/// 3.7-9.3 MB. The two-walk design means a legitimate document is walked
+/// Rejection is cheap **when this ceiling is what rejects**: every attack
+/// payload in the module doc comment's history tables is rejected in
+/// 0.6-24.5 ms release (3.8-216.4 ms debug), re-measured at fix round 3
+/// across every payload the tables name, with process peak RSS of
+/// 3.7-9.3 MB. It is *not* cheap when a later check rejects: a document whose
+/// aliases are top-level steps passes this ceiling, is deserialized in full,
+/// and only then trips [`MAX_TOP_LEVEL_STEPS`] — measured at 3,747.7 ms for
+/// the integer maximiser of the axis inventory's integer decode row (fix
+/// round 6). The two-walk design means a legitimate document is walked
 /// twice: measured overhead is 0.07 ms on the frozen §8.9 fixture (2,271 B)
 /// and 21.9 ms on a maximally dense 256 KiB document, the worst case the
 /// byte cap allows.
@@ -598,16 +653,25 @@ pub const MAX_EXPANDED_WEIGHT: usize = 2_621_440;
 /// byte-at-a-time. Earlier rounds published figures from mantissa payloads
 /// and were low every time.
 ///
-/// | payload | bytes | result |
-/// |---|---|---|
-/// | exponent maximiser, tuned just under the ceiling | 259,742 | **ADMITTED, 1,603.3 ms** |
-/// | the same family with floats uncharged (round 3's behaviour) | 257,442 | **18,318.9 ms** burned, then stopped by `serde_yaml`'s own repetition guard |
-/// | exponent maximiser, rejected by the ceiling | 174,146 | rejected, 383.8 ms |
-/// | the same digits in the *mantissa* instead | 174,143 | rejected, 97.6 ms — 4.0x cheaper |
+/// | payload | bytes | result | round |
+/// |---|---|---|---|
+/// | exponent maximiser, 245,000 digits, aliased 4,970x, tuned just under the ceiling | 249,582 | **ADMITTED, 1,519.1 ms** | 6 |
+/// | the same shape with 240,000 digits and a 2,000-entry pad list | 248,302 | **ADMITTED, 1,489.2 ms** | 6 |
+/// | the same shape, 200,000 digits, with a 20,000-entry pad list spending 180,000 of the weight budget on the pad | 243,678 | rejected, 589.8 ms | 6 |
+/// | exponent maximiser, tuned just under the ceiling | 259,742 | ADMITTED, 1,603.3 ms | 5 |
+/// | the same family with floats uncharged (round 3's behaviour) | 257,442 | **18,318.9 ms** burned, then stopped by `serde_yaml`'s own repetition guard | 5 |
+/// | exponent maximiser, rejected by the ceiling | 174,146 | rejected, 383.8 ms | 5 |
+/// | the same digits in the *mantissa* instead | 174,143 | rejected, 97.6 ms — 4.0x cheaper | 5 |
 ///
-/// **The admitted figure is the one that matters** — a rejection is the
-/// cheap case. It is ~2x the metered walk alone, because of the structural
-/// doubling described in this module's axis inventory.
+/// **The admitted figure is the one that matters** — for *this* axis a
+/// rejection is the cheap case. It is ~2x the metered walk alone, because of
+/// the structural doubling described in this module's axis inventory.
+///
+/// **"Rejection is cheap" does not carry across to integers**, and round 5
+/// implied it did by publishing one row for both: on the integer axis the
+/// same family is rejected only *after* both walks complete, measured at
+/// 3,747.7 ms. See [`MAX_INTEGER_SCALAR_VISITS`] and the inventory's integer
+/// decode row.
 ///
 /// # What it over-rejects
 ///
@@ -615,22 +679,50 @@ pub const MAX_EXPANDED_WEIGHT: usize = 2_621_440;
 /// total. One full 2,000-item map step of floats is admitted with 2.5x
 /// headroom; three are not. Integer ids — the shape
 /// [`crate::caps::MAX_MAP_ITEMS`] is actually written for — are charged
-/// eight times less and are covered to 65,536; see
-/// [`MAX_INTEGER_SCALAR_VISITS`].
+/// sixteen times less (`512 / 32 = 16`) and are covered to 65,536; see
+/// [`MAX_INTEGER_SCALAR_VISITS`], and read its residual note before treating
+/// that as the same kind of coverage.
 pub const MAX_FLOAT_SCALAR_VISITS: usize =
     MAX_EXPANDED_WEIGHT / (expansion::NODE_WEIGHT_BYTES + expansion::FLOAT_SCALAR_WEIGHT_BYTES);
 
 /// How many scalars `serde_yaml` decodes as **integers** one document may
-/// expand to. Derived the same way, from the eight-times-smaller
-/// [`expansion::INTEGER_SCALAR_WEIGHT_BYTES`].
+/// expand to. Derived the same way, from the sixteen-times-smaller
+/// [`expansion::INTEGER_SCALAR_WEIGHT_BYTES`] (`512 / 32 = 16`; an earlier
+/// version of this line said "eight", which is the arithmetic of a value this
+/// constant no longer has, and following it back to 64 would land at 36,408
+/// visits — 1.1% above the tripwire below, so the build would *not* catch it).
+///
+/// # This caps a count, not a cost, and the difference is measured
+///
+/// **It is not a bound on integer-decode work and must not be cited as one.**
+/// A `serde_yaml` integer decode is O(token length) and the visitor never sees
+/// the token, so this ceiling and [`MAX_YAML_BYTES`] together permit
+/// `65,536 x 262,144` = **17.2 GB** of `from_str_radix` scanning. Measured
+/// fix round 6: a 262,143-byte document — one anchored `0x` + 131,019 zeros +
+/// `1` aliased 43,673 times — is **ADMITTED in 9,435.7 ms**, and it makes only
+/// 43,674 integer visits, so this ceiling is never reached and plays no part
+/// in the outcome. What limits that attacker is [`MAX_YAML_BYTES`].
+///
+/// That is an **accepted residual** under ruling P63 rather than an open
+/// question: the project owner weighed it against lowering [`MAX_YAML_BYTES`]
+/// and [`MAX_TOP_LEVEL_STEPS`] and chose to keep the document size. See this
+/// module's axis inventory (integer decode row) and
+/// [`expansion::FLOAT_SCALAR_WEIGHT_BYTES`] for the `serde_yaml` mechanism.
+///
+/// # The value, sized against the corpus in the over-rejection direction
 ///
 /// Sized against the binding corpus case rather than chosen: the largest
 /// `map`-over-numeric-ids workflow [`MAX_YAML_BYTES`] admits at all is
 /// **18 map steps x 2,000 six-digit ids = 36,001 integer scalars in 253,952
-/// bytes** (measured; a 19th step exceeds the byte cap). 65,536 is 1.82x
-/// that. Fix round 4 charged integers at the float rate, which admitted only
-/// 5,041 and refused a **42,384-byte, alias-free** three-map-step workflow —
-/// a shape this crate blesses through [`crate::caps::MAX_MAP_ITEMS`].
+/// bytes** (measured, fix round 5; a 19th step exceeds the byte cap). 65,536
+/// is 1.82x that. Fix round 4 charged integers at the float rate, which
+/// admitted only 5,041 and refused a **42,384-byte, alias-free**
+/// three-map-step workflow — a shape this crate blesses through
+/// [`crate::caps::MAX_MAP_ITEMS`]. That corpus constraint is real and it is
+/// also why the residual above cannot be closed by moving this constant:
+/// admitting 36,001 integers needs a charge of at most 64, and the closing
+/// security review put the charge needed to bound the attack at ~481
+/// (reported, not re-measured here).
 pub const MAX_INTEGER_SCALAR_VISITS: usize =
     MAX_EXPANDED_WEIGHT / (expansion::NODE_WEIGHT_BYTES + expansion::INTEGER_SCALAR_WEIGHT_BYTES);
 

@@ -801,6 +801,101 @@ fn every_tag_spelling_that_reaches_a_decoded_numeric_visit_is_charged() {
     }
 }
 
+/// One anchored `0x` + `zeros` zeros + `1` integer token, aliased `k` times in
+/// a flat flow sequence inside one step body (a raw `serde_yaml::Value`, so
+/// nothing is typed away and the real parse materialises all of it).
+fn hex_zero_run(zeros: usize, k: usize) -> String {
+    let mut y = String::with_capacity(zeros + 3 * k + 256);
+    y.push_str(
+        "name: t\nversion: 1\npermissions:\n  unattended: { escalate: fail }\nsteps:\n  - id: s\n",
+    );
+    y.push_str("    f: &f 0x");
+    for _ in 0..zeros {
+        y.push('0');
+    }
+    y.push_str("1\n    b: [");
+    for i in 0..k {
+        if i > 0 {
+            y.push(',');
+        }
+        y.push_str("*f");
+    }
+    y.push_str("]\n");
+    y
+}
+
+#[test]
+fn a_long_hex_integer_token_aliased_many_times_is_admitted_as_an_accepted_residual() {
+    // Task X1 fix round 6. This test pins the DOCUMENTED behaviour of the
+    // integer-decode axis, which is that a long integer token aliased many
+    // times is **admitted**. It is not a bug report; it is ruling P63's
+    // accepted residual, made visible so a future change to
+    // `INTEGER_SCALAR_WEIGHT_BYTES` or `MAX_YAML_BYTES` has to walk past it.
+    //
+    // Why it exists: fix round 5 deleted the only test carrying a long
+    // *integer-route* token, leaving the suite covering the axis its integer
+    // constant was resized on with nothing but `"7"`, `"-7"` and six-digit
+    // ids. That blind spot is how a false claim about `serde_yaml`'s integer
+    // decoding shipped.
+    //
+    // The mechanism, asserted rather than described. `parse_unsigned_int`
+    // (`serde_yaml-0.9.34/src/de.rs:940-975`) tries `0x`/`0o`/`0b` at the top
+    // and consults `digits_but_not_number` only at `de.rs:972`, after all
+    // three. `from_str_radix(rest, 16)` cannot overflow on a run of zeros, so
+    // it scans the whole token, succeeds, and reaches `visit_u64` — where the
+    // meter charges a flat `INTEGER_SCALAR_WEIGHT_BYTES` that says nothing
+    // about the token's length.
+    let long_hex = format!("0x{}1", "0".repeat(20_000));
+    assert_eq!(
+        route_of(&long_hex),
+        "visit_u64",
+        "a `0x` + long-zero-run token must reach a decoded-integer visit; if this now \
+         says visit_str, `serde_yaml` has moved `digits_but_not_number` above the radix \
+         branches and the residual documented on `MAX_INTEGER_SCALAR_VISITS` may be gone"
+    );
+    // The contrast, and the shape round 5's false claim actually described:
+    // the DECIMAL leading-zero spelling *is* diverted to `visit_str` and
+    // charged its length. Correct for that spelling, and it does not
+    // generalise — which was the whole defect.
+    assert_eq!(
+        route_of(&format!("0{}1", "0".repeat(20_000))),
+        "visit_str",
+        "the decimal leading-zero spelling must still be diverted by `digits_but_not_number`"
+    );
+
+    // Payload: `f: &f 0x<20,000 zeros>1` aliased 3,000 times as
+    // `b: [*f,*f,…]` — 29,105 bytes, one step, no nesting, every bracket
+    // balanced. Measured fix round 6: ADMITTED in 100.3 ms release. The
+    // fixture is deliberately ~30 KB rather than at the byte cap: the
+    // maximiser at 262,143 bytes is ADMITTED in 9,435.7 ms, which is the
+    // figure the axis inventory publishes and far too expensive for CI.
+    let zeros = 20_000;
+    let aliases = 3_000;
+    let yaml = hex_zero_run(zeros, aliases);
+    assert_eq!(yaml.len(), 29_105, "fixture shape changed; re-measure it");
+    assert!(yaml.len() <= MAX_YAML_BYTES);
+
+    // The charge does not fire, and that is the point: the document's integer
+    // visits sit far below the ceiling, so `MAX_INTEGER_SCALAR_VISITS` plays
+    // no part in the outcome. Scaled up to the byte cap the same shape reaches
+    // 43,674 visits — still two-thirds of the ceiling.
+    let integer_visits = aliases + 1;
+    assert!(
+        integer_visits < MAX_INTEGER_SCALAR_VISITS,
+        "{integer_visits} visits must stay under the {MAX_INTEGER_SCALAR_VISITS} ceiling, \
+         or this fixture is testing the charge rather than the residual"
+    );
+
+    let def = parse_workflow(&yaml).expect(
+        "a long `0x` integer token aliased many times is ADMITTED — this is the accepted \
+         residual recorded under ruling P63 on `MAX_INTEGER_SCALAR_VISITS`. If this now \
+         fails, the residual has been closed: that is good news, but the axis inventory's \
+         integer decode row, `INTEGER_SCALAR_WEIGHT_BYTES` and P63 all describe behaviour \
+         that no longer exists and must be rewritten in the same change",
+    );
+    assert_eq!(def.steps.len(), 1);
+}
+
 /// One anchored `!!float` whose digits sit in the **exponent**, folded every
 /// 512 characters by escaped line continuations, aliased `n * m` times with a
 /// `pad`-entry list to lift `serde_yaml`'s jump budget. This is the

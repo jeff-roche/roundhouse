@@ -264,10 +264,11 @@ pub const NODE_WEIGHT_BYTES: usize = 8;
 
 /// Extra weight charged for a scalar `serde_yaml` hands over **already
 /// decoded as a float**, on top of [`NODE_WEIGHT_BYTES`]. With
-/// [`INTEGER_SCALAR_WEIGHT_BYTES`] this is what bounds the numeric-decode
-/// axis.
+/// [`INTEGER_SCALAR_WEIGHT_BYTES`] this is what caps the *number* of numeric
+/// decodes a document may make. It does not cap what each one costs; the
+/// residual that leaves is stated below and in [`super`]'s axis inventory.
 ///
-/// # Why a flat charge closes an axis the meter cannot see
+/// # Why a flat charge prices an axis the meter cannot see
 ///
 /// The visitor is handed an `f64`, never the token it came from, so the
 /// meter cannot price a numeric scalar by its length. Rounds 2 and 3 both
@@ -277,7 +278,8 @@ pub const NODE_WEIGHT_BYTES: usize = 8;
 /// interception point in `serde_yaml` 0.9.34, and round 3 concluded from
 /// those two failures that the axis was unclosable in-process.
 ///
-/// **That conclusion was wrong.** Both attempts were about identifying
+/// **That conclusion was wrong about pricing, though not about bounding.**
+/// Both attempts were about identifying
 /// *which route* a token arrives on. Pricing does not need to know: every
 /// route converges on the same handful of visitor callbacks. Charging there
 /// is route-independent by construction, and a security review established
@@ -286,16 +288,19 @@ pub const NODE_WEIGHT_BYTES: usize = 8;
 /// `visit_i64` and `visit_f32` to `visit_f64`, so no numeric arrival misses
 /// the charge even if `serde_yaml` changes the width it decodes to.
 ///
-/// # The bound
+/// # What the charge caps: the count of decodes, not the cost of one
 ///
 /// A decoded scalar can never be longer than the source it came from
 /// (escapes shrink: `\u0037` is six source bytes and one decoded byte;
 /// block folding replaces a newline with a space; nothing grows). So one
-/// token's length is capped by [`super::MAX_YAML_BYTES`], and the only
-/// unbounded factor was *how many times* a decode happens. Charging caps
-/// that count at [`super::MAX_FLOAT_SCALAR_VISITS`].
+/// token's length is capped by [`super::MAX_YAML_BYTES`], and the count of
+/// decodes is capped by charging, at [`super::MAX_FLOAT_SCALAR_VISITS`].
+/// **Both factors being capped is not the same as their product being small**
+/// — an earlier version of this heading read "The bound" and elided exactly
+/// that step. `5,041 x 262,144` = 1.32 GB of `dec2flt` scanning is what the
+/// two caps together permit for floats; the integer figure is 13x worse.
 ///
-/// # Floats and integers are charged differently, and only one is load-bearing
+/// # Floats and integers are charged differently, and neither charge bounds work
 ///
 /// Floats carry the expensive decode: `dec2flt` is O(token), and measurably
 /// worse when the digits sit in the **exponent** rather than the mantissa,
@@ -304,26 +309,78 @@ pub const NODE_WEIGHT_BYTES: usize = 8;
 /// with the same digit count: 383.8 ms with the digits in the exponent
 /// against 94.9 ms in the mantissa, **4.0x**.
 ///
-/// Integers are charged [`INTEGER_SCALAR_WEIGHT_BYTES`], eight times less,
+/// Integers are charged [`INTEGER_SCALAR_WEIGHT_BYTES`], sixteen times less,
 /// because charging them what floats cost bought no bound and caused
-/// essentially all of the over-rejection — see that constant. **The division
-/// of what is guaranteed from what is merely sized:**
+/// essentially all of the over-rejection — see that constant.
 ///
-/// - **Guaranteed regardless of `serde_yaml`'s behaviour:** every arrival at
-///   a decoded-numeric callback is charged, so the *count* of decodes is
-///   capped. That is what makes the bound route-independent, and it does not
-///   rest on any argument about the library's internals.
-/// - **Sized by an argument about those internals:** *how small* the integer
-///   charge can safely be. Today no integer route performs an O(token)
-///   decode that succeeds — a long `!!int` fails closed (measured: rejected
-///   in 4.1 ms), and a plain leading-zero digit string is diverted to
-///   `visit_str` by `digits_but_not_number` and charged its length. If that
-///   ever changed, the integer charge would still bound the count, but the
-///   product of count and token length would need re-sizing.
+/// **What the charge does, stated without the overclaim it used to carry.**
+/// It caps the *count* of decoded-numeric arrivals — at
+/// [`super::MAX_FLOAT_SCALAR_VISITS`] and
+/// [`super::MAX_INTEGER_SCALAR_VISITS`] — and that much is route-independent
+/// at the serde trait level and rests on no argument about `serde_yaml`'s
+/// internals. It does **not** cap the cost of any one decode. The visitor is
+/// handed an already-decoded `f64`/`u64` and never sees the token, so
+/// per-decode work is O(token length) and is invisible here. The product of
+/// the two — which is what an attacker actually spends — is bounded only by
+/// `visits x` [`super::MAX_YAML_BYTES`]: **1.32 GB** of `dec2flt` scanning
+/// for floats, **17.2 GB** of `from_str_radix` scanning for integers. Those
+/// are the ceilings that exist *in the absence* of a bound, not bounds
+/// anything relies on.
 ///
-/// That division is deliberate: the route-dependent reasoning this module
-/// has had falsified four times is confined to the *tuning*, never to the
-/// safety property.
+/// # The false claim this section used to make, and the mechanism that falsifies it
+///
+/// Fix round 5 wrote here: *"Today no integer route performs an O(token)
+/// decode that succeeds — a long `!!int` fails closed ... and a plain
+/// leading-zero digit string is diverted to `visit_str` by
+/// `digits_but_not_number` and charged its length."* **Both halves are
+/// false.** Two independent review lenses falsified it by execution and the
+/// mechanism was then confirmed against numbered source lines, so it is named
+/// here rather than described — the next reader should be able to re-check it
+/// without re-running anything:
+///
+/// `serde_yaml-0.9.34/src/de.rs:944-967` tries the `0x` / `0o` / `0b` radix
+/// branches at the **top** of `parse_unsigned_int`. `digits_but_not_number`
+/// is consulted only at `de.rs:972`, *after* all three, immediately before
+/// the base-10 path — and it additionally requires every byte after the
+/// leading `0` to be an ASCII digit (`de.rs:1092-1097`), which `0x000…01` is
+/// not. So a `0x` prefix followed by a long run of zeros never reaches that
+/// diversion at all: `from_str_radix(rest, 16)` cannot overflow on zeros, so
+/// it scans the **whole** token, returns `Ok`, and lands in this module's
+/// `visit_u64` charged a flat [`INTEGER_SCALAR_WEIGHT_BYTES`].
+///
+/// Measured routes, this workspace's pinned `serde_yaml`, release
+/// (`m1_route_probe`, fix round 6):
+///
+/// ```text
+/// 0x + 200,000 zeros + 1                 -> visit_u64
+/// !!int "0x + 200,000 zeros + 1"         -> visit_u64
+/// 0o / 0b + 200,000 zeros + 1            -> visit_u64
+/// -0x + 200,000 zeros + 1                -> visit_i64
+/// 0  + 200,000 zeros + 1  (decimal)      -> visit_str   <- the only shape the old text examined
+/// !!int "<200,000 sevens>"               -> Err(invalid value)
+/// ```
+///
+/// The decimal-leading-zero reasoning was correct *for the decimal spelling*
+/// and does not generalise to the radix spellings, because
+/// `digits_but_not_number` sits below them. That non-generalisation is the
+/// entire defect.
+///
+/// # The residual this leaves, which is accepted rather than open
+///
+/// With the constants as they stand a 262,143-byte document — one anchored
+/// `0x` + 131,019 zeros + `1`, aliased 43,673 times in a flat flow sequence —
+/// is **ADMITTED** by [`super::parse_workflow`] in **9,435.7 ms** (measured
+/// fix round 6; 8,821 / 9,312 / 9,431 ms on re-runs, peak RSS 13.5 MB). That
+/// document makes 43,674 integer visits, two-thirds of
+/// [`super::MAX_INTEGER_SCALAR_VISITS`], so **the charge never fires**: what
+/// limits the attacker on this axis is [`super::MAX_YAML_BYTES`].
+///
+/// **This is a known, accepted residual (ruling P63), decided by the project
+/// owner against the orchestrator's recommendation — not an oversight and not
+/// a bound nobody got round to tightening.** It is covered by the same
+/// out-of-process `RLIMIT_CPU` remedy [`super`]'s axis inventory names for its
+/// still-open tokenizing row. See that inventory's integer row for the full
+/// method, the rejection-side cost, and what reopening it would mean.
 ///
 /// # Failure direction
 ///
@@ -335,8 +392,25 @@ pub const NODE_WEIGHT_BYTES: usize = 8;
 pub const FLOAT_SCALAR_WEIGHT_BYTES: usize = 512;
 
 /// Extra weight charged for a scalar `serde_yaml` hands over **already
-/// decoded as an integer**, on top of [`NODE_WEIGHT_BYTES`]. Eight times
+/// decoded as an integer**, on top of [`NODE_WEIGHT_BYTES`]. Sixteen times
 /// smaller than [`FLOAT_SCALAR_WEIGHT_BYTES`], and the reason is measured.
+///
+/// **Read [`FLOAT_SCALAR_WEIGHT_BYTES`]'s residual section before touching
+/// this number.** What follows derives the value against the corpus, which is
+/// the *over*-rejection direction. In the under-rejection direction this
+/// constant buys much less than its neighbour: it caps how many integer
+/// decodes a document may make and not how long each one is, and at 32 the
+/// count ceiling is not what binds — a measured 262,143-byte document is
+/// admitted after 9,435.7 ms of `from_str_radix` scanning while using only
+/// two-thirds of the ceiling. That is an accepted residual under ruling P63,
+/// and it is why raising this constant back towards
+/// [`FLOAT_SCALAR_WEIGHT_BYTES`] is a *product* decision about document size
+/// rather than a free tightening. Admitting the 36,001-integer corpus
+/// document below needs `w <= 64` (arithmetic on the constants in this file:
+/// `MAX_EXPANDED_WEIGHT / (NODE_WEIGHT_BYTES + w) >= 36_001`); bounding the
+/// attack to the float axis's ~1.5 s needs `w ~= 481` (**reported by the
+/// closing security review, not re-measured here**). No flat charge satisfies
+/// both.
 ///
 /// # Why integers are cheap to admit and expensive to over-charge
 ///
@@ -404,16 +478,23 @@ pub(super) enum Verdict {
 /// a 255,541-byte payload burned **8.6 s inside this function** before the
 /// ceiling fired, because `serde_yaml` re-ran an O(250,000) `dec2flt` scan
 /// for each expansion of one long plain numeric scalar and this function
-/// charged 8 bytes for each. Per-node work is bounded only because
-/// Fix round 4 closed this by charging the numeric visitor callbacks
-/// themselves ([`FLOAT_SCALAR_WEIGHT_BYTES`],
+/// charged 8 bytes for each. Fix round 4 charged the numeric visitor
+/// callbacks themselves ([`FLOAT_SCALAR_WEIGHT_BYTES`],
 /// [`INTEGER_SCALAR_WEIGHT_BYTES`]), which is route-independent. Successive
 /// rounds each published a worst case the next reviewer beat — 5,960 ms,
 /// then 9,304.7 ms — because each pinned a *mantissa* payload; the
 /// maximiser puts the digits in the exponent and measures **~13.7 s
-/// admitted**. With the charge in place the worst admitted document is
-/// **1,603.3 ms**. Per-node work is now bounded: see
-/// [`super::MAX_FLOAT_SCALAR_VISITS`] and [`super`]'s axis inventory.
+/// admitted**. With the float charge in place the worst admitted **float**
+/// document measures **1,519.1 ms** (re-measured fix round 6, 249,582 B; fix
+/// round 5 published 1,603.3 ms for the same family at 259,742 B).
+///
+/// **Per-node work is still not bounded, and saying it was is what round 5
+/// got wrong.** The charge caps the *count* of decodes, not the cost of one,
+/// so the worst admitted document is now an *integer* one: 262,143 bytes,
+/// **9,435.7 ms** admitted, using two-thirds of
+/// [`super::MAX_INTEGER_SCALAR_VISITS`] so the charge never fires. See
+/// [`INTEGER_SCALAR_WEIGHT_BYTES`], [`FLOAT_SCALAR_WEIGHT_BYTES`]'s residual
+/// section, and [`super`]'s axis inventory.
 pub(super) fn check_expansion(yaml: &str, max: usize) -> Verdict {
     let weighed = Cell::new(0usize);
     let over_budget = Cell::new(false);
