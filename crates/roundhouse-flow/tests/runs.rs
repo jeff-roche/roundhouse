@@ -320,17 +320,103 @@ fn a_completed_task_of_another_kind_in_the_same_session_is_not_read_as_a_report(
 /// §8.13's retry-from-step can leave a session with more than one `Report`
 /// task. The run's answer is the last report it produced, which is what the
 /// `ORDER BY e.seq DESC` picks.
+///
+/// # Both orderings, because a `Report` event need not carry a report
+///
+/// `load_report` walks the rows newest-first and **skips** any that is not a
+/// `TaskCompleted` with `Json` — §8.13's retry case, where a newer `Report`
+/// task has been created but has not completed with a report yet, sitting at a
+/// higher `seq` than the older completed one. Every seeded `Report` event in
+/// this file used to be `Json`, so the first row always answered and the loop
+/// **never iterated**: `while let Some(row)` → `if let Some(row)` killed
+/// nothing, and a run in exactly that retry state would have dropped out of the
+/// inbox entirely — the silent omission `RunsError::InvalidReport`'s doc argues
+/// hardest against (ruling P92).
+///
+/// So the non-`Json` event is seeded at **both** ends, in two sessions, which is
+/// P92's amendment: with it only above the winner, `while`→`if` dies and a
+/// mutation that skips the first row lives, because no fixture then has
+/// anything interesting at the top.
+///
+/// - `newest_first`: `Text` above the winner. The loop must iterate past it.
+/// - `oldest_first`: `Text` below the winner, and a *superseded* report between
+///   them. A read that skipped the first row would answer "superseded-b".
 #[test]
-fn the_newest_report_wins_when_a_session_produced_more_than_one() {
+fn the_newest_report_wins_wherever_a_reportless_event_sits() {
     let mut conn = open_test_db();
 
-    let run = completed_run(None, 1_000);
-    insert(&mut conn, &run);
-    seed_report(&conn, run.session_id, 1, report_json("superseded", &[]));
-    seed_report(&conn, run.session_id, 2, report_json("final", &[]));
+    // Seq 3 is a `Report` task that completed with text, not a report: the
+    // newest row, and the one the query has to walk past.
+    let newest_first = completed_run(None, 1_000);
+    insert(&mut conn, &newest_first);
+    seed_report(
+        &conn,
+        newest_first.session_id,
+        1,
+        report_json("superseded-a", &[]),
+    );
+    seed_report(
+        &conn,
+        newest_first.session_id,
+        2,
+        report_json("final-a", &[]),
+    );
+    seed_report_task(
+        &conn,
+        newest_first.session_id,
+        3,
+        TaskOutput::Text("a retry's Report task that has not produced one yet".into()),
+    );
+
+    // The mirror: the non-report is the *oldest* row, and there is a superseded
+    // report immediately below the winner.
+    let oldest_first = completed_run(None, 2_000);
+    insert(&mut conn, &oldest_first);
+    seed_report_task(
+        &conn,
+        oldest_first.session_id,
+        1,
+        TaskOutput::Text("a Report task that completed with text".into()),
+    );
+    seed_report(
+        &conn,
+        oldest_first.session_id,
+        2,
+        report_json("superseded-b", &[]),
+    );
+    seed_report(
+        &conn,
+        oldest_first.session_id,
+        3,
+        report_json("final-b", &[]),
+    );
 
     let summaries = load_run_summaries(&conn, MAX_INBOX_RUNS).expect("the inbox loads");
-    assert_eq!(summaries[0].report.headline, "final");
+    let headline_of = |id: RunId| {
+        summaries
+            .iter()
+            .find(|summary| summary.run_id == id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "run {id} must be in the inbox: it has a completed report, and a `Report` \
+                     event that carries no report is skipped rather than ending the search"
+                )
+            })
+            .report
+            .headline
+            .clone()
+    };
+
+    assert_eq!(
+        headline_of(newest_first.id),
+        "final-a",
+        "a newer Report task with no report in it is walked past, not treated as the answer"
+    );
+    assert_eq!(
+        headline_of(oldest_first.id),
+        "final-b",
+        "the newest report still wins when the reportless event is the oldest row"
+    );
 }
 
 /// Newest run first, and the cap is a real cap. Three runs and a limit of two

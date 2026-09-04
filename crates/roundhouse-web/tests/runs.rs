@@ -265,8 +265,24 @@ fn collapsed_rows_come_back_in_first_seen_order() {
     );
 }
 
+/// A finding carrying `status`, and whatever else the job wrote, in `extra`.
+fn shadowing_finding(id: &str, own_status: &str) -> Finding {
+    let mut extra = serde_json::Map::new();
+    extra.insert("status".into(), serde_json::json!(own_status));
+    extra.insert("pr_number".into(), serde_json::json!(4471));
+
+    Finding {
+        id: id.into(),
+        title: format!("finding {id}"),
+        severity: Severity::Med,
+        location: "src/lib.rs:1".into(),
+        extra,
+    }
+}
+
 /// The wire shape, and specifically that a finding's job-defined extension
-/// fields cannot shadow the diff verdict.
+/// fields cannot shadow the diff verdict — for **every** finding, at whichever
+/// end of the list it sits.
 ///
 /// §8.6 lets a job put arbitrary keys on a finding, and `Finding` renders them
 /// with `#[serde(flatten)]` — directly on the finding object. A finding with its
@@ -274,28 +290,37 @@ fn collapsed_rows_come_back_in_first_seen_order() {
 /// alongside `status` here would let it overwrite `new`/`persisting`/`resolved`
 /// with whatever the job wrote. This asserts both keys are present and that the
 /// verdict is the one the diff produced.
+///
+/// # Two findings, both interesting, and that is the point (ruling P92)
+///
+/// The earlier version of this test built **one** finding, and it was the only
+/// non-empty `diffed_findings` fixture in the file. So
+/// `into_iter().take(1)` in the wire conversion survived the whole suite: the
+/// inbox could have truncated to one finding per run with everything green.
+/// P92's amendment is why the property is asserted at *both* ends rather than
+/// moved to the second position: with the interesting finding at position 2,
+/// `.take(1)` dies and `.skip(1)` lives, which is the same blindness pointing
+/// the other way.
+///
+/// So both findings carry a shadowing `status`, with **different** values and
+/// **different** diff verdicts, and both are asserted by position. That kills
+/// `.take(1)`, `.skip(1)` and `.first()` on the length alone, and a conversion
+/// that emitted one finding twice on the values.
 #[test]
-fn a_findings_own_status_field_cannot_shadow_the_diff_verdict() {
-    let mut extra = serde_json::Map::new();
-    extra.insert("status".into(), serde_json::json!("wontfix"));
-    extra.insert("pr_number".into(), serde_json::json!(4471));
-
+fn a_findings_own_status_field_cannot_shadow_the_diff_verdict_wherever_it_sits() {
     let binding_id = BindingId::new();
     let run_id = RunId::new();
     let json = serde_json::to_value(RunSummaryJson::from(RunSummary {
         run_id,
         binding_id: Some(binding_id),
         report: report(Outcome::Findings, Severity::Med, false),
-        diffed_findings: vec![(
-            Finding {
-                id: "f1".into(),
-                title: "a finding".into(),
-                severity: Severity::Med,
-                location: "src/lib.rs:1".into(),
-                extra,
-            },
-            FindingStatus::Persisting,
-        )],
+        diffed_findings: vec![
+            (
+                shadowing_finding("f1", "wontfix"),
+                FindingStatus::Persisting,
+            ),
+            (shadowing_finding("f2", "accepted"), FindingStatus::New),
+        ],
     }))
     .expect("the wire shape serialises");
 
@@ -305,19 +330,33 @@ fn a_findings_own_status_field_cannot_shadow_the_diff_verdict() {
         serde_json::json!(binding_id.to_string())
     );
 
-    let diffed = &json["diffed_findings"][0];
+    let diffed = json["diffed_findings"]
+        .as_array()
+        .expect("diffed_findings is a list");
     assert_eq!(
-        diffed["status"],
-        serde_json::json!("persisting"),
-        "the diff verdict is the one the diff produced"
+        diffed.len(),
+        2,
+        "every finding reaches the wire, not just the first one"
     );
-    assert_eq!(
-        diffed["finding"]["status"],
-        serde_json::json!("wontfix"),
-        "the job's own field survives, in the finding's namespace"
-    );
-    assert_eq!(diffed["finding"]["pr_number"], serde_json::json!(4471));
-    assert_eq!(diffed["finding"]["id"], serde_json::json!("f1"));
+
+    for (index, id, verdict, own_status) in [
+        (0, "f1", "persisting", "wontfix"),
+        (1, "f2", "new", "accepted"),
+    ] {
+        let finding = &diffed[index];
+        assert_eq!(finding["finding"]["id"], serde_json::json!(id));
+        assert_eq!(
+            finding["status"],
+            serde_json::json!(verdict),
+            "finding {id}'s diff verdict is the one the diff produced"
+        );
+        assert_eq!(
+            finding["finding"]["status"],
+            serde_json::json!(own_status),
+            "finding {id}'s own field survives, in the finding's namespace"
+        );
+        assert_eq!(finding["finding"]["pr_number"], serde_json::json!(4471));
+    }
 }
 
 /// A manually-invoked run has no binding, and `null` is what that is on the
@@ -471,6 +510,87 @@ async fn a_request_over_the_pool_bound_is_shed_rather_than_left_to_queue() {
     assert_ne!(
         no_store["error"], body["error"],
         "the two 503s are different problems and must not read the same"
+    );
+}
+
+/// **The property P93 §B is actually about**: a second request arriving while
+/// the first still holds a connection is *shed*, not queued behind it.
+///
+/// The two cheap tests either side of this one cannot show that. With a bound
+/// of zero every request is shed whether or not the handler holds its permit
+/// for any length of time, so `let Some(_permit) = …` and a version that
+/// dropped the permit on the next line are indistinguishable to them — and the
+/// second is precisely the bug that makes the bound count nothing.
+///
+/// So this makes a request genuinely in flight, deterministically: the test
+/// holds **every** connection in the pool, so the spawned request takes its
+/// permit and then blocks inside `pool.get()` — which is the exact state the
+/// ruling is about, since `roundhouse_store::writer` would be blocking there
+/// too. `pool.status().waiting` is the signal that it has got there; a
+/// `#[tokio::test]`'s runtime is single-threaded, so `yield_now` hands control
+/// to the spawned task rather than spinning.
+///
+/// The second request must then come back **immediately** with a `503`. If the
+/// permit were not held, it would join the same queue and the `timeout` would
+/// elapse — which is why the timeout is `expect`ed rather than matched: its
+/// elapsing is the failure.
+#[tokio::test]
+async fn a_second_request_is_shed_while_the_first_still_holds_a_connection() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let store = store(&dir).await;
+
+    // Every connection the pool will ever hand out, held here — so nothing else
+    // can acquire one until this test lets go.
+    let mut held = Vec::new();
+    for _ in 0..store.pool.status().max_size {
+        held.push(store.pool.get().await.expect("a pooled connection"));
+    }
+
+    let state = AppState {
+        store: Some(store.clone()),
+        api_pool_permits: roundhouse_web::ApiPoolPermits::new(1),
+        ..AppState::default()
+    };
+    let first = tokio::spawn(get(
+        build_router(state.clone(), &BindConfig::loopback()),
+        "/api/runs",
+    ));
+
+    // Bounded rather than a bare `while`: if the request never reaches the
+    // pool, this must fail loudly instead of hanging.
+    let mut spins = 0;
+    while store.pool.status().waiting == 0 {
+        tokio::task::yield_now().await;
+        spins += 1;
+        assert!(
+            spins < 10_000,
+            "the first request never reached the pool, so nothing is in flight to shed against"
+        );
+    }
+
+    let shed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        get(build_router(state, &BindConfig::loopback()), "/api/runs"),
+    )
+    .await
+    .expect("the second request must be shed immediately, not queued behind the first");
+
+    assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(shed).await;
+    let reason = body["error"].as_str().expect("the body names a reason");
+    assert!(
+        reason.contains("concurrency bound"),
+        "a shed request must say which 503 this is; got {reason}"
+    );
+
+    drop(held);
+    let first = first
+        .await
+        .expect("the first request finishes once a connection frees up");
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "the request that held the permit still completes"
     );
 }
 
