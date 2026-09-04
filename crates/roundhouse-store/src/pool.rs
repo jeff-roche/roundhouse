@@ -106,9 +106,33 @@ pub struct StorePool {
 /// 34's fix round added it for `roundhouse_web::StoreConnection`, which pairs a
 /// connection with the semaphore permit bounding it so that the two cannot be
 /// obtained separately (ruling P93 §B); that crate deliberately names neither
-/// `rusqlite` nor `deadpool` (see its manifest), and `interact`'s closure
-/// parameter is inferred, so this alias is the whole surface it needs.
+/// `rusqlite` nor `deadpool` (see its manifest), so these three aliases are the
+/// whole surface it needs.
 pub type PooledConnection = deadpool_sqlite::Object;
+
+/// The connection a [`PooledConnection`]'s `interact` closure is handed.
+///
+/// The same kind of alias as [`PooledConnection`] above, added by Phase 5 Task
+/// 35's third fix round and for the same reason: `roundhouse-web` declares no
+/// `rusqlite` edge (ruling P86 removed it on purpose), so this is how it names
+/// the type without one.
+///
+/// Until that round the name was not needed there, because the closure's
+/// parameter type was *inferred* — `roundhouse_web::StoreConnection` `Deref`'d
+/// to `deadpool`'s wrapper and `.interact` resolved through it. Ruling P103
+/// removed that `Deref` so no upstream release can widen what a permitted
+/// connection re-exposes, which means the wrapping crate now writes the
+/// forwarding signature out, which means it has to be able to spell this.
+pub type SqliteConnection = rusqlite::Connection;
+
+/// Why a [`PooledConnection`]'s `interact` closure did not run to completion.
+///
+/// `deadpool`'s own error, aliased here for the reason
+/// [`SqliteConnection`] gives — a caller that forwards `interact` names it in
+/// its own signature and must not need a `deadpool-sqlite` edge to do so. It is
+/// an error enum with no handle in it, so unlike `deadpool_sqlite::Object` it
+/// re-exposes nothing.
+pub type InteractError = deadpool_sqlite::InteractError;
 
 /// The `post_create` hook shared by [`open`] and [`open_pool`] — every pooled
 /// connection this crate hands out, migrated or not, gets the same three

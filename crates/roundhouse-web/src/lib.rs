@@ -151,11 +151,12 @@ impl AppState {
     /// Every reach for the pool that a handler module can *express* goes
     /// through here, and [`BoundedStore`] carries the two mechanisms that make
     /// that so — a pool field private to a leaf module, and a
-    /// [`StoreConnection`] that does not re-expose `deadpool`'s
-    /// `Object::pool`. It is deliberately not stated as "the only way": that
-    /// sentence stood here through two rounds and was false both times
-    /// (rulings P98 and P101), and [`BoundedStore`] also records the one
-    /// residual that is disclosed rather than closed.
+    /// [`StoreConnection`] that inherits no upstream API at all, because it
+    /// `Deref`s to nothing and forwards the one operation handlers use. It is
+    /// deliberately not stated as "the only way": that sentence stood here
+    /// through two rounds and was false both times (rulings P98 and P101), and
+    /// [`BoundedStore`] also records the one residual that is disclosed rather
+    /// than closed.
     ///
     /// # Why this is a method and not three lines in a handler
     ///
@@ -182,6 +183,11 @@ impl AppState {
     ///   method returns — `E0308`, since [`StoreConnection`] no longer `Deref`s
     ///   to the type that owns `pool`. Ruling P101 is the round where *this* one
     ///   compiled, from `runs.rs`, with exit 0.
+    /// - `connection.pool()`, and equally `connection.lock()` or any other
+    ///   method of `deadpool`'s `Object` or of the wrapper under it — `E0599`.
+    ///   [`StoreConnection`] `Deref`s to nothing at all, so it inherits no
+    ///   upstream API and no upstream release can widen what it has. Ruling
+    ///   P103; the last two of those built with exit 0 the commit before it.
     ///
     /// This method reads none of them: it delegates to
     /// [`BoundedStore::connection`], which lives in the same **leaf** module as

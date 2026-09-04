@@ -37,7 +37,12 @@ pub use pool::{open, StoreError, StorePool, MIGRATIONS};
 
 // Phase 5 Task 34 (fix round 2): a name for a checked-out connection, so a
 // caller can hold one in a struct without declaring a `deadpool-sqlite` edge.
-pub use pool::PooledConnection;
+//
+// Phase 5 Task 35 (fix round 3, ruling P103): and names for the two types in
+// `interact`'s signature, so a caller can *forward* it — rather than inherit it
+// through a `Deref` that also inherits everything else `deadpool` puts on
+// `Object` — still without declaring a `rusqlite` or `deadpool-sqlite` edge.
+pub use pool::{InteractError, PooledConnection, SqliteConnection};
 
 // Task 2 exports
 pub use writer::{serialize_payload, spawn_writer, EventWriter};

@@ -43,18 +43,32 @@
 //! # The field is one path to the pool, and it was not the only one
 //!
 //! Everything above is about `inner`. It closed the *field* path and left every
-//! *method* path open, which ruling P101 then found: [`StoreConnection`] is a
-//! newtype over [`roundhouse_store::PooledConnection`], a newtype inherits its
-//! `Deref` target's whole inherent API, and `deadpool`'s `Object::pool` is a
-//! back-reference handing out the pool itself. No expression naming `inner` was
-//! involved, so neither the scan nor the `trybuild` case could see it.
+//! *method* path open, which ruling P101 then found: [`StoreConnection`] was a
+//! newtype over [`roundhouse_store::PooledConnection`] that `Deref`'d to it, a
+//! newtype inherits its `Deref` target's whole inherent API, and `deadpool`'s
+//! `Object::pool` is a back-reference handing out the pool itself. No
+//! expression naming `inner` was involved, so neither the scan nor the
+//! `trybuild` case could see it.
 //!
-//! The `Deref` impl at the bottom of this file is where that is closed, and it
-//! carries the argument. **The general shape is worth keeping in view whenever
-//! anything here changes: encapsulation by newtype is only as tight as the
-//! `Deref` target's API**, so "the only way" is a claim about two surfaces
-//! rather than one — which is why nothing in this file makes that claim
-//! unqualified any more.
+//! P101's remedy was to `Deref` one level *further*, past `Object` to the
+//! wrapper `.interact` actually lives on. That closed `Object::pool` and left a
+//! hazard whose trigger is **someone else's release**: it held only because
+//! `deadpool-sync` 0.2.0's inherent API happens to contain no back-reference,
+//! `deadpool-sync` is transitive so nothing here pins it, and a version that
+//! added one would reopen the reach with no source change and no failing test.
+//!
+//! **Ruling P103's answer, and the shape worth keeping in view whenever
+//! anything here changes: do not enumerate what is currently unsafe in someone
+//! else's API — decline to inherit the API.** [`StoreConnection`] has no
+//! `Deref` impl at all. It forwards the one operation handlers use
+//! ([`StoreConnection::interact`]) and nothing else, so what it exposes is a
+//! list written here rather than a list upstream can extend. That retires the
+//! class instead of the instance: P101 closed `Object::pool`, this closes
+//! `Object::anything`, including methods that do not exist yet.
+//!
+//! `tests/bounded_reach.rs` pins the absence, which is the assertion that has
+//! to be checked in source: adding a `Deref` impl back is the bypass, and it
+//! compiles.
 
 /// The store pool with its `Pool` handle **out of reach**, so that
 /// [`BoundedStore::connection`] is not merely the convenient way to take a
@@ -71,16 +85,35 @@
 ///   no `mod`, so it has no descendants and no other module in the crate can
 ///   read it. `tests/bounded_reach.rs` fails if either half changes.
 /// - **The method path.** `StoreConnection` — `pub(crate)`, so it has no public
-///   page to link to — `Deref`s **past**
-///   [`roundhouse_store::PooledConnection`] rather than to it, so `deadpool`'s
-///   `Object::pool` back-reference — which would hand a permitted connection's
-///   holder the whole pool, needing no dependency and never naming `inner` — is
-///   not re-exposed. Also pinned in `tests/bounded_reach.rs`.
+///   page to link to — has **no `Deref` impl**, so it inherits no part of
+///   [`roundhouse_store::PooledConnection`]'s inherent API: not `deadpool`'s
+///   `Object::pool` back-reference, which would hand a permitted connection's
+///   holder the whole pool while needing no dependency and never naming
+///   `inner`, and not whatever a future `deadpool` release adds beside it. It
+///   forwards `interact` and nothing else. Also pinned in
+///   `tests/bounded_reach.rs`.
 ///
-/// **Where it stops:** an `fn pool(&self)` accessor added to *this file* would
-/// restore the reach, and no test in this crate would fail. That residual is
-/// disclosed rather than guarded, deliberately — see `tests/compile_fail.rs`
-/// and ruling P100, which rejected a `grep` for the signature as fail-open.
+/// **Where it stops, and this is now the only place it does.** A hand-written
+/// accessor added to *this file* restores the reach and no test in this crate
+/// fails — an `fn pool(&self)` on this type, or anything on `StoreConnection`
+/// (again `pub(crate)`, so again no link) handing back the
+/// [`roundhouse_store::PooledConnection`] its forwarding method keeps to
+/// itself. With the `Deref` gone (ruling P103)
+/// that is the **sole** unguarded path, rather than one residual beside a
+/// method path believed closed, and it is worth stating at that weight rather
+/// than as a footnote: every other route above is either scanned or does not
+/// compile, and this one is held by a reader noticing.
+///
+/// What makes it a smaller thing than what it replaced: it needs someone in
+/// this file to *write* the accessor. The `Deref` it replaces could have
+/// reopened silently, on an upstream release, with nothing in this repo
+/// changing at all.
+///
+/// It stays disclosed rather than guarded, deliberately. Ruling P100 rejected a
+/// `grep` for the signature because a rename defeats it, and a guard that fails
+/// open is worse than none — it gives a future reviewer a reason not to look,
+/// which is the failure this whole sequence exists to prevent. See
+/// `tests/compile_fail.rs`, which says the same thing about its own case.
 ///
 /// # Why a newtype rather than a doc note
 ///
@@ -300,6 +333,10 @@ impl std::fmt::Debug for ApiPoolPermits {
 /// connection cannot exist in this crate without the permit that accounts for
 /// it, so the bound cannot be bypassed by forgetting a step.
 ///
+/// **And it has no `Deref` impl, which is the other point** — ruling P103. See
+/// [`interact`](Self::interact) below for what taking one out cost and why it
+/// is worth the method.
+///
 /// **Field order is the drop order and is load-bearing.** Struct fields drop in
 /// declaration order, so the connection goes back to the pool *before* the
 /// permit is released. The other order would let a waiting request take the
@@ -311,40 +348,67 @@ pub(crate) struct StoreConnection {
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-impl std::ops::Deref for StoreConnection {
-    /// **One level past [`roundhouse_store::PooledConnection`], and that is the
-    /// point** — ruling P101.
+impl StoreConnection {
+    /// Runs `f` against the checked-out `sqlite` connection on the pool's
+    /// blocking thread — **the whole of what a handler can do with one.**
     ///
-    /// Deref'ing to `PooledConnection` itself re-exposed that type's whole
-    /// inherent API, and `deadpool` 0.13.1 puts a back-reference to the pool in
-    /// it: `pub fn pool(this: &Self) -> Option<Pool<M>>`
-    /// (`deadpool/src/managed/object.rs`). So
-    /// `PooledConnection::pool(&conn).unwrap().get().await` minted an unbounded
-    /// connection from a legitimately permitted one — ruling P93 §B's writer
-    /// starvation, reopened through a path that never names `inner` and that no
-    /// field-privacy check can see. Compiled, not recalled: that expression
-    /// built with exit 0 from `runs.rs` before this line changed.
+    /// # Why this is a method and not a `Deref`
     ///
-    /// Naming the target *structurally* rather than writing the type out is
-    /// deliberate. `<PooledConnection as Deref>::Target` is
-    /// `deadpool_sync::SyncWrapper<rusqlite::Connection>`, and spelling that out
-    /// would need two dependencies this crate does not have and must not grow —
-    /// ruling P86 removed the `rusqlite` edge on purpose. The projection needs
-    /// neither.
+    /// Ruling P103. There were three versions of this, and the first two were
+    /// both wrong in the same direction:
     ///
-    /// What survives is what handlers actually use: [`crate::runs::list_runs`]
-    /// calls only `.interact`, which is an inherent method of `SyncWrapper`
-    /// (`deadpool-sync` 0.2.0) and so is reached in one deref step from here
-    /// instead of two. `PooledConnection::pool(&conn)` is now `E0308`.
+    /// - **`Deref` to [`roundhouse_store::PooledConnection`]** re-exposed that
+    ///   type's whole inherent API, and `deadpool` 0.13.1 puts a back-reference
+    ///   to the pool in it: `pub fn pool(this: &Self) -> Option<Pool<M>>`
+    ///   (`deadpool/src/managed/object.rs`). So
+    ///   `PooledConnection::pool(&conn).unwrap().get().await` minted an
+    ///   *unbounded* connection from a legitimately permitted one — ruling P93
+    ///   §B's writer starvation, reopened through a path that never names
+    ///   `inner` and that no field-privacy check can see. Compiled, not
+    ///   recalled: that expression built with exit 0 from `runs.rs`. Ruling
+    ///   P101.
+    /// - **`Deref` to `<PooledConnection as Deref>::Target`** — one level
+    ///   further, to the wrapper `.interact` is actually inherent to — closed
+    ///   that one. But it held only because `deadpool-sync` 0.2.0's inherent
+    ///   API happens to contain no back-reference. That crate is transitive, so
+    ///   nothing in this repo pins it, and a release adding one would reopen
+    ///   the reach with **no source change and no failing test**. A residual
+    ///   whose trigger is someone else's release is one nobody here is looking
+    ///   at when it fires.
     ///
-    /// (Ruling P101 attributes `.interact` to "`deadpool_sqlite::Connection`,
-    /// not `Object`". Those are the same type — `deadpool_sqlite::Connection` is
-    /// a type alias for `Object`, which is `deadpool::managed::Object<Manager>`.
-    /// The remedy is right for a different reason than the one given: `.interact`
-    /// is not on either of those names but on the `Deref` target they share.)
-    type Target = <roundhouse_store::PooledConnection as std::ops::Deref>::Target;
-
-    fn deref(&self) -> &Self::Target {
-        &self.connection
+    /// So the third version inherits nothing. A forwarding method exposes a
+    /// list written *here*, which no upstream release can extend — and that
+    /// retires the whole class rather than this instance: P101 closed
+    /// `Object::pool`, this closes `Object::anything`, including methods that
+    /// do not exist yet. `PooledConnection::pool(&conn)` is `E0308`;
+    /// `conn.pool()` and every other `Object` or wrapper method is `E0599`.
+    ///
+    /// Rejected, so they are not re-derived: pinning `deadpool-sync` (it is
+    /// transitive, and a pin is a dated fact that rots into a false assurance);
+    /// a source scan for `Deref` (to know which target is dangerous it would
+    /// have to enumerate the upstream API — the exact enumeration this stops
+    /// doing). What `tests/bounded_reach.rs` scans for instead is any `Deref`
+    /// impl at all, which needs to know nothing about `deadpool`.
+    ///
+    /// # The cost, stated because it is the only cost
+    ///
+    /// A `Deref` needs no type names — the closure's parameter is inferred
+    /// through it. Writing the signature out means naming both types in it, and
+    /// this crate has neither a `rusqlite` nor a `deadpool-sqlite` edge (ruling
+    /// P86 removed the first on purpose). [`roundhouse_store::SqliteConnection`]
+    /// and [`roundhouse_store::InteractError`] are aliases added there for this,
+    /// beside the [`roundhouse_store::PooledConnection`] alias added for the
+    /// same reason a round earlier. No new dependency, no new crate in the
+    /// graph, and the call site in [`crate::runs::list_runs`] is unchanged.
+    ///
+    /// [`roundhouse_store::InteractError`] is an error enum with no handle in
+    /// it, so unlike `Object` it re-exposes nothing — the reason this signature
+    /// can hand the upstream type back rather than wrap it.
+    pub(crate) async fn interact<F, R>(&self, f: F) -> Result<R, roundhouse_store::InteractError>
+    where
+        F: FnOnce(&mut roundhouse_store::SqliteConnection) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.connection.interact(f).await
     }
 }

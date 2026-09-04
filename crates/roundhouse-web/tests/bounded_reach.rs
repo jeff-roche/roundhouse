@@ -36,8 +36,8 @@
 //!
 //! The third assertion is a **different path to the same pool**, and closing
 //! the field path did nothing about it (ruling P101). `StoreConnection` is a
-//! newtype over `roundhouse_store::PooledConnection`, and a newtype inherits its
-//! `Deref` target's entire inherent API — including
+//! newtype over `roundhouse_store::PooledConnection`, and a newtype that
+//! `Deref`s inherits its target's entire inherent API — including
 //! `deadpool::managed::Object::pool`, a back-reference handing out the `Pool`
 //! itself. While `StoreConnection` deref'd *to* `PooledConnection`, this built
 //! with exit 0 in `src/runs.rs`, using the connection a permit was legitimately
@@ -51,11 +51,19 @@
 //!
 //! It never names `inner`, so the two assertions above cannot see it, and no
 //! compile-fail case can either: `StoreConnection` is `pub(crate)`, so an
-//! out-of-crate harness cannot obtain one. The fix is to deref one level
-//! *further* — `<PooledConnection as Deref>::Target`, which is what `.interact`
-//! actually lives on — and the assertion below pins that the target stays the
-//! projection. A future widening back to `PooledConnection` reopens the reach
-//! silently, which is precisely what this test exists to make loud.
+//! out-of-crate harness cannot obtain one.
+//!
+//! **What the third assertion is, and what it deliberately is not.** P101's fix
+//! was to deref one level *further*, and this test then pinned that specific
+//! target. Ruling P103 replaced both. The further target was safe only because
+//! `deadpool-sync` 0.2.0's inherent API happens to hold no back-reference; that
+//! crate is transitive, nothing here pins it, and a release adding one would
+//! reopen the reach with **no source change and nothing failing here** — a
+//! pinned-target assertion cannot see a hazard that lives in someone else's
+//! release. So `StoreConnection` inherits nothing at all now: it forwards
+//! `interact`, which is a surface this repo writes, and the assertion below is
+//! that no code line in `bounded.rs` names `Deref`. That is checkable without
+//! knowing anything about `deadpool`, which is the whole point of it.
 //!
 //! Rejected, so it is not re-derived: scanning the crate's other modules for the
 //! token `inner`, which is the standing form of the `grep` ruling P98 ran by
@@ -129,25 +137,25 @@ fn pool_field_declarations(source: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Every associated-type declaration naming `Target` in `source`, trimmed — the
-/// scan behind [`the_connection_derefs_past_the_type_that_owns_the_pool_handle`].
+/// Every code line in `source` naming `Deref`, trimmed — the scan behind
+/// [`the_connection_inherits_no_upstream_api_because_it_derefs_to_nothing`].
 ///
-/// Both tokens are required. `Target` alone also matches
-/// `fn deref(&self) -> &Self::Target {`, which is the impl's *body* and says
-/// nothing about the target; `type` alone would match any future alias.
-fn deref_target_declarations(source: &str) -> Vec<&str> {
+/// **The token, not an impl header, and that is deliberate.** An earlier version
+/// of this scan matched one exact `type Target = …` declaration, which required
+/// knowing which target was safe; ruling P103 is precisely about not needing to
+/// know that. Nothing in this file legitimately derefs, so the honest assertion
+/// is that the word does not appear in its code at all — which no upstream API
+/// knowledge is involved in checking, and which a reformatted `impl` header
+/// split across lines cannot slip past.
+///
+/// `starts_with` rather than equality so `DerefMut` — a separate token under
+/// [`tokens`] — is caught too, along with anything else built on the name. A
+/// false positive here fails the test, which is the direction to be wrong in.
+fn deref_mentions(source: &str) -> Vec<&str> {
     code_lines(source)
         .into_iter()
         .map(str::trim)
-        .filter(|line| {
-            let mut saw_type = false;
-            let mut saw_target = false;
-            for token in tokens(line) {
-                saw_type |= token == "type";
-                saw_target |= token == "Target";
-            }
-            saw_type && saw_target
-        })
+        .filter(|line| tokens(line).any(|token| token.starts_with("Deref")))
         .collect()
 }
 
@@ -201,44 +209,51 @@ fn the_pool_field_is_private_and_not_merely_crate_visible() {
     );
 }
 
-/// **The method path: `StoreConnection` must deref *past* the type that owns
-/// `deadpool`'s pool back-reference, not to it.** Ruling P101.
+/// **The method path: `StoreConnection` must not `Deref` to anything.** Ruling
+/// P103.
 ///
 /// `PooledConnection` is `deadpool::managed::Object`, whose inherent
 /// `pub fn pool(this: &Self) -> Option<Pool<M>>` hands out the pool itself. A
 /// `StoreConnection` deref'ing to it re-exposes that function to every handler,
 /// reopening ruling P93 §B through an expression that names neither `inner` nor
 /// `deadpool` — invisible to both tests above and to `tests/compile_fail.rs`.
+/// That is the state ruling P101 found, and the assertion this test used to
+/// make was that the target was one specific safer type instead.
 ///
-/// Deref'ing to `<PooledConnection as Deref>::Target` keeps `.interact`, which
-/// is what handlers use and which lives one step further down on
-/// `deadpool_sync::SyncWrapper`, and makes `PooledConnection::pool(&conn)` an
-/// `E0308`. That target's own inherent API was enumerated rather than assumed —
-/// `new`, `interact`, `is_mutex_poisoned`, `lock`, `try_lock` — and it holds no
-/// back-reference to the pool and implements no further `Deref`, so the chain
-/// terminates here.
+/// **Which was the wrong assertion to be making, for a reason worth keeping.**
+/// The safer target was `<PooledConnection as Deref>::Target`, and it was safe
+/// only because `deadpool-sync` 0.2.0's inherent API — `new`, `interact`,
+/// `is_mutex_poisoned`, `lock`, `try_lock` — happens to hold no back-reference.
+/// `deadpool-sync` is transitive, so nothing in this repo pins it, and a
+/// release adding one would have reopened the reach with no source change and
+/// no test failing here. A pinned-target assertion cannot see that, because
+/// what it pins is *our* line and the hazard is in *their* release.
 ///
-/// The target is written as the projection rather than spelled out because
-/// naming `SyncWrapper<rusqlite::Connection>` would need two dependencies this
-/// crate deliberately does not have (ruling P86). Matching the whole
-/// declaration is what makes a *widening* fail rather than only a deletion, and
-/// collecting every `type ... Target` line in the file is what makes a second
-/// `Deref` impl fail too — either is a change to this type's reach that should
-/// be looked at.
+/// So the type inherits nothing at all now: it forwards `interact` and that is
+/// its whole surface, which is a list this repo writes rather than one upstream
+/// can extend. Compiled, not recalled: with the `Deref` gone,
+/// `PooledConnection::pool(&conn)` is `E0308` and `conn.pool()`,
+/// `conn.lock()` and `conn.is_mutex_poisoned()` are each `E0599` from
+/// `runs.rs` — and the last two built with exit 0 one commit ago.
+///
+/// The assertion is therefore an absence, and it needs to know nothing about
+/// `deadpool` to make it: a re-introduced `Deref` in this file is the bypass,
+/// so no code line here may name one. See [`deref_mentions`] for why the scan
+/// is the bare token.
 #[test]
-fn the_connection_derefs_past_the_type_that_owns_the_pool_handle() {
-    const DECLARATION: &str =
-        "type Target = <roundhouse_store::PooledConnection as std::ops::Deref>::Target;";
-
+fn the_connection_inherits_no_upstream_api_because_it_derefs_to_nothing() {
     let (path, source) = bounded_source();
 
     assert_eq!(
-        deref_target_declarations(&source),
-        vec![DECLARATION],
-        "`StoreConnection`'s `Deref` target must be declared exactly `{DECLARATION}` in {}. \
-         Deref'ing to `roundhouse_store::PooledConnection` itself re-exposes \
-         `deadpool::managed::Object::pool`, so a handler holding one permitted connection can \
-         mint unbounded ones from the pool it hands back (rulings P93 §B and P101).",
+        deref_mentions(&source),
+        Vec::<&str>::new(),
+        "no code line in {} may name `Deref`. `StoreConnection` wraps \
+         `roundhouse_store::PooledConnection`, and a newtype that derefs inherits its target's \
+         entire inherent API — `deadpool::managed::Object::pool` hands out the pool, so a handler \
+         holding one permitted connection could mint unbounded ones (rulings P93 §B, P101), and a \
+         deref one level further would leave that hostage to a `deadpool-sync` release adding a \
+         back-reference (ruling P103). Forward the one operation handlers need, as \
+         `StoreConnection::interact` does.",
         path.display()
     );
 }
@@ -283,14 +298,19 @@ fn the_leafness_scan_fires_on_a_planted_module() {
 /// Same purpose as the test above, for the other two assertions: a
 /// [`code_lines`] that stripped trailing comments, or a `contains` narrowed to a
 /// longer literal, would leave both live tests green over a `pub(crate) inner`
-/// or a `Deref` pointed back at `PooledConnection`. Each fixture is asserted to
-/// produce a declaration list that is *not* the accepted one, which is exactly
-/// what makes the live `assert_eq!` fail.
+/// or a re-introduced `Deref`. The field fixtures are asserted to produce a
+/// declaration list that is *not* the accepted one; the `Deref` fixtures are
+/// asserted to produce a non-empty one, which is what makes the live
+/// `assert_eq!` against the empty list fail.
+///
+/// The `Deref` fixtures cover the two shapes ruling P103 rejects — a target
+/// pointed back at `PooledConnection`, and the projection one level past it
+/// that was safe only until `deadpool-sync`'s next release — plus the two ways
+/// a re-introduction could dodge a scan that matched an `impl` header instead
+/// of the token: a header split across lines, and `DerefMut`.
 #[test]
 fn the_declaration_scans_fire_on_planted_widenings() {
     const FIELD: &str = "inner: roundhouse_store::StorePool,";
-    const TARGET: &str =
-        "type Target = <roundhouse_store::PooledConnection as std::ops::Deref>::Target;";
 
     for planted in [
         "    pub(crate) inner: roundhouse_store::StorePool,\n",
@@ -306,26 +326,35 @@ fn the_declaration_scans_fire_on_planted_widenings() {
     }
 
     for planted in [
-        "    type Target = roundhouse_store::PooledConnection;\n",
-        "    type Target = deadpool_sqlite::Object;\n",
-        "    type Target = <roundhouse_store::PooledConnection as std::ops::Deref>::Target;\n    \
-         type Target = roundhouse_store::PooledConnection;\n",
+        "impl std::ops::Deref for StoreConnection {\n    type Target = \
+         roundhouse_store::PooledConnection;\n}\n",
+        "impl std::ops::Deref for StoreConnection {\n    type Target = \
+         <roundhouse_store::PooledConnection as std::ops::Deref>::Target;\n}\n",
+        "impl\n    std::ops::Deref\n    for StoreConnection\n{\n}\n",
+        "impl std::ops::DerefMut for StoreConnection {\n}\n",
+        "use std::ops::Deref as Reach;\n",
     ] {
-        assert_ne!(
-            deref_target_declarations(planted),
-            vec![TARGET],
-            "the deref-target scan accepted a planted widening: {planted:?}"
+        assert!(
+            !deref_mentions(planted).is_empty(),
+            "the deref scan accepted a planted re-introduction: {planted:?}"
         );
     }
 
-    // Both scans still accept the accepted forms, so the assertions above are
-    // discrimination and not a scan that rejects everything.
+    // Both scans still discriminate rather than rejecting everything: the
+    // accepted field declaration is accepted, and code that merely mentions
+    // dereferencing in prose or names something else is not a `Deref`.
     assert_eq!(
         pool_field_declarations(&format!("    {FIELD}\n")),
         vec![FIELD]
     );
-    assert_eq!(
-        deref_target_declarations(&format!("    {TARGET}\n")),
-        vec![TARGET]
-    );
+    for benign in [
+        "/// A `Deref` impl here would inherit the whole upstream API.\n",
+        "    let value = *reference;\n",
+        "    fn defer(&self) -> u8 { 0 }\n",
+    ] {
+        assert!(
+            deref_mentions(benign).is_empty(),
+            "the deref scan fired on benign source: {benign:?}"
+        );
+    }
 }

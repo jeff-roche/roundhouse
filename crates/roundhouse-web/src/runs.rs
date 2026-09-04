@@ -219,8 +219,10 @@ impl From<RunSummary> for RunSummaryJson {
 /// [`crate::AppState::store_connection`] hands back one that already holds its
 /// permit — so this handler cannot acquire them in the wrong order, or take one
 /// without the other, because it never sees them apart. Nor can it reach around
-/// them: neither the pool field nor `deadpool`'s `Object::pool` is expressible
-/// from this module. [`crate::BoundedStore`] gives those two mechanisms and
+/// them: the pool field is not expressible from this module, and neither is any
+/// method of `deadpool`'s `Object` — `interact` below is forwarded rather than
+/// inherited, so the connection this handler holds carries no upstream API at
+/// all (ruling P103). [`crate::BoundedStore`] gives those two mechanisms and
 /// stops there, rather than claiming no route exists — this file made that
 /// claim twice and it was false twice (rulings P98, P101). `store_connection`
 /// also owns the
@@ -232,9 +234,12 @@ async fn list_runs(State(state): State<crate::AppState>) -> Response {
         Err(response) => return response,
     };
 
-    // The query is synchronous and lives in `roundhouse-flow`; `interact` is
-    // what runs it on the pool's blocking thread. Note the closure never names
-    // `rusqlite` — that is what keeps this crate free of the edge P86 removed.
+    // The query is synchronous and lives in `roundhouse-flow`;
+    // `StoreConnection::interact` is what runs it on the pool's blocking
+    // thread — this crate's own forwarding method, not `deadpool`'s, which is
+    // what stops the connection carrying the rest of `deadpool`'s API with it
+    // (ruling P103). The closure still names no `rusqlite` type: `conn` is
+    // inferred from that signature, and this crate holds no such edge (P86).
     let loaded = connection
         .interact(|conn| load_run_summaries(conn, MAX_INBOX_RUNS))
         .await;

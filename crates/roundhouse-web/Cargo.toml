@@ -32,10 +32,18 @@ roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-flow = { path = "../roundhouse-flow" }
 # Task 34: `StorePool`, the one field D5 adds to `AppState`.
 #
-# Only the pool *type* is needed here — the query itself is
-# `roundhouse_flow::runs::load_run_summaries`, and the handler reaches the
-# connection through `deadpool`'s `interact`, whose closure parameter is
-# inferred, so this crate never names `rusqlite::Connection` either.
+# The query itself is `roundhouse_flow::runs::load_run_summaries`; what is
+# needed from here is the pool type plus the two names in `interact`'s
+# signature (`SqliteConnection`, `InteractError`), which `roundhouse-store`
+# aliases for exactly this. Ruling P103 is why those two are needed at all:
+# `bounded::StoreConnection` used to reach `interact` through a `Deref`, which
+# inferred the closure's parameter and named nothing — and inherited every
+# other method `deadpool` puts on the type, including the `Object::pool`
+# back-reference and whatever a future release adds. It now forwards `interact`
+# explicitly, which means writing the signature, which means spelling the
+# types. **No `rusqlite` or `deadpool-sqlite` edge either way** — that is what
+# the aliases over there are for, and the handler's closure parameter is still
+# inferred at the call site.
 #
 # `roundhouse_store::StorePool` rather than a hand-rolled
 # `Arc<Mutex<rusqlite::Connection>>` (which is what this task's plan specified):
