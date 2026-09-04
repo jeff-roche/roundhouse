@@ -3611,7 +3611,9 @@ version = "0.1.0"
 dependencies = [
  "roundhouse-core",
  "roundhouse-engine",
+ "roundhouse-flow",
  "roundhouse-store",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",

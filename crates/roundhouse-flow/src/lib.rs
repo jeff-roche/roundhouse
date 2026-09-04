@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod caps;
+pub mod durability;
 pub mod exec;
 pub mod expr;
 pub mod hitl;

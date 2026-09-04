@@ -7,10 +7,26 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# L7 (security ruling, first applied to `roundhouse-sched`): gates
+# `durability::open_test_db` so daemon code can never reach for it as if it
+# were the crate's normal way to open a connection — that would silently
+# write a run's whole durable state to a private in-memory database that
+# vanishes with the process. Activated for this crate's own integration tests
+# via the self dev-dependency below; `cfg(test)` alone covers only in-lib unit
+# tests, not the separate `tests/*.rs` crates.
+test-util = []
+
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-engine = { path = "../roundhouse-engine" }
 roundhouse-store = { path = "../roundhouse-store" }
+# Task 16 (`durability.rs`): the `workflow_run`/`workflow_step_run` state
+# machine writes directly against a `rusqlite::Connection` via
+# `roundhouse_store::begin_immediate` (ruling P4 — the tables themselves live
+# in `roundhouse-store`'s migration list, not a per-crate migration file).
+# Same workspace-pinned version `roundhouse-store` already uses.
+rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -37,3 +53,9 @@ serde_yaml = "0.9"
 # `serde` impls in non-test code. Same version/feature set
 # `roundhouse-core`'s own `Cargo.toml` already pins for the same purpose.
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+# Self dev-dependency, activating the `test-util` feature for this crate's own
+# `tests/*.rs` integration-test crates (L7) — `cfg(test)` alone does not cover
+# them, only this crate's in-lib `#[cfg(test)] mod tests`.
+roundhouse-flow = { path = ".", features = ["test-util"] }

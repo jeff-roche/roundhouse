@@ -140,6 +140,117 @@ CREATE UNIQUE INDEX trigger_event_dedupe
     ON trigger_event(binding_id, idempotency_key);
 "#;
 
+/// Phase 5, Subsystem B, Task 16 (workflow durability): §8.10's
+/// "checkpoint-and-re-drive" state machine — `workflow_run` plus
+/// `workflow_step_run`, "every transition one SQLite transaction through the
+/// single writer. Recovery = load and resume." Ruling P4 applies here for the
+/// same reason it did to `trigger_event` above: a per-crate
+/// `roundhouse-flow/migrations/*.sql` file would never reach the daemon's
+/// actual database. `roundhouse_flow::durability` reads and writes these two
+/// tables; nothing else does.
+///
+/// Timestamps are unix **nanoseconds** (`INTEGER`, matching
+/// `roundhouse_core::Timestamp` and the `events.ts`/`tasks.suspended_since`
+/// columns), not `trigger_event`'s RFC3339 `TEXT`. These rows are siblings of
+/// the task log, which they join back to via `first_task_seq`/`last_task_seq`
+/// (§8.10), so they use the log's own time convention.
+///
+/// No `FOREIGN KEY` constraints: no connection in this workspace sets
+/// `PRAGMA foreign_keys = ON` (see `pool.rs`, which sets only
+/// `journal_mode`/`synchronous`/`busy_timeout`), so declaring them would
+/// record an intention SQLite would not enforce. `workflow_run.session_id`,
+/// `parent_run_id`, `forked_from_run_id` and `trigger_event_id` are therefore
+/// documented references, checked by the application, not by the engine.
+const MIGRATION_0007_WORKFLOW_RUN: &str = r#"
+CREATE TABLE workflow_run (
+    id                 TEXT    PRIMARY KEY,
+    -- The pinned (job_id, version, content_hash) triple: old JobVersions are
+    -- never removed, so a run can always resolve the exact content it ran.
+    job_id             TEXT    NOT NULL,
+    job_version        INTEGER NOT NULL,
+    content_hash       TEXT    NOT NULL,
+    -- §8.6: each run creates a new Session.
+    session_id         TEXT    NOT NULL,
+    -- §8.6: "a workflow_run.binding_id / trigger_event_id column on every run
+    -- row — this is how 'the previous run of this binding' is queried". Both
+    -- nullable: a manually-invoked `round workflow run` has neither.
+    -- trigger_event_id is INTEGER because trigger_event.id (migration 0006)
+    -- is `INTEGER PRIMARY KEY AUTOINCREMENT`.
+    binding_id         TEXT,
+    trigger_event_id   INTEGER,
+    state              TEXT    NOT NULL CHECK (state IN (
+        'running', 'paused', 'cancelling', 'awaiting_human',
+        'completed', 'failed', 'cancelled'
+    )),
+    -- §8.12: a `call:` sub-workflow creates a CHILD workflow_run.
+    parent_run_id      TEXT,
+    -- §8.13: retry-from-step forks a new run inheriting completed step
+    -- outputs, linked back by this column. History is append-only; a fork is
+    -- never a rewrite.
+    forked_from_run_id TEXT,
+    -- Nullable, ABSOLUTE deadline of a park (unix nanos). WRITTEN BY TASK 17
+    -- (B9), which owns the relative->absolute conversion; this task only
+    -- creates the column. `hitl::AwaitingHuman` carries a *relative*
+    -- `timeout_after` and is deliberately not `Deserialize`, precisely so a
+    -- park record cannot be stored as that struct and re-derived with a fresh
+    -- full window on every resume. The absolute instant lives here instead.
+    awaiting_until     INTEGER,
+    started_at         INTEGER NOT NULL,
+    ended_at           INTEGER
+) STRICT;
+
+-- The index behind `previous_run_for_binding` (§8.6's "the previous run of
+-- this binding"), matching that query's `WHERE binding_id = ? ORDER BY
+-- started_at DESC` exactly. Partial, because a manually-invoked run has no
+-- binding and can never be an answer to that query.
+CREATE INDEX workflow_run_binding_idx
+    ON workflow_run (binding_id, started_at)
+    WHERE binding_id IS NOT NULL;
+
+CREATE TABLE workflow_step_run (
+    run_id                   TEXT    NOT NULL,
+    step_id                  TEXT    NOT NULL,
+    attempt                  INTEGER NOT NULL,
+    -- item_index is part of the PRIMARY KEY because
+    -- `exec::provenance::Provenance` is exactly
+    -- (run_id, step_id, attempt, item_index): without it, two items of one
+    -- `map` step collide and the second silently overwrites the first.
+    -- NOT NULL with a -1 sentinel for "not a map item", never NULL: SQLite
+    -- allows NULLs in a rowid table's PRIMARY KEY and compares every NULL
+    -- distinct, so a nullable column here would make repeated checkpoints of
+    -- one top-level step insert duplicate rows instead of updating one.
+    -- -1 is outside u32, so it cannot collide with a real item index.
+    item_index               INTEGER NOT NULL CHECK (item_index >= -1),
+    disposition              TEXT    NOT NULL CHECK (disposition IN (
+        'pure', 'idempotent', 'effectful'
+    )),
+    state                    TEXT    NOT NULL CHECK (state IN (
+        'pending', 'running', 'completed', 'indeterminate', 'failed'
+    )),
+    -- §8.10: "workflow_step_run.first_task_seq/last_task_seq join back to the
+    -- log, so a step's full evidence is SELECT ... WHERE session_id = ? AND
+    -- seq BETWEEN ? AND ?". Nullable, because a step checkpointed before it
+    -- has emitted any task genuinely has no range — a NOT NULL column would
+    -- have to fake one, and a fake 0..0 range silently mis-joins that query.
+    -- A `seq` is a u64 in `roundhouse-core`; SQLite has no unsigned integers,
+    -- so the non-negative half of the INTEGER range is the whole domain.
+    first_task_seq           INTEGER CHECK (first_task_seq IS NULL OR first_task_seq >= 0),
+    last_task_seq            INTEGER CHECK (last_task_seq IS NULL OR last_task_seq >= 0),
+    -- §8.13's fork "inheriting completed step outputs" needs the real output,
+    -- so this column holds the step's UNREDACTED output JSON.
+    -- output_is_secret_derived is the executor's own flag, persisted verbatim
+    -- from StepOutcome rather than re-derived later (exec/mod.rs: "a
+    -- re-derivation that disagrees with this one is a leak"). Any consumer
+    -- rendering `output` must consult it.
+    output                   TEXT,
+    output_is_secret_derived INTEGER NOT NULL CHECK (output_is_secret_derived IN (0, 1)),
+    -- No output means nothing to be tainted: keeps "no output yet" a single
+    -- representable state rather than two.
+    CHECK (output IS NOT NULL OR output_is_secret_derived = 0),
+    PRIMARY KEY (run_id, step_id, attempt, item_index)
+) STRICT;
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_0001_INITIAL_SCHEMA),
@@ -148,5 +259,6 @@ pub fn migrations() -> Migrations<'static> {
         M::up(MIGRATION_0004_TASKS_REDACTIONS_COLUMN),
         M::up(MIGRATION_0005_ATTENTION_INDEX),
         M::up(MIGRATION_0006_TRIGGER_EVENT),
+        M::up(MIGRATION_0007_WORKFLOW_RUN),
     ])
 }
