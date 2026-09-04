@@ -795,11 +795,16 @@ fn presented_token(request: &Request) -> Option<&str> {
 /// native credential dialog: browsers do not implement the `Bearer` scheme, so
 /// the 401 stays the page's problem, which is what §11.3's "no login system"
 /// means in practice.
+///
+/// The body takes `/api`'s one error shape — see [`crate::runs::error_body`],
+/// which argues for having exactly one — so a client that reads a failure with
+/// `res.json()` gets a reason on every path under `/api` rather than a parse
+/// error on some of them.
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, "Bearer")],
-        "LAN access requires the shared token from the state dir\n",
+        crate::runs::error_body("LAN access requires the shared token from the state dir"),
     )
         .into_response()
 }

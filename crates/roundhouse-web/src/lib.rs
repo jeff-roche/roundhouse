@@ -115,6 +115,111 @@ pub struct AppState {
     /// yet**, because nothing links this crate at all; see this module's docs
     /// for what wiring the daemon up costs.
     pub store: Option<roundhouse_store::StorePool>,
+    /// How many API requests may hold a [`store`](Self::store) connection at
+    /// once. See [`ApiPoolPermits`] — the field exists so that a handler cannot
+    /// starve the event-log writer, and its [`Default`] is the bound.
+    pub api_pool_permits: ApiPoolPermits,
+}
+
+/// A bound on how many API requests may hold a store connection at once,
+/// **shedding** rather than queueing when it is reached.
+///
+/// # The failure this exists to prevent
+///
+/// [`runs::router`]'s handler is the first thing in this workspace that takes a
+/// [`roundhouse_store::StorePool`] connection *on request*, and the pool it
+/// takes from is the one `roundhouse_store::writer` appends events through.
+/// Measured, not assumed: `deadpool` 0.13.1's default `max_size` is
+/// `CPU_COUNT * 2` (`deadpool::util::get_default_pool_max_size`) and
+/// `Timeouts::default()` sets **no wait timeout**, and `roundhouse_store::open`
+/// overrides neither. One `GET /api/runs` holds its connection for up to
+/// `1 + 3 × MAX_INBOX_RUNS` queries.
+///
+/// So `CPU_COUNT * 2` concurrent requests — from an unauthenticated loopback
+/// caller, a paired LAN device, or `HEAD` requests that pay the whole cost and
+/// take no body — hold every connection in the pool, and every other caller,
+/// **including an event append**, waits forever. Ruling P93 §B.
+///
+/// # Why a semaphore, and why `try_acquire`
+///
+/// Three alternatives were measured and rejected there, recorded so they are
+/// not re-derived:
+///
+/// - **Setting `Timeouts.wait` in `roundhouse_store::open`** is one line, and
+///   it converts the writer's benign wait under contention into a hard
+///   `PoolTimeout` on the **write** path. That is worse than the problem.
+/// - **`tokio::time::timeout` around `pool.get()`** bounds how long *one*
+///   handler waits, not how many connections concurrent handlers already hold.
+///   It misses the mechanism.
+/// - **`tower::ConcurrencyLimitLayer`** queues rather than sheds, converting
+///   starvation into unbounded queueing, and drags `tower` out of
+///   dev-dependencies.
+///
+/// `try_acquire_owned` is what makes this shed: over the bound, the request is
+/// answered `503` immediately instead of joining a queue with no end. That
+/// matches [`runs`]'s existing convention, where `503` means "this surface is
+/// not ready" rather than "your request is wrong".
+///
+/// # The default, and why it is a fraction rather than a constant
+///
+/// The pool's size is a function of the CPU count, so a fixed number would be
+/// most of the pool on a small machine and a rounding error on a large one. The
+/// default is a quarter of `deadpool`'s own default `max_size` — see
+/// [`ApiPoolPermits::default`] — with a floor of one, so a single-core machine
+/// can still answer.
+///
+/// `Default` is what [`AppState`] needs and is also what a caller should
+/// normally use. [`ApiPoolPermits::new`] exists for a caller that has measured
+/// something better, and for tests that need the shed path deterministically.
+#[derive(Clone)]
+pub struct ApiPoolPermits(std::sync::Arc<tokio::sync::Semaphore>);
+
+impl ApiPoolPermits {
+    /// A bound of exactly `permits` concurrent store-holding API requests.
+    ///
+    /// `0` is legal and means "shed everything", which is the only way to
+    /// exercise the shed path without racing a real pool.
+    pub fn new(permits: usize) -> Self {
+        Self(std::sync::Arc::new(tokio::sync::Semaphore::new(permits)))
+    }
+
+    /// The permit for one request, or `None` if the bound is reached.
+    ///
+    /// The caller holds the returned value for as long as it holds a pool
+    /// connection — which is why it is an owned permit and not a borrowed one:
+    /// the handler's future outlives any borrow of the state.
+    pub(crate) fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        std::sync::Arc::clone(&self.0).try_acquire_owned().ok()
+    }
+}
+
+impl Default for ApiPoolPermits {
+    /// A quarter of `deadpool`'s default `max_size` of `CPU_COUNT * 2`, floored
+    /// at one.
+    ///
+    /// The CPU count comes from `std::thread::available_parallelism`, which is
+    /// not literally the `num_cpus::get()` `deadpool` uses: in a cgroup-limited
+    /// container the std answer is the *smaller* of the two, which lowers this
+    /// bound and never raises it past its intended fraction. That is the
+    /// direction to be wrong in.
+    fn default() -> Self {
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        Self::new((cpus / 2).max(1))
+    }
+}
+
+impl std::fmt::Debug for ApiPoolPermits {
+    /// Hand-written because [`AppState`] derives `Debug` and
+    /// `tests/assets.rs::a_handler_taking_app_state_composes_with_the_asset_router`
+    /// compares two independently constructed `AppState::default()` renderings.
+    /// A derived `Debug` here would print `tokio::sync::Semaphore`'s internals,
+    /// which are not part of this type's meaning; the number of permits still
+    /// free is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ApiPoolPermits")
+            .field(&self.0.available_permits())
+            .finish()
+    }
 }
 
 /// The single router a future daemon listener would mount.
@@ -290,5 +395,9 @@ fn api_router(bind: &lan_auth::BindConfig) -> axum::Router<AppState> {
 /// answers, and therefore whether the answer is gated.
 async fn api_not_found() -> axum::response::Response {
     use axum::response::IntoResponse;
-    (axum::http::StatusCode::NOT_FOUND, "no such API route\n").into_response()
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        runs::error_body("no such API route"),
+    )
+        .into_response()
 }

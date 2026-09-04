@@ -194,6 +194,10 @@ async fn stream(
     let state = AppState {
         sse: hub.clone(),
         store: None,
+        // Task 34's fix round added the pool bound (ruling P93 §B). Its default
+        // is right here: with no store there is no pool to bound, and the SSE
+        // handler takes no permit.
+        ..AppState::default()
     };
     let response = build_router(state, &BindConfig::loopback())
         .oneshot(request)

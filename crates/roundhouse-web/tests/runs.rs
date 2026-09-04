@@ -367,13 +367,138 @@ async fn the_runs_route_reports_a_missing_store_rather_than_an_empty_inbox() {
     let response = get(router, "/api/runs").await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-    let body = axum::body::to_bytes(response.into_body(), 4096)
+    let reason = json_body(response).await;
+    let reason = reason["error"].as_str().expect("the body names a reason");
+    assert!(
+        reason.contains("no store"),
+        "the body names the reason, since a 503 alone does not distinguish it from a restart; \
+         got {reason}"
+    );
+}
+
+/// The body of a `/api/runs` response, parsed as JSON.
+///
+/// Parsed rather than string-matched because the whole point of `/api`'s error
+/// shape is that a client can `res.json()` a failure the same way it does a
+/// success — see `runs::error_body`.
+async fn json_body(response: axum::http::Response<Body>) -> serde_json::Value {
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .expect("the body fits");
-    assert!(
-        String::from_utf8_lossy(&body).contains("no store"),
-        "the body names the reason, since a 503 alone does not distinguish it from a restart"
+    serde_json::from_slice(&body).expect("every /api/runs body is JSON")
+}
+
+/// A real store on a temp directory, migrations applied — the same
+/// `roundhouse_store::open` the daemon will use.
+async fn store(dir: &tempfile::TempDir) -> roundhouse_store::StorePool {
+    roundhouse_store::open(&dir.path().join("roundhouse.db"))
+        .await
+        .expect("a fresh database opens and migrates")
+}
+
+/// **The success path, which nothing exercised at all before this.** Everything
+/// past the `let Some(store) = … else` guard — `MAX_INBOX_RUNS`, the
+/// `sort_for_triage` call, the `.map(RunSummaryJson::from)` — was uncovered,
+/// because nothing in the workspace built an `AppState` with a store in it.
+///
+/// What this pins is the **composition**: that the two halves, each well tested
+/// on its own, are wired to each other and to the route. An empty database is
+/// enough for that, and it is the state every fresh install is in.
+///
+/// **What it does not do, said plainly rather than implied:** it does not kill a
+/// mutation that drops the `sort_for_triage` call. That needs seeded rows, and
+/// seeding them here would mean SQL in this crate's tests, which ruling P86 put
+/// in `roundhouse-flow` on purpose. The sort itself is exercised five ways above.
+#[tokio::test]
+async fn a_router_with_a_real_store_answers_an_empty_inbox_as_an_empty_list() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let state = AppState {
+        store: Some(store(&dir).await),
+        ..AppState::default()
+    };
+
+    let response = get(build_router(state, &BindConfig::loopback()), "/api/runs").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("a JSON response names its content type"),
+        "application/json",
     );
+    assert_eq!(
+        json_body(response).await,
+        serde_json::json!([]),
+        "an empty database is an empty inbox — and, unlike the 503, a real answer"
+    );
+}
+
+/// Ruling P93 §B: this handler holds a connection from the pool
+/// `roundhouse_store::writer` appends events through, so enough concurrent
+/// requests would block event appends indefinitely. The bound sheds instead of
+/// queueing, and `ApiPoolPermits::new(0)` is what makes "over the bound"
+/// reachable without racing a real pool.
+///
+/// The two `503`s must stay distinguishable: "no store attached" and "at the
+/// concurrency bound" are different operator problems with the same status, and
+/// the body is the only thing that separates them.
+#[tokio::test]
+async fn a_request_over_the_pool_bound_is_shed_rather_than_left_to_queue() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let state = AppState {
+        store: Some(store(&dir).await),
+        api_pool_permits: roundhouse_web::ApiPoolPermits::new(0),
+        ..AppState::default()
+    };
+
+    let response = get(build_router(state, &BindConfig::loopback()), "/api/runs").await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(response).await;
+    let reason = body["error"].as_str().expect("the body names a reason");
+    assert!(
+        reason.contains("concurrency bound"),
+        "a shed request must say so rather than read as a missing store; got {reason}"
+    );
+
+    let no_store = get(
+        build_router(AppState::default(), &BindConfig::loopback()),
+        "/api/runs",
+    )
+    .await;
+    let no_store = json_body(no_store).await;
+    assert_ne!(
+        no_store["error"], body["error"],
+        "the two 503s are different problems and must not read the same"
+    );
+}
+
+/// The permit is released when the request finishes, so a bound of one is a
+/// bound on *concurrency* and not a budget of one request per process. Two
+/// sequential requests through the same state is the smallest fixture that
+/// separates the two — a permit that leaked would make the second a `503`.
+#[tokio::test]
+async fn a_permit_is_released_when_the_request_finishes() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let state = AppState {
+        store: Some(store(&dir).await),
+        api_pool_permits: roundhouse_web::ApiPoolPermits::new(1),
+        ..AppState::default()
+    };
+
+    for attempt in 1..=2 {
+        let response = get(
+            build_router(state.clone(), &BindConfig::loopback()),
+            "/api/runs",
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "request {attempt} of 2: a bound of one must not be spent permanently"
+        );
+    }
 }
 
 /// The route is registered, not merely reachable through the SPA fallback. A

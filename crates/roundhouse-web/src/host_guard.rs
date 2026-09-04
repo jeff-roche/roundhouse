@@ -187,9 +187,9 @@ pub(crate) async fn require_expected_host(
 fn forbidden() -> Response {
     (
         StatusCode::FORBIDDEN,
-        axum::Json(serde_json::json!({
-            "error": "this API answers only to the host it is bound to; check the Host header"
-        })),
+        crate::runs::error_body(
+            "this API answers only to the host it is bound to; check the Host header",
+        ),
     )
         .into_response()
 }
