@@ -137,13 +137,21 @@ fn a_non_object_body_names_its_own_shape() {
 /// than as a byte-count threshold. A threshold would have to be re-tuned every
 /// time the wording changed, and would pass for a bound that was merely large.
 ///
-/// Multi-byte on purpose: `&s[..64]` panics on this input, so this also pins
-/// that the truncation is by `char` and not by byte.
+/// # The filler character is `€` for a reason, and the reason is a caught bug
+///
+/// This test first used `é`, which is **two** bytes — and 64 is even, so
+/// `&value[..64]` lands exactly on a char boundary and does not panic. The
+/// byte-truncation mutation survived the sweep against a test whose whole
+/// second half is about char boundaries.
+///
+/// `€` is three bytes and `64 % 3 == 1`, so a byte slice at the bound splits a
+/// character and panics. Picking a multi-byte character is not enough; it has to
+/// be one whose width does not divide the bound.
 #[test]
 fn a_rejected_value_is_echoed_back_bounded_and_on_a_char_boundary() {
     let render = |repeats: usize| {
-        parse_interaction(&json!({ "kind": "é".repeat(repeats) }))
-            .expect_err("a run of 'é' is not one of the four")
+        parse_interaction(&json!({ "kind": "€".repeat(repeats) }))
+            .expect_err("a run of '€' is not one of the four")
             .to_string()
     };
 
@@ -159,7 +167,7 @@ fn a_rejected_value_is_echoed_back_bounded_and_on_a_char_boundary() {
     );
     // The same value under the bound is quoted whole, so the truncation is a
     // bound and not an unconditional shortening.
-    assert!(render(3).contains("ééé"), "got {}", render(3));
+    assert!(render(3).contains("€€€"), "got {}", render(3));
 }
 
 async fn post(router: axum::Router, uri: &str, body: serde_json::Value) -> (StatusCode, String) {
@@ -326,6 +334,41 @@ async fn an_extractor_rejection_is_json_like_every_other_api_error() {
             "the namespace's error shape is {{\"error\": …}}; got {parsed}"
         );
     }
+}
+
+/// **The route exists under `/api` and nowhere else** — ruling P88 §A's gate is
+/// worth exactly what this pins.
+///
+/// `the_route_is_mounted_under_the_api_namespace` proves the route *is* inside
+/// the nest that `build_router` gates. It cannot prove there is no **second,
+/// ungated** copy: merging `interaction::router()` onto `build_router`'s outer
+/// chain as well as inside `api_router` leaves the `/api` path working, every
+/// other test in this file passing, and `POST /sessions/{id}/interactions`
+/// answering the handler with no token and no `Host` check in front of it. That
+/// is not a hypothetical shape — it is the one P88 §A was written about, and it
+/// survived the sweep until this test existed.
+///
+/// The un-prefixed path must therefore reach the **asset** surface, which is
+/// what ruling P85 accepts as ungated, and not the handler.
+#[tokio::test]
+async fn the_route_is_not_also_served_outside_the_api_namespace() {
+    let (status, body) = post(
+        router(),
+        "/sessions/9d1ad699-0000-4000-8000-000000000001/interactions",
+        json!({"kind": "soft_interrupt"}),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "an interaction route outside /api is outside the LAN gate and the Host check; got {body}"
+    );
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "reaching the handler's own validation means the handler is mounted here; got {body}"
+    );
 }
 
 /// The `/api` namespace fallback still answers, which is what ruling P88 §A's
