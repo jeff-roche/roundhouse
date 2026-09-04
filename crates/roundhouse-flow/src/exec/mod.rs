@@ -283,6 +283,24 @@ use std::fmt;
 
 /// Stands in for `roundhouse-engine`'s real task admission so this crate
 /// stays testable without linking the full engine (this task's Interfaces).
+///
+/// # The missing `SessionId` is what stops this crate driving a child run
+///
+/// Named here, at the trait a future implementer would have to change, rather
+/// than only in [`run_loop`]'s module doc (B12c fix round): [`Self::emit`]
+/// carries no `SessionId`, so every task it writes lands in **the sink's own
+/// session**. §8.6 gives a `call:` child run its own Session, so
+/// `run_loop::Loop::dispatch_call` can create the child `workflow_run` row and
+/// draw its grant — both of which are `workflow_run` writes, not log writes —
+/// but it cannot execute the child's steps, because their tasks would be filed
+/// under the parent.
+///
+/// That is a real crate boundary, not a shortcut: a sink that took a
+/// `SessionId` would let any caller write into any session's append-only log.
+/// The daemon drives a child by calling [`run_loop::run_workflow`] on it with
+/// **that** session's sink, exactly as it drives the parent. §8.12's refund
+/// needs no driver and is already wired — a child refunds itself at its own
+/// terminal transition.
 pub trait TaskSink {
     fn emit(
         &mut self,
@@ -594,6 +612,36 @@ pub struct Executor<'a> {
     /// there is no ledger to read, and `dispatch_map_step` falls back to the
     /// placeholder that says so.
     map_budget: Option<map_step::MapBudget>,
+    /// Where an authored `report:` step's redacted, validated document goes
+    /// — see [`ReportEmission`].
+    report_emission: ReportEmission,
+}
+
+/// Whether an authored `report:` step emits its `TaskKind::Report` task at
+/// dispatch, or hands the document back for its caller to emit later.
+///
+/// **Ruling P117 §C is why this is a choice at all.** §8.6's report is a
+/// document *about the run*, and the one fact a reader most needs from it —
+/// how the run ended — is not known while the step that writes it is running.
+/// A `report:` step that completes and is then followed by a failing step
+/// leaves the inbox a document reading `outcome: changed, needs_human: false`
+/// for a `Failed` run, which §8.6's `(needs_human, severity, outcome !=
+/// nothing)` sort then buries: the same failure ruling P112 exists to prevent,
+/// arriving through the authored path rather than the missing one.
+///
+/// So under a real run the emit is **deferred** to
+/// [`run_loop::run_workflow`]'s terminal step, which annotates the run's
+/// actual terminal state onto the extension half before emitting. There is
+/// still exactly one report task; it is written later and says more.
+enum ReportEmission {
+    /// [`Executor::run_to_completion`]: emit at dispatch. The in-memory
+    /// sequencer has no `workflow_run` row, so there is no terminal state to
+    /// annotate and nothing downstream that would ever emit the document.
+    Immediate,
+    /// [`run_loop::run_workflow`]: hold the validated, redacted document for
+    /// the loop to annotate and emit at `finish_run` time. `None` until a
+    /// `report:` step actually completes.
+    Deferred(Option<Value>),
 }
 
 impl<'a> Executor<'a> {
@@ -660,6 +708,7 @@ impl<'a> Executor<'a> {
             ctx,
             redaction_needles,
             map_budget: None,
+            report_emission: ReportEmission::Immediate,
         })
     }
 
@@ -1004,7 +1053,22 @@ impl<'a> Executor<'a> {
                 // validates *implies* the typed core (`outcome`, `severity`,
                 // `needs_human`, `cost`) of `logged` is byte-identical to
                 // `resolved`'s — redaction can only ever steer
-                // valid -> invalid, never invalid -> valid. The divergence
+                // valid -> invalid, never invalid -> valid.
+                //
+                // **"Only ever valid -> invalid" is the safe direction for a
+                // step, and not for a synthesised report** (ruling P117 §D).
+                // Here, an invalid `logged` fails *this step*, which is
+                // ordinary control flow: the run goes on to fail with a
+                // synthesised report explaining why. On
+                // `run_loop::Loop::synthesise_report`'s path there is no step
+                // to fail — a `secrets` value that redaction steers into an
+                // invalid document there is a run that can reach **no**
+                // terminal state at all, on this drive or any later one,
+                // because the report is what `finish_run` requires. Same
+                // direction, unrecoverable rather than recoverable; see that
+                // function's own note.
+                //
+                // The divergence
                 // between `logged` and `resolved` is confined to free-text
                 // fields validation does not constrain beyond "is a string"
                 // (`headline`, finding `id`/`title`/`location`, and anything
@@ -1015,26 +1079,35 @@ impl<'a> Executor<'a> {
                     return StepOutcome::failed(&step.id, format!("invalid `report:`: {e}"));
                 }
                 let output_is_secret_derived = resolved.is_secret_derived();
-                self.sink.emit(
-                    task_id,
-                    None,
-                    TaskKind::Report,
-                    EventPayload::TaskCreated {
-                        kind: TaskKind::Report,
-                        parent: None,
-                        origin: Origin::System,
-                        input: TaskInput::Json(logged.clone()),
-                    },
-                );
-                self.sink.emit(
-                    task_id,
-                    None,
-                    TaskKind::Report,
-                    EventPayload::TaskCompleted {
-                        output: TaskOutput::Json(logged),
-                        usage: Usage::default(),
-                    },
-                );
+                match &mut self.report_emission {
+                    // Ruling P117 §C: hand the document to the run loop
+                    // rather than emitting it now, so the one report task
+                    // this run leaves behind can carry the run's real
+                    // terminal state. See `ReportEmission`.
+                    ReportEmission::Deferred(slot) => *slot = Some(logged),
+                    ReportEmission::Immediate => {
+                        self.sink.emit(
+                            task_id,
+                            None,
+                            TaskKind::Report,
+                            EventPayload::TaskCreated {
+                                kind: TaskKind::Report,
+                                parent: None,
+                                origin: Origin::System,
+                                input: TaskInput::Json(logged.clone()),
+                            },
+                        );
+                        self.sink.emit(
+                            task_id,
+                            None,
+                            TaskKind::Report,
+                            EventPayload::TaskCompleted {
+                                output: TaskOutput::Json(logged),
+                                usage: Usage::default(),
+                            },
+                        );
+                    }
+                }
                 StepOutcome {
                     step_id: step.id.clone(),
                     output: resolved.into_unredacted_for_dispatch(),
@@ -1205,10 +1278,22 @@ const MAX_STEPS_CONTEXT_ERROR_LEN: usize = 512;
 /// valid UTF-8 boundary), appending the original byte length when
 /// truncation actually happens.
 fn truncate_steps_context_error(text: &str) -> Cow<'_, str> {
-    if text.len() <= MAX_STEPS_CONTEXT_ERROR_LEN {
+    truncate_diagnostic(text, MAX_STEPS_CONTEXT_ERROR_LEN)
+}
+
+/// The truncation both bounded diagnostic sinks in this crate share.
+///
+/// Split out by B12c's fix round for the third one:
+/// [`run_loop::MAX_FINDING_TITLE_LEN`] bounds a step's failure message on its
+/// way into a synthesised report's finding `title`, and it was the only one of
+/// the three arriving unbounded. One implementation rather than a third copy,
+/// so "truncate at a char boundary and say how much was dropped" cannot drift
+/// between them.
+fn truncate_diagnostic(text: &str, limit: usize) -> Cow<'_, str> {
+    if text.len() <= limit {
         return Cow::Borrowed(text);
     }
-    let mut end = MAX_STEPS_CONTEXT_ERROR_LEN;
+    let mut end = limit;
     while !text.is_char_boundary(end) {
         end -= 1;
     }

@@ -33,6 +33,31 @@
 //! **The one case the run loop cannot serve is a crash**: a killed daemon
 //! writes nothing, so that report belongs to the recovery path on restart
 //! (ruling P112 §5), which is daemon-side and unowned.
+//!
+//! # The other unowned report: a park that times out
+//!
+//! Ruling P112 lists it and no code drives that transition, correctly — the
+//! §8.11 reaper that notices `workflow_run.awaiting_until` has passed is
+//! daemon-side periodic work, put out of scope by ruling P77 §C. The run loop
+//! cannot own it because a parked run is **not** being driven by anything: it
+//! is a row and a deadline.
+//!
+//! Recorded here so the obligation arrives with whoever builds the reaper
+//! rather than being rediscovered: **a timeout that ends the run owes it a
+//! report, exactly as every other terminal path does.** §8.11's four
+//! `on_timeout` outcomes split two ways — `approve`/`default(value)` resume
+//! the run, which puts the report back in
+//! [`crate::exec::run_loop::run_workflow`]'s hands and needs nothing new;
+//! `deny`/`fail` end it, and those are the two that need one. A run that ended
+//! because nobody answered is precisely the run §8.6's
+//! `(needs_human, severity, outcome != nothing)` sort exists to surface, so
+//! omitting it reproduces P112's failure at the one door left open.
+//!
+//! The mechanism is already built and needs no new code — assemble a document,
+//! [`validate_report`] it, emit one `TaskKind::Report` task — but the run loop's
+//! compile-time witness (`ReportPersisted`) does **not** reach this path,
+//! because the transition is not the loop's. It is an obligation, not an
+//! invariant, until the reaper has an owner.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

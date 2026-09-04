@@ -250,6 +250,27 @@ fn drive_with(
     (conn, run_id, sink, host, result)
 }
 
+/// Writes a finished `Completed` row for `step_id`, so a re-drive skips it —
+/// the state a run that was interrupted (or parked) between passes is in.
+fn checkpoint_completed(conn: &mut Connection, run_id: RunId, step_id: &str) {
+    roundhouse_flow::durability::checkpoint_step(
+        conn,
+        &roundhouse_flow::durability::WorkflowStepRun {
+            run_id,
+            step_id: step_id.to_string(),
+            attempt: 1,
+            item_index: None,
+            disposition: roundhouse_flow::durability::StepDisposition::Pure,
+            state: StepRunState::Completed,
+            first_task_seq: None,
+            last_task_seq: None,
+            output: None,
+            error: None,
+        },
+    )
+    .expect("checkpoint the finished step");
+}
+
 fn step_row(conn: &Connection, run_id: RunId, step_id: &str) -> (StepRunState, Option<String>) {
     let recovered = recover_run(conn, run_id).expect("the run is recoverable");
     let row = recovered
@@ -1010,16 +1031,16 @@ fn a_call_step_creates_a_funded_child_run_and_one_agent_task() {
     assert_eq!(grant.max_tool_calls, 9);
     assert_eq!(
         grant.max_tokens,
-        a_grant().max_tokens,
-        "every other field is clamped to the parent's *remaining*, and the \
-         parent has spent no tokens: this loop charges tasks, tool calls and \
-         sub-agents, never a token figure it would have had to invent"
+        a_grant().max_tokens / 2,
+        "an undeclared field asks for a bounded *share* of what the parent has \
+         left, never the remainder (ruling P116 §A) — the parent has spent no \
+         tokens, so half of its whole ceiling"
     );
     assert_eq!(
         grant.max_tasks,
-        a_grant().max_tasks - 1,
-        "the countable it does charge is one task per step, and the call \
-         step's own admission already took one"
+        (a_grant().max_tasks - 1) / 2,
+        "and half of the tasks it has left: the call step's own admission \
+         already took one of the hundred"
     );
     assert_eq!(
         host.sessions_created.len(),
@@ -1055,8 +1076,13 @@ fn a_call_step_creates_a_funded_child_run_and_one_agent_task() {
 /// and is measured in `tests/control.rs`; the path that reaches it is
 /// `retry_from_step`, which copies the original's caps rather than clamping
 /// them.
+///
+/// **This test asserted the defect ruling P116 §A names, as correct.** It used
+/// to read *"the parent is charged that remainder, so it now has nothing
+/// left"* — which is exactly the starvation that stops `finally:` running. The
+/// draw is now a bounded share, so the parent keeps a remainder of its own.
 #[test]
-fn a_call_draws_only_what_the_parent_has_left_rather_than_being_refused() {
+fn a_call_draws_a_bounded_share_of_what_the_parent_has_left_and_leaves_it_some() {
     let mut conn = open_test_db();
     let run_id = RunId::new();
     let mut run = a_run(run_id, SessionId::new());
@@ -1114,13 +1140,15 @@ fn a_call_draws_only_what_the_parent_has_left_rather_than_being_refused() {
     let child = run_ledger(&conn, child_id).unwrap();
     assert_eq!(
         child.caps.unwrap().max_tokens,
-        3,
-        "exactly the parent's remainder, never its ceiling"
+        1,
+        "half of the parent's remaining 3, never its ceiling and never the \
+         whole remainder"
     );
     assert_eq!(
         run_ledger(&conn, run_id).unwrap().spent.tokens,
-        10,
-        "and the parent is charged that remainder, so it now has nothing left"
+        8,
+        "and the parent is charged only that share — 7 spent plus the 1 it \
+         granted, so it still has 2 tokens of its own to finish with"
     );
 }
 
@@ -1657,6 +1685,12 @@ fn a_re_drive_honours_every_kind_of_finished_row_and_re_runs_the_rest() {
 /// `secret_derived_steps` fold, so `steps.<id>.output` read by a later step is
 /// tainted even though it was never itself a `secrets.*` lookup (ruling P33's
 /// property, at this loop's own boundary rather than `run_to_completion`'s).
+///
+/// Two tainted steps, with the leaf under test relayed from the **first** —
+/// `two_secret_derived_steps_are_both_marked_so_neither_end_of_the_projection_can_be_dropped`
+/// relays it from the last. Before this round both taint tests had exactly one
+/// tainted step, so the projection in `Loop::bind_steps_context` had no
+/// cardinality any fixture could hold it to (ruling P116 §D).
 #[test]
 fn taint_crosses_a_step_boundary_inside_the_run_loop_too() {
     let mut conn = open_test_db();
@@ -1671,8 +1705,10 @@ fn taint_crosses_a_step_boundary_inside_the_run_loop_too() {
         "steps:\n\
          \x20 - id: source\n\
          \x20   emit: { body: \"${{ json(secrets.TOKEN).inner }}\" }\n\
+         \x20 - id: other_source\n\
+         \x20   emit: { body: \"${{ json(secrets.TOKEN).other }}\" }\n\
          \x20 - id: sink_step\n\
-         \x20   needs: [source]\n\
+         \x20   needs: [source, other_source]\n\
          \x20   emit: { relayed: \"${{ steps.source.output.body }}\" }\n",
     ))
     .expect("fixture parses");
@@ -1681,7 +1717,7 @@ fn taint_crosses_a_step_boundary_inside_the_run_loop_too() {
     let mut run_ctx = ctx(run_id);
     run_ctx.secrets.insert(
         "TOKEN".into(),
-        "{\"inner\":\"derived-leaf-not-a-needle\"}".into(),
+        "{\"inner\":\"derived-leaf-not-a-needle\",\"other\":\"other-derived-leaf\"}".into(),
     );
 
     let outcome = run_workflow(
@@ -1713,10 +1749,12 @@ fn taint_crosses_a_step_boundary_inside_the_run_loop_too() {
     );
 
     let logged = format!("{:?}", sink.emitted);
-    assert!(
-        !logged.contains("derived-leaf-not-a-needle"),
-        "a derived leaf must not reach the log in cleartext: {logged}"
-    );
+    for leaf in ["derived-leaf-not-a-needle", "other-derived-leaf"] {
+        assert!(
+            !logged.contains(leaf),
+            "a derived leaf must not reach the log in cleartext: {leaf} in {logged}"
+        );
+    }
 }
 
 /// A step's crash disposition is derived from its real kind, not stamped a
@@ -1896,7 +1934,7 @@ fn a_call_is_charged_a_subagent_so_a_run_with_none_left_cannot_make_one() {
 /// remainder, so a second `call:` in the same run is refused by its own
 /// sub-agent admission before it can measure anything.
 #[test]
-fn a_childs_grant_is_the_parents_remainder_clamped_and_not_a_default() {
+fn a_childs_grant_is_a_bounded_share_clamped_and_not_a_default() {
     fn child_grant_for(body: &str) -> ResourceCaps {
         let mut conn = open_test_db();
         let (run_id, _) = seed_run(&mut conn);
@@ -1929,9 +1967,10 @@ fn a_childs_grant_is_the_parents_remainder_clamped_and_not_a_default() {
 
     assert_eq!(
         child_grant_for("steps:\n \x20- id: sub\n \x20  call: child-flow\n").max_cost_usd,
-        100.0,
-        "with no `caps:` block the child asks for the parent's remainder \
-         ($100), not `ResourceCaps::default()`'s $10"
+        50.0,
+        "with no `caps:` block the child asks for a bounded share of the \
+         parent's remainder — half of $100, not the whole $100 and not \
+         `ResourceCaps::default()`'s $10"
     );
     assert_eq!(
         child_grant_for(
@@ -2207,5 +2246,566 @@ fn a_secret_too_short_to_redact_refuses_the_run_and_says_so() {
         recover_run(&conn, run_id).unwrap().run.state,
         RunState::Running,
         "and the run is untouched"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B12c fix round — ruling P116 §A/§B/§D and ruling P117 §A/§B/§C
+// ---------------------------------------------------------------------------
+
+/// **The Critical (ruling P117 §A): a cancel is invisible to the terminal-state
+/// computation after the last admission.**
+///
+/// `run_phase` observes a cancel only at `admit`, and `admit` runs only for
+/// steps not already checkpointed. This fixture is that window made
+/// deterministic: every `steps:` row is already `Completed`, so nothing admits
+/// at all, and `finally:` admits through the §8.13 exemption that
+/// deliberately does *not* refuse a `Cancelling` run. The loop therefore saw
+/// no cancel anywhere.
+///
+/// Before the fix this returned `Err("run ... cannot move from Cancelling to
+/// Completed")` with the row left `Cancelling` and `ended_at` NULL — and since
+/// `finish_run` is the only writer of `Cancelled`/`Failed` in the workspace,
+/// **nothing could ever move that row again**, while every retry committed
+/// another report into an append-only table.
+#[test]
+fn a_cancel_after_the_last_admission_still_reaches_a_terminal_state() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: alpha\n\
+         \x20   emit: { a: 1 }\n\
+         \x20 - id: beta\n\
+         \x20   emit: { b: 2 }\n\
+         finally:\n\
+         \x20 - id: cleanup\n\
+         \x20   emit: { cleaned: true }\n",
+    ))
+    .expect("fixture parses");
+    // Two finished rows, so the "nothing admits" condition is reached from a
+    // real history rather than an empty workflow.
+    for step_id in ["alpha", "beta"] {
+        checkpoint_completed(&mut conn, run_id, step_id);
+    }
+    transition_run(&mut conn, run_id, RunState::Cancelling, at(5)).unwrap();
+
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("a `Cancelling` run must be drivable to a terminal state");
+
+    let RunOutcome::Terminal { state, .. } = outcome else {
+        panic!("no gate");
+    };
+    assert_eq!(
+        state,
+        RunState::Cancelled,
+        "the durable row is the second observer of a cancel, and it is \
+         consulted before the terminal state is computed"
+    );
+    let row = recover_run(&conn, run_id).unwrap().run;
+    assert_eq!(row.state, RunState::Cancelled);
+    assert!(
+        row.ended_at.is_some(),
+        "`ended_at` is stamped, so the run does not look live forever"
+    );
+    assert_eq!(
+        step_row(&conn, run_id, "cleanup").0,
+        StepRunState::Completed,
+        "§8.13's `finally:` still ran — the exemption is why the cancel was \
+         invisible in the first place, and it is not what is being changed"
+    );
+
+    let report = sink.the_report();
+    assert_eq!(
+        report["headline"], "run cancelled",
+        "and the report the operator reads says what happened, not \
+         `run completed: 0 steps`"
+    );
+    assert_eq!(report["outcome"], "failed");
+    assert_eq!(
+        report["run_state"], "cancelled",
+        "ruling P117 §C: the report carries the run's real terminal state"
+    );
+}
+
+/// The durable consequence ruling P117 §A names second: **a cancelled child
+/// leaks its parent's grant permanently.**
+///
+/// `refund_child_run` correctly refuses a non-terminal child, so a child that
+/// could never reach a terminal state could never return what it drew —
+/// §8.12's *"refunded on completion"* defeated by the very action meant to end
+/// the run.
+///
+/// The child here has **nothing** left to admit (an empty `steps:` and no
+/// `finally:`), which is ruling P116 §C's variant of the same window: `admit`
+/// never runs at all, so the cancel has no in-memory observer whatsoever.
+#[test]
+fn a_child_cancelled_with_nothing_left_to_admit_refunds_rather_than_leaking_its_grant() {
+    let mut conn = open_test_db();
+    let (parent_id, _) = seed_run(&mut conn);
+
+    let child_id = RunId::new();
+    let mut child = a_run(child_id, SessionId::new());
+    child.parent_run_id = Some(parent_id);
+    child.session_depth = Some(1);
+    child.caps = Some(ResourceCaps {
+        max_tokens: 400,
+        ..a_grant()
+    });
+    insert_workflow_run(&mut conn, &child).expect("the child draws its grant at insert");
+    assert_eq!(
+        run_ledger(&conn, parent_id).unwrap().spent.tokens,
+        400,
+        "the parent was charged the child's whole grant up front"
+    );
+
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: alpha\n\
+         \x20   emit: { a: 1 }\n\
+         \x20 - id: beta\n\
+         \x20   emit: { b: 2 }\n",
+    ))
+    .expect("fixture parses");
+    for step_id in ["alpha", "beta"] {
+        checkpoint_completed(&mut conn, child_id, step_id);
+    }
+    transition_run(&mut conn, child_id, RunState::Cancelling, at(5)).unwrap();
+
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        child_id,
+        &mut sink,
+        &mut host,
+        ctx(child_id),
+        at(10),
+        None,
+    )
+    .expect("the cancelled child reaches a terminal state");
+    let RunOutcome::Terminal { state, .. } = outcome else {
+        panic!("no gate");
+    };
+    assert_eq!(state, RunState::Cancelled);
+    assert_eq!(
+        recover_run(&conn, child_id).unwrap().run.state,
+        RunState::Cancelled
+    );
+    assert_eq!(
+        run_ledger(&conn, parent_id).unwrap().spent.tokens,
+        0,
+        "and the whole unspent grant went back to the parent, rather than \
+         being stranded on a child that could never end"
+    );
+    assert!(run_ledger(&conn, child_id).unwrap().refunded_at.is_some());
+    assert_eq!(
+        sink.the_report()["run_state"],
+        "cancelled",
+        "one report, and it says what the row says"
+    );
+}
+
+/// **Ruling P116 §B / P117 §B: an authored report must survive a re-drive, and
+/// the sink must be the one production has.**
+///
+/// Every other test in this file builds a fresh `RecordingSink` per
+/// `run_workflow` call; the real sink is per **session**, so a second report
+/// emitted on a second pass was invisible to the whole suite. This test
+/// accumulates one sink across both passes, which is the only shape that can
+/// see it.
+///
+/// Reachable with no crash at all: an authored `report:` ordered before a
+/// `gate:`, which the author chooses and stable-Kahn file order permits.
+#[test]
+fn one_sink_across_two_passes_sees_exactly_one_report_and_it_is_the_authored_one() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: report\n\
+         \x20   report:\n\
+         \x20     outcome: findings\n\
+         \x20     severity: high\n\
+         \x20     headline: the author found something\n\
+         \x20     needs_human: true\n\
+         \x20     cost: { usd: 0.5, tokens: 12 }\n\
+         \x20 - id: approve\n\
+         \x20   needs: [report]\n\
+         \x20   gate:\n\
+         \x20     title: \"ok?\"\n\
+         \x20     form: { approve: { type: boolean } }\n\
+         \x20     timeout: 1h\n\
+         \x20     on_timeout: deny\n",
+    ))
+    .expect("fixture parses");
+
+    // One sink, for both passes — this is the fixture, not an incidental
+    // detail.
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+
+    let first = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("pass one drives");
+    assert!(
+        matches!(first, RunOutcome::Parked(_)),
+        "the gate parks the run after the report step has completed"
+    );
+    assert_eq!(
+        sink.reports().len(),
+        0,
+        "a parked run is not terminal, so it carries no report at all \
+         (`RunOutcome::Parked`'s own doc)"
+    );
+
+    let second = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(20),
+        Some(GateAnswer {
+            step_id: "approve".into(),
+            output: serde_json::json!({ "approve": true }),
+        }),
+    )
+    .expect("pass two drives");
+    let RunOutcome::Terminal { report, state, .. } = second else {
+        panic!("the gate was answered, so the run ends");
+    };
+    assert_eq!(state, RunState::Completed);
+    assert_eq!(
+        report,
+        ReportOrigin::Authored {
+            step_id: "report".into()
+        },
+        "the report step is in `finished_before` on this pass, and the loop \
+         still knows the author wrote one"
+    );
+
+    // The assertion the fresh-sink-per-call convention could not make.
+    let document = sink.the_report();
+    assert_eq!(document["headline"], "the author found something");
+    assert_eq!(document["needs_human"], true);
+    assert_eq!(document["severity"], "high");
+    assert_eq!(
+        document.get("synthesised_by"),
+        None,
+        "a synthesised companion would be generic by construction — \
+         `outcome: nothing`, `severity: low`, `needs_human: false` — and would \
+         sort this run to the BOTTOM of §8.6's order. That is ruling P112's \
+         failure reached by ADDING a report, not by omitting one."
+    );
+}
+
+/// **Ruling P117 §C: the report carries the run's real terminal state.**
+///
+/// An authored `report:` that completed before a later step failed leaves the
+/// inbox a document reading `outcome: changed, needs_human: false` for a
+/// `Failed` run — and §8.6's `(needs_human, severity, outcome != nothing)`
+/// sort then buries exactly the run ruling P112 exists to surface.
+///
+/// The author's core judgement is left alone; the loop's fact goes on the
+/// extension half.
+#[test]
+fn an_authored_report_carries_the_terminal_state_of_a_run_that_failed_after_it() {
+    let (conn, run_id, sink, _, result) = drive(
+        "steps:\n\
+         \x20 - id: report\n\
+         \x20   report:\n\
+         \x20     outcome: changed\n\
+         \x20     severity: low\n\
+         \x20     headline: all good so far\n\
+         \x20     needs_human: false\n\
+         \x20     cost: { usd: 0.5, tokens: 12 }\n\
+         \x20 - id: boom\n\
+         \x20   needs: [report]\n\
+         \x20   emit: \"${{ no_such_fn(1) }}\"\n",
+        10,
+    );
+    let RunOutcome::Terminal { state, report, .. } = result.expect("the run drives") else {
+        panic!("no gate");
+    };
+    assert_eq!(state, RunState::Failed);
+    assert_eq!(
+        report,
+        ReportOrigin::Authored {
+            step_id: "report".into()
+        },
+        "the author's report is still the run's one report — an authored \
+         `report:` outside `finally:` is not refused"
+    );
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::Failed
+    );
+
+    let document = sink.the_report();
+    assert_eq!(
+        document["run_state"], "failed",
+        "the one fact a reader cannot recover from the author's core half"
+    );
+    assert_eq!(
+        document["outcome"], "changed",
+        "and the author's own judgement is left exactly as written — the \
+         annotation is additive, not a rewrite"
+    );
+    assert_eq!(document["needs_human"], false);
+}
+
+/// A `report:` nested inside a `map` would emit one `TaskKind::Report` task
+/// **per item**, and `run_workflow`'s §8.6 "exactly one" pre-check
+/// structurally cannot see it: it flattens the three phase lists only.
+///
+/// `gate:` and `call:` already carry this refusal; a report is a property of
+/// the run in exactly the same way, which is the argument already written for
+/// those two. Two items, and `on_item_error: continue`, so a refusal that
+/// fired for only one of them would be visible.
+#[test]
+fn a_report_step_inside_a_map_is_refused_rather_than_emitting_one_per_item() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: per_item_report\n\
+         \x20       report:\n\
+         \x20         outcome: changed\n\
+         \x20         severity: low\n\
+         \x20         headline: \"per item\"\n\
+         \x20         needs_human: false\n\
+         \x20         cost: { usd: 0.0, tokens: 0 }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": ["one", "two"] });
+
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    )
+    .expect("the run drives");
+    let RunOutcome::Terminal { steps, .. } = outcome else {
+        panic!("no gate");
+    };
+
+    let items = steps
+        .iter()
+        .find(|s| s.step_id == "fan")
+        .expect("the map ran")
+        .output["items"]
+        .as_array()
+        .expect("one entry per item")
+        .clone();
+    assert_eq!(items.len(), 2);
+    for item in &items {
+        assert_eq!(item["status"], "failed");
+        assert!(
+            item["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("cannot run inside a `map`")),
+            "every item is refused, not just the first: {item:?}"
+        );
+    }
+
+    // The invariant the refusal defends: still exactly one report task, and it
+    // is the run's, not an item's.
+    assert_eq!(sink.reports().len(), 1);
+    assert_eq!(
+        sink.the_report()["synthesised_by"],
+        "run_loop",
+        "no `report:` step ran, so the run's one report is the synthesised one"
+    );
+}
+
+/// **The fixture ruling P116 §A says no test in this file built: a step after a
+/// `call:`.**
+///
+/// With every child drawing its grant at insert (rulings P113/P114) and
+/// `Spend::for_grant` charging the parent the whole grant, an uncapped `call:`
+/// that asked for the parent's *remainder* took everything — and every step
+/// after it, `finally:` included, was refused `CapsExceeded`. §8.13's
+/// *"`finally:` runs"* defeated by the budget route the admission exemption
+/// does not cover.
+#[test]
+fn a_step_after_a_call_still_runs_and_so_does_finally() {
+    let (conn, run_id, sink, _, result) = drive_with(
+        "steps:\n\
+         \x20 - id: sub\n\
+         \x20   call: child-flow\n\
+         \x20 - id: after\n\
+         \x20   needs: [sub]\n\
+         \x20   emit: { ran: true }\n\
+         finally:\n\
+         \x20 - id: cleanup\n\
+         \x20   emit: { cleaned: true }\n",
+        10,
+        FakeHost::new().resolving("child-flow"),
+        None,
+    );
+    let RunOutcome::Terminal { state, .. } = result.expect("the run drives") else {
+        panic!("no gate");
+    };
+    assert_eq!(
+        state,
+        RunState::Completed,
+        "an uncapped `call:` does not starve the run that made it"
+    );
+    assert_eq!(
+        step_row(&conn, run_id, "after").0,
+        StepRunState::Completed,
+        "the step after the `call:` was admitted"
+    );
+    assert_eq!(
+        step_row(&conn, run_id, "cleanup").0,
+        StepRunState::Completed,
+        "and §8.13's `finally:` ran"
+    );
+    assert_eq!(sink.the_report()["outcome"], "nothing");
+}
+
+/// The taint projection's **cardinality**, which ruling P116 §D found had no
+/// mutation and no fixture that could catch one: both existing taint tests had
+/// exactly one tainted step, so a `.take(1)` on `Loop::bind_steps_context`'s
+/// `secret_derived_steps` iteration was invisible.
+///
+/// Two secret-derived steps, each producing a **derived leaf** the whole-value
+/// needle backstop structurally cannot match. The leaf under test is relayed
+/// from the **second** tainted step here and from the **first** in
+/// `taint_crosses_a_step_boundary_inside_the_run_loop_too`, so a truncation at
+/// either end of the projection leaks a cleartext credential into the log and
+/// fails one of the two.
+#[test]
+fn two_secret_derived_steps_are_both_marked_so_neither_end_of_the_projection_can_be_dropped() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: first_source\n\
+         \x20   emit: { body: \"${{ json(secrets.TOKEN).first }}\" }\n\
+         \x20 - id: second_source\n\
+         \x20   emit: { body: \"${{ json(secrets.TOKEN).second }}\" }\n\
+         \x20 - id: sink_step\n\
+         \x20   needs: [first_source, second_source]\n\
+         \x20   emit: { relayed: \"${{ steps.second_source.output.body }}\" }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.secrets.insert(
+        "TOKEN".into(),
+        "{\"first\":\"first-derived-leaf\",\"second\":\"second-derived-leaf\"}".into(),
+    );
+
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(2),
+        None,
+    )
+    .unwrap();
+    let RunOutcome::Terminal { state, steps, .. } = outcome else {
+        panic!("no gate")
+    };
+    assert_eq!(state, RunState::Completed, "every step ran: {steps:?}");
+    assert_eq!(
+        steps
+            .iter()
+            .find(|s| s.step_id == "sink_step")
+            .expect("the relay ran")
+            .output["relayed"],
+        "second-derived-leaf",
+        "the relay really did carry the second source's leaf, unredacted, for \
+         dispatch"
+    );
+
+    let logged = format!("{:?}", sink.emitted);
+    for leaf in ["first-derived-leaf", "second-derived-leaf"] {
+        assert!(
+            !logged.contains(leaf),
+            "a derived leaf must not reach the log in cleartext: {leaf} in {logged}"
+        );
+    }
+}
+
+/// The finding `title` is the third sink for a step's failure message, and
+/// until this round the only unbounded one — the other two are `durability`'s
+/// `MAX_STORED_STEP_ERROR_LEN` and `exec`'s `MAX_STEPS_CONTEXT_ERROR_LEN`,
+/// both 512. An unbounded `call:` workflow name became an unbounded finding
+/// title in a table that physically rejects `UPDATE`/`DELETE`.
+#[test]
+fn a_findings_title_is_bounded_even_when_the_step_message_that_produced_it_is_not() {
+    let long_name = "w".repeat(20_000);
+    let (_, _, sink, _, result) = drive(
+        &format!(
+            "steps:\n\
+             \x20 - id: sub\n\
+             \x20   call: {long_name}\n"
+        ),
+        10,
+    );
+    let RunOutcome::Terminal { state, .. } = result.expect("the run drives") else {
+        panic!("no gate");
+    };
+    assert_eq!(
+        state,
+        RunState::Failed,
+        "the workflow name does not resolve"
+    );
+
+    let report = sink.the_report();
+    let title = report["findings"][0]["title"]
+        .as_str()
+        .expect("one finding for the failed step");
+    assert!(
+        title.len() < 700,
+        "512 bytes plus the truncation suffix, not 20,000: {} bytes",
+        title.len()
+    );
+    assert!(
+        title.ends_with("bytes total)"),
+        "and it says how much was dropped rather than silently cutting: \
+         {title:?}"
     );
 }

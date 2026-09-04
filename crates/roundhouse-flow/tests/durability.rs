@@ -859,6 +859,7 @@ const LEGAL_TRANSITIONS: &[(RunState, RunState)] = &[
     (RunState::Running, RunState::Failed),
     (RunState::Paused, RunState::Running),
     (RunState::Paused, RunState::Cancelling),
+    (RunState::Paused, RunState::Completed),
     (RunState::Paused, RunState::Failed),
     (RunState::AwaitingHuman, RunState::AwaitingHuman),
     (RunState::AwaitingHuman, RunState::Running),
@@ -879,15 +880,15 @@ const ALL_RUN_STATES: &[RunState] = &[
 ];
 
 #[test]
-fn the_legality_matrix_admits_exactly_fourteen_of_the_forty_nine_ordered_pairs() {
+fn the_legality_matrix_admits_exactly_fifteen_of_the_forty_nine_ordered_pairs() {
     // Fix round 1 (Task 20a, item G): the test's own NAME was never actually
     // asserted anywhere below — deleting a row from both `LEGAL_TRANSITIONS`
     // and `transition_is_legal` left this test green with a name that was
     // now false. State the count on both sides of the comparison.
     assert_eq!(
         LEGAL_TRANSITIONS.len(),
-        14,
-        "the table this test's name promises must actually hold fourteen pairs"
+        15,
+        "the table this test's name promises must actually hold fifteen pairs"
     );
     let mut admitted_pairs = 0;
     for &from in ALL_RUN_STATES {
@@ -905,8 +906,8 @@ fn the_legality_matrix_admits_exactly_fourteen_of_the_forty_nine_ordered_pairs()
         }
     }
     assert_eq!(
-        admitted_pairs, 14,
-        "transition_is_legal itself must admit exactly fourteen of the 7x7 ordered pairs"
+        admitted_pairs, 15,
+        "transition_is_legal itself must admit exactly fifteen of the 7x7 ordered pairs"
     );
 }
 

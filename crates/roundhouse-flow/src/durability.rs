@@ -434,6 +434,22 @@ impl RunState {
         )
     }
 
+    /// The state's name as §8.6's report extension half spells it — ruling
+    /// P117 §C's `run_state` annotation, written by
+    /// [`crate::exec::run_loop`] onto the one report every terminal run
+    /// leaves behind.
+    ///
+    /// **Deliberately the same spelling as the SQL discriminant, and
+    /// deliberately not a second `match`.** This module's rule is that a
+    /// run-state discriminant is spelled in exactly one place (see
+    /// [`Self::as_sql_str`]); a report annotation that hand-wrote
+    /// `"cancelled"` would be a second spelling to drift from, and an inbox
+    /// filtering reports by state would then be filtering on a vocabulary
+    /// nothing else in the tree uses.
+    pub fn wire_name(self) -> &'static str {
+        self.as_sql_str()
+    }
+
     /// Private again as of Task 20a. It was `pub(crate)` because
     /// [`crate::parking`] owned §8.11's park write and had to name the same
     /// discriminant text this module reads back; that write now routes
@@ -480,7 +496,7 @@ impl RunState {
 /// §8.13's run state machine, as an explicit matrix: may a run move from
 /// `from` to `to`?
 ///
-/// Fourteen of the forty-nine ordered pairs are permitted. This predicate is
+/// Fifteen of the forty-nine ordered pairs are permitted. This predicate is
 /// pure so that the matrix can be reviewed and tested as a table rather than
 /// inferred from the writer's control flow; [`transition_run`] is the only
 /// thing that consults it against a real row.
@@ -533,7 +549,8 @@ impl RunState {
 /// - `Running -> {Completed, Failed}`. INFERRED. §8's run outcomes exist
 ///   throughout (a report has an outcome, §8.10 re-drives to completion) but
 ///   §8.13 discusses controls, not ordinary completion.
-/// - `Paused -> {Cancelling, Failed}` and `AwaitingHuman -> Cancelling`.
+/// - `Paused -> {Cancelling, Completed, Failed}` and
+///   `AwaitingHuman -> Cancelling`.
 ///   INFERRED, and the second goes **beyond** the minimum matrix this task's
 ///   brief listed: §8.13 states its controls unconditionally, and a run
 ///   waiting on a human who never answers is exactly the run an operator
@@ -546,6 +563,28 @@ impl RunState {
 ///   states; resurrecting a run that has ended would rewrite its recorded
 ///   outcome, and retry-from-step's fork is the sanctioned way to continue
 ///   from one.
+///
+/// # `Paused -> Completed`, added by B12c's fix round (ruling P117 §A)
+///
+/// `Paused -> Failed` was here from the start and its mirror was not, which
+/// made the pair an asymmetry rather than a decision. The asymmetry is a
+/// defect: [`crate::control::pause`] can land on a `Running` run **after the
+/// run loop has executed its last step**, and the loop's terminal write is
+/// then refused with no legal alternative — `finish_run` is the only writer of
+/// `Completed`/`Failed`/`Cancelled` in the workspace, so the run can never be
+/// moved again and `ended_at` stays `NULL` forever, which is precisely the
+/// *"run that looks live forever"* [`insert_run_row`]'s own guard exists to
+/// prevent.
+///
+/// The edge is safe in a way `Running -> Cancelled` would not be (that one was
+/// considered and rejected: it skips `Cancelling`, which is the state
+/// [`crate::ledger::admit_spend_during_finally`] keys off, so `finally:` would
+/// stop running). A pause is not a drain state and nothing is skipped by
+/// passing through it — and unlike `Cancelling -> Completed`, which is refused
+/// below because a cancelled run *did not complete*, a paused run whose steps
+/// all ran demonstrably did. The run loop refuses to **drive** a `Paused` run
+/// ([`crate::exec::run_loop::RunLoopError::RunNotDrivable`]), so the only
+/// reachable producer of this edge is that one race.
 ///
 /// **Deliberately absent, and named so the gap is a decision.**
 /// `AwaitingHuman -> Paused` (a parked run is already not executing; pausing
@@ -566,6 +605,7 @@ pub fn transition_is_legal(from: RunState, to: RunState) -> bool {
             | (RunState::Running, RunState::Failed)
             | (RunState::Paused, RunState::Running)
             | (RunState::Paused, RunState::Cancelling)
+            | (RunState::Paused, RunState::Completed)
             | (RunState::Paused, RunState::Failed)
             | (RunState::AwaitingHuman, RunState::AwaitingHuman)
             | (RunState::AwaitingHuman, RunState::Running)

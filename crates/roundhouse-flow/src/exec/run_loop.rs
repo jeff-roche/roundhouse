@@ -80,8 +80,8 @@ use thiserror::Error;
 
 use super::map_step::MapBudget;
 use super::{
-    evaluate_when_gate, redact_with_needles, steps_context_entry, Executor, GateDecision, RunId,
-    StepOutcome, StepStatus, TaskSink,
+    evaluate_when_gate, redact_with_needles, steps_context_entry, truncate_diagnostic, Executor,
+    GateDecision, ReportEmission, RunId, StepOutcome, StepStatus, TaskSink,
 };
 use crate::caps::ResourceCaps;
 use crate::compose::draw_child_budget;
@@ -196,6 +196,18 @@ pub enum RunLoopError {
     /// report that reaches the sink is there permanently.
     #[error("the synthesised report is not a valid report: {0}")]
     SynthesisedReportInvalid(String),
+    /// Ruling P117 §C's `run_state` annotation turned an **authored** report
+    /// that already validated at its own step into one that does not.
+    ///
+    /// Distinct from [`Self::SynthesisedReportInvalid`] because it blames a
+    /// different author: that variant means this module assembled a bad
+    /// document, this one means this module's own one-key annotation broke a
+    /// document the workflow wrote and [`validate_report`] had already
+    /// accepted. Checked rather than assumed for the same reason the two
+    /// producers check: the `events` table physically rejects
+    /// `UPDATE`/`DELETE`.
+    #[error("annotating the report with the run's terminal state made it invalid: {0}")]
+    AnnotatedReportInvalid(String),
     /// A `gate:` step's own fields are not usable — an empty `title`, a
     /// malformed `timeout:`, a `form:` that is not an object.
     #[error(transparent)]
@@ -264,6 +276,13 @@ pub enum RunOutcome {
     /// see [`crate::report::Outcome`]'s own doc: a run in `AwaitingHuman` has
     /// no result to report yet. Call [`run_workflow`] again with a
     /// [`GateAnswer`] to resume it.
+    ///
+    /// **This holds even when the workflow's `report:` step has already
+    /// completed** — the document it produced is held, not emitted, until the
+    /// run reaches a terminal state (see [`super::ReportEmission`]). The park
+    /// that never gets answered is therefore the one terminal path with no
+    /// report and no owner: `crate::report`'s module doc records that
+    /// obligation for whoever builds §8.11's reaper.
     Parked(Box<ParkResult>),
 }
 
@@ -352,16 +371,21 @@ pub fn run_workflow<H: WorkflowHost>(
     // Checked before anything runs: a workflow that cannot satisfy §8.6's
     // "exactly one" must not get halfway through committing side effects
     // before saying so.
-    let report_steps = [&main, &catch, &finally]
+    //
+    // It cannot see a `report:` nested inside a `map` — it flattens the three
+    // phase lists only — which is why such a step is refused where the nesting
+    // *is* visible, in `map_step`'s inner-step loop.
+    let report_steps: Vec<&StepDef> = [&main, &catch, &finally]
         .iter()
         .flat_map(|phase| phase.iter())
         .filter(|step| matches!(step.body, StepBody::Report { .. }))
-        .count();
-    if report_steps > 1 {
+        .collect();
+    if report_steps.len() > 1 {
         return Err(RunLoopError::MultipleReportSteps {
-            count: report_steps,
+            count: report_steps.len(),
         });
     }
+    let report_step = report_steps.first().map(|s| (*s).clone());
 
     let recovered = recover_run(conn, run_id)?;
     let session_id = recovered.run.session_id;
@@ -391,6 +415,10 @@ pub fn run_workflow<H: WorkflowHost>(
     // `Executor::new`'s only refusal is a secret too short to redact, which is
     // a run-level configuration fault — see `RunLoopError::Executor`.
     let mut executor = Executor::new(def, sink, run_ctx)?;
+    // Ruling P117 §C: under a real run the one report task is emitted by
+    // `ensure_report`, after the terminal state is known, so that the document
+    // can carry it. See `super::ReportEmission`.
+    executor.report_emission = ReportEmission::Deferred(None);
 
     let mut run = Loop {
         conn,
@@ -402,6 +430,7 @@ pub fn run_workflow<H: WorkflowHost>(
         secret_derived_steps: Vec::new(),
         outcomes: Vec::new(),
         authored_report: None,
+        report_step,
         finished_before: finished_step_rows(&recovered.steps),
         gate_answer: resume,
     };
@@ -429,7 +458,26 @@ pub fn run_workflow<H: WorkflowHost>(
     let finally_result = run.run_phase(&mut executor, Phase::Finally, &finally)?;
     let finally_failed = matches!(finally_result, PhaseEnd::Failed);
 
-    let state = if cancelled {
+    // **Ruling P117 §A, leg 1: the durable row is the second observer of a
+    // cancel, and it has to be consulted.** `cancelled` above is set only by
+    // `admit`, which runs only for steps *not* already checkpointed — so the
+    // last admission of the run is the last instant a cancel can be seen that
+    // way. Everything after it (that step's execution, the whole `finally:`
+    // phase, `ensure_report`) was a window in which an operator's `cancel`
+    // was invisible here: `state` computed `Completed`, `transition_is_legal`
+    // has no `Cancelling -> Completed` edge, and because `finish_run` is the
+    // **only** writer of `Cancelled`/`Failed` in the workspace, the run then
+    // could never be moved again — `ended_at` stayed `NULL`, the "run that
+    // looks live forever" `insert_run_row`'s guard is named for, and a
+    // cancelled child's grant leaked to nobody because `refund_child_run`
+    // correctly refuses a non-terminal child.
+    //
+    // One row read closes it, and it also closes ruling P116 §C's variant of
+    // the same defect (a run cancelled with nothing left to admit, where
+    // `admit` never runs at all). It is read here rather than at entry
+    // because a cancel that lands *during* the run must be seen too.
+    let observed = run_ledger(run.conn, run_id)?.state;
+    let state = if cancelled || observed == RunState::Cancelling {
         RunState::Cancelled
     } else if main_failed || finally_failed {
         RunState::Failed
@@ -439,10 +487,15 @@ pub fn run_workflow<H: WorkflowHost>(
 
     let report = run.ensure_report(&mut executor, state)?;
     let steps = std::mem::take(&mut run.outcomes);
-    finish_run(run.conn, run_id, state, now, &report)?;
+    let landed = finish_run(run.conn, run_id, state, now, &report)?;
 
     Ok(RunOutcome::Terminal {
-        state,
+        // The state that **actually landed on the row**, not the one computed
+        // above: leg 2 of the fix can re-target a cancel that raced the read,
+        // and a returned value that disagreed with the row would be exactly
+        // the "in-memory answer nothing else can see" defect this subsystem
+        // keeps producing.
+        state: landed,
         report: report.0,
         steps,
     })
@@ -523,14 +576,55 @@ fn ensure_gate_step(main: &[StepDef], answer: &GateAnswer) -> Result<(), RunLoop
 /// §8.12's *"refunded on completion"* also lands here, for the same reason
 /// `ended_at` does: it is a thing that is true exactly once, at the one edge
 /// where a run ends. A run with no `parent_run_id` refunds nothing.
+///
+/// # Leg 2 of ruling P117 §A: a cancel that raced the terminal write
+///
+/// Returns the state that **actually landed**, which is not always the one
+/// asked for. `run_workflow` reads the run's observed state just before
+/// computing `state` (leg 1), but a `cancel` can still land in the gap between
+/// that read and this write. The retry below closes it, and it is **race-free
+/// rather than a narrower window**: `Cancelling` has exactly two outgoing
+/// edges (`Cancelled` and `Failed`) and this function is the only writer of
+/// either, so a `Cancelling` observed by `transition_run`'s own
+/// `BEGIN IMMEDIATE` cannot become anything else before the retry runs.
+///
+/// Three alternatives were considered and rejected. Adding
+/// `(Running, Cancelled)` to [`transition_is_legal`](crate::durability::transition_is_legal)
+/// creates a path that skips `Cancelling`, which is the state
+/// [`admit_spend_during_finally`] keys off — `finally:` would stop running.
+/// Refusing to drive a `Cancelling` run at all leaves `finally:` unrun and the
+/// mandatory report unwritten (ruling P115 §A). Mapping the error onto
+/// `Failed` converges, but misreports an operator's cancel as a failure.
+///
+/// The `Paused` sibling is closed differently — by the
+/// `Paused -> Completed` edge the matrix was missing, so there is nothing to
+/// retry. See `transition_is_legal`'s own section on it.
+///
+/// **What the retry cannot fix, stated rather than implied:** the report was
+/// already persisted, with the terminal state as of leg 1's read annotated
+/// onto it. A cancel landing inside this gap therefore leaves a `Cancelled`
+/// run whose one report says `completed`. The row is authoritative; the
+/// annotation is one edge stale in exactly this race and no other. Closing
+/// that too would need the report emit and the transition in one transaction,
+/// and the sink is not a database handle (see [`TaskSink`]).
 fn finish_run(
     conn: &mut Connection,
     run_id: RunId,
     state: RunState,
     now: Timestamp,
     _report: &ReportPersisted,
-) -> Result<(), RunLoopError> {
-    transition_run(conn, run_id, state, now)?;
+) -> Result<RunState, RunLoopError> {
+    let landed = match transition_run(conn, run_id, state, now) {
+        Ok(_) => state,
+        Err(DurabilityError::IllegalTransition {
+            from: RunState::Cancelling,
+            ..
+        }) => {
+            transition_run(conn, run_id, RunState::Cancelled, now)?;
+            RunState::Cancelled
+        }
+        Err(other) => return Err(other.into()),
+    };
     // Read *after* the transition, because `refund_child_run` refuses a child
     // that has not reached a terminal state — correctly, since returning a live
     // child's grant would let it spend budget its parent had reclaimed.
@@ -538,7 +632,7 @@ fn finish_run(
     if ledger.parent_run_id.is_some() {
         refund_child_run(conn, run_id, now)?;
     }
-    Ok(())
+    Ok(landed)
 }
 
 /// How a phase ended.
@@ -567,7 +661,15 @@ struct Loop<'c, H: WorkflowHost> {
     steps_context: serde_json::Map<String, Value>,
     secret_derived_steps: Vec<String>,
     outcomes: Vec<StepOutcome>,
+    /// The id of the `report:` step that completed, whether on **this** pass
+    /// or an earlier one — see [`Loop::seed_context_from_checkpoints`] for why
+    /// the second half matters.
     authored_report: Option<String>,
+    /// The workflow's one `report:` step, if it declares one. Kept so a
+    /// re-drive whose report step is already checkpointed can still produce
+    /// the document (`ensure_report` re-renders it); `run_workflow`'s §8.6
+    /// pre-check has already established there is at most one.
+    report_step: Option<StepDef>,
     finished_before: HashMap<String, WorkflowStepRun>,
     gate_answer: Option<GateAnswer>,
 }
@@ -586,10 +688,39 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// so the taint survives the restart rather than being re-derived — the
     /// property [`StepOutcome::output_is_secret_derived`]'s doc calls a leak to
     /// recompute.
+    ///
+    /// # `authored_report` is restored here for the same reason, and it is not cosmetic
+    ///
+    /// [`Loop::authored_report`] used to be written **only** by
+    /// [`Loop::record`], which the `finished_before` skip bypasses. So a run
+    /// whose `report:` step completed on an earlier pass — an authored
+    /// `report:` ordered before a `gate:` is enough, no crash required —
+    /// resumed with `authored_report: None` and **synthesised a second
+    /// report** into an append-only log.
+    ///
+    /// The cost is not "two reports", it is triage inversion: a synthesised
+    /// report is generic by construction (`outcome: nothing`, `severity: low`,
+    /// `needs_human: false`), so a run whose author reported
+    /// `findings`/`high`/`needs_human: true` acquired a companion that sorts
+    /// it to the **bottom** of §8.6's order — ruling P112's own failure mode,
+    /// reached by *adding* a report rather than omitting one.
+    ///
+    /// It was invisible to the suite because every test built a fresh
+    /// `TaskSink` per `run_workflow` call while the production sink is per
+    /// **session**, so the second pass's assertion never saw the first pass's
+    /// report at all.
     fn seed_context_from_checkpoints(&mut self, rows: &[WorkflowStepRun]) {
         for row in rows {
             if row.item_index.is_some() {
                 continue;
+            }
+            if row.state == StepRunState::Completed
+                && self
+                    .report_step
+                    .as_ref()
+                    .is_some_and(|step| step.id == row.step_id)
+            {
+                self.authored_report = Some(row.step_id.clone());
             }
             let (status, output) = match row.state {
                 StepRunState::Completed => (
@@ -619,6 +750,28 @@ impl<H: WorkflowHost> Loop<'_, H> {
         }
     }
 
+    /// Rebinds `${{ steps }}` from the loop's own fold, carrying the taint
+    /// paths with it.
+    ///
+    /// **The projection below is where every secret-derived step's output is
+    /// marked, and its cardinality is load-bearing.** `set_with_secret_paths`
+    /// marks exactly the paths this iterator yields; a truncation of it
+    /// (`.take(1)`, `.skip(1)`) leaves some tainted step's output *unmarked*,
+    /// and an unmarked derived leaf reaches the log in **cleartext** — the
+    /// whole-value needle backstop structurally cannot catch a leaf of a JSON
+    /// secret. `tests/run_loop.rs` therefore carries two secret-derived steps,
+    /// with the leaf that matters relayed from the first in one test and the
+    /// last in another.
+    fn bind_steps_context(&self, executor: &mut Executor<'_>) {
+        executor.ctx.set_with_secret_paths(
+            "steps",
+            Value::Object(self.steps_context.clone()),
+            self.secret_derived_steps
+                .iter()
+                .map(|id| vec![id.clone(), "output".to_string()]),
+        );
+    }
+
     fn run_phase(
         &mut self,
         executor: &mut Executor<'_>,
@@ -633,13 +786,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 continue;
             }
 
-            executor.ctx.set_with_secret_paths(
-                "steps",
-                Value::Object(self.steps_context.clone()),
-                self.secret_derived_steps
-                    .iter()
-                    .map(|id| vec![id.clone(), "output".to_string()]),
-            );
+            self.bind_steps_context(executor);
 
             // §8.4's *"caps enforced at task admission"*, at the one place
             // every step passes. This is also where §8.13's cancel is
@@ -1166,17 +1313,38 @@ impl<H: WorkflowHost> Loop<'_, H> {
     }
 }
 
-/// The child caps a `call:` asks for: the step's own `caps:` overlaid on the
-/// parent's remaining ceiling.
+/// The child caps a `call:` asks for: the step's own `caps:` overlaid on a
+/// **bounded share** of the parent's remaining ceiling.
 ///
+/// # Why a share, and not the remainder (ruling P116 §A)
+///
+/// This used to default every field to `parent_remaining`. Combined with
+/// rulings P113/P114 — *every* child run draws its grant at insert, and
+/// [`Spend::for_grant`] charges the parent the child's **whole** grant up
+/// front — that made an uncapped `call:` take everything the parent had left.
+/// Every step after it was then refused `CapsExceeded`, **`finally:`
+/// included**: §8.13's *"`finally:` runs"* defeated by the budget route that
+/// [`admit_spend_during_finally`]'s admission exemption does not cover,
+/// because this is the caps check, not the admission gate. The run always
+/// ended `Failed`.
+///
+/// It was measured, not reasoned: with `max_tasks: 100` and one step spent,
+/// the child drew all 99 remaining tasks and the parent's next `admit` refused.
+/// Two things hid it — a test asserting the old behaviour as correct, and the
+/// fact that **no fixture placed any step after a `call:`**.
+///
+/// The rule is per *field*, so a declared `caps:` block is honoured for what
+/// it names and everything it does not name is bounded rather than total.
 /// [`crate::parse::steps::CapsDef`] carries only `max_cost_usd` and
-/// `max_tool_calls` — the two §8.9's reference workflow writes — so every other
-/// field asks for the parent's remainder and is clamped to it by
-/// [`draw_child_budget`]. Asking for the remainder is not the same as
-/// receiving it: the draw is `min(requested, remaining)` per field, so the
-/// effect is "as much as is left" and never more.
+/// `max_tool_calls` — the two §8.9's reference workflow writes — so the other
+/// five countables are the ones this default actually governs, which is the
+/// sharper half: a `caps:` block does not save an author from it.
+///
+/// Asking is still not receiving: [`draw_child_budget`] takes
+/// `min(requested, remaining)` per field, so a declared figure larger than the
+/// parent's remainder is clamped to it.
 fn requested_child_caps(step: &StepDef, parent_remaining: &ResourceCaps) -> ResourceCaps {
-    let mut requested = parent_remaining.clone();
+    let mut requested = bounded_child_share(parent_remaining);
     if let Some(caps) = &step.caps {
         if let Some(usd) = caps.max_cost_usd {
             requested.max_cost_usd = usd;
@@ -1188,6 +1356,46 @@ fn requested_child_caps(step: &StepDef, parent_remaining: &ResourceCaps) -> Reso
     requested
 }
 
+/// Half of each of the parent's remaining countables — the *"bounded share,
+/// never the remainder"* ruling P116 §A settles on, with the three
+/// `Duration` ceilings passed through unchanged.
+///
+/// # Why not [`split_budget`](super::map_step::split_budget)`(remaining, 2)` verbatim
+///
+/// Ruling P116 §A names that call as "the shape", and it is — but reusing it
+/// here would **not fix the defect**, which is why this is a second function
+/// rather than a call to that one. `split_budget` divides `max_cost_usd`,
+/// `max_tokens`, `max_tool_calls` and `max_bytes_written` and deliberately
+/// passes `max_tasks`, `max_subagents` and `max_escalations` through whole —
+/// correctly for its own caller, where the run-level cap is the meaningful
+/// per-item ceiling and nothing is *withdrawn* from the parent.
+///
+/// A child-run draw is the opposite: [`Spend::for_grant`] charges the parent
+/// **every** field of the grant, `max_tasks` included, and `max_tasks` is the
+/// field that actually starves the run — the loop charges one task per step.
+/// Measured against a parent with `max_tasks: 100` and 99 remaining:
+/// `split_budget(&remaining, 2).max_tasks` is 99, the parent is charged 99,
+/// and the step after the `call:` is refused exactly as before. So the
+/// division has to cover the fields `for_grant` charges, which is all seven.
+///
+/// The three `Duration`s are not divided for the reason
+/// [`draw_child_budget`] gives for clamping rather than withdrawing them: wall
+/// clock is not a quantity a parent hands over.
+fn bounded_child_share(remaining: &ResourceCaps) -> ResourceCaps {
+    ResourceCaps {
+        max_tokens: remaining.max_tokens / 2,
+        max_cost_usd: remaining.max_cost_usd / 2.0,
+        max_tasks: remaining.max_tasks / 2,
+        max_tool_calls: remaining.max_tool_calls / 2,
+        max_subagents: remaining.max_subagents / 2,
+        max_bytes_written: remaining.max_bytes_written / 2,
+        max_escalations: remaining.max_escalations / 2,
+        run_wall_timeout: remaining.run_wall_timeout,
+        run_active_timeout: remaining.run_active_timeout,
+        step_timeout: remaining.step_timeout,
+    }
+}
+
 impl<H: WorkflowHost> Loop<'_, H> {
     /// Ruling P112's two producers, in order: an authored `report:` step that
     /// completed, otherwise one assembled from the run's tasks.
@@ -1195,15 +1403,58 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// Returning a [`ReportPersisted`] is what lets [`finish_run`] be called
     /// at all, so there is no path from here to a terminal state that skips
     /// this function.
+    /// (continued) An authored report's document is **emitted here**, not at
+    /// its own step — [`super::ReportEmission`] says why, and it is what lets
+    /// the `run_state` annotation below be the run's real terminal state
+    /// rather than a guess made before `finally:` ran.
     fn ensure_report(
         &mut self,
         executor: &mut Executor<'_>,
         state: RunState,
     ) -> Result<ReportPersisted, RunLoopError> {
-        if let Some(step_id) = self.authored_report.clone() {
-            return Ok(ReportPersisted(ReportOrigin::Authored { step_id }));
+        let Some(step_id) = self.authored_report.clone() else {
+            return self.synthesise_report(executor, state);
+        };
+
+        let document = match take_deferred_report(executor) {
+            Some(document) => Some(document),
+            // The report step completed on an **earlier** pass, so
+            // `finished_before` skipped it this time and the executor holds
+            // nothing. Re-render it: `report:` is an interpolation of workflow
+            // source against a context this loop has already rebuilt from the
+            // checkpoint rows, and the redaction that makes it safe to persist
+            // needs live provenance that the stored (unredacted) step output
+            // cannot supply.
+            //
+            // Deliberately dispatched **here** rather than by un-skipping the
+            // step in `run_phase`: that would re-admit it against the budget
+            // and re-evaluate its `when:`, letting a condition that reads
+            // differently now change a control-flow decision that already
+            // happened ([`StepRunState::Skipped`]'s own argument).
+            None => {
+                let step = self
+                    .report_step
+                    .clone()
+                    .expect("authored_report is only ever set from report_step");
+                self.bind_steps_context(executor);
+                executor.dispatch_step(&step);
+                take_deferred_report(executor)
+            }
+        };
+
+        match document {
+            Some(document) => {
+                persist_report(executor, document, state)
+                    .map_err(RunLoopError::AnnotatedReportInvalid)?;
+                Ok(ReportPersisted(ReportOrigin::Authored { step_id }))
+            }
+            // Re-rendering failed (its `${{ }}` no longer resolves, or the
+            // document no longer validates). §8.6 still owes this run a
+            // report, so the second producer runs — the one case where a
+            // terminal run's report is `Synthesised` despite the workflow
+            // having authored one.
+            None => self.synthesise_report(executor, state),
         }
-        self.synthesise_report(executor, state)
     }
 
     /// §4.2's *"input: none (assembled from the run's tasks)"*.
@@ -1242,6 +1493,18 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// workflow-source field — which can be a credential an author pasted
     /// literally into the YAML, and which no provenance can see. That is
     /// exactly what [`redact_with_needles`] exists to catch.
+    ///
+    /// **And here, unlike on the authored path, "redaction can only ever steer
+    /// valid -> invalid" is not a safe direction** (ruling P117 §D). There the
+    /// invalid document fails one step and the run goes on to end. Here there
+    /// is no step to fail: a `secrets` value that redaction substitutes into a
+    /// field validation constrains — a secret whose literal value is
+    /// `findings`, say, redacting `outcome` to `***` — returns
+    /// [`RunLoopError::SynthesisedReportInvalid`], and since `finish_run`
+    /// cannot be reached without a [`ReportPersisted`], the run reaches **no**
+    /// terminal state on this drive or any later one. Absurdly narrow, and the
+    /// same shape as the Critical this fix round closed, so it is written down
+    /// rather than left to be rediscovered.
     fn synthesise_report(
         &mut self,
         executor: &mut Executor<'_>,
@@ -1281,7 +1544,15 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 };
                 serde_json::json!({
                     "id": o.step_id,
-                    "title": message,
+                    // The **third** sink for a step's failure message, and
+                    // until B12c's fix round the only unbounded one: the other
+                    // two are `durability`'s `MAX_STORED_STEP_ERROR_LEN` and
+                    // `exec`'s `MAX_STEPS_CONTEXT_ERROR_LEN`, both 512. A
+                    // `call:` naming a workflow whose name is arbitrarily long
+                    // produces an arbitrarily long step failure, and this
+                    // finding title is written into a table that physically
+                    // rejects `UPDATE`/`DELETE`.
+                    "title": truncate_diagnostic(message, MAX_FINDING_TITLE_LEN).as_ref(),
                     "severity": "high",
                     "location": o.step_id,
                 })
@@ -1304,30 +1575,203 @@ impl<H: WorkflowHost> Loop<'_, H> {
             "synthesised_by": "run_loop",
         });
         let logged = redact_with_needles(&document, &executor.redaction_needles);
-        validate_report(&logged)
-            .map_err(|e| RunLoopError::SynthesisedReportInvalid(e.to_string()))?;
-
-        let task_id = TaskId::new();
-        executor.sink.emit(
-            task_id,
-            None,
-            TaskKind::Report,
-            EventPayload::TaskCreated {
-                kind: TaskKind::Report,
-                parent: None,
-                origin: Origin::System,
-                input: TaskInput::Json(logged.clone()),
-            },
-        );
-        executor.sink.emit(
-            task_id,
-            None,
-            TaskKind::Report,
-            EventPayload::TaskCompleted {
-                output: TaskOutput::Json(logged),
-                usage: Usage::default(),
-            },
-        );
+        persist_report(executor, logged, state).map_err(RunLoopError::SynthesisedReportInvalid)?;
         Ok(ReportPersisted(ReportOrigin::Synthesised))
+    }
+}
+
+/// §8.6's extension key carrying the run's **real** terminal state (ruling
+/// P117 §C).
+///
+/// The one fact about a run that its report cannot otherwise be trusted for:
+/// an authored `report:` that completed before a later step failed says
+/// `outcome: changed, needs_human: false` about a run that is `Failed`, and
+/// §8.6's `(needs_human, severity, outcome != nothing)` sort then buries
+/// exactly the run ruling P112 exists to surface. The core half is the
+/// author's judgement and stays theirs; this is the loop's fact, on the half
+/// §8.6 leaves open for facts.
+///
+/// The alternative considered and rejected was refusing an authored `report:`
+/// outside `finally:` — that forbids the ordinary authoring pattern to work
+/// around an accounting bug.
+const RUN_STATE_KEY: &str = "run_state";
+
+/// A step's failure message, on its way into a synthesised report's finding
+/// `title`. Matches `durability`'s `MAX_STORED_STEP_ERROR_LEN` and `exec`'s
+/// `MAX_STEPS_CONTEXT_ERROR_LEN`, the other two sinks for the same text, and
+/// carries the same status they document: a round number, not a figure
+/// derived from any analysis.
+const MAX_FINDING_TITLE_LEN: usize = 512;
+
+/// Takes the document an authored `report:` step handed back instead of
+/// emitting — see [`super::ReportEmission`]. `None` when no `report:` step ran
+/// on this pass.
+fn take_deferred_report(executor: &mut Executor<'_>) -> Option<Value> {
+    match &mut executor.report_emission {
+        ReportEmission::Deferred(slot) => slot.take(),
+        // Unreachable from this module: `run_workflow` sets `Deferred` before
+        // any step dispatches. Written out rather than left to a `_` so that a
+        // third emission mode is a compile error here.
+        ReportEmission::Immediate => None,
+    }
+}
+
+/// Annotates the run's terminal state onto a report's extension half,
+/// re-validates, and emits the one `TaskKind::Report` task the run leaves
+/// behind. Both of §8.6's producers end here, so there is one place where a
+/// report reaches the log.
+///
+/// **Annotate, then validate, then emit** — the order the authored path
+/// already documents for redaction, and for the same reason: the bytes that
+/// are validated are byte-for-byte the bytes that are persisted, in a table
+/// that physically rejects `UPDATE`/`DELETE`. A `run_state` the author had
+/// also written is overwritten, deliberately: the loop's is the fact.
+///
+/// Returns the validation error's text rather than a [`RunLoopError`] so the
+/// two callers can each blame the right author — see
+/// [`RunLoopError::AnnotatedReportInvalid`].
+fn persist_report(
+    executor: &mut Executor<'_>,
+    document: Value,
+    state: RunState,
+) -> Result<(), String> {
+    let mut annotated = document;
+    if let Value::Object(fields) = &mut annotated {
+        fields.insert(
+            RUN_STATE_KEY.to_string(),
+            Value::String(state.wire_name().to_string()),
+        );
+    }
+    validate_report(&annotated).map_err(|e| e.to_string())?;
+
+    let task_id = TaskId::new();
+    executor.sink.emit(
+        task_id,
+        None,
+        TaskKind::Report,
+        EventPayload::TaskCreated {
+            kind: TaskKind::Report,
+            parent: None,
+            origin: Origin::System,
+            input: TaskInput::Json(annotated.clone()),
+        },
+    );
+    executor.sink.emit(
+        task_id,
+        None,
+        TaskKind::Report,
+        EventPayload::TaskCompleted {
+            output: TaskOutput::Json(annotated),
+            usage: Usage::default(),
+        },
+    );
+    Ok(())
+}
+
+/// Ruling P117 §A leg 2, at the only level it is reachable.
+///
+/// The retry defends a window between [`run_workflow`]'s state read and
+/// [`finish_run`]'s write, which a single-threaded integration test over an
+/// **in-memory** database cannot construct — there is no second connection to
+/// the same database and no hook that hands a caller the loop's own
+/// `&mut Connection` mid-run. `finish_run` is module-private, so this is where
+/// the retry can be handed the state that fails and asked what it does.
+///
+/// The `Paused` sibling is here for the same reason and closes differently:
+/// no retry, one matrix edge (`Paused -> Completed`) that was missing.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::durability::{insert_workflow_run, open_test_db, recover_run};
+    use roundhouse_core::JobId;
+
+    fn seeded_run(conn: &mut Connection) -> RunId {
+        let run_id = RunId::new();
+        insert_workflow_run(
+            conn,
+            &WorkflowRun {
+                id: run_id,
+                job_id: JobId::new(),
+                job_version: 1,
+                content_hash: "sha256:pinned".into(),
+                session_id: SessionId::new(),
+                binding_id: None,
+                trigger_event_id: None,
+                state: RunState::Running,
+                parent_run_id: None,
+                forked_from_run_id: None,
+                awaiting_until: None,
+                started_at: Timestamp::from_unix_nanos(0),
+                ended_at: None,
+                session_depth: Some(0),
+                caps: Some(ResourceCaps::default()),
+            },
+        )
+        .expect("seed the run row");
+        run_id
+    }
+
+    #[test]
+    fn a_cancel_that_raced_the_terminal_write_lands_cancelled_not_stranded() {
+        let mut conn = open_test_db();
+        let run_id = seeded_run(&mut conn);
+        // The operator's cancel, arriving after `run_workflow` read the state
+        // and before it wrote the terminal one.
+        transition_run(
+            &mut conn,
+            run_id,
+            RunState::Cancelling,
+            Timestamp::from_unix_nanos(1),
+        )
+        .expect("Running -> Cancelling");
+
+        let landed = finish_run(
+            &mut conn,
+            run_id,
+            RunState::Completed,
+            Timestamp::from_unix_nanos(2),
+            &ReportPersisted(ReportOrigin::Synthesised),
+        )
+        .expect("the run reaches a terminal state rather than being stranded");
+
+        assert_eq!(
+            landed,
+            RunState::Cancelled,
+            "an operator's cancel outranks the loop's `Completed`, and is not \
+             misreported as `Failed`"
+        );
+        let row = recover_run(&conn, run_id).unwrap().run;
+        assert_eq!(row.state, RunState::Cancelled);
+        assert!(
+            row.ended_at.is_some(),
+            "and `ended_at` is stamped — the run does not look live forever"
+        );
+    }
+
+    #[test]
+    fn a_pause_that_raced_the_terminal_write_still_completes_the_run() {
+        let mut conn = open_test_db();
+        let run_id = seeded_run(&mut conn);
+        crate::control::pause(&mut conn, run_id, Timestamp::from_unix_nanos(1))
+            .expect("Running -> Paused");
+
+        let landed = finish_run(
+            &mut conn,
+            run_id,
+            RunState::Completed,
+            Timestamp::from_unix_nanos(2),
+            &ReportPersisted(ReportOrigin::Synthesised),
+        )
+        .expect("a run paused after its last step still ends");
+
+        assert_eq!(
+            landed,
+            RunState::Completed,
+            "a paused run whose steps all ran did complete — unlike a \
+             cancelled one, which did not"
+        );
+        let row = recover_run(&conn, run_id).unwrap().run;
+        assert_eq!(row.state, RunState::Completed);
+        assert!(row.ended_at.is_some());
     }
 }

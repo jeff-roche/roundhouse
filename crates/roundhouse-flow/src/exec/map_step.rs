@@ -53,7 +53,7 @@
 use crate::caps::ResourceCaps;
 use crate::exec::{evaluate_when_gate, Executor, GateDecision, StepOutcome, StepStatus};
 use crate::expr::{eval_delimited_expression, TemplateSource};
-use crate::parse::steps::{parse_step, OnItemError, StepDef};
+use crate::parse::steps::{parse_step, OnItemError, StepBody, StepDef};
 use serde_json::Value;
 
 /// Hard, closed-fail cap on a single `map` step's item count (fix round 1,
@@ -812,12 +812,59 @@ impl<'a> Executor<'a> {
             max_parallel,
             on_item_error,
             &mut budget,
+            // **`_item_caps` is where ruling P108 §C stops being discharged,
+            // and this binding is the reason** (named here, at the site a
+            // future implementer works, not only where the value is sourced).
+            // `run_loop::run_workflow` computes a real, live
+            // `split_budget(&budget.total_remaining, n)` from the run's
+            // ledger and `run_map` hands it to this closure — and nothing
+            // reads it, so per-item *enforcement* does not exist. B12c's
+            // mutation sweep measured exactly that: the two survivors it
+            // could not kill (`M1`/`M2`) both mutate the split arithmetic,
+            // and both are `EQUIVALENT` **because of this underscore**.
+            //
+            // Whoever gives `map` real fan-out owns closing it: bind the
+            // parameter, and admit each item's spend against it through
+            // `ledger::admit_spend` the way `run_loop::Loop::admit` does for
+            // a top-level step. Until then the sourcing is correct and the
+            // ceiling is the run-level one.
             |item, _item_caps| {
                 let item_evaluated = over_evaluated.derive(item.clone());
                 self.ctx.set_from(as_name, &item_evaluated);
 
                 let mut last = ItemOutcome::Completed(Value::Null);
                 for inner in &inner_steps {
+                    // **A `report:` is a property of the run, not of a map
+                    // item** — the same argument already written for the
+                    // nested `gate:` and `call:` refusals in
+                    // `Executor::dispatch_step`'s catch-all arm, applied to
+                    // the third step kind that has run-wide meaning (B12c fix
+                    // round, ruling P116 §B).
+                    //
+                    // Refused **here** rather than in that arm because
+                    // `dispatch_step` is also how a *top-level* `report:` step
+                    // is run, by both `run_to_completion` and
+                    // `run_loop::run_workflow`; the arm cannot tell the two
+                    // callers apart, and this loop is the one that knows the
+                    // step is nested.
+                    //
+                    // What it costs to leave open: `run_workflow`'s §8.6
+                    // "exactly one report" pre-check flattens only the three
+                    // phase step lists, so it structurally cannot see a
+                    // `report:` under a `map` — and a nested one emits one
+                    // `TaskKind::Report` task **per item**, into a log that
+                    // physically rejects `UPDATE`/`DELETE`. Ruling P112's
+                    // invariant would then be violated by a workflow the
+                    // pre-check accepted.
+                    if matches!(inner.body, StepBody::Report { .. }) {
+                        last = ItemOutcome::Failed(format!(
+                            "step `{}`: a `report:` step cannot run inside a `map`: \
+                             §8.6's report is a property of the run, and one per item \
+                             would leave the Runs inbox choosing between them",
+                            inner.id
+                        ));
+                        break;
+                    }
                     // Fix round 2, item 1: evaluate the inner step's own
                     // `when:` gate before dispatching it — the fail-open
                     // defect this closes, and why a shared helper rather
