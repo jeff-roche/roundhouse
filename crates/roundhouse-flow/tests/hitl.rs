@@ -17,8 +17,10 @@
 //! `serde_json::Value` (whose map equality is order-insensitive) or indexed
 //! key by key.
 
-use roundhouse_core::{PolicyDecision, TaskId};
-use roundhouse_flow::hitl::{AwaitingHuman, Escalate, Escalation, HitlError, HumanWaitSource};
+use roundhouse_core::{PolicyDecision, SessionId, SuspendReason, TaskId};
+use roundhouse_flow::hitl::{
+    AwaitingHuman, Escalate, Escalation, HitlError, HumanWaitSource, UncheckedOnTimeout,
+};
 use roundhouse_flow::parse::steps::{parse_step, StepBody};
 use roundhouse_flow::parse::types::{OnTimeout, RetryDef, UnattendedDef, UnattendedEscalate};
 use roundhouse_flow::retry::{retry_policy_from_def, DurationParseError, RetryPolicyError};
@@ -72,8 +74,11 @@ fn an_explicit_gate_step_and_a_permission_escalation_produce_the_same_task_shape
             ..from_escalate.clone()
         }
     );
-    assert_eq!(from_gate.deadline, Some(Duration::from_secs(12 * 3600)));
-    assert_eq!(from_gate.on_timeout, OnTimeout::Deny);
+    assert_eq!(
+        from_gate.timeout_after,
+        Some(Duration::from_secs(12 * 3600))
+    );
+    assert_eq!(from_gate.on_timeout.as_written(), &OnTimeout::Deny);
 }
 
 #[test]
@@ -89,7 +94,7 @@ fn the_deadline_is_a_relative_duration_not_an_absolute_instant() {
     let first = AwaitingHuman::from_gate(task_id, &title, &form, &timeout, &on_timeout).unwrap();
     let second = AwaitingHuman::from_gate(task_id, &title, &form, &timeout, &on_timeout).unwrap();
 
-    assert_eq!(first.deadline, Some(Duration::from_secs(86_400)));
+    assert_eq!(first.timeout_after, Some(Duration::from_secs(86_400)));
     assert_eq!(first, second);
 }
 
@@ -312,8 +317,8 @@ fn only_an_ask_escalates_and_each_job_level_escalate_shape_resolves_it_different
     };
     assert_eq!(awaiting.source, HumanWaitSource::PermissionEscalate);
     assert_eq!(awaiting.task_id, task_id);
-    assert_eq!(awaiting.deadline, Some(Duration::from_secs(3600)));
-    assert_eq!(awaiting.on_timeout, OnTimeout::Deny);
+    assert_eq!(awaiting.timeout_after, Some(Duration::from_secs(3600)));
+    assert_eq!(awaiting.on_timeout.as_written(), &OnTimeout::Deny);
 
     // §8.5 point 3: `DenyAndContinue` turns the `Ask` into a plain `Deny`;
     // rendering it as a structured tool error is the executor's job.
@@ -328,6 +333,88 @@ fn only_an_ask_escalates_and_each_job_level_escalate_shape_resolves_it_different
 }
 
 #[test]
+fn a_gate_timeout_that_parses_to_zero_is_rejected_so_no_wait_is_born_already_expired() {
+    // `parse_duration_str("0s")` is `Ok(Duration::ZERO)` — zero rejection was
+    // never in the parser; it lives in `retry.rs`'s `resolve_duration`, which
+    // is retry-only. Without a counterpart here, `timeout: 0s` produces a
+    // human wait whose window is already closed: it resolves per `on_timeout`
+    // with no human able to see it, while still appearing in the run record
+    // as a configured approval gate. Task 17 cannot catch it — it receives a
+    // `Duration` and cannot tell an authored `0s` from a legitimately elapsed
+    // one.
+    for zero in ["0s", "0m", "0h", "0d", "00s", "000000s"] {
+        let (title, form, timeout, on_timeout) = gate_fields(&format!(
+            "id: g\ngate: {{ title: t, timeout: '{zero}', on_timeout: approve }}"
+        ));
+        let err = AwaitingHuman::from_gate(TaskId::new(), &title, &form, &timeout, &on_timeout)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            HitlError::ZeroDeadline {
+                field: "gate.timeout",
+                value: zero.to_string(),
+            },
+            "gate timeout {zero:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unattended_park_deadline_that_parses_to_zero_is_rejected_on_the_same_grounds() {
+    // The escalate site does this for *every* `PolicyDecision::Ask` in an
+    // unattended run, so the same degenerate value is worse here than at a
+    // single gate.
+    for zero in ["0s", "0m", "0h", "0d", "00s", "000000s"] {
+        assert_eq!(
+            Escalate::try_from(&UnattendedDef {
+                escalate: UnattendedEscalate::Park,
+                deadline: Some(zero.to_string()),
+                on_timeout: Some(OnTimeout::Approve),
+            })
+            .unwrap_err(),
+            HitlError::ZeroDeadline {
+                field: "permissions.unattended.deadline",
+                value: zero.to_string(),
+            },
+            "unattended deadline {zero:?}"
+        );
+    }
+}
+
+#[test]
+fn a_zero_duration_is_now_rejected_on_the_gate_the_escalate_and_the_retry_paths_alike() {
+    // The claim `from_gate`'s doc used to make — that a gate's `timeout` is
+    // rejected exactly as a retry's `base` is — was true of malformed text
+    // and false of degenerate-but-valid text. This pins the parity that now
+    // actually holds, on the same `"0s"` through all three entry points.
+    assert!(matches!(
+        retry_policy_from_def(&RetryDef {
+            base: Some("0s".to_string()),
+            ..RetryDef::default()
+        })
+        .unwrap_err(),
+        RetryPolicyError::ZeroDuration { field: "base", .. }
+    ));
+
+    let (title, form, timeout, on_timeout) =
+        gate_fields("id: g\ngate: { title: t, timeout: '0s', on_timeout: deny }");
+    assert!(matches!(
+        AwaitingHuman::from_gate(TaskId::new(), &title, &form, &timeout, &on_timeout).unwrap_err(),
+        HitlError::ZeroDeadline { .. }
+    ));
+
+    assert!(matches!(
+        Escalate::try_from(&UnattendedDef {
+            escalate: UnattendedEscalate::Park,
+            deadline: Some("0s".to_string()),
+            on_timeout: Some(OnTimeout::Deny),
+        })
+        .unwrap_err(),
+        HitlError::ZeroDeadline { .. }
+    ));
+}
+
+#[test]
 fn gate_on_timeout_approve_reaches_awaiting_human_unchecked_because_its_precondition_is_run_time() {
     // §8.11: "`approve` is permitted only when the run's policy is narrower
     // than the job default" — a fact about the bound, running policy, not
@@ -339,7 +426,138 @@ fn gate_on_timeout_approve_reaches_awaiting_human_unchecked_because_its_precondi
         gate_fields("id: g\ngate: { title: t, timeout: 1h, on_timeout: approve }");
     let awaiting =
         AwaitingHuman::from_gate(TaskId::new(), &title, &form, &timeout, &on_timeout).unwrap();
-    assert_eq!(awaiting.on_timeout, OnTimeout::Approve);
+    assert_eq!(awaiting.on_timeout.as_written(), &OnTimeout::Approve);
+}
+
+#[test]
+fn reading_an_unchecked_on_timeout_as_a_decision_requires_supplying_the_run_time_fact() {
+    // The deferral is a type, not a comment: the only way to a decision is
+    // `resolve`, whose argument *is* §8.11's precondition. `false` fails
+    // closed (§8.5 point 5, "capabilities narrow downward only") by
+    // downgrading `approve` to `deny`; nothing else carries a precondition,
+    // so nothing else moves in either direction.
+    let approve = UncheckedOnTimeout::new(OnTimeout::Approve);
+    assert_eq!(approve.resolve(false), OnTimeout::Deny);
+    assert_eq!(approve.resolve(true), OnTimeout::Approve);
+    // ...while the written value is still available for *rendering* the wait
+    // ("approves on timeout"), which is what `as_written` is named for.
+    assert_eq!(approve.as_written(), &OnTimeout::Approve);
+
+    for unconditioned in [
+        OnTimeout::Deny,
+        OnTimeout::Fail,
+        OnTimeout::Default("${{ inputs.fallback }}".to_string()),
+    ] {
+        let wrapped = UncheckedOnTimeout::new(unconditioned.clone());
+        assert_eq!(wrapped.resolve(false), unconditioned, "{unconditioned:?}");
+        assert_eq!(wrapped.resolve(true), unconditioned, "{unconditioned:?}");
+    }
+}
+
+#[test]
+fn every_suspend_reason_is_classified_so_a_sixth_core_variant_breaks_the_build() {
+    // `SuspendReason` has five variants, not three: the three human waits
+    // §8.11 unifies, plus the two messaging waits, which are not human waits
+    // at all. This `match` has no wildcard arm, so adding a sixth core
+    // variant fails to compile here rather than quietly falling through a
+    // stale comment.
+    fn human_wait_source_of(reason: &SuspendReason) -> Option<HumanWaitSource> {
+        match reason {
+            SuspendReason::WorkflowGate { .. } => Some(HumanWaitSource::Gate),
+            SuspendReason::AwaitingApproval { .. } => Some(HumanWaitSource::PermissionEscalate),
+            SuspendReason::AwaitingElicitation { .. } => Some(HumanWaitSource::Elicitation),
+            SuspendReason::AwaitingReply | SuspendReason::AwaitingPeer { .. } => None,
+        }
+    }
+
+    assert_eq!(
+        human_wait_source_of(&SuspendReason::WorkflowGate {
+            step_ref: "deploy".to_string()
+        }),
+        Some(HumanWaitSource::Gate)
+    );
+    assert_eq!(
+        human_wait_source_of(&SuspendReason::AwaitingApproval {
+            rule: None,
+            params_digest: [0u8; 32],
+        }),
+        Some(HumanWaitSource::PermissionEscalate)
+    );
+    assert_eq!(
+        human_wait_source_of(&SuspendReason::AwaitingElicitation {
+            schema: serde_json::json!({"type": "object"}),
+        }),
+        Some(HumanWaitSource::Elicitation)
+    );
+    assert_eq!(human_wait_source_of(&SuspendReason::AwaitingReply), None);
+    assert_eq!(
+        human_wait_source_of(&SuspendReason::AwaitingPeer {
+            session: SessionId::new(),
+        }),
+        None
+    );
+}
+
+#[test]
+fn a_gate_that_declares_no_form_asks_the_same_question_an_escalation_asks() {
+    // `form:` is optional and defaults to `{}`, which as a schema is
+    // `properties: {}` — no field expressing the decision, while every
+    // escalation gets `{"approve": {"type": "boolean"}}`. That is the one
+    // shape where §8.11's "TUI and web render from the same schema" would
+    // hand the two renderers materially different instructions for the same
+    // question, so a formless gate falls back to the escalation's field.
+    let (title, form, timeout, on_timeout) =
+        gate_fields("id: g\ngate: { title: 'Allow `git push`?', timeout: 1h, on_timeout: deny }");
+    let formless =
+        AwaitingHuman::from_gate(TaskId::new(), &title, &form, &timeout, &on_timeout).unwrap();
+    assert_eq!(
+        formless.form_schema["properties"]["approve"]["type"],
+        serde_json::json!("boolean")
+    );
+
+    // An explicitly empty `form: {}` is indistinguishable from an omitted one
+    // by the time it reaches here — `GateBodyDef` defaults the field to the
+    // same `{}` — so it resolves the same way.
+    let (title, form, timeout, on_timeout) = gate_fields(
+        "id: g\ngate: { title: 'Allow `git push`?', form: {}, timeout: 1h, on_timeout: deny }",
+    );
+    let empty_form =
+        AwaitingHuman::from_gate(TaskId::new(), &title, &form, &timeout, &on_timeout).unwrap();
+    assert_eq!(empty_form.form_schema, formless.form_schema);
+
+    // A gate that *does* declare fields has stated the form in full and is
+    // left exactly as written — no approve field is injected alongside.
+    let (title, form, timeout, on_timeout) = gate_fields(
+        "id: g\ngate: { title: t, form: { note: { type: string } }, timeout: 1h, on_timeout: deny }",
+    );
+    let declared =
+        AwaitingHuman::from_gate(TaskId::new(), &title, &form, &timeout, &on_timeout).unwrap();
+    assert_eq!(
+        declared.form_schema["properties"]["note"]["type"],
+        serde_json::json!("string")
+    );
+    assert_eq!(
+        declared.form_schema["properties"]["approve"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn a_gate_with_an_empty_title_is_rejected_rather_than_rendered_as_an_unlabelled_prompt() {
+    // `GateBodyDef::title` is an unconstrained `String`, and `""` reaches
+    // `form_schema`'s `"title"` and out to both renderers as an approval
+    // prompt with nothing on it saying what is being approved.
+    for blank in ["''", "'   '", "\"\\t\""] {
+        let (title, form, timeout, on_timeout) = gate_fields(&format!(
+            "id: g\ngate: {{ title: {blank}, timeout: 1h, on_timeout: deny }}"
+        ));
+        assert_eq!(
+            AwaitingHuman::from_gate(TaskId::new(), &title, &form, &timeout, &on_timeout)
+                .unwrap_err(),
+            HitlError::EmptyGateTitle,
+            "gate title {blank}"
+        );
+    }
 }
 
 #[test]
@@ -353,7 +571,7 @@ fn on_timeout_default_carries_its_argument_verbatim_with_evaluation_still_deferr
     // Uninterpolated source text, not a value: the `${{ }}` expression
     // language evaluates it at timeout time, not here.
     assert_eq!(
-        awaiting.on_timeout,
-        OnTimeout::Default("${{ inputs.fallback }}".to_string())
+        awaiting.on_timeout.as_written(),
+        &OnTimeout::Default("${{ inputs.fallback }}".to_string())
     );
 }
