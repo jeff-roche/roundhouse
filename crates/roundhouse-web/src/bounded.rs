@@ -1,6 +1,6 @@
 //! The store pool, the bound on how many API requests may hold a connection
 //! from it, and the one expression that reaches through the first — **in a leaf
-//! module, which is the whole reason this file exists.**
+//! module, which is why this file exists rather than being part of `lib.rs`.**
 //!
 //! # Why a module and not a private field in the crate root
 //!
@@ -39,6 +39,22 @@
 //! `lan_auth::BindConfig`, which has an `inner` field of its own, three times.
 //! `tests/bounded_reach.rs` checks the properties instead, and says why the grep
 //! is not the test.
+//!
+//! # The field is one path to the pool, and it was not the only one
+//!
+//! Everything above is about `inner`. It closed the *field* path and left every
+//! *method* path open, which ruling P101 then found: [`StoreConnection`] is a
+//! newtype over [`roundhouse_store::PooledConnection`], a newtype inherits its
+//! `Deref` target's whole inherent API, and `deadpool`'s `Object::pool` is a
+//! back-reference handing out the pool itself. No expression naming `inner` was
+//! involved, so neither the scan nor the `trybuild` case could see it.
+//!
+//! The `Deref` impl at the bottom of this file is where that is closed, and it
+//! carries the argument. **The general shape is worth keeping in view whenever
+//! anything here changes: encapsulation by newtype is only as tight as the
+//! `Deref` target's API**, so "the only way" is a claim about two surfaces
+//! rather than one — which is why nothing in this file makes that claim
+//! unqualified any more.
 
 /// The store pool with its `Pool` handle **out of reach**, so that
 /// [`BoundedStore::connection`] is not merely the convenient way to take a
@@ -54,7 +70,8 @@
 ///   privacy is the defining module *and its descendants*. This module declares
 ///   no `mod`, so it has no descendants and no other module in the crate can
 ///   read it. `tests/bounded_reach.rs` fails if either half changes.
-/// - **The method path.** [`StoreConnection`] `Deref`s **past**
+/// - **The method path.** `StoreConnection` (`pub(crate)`, so not linked — it
+///   is below this page) `Deref`s **past**
 ///   [`roundhouse_store::PooledConnection`] rather than to it, so `deadpool`'s
 ///   `Object::pool` back-reference — which would hand a permitted connection's
 ///   holder the whole pool, needing no dependency and never naming `inner` — is
