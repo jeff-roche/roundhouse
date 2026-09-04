@@ -444,10 +444,11 @@ async fn store(dir: &tempfile::TempDir) -> roundhouse_store::StorePool {
 /// on its own, are wired to each other and to the route. An empty database is
 /// enough for that, and it is the state every fresh install is in.
 ///
-/// **What it does not do, said plainly rather than implied:** it does not kill a
-/// mutation that drops the `sort_for_triage` call. That needs seeded rows, and
-/// seeding them here would mean SQL in this crate's tests, which ruling P86 put
-/// in `roundhouse-flow` on purpose. The sort itself is exercised five ways above.
+/// **What it does not do:** it does not kill a mutation of the handler's outer
+/// map, because the empty list is the correct answer to every one of them. That
+/// is what `a_non_empty_inbox_comes_back_whole_and_in_triage_order` below is
+/// for; this test keeps the empty case, which is the state every fresh install
+/// is in and is a different answer from the `503` above.
 #[tokio::test]
 async fn a_router_with_a_real_store_answers_an_empty_inbox_as_an_empty_list() {
     let dir = tempfile::tempdir().expect("a temp dir is creatable");
@@ -470,6 +471,98 @@ async fn a_router_with_a_real_store_answers_an_empty_inbox_as_an_empty_list() {
         json_body(response).await,
         serde_json::json!([]),
         "an empty database is an empty inbox — and, unlike the 503, a real answer"
+    );
+}
+
+/// Seeds `runs` into `pool`'s database, in the order given.
+///
+/// The seeding is `roundhouse_flow::runs::seed_completed_run_with_report`,
+/// reached through this crate's `test-util` dev-dependency (ruling P96 §B).
+/// **There is still no SQL in this crate** — ruling P86 keeps the `INSERT`s
+/// beside the query they seed for, in the crate that owns both the tables' edge
+/// and §8.6's report shape. Note the `interact` closure never names
+/// `rusqlite::Connection`; its parameter is inferred, exactly as
+/// `runs::list_runs` does it.
+async fn seed(pool: &roundhouse_store::StorePool, runs: Vec<(i64, Report)>) {
+    let connection = pool.pool.get().await.expect("a pooled connection");
+    connection
+        .interact(move |conn| {
+            for (started_at, report) in runs {
+                roundhouse_flow::runs::seed_completed_run_with_report(
+                    conn, None, started_at, &report,
+                );
+            }
+        })
+        .await
+        .expect("the seeding closure runs on the pool's blocking thread");
+}
+
+/// The handler's outer map — `sort_for_triage(…).into_iter().map(…).collect()`
+/// — end to end over a real database, which is the only place its four
+/// mutations are visible.
+///
+/// # What was wrong with only having the empty-inbox test
+///
+/// `[]` is the correct answer to `.take(1)`, to `.skip(1)`, to `.take(0)` and to
+/// dropping the `sort_for_triage` call alike, so all four survived the sweep
+/// (WC4-WC7) against a suite that was otherwise green. The sort is exercised
+/// five ways above — but on `sort_for_triage` **called directly**, which says
+/// nothing about whether the handler calls it.
+///
+/// # Why the fixture is two runs and not one, and why these two
+///
+/// The two runs are chosen so that **query order and triage order disagree**,
+/// which is what separates "the sort ran" from "the rows happened to come back
+/// sorted". `recent_workflow_runs` returns `ORDER BY started_at DESC`, so the
+/// newer run leads the query; it is the one that wants no human, so triage
+/// puts it **last**. Every one of the four mutations therefore changes this
+/// assertion:
+///
+/// ```text
+/// intact    -> ["needs a human", "quiet and newer"]
+/// no sort   -> ["quiet and newer", "needs a human"]   (query order)
+/// .take(1)  -> ["needs a human"]
+/// .skip(1)  -> ["quiet and newer"]
+/// .take(0)  -> []
+/// ```
+///
+/// The whole body is compared rather than a length, so a mutation that drops a
+/// run cannot pass by returning a different one.
+#[tokio::test]
+async fn a_non_empty_inbox_comes_back_whole_and_in_triage_order() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let pool = store(&dir).await;
+
+    let mut quiet = report(Outcome::Nothing, Severity::Low, false);
+    quiet.headline = "quiet and newer".into();
+    let mut urgent = report(Outcome::Changed, Severity::High, true);
+    urgent.headline = "needs a human".into();
+    seed(&pool, vec![(100, urgent), (200, quiet)]).await;
+
+    let state = AppState {
+        store: Some(BoundedStore::new(pool)),
+        ..AppState::default()
+    };
+    let response = get(build_router(state, &BindConfig::loopback()), "/api/runs").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let headlines: Vec<&str> = body
+        .as_array()
+        .expect("the inbox is a JSON array")
+        .iter()
+        .map(|run| {
+            run["report"]["headline"]
+                .as_str()
+                .expect("every row carries its report's headline")
+        })
+        .collect();
+
+    assert_eq!(
+        headlines,
+        vec!["needs a human", "quiet and newer"],
+        "the handler must return every seeded run, and in triage order rather than the query \
+         order the newer run would lead"
     );
 }
 

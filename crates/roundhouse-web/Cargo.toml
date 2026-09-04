@@ -210,6 +210,29 @@ tower = { version = "=0.5.3", features = ["util"] }
 # rather than the `"3"` range seven other crates use, for the exact-pin reason
 # stated throughout this manifest.
 tempfile = "=3.27.0"
+# Task 35 (Phase 5, Subsystem D6), ruling P96 §B: the same `roundhouse-flow`
+# already in `[dependencies]` above, re-declared here **only** to turn on its
+# `test-util` feature for this crate's `tests/*.rs`. It adds no package and no
+# edge — `cargo` unifies the two declarations into one dependency whose feature
+# set is the union.
+#
+# What it unlocks is `roundhouse_flow::runs::seed_completed_run_with_report`,
+# which puts runs in a real database so `tests/runs.rs` can assert what
+# `GET /api/runs` returns for a **non-empty** inbox. Until then the only
+# real-store fixture asserted `[]`, and four mutations of `list_runs`'s outer
+# map survived the sweep because the empty list is the correct answer to all of
+# them (WC4-WC7: `.take(1)`, `.skip(1)`, `.take(0)`, and dropping
+# `sort_for_triage`).
+#
+# The seeding lives over there rather than here, which is the point: ruling P86
+# keeps `roundhouse-web` free of SQL against another crate's private schema, and
+# hand-writing those `INSERT`s in this crate's *tests* would be the same
+# violation with a thinner excuse. There is still **no `rusqlite` here and no
+# SQL anywhere in this crate**, tests included.
+#
+# `default-features = false` is deliberately absent: `roundhouse-flow` declares
+# no default features, so there is nothing to switch off.
+roundhouse-flow = { path = "../roundhouse-flow", features = ["test-util"] }
 # Task 35 (Phase 5, Subsystem D6), ruling P96 §C: `tests/compile_fail.rs` pins
 # that `BoundedStore`'s pool is unreachable from outside this crate. That is a
 # property of what does *not* compile, so it has no runtime test and no

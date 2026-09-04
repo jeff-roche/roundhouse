@@ -264,6 +264,143 @@ fn extract_report_json(payload: &str) -> Option<serde_json::Value> {
         .cloned()
 }
 
+/// Test-only helper: one completed [`crate::durability::WorkflowRun`] that
+/// [`load_run_summaries`] will return, with `report` as its terminal `Report`
+/// task's output. Returns the run's id.
+///
+/// # Why this is here rather than in the crate that serves the inbox
+///
+/// Same reason as the query above it, ruling P86. `roundhouse-web` renders the
+/// inbox, and its own test suite could only reach past
+/// `AppState::store_connection` with a database that has runs in it — but
+/// seeding one means `INSERT`s against **`roundhouse-store`'s** `workflow_run`,
+/// `tasks` and `events` tables, and `roundhouse-web` declares neither
+/// `rusqlite` nor any compile-time link to that schema. Writing those `INSERT`s
+/// there would put the crate back in the position P86 took it out of, in its
+/// tests instead of its source, which is the same hazard with a thinner excuse.
+///
+/// So the seeding lives beside the query it seeds for, and `roundhouse-web`
+/// dev-depends on this crate with `features = ["test-util"]`.
+///
+/// **What that bought, specifically.** Before it, `roundhouse-web`'s only
+/// real-store fixture asserted `[]` against an empty database, so four
+/// mutations of `runs::list_runs`'s outer map survived the sweep: `.take(1)`,
+/// `.skip(1)` and `.take(0)` on the run list, and dropping the
+/// `sort_for_triage` call entirely (WC4-WC7). Every one of them is invisible to
+/// a fixture whose correct answer is the empty list.
+///
+/// # `&Report`, and the round-trip it checks on the way past
+///
+/// The parameter is a typed [`Report`] rather than a `serde_json::Value`, so a
+/// caller does not hand-write §8.6's document shape — and the serialized form
+/// is fed back through [`validate_report`] here, before it is written. That is
+/// not belt-and-braces: [`Report`] derives `Serialize` and **not**
+/// `Deserialize` (its `extra` map is `#[serde(flatten)]`, and this module's
+/// docs record why the pair cannot be a typed round-trip), so nothing else in
+/// the workspace would notice if the two drifted. A seeded row the real query
+/// then rejects as [`RunsError::InvalidReport`] would fail a caller's test with
+/// a message about the *query*; this fails it here, naming the report.
+///
+/// # Cost model
+///
+/// `started_at_nanos` orders the runs: [`crate::durability::recent_workflow_runs`]
+/// returns `ORDER BY started_at DESC, id DESC`, so a caller that wants query
+/// order to differ from triage order controls it with this. Every run gets a
+/// fresh [`SessionId`], so the event `seq` is always `1` and no caller has to
+/// track one.
+///
+/// # Its relationship to the finer helpers in this crate's own `tests/runs.rs`
+///
+/// Named rather than left for a reader to trip over: that file has
+/// `completed_run` / `seed_report_task` / `seed_report`, and these `INSERT`s are
+/// the same rows. They are **not** folded into this one and should not be.
+/// Those tests seed a `TaskOutput::Text`, a hand-written malformed payload, and
+/// two `Report` tasks in *one* session at different `seq`s (§8.13's
+/// retry-from-step case) — none of which this signature can express, and all of
+/// which are the negative cases that file exists for. This is the "one ordinary
+/// completed run" shape, which is all an out-of-crate caller can want, and it is
+/// deliberately the only shape exported.
+///
+/// Ruling L7, exactly as [`crate::durability::open_test_db`] states it: gated
+/// behind `cfg(test)` / the `test-util` feature so daemon code can never reach
+/// for this as though it were a way to record a real run. It is not — it writes
+/// a run row directly rather than through the state machine in
+/// [`crate::durability`], so nothing it produces has a legal transition history.
+#[cfg(any(test, feature = "test-util"))]
+pub fn seed_completed_run_with_report(
+    conn: &mut Connection,
+    binding_id: Option<BindingId>,
+    started_at_nanos: i64,
+    report: &Report,
+) -> RunId {
+    use roundhouse_core::{EventPayload, JobId, TaskId, TaskOutput, Timestamp, Usage};
+
+    use crate::durability::{insert_workflow_run, RunState, WorkflowRun};
+
+    let json = serde_json::to_value(report).expect("a Report serializes");
+    validate_report(&json).expect(
+        "a seeded Report must survive its own Serialize -> validate_report round trip, or the \
+         query under test would reject the row rather than return it",
+    );
+
+    let run = WorkflowRun {
+        id: RunId::new(),
+        job_id: JobId::new(),
+        job_version: 1,
+        content_hash: "sha256:seeded".into(),
+        session_id: SessionId::new(),
+        binding_id,
+        trigger_event_id: None,
+        // `ended_at` is `Some` because `insert_workflow_run` refuses a terminal
+        // state without one — the "run that looks live forever" guard.
+        state: RunState::Completed,
+        parent_run_id: None,
+        forked_from_run_id: None,
+        awaiting_until: None,
+        started_at: Timestamp::from_unix_nanos(started_at_nanos),
+        ended_at: Some(Timestamp::from_unix_nanos(started_at_nanos + 1)),
+    };
+    insert_workflow_run(conn, &run).expect("a fresh run row inserts");
+
+    // Plain `INSERT`s and not `roundhouse_store`'s async `EventWriter`: what
+    // these rows exist for is a **read**, and the writer would only add a
+    // runtime. Every column the real schema requires is supplied explicitly, so
+    // a migration adding another `NOT NULL` column breaks this rather than
+    // silently passing.
+    let task_id = TaskId::new();
+    conn.execute(
+        "INSERT INTO tasks (task_id, session_id, kind, state, parent, created_seq, updated_seq)
+         VALUES (?1, ?2, ?3, 'Completed', NULL, 1, 1)",
+        rusqlite::params![
+            task_id.to_string(),
+            run.session_id.to_string(),
+            // Written exactly as `tasks_view::task_kind_as_sql_str` writes it,
+            // which is what `report_task_kind` above reads back.
+            report_task_kind(),
+        ],
+    )
+    .expect("a Report task row inserts");
+
+    let payload = roundhouse_store::serialize_payload(&EventPayload::TaskCompleted {
+        output: TaskOutput::Json(json),
+        usage: Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+        },
+    })
+    .expect("an EventPayload serializes to JSON");
+
+    conn.execute(
+        "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v)
+         VALUES (?1, 1, 0, ?2, ?3, 1)",
+        rusqlite::params![run.session_id.to_string(), task_id.to_string(), payload],
+    )
+    .expect("an event row inserts");
+
+    run.id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
