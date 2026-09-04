@@ -7,7 +7,69 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# L7 (fix round 1 security review): gates `store::open_test_db` so daemon
+# code can never reach for it as if it were the crate's normal way to open a
+# connection (that would silently reduce trigger-event dedupe to
+# per-process, in-memory scope). Activated for this crate's own integration
+# tests via the self dev-dependency below; `cfg(test)` alone only covers
+# in-lib unit tests, not the separate `tests/*.rs` crates.
+test-util = []
+
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-engine = { path = "../roundhouse-engine" }
 roundhouse-store = { path = "../roundhouse-store" }
+# Deliberate, tracked deviation from the frozen crate dependency table
+# (`docs/architecture/02-system-architecture.md` §5.2, which lists this crate's
+# dependencies as `core, engine, store`): Task 4 (Subsystem A, `trigger_event`
+# persistence + dedupe) mints a `Message`-trigger `Binding`'s own id as the
+# `SessionId` under which the daemon-side bus registers a mailbox
+# (`bind_message_trigger`/`poll_message_trigger`), which requires calling the
+# `Bus` trait directly. Confirmed no dependency cycle: `roundhouse-bus`
+# depends only on `roundhouse-core`. See `docs/architecture/02-system-architecture.md`
+# §5.2's `roundhouse-sched` row for the matching table update.
+roundhouse-bus = { path = "../roundhouse-bus" }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+# Pinned exact per §5.3's "never track to latest" discipline. `chrono-tz`
+# isn't in §5.3's table (trigger scheduling is new this Phase); pinned to
+# 0.10.4 rather than a bare "0.10" range. Task 1 originally added this as a
+# soft "0.10" requirement — 0.10.4 is what that already resolves and locks
+# to on this branch, so tightening to it here (rather than to some other
+# 0.10.x) changes no behavior, only the pin discipline.
+chrono-tz = { version = "=0.10.4", features = ["serde"] }
+# Pinned exact per §5.3's discipline (also not in that table for the same
+# reason as chrono-tz above). See `src/cron.rs` for the real (verified
+# against the crate source) `Schedule::after`/`upcoming` API this task uses.
+cron = "=0.15.0"
+# Task 4 (`store.rs`): `record_trigger_event` writes directly against a
+# `rusqlite::Connection` via `roundhouse_store::begin_immediate` (Ruling
+# P4). Same workspace-pinned version `roundhouse-store` already uses.
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Task 5 (admission gate, fix round 1): `decide_admission` warns when a
+# `Queue` binding's backlog is dropped as backpressure and when a
+# `CancelPrevious` cancellation can't be confirmed — both are anomalies an
+# operator needs visibility into, not silent `SkipDueToOverlap` returns.
+# Already a workspace dependency used by several other crates; no new edge
+# in the frozen crate dependency table.
+tracing = { workspace = true }
+# Task 3 (scheduler): only `tokio::time::Instant` is used, for a monotonic
+# clock reading that is immune to wall-clock adjustments. No async runtime
+# is spun up by this crate, so only the `time` feature is enabled.
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+# Task 4's message-trigger tests are `#[tokio::test]`s exercising the real
+# `LocalBus`; "time" alone (the sole normal-dependency feature above) has no
+# executor. `LocalBus` is already reachable through the `[dependencies]`
+# entry Task 1 added, so no extra dev-dependency is needed for it.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+# Self dev-dependency, activating the `test-util` feature for this crate's
+# own `tests/*.rs` integration-test crates (L7) — `cfg(test)` alone does not
+# cover them, only this crate's in-lib `#[cfg(test)] mod tests`.
+roundhouse-sched = { path = ".", features = ["test-util"] }

@@ -387,6 +387,22 @@ mod tests {
         async fn requeue(&self, envelope: Envelope) -> Result<(), BusError> {
             self.inner.requeue(envelope).await
         }
+        async fn register_handle(
+            &self,
+            workspace: WorkspaceId,
+            name: String,
+            session: SessionId,
+        ) -> Result<(), BusError> {
+            self.inner.register_handle(workspace, name, session).await
+        }
+        async fn unregister_handle(
+            &self,
+            workspace: WorkspaceId,
+            name: &str,
+            session: SessionId,
+        ) -> Result<(), BusError> {
+            self.inner.unregister_handle(workspace, name, session).await
+        }
     }
 
     struct FakeTaskHandle {

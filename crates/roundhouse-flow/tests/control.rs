@@ -1,0 +1,970 @@
+//! Task 20a (B12a) — §8.13's run controls, over the durable row.
+//!
+//! Every assertion here reads the run back out of SQLite rather than
+//! inspecting a returned value: the defect this task closes is that the
+//! planned controls mutated a borrowed enum and changed nothing durable.
+//!
+//! Every test supplies `now` explicitly — this crate reads no clock.
+
+use roundhouse_core::{JobId, SessionId, Timestamp};
+use roundhouse_flow::control::{cancel, pause, resume, retry_from_step, ControlError};
+use roundhouse_flow::durability::{
+    checkpoint_step, insert_workflow_run, open_test_db, recover_run, transition_run,
+    DurabilityError, RunState, StepDisposition, StepOutput, StepRunState, WorkflowRun,
+    WorkflowStepRun,
+};
+use roundhouse_flow::exec::{RunId, StepOutcome, StepStatus};
+use rusqlite::Connection;
+
+const NANOS_PER_SEC: i64 = 1_000_000_000;
+
+fn a_run(id: RunId, session_id: SessionId) -> WorkflowRun {
+    WorkflowRun {
+        id,
+        job_id: JobId::new(),
+        job_version: 3,
+        content_hash: "sha256:pinned".into(),
+        session_id,
+        binding_id: None,
+        trigger_event_id: None,
+        state: RunState::Running,
+        parent_run_id: None,
+        forked_from_run_id: None,
+        awaiting_until: None,
+        started_at: Timestamp::from_unix_nanos(1_000 * NANOS_PER_SEC),
+        ended_at: None,
+        session_depth: None,
+        caps: None,
+    }
+}
+
+fn a_running_run() -> (Connection, RunId) {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, SessionId::new())).expect("insert the run row");
+    (conn, run_id)
+}
+
+fn at(secs: i64) -> Timestamp {
+    Timestamp::from_unix_nanos(secs * NANOS_PER_SEC)
+}
+
+/// A completed step row carrying a real output, built through
+/// `StepOutput::from_outcome` so the taint flag is the executor's own.
+fn completed_step(run_id: RunId, step_id: &str, output: serde_json::Value) -> WorkflowStepRun {
+    WorkflowStepRun {
+        run_id,
+        step_id: step_id.to_string(),
+        attempt: 1,
+        item_index: None,
+        disposition: StepDisposition::Effectful,
+        state: StepRunState::Completed,
+        first_task_seq: Some(10),
+        last_task_seq: Some(12),
+        output: Some(StepOutput::from_outcome(&StepOutcome {
+            step_id: step_id.to_string(),
+            output,
+            status: StepStatus::Completed,
+            output_is_secret_derived: false,
+            gate_condition_was_secret_derived: false,
+        })),
+        error: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cancel / pause / resume — durable, not a borrowed enum
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cancel_marks_cancelling_in_the_row_rather_than_in_a_borrowed_enum() {
+    let (mut conn, run_id) = a_running_run();
+
+    cancel(&mut conn, run_id, at(2_000)).expect("a running run can be cancelled");
+
+    let row = recover_run(&conn, run_id).unwrap().run;
+    assert_eq!(
+        row.state,
+        RunState::Cancelling,
+        "§8.13's cancel is cooperative: it marks Cancelling and lets in-flight \
+         work drain; it does not jump straight to Cancelled"
+    );
+    assert_eq!(
+        row.ended_at, None,
+        "a cancelling run has not ended yet — the drain and `finally:` still run"
+    );
+}
+
+#[test]
+fn a_cancelling_run_reaches_cancelled_with_the_instant_it_ended() {
+    let (mut conn, run_id) = a_running_run();
+    cancel(&mut conn, run_id, at(2_000)).unwrap();
+
+    transition_run(&mut conn, run_id, RunState::Cancelled, at(2_500))
+        .expect("the drain finishes and the terminal state lands");
+
+    let row = recover_run(&conn, run_id).unwrap().run;
+    assert_eq!(row.state, RunState::Cancelled);
+    assert_eq!(row.ended_at, Some(at(2_500)));
+}
+
+#[test]
+fn pause_and_resume_round_trip_through_the_row() {
+    let (mut conn, run_id) = a_running_run();
+
+    pause(&mut conn, run_id, at(2_000)).expect("a running run can be paused");
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::Paused
+    );
+
+    resume(&mut conn, run_id, at(3_000)).expect("a paused run can be resumed");
+    let row = recover_run(&conn, run_id).unwrap().run;
+    assert_eq!(row.state, RunState::Running);
+    assert_eq!(
+        row.ended_at, None,
+        "neither pause nor resume is a terminal transition"
+    );
+}
+
+#[test]
+fn resuming_a_run_that_is_not_paused_reports_the_state_it_actually_found() {
+    let (mut conn, run_id) = a_running_run();
+
+    let err = resume(&mut conn, run_id, at(2_000)).expect_err("a running run is not resumable");
+
+    match err {
+        ControlError::NotPaused { run_id: r, state } => {
+            assert_eq!(r, run_id);
+            assert_eq!(
+                state,
+                RunState::Running,
+                "the error names the state the row was actually in, so an \
+                 operator is not told only that the call failed"
+            );
+        }
+        other => panic!("expected NotPaused, got {other:?}"),
+    }
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::Running
+    );
+}
+
+#[test]
+fn pausing_a_run_that_is_already_cancelling_is_refused() {
+    let (mut conn, run_id) = a_running_run();
+    cancel(&mut conn, run_id, at(2_000)).unwrap();
+
+    let err = pause(&mut conn, run_id, at(3_000)).expect_err("a cancel in flight is not pausable");
+
+    assert!(
+        matches!(
+            err,
+            ControlError::NotRunning {
+                state: RunState::Cancelling,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::Cancelling,
+        "the cancel stands"
+    );
+}
+
+#[test]
+fn cancelling_an_already_cancelling_run_is_refused_rather_than_reported_as_a_fresh_cancel() {
+    let (mut conn, run_id) = a_running_run();
+    cancel(&mut conn, run_id, at(2_000)).unwrap();
+
+    let err = cancel(&mut conn, run_id, at(3_000)).expect_err("already draining");
+
+    assert!(
+        matches!(
+            err,
+            ControlError::NotCancellable {
+                state: RunState::Cancelling,
+                ..
+            }
+        ),
+        "an operator asking twice is told the run is already draining: {err:?}"
+    );
+}
+
+#[test]
+fn a_parked_run_can_still_be_cancelled() {
+    let (mut conn, run_id) = a_running_run();
+    transition_run(&mut conn, run_id, RunState::AwaitingHuman, at(2_000)).unwrap();
+
+    cancel(&mut conn, run_id, at(3_000))
+        .expect("a run waiting on a human who never answers must remain cancellable");
+
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::Cancelling
+    );
+}
+
+#[test]
+fn controlling_a_run_with_no_row_is_not_found_not_a_state_complaint() {
+    let mut conn = open_test_db();
+    let absent = RunId::new();
+
+    let err = cancel(&mut conn, absent, at(1)).expect_err("no row, no control");
+
+    assert!(
+        matches!(
+            err,
+            ControlError::Durability(DurabilityError::RunNotFound { .. })
+        ),
+        "got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// retry-from-step: §8.13's fork (history is append-only, never rewritten)
+// ---------------------------------------------------------------------------
+
+/// A finished run with three completed steps, ready to be forked.
+fn a_finished_run_with_three_steps() -> (Connection, RunId) {
+    let (mut conn, run_id) = a_running_run();
+    for (step_id, value) in [
+        ("checkout", serde_json::json!({"sha": "abc"})),
+        ("build", serde_json::json!({"artifact": "app.tar"})),
+        ("deploy", serde_json::json!({"url": "https://x"})),
+    ] {
+        checkpoint_step(&mut conn, &completed_step(run_id, step_id, value)).unwrap();
+    }
+    transition_run(&mut conn, run_id, RunState::Failed, at(5_000)).unwrap();
+    (conn, run_id)
+}
+
+const STEP_ORDER: &[&str] = &["checkout", "build", "deploy"];
+
+#[test]
+fn retry_from_step_writes_a_new_run_row_linked_by_forked_from_run_id() {
+    let (mut conn, original) = a_finished_run_with_three_steps();
+    let new_session = SessionId::new();
+
+    let forked = retry_from_step(
+        &mut conn,
+        original,
+        "build",
+        STEP_ORDER,
+        new_session,
+        at(6_000),
+    )
+    .expect("a failed run can be retried from a step");
+
+    assert_ne!(
+        forked.new_run_id, original,
+        "a genuinely new run, not a mutation of the old one"
+    );
+    assert_eq!(forked.forked_from_run_id, original);
+
+    let fork_row = recover_run(&conn, forked.new_run_id)
+        .expect("the fork is a real row, not just a returned value")
+        .run;
+    assert_eq!(
+        fork_row.forked_from_run_id,
+        Some(original),
+        "the column migration 0007 added for §8.13's fork link is finally written"
+    );
+    assert_eq!(fork_row.state, RunState::Running);
+    assert_eq!(fork_row.started_at, at(6_000));
+    assert_eq!(fork_row.ended_at, None);
+    assert_eq!(
+        fork_row.session_id, new_session,
+        "§8.6: each run is a new Session"
+    );
+    assert_eq!(
+        (fork_row.job_id, fork_row.job_version, fork_row.content_hash),
+        {
+            let origin = recover_run(&conn, original).unwrap().run;
+            (origin.job_id, origin.job_version, origin.content_hash)
+        },
+        "the fork runs the same pinned job content as the run it forks"
+    );
+}
+
+#[test]
+fn a_fork_inherits_completed_steps_before_the_cut_and_nothing_from_the_cut_onward() {
+    let (mut conn, original) = a_finished_run_with_three_steps();
+
+    let forked = retry_from_step(
+        &mut conn,
+        original,
+        "build",
+        STEP_ORDER,
+        SessionId::new(),
+        at(6_000),
+    )
+    .unwrap();
+
+    let inherited: Vec<&str> = forked
+        .inherited_step_outputs
+        .iter()
+        .map(|s| s.step_id.as_str())
+        .collect();
+    assert_eq!(
+        inherited,
+        vec!["checkout"],
+        "`build` is the retry point and `deploy` is downstream of it, so both re-run"
+    );
+
+    let fork_steps = recover_run(&conn, forked.new_run_id).unwrap().steps;
+    assert_eq!(
+        fork_steps.len(),
+        1,
+        "the fork's own rows are the inherited ones and nothing else"
+    );
+    assert_eq!(fork_steps[0].step_id, "checkout");
+    assert_eq!(fork_steps[0].run_id, forked.new_run_id);
+    assert_eq!(fork_steps[0].state, StepRunState::Completed);
+    assert_eq!(
+        fork_steps[0]
+            .output
+            .as_ref()
+            .expect("the inherited output is the point of the fork")
+            .value_unredacted_for_resume(),
+        &serde_json::json!({"sha": "abc"}),
+        "§8.13: the fork inherits completed step OUTPUTS, so `${{ steps.checkout.output }}` \
+         still resolves in the new run"
+    );
+}
+
+#[test]
+fn an_inherited_step_carries_no_task_seq_range_because_its_evidence_is_the_originals() {
+    let (mut conn, original) = a_finished_run_with_three_steps();
+
+    let forked = retry_from_step(
+        &mut conn,
+        original,
+        "deploy",
+        STEP_ORDER,
+        SessionId::new(),
+        at(6_000),
+    )
+    .unwrap();
+
+    let fork_steps = recover_run(&conn, forked.new_run_id).unwrap().steps;
+    assert_eq!(fork_steps.len(), 2);
+    for step in &fork_steps {
+        assert_eq!(
+            (step.first_task_seq, step.last_task_seq),
+            (None, None),
+            "§8.10's seq range joins back to a session's log, and the tasks live \
+             in the ORIGINAL run's session — copying the range would point the \
+             fork's join at tasks its own session never emitted"
+        );
+    }
+
+    let origin_steps = recover_run(&conn, original).unwrap().steps;
+    assert!(
+        origin_steps
+            .iter()
+            .all(|s| s.first_task_seq == Some(10) && s.last_task_seq == Some(12)),
+        "the original keeps its ranges: the evidence is still exactly where it was"
+    );
+}
+
+#[test]
+fn retry_from_step_never_rewrites_the_run_it_forks() {
+    let (mut conn, original) = a_finished_run_with_three_steps();
+    let before = recover_run(&conn, original).unwrap();
+
+    retry_from_step(
+        &mut conn,
+        original,
+        "build",
+        STEP_ORDER,
+        SessionId::new(),
+        at(6_000),
+    )
+    .unwrap();
+
+    let after = recover_run(&conn, original).unwrap();
+    assert_eq!(
+        after.run, before.run,
+        "§8.13: history is append-only, so a fork never rewrites it"
+    );
+    assert_eq!(after.steps, before.steps);
+    assert_eq!(after.run.state, RunState::Failed);
+    assert_eq!(after.run.ended_at, Some(at(5_000)));
+}
+
+#[test]
+fn forking_from_a_step_the_job_never_declared_is_refused_rather_than_inheriting_everything() {
+    let (mut conn, original) = a_finished_run_with_three_steps();
+
+    let err = retry_from_step(
+        &mut conn,
+        original,
+        "publsh",
+        STEP_ORDER,
+        SessionId::new(),
+        at(6_000),
+    )
+    .expect_err("a typo'd step id must not silently fork the whole run");
+
+    match err {
+        ControlError::UnknownStep { ref step_id } => assert_eq!(step_id, "publsh"),
+        ref other => panic!("expected UnknownStep, got {other:?}"),
+    }
+    assert_eq!(
+        count_runs(&conn),
+        1,
+        "a refused retry writes no fork row at all"
+    );
+}
+
+/// Fix round 1 (Task 20a, item E): a `Completed` step `step_order` never
+/// mentions must not be silently dropped from the fork — for an `Effectful`
+/// step that is a duplicate side effect on re-drive, the exact consequence
+/// `fork_run`'s own transaction exists to prevent for any other reason.
+#[test]
+fn a_completed_step_missing_from_step_order_is_refused_rather_than_dropped_and_rerun() {
+    let (mut conn, original) = a_finished_run_with_three_steps();
+    // "deploy" completed in the original run but the caller's step_order
+    // never names it — a wrong step_order reaching the fork with the
+    // transaction fully intact.
+    let incomplete_step_order: &[&str] = &["checkout", "build"];
+
+    let err = retry_from_step(
+        &mut conn,
+        original,
+        "build",
+        incomplete_step_order,
+        SessionId::new(),
+        at(6_000),
+    )
+    .expect_err("a completed step invisible to step_order would silently re-execute in the fork");
+
+    match err {
+        ControlError::StepOrderMissingCompletedStep {
+            run_id,
+            ref step_id,
+        } => {
+            assert_eq!(run_id, original);
+            assert_eq!(step_id, "deploy");
+        }
+        ref other => panic!("expected StepOrderMissingCompletedStep, got {other:?}"),
+    }
+    assert_eq!(
+        count_runs(&conn),
+        1,
+        "a refused retry writes no fork row at all"
+    );
+}
+
+/// Fix round 1 (Task 20a, item D): the one property `StepOutput`'s design
+/// exists to carry — `output_is_secret_derived` — must survive a fork.
+/// Every other fork fixture in this file builds `false`, so this is the only
+/// test that exercises the `true` path through `..step.clone()`.
+#[test]
+fn a_fork_preserves_a_secret_derived_output_flag() {
+    let (mut conn, run_id) = a_running_run();
+    let tainted = WorkflowStepRun {
+        run_id,
+        step_id: "fetch_secret".to_string(),
+        attempt: 1,
+        item_index: None,
+        disposition: StepDisposition::Effectful,
+        state: StepRunState::Completed,
+        first_task_seq: Some(1),
+        last_task_seq: Some(2),
+        output: Some(StepOutput::from_outcome(&StepOutcome {
+            step_id: "fetch_secret".to_string(),
+            output: serde_json::json!({"token": "abc"}),
+            status: StepStatus::Completed,
+            output_is_secret_derived: true,
+            gate_condition_was_secret_derived: false,
+        })),
+        error: None,
+    };
+    checkpoint_step(&mut conn, &tainted).unwrap();
+    transition_run(&mut conn, run_id, RunState::Failed, at(5_000)).unwrap();
+
+    let forked = retry_from_step(
+        &mut conn,
+        run_id,
+        "next",
+        &["fetch_secret", "next"],
+        SessionId::new(),
+        at(6_000),
+    )
+    .expect("a failed run with a tainted completed step can be forked");
+
+    let fork_steps = recover_run(&conn, forked.new_run_id).unwrap().steps;
+    assert_eq!(fork_steps.len(), 1);
+    assert!(
+        fork_steps[0]
+            .output
+            .as_ref()
+            .expect("the tainted output is the point of this test")
+            .is_secret_derived(),
+        "the fork must inherit the taint flag, not silently launder it"
+    );
+}
+
+#[test]
+fn retry_from_step_refuses_a_run_that_has_not_ended() {
+    let (mut conn, original) = a_running_run();
+
+    let err = retry_from_step(
+        &mut conn,
+        original,
+        "build",
+        STEP_ORDER,
+        SessionId::new(),
+        at(6_000),
+    )
+    .expect_err("forking a live run would duplicate its in-flight effectful steps");
+
+    assert!(
+        matches!(
+            err,
+            ControlError::RunStillActive {
+                state: RunState::Running,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(count_runs(&conn), 1);
+}
+
+#[test]
+fn retrying_a_run_that_does_not_exist_is_not_found() {
+    let mut conn = open_test_db();
+
+    let err = retry_from_step(
+        &mut conn,
+        RunId::new(),
+        "build",
+        STEP_ORDER,
+        SessionId::new(),
+        at(6_000),
+    )
+    .expect_err("nothing to fork");
+
+    assert!(
+        matches!(
+            err,
+            ControlError::Durability(DurabilityError::RunNotFound { .. })
+        ),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn a_fork_can_itself_be_forked_so_a_lineage_is_a_chain_not_a_star() {
+    let (mut conn, original) = a_finished_run_with_three_steps();
+    let first = retry_from_step(
+        &mut conn,
+        original,
+        "deploy",
+        STEP_ORDER,
+        SessionId::new(),
+        at(6_000),
+    )
+    .unwrap();
+    transition_run(&mut conn, first.new_run_id, RunState::Failed, at(7_000)).unwrap();
+
+    let second = retry_from_step(
+        &mut conn,
+        first.new_run_id,
+        "build",
+        STEP_ORDER,
+        SessionId::new(),
+        at(8_000),
+    )
+    .unwrap();
+
+    assert_eq!(second.forked_from_run_id, first.new_run_id);
+    assert_eq!(
+        recover_run(&conn, second.new_run_id)
+            .unwrap()
+            .run
+            .forked_from_run_id,
+        Some(first.new_run_id),
+        "each fork links to the run it was forked from, not to the root of the lineage"
+    );
+    assert_eq!(
+        recover_run(&conn, second.new_run_id)
+            .unwrap()
+            .steps
+            .iter()
+            .map(|s| s.step_id.clone())
+            .collect::<Vec<_>>(),
+        vec!["checkout".to_string()],
+        "the second fork inherits from the FIRST fork's own rows, which is why \
+         those rows had to be copied rather than left behind"
+    );
+}
+
+fn count_runs(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM workflow_run", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// A `map` step's per-item rows are distinct rows only because
+/// `(step_id, attempt, item_index)` is part of the key — so a fork must carry
+/// each item across separately rather than collapsing them into one row.
+#[test]
+fn a_fork_carries_each_map_item_row_across_separately() {
+    let (mut conn, run_id) = a_running_run();
+    for item in 0u32..2 {
+        let mut row = completed_step(run_id, "fanout", serde_json::json!({ "item": item }));
+        row.item_index = Some(item);
+        row.attempt = 2;
+        checkpoint_step(&mut conn, &row).unwrap();
+    }
+    checkpoint_step(
+        &mut conn,
+        &completed_step(run_id, "collect", serde_json::json!({})),
+    )
+    .unwrap();
+    transition_run(&mut conn, run_id, RunState::Failed, at(5_000)).unwrap();
+
+    let forked = retry_from_step(
+        &mut conn,
+        run_id,
+        "collect",
+        &["fanout", "collect"],
+        SessionId::new(),
+        at(6_000),
+    )
+    .unwrap();
+
+    let fork_steps = recover_run(&conn, forked.new_run_id).unwrap().steps;
+    assert_eq!(
+        fork_steps
+            .iter()
+            .map(|s| (s.step_id.as_str(), s.item_index, s.attempt))
+            .collect::<Vec<_>>(),
+        vec![("fanout", Some(0), 2), ("fanout", Some(1), 2)],
+        "both items survive with their own index, and the attempt number is \
+         the original's — the fork did not re-run these steps, so claiming \
+         attempt 1 would misreport how the output was reached"
+    );
+    assert_eq!(
+        fork_steps[1]
+            .output
+            .as_ref()
+            .unwrap()
+            .value_unredacted_for_resume(),
+        &serde_json::json!({"item": 1}),
+        "each item keeps its own output rather than one overwriting the other"
+    );
+}
+
+/// B12b: a fork sits where the run it forked sat in the session tree, so its
+/// own `call:` chain is bounded from the same depth. Recomputing the fork's
+/// depth as `0` would hand a deep run a fresh four levels on every retry —
+/// ruling P76 §1's escape reached through retry-from-step instead of through
+/// the wrong counter.
+#[test]
+fn a_fork_inherits_the_originals_session_depth_and_grant_but_not_its_spend() {
+    use roundhouse_flow::caps::ResourceCaps;
+    use roundhouse_flow::ledger::{run_ledger, Spend};
+
+    let mut conn = open_test_db();
+    let original = RunId::new();
+    let grant = ResourceCaps {
+        max_tokens: 900,
+        ..ResourceCaps::default()
+    };
+    let mut run = a_run(original, SessionId::new());
+    run.session_depth = Some(2);
+    run.caps = Some(grant.clone());
+    insert_workflow_run(&mut conn, &run).expect("insert the run row");
+    for (step_id, value) in [
+        ("checkout", serde_json::json!({"sha": "abc"})),
+        ("build", serde_json::json!({"artifact": "app.tar"})),
+    ] {
+        checkpoint_step(&mut conn, &completed_step(original, step_id, value)).unwrap();
+    }
+    roundhouse_flow::ledger::admit_spend(
+        &mut conn,
+        original,
+        &Spend {
+            tokens: 400,
+            ..Spend::ZERO
+        },
+        at(1_000),
+    )
+    .expect("the original spends some of its grant");
+    transition_run(&mut conn, original, RunState::Failed, at(5_000)).unwrap();
+
+    let forked = retry_from_step(
+        &mut conn,
+        original,
+        "build",
+        &["checkout", "build"],
+        SessionId::new(),
+        at(6_000),
+    )
+    .expect("a failed run can be retried from a step");
+
+    let fork = run_ledger(&conn, forked.new_run_id).unwrap();
+    assert_eq!(
+        fork.session_depth,
+        Some(2),
+        "same place in the session tree"
+    );
+    assert_eq!(fork.caps, Some(grant));
+    assert_eq!(
+        fork.spent,
+        Spend::ZERO,
+        "a fork is a fresh grant, not a continuation of the original's remaining budget — \
+         charging it the original's spend would make retrying an expensive run fail immediately"
+    );
+    assert_eq!(
+        run_ledger(&conn, original).unwrap().spent.tokens,
+        400,
+        "and the original's own ledger is untouched: a fork is never a rewrite"
+    );
+}
+
+/// A parent's grant, generous in every field **except** the one a test means
+/// to exhaust, so that a draw refused for the wrong reason is a loud failure
+/// rather than a green test measuring the wrong ceiling.
+fn a_roomy_grant() -> roundhouse_flow::caps::ResourceCaps {
+    roundhouse_flow::caps::ResourceCaps {
+        max_tokens: 5_000,
+        max_cost_usd: 1_000.0,
+        max_tasks: 100_000,
+        max_tool_calls: 100_000,
+        max_subagents: 1_000,
+        max_bytes_written: 10_000_000_000,
+        max_escalations: 1_000,
+        ..roundhouse_flow::caps::ResourceCaps::default()
+    }
+}
+
+/// A child's grant: one hundredth of [`a_roomy_grant`] in every countable, so
+/// several children fit and the arithmetic is legible.
+fn a_child_grant() -> roundhouse_flow::caps::ResourceCaps {
+    roundhouse_flow::caps::ResourceCaps {
+        max_tokens: 100,
+        max_cost_usd: 1.0,
+        max_tasks: 10,
+        max_tool_calls: 10,
+        max_subagents: 1,
+        max_bytes_written: 1_000,
+        max_escalations: 1,
+        ..roundhouse_flow::caps::ResourceCaps::default()
+    }
+}
+
+/// The B12b fix round's Critical, as the measurement that found it (ruling
+/// P110): **one draw of 100 produced two refunds, and a parent holding 500
+/// tokens of unrelated spend recorded 400 afterwards.** Not phantom credit —
+/// real spend erased, with every counter non-negative the whole way, which is
+/// why flooring at zero was never the guard the code claimed it was.
+///
+/// The mechanism: `retry_from_step` copies `parent_run_id` **and** `caps`, and
+/// a fresh run row starts `refunded_at` `NULL` with `spent_* = 0`. That made
+/// the fork satisfy every precondition of `refund_child_run` — and the
+/// original satisfies them too, because being terminal is `retry_from_step`'s
+/// own precondition.
+///
+/// **B12c changes the answer to the spend direction and this test with it**
+/// (rulings P113/P114). B12b's contained fix stamped the fork settled at
+/// creation, so the fork was unrefundable *because it was never charged for*.
+/// A fork now **draws** like any other child, in `fork_run`'s own transaction,
+/// so it is refundable — and refunding it returns exactly the grant that was
+/// drawn for it. What is asserted here is the property both fixes defend:
+/// **one draw per child row, one refund per draw, and the parent's own
+/// unrelated 500 tokens survive every round trip.**
+#[test]
+fn a_forks_draw_and_refund_balance_so_one_grant_cannot_be_returned_twice() {
+    use roundhouse_flow::ledger::{
+        draw_child_run, refund_child_run, run_ledger, LedgerError, Spend,
+    };
+
+    let mut conn = open_test_db();
+
+    // A parent with 500 tokens of spend that has nothing to do with any child.
+    let parent = RunId::new();
+    let mut parent_run = a_run(parent, SessionId::new());
+    parent_run.session_depth = Some(0);
+    parent_run.caps = Some(a_roomy_grant());
+    insert_workflow_run(&mut conn, &parent_run).expect("insert the parent");
+    roundhouse_flow::ledger::admit_spend(
+        &mut conn,
+        parent,
+        &Spend {
+            tokens: 500,
+            ..Spend::ZERO
+        },
+        at(1_000),
+    )
+    .expect("the parent spends on its own work");
+
+    // One child. Inserting it *is* the draw (ruling P114 §A's invariant), so
+    // the parent is charged its whole 100-token grant by the insert itself,
+    // taking recorded spend to 600.
+    let child = RunId::new();
+    let child_grant = a_child_grant();
+    let mut child_run = a_run(child, SessionId::new());
+    child_run.parent_run_id = Some(parent);
+    child_run.session_depth = Some(1);
+    child_run.caps = Some(child_grant);
+    child_run.started_at = at(1_100);
+    insert_workflow_run(&mut conn, &child_run).expect("insert the child");
+    assert_eq!(run_ledger(&conn, parent).unwrap().spent.tokens, 600);
+    assert_eq!(
+        run_ledger(&conn, child).unwrap().drawn_at,
+        Some(at(1_100)),
+        "the draw is stamped with the child's own creation instant"
+    );
+    let second_draw = draw_child_run(&mut conn, child, at(1_200));
+    assert!(
+        matches!(second_draw, Err(LedgerError::AlreadyDrawn { .. })),
+        "and a second draw for the same row is refused; got {second_draw:?}"
+    );
+
+    transition_run(&mut conn, child, RunState::Failed, at(2_000)).unwrap();
+
+    // An operator retries the child. The fork inherits the parent id and the
+    // grant, starts unspent — and is charged for, in `fork_run`'s own
+    // transaction, taking the parent to 700.
+    let forked = retry_from_step(
+        &mut conn,
+        child,
+        "only",
+        &["only"],
+        SessionId::new(),
+        at(3_000),
+    )
+    .expect("a failed run can be retried from a step");
+    let fork = run_ledger(&conn, forked.new_run_id).unwrap();
+    assert_eq!(fork.parent_run_id, Some(parent));
+    assert_eq!(
+        fork.drawn_at,
+        Some(at(3_000)),
+        "the retry drew from the parent like any other child (ruling P113)"
+    );
+    assert_eq!(
+        fork.refunded_at, None,
+        "and is not settled at creation any more: it has something to give back"
+    );
+    assert_eq!(
+        run_ledger(&conn, parent).unwrap().spent.tokens,
+        700,
+        "n retries cost n grants — which is what §8.12's invariant means"
+    );
+
+    transition_run(&mut conn, forked.new_run_id, RunState::Completed, at(4_000)).unwrap();
+    let fork_refund =
+        refund_child_run(&mut conn, forked.new_run_id, at(5_000)).expect("the fork's draw refunds");
+    assert_eq!(fork_refund.tokens, 100);
+    assert_eq!(
+        run_ledger(&conn, parent).unwrap().spent.tokens,
+        600,
+        "exactly the fork's own grant came back, never the original's"
+    );
+    let fork_again = refund_child_run(&mut conn, forked.new_run_id, at(5_500));
+    assert!(
+        matches!(fork_again, Err(LedgerError::AlreadyRefunded { .. })),
+        "got {fork_again:?}"
+    );
+
+    // The original draw is refundable exactly once too, and returns exactly it.
+    let refunded = refund_child_run(&mut conn, child, at(6_000)).expect("the real draw refunds");
+    assert_eq!(refunded.tokens, 100);
+    let repeated = refund_child_run(&mut conn, child, at(7_000));
+    assert!(
+        matches!(repeated, Err(LedgerError::AlreadyRefunded { .. })),
+        "got {repeated:?}"
+    );
+
+    assert_eq!(
+        run_ledger(&conn, parent).unwrap().spent.tokens,
+        500,
+        "the parent is back to its own unrelated spend — not the 400 the \
+         two-refund defect produced, and not the 300 a second unpaid refund \
+         would have left"
+    );
+}
+
+/// Ruling P113's failure mode, at the boundary: *"this retry needs $40 and the
+/// root has $12 — raise the ceiling or accept the failure."*
+///
+/// The refusal is what makes the invariant worth having. A silent grant would
+/// be the defect P113 rules against; a silent truncation would be a budget
+/// that reports success while doing nothing. And it is the **whole fork** that
+/// is refused, not just the draw: `insert_run_row` draws inside `fork_run`'s
+/// transaction, so a refused draw rolls the child row back with it.
+#[test]
+fn a_retry_the_parent_cannot_cover_is_refused_and_no_fork_row_survives() {
+    use roundhouse_flow::ledger::{run_ledger, LedgerError};
+
+    let mut conn = open_test_db();
+
+    // A parent whose grant covers exactly one 100-token child and no more.
+    let parent = RunId::new();
+    let mut parent_run = a_run(parent, SessionId::new());
+    parent_run.session_depth = Some(0);
+    // Roomy in every field but `max_tokens`, where it covers exactly one child.
+    parent_run.caps = Some(roundhouse_flow::caps::ResourceCaps {
+        max_tokens: 100,
+        ..a_roomy_grant()
+    });
+    insert_workflow_run(&mut conn, &parent_run).expect("insert the parent");
+
+    let child = RunId::new();
+    let mut child_run = a_run(child, SessionId::new());
+    child_run.parent_run_id = Some(parent);
+    child_run.session_depth = Some(1);
+    child_run.caps = Some(roundhouse_flow::caps::ResourceCaps {
+        max_tokens: 100,
+        ..a_child_grant()
+    });
+    insert_workflow_run(&mut conn, &child_run).expect("the first child fits exactly");
+    assert_eq!(run_ledger(&conn, parent).unwrap().spent.tokens, 100);
+    transition_run(&mut conn, child, RunState::Failed, at(2_000)).unwrap();
+
+    let refused = retry_from_step(
+        &mut conn,
+        child,
+        "only",
+        &["only"],
+        SessionId::new(),
+        at(3_000),
+    );
+    let Err(ControlError::Durability(DurabilityError::ChildDrawRefused { source, .. })) = refused
+    else {
+        panic!("the retry must be refused with a distinguishable error, got {refused:?}");
+    };
+    assert!(
+        matches!(
+            *source,
+            LedgerError::CapsExceeded {
+                field: "max_tokens",
+                ..
+            }
+        ),
+        "and the reason must name what ran out, got {source:?}"
+    );
+    assert_eq!(
+        run_ledger(&conn, parent).unwrap().spent.tokens,
+        100,
+        "a refused retry charges the parent nothing"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM workflow_run WHERE forked_from_run_id IS NOT NULL",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "and leaves no fork row behind to spend against an uncharged budget"
+    );
+}

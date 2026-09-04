@@ -65,6 +65,24 @@ impl Bus for NoopBus {
     async fn requeue(&self, _envelope: Envelope) -> Result<(), BusError> {
         Ok(())
     }
+
+    async fn register_handle(
+        &self,
+        _workspace: WorkspaceId,
+        _name: String,
+        _session: SessionId,
+    ) -> Result<(), BusError> {
+        Ok(())
+    }
+
+    async fn unregister_handle(
+        &self,
+        _workspace: WorkspaceId,
+        _name: &str,
+        _session: SessionId,
+    ) -> Result<(), BusError> {
+        Ok(())
+    }
 }
 
 #[tokio::test]

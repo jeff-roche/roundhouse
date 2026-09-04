@@ -9,3 +9,250 @@ workspace = true
 
 [dependencies]
 roundhouse-proto = { path = "../roundhouse-proto" }
+# Task 31 (Phase 5, Subsystem D2): §11.3's SSE cursor is `(session_id, seq)`,
+# and `SessionId` lives here. `roundhouse-proto` uses it but does not
+# re-export it, so there is no way to reach it through the existing edge.
+#
+# TRACKED DEVIATION from §5.2's original `roundhouse-web` row (`proto`),
+# authorised by ruling P9 ("`roundhouse-web` may depend on `roundhouse-flow`,
+# `roundhouse-core`, and `roundhouse-store`"), same style as the
+# `roundhouse-sched -> roundhouse-bus` deviation. Recorded in §5.2 of
+# `docs/architecture/02-system-architecture.md` and in
+# `xtask/tests/workspace_shape.rs`'s exact-set assertion, both in the same
+# commit as this line — that test's failure message requires it.
+roundhouse-core = { path = "../roundhouse-core" }
+# Task 34 (Phase 5, Subsystem D5): §8.6's Runs inbox. Ruling P86 puts the query
+# and the fingerprint diffing in `roundhouse-flow` — which already owns
+# `WorkflowRun`, `Report`, `previous_run_for_binding` and `diff_findings`, and
+# already has the `roundhouse-store` edge the `tasks`/`events` tables belong to
+# — rather than letting this leaf crate hand-write SQL against another crate's
+# private schema with no compile-time link to it. So this edge is what replaces
+# a `rusqlite` edge, not what adds to one: **there is no `rusqlite` here and no
+# SQL anywhere in this crate.**
+roundhouse-flow = { path = "../roundhouse-flow" }
+# Task 34: `StorePool`, the one field D5 adds to `AppState`.
+#
+# The query itself is `roundhouse_flow::runs::load_run_summaries`; what is
+# needed from here is the pool type plus the two names in `interact`'s
+# signature (`SqliteConnection`, `InteractError`), which `roundhouse-store`
+# aliases for exactly this. Ruling P103 is why those two are needed at all:
+# `bounded::StoreConnection` used to reach `interact` through a `Deref`, which
+# inferred the closure's parameter and named nothing — and inherited every
+# other method `deadpool` puts on the type, including the `Object::pool`
+# back-reference and whatever a future release adds. It now forwards `interact`
+# explicitly, which means writing the signature, which means spelling the
+# types. **No `rusqlite` or `deadpool-sqlite` edge either way** — that is what
+# the aliases over there are for, and the handler's closure parameter is still
+# inferred at the call site.
+#
+# `roundhouse_store::StorePool` rather than a hand-rolled
+# `Arc<Mutex<rusqlite::Connection>>` (which is what this task's plan specified):
+# `pool.rs`'s own comment records that `open_pool` was once found to be a
+# second, hook-free pool constructor that silently skipped all three
+# per-connection pragmas, and was fixed by routing both constructors through one
+# `post_create` hook. A bare `Connection` opened in here would be the third such
+# path and would skip them again.
+#
+# TRACKED DEVIATION from §5.2's original `roundhouse-web` row, both of these,
+# authorised by ruling P9 ("`roundhouse-web` may depend on `roundhouse-flow`,
+# `roundhouse-core`, and `roundhouse-store`") — same style and same procedure as
+# the `roundhouse-core` edge above: recorded in §5.2 of
+# `docs/architecture/02-system-architecture.md` and in
+# `xtask/tests/workspace_shape.rs`'s exact-set assertion, both in the same
+# commit as these lines.
+roundhouse-store = { path = "../roundhouse-store" }
+# Task 30 (Phase 5, Subsystem D1): the inbound HTTP server framework for the
+# web UI. Chosen over hand-rolled `hyper` or `actix-web` because it is written
+# by the `tokio`/`hyper` team (no ecosystem-fit risk against the workspace's
+# pinned tokio 1.53) and needs zero non-tokio runtime glue. §5.3 pins no
+# inbound server framework, so this is a net-new addition; it is recorded in
+# the §5.3 additions table in `docs/architecture/02-system-architecture.md`.
+# Exact `=` pin, not a `0.8` range: §5.3's pin discipline is "never track to
+# latest", and a soft range is precisely what that forbids.
+axum = "=0.8.4"
+# Task 30 (Phase 5, Subsystem D1): compiles `assets/dist/` into the library, so
+# the web client ships inside the daemon binary rather than as files the
+# operator has to deploy alongside it (P10 — `roundhouse-web` links into
+# `roundhouse-daemon`).
+#
+# `debug-embed` is REQUIRED, not a convenience: without it `rust-embed` reads
+# from the filesystem in debug builds, and `cargo test` is a debug build — the
+# embedding this crate exists to do would never be exercised by its own tests.
+# `mime-guess` gives `EmbeddedFile::metadata().mimetype()`, the content type
+# recorded at embed time; taking it from `rust-embed` avoids declaring
+# `mime_guess` a second time as a direct dependency for what this crate
+# already provides.
+#
+# Net-new addition, so the same exact-`=` pin discipline applies regardless of
+# which task introduces it (`roundhouse-cli/Cargo.toml`): pinned to the
+# current 8.12.0 rather than a `8` range.
+rust-embed = { version = "=8.12.0", features = ["debug-embed", "mime-guess"] }
+# Task 31 (Phase 5, Subsystem D2): `broadcast` for the SSE fan-out hub, and
+# the runtime the stream is polled on.
+#
+# This REPLACES the `[dev-dependencies]` entry Task 30 added, and supersedes
+# the reasoning in its comment. That comment said a router is data and this
+# crate builds one without starting a runtime, which was true while the crate
+# only served static bytes. `sse.rs` holds a live `tokio::sync::broadcast`
+# channel per process and a stream polled by the server, so `tokio` is now a
+# real, non-test dependency. Still no listener and no runtime *started* here:
+# whoever binds the socket in `roundhouse-daemon` brings the runtime.
+#
+# `{ workspace = true }` rather than a narrow feature list, matching every
+# other crate: `sync` (broadcast) and `time` (the tests' timeout) are already
+# in the workspace feature set, along with `macros`/`rt-multi-thread` for
+# `#[tokio::test]`.
+tokio = { workspace = true }
+# Task 31: `stream::unfold`, which builds the SSE stream out of the broadcast
+# receiver.
+#
+# Deliberately NOT `async-stream`: its `stream!` macro is genuinely net-new
+# (zero entries in `Cargo.lock`) and expands `unsafe` into the calling crate,
+# which `#![forbid(unsafe_code)]` rejects — `forbid` cannot be lifted by a
+# local `allow`. `futures-util` is already in the graph at 0.3.34 as `axum`'s
+# own dependency, and `unfold` needs no feature beyond what `axum` enables, so
+# `default-features = false` here adds no crate and no feature to the build.
+#
+# Exact `=` pin for the same reason as `axum` and `rust-embed` above.
+futures-util = { version = "=0.3.34", default-features = false }
+# Task 31: serialises the `roundhouse_proto::ClientEvent` payload into each
+# SSE frame's `data:` field.
+serde_json = { workspace = true }
+# Task 34 (D5): `#[derive(Serialize)]` for `runs::RunSummaryJson`, the wire
+# shape of `GET /api/runs`. `serde_json` above brings `serde` in transitively
+# but not its `derive` macro, which is a separate feature this crate now needs
+# in its own right. Workspace-pinned, like every other `serde` in the tree.
+serde = { workspace = true }
+# Task 31: parses the session UUID out of a `Last-Event-ID` value and out of
+# the URL path. `SessionId` exposes `from_uuid`, not `FromStr`, so the `Uuid`
+# has to be parsed here.
+#
+# No features: this crate only parses, never generates (no `v4`) and never
+# serialises a bare `Uuid` (no `serde`). The eight other crates that declare
+# `uuid` use a `"1"` range; this one takes the exact `=` pin its own two
+# paragraphs above demand of every direct dependency here. The cost is real
+# and worth naming: a future workspace-wide `uuid` bump has to touch this line
+# too, or resolution pins back to 1.26.0 for everyone.
+uuid = "=1.26.0"
+# Task 31: `CursorError`'s `Display`, which is what the `400` body says.
+thiserror = { workspace = true }
+# Task 33 (Phase 5, Subsystem D4): the four pieces §11.3's shared LAN token
+# needs. All four are already resolved in `Cargo.lock`, so none of them fetches
+# a new crate or adds a graph node — the declarations only make edges this
+# crate already builds against explicit.
+#
+# Counted exactly, because this manifest's comments get cited as evidence: the
+# lockfile gains **five** dependency edges on the `roundhouse-web` package and
+# **zero** `[[package]]` blocks. Four are these (`getrandom`, `subtle`, `hex`,
+# `rustix`); the fifth is `tempfile` in `[dev-dependencies]` below. The
+# load-bearing half of the claim is the zero.
+#
+# `getrandom`: the token's 32 bytes, straight from the OS CSPRNG. Deliberately
+# NOT `rand`: `roundhouse-provider` declares `rand = "0.9"` and the lockfile
+# also carries 0.8 and 0.10, so reaching for `rand` here means picking a major
+# and explaining why this crate's is the right one. `getrandom` is the layer
+# underneath all of them, is the entire surface a token needs, and has no
+# userspace generator state to reason about. Net-new as a *declared*
+# dependency, so it gets a §5.3 additions-table row. The `std` feature is
+# required, not cosmetic: without it `getrandom::Error` implements neither
+# `std::error::Error` nor the OS-error lookup its `Display` uses, so a failure
+# to draw entropy would neither convert into `io::Error` nor say what went
+# wrong.
+#
+# It adds **no crate** (`std = []` in getrandom's own manifest, so feature
+# unification pulls nothing new into the graph), but "purely additive, no code
+# path" would be wrong and is worth stating accurately since features unify
+# workspace-wide. Enabling `std` also changes behaviour for every other
+# `getrandom` consumer in this graph, in three places: `Error`'s `Display` text
+# becomes `std::io::Error::from_raw_os_error(errno)`'s instead of
+# `"OS Error: {errno}"` (`src/error.rs:200`), its `Debug` gains a
+# `description` field (`src/error.rs:184`), and the aarch64 RNDR backend
+# detects FEAT_RNG with `is_aarch64_feature_detected!` rather than the
+# MRS-emulation probe (`src/backends/rndr.rs:75`). None of the three matters on
+# this workspace's platforms — they are message text, and a backend not
+# selected here — but none of them is "no code path".
+#
+# `subtle`: constant-time comparison of the presented token. Already in
+# `Cargo.lock` at 2.6.1, declared by nobody until now. The alternative is a
+# hand-rolled `fold(0, |acc, (x, y)| acc | (x ^ y)) == 0`, which is
+# constant-time only for as long as LLVM chooses not to branch on it — nothing
+# in that source says it must not. Net-new as a declared dependency; §5.3 row.
+#
+# `hex`: the token's on-disk and on-the-wire encoding. §5.3's additions table
+# already lists `hex` (for Phase 6's SigV4 signing) and `roundhouse-secrets`
+# already declares it at `0.4`; this pulls the same 0.4.3 forward a phase, so
+# it needs no new row.
+#
+# `rustix` (`process`, `fs`): `process` for `getuid()`, for the owner check on
+# the token file and the state dir — `#![forbid(unsafe_code)]` rules out
+# calling `libc::getuid` directly, and there is no std API. Same crate, same
+# feature, same reason as `roundhouse-secrets`'
+# `read_permission_checked_file`, so no new row either. `fs` is for
+# `OFlags::NOFOLLOW`'s numeric value, which differs per platform and which
+# `lan_auth`'s token read passes to `OpenOptions::custom_flags`; `libc` is not
+# a dependency of this crate and adding one for a single constant would be the
+# worse trade.
+#
+# Exact `=` pins throughout, for the reason stated on `axum` above: §5.3's pin
+# discipline is "never track to latest", and a soft range is what that forbids.
+# Each pin is the version already resolved in `Cargo.lock`, so pinning here
+# cannot move anyone else's resolution.
+getrandom = { version = "=0.3.4", features = ["std"] }
+subtle = "=2.6.1"
+hex = "=0.4.3"
+rustix = { version = "=1.1.4", features = ["process", "fs"] }
+
+[dev-dependencies]
+# Task 30: `ServiceExt::oneshot` drives the router in-process, so the tests
+# exercise the real `axum::Router` without binding a socket. Not a normal
+# dependency — building a router needs no `tower` surface of our own. Already
+# in the lockfile at 0.5.3 as a transitive dependency; pinned to that exact
+# version so this declaration cannot drift the resolution.
+tower = { version = "=0.5.3", features = ["util"] }
+# Task 30 declared `tokio` here as a dev-only dependency. Task 31 (D2) moved
+# it to `[dependencies]`: see the comment on that line for why the "a router
+# is data" reasoning stopped holding.
+# Task 33 (D4): `tests/lan_auth.rs` needs a real directory to put a real
+# `0600` token file in, since the whole control is filesystem behaviour that a
+# mock would assert nothing about. Same `=3.27.0` pin `roundhouse-cli` uses,
+# rather than the `"3"` range seven other crates use, for the exact-pin reason
+# stated throughout this manifest.
+tempfile = "=3.27.0"
+# Task 35 (Phase 5, Subsystem D6), ruling P96 §B: the same `roundhouse-flow`
+# already in `[dependencies]` above, re-declared here **only** to turn on its
+# `test-util` feature for this crate's `tests/*.rs`. It adds no package and no
+# edge — `cargo` unifies the two declarations into one dependency whose feature
+# set is the union.
+#
+# What it unlocks is `roundhouse_flow::runs::seed_completed_run_with_report`,
+# which puts runs in a real database so `tests/runs.rs` can assert what
+# `GET /api/runs` returns for a **non-empty** inbox. Until then the only
+# real-store fixture asserted `[]`, and four mutations of `list_runs`'s outer
+# map survived the sweep because the empty list is the correct answer to all of
+# them (WC4-WC7: `.take(1)`, `.skip(1)`, `.take(0)`, and dropping
+# `sort_for_triage`).
+#
+# The seeding lives over there rather than here, which is the point: ruling P86
+# keeps `roundhouse-web` free of SQL against another crate's private schema, and
+# hand-writing those `INSERT`s in this crate's *tests* would be the same
+# violation with a thinner excuse. There is still **no `rusqlite` here and no
+# SQL anywhere in this crate**, tests included.
+#
+# `default-features = false` is deliberately absent: `roundhouse-flow` declares
+# no default features, so there is nothing to switch off.
+roundhouse-flow = { path = "../roundhouse-flow", features = ["test-util"] }
+# Task 35 (Phase 5, Subsystem D6), ruling P96 §C: `tests/compile_fail.rs` pins
+# that `BoundedStore`'s pool is unreachable from outside this crate. That is a
+# property of what does *not* compile, so it has no runtime test and no
+# mutation can score it — see that file's docs.
+#
+# It is **only** the out-of-crate direction: `trybuild` compiles each case as its
+# own crate. The intra-crate direction — the one rulings P96 §C and P98 are about
+# — needs no dependency at all and lives in `tests/bounded_reach.rs`.
+#
+# `"1"` and not an exact `=` pin, unlike every dependency above: `trybuild` is
+# already declared at `"1"` by `roundhouse-core`, `roundhouse-net` and
+# `roundhouse-secrets`, and a narrower requirement here would fragment the
+# workspace's one compile-fail harness across two resolved versions for no
+# benefit. It is also dev-only, so it reaches no shipped artefact.
+trybuild = "1"

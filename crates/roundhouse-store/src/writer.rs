@@ -44,9 +44,27 @@ pub struct EventWriter {
 /// it only errors on genuinely non-serializable inputs, e.g. a map with
 /// non-string keys). So a non-finite value here is a lossy round-trip
 /// (`Some(NaN)` -> `null` -> `None` on replay), not a rejected write. This is
-/// benign in this codebase today because the only float field on any
-/// `EventPayload` variant is `Progress.fraction: Option<f32>`, where losing a
+/// benign for the only float field embedded directly in an `EventPayload`
+/// variant today, `Progress.fraction: Option<f32>`, where losing a
 /// NaN/Infinity to `None` is an acceptable degradation, not data corruption.
+///
+/// **Stale-claim correction (Workflows Task 3 fix round 1, finding H2):** an
+/// earlier version of this comment said `Progress.fraction` was "the only
+/// float field on any `EventPayload` variant" — full stop, not scoped to
+/// "embedded directly." That's no longer accurate for the workspace as a
+/// whole: `roundhouse_flow::parse::steps::CapsDef::max_cost_usd` is a second
+/// `f64` field, and unlike a progress fraction it represents a spend cap,
+/// where a silent `NaN`/`Infinity` -> `null` -> `None` round-trip would mean
+/// a cap survives a crash-resume as *no cap at all*. It is validated to be
+/// finite and non-negative at parse time (`CapsDef`'s own `TryFrom`), so a
+/// non-finite value can never exist inside one — and it does not reach
+/// `EventPayload`/this function today (workflow execution, Task 5, is not
+/// built yet). Whoever wires the first path from a parsed `CapsDef` into an
+/// `EventPayload` inherits the question this comment's original, unscoped
+/// claim would have hidden: confirm that path still can't carry a non-finite
+/// value (it can't, today, only because `CapsDef` itself already rejects
+/// one) rather than assuming this function's silent-`null` behavior is still
+/// "benign" for every float in the workspace.
 /// The `Result` return type is kept for whatever `serde_json::to_string` *can*
 /// still fail on (and as a stable signature for callers), not because
 /// non-finite floats trigger it.

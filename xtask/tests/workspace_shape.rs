@@ -167,9 +167,20 @@ const EXPECTED_EDGES: &[(&str, &[&str])] = &[
         "roundhouse-flow",
         &["roundhouse-core", "roundhouse-engine", "roundhouse-store"],
     ),
+    // `roundhouse-bus` below is a deliberate, authorized addition (Task 1,
+    // Phase 5, Subsystem A): a `Message` trigger's `Binding` doubles as the
+    // addressable recipient for a bus mailbox, and Task 4's
+    // `bind_message_trigger`/`poll_message_trigger` call the `Bus` trait
+    // directly — the doc table row was updated in the same commit per this
+    // test's keep-both-in-sync rule.
     (
         "roundhouse-sched",
-        &["roundhouse-core", "roundhouse-engine", "roundhouse-store"],
+        &[
+            "roundhouse-core",
+            "roundhouse-engine",
+            "roundhouse-store",
+            "roundhouse-bus",
+        ],
     ),
     (
         "roundhouse-daemon",
@@ -193,7 +204,28 @@ const EXPECTED_EDGES: &[(&str, &[&str])] = &[
     ),
     ("roundhouse-tui", &["roundhouse-proto"]),
     ("roundhouse-cli", &["roundhouse-proto", "roundhouse-tui"]),
-    ("roundhouse-web", &["roundhouse-proto"]),
+    // Phase 5 Task 31 (Subsystem D2): `roundhouse-core` is a deliberate,
+    // tracked deviation from this table's original `proto`-only row for
+    // `roundhouse-web`, authorised by ruling P9. §11.3's SSE cursor is
+    // `(session_id, seq)` and `SessionId` lives in `roundhouse-core`;
+    // `roundhouse-proto` uses it without re-exporting it. See
+    // `crates/roundhouse-web/Cargo.toml`'s own comment on the edge.
+    // Phase 5 Task 34 (Subsystem D5): `roundhouse-flow` and `roundhouse-store`
+    // join `roundhouse-core` as tracked deviations from the original
+    // `proto`-only row, on the same ruling P9. §8.6's Runs inbox query lives in
+    // `roundhouse-flow` (ruling P86 — it already owns `WorkflowRun`/`Report`
+    // and the `roundhouse-store` edge, so this crate writes no SQL), and
+    // `AppState` carries a `roundhouse_store::StorePool`. See
+    // `crates/roundhouse-web/Cargo.toml`'s own comments on both edges.
+    (
+        "roundhouse-web",
+        &[
+            "roundhouse-core",
+            "roundhouse-flow",
+            "roundhouse-proto",
+            "roundhouse-store",
+        ],
+    ),
     ("roundhouse-net", &["roundhouse-core", "roundhouse-store"]),
 ];
 

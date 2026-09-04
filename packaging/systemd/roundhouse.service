@@ -1,0 +1,30 @@
+[Unit]
+Description=Roundhouse daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/round daemon
+Restart=always
+RestartSec=2
+# §8.7: "the OS answers 'is the daemon running', the daemon answers 'what
+# runs when'" — the timer unit's `Persistent` directive (which would replay
+# missed runs on the next boot) is deliberately left unset here. We run our
+# own catch-up (Scheduling Task 4's compute_catch_up, wired through
+# Scheduler::tick and catch_up_after_wake), so relying on systemd's own
+# missed-timer replay would be a second, disagreeing source of truth.
+#
+# Fix round 1 (security review): a paired `roundhouse.socket` unit
+# (§8.7: "ideally socket-activated") was removed from this package. The
+# daemon binds `$XDG_RUNTIME_DIR/roundhouse-<user>/round.sock`
+# (`roundhouse_tui::paths::default_socket_path`), not the
+# `%t/roundhouse/daemon.sock` a `.socket` unit here would have listened on,
+# and implements no socket-activation protocol (no `LISTEN_FDS`/
+# `sd_listen_fds` anywhere in `roundhouse-daemon`) — so shipping one would
+# have created a socket nobody accepts on and hung anyone who connected to
+# it. Revisit once the daemon actually implements socket activation.
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

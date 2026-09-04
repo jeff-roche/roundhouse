@@ -105,6 +105,25 @@ pub enum BusError {
         workspace: WorkspaceId,
         name: String,
     },
+    /// H2: `register_handle` refuses to silently steal a name a *different*
+    /// session already holds — without this, whichever binding registers
+    /// second would silently take over the name and receive the first
+    /// binding's payloads, with no error and no log.
+    #[error(
+        "handle {name:?} in workspace {workspace:?} is already registered to a different session"
+    )]
+    HandleAlreadyRegistered {
+        workspace: WorkspaceId,
+        name: String,
+    },
+    /// H2: `unregister_handle` is a compare-and-remove against the caller's
+    /// own session, not a bare remove-by-name — without this, unbinding your
+    /// own trigger could delete a mapping a different session owns.
+    #[error("caller does not own handle {name:?} in workspace {workspace:?}; unregister refused")]
+    NotAuthorizedForHandle {
+        workspace: WorkspaceId,
+        name: String,
+    },
     #[error("depth limit exceeded: {depth} > {max}")]
     DepthLimitExceeded { depth: u8, max: u8 },
     #[error("fan-out limit exceeded: {count} > {max}")]

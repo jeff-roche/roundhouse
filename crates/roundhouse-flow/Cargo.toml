@@ -7,7 +7,55 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# L7 (security ruling, first applied to `roundhouse-sched`): gates
+# `durability::open_test_db` so daemon code can never reach for it as if it
+# were the crate's normal way to open a connection — that would silently
+# write a run's whole durable state to a private in-memory database that
+# vanishes with the process. Activated for this crate's own integration tests
+# via the self dev-dependency below; `cfg(test)` alone covers only in-lib unit
+# tests, not the separate `tests/*.rs` crates.
+test-util = []
+
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-engine = { path = "../roundhouse-engine" }
 roundhouse-store = { path = "../roundhouse-store" }
+# Task 16 (`durability.rs`): the `workflow_run`/`workflow_step_run` state
+# machine writes directly against a `rusqlite::Connection` via
+# `roundhouse_store::begin_immediate` (ruling P4 — the tables themselves live
+# in `roundhouse-store`'s migration list, not a per-crate migration file).
+# Same workspace-pinned version `roundhouse-store` already uses.
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Pinned, fixed-algorithm content hash for `content_hash` (Task 1): the point
+# of a content hash is that identical content hashes identically across
+# processes and across releases. `std::collections::hash_map::DefaultHasher`
+# is explicitly NOT stable across releases (Subsystem A hit exactly this
+# defect for binding/job addressing and had to replace it) — sha2's SHA-256
+# is a fixed, versioned algorithm we pin here instead.
+sha2 = "0.10"
+# Promoted from a Task 1 dev-dependency to a real one: Task 2's
+# `parse::parse_workflow` deserializes workflow YAML at runtime (not just in
+# tests), consuming exactly the `workflow_yaml` shape
+# `job::Body::to_workflow_yaml` produces. Still unpinned beyond the minor
+# version (`"0.9"`, matching what Task 1 already recorded in `Cargo.lock`)
+# since `roundhouse-flow`'s frozen deps/pins in the Phase 5 Global
+# Constraints don't name a YAML crate at all — this is this crate's own
+# choice, not a §5.3 pin.
+serde_yaml = "0.9"
+# Promoted from a dev-dependency (Task 1) to a real one: Task 13's
+# `exec::provenance::RunId` is this crate's own identity newtype (ruling P6 —
+# `roundhouse-core`'s equivalent macro is private, so `RunId` is written out
+# by hand here following the identical pattern), which needs `Uuid` and its
+# `serde` impls in non-test code. Same version/feature set
+# `roundhouse-core`'s own `Cargo.toml` already pins for the same purpose.
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+# Self dev-dependency, activating the `test-util` feature for this crate's own
+# `tests/*.rs` integration-test crates (L7) — `cfg(test)` alone does not cover
+# them, only this crate's in-lib `#[cfg(test)] mod tests`.
+roundhouse-flow = { path = ".", features = ["test-util"] }

@@ -1,0 +1,18 @@
+/*
+ * Hand-committed placeholder build output (ruling P12), NOT a generated
+ * artifact — the companion to `index.html`, which references it.
+ *
+ * It exists so `assets/dist/` holds more than one content type. With only the
+ * HTML shell embedded, `text/html` was the only value any response could
+ * carry, and every content-type assertion in `tests/assets.rs` passed against
+ * a handler that ignored `rust-embed`'s recorded type and hardcoded
+ * `"text/html"`. Serving this file as `text/css` is what makes those
+ * assertions capable of failing.
+ *
+ * Whoever replaces this directory with a real client build replaces this file
+ * along with the rest of it; the test asserts a CSS asset is served as CSS,
+ * not that this particular file survives.
+ */
+#app {
+  font-family: system-ui, sans-serif;
+}

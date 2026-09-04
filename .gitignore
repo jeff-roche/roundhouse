@@ -7,3 +7,23 @@
 .DS_Store
 .idea/
 *.swp
+
+# Working notes that are deliberately local-only, and that `AGENTS.md` already
+# describes as ignored: "`docs/superpowers/plans/`, `docs/audits/`, and
+# `docs/scratch/` hold the phase-by-phase implementation plans, audit findings,
+# and scratch notes — they exist locally but are gitignored, so don't expect
+# them on a fresh clone." Until now that sentence was simply false; these four
+# lines make it true.
+#
+# This is a safety property and not tidiness. Untracked directories of this
+# size sit directly in `git add -A`'s path: one such command swept 60k+ lines
+# of ledger into a commit during Subsystem D, and recovering from it cost more
+# than the work it interrupted. `docs/architecture/` is the *frozen design* and
+# stays tracked — only these three subtrees are local.
+docs/superpowers/
+docs/audits/
+docs/scratch/
+# The orchestration ledger (task briefs, reports, sweep output, `progress.md`).
+# Same class as the three above: local working state for the agent run, not
+# part of the repository's history.
+.superpowers/

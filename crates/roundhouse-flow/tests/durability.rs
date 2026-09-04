@@ -1,0 +1,1190 @@
+//! Task 16 (B8) — the durable state machine behind §8.10's
+//! "checkpoint-and-re-drive beats replay whenever control flow is data
+//! rather than code".
+
+use roundhouse_core::{BindingId, JobId, SessionId, Timestamp};
+use roundhouse_flow::durability::{
+    checkpoint_step, crash_policy, derive_disposition, on_crash_policy, open_test_db,
+    previous_run_for_binding, recover_run, transition_is_legal, transition_run, CrashPolicy,
+    DurabilityError, RunState, StepDisposition, StepOutput, StepRunState, WorkflowRun,
+    WorkflowStepRun,
+};
+use roundhouse_flow::durability::{insert_workflow_run, TOP_LEVEL_ITEM_INDEX};
+use roundhouse_flow::exec::{Provenance, RunId, StepOutcome, StepStatus};
+use roundhouse_flow::parse::steps::parse_step;
+
+fn step(yaml: &str) -> roundhouse_flow::parse::steps::StepDef {
+    parse_step(&serde_yaml::from_str(yaml).expect("fixture parses as YAML"))
+        .expect("fixture parses as a step")
+}
+
+fn a_run(id: RunId, binding_id: Option<BindingId>, started_at: i64) -> WorkflowRun {
+    WorkflowRun {
+        id,
+        job_id: JobId::new(),
+        job_version: 1,
+        content_hash: "sha256:a".into(),
+        session_id: SessionId::new(),
+        binding_id,
+        trigger_event_id: None,
+        state: RunState::Running,
+        parent_run_id: None,
+        forked_from_run_id: None,
+        awaiting_until: None,
+        started_at: Timestamp::from_unix_nanos(started_at),
+        ended_at: None,
+        // The default fixture records neither ledger fact, which is exactly a
+        // pre-migration-0008 row; the tests that care about them set them
+        // explicitly, on both sides of every boundary.
+        session_depth: None,
+        caps: None,
+    }
+}
+
+fn a_step_run(run_id: RunId, step_id: &str, disposition: StepDisposition) -> WorkflowStepRun {
+    WorkflowStepRun {
+        run_id,
+        step_id: step_id.to_string(),
+        attempt: 1,
+        item_index: None,
+        disposition,
+        state: StepRunState::Running,
+        first_task_seq: Some(10),
+        last_task_seq: Some(12),
+        output: None,
+        error: None,
+    }
+}
+
+#[test]
+fn disposition_is_derived_from_the_real_step_kind_not_hand_picked() {
+    let post = step("id: post\ntool: shell\nwith: { cmd: [gh, pr, comment] }");
+    assert_eq!(
+        derive_disposition(&post),
+        StepDisposition::Effectful,
+        "shell is side-effecting by default"
+    );
+
+    let list_prs =
+        step("id: list_prs\ntool: http\nwith: { method: GET, url: 'https://api.github.com' }");
+    assert_eq!(
+        derive_disposition(&list_prs),
+        StepDisposition::Pure,
+        "a GET is safe to re-run blindly"
+    );
+
+    let post_http =
+        step("id: p\ntool: http\nwith: { method: POST, url: 'https://api.github.com' }");
+    assert_eq!(derive_disposition(&post_http), StepDisposition::Effectful);
+
+    let read = step("id: r\ntool: read\nwith: { path: 'x.txt' }");
+    assert_eq!(derive_disposition(&read), StepDisposition::Pure);
+
+    let post_with_key = step(
+        "id: post\ntool: shell\nidempotency_key: 'pr-1-review'\nwith: { cmd: [gh, pr, comment] }",
+    );
+    assert_eq!(
+        derive_disposition(&post_with_key),
+        StepDisposition::Idempotent,
+        "an explicit idempotency_key overrides the tool-kind default"
+    );
+}
+
+/// A `method:` this crate cannot read as a literal `GET`/`HEAD` — because it
+/// is still an uninterpolated `${{ }}` template, or spelled in lowercase —
+/// falls to `Effectful`, the fail-safe side. Pinned so the fallback is a
+/// decision rather than an accident.
+#[test]
+fn an_http_method_this_crate_cannot_read_as_a_literal_get_is_effectful_not_pure() {
+    let templated =
+        step("id: t\ntool: http\nwith: { method: '${{ inputs.m }}', url: 'https://x' }");
+    assert_eq!(derive_disposition(&templated), StepDisposition::Effectful);
+
+    let lowercase = step("id: l\ntool: http\nwith: { method: get, url: 'https://x' }");
+    assert_eq!(derive_disposition(&lowercase), StepDisposition::Effectful);
+}
+
+#[test]
+fn effectful_step_found_running_after_crash_is_marked_indeterminate_not_completed() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    let post = step("id: post\ntool: shell\nwith: { cmd: [gh, pr, comment] }");
+    let step_run = a_step_run(run_id, &post.id, derive_disposition(&post));
+    checkpoint_step(&mut conn, &step_run).unwrap();
+
+    // Simulate a crash: recover without any further writes.
+    let recovered = recover_run(&conn, run_id).unwrap();
+    let post_row = recovered
+        .steps
+        .iter()
+        .find(|s| s.step_id == "post")
+        .expect("the checkpointed step is recovered");
+    assert_eq!(
+        post_row.state,
+        StepRunState::Indeterminate,
+        "a Running Effectful step is NOT known to have completed"
+    );
+
+    // A Pure step in the same position stays Running — §8.10 tier 2 marks
+    // only Effectful steps Indeterminate.
+    let read = step("id: r\ntool: read\nwith: { path: 'x.txt' }");
+    let read_run = a_step_run(run_id, &read.id, derive_disposition(&read));
+    checkpoint_step(&mut conn, &read_run).unwrap();
+    let recovered = recover_run(&conn, run_id).unwrap();
+    let read_row = recovered.steps.iter().find(|s| s.step_id == "r").unwrap();
+    assert_eq!(read_row.state, StepRunState::Running);
+    assert_eq!(on_crash_policy(read_row.disposition), CrashPolicy::Rerun);
+}
+
+#[test]
+fn pure_and_idempotent_steps_rerun_on_crash_effectful_defaults_to_ask() {
+    assert_eq!(on_crash_policy(StepDisposition::Pure), CrashPolicy::Rerun);
+    assert_eq!(
+        on_crash_policy(StepDisposition::Idempotent),
+        CrashPolicy::Rerun
+    );
+    assert_eq!(
+        on_crash_policy(StepDisposition::Effectful),
+        CrashPolicy::Ask
+    );
+}
+
+/// §8.10 tier 2's `on_crash: rerun | fail | ask` as a **declared** attribute
+/// (B12c), which until now was a hard parse error against
+/// `StepDefWire`'s `deny_unknown_fields`.
+///
+/// The declaration wins outright, in both directions — over-riding an
+/// `Effectful` default *down* to `rerun` and a `Pure` default *up* to `ask` —
+/// because §8.10 writes it as an override and an override the reader
+/// second-guessed would not be one.
+#[test]
+fn a_declared_on_crash_overrides_the_derived_default_in_both_directions() {
+    // Nothing declared: the derivation stands, unchanged.
+    let shell = step("id: a\ntool: shell\nwith: { cmd: [ls] }");
+    assert_eq!(shell.on_crash, None);
+    assert_eq!(crash_policy(&shell), CrashPolicy::Ask);
+    let read = step("id: b\ntool: read\nwith: { path: x }");
+    assert_eq!(crash_policy(&read), CrashPolicy::Rerun);
+
+    // Declared down: an author asserting this particular shell is safe to
+    // repeat.
+    let rerun = step("id: c\ntool: shell\nwith: { cmd: [ls] }\non_crash: rerun");
+    assert_eq!(rerun.on_crash, Some(CrashPolicy::Rerun));
+    assert_eq!(crash_policy(&rerun), CrashPolicy::Rerun);
+
+    // Declared up: an author asserting this particular read is not.
+    let ask = step("id: d\ntool: read\nwith: { path: x }\non_crash: ask");
+    assert_eq!(crash_policy(&ask), CrashPolicy::Ask);
+
+    // And `fail`, which no derivation can produce: before the declared
+    // attribute existed, `CrashPolicy::Fail` was unreachable from any input.
+    let fail = step("id: e\ntool: read\nwith: { path: x }\non_crash: fail");
+    assert_eq!(crash_policy(&fail), CrashPolicy::Fail);
+    assert_ne!(
+        on_crash_policy(derive_disposition(&fail)),
+        CrashPolicy::Fail,
+        "so the declaration is doing the work, not the derivation"
+    );
+}
+
+/// The vocabulary is closed: §8.10 gives three words and a misspelling is a
+/// parse error, not a silently-ignored key that falls back to the default —
+/// the same rule every other enum in this parser follows.
+#[test]
+fn an_unrecognised_on_crash_value_is_a_parse_error_not_a_silent_default() {
+    let err = parse_step(
+        &serde_yaml::from_str("id: a\ntool: read\nwith: { path: x }\non_crash: reboot").unwrap(),
+    )
+    .expect_err("`reboot` is not one of rerun | fail | ask");
+    // The message names the three legal words rather than the key —
+    // `serde_yaml`'s unknown-variant error carries the variant list, not the
+    // field it was found under, which is the same shape every other closed
+    // enum in this parser produces. What matters is that an author is told
+    // what they may write.
+    let rendered = err.to_string();
+    for word in ["rerun", "fail", "ask"] {
+        assert!(
+            rendered.contains(word),
+            "the error should list {word} as a legal value, got {rendered}"
+        );
+    }
+}
+
+/// An `idempotency_key` wins over the *derivation*; a declared `on_crash:`
+/// wins over both. Two overrides on one step, and which one governs is worth
+/// pinning rather than leaving to be inferred from the call order.
+#[test]
+fn a_declared_on_crash_wins_over_an_idempotency_key_which_wins_over_the_kind() {
+    let keyed = step("id: a\ntool: shell\nwith: { cmd: [ls] }\nidempotency_key: k");
+    assert_eq!(derive_disposition(&keyed), StepDisposition::Idempotent);
+    assert_eq!(crash_policy(&keyed), CrashPolicy::Rerun);
+
+    let both = step("id: a\ntool: shell\nwith: { cmd: [ls] }\nidempotency_key: k\non_crash: ask");
+    assert_eq!(
+        derive_disposition(&both),
+        StepDisposition::Idempotent,
+        "the key still decides the disposition, which is a different question"
+    );
+    assert_eq!(
+        crash_policy(&both),
+        CrashPolicy::Ask,
+        "but the declaration decides what to do about a crash"
+    );
+}
+
+#[test]
+fn previous_run_for_binding_finds_the_most_recent_prior_run_excluding_itself() {
+    let mut conn = open_test_db();
+    let binding_id = BindingId::new();
+    let older = a_run(RunId::new(), Some(binding_id), 1_000);
+    let newer = a_run(RunId::new(), Some(binding_id), 2_000);
+    let other_binding = a_run(RunId::new(), Some(BindingId::new()), 3_000);
+    let manual = a_run(RunId::new(), None, 4_000);
+
+    insert_workflow_run(&mut conn, &older).unwrap();
+    insert_workflow_run(&mut conn, &newer).unwrap();
+    insert_workflow_run(&mut conn, &other_binding).unwrap();
+    insert_workflow_run(&mut conn, &manual).unwrap();
+
+    let previous = previous_run_for_binding(&conn, binding_id, newer.id).unwrap();
+    assert_eq!(
+        previous.expect("the older run of the same binding").id,
+        older.id,
+        "the previous run is the most recent run of this binding before the asking run"
+    );
+
+    let none_for_first_run = previous_run_for_binding(&conn, binding_id, older.id).unwrap();
+    assert!(
+        none_for_first_run.is_none(),
+        "a binding's very first run has no previous run, even though a later run exists — \
+         `previous` means strictly earlier, not merely `some other run`"
+    );
+
+    // The `carry_over` case: the daemon asks before the new run's row exists,
+    // and gets the binding's most recent run.
+    let not_yet_inserted = RunId::new();
+    let previous = previous_run_for_binding(&conn, binding_id, not_yet_inserted).unwrap();
+    assert_eq!(
+        previous.expect("a run of this binding").id,
+        newer.id,
+        "a run whose row does not exist yet still gets the binding's latest run to seed from"
+    );
+}
+
+/// B-2. `Provenance` is `(run_id, step_id, attempt, item_index)`, so the
+/// `workflow_step_run` primary key must be too — otherwise two items of one
+/// `map` step collide and the second silently overwrites the first.
+#[test]
+fn two_map_items_of_the_same_step_and_attempt_are_distinct_rows_not_one_overwritten_row() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    for item_index in [0u32, 1u32] {
+        let provenance = Provenance {
+            run_id,
+            step_id: "review".into(),
+            attempt: 1,
+            item_index: Some(item_index),
+        };
+        let mut row = a_step_run(run_id, &provenance.step_id, StepDisposition::Effectful);
+        row.attempt = provenance.attempt;
+        row.item_index = provenance.item_index;
+        row.state = StepRunState::Completed;
+        row.first_task_seq = Some(u64::from(item_index) + 100);
+        row.last_task_seq = Some(u64::from(item_index) + 200);
+        checkpoint_step(&mut conn, &row).unwrap();
+    }
+
+    let recovered = recover_run(&conn, run_id).unwrap();
+    let mut items: Vec<Option<u32>> = recovered
+        .steps
+        .iter()
+        .filter(|s| s.step_id == "review")
+        .map(|s| s.item_index)
+        .collect();
+    items.sort();
+    assert_eq!(
+        items,
+        vec![Some(0), Some(1)],
+        "each map item keeps its own row"
+    );
+
+    let seqs: Vec<(Option<u64>, Option<u64>)> = {
+        let mut v: Vec<_> = recovered
+            .steps
+            .iter()
+            .filter(|s| s.step_id == "review")
+            .map(|s| (s.first_task_seq, s.last_task_seq))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        seqs,
+        vec![(Some(100), Some(200)), (Some(101), Some(201))],
+        "neither item's log join range was overwritten by the other's"
+    );
+}
+
+/// The other half of B-2: a *top-level* step has no item index, and two
+/// checkpoints of it must still be one row. `item_index` is stored with a
+/// sentinel rather than NULL because these are `STRICT` tables, where every
+/// `PRIMARY KEY` column is implicitly `NOT NULL` and a NULL therefore cannot
+/// be stored at all. (The "NULLs compare distinct in a PRIMARY KEY" behaviour
+/// is real, but it belongs to an ordinary rowid table; under `STRICT` the
+/// same mistake is an insert-time error instead of silent duplicate rows.)
+/// Either way the sentinel is required — this pins the one-row result.
+#[test]
+fn a_top_level_step_checkpointed_twice_is_one_row_not_two() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    let mut row = a_step_run(run_id, "build", StepDisposition::Effectful);
+    assert_eq!(row.item_index, None);
+    checkpoint_step(&mut conn, &row).unwrap();
+    row.state = StepRunState::Completed;
+    row.last_task_seq = Some(99);
+    checkpoint_step(&mut conn, &row).unwrap();
+
+    let recovered = recover_run(&conn, run_id).unwrap();
+    let build: Vec<_> = recovered
+        .steps
+        .iter()
+        .filter(|s| s.step_id == "build")
+        .collect();
+    assert_eq!(build.len(), 1, "the second checkpoint updated one row");
+    assert_eq!(build[0].state, StepRunState::Completed);
+    assert_eq!(build[0].item_index, None);
+    assert_eq!(
+        build[0].last_task_seq,
+        Some(99),
+        "the later checkpoint's state is what survives"
+    );
+    assert_eq!(
+        build[0].first_task_seq,
+        Some(10),
+        "`first` means first: a later checkpoint never moves it"
+    );
+    // The sentinel is outside `u32`, so `map` item 0 of the same step is a
+    // different row rather than an overwrite of the top-level one.
+    assert!(u32::try_from(TOP_LEVEL_ITEM_INDEX).is_err());
+    let mut item_zero = a_step_run(run_id, "build", StepDisposition::Effectful);
+    item_zero.item_index = Some(0);
+    item_zero.state = StepRunState::Failed;
+    checkpoint_step(&mut conn, &item_zero).unwrap();
+
+    let recovered = recover_run(&conn, run_id).unwrap();
+    let mut build: Vec<(Option<u32>, StepRunState)> = recovered
+        .steps
+        .iter()
+        .filter(|s| s.step_id == "build")
+        .map(|s| (s.item_index, s.state))
+        .collect();
+    build.sort_by_key(|(i, _)| *i);
+    assert_eq!(
+        build,
+        vec![
+            (None, StepRunState::Completed),
+            (Some(0), StepRunState::Failed)
+        ],
+        "item 0 and the top-level row coexist"
+    );
+}
+
+/// B-3. `checkpoint_step` persists the step's output **and** the
+/// `output_is_secret_derived` flag the executor already computed. Both
+/// survive the round trip, so a consumer reads the flag rather than
+/// re-deriving it (`exec/mod.rs`: "a re-derivation that disagrees with this
+/// one is a leak").
+#[test]
+fn step_output_and_its_taint_flag_round_trip_instead_of_being_re_derived() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    let tainted = StepOutcome {
+        step_id: "notify".into(),
+        output: serde_json::json!({"body": "token sk-super-secret"}),
+        status: StepStatus::Completed,
+        output_is_secret_derived: true,
+        gate_condition_was_secret_derived: false,
+    };
+    let clean = StepOutcome {
+        step_id: "summary".into(),
+        output: serde_json::json!({"count": 3}),
+        status: StepStatus::Completed,
+        output_is_secret_derived: false,
+        gate_condition_was_secret_derived: false,
+    };
+
+    for outcome in [&tainted, &clean] {
+        let mut row = a_step_run(run_id, &outcome.step_id, StepDisposition::Effectful);
+        row.state = StepRunState::Completed;
+        row.output = Some(StepOutput::from_outcome(outcome));
+        checkpoint_step(&mut conn, &row).unwrap();
+    }
+
+    let recovered = recover_run(&conn, run_id).unwrap();
+    let notify = recovered
+        .steps
+        .iter()
+        .find(|s| s.step_id == "notify")
+        .unwrap();
+    let notify_output = notify.output.as_ref().expect("output was persisted");
+    assert_eq!(
+        notify_output.value_unredacted_for_resume(),
+        &serde_json::json!({"body": "token sk-super-secret"}),
+        "§8.13's fork inherits the real completed step output, not a redacted stand-in"
+    );
+    assert!(
+        notify_output.is_secret_derived(),
+        "the executor's own flag is what comes back"
+    );
+
+    let summary = recovered
+        .steps
+        .iter()
+        .find(|s| s.step_id == "summary")
+        .unwrap();
+    let summary_output = summary.output.as_ref().unwrap();
+    assert_eq!(
+        summary_output.value_unredacted_for_resume(),
+        &serde_json::json!({"count": 3})
+    );
+    assert!(!summary_output.is_secret_derived());
+
+    // A step with no output at all is distinguishable from one whose output
+    // is JSON `null` — the resume path must not confuse the two.
+    let mut pending = a_step_run(run_id, "pending", StepDisposition::Pure);
+    pending.state = StepRunState::Pending;
+    pending.output = None;
+    checkpoint_step(&mut conn, &pending).unwrap();
+    let recovered = recover_run(&conn, run_id).unwrap();
+    let pending = recovered
+        .steps
+        .iter()
+        .find(|s| s.step_id == "pending")
+        .unwrap();
+    assert!(pending.output.is_none());
+}
+
+/// A hand-written `Debug` prints the output's *shape*, never a leaf's
+/// content — `StepOutput` is `pub` and reachable from any consumer's
+/// `tracing::debug!`, and it deliberately holds unredacted material.
+#[test]
+fn step_output_debug_never_prints_a_leaf_value() {
+    let outcome = StepOutcome {
+        step_id: "notify".into(),
+        output: serde_json::json!({"body": "sk-super-secret"}),
+        status: StepStatus::Completed,
+        output_is_secret_derived: true,
+        gate_condition_was_secret_derived: false,
+    };
+    let rendered = format!("{:?}", StepOutput::from_outcome(&outcome));
+    assert!(
+        !rendered.contains("sk-super-secret"),
+        "leaf content must not reach a Debug rendering: {rendered}"
+    );
+    assert!(
+        rendered.contains("body"),
+        "the shape (key names) is what is printed: {rendered}"
+    );
+}
+
+/// B-4. The three run-level columns Tasks 17/20 need exist and round-trip
+/// now, so neither has to migrate the table later. `awaiting_until` is an
+/// **absolute** instant, written by Task 17.
+#[test]
+fn awaiting_until_parent_run_and_forked_from_run_round_trip() {
+    use roundhouse_flow::caps::ResourceCaps;
+
+    let mut conn = open_test_db();
+    let binding_id = BindingId::new();
+    let mut parent = a_run(RunId::new(), Some(binding_id), 1_000);
+    // Both sides carry a grant, because the child below carries a
+    // `parent_run_id` and B12c refuses to commit such a row without a draw in
+    // the same transaction (ruling P114 §A). A child with no recorded grant
+    // has nothing to draw, and one whose parent has none has nowhere to draw
+    // from — both are `ChildDrawRefused`, which is the fail-closed direction.
+    parent.caps = Some(ResourceCaps::default());
+    insert_workflow_run(&mut conn, &parent).unwrap();
+
+    // Terminal, not `AwaitingHuman`: `insert_run_row`'s fix-round-1 guard
+    // (item B) rejects a non-terminal state paired with a set `ended_at`, and
+    // this fixture wants to round-trip `ended_at` in the same row as
+    // `awaiting_until` — a stale-but-not-yet-cleared deadline on an ended run
+    // is exactly the shape a real row can have, since a terminal transition
+    // out of `AwaitingHuman` stamps `ended_at` and clears `awaiting_until`
+    // separately (see the `transition` fn); this row exercises the read path
+    // for both columns regardless of which one a given write actually set.
+    let mut child = a_run(RunId::new(), Some(binding_id), 2_000);
+    child.parent_run_id = Some(parent.id);
+    child.forked_from_run_id = Some(parent.id);
+    child.state = RunState::Completed;
+    child.awaiting_until = Some(Timestamp::from_unix_nanos(9_000_000_000));
+    child.trigger_event_id = Some(42);
+    child.ended_at = Some(Timestamp::from_unix_nanos(2_500));
+    child.caps = Some(ResourceCaps::default());
+    insert_workflow_run(&mut conn, &child).unwrap();
+
+    let read_back = recover_run(&conn, child.id).unwrap().run;
+    assert_eq!(read_back, child, "every run-level column round-trips");
+    assert_eq!(
+        read_back.awaiting_until,
+        Some(Timestamp::from_unix_nanos(9_000_000_000))
+    );
+}
+
+#[test]
+fn recover_run_for_an_unknown_run_id_is_an_error_not_an_empty_step_list() {
+    let mut conn = open_test_db();
+    let err = recover_run(&conn, RunId::new()).unwrap_err();
+    assert!(
+        matches!(err, DurabilityError::RunNotFound { .. }),
+        "an unknown run must not be indistinguishable from a run with no steps yet: {err:?}"
+    );
+
+    // A run that exists but has checkpointed nothing yet is a legitimate
+    // state, and reads as an empty step list rather than an error.
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+    let recovered = recover_run(&conn, run_id).unwrap();
+    assert!(recovered.steps.is_empty());
+    assert_eq!(recovered.run.id, run_id);
+}
+
+/// No connection in this workspace turns on `PRAGMA foreign_keys`, so a
+/// declared `FOREIGN KEY` would be inert. `checkpoint_step` does the check
+/// itself: without it, the step row would be written and then be permanently
+/// invisible to `recover_run`, which errors on the missing run.
+#[test]
+fn checkpointing_a_step_of_a_run_that_was_never_inserted_is_refused_not_orphaned() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    let row = a_step_run(run_id, "build", StepDisposition::Effectful);
+
+    let err = checkpoint_step(&mut conn, &row).unwrap_err();
+    assert!(
+        matches!(err, DurabilityError::RunNotFound { .. }),
+        "expected RunNotFound, got {err:?}"
+    );
+
+    // And the refusal rolled back: inserting the run afterwards must not
+    // reveal a step row written by the rejected call.
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+    assert!(recover_run(&conn, run_id).unwrap().steps.is_empty());
+}
+
+/// I-2 (fix round 1). `StepOutput` now has a **safe** accessor as well as an
+/// honestly-named hazardous one. `value_for_display` is the call a web
+/// handler or an inbox renderer reaches for, and it performs the taint check
+/// itself — so the leak shape the security lens described
+/// (`json!({ "output": step.output.as_ref().map(StepOutput::value) })`) has
+/// no innocent-looking spelling left.
+#[test]
+fn a_tainted_output_is_withheld_from_the_display_accessor_but_not_from_resume() {
+    let tainted = StepOutput::from_outcome(&StepOutcome {
+        step_id: "notify".into(),
+        output: serde_json::json!({"body": "sk-super-secret"}),
+        status: StepStatus::Completed,
+        output_is_secret_derived: true,
+        gate_condition_was_secret_derived: false,
+    });
+    assert_eq!(
+        tainted.value_for_display(),
+        None,
+        "a secret-derived output is not renderable"
+    );
+    assert_eq!(
+        tainted.value_unredacted_for_resume(),
+        &serde_json::json!({"body": "sk-super-secret"}),
+        "resume and §8.13's fork still need the real value"
+    );
+
+    let clean = StepOutput::from_outcome(&StepOutcome {
+        step_id: "summary".into(),
+        output: serde_json::json!({"count": 3}),
+        status: StepStatus::Completed,
+        output_is_secret_derived: false,
+        gate_condition_was_secret_derived: false,
+    });
+    assert_eq!(
+        clean.value_for_display(),
+        Some(&serde_json::json!({"count": 3})),
+        "an untainted output renders normally"
+    );
+}
+
+/// C-1 (fix round 1). A `when:`-skipped step is **finished**: on re-drive the
+/// run loop must not re-evaluate its `when:`, and downstream steps read
+/// `${{ steps.<id>.status }}`. `exec::StepStatus::Skipped` already exists, so
+/// migration 0007's CHECK and `StepRunState` carry `skipped` from the start
+/// rather than making Task 20 rebuild a table SQLite cannot alter in place.
+/// Nothing in this task writes it; this pins that it *can* be written.
+#[test]
+fn a_skipped_step_state_round_trips_through_the_schema() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    let mut skipped = a_step_run(run_id, "deploy", StepDisposition::Effectful);
+    skipped.state = StepRunState::Skipped;
+    skipped.error = Some("when: evaluated false".into());
+    checkpoint_step(&mut conn, &skipped).unwrap();
+
+    let recovered = recover_run(&conn, run_id).unwrap();
+    let deploy = recovered
+        .steps
+        .iter()
+        .find(|s| s.step_id == "deploy")
+        .expect("the skipped step was checkpointed");
+    assert_eq!(
+        deploy.state,
+        StepRunState::Skipped,
+        "skipped is a storable, recoverable state — not re-derived by re-evaluating `when:`"
+    );
+    assert_eq!(
+        deploy.error.as_deref(),
+        Some("when: evaluated false"),
+        "the skip reason survives the process that produced it"
+    );
+    assert_ne!(
+        deploy.state,
+        StepRunState::Indeterminate,
+        "an Effectful step that was skipped was never Running, so recovery must not mark it \
+         indeterminate"
+    );
+}
+
+/// C-3 (fix round 1). A failure message is persisted for the same reason the
+/// output is: it cannot be recomputed once the process that produced it is
+/// gone, and Task 20's `catch:` and the web Runs inbox both need it.
+#[test]
+fn a_failure_message_survives_the_checkpoint_instead_of_being_dropped() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    let mut failed = a_step_run(run_id, "build", StepDisposition::Effectful);
+    failed.state = StepRunState::Failed;
+    failed.error = Some("cargo build exited 101".into());
+    checkpoint_step(&mut conn, &failed).unwrap();
+
+    let build = recover_run(&conn, run_id).unwrap().steps.remove(0);
+    assert_eq!(build.state, StepRunState::Failed);
+    assert_eq!(build.error.as_deref(), Some("cargo build exited 101"));
+
+    // And a step that has not failed carries no error, rather than an empty
+    // string standing in for one.
+    let ok = a_step_run(run_id, "aaa_ok", StepDisposition::Pure);
+    checkpoint_step(&mut conn, &ok).unwrap();
+    let recovered = recover_run(&conn, run_id).unwrap();
+    let ok = recovered
+        .steps
+        .iter()
+        .find(|s| s.step_id == "aaa_ok")
+        .unwrap();
+    assert_eq!(ok.error, None);
+}
+
+/// Fix round 2 (M-2): `workflow_step_run.error` was a second, uncapped sink
+/// for `StepStatus::Failed`/`Skipped` text alongside `exec`'s
+/// `steps.<id>.error`, which is bounded at 512 bytes. `checkpoint_step` now
+/// bounds this column too, at its own independent constant. Payload: a
+/// 5,000-byte message of repeated `'e'`s.
+#[test]
+fn an_oversized_failure_message_is_truncated_before_it_reaches_the_column() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    let huge_message: String = std::iter::repeat_n('e', 5_000).collect();
+    let mut failed = a_step_run(run_id, "build", StepDisposition::Effectful);
+    failed.state = StepRunState::Failed;
+    failed.error = Some(huge_message.clone());
+    checkpoint_step(&mut conn, &failed).unwrap();
+
+    let build = recover_run(&conn, run_id).unwrap().steps.remove(0);
+    let stored = build.error.expect("a Failed step keeps its error");
+    assert!(
+        stored.len() < huge_message.len(),
+        "stored error ({} bytes) must be shorter than the original 5,000-byte \
+         message, got the same or longer",
+        stored.len()
+    );
+    assert!(
+        stored.ends_with("(5000 bytes total)"),
+        "truncated error should name the original byte length, got: {stored:?}"
+    );
+    assert!(
+        stored.starts_with(&"e".repeat(100)),
+        "truncation keeps a real prefix of the message, not just the suffix marker"
+    );
+}
+
+/// Fix round 2 (M-2): before this fix, `WorkflowStepRun` derived `Debug`, so
+/// a value that had never been through `checkpoint_step` (and so had no
+/// chance to be bounded at the storage layer) printed `error` at full
+/// length via `{:?}` — the same failure shape `exec::StepStatus`'s
+/// hand-written `Debug` was written to prevent for the in-memory value this
+/// column is copied from. Payload: a 5,000-byte message of repeated `'s'`s,
+/// never checkpointed.
+#[test]
+fn debug_formatting_a_step_run_bounds_an_unpersisted_error_field() {
+    let huge_message: String = std::iter::repeat_n('s', 5_000).collect();
+    let mut failed = a_step_run(RunId::new(), "build", StepDisposition::Effectful);
+    failed.state = StepRunState::Failed;
+    failed.error = Some(huge_message.clone());
+
+    let printed = format!("{failed:?}");
+    assert!(
+        printed.len() < huge_message.len(),
+        "the full 5,000-byte message must not reach Debug output verbatim, \
+         printed output was {} bytes",
+        printed.len()
+    );
+    assert!(
+        !printed.contains(&huge_message),
+        "Debug output must not contain the unbounded message as a substring"
+    );
+}
+
+/// `checkpoint_step`'s upsert makes `output` last-write-wins rather than
+/// `COALESCE`ing it, so a checkpoint carrying no output **clears** a stored
+/// one. That is deliberate on both counts: it keeps `output` and its taint
+/// flag moving together (a `COALESCE`d value beside a fresh `0` flag would be
+/// a leak), and it is the only mechanism by which a stored output can ever be
+/// erased — the erasure whose *caller* is a residual owned by Task 20. Pinned
+/// here so it is a decision rather than something rediscovered as a bug.
+#[test]
+fn a_checkpoint_with_no_output_clears_a_previously_stored_one() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    let mut row = a_step_run(run_id, "notify", StepDisposition::Effectful);
+    row.state = StepRunState::Completed;
+    row.output = Some(StepOutput::from_outcome(&StepOutcome {
+        step_id: "notify".into(),
+        output: serde_json::json!({"body": "sk-super-secret"}),
+        status: StepStatus::Completed,
+        output_is_secret_derived: true,
+        gate_condition_was_secret_derived: false,
+    }));
+    checkpoint_step(&mut conn, &row).unwrap();
+    assert!(recover_run(&conn, run_id).unwrap().steps[0]
+        .output
+        .is_some());
+
+    row.output = None;
+    checkpoint_step(&mut conn, &row).unwrap();
+    let recovered = recover_run(&conn, run_id).unwrap();
+    assert_eq!(recovered.steps.len(), 1, "still one row, not two");
+    assert!(
+        recovered.steps[0].output.is_none(),
+        "the stored output was cleared, and with it the taint flag"
+    );
+}
+
+/// C-2 (fix round 1). `item_index` is bounded at both ends. The lower bound
+/// keeps the `-1` sentinel the only negative value; the upper bound matters
+/// because `item_index` is a `u32` in Rust, so an out-of-domain stored value
+/// would otherwise read back through the same "not a u32" path as the
+/// sentinel — aliasing two rows with different states onto one identity.
+/// Insert-time rejection and read-back rejection are both pinned; the
+/// read-back leg is reached by suspending CHECK enforcement, which is the
+/// closest a test can get to a hand-edited or pre-CHECK row.
+#[test]
+fn an_out_of_domain_item_index_is_refused_on_write_and_on_read_never_aliased() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+    let run_text = run_id.to_string();
+
+    let insert = "INSERT INTO workflow_step_run \
+         (run_id, step_id, attempt, item_index, disposition, state, output_is_secret_derived) \
+         VALUES (?1, ?2, 1, ?3, 'effectful', 'running', 0)";
+
+    let too_big = conn.execute(insert, rusqlite::params![run_text, "m", 4_294_967_296i64]);
+    assert!(
+        too_big.is_err(),
+        "an item_index above u32::MAX must violate the CHECK constraint"
+    );
+    let too_small = conn.execute(insert, rusqlite::params![run_text, "m", -2i64]);
+    assert!(
+        too_small.is_err(),
+        "-1 is the only negative item_index the CHECK admits"
+    );
+
+    // A row that got in anyway: read-back must reject it rather than hand it
+    // back as the top-level sentinel, which is what `u32::try_from(..).ok()`
+    // used to do.
+    conn.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    conn.execute(insert, rusqlite::params![run_text, "m", 4_294_967_296i64])
+        .expect("CHECK enforcement is suspended for this one insert");
+    conn.pragma_update(None, "ignore_check_constraints", false)
+        .unwrap();
+
+    let err = recover_run(&conn, run_id).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DurabilityError::ItemIndexOutOfRange {
+                stored: 4_294_967_296
+            }
+        ),
+        "expected ItemIndexOutOfRange, got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 20a (B12a) — the run-state transition writer (§8.13)
+// ---------------------------------------------------------------------------
+
+/// Every ordered pair `(from, to)` the matrix admits, written out here
+/// independently of the implementation rather than by calling it — so the
+/// test is a second statement of the contract, not a mirror of the code.
+/// See `durability::transition_is_legal`'s doc comment for which of these
+/// §8.13/§8.11 name and which are inferred.
+const LEGAL_TRANSITIONS: &[(RunState, RunState)] = &[
+    (RunState::Running, RunState::Paused),
+    (RunState::Running, RunState::Cancelling),
+    (RunState::Running, RunState::AwaitingHuman),
+    (RunState::Running, RunState::Completed),
+    (RunState::Running, RunState::Failed),
+    (RunState::Paused, RunState::Running),
+    (RunState::Paused, RunState::Cancelling),
+    (RunState::Paused, RunState::Completed),
+    (RunState::Paused, RunState::Failed),
+    (RunState::AwaitingHuman, RunState::AwaitingHuman),
+    (RunState::AwaitingHuman, RunState::Running),
+    (RunState::AwaitingHuman, RunState::Cancelling),
+    (RunState::AwaitingHuman, RunState::Failed),
+    (RunState::Cancelling, RunState::Cancelled),
+    (RunState::Cancelling, RunState::Failed),
+];
+
+const ALL_RUN_STATES: &[RunState] = &[
+    RunState::Running,
+    RunState::Paused,
+    RunState::Cancelling,
+    RunState::AwaitingHuman,
+    RunState::Completed,
+    RunState::Failed,
+    RunState::Cancelled,
+];
+
+#[test]
+fn the_legality_matrix_admits_exactly_fifteen_of_the_forty_nine_ordered_pairs() {
+    // Fix round 1 (Task 20a, item G): the test's own NAME was never actually
+    // asserted anywhere below — deleting a row from both `LEGAL_TRANSITIONS`
+    // and `transition_is_legal` left this test green with a name that was
+    // now false. State the count on both sides of the comparison.
+    assert_eq!(
+        LEGAL_TRANSITIONS.len(),
+        15,
+        "the table this test's name promises must actually hold fifteen pairs"
+    );
+    let mut admitted_pairs = 0;
+    for &from in ALL_RUN_STATES {
+        for &to in ALL_RUN_STATES {
+            let expected = LEGAL_TRANSITIONS.contains(&(from, to));
+            assert_eq!(
+                transition_is_legal(from, to),
+                expected,
+                "({from:?} -> {to:?}) should be {}",
+                if expected { "legal" } else { "refused" }
+            );
+            if transition_is_legal(from, to) {
+                admitted_pairs += 1;
+            }
+        }
+    }
+    assert_eq!(
+        admitted_pairs, 15,
+        "transition_is_legal itself must admit exactly fifteen of the 7x7 ordered pairs"
+    );
+}
+
+/// Fix round 1 (Task 20a, item G): `ALL_RUN_STATES` is hand-written, so an
+/// eighth `RunState` variant could silently shrink what it (and the two tests
+/// keyed on it) actually cover, with no compile error. This match has no `_`
+/// arm, so adding a variant to `RunState` without adding it here fails the
+/// build instead of failing silently.
+#[test]
+fn all_run_states_is_exhaustive_over_run_state_so_an_eighth_variant_cannot_hide() {
+    fn assert_every_variant_is_named(state: RunState) {
+        match state {
+            RunState::Running
+            | RunState::Paused
+            | RunState::Cancelling
+            | RunState::AwaitingHuman
+            | RunState::Completed
+            | RunState::Failed
+            | RunState::Cancelled => {}
+        }
+    }
+    for &state in ALL_RUN_STATES {
+        assert_every_variant_is_named(state);
+    }
+    assert_eq!(
+        ALL_RUN_STATES.len(),
+        7,
+        "seven RunState variants exist today"
+    );
+}
+
+#[test]
+fn every_terminal_state_is_absorbing_and_no_other_state_is() {
+    for &state in ALL_RUN_STATES {
+        let has_outgoing = ALL_RUN_STATES
+            .iter()
+            .any(|&to| transition_is_legal(state, to));
+        assert_eq!(
+            state.is_terminal(),
+            !has_outgoing,
+            "{state:?}: terminal iff it has no outgoing transition"
+        );
+    }
+    assert!(RunState::Completed.is_terminal());
+    assert!(RunState::Failed.is_terminal());
+    assert!(RunState::Cancelled.is_terminal());
+    assert!(!RunState::Cancelling.is_terminal());
+}
+
+#[test]
+fn a_terminal_transition_stamps_ended_at_and_a_non_terminal_one_leaves_it_null() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    transition_run(
+        &mut conn,
+        run_id,
+        RunState::Paused,
+        Timestamp::from_unix_nanos(2_000),
+    )
+    .expect("running -> paused");
+    let paused = recover_run(&conn, run_id).unwrap().run;
+    assert_eq!(paused.state, RunState::Paused);
+    assert_eq!(
+        paused.ended_at, None,
+        "a run that is paused has not ended; nothing may stamp ended_at yet"
+    );
+
+    transition_run(
+        &mut conn,
+        run_id,
+        RunState::Running,
+        Timestamp::from_unix_nanos(3_000),
+    )
+    .expect("paused -> running");
+    transition_run(
+        &mut conn,
+        run_id,
+        RunState::Completed,
+        Timestamp::from_unix_nanos(4_000),
+    )
+    .expect("running -> completed");
+
+    let done = recover_run(&conn, run_id).unwrap().run;
+    assert_eq!(done.state, RunState::Completed);
+    assert_eq!(
+        done.ended_at,
+        Some(Timestamp::from_unix_nanos(4_000)),
+        "ended_at is the `now` the terminal transition was given — before Task \
+         20a nothing wrote this column at all"
+    );
+    assert_eq!(
+        done.started_at,
+        Timestamp::from_unix_nanos(1_000),
+        "started_at is untouched"
+    );
+}
+
+#[test]
+fn an_illegal_transition_is_refused_and_leaves_the_row_exactly_as_it_was() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+    transition_run(
+        &mut conn,
+        run_id,
+        RunState::Completed,
+        Timestamp::from_unix_nanos(4_000),
+    )
+    .unwrap();
+    let before = recover_run(&conn, run_id).unwrap().run;
+
+    let err = transition_run(
+        &mut conn,
+        run_id,
+        RunState::Running,
+        Timestamp::from_unix_nanos(5_000),
+    )
+    .expect_err("a completed run is absorbing; it cannot be resurrected");
+
+    match err {
+        DurabilityError::IllegalTransition {
+            run_id: r,
+            from,
+            to,
+        } => {
+            assert_eq!(r, run_id);
+            assert_eq!(from, RunState::Completed);
+            assert_eq!(to, RunState::Running);
+        }
+        other => panic!("expected IllegalTransition, got {other:?}"),
+    }
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run,
+        before,
+        "a refused transition writes nothing at all, ended_at included"
+    );
+}
+
+#[test]
+fn a_run_with_no_row_is_not_found_rather_than_an_illegal_transition() {
+    let mut conn = open_test_db();
+    let absent = RunId::new();
+    let err = transition_run(
+        &mut conn,
+        absent,
+        RunState::Cancelling,
+        Timestamp::from_unix_nanos(1),
+    )
+    .expect_err("no row means no transition");
+    match err {
+        DurabilityError::RunNotFound { run_id } => assert_eq!(run_id, absent),
+        other => panic!(
+            "\"run not found\" and \"wrong state\" are different facts a caller \
+             must be able to tell apart; got {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn a_transition_returns_the_state_it_displaced() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+    let displaced = transition_run(
+        &mut conn,
+        run_id,
+        RunState::Cancelling,
+        Timestamp::from_unix_nanos(2_000),
+    )
+    .unwrap();
+    assert_eq!(
+        displaced,
+        RunState::Running,
+        "the previous state is read inside the same transaction as the write, \
+         so it is the one the write actually displaced"
+    );
+    assert_eq!(
+        transition_run(
+            &mut conn,
+            run_id,
+            RunState::Cancelled,
+            Timestamp::from_unix_nanos(3_000)
+        )
+        .unwrap(),
+        RunState::Cancelling
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B12b: the two caller-supplied ledger columns
+// ---------------------------------------------------------------------------
+
+/// Both facts a run's creator knows, round-tripped through the row — and both
+/// absent on a second run in the same database, which is what a row written
+/// before migration 0008 looks like. Two runs rather than one, so a reader
+/// that returned a constant for either column would fail on one of them.
+#[test]
+fn a_runs_session_depth_and_caps_grant_round_trip_and_so_does_their_absence() {
+    use roundhouse_flow::caps::ResourceCaps;
+
+    let mut conn = open_test_db();
+    let grant = ResourceCaps {
+        max_tokens: 777,
+        max_cost_usd: 1.25,
+        ..ResourceCaps::default()
+    };
+
+    let recorded = RunId::new();
+    let mut run = a_run(recorded, None, 100);
+    run.session_depth = Some(3);
+    run.caps = Some(grant.clone());
+    insert_workflow_run(&mut conn, &run).expect("insert");
+
+    let unrecorded = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(unrecorded, None, 200)).expect("insert");
+
+    let loaded = recover_run(&conn, recorded).unwrap().run;
+    assert_eq!(loaded.session_depth, Some(3));
+    assert_eq!(loaded.caps, Some(grant));
+
+    let loaded = recover_run(&conn, unrecorded).unwrap().run;
+    assert_eq!(loaded.session_depth, None);
+    assert_eq!(
+        loaded.caps, None,
+        "an unrecorded grant reads back as unrecorded, never as the default"
+    );
+}
+
+/// The read-back leg of the `caps_json` column, which deliberately carries no
+/// `CHECK` of its own: a `json_valid()` constraint would bind the schema to
+/// SQLite's JSON1 extension being present in every future build, which is the
+/// same shape of hazard as ruling P104's `ADD CONSTRAINT`.
+#[test]
+fn a_caps_column_that_is_not_a_resource_caps_is_refused_on_read() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 100)).expect("insert");
+    conn.execute(
+        "UPDATE workflow_run SET caps_json = '{\"max_tokens\": \"not a number\"}' WHERE id = ?1",
+        rusqlite::params![run_id.to_string()],
+    )
+    .unwrap();
+
+    assert!(
+        matches!(
+            recover_run(&conn, run_id),
+            Err(DurabilityError::MalformedStoredCaps { .. })
+        ),
+        "a stored grant this crate cannot read is an error, not an empty budget"
+    );
+}
+
+/// Migration 0008's `CHECK` is the insert-time leg; this is the read-back leg,
+/// reached by disabling the constraint the way a hand-edited database or a
+/// pre-`CHECK` row would.
+#[test]
+fn a_stored_session_depth_outside_u32_is_refused_on_read_rather_than_clamped() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 100)).expect("insert");
+    conn.pragma_update(None, "ignore_check_constraints", true)
+        .expect("the CHECK can be suspended to plant the row it exists to reject");
+    conn.execute(
+        "UPDATE workflow_run SET session_depth = 4294967296 WHERE id = ?1",
+        rusqlite::params![run_id.to_string()],
+    )
+    .expect("the planted row is written only because the CHECK is suspended");
+    conn.pragma_update(None, "ignore_check_constraints", false)
+        .unwrap();
+
+    assert!(
+        matches!(
+            recover_run(&conn, run_id),
+            Err(DurabilityError::SessionDepthOutOfRange { stored: 4294967296 })
+        ),
+        "clamping would turn a corrupt row into a depth decision"
+    );
+}

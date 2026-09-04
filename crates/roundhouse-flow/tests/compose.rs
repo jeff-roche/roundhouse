@@ -1,0 +1,850 @@
+//! Task 19 (B11): composition primitives — the `call:` budget transfer, the
+//! recursion-depth and fan-out bounds, and workflow-as-tool registration.
+//!
+//! These test the primitives only. Nothing here drives a run: Task 20 (B12)
+//! owns composition's run loop and is the caller that will wire all four.
+
+use roundhouse_core::JobId;
+use roundhouse_flow::caps::ResourceCaps;
+use roundhouse_flow::compose::{
+    admit_child_call, child_call_depth, draw_child_budget, refund_child_budget, register_as_tool,
+    CallDepthError, CallFanOutError, MAX_CALL_DEPTH, MAX_DIRECT_CHILD_CALLS,
+};
+use roundhouse_flow::job::{Body, InputSchema, JobVersion, SessionTemplate};
+use roundhouse_flow::parse::parse_workflow;
+use std::time::Duration;
+
+fn template() -> SessionTemplate {
+    SessionTemplate {
+        provider: "anthropic".to_string(),
+        model: "claude-sonnet".to_string(),
+        cwd: "/repo".to_string(),
+        tools: vec![],
+        isolation: roundhouse_core::Tier::Worktree,
+        permission_policy_ref: "default".to_string(),
+    }
+}
+
+/// A workflow body that really parses: `WorkflowDef` requires `permissions`
+/// (with `unattended.escalate`, plus `deadline`/`on_timeout` for `park`) and
+/// `steps`, and is `deny_unknown_fields`. A fixture missing any of them makes
+/// `parse_workflow` fail, which is the whole point of
+/// `a_workflow_whose_body_does_not_parse_is_refused_rather_than_named_unknown`
+/// below.
+const PR_REVIEW_YAML: &str = r#"
+name: pr-review
+version: 3
+inputs:
+  repo:    { type: string, required: true }
+  branch:  { type: string, required: true }
+  max_prs: { type: integer, default: 10 }
+  dry_run: { type: boolean }
+permissions:
+  default: deny
+  unattended:
+    escalate: park
+    deadline: 24h
+    on_timeout: deny
+steps:
+  - id: run
+    emit:
+      done: true
+"#;
+
+fn workflow_job(yaml: &str) -> JobVersion {
+    JobVersion::new(
+        JobId::new(),
+        3,
+        template(),
+        Body::Workflow {
+            workflow_yaml: yaml.to_string(),
+        },
+        // Deliberately *not* the tool schema: §8.9's "the `inputs:` schema
+        // becomes the JSON tool schema" names `WorkflowDef.inputs`, a
+        // different object from `JobVersion::input_schema`. If
+        // `register_as_tool` ever reached for this instead, the assertions
+        // below would see `{"never": "this one"}`.
+        InputSchema(serde_json::json!({"never": "this one"})),
+    )
+}
+
+/// Half of every default, so a draw of the full default is a draw of exactly
+/// what remains — the clamp is visible in the numbers rather than inferred.
+fn half_of_default() -> ResourceCaps {
+    ResourceCaps {
+        run_wall_timeout: Duration::from_secs(300),
+        run_active_timeout: Duration::from_secs(240),
+        step_timeout: Duration::from_secs(60),
+        max_tokens: 1_000_000,
+        max_cost_usd: 5.0,
+        max_tasks: 2_500,
+        max_tool_calls: 1_000,
+        max_subagents: 10,
+        max_bytes_written: 50_000_000,
+        max_escalations: 25,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Budget: draw is a real transfer, refund returns only what went unspent
+// ---------------------------------------------------------------------------
+
+#[test]
+fn drawing_a_child_budget_is_a_real_transfer_and_refund_returns_only_the_unspent_part() {
+    let mut parent = ResourceCaps {
+        max_cost_usd: 10.0,
+        max_tokens: 1_000_000,
+        max_tool_calls: 100,
+        ..ResourceCaps::default()
+    };
+    let requested = ResourceCaps {
+        max_cost_usd: 4.0,
+        max_tokens: 400_000,
+        max_tool_calls: 40,
+        ..ResourceCaps::default()
+    };
+
+    let drawn = draw_child_budget(&mut parent, &requested);
+
+    assert_eq!(drawn.caps().max_cost_usd, 4.0);
+    assert_eq!(drawn.caps().max_tokens, 400_000);
+    assert_eq!(drawn.caps().max_tool_calls, 40);
+    assert_eq!(
+        parent.max_cost_usd, 6.0,
+        "drawing decrements the parent's pool — a transfer, not a display rollup"
+    );
+    assert_eq!(parent.max_tokens, 600_000);
+    assert_eq!(parent.max_tool_calls, 60);
+
+    // The child spent 2.5 / 250_000 / 25 of its 4.0 / 400_000 / 40.
+    let spent = ResourceCaps {
+        max_cost_usd: 2.5,
+        max_tokens: 250_000,
+        max_tool_calls: 25,
+        ..ResourceCaps::default()
+    };
+    refund_child_budget(&mut parent, drawn, &spent);
+
+    assert_eq!(parent.max_cost_usd, 7.5);
+    assert_eq!(parent.max_tokens, 750_000);
+    assert_eq!(parent.max_tool_calls, 75);
+}
+
+#[test]
+fn every_countable_field_is_drawn_and_decremented_not_passed_through() {
+    // Ruling P75 §C: the plan drew three of ten fields and passed the other
+    // seven through `..requested.clone()`. This pins all seven countables.
+    let mut parent = half_of_default();
+    let requested = ResourceCaps::default(); // asks for the full default of everything
+
+    let drawn = draw_child_budget(&mut parent, &requested);
+    let child = drawn.caps();
+
+    assert_eq!(child.max_cost_usd, 5.0);
+    assert_eq!(child.max_tokens, 1_000_000);
+    assert_eq!(child.max_tasks, 2_500);
+    assert_eq!(child.max_tool_calls, 1_000);
+    assert_eq!(child.max_subagents, 10);
+    assert_eq!(child.max_bytes_written, 50_000_000);
+    assert_eq!(child.max_escalations, 25);
+
+    assert_eq!(parent.max_cost_usd, 0.0);
+    assert_eq!(parent.max_tokens, 0);
+    assert_eq!(parent.max_tasks, 0);
+    assert_eq!(parent.max_tool_calls, 0);
+    assert_eq!(parent.max_subagents, 0);
+    assert_eq!(parent.max_bytes_written, 0);
+    assert_eq!(parent.max_escalations, 0);
+}
+
+#[test]
+fn the_three_durations_are_clamped_to_the_parents_window_and_never_decremented() {
+    // Ruling P75 §C's concrete example: a child asking for a 24 h wall
+    // timeout from a parent with five minutes left.
+    let mut parent = half_of_default();
+    let before = parent.clone();
+    let requested = ResourceCaps::default(); // 24 h / 4 h / 30 min
+
+    let drawn = draw_child_budget(&mut parent, &requested);
+
+    assert_eq!(drawn.caps().run_wall_timeout, Duration::from_secs(300));
+    assert_eq!(drawn.caps().run_active_timeout, Duration::from_secs(240));
+    assert_eq!(drawn.caps().step_timeout, Duration::from_secs(60));
+
+    assert_eq!(
+        (
+            parent.run_wall_timeout,
+            parent.run_active_timeout,
+            parent.step_timeout
+        ),
+        (
+            before.run_wall_timeout,
+            before.run_active_timeout,
+            before.step_timeout
+        ),
+        "wall-clock windows are clamped, not withdrawn: the parent's clock does \
+         not stop running because a child is running inside it"
+    );
+}
+
+#[test]
+fn a_shorter_requested_timeout_is_honoured_rather_than_widened_to_the_parents() {
+    let mut parent = ResourceCaps::default();
+    let requested = ResourceCaps {
+        run_wall_timeout: Duration::from_secs(30),
+        run_active_timeout: Duration::from_secs(20),
+        step_timeout: Duration::from_secs(10),
+        ..ResourceCaps::default()
+    };
+
+    let drawn = draw_child_budget(&mut parent, &requested);
+
+    assert_eq!(drawn.caps().run_wall_timeout, Duration::from_secs(30));
+    assert_eq!(drawn.caps().run_active_timeout, Duration::from_secs(20));
+    assert_eq!(drawn.caps().step_timeout, Duration::from_secs(10));
+}
+
+#[test]
+fn a_subtree_can_never_spend_more_than_its_root_was_given() {
+    // §8.12's invariant, stated over every countable field rather than three.
+    let mut parent = ResourceCaps {
+        max_cost_usd: 5.0,
+        max_tokens: 100,
+        max_tasks: 3,
+        max_tool_calls: 7,
+        max_subagents: 1,
+        max_bytes_written: 900,
+        max_escalations: 2,
+        ..ResourceCaps::default()
+    };
+
+    let greedy = ResourceCaps {
+        max_cost_usd: 20.0,
+        max_tokens: 9_999_999,
+        max_tasks: 9_999,
+        max_tool_calls: 9_999,
+        max_subagents: 9_999,
+        max_bytes_written: 9_999_999_999,
+        max_escalations: 9_999,
+        ..ResourceCaps::default()
+    };
+
+    let first = draw_child_budget(&mut parent, &greedy);
+    assert_eq!(first.caps().max_cost_usd, 5.0, "clamped to what remains");
+    assert_eq!(first.caps().max_tokens, 100);
+    assert_eq!(first.caps().max_tasks, 3);
+    assert_eq!(first.caps().max_tool_calls, 7);
+    assert_eq!(first.caps().max_subagents, 1);
+    assert_eq!(first.caps().max_bytes_written, 900);
+    assert_eq!(first.caps().max_escalations, 2);
+
+    // A second sibling call, from a pool the first drained, gets nothing —
+    // not a second full grant. This is the property that makes the invariant
+    // hold across siblings, not just across one call.
+    let second = draw_child_budget(&mut parent, &greedy);
+    assert_eq!(second.caps().max_cost_usd, 0.0);
+    assert_eq!(second.caps().max_tokens, 0);
+    assert_eq!(second.caps().max_tasks, 0);
+    assert_eq!(second.caps().max_tool_calls, 0);
+    assert_eq!(second.caps().max_subagents, 0);
+    assert_eq!(second.caps().max_bytes_written, 0);
+    assert_eq!(second.caps().max_escalations, 0);
+}
+
+#[test]
+fn a_refund_can_never_return_more_than_was_drawn() {
+    // The refund is computed from the grant the draw handed back, so there is
+    // no caller-supplied "unspent" figure that could exceed it — the tightest
+    // case is a child that spent nothing, which lands the parent exactly back
+    // where it started and never above.
+    let before = half_of_default();
+    let mut parent = before.clone();
+    let drawn = draw_child_budget(
+        &mut parent,
+        &ResourceCaps {
+            max_cost_usd: 4.0,
+            max_tokens: 400,
+            max_tasks: 4,
+            max_tool_calls: 40,
+            max_subagents: 4,
+            max_bytes_written: 4_000,
+            max_escalations: 4,
+            ..ResourceCaps::default()
+        },
+    );
+    assert_eq!(parent.max_cost_usd, 1.0);
+    assert_eq!(parent.max_tokens, 999_600);
+
+    let spent_nothing = ResourceCaps {
+        max_cost_usd: 0.0,
+        max_tokens: 0,
+        max_tasks: 0,
+        max_tool_calls: 0,
+        max_subagents: 0,
+        max_bytes_written: 0,
+        max_escalations: 0,
+        ..ResourceCaps::default()
+    };
+    refund_child_budget(&mut parent, drawn, &spent_nothing);
+
+    assert_eq!(
+        parent, before,
+        "a full refund restores the parent exactly, and cannot overshoot it"
+    );
+}
+
+#[test]
+fn a_child_that_reports_spending_more_than_its_grant_refunds_nothing() {
+    let mut parent = ResourceCaps {
+        max_cost_usd: 10.0,
+        max_tokens: 1_000,
+        ..ResourceCaps::default()
+    };
+    let drawn = draw_child_budget(
+        &mut parent,
+        &ResourceCaps {
+            max_cost_usd: 4.0,
+            max_tokens: 400,
+            ..ResourceCaps::default()
+        },
+    );
+
+    let overspent = ResourceCaps {
+        max_cost_usd: 40.0,
+        max_tokens: 4_000,
+        ..ResourceCaps::default()
+    };
+    refund_child_budget(&mut parent, drawn, &overspent);
+
+    assert_eq!(
+        parent.max_cost_usd, 6.0,
+        "no refund, and no negative refund"
+    );
+    assert_eq!(parent.max_tokens, 600);
+}
+
+#[test]
+fn a_nan_or_negative_requested_cost_draws_nothing_rather_than_minting_budget() {
+    // `max_cost_usd` is `f64` (see `caps.rs`'s recorded deviation from
+    // §8.4's `Decimal`) and reaches this function from YAML `caps:`, where
+    // `.nan` and `-1e18` are both authorable scalars. Unguarded,
+    // `parent -= requested.min(parent)` with a negative request *raises* the
+    // parent's remaining budget.
+    for hostile in [f64::NAN, -1.0e18, f64::NEG_INFINITY, f64::INFINITY] {
+        let mut parent = ResourceCaps {
+            max_cost_usd: 10.0,
+            ..ResourceCaps::default()
+        };
+        let drawn = draw_child_budget(
+            &mut parent,
+            &ResourceCaps {
+                max_cost_usd: hostile,
+                ..ResourceCaps::default()
+            },
+        );
+        assert_eq!(
+            drawn.caps().max_cost_usd,
+            0.0,
+            "a {hostile} request must draw nothing"
+        );
+        assert_eq!(
+            parent.max_cost_usd, 10.0,
+            "a {hostile} request must not change the parent's pool"
+        );
+        assert!(drawn.caps().max_cost_usd.is_finite());
+    }
+}
+
+#[test]
+fn an_unusable_reported_spend_refunds_nothing() {
+    // NaN, infinite and negative reported spends all mean the caller's ledger
+    // is broken. Refusing to refund is the direction that cannot inflate the
+    // parent's pool above what the root granted.
+    for hostile in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY, -5.0] {
+        let mut parent = ResourceCaps {
+            max_cost_usd: 10.0,
+            ..ResourceCaps::default()
+        };
+        let drawn = draw_child_budget(
+            &mut parent,
+            &ResourceCaps {
+                max_cost_usd: 4.0,
+                ..ResourceCaps::default()
+            },
+        );
+        refund_child_budget(
+            &mut parent,
+            drawn,
+            &ResourceCaps {
+                max_cost_usd: hostile,
+                ..ResourceCaps::default()
+            },
+        );
+        assert_eq!(
+            parent.max_cost_usd, 6.0,
+            "an unusable reported spend of {hostile} refunds nothing"
+        );
+        assert!(parent.max_cost_usd.is_finite());
+    }
+}
+
+#[test]
+fn a_non_finite_or_negative_parent_pool_is_normalised_down_by_the_refund_not_left_poisoned() {
+    // Every other hostile-value test above varies the *request* or the
+    // *spend* against a healthy parent. This varies the parent itself — the
+    // operand `refund_child_budget` writes back to. Without the `.max(0.0)`
+    // on the refund line, `parent += refund` leaves a `NaN` parent `NaN` and a
+    // negative parent negative, which is the fail-open the draw side already
+    // closes.
+    //
+    // The pool is poisoned *after* the draw deliberately: the draw's own
+    // `.max(0.0)` normalises the parent it is handed, so the only way a
+    // poisoned pool reaches the refund is by arriving between the two calls —
+    // which is exactly the situation Task 20's run loop creates, since it
+    // threads one `parent_remaining` across a child run's whole lifetime and
+    // other code (a spend deduction, a rehydration from a durable row) writes
+    // that field in between.
+    for hostile in [f64::NAN, -12.5] {
+        let mut parent = ResourceCaps {
+            max_cost_usd: 10.0,
+            ..ResourceCaps::default()
+        };
+        let drawn = draw_child_budget(
+            &mut parent,
+            &ResourceCaps {
+                max_cost_usd: 4.0,
+                ..ResourceCaps::default()
+            },
+        );
+        assert_eq!(parent.max_cost_usd, 6.0);
+
+        parent.max_cost_usd = hostile;
+        refund_child_budget(
+            &mut parent,
+            drawn,
+            &ResourceCaps {
+                max_cost_usd: 1.0,
+                ..ResourceCaps::default()
+            },
+        );
+        assert_eq!(
+            parent.max_cost_usd, 0.0,
+            "a {hostile} pool is normalised down to empty, symmetric with the draw"
+        );
+        assert!(parent.max_cost_usd.is_finite());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The recursion bound (ruling P75 §B)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_two_ceilings_are_section_7_7s_and_are_one_definition_not_a_local_copy() {
+    // Ruling P76 §2: an earlier version of this module carried a local `4`
+    // beside `roundhouse-bus`'s existing `MAX_DEPTH = 4` — two ceilings over
+    // one session chain, agreeing only by coincidence. These are now `pub
+    // const` aliases of the bus's constants, reached over the `flow -> engine`
+    // edge, so a change to §7.7's numbers moves both predicates at once.
+    assert_eq!(
+        MAX_CALL_DEPTH,
+        u32::from(roundhouse_engine::limits::MAX_DEPTH)
+    );
+    assert_eq!(
+        MAX_DIRECT_CHILD_CALLS,
+        roundhouse_engine::limits::MAX_FAN_OUT
+    );
+    // And the values §7.7 actually states: "Depth limit 4 (inherited +1 per
+    // spawn). Fan-out <=8 direct children per session".
+    assert_eq!(MAX_CALL_DEPTH, 4);
+    assert_eq!(MAX_DIRECT_CHILD_CALLS, 8);
+}
+
+#[test]
+fn direct_call_fan_out_is_bounded_and_the_bound_fails_closed() {
+    // The count checked is the count *after* the call would succeed, matching
+    // `roundhouse_engine::agent_spawn`'s `check_fan_out(parent_direct_children
+    // + 1)`. A run with no children admits one; a run with 7 admits an 8th.
+    assert_eq!(admit_child_call(0), Ok(1));
+    assert_eq!(admit_child_call(7), Ok(8));
+
+    // At the ceiling: a run that already has 8 direct `call:` children does
+    // not get a 9th.
+    assert_eq!(
+        admit_child_call(8),
+        Err(CallFanOutError::TooWide {
+            existing_direct_children: 8,
+            attempted: 9,
+            max: MAX_DIRECT_CHILD_CALLS
+        })
+    );
+    // And the `map`-over-2,000-items shape ruling P76 §3 names: the 2,000th
+    // `call:` in a map is refused, rather than every one of them being
+    // admitted at depth 1.
+    assert_eq!(
+        admit_child_call(1_999),
+        Err(CallFanOutError::TooWide {
+            existing_direct_children: 1_999,
+            attempted: 2_000,
+            max: MAX_DIRECT_CHILD_CALLS
+        })
+    );
+}
+
+#[test]
+fn a_direct_child_count_at_the_integer_ceiling_is_refused_rather_than_wrapping_to_zero() {
+    // Saturating, not wrapping: `u32::MAX + 1` must not become 0 and hand back
+    // a fresh fan-out budget. Same closed-fail shape as
+    // `a_parent_depth_at_the_integer_ceiling_is_refused_rather_than_wrapping_to_zero`.
+    assert_eq!(
+        admit_child_call(u32::MAX),
+        Err(CallFanOutError::TooWide {
+            existing_direct_children: u32::MAX,
+            attempted: u32::MAX,
+            max: MAX_DIRECT_CHILD_CALLS
+        })
+    );
+}
+
+#[test]
+fn depth_and_fan_out_together_bound_the_subtree_where_depth_alone_did_not() {
+    // The concrete escape ruling P76 §3 names, in the diff's own numbers. With
+    // only the depth predicate, a run may have any number of direct children
+    // at depth 1 — `child_call_depth(0)` returns `Ok(1)` for all 2,000 items
+    // of a maximal `map`, so the widest admissible tree is `2000^4`. With both
+    // predicates the base is bounded too, and the tree is at most `8^4`.
+    let mut widest_admissible_children = 0u32;
+    while admit_child_call(widest_admissible_children).is_ok() {
+        widest_admissible_children += 1;
+    }
+    assert_eq!(widest_admissible_children, MAX_DIRECT_CHILD_CALLS);
+
+    let mut deepest_admissible_depth = 0u32;
+    while let Ok(next) = child_call_depth(deepest_admissible_depth) {
+        deepest_admissible_depth = next;
+    }
+    assert_eq!(deepest_admissible_depth, MAX_CALL_DEPTH);
+
+    assert_eq!(
+        widest_admissible_children.pow(deepest_admissible_depth),
+        4_096,
+        "8^4 — arithmetic over the two constants, not a measurement of any run"
+    );
+}
+
+#[test]
+fn call_depth_is_bounded_and_the_bound_fails_closed() {
+    assert_eq!(MAX_CALL_DEPTH, 4);
+
+    // The root run is depth 0; each `call:` adds one.
+    assert_eq!(child_call_depth(0), Ok(1));
+    assert_eq!(child_call_depth(1), Ok(2));
+    assert_eq!(child_call_depth(2), Ok(3));
+    assert_eq!(child_call_depth(3), Ok(4));
+
+    // The fifth nested call is refused, which is what makes `call: self`
+    // terminate rather than recurse forever.
+    assert_eq!(
+        child_call_depth(4),
+        Err(CallDepthError::TooDeep {
+            parent_depth: 4,
+            attempted: 5,
+            max: MAX_CALL_DEPTH
+        })
+    );
+    assert_eq!(
+        child_call_depth(9),
+        Err(CallDepthError::TooDeep {
+            parent_depth: 9,
+            attempted: 10,
+            max: MAX_CALL_DEPTH
+        })
+    );
+}
+
+#[test]
+fn a_parent_depth_at_the_integer_ceiling_is_refused_rather_than_wrapping_to_zero() {
+    // Saturating, not wrapping: `u32::MAX + 1` must not become 0 and hand
+    // back a fresh depth budget.
+    assert_eq!(
+        child_call_depth(u32::MAX),
+        Err(CallDepthError::TooDeep {
+            parent_depth: u32::MAX,
+            attempted: u32::MAX,
+            max: MAX_CALL_DEPTH
+        })
+    );
+}
+
+#[test]
+fn a_self_calling_workflow_terminates_after_max_call_depth_calls() {
+    // The `call: self` shape ruling P75 §B names, driven to exhaustion: a
+    // workflow that calls itself unconditionally gets exactly
+    // `MAX_CALL_DEPTH` child runs and then a refusal, instead of recursing
+    // until the process dies.
+    let mut depth = 0u32;
+    let mut children = 0u32;
+    while let Ok(next) = child_call_depth(depth) {
+        children += 1;
+        depth = next;
+        assert!(
+            children <= MAX_CALL_DEPTH,
+            "the loop must terminate at the bound, not run away"
+        );
+    }
+    assert_eq!(children, MAX_CALL_DEPTH);
+    assert_eq!(depth, MAX_CALL_DEPTH);
+    // And the refusal that ended it is the depth bound, not some other error.
+    assert!(matches!(
+        child_call_depth(depth),
+        Err(CallDepthError::TooDeep { .. })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Workflow-as-tool registration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_workflow_registers_as_workflow_name_with_its_inputs_block_as_the_tool_schema() {
+    let job = workflow_job(PR_REVIEW_YAML);
+    let reg = register_as_tool(&job, "ignored-for-a-workflow-body").expect("fixture parses");
+
+    assert_eq!(reg.name, "workflow:pr-review");
+
+    // Ruling P29: assert on the parsed structure, never on serialized text.
+    assert_eq!(reg.input_schema["type"], serde_json::json!("object"));
+    assert_eq!(
+        reg.input_schema["properties"]["repo"],
+        serde_json::json!({"type": "string"})
+    );
+    assert_eq!(
+        reg.input_schema["properties"]["max_prs"],
+        serde_json::json!({"type": "integer", "default": 10})
+    );
+    assert_eq!(
+        reg.input_schema["properties"]["dry_run"],
+        serde_json::json!({"type": "boolean"})
+    );
+    assert_eq!(
+        reg.input_schema["required"],
+        serde_json::json!(["branch", "repo"]),
+        "required names are sorted, so the schema does not change shape \
+         between processes with `inputs` being a HashMap"
+    );
+
+    // The `JobVersion::input_schema` decoy is not what got used.
+    assert!(reg.input_schema.get("never").is_none());
+}
+
+#[test]
+fn required_input_names_are_emitted_in_a_deterministic_sorted_order() {
+    // `WorkflowDef.inputs` is a `HashMap`, whose iteration order is randomised
+    // per process. Six required names would land in sorted order by chance
+    // with probability 1/720.
+    let yaml = r#"
+name: many-inputs
+version: 1
+inputs:
+  zulu:    { type: string, required: true }
+  yankee:  { type: string, required: true }
+  xray:    { type: string, required: true }
+  whiskey: { type: string, required: true }
+  victor:  { type: string, required: true }
+  uniform: { type: string, required: true }
+permissions:
+  default: deny
+  unattended:
+    escalate: fail
+steps:
+  - id: run
+    emit:
+      done: true
+"#;
+    let reg = register_as_tool(&workflow_job(yaml), "n/a").expect("fixture parses");
+    assert_eq!(
+        reg.input_schema["required"],
+        serde_json::json!(["uniform", "victor", "whiskey", "xray", "yankee", "zulu"])
+    );
+
+    let props = reg.input_schema["properties"]
+        .as_object()
+        .expect("properties is an object");
+    assert_eq!(
+        props.keys().cloned().collect::<Vec<_>>(),
+        vec!["uniform", "victor", "whiskey", "xray", "yankee", "zulu"],
+        "property keys are inserted in sorted order too, so the schema is \
+         byte-identical run to run — `preserve_order` is on today (ruling \
+         P29), which makes this insertion order the serialized key order"
+    );
+}
+
+#[test]
+fn a_workflow_with_no_inputs_gets_an_empty_object_schema_with_no_required_key() {
+    let yaml = r#"
+name: no-inputs
+version: 1
+permissions:
+  default: deny
+  unattended:
+    escalate: fail
+steps:
+  - id: run
+    emit:
+      done: true
+"#;
+    let reg = register_as_tool(&workflow_job(yaml), "n/a").expect("fixture parses");
+    assert_eq!(reg.input_schema["type"], serde_json::json!("object"));
+    assert_eq!(reg.input_schema["properties"], serde_json::json!({}));
+    assert!(
+        reg.input_schema.get("required").is_none(),
+        "an empty `required` array is omitted rather than emitted empty"
+    );
+}
+
+#[test]
+fn a_workflow_whose_body_does_not_parse_is_refused_rather_than_named_unknown() {
+    // Ruling P75 §D.3: the plan's `unwrap_or_else(|_| "unknown")` turned an
+    // unparsable body into a cheerfully-registered `workflow:unknown`. This
+    // fixture is the exact shape `tests/job.rs` uses for hashing — valid
+    // YAML, but missing `WorkflowDef`'s required `permissions` and `steps`.
+    let job = workflow_job("name: pr-review\nversion: 1\n");
+    let err = register_as_tool(&job, "n/a").expect_err("missing permissions/steps must not parse");
+    let rendered = err.to_string();
+    assert!(!rendered.contains("workflow:unknown"), "got {rendered:?}");
+    assert!(
+        rendered.contains("permissions"),
+        "the error should name the missing field, got {rendered:?}"
+    );
+}
+
+#[test]
+fn the_yaml_name_is_authoritative_for_a_workflow_body_and_the_argument_is_ignored() {
+    let reg =
+        register_as_tool(&workflow_job(PR_REVIEW_YAML), "some-other-name").expect("fixture parses");
+    assert_eq!(reg.name, "workflow:pr-review");
+}
+
+#[test]
+fn a_prompt_bodied_job_registers_under_the_name_the_caller_supplies() {
+    // `Body::Prompt` synthesizes its YAML and has no `name:` of its own, so
+    // the caller's job name is the only source for one (§8.3: a prompt job is
+    // sugar for a single-step workflow).
+    let job = JobVersion::new(
+        JobId::new(),
+        1,
+        template(),
+        Body::Prompt {
+            template: "summarise the diff".to_string(),
+        },
+        InputSchema(serde_json::json!({"never": "this one"})),
+    );
+    let reg = register_as_tool(&job, "nightly-summary").expect("prompt lowering parses");
+    assert_eq!(reg.name, "workflow:nightly-summary");
+    assert_eq!(reg.input_schema["properties"], serde_json::json!({}));
+}
+
+#[test]
+fn outputs_is_not_authorable_in_the_workflow_format_and_the_result_schema_is_the_report() {
+    // §8.12 says "`outputs` *is* the result", and `WorkflowDef` has no
+    // `outputs` field and is `deny_unknown_fields`, so authoring one is a hard
+    // parse error rather than an ignored key. B12c keeps that refusal
+    // deliberately: a run's result is its mandatory report task (ruling P112),
+    // so there is a real result schema and nothing for a declared block to
+    // add. This pins the refusal as an observed fact, not a claim.
+    let with_outputs = r#"
+name: has-outputs
+version: 1
+outputs:
+  verdict: { type: string }
+permissions:
+  default: deny
+  unattended:
+    escalate: fail
+steps:
+  - id: run
+    emit:
+      done: true
+"#;
+    let err = parse_workflow(with_outputs).expect_err("`outputs:` must not parse");
+    assert!(
+        err.to_string().contains("outputs"),
+        "the parse error should name the rejected key, got {:?}",
+        err.to_string()
+    );
+
+    // And the registration carries §8.6's report schema — not `None`, and not
+    // a fabricated `{"type": "object"}`.
+    let reg = register_as_tool(&workflow_job(PR_REVIEW_YAML), "n/a").expect("fixture parses");
+    assert_eq!(
+        reg.output_schema,
+        Some(roundhouse_flow::report::core_json_schema()),
+        "a workflow's result is its report"
+    );
+}
+
+/// The result schema must describe the validator that actually runs, or it is
+/// a promise nothing keeps. Every core field it marks `required` is one
+/// `validate_report` requires, and every enum domain it declares is one
+/// `validate_report` accepts — checked by feeding the schema's own vocabulary
+/// through the validator rather than by reading both and agreeing they look
+/// alike.
+#[test]
+fn the_registered_result_schema_agrees_with_the_report_validator() {
+    use roundhouse_flow::report::{core_json_schema, validate_report};
+
+    let schema = core_json_schema();
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .expect("required is an array")
+        .iter()
+        .map(|v| v.as_str().expect("a field name"))
+        .collect();
+    assert_eq!(
+        required,
+        ["outcome", "severity", "headline", "needs_human", "cost"],
+        "§8.6's core, and only it"
+    );
+
+    let minimal = serde_json::json!({
+        "outcome": "nothing",
+        "severity": "low",
+        "headline": "ok",
+        "needs_human": false,
+        "cost": { "usd": 0.0, "tokens": 0 },
+    });
+    validate_report(&minimal).expect("the schema's own required set validates");
+
+    // Dropping any one of them must fail the validator, so `required` is not
+    // wider than what is enforced.
+    for field in &required {
+        let mut short = minimal.clone();
+        short.as_object_mut().unwrap().remove(*field);
+        assert!(
+            validate_report(&short).is_err(),
+            "the schema calls {field} required, so the validator must too"
+        );
+    }
+
+    // Every declared `outcome` and `severity` spelling is one the validator
+    // accepts, so the enum domains cannot drift apart.
+    for outcome in schema["properties"]["outcome"]["enum"].as_array().unwrap() {
+        let mut candidate = minimal.clone();
+        candidate["outcome"] = outcome.clone();
+        validate_report(&candidate)
+            .unwrap_or_else(|e| panic!("outcome {outcome} is declared but rejected: {e}"));
+    }
+    for severity in schema["properties"]["severity"]["enum"].as_array().unwrap() {
+        let mut candidate = minimal.clone();
+        candidate["severity"] = severity.clone();
+        validate_report(&candidate)
+            .unwrap_or_else(|e| panic!("severity {severity} is declared but rejected: {e}"));
+    }
+
+    // And the extension half stays open, which is the whole point of §8.6's
+    // core+extension split.
+    assert_eq!(schema["additionalProperties"], serde_json::json!(true));
+    let mut extended = minimal.clone();
+    extended["pr_number"] = serde_json::json!(4471);
+    validate_report(&extended).expect("a job's own top-level field is not an error");
+}
