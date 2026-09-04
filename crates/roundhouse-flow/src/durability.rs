@@ -196,6 +196,20 @@ pub enum DurabilityError {
         is_terminal: bool,
         ended_at_is_some: bool,
     },
+    /// [`insert_run_row`] was handed a [`ResourceCaps`] whose `max_cost_usd`
+    /// is not [`crate::caps::is_usable_cost_usd`] — the **diagnosis** leg of
+    /// ruling P109 §D, refusing the insert that would otherwise store a
+    /// `caps_json` nobody can use.
+    ///
+    /// Diagnosis rather than enforcement: `ledger::admit_spend` refuses such a
+    /// ceiling too, and that is the leg that stops a `NaN` ceiling admitting
+    /// every spend. This one exists because the alternative is a row that
+    /// fails at some later, unrelated read — `serde_json` writes a non-finite
+    /// `f64` as `null`, so the caps block round-trips into
+    /// [`Self::MalformedStoredCaps`] whenever the row is next loaded, which
+    /// names neither the field nor the writer that stored it.
+    #[error("run {run_id} was inserted with {amount} as max_cost_usd, which is not usable")]
+    UnusableCostAmount { run_id: RunId, amount: f64 },
 }
 
 /// §8.10 tier 2's crash-recovery classification of a step.
@@ -979,14 +993,36 @@ fn insert_run_row(conn: &Connection, run: &WorkflowRun) -> Result<(), Durability
     // `DEFAULT 0` is the exact value for a run that has recorded nothing, and
     // leaving them out of the caller-supplied `WorkflowRun` is what stops a
     // caller inserting a run that claims five hours of parked time or a spend
-    // it never made. `parked_at`/`hold_until`/`refunded_at` are absent for the
-    // same reason: they are written only by this crate's own transitions.
+    // it never made. `parked_at`/`hold_until`/`drawn_at`/`refunded_at` are
+    // absent for the same reason: they are written only by this crate's own
+    // transitions and by `ledger`'s draw and refund.
     // `session_depth` and `caps_json` *are* here, because both are facts only
     // the run's creator knows.
-    let caps_json = run.caps.as_ref().map(|caps| {
-        serde_json::to_string(caps)
-            .expect("ResourceCaps is a plain struct of scalars and Durations")
-    });
+    // Ruling P109 §D's diagnosis leg. Checked *before* serialising, because
+    // `serde_json` does not refuse a non-finite `f64` — it writes `null` — so
+    // the failure this replaces was not a serialisation error at all but a
+    // `MalformedStoredCaps` at whatever unrelated read next touched the row.
+    // The predicate is `caps::is_usable_cost_usd`, shared with `parse::steps`
+    // and `ledger::admit_spend`, so the crate keeps one definition of "a
+    // usable dollar figure".
+    let caps_json = run
+        .caps
+        .as_ref()
+        .map(|caps| {
+            if !crate::caps::is_usable_cost_usd(caps.max_cost_usd) {
+                return Err(DurabilityError::UnusableCostAmount {
+                    run_id: run.id,
+                    amount: caps.max_cost_usd,
+                });
+            }
+            // Infallible for the reason stated, and now genuinely so: the one
+            // value `serde_json` would have mishandled has been refused above.
+            Ok(serde_json::to_string(caps).expect(
+                "ResourceCaps is a plain struct of finite scalars and Durations, \
+                 whose only non-finite-capable field was refused above",
+            ))
+        })
+        .transpose()?;
     conn.execute(
         "INSERT INTO workflow_run
             (id, job_id, job_version, content_hash, session_id, binding_id, trigger_event_id,
@@ -1354,6 +1390,26 @@ fn transition(
 /// is absent) before assembling anything — and nothing in this workspace
 /// deletes a `workflow_run` row, so the property cannot lapse between the two
 /// calls. Re-querying it here would be an unreachable branch.
+/// # The fork is stamped `refunded_at` at creation, and that is a budget fix
+///
+/// A fork copies `parent_run_id` **and** `caps` from the run it forks, and its
+/// own `spent_*` accumulators start at zero — which made it satisfy every
+/// precondition of [`crate::ledger::refund_child_run`]: a parent, a terminal
+/// state (in due course), an unstamped `refunded_at`, a recorded grant.
+/// Measured before this stamp existed: **one draw of 100 produced two refunds**
+/// — one for the original and one for the fork — and a parent holding 500
+/// tokens of unrelated spend recorded 400 afterwards. Not phantom credit but
+/// **real spend erased**, and floors at zero do not stop it; they only stop the
+/// counter going negative (rulings P109 §A, P110).
+///
+/// Stamping here puts the fact **in the row** rather than in the reader: this
+/// fork's grant was never drawn *here*, so there is nothing to return, and the
+/// value used is `fork.started_at` — the fork's own creation instant, which is
+/// the `now` its caller passed — rather than a second parameter that could
+/// disagree with it. The refusal of a child whose *draw* was never recorded is
+/// the general leg and lives in `ledger::refund_child_run`
+/// (`workflow_run.drawn_at`); this stamp is the specific one, and each covers a
+/// case the other does not.
 pub(crate) fn fork_run(
     conn: &mut Connection,
     fork: &WorkflowRun,
@@ -1361,6 +1417,10 @@ pub(crate) fn fork_run(
 ) -> Result<(), DurabilityError> {
     let txn = roundhouse_store::begin_immediate(conn)?;
     insert_run_row(&txn, fork)?;
+    txn.execute(
+        "UPDATE workflow_run SET refunded_at = ?1 WHERE id = ?2",
+        params![fork.started_at.as_unix_nanos(), fork.id.to_string()],
+    )?;
     for step in inherited {
         write_step_row(&txn, fork.id, step)?;
     }

@@ -389,8 +389,9 @@ CREATE TABLE workflow_step_run (
 ///    (`run_active_timeout` *"excludes `AwaitingHuman`"*). An in-memory
 ///    tracker would be lost on the first daemon restart, which is precisely
 ///    the multi-day park it exists to measure.
-/// 4. **`session_depth`, `caps_json`, the seven `spent_*` accumulators and
-///    `refunded_at`** — §8.12's budget transfer and §7.7's recursion bound,
+/// 4. **`session_depth`, `caps_json`, the seven `spent_*` accumulators,
+///    `drawn_at` and `refunded_at`** — §8.12's budget transfer and §7.7's
+///    recursion bound,
 ///    both of which must survive a restart. `session_depth` is the depth of
 ///    the run's **Session** in the session tree, the same number
 ///    `roundhouse_engine::agent_spawn` takes as `parent_depth` — deliberately
@@ -414,12 +415,22 @@ CREATE TABLE workflow_step_run (
 /// is the *exact* value for a run that has recorded no spend and no completed
 /// park, not a stand-in for an unknown one.
 ///
-/// `refunded_at` is the durable twin of `compose::ChildBudget`'s
-/// consumed-by-value token: it stamps a child run whose unspent grant has been
-/// returned to its parent, so a second refund cannot mint budget the root
-/// never granted. That a run with no `parent_run_id` can never be refunded is
-/// a cross-column rule and therefore lives in Rust (`ledger::refund_child_run`),
-/// per the `ADD CONSTRAINT` section above.
+/// `drawn_at` and `refunded_at` are the **two halves of one transfer**, and
+/// shipping only the second is what ruling P109 §A found: `refunded_at` stamps
+/// a child whose unspent grant has been returned, so a second refund cannot
+/// mint budget the root never granted — but with no durable record that a draw
+/// ever happened, *any* row that merely looks like a child (a parent id and a
+/// recorded grant) was refundable, and `control::retry_from_step`'s fork is
+/// exactly such a row. `drawn_at` records that a parent was actually charged
+/// `Spend::for_grant`, and `ledger::refund_child_run` refuses a child that
+/// carries none. That a run with no `parent_run_id` can never be refunded is a
+/// cross-column rule and therefore lives in Rust
+/// (`ledger::refund_child_run`), per the `ADD CONSTRAINT` section above.
+///
+/// The column lands here rather than in a later migration because it is
+/// `ADD COLUMN`-shaped and this migration has not shipped: ruling P109 §B, and
+/// ruling P77's whole reason for splitting Task 20 was to do this table's
+/// schema once rather than across an 0008, an 0009 and an 0010.
 ///
 /// # `spent_cost_usd` is `REAL`, and the column is not the whole guard
 ///
@@ -455,6 +466,8 @@ ALTER TABLE workflow_run ADD COLUMN spent_bytes_written INTEGER NOT NULL DEFAULT
     CHECK (spent_bytes_written >= 0);
 ALTER TABLE workflow_run ADD COLUMN spent_escalations INTEGER NOT NULL DEFAULT 0
     CHECK (spent_escalations >= 0);
+ALTER TABLE workflow_run ADD COLUMN drawn_at INTEGER
+    CHECK (drawn_at IS NULL OR drawn_at >= 0);
 ALTER TABLE workflow_run ADD COLUMN refunded_at INTEGER
     CHECK (refunded_at IS NULL OR refunded_at >= 0);
 

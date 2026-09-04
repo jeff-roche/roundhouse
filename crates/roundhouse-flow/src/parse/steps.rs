@@ -461,7 +461,7 @@ impl TryFrom<CapsDefWire> for CapsDef {
 
     fn try_from(w: CapsDefWire) -> Result<Self, String> {
         if let Some(cost) = w.max_cost_usd {
-            if !(cost.is_finite() && cost >= 0.0) {
+            if !crate::caps::is_usable_cost_usd(cost) {
                 return Err(format!(
                     "caps.max_cost_usd must be a finite, non-negative number, got {cost}"
                 ));

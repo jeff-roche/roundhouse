@@ -729,3 +729,122 @@ fn a_fork_inherits_the_originals_session_depth_and_grant_but_not_its_spend() {
         "and the original's own ledger is untouched: a fork is never a rewrite"
     );
 }
+
+/// The B12b fix round's Critical, as the measurement that found it (ruling
+/// P110): **one draw of 100 produced two refunds, and a parent holding 500
+/// tokens of unrelated spend recorded 400 afterwards.** Not phantom credit —
+/// real spend erased, with every counter non-negative the whole way, which is
+/// why flooring at zero was never the guard the code claimed it was.
+///
+/// The mechanism: `retry_from_step` copies `parent_run_id` **and** `caps`, and
+/// a fresh run row starts `refunded_at` `NULL` with `spent_* = 0`. That made
+/// the fork satisfy every precondition of `refund_child_run` — and the
+/// original satisfies them too, because being terminal is `retry_from_step`'s
+/// own precondition. Both legs of the fix are asserted here: the fork carries
+/// no `drawn_at`, and `fork_run` stamps its `refunded_at` at creation.
+#[test]
+fn a_fork_is_not_refundable_so_one_draw_cannot_be_returned_twice() {
+    use roundhouse_flow::caps::ResourceCaps;
+    use roundhouse_flow::ledger::{
+        draw_child_run, refund_child_run, run_ledger, LedgerError, Spend,
+    };
+
+    let mut conn = open_test_db();
+
+    // A parent with 500 tokens of spend that has nothing to do with any child.
+    let parent = RunId::new();
+    let mut parent_run = a_run(parent, SessionId::new());
+    parent_run.session_depth = Some(0);
+    parent_run.caps = Some(ResourceCaps {
+        max_tokens: 5_000,
+        ..ResourceCaps::default()
+    });
+    insert_workflow_run(&mut conn, &parent_run).expect("insert the parent");
+    roundhouse_flow::ledger::admit_spend(
+        &mut conn,
+        parent,
+        &Spend {
+            tokens: 500,
+            ..Spend::ZERO
+        },
+        at(1_000),
+    )
+    .expect("the parent spends on its own work");
+
+    // One child, drawn for once: the parent is charged its whole 100-token
+    // grant, taking recorded spend to 600.
+    let child = RunId::new();
+    let child_grant = ResourceCaps {
+        max_tokens: 100,
+        ..ResourceCaps::default()
+    };
+    let mut child_run = a_run(child, SessionId::new());
+    child_run.parent_run_id = Some(parent);
+    child_run.session_depth = Some(1);
+    child_run.caps = Some(child_grant);
+    insert_workflow_run(&mut conn, &child_run).expect("insert the child");
+    draw_child_run(&mut conn, child, at(1_100)).expect("the draw charges the parent");
+    assert_eq!(run_ledger(&conn, parent).unwrap().spent.tokens, 600);
+
+    transition_run(&mut conn, child, RunState::Failed, at(2_000)).unwrap();
+
+    // An operator retries the child. The fork inherits the parent id and the
+    // grant, and starts unspent — which is what made it look refundable.
+    let forked = retry_from_step(
+        &mut conn,
+        child,
+        "only",
+        &["only"],
+        SessionId::new(),
+        at(3_000),
+    )
+    .expect("a failed run can be retried from a step");
+    let fork = run_ledger(&conn, forked.new_run_id).unwrap();
+    assert_eq!(fork.parent_run_id, Some(parent));
+    assert_eq!(
+        fork.drawn_at, None,
+        "nothing was charged to the parent for this fork"
+    );
+    assert_eq!(
+        fork.refunded_at,
+        Some(at(3_000)),
+        "so fork_run settles it at creation: there is nothing to return"
+    );
+
+    transition_run(&mut conn, forked.new_run_id, RunState::Completed, at(4_000)).unwrap();
+    let fork_refund = refund_child_run(&mut conn, forked.new_run_id, at(5_000));
+    assert!(
+        matches!(fork_refund, Err(LedgerError::DrawNotRecorded { .. })),
+        "a fork's grant was never drawn, so there is nothing to refund; got {fork_refund:?}"
+    );
+    assert_eq!(
+        run_ledger(&conn, parent).unwrap().spent.tokens,
+        600,
+        "and the refusal must not have credited anything on its way to refusing"
+    );
+
+    // Nor can the hole be closed from the other end by drawing for the fork
+    // after the fact: `fork_run` settled it, and a settled run charged now
+    // would be a charge `refund_child_run` could never return.
+    let late_draw = draw_child_run(&mut conn, forked.new_run_id, at(5_500));
+    assert!(
+        matches!(late_draw, Err(LedgerError::AlreadySettled { .. })),
+        "got {late_draw:?}"
+    );
+
+    // The one real draw is refundable exactly once, and returns exactly it.
+    let refunded = refund_child_run(&mut conn, child, at(6_000)).expect("the real draw refunds");
+    assert_eq!(refunded.tokens, 100);
+    let repeated = refund_child_run(&mut conn, child, at(7_000));
+    assert!(
+        matches!(repeated, Err(LedgerError::AlreadyRefunded { .. })),
+        "got {repeated:?}"
+    );
+
+    assert_eq!(
+        run_ledger(&conn, parent).unwrap().spent.tokens,
+        500,
+        "the parent is back to its own unrelated spend — not the 400 the \
+         two-refund defect produced"
+    );
+}

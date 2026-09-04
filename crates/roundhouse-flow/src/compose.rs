@@ -632,12 +632,28 @@ pub fn draw_child_budget(
 /// **The parent side, from outside the child run** — Phase 2's cost
 /// accounting, which observes the child's actual consumption. Never a figure
 /// originating *in* the child run, and never one derived from a model's
-/// output. §8.12's invariant (*"a workflow subtree can never spend more than
-/// its root was given"*) reduces entirely to `spent` being truthful: every
-/// fail-closed guard in this module is about the *shape* of the number, and
-/// none of them can tell an honest small spend from a self-reported one. A
-/// child that reports `0` is refunded its entire grant, correctly, by this
-/// function.
+/// output. **Within one draw/refund pair**, §8.12's invariant (*"a workflow
+/// subtree can never spend more than its root was given"*) reduces entirely to
+/// `spent` being truthful: every fail-closed guard in this module is about the
+/// *shape* of the number, and none of them can tell an honest small spend from
+/// a self-reported one. A child that reports `0` is refunded its entire grant,
+/// correctly, by this function.
+///
+/// # The one exception, which is not about `spent` at all
+///
+/// The invariant does **not** hold across a **fork**.
+/// [`crate::control::retry_from_step`] copies the original run's `caps` and
+/// starts the fork's accumulators at zero, and no draw is recorded against the
+/// parent, so a retried subtree spends against a grant nobody was charged for
+/// — by `n` grants over `n` retries. That is a policy question §8.13 does not
+/// answer (see that function's own comment); it is named here because this
+/// paragraph is where a reader looks for the invariant's scope.
+///
+/// What *is* closed is the far worse half: a fork used to be **refundable**,
+/// crediting the parent for a draw that never happened and erasing real spend.
+/// [`crate::durability::fork_run`] now stamps a fork settled at creation, and
+/// [`crate::ledger::refund_child_run`] refuses any child with no recorded
+/// draw (rulings P109 §A, P110).
 ///
 /// # `spent` is a measurement typed as a ceiling
 ///

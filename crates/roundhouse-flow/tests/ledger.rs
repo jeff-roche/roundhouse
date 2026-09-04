@@ -8,16 +8,16 @@
 //! invisible to the suite.
 
 use roundhouse_core::{JobId, SessionId, Timestamp};
-use roundhouse_flow::caps::ResourceCaps;
+use roundhouse_flow::caps::{is_usable_cost_usd, ResourceCaps};
 use roundhouse_flow::compose::{MAX_CALL_DEPTH, MAX_DIRECT_CHILD_CALLS};
 use roundhouse_flow::durability::{
-    insert_workflow_run, open_test_db, transition_run, RunState, WorkflowRun,
+    insert_workflow_run, open_test_db, transition_run, DurabilityError, RunState, WorkflowRun,
 };
 use roundhouse_flow::exec::map_step::MapBudget;
 use roundhouse_flow::exec::RunId;
 use roundhouse_flow::ledger::{
-    active_elapsed, admit_call_from_run, admit_spend, parked_runs_past_hold_cap, refund_child_run,
-    remaining_caps, run_ledger, LedgerError, Spend,
+    active_elapsed, admit_call_from_run, admit_spend, draw_child_run, parked_runs_past_hold_cap,
+    refund_child_run, remaining_caps, run_ledger, LedgerError, Spend,
 };
 use rusqlite::Connection;
 use std::time::Duration;
@@ -449,37 +449,251 @@ fn a_dollar_amount_that_is_not_a_usable_number_is_refused_at_the_writer() {
 /// *column* is what cannot hold it. Refused rather than wrapped: a wrapped
 /// counter reads back negative and then saturates to zero, turning an
 /// enormous spend into no spend at all.
+///
+/// Parameterised over **both** `u64` columns. An earlier version tested only
+/// `spent_tokens`, and `u64_to_sql(…, "spent_bytes_written") -> as i64`
+/// survived a mutation sweep at zero failures: the same call, one line down,
+/// with nothing measuring it.
 #[test]
 fn a_spend_that_does_not_fit_a_sqlite_integer_is_refused_rather_than_wrapped() {
+    for (column, grant, requested) in [
+        (
+            "spent_tokens",
+            ResourceCaps {
+                max_tokens: u64::MAX,
+                ..a_grant()
+            },
+            Spend {
+                tokens: u64::MAX,
+                ..Spend::ZERO
+            },
+        ),
+        (
+            "spent_bytes_written",
+            ResourceCaps {
+                max_bytes_written: u64::MAX,
+                ..a_grant()
+            },
+            Spend {
+                bytes_written: u64::MAX,
+                ..Spend::ZERO
+            },
+        ),
+    ] {
+        let mut conn = open_test_db();
+        let run_id = seed(&mut conn, &a_run(RunId::new(), Some(0), Some(grant)));
+
+        let refused = admit_spend(&mut conn, run_id, &requested, at_secs(1));
+        assert!(
+            matches!(
+                refused,
+                Err(LedgerError::ValueOutOfRange {
+                    column: c,
+                    value: u64::MAX
+                }) if c == column
+            ),
+            "{column} must refuse a value past i64::MAX, got {refused:?}"
+        );
+        let after = run_ledger(&conn, run_id).unwrap().spent;
+        assert_eq!(
+            (after.tokens, after.bytes_written),
+            (0, 0),
+            "and the transaction that could not write {column} rolled back"
+        );
+    }
+}
+
+/// `checked_total`'s anti-wrap guard, which its own doc says exists so *"a
+/// hostile pair cannot wrap into a small total that fits"* — and which nothing
+/// measured: `saturating_add` -> `wrapping_add` survived a sweep at zero
+/// failures in **both** the `u64` and `u32` functions.
+///
+/// The reason it survived is the whole point of this test. Every prior
+/// admission test started from `spent = 0`, where saturating and wrapping
+/// arithmetic are identical. The scenario needs a **non-zero prior spend**:
+/// with `spent = 1` and `requested = u64::MAX`, a wrapping total is `0`,
+/// `0 > ceiling` is false, and an unbounded spend is admitted **and recorded
+/// as zero** — the ceiling comparison intact and useless, because the
+/// arithmetic feeding it lied.
+///
+/// Ruling P110 §A, which is P92's new fifth clause: a guard on a comparison
+/// has two populations — the values compared, and the arithmetic that produces
+/// them.
+#[test]
+fn a_total_that_would_wrap_is_refused_rather_than_admitted_as_a_small_number() {
     let mut conn = open_test_db();
-    let run_id = seed(
+    let run_id = a_seeded_run(&mut conn); // 1_000 tokens, 20 tasks
+
+    // The non-zero prior spend, without which this test cannot distinguish
+    // saturating from wrapping at all.
+    admit_spend(&mut conn, run_id, &a_spend_of(1, 0.0), at_secs(1)).unwrap();
+    admit_spend(
         &mut conn,
-        &a_run(
+        run_id,
+        &Spend {
+            tasks: 1,
+            ..Spend::ZERO
+        },
+        at_secs(1),
+    )
+    .unwrap();
+
+    let u64_leg = admit_spend(&mut conn, run_id, &a_spend_of(u64::MAX, 0.0), at_secs(2));
+    assert!(
+        matches!(
+            u64_leg,
+            Err(LedgerError::CapsExceeded {
+                field: "max_tokens",
+                ..
+            })
+        ),
+        "1 + u64::MAX must saturate past the ceiling, not wrap to 0; got {u64_leg:?}"
+    );
+
+    let u32_leg = admit_spend(
+        &mut conn,
+        run_id,
+        &Spend {
+            tasks: u32::MAX,
+            ..Spend::ZERO
+        },
+        at_secs(2),
+    );
+    assert!(
+        matches!(
+            u32_leg,
+            Err(LedgerError::CapsExceeded {
+                field: "max_tasks",
+                ..
+            })
+        ),
+        "1 + u32::MAX must saturate past the ceiling, not wrap to 0; got {u32_leg:?}"
+    );
+
+    let after = run_ledger(&conn, run_id).unwrap().spent;
+    assert_eq!(
+        (after.tokens, after.tasks),
+        (1, 1),
+        "and neither refusal recorded a wrapped total over the real spend"
+    );
+}
+
+/// Ruling P109 §D: `admit_spend` guarded both operands of the cost comparison
+/// and **not its ceiling**.
+///
+/// # What is reachable here, measured rather than assumed
+///
+/// P109 §D's scenario is a `NaN`/`+inf` ceiling, against which
+/// `cost_total > caps.max_cost_usd` is `false` and every spend is admitted. It
+/// says a hand-built `caps_json` reaches that because *"`1e999` parses back as
+/// `+Inf` cleanly"*. **Measured in this tree, it does not**: `serde_json`
+/// refuses an out-of-range float on the way *in* as well as writing `null` on
+/// the way out — see
+/// [`serde_json_refuses_a_non_finite_dollar_figure_in_both_directions`]. So no
+/// non-finite ceiling can reach this comparison through `caps_json` at all,
+/// and the fail-*open* direction is not reachable today.
+///
+/// What **is** reachable is a **negative** ceiling: `-1.0` is finite, valid
+/// JSON, and round-trips cleanly. Its old behaviour was fail-closed but
+/// misnamed — every spend refused as `CapsExceeded { field: "max_cost_usd" }`,
+/// which says the run is over budget when in fact its stored ceiling is
+/// nonsense. It now says so.
+#[test]
+fn a_negative_stored_ceiling_names_itself_rather_than_reporting_every_spend_as_over_budget() {
+    let mut conn = open_test_db();
+    let run_id = a_seeded_run(&mut conn);
+
+    let valid = serde_json::to_string(&a_grant()).unwrap();
+    let poisoned = valid.replace("\"max_cost_usd\":4.0", "\"max_cost_usd\":-1.0");
+    assert_ne!(poisoned, valid, "the fixture must really have been edited");
+    conn.execute(
+        "UPDATE workflow_run SET caps_json = ?1 WHERE id = ?2",
+        rusqlite::params![poisoned, run_id.to_string()],
+    )
+    .unwrap();
+    let stored = run_ledger(&conn, run_id)
+        .unwrap()
+        .caps
+        .unwrap()
+        .max_cost_usd;
+    assert_eq!(
+        stored, -1.0,
+        "a negative ceiling round-trips cleanly, which is what makes it the reachable case"
+    );
+    assert!(!is_usable_cost_usd(stored));
+
+    let refused = admit_spend(&mut conn, run_id, &a_spend_of(0, 0.01), at_secs(1));
+    assert!(
+        matches!(refused, Err(LedgerError::UnusableCostAmount { .. })),
+        "the ceiling is what is wrong, not the request; got {refused:?}"
+    );
+    assert_eq!(run_ledger(&conn, run_id).unwrap().spent.cost_usd, 0.0);
+}
+
+/// The measurement the guard above is scoped against, pinned rather than
+/// asserted — ruling P108 §B's rule that a claim about a dependency's
+/// behaviour is worth exactly the run that produced it.
+///
+/// `serde_json` treats a non-finite `f64` as unrepresentable **in both
+/// directions**: it writes `inf`/`NaN` as `null`, and it *refuses to parse* an
+/// out-of-range literal rather than yielding `inf`. That second half is the
+/// one ruling P109 §D got wrong, and it is why `caps_json` cannot deliver a
+/// non-finite ceiling to `admit_spend`.
+///
+/// This does not make either guard redundant. `1e308` shows the boundary is
+/// magnitude, not syntax, so the two legs are what keep the crate from
+/// depending on a serialiser convention nobody wrote down — and the *negative*
+/// ceiling, which needs no convention to arrive, is reachable regardless.
+#[test]
+fn serde_json_refuses_a_non_finite_dollar_figure_in_both_directions() {
+    assert_eq!(serde_json::to_string(&f64::INFINITY).unwrap(), "null");
+    assert_eq!(serde_json::to_string(&f64::NAN).unwrap(), "null");
+
+    for out_of_range in ["1e999", "-1e999", "1e309"] {
+        let parsed: Result<f64, _> = serde_json::from_str(out_of_range);
+        assert!(
+            parsed.is_err(),
+            "{out_of_range} must be refused on the way in, not read back as an infinity"
+        );
+    }
+    assert_eq!(
+        serde_json::from_str::<f64>("1e308").unwrap(),
+        1e308,
+        "the boundary is magnitude, not syntax"
+    );
+    assert_eq!(serde_json::from_str::<f64>("-1.0").unwrap(), -1.0);
+}
+
+/// The diagnosis leg of the same rule (ruling P109 §D): a `ResourceCaps` whose
+/// `max_cost_usd` is unusable is refused **at the insert**, rather than
+/// serialised as `null` and failing at whatever unrelated read next loads the
+/// row. `serde_json` does not refuse a non-finite `f64` — that was the reason
+/// `insert_run_row`'s `expect` gave, and it was not the true one.
+#[test]
+fn a_run_cannot_be_inserted_with_a_ceiling_that_is_not_a_usable_dollar_amount() {
+    for amount in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01] {
+        let mut conn = open_test_db();
+        let run = a_run(
             RunId::new(),
             Some(0),
             Some(ResourceCaps {
-                max_tokens: u64::MAX,
+                max_cost_usd: amount,
                 ..a_grant()
             }),
-        ),
-    );
-
-    let refused = admit_spend(&mut conn, run_id, &a_spend_of(u64::MAX, 0.0), at_secs(1));
-    assert!(
-        matches!(
-            refused,
-            Err(LedgerError::ValueOutOfRange {
-                column: "spent_tokens",
-                value: u64::MAX
-            })
-        ),
-        "got {refused:?}"
-    );
-    assert_eq!(
-        run_ledger(&conn, run_id).unwrap().spent.tokens,
-        0,
-        "and the transaction that could not write it rolled back"
-    );
+        );
+        let refused = insert_workflow_run(&mut conn, &run);
+        assert!(
+            matches!(refused, Err(DurabilityError::UnusableCostAmount { .. })),
+            "{amount} must be refused at the writer, got {refused:?}"
+        );
+        assert!(
+            matches!(
+                run_ledger(&conn, run.id),
+                Err(LedgerError::RunNotFound { .. })
+            ),
+            "and no row is left behind"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -663,15 +877,66 @@ fn admitting_a_call_from_a_run_with_no_row_is_not_found() {
     );
 }
 
+/// Ruling P109 §C: a `call:` **is** new task admission — §8.12 describes it as
+/// creating a child `workflow_run`, a child Session and an `agent`-kind task —
+/// so §8.13's *"refuse new task admission"* binds here exactly as it binds
+/// `admit_spend`. Before this, `admit_call_from_run` read the run's state and
+/// then consulted only `session_depth`, so an operator could cancel a
+/// misbehaving run and watch it keep spawning children, each starting
+/// `Running` and admitting freely.
+///
+/// Mirrors `no_state_but_running_admits_new_work` deliberately: the two
+/// chokepoints share one predicate, so they are tested over one list.
+#[test]
+fn no_state_but_running_admits_a_call_either() {
+    for (target, via) in [
+        (RunState::Paused, None),
+        (RunState::Cancelling, None),
+        (RunState::AwaitingHuman, None),
+        (RunState::Completed, None),
+        (RunState::Failed, None),
+        (RunState::Cancelled, Some(RunState::Cancelling)),
+    ] {
+        let mut conn = open_test_db();
+        let run_id = a_seeded_run(&mut conn);
+        if let Some(intermediate) = via {
+            transition_run(&mut conn, run_id, intermediate, at_secs(1)).unwrap();
+        }
+        transition_run(&mut conn, run_id, target, at_secs(2)).unwrap();
+
+        // Depth 0 with no children: every §7.7 bound would admit this call, so
+        // the only thing that can refuse it is the run's state.
+        let refused = admit_call_from_run(&conn, run_id, 0);
+        assert!(
+            matches!(refused, Err(LedgerError::NotAdmitting { state, .. }) if state == target),
+            "{target:?} must not admit a call, got {refused:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // §8.12's refund, re-derived from rows
 // ---------------------------------------------------------------------------
 
-/// Seeds a parent charged the child's whole grant, plus the child itself.
+/// Seeds a child of a parent, and **draws** its grant so the parent is really
+/// charged — which is what makes the child refundable. Before `drawn_at`
+/// existed this helper did the draw by hand as a bare `admit_spend`, and a row
+/// that merely *looked* like a child (a parent id and a grant, which
+/// `retry_from_step`'s fork copies) was refundable too.
 fn a_parent_and_child(conn: &mut Connection, child_grant: ResourceCaps) -> (RunId, RunId) {
     let parent = a_seeded_run(conn);
-    admit_spend(conn, parent, &Spend::for_grant(&child_grant), at_secs(1))
-        .expect("the draw is a spend against the parent");
+    let mut child = a_run(RunId::new(), Some(1), Some(child_grant));
+    child.parent_run_id = Some(parent);
+    let child = seed(conn, &child);
+    draw_child_run(conn, child, at_secs(1)).expect("the draw charges the parent the whole grant");
+    (parent, child)
+}
+
+/// A child row with a parent and a grant but **no draw** — the shape a fork
+/// has, built here without one so the ledger's own refusal can be tested
+/// without reaching for `control::retry_from_step`.
+fn an_undrawn_child(conn: &mut Connection, child_grant: ResourceCaps) -> (RunId, RunId) {
+    let parent = a_seeded_run(conn);
     let mut child = a_run(RunId::new(), Some(1), Some(child_grant));
     child.parent_run_id = Some(parent);
     let child = seed(conn, &child);
@@ -791,6 +1056,92 @@ fn a_child_that_has_not_finished_cannot_have_its_grant_reclaimed() {
     );
 }
 
+/// The draw half, which until this fix round had no caller anywhere in the
+/// workspace — the asymmetry ruling P109 §A found: a durable stamp on the
+/// refund and nothing on the draw.
+#[test]
+fn the_draw_charges_the_parent_the_childs_whole_grant_and_stamps_the_child() {
+    let mut conn = open_test_db();
+    let (parent, child) = an_undrawn_child(&mut conn, a_small_grant());
+
+    assert_eq!(run_ledger(&conn, parent).unwrap().spent, Spend::ZERO);
+    let drawn = draw_child_run(&mut conn, child, at_secs(1)).unwrap();
+
+    assert_eq!(
+        drawn,
+        Spend::for_grant(&a_small_grant()),
+        "a draw is the child's whole grant, not its running total: a parent \
+         with $1 left cannot start two children each promised $1"
+    );
+    assert_eq!(run_ledger(&conn, parent).unwrap().spent, drawn);
+    assert_eq!(run_ledger(&conn, child).unwrap().drawn_at, Some(at_secs(1)));
+}
+
+#[test]
+fn a_second_draw_for_one_child_is_refused_rather_than_charging_the_parent_twice() {
+    let mut conn = open_test_db();
+    let (parent, child) = a_parent_and_child(&mut conn, a_small_grant());
+    let charged = run_ledger(&conn, parent).unwrap().spent;
+
+    let repeated = draw_child_run(&mut conn, child, at_secs(2));
+    assert!(
+        matches!(repeated, Err(LedgerError::AlreadyDrawn { .. })),
+        "got {repeated:?}"
+    );
+    assert_eq!(run_ledger(&conn, parent).unwrap().spent, charged);
+}
+
+/// The draw goes through `admit_spend`'s chokepoint, so a parent that is not
+/// admitting new work cannot be charged for a new child either — §8.13's
+/// *"refuse new task admission"*, reached through the draw.
+#[test]
+fn a_parent_that_is_not_admitting_cannot_be_drawn_from() {
+    let mut conn = open_test_db();
+    let (parent, child) = an_undrawn_child(&mut conn, a_small_grant());
+    transition_run(&mut conn, parent, RunState::Cancelling, at_secs(1)).unwrap();
+
+    let refused = draw_child_run(&mut conn, child, at_secs(2));
+    assert!(
+        matches!(
+            refused,
+            Err(LedgerError::NotAdmitting {
+                state: RunState::Cancelling,
+                ..
+            })
+        ),
+        "got {refused:?}"
+    );
+    assert_eq!(
+        run_ledger(&conn, child).unwrap().drawn_at,
+        None,
+        "and the child is not stamped by a draw that did not happen"
+    );
+}
+
+/// Ruling P109 §A / P110's Critical, at the ledger's own level: a child that
+/// carries a parent id and a grant but **no recorded draw** is not refundable.
+/// `control::retry_from_step`'s fork is the row that shape describes, and
+/// `tests/control.rs` measures that whole path; this pins the refusal itself.
+#[test]
+fn a_child_whose_draw_was_never_recorded_cannot_be_refunded() {
+    let mut conn = open_test_db();
+    let (parent, child) = an_undrawn_child(&mut conn, a_small_grant());
+    transition_run(&mut conn, child, RunState::Completed, at_secs(3)).unwrap();
+    let before = run_ledger(&conn, parent).unwrap().spent;
+
+    let refused = refund_child_run(&mut conn, child, at_secs(4));
+    assert!(
+        matches!(refused, Err(LedgerError::DrawNotRecorded { .. })),
+        "refunding a draw that never happened would decrement spend the parent \
+         really made; got {refused:?}"
+    );
+    assert_eq!(
+        run_ledger(&conn, parent).unwrap().spent,
+        before,
+        "and nothing is credited on the way to refusing"
+    );
+}
+
 #[test]
 fn a_run_with_no_parent_has_nothing_to_refund_to() {
     let mut conn = open_test_db();
@@ -852,4 +1203,156 @@ fn a_park_a_spend_and_a_depth_survive_the_connection_that_wrote_them() {
 
     drop(conn);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// The read-back guards, each of which the code argues for at length and none
+// of which had a test (they survived a mutation sweep at zero failures).
+//
+// All of them are reachable only from a **hand-edited or pre-`CHECK` row**,
+// which is why they are guards rather than paths — and why these tests write
+// their fixtures with `PRAGMA ignore_check_constraints`, the closest thing to
+// an operator with a `sqlite3` prompt. A guard nothing exercises is a claim,
+// not a guard.
+// ---------------------------------------------------------------------------
+
+/// Writes a value the column's own `CHECK` would reject — the hand-edited row
+/// every read-back guard below exists for. The pragma is per-connection and
+/// this is a per-test in-memory database, so it leaks nowhere.
+fn hand_edit(conn: &Connection, set_clause: &str, run_id: RunId) {
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .expect("a hand-edited row is what these guards exist for");
+    conn.execute(
+        &format!("UPDATE workflow_run SET {set_clause} WHERE id = ?1"),
+        rusqlite::params![run_id.to_string()],
+    )
+    .expect("the hand edit lands");
+    conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
+        .unwrap();
+}
+
+/// `nonneg_u32` saturates **up**, not down: for a spend, the larger number is
+/// the one that admits less. Down would be the fail-open direction — a stored
+/// count past `u32::MAX` read as a small spend, and the run handed budget it
+/// had already used.
+#[test]
+fn a_stored_u32_counter_past_its_range_reads_as_the_maximum_not_as_a_small_number() {
+    let mut conn = open_test_db();
+    let run_id = a_seeded_run(&mut conn);
+    // Above u32::MAX and comfortably inside i64, so the column's own
+    // `CHECK (>= 0)` is satisfied and only the read-back guard is in play.
+    hand_edit(&conn, "spent_tasks = 5000000000", run_id);
+
+    assert_eq!(run_ledger(&conn, run_id).unwrap().spent.tasks, u32::MAX);
+    let refused = admit_spend(
+        &mut conn,
+        run_id,
+        &Spend {
+            tasks: 1,
+            ..Spend::ZERO
+        },
+        at_secs(1),
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(LedgerError::CapsExceeded {
+                field: "max_tasks",
+                ..
+            })
+        ),
+        "saturating up must refuse further work, not admit it; got {refused:?}"
+    );
+}
+
+/// The negative half of the same pair: a negative accumulator reads as zero
+/// rather than wrapping into an enormous unsigned value. Documented as the
+/// deliberate difference from `session_depth`, which refuses — an accounting
+/// figure saturates because the alternative is a run that can never be
+/// admitted again, while a bypassed *bound* must refuse.
+#[test]
+fn a_negative_stored_accumulator_reads_as_zero_rather_than_wrapping() {
+    let mut conn = open_test_db();
+    let run_id = a_seeded_run(&mut conn);
+    hand_edit(
+        &conn,
+        "spent_tokens = -5, spent_tasks = -5, spent_bytes_written = -5",
+        run_id,
+    );
+
+    let spent = run_ledger(&conn, run_id).unwrap().spent;
+    assert_eq!(
+        (spent.tokens, spent.tasks, spent.bytes_written),
+        (0, 0, 0),
+        "a wrapped read would report an enormous spend and lock the run out forever"
+    );
+}
+
+/// `remaining_from_ledger`'s `.max(0.0)`: an `f64` subtraction of a stored
+/// `+inf` spend yields `-inf`, and an un-normalised negative remaining would
+/// make every later `min` hand the whole pool back. Measured in
+/// `roundhouse-store`'s `migration_0008` tests: `+inf` satisfies
+/// `CHECK (spent_cost_usd >= 0)` and is stored, so this row needs no pragma.
+#[test]
+fn an_infinite_stored_dollar_spend_leaves_no_remaining_pool_rather_than_a_negative_one() {
+    let mut conn = open_test_db();
+    let run_id = a_seeded_run(&mut conn);
+    conn.execute(
+        "UPDATE workflow_run SET spent_cost_usd = ?1 WHERE id = ?2",
+        rusqlite::params![f64::INFINITY, run_id.to_string()],
+    )
+    .expect("+inf passes the column's CHECK; that is the whole point");
+
+    let remaining = remaining_caps(&conn, run_id, at_secs(1)).unwrap();
+    assert_eq!(
+        remaining.max_cost_usd, 0.0,
+        "an empty pool, not -inf: a negative remaining would make min() hand it all back"
+    );
+}
+
+/// `active_elapsed`'s floor. `parked_nanos` cannot exceed the wall clock in a
+/// row this crate wrote, but a hand-edited one can — and an unsigned
+/// subtraction that wrapped would report an *enormous* active time, the
+/// direction that refuses work forever.
+#[test]
+fn parked_time_larger_than_the_wall_clock_floors_active_time_at_zero() {
+    let mut conn = open_test_db();
+    let run_id = a_seeded_run(&mut conn);
+    hand_edit(&conn, &format!("parked_nanos = {}", i64::MAX), run_id);
+
+    let ledger = run_ledger(&conn, run_id).unwrap();
+    assert_eq!(
+        active_elapsed(&ledger, at_secs(60)),
+        Duration::ZERO,
+        "a wrapped subtraction would report centuries of active time and lock the run out"
+    );
+    // And the run is still admissible, which is the consequence that matters.
+    admit_spend(&mut conn, run_id, &a_spend_of(1, 0.0), at_secs(60))
+        .expect("a floored active time must not exhaust the active window");
+}
+
+/// The refund's banking `.max(0)`. A parent whose accumulators do not cover
+/// the refund can only be a row that was never charged the draw it is being
+/// credited for; the direction that under-credits is the one that does not
+/// wrap a `u64` counter into an enormous apparent spend.
+///
+/// Stated exactly, because the comment this replaces overclaimed: the floor
+/// keeps the counter non-negative. It does **not** make refunding a child that
+/// was never charged for safe — that is `DrawNotRecorded`'s job.
+#[test]
+fn a_refund_larger_than_the_parents_recorded_spend_floors_at_zero_rather_than_wrapping() {
+    let mut conn = open_test_db();
+    let (parent, child) = a_parent_and_child(&mut conn, a_small_grant());
+    // The parent really was charged 500 tokens by the draw; an operator edits
+    // it down to 100, so the 500-token refund cannot be covered.
+    hand_edit(&conn, "spent_tokens = 100", parent);
+
+    transition_run(&mut conn, child, RunState::Completed, at_secs(3)).unwrap();
+    let refunded = refund_child_run(&mut conn, child, at_secs(4)).unwrap();
+    assert_eq!(refunded.tokens, 500, "the child spent none of its grant");
+    assert_eq!(
+        run_ledger(&conn, parent).unwrap().spent.tokens,
+        0,
+        "floored, not wrapped into 18 quintillion"
+    );
 }

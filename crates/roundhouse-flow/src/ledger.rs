@@ -45,6 +45,11 @@
 //! - [`admit_spend`] is the chokepoint §8.4's *"caps enforced at task
 //!   admission"* describes, but the thing that calls it once per task is the
 //!   run loop's.
+//! - [`draw_child_run`] and [`refund_child_run`] are §8.12's transfer, both
+//!   halves of it, over rows. **Neither has a production caller**: the `call:`
+//!   step that creates a child run and the completion that returns its grant
+//!   are both the run loop's (B12c). B12b's job was to make the pair
+//!   *symmetric* — see [`draw_child_run`] for what the missing half cost.
 //! - [`crate::exec::map_step::MapBudget::from_run_ledger`] sources a `map`'s
 //!   budget from [`remaining_caps`], but the `map` dispatch arm still builds
 //!   [`crate::exec::map_step::MapBudget::unenforced_placeholder`], because
@@ -66,7 +71,7 @@
 //! task with a run loop, and therefore the first that can observe what a
 //! declared run-level cap would have to mean.
 
-use crate::caps::ResourceCaps;
+use crate::caps::{is_usable_cost_usd, ResourceCaps};
 use crate::compose::{admit_child_call, child_call_depth, CallDepthError, CallFanOutError};
 use crate::durability::{DurabilityError, RunState};
 use crate::exec::RunId;
@@ -157,6 +162,31 @@ pub enum LedgerError {
     /// exactly §8.12's invariant inverted.
     #[error("run {run_id} was already refunded at {at:?}")]
     AlreadyRefunded { run_id: RunId, at: Timestamp },
+    /// [`refund_child_run`] was asked to refund a child whose
+    /// `workflow_run.drawn_at` is `NULL`: **no draw against the parent was
+    /// ever recorded**, so there is nothing to give back and crediting the
+    /// parent would decrement spend it really made.
+    ///
+    /// This is ruling P109 §A's defect as a refusal. Before the column
+    /// existed, `caps_json` and `parent_run_id` were the whole evidence a
+    /// refund needed — and both are values a row can carry without any draw
+    /// having happened, which is precisely what `control::retry_from_step`'s
+    /// fork produces by copying them.
+    #[error("run {run_id} has no recorded draw against its parent, so there is nothing to refund")]
+    DrawNotRecorded { run_id: RunId },
+    /// [`draw_child_run`] was asked to charge a parent for a child that is
+    /// already stamped `drawn_at`. `refunded_at`'s mirror image: a second draw
+    /// would charge the parent twice for one grant, so §8.12's invariant fails
+    /// in the *other* direction — a subtree unable to spend what its root gave
+    /// it.
+    #[error("run {run_id} was already drawn at {at:?}")]
+    AlreadyDrawn { run_id: RunId, at: Timestamp },
+    /// [`draw_child_run`] was asked to charge a parent for a run whose
+    /// `refunded_at` is already stamped — a settled run, which
+    /// `durability::fork_run` also produces at creation. Drawing for one would
+    /// charge the parent a grant [`refund_child_run`] can then never return.
+    #[error("run {run_id} was settled at {at:?} and cannot be drawn for")]
+    AlreadySettled { run_id: RunId, at: Timestamp },
     /// A `u64` counter does not fit SQLite's signed 64-bit `INTEGER`.
     /// Surfaced rather than silently wrapped, the same rule
     /// [`DurabilityError::SeqOutOfRange`] states for a task `seq`.
@@ -218,6 +248,10 @@ impl Spend {
     /// Charging the grant up front rather than the child's running total is
     /// what makes the invariant hold while the child is still running: a
     /// parent with $1 left cannot start two children each promised $1.
+    ///
+    /// [`draw_child_run`] is the caller, and until it existed there was none
+    /// anywhere in the workspace — which is exactly why a refund could pay out
+    /// against a draw that never happened (ruling P109 §A).
     pub fn for_grant(caps: &ResourceCaps) -> Spend {
         Spend {
             tokens: caps.max_tokens,
@@ -236,15 +270,15 @@ impl Spend {
 ///
 /// # Why this is a separate struct from [`crate::durability::WorkflowRun`]
 ///
-/// `WorkflowRun` is the value a **caller constructs** to insert a run. Five of
+/// `WorkflowRun` is the value a **caller constructs** to insert a run. Six of
 /// the fields below — [`Self::parked_at`], [`Self::hold_until`],
-/// [`Self::parked_nanos`], [`Self::spent`] and [`Self::refunded_at`], which
-/// are eleven columns between them — are written **only** by this crate's own
-/// writers and default to zero or `NULL` in the schema. Putting those on the
-/// constructed type would invite a caller to insert a run that claims five
-/// hours of parked time, or a spend it never made, and would make every
-/// construction site in the tree responsible for eleven columns it has no
-/// opinion about.
+/// [`Self::parked_nanos`], [`Self::spent`], [`Self::drawn_at`] and
+/// [`Self::refunded_at`], which are twelve columns between them — are written
+/// **only** by this crate's own writers and default to zero or `NULL` in the
+/// schema. Putting those on the constructed type would invite a caller to
+/// insert a run that claims five hours of parked time, or a spend it never
+/// made, and would make every construction site in the tree responsible for
+/// twelve columns it has no opinion about.
 ///
 /// The other seven (`run_id`, `state`, `parent_run_id`, `started_at`,
 /// `ended_at`, `session_depth`, `caps`) *are* on `WorkflowRun`, and are read
@@ -277,7 +311,15 @@ pub struct RunLedger {
     /// What the run has consumed so far, against [`Self::caps`]. Written only
     /// by [`admit_spend`] and [`refund_child_run`].
     pub spent: Spend,
-    /// Stamped when this run's unspent grant was returned to its parent.
+    /// Stamped when this run's grant was **drawn from its parent** — the
+    /// durable record that [`Spend::for_grant`] was charged, without which a
+    /// row that merely carries a parent id and a grant is indistinguishable
+    /// from one that was really paid for. `None` on a root run, and on a
+    /// child whose draw has not happened yet.
+    pub drawn_at: Option<Timestamp>,
+    /// Stamped when this run's unspent grant was returned to its parent — or,
+    /// for a fork, at creation, because a fork's copied grant was never drawn
+    /// and so has nothing to return (see `durability::fork_run`).
     pub refunded_at: Option<Timestamp>,
 }
 
@@ -289,7 +331,7 @@ pub struct RunLedger {
 const RUN_LEDGER_SELECT: &str = "SELECT id, state, parent_run_id, started_at, ended_at,
             parked_at, hold_until, parked_nanos, session_depth, caps_json,
             spent_tokens, spent_cost_usd, spent_tasks, spent_tool_calls,
-            spent_subagents, spent_bytes_written, spent_escalations, refunded_at
+            spent_subagents, spent_bytes_written, spent_escalations, drawn_at, refunded_at
      FROM workflow_run";
 
 /// Loads one run's ledger.
@@ -319,7 +361,8 @@ fn read_ledger(conn: &Connection, run_id: RunId) -> Result<RunLedger, LedgerErro
                 spent_subagents: row.get(14)?,
                 spent_bytes_written: row.get(15)?,
                 spent_escalations: row.get(16)?,
-                refunded_at: row.get(17)?,
+                drawn_at: row.get(17)?,
+                refunded_at: row.get(18)?,
             })
         })
         .optional()?;
@@ -348,6 +391,7 @@ struct RawLedgerColumns {
     spent_subagents: i64,
     spent_bytes_written: i64,
     spent_escalations: i64,
+    drawn_at: Option<i64>,
     refunded_at: Option<i64>,
 }
 
@@ -399,6 +443,7 @@ fn ledger_from_row(raw: RawLedgerColumns) -> Result<RunLedger, LedgerError> {
             bytes_written: nonneg(raw.spent_bytes_written),
             escalations: nonneg_u32(raw.spent_escalations),
         },
+        drawn_at: raw.drawn_at.map(Timestamp::from_unix_nanos),
         refunded_at: raw.refunded_at.map(Timestamp::from_unix_nanos),
     })
 }
@@ -534,29 +579,44 @@ fn remaining_from_ledger(ledger: &RunLedger, now: Timestamp) -> Result<ResourceC
 /// writes over — the same argument [`crate::durability`]'s `transition` makes
 /// for reading a run's state before writing it.
 ///
-/// # Which states admit work, and which half of that is quoted
+/// # Which states admit work
 ///
-/// **Named:** §8.13's cancel is *"cooperative — mark `Cancelling`, **refuse
-/// new task admission**, SIGTERM->SIGKILL running shells, run `finally:`"*.
-/// That sentence is the whole reason this function looks at the run state at
-/// all.
-///
-/// **Inferred:** that `Paused`, `AwaitingHuman` and the three terminal states
-/// also admit nothing. No document says so. Each is the reading that refuses:
-/// a paused run is executing no step, a parked run is waiting on a human, and
-/// a run that has ended has ended. If a later task finds a real need to admit
-/// work in one of them, this is the one place to change.
+/// See [`ensure_admitting`], which is the shared predicate this and
+/// [`admit_call_from_run`] both apply.
 ///
 /// # The dollar guard the column cannot be
 ///
-/// A non-finite or negative `cost_usd` — in the request, or in the total it
-/// would produce — is [`LedgerError::UnusableCostAmount`], not a clamp.
-/// Measured: migration 0008's `CHECK (spent_cost_usd >= 0)` rejects a
-/// negative, and `NOT NULL` rejects a `NaN` (SQLite stores `NaN` as `NULL`),
-/// but **`+inf` passes both and is stored**. A stored `+inf` spend makes
-/// every later `remaining_caps` return an empty pool, which is the safe
+/// A non-finite or negative `cost_usd` — in the request, in the **ceiling**,
+/// or in the total the two produce — is [`LedgerError::UnusableCostAmount`],
+/// not a clamp. Measured: migration 0008's `CHECK (spent_cost_usd >= 0)`
+/// rejects a negative, and `NOT NULL` rejects a `NaN` (SQLite stores `NaN` as
+/// `NULL`), but **`+inf` passes both and is stored**. A stored `+inf` spend
+/// makes every later `remaining_caps` return an empty pool, which is the safe
 /// direction — but it is unrecoverable, and refusing the write is better than
 /// poisoning the row.
+///
+/// **The ceiling was the leg this function was missing** (ruling P109 §D):
+/// against a `NaN` `max_cost_usd`, `cost_total > caps.max_cost_usd` is
+/// `false`, so **every** spend would be admitted — the one direction in this
+/// module where a bad `f64` means *yes*.
+///
+/// Scoped to what is actually reachable, which is narrower than P109 §D says
+/// and is measured by
+/// `tests/ledger.rs::serde_json_refuses_a_non_finite_dollar_figure_in_both_directions`:
+/// `serde_json` treats a non-finite `f64` as unrepresentable **both ways** —
+/// it writes `inf`/`NaN` as `null` *and* refuses to parse an out-of-range
+/// literal (`1e999` is `number out of range`, not `+inf`, which is the one
+/// thing P109 §D asserts about it). So a non-finite ceiling cannot reach this
+/// comparison through `caps_json`, and the fail-open case is not live today.
+///
+/// A **negative** ceiling is a different matter: `-1.0` is finite, valid JSON
+/// and round-trips cleanly. Its old behaviour was fail-closed but misnamed —
+/// every spend refused as `CapsExceeded { field: "max_cost_usd" }`, which
+/// reports a run over budget when the truth is a stored ceiling that is not a
+/// dollar amount. That case is why this guard earns its place even with the
+/// serialiser's accidental help; the other reason is that the help is
+/// accidental, undocumented in `serde_json`'s contract, and one hand-built
+/// writer away from being gone.
 pub fn admit_spend(
     conn: &mut Connection,
     run_id: RunId,
@@ -564,24 +624,39 @@ pub fn admit_spend(
     now: Timestamp,
 ) -> Result<ResourceCaps, LedgerError> {
     let txn = roundhouse_store::begin_immediate(conn)?;
-    let ledger = read_ledger(&txn, run_id)?;
+    let remaining = admit_spend_within(&txn, run_id, requested, now)?;
+    txn.commit()?;
+    Ok(remaining)
+}
 
-    if ledger.state != RunState::Running {
-        return Err(LedgerError::NotAdmitting {
-            run_id,
-            state: ledger.state,
-        });
-    }
+/// [`admit_spend`] without a transaction of its own, so [`draw_child_run`] can
+/// charge a parent and stamp the child inside **one** transaction. Takes
+/// `&Connection` for the reason `durability`'s `insert_run_row` does:
+/// `rusqlite::Transaction` derefs to it.
+fn admit_spend_within(
+    txn: &Connection,
+    run_id: RunId,
+    requested: &Spend,
+    now: Timestamp,
+) -> Result<ResourceCaps, LedgerError> {
+    let ledger = read_ledger(txn, run_id)?;
+    ensure_admitting(&ledger)?;
 
     let caps = ledger
         .caps
         .as_ref()
         .ok_or(LedgerError::CapsNotRecorded { run_id })?;
 
-    if !requested.cost_usd.is_finite() || requested.cost_usd < 0.0 {
+    if !is_usable_cost_usd(requested.cost_usd) {
         return Err(LedgerError::UnusableCostAmount {
             run_id,
             amount: requested.cost_usd,
+        });
+    }
+    if !is_usable_cost_usd(caps.max_cost_usd) {
+        return Err(LedgerError::UnusableCostAmount {
+            run_id,
+            amount: caps.max_cost_usd,
         });
     }
 
@@ -662,7 +737,7 @@ pub fn admit_spend(
     )?;
 
     write_spend(
-        &txn,
+        txn,
         run_id,
         &Spend {
             tokens,
@@ -689,9 +764,50 @@ pub fn admit_spend(
         },
         ..ledger
     };
-    let remaining = remaining_from_ledger(&after, now)?;
-    txn.commit()?;
-    Ok(remaining)
+    remaining_from_ledger(&after, now)
+}
+
+/// The one predicate for *"is this run admitting new work?"*, shared by
+/// [`admit_spend`] and [`admit_call_from_run`] so the two chokepoints cannot
+/// drift.
+///
+/// # Which half is quoted and which is inferred
+///
+/// **Named:** §8.13's cancel is *"cooperative — mark `Cancelling`, **refuse
+/// new task admission**, SIGTERM->SIGKILL running shells, run `finally:`"*.
+/// That sentence is the whole reason either function looks at run state.
+///
+/// **Inferred:** that `Paused`, `AwaitingHuman` and the three terminal states
+/// also admit nothing. No document says so. Each is the reading that refuses:
+/// a paused run is executing no step, a parked run is waiting on a human, and
+/// a run that has ended has ended.
+///
+/// # Why a `call:` is admission too (ruling P109 §C)
+///
+/// [`admit_call_from_run`] used to consult only `session_depth`, so a `call:`
+/// was admissible from a `Cancelling` run — and a `call:` **is** new task
+/// admission by §8.12's own description: it creates a child `workflow_run`, a
+/// child Session, and an `agent`-kind task in the parent's log. The visible
+/// consequence was a cancel that does not converge: an operator marks a
+/// misbehaving run `Cancelling` and it keeps spawning children, each starting
+/// `Running` and admitting freely.
+///
+/// # The open question this predicate now holds exactly once
+///
+/// **Does a `finally:` block's own work run during `Cancelling`?** §8.13 says
+/// `finally:` runs *and* that admission is refused, and it does not say how a
+/// `finally:` step executes without being admitted. This function does not
+/// resolve that — deliberately. It concentrates the tension in one place, so
+/// whoever resolves it (the run loop, B12c) writes **one exemption in one
+/// predicate** rather than two that must be remembered together.
+fn ensure_admitting(ledger: &RunLedger) -> Result<(), LedgerError> {
+    if ledger.state != RunState::Running {
+        return Err(LedgerError::NotAdmitting {
+            run_id: ledger.run_id,
+            state: ledger.state,
+        });
+    }
+    Ok(())
 }
 
 /// `spent + requested`, refused if it would pass `ceiling`. Saturating on the
@@ -790,12 +906,23 @@ fn u64_to_sql(value: u64, column: &'static str) -> Result<i64, LedgerError> {
 /// `roundhouse-bus`'s roster, so the caller that can see it supplies it. This
 /// function's job is to make the depth half durable and to put both checks in
 /// one place; it does not pretend to source a number this crate cannot read.
+///
+/// # Run state is checked first, and §7.7 is not why
+///
+/// A `call:` is **new task admission** — §8.12 describes it as creating a
+/// child `workflow_run`, a child Session and an `agent`-kind task — so §8.13's
+/// *"refuse new task admission"* binds here exactly as it binds
+/// [`admit_spend`]. The predicate is [`ensure_admitting`], shared with that
+/// function rather than restated, because two admission chokepoints in one
+/// module disagreeing about whether run state is load-bearing is how a cancel
+/// stops converging (ruling P109 §C).
 pub fn admit_call_from_run(
     conn: &Connection,
     parent_run_id: RunId,
     parent_direct_children: u32,
 ) -> Result<u32, LedgerError> {
     let ledger = read_ledger(conn, parent_run_id)?;
+    ensure_admitting(&ledger)?;
     let parent_depth = ledger
         .session_depth
         .ok_or(LedgerError::SessionDepthNotRecorded {
@@ -804,6 +931,78 @@ pub fn admit_call_from_run(
     let child_depth = child_call_depth(parent_depth)?;
     admit_child_call(parent_direct_children)?;
     Ok(child_depth)
+}
+
+/// §8.12's **draw**: charges `child_run_id`'s parent the child's whole grant
+/// and stamps the child `drawn_at`, in one transaction.
+///
+/// # Why this exists at all — the asymmetry ruling P109 §A found
+///
+/// The refund half shipped a durable idempotency stamp (`refunded_at`); the
+/// draw half shipped **nothing**, and [`Spend::for_grant`] had no caller
+/// anywhere in the workspace. So a refund paid out on `caps_json` plus
+/// `parent_run_id` alone — two values a row can carry with no draw behind them
+/// — and `control::retry_from_step` copies both. Measured before this
+/// existed: **one draw of 100 produced two refunds**, and a parent holding 500
+/// tokens of unrelated spend recorded 400 afterwards.
+///
+/// `drawn_at` is what makes the pair symmetric: [`refund_child_run`] now
+/// refuses a child whose draw was never recorded, which closes the whole class
+/// rather than the one path a fork takes.
+///
+/// # What it charges, and against whom
+///
+/// [`Spend::for_grant`] of the child's **recorded** `caps_json` — never a
+/// caller-supplied figure — against the parent named by the child's own
+/// `parent_run_id`, through the same [`admit_spend`] chokepoint any other
+/// spend passes. So a parent with $1 left cannot start two children each
+/// promised $1, and a parent that is `Cancelling` cannot be drawn from at all.
+///
+/// # Not yet called by anything
+///
+/// The run loop is B12c's (see this module's *"What this module is NOT"*), and
+/// so is the call site that draws when a `call:` step creates a child run.
+/// B12b supplies the operation, the column and the refusal; **B12c calls it**
+/// — recorded as an obligation in ruling P109 §B alongside the two in P108
+/// §C/§D.
+pub fn draw_child_run(
+    conn: &mut Connection,
+    child_run_id: RunId,
+    now: Timestamp,
+) -> Result<Spend, LedgerError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    let child = read_ledger(&txn, child_run_id)?;
+
+    let parent_run_id = child.parent_run_id.ok_or(LedgerError::NotAChildRun {
+        run_id: child_run_id,
+    })?;
+    if let Some(at) = child.drawn_at {
+        return Err(LedgerError::AlreadyDrawn {
+            run_id: child_run_id,
+            at,
+        });
+    }
+    // A run already stamped `refunded_at` is settled — `durability::fork_run`
+    // stamps one at creation. Drawing for it would charge the parent a grant
+    // `refund_child_run` could then never give back.
+    if let Some(at) = child.refunded_at {
+        return Err(LedgerError::AlreadySettled {
+            run_id: child_run_id,
+            at,
+        });
+    }
+    let grant = child.caps.as_ref().ok_or(LedgerError::CapsNotRecorded {
+        run_id: child_run_id,
+    })?;
+
+    let draw = Spend::for_grant(grant);
+    admit_spend_within(&txn, parent_run_id, &draw, now)?;
+    txn.execute(
+        "UPDATE workflow_run SET drawn_at = ?1 WHERE id = ?2",
+        params![now.as_unix_nanos(), child_run_id.to_string()],
+    )?;
+    txn.commit()?;
+    Ok(draw)
 }
 
 /// §8.12's *"refunded on completion"*, re-derived from durable rows: returns
@@ -837,8 +1036,19 @@ pub fn admit_call_from_run(
 /// The child must have a parent ([`LedgerError::NotAChildRun`]), must have
 /// reached a terminal state ([`LedgerError::ChildNotFinished`] — §8.12 says
 /// *on completion*, and returning a live child's grant would let it spend
-/// budget its parent has reclaimed), must have a recorded grant
+/// budget its parent has reclaimed), must carry a recorded **draw**
+/// ([`LedgerError::DrawNotRecorded`]), must have a recorded grant
 /// ([`LedgerError::CapsNotRecorded`]), and must not already be stamped.
+///
+/// # The draw check comes before the `refunded_at` check, deliberately
+///
+/// A fork satisfies both refusals — it has no `drawn_at` *and*
+/// `durability::fork_run` stamps its `refunded_at` at creation — and *"no
+/// draw was recorded"* is the fact that explains why, where *"already refunded
+/// at <its own creation instant>"* reads as though a refund had happened. The
+/// two guards cover different cases and neither is redundant: `drawn_at`
+/// catches every child that was never charged for, `refunded_at` catches the
+/// second refund of one that was.
 pub fn refund_child_run(
     conn: &mut Connection,
     child_run_id: RunId,
@@ -854,6 +1064,11 @@ pub fn refund_child_run(
         return Err(LedgerError::ChildNotFinished {
             run_id: child_run_id,
             state: child.state,
+        });
+    }
+    if child.drawn_at.is_none() {
+        return Err(LedgerError::DrawNotRecorded {
+            run_id: child_run_id,
         });
     }
     if let Some(at) = child.refunded_at {
@@ -886,11 +1101,19 @@ pub fn refund_child_run(
 
     let parent = read_ledger(&txn, parent_run_id)?;
     // The parent was charged the child's whole grant at the draw
-    // (`Spend::for_grant`), so returning the unspent part is a *decrement* of
-    // the parent's spend, not a credit to its caps. Floored at zero: a parent
-    // whose accumulators do not cover the refund is a row that was never
-    // charged the draw, and the direction that under-credits is the one that
-    // cannot mint budget the root never granted.
+    // (`draw_child_run` -> `Spend::for_grant`), so returning the unspent part
+    // is a *decrement* of the parent's spend, not a credit to its caps.
+    //
+    // Floored at zero, and here is what the floor does and does not do. It
+    // stops an accumulator going negative and wrapping into an enormous
+    // apparent spend. It does **not** make a refund safe against a child that
+    // was never charged for: measured (ruling P110), a parent holding 500
+    // tokens of unrelated spend plus a 100-token draw recorded **400** after
+    // two refunds of that one draw — real spend erased, with every counter
+    // still non-negative throughout. An earlier draft of this comment claimed
+    // the floor "cannot mint budget the root never granted"; that was false,
+    // and the guard that actually holds the invariant is the
+    // `DrawNotRecorded` refusal above, not this `.max`/`saturating_sub`.
     let parent_spend = Spend {
         tokens: parent.spent.tokens.saturating_sub(unspent.tokens),
         cost_usd: (parent.spent.cost_usd - unspent.cost_usd).max(0.0),
@@ -916,7 +1139,7 @@ pub fn refund_child_run(
 /// nothing — the direction that cannot inflate the parent's pool — matching
 /// `compose::refund_f64` exactly, including its treatment of a `NaN` spend.
 fn refundable_dollars(grant: f64, spent: f64) -> f64 {
-    if !spent.is_finite() || spent < 0.0 {
+    if !is_usable_cost_usd(spent) {
         return 0.0;
     }
     (grant - spent).max(0.0)

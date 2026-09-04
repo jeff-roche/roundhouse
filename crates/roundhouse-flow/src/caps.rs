@@ -85,3 +85,32 @@ impl Default for ResourceCaps {
         }
     }
 }
+
+/// Whether an `f64` is usable as a dollar figure: **finite and non-negative**.
+///
+/// One definition for the whole crate, because there are now three enforcement
+/// points for the same rule and they must not drift:
+/// [`crate::parse::steps::CapsDef`]'s `TryFrom` (a `caps:` block authored in
+/// YAML, where `.nan`, `.inf` and `-1e18` are all valid scalars),
+/// [`crate::durability`]'s `insert_run_row` (before a `ResourceCaps` is
+/// serialised into `workflow_run.caps_json`) and [`crate::ledger::admit_spend`]
+/// (both operands of the cost comparison **and its ceiling**).
+///
+/// The ceiling is the one that was missed: against a `NaN` `max_cost_usd`,
+/// `cost_total > caps.max_cost_usd` is `false`, so every spend is admitted —
+/// the only direction in the ledger where a bad `f64` means *yes* rather than
+/// *no* (ruling P109 §D). Nothing in the schema catches a bad dollar figure
+/// either: measured in `roundhouse-store`'s `migration_0008` tests, `+inf`
+/// satisfies `CHECK (spent_cost_usd >= 0)` and is stored (ruling P108 §B).
+///
+/// Two of the three points are about values that really can arrive.
+/// `parse::steps` reads YAML, where `.nan` and `.inf` are ordinary scalars.
+/// `admit_spend`'s **negative** case is reachable through `caps_json` —
+/// `-1.0` round-trips cleanly — where its non-finite case is not, because
+/// `serde_json` refuses an out-of-range float in both directions (measured;
+/// `1e999` is a parse error, not `+inf`). `insert_run_row`'s is the diagnosis
+/// leg: it names the writer instead of leaving a `null` in the column for some
+/// later read to trip over.
+pub fn is_usable_cost_usd(amount: f64) -> bool {
+    amount.is_finite() && amount >= 0.0
+}

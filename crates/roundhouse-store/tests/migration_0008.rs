@@ -1,17 +1,33 @@
 //! Migration 0008 (`workflow_run`'s run-level ledger, Phase 5 B12b).
 //!
-//! # Why this file tests two paths and compares them
+//! # Why this file tests two paths — and what that test can and cannot fail on
 //!
 //! A migration has two consumers that never meet: an **existing** install,
 //! which arrives at the new schema by applying 0008 on top of 0007, and a
-//! **fresh** install, which applies 0001..0008 in one go. Those are the two
-//! paths that diverge if anything is wrong — a column added with the wrong
-//! type, a `CHECK` that only one path carries, an index created twice — and a
-//! test that exercises only `to_latest()` on an empty database checks the
-//! second and says nothing about the first. Ruling P69 §2: migrations are the
-//! expensive irreversible surface, and an existing install that keeps working
-//! while a fresh one fails (or vice versa) is a divergence nobody sees until
-//! it is shipped.
+//! **fresh** install, which applies 0001..0008 in one go. Ruling P69 §2:
+//! migrations are the expensive irreversible surface, and an existing install
+//! that keeps working while a fresh one fails (or vice versa) is a divergence
+//! nobody sees until it is shipped.
+//!
+//! **What that comparison does not establish today** (ruling P110 §B, which
+//! corrects this file's earlier claim): there is no consolidated baseline in
+//! this tree, so `rusqlite_migration` reaches the latest version by executing
+//! the *identical statement sequence* on both paths — `to_version(7)` then
+//! `to_latest()` runs 0001..0007 and then 0008; a bare `to_latest()` runs
+//! 0001..0008. The two therefore **cannot** diverge, and no authoring mistake
+//! in 0008 can make
+//! [`a_database_created_at_0007_reaches_exactly_the_schema_a_fresh_one_does`]
+//! fail. The property it asserts is supplied by the migration library's
+//! design, not by this test.
+//!
+//! The test is kept anyway, and the reason is specific rather than defensive:
+//! the moment anyone collapses 0001..000N into a consolidated `CREATE TABLE`
+//! baseline for fresh installs — the standard remedy once a migration list
+//! gets long — the two paths stop executing the same statements and the
+//! property stops being free. This test is what would catch the baseline that
+//! drifts from the incremental path. The assertions that *do* discriminate
+//! today are the ones below it: the column types and defaults, the `CHECK`
+//! enforcement on both paths, and the pre-0008 row that survives the upgrade.
 //!
 //! Every assertion below is measured against the **bundled** SQLite
 //! (`rusqlite` `features = ["bundled"]`, `libsqlite3-sys` 0.38.2), whose
@@ -133,6 +149,7 @@ fn the_ledger_columns_land_on_workflow_run_with_the_declared_types_and_defaults(
         "hold_until",
         "session_depth",
         "caps_json",
+        "drawn_at",
         "refunded_at",
     ] {
         let (_, _, notnull, default, _) = by_name(nullable);
@@ -243,6 +260,7 @@ fn the_new_columns_reject_out_of_domain_values_on_both_migration_paths() {
         for (column, value) in [
             ("parked_at", "-1"),
             ("hold_until", "-1"),
+            ("drawn_at", "-1"),
             ("refunded_at", "-1"),
             ("parked_nanos", "-1"),
             ("session_depth", "-1"),
