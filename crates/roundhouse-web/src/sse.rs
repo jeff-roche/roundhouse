@@ -45,7 +45,7 @@
 //!   frame builder, emitted for exactly one condition — *the events the client
 //!   still needs are older than the oldest the server can offer*. That is
 //!   §11.3's *"the cursor is older than the ring's tail"* wherever the ring has
-//!   a tail, and [`Connection::deliver`]'s seq discontinuity where it does not.
+//!   a tail, and `Connection::deliver`'s seq discontinuity where it does not.
 //!   One event name, one payload shape. D2 emitted it for `Lagged` as well,
 //!   with a different payload, because it had no ring to recover from; it now
 //!   has one.
@@ -165,8 +165,8 @@
 //! that stayed watched, not a gap in one that did not.**
 //!
 //! What it does do for the unwatched case is **say so**. That gap has no tail
-//! to be older than — the ring is empty — so [`Ring::replay_since`] cannot see
-//! it; [`Connection::deliver`] catches it at the first event that skips past
+//! to be older than — the ring is empty — so `Ring::replay_since` cannot see
+//! it; `Connection::deliver` catches it at the first event that skips past
 //! what the client is owed, and answers with the same `resync_required`. The
 //! client refetches a snapshot instead of silently jumping its `Last-Event-ID`
 //! across the missing range.
@@ -554,6 +554,23 @@ impl Ring {
     /// Answering `resync_required` there would resync every first connection to
     /// a freshly created entry, which is every connection this endpoint has
     /// ever served.
+    ///
+    /// # The tail-miss branch is a short-circuit, not the sole guarantor
+    ///
+    /// Stated because the mutation sweep measured it: deleting the
+    /// `resume_from < oldest_retained` branch below and replaying whatever the
+    /// ring holds kills **no integration test**, because
+    /// [`Connection::deliver`] then sees the first replayed event skip past
+    /// `resume_from` and produces `Next::Resync` with the identical two
+    /// numbers. The two checks are one condition observed at two places.
+    ///
+    /// The branch stays for two reasons that are not correctness: it answers
+    /// before the stream opens, so the subscription is dropped immediately
+    /// rather than one poll later; and it avoids materialising a `Vec` of the
+    /// whole ring — up to [`Retention::ring_bytes`] of `Arc` clones — on the
+    /// way to discarding it. Its contract is therefore pinned at this level, by
+    /// `a_cursor_below_the_rings_tail_is_a_tail_miss_rather_than_a_partial_replay`,
+    /// rather than through the endpoint.
     fn replay_since(&self, resume_from: u64) -> Replay {
         let Some(oldest) = self.retained.front() else {
             return Replay::Events(Vec::new());
@@ -804,7 +821,7 @@ impl SseHub {
     /// is worth more than where a `Drop` runs.)
     ///
     /// Since that lock is held across two operations, what runs **inside** it is
-    /// kept to the two: [`retained_bytes`] walks the whole serialised payload,
+    /// kept to the two: `retained_bytes` walks the whole serialised payload,
     /// so it is measured here, before the lock, and handed to `Ring::push`. A
     /// publish for a session with N connections would otherwise cost one full
     /// serialisation pass for the ring plus N for the frames, with the first of
@@ -1564,6 +1581,41 @@ mod tests {
             ring.bytes > 1024,
             "the exception is real and measured: {} bytes retained against a 1024-byte budget",
             ring.bytes,
+        );
+    }
+
+    /// §11.3's tail miss, pinned at the ring's own level.
+    ///
+    /// It is tested here rather than only through the endpoint because deleting
+    /// the branch kills nothing out there: `Connection::deliver` reaches the
+    /// same two numbers from the first replayed event. See `Ring::replay_since`
+    /// — the branch is a short-circuit, and this is where its contract lives.
+    ///
+    /// **Mutation killed:** removing the `resume_from < oldest_retained` arm
+    /// from `Ring::replay_since` — the first assertion gets
+    /// `Replay::Events([5, 6, 7])`, a partial replay silently skipping seq 4.
+    #[test]
+    fn a_cursor_below_the_rings_tail_is_a_tail_miss_rather_than_a_partial_replay() {
+        let session_id = SessionId::new();
+        let mut ring = ring(3, usize::MAX);
+        for seq in 5..8 {
+            push(&mut ring, update(session_id, seq, "delta"));
+        }
+
+        assert!(
+            matches!(
+                ring.replay_since(4),
+                Replay::ResyncRequired {
+                    resume_from: 4,
+                    oldest_retained: 5,
+                }
+            ),
+            "seq 4 is below the ring's tail of 5, so it is a miss and not a replay of 5 onwards",
+        );
+        // The boundary from the other side: the tail itself is not a miss.
+        assert!(
+            matches!(ring.replay_since(5), Replay::Events(events) if events.len() == 3),
+            "the tail is exactly reachable, so the whole ring replays",
         );
     }
 

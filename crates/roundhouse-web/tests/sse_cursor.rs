@@ -1037,22 +1037,33 @@ async fn the_default_retention_recovers_a_full_live_queue_of_realistic_events() 
 /// A burst on one session must not cost an **idle** session its stream. Under a
 /// single process-global channel, every session's traffic passes through every
 /// connection's receiver slot, so this session — which has produced one event —
-/// would be pushed past the buffer by another session's five and be told
-/// `resync_required` having missed nothing of its own. Worse, the
-/// `dropped_events` count it would be handed is a measure of *the other
-/// session's* traffic.
+/// would be pushed past the buffer by another session's five, and would then
+/// have to recover a gap it did not cause from a ring another session's traffic
+/// also occupies.
 ///
-/// **Mutation killed:** replacing the per-session map with one shared
-/// `broadcast::Sender` (the pre-fix shape), whether or not `Filter`'s session
-/// check is kept — the filter runs after the buffer has already overrun. The
-/// body becomes a single `resync_required` frame carrying a count of events
-/// this client was never entitled to know about, instead of the one frame this
-/// session actually produced.
+/// **Mutation killed:** replacing the per-session map with one shared entry —
+/// one `broadcast::Sender` *and one ring* — for every session (the pre-fix
+/// shape), whether or not `Filter`'s session check is kept.
 ///
-/// The receiver counts are collected during the publish and asserted **after**
-/// the body, deliberately: asserting them inline would abort the test at the
-/// first flood publish under that mutation, and the body assertions — which are
-/// what actually show the coupling — would never run.
+/// **What kills it is the `receiver_counts` assertion, and only that one.**
+/// Measured under the filter-kept half of that mutation: the sole failure is
+/// `receiver_counts` at `[1, 1, 1, 1, 1, 1]` against `[0, 0, 0, 0, 0, 1]` —
+/// every publish reached this stream, which is the coupling itself. Both body
+/// assertions **pass**: the body is exactly `["<mine>:0"]` with no
+/// `resync_required` frame. (The explanation, which is a reading of the code
+/// rather than a second measurement: the burst does still bump this connection
+/// out of the shared live queue, but the now-shared *ring* covers the lag and
+/// `Filter` discards the five replayed updates that name another session.)
+///
+/// (D2's version of this comment said the body became a single
+/// `resync_required` frame carrying a `dropped_events` count of another
+/// session's traffic. That was true before the ring and is not true now: the
+/// ring recovers the lag, and no count is reported at all.)
+///
+/// The counts are still collected during the publish and asserted **after** the
+/// body rather than inline, because an inline assertion would abort at the
+/// first flood publish and the body assertions would never run — they are what
+/// shows *how* the mutation manifests, even though they no longer fail.
 #[tokio::test]
 async fn a_burst_on_another_session_does_not_lag_this_sessions_stream() {
     // Two slots, so five events on the other session would overrun a shared
