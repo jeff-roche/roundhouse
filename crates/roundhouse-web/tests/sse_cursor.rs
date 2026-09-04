@@ -240,16 +240,27 @@ async fn stream(
 
 /// Drives the real router, reads the **first `frames` frames**, and then drops
 /// the response — a client that *disconnects*, which is the one thing
-/// [`stream`] structurally cannot express.
+/// [`stream`] cannot express for a connection that is still **open**.
 ///
-/// [`stream`] ends its body by dropping the last `SseHub` handle, because a
-/// session's `broadcast::Sender` lives in the hub's map and a stream ends only
-/// once its sender is gone. That is why every test above performs exactly **one**
-/// connection: the hub does not survive it, so there is nothing left to
-/// reconnect to. A *sequence* of connections needs a first one that ends without
-/// taking the hub with it, and a real client's disconnect is exactly that — the
-/// response body is dropped, which drops the `Sse` stream, which drops the
-/// `Connection` and with it the handler's `SessionSubscription`.
+/// [`stream`] takes the hub **by value** and ends its body by dropping that last
+/// `SseHub` handle, because a session's `broadcast::Sender` lives in the hub's
+/// map and an open stream ends only once its sender is gone. So an open first
+/// connection cannot be followed by a second: the hub does not survive it. What
+/// holds of the tests above is therefore one connection **per hub** — not one
+/// per test; three of them connect more than once, each time to a fresh hub.
+///
+/// The exception is a stream that is **terminal on its own**. A connect-time
+/// `resync_required` drops its subscription, emits one frame, and is `Done`
+/// (`sse.rs`, `StreamState::Resync`) without waiting on any sender, so
+/// [`stream`] can already sequence *that* first connection, given a clone of a
+/// hub the caller keeps. This helper is what an open first connection needs —
+/// which is why the composition test below cannot be written without it, and
+/// why the resync test after it uses the helper for uniformity rather than
+/// necessity.
+///
+/// What ends the body here instead is a real client's disconnect: the response
+/// is dropped, which drops the `Sse` stream, which drops the `Connection` and
+/// with it the handler's `SessionSubscription`.
 ///
 /// So the hub is **borrowed**, not consumed, and the caller must hold a second
 /// subscription across the call: that dropped subscription is otherwise the
@@ -1062,12 +1073,12 @@ async fn a_client_that_reconnects_exactly_where_it_left_off_is_not_resynced_by_a
 
 // ── reconnect *sequences*: the cursor has to compose, not just be right once ──
 //
-// Task 36 (Phase 5, Subsystem D7). Every test above performs exactly one
-// reconnect, because `stream` ends a body by destroying the hub. These two hold
-// the hub up across a disconnect (`stream_until_disconnect`) and ask what the
-// *next* connection gets — the two sequences whose failure modes a
-// single-reconnect test cannot see: a cursor that stops composing, and a resync
-// that resyncs again.
+// Task 36 (Phase 5, Subsystem D7). No test above connects to the same hub
+// twice, because `stream` ends a body by destroying the hub it was handed.
+// These two hold one hub up across a disconnect (`stream_until_disconnect`)
+// and ask what the *next* connection gets — the two sequences whose failure
+// modes a single-connection test cannot see: a cursor that stops composing,
+// and a resync that resyncs again.
 
 /// A second reconnect resumes after what the **first one delivered**, and the
 /// cursor it resumes from is read out of the first connection's own frames
@@ -1096,9 +1107,15 @@ async fn a_client_that_reconnects_exactly_where_it_left_off_is_not_resynced_by_a
 /// **Mutations also killed, jointly with tests above** (measured, not reasoned —
 /// the sweep's full rows are in the task report): resuming at `cursor.seq`
 /// rather than `cursor.seq + 1`; a replay exclusive of the cursor rather than
-/// inclusive; a connection that never advances its own resume point; a replay
-/// that skips the ring's oldest entry; and `oldest_retained` read off the ring's
-/// newest end.
+/// inclusive; a connection that never advances its own resume point; and
+/// `oldest_retained` read off the ring's newest end.
+///
+/// A replay that **skips the ring's oldest entry** is *not* one of them, and is
+/// invisible here by construction: both connections resume above seq 0 — the
+/// first at 1 against a ring holding `[0, 1, 2]`, the second at 3 — so dropping
+/// entry 0 leaves each replay's filter output unchanged. Measured: `.iter()` →
+/// `.iter().skip(1)` leaves this test green and fails the one below, which is
+/// where that row belongs.
 #[tokio::test]
 async fn a_second_reconnect_resumes_after_the_first_ones_last_frame_rather_than_replaying_its_gap()
 {
@@ -1183,11 +1200,12 @@ async fn a_second_reconnect_resumes_after_the_first_ones_last_frame_rather_than_
 /// **Mutation killed, and this is the only test in the workspace that kills
 /// it:** freeing the ring once a resync has been issued — the plausible
 /// optimisation, since the client was just told to refetch a snapshot and will
-/// not ask for that history again. Every other test performs one connection, so
-/// a ring emptied *by* a resync is invisible to all of them: the mutation
-/// changes nothing they can observe. Here the second connection's body collapses
-/// to `[]` against the four frames asserted (measured), because a client that
-/// did exactly as it was told finds the history it was promised gone.
+/// not ask for that history again. No other test connects to a hub a second
+/// time, so none of them ever reads a ring back after a resync was issued
+/// against it: the mutation changes nothing they can observe. Here the second
+/// connection's body collapses to `[]` against the four frames asserted
+/// (measured), because a client that did exactly as it was told finds the
+/// history it was promised gone.
 ///
 /// **A mutation this test does *not* uniquely kill, recorded because the first
 /// draft of this comment claimed it did.** Widening `Ring::replay_since`'s
