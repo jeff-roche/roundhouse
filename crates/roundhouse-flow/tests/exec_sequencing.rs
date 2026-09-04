@@ -182,6 +182,97 @@ steps:
     );
 }
 
+// ---- Task 18 (B10): the `report:` arm's promised validator. The landed arm
+// carried a comment saying "Task 10 additionally wraps this exact call site
+// with a report validator so a malformed report step fails loudly at run time
+// rather than persisting garbage; that validator does not exist yet in this
+// crate, so it is not called here." It exists now. ----
+
+#[test]
+fn a_report_that_fails_validation_fails_the_step_and_persists_nothing() {
+    // `outcome: "ok"` is not one of §8.6's five outcomes. Before the
+    // validator, this persisted verbatim as a `TaskKind::Report` task's
+    // completed output and the inbox had no bucket to sort it into — the
+    // "garbage the inbox cannot read back" the validator exists to prevent.
+    // The append-only `events` table physically rejects UPDATE/DELETE, so
+    // "persist it and fix it later" is not available: refusing to emit is
+    // the only correction there is.
+    let yaml = r#"
+name: bad-report
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: final_report
+    report: { outcome: "ok", severity: "low", headline: "clean run", needs_human: false, cost: { usd: 0.0, tokens: 0 } }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({}))).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    assert_eq!(outcomes.len(), 1);
+    match &outcomes[0].status {
+        StepStatus::Failed { message } => {
+            assert_eq!(
+                message,
+                "invalid `report:`: invalid value for field `outcome`: \"ok\""
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(
+        !sink.0.iter().any(|e| matches!(e.kind, TaskKind::Report)),
+        "a report that failed validation must emit neither TaskCreated nor TaskCompleted \
+         — the plan's version set the step to Failed and persisted the invalid payload anyway"
+    );
+}
+
+#[test]
+fn a_report_whose_secret_derived_field_survives_redaction_still_validates() {
+    // The validator runs against the *redacted* rendering, because that is
+    // what is persisted and what the inbox loads back. A secret in a free
+    // text field therefore validates as the redaction placeholder — correct,
+    // and worth stating because it is surprising.
+    let yaml = r#"
+name: report-secret-valid
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: a
+    report: { outcome: "changed", severity: "low", headline: "key ${{ secrets.GH_TOKEN }}", needs_human: false, cost: { usd: 0.0, tokens: 0 } }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(serde_json::json!({}), "GH_TOKEN", "sk-super-secret");
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+    assert!(matches!(outcomes[0].status, StepStatus::Completed));
+
+    let completed = sink
+        .0
+        .iter()
+        .find(|e| {
+            matches!(e.kind, TaskKind::Report) && e.payload_json.get("TaskCompleted").is_some()
+        })
+        .expect("TaskCompleted was emitted");
+    let headline = completed.payload_json["TaskCompleted"]["output"]["Json"]["headline"]
+        .as_str()
+        .expect("headline is a string");
+    assert!(
+        !headline.contains("sk-super-secret") && headline.contains("***"),
+        "the persisted headline carries the placeholder, not the secret: {headline}"
+    );
+    let validated = roundhouse_flow::report::validate_report(
+        &completed.payload_json["TaskCompleted"]["output"]["Json"],
+    )
+    .expect("what was persisted is what the inbox can load back");
+    assert_eq!(validated.headline, headline);
+}
+
 // ---- Fix round 1, item 4: `when:` must accept the documented `${{ }}`
 // delimited form (docs/architecture/05-scheduling-and-workflows.md §8.9's
 // own reference workflow uses `when: "${{ ... }}"` in both of its
@@ -577,6 +668,13 @@ fn a_secret_referenced_in_report_is_redacted_in_both_the_created_and_completed_e
     // §8.8's *mandatory* per-run block — payload measured to leak, verbatim,
     // on the pre-fix code:
     // `{"TaskCreated":{"input":{"Json":{"headline":"key sk-super-secret",...`
+    //
+    // Task 18 (B10) changed this fixture's `outcome` from `"ok"` to
+    // `"changed"`. `"ok"` was never one of §8.6's five outcomes; it only
+    // reached the sink because nothing validated the report. Now that the
+    // arm validates, an invalid report emits no events at all, which would
+    // make this redaction test vacuously green. The assertions below are
+    // unchanged — the fixture is only made valid enough to reach them.
     let yaml = r#"
 name: report-secret
 version: 1
@@ -585,7 +683,7 @@ defaults: { isolation: worktree }
 permissions: { default: deny, unattended: { escalate: fail } }
 steps:
   - id: a
-    report: { outcome: "ok", severity: "low", headline: "key ${{ secrets.GH_TOKEN }}", needs_human: false, cost: { usd: 0.0, tokens: 0 } }
+    report: { outcome: "changed", severity: "low", headline: "key ${{ secrets.GH_TOKEN }}", needs_human: false, cost: { usd: 0.0, tokens: 0 } }
 "#;
     let def = parse_workflow(yaml).unwrap();
     let mut sink = RecordingSink(Vec::new());

@@ -395,7 +395,18 @@ pub fn content_hash(job: &JobVersion) -> String {
 /// were originally inserted in, and regardless of whether the `Map`
 /// `serde_json` uses under the hood is a `BTreeMap` or an insertion-ordered
 /// map (i.e. regardless of the `preserve_order` feature).
-fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
+///
+/// `pub(crate)` rather than private (Task 18/B10, ruling P73): the workspace
+/// already carries three copies of this recursive key-sort — here,
+/// `roundhouse-policy`'s `approval.rs`, and `roundhouse-mcp`'s `executor.rs`,
+/// the last with a written invitation to replace itself with a call to this
+/// one if it were ever made public. [`crate::report`] needs the identical
+/// property for [`crate::report::Report`]'s open extension fields and for the
+/// carry-over seed, and a fourth copy *in the same crate as the first* would
+/// be indefensible. Cross-crate deduplication is a separate move: this helper
+/// would have to land in `roundhouse-core` to serve the other two, which is
+/// not this task's to do.
+pub(crate) fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();

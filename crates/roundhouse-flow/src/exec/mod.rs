@@ -917,11 +917,9 @@ impl<'a> Executor<'a> {
                 // sink as a real `TaskKind::Report` task, carrying the
                 // report JSON as its completed output — this is what makes
                 // the Runs inbox/fingerprint diffing (Task 10) have
-                // something to load back. Task 10 additionally wraps this
-                // exact call site with a report validator so a malformed
-                // report step fails loudly at run time rather than
-                // persisting garbage; that validator does not exist yet in
-                // this crate, so it is not called here.
+                // something to load back. Task 18 (B10) supplies the report
+                // validator this comment used to say did not exist yet, and
+                // gates the emit on it below.
                 let resolved = match interpolate_json(
                     JsonTemplateSource::from_workflow_file(report),
                     &self.ctx,
@@ -941,6 +939,22 @@ impl<'a> Executor<'a> {
                 // path, not just an author's optional notification block.
                 let logged =
                     redact_with_needles(resolved.redacted_for_logging(), &self.redaction_needles);
+                // Task 18 (B10): validate before emitting, and emit nothing
+                // at all when validation fails. The `events` table
+                // physically rejects UPDATE/DELETE, so a malformed report
+                // that reaches the sink is there permanently — failing the
+                // step is the only correction available.
+                //
+                // Validation runs on `logged`, not on `resolved`, for two
+                // reasons: `logged` is byte-for-byte what is persisted and
+                // what the inbox loads back, so validating anything else
+                // would bless a payload nobody will ever read; and
+                // `ReportError` quotes the offending value, so validating
+                // the redacted rendering keeps secret material out of the
+                // failure message too.
+                if let Err(e) = crate::report::validate_report(&logged) {
+                    return StepOutcome::failed(&step.id, format!("invalid `report:`: {e}"));
+                }
                 let output_is_secret_derived = resolved.is_secret_derived();
                 self.sink.emit(
                     task_id,
