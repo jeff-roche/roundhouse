@@ -31,19 +31,46 @@ use xtask::scan::{scan_dir_for, scan_workspace_for};
 /// diverge: a planted violation that the live scan would miss is not evidence
 /// of anything.
 ///
-/// Line-oriented, like every other scan in this directory. A statement split
-/// across two source lines between `ALTER TABLE` and `ADD CONSTRAINT` would
-/// evade it — stated rather than left to be discovered, and the reason the
-/// migration module doc names the rule too. It is deliberately not anchored to
-/// `migrations.rs`: the point is that no file anywhere reaches for the
-/// statement, including a test that would "just check it works".
+/// # What it does and does not catch — the complete list
+///
+/// Line-oriented, like every other scan in this directory, and **inner
+/// whitespace is normalised** before matching, so `ADD  CONSTRAINT` (two
+/// spaces) and `ADD\tCONSTRAINT` (a tab) are caught. Both were measured as
+/// evasions of an earlier `contains("ADD CONSTRAINT")` form (ruling P110 §C).
+///
+/// Three limits remain, enumerated because enumerating *one* of them reads as
+/// exhaustive and is not:
+///
+/// 1. **A statement split across two source lines** between `ALTER TABLE` and
+///    `ADD CONSTRAINT` evades it. Closing that needs a whole-file match, which
+///    would then have to model string literals and comments to stay honest.
+/// 2. **A trailing comment on a code line is a false positive**: only a line
+///    that *starts* with `--` or `//` is skipped, so
+///    `let x = 1; // ALTER … ADD CONSTRAINT` fires. Failing loudly on a
+///    mention is the direction to prefer here — the fix is to reword the
+///    comment — but it is a false positive and is not one anybody should have
+///    to rediscover.
+/// 3. **The live scan walks `crates/` only** (`scan_workspace_for`), so
+///    `xtask` is exempt. That exemption is load-bearing for this very file:
+///    it is the only reason the self-test's planted violation string, and the
+///    module doc above it, do not trip
+///    [`no_file_reaches_for_alter_table_add_constraint`]. It also means a
+///    migration written under `xtask/` would not be scanned — nothing writes
+///    one there, and `roundhouse-store` is where migrations live.
+///
+/// The predicate is deliberately not anchored to `migrations.rs`: the point is
+/// that no file anywhere under `crates/` reaches for the statement, including a
+/// test that would "just check it works".
 fn alter_table_add_constraint(line: &str) -> Option<String> {
     let upper = line.to_ascii_uppercase();
     let code = upper.trim_start();
-    if code.starts_with("--") || code.starts_with("//") || code.starts_with("///") {
+    if code.starts_with("--") || code.starts_with("//") {
         return None;
     }
-    if upper.contains("ALTER") && upper.contains("ADD CONSTRAINT") {
+    // Collapses every run of whitespace — spaces, tabs — to a single space, so
+    // the match below cannot be evaded by spacing.
+    let normalised = upper.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalised.contains("ALTER") && normalised.contains("ADD CONSTRAINT") {
         Some("ALTER TABLE ... ADD CONSTRAINT (ruling P104)".to_string())
     } else {
         None
@@ -70,8 +97,15 @@ fn no_file_reaches_for_alter_table_add_constraint() {
 /// describing the banned statement (what this file's own module doc is made
 /// of) — so the test pins that the scan distinguishes the three, not merely
 /// that it fires on something.
+///
+/// The two **whitespace** variants are planted too, and were genuine evasions
+/// before the predicate normalised (ruling P110 §C measured both against the
+/// live scan). Per ruling P92 the positives are three files rather than one,
+/// and the assertion is over the *set* of files that fired — `read_dir` order
+/// is not specified, so an assertion on position would be pinning the
+/// filesystem rather than the scan.
 #[test]
-fn the_scan_fires_on_a_planted_add_constraint_and_not_on_a_legitimate_add_column() {
+fn the_scan_fires_on_every_spelling_of_add_constraint_and_not_on_a_legitimate_add_column() {
     let thread_id = format!("{:?}", std::thread::current().id())
         .replace("ThreadId(", "")
         .replace(")", "");
@@ -89,6 +123,16 @@ fn the_scan_fires_on_a_planted_add_constraint_and_not_on_a_legitimate_add_column
     )
     .unwrap();
     fs::write(
+        temp_root.join("violation_two_spaces.rs"),
+        "const M: &str = \"ALTER TABLE workflow_run ADD  CONSTRAINT ck CHECK (a > 0);\";\n",
+    )
+    .unwrap();
+    fs::write(
+        temp_root.join("violation_tab.rs"),
+        "const M: &str = \"ALTER TABLE workflow_run ADD\tCONSTRAINT ck CHECK (a > 0);\";\n",
+    )
+    .unwrap();
+    fs::write(
         temp_root.join("legitimate.rs"),
         "const M: &str = \"ALTER TABLE workflow_run ADD COLUMN parked_at INTEGER \
          CHECK (parked_at IS NULL OR parked_at >= 0);\";\n\
@@ -99,13 +143,24 @@ fn the_scan_fires_on_a_planted_add_constraint_and_not_on_a_legitimate_add_column
     let hits = scan_dir_for(&temp_root, alter_table_add_constraint);
     let _ = fs::remove_dir_all(&temp_root);
 
+    let mut fired: Vec<String> = hits
+        .iter()
+        .map(|(path, _)| {
+            path.file_name()
+                .expect("a scanned hit names a file")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    fired.sort();
     assert_eq!(
-        hits.len(),
-        1,
-        "expected exactly the planted violation to fire, got {hits:?}"
-    );
-    assert!(
-        hits[0].0.ends_with("violation.rs"),
-        "the ADD COLUMN file and the comment line must not fire: {hits:?}"
+        fired,
+        vec![
+            "violation.rs".to_string(),
+            "violation_tab.rs".to_string(),
+            "violation_two_spaces.rs".to_string(),
+        ],
+        "every spelling must fire, and the ADD COLUMN file and the comment line \
+         must not: {hits:?}"
     );
 }
