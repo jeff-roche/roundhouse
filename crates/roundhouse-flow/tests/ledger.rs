@@ -17,7 +17,7 @@ use roundhouse_flow::exec::map_step::MapBudget;
 use roundhouse_flow::exec::RunId;
 use roundhouse_flow::ledger::{
     active_elapsed, admit_call_from_run, admit_spend, draw_child_run, parked_runs_past_hold_cap,
-    refund_child_run, remaining_caps, run_ledger, LedgerError, Spend,
+    refund_child_run, remaining_caps, run_ledger, wall_elapsed, LedgerError, Spend,
 };
 use rusqlite::Connection;
 use std::time::Duration;
@@ -1343,16 +1343,181 @@ fn parked_time_larger_than_the_wall_clock_floors_active_time_at_zero() {
 fn a_refund_larger_than_the_parents_recorded_spend_floors_at_zero_rather_than_wrapping() {
     let mut conn = open_test_db();
     let (parent, child) = a_parent_and_child(&mut conn, a_small_grant());
-    // The parent really was charged 500 tokens by the draw; an operator edits
-    // it down to 100, so the 500-token refund cannot be covered.
-    hand_edit(&conn, "spent_tokens = 100", parent);
+    // The parent really was charged 500 tokens and $2.00 by the draw; an
+    // operator edits both down, so neither leg of the refund can be covered.
+    // Both legs, because they are different arithmetic — `saturating_sub` on a
+    // `u64` and `.max(0.0)` on an `f64` — and an earlier version of this test
+    // edited only the integer one, leaving the dollar floor unmeasured.
+    hand_edit(&conn, "spent_tokens = 100, spent_cost_usd = 0.5", parent);
 
     transition_run(&mut conn, child, RunState::Completed, at_secs(3)).unwrap();
     let refunded = refund_child_run(&mut conn, child, at_secs(4)).unwrap();
     assert_eq!(refunded.tokens, 500, "the child spent none of its grant");
+    assert_eq!(refunded.cost_usd, 2.0);
+
+    let after = run_ledger(&conn, parent).unwrap().spent;
+    assert_eq!(after.tokens, 0, "floored, not wrapped into 18 quintillion");
     assert_eq!(
-        run_ledger(&conn, parent).unwrap().spent.tokens,
-        0,
-        "floored, not wrapped into 18 quintillion"
+        after.cost_usd, 0.0,
+        "and floored on the dollar leg too — an un-floored -1.5 would not even \
+         survive the column's CHECK (spent_cost_usd >= 0)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The per-field floors, against a row whose SPEND EXCEEDS ITS GRANT.
+//
+// Ruling P110 §A's fifth P92 clause, applied and then re-applied: the first
+// pass mutated the arithmetic and found seven survivors, six of which needed
+// this one fixture shape. `admit_spend` cannot produce a spend past the
+// ceiling, so every earlier test in this file has `spent <= grant` — and every
+// `saturating_sub` in `remaining_from_ledger` and `refund_child_run` is
+// *exactly* the guard for the case where that does not hold. Whole families of
+// floors were unmeasured because the fixture could never reach them.
+//
+// These rows need no `PRAGMA` where the values are non-negative: a spend of
+// 2_000 against a grant of 1_000 satisfies every column `CHECK` there is. The
+// schema has no cross-column constraint tying a spend to its grant, and
+// migration 0008's doc says why one is not there (it would need the table
+// rebuild). So this is a row the database will hold quite happily and only the
+// Rust floors refuse to be misled by.
+// ---------------------------------------------------------------------------
+
+/// Every countable in `remaining_caps` floors at zero when the stored spend is
+/// larger than the grant. Wrapping instead would report a pool of roughly
+/// `u64::MAX` — a run whose budget is exhausted being handed an unbounded one,
+/// which is the fail-open direction on the number `MapBudget` divides.
+#[test]
+fn a_stored_spend_larger_than_the_grant_leaves_no_remaining_pool_in_any_field() {
+    let mut conn = open_test_db();
+    let run_id = a_seeded_run(&mut conn);
+    conn.execute(
+        "UPDATE workflow_run
+            SET spent_tokens = 2000, spent_cost_usd = 9.0, spent_tasks = 50,
+                spent_tool_calls = 60, spent_subagents = 9,
+                spent_bytes_written = 9000, spent_escalations = 7
+          WHERE id = ?1",
+        rusqlite::params![run_id.to_string()],
+    )
+    .expect("every one of these satisfies its column CHECK; only the grant disagrees");
+
+    let remaining = remaining_caps(&conn, run_id, at_secs(1)).unwrap();
+    assert_eq!(
+        (
+            remaining.max_tokens,
+            remaining.max_cost_usd,
+            remaining.max_tasks,
+            remaining.max_tool_calls,
+            remaining.max_subagents,
+            remaining.max_bytes_written,
+            remaining.max_escalations,
+        ),
+        (0, 0.0, 0, 0, 0, 0, 0),
+        "an exhausted budget is zero in every field, never a wrapped maximum"
+    );
+}
+
+/// The same shape one level over: a **child** whose stored spend exceeds its
+/// grant refunds **nothing**, per field. Wrapping would return roughly
+/// `u64::MAX` to the parent — §8.12's invariant inverted as far as it goes.
+#[test]
+fn a_child_that_overspent_its_grant_refunds_nothing_rather_than_an_enormous_amount() {
+    let mut conn = open_test_db();
+    let (parent, child) = a_parent_and_child(&mut conn, a_small_grant());
+    let parent_before = run_ledger(&conn, parent).unwrap().spent;
+    conn.execute(
+        "UPDATE workflow_run
+            SET spent_tokens = 900, spent_cost_usd = 5.0, spent_tasks = 40,
+                spent_tool_calls = 50, spent_subagents = 8,
+                spent_bytes_written = 9000, spent_escalations = 6
+          WHERE id = ?1",
+        rusqlite::params![child.to_string()],
+    )
+    .unwrap();
+    transition_run(&mut conn, child, RunState::Completed, at_secs(3)).unwrap();
+
+    let refunded = refund_child_run(&mut conn, child, at_secs(4)).unwrap();
+    assert_eq!(
+        refunded,
+        Spend::ZERO,
+        "there is nothing unspent to give back, in any field"
+    );
+    assert_eq!(
+        run_ledger(&conn, parent).unwrap().spent,
+        parent_before,
+        "and the parent's ledger is untouched by a zero refund"
+    );
+}
+
+/// `refundable_dollars`'s guard on an unusable stored spend, and the one input
+/// shape where it is load-bearing.
+///
+/// Measured: for `+inf` and `NaN` the guard is redundant — `(grant - inf)` is
+/// `-inf` and `(grant - NaN)` is `NaN`, and `f64::max(0.0)` turns both into
+/// `0.0` on its own. The case that needs it is a **negative** stored spend,
+/// where `(grant - -5.0)` is `grant + 5` and the refund *inflates*: the parent
+/// is credited more than the draw ever took out.
+#[test]
+fn a_negative_stored_dollar_spend_refunds_nothing_rather_than_inflating_the_parents_pool() {
+    let mut conn = open_test_db();
+    let (parent, child) = a_parent_and_child(&mut conn, a_small_grant());
+    let parent_charged = run_ledger(&conn, parent).unwrap().spent.cost_usd;
+    assert_eq!(
+        parent_charged, 2.0,
+        "the draw charged the child's whole grant"
+    );
+
+    hand_edit(&conn, "spent_cost_usd = -5.0, spent_tokens = 500", child);
+    transition_run(&mut conn, child, RunState::Completed, at_secs(3)).unwrap();
+
+    let refunded = refund_child_run(&mut conn, child, at_secs(4)).unwrap();
+    assert_eq!(
+        refunded.cost_usd, 0.0,
+        "an unusable stored spend refunds nothing; grant - (-5) would refund 7.0"
+    );
+    assert_eq!(
+        run_ledger(&conn, parent).unwrap().spent.cost_usd,
+        parent_charged,
+        "so the parent's recorded spend is not decremented by budget nobody granted"
+    );
+}
+
+/// `wall_elapsed`'s floor at the boundary the *signature* admits rather than
+/// the one the schema usually holds — ruling P108 §E's "accurate about the
+/// values you had in mind and wrong about the values the signature admits".
+///
+/// `saturating_sub` and a plain subtraction agree everywhere except where
+/// `end - started` overflows `i64`, which needs the two extremes. There it
+/// matters a great deal: saturating reports ~292 years of elapsed wall time and
+/// the run is refused, wrapping reports **zero** and the run has an unbounded
+/// window.
+#[test]
+fn a_wall_clock_that_overflows_i64_saturates_rather_than_wrapping_to_no_elapsed_time() {
+    let mut conn = open_test_db();
+    let run_id = a_seeded_run(&mut conn);
+    conn.execute(
+        "UPDATE workflow_run SET started_at = ?1 WHERE id = ?2",
+        rusqlite::params![i64::MIN, run_id.to_string()],
+    )
+    .expect("started_at carries no CHECK, so this needs no pragma");
+    let far_future = Timestamp::from_unix_nanos(i64::MAX);
+
+    let ledger = run_ledger(&conn, run_id).unwrap();
+    assert_eq!(
+        wall_elapsed(&ledger, far_future),
+        Duration::from_nanos(i64::MAX as u64),
+        "i64::MAX - i64::MIN saturates; wrapping would report -1 and read back as zero"
+    );
+
+    let refused = admit_spend(&mut conn, run_id, &a_spend_of(1, 0.0), far_future);
+    assert!(
+        matches!(
+            refused,
+            Err(LedgerError::CapsExceeded {
+                field: "run_wall_timeout",
+                ..
+            })
+        ),
+        "and the wall window is what refuses it, before the active one does; got {refused:?}"
     );
 }

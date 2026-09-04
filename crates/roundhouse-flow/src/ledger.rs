@@ -503,6 +503,13 @@ pub fn active_elapsed(ledger: &RunLedger, now: Timestamp) -> Duration {
     let in_progress = ledger
         .parked_at
         .map_or(0, |start| nonneg(end.saturating_sub(start.as_unix_nanos())));
+    // `saturating_add` here can never actually saturate, and the margin is
+    // exactly one: both operands come through [`nonneg`], so each is at most
+    // `i64::MAX`, and `2 * (2^63 - 1) = 2^64 - 2`, one below `u64::MAX`.
+    // Measured rather than assumed, because "saturating" reads as though the
+    // ceiling were reachable. It is kept as the saturating form anyway: it
+    // costs nothing, and the property that makes it unreachable is a property
+    // of `nonneg`, one call away, not of this line.
     let parked = ledger.parked_nanos.saturating_add(in_progress);
     Duration::from_nanos(
         nonneg(end.saturating_sub(ledger.started_at.as_unix_nanos())).saturating_sub(parked),

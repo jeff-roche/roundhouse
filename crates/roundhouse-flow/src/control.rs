@@ -399,8 +399,9 @@ pub fn retry_from_step(
         //   that is unbounded, not the parent's charge.
         // - **A fork cannot be refunded**, which is the half that was
         //   actively dangerous. It copies `parent_run_id` and `caps` and
-        //   starts terminal-eligible with `spent_* = 0`, so before B12b's fix
-        //   round it satisfied every precondition of
+        //   starts unspent, so once it reached a terminal state — which a
+        //   retried run does like any other — it satisfied, before B12b's fix
+        //   round, every precondition of
         //   `ledger::refund_child_run` and credited the parent a grant nobody
         //   drew — measured at one draw producing two refunds, and erasing
         //   500 tokens of the parent's real, unrelated spend down to 400.

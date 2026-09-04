@@ -999,9 +999,13 @@ fn insert_run_row(conn: &Connection, run: &WorkflowRun) -> Result<(), Durability
     // `session_depth` and `caps_json` *are* here, because both are facts only
     // the run's creator knows.
     // Ruling P109 §D's diagnosis leg. Checked *before* serialising, because
-    // `serde_json` does not refuse a non-finite `f64` — it writes `null` — so
-    // the failure this replaces was not a serialisation error at all but a
-    // `MalformedStoredCaps` at whatever unrelated read next touched the row.
+    // `serde_json` does not refuse a non-finite `f64` on the way out — it
+    // writes `null` — so the failure this replaces was not a serialisation
+    // error at all but a `MalformedStoredCaps` at whatever unrelated read next
+    // touched the row. (On the way *in* it does refuse: an out-of-range
+    // literal is a parse error, measured in `tests/ledger.rs`. That asymmetry
+    // is why the enforcement leg in `ledger::admit_spend` is scoped to a
+    // negative ceiling rather than a non-finite one.)
     // The predicate is `caps::is_usable_cost_usd`, shared with `parse::steps`
     // and `ledger::admit_spend`, so the crate keeps one definition of "a
     // usable dollar figure".
@@ -1390,6 +1394,7 @@ fn transition(
 /// is absent) before assembling anything — and nothing in this workspace
 /// deletes a `workflow_run` row, so the property cannot lapse between the two
 /// calls. Re-querying it here would be an unreachable branch.
+///
 /// # The fork is stamped `refunded_at` at creation, and that is a budget fix
 ///
 /// A fork copies `parent_run_id` **and** `caps` from the run it forks, and its
