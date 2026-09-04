@@ -15,7 +15,11 @@
 //! which records why it is *not* layered over the whole router. Task 34 (D5)
 //! added the second API route, §8.6's Runs inbox, in [`runs`] — and with it the
 //! single `api_router` registration point every later API route goes through,
-//! so that adding a route and being gated are one act (ruling P88 §A).
+//! so that adding a route and being gated are one act (ruling P88 §A). Its fix
+//! round added the second thing that registration point buys: an always-on
+//! `Host` check (`host_guard`), because a parameterless `/api` read makes DNS
+//! rebinding a working attack against the *ungated loopback* arm, which no
+//! token and no CORS header can defend (ruling P93 §A).
 //! **This crate still binds no listener and starts no server**, and nothing
 //! links it yet — so [`lan_auth::BindConfig::bind_addr`] has no caller.
 //!
@@ -39,6 +43,7 @@
 #![forbid(unsafe_code)]
 
 pub mod assets;
+mod host_guard;
 pub mod lan_auth;
 pub mod runs;
 pub mod sse;
@@ -201,8 +206,8 @@ pub fn build_router(state: AppState, bind: &lan_auth::BindConfig) -> axum::Route
     // `.nest("/api", …)` down there would sit outside this `match` and would be
     // served ungated (ruling P88 §A).
     let api = match bind.gate() {
-        None => api_router(),
-        Some(gate) => api_router().layer(axum::middleware::from_fn_with_state(
+        None => api_router(bind),
+        Some(gate) => api_router(bind).layer(axum::middleware::from_fn_with_state(
             gate,
             lan_auth::require_lan_token,
         )),
@@ -231,8 +236,40 @@ pub fn build_router(state: AppState, bind: &lan_auth::BindConfig) -> axum::Route
 /// asserts `401` on an `/api` path that matches **no** route at all, which is
 /// what pins "the gate covers the nest" rather than "the gate covers the routes
 /// that happened to exist when the test was written".
-fn api_router() -> axum::Router<AppState> {
-    sse::router().merge(runs::router()).fallback(api_not_found)
+///
+/// # The `Host` check is here for the same reason, and it is always on
+///
+/// [`host_guard::require_expected_host`] refuses any request that addresses
+/// this process by a name it does not bind to — the DNS-rebinding defence
+/// ruling P93 §A requires, and the only thing standing between a page the
+/// victim merely visited and the whole of `GET /api/runs`. It is layered
+/// **here** rather than in [`build_router`] for exactly the reason the
+/// registration point exists: a route added to this function is `Host`-checked
+/// by the act of being added.
+///
+/// It is unconditional, unlike the LAN gate, because the arm that needs it is
+/// the *ungated loopback* one: `/api/runs` takes no path segment, no query
+/// parameter and no body, so a rebinding page needs to guess nothing.
+///
+/// `layer` and not `route_layer`: `axum::Router::layer` wraps the fallback and
+/// the catch-all too (checked against axum 0.8.4's `Router::layer`, which maps
+/// over `path_router`, `fallback_router` **and** `catch_all_fallback`), so
+/// [`api_not_found`] is behind the check as well. `route_layer` maps only
+/// `path_router` and would leave the fallback open — the same shape of hole
+/// P88 §A is about.
+///
+/// The `Host` check sits **inside** the LAN gate, so on a LAN bind a request
+/// with neither token nor correct `Host` is answered `401` and never reaches
+/// the `403`. That order tells an unauthenticated caller less, and it is what
+/// `tests/lan_auth.rs`'s boundary test observes.
+fn api_router(bind: &lan_auth::BindConfig) -> axum::Router<AppState> {
+    sse::router()
+        .merge(runs::router())
+        .fallback(api_not_found)
+        .layer(axum::middleware::from_fn_with_state(
+            bind.allowed_hosts(),
+            host_guard::require_expected_host,
+        ))
 }
 
 /// `404` for an `/api` path that matches no API route.

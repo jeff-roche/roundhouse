@@ -336,9 +336,20 @@ fn a_run_with_no_binding_serialises_its_binding_id_as_null() {
     assert_eq!(json["binding_id"], serde_json::Value::Null);
 }
 
+/// Every router here is loopback-bound, so `127.0.0.1` is the name it answers
+/// to. The `Host` is not optional: ruling P93 §A's rebinding check refuses an
+/// `/api` request that does not address the bind, and an in-process `oneshot`
+/// sets no `Host` of its own. `tests/host_guard.rs` is where that refusal is
+/// the assertion rather than the background.
 async fn get(router: axum::Router, uri: &str) -> axum::http::Response<Body> {
     router
-        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("Host", "127.0.0.1")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .expect("the router is infallible")
 }

@@ -84,6 +84,14 @@
 //!    threat model, and this module is not the place to change that
 //!    unilaterally.
 //!
+//! **One thing this reasoning does not cover, and now does not have to.** "A
+//! same-uid local process can already read everything" is an argument about a
+//! local *process*. It says nothing about a remote *web page*, which after a
+//! DNS rebind reaches the loopback bind as its own origin — so the ungated arm
+//! is exactly the arm that needs `crate::host_guard`'s `Host` check, and that
+//! check is always on rather than gated behind this module's `Some(gate)`. See
+//! that module for the attack and for why CORS cannot answer it (ruling P93 §A).
+//!
 //! **The cost, stated rather than assumed away:** Task 32 gave
 //! [`crate::sse::SseHub`] a replay ring, so an unauthenticated *local* reader of
 //! `/api/sessions/{id}/events` now gets up to the ring's retained **history**
@@ -157,7 +165,7 @@
 use std::fmt;
 use std::fs::{DirBuilder, OpenOptions, Permissions};
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -663,6 +671,37 @@ impl BindConfig {
         }
     }
 
+    /// Which `Host` values this bind answers to — the DNS-rebinding defence
+    /// [`crate::api_router`] layers on unconditionally (ruling P93 §A).
+    ///
+    /// Derived from the same value that decides the address, so "what we bind"
+    /// and "what we answer to" cannot drift apart. See [`crate::host_guard`]
+    /// for the attack, for why a missing `Host` is refused, and for the
+    /// hostname residual on the LAN arm.
+    ///
+    /// Loopback admits the three names a browser reaches loopback by. A LAN
+    /// bind admits the literal it was given — except the **unspecified**
+    /// address, which names no interface: there the operator's address is
+    /// whatever DHCP handed the machine and is not in this config, so any IP
+    /// literal is admitted and every *name* is still refused, which is the half
+    /// that stops rebinding.
+    pub(crate) fn allowed_hosts(&self) -> crate::host_guard::AllowedHosts {
+        use crate::host_guard::AllowedHosts;
+
+        match &self.inner {
+            Bind::Loopback => AllowedHosts::Named(
+                vec![
+                    Ipv4Addr::LOCALHOST.to_string(),
+                    format!("[{}]", Ipv6Addr::LOCALHOST),
+                    "localhost".to_string(),
+                ]
+                .into(),
+            ),
+            Bind::Lan { addr, .. } if addr.is_unspecified() => AllowedHosts::AnyIpLiteral,
+            Bind::Lan { addr, .. } => AllowedHosts::Named(vec![host_literal(*addr)].into()),
+        }
+    }
+
     /// The gate [`crate::build_router`] layers on, or `None` for loopback.
     pub(crate) fn gate(&self) -> Option<LanGate> {
         match &self.inner {
@@ -671,6 +710,16 @@ impl BindConfig {
                 token: Arc::clone(token),
             }),
         }
+    }
+}
+
+/// An address as it is spelled in a `Host` header: bare for IPv4, bracketed
+/// for IPv6 (RFC 3986 §3.2.2, which is what makes an IPv6 address's own colons
+/// distinguishable from the port separator).
+fn host_literal(addr: IpAddr) -> String {
+    match addr {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
     }
 }
 

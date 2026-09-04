@@ -173,7 +173,12 @@ async fn stream(
     last_event_id: Option<&[u8]>,
     publish: impl FnOnce(&SseHub),
 ) -> Streamed {
-    let mut builder = Request::builder().uri(uri);
+    // Task 34's fix round added the rebinding check (ruling P93 §A): an `/api`
+    // request that does not address the bind is `403` before it reaches any
+    // handler, and an in-process `oneshot` sets no `Host` of its own. These
+    // routers are loopback-bound, so this is the name they answer to. The
+    // refusal itself is asserted in `tests/host_guard.rs`.
+    let mut builder = Request::builder().uri(uri).header("Host", "127.0.0.1");
     if let Some(id) = last_event_id {
         builder = builder.header(
             "Last-Event-ID",

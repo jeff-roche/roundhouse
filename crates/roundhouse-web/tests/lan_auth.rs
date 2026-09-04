@@ -116,12 +116,18 @@ fn mode_of(path: &Path) -> u32 {
         & 0o777
 }
 
+/// The address every LAN-bound router in this file listens on, and therefore
+/// the `Host` every request to one has to present (ruling P93 §A). A named
+/// constant because the two have to agree, and a literal repeated at both ends
+/// is exactly the pair that drifts.
+const LAN_ADDR: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 40);
+
 /// Builds the LAN-gated router for `dir`'s token, plus the token's text.
 fn lan_router(dir: &Path) -> (axum::Router, String) {
     let _umask = umask_guard();
     let token = LanToken::load_or_create(dir).expect("a fresh 0700 dir yields a token");
     let text = token_text(dir);
-    let bind = BindConfig::lan(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 40)), token);
+    let bind = BindConfig::lan(IpAddr::V4(LAN_ADDR), token);
     (build_router(AppState::default(), &bind), text)
 }
 
@@ -133,9 +139,24 @@ async fn status_of(router: axum::Router, request: Request<Body>) -> StatusCode {
         .status()
 }
 
+/// Every `/api` request in this file carries a `Host`, because ruling P93 §A's
+/// rebinding check refuses one that does not — see `tests/host_guard.rs`, which
+/// is where *that* refusal is the assertion. Here it is background: the token
+/// is what these tests are about, so each request addresses the bind correctly
+/// and a `401` or `200` is therefore the gate's verdict and not the host
+/// check's.
+///
+/// [`lan_router`] binds [`LAN_ADDR`], so this is the name that bind answers to.
 fn get(uri: &str) -> Request<Body> {
+    get_from_host(&LAN_ADDR.to_string(), uri)
+}
+
+/// [`get`], addressed to an arbitrary host — for the tests whose router is
+/// bound somewhere other than [`LAN_ADDR`].
+fn get_from_host(host: &str, uri: &str) -> Request<Body> {
     Request::builder()
         .uri(uri)
+        .header("Host", host)
         .body(Body::empty())
         .expect("the request builds")
 }
@@ -143,6 +164,7 @@ fn get(uri: &str) -> Request<Body> {
 fn get_with_auth(uri: &str, authorization: &str) -> Request<Body> {
     Request::builder()
         .uri(uri)
+        .header("Host", LAN_ADDR.to_string())
         .header("Authorization", authorization)
         .body(Body::empty())
         .expect("the request builds")
@@ -217,8 +239,10 @@ fn the_token_survives_a_restart_so_paired_devices_stay_paired() {
     );
     // Verified through the public surface: both handles must accept the one
     // token on disk. `LanToken` deliberately has no accessor to compare.
-    let bind_first = BindConfig::lan(IpAddr::V4(Ipv4Addr::LOCALHOST), first);
-    let bind_second = BindConfig::lan(IpAddr::V4(Ipv4Addr::LOCALHOST), second);
+    // Bound at `LAN_ADDR` rather than at loopback so `get_with_auth`'s `Host`
+    // addresses it — the address is incidental to what this test is about.
+    let bind_first = BindConfig::lan(IpAddr::V4(LAN_ADDR), first);
+    let bind_second = BindConfig::lan(IpAddr::V4(LAN_ADDR), second);
     for bind in [bind_first, bind_second] {
         let router = build_router(AppState::default(), &bind);
         let request = get_with_auth(&api_events(), &format!("Bearer {text}"));
@@ -452,12 +476,20 @@ async fn a_loopback_router_serves_both_surfaces_with_no_token() {
     let bind = BindConfig::loopback();
 
     assert_eq!(
-        status_of(build_router(AppState::default(), &bind), get("/")).await,
+        status_of(
+            build_router(AppState::default(), &bind),
+            get_from_host("127.0.0.1", "/")
+        )
+        .await,
         StatusCode::OK,
         "the client shell is unauthenticated on loopback"
     );
     assert_eq!(
-        status_of(build_router(AppState::default(), &bind), get(&api_events())).await,
+        status_of(
+            build_router(AppState::default(), &bind),
+            get_from_host("127.0.0.1", &api_events())
+        )
+        .await,
         StatusCode::OK,
         "the SSE stream is unauthenticated on loopback"
     );
