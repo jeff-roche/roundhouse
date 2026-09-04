@@ -443,6 +443,45 @@ fn a_dollar_amount_that_is_not_a_usable_number_is_refused_at_the_writer() {
     }
 }
 
+/// SQLite has no unsigned integers, so a `u64` counter round-trips through
+/// `i64`. The only grant under which a spend can reach that boundary is one
+/// that names `u64::MAX` — where the ceiling comparison admits it and the
+/// *column* is what cannot hold it. Refused rather than wrapped: a wrapped
+/// counter reads back negative and then saturates to zero, turning an
+/// enormous spend into no spend at all.
+#[test]
+fn a_spend_that_does_not_fit_a_sqlite_integer_is_refused_rather_than_wrapped() {
+    let mut conn = open_test_db();
+    let run_id = seed(
+        &mut conn,
+        &a_run(
+            RunId::new(),
+            Some(0),
+            Some(ResourceCaps {
+                max_tokens: u64::MAX,
+                ..a_grant()
+            }),
+        ),
+    );
+
+    let refused = admit_spend(&mut conn, run_id, &a_spend_of(u64::MAX, 0.0), at_secs(1));
+    assert!(
+        matches!(
+            refused,
+            Err(LedgerError::ValueOutOfRange {
+                column: "spent_tokens",
+                value: u64::MAX
+            })
+        ),
+        "got {refused:?}"
+    );
+    assert_eq!(
+        run_ledger(&conn, run_id).unwrap().spent.tokens,
+        0,
+        "and the transaction that could not write it rolled back"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The reaper's query
 // ---------------------------------------------------------------------------
