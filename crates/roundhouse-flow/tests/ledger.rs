@@ -248,6 +248,94 @@ fn a_run_with_no_recorded_grant_is_refused_rather_than_handed_the_default() {
         matches!(refused, Err(LedgerError::CapsNotRecorded { .. })),
         "got {refused:?}"
     );
+
+    // A spend far past `ResourceCaps::default()`, so the refusal has to name
+    // the right fact. Found by mutation `A11`, which swapped
+    // `ok_or(CapsNotRecorded)` for `unwrap_or(&ResourceCaps::default())` and
+    // survived the two assertions above: the closing `remaining_caps` call
+    // still errored, so the *outcome* was unchanged for a small spend and only
+    // the *reason* differed. A run with no recorded grant has not exceeded a
+    // budget — it has no budget — and telling an operator it ran out is a
+    // wrong answer even when the refusal is right.
+    let refused = admit_spend(
+        &mut conn,
+        run_id,
+        &a_spend_of(ResourceCaps::default().max_tokens * 2, 0.0),
+        at_secs(1),
+    );
+    assert!(
+        matches!(refused, Err(LedgerError::CapsNotRecorded { .. })),
+        "an unrecorded grant is not an exceeded one, got {refused:?}"
+    );
+}
+
+/// Both of §8.4's run-level elapsed-time ceilings are enforced at admission,
+/// not only the active one. Found by mutation `A1`: with
+/// `run_wall_timeout`'s check removed the whole suite stayed green, because
+/// every other test's window is the *active* one, which is always the smaller
+/// of the two in the fixture grant.
+#[test]
+fn admission_refuses_once_the_wall_clock_window_is_used_up() {
+    let mut conn = open_test_db();
+    // A grant whose wall window is the binding one: an hour of wall clock, a
+    // day of active time, so only the wall check can produce this refusal.
+    let run_id = seed(
+        &mut conn,
+        &a_run(
+            RunId::new(),
+            Some(0),
+            Some(ResourceCaps {
+                run_wall_timeout: Duration::from_secs(3_600),
+                run_active_timeout: Duration::from_secs(86_400),
+                ..a_grant()
+            }),
+        ),
+    );
+
+    admit_spend(&mut conn, run_id, &a_spend_of(1, 0.0), at_secs(3_599))
+        .expect("one second short of the wall window still admits");
+    let refused = admit_spend(&mut conn, run_id, &a_spend_of(1, 0.0), at_secs(3_600));
+    assert!(
+        matches!(
+            refused,
+            Err(LedgerError::CapsExceeded {
+                field: "run_wall_timeout",
+                ..
+            })
+        ),
+        "got {refused:?}"
+    );
+}
+
+/// §8.12 names `max_cost_usd` as one of the two fields drawn by a `call:`, and
+/// it is the only countable that is an `f64` rather than an integer — so it is
+/// checked by its own comparison rather than by `checked_total`. Found by
+/// mutation `A6`: removing that comparison left the suite green, because every
+/// other admission test measured tokens.
+#[test]
+fn a_dollar_spend_past_the_grant_is_refused_and_records_nothing() {
+    let mut conn = open_test_db();
+    let run_id = a_seeded_run(&mut conn); // $4.00 granted
+    admit_spend(&mut conn, run_id, &a_spend_of(0, 3.5), at_secs(1)).unwrap();
+
+    let refused = admit_spend(&mut conn, run_id, &a_spend_of(0, 1.0), at_secs(2));
+    assert!(
+        matches!(
+            refused,
+            Err(LedgerError::CapsExceeded {
+                field: "max_cost_usd",
+                ..
+            })
+        ),
+        "got {refused:?}"
+    );
+    assert_eq!(
+        run_ledger(&conn, run_id).unwrap().spent.cost_usd,
+        3.5,
+        "a refused admission must not have banked a partial dollar spend"
+    );
+    admit_spend(&mut conn, run_id, &a_spend_of(0, 0.5), at_secs(3))
+        .expect("the last 50 cents of the grant still fits exactly");
 }
 
 #[test]
