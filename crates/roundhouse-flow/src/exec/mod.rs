@@ -8,8 +8,21 @@
 //!
 //! `tool`/`agent`/`emit`/`report`/`map` step bodies are dispatched here (`map`
 //! via [`Executor::dispatch_map_step`], defined in [`map_step`], Task
-//! 14/B6). `gate`/`call` remain specialized handlers Tasks 7/11 build on top
-//! of [`Executor::dispatch_step`], not duplicated sequencing logic.
+//! 14/B6). `gate`/`call` remain stubs: both are **Task 20 (B12)**'s, which
+//! owns parking's and composition's run loops and will build their handlers
+//! on top of [`Executor::dispatch_step`] rather than duplicating sequencing
+//! logic.
+//!
+//! This attribution used to read "Tasks 7/11" and was corrected by Task 19
+//! (B11) under ruling P75 §A. Tasks 7 and 11 landed the *primitives* those
+//! handlers need — [`crate::parking`] (Task 17/B9) for the `gate` park, and
+//! [`crate::compose`] (Task 19/B11) for the `call:` budget transfer,
+//! recursion bound and workflow-as-tool shape — and deliberately left both
+//! arms stubbed, because a run loop is what actually dispatches them and P68
+//! §C moved that to Task 20. `durability.rs`'s
+//! [`WorkflowRun::parent_run_id`](crate::durability::WorkflowRun::parent_run_id)
+//! comment already said Task 20; these two comments disagreed with it until
+//! this correction.
 //!
 //! # Ruling P23 — establishing trust at the parse boundary: **rejected for this task**
 //!
@@ -1022,9 +1035,15 @@ impl<'a> Executor<'a> {
                 steps,
                 ..
             } => self.dispatch_map_step(&step.id, over, r#as, *max_parallel, *on_item_error, steps),
-            // Gate/Call are dispatched by the specialized handlers added in
-            // Tasks 7/11, which wrap this same `dispatch_step` for their
+            // Gate/Call are dispatched by the specialized handlers **Task 20
+            // (B12)** adds, which wrap this same `dispatch_step` for their
             // inner/leaf steps rather than duplicating sequencing logic.
+            // (Corrected from "Tasks 7/11" by Task 19 under ruling P75 §A —
+            // see this module's doc comment. Their primitives exist:
+            // `crate::parking` for the park, `crate::compose` for the `call:`
+            // budget draw/refund, `MAX_CALL_DEPTH` and the workflow-as-tool
+            // shape. What is missing in both cases is the run loop that would
+            // call them, which is why these arms are still stubs.)
             // Fix round 1, item 8: the message used to be
             // `format!("step kind {other:?} handled by a later task")` — a
             // full `{:?}` dump of the step body, flowing through
