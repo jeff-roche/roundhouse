@@ -14,7 +14,7 @@ fn finding(id: &str) -> Finding {
         title: id.to_string(),
         severity: Severity::Med,
         location: "x".to_string(),
-        extra: json!({}),
+        extra: serde_json::Map::new(),
     }
 }
 
@@ -253,7 +253,7 @@ fn carry_over_seeds_from_the_previous_reports_headline_and_findings() {
         findings: vec![finding("a")],
         artifacts: vec![],
         next_actions: vec![],
-        extra: json!({}),
+        extra: serde_json::Map::new(),
     };
     let seed = build_carry_over_seed(&carry_over, Some(&previous))
         .expect("carry_over.last_report is set and a previous report exists");
@@ -283,7 +283,7 @@ fn carry_over_off_or_no_history_yields_no_seed_and_never_fails_the_run() {
         findings: vec![],
         artifacts: vec![],
         next_actions: vec![],
-        extra: json!({}),
+        extra: serde_json::Map::new(),
     };
     assert!(
         build_carry_over_seed(&CarryOver { last_report: false }, Some(&report)).is_none(),
@@ -335,19 +335,97 @@ fn a_validated_report_and_its_carry_over_seed_encode_canonically() {
 }
 
 #[test]
-fn a_validated_report_round_trips_through_the_event_log_encoding() {
-    // The derives exist for this: a report is persisted as
-    // `TaskCompleted.output` JSON and read back by whoever loads the run.
-    let raw = json!({
-        "outcome": "needs_human", "severity": "high", "headline": "h", "needs_human": true,
-        "cost": { "usd": 1.5, "tokens": 9 },
-        "findings": [ { "id": "i", "title": "t", "severity": "high", "location": "l", "n": 1 } ],
-        "artifacts": [ { "kind": "diff" } ],
-        "next_actions": [ "look" ],
-        "job_specific": { "b": 1, "a": 2 }
+fn a_validated_reports_encoding_reproduces_section_8_6s_literal_example() {
+    // §8.6's own wire-shape example (`docs/architecture/05-scheduling-and-
+    // workflows.md:157-163`), jsonc comments stripped — its `// nothing |
+    // changed | ...` and `// extension field, job-defined` annotations carry
+    // no meaning to the validator — and its `…` placeholders kept as
+    // ordinary string content.
+    //
+    // Task 18 fix round 1 (ruling P74): a `Report -> Value -> Report` round
+    // trip only proves the type's own encoding is self-consistent; it can
+    // never prove conformance to a *foreign* wire shape. This test starts
+    // from that foreign shape instead: §8.6's document is flat (`pr_number`
+    // sits directly on the finding object, not nested under an `extra`
+    // key), which is exactly what `#[serde(flatten)]` on `Report::extra` /
+    // `Finding::extra` produces and the pre-fix plain named `extra` field
+    // never did (`to_value` used to emit `{"outcome": …, "extra": {…}}`).
+    let example = json!({
+        "outcome": "changed",
+        "severity": "low", "headline": "3 flaky tests quarantined", "needs_human": false,
+        "findings": [ { "id": "sha256:…", "title": "…", "severity": "med", "location": "…",
+                        "pr_number": 4471 } ],
+        "artifacts": [ { "kind": "diff", "ref": "worktree:…", "summary": "…" } ],
+        "next_actions": [ "…" ], "cost": { "usd": 0.42, "tokens": 118204 }
     });
-    let report = validate_report(&raw).expect("valid");
+
+    let report = validate_report(&example).expect("§8.6's own example is a valid report");
     let encoded = serde_json::to_value(&report).expect("serializes");
-    let decoded: Report = serde_json::from_value(encoded).expect("deserializes");
-    assert_eq!(decoded, report);
+    assert_eq!(
+        encoded, example,
+        "a validated report's encoding must reproduce §8.6's flat document exactly, \
+         with no `extra` wrapper anywhere"
+    );
+
+    // Validating a validated report's own encoding a second time must be a
+    // no-op: nothing migrates into (or out of) an extension bucket on repeat
+    // passes.
+    let revalidated = validate_report(&encoded).expect("a report's own encoding is itself valid");
+    let reencoded = serde_json::to_value(&revalidated).expect("serializes");
+    assert_eq!(
+        reencoded, encoded,
+        "re-validating an already-validated report's encoding must be idempotent"
+    );
+}
+
+#[test]
+fn costs_missing_or_mistyped_subfield_names_the_subfield() {
+    let missing_tokens = json!({
+        "outcome": "nothing", "severity": "low", "headline": "x", "needs_human": false,
+        "cost": { "usd": 0.42 }
+    });
+    assert_eq!(
+        validate_report(&missing_tokens)
+            .expect_err("cost.tokens is required")
+            .to_string(),
+        "missing required core field: `cost.tokens`"
+    );
+
+    let bad_usd = json!({
+        "outcome": "nothing", "severity": "low", "headline": "x", "needs_human": false,
+        "cost": { "usd": "free", "tokens": 0 }
+    });
+    assert_eq!(
+        validate_report(&bad_usd)
+            .expect_err("cost.usd must be a number")
+            .to_string(),
+        "invalid value for field `cost.usd`: \"free\""
+    );
+}
+
+#[test]
+fn a_next_action_element_error_names_its_index() {
+    let raw = json!({
+        "outcome": "nothing", "severity": "low", "headline": "x", "needs_human": false,
+        "cost": { "usd": 0.0, "tokens": 0 },
+        "next_actions": [ "fine", 42 ]
+    });
+    let err = validate_report(&raw).expect_err("next_actions[1] is not a string");
+    assert_eq!(err.to_string(), "next_actions[1]: invalid value: 42");
+}
+
+#[test]
+fn an_explicitly_null_collection_is_treated_as_absent() {
+    // Ordinary hand-written YAML for `findings:` followed by nothing parses
+    // to `Value::Null`, not to an absent key — that must not be rejected
+    // when an absent key is accepted.
+    let raw = json!({
+        "outcome": "nothing", "severity": "low", "headline": "x", "needs_human": false,
+        "cost": { "usd": 0.0, "tokens": 0 },
+        "findings": null, "artifacts": null, "next_actions": null
+    });
+    let report = validate_report(&raw).expect("an explicit null collection is treated as absent");
+    assert!(report.findings.is_empty());
+    assert!(report.artifacts.is_empty());
+    assert!(report.next_actions.is_empty());
 }

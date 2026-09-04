@@ -91,9 +91,9 @@ pub enum Severity {
 /// [`Cost::usd`] into a hash, a fingerprint, or an equality used for
 /// deduplication.** `0.1 + 0.2` and `0.3` are different `f64`s and would make
 /// two otherwise-identical reports compare unequal. The derived `PartialEq`
-/// here exists for tests and for the round-trip check in
-/// `tests/report.rs`; it is deliberately not `Eq`/`Hash`, so the type system
-/// refuses to let this value key a map or enter a `HashSet`.
+/// here exists for tests in `tests/report.rs`; it is deliberately not
+/// `Eq`/`Hash`, so the type system refuses to let this value key a map or
+/// enter a `HashSet`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Cost {
     pub usd: f64,
@@ -108,7 +108,7 @@ pub struct Cost {
 /// PR-review job hashes `(pr_number, comment_category)`) — but that a stable
 /// fingerprint exists is core and mandatory."* This crate never computes one;
 /// it only ever compares the ids it is handed ([`diff_findings`]).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     pub id: String,
     pub title: String,
@@ -117,9 +117,14 @@ pub struct Finding {
     /// Everything the finding object carries beyond the four core fields —
     /// rendered generically in a human's detail view, invisible to the
     /// inbox's cross-job sort (§8.6: core is *"precisely the fields the
-    /// generic inbox touches, nothing more"*). Always a `Value::Object` when
-    /// produced by [`validate_report`], with keys canonically sorted.
-    pub extra: serde_json::Value,
+    /// generic inbox touches, nothing more"*). `#[serde(flatten)]`, so on the
+    /// wire these keys sit directly on the finding object (matching §8.6's
+    /// `"pr_number": 4471` example) rather than nested under an `extra` key.
+    /// Always canonically sorted when produced by [`validate_report`]. No
+    /// `Deserialize` on the containing [`Finding`] means flatten affects only
+    /// this output direction — see [`Report`]'s doc for why.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A validated report.
@@ -142,6 +147,13 @@ pub struct Finding {
 /// private fields plus an accessor would imply a check that has nothing left
 /// to check.
 ///
+/// This holds because of *where the one call site is*, not because anything
+/// here enforces it: `exec/mod.rs`'s `Report` step arm is the only place in
+/// the crate that calls [`validate_report`], and it always passes the
+/// already-redacted `logged` value. A caller that instead validated
+/// unredacted material would build a `Report` this guarantee does not
+/// actually hold for — there is nothing in this module that would notice.
+///
 /// The visible consequence, which surprises people: a `headline` or a
 /// `finding.id` interpolated from a secret validates and persists as the
 /// redaction placeholder, not as the secret. That is correct — the log is
@@ -149,15 +161,26 @@ pub struct Finding {
 /// fingerprints findings from secret-derived material gets one fingerprint
 /// for all of them.
 ///
-/// # Why `Serialize`/`Deserialize`
+/// # Why `Serialize` only, and no `Deserialize`
 ///
-/// Not for any HTTP consumer — `roundhouse-web` is still a stub with a single
-/// `api_version()` function. The derives are for the **event-log round
-/// trip**: the executor persists this shape as `TaskCompleted.output` JSON
-/// into an append-only log, and the inbox, fingerprint diffing, and
-/// `round workflow replay` all read it back out later (§8.6: *"never
-/// assembled in memory and discarded"*).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Nothing in this crate — or downstream — ever deserializes a `Report`: the
+/// executor persists the raw redacted `serde_json::Value` as
+/// `TaskCompleted.output`, not a serialized `Report`, and reads it back the
+/// same way. `Serialize` exists so a validated report can be rendered in
+/// §8.6's flat wire shape (via `extra`'s `#[serde(flatten)]` below, on both
+/// this type and [`Finding`]); [`validate_report`] is the only way to obtain
+/// a `Report` at all.
+///
+/// `Deserialize` is deliberately absent, not merely unused. Adding it back
+/// (even with `#[serde(flatten)]` + `#[serde(default)]` on `extra`, to make
+/// §8.6's own example round-trip) would open a second ingress —
+/// `serde_json::from_value::<Report>(v)` — that constructs a `Report`
+/// straight from `v` without ever calling [`validate_report`], silently
+/// skipping every one of its checks. If a future caller needs to read a
+/// persisted report back as a typed `Report`, the answer is to call
+/// [`validate_report`] on the persisted `Value` a second time, not to
+/// deserialize it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Report {
     pub outcome: Outcome,
     pub severity: Severity,
@@ -167,9 +190,12 @@ pub struct Report {
     pub findings: Vec<Finding>,
     pub artifacts: Vec<serde_json::Value>,
     pub next_actions: Vec<String>,
-    /// Job-defined top-level fields. Always a `Value::Object` when produced
-    /// by [`validate_report`], with keys canonically sorted.
-    pub extra: serde_json::Value,
+    /// Job-defined top-level fields. `#[serde(flatten)]`, so on the wire
+    /// these sit at the top level of the report document (matching §8.6's
+    /// literal example) rather than nested under an `extra` key. Always
+    /// canonically sorted when produced by [`validate_report`].
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Why a candidate report is not one.
@@ -195,6 +221,8 @@ pub enum ReportError {
         field: &'static str,
         value: String,
     },
+    #[error("next_actions[{index}]: invalid value: {value}")]
+    InvalidNextAction { index: usize, value: String },
 }
 
 /// §8.6: *"Core, required, fixed-shape: `outcome`, `severity`, `needs_human`,
@@ -251,6 +279,14 @@ fn brief(value: &serde_json::Value) -> String {
 /// `serde_json`'s `preserve_order` live workspace-wide those are different
 /// things, and anything downstream that hashes, ETags, or byte-compares a
 /// report would otherwise be non-deterministic.
+///
+/// **This canonicalization does not currently reach the persisted
+/// artifact.** It lives in the `Report` this function returns; the
+/// executor's `report:` arm calls this function only to decide pass/fail and
+/// persists the pre-validation `logged` `Value` — with the author's original
+/// key order — as `TaskCompleted.output`. A future inbox that ETags or
+/// byte-compares persisted report bytes must canonicalize *on read*; it
+/// cannot rely on this function having already done so for what is on disk.
 pub fn validate_report(v: &serde_json::Value) -> Result<Report, ReportError> {
     let obj = v
         .as_object()
@@ -276,7 +312,7 @@ pub fn validate_report(v: &serde_json::Value) -> Result<Report, ReportError> {
             field: "needs_human",
             value: brief(&obj["needs_human"]),
         })?;
-    let cost: Cost = typed(&obj["cost"], "cost")?;
+    let cost = parse_cost(&obj["cost"])?;
 
     let mut findings = Vec::new();
     for (index, raw) in array_field(obj, "findings")?.iter().enumerate() {
@@ -289,11 +325,11 @@ pub fn validate_report(v: &serde_json::Value) -> Result<Report, ReportError> {
         .collect();
 
     let mut next_actions = Vec::new();
-    for raw in array_field(obj, "next_actions")? {
+    for (index, raw) in array_field(obj, "next_actions")?.iter().enumerate() {
         next_actions.push(
             raw.as_str()
-                .ok_or_else(|| ReportError::InvalidValue {
-                    field: "next_actions",
+                .ok_or_else(|| ReportError::InvalidNextAction {
+                    index,
                     value: brief(raw),
                 })?
                 .to_string(),
@@ -327,14 +363,42 @@ fn typed<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// An optional array-valued field: absent yields an empty slice, present but
-/// not an array is a rejection.
+/// §8.6's `"cost": { "usd": 0.42, "tokens": 118204 }`, parsed subfield by
+/// subfield rather than through [`typed`] so a missing or mistyped subfield
+/// names *that subfield* (`cost.tokens`) instead of quoting the whole `cost`
+/// object back at the caller and leaving them to guess which key is wrong.
+fn parse_cost(value: &serde_json::Value) -> Result<Cost, ReportError> {
+    let obj = value.as_object().ok_or_else(|| ReportError::InvalidValue {
+        field: "cost",
+        value: brief(value),
+    })?;
+    let usd = match obj.get("usd") {
+        None => return Err(ReportError::MissingField("cost.usd")),
+        Some(raw) => raw.as_f64().ok_or_else(|| ReportError::InvalidValue {
+            field: "cost.usd",
+            value: brief(raw),
+        })?,
+    };
+    let tokens = match obj.get("tokens") {
+        None => return Err(ReportError::MissingField("cost.tokens")),
+        Some(raw) => raw.as_u64().ok_or_else(|| ReportError::InvalidValue {
+            field: "cost.tokens",
+            value: brief(raw),
+        })?,
+    };
+    Ok(Cost { usd, tokens })
+}
+
+/// An optional array-valued field: absent — or explicitly `null`, which is
+/// what ordinary hand-written YAML produces for a key with nothing after
+/// it (`findings:` alone) — yields an empty slice; present with any other
+/// non-array type is a rejection.
 fn array_field<'a>(
     obj: &'a serde_json::Map<String, serde_json::Value>,
     field: &'static str,
 ) -> Result<&'a [serde_json::Value], ReportError> {
     match obj.get(field) {
-        None => Ok(&[]),
+        None | Some(serde_json::Value::Null) => Ok(&[]),
         Some(value) => {
             value
                 .as_array()
@@ -386,19 +450,23 @@ fn parse_finding(raw: &serde_json::Value, index: usize) -> Result<Finding, Repor
 }
 
 /// Everything in `obj` that is neither a core field nor a separately-parsed
-/// collection, as a canonically-keyed object.
+/// collection, as a canonically-keyed map — ready to sit behind
+/// [`Report::extra`] or [`Finding::extra`]'s `#[serde(flatten)]`.
 fn extension_fields(
     obj: &serde_json::Map<String, serde_json::Value>,
     core: &[&str],
     collections: &[&str],
-) -> serde_json::Value {
+) -> serde_json::Map<String, serde_json::Value> {
     let mut extra = serde_json::Map::new();
     for (key, value) in obj {
         if !core.contains(&key.as_str()) && !collections.contains(&key.as_str()) {
             extra.insert(key.clone(), value.clone());
         }
     }
-    canonicalize_json(&serde_json::Value::Object(extra))
+    match canonicalize_json(&serde_json::Value::Object(extra)) {
+        serde_json::Value::Object(map) => map,
+        _ => unreachable!("canonicalize_json preserves the Object variant"),
+    }
 }
 
 /// A finding's standing relative to the previous run of the same binding.

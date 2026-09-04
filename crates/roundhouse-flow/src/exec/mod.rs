@@ -945,13 +945,31 @@ impl<'a> Executor<'a> {
                 // that reaches the sink is there permanently — failing the
                 // step is the only correction available.
                 //
-                // Validation runs on `logged`, not on `resolved`, for two
-                // reasons: `logged` is byte-for-byte what is persisted and
-                // what the inbox loads back, so validating anything else
-                // would bless a payload nobody will ever read; and
-                // `ReportError` quotes the offending value, so validating
-                // the redacted rendering keeps secret material out of the
-                // failure message too.
+                // Validation runs on `logged`, not on `resolved`. `logged`
+                // is byte-for-byte what is persisted and what the inbox
+                // loads back, so validating anything else would bless a
+                // payload nobody will ever read; and `ReportError` quotes
+                // the offending value, so validating the redacted rendering
+                // keeps secret material out of the failure message too.
+                //
+                // Validating the redacted rendering is also provably sound,
+                // not merely prudent — a structural argument, not just a
+                // practical one (fix round 1, ruling P74): redaction
+                // substitutes `***` into **string leaves only**;
+                // `needs_human` is a bool and `cost`'s figures are numbers,
+                // neither of which redaction ever touches; and no member of
+                // `{nothing, changed, findings, failed, needs_human}` or
+                // `{low, med, high}` contains `***`. So a `logged` that
+                // validates *implies* the typed core (`outcome`, `severity`,
+                // `needs_human`, `cost`) of `logged` is byte-identical to
+                // `resolved`'s — redaction can only ever steer
+                // valid -> invalid, never invalid -> valid. The divergence
+                // between `logged` and `resolved` is confined to free-text
+                // fields validation does not constrain beyond "is a string"
+                // (`headline`, finding `id`/`title`/`location`, and anything
+                // under `extra`), which is exactly why those fields can
+                // arrive as the redaction placeholder — see `Report`'s doc
+                // comment on the visible consequence of that.
                 if let Err(e) = crate::report::validate_report(&logged) {
                     return StepOutcome::failed(&step.id, format!("invalid `report:`: {e}"));
                 }

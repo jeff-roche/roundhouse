@@ -673,8 +673,12 @@ fn a_secret_referenced_in_report_is_redacted_in_both_the_created_and_completed_e
     // `"changed"`. `"ok"` was never one of §8.6's five outcomes; it only
     // reached the sink because nothing validated the report. Now that the
     // arm validates, an invalid report emits no events at all, which would
-    // make this redaction test vacuously green. The assertions below are
-    // unchanged — the fixture is only made valid enough to reach them.
+    // have failed the length assertion below (`0 != 2`); the fixture is
+    // corrected so the redaction assertions still run. (Fix round 1, ruling
+    // P74: only the `for` loop over `report_events` would have been
+    // vacuous — the preceding `assert_eq!(report_events.len(), 2, …)` fails
+    // loudly on its own, so leaving `"ok"` in place would not have gone
+    // silently green.)
     let yaml = r#"
 name: report-secret
 version: 1
