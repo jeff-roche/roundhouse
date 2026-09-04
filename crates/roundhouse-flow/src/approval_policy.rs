@@ -91,13 +91,21 @@ use std::time::Duration;
 /// its own parser). Nothing in this crate needs to write a bundle, so the
 /// second spelling simply does not exist.
 ///
-/// # Validation is on the load path only
+/// # Validation is on the load path, with one exception at match time
 ///
 /// The fields are `pub`, so a hand-built bundle can carry values the
 /// document path rejects — the same caveat `Escalate::Park`'s doc records
 /// for `Duration::ZERO`. That is the crate's existing stance and not an
 /// oversight: the artifact §6.4 describes arrives as a document, and that
 /// path is checked.
+///
+/// The exception is a **blank** `approved_rule_ids` entry, which
+/// [`evaluate_unattended_approval`] refuses at match time as well. It is the
+/// only value in this type that a hand-built bundle can carry and have fail
+/// *open*: a caller that passes no rule id at all would be approved by it.
+/// An untrimmed entry needs no second check — it simply never matches, which
+/// is already the fail-closed direction, so the load path stays its only
+/// gate.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "PreapprovedBundleWire")]
 pub struct PreapprovedBundle {
@@ -231,6 +239,31 @@ pub enum OnApprovalTimeout {
 /// (§8.5 point 2, `crate::hitl`), which operates *underneath* whatever this
 /// policy allows through. See this module's doc comment for why it derives
 /// no serde impls.
+///
+/// # How a run record says what it was admitted under: cite, do not re-emit
+///
+/// Everything in this system is event-sourced, so a run admitted under a
+/// policy should be able to say which one — and the obvious way to get that
+/// is `Serialize` on this enum. **Do not add it** (ruling P89 §A). The
+/// module doc gives one reason (a persisted-and-re-read `Notify` window
+/// hands every resume a fresh full timeout); [`PreapprovedBundle`]'s doc
+/// gives the stronger one, and `Serialize` here would drag the bundle along
+/// with it: a re-emitted grant is a second text for something a human wrote
+/// and a reviewer read, unreviewed and free to drift from the first.
+///
+/// The record therefore **cites** the grant instead of copying it: the
+/// variant name, plus — for `Preapproved` — the pair
+/// (`bundle.name`, `bundle.version`), which reads as
+/// `preapproved(nightly-lint-bundle, v3)`. That pair is precisely what
+/// [`PreapprovedBundle`]'s `version` field exists for; a reviewer given it
+/// can diff v2 against v3 in the repository that holds the authored
+/// document, which a serialized copy would not let them do any better and
+/// might let them do worse.
+///
+/// This is a note for the run-admission author in `roundhouse-daemon`, since
+/// this crate does no I/O and holds no run records: write the citation at
+/// the point of admission. There is nothing to hand-roll a record type
+/// against here, and nothing here to reach for `Serialize` on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalPolicy {
     /// Ask the human. Correct — and the only correct value — for an
@@ -316,9 +349,19 @@ pub fn default_for_unattended() -> ApprovalPolicy {
 /// human-written list; a set is a drop-in replacement with identical
 /// semantics if one ever gets long. Exact matching is safe to rely on
 /// because the load path rejects ids that are empty or carry surrounding
-/// whitespace (see [`PreapprovedBundle`]) — a hand-built bundle can still
-/// carry one, with the same caveat `Escalate::Park` records for its own
-/// hand-built values.
+/// whitespace (see [`PreapprovedBundle`]).
+///
+/// A **blank `rule_id` is refused outright**, before the scan runs, and is
+/// the one thing here not left to the load path. The fields of a
+/// [`PreapprovedBundle`] are `pub`, so a hand-built one can carry a blank
+/// entry, and that is the single combination in this module that fails
+/// *open*: a broken caller passing `""` — no rule id at all — would meet it
+/// and be approved. Closing it costs one condition, so it is closed here
+/// rather than left as a documented caveat. The guard applies to the
+/// caller's argument only; it does not normalise the comparison, which
+/// remains exact equality, so nothing above about "no normalisation" is
+/// weakened by it. An untrimmed `rule_id` gets no such guard and needs none:
+/// it fails to match, which is already fail-closed.
 ///
 /// The only [`ApprovalOutcome::PendingNotify`] this returns is for
 /// [`ApprovalPolicy::Notify`]; resolving that pending state is
@@ -331,7 +374,12 @@ pub fn evaluate_unattended_approval(policy: &ApprovalPolicy, rule_id: &str) -> A
         ApprovalPolicy::Interactive => ApprovalOutcome::Blocked,
         ApprovalPolicy::DenyAll => ApprovalOutcome::Blocked,
         ApprovalPolicy::Preapproved { bundle } => {
-            if bundle.approved_rule_ids.iter().any(|r| r == rule_id) {
+            // A blank `rule_id` is refused before the scan rather than
+            // compared against it — see this function's doc comment. This
+            // guards the *caller's argument*; it does not normalise the
+            // comparison, which remains exact equality between two non-blank
+            // strings.
+            if !rule_id.trim().is_empty() && bundle.approved_rule_ids.iter().any(|r| r == rule_id) {
                 ApprovalOutcome::Approved
             } else {
                 ApprovalOutcome::Blocked

@@ -82,6 +82,42 @@ fn a_rule_id_that_merely_resembles_an_approved_one_is_not_approved() {
     }
 }
 
+/// The load path rejects a blank `approved_rule_ids` entry, but the fields
+/// are `pub`, so a hand-built bundle can still carry one — and that is the
+/// only value in this module that fails *open*: a broken caller passing no
+/// rule id at all would match it. `evaluate_unattended_approval` therefore
+/// refuses a blank `rule_id` before it scans, which is why this bundle,
+/// which no document could produce, still approves nothing blank.
+///
+/// The blank entries sit *behind* a well-formed one, so a scan truncated to
+/// position 1 could not make this pass by accident (P92).
+#[test]
+fn a_blank_rule_id_is_never_approved_even_by_a_hand_built_bundle_carrying_one() {
+    let policy = ApprovalPolicy::Preapproved {
+        bundle: PreapprovedBundle {
+            name: "hand-built-bundle".to_string(),
+            version: 1,
+            approved_rule_ids: vec![
+                "shell:cargo-test".to_string(),
+                String::new(),
+                "   ".to_string(),
+            ],
+        },
+    };
+    for blank in ["", "   ", "\n"] {
+        assert_eq!(
+            evaluate_unattended_approval(&policy, blank),
+            ApprovalOutcome::Blocked,
+            "{blank:?} is a broken caller passing no rule id, not an authored grant"
+        );
+    }
+    assert_eq!(
+        evaluate_unattended_approval(&policy, "shell:cargo-test"),
+        ApprovalOutcome::Approved,
+        "the guard refuses a blank caller id; it does not disable the rest of the bundle"
+    );
+}
+
 #[test]
 fn notify_applies_on_timeout_when_no_response_arrives() {
     let notify_deny = ApprovalPolicy::Notify {
