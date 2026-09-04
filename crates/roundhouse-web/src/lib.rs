@@ -183,6 +183,17 @@ impl ApiPoolPermits {
         Self(std::sync::Arc::new(tokio::sync::Semaphore::new(permits)))
     }
 
+    /// What is left of the bound.
+    ///
+    /// Public because the bound's *size* is otherwise unmeasurable from
+    /// outside, and it is a claim worth measuring: `tests/runs.rs::
+    /// the_default_bound_is_well_below_the_pools_own_max_size` reads this and
+    /// compares it against `pool.status().max_size`, which is the property
+    /// [`Default`] exists to have rather than a number it happens to produce.
+    pub fn available_permits(&self) -> usize {
+        self.0.available_permits()
+    }
+
     /// The permit for one request, or `None` if the bound is reached.
     ///
     /// The caller holds the returned value for as long as it holds a pool

@@ -594,6 +594,57 @@ async fn a_second_request_is_shed_while_the_first_still_holds_a_connection() {
     );
 }
 
+/// The order of the two `503`s, which `list_runs`' doc argues for and nothing
+/// held: the store check runs **first**, so a router with no store says "no
+/// store" even when the bound is also exhausted. A router with no store never
+/// touches the pool, so shedding its requests would name the wrong problem —
+/// and "the surface is misconfigured" is the one an operator can act on.
+#[tokio::test]
+async fn a_store_less_router_names_the_missing_store_and_not_the_bound() {
+    let state = AppState {
+        store: None,
+        api_pool_permits: roundhouse_web::ApiPoolPermits::new(0),
+        ..AppState::default()
+    };
+
+    let response = get(build_router(state, &BindConfig::loopback()), "/api/runs").await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(response).await;
+    let reason = body["error"].as_str().expect("the body names a reason");
+    assert!(
+        reason.contains("no store"),
+        "with no store and no permits, the missing store is the answer; got {reason}"
+    );
+}
+
+/// The **size** of the default bound, which is otherwise a number nothing
+/// measures. It has to be strictly below the pool's own `max_size` — a bound at
+/// or above it bounds nothing, which is the whole failure P93 §B describes —
+/// and at least one, or the surface cannot answer at all on a single-core
+/// machine.
+///
+/// Compared against `pool.status().max_size` rather than against a recomputed
+/// `CPU_COUNT * 2`: the pool is the thing being protected, so it is the thing
+/// worth asking, and a `deadpool` release that changed its default formula
+/// would show up here instead of silently making the bound meaningless.
+#[tokio::test]
+async fn the_default_bound_is_well_below_the_pools_own_max_size() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let max_size = store(&dir).await.pool.status().max_size;
+    let bound = roundhouse_web::ApiPoolPermits::default().available_permits();
+
+    assert!(
+        bound >= 1,
+        "a bound of zero sheds every request and the surface never answers"
+    );
+    assert!(
+        bound < max_size,
+        "the API's bound ({bound}) must leave connections for the event-log writer, which draws \
+         from the same pool of {max_size}"
+    );
+}
+
 /// The permit is released when the request finishes, so a bound of one is a
 /// bound on *concurrency* and not a budget of one request per process. Two
 /// sequential requests through the same state is the smallest fixture that
