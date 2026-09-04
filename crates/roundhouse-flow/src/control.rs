@@ -37,11 +37,15 @@
 //! - **The cooperative half of cancel.** §8.13's cancel is *"refuse new task
 //!   admission, SIGTERM->SIGKILL running shells, run `finally:`"*; this
 //!   module writes the `Cancelling` mark that those three read, and nothing
-//!   else. Admission and `finally:` are the run loop (**B12c**); the signals
-//!   are `roundhouse-tools`, which already implements them for a task.
+//!   else. Admission and `finally:` are [`crate::exec::run_loop`]'s (B12c) —
+//!   it observes the mark at [`crate::ledger::admit_spend`]'s refusal and
+//!   drains — and the signals are `roundhouse-tools`, which already implements
+//!   them for a task.
 //! - **Reaching `Cancelled`.** The drain ends the run, so the
-//!   `Cancelling -> Cancelled` write is the run loop's (**B12c**);
-//!   [`durability::transition_run`] is what it will call.
+//!   `Cancelling -> Cancelled` write is [`crate::exec::run_loop`]'s, through
+//!   [`durability::transition_run`] — and it happens only after that loop has
+//!   run `finally:` and left the run's one report task behind (ruling
+//!   P112).
 //! - **Clearing inherited outputs a fork can no longer target.** Migration
 //!   0007 and `durability`'s module doc name that eraser as Task 20's; it
 //!   needs a retention policy deciding which runs are past forking, which is
@@ -257,15 +261,20 @@ pub struct ForkedRun {
 /// - **Only `Completed` steps**, per §8.13's own words ("completed step
 ///   outputs"). A step that failed, is pending, or was found
 ///   `Indeterminate` after a crash re-runs.
-/// - `StepRunState::Skipped` rows are **not** inherited, and that is an open
-///   question rather than a settled rule: a skipped step is *finished*
-///   (migration 0007 says so, because the run loop must not re-evaluate
-///   `when:` on re-drive), so a fork arguably should carry the skip forward
-///   instead of re-evaluating a condition that may now read differently.
-///   Nothing writes `Skipped` yet (radius: `StepRunState::Skipped` appears in
-///   `durability.rs` and in tests only; `exec::StepStatus::Skipped` is
-///   produced but never checkpointed), so no such row can exist today. The
-///   decision belongs with **B12c**, which writes the first one.
+/// - `StepRunState::Skipped` rows are **not** inherited, and B12c — which
+///   writes the first ones — settles that this is the right rule rather than
+///   an open question. The apparent tension is between two different things: a
+///   skipped step is *finished*, so **within one run** the loop must not
+///   re-evaluate its `when:` on re-drive (migration 0007 and
+///   [`StepRunState::Skipped`]'s doc say so, because a condition that reads
+///   differently later would change control flow that already happened), and
+///   [`crate::exec::run_loop`] honours that by treating `Skipped` as finished.
+///   **A fork is not the same run.** It is a new run over the same pinned
+///   content, with its own inputs and its own `steps` context, and §8.13 gives
+///   it *"completed step outputs"* — not completed step *decisions*. Carrying
+///   a skip forward would pin a control-flow choice the original made under
+///   conditions the fork does not share, which is the opposite of what a retry
+///   is for.
 /// - **`attempt` is preserved, not renumbered.** An inherited step is not
 ///   re-run, so its attempt count is a fact about how the original reached
 ///   that output; rewriting it to 1 would claim the fork achieved in one
@@ -286,12 +295,12 @@ pub struct ForkedRun {
 ///   [`durability::previous_run_for_binding`], so `carry_over` sees the fork
 ///   rather than the run it forked once the fork is the more recent row.
 /// - `parent_run_id` is inherited, so a forked `call:` child still names the
-///   run that called it. **Nothing yet sets that column to a run** (radius:
-///   `grep -rn parent_run_id --include=*.rs crates/` finds `durability`'s
-///   field and read/write, `compose`'s doc comments, this fork, and two test
-///   fixtures — §8.12's `call:` arm that would produce one is B12c), so the
-///   value copied here is always `None` today and the choice is reasoned,
-///   not exercised.
+///   run that called it — and since B12c's `call:` arm writes that column, the
+///   case is live rather than reasoned-but-unexercised. It is also what makes
+///   a retry **draw** from that parent (ruling P113): `fork_run` routes through
+///   `insert_run_row`, which draws for any parented row in the same
+///   transaction, so a retry the parent cannot fund is refused with
+///   [`DurabilityError::ChildDrawRefused`] rather than forked.
 ///
 /// # Why the original must have ended
 ///

@@ -22,8 +22,7 @@
 //! per-step sequencing (bind `steps`, evaluate `when:`, dispatch) around a
 //! great deal more, and shares the two decisions that must not diverge through
 //! the same helpers `run_to_completion` uses:
-//! [`evaluate_when_gate`](super::evaluate_when_gate) and
-//! [`steps_context_entry`](super::steps_context_entry). That is the same
+//! [`evaluate_when_gate`] and [`steps_context_entry`]. That is the same
 //! reasoning `evaluate_when_gate` itself records for why `map`'s inner loop
 //! shares it rather than owning a second copy.
 //!

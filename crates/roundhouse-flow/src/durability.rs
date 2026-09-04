@@ -33,9 +33,9 @@
 //! - **Actual parking** — the implicit `checkpoint` task, `hold_workspace`
 //!   TTL, the 7-day reaper, and writing [`WorkflowRun::awaiting_until`] —
 //!   **Task 17 (B9)**, since landed as [`crate::parking`]. The run loop that
-//!   *decides* to park, and the deadline registration/cancellation that
-//!   `awaiting_until` feeds, are still **B12c** and daemon work
-//!   respectively.
+//!   *decides* to park landed as [`crate::exec::run_loop`]'s `gate:` arm
+//!   (B12c); the deadline registration/cancellation that `awaiting_until`
+//!   feeds is still daemon work.
 //! - **The run loop itself**: `catch:`/`finally:`/stop-on-failure, calling
 //!   task admission, and `map` process spawn / `max_parallel`. Writing
 //!   [`StepRunState::Skipped`] and [`WorkflowStepRun::error`] belongs to that
@@ -44,8 +44,9 @@
 //!   landed the state machine ([`transition_is_legal`], [`transition_run`])
 //!   and §8.13's cancel/pause/resume/retry-from-step in [`crate::control`];
 //!   B12b landed migration 0008 and the run-level ledger
-//!   ([`crate::ledger`]), including this module's own park-column writes**;
-//!   the run loop itself is **B12c**. `map` worktree spawn is not B12 at all
+//!   ([`crate::ledger`]), including this module's own park-column writes; and
+//!   B12c landed the loop as [`crate::exec::run_loop`]**, which is now the
+//!   writer of both values above. `map` worktree spawn is not B12 at all
 //!   — §5.2 gives this crate no git and no `tokio`.
 //! - **Clearing `output` for steps no fork can still target** — **still
 //!   unowned after ruling P77's split; not B12a**. This is the one residual with a security edge, so it is named
@@ -348,9 +349,10 @@ pub enum StepRunState {
     /// [`recover_run`].
     Indeterminate,
     Failed,
-    /// A step whose `when:` guard evaluated false. **Written by B12c**,
-    /// which owns the run loop; `exec::StepStatus::Skipped` is
-    /// already produced there.
+    /// A step whose `when:` guard evaluated false, **or one an earlier
+    /// failure or a cancel stopped from running at all**. Written by
+    /// [`crate::exec::run_loop`] (B12c) in both roles; the second is why a
+    /// stopped phase leaves rows saying why rather than an absence.
     ///
     /// It is in the enum, and in migration 0007's `CHECK`, now rather than
     /// later for the reason [`RunState`]'s doc gives: a skipped step is

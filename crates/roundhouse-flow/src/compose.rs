@@ -10,9 +10,12 @@
 //! Composition's *run loop* — creating the child `workflow_run`, writing
 //! [`WorkflowRun::parent_run_id`](crate::durability::WorkflowRun::parent_run_id),
 //! creating the child Session, and emitting §8.12's `agent`-kind task
-//! standing for the call — is **B12c**'s, and
-//! [`crate::exec::Executor::dispatch_step`]'s `StepBody::Call` arm stays a
-//! stub until then.
+//! standing for the call — is **B12c**'s, and landed as
+//! [`crate::exec::run_loop`]'s `call:` arm. It is not
+//! [`crate::exec::Executor::dispatch_step`]'s `StepBody::Call` arm, which
+//! stays a refusal: that function holds no `Connection`, and a `call:` reached
+//! from inside a `map` is refused for the same reason `map`'s worktree fan-out
+//! is deferred.
 //!
 //! **B12b closed the sourcing half.** [`crate::ledger::admit_call_from_run`]
 //! reads the parent run's `session_depth` (migration 0008) and calls both
@@ -46,7 +49,7 @@
 //! **B12c makes the judgement that gap asked for, and the answer is that no
 //! wire-shape change is wanted.** A run's result is its mandatory
 //! `TaskKind::Report` task — ruling P112 makes exactly one of those exist in
-//! every terminal state, synthesised by [`crate::run_loop`] when the author
+//! every terminal state, synthesised by [`crate::exec::run_loop`] when the author
 //! declares no `report:` step — so
 //! [`crate::report::core_json_schema`] is the result schema, and
 //! [`WorkflowToolRegistration::output_schema`] returns it. §8.6's extension
@@ -217,12 +220,13 @@ use thiserror::Error;
 ///   remaining pool, so a subtree's total *spend* is capped by the root's
 ///   grant. **The ledger that half draws against exists as of B12b** —
 ///   [`crate::ledger::remaining_caps`] and [`crate::ledger::admit_spend`],
-///   over migration 0008's columns — but the thing that calls the chokepoint
-///   once per task is the run loop's, and that is B12c.
+///   over migration 0008's columns — and B12c calls the chokepoint once per
+///   step, with a child run's whole grant drawn at its creation.
 ///
-/// **Not measured:** no `call:` chain of any depth or width has been executed,
-/// because the `StepBody::Call` arm is a stub, and neither predicate has a
-/// caller. Nothing here is a claim about runtime cost. Each of
+/// **Not measured:** no `call:` chain of any depth or width has been executed
+/// end to end, because B12c's `call:` arm *creates* the child run and does not
+/// drive it (see [`crate::exec::run_loop`]'s module doc for the two structural
+/// reasons). Nothing here is a claim about runtime cost. Each of
 /// [`child_call_depth`] and [`admit_child_call`] is one saturating add and one
 /// comparison, with no allocation and no I/O; that is a description of the
 /// code, not a benchmark.

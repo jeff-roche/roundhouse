@@ -8,21 +8,23 @@
 //!
 //! `tool`/`agent`/`emit`/`report`/`map` step bodies are dispatched here (`map`
 //! via [`Executor::dispatch_map_step`], defined in [`map_step`], Task
-//! 14/B6). `gate`/`call` remain stubs: both are **Task 20 (B12)**'s, which
-//! owns parking's and composition's run loops and will build their handlers
-//! on top of [`Executor::dispatch_step`] rather than duplicating sequencing
-//! logic.
+//! 14/B6). **`gate`/`call` are not**: they belong to [`run_loop`] (B12c),
+//! which intercepts both before reaching [`Executor::dispatch_step`], because
+//! a park is a durable transition plus a checkpoint and a `call:` creates a
+//! child run — and this type deliberately holds no
+//! [`rusqlite::Connection`](https://docs.rs/rusqlite). `dispatch_step`'s arm
+//! for the two is a refusal naming that, and it is reachable only from a
+//! caller with no run behind it: the in-memory
+//! [`Executor::run_to_completion`], or a `gate:`/`call:` nested inside a
+//! `map`.
 //!
-//! This attribution used to read "Tasks 7/11" and was corrected by Task 19
-//! (B11) under ruling P75 §A. Tasks 7 and 11 landed the *primitives* those
-//! handlers need — [`crate::parking`] (Task 17/B9) for the `gate` park, and
+//! The attribution here used to read "Tasks 7/11", was corrected by Task 19
+//! (B11) under ruling P75 §A to "Task 20 (B12)", and is now the module that
+//! actually does it. Tasks 7 and 11 landed the *primitives* —
+//! [`crate::parking`] (Task 17/B9) for the `gate` park, and
 //! [`crate::compose`] (Task 19/B11) for the `call:` budget transfer,
 //! recursion bound and workflow-as-tool shape — and deliberately left both
-//! arms stubbed, because a run loop is what actually dispatches them and P68
-//! §C moved that to Task 20. `durability.rs`'s
-//! [`WorkflowRun::parent_run_id`](crate::durability::WorkflowRun::parent_run_id)
-//! comment already said Task 20; these two comments disagreed with it until
-//! this correction.
+//! arms stubbed, because a run loop is what actually dispatches them.
 //!
 //! # Ruling P23 — establishing trust at the parse boundary: **rejected for this task**
 //!
@@ -662,15 +664,18 @@ impl<'a> Executor<'a> {
     }
 
     /// Runs every top-level step to completion in dependency order (§8.8's
-    /// "the graph is the deterministic skeleton"). `map`/`gate`/`call` steps
-    /// are handled by Tasks 6/7/11 respectively via [`Self::dispatch_step`];
-    /// this task implements sequencing plus the `tool`/`agent`/`emit`/
-    /// `report` leaf dispatch.
+    /// "the graph is the deterministic skeleton"), **in memory**: no
+    /// `workflow_run` row, no checkpoints, no admission, no terminal state.
     ///
-    /// Stopping-on-failure, `catch:`/`finally:`, and retry are later tasks'
-    /// concerns (`continue_on_error` is parsed onto every [`StepDef`]
-    /// already, but nothing reads it here) — every step in topological
-    /// order is attempted regardless of an earlier step's outcome.
+    /// # This is not the run loop — [`run_loop::run_workflow`] is
+    ///
+    /// Stopping-on-failure, `catch:`/`finally:` and the durable half all live
+    /// there (B12c). Here, `continue_on_error` is still not read and **every
+    /// step in topological order is attempted regardless of an earlier step's
+    /// outcome** — which is correct for what this function is (a pure
+    /// sequencer for this crate's own tests and
+    /// `examples/measure_dual_render.rs`) and wrong for a real run. A caller
+    /// that wants §8.9's semantics wants the other function.
     ///
     /// # Residual: dependents cannot reliably detect an upstream failure at all
     ///
@@ -686,10 +691,14 @@ impl<'a> Executor<'a> {
     /// in this crate stops a dependent from acting on a degenerate `null`
     /// argument, and `steps.<id>.status` (fixed in this same round, item 3,
     /// to a stable `"completed"`/`"failed"`/`"skipped"` string) is the
-    /// *only* signal a workflow author has to guard against it — there is
-    /// no `catch:`/stop-on-failure mechanism yet. **Owner: Task 8**
-    /// (durability layer), which is where stop-on-failure and `catch:`
-    /// handling land.
+    /// *only* signal a workflow author has to guard against it.
+    ///
+    /// **Closed for a real run, and deliberately still open here** (B12c):
+    /// [`run_loop::run_workflow`] stops the phase on a failure unless the step
+    /// declared `continue_on_error`, so a dependent never runs after an
+    /// upstream failure at all. This function keeps the old behaviour because
+    /// it has no run to fail — it is the pure sequencer, and a caller that
+    /// wants stop-on-failure is asking for the other function.
     pub fn run_to_completion(&mut self) -> Result<Vec<StepOutcome>, ParseError> {
         // Fix round 1, item 2: this used to be
         // `.expect("workflow YAML validated at parse time")`, twice — a

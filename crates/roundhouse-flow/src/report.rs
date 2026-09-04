@@ -13,15 +13,26 @@
 //! yet and is not this module's to write; [`diff_findings`] and
 //! [`build_carry_over_seed`] operate on values a caller has already loaded.
 //!
-//! # What this module does *not* decide
+//! # Decided elsewhere: mandatoriness (ruling P112, built by B12c)
 //!
 //! Whether a run is *required* to produce a report, and which terminal states
-//! (`Cancelled`? `Failed`? a timed-out `AwaitingHuman`?) must carry one, is
-//! the run loop's question, not the schema's. §4.2 of `01-data-model.md` says
-//! the report is the mandatory terminal task of every run and that its input
-//! is *"none (assembled from the run's tasks)"*, while the landed executor
-//! takes it from the author's `report:` block and nothing enforces
-//! mandatoriness anywhere. That gap is recorded against Task 20 (B12).
+//! must carry one, was the run loop's question and not the schema's. It is
+//! answered: **every** terminal state carries exactly one `TaskKind::Report`
+//! task — `Completed`, `Failed` and `Cancelled` alike — and
+//! [`crate::exec::run_loop::run_workflow`] cannot mark a run terminal without
+//! one. §4.2's *"input: none (assembled from the run's tasks)"* describes the
+//! **implicit** producer, which the run loop is; an authored `report:` step is
+//! the other, and `05-scheduling-and-workflows.md:150-152` names both.
+//!
+//! The argument, because it should drive a reader rather than be taken on
+//! authority: the inbox exists to triage, and a run that failed or was
+//! cancelled needs triage *more*. §8.6 sorts on
+//! `(needs_human, severity, outcome != nothing)`, so without a report the Runs
+//! inbox would silently omit precisely the runs an operator most needs to see.
+//!
+//! **The one case the run loop cannot serve is a crash**: a killed daemon
+//! writes nothing, so that report belongs to the recovery path on restart
+//! (ruling P112 §5), which is daemon-side and unowned.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -588,7 +599,7 @@ pub fn build_carry_over_seed(
 ///
 /// - **Exactly one thing is produced by every run, in every terminal state.**
 ///   Ruling P112 makes the `TaskKind::Report` task mandatory —
-///   [`crate::run_loop`] synthesises one when the author declares no `report:`
+///   [`crate::exec::run_loop`] synthesises one when the author declares no `report:`
 ///   step — so the report is the only value a caller of `workflow:<name>` can
 ///   be promised.
 /// - **A declared `outputs:` block would be a promise with no mechanism

@@ -43,8 +43,10 @@
 //!   machinery `blobs.rs`'s daily GC wants, so one owner should take both.
 //!   **B12b supplies the column and the query; not the runner.**
 //! - [`admit_spend`] is the chokepoint §8.4's *"caps enforced at task
-//!   admission"* describes, but the thing that calls it once per task is the
-//!   run loop's.
+//!   admission"* describes, and [`crate::exec::run_loop`] (B12c) calls it
+//!   once per step. It is also where §8.13's cancel is *observed*: the loop
+//!   reads the drain off this refusal rather than from a second state read
+//!   that could disagree with it.
 //! - [`draw_child_run`] and [`refund_child_run`] are §8.12's transfer, both
 //!   halves of it, over rows. B12b's job was to make the pair *symmetric* —
 //!   see [`draw_child_run`] for what the missing half cost. **B12c wired the
@@ -55,12 +57,17 @@
 //!   creator of a child row rather than for the one this slice happened to
 //!   build. The **refund** still has no production caller: returning a child's
 //!   grant on completion is the run loop's, and today only the `call:` arm
-//!   creates a child run whose completion it could observe.
+//!   creates a child run whose completion it could observe. **The refund is
+//!   wired, and it needed no such observer**: a run that *is* a child refunds
+//!   its own unspent grant at its own terminal transition, from inside
+//!   [`crate::exec::run_loop`], which is what *"refunded on completion"* means
+//!   read from the completing run's side.
 //! - [`crate::exec::map_step::MapBudget::from_run_ledger`] sources a `map`'s
-//!   budget from [`remaining_caps`], but the `map` dispatch arm still builds
-//!   [`crate::exec::map_step::MapBudget::unenforced_placeholder`], because
-//!   `Executor` holds no [`Connection`] and giving it one is run-loop
-//!   plumbing. See that constructor's doc for the exact swap B12c makes.
+//!   budget from [`remaining_caps`], and B12c calls it: the run loop reads the
+//!   value before each dispatch and hands it to the executor, which is §8.9's
+//!   *"at the moment the map starts"* taken literally. `Executor` still holds
+//!   no [`Connection`] — see that constructor's doc for why a value, not a
+//!   handle, is what closed ruling P108 §C.
 //!
 //! # Named gap: a run-level `caps:` block is not authorable
 //!
@@ -73,9 +80,16 @@
 //! hard parse error, since `WorkflowDef` is `#[serde(deny_unknown_fields)]`.
 //! Recorded as a wire-shape gap of the same class as `on_crash:` and
 //! `outputs:` (see [`crate::durability`]'s and [`crate::compose`]'s module
-//! docs), owned by **B12c** for the same reason those are: it is the first
-//! task with a run loop, and therefore the first that can observe what a
-//! declared run-level cap would have to mean.
+//! docs), and **left open by B12c on the same evidence that closed those
+//! two.** With the run loop built, what a run-level `caps:` would have to mean
+//! is observable — it is the grant `insert_workflow_run` records — and the
+//! answer is that the author is the wrong source for it. A workflow that
+//! declared its own ceiling would be asking to be trusted about its own
+//! budget, which is exactly the direction §8.12's invariant runs against; the
+//! grant belongs to whoever *starts* the run (the daemon's configuration for a
+//! root, [`crate::compose::draw_child_budget`] for a child). Named as a
+//! decision now rather than as a gap, so a future reader meets the reasoning
+//! rather than the absence.
 
 use crate::caps::{is_usable_cost_usd, ResourceCaps};
 use crate::compose::{admit_child_call, child_call_depth, CallDepthError, CallFanOutError};

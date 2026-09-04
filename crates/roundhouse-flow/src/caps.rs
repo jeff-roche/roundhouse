@@ -5,9 +5,10 @@
 //! The "caps enforced at task admission" chokepoint §8.4 describes is
 //! [`crate::ledger::admit_spend`] (B12b), which checks a request against this
 //! type's fields and records it in one transaction over migration 0008's
-//! columns. What is still missing is its *caller*: the run loop that invokes
-//! it once per task is **B12c**. See [`ResourceCaps`]'s own doc comment for
-//! why this owner moved twice — off Task 8, then across ruling P77's split.
+//! columns. Its caller is [`crate::exec::run_loop`] (B12c), which admits every
+//! step of every phase — see [`ResourceCaps`]'s own doc comment for why this
+//! owner moved twice before landing there, and for which fields the loop can
+//! honestly charge.
 //!
 //! # Deviation from §8.4's illustrative code block: `max_cost_usd` is `f64`, not `Decimal`
 //!
@@ -34,12 +35,24 @@ use std::time::Duration;
 /// Mirrors §8.4's `ResourceCaps` (see the module doc comment for the one
 /// field-type deviation). Enforced at task admission — the one chokepoint
 /// every task already passes through, per the everything-is-a-task
-/// invariant — by [`crate::ledger::admit_spend`]. What remains unbuilt is the
-/// **caller**: the run loop that calls it once per task is **B12c**.
+/// invariant — by [`crate::ledger::admit_spend`], which
+/// [`crate::exec::run_loop::run_workflow`] calls once per step.
 ///
-/// It used to say "Task 8's durability layer", then "Task 20". Both went
-/// stale as the ledger moved: Task 16 (B8) landed `durability` with the
-/// `workflow_run` / `workflow_step_run` state machine and deliberately no
+/// **Which fields that makes real today**, stated because the difference
+/// matters: the run loop charges the countables it *knows* — one task per
+/// step, one tool call per `tool:` step, one sub-agent per `agent:`/`call:`
+/// step — so `max_tasks`, `max_tool_calls` and `max_subagents` are enforced
+/// end to end, as are both elapsed-time ceilings, which `admit_spend` checks
+/// on every call regardless of what is being spent. `max_tokens`,
+/// `max_cost_usd` and `max_bytes_written` are enforced by the same chokepoint
+/// and are charged by **Phase 2's cost accounting**, which measures them from
+/// outside the run; a figure the run loop invented would be the self-reported
+/// number [`crate::ledger::Spend`]'s doc says the whole invariant reduces to
+/// not trusting.
+///
+/// The owner line used to say "Task 8's durability layer", then "Task 20".
+/// Both went stale as the ledger moved: Task 16 (B8) landed `durability` with
+/// the `workflow_run` / `workflow_step_run` state machine and deliberately no
 /// run-level ledger, and ruling P77 then split Task 20 in three, putting the
 /// ledger and its migration in B12b and the loop in B12c.
 ///

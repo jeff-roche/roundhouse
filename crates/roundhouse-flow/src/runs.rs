@@ -46,9 +46,13 @@
 //!
 //! # What this module does not decide
 //!
-//! Nothing in this workspace yet drives a run to a terminal state with a
-//! `Report` task — B12c owns the run loop — so this is written and tested
-//! against seeded rows and has no end-to-end path through it today.
+//! Since B12c there is a driver: [`crate::exec::run_loop::run_workflow`]
+//! ends every run in a terminal state carrying exactly one `Report` task
+//! (ruling P112), so the inbox is non-empty for exactly the runs it exists to
+//! surface — including the failed and cancelled ones, which is the case that
+//! ruling names as the reason mandatoriness matters. This module is still
+//! written and tested against seeded rows, because it is a query and the
+//! daemon that would run both halves in one process does not exist yet.
 //!
 //! It also does not filter on [`crate::durability::RunState`]. **Having a
 //! report is the filter**: §8.6 makes the report the terminal task of a run, so
