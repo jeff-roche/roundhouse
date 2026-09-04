@@ -236,15 +236,21 @@ impl Spend {
 ///
 /// # Why this is a separate struct from [`crate::durability::WorkflowRun`]
 ///
-/// `WorkflowRun` is the value a **caller constructs** to insert a run.
-/// Everything below except `state`, `started_at`, `ended_at` and
-/// `parent_run_id` is written only by this crate's own writers and defaults
-/// to zero or `NULL` in the schema, so putting these fields on the
+/// `WorkflowRun` is the value a **caller constructs** to insert a run. Five of
+/// the fields below — [`Self::parked_at`], [`Self::hold_until`],
+/// [`Self::parked_nanos`], [`Self::spent`] and [`Self::refunded_at`], which
+/// are eleven columns between them — are written **only** by this crate's own
+/// writers and default to zero or `NULL` in the schema. Putting those on the
 /// constructed type would invite a caller to insert a run that claims five
 /// hours of parked time, or a spend it never made, and would make every
-/// construction site in the tree responsible for eleven fields it has no
-/// opinion about. The overlap is deliberate duplication of four read-only
-/// values, not a second identity for the row.
+/// construction site in the tree responsible for eleven columns it has no
+/// opinion about.
+///
+/// The other seven (`run_id`, `state`, `parent_run_id`, `started_at`,
+/// `ended_at`, `session_depth`, `caps`) *are* on `WorkflowRun`, and are read
+/// here because the ledger's own arithmetic needs them. That overlap is
+/// deliberate duplication of read-only values, not a second identity for the
+/// row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunLedger {
     pub run_id: RunId,
@@ -268,6 +274,8 @@ pub struct RunLedger {
     pub session_depth: Option<u32>,
     /// The grant. See [`crate::durability::WorkflowRun::caps`].
     pub caps: Option<ResourceCaps>,
+    /// What the run has consumed so far, against [`Self::caps`]. Written only
+    /// by [`admit_spend`] and [`refund_child_run`].
     pub spent: Spend,
     /// Stamped when this run's unspent grant was returned to its parent.
     pub refunded_at: Option<Timestamp>,
