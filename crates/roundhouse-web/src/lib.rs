@@ -32,6 +32,13 @@ pub use assets::{asset_router, WebAssets};
 
 /// The wire-protocol version this crate's API speaks, shared with every other
 /// client of `roundhouse-proto`.
+///
+/// **Do not delete this as unused.** `xtask/tests/exit_criterion.rs` asserts a
+/// required Cargo edge `roundhouse-web -> roundhouse-proto`, and this is the
+/// only place in the crate that uses `roundhouse_proto`. Removing it makes the
+/// dependency look dead, and dropping the dependency fails that test. Keep it
+/// until a Subsystem D task gives the crate a real `roundhouse-proto` use
+/// site — which D2 onwards will, since the API routers speak those wire types.
 pub fn api_version() -> roundhouse_proto::ApiVersion {
     roundhouse_proto::ApiVersion::CURRENT
 }
@@ -41,7 +48,10 @@ pub fn api_version() -> roundhouse_proto::ApiVersion {
 /// Empty today: D1 serves only static embedded assets, which need no state.
 /// It exists as the seam the later Subsystem D tasks add their fields to (an
 /// SSE hub, the store handle) so that adding one is a field, not a change to
-/// every handler signature in the crate.
+/// every handler signature in the crate. That the seam actually carries state
+/// to a handler is checked by
+/// `tests/assets.rs::a_handler_taking_app_state_composes_with_the_asset_router`,
+/// not just asserted here.
 #[derive(Clone, Debug, Default)]
 pub struct AppState {}
 
@@ -50,8 +60,16 @@ pub struct AppState {}
 /// Today it is the asset router plus the shared state. Later Subsystem D tasks
 /// `.nest()` their API routers here, **ahead of** the asset fallback, so that
 /// an `/api/...` path never falls through to the `index.html` shell.
+///
+/// **Nest before `with_state`, not after.** `with_state` applies the state to
+/// the routes registered up to that point and turns the result into a
+/// `Router<()>`; anything added afterwards can no longer take a
+/// `State<AppState>` extractor. So a new router goes in between
+/// [`assets::asset_router`] and `.with_state(state)` — which is also why
+/// `asset_router` is generic over the state type.
+/// `tests/assets.rs::a_handler_taking_app_state_composes_with_the_asset_router`
+/// compiles exactly that composition, so this stops being prose the moment it
+/// stops being true.
 pub fn build_router(state: AppState) -> axum::Router {
-    axum::Router::new()
-        .with_state(state)
-        .fallback(assets::serve_asset)
+    assets::asset_router().with_state(state)
 }

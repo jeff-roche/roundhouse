@@ -6,17 +6,29 @@
 //! `round-daemon-internal` as a child process rather than linking the daemon
 //! in. Nothing in this module binds a listener or starts a server; it builds
 //! a router and stops there.
+//!
+//! **The `debug-embed` feature is load-bearing for more than test fidelity.**
+//! With it, `WebAssets::get` is generated as a lookup over a `static` array of
+//! compile-time literals — no filesystem access at all, so a request path can
+//! only hit or miss a fixed key set. Without it, `rust-embed` generates its
+//! filesystem-reading implementation instead, whose own source carries a
+//! `TODO` conceding that a symlink pointing outside the embedded folder is
+//! still served. That property therefore rests on one line of `Cargo.toml`,
+//! which `tests/assets.rs` asserts on directly.
 
-use axum::body::Body;
+use std::borrow::Cow;
+
+use axum::body::{Body, Bytes};
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use rust_embed::{EmbeddedFile, RustEmbed};
 
 /// The web client's build output, embedded at compile time.
 ///
-/// The directory is hand-committed placeholder HTML today (ruling P12); no
-/// task in this plan builds the real SolidJS client. The embedding mechanism
-/// is what this task delivers, and it does not care what the directory holds.
+/// The directory is hand-committed placeholder HTML and CSS today (ruling
+/// P12); no task in this plan builds the real SolidJS client. The embedding
+/// mechanism is what this task delivers, and it does not care what the
+/// directory holds.
 #[derive(RustEmbed)]
 #[folder = "assets/dist"]
 pub struct WebAssets;
@@ -31,14 +43,26 @@ pub struct WebAssets;
 /// missing JavaScript bundle with a 200 and a page of HTML, and the browser
 /// would report that as an opaque MIME-type failure with no trail back to the
 /// build that dropped the file.
+///
+/// **Lookup is on the raw request path.** `uri.path()` is the target as the
+/// client sent it; axum does not percent-decode it, and this function does not
+/// either — the string is used as an exact key against the embedded set. So a
+/// client that ships a file whose name contains a space, a `%`, or any
+/// non-ASCII character will 404 on it, because the browser requests
+/// `/my%20app.css` while the embedded key is `my app.css`. That is a
+/// functional limit on filenames, not a security boundary: decoding here would
+/// be the thing that *introduced* one. Whoever hits it should rename the asset
+/// rather than add a decode step.
 pub async fn serve_asset(uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
+    let Some((key, segments)) = split_request_path(uri.path()) else {
+        return not_found();
+    };
 
-    if let Some(file) = WebAssets::get(if path.is_empty() { "index.html" } else { path }) {
+    if let Some(file) = WebAssets::get(key) {
         return embedded_response(file);
     }
 
-    if is_client_route(uri.path()) {
+    if is_client_route(&segments) {
         return match WebAssets::get("index.html") {
             Some(shell) => embedded_response(shell),
             // Only reachable if `assets/dist/` was emptied of its shell; the
@@ -51,32 +75,102 @@ pub async fn serve_asset(uri: Uri) -> Response {
         };
     }
 
-    (StatusCode::NOT_FOUND, "not found").into_response()
+    not_found()
 }
 
 /// The router serving the embedded client: every path is handled by
 /// [`serve_asset`], which is why this is a `fallback` rather than a set of
-/// routes. Later Subsystem D tasks nest their own API routers *ahead* of this
-/// one in [`crate::build_router`], so `/api/...` never reaches the shell.
-pub fn asset_router() -> axum::Router {
+/// routes.
+///
+/// Generic over the state type on purpose. [`serve_asset`] takes no `State`
+/// extractor, so this router is compatible with any state — which is what lets
+/// [`crate::build_router`] add it to a `Router<AppState>` pipeline and apply
+/// the state once, at the end. Called on its own (as the tests do) `S` infers
+/// to `()`, because that is the only state type for which `Router` is itself a
+/// `Service`.
+pub fn asset_router<S>() -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     axum::Router::new().fallback(serve_asset)
+}
+
+fn not_found() -> Response {
+    (StatusCode::NOT_FOUND, "not found").into_response()
+}
+
+/// Splits a request path into the embedded-asset lookup key and its segments,
+/// or `None` if the path is not one this router will answer. The site root
+/// (`/`) is the one path whose key is not its own text: it maps to
+/// `index.html` with no segments.
+///
+/// Empty segments are rejected rather than skipped, so `//index.html` and
+/// `/w/default//inbox` are 404s. Collapsing them would make this layer *more*
+/// permissive than `axum`'s own matcher — `matchit` does not collapse repeated
+/// slashes — and any future path-prefix policy or middleware in front of this
+/// router would then be reasoning about a different path than the one served.
+/// The same rule makes a trailing slash (`/settings/`) a 404, matching how
+/// `matchit` treats it.
+fn split_request_path(path: &str) -> Option<(&str, Vec<&str>)> {
+    let rest = path.strip_prefix('/')?;
+    if rest.is_empty() {
+        return Some(("index.html", Vec::new()));
+    }
+
+    let segments: Vec<&str> = rest.split('/').collect();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+
+    Some((rest, segments))
 }
 
 /// Wraps an embedded file in a response carrying the content type `rust-embed`
 /// recorded for it at embed time (the `mime-guess` feature), rather than
 /// re-deriving one from the request path.
+///
+/// **The recorded type is sent verbatim, with no `charset` parameter.** That is
+/// a decision, not an oversight: this crate does not produce the bytes it
+/// serves — ruling P12 says `assets/dist/` is replaced wholesale by a future
+/// client build — so it is in no position to assert their encoding. The one
+/// file it does own declares its own charset in-document. Whoever ships a real
+/// client whose text assets need a declared encoding should add it here
+/// deliberately, knowing what that build emits.
+///
+/// `X-Content-Type-Options: nosniff` is sent on every asset. Two reasons, both
+/// specific to this router: it already answers `.js`-suffixed URLs under
+/// `/settings/<one segment>` with HTML (the app shell), and `nosniff` turns
+/// that silent misfire into a console error naming the type mismatch; and any
+/// extension `mime-guess` does not recognise is recorded as
+/// `application/octet-stream`, which is exactly where content sniffing is
+/// worth refusing.
 fn embedded_response(file: EmbeddedFile) -> Response {
     let mime = file.metadata.mimetype().to_owned();
+    // `debug-embed` gives every file a `Cow::Borrowed(&'static [u8])`, so the
+    // borrowed arm hands `Bytes` a pointer to the binary's own read-only data
+    // and copies nothing. The owned arm exists for the filesystem-reading
+    // build, where the bytes were just read and are already owned. Copying
+    // unconditionally (`into_owned()`) would memcpy the whole asset per
+    // request; unmeasured here, where the largest asset is under a kilobyte,
+    // but the shape is per-request-per-byte either way.
+    let body = match file.data {
+        Cow::Borrowed(bytes) => Body::from(Bytes::from_static(bytes)),
+        Cow::Owned(bytes) => Body::from(bytes),
+    };
+
     (
-        [(header::CONTENT_TYPE, mime)],
-        Body::from(file.data.into_owned()),
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+        ],
+        body,
     )
         .into_response()
 }
 
-/// Whether `path` is one of §11.1's client-side routes — a view the browser
-/// router resolves, for which the server's whole job is to hand back the app
-/// shell.
+/// Whether `segments` are one of §11.1's client-side routes — a view the
+/// browser router resolves, for which the server's whole job is to hand back
+/// the app shell.
 ///
 /// The table (`docs/architecture/08-ui-design.md` §11.1) is:
 /// `/w/:ws`, `/w/:ws/inbox`, `/w/:ws/s/:session[/t/:task[/diff]]`,
@@ -85,12 +179,18 @@ fn embedded_response(file: EmbeddedFile) -> Response {
 ///
 /// `/settings` itself is accepted alongside its subtree: the table writes the
 /// subtree as an unenumerated `...`, and the bare prefix is its natural root.
-fn is_client_route(path: &str) -> bool {
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-    match segments.as_slice() {
-        // `/settings/...`
-        ["settings", ..] => true,
+/// The subtree is bounded to **one** segment below `/settings` rather than
+/// matched as a prefix. An unbounded `["settings", ..]` arm was the one arm of
+/// this set that never closed: it answered `/settings/../../../etc/passwd`
+/// with a 200 and the app shell. Nothing was disclosed by that — the lookup
+/// above cannot leave the embedded key set — but it contradicted this module's
+/// stated rule that an unknown path is a 404. A `/settings/<name>` that the
+/// client does not route still serves the shell, which is what an unenumerated
+/// `...` in the table means; depth is what is now bounded.
+fn is_client_route(segments: &[&str]) -> bool {
+    match segments {
+        // `/settings` and `/settings/:view`
+        ["settings"] | ["settings", _] => true,
         // `/w/:ws`
         ["w", _ws] => true,
         // `/w/:ws/{inbox,tree,messages,runs,search,cost}`
