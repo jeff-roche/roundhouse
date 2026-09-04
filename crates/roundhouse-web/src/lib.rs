@@ -11,7 +11,8 @@
 //! reconnecting client's gap is replayed and `resync_required` is left naming
 //! the one condition §11.3 gives it. See [`sse`]. Task 33 (D4) added the rest
 //! of §11.3's access scope: the opt-in LAN bind and its shared per-device
-//! token, in [`lan_auth`], layered over the whole router by [`build_router`].
+//! token, in [`lan_auth`], layered onto the `/api` nest by [`build_router`] —
+//! which records why it is *not* layered over the whole router.
 //! **This crate still binds no listener and starts no server**, and nothing
 //! links it yet — so [`lan_auth::BindConfig::bind_addr`] has no caller.
 //!
@@ -95,35 +96,67 @@ pub struct AppState {
 /// compiles exactly that composition, so this stops being prose the moment it
 /// stops being true.
 ///
-/// # The LAN gate goes on last, and covers everything
+/// # The LAN gate goes on the `/api` nest, and the shell is served ungated
 ///
 /// `bind` is taken by value-reference rather than defaulted because the caller
 /// must *make* the loopback-vs-LAN decision to get a router at all; there is no
 /// signature here that quietly serves the LAN ungated. See
 /// [`lan_auth::BindConfig`] for why that decision and the token are one value.
 ///
-/// When [`lan_auth::BindConfig::gate`] yields a gate it is applied as a single
-/// `.layer(...)` **after** `with_state`, not nested before it. That is
-/// deliberate and it is the opposite of the nesting rule above, because it is
-/// solving the opposite problem: `.layer` on the finished `Router<()>` wraps
-/// every route registered up to that point, which here means **the `/api` SSE
-/// routes and the embedded-asset fallback alike**. A gate mounted only on the
-/// nested `/api` router would leave the client shell, and every embedded asset,
-/// readable by an unauthenticated LAN peer. One gate, whole surface.
+/// When [`lan_auth::BindConfig::gate`] yields a gate it is layered onto
+/// [`sse::router`] **before** that router is nested. So the gated set is
+/// `/api/...` and the ungated set is "whatever [`assets::asset_router`] serves"
+/// — **by construction**, not by a path-prefix string test on the outer router,
+/// which is the loose form that drifts the moment a route is added.
+///
+/// ## The whole-surface gate was tried first, and it does not work
+///
+/// Recorded rather than deleted, because "one gate over everything" reads like
+/// the safer choice and a reader who finds the gate on `/api` will otherwise
+/// change it back. Until ruling P85 this was a single `.layer(...)` on the
+/// finished `Router<()>`, wrapping the `/api` SSE routes and the embedded-asset
+/// fallback alike. The failure is mechanical, not a matter of taste:
+///
+/// Under [`lan_auth::BindConfig::lan`] a browser's only way to present a
+/// credential on a **document** request is `http://host:port/?access_token=…`.
+/// There is no cookie (deliberately — see [`lan_auth`]), and a top-level
+/// navigation sets no request header. That request serves `index.html`, whose
+/// `<link rel="stylesheet" href="/app.css">` is a **subresource**: its URL is
+/// written by the client *build*, not by the client *code*, so it can carry
+/// neither the header nor the query parameter. It 401s, and the page never
+/// boots. The real SolidJS client P12 defers emits hashed `/assets/*.js` and
+/// `/assets/*.css` with exactly the same shape. The whole-surface gate
+/// therefore left the LAN bind — the entire point of the feature — with **no
+/// working browser configuration**, and the two repairs nearest to hand were
+/// both forbidden (`Set-Cookie` is the ambient authority [`lan_auth`] exists
+/// without; an asset exemption bolted on under time pressure gets written as a
+/// loose path prefix).
+///
+/// What is given up by serving the shell ungated is bounded and small.
+/// `assets/dist/` is **compile-time-constant public content**: the same bytes
+/// in every install, embedded from the repo at build time, with no session
+/// data, no secrets and no per-install configuration in them — a standing
+/// constraint on whoever replaces the placeholder, stated in [`assets`]'s
+/// module docs. An unauthenticated LAN peer therefore learns "a Roundhouse
+/// instance is here", which the open TCP port already told them, plus client
+/// code from an open-source repository. Every route that can disclose a
+/// *session* is under `/api`, and `/api` is what stays gated.
+///
+/// `tests/lan_auth.rs::the_gate_is_on_api_and_the_asset_surface_is_ungated`
+/// pins that boundary from both sides, so this stops being prose the moment it
+/// stops being true.
 ///
 /// The layer is absent — not merely inert — on the loopback path, so the
 /// zero-configuration router has no authentication code in its request path at
 /// all.
 pub fn build_router(state: AppState, bind: &lan_auth::BindConfig) -> axum::Router {
-    let router = assets::asset_router()
-        .nest("/api", sse::router())
-        .with_state(state);
-
-    match bind.gate() {
-        None => router,
-        Some(gate) => router.layer(axum::middleware::from_fn_with_state(
+    let api = match bind.gate() {
+        None => sse::router(),
+        Some(gate) => sse::router().layer(axum::middleware::from_fn_with_state(
             gate,
             lan_auth::require_lan_token,
         )),
-    }
+    };
+
+    assets::asset_router().nest("/api", api).with_state(state)
 }

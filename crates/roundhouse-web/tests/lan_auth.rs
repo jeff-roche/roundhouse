@@ -16,9 +16,17 @@
 //! deliberately make hostile for the duration of one test each.
 //!
 //! The router tests go through [`roundhouse_web::build_router`] rather than
-//! calling the middleware directly, because "is the gate actually mounted, over
-//! the whole surface" is the failure P84 §E was written against — a gate that
+//! calling the middleware directly, because "is the gate actually mounted, and
+//! over which routes" is the failure P84 §E was written against — a gate that
 //! exists and is never layered passes every unit test of the gate itself.
+//!
+//! **Which URI a gate test uses is load-bearing since ruling P85.** The gate is
+//! mounted on the `/api` nest, so `/` and every other asset path answers `200`
+//! with or without a token; a gate test written against `/` could not fail.
+//! Every test about the gate therefore uses [`api_events`], and the asset paths
+//! appear in exactly one test —
+//! [`the_gate_is_on_api_and_the_asset_surface_is_ungated`] — where their being
+//! ungated is the assertion.
 //!
 //! Per rulings P79/P81, every test here (and every `lan_auth` unit test in
 //! `src/`) is killed by at least one stated mutation of the implementation, and
@@ -46,6 +54,20 @@ use tower::ServiceExt;
 /// below reach the SSE handler rather than being rejected as un-parseable
 /// before the gate's verdict is even interesting.
 const SESSION_ID: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+
+/// The one gated path in this crate's router, and therefore the path every
+/// test about the *gate* has to use.
+///
+/// Since ruling P85 the gate is mounted on the `/api` nest and the embedded
+/// shell is served ungated, so a gate test written against `/` would pass
+/// whatever the token was — it would be `200` for a correct token, a wrong
+/// token, and no token alike. That is exactly the "test that cannot fail"
+/// shape P79 is about, so the asset paths appear in precisely one test
+/// ([`the_gate_is_on_api_and_the_asset_surface_is_ungated`]), where being
+/// ungated is the assertion rather than the accident.
+fn api_events() -> String {
+    format!("/api/sessions/{SESSION_ID}/events")
+}
 
 /// The umask is process-global, and this binary runs its tests in threads. Any
 /// test that creates a token file and then asserts on its mode has to hold this
@@ -199,7 +221,7 @@ fn the_token_survives_a_restart_so_paired_devices_stay_paired() {
     let bind_second = BindConfig::lan(IpAddr::V4(Ipv4Addr::LOCALHOST), second);
     for bind in [bind_first, bind_second] {
         let router = build_router(AppState::default(), &bind);
-        let request = get_with_auth("/", &format!("Bearer {text}"));
+        let request = get_with_auth(&api_events(), &format!("Bearer {text}"));
         assert_eq!(block_on(status_of(router, request)), StatusCode::OK);
     }
 }
@@ -435,11 +457,7 @@ async fn a_loopback_router_serves_both_surfaces_with_no_token() {
         "the client shell is unauthenticated on loopback"
     );
     assert_eq!(
-        status_of(
-            build_router(AppState::default(), &bind),
-            get(&format!("/api/sessions/{SESSION_ID}/events"))
-        )
-        .await,
+        status_of(build_router(AppState::default(), &bind), get(&api_events())).await,
         StatusCode::OK,
         "the SSE stream is unauthenticated on loopback"
     );
@@ -448,33 +466,60 @@ async fn a_loopback_router_serves_both_surfaces_with_no_token() {
 #[tokio::test]
 async fn a_lan_router_rejects_a_request_with_no_token() {
     let dir = state_dir();
+    let (router, _) = lan_router(dir.path());
 
-    let events = format!("/api/sessions/{SESSION_ID}/events");
-    for uri in ["/", events.as_str()] {
-        let (router, _) = lan_router(dir.path());
-        assert_eq!(
-            status_of(router, get(uri)).await,
-            StatusCode::UNAUTHORIZED,
-            "{uri} must be gated"
-        );
-    }
+    assert_eq!(
+        status_of(router, get(&api_events())).await,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
-/// The gate must cover the embedded assets, not only `/api`. A gate mounted on
-/// the nested API router alone leaves the whole client shell readable, which is
-/// the mistake the single `.layer` after `with_state` is there to prevent.
+/// Ruling P85's boundary, pinned from **both** sides in one test because it is
+/// one decision: the gate is on the `/api` nest, so every asset path is served
+/// ungated and every `/api` path is refused without the token.
+///
+/// The asset list is not arbitrary. `/` and `/index.html` are the document a
+/// browser navigates to; `/w/default/inbox` is a §11.1 client route served the
+/// shell; and **`/does-not-exist.js` is the load-bearing one** — it reaches
+/// nothing but `asset_router`'s fallback, so its 404 is what proves the
+/// *fallback* is on the ungated side rather than only the named routes. A gate
+/// re-applied over the finished router would turn every one of these into a
+/// 401, which is precisely the state that left the LAN bind with no working
+/// browser: `index.html`'s `<link href="/app.css">` is a subresource and can
+/// carry no credential.
+///
+/// The `/api` half is what stops "ungate the assets" from drifting into
+/// "ungate everything". Both halves use the same router construction, so
+/// neither can pass by accident of how it was built.
 #[tokio::test]
-async fn the_gate_covers_the_asset_fallback_and_the_spa_routes() {
+async fn the_gate_is_on_api_and_the_asset_surface_is_ungated() {
     let dir = state_dir();
 
-    for uri in ["/", "/index.html", "/w/default/inbox", "/does-not-exist.js"] {
+    // The expected status is asserted, not merely "not 401": the shell has to
+    // *serve*, and `/does-not-exist.js` has to reach the fallback's own 404
+    // rather than any other refusal.
+    for (uri, expected) in [
+        ("/", StatusCode::OK),
+        ("/index.html", StatusCode::OK),
+        ("/app.css", StatusCode::OK),
+        ("/w/default/inbox", StatusCode::OK),
+        ("/does-not-exist.js", StatusCode::NOT_FOUND),
+    ] {
         let (router, _) = lan_router(dir.path());
         assert_eq!(
             status_of(router, get(uri)).await,
-            StatusCode::UNAUTHORIZED,
-            "{uri} must be gated, including the paths that would otherwise 404"
+            expected,
+            "{uri} is compile-time-constant public content and must be served ungated, or the \
+             LAN bind has no working browser"
         );
     }
+
+    let (router, _) = lan_router(dir.path());
+    assert_eq!(
+        status_of(router, get(&format!("/api/sessions/{SESSION_ID}/events"))).await,
+        StatusCode::UNAUTHORIZED,
+        "the SSE stream is under the gated nest and must be refused without the token"
+    );
 }
 
 #[tokio::test]
@@ -489,7 +534,11 @@ async fn a_lan_router_rejects_a_wrong_token() {
     wrong.push(if text.ends_with('0') { '1' } else { '0' });
 
     assert_eq!(
-        status_of(router, get_with_auth("/", &format!("Bearer {wrong}"))).await,
+        status_of(
+            router,
+            get_with_auth(&api_events(), &format!("Bearer {wrong}"))
+        )
+        .await,
         StatusCode::UNAUTHORIZED
     );
 }
@@ -501,7 +550,11 @@ async fn a_lan_router_rejects_a_token_of_the_wrong_length() {
     let truncated = &text[..text.len() - 1];
 
     assert_eq!(
-        status_of(router, get_with_auth("/", &format!("Bearer {truncated}"))).await,
+        status_of(
+            router,
+            get_with_auth(&api_events(), &format!("Bearer {truncated}"))
+        )
+        .await,
         StatusCode::UNAUTHORIZED,
         "a prefix of the real token must not authenticate"
     );
@@ -510,16 +563,17 @@ async fn a_lan_router_rejects_a_token_of_the_wrong_length() {
 #[tokio::test]
 async fn a_lan_router_accepts_the_token_in_an_authorization_bearer_header() {
     let dir = state_dir();
+    let (router, text) = lan_router(dir.path());
 
-    let events = format!("/api/sessions/{SESSION_ID}/events");
-    for uri in ["/", events.as_str()] {
-        let (router, text) = lan_router(dir.path());
-        assert_eq!(
-            status_of(router, get_with_auth(uri, &format!("Bearer {text}"))).await,
-            StatusCode::OK,
-            "{uri} must be reachable with the token"
-        );
-    }
+    assert_eq!(
+        status_of(
+            router,
+            get_with_auth(&api_events(), &format!("Bearer {text}"))
+        )
+        .await,
+        StatusCode::OK,
+        "the gated nest must be reachable with the token"
+    );
 }
 
 /// RFC 7235: the scheme name is case-insensitive. Asserted because rejecting
@@ -530,7 +584,11 @@ async fn the_bearer_scheme_name_is_matched_case_insensitively() {
     let (router, text) = lan_router(dir.path());
 
     assert_eq!(
-        status_of(router, get_with_auth("/", &format!("bEaReR {text}"))).await,
+        status_of(
+            router,
+            get_with_auth(&api_events(), &format!("bEaReR {text}"))
+        )
+        .await,
         StatusCode::OK
     );
 }
@@ -547,9 +605,7 @@ async fn a_lan_router_accepts_the_token_in_the_query_parameter_for_event_source(
     assert_eq!(
         status_of(
             router,
-            get(&format!(
-                "/api/sessions/{SESSION_ID}/events?access_token={text}"
-            ))
+            get(&format!("{}?access_token={text}", api_events()))
         )
         .await,
         StatusCode::OK
@@ -564,7 +620,14 @@ async fn the_query_parameter_is_found_among_others() {
     let (router, text) = lan_router(dir.path());
 
     assert_eq!(
-        status_of(router, get(&format!("/?foo=bar&access_token={text}&baz=1"))).await,
+        status_of(
+            router,
+            get(&format!(
+                "{}?foo=bar&access_token={text}&baz=1",
+                api_events()
+            ))
+        )
+        .await,
         StatusCode::OK
     );
 }
@@ -577,7 +640,11 @@ async fn a_parameter_whose_name_only_ends_with_the_real_one_is_not_the_token() {
     let (router, text) = lan_router(dir.path());
 
     assert_eq!(
-        status_of(router, get(&format!("/?not_access_token={text}"))).await,
+        status_of(
+            router,
+            get(&format!("{}?not_access_token={text}", api_events()))
+        )
+        .await,
         StatusCode::UNAUTHORIZED
     );
 }
@@ -591,7 +658,11 @@ async fn a_non_bearer_authorization_header_does_not_authenticate() {
     let (router, text) = lan_router(dir.path());
 
     assert_eq!(
-        status_of(router, get_with_auth("/", &format!("Basic {text}"))).await,
+        status_of(
+            router,
+            get_with_auth(&api_events(), &format!("Basic {text}"))
+        )
+        .await,
         StatusCode::UNAUTHORIZED
     );
 }
@@ -605,7 +676,7 @@ async fn the_rejection_carries_a_bearer_challenge() {
     let (router, _) = lan_router(dir.path());
 
     let response = router
-        .oneshot(get("/"))
+        .oneshot(get(&api_events()))
         .await
         .expect("the router is infallible");
 

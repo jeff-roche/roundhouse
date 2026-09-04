@@ -14,6 +14,33 @@
       serves nothing. No task in the Phase 5 plan builds the real SolidJS
       client; whoever does replaces this directory's contents wholesale with
       the client's build output and touches no Rust.
+
+      TWO THINGS THAT PERSON INHERITS. Both are stated in Rust as well
+      (`assets.rs`'s module docs), but this file is where they will be looking.
+
+      1. THIS DIRECTORY IS PUBLIC CONTENT. When the daemon is bound to the LAN
+         (`BindConfig::lan`), the shared-token gate is mounted on `/api` only
+         and everything here is served to any unauthenticated peer on the
+         network. It is safe because it is compile-time-constant and identical
+         in every install. So: never put session data, secrets, or per-install
+         configuration in a built asset — no baked-in token, no generated
+         config.json, no host names, no workspace or session ids. Anything
+         per-install comes from a gated /api route at runtime. Nothing in the
+         Rust can detect a violation; it serves whatever is here.
+
+      2. THE CLIENT OWNS THE TOKEN HANDLING. Pairing a device means opening
+         http://host:port/?access_token=<64 hex> — a top-level navigation has
+         no other way to carry a credential. On boot the client must:
+           - read `access_token` from location.search;
+           - keep it in sessionStorage (not localStorage — it should not
+             outlive the tab);
+           - history.replaceState it out of the URL immediately. That URL
+             otherwise persists in browser history, in browser account sync,
+             and in URL-bar autocomplete, and no server-side code can reach
+             any of the three. This step is the whole mitigation;
+           - send it as an `Authorization: Bearer` header on every fetch, and
+             as an `?access_token=` query parameter on EventSource, which
+             cannot set request headers at all.
     -->
     <div id="app">Roundhouse web UI — client build output goes here.</div>
   </body>

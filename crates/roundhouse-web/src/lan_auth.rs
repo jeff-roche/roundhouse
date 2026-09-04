@@ -41,6 +41,21 @@
 //! none of [`LanToken`]'s permissions. Nothing in this module can enforce that
 //! for a logger that does not exist yet.
 //!
+//! **A second residual of the same shape, and it is the client author's, not a
+//! logger author's.** Since ruling P85 the gate sits on `/api` and the shell is
+//! ungated, but the token still has to reach the browser somehow, and the only
+//! carrier a **top-level navigation** has is the query string:
+//! `http://host:port/?access_token=…` is how a device is paired. A URL typed or
+//! opened in a browser lands in **browser history, in browser account sync
+//! (Chrome/Firefox/Safari all sync history across a signed-in user's devices),
+//! and in URL-bar autocomplete**, where it will be offered back long after the
+//! tab is gone. **No server-side code closes this** — the server cannot see, let
+//! alone edit, the client's history. The mitigation is the `history.replaceState`
+//! step of the client contract below, it runs in the client, and it belongs to
+//! whoever writes the client. It is recorded here so that person inherits a
+//! stated obligation rather than discovering it — see *The client contract*
+//! below for the whole of it.
+//!
 //! A second bound worth stating plainly rather than implying: §11.3 specifies
 //! **no TLS by default**, so the token is already plaintext on the wire on the
 //! trusted LAN this deliberately assumes. Header-versus-query is a marginal
@@ -87,14 +102,46 @@
 //! the token, so mounting the gate and choosing a non-loopback address are one
 //! decision rather than two fields a typo can separate.
 //!
-//! # 4. The gate is per-bind, not per-peer
+//! # 4. The gate is per-bind, not per-peer — and it covers `/api`, not the shell
 //!
-//! When LAN binding is on, **every** request is gated, including one arriving
-//! over loopback. This module never inspects the peer address to decide whether
-//! to authenticate. That would make the security decision depend on socket-level
-//! information a handler behind any future reverse proxy sees wrongly, and it
-//! would split one gate into two code paths with different behaviour. One gate,
-//! mounted or not, decided once at bind time.
+//! When LAN binding is on, **every `/api` request is gated**, including one
+//! arriving over loopback. This module never inspects the peer address to
+//! decide whether to authenticate. That would make the security decision depend
+//! on socket-level information a handler behind any future reverse proxy sees
+//! wrongly, and it would split one gate into two code paths with different
+//! behaviour. One gate, mounted or not, decided once at bind time.
+//!
+//! *Which* routes it is mounted over is [`crate::build_router`]'s decision and
+//! is argued in full there: the gate goes on the `/api` nest, so the embedded
+//! client shell is served ungated. The short version is that a subresource
+//! fetch (`/app.css`, and the real client's hashed `/assets/*.js`) carries
+//! neither the header nor the query parameter, so a whole-surface gate leaves
+//! the LAN bind with no working browser at all — while `assets/dist/` is
+//! compile-time-constant public content whose disclosure is "an instance is
+//! here", which the open port already gives away.
+//!
+//! # The client contract
+//!
+//! The browser's half of §1 and of the history residual above. Stated here for
+//! completeness and stated **again** in `assets/dist/index.html` and
+//! [`crate::assets`]'s module docs, because ruling P12 hands the client to
+//! someone who "touches no Rust" and will therefore never open this file. On
+//! boot the client must:
+//!
+//! 1. read `access_token` from `location.search` — pairing a device is opening
+//!    `http://host:port/?access_token=<64 hex>`, and a top-level navigation has
+//!    no other way to carry a credential;
+//! 2. keep it in `sessionStorage`, not `localStorage`: it should not outlive
+//!    the tab;
+//! 3. `history.replaceState` it out of the URL immediately — the mitigation for
+//!    the history/sync/autocomplete residual above, and the only one there is;
+//! 4. send it as an `Authorization: Bearer` header on every `fetch`, and as an
+//!    `?access_token=` query parameter on `EventSource`, which cannot set
+//!    request headers at all (§1).
+//!
+//! Step 3 is also what §11.3's *"entered once per device"* means in practice:
+//! nothing server-side remembers a device, so "once" is the client keeping what
+//! the pairing URL delivered.
 //!
 //! # What is *not* here
 //!
@@ -636,9 +683,11 @@ pub(crate) struct LanGate {
 /// `middleware::from_fn_with_state` requires it, and a bare `Arc<T>` does not
 /// implement `FromRequestParts`, so it cannot stand in.
 ///
-/// Layered by [`crate::build_router`] over the **whole** router — the embedded
-/// client assets as well as `/api` — see that function for why that is one
-/// `.layer` and not a per-route guard.
+/// Layered by [`crate::build_router`] onto the **`/api` nest**, so the routes
+/// it guards are exactly the ones [`crate::sse::router`] registers and the
+/// embedded client assets are served ungated. See that function for why the
+/// whole-surface alternative was tried and abandoned, and why the exemption is
+/// structural rather than a path-prefix test in here.
 pub(crate) async fn require_lan_token(
     State(gate): State<LanGate>,
     request: Request,

@@ -7,6 +7,51 @@
 //! in. Nothing in this module binds a listener or starts a server; it builds
 //! a router and stops there.
 //!
+//! # `assets/dist/` is PUBLIC CONTENT — a standing constraint, not a note
+//!
+//! Since ruling P85 the LAN token gate is mounted on the `/api` nest and this
+//! router is served **ungated**, so under `BindConfig::lan(...)` every byte in
+//! `assets/dist/` is readable by any unauthenticated peer on the LAN. That is
+//! safe for exactly one reason: the directory is **compile-time-constant public
+//! content** — the same bytes in every install, embedded from the repo at build
+//! time. The reason the gate had to move is mechanical and is argued in full on
+//! [`crate::build_router`]: a browser can present the token on a *document*
+//! request (`/?access_token=…`), but a **subresource** URL is written by the
+//! client build rather than by the client code, so `/app.css` — and the real
+//! client's hashed `/assets/*.js` — can carry no credential at all. With the
+//! gate over the whole surface they 401 and the page never boots.
+//!
+//! So, for whoever replaces the placeholder with a real client build (ruling
+//! P12 — that person "touches no Rust", which is why this is also restated in
+//! `assets/dist/index.html` itself):
+//!
+//! **`assets/dist/` must never carry session data, secrets, or per-install
+//! configuration.** No baked-in token, no workspace or session identifiers, no
+//! host names, no generated `config.json` — nothing whose value differs between
+//! two installs or between two users of one install. Per-install values reach
+//! the client at runtime, from a gated `/api` route. Breaking this puts the
+//! value on an unauthenticated LAN endpoint, and nothing in this crate can
+//! detect it: `serve_asset` serves whatever the directory holds.
+//!
+//! # The client contract for the LAN token
+//!
+//! Recorded here and in `assets/dist/index.html` because it is the client's
+//! half of `lan_auth`'s design, and its author will not read `lan_auth.rs`. On
+//! boot the client must:
+//!
+//! 1. read `access_token` from `location.search` — pairing a device is opening
+//!    `http://host:port/?access_token=<64 hex>`, which is the only way a
+//!    top-level navigation can carry a credential;
+//! 2. keep it in `sessionStorage`, not `localStorage`: it should not outlive
+//!    the tab;
+//! 3. `history.replaceState` it out of the URL immediately. This is the
+//!    **mitigation for a residual no server-side code can close** — a URL a
+//!    browser navigated to lands in history, in browser account sync, and in
+//!    URL-bar autocomplete (see `lan_auth`'s residuals);
+//! 4. send it as an `Authorization: Bearer` header on every `fetch`, and as an
+//!    `?access_token=` query parameter on `EventSource`, which cannot set
+//!    request headers at all.
+//!
 //! **The `debug-embed` feature is load-bearing for more than test fidelity.**
 //! With it, `WebAssets::get` is generated as a lookup over a `static` array of
 //! compile-time literals — no filesystem access at all, so a request path can
