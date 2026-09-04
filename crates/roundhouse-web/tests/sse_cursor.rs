@@ -25,6 +25,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+use futures_util::StreamExt;
 use roundhouse_core::{Delta, EventPayload, SessionId};
 use roundhouse_proto::ClientEvent;
 use roundhouse_web::lan_auth::BindConfig;
@@ -150,16 +151,7 @@ struct Streamed {
 /// 65 events of 4096 characters, **measured at ~280 KiB** of frames.
 const MAX_COLLECTED_BODY: usize = 2 * 1024 * 1024;
 
-/// Drives the real router end to end.
-///
-/// Ordering is load-bearing: the request is dispatched **first**, because the
-/// handler is what subscribes to the hub; then `publish` runs; then the last
-/// `SseHub` handle is dropped. The hub owns the map that owns every session's
-/// sender, so that drop closes the channels and every stream ends, letting the
-/// body be collected. Without it an SSE body never ends — which is also why
-/// `SessionSubscription` holds only a `Weak` back-reference to that map: a
-/// strong one would keep its own sender alive and the close would never
-/// arrive.
+/// The request every test in this file sends.
 ///
 /// The header is passed as **bytes**, not `&str`, so a test can send a value
 /// that is a legal HTTP header but not valid ASCII text — the `to_str()`
@@ -167,12 +159,7 @@ const MAX_COLLECTED_BODY: usize = 2 * 1024 * 1024;
 /// way: `HeaderValue` refuses to hold them, so `axum`'s documented `Event::id`
 /// panic on a NUL is unreachable from the wire even before this module
 /// declines to echo the header.)
-async fn stream(
-    hub: SseHub,
-    uri: &str,
-    last_event_id: Option<&[u8]>,
-    publish: impl FnOnce(&SseHub),
-) -> Streamed {
+fn sse_request(uri: &str, last_event_id: Option<&[u8]>) -> Request<Body> {
     // Task 34's fix round added the rebinding check (ruling P93 §A): an `/api`
     // request that does not address the bind is `403` before it reaches any
     // handler, and an in-process `oneshot` sets no `Host` of its own. These
@@ -185,22 +172,44 @@ async fn stream(
             HeaderValue::from_bytes(id).expect("test header value is a legal HTTP header"),
         );
     }
-    let request = builder.body(Body::empty()).expect("request builds");
+    builder.body(Body::empty()).expect("request builds")
+}
 
-    // Task 33 added the bind argument. Loopback: these are cursor tests, and
-    // the loopback bind is the one that puts no gate in front of the stream.
-    // Task 34 added the `store` field. `None`: these are SSE cursor tests and
-    // touch no store — see `AppState`'s docs for why that field is an `Option`.
-    let state = AppState {
+/// The state every test in this file builds its router over.
+///
+/// Task 34 added the `store` field. `None`: these are SSE cursor tests and
+/// touch no store — see `AppState`'s docs for why that field is an `Option`.
+fn sse_state(hub: &SseHub) -> AppState {
+    AppState {
         sse: hub.clone(),
         store: None,
         // Task 34's fix round added the pool bound (ruling P93 §B). Its default
         // is right here: with no store there is no pool to bound, and the SSE
         // handler takes no permit.
         ..AppState::default()
-    };
-    let response = build_router(state, &BindConfig::loopback())
-        .oneshot(request)
+    }
+}
+
+/// Drives the real router end to end.
+///
+/// Ordering is load-bearing: the request is dispatched **first**, because the
+/// handler is what subscribes to the hub; then `publish` runs; then the last
+/// `SseHub` handle is dropped. The hub owns the map that owns every session's
+/// sender, so that drop closes the channels and every stream ends, letting the
+/// body be collected. Without it an SSE body never ends — which is also why
+/// `SessionSubscription` holds only a `Weak` back-reference to that map: a
+/// strong one would keep its own sender alive and the close would never
+/// arrive.
+async fn stream(
+    hub: SseHub,
+    uri: &str,
+    last_event_id: Option<&[u8]>,
+    publish: impl FnOnce(&SseHub),
+) -> Streamed {
+    // Task 33 added the bind argument. Loopback: these are cursor tests, and
+    // the loopback bind is the one that puts no gate in front of the stream.
+    let response = build_router(sse_state(&hub), &BindConfig::loopback())
+        .oneshot(sse_request(uri, last_event_id))
         .await
         .expect("router is infallible");
 
@@ -226,6 +235,63 @@ async fn stream(
         status,
         headers,
         body: String::from_utf8(body.to_vec()).expect("SSE bodies are UTF-8"),
+    }
+}
+
+/// Drives the real router, reads the **first `frames` frames**, and then drops
+/// the response — a client that *disconnects*, which is the one thing
+/// [`stream`] structurally cannot express.
+///
+/// [`stream`] ends its body by dropping the last `SseHub` handle, because a
+/// session's `broadcast::Sender` lives in the hub's map and a stream ends only
+/// once its sender is gone. That is why every test above performs exactly **one**
+/// connection: the hub does not survive it, so there is nothing left to
+/// reconnect to. A *sequence* of connections needs a first one that ends without
+/// taking the hub with it, and a real client's disconnect is exactly that — the
+/// response body is dropped, which drops the `Sse` stream, which drops the
+/// `Connection` and with it the handler's `SessionSubscription`.
+///
+/// So the hub is **borrowed**, not consumed, and the caller must hold a second
+/// subscription across the call: that dropped subscription is otherwise the
+/// session's last, and `SessionSubscription::drop` prunes the map entry — ring
+/// included — before the next connection can reach it. Both callers hold a
+/// `_keeper` for that reason, and it is what a second open tab is in production.
+///
+/// `frames` is counted in `\n\n`-terminated blocks, the same unit
+/// [`parse_frames`] splits on. The wait is bounded and reported as a failure
+/// rather than hanging, for the same reason [`stream`]'s is.
+async fn stream_until_disconnect(
+    hub: &SseHub,
+    uri: &str,
+    last_event_id: Option<&[u8]>,
+    frames: usize,
+) -> Streamed {
+    let response = build_router(sse_state(hub), &BindConfig::loopback())
+        .oneshot(sse_request(uri, last_event_id))
+        .await
+        .expect("router is infallible");
+
+    let status = response.status();
+    let headers = response.headers().clone();
+
+    let mut chunks = response.into_body().into_data_stream();
+    let mut body = String::new();
+    while body.matches("\n\n").count() < frames {
+        let chunk = tokio::time::timeout(Duration::from_secs(10), chunks.next())
+            .await
+            .expect("the endpoint must emit the frames this connection waits for")
+            .expect("the stream must not end before it has emitted them")
+            .expect("body chunks are readable");
+        body.push_str(std::str::from_utf8(&chunk).expect("SSE bodies are UTF-8"));
+    }
+    // The disconnect itself, and the point of this helper: the subscription
+    // behind the response goes with it, while the hub stays up.
+    drop(chunks);
+
+    Streamed {
+        status,
+        headers,
+        body,
     }
 }
 
@@ -991,6 +1057,214 @@ async fn a_client_that_reconnects_exactly_where_it_left_off_is_not_resynced_by_a
     assert_eq!(
         frame_ids(&streamed.body),
         vec![format!("{session}:26"), format!("{session}:27")],
+    );
+}
+
+// ── reconnect *sequences*: the cursor has to compose, not just be right once ──
+//
+// Task 36 (Phase 5, Subsystem D7). Every test above performs exactly one
+// reconnect, because `stream` ends a body by destroying the hub. These two hold
+// the hub up across a disconnect (`stream_until_disconnect`) and ask what the
+// *next* connection gets — the two sequences whose failure modes a
+// single-reconnect test cannot see: a cursor that stops composing, and a resync
+// that resyncs again.
+
+/// A second reconnect resumes after what the **first one delivered**, and the
+/// cursor it resumes from is read out of the first connection's own frames
+/// rather than written into the test.
+///
+/// The property is composition: `Last-Event-ID` is not merely correct once. A
+/// client that reconnected, was replayed a gap, and dropped its connection must
+/// be able to reconnect again from the last id it actually saw and be given only
+/// what came after it — not the first gap a second time, and not nothing.
+///
+/// Nothing is published while either connection is open, so every frame in both
+/// bodies comes from the ring. That is what makes the second body's contents an
+/// assertion about the ring surviving the first connection's departure rather
+/// than about the live fan-out.
+///
+/// **Mutation killed, and it is killed *only* here:** making
+/// `impl Drop for SessionSubscription` prune unconditionally instead of at
+/// `receiver_count() <= 1`. The first connection's disconnect then takes the
+/// session's entry — channel and ring — with it even though `_keeper` is still
+/// reading, and the publish of seq 3 reaches nobody: `publish`'s receiver-count
+/// assertion fires. `a_sessions_channel_is_dropped_with_its_last_subscriber`
+/// cannot see this, because every subscription it holds drops at the same
+/// closing brace; no other test in this file drops one while another lives.
+///
+/// **Mutations also killed, jointly with tests above:** replaying the whole ring
+/// rather than the suffix from the cursor — the second body becomes `:1`..`:4`;
+/// not reading the header on the second request — the same; resuming at
+/// `cursor.seq` rather than `cursor.seq + 1` — `:2` is delivered twice across
+/// the two bodies.
+#[tokio::test]
+async fn a_second_reconnect_resumes_after_the_first_ones_last_frame_rather_than_replaying_its_gap()
+{
+    let hub = SseHub::new();
+    let session = SessionId::new();
+    // Another tab, open throughout: it is what keeps the session's entry — and
+    // so its ring — alive across the disconnect between the two connections.
+    let _keeper = hub.subscribe(session);
+
+    for (seq, text) in [(0, "zeroth"), (1, "first"), (2, "second")] {
+        publish(&hub, text_event(session, seq, text));
+    }
+
+    // First reconnect: the client holds seq 0 and is replayed the gap.
+    let first_cursor = format_event_id(&Cursor {
+        session_id: session,
+        seq: 0,
+    });
+    let first =
+        stream_until_disconnect(&hub, &events_uri(session), Some(first_cursor.as_bytes()), 2).await;
+
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(
+        frame_ids(&first.body),
+        vec![format!("{session}:1"), format!("{session}:2")],
+    );
+
+    // The daemon keeps appending while the client is away. That these reach a
+    // receiver at all is the assertion that the disconnect did not take the
+    // session's entry with it.
+    for (seq, text) in [(3, "third"), (4, "fourth")] {
+        publish(&hub, text_event(session, seq, text));
+    }
+
+    // Second reconnect, from the last id the first connection actually emitted
+    // — the value a browser sends back, not one this test chose.
+    let second_cursor = frame_ids(&first.body)
+        .pop()
+        .expect("the first connection emitted at least one frame");
+    let second = stream(
+        hub,
+        &events_uri(session),
+        Some(second_cursor.as_bytes()),
+        |_| {},
+    )
+    .await;
+
+    assert_eq!(second.status, StatusCode::OK);
+    assert_eq!(
+        frame_ids(&second.body),
+        vec![format!("{session}:3"), format!("{session}:4")],
+        "the second reconnect is owed exactly what was published after the first one ended: \
+         not the gap the first one already replayed, and not nothing. Body was:\n{}",
+        second.body
+    );
+
+    let expected: Vec<serde_json::Value> = [(3, "third"), (4, "fourth")]
+        .into_iter()
+        .map(|(seq, text)| {
+            serde_json::to_value(text_event(session, seq, text).event).expect("serializes")
+        })
+        .collect();
+    assert_eq!(frame_payloads(&second.body), expected);
+}
+
+/// A client that was told `resync_required` and reconnected **is not told it
+/// again**. The live-lock, pinned.
+///
+/// `resync_required` is an instruction: refetch a snapshot and reconnect. If the
+/// reconnect it asks for produces a second `resync_required`, the client is in a
+/// loop it cannot leave — a permanently blank page whose network tab shows a
+/// stream opening and closing forever. Every test above stops at the resync
+/// frame, so nothing pins the connection that comes after it.
+///
+/// The reconnect point is **derived from the resync frame's own payload**, which
+/// is what makes this an assertion about the protocol rather than about a
+/// number: `oldest_retained` is the oldest seq the server can still offer, so a
+/// client that snapshotted through `oldest_retained - 1` is owed exactly the
+/// ring's tail. If that is not a usable cursor, the frame does not say enough to
+/// escape the loop, whatever else is true of it.
+///
+/// **Mutation killed:** widening `Ring::replay_since`'s tail-miss test from
+/// `resume_from < oldest_retained` to `<=`. The first connection is unchanged —
+/// 1 is below 6 either way — and the second becomes a second `resync_required`
+/// carrying `{resume_from: 6, oldest_retained: 6}`, a client told to resync to
+/// where it already is. Neither
+/// `a_cursor_older_than_the_rings_tail_is_told_resync_required_rather_than_a_partial_replay`
+/// (whose cursor is far below the tail) nor
+/// `a_reconnecting_client_is_replayed_the_gap_the_ring_still_holds` (whose ring
+/// still holds seq 0, so its cursor is above the tail) is at the boundary. The
+/// ring's unit test
+/// `a_cursor_below_the_rings_tail_is_a_tail_miss_rather_than_a_partial_replay`
+/// does pin it, at that level; this is the same boundary through the endpoint,
+/// stated as the consequence a user experiences.
+#[tokio::test]
+async fn a_client_that_reconnects_after_a_resync_required_gets_a_stream_rather_than_a_second_resync(
+) {
+    let hub = SseHub::with_retention(Retention {
+        live_queue: 1,
+        ring_events: 4,
+        ..Retention::default()
+    });
+    let session = SessionId::new();
+    let _keeper = hub.subscribe(session);
+
+    for seq in 0..10 {
+        publish(&hub, text_event(session, seq, "delta"));
+    }
+
+    // The client holds only seq 0; the ring's tail is seq 6. One frame, and it
+    // is the instruction to resync.
+    let stale = format_event_id(&Cursor {
+        session_id: session,
+        seq: 0,
+    });
+    let refused =
+        stream_until_disconnect(&hub, &events_uri(session), Some(stale.as_bytes()), 1).await;
+
+    let frames = parse_frames(&refused.body);
+    assert_eq!(frames[0].event.as_deref(), Some("resync_required"));
+    let told: serde_json::Value = serde_json::from_str(
+        frames[0]
+            .data
+            .as_deref()
+            .expect("the resync frame states what it could not deliver"),
+    )
+    .expect("JSON");
+    assert_eq!(
+        told,
+        serde_json::json!({ "resume_from": 1, "oldest_retained": 6 })
+    );
+
+    // The client obeys: it refetches a snapshot, which brings it up to the event
+    // *before* the oldest the server still holds, and reconnects there. Nothing
+    // is published in between — the whole of the second body is what the ring
+    // owes a client that did as it was told.
+    let oldest_retained = told["oldest_retained"]
+        .as_u64()
+        .expect("oldest_retained is a seq");
+    let after_snapshot = format_event_id(&Cursor {
+        session_id: session,
+        seq: oldest_retained - 1,
+    });
+    let resumed = stream(
+        hub,
+        &events_uri(session),
+        Some(after_snapshot.as_bytes()),
+        |_| {},
+    )
+    .await;
+
+    assert_eq!(resumed.status, StatusCode::OK);
+    assert!(
+        parse_frames(&resumed.body)
+            .iter()
+            .all(|frame| frame.event.is_none()),
+        "a client that resynced and reconnected where the resync frame pointed it must get a \
+         working stream, not a second resync_required — that is a loop it cannot leave. \
+         Body was:\n{}",
+        resumed.body
+    );
+    assert_eq!(
+        frame_ids(&resumed.body),
+        (6..10)
+            .map(|seq| format!("{session}:{seq}"))
+            .collect::<Vec<_>>(),
+        "the reconnect is owed the ring's whole contents, from its tail on. Body was:\n{}",
+        resumed.body
     );
 }
 
