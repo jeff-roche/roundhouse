@@ -89,17 +89,62 @@
 //!   run-level ledger. It needs a durable column to live in; an in-memory
 //!   tracker would be lost on the first daemon restart, which is precisely
 //!   the case it exists to measure.
+//! - **The reaper's periodic runner, AND the durable `parked_at` it would
+//!   need to read** (ruling P72) — **Task 20 (B12)**, the same owner as the
+//!   run-level ledger above. Unlike the runner-only gap `blobs.rs`'s daily
+//!   GC has, there is no column anywhere in the schema that records when a
+//!   run parked: `workflow_run.started_at` is the run's start, not its park
+//!   time, `workflow_step_run` has no timestamp column at all, and
+//!   [`WorkspaceDisposition::HoldUntil`] is an in-process value that does
+//!   not survive a daemon restart. `awaiting_until` cannot substitute — see
+//!   the next section. Whoever builds the runner needs a
+//!   `roundhouse-store` migration first; this task does not add one (see
+//!   "The reaper's periodic runner does not exist" below).
+//! - **A `Duration::ZERO` screen for `timeout_after`.** No document-driven
+//!   path produces one today — [`AwaitingHuman::from_gate`] rejects it and
+//!   `TryFrom<&UnattendedDef>` rejects it before `from_escalate` ever sees
+//!   it — and [`crate::hitl::HumanWaitSource::Elicitation`] has no
+//!   constructor at all, so
+//!   the only way to reach [`park`] with `timeout_after: Some(Duration::ZERO)`
+//!   today is to hand-build an [`AwaitingHuman`], as
+//!   `tests/parking.rs`'s elicitation fixtures do. [`absolute_deadline`]
+//!   would turn that into `awaiting_until == now`: not wrong, but a park
+//!   that expires the instant it is taken. The screen belongs either in
+//!   whichever crate builds the real elicitation constructor, or in
+//!   `absolute_deadline`/`park` directly once one exists — recorded here
+//!   because neither exists yet.
 //!
-//! # The reaper's periodic runner does not exist
+//! # The reaper's periodic runner does not exist — and its input is not durable either
 //!
 //! [`reaper_cutoff`] is a pure predicate in the shape of
-//! `roundhouse_store::blobs::gc_eligible_blobs`. **The periodic runner that
-//! would call it on a schedule is unowned daemon work**: there is no
+//! `roundhouse_store::blobs::gc_eligible_blobs`, and the periodic runner
+//! that would call it on a schedule is unowned daemon work: there is no
 //! periodic-task machinery in `roundhouse-daemon` at all today (verified by
 //! grep: one `tokio::spawn`, the socket accept loop, and no call to
-//! `Scheduler::tick` anywhere). Whoever builds that runner serves two
-//! callers, not one — `blobs.rs`'s daily GC wants the identical missing
-//! machinery.
+//! `Scheduler::tick` anywhere). **That much of the comparison to
+//! `blobs.rs`'s daily GC holds** — both want the identical missing timer.
+//!
+//! **The rest of the comparison does not, and an earlier version of this
+//! note stated it as an unqualified "same as `blobs.rs`", which was wrong
+//! (ruling P72).** `gc_eligible_blobs` queries **real columns**; for it, the
+//! timer really is the only missing piece. `reaper_cutoff(parked_at, now)`
+//! has **no durable source for `parked_at` anywhere in the schema**:
+//! `workflow_run` carries `started_at` (run start, not park time) and
+//! `awaiting_until`; `workflow_step_run` has no timestamp column at all; and
+//! [`WorkspaceDisposition::HoldUntil`] is an in-process return value that
+//! survives no restart. `awaiting_until` cannot stand in for it — it is the
+//! *wait's* own deadline, deliberately **not** clamped to
+//! [`SYSTEM_WIDE_HOLD_CAP`] (see [`park`]'s "two different quantities"
+//! section), and it is `NULL` in exactly the windowless-elicitation case
+//! that can still hold a workspace.
+//!
+//! So whoever builds the periodic runner is not just adding a timer — they
+//! need a `roundhouse-store` migration first, to add a durable park-time
+//! column. That owner is **Task 20 (B12)**, which already owns the durable
+//! run-level ledger `caps.rs` points at. This task deliberately does not add
+//! that column: doing so here would be the same silent scope creep the
+//! `on_crash` deferral avoided elsewhere in this phase, and migration 0007
+//! belongs to Task 16.
 
 use crate::durability::RunState;
 use crate::exec::RunId;
@@ -131,11 +176,21 @@ pub const SYSTEM_WIDE_HOLD_CAP: Duration = Duration::from_secs(7 * 86400);
 ///
 /// **Derived, not restated**, so the two cannot drift apart into a clamp and
 /// a reaper that disagree — the failure mode the "two legs of the same rule"
-/// note on [`resolve_hold_ttl`] describes. `as_secs()` loses nothing here
-/// because [`SYSTEM_WIDE_HOLD_CAP`] is a whole number of seconds
-/// (`Duration::from_secs`), and a value large enough to make this multiply
-/// overflow would be a compile error rather than a wrap.
-const SYSTEM_WIDE_HOLD_CAP_NANOS: i64 = SYSTEM_WIDE_HOLD_CAP.as_secs() as i64 * 1_000_000_000;
+/// note on [`resolve_hold_ttl`] describes.
+///
+/// Goes through [`Duration::as_nanos`] rather than
+/// `as_secs() as i64 * 1_000_000_000`: `as_nanos` is `const`, exact for the
+/// current whole-week value, and stays exact if this constant is ever
+/// edited to a non-whole-second duration — `as_secs()` would silently
+/// truncate that precision away before the multiply ever ran. The remaining
+/// `u128 -> i64` narrowing is exact for the current value (604,800 seconds
+/// in nanoseconds is far under `i64::MAX`), but it is **not** a
+/// self-defending guard the way the multiply it replaces would have been:
+/// an `as` cast that no longer fits truncates silently rather than failing
+/// the build, unlike the arithmetic overflow the const evaluator rejects at
+/// compile time. A future edit large enough to overflow this cast would not
+/// be caught here.
+const SYSTEM_WIDE_HOLD_CAP_NANOS: i64 = SYSTEM_WIDE_HOLD_CAP.as_nanos() as i64;
 
 /// A handle to the restore point §8.11's implicit `checkpoint` task
 /// produces. Opaque text, because the shape belongs to whoever implements
@@ -149,6 +204,20 @@ pub struct CheckpointRef(pub String);
 /// [`Checkpointer`] lives outside this crate (git and filesystem work, see
 /// the module doc), so this crate has no vocabulary of its own for the ways
 /// it can fail — only the obligation to refuse to park when it does.
+///
+/// **Doc contract for implementors — not enforced by this crate.**
+/// `message` never reaches a database column; it only flows into
+/// [`ParkError`]'s `Display`, which is log-only, so this crate adds no
+/// truncation machinery of its own here (contrast `durability.rs`'s
+/// `truncate_stored_step_error`, which bounds the same class of text at its
+/// funnel *because* that text does reach a column). But a [`Checkpointer`]
+/// implementation is out-of-crate git/filesystem code that can see
+/// arbitrarily large or sensitive text — a diff, a path under a secret
+/// directory, a git error that echoes file contents — so an implementation
+/// MUST keep `message` short (comfortably under a few hundred bytes, the
+/// same order of magnitude other diagnostic text in this crate is bounded
+/// to) and MUST NOT include secret material. Nothing here checks either
+/// property; both are the contract this field's producer takes on.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("the implicit checkpoint task failed: {message}")]
 pub struct CheckpointError {
@@ -223,16 +292,29 @@ pub struct ParkResult {
     pub workspace: WorkspaceDisposition,
 }
 
-/// Why a park failed. Every variant means **nothing was written**.
+/// Why a park failed.
+///
+/// **Every variant means nothing *durable* was written; the two variants
+/// reachable after the checkpoint has already been taken may leave behind
+/// an unused restore point.** Those two are [`Sqlite`](Self::Sqlite), from
+/// the `UPDATE`/commit itself, and the post-`UPDATE` zero-row
+/// [`RunNotFound`](Self::RunNotFound) (see its doc for the two points it is
+/// actually raised from). `DeadlineOverflow`, `MalformedId`, `Checkpoint`,
+/// and the pre-read `RunNotFound` all fail before any checkpoint is taken,
+/// so for those four nothing at all is left behind, durable or not.
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ParkError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
-    /// The run has no `workflow_run` row. The application-level leg of the
-    /// reference `durability::checkpoint_step` also checks, for the same
-    /// reason: no connection in this workspace sets `PRAGMA foreign_keys =
-    /// ON`, so a declared `FOREIGN KEY` would be inert.
+    /// The run has no `workflow_run` row — or, at the second of this
+    /// variant's two raise points, it did when [`park`] read it but no
+    /// longer matches (see [`run_session_id`] and [`park`]'s `UPDATE`,
+    /// which now binds `session_id` into its `WHERE` clause). The
+    /// application-level leg of the reference `durability::checkpoint_step`
+    /// also checks for the row's existence, for the same reason: no
+    /// connection in this workspace sets `PRAGMA foreign_keys = ON`, so a
+    /// declared `FOREIGN KEY` would be inert.
     #[error("no workflow_run row for run {run_id}")]
     RunNotFound { run_id: RunId },
     /// A stored id column does not parse as a UUID — the read-back leg of
@@ -336,9 +418,41 @@ pub fn resolve_hold_ttl(gate_timeout: Option<Duration>) -> Duration {
 /// that matters: nothing in this workspace ever deletes a `workflow_run`
 /// row, and `session_id` is never updated after insert, so a row read here
 /// is still present and still carries the same session when the `UPDATE`
-/// runs. The `UPDATE`'s own zero-row check is kept anyway rather than being
-/// assumed away — it is the leg that would catch that assumption becoming
-/// false.
+/// runs. The `UPDATE` binds that same `session_id` into its own `WHERE`
+/// clause (`WHERE id = ?3 AND session_id = ?4`) rather than relying on the
+/// assumption alone — that is what actually turns "`session_id` never
+/// changes after insert" into a checked precondition rather than an
+/// unenforced one: the zero-row check catches a row that vanished between
+/// the two statements, but on its own it could not have told a row whose
+/// `session_id` changed out from under it from one that simply moved
+/// forward normally. One bind parameter, no extra statement, and no lock
+/// held any longer — the check happens inside the same `BEGIN IMMEDIATE`
+/// the `UPDATE` already opens.
+///
+/// # No transition-legality check
+///
+/// `park` does not check the run's *current* `state` before moving it to
+/// `AwaitingHuman` — it will move a `completed`, `failed`, `cancelled`, or
+/// `cancelling` run there just as readily as a `running` one, resurrecting
+/// a terminal run or silently un-cancelling a cancel in flight. There is no
+/// run state machine being bypassed by this: nothing else in this tree
+/// issues an `UPDATE workflow_run SET state`, so this is the first writer,
+/// not a writer that skipped a check others rely on.
+///
+/// **This is deliberately the caller's obligation, not this function's.**
+/// The run loop that decides *when* to park a run is Task 20 (B12)'s
+/// `exec::Executor` run loop, not this crate's `park`, and source-state
+/// validation belongs with the decision to park, not with the mechanism
+/// that records it — the same division `run_session_id` already draws for
+/// "which session". Task 20 must add this check before wiring `park` into
+/// the run loop; the security lens reviewing this task named cancel-evasion
+/// (parking a run to dodge an in-flight cancellation) as the concrete shape
+/// this gap takes once that wiring exists. **If a state predicate is added,
+/// it must be `state IN ('running', 'awaiting_human')`, not `= 'running'`**
+/// — re-parking an already-`awaiting_human` run is the idempotency
+/// `a_re_driven_park_never_gets_a_fresh_window_it_moves_only_by_the_now_the_caller_supplied`
+/// in `tests/parking.rs` pins, and a bare `= 'running'` predicate would
+/// break it.
 ///
 /// # The wait's deadline and the workspace hold are two different quantities
 ///
@@ -383,11 +497,12 @@ pub fn park(
 
     let txn = roundhouse_store::begin_immediate(conn)?;
     let updated = txn.execute(
-        "UPDATE workflow_run SET state = ?1, awaiting_until = ?2 WHERE id = ?3",
+        "UPDATE workflow_run SET state = ?1, awaiting_until = ?2 WHERE id = ?3 AND session_id = ?4",
         params![
             RunState::AwaitingHuman.as_sql_str(),
             awaiting_until.map(|t| t.as_unix_nanos()),
             run_id.to_string(),
+            session_id.to_string(),
         ],
     )?;
     if updated == 0 {

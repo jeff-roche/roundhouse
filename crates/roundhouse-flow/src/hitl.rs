@@ -344,12 +344,15 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 }
 
 impl AwaitingHuman {
-    /// Turns a parsed `StepBody::Gate { title, form, timeout, on_timeout }`
-    /// into the one mechanism.
+    /// Turns a parsed `StepBody::Gate { title, form, timeout, on_timeout,
+    /// hold_workspace }` into the one mechanism — all but `hold_workspace`,
+    /// which this constructor does not consume: it is
+    /// `crate::parking::park`'s concern (see that module's doc), not part of
+    /// the human-wait shape itself.
     ///
-    /// Takes the four fields rather than the `StepBody` so the caller can
-    /// destructure once and so this never has to reject a non-`Gate` body it
-    /// was handed by mistake.
+    /// Takes the four fields it uses rather than the `StepBody` so the
+    /// caller can destructure once and so this never has to reject a
+    /// non-`Gate` body it was handed by mistake.
     ///
     /// `timeout` goes through the crate's single duration parser
     /// ([`parse_duration_str`]), so a gate's malformed `timeout: "10 s"` is

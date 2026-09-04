@@ -11,12 +11,13 @@ use roundhouse_flow::durability::{
     insert_workflow_run, open_test_db, recover_run, RunState, WorkflowRun,
 };
 use roundhouse_flow::exec::RunId;
-use roundhouse_flow::hitl::AwaitingHuman;
+use roundhouse_flow::hitl::{AwaitingHuman, HumanWaitSource, UncheckedOnTimeout};
 use roundhouse_flow::parking::{
     absolute_deadline, park, reaper_cutoff, resolve_hold_ttl, CheckpointError, CheckpointRef,
     Checkpointer, ParkError, WorkspaceDisposition, DEFAULT_HOLD_TTL, SYSTEM_WIDE_HOLD_CAP,
 };
 use roundhouse_flow::parse::steps::{parse_step, StepBody, StepDef};
+use roundhouse_flow::parse::types::OnTimeout;
 use rusqlite::Connection;
 use std::time::Duration;
 
@@ -110,6 +111,28 @@ fn awaiting_from_gate(step: &StepDef) -> AwaitingHuman {
         .expect("the fixture gate builds a human wait")
 }
 
+/// A mid-step elicitation with no declared window — `timeout_after: None`
+/// paired with `HumanWaitSource::Elicitation`, the only shape `hitl.rs:249-252`
+/// documents as reachable for a `None` deadline. Built literally, field by
+/// field, rather than by mutating a `from_gate` value down to `None`: every
+/// `AwaitingHuman` field is `pub` and `HumanWaitSource::Elicitation` has no
+/// constructor in this crate on purpose (the elicitation call site is
+/// outside it, Phase 3's MCP host), so a hand-built struct literal *is* the
+/// shape the real caller will eventually pass, not a test-only shortcut.
+fn an_elicitation_with_no_deadline() -> AwaitingHuman {
+    AwaitingHuman {
+        task_id: TaskId::new(),
+        source: HumanWaitSource::Elicitation,
+        form_schema: serde_json::json!({
+            "type": "object",
+            "title": "Provide input",
+            "properties": {},
+        }),
+        timeout_after: None,
+        on_timeout: UncheckedOnTimeout::new(OnTimeout::Deny),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The durable park: relative -> absolute, written with the run state
 // ---------------------------------------------------------------------------
@@ -184,11 +207,7 @@ fn a_re_driven_park_never_gets_a_fresh_window_it_moves_only_by_the_now_the_calle
 fn an_elicitation_with_no_declared_window_parks_with_a_null_deadline() {
     let session_id = SessionId::new();
     let (mut conn, run_id) = a_running_run(session_id);
-    let step = gate_step("id: approve\ngate: { title: 'Ship it?', timeout: 1h, on_timeout: deny }");
-    let mut awaiting = awaiting_from_gate(&step);
-    // `timeout_after: None` is reachable only from an elicitation: a gate's
-    // `timeout:` is mandatory in the wire shape.
-    awaiting.timeout_after = None;
+    let awaiting = an_elicitation_with_no_deadline();
     let now = Timestamp::from_unix_nanos(1_000 * NANOS_PER_SEC);
     let mut cp = FakeCheckpointer::new();
 
@@ -369,9 +388,7 @@ fn holding_a_workspace_for_a_wait_with_no_window_uses_the_72h_fallback() {
     // one source that can produce it.
     let session_id = SessionId::new();
     let (mut conn, run_id) = a_running_run(session_id);
-    let step = gate_step("id: approve\ngate: { title: 'Ship it?', timeout: 1h, on_timeout: deny }");
-    let mut awaiting = awaiting_from_gate(&step);
-    awaiting.timeout_after = None;
+    let awaiting = an_elicitation_with_no_deadline();
     let now = Timestamp::from_unix_nanos(0);
     let mut cp = FakeCheckpointer::new();
 
@@ -477,12 +494,28 @@ fn a_representable_deadline_is_computed_exactly() {
     );
 }
 
+#[test]
+fn a_deadline_landing_exactly_on_the_largest_representable_instant_succeeds() {
+    // The two overflow tests and `a_representable_deadline_is_computed_exactly`
+    // bracket `i64::MAX` from either side but never land on it. `now + after
+    // == i64::MAX` is the last instant `checked_add` accepts before the
+    // overflow arm those other tests exercise.
+    let now = Timestamp::from_unix_nanos(i64::MAX - 11);
+    assert_eq!(
+        absolute_deadline(now, Duration::from_nanos(11)).expect("i64::MAX itself fits"),
+        Timestamp::from_unix_nanos(i64::MAX)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The reaper predicate
 // ---------------------------------------------------------------------------
 
 #[test]
-fn seven_day_system_wide_cap_applies_regardless_of_any_individual_gate_ttl() {
+fn reaper_cutoff_is_true_well_past_seven_days_and_false_well_within_it() {
+    // No gate and no gate TTL are involved here — this is a pure
+    // `reaper_cutoff` boundary test, not a claim about any individual
+    // gate's timeout (the previous name over-claimed that).
     let now = Timestamp::from_unix_nanos(30 * 86400 * NANOS_PER_SEC);
     let eight_days_ago = Timestamp::from_unix_nanos((30 - 8) * 86400 * NANOS_PER_SEC);
     assert!(reaper_cutoff(eight_days_ago, now));
