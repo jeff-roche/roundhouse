@@ -1,10 +1,19 @@
 //! §11.3's opt-in LAN bind and its shared per-device token.
 //!
-//! §11.3, in full: *"Binding beyond `127.0.0.1` is opt-in (a flag, off by
-//! default — loopback-only remains what you get with no configuration), and
-//! when enabled it's gated by a **shared token** entered once per device,
-//! generated into the state dir […] — no login system, no session management,
-//! no TLS by default."*
+//! §11.3: *"Binding beyond `127.0.0.1` is opt-in (a flag, off by default —
+//! loopback-only remains what you get with no configuration), and when enabled
+//! it's gated by a **shared token** entered once per device, generated into the
+//! state dir […] — no login system, no session management, no TLS by default."*
+//!
+//! The `[…]` is not cosmetic and is named here so a reader checking the quote
+//! does not trip over it. What it elides is *"the same way the existing
+//! loopback token already is (§6.4's approval-flow token pattern)"*
+//! (`docs/architecture/08-ui-design.md:125`) — the clause ruling P84 §E
+//! identified as unresolvable: a `grep` over `crates/` finds **neither
+//! referent**, no "existing loopback token" and no §6.4 approval-flow token.
+//! The elision is therefore a dropped false premise, not a shortened sentence,
+//! and the file hygiene below is this module's own design rather than a pattern
+//! it copied from somewhere.
 //!
 //! Four things about that sentence drive everything below, and each one is a
 //! decision this module makes rather than inherits.
@@ -160,12 +169,27 @@ const QUERY_PARAM_PREFIX: &str = "access_token=";
 /// `default_runtime_dir`'s reason: it would resolve against a working directory
 /// that differs between processes.
 ///
-/// **Residual:** this is the only definition, and `roundhouse-web` is linked by
-/// one binary. The moment a second crate needs the state dir, this must move to
-/// a crate both depend on — the way `default_runtime_dir` lives in
-/// `roundhouse-tui` because both binaries need it — rather than being copied.
-/// Two definitions of "where the state dir is" drift silently, and the symptom
-/// is a daemon reading a token some other component never wrote.
+/// **Residual: this must move, and the trigger is nearer than it looks.** It is
+/// the only *definition* today, but it is not the only *claim*:
+/// `roundhouse-policy/src/trust.rs:94` already names `~/.local/state/roundhouse`
+/// in prose as the root of the trust store, and `TrustStore::new` takes that
+/// path from its caller rather than computing it. So the accurate trigger is
+/// **the moment the daemon constructs a `TrustStore`** — at that point one
+/// process needs the trust store and the LAN token rooted at the same
+/// directory, and it would be resolving that directory twice, once here and
+/// once wherever the daemon spells it.
+///
+/// The destination is **`roundhouse-config`**: it already reads the environment
+/// (`loader.rs:108` resolves `$HOME`), and both `roundhouse-web` and
+/// `roundhouse-policy`'s caller can depend on it. `roundhouse-core` is ruled
+/// out — it is the zero-I/O root, and `std::env` is I/O for its purposes.
+///
+/// Worth naming the layering too, because it is the part that makes this a
+/// residual rather than a preference: `roundhouse-web` is a leaf, and a path
+/// policy that is not web-specific living in a leaf means the daemon would
+/// reach **up** into it for something the daemon owns. Two definitions of
+/// "where the state dir is" drift silently, and the symptom is a daemon reading
+/// a token some other component never wrote.
 pub fn default_state_dir() -> Option<PathBuf> {
     state_dir_from(
         std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
@@ -336,8 +360,15 @@ fn create_token_file(path: &Path) -> io::Result<String> {
 ///    token we never generated.
 /// 3. **`0o077` bits set**: someone other than the owner can reach the token.
 /// 4. **Larger than [`MAX_TOKEN_FILE_BYTES`]**, refused from the `fstat` above
-///    rather than by reading and then judging, so the read below is bounded by
-///    something other than what the file turned out to be.
+///    rather than by reading and then judging. The read itself is *also*
+///    capped at that constant with `Read::take`, and the two are not redundant:
+///    the `fstat` is what produces a refusal with a message naming the size,
+///    and `take` is what makes "the read is bounded" true of the read rather
+///    than of the check in front of it. A file that grows between the `fstat`
+///    and the read — or a `/proc`-style file whose `st_size` is 0 and whose
+///    contents are not — would otherwise be an unbounded `read_to_string` into
+///    memory. Neither is reachable for a `0600` regular file inside a `0700`
+///    directory this uid owns; the cap costs one call and removes the caveat.
 /// 5. **Not [`TOKEN_BYTES`] of hex**, which covers a different failure entirely:
 ///    two daemons starting together race, one creates the file and the other
 ///    opens it between the `O_EXCL` create and the `write_all`, reading zero
@@ -349,36 +380,26 @@ fn create_token_file(path: &Path) -> io::Result<String> {
 ///    be typed in by hand.
 ///
 fn read_token_file(path: &Path) -> io::Result<String> {
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
         .open(path)?;
     let meta = file.metadata()?;
 
-    if meta.uid() != rustix::process::getuid().as_raw() {
-        return Err(io::Error::other(format!(
-            "{} is not owned by the current user, refusing to use it as the LAN token",
-            path.display()
-        )));
-    }
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(io::Error::other(format!(
-            "{} permissions too open, refusing to use it as the LAN token",
-            path.display()
-        )));
-    }
-
-    if meta.len() > MAX_TOKEN_FILE_BYTES {
-        return Err(io::Error::other(format!(
-            "{} is {} bytes, past the {MAX_TOKEN_FILE_BYTES}-byte limit for a token file; \
-             refusing to read it",
-            path.display(),
-            meta.len()
-        )));
-    }
+    check_token_metadata(meta.uid(), meta.permissions().mode(), meta.len())
+        // The predicate says *what* is wrong; only this frame knows *which
+        // file*. Prefixing here keeps the messages exactly as they read before
+        // the split — "<path> is not owned by…", "<path> permissions too
+        // open…" — while leaving the predicate free of a path argument it
+        // would only ever interpolate.
+        .map_err(|err| io::Error::new(err.kind(), format!("{} {err}", path.display())))?;
 
     let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
+    // Bounded by the same constant the `fstat` above judged against — see
+    // refusal 4 for why both, and why neither is redundant.
+    (&file)
+        .take(MAX_TOKEN_FILE_BYTES)
+        .read_to_string(&mut contents)?;
     let hex = contents.trim().to_string();
     match hex::decode(&hex) {
         Ok(bytes) if bytes.len() == TOKEN_BYTES => Ok(hex),
@@ -388,6 +409,45 @@ fn read_token_file(path: &Path) -> io::Result<String> {
             path.display()
         ))),
     }
+}
+
+/// [`read_token_file`]'s refusals 2, 3 and 4, as a predicate over the three
+/// `fstat` fields they read — file owner, mode, size — in that order.
+///
+/// # Why this is split out rather than inlined
+///
+/// **So the uid refusal has a test at all.** A `cargo test` run has exactly one
+/// uid, and the file it reads is one it just created, so the end-to-end path
+/// through [`read_token_file`] can never reach the uid branch: there is no way
+/// to make a test process own a file it does not own. That branch was
+/// consequently the one hole in this module's mutation table — deleting it
+/// killed nothing. As a free function over three integers the *predicate* is
+/// reachable with `uid = getuid() + 1`, which is what
+/// `a_token_file_owned_by_another_uid_is_refused` does. What stays untestable
+/// is only the wiring — that [`read_token_file`] passes `meta.uid()` and not
+/// something else — and that is one line in view of its caller rather than a
+/// branch buried three checks deep.
+///
+/// The messages deliberately carry no path: they are written to be read with
+/// the file name prefixed by the caller, which is the only frame that knows it.
+fn check_token_metadata(uid: u32, mode: u32, len: u64) -> io::Result<()> {
+    if uid != rustix::process::getuid().as_raw() {
+        return Err(io::Error::other(
+            "is not owned by the current user, refusing to use it as the LAN token",
+        ));
+    }
+    if mode & 0o077 != 0 {
+        return Err(io::Error::other(
+            "permissions too open, refusing to use it as the LAN token",
+        ));
+    }
+    if len > MAX_TOKEN_FILE_BYTES {
+        return Err(io::Error::other(format!(
+            "is {len} bytes, past the {MAX_TOKEN_FILE_BYTES}-byte limit for a token file; \
+             refusing to read it"
+        )));
+    }
+    Ok(())
 }
 
 /// Creates the state dir `0700`, or verifies an existing one is a directory,
@@ -408,13 +468,39 @@ fn read_token_file(path: &Path) -> io::Result<String> {
 /// they are shared, conventional locations, and demanding `0700` of `~/.local`
 /// would fail on most systems for no gain — the privacy property belongs to the
 /// leaf, which is the directory the token is in.
+///
+/// # The mode is set after the create, and it is not redundant with `DirBuilder::mode`
+///
+/// Same asymmetry [`create_token_file`] fixes one function over, and for the
+/// same reason: `DirBuilder::mode` is masked by the process umask, which can
+/// only *clear* bits — so it cannot make the directory more permissive than
+/// `0700`, but it can and does make it less. What makes it worth a line here is
+/// that the failure is **permanent**, not transient. A daemon first started
+/// under `umask 0o277` creates a `0500` directory; check 2 below then rejects
+/// it — its own directory, at its own path — on every subsequent start, forever,
+/// with no `umask` the operator can set to undo it. Re-chmodding at creation
+/// means the mode is a property of this function rather than of whatever umask
+/// the daemon happened to inherit the first time it ran.
+///
+/// Through an open descriptor (`fchmod`), like the token file's, so the chmod
+/// cannot land on a different inode than the `create` just made; `O_NOFOLLOW |
+/// O_DIRECTORY` refuses to open anything swapped in between the two.
 fn ensure_state_dir(dir: &Path) -> io::Result<()> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
     match DirBuilder::new().mode(STATE_DIR_MODE).create(dir) {
-        // Freshly created by us: a directory, 0700, and ours by construction.
-        Ok(()) => Ok(()),
+        // Freshly created by us: a directory and ours by construction; 0700
+        // only once the umask's contribution is undone.
+        Ok(()) => {
+            let created = OpenOptions::new()
+                .read(true)
+                .custom_flags(
+                    (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::DIRECTORY).bits() as i32,
+                )
+                .open(dir)?;
+            created.set_permissions(Permissions::from_mode(STATE_DIR_MODE))
+        }
         Err(err) if err.kind() == ErrorKind::AlreadyExists => {
             let meta = std::fs::symlink_metadata(dir)?;
             if !meta.file_type().is_dir() {
@@ -430,9 +516,15 @@ fn ensure_state_dir(dir: &Path) -> io::Result<()> {
             if mode != STATE_DIR_MODE {
                 return Err(io::Error::new(
                     ErrorKind::PermissionDenied,
+                    // The remedy is in the message on purpose. A plain
+                    // `create_dir_all` from any other component, under a normal
+                    // 0022 umask, leaves 0755 here — and then LAN opt-in fails
+                    // permanently with no hint of what to do. Failing closed is
+                    // right; failing closed silently is a bug report.
                     format!(
                         "{} has mode {mode:04o}, expected {STATE_DIR_MODE:04o}; refusing to keep \
-                         the LAN token in a directory others can reach",
+                         the LAN token in a directory others can reach. Fix it with: chmod 700 {}",
+                        dir.display(),
                         dir.display()
                     ),
                 ));
@@ -651,5 +743,74 @@ mod tests {
     fn nothing_usable_yields_none_rather_than_a_guess() {
         assert_eq!(state_dir_from(None, None), None);
         assert_eq!(state_dir_from(Some("rel".into()), Some("rel".into())), None);
+    }
+
+    /// This uid, so the metadata a legitimate token file presents.
+    fn our_uid() -> u32 {
+        rustix::process::getuid().as_raw()
+    }
+
+    /// The refusal that has no end-to-end test and can have none: a `cargo
+    /// test` run has one uid, and every token file it reads is one it created.
+    /// The predicate is reachable where the path through [`read_token_file`] is
+    /// not — see [`check_token_metadata`] for why it is a free function.
+    #[test]
+    fn a_token_file_owned_by_another_uid_is_refused() {
+        // `wrapping_add` rather than `+ 1`: at `u32::MAX` this must still name
+        // *a* different uid, not panic in a debug build.
+        let other = our_uid().wrapping_add(1);
+
+        let error = check_token_metadata(other, 0o600, 64)
+            .expect_err("a token file owned by another uid is refused");
+        assert!(
+            error.to_string().contains("not owned by the current user"),
+            "the refusal must name the owner, not some other check; got {error}"
+        );
+    }
+
+    /// The three refusals run in a fixed order, and this pins it: a file that
+    /// is *both* foreign and loose is refused as foreign. If the owner check
+    /// were moved below the mode check, a `0600` file owned by someone else
+    /// would pass the mode check and this would still refuse it — but with the
+    /// wrong reason, and the reason is what an operator acts on.
+    #[test]
+    fn the_owner_check_runs_before_the_mode_check() {
+        let error = check_token_metadata(our_uid().wrapping_add(1), 0o644, 64)
+            .expect_err("foreign and loose is still refused");
+        assert!(
+            error.to_string().contains("not owned by the current user"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn a_token_file_others_can_reach_is_refused_by_the_predicate() {
+        let error = check_token_metadata(our_uid(), 0o640, 64)
+            .expect_err("a group-readable token file is refused");
+        assert!(
+            error.to_string().contains("permissions too open"),
+            "got {error}"
+        );
+    }
+
+    /// The limit is inclusive: exactly [`MAX_TOKEN_FILE_BYTES`] is accepted and
+    /// one byte past it is not. Asserted at the boundary because an off-by-one
+    /// here is invisible at any other size.
+    #[test]
+    fn the_size_refusal_is_exclusive_at_the_limit() {
+        check_token_metadata(our_uid(), 0o600, MAX_TOKEN_FILE_BYTES)
+            .expect("exactly the limit is not past it");
+
+        let error = check_token_metadata(our_uid(), 0o600, MAX_TOKEN_FILE_BYTES + 1)
+            .expect_err("one byte past the limit is refused");
+        assert!(error.to_string().contains("past the"), "got {error}");
+    }
+
+    /// The metadata a file this module just wrote presents, so that a mutation
+    /// tightening any of the three checks — `!=` for `==`, `0o077` for `0o777`,
+    /// `>` for `>=` — fails here rather than only in the negative cases.
+    #[test]
+    fn a_token_file_this_daemon_wrote_passes_every_check() {
+        check_token_metadata(our_uid(), 0o600, 64).expect("0600, ours, 64 bytes is the good case");
     }
 }

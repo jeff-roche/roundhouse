@@ -7,10 +7,13 @@
 //! that was read — and a mock would assert only that this file agrees with
 //! itself. Every temp directory here has its mode set explicitly rather than
 //! left to the umask, because a `tempdir()` inherits the ambient `0022` as
-//! `0755` — which [`a_state_dir_others_can_reach_is_refused`] shows the
-//! implementation correctly rejects, and which
+//! `0755` — which
+//! [`a_state_dir_others_can_reach_is_refused_with_the_chmod_that_fixes_it`]
+//! shows the implementation correctly rejects, and which
 //! [`the_token_file_is_owner_read_write_even_under_a_umask_that_would_strip_the_write_bit`]
-//! deliberately makes hostile for the duration of one test.
+//! and
+//! [`the_state_dir_is_reusable_after_a_first_start_under_a_hostile_umask`]
+//! deliberately make hostile for the duration of one test each.
 //!
 //! The router tests go through [`roundhouse_web::build_router`] rather than
 //! calling the middleware directly, because "is the gate actually mounted, over
@@ -19,12 +22,12 @@
 //!
 //! Per rulings P79/P81, every test here (and every `lan_auth` unit test in
 //! `src/`) is killed by at least one stated mutation of the implementation, and
-//! each of those mutations kills a **proper** subset — the table of 26
-//! mutations and the tests each one killed is in this task's report, measured
-//! against this file as it ships rather than an earlier revision of it. One
-//! candidate test was cut for failing that bar: an oversized token file is
-//! refused with or without a size check, so the surviving test asserts on the
-//! *message*, which is the only thing that actually differs.
+//! each of those mutations kills a **proper** subset. The mutation table, and
+//! which tests each mutation killed, is in this task's report, measured against
+//! this file as it ships rather than an earlier revision of it. One candidate test
+//! was cut for failing that bar: an oversized token file is refused with or
+//! without a size check, so the surviving test asserts on the *message*, which
+//! is the only thing that actually differs.
 
 use std::fs::Permissions;
 use std::net::{IpAddr, Ipv4Addr};
@@ -261,8 +264,14 @@ fn the_token_file_is_owner_read_write_even_under_a_umask_that_would_strip_the_wr
 /// place anyone can plant a symlink for the token open to follow. `tempdir()`
 /// without explicit permissions produces exactly that under a typical `0022`
 /// umask, which is what this uses.
+///
+/// The refusal must also carry its remedy. `0755` is what a plain
+/// `create_dir_all` from any other component produces under a normal umask, so
+/// this is a state a user reaches without doing anything wrong — and without
+/// the `chmod` in the message, LAN opt-in fails permanently with nothing
+/// saying how to unstick it.
 #[test]
-fn a_state_dir_others_can_reach_is_refused() {
+fn a_state_dir_others_can_reach_is_refused_with_the_chmod_that_fixes_it() {
     let dir = tempfile::tempdir().expect("a temp dir is creatable");
     std::fs::set_permissions(dir.path(), Permissions::from_mode(0o755))
         .expect("the mode is settable");
@@ -273,9 +282,45 @@ fn a_state_dir_others_can_reach_is_refused() {
         "the error must name the mode it found; got {error}"
     );
     assert!(
+        error
+            .to_string()
+            .contains(&format!("chmod 700 {}", dir.path().display())),
+        "the error must name the command that fixes it, with the path; got {error}"
+    );
+    assert!(
         !token_path(dir.path()).exists(),
         "refusing must not leave a token file behind in the directory it refused"
     );
+}
+
+/// `DirBuilder::mode(0o700)` is masked by the umask exactly as `OpenOptions::
+/// mode` is, so under `0o277` the state dir is created `0o500` — and then
+/// `ensure_state_dir`'s own `mode != 0o700` check refuses it on **every
+/// subsequent start**, for a directory this code created, with no umask the
+/// operator can set to undo it. The failure is permanent rather than transient,
+/// which is why the `fchmod` after the create is worth its lines.
+///
+/// The second load is the assertion that matters: the first one could pass with
+/// no fix at all, since a freshly created dir takes the `Ok(())` arm without
+/// being re-checked.
+#[test]
+fn the_state_dir_is_reusable_after_a_first_start_under_a_hostile_umask() {
+    let dir = tempfile::tempdir().expect("a temp dir is creatable");
+    let state = dir.path().join("roundhouse");
+    let _umask = umask_guard();
+
+    let previous = rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o277));
+    let first = LanToken::load_or_create(&state);
+    rustix::process::umask(previous);
+
+    first.expect("a fresh state dir yields a token whatever the umask");
+    assert_eq!(
+        mode_of(&state),
+        0o700,
+        "the mode must come from this code, not from the ambient umask"
+    );
+    LanToken::load_or_create(&state)
+        .expect("a restart must not be refused by the mode this code itself created");
 }
 
 #[test]
@@ -291,6 +336,17 @@ fn a_token_file_others_can_reach_is_refused() {
     assert!(
         error.to_string().contains("permissions too open"),
         "got {error}"
+    );
+    // The reason comes from `check_token_metadata`, which is a predicate over
+    // three integers and cannot know *which* file; the path is prefixed by
+    // `read_token_file`, the only frame that does. Asserted because a refusal
+    // naming no file is one an operator cannot act on, and because the split
+    // into a predicate is what put those two halves in different functions.
+    assert!(
+        error
+            .to_string()
+            .contains(&token_path(dir.path()).display().to_string()),
+        "the refusal must name the file it refused; got {error}"
     );
 }
 

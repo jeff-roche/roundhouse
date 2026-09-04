@@ -96,6 +96,12 @@ thiserror = { workspace = true }
 # a new crate or adds a graph node — the declarations only make edges this
 # crate already builds against explicit.
 #
+# Counted exactly, because this manifest's comments get cited as evidence: the
+# lockfile gains **five** dependency edges on the `roundhouse-web` package and
+# **zero** `[[package]]` blocks. Four are these (`getrandom`, `subtle`, `hex`,
+# `rustix`); the fifth is `tempfile` in `[dev-dependencies]` below. The
+# load-bearing half of the claim is the zero.
+#
 # `getrandom`: the token's 32 bytes, straight from the OS CSPRNG. Deliberately
 # NOT `rand`: `roundhouse-provider` declares `rand = "0.9"` and the lockfile
 # also carries 0.8 and 0.10, so reaching for `rand` here means picking a major
@@ -106,9 +112,20 @@ thiserror = { workspace = true }
 # required, not cosmetic: without it `getrandom::Error` implements neither
 # `std::error::Error` nor the OS-error lookup its `Display` uses, so a failure
 # to draw entropy would neither convert into `io::Error` nor say what went
-# wrong. It is purely additive — it adds impls, no code path and no crate — so
-# feature unification with the graph's other `getrandom` users is a no-op for
-# them.
+# wrong.
+#
+# It adds **no crate** (`std = []` in getrandom's own manifest, so feature
+# unification pulls nothing new into the graph), but "purely additive, no code
+# path" would be wrong and is worth stating accurately since features unify
+# workspace-wide. Enabling `std` also changes behaviour for every other
+# `getrandom` consumer in this graph, in three places: `Error`'s `Display` text
+# becomes `std::io::Error::from_raw_os_error(errno)`'s instead of
+# `"OS Error: {errno}"` (`src/error.rs:200`), its `Debug` gains a
+# `description` field (`src/error.rs:184`), and the aarch64 RNDR backend
+# detects FEAT_RNG with `is_aarch64_feature_detected!` rather than the
+# MRS-emulation probe (`src/backends/rndr.rs:75`). None of the three matters on
+# this workspace's platforms — they are message text, and a backend not
+# selected here — but none of them is "no code path".
 #
 # `subtle`: constant-time comparison of the presented token. Already in
 # `Cargo.lock` at 2.6.1, declared by nobody until now. The alternative is a
