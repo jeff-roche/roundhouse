@@ -35,7 +35,20 @@
 //!   **Task 17 (B9)**.
 //! - **The run loop itself**: `catch:`/stop-on-failure, task admission, `map`
 //!   process spawn / `max_parallel`, the run-level budget ledger, and
-//!   cancel/pause/resume/retry-from-step — **Task 20 (B12)**.
+//!   cancel/pause/resume/retry-from-step — **Task 20 (B12)**. Writing
+//!   [`StepRunState::Skipped`] and [`WorkflowStepRun::error`] belongs to that
+//!   loop too: this task has the columns and the types, and produces neither
+//!   value.
+//! - **Clearing `output` for steps no fork can still target** — **Task 20
+//!   (B12)**. This is the one residual with a security edge, so it is named
+//!   rather than assumed: [`checkpoint_step`] deliberately makes `output`
+//!   last-write-wins, so checkpointing a step with `output: None` already
+//!   writes `output = NULL, output_is_secret_derived = 0` and (with
+//!   `PRAGMA secure_delete = ON`, set in `roundhouse-store`'s pool) zeroes
+//!   the freed bytes. The **mechanism exists and is tested; what is missing
+//!   is a caller** — a retention policy deciding which completed runs can no
+//!   longer be forked. Until then, unredacted step output stays at rest for
+//!   the life of the row.
 //! - **§8.10 tier 3** (agent-step conversation reload) and
 //!   `round workflow replay --dry` — unscheduled; recorded as phase
 //!   residuals, not silently assumed.
@@ -98,6 +111,14 @@ pub enum DurabilityError {
     /// the value's only purpose is to join back to the log.
     #[error("task seq {seq} does not fit a SQLite INTEGER")]
     SeqOutOfRange { seq: u64 },
+    /// A stored `item_index` is neither [`TOP_LEVEL_ITEM_INDEX`] nor a `u32`.
+    /// The same read-back rule as [`Self::UnrecognizedDiscriminant`], applied
+    /// to a numeric column: mapping an out-of-domain value onto `None` would
+    /// make it indistinguishable from the sentinel, so two rows with
+    /// different states could be recovered under one identity. The value is
+    /// echoed because it is a bounded integer, not stored content.
+    #[error("column workflow_step_run.item_index holds {stored}, which is neither the top-level sentinel nor a u32")]
+    ItemIndexOutOfRange { stored: i64 },
 }
 
 /// §8.10 tier 2's crash-recovery classification of a step.
@@ -186,6 +207,9 @@ impl StepDisposition {
 }
 
 /// The persisted state of one step attempt.
+///
+/// As with [`RunState`], the set is deliberately wider than this task's own
+/// writes need — see [`Self::Skipped`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepRunState {
     Pending,
@@ -196,6 +220,19 @@ pub enum StepRunState {
     /// [`recover_run`].
     Indeterminate,
     Failed,
+    /// A step whose `when:` guard evaluated false. **Written by Task 20
+    /// (B12)**, which owns the run loop; `exec::StepStatus::Skipped` is
+    /// already produced there.
+    ///
+    /// It is in the enum, and in migration 0007's `CHECK`, now rather than
+    /// later for the reason [`RunState`]'s doc gives: a skipped step is
+    /// *finished*, so on re-drive the run loop must not re-evaluate its
+    /// `when:` (the condition may read differently by then, changing control
+    /// flow) and downstream steps interpolate `${{ steps.<id>.status }}`. A
+    /// `CHECK` that omitted it would force Task 20 to rebuild the table —
+    /// SQLite has no `ALTER TABLE … DROP/MODIFY CONSTRAINT`. Shape now,
+    /// behaviour later.
+    Skipped,
 }
 
 impl StepRunState {
@@ -206,6 +243,7 @@ impl StepRunState {
             StepRunState::Completed => "completed",
             StepRunState::Indeterminate => "indeterminate",
             StepRunState::Failed => "failed",
+            StepRunState::Skipped => "skipped",
         }
     }
 
@@ -218,6 +256,7 @@ impl StepRunState {
             "completed" => Ok(StepRunState::Completed),
             "indeterminate" => Ok(StepRunState::Indeterminate),
             "failed" => Ok(StepRunState::Failed),
+            "skipped" => Ok(StepRunState::Skipped),
             other => Err(DurabilityError::UnrecognizedDiscriminant {
                 column: "workflow_step_run.state",
                 value: other.to_string(),
@@ -285,6 +324,11 @@ impl RunState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashPolicy {
     Rerun,
+    /// Only a step that *declared* `on_crash: fail` produces this, and no
+    /// step can declare anything today — see this module's "Named gap"
+    /// section. [`on_crash_policy`] therefore never returns it; the variant
+    /// exists because §8.10 tier 2's vocabulary has three members, and a
+    /// two-member enum would misreport the contract as smaller than it is.
     Fail,
     Ask,
 }
@@ -314,9 +358,15 @@ pub fn on_crash_policy(disposition: StepDisposition) -> CrashPolicy {
 /// explicit that this layer must **read** that flag rather than recompute it:
 /// *"a re-derivation that disagrees with this one is a leak."* Pairing the
 /// value with the flag in a type whose only public constructor is
-/// [`StepOutput::from_outcome`] is what makes that structural: there is no
-/// public way to build a `StepOutput` while supplying a taint verdict of your
-/// own.
+/// [`StepOutput::from_outcome`] is what makes that structural — for
+/// *accidental* mis-pairing, which is the failure this defends against: no
+/// caller can hand this type a value and a taint verdict chosen
+/// independently. It is **not** a laundering barrier: `exec::StepOutcome` is
+/// `pub` with `pub` fields and no `#[non_exhaustive]`, so a determined caller
+/// can build one whose flag disagrees with its value (this crate's own tests
+/// build outcomes that way) and pass it in. Making that impossible would mean
+/// changing `exec`'s public shape, which this task deliberately does not
+/// touch.
 ///
 /// # This holds UNREDACTED material, by design
 ///
@@ -326,11 +376,15 @@ pub fn on_crash_policy(disposition: StepDisposition) -> CrashPolicy {
 /// resume and fork silently produce different results from the original run.
 /// The consequence, stated plainly rather than left implicit: **the
 /// `workflow_step_run.output` column can contain secret-derived material at
-/// rest**, and every consumer that renders, logs, or ships it onward
-/// (Task 20's fork, the web Runs inbox) must branch on
-/// [`Self::is_secret_derived`]. That is the obligation this flag exists to
-/// carry. [`Self`]'s hand-written [`fmt::Debug`] discharges it for the one
-/// consumer this crate can speak for: its own `{:?}`.
+/// rest**, and every consumer that renders, logs, or ships it onward (the web
+/// Runs inbox, Task 20's fork) owes a taint check first.
+///
+/// That obligation is carried by the accessors rather than by this comment:
+/// [`Self::value_for_display`] performs the check and yields `None` when the
+/// value is tainted, and [`Self::value_unredacted_for_resume`] is named so
+/// that reaching past the check is a visible act rather than the path of
+/// least resistance. [`Self`]'s hand-written [`fmt::Debug`] closes the third
+/// route, its own `{:?}`.
 #[derive(Clone, PartialEq)]
 pub struct StepOutput {
     value: serde_json::Value,
@@ -347,13 +401,39 @@ impl StepOutput {
         }
     }
 
-    /// The step's real, unredacted output — see this type's doc comment for
-    /// what a caller owes before rendering it.
-    pub fn value(&self) -> &serde_json::Value {
+    /// The step's real, **unredacted** output, for the two callers that need
+    /// the real value and nothing else will do: persisting it here, and
+    /// §8.13's fork/resume re-seeding a step context from it.
+    ///
+    /// Named the way it is on purpose. The neighbouring module already
+    /// settled this convention — `exec` pairs `redacted_for_logging()` with
+    /// `into_unredacted_for_dispatch()` so the hazardous call cannot be typed
+    /// innocently — and a display path that reaches for this one is visibly
+    /// reaching for the wrong thing. Anything that renders, logs, or ships an
+    /// output onward wants [`Self::value_for_display`] instead.
+    pub fn value_unredacted_for_resume(&self) -> &serde_json::Value {
         &self.value
     }
 
-    /// Whether [`Self::value`] was computed by reading secret-marked material.
+    /// The output when it is safe to show, and `None` when it is not.
+    ///
+    /// This is the accessor a web handler, an inbox renderer, or a log line
+    /// should call: the taint check is *inside* it, so forgetting the check is
+    /// not something a caller can do by typing the obvious thing. `None` here
+    /// means exactly one thing — there **is** an output and it is
+    /// secret-derived, so it is withheld. ("There is no output at all" is
+    /// [`WorkflowStepRun::output`] being `None`, one level up.) A renderer
+    /// that wants to say *why* it is showing nothing asks
+    /// [`Self::is_secret_derived`].
+    pub fn value_for_display(&self) -> Option<&serde_json::Value> {
+        if self.is_secret_derived {
+            None
+        } else {
+            Some(&self.value)
+        }
+    }
+
+    /// Whether the output was computed by reading secret-marked material.
     pub fn is_secret_derived(&self) -> bool {
         self.is_secret_derived
     }
@@ -417,11 +497,23 @@ impl fmt::Debug for ValueShape<'_> {
 /// Stored in `workflow_step_run.item_index` for a step that is not a `map`
 /// item (i.e. [`WorkflowStepRun::item_index`] is `None`).
 ///
-/// A sentinel rather than `NULL` because SQLite permits `NULL` in a rowid
-/// table's `PRIMARY KEY` and treats every `NULL` as distinct from every
-/// other, so a nullable column would make each checkpoint of one top-level
-/// step insert a **new** row instead of updating the existing one. `-1` is
-/// outside `u32`, so it can never collide with a real item index.
+/// A sentinel rather than `NULL` because `workflow_step_run` is a `STRICT`
+/// table, and `STRICT` makes every `PRIMARY KEY` column implicitly `NOT
+/// NULL` — so `NULL` is not storable in this column at all, and a "nullable"
+/// `item_index` would fail the very first top-level checkpoint with
+/// *"NOT NULL constraint failed"*.
+///
+/// The failure would be **loud**, not silent. (In an ordinary, non-`STRICT`
+/// rowid table it would instead be silent duplicate rows, since SQLite does
+/// permit `NULL`s in such a `PRIMARY KEY` and compares every `NULL` as
+/// distinct. Both halves verified directly against SQLite 3.53.4.) The
+/// sentinel is required either way; only the shape of the averted failure
+/// differs.
+///
+/// `-1` is outside `u32`, so it can never collide with a real item index —
+/// and migration 0007 bounds the column at `u32::MAX` above so that nothing
+/// *else* can land outside `u32` either and become indistinguishable from
+/// this sentinel on read-back (see [`item_index_from_sql`]).
 pub const TOP_LEVEL_ITEM_INDEX: i64 = -1;
 
 /// One attempt at one step (of one `map` item, where applicable).
@@ -447,6 +539,21 @@ pub struct WorkflowStepRun {
     pub last_task_seq: Option<u64>,
     /// The step's output once it has one — see [`StepOutput`].
     pub output: Option<StepOutput>,
+    /// The message from `exec::StepStatus::Failed { message }` or the reason
+    /// from `Skipped { reason }`, persisted because it cannot be recomputed
+    /// once the process that produced it is gone — the same argument that
+    /// puts [`Self::output`] in the row. Task 20 (B12)'s `catch:` and the web
+    /// Runs inbox are the consumers; **Task 20 is also the writer**, since
+    /// this task owns no run loop and so never produces a `Failed`/`Skipped`
+    /// status of its own. `None` for any step that neither failed nor was
+    /// skipped.
+    ///
+    /// Not redacted, and no taint flag: the executor computes none for a
+    /// status message. `exec::StepStatus`'s hand-written `Debug` bounds what
+    /// a `{:?}` of such a message *prints*, which is not the same as bounding
+    /// what is stored here — this column holds the message in full. Treat it
+    /// with the same care as [`Self::output`].
+    pub error: Option<String>,
 }
 
 /// One workflow run.
@@ -546,6 +653,23 @@ pub fn insert_workflow_run(
 /// is `COALESCE`d: *first* means first, so once a step's log range has a
 /// start, a later checkpoint never moves it.
 ///
+/// **`output` is deliberately last-write-wins, not `COALESCE`d**, so a
+/// checkpoint carrying no output *clears* a previously persisted one. Two
+/// reasons, both load-bearing:
+///
+/// 1. `output` and `output_is_secret_derived` are one fact in two columns —
+///    that pairing is the whole point of [`StepOutput`]. `COALESCE`ing the
+///    value while taking the flag from the incoming row would let a tainted
+///    output survive next to a `0` flag, which is the leak this design
+///    exists to prevent; keeping them both last-write-wins keeps them
+///    honest.
+/// 2. This is the only mechanism by which a stored output can ever be
+///    erased, and migration 0007 names erasing outputs no fork can still
+///    target as a residual owned by **Task 20 (B12)**. `COALESCE`ing here
+///    would delete that mechanism before its caller was written.
+///
+/// The erasure is pinned by a test rather than left to be rediscovered.
+///
 /// The taint flag written here is [`StepOutput`]'s, i.e. the executor's own —
 /// this function has no way to compute one and deliberately offers none.
 ///
@@ -561,11 +685,17 @@ pub fn checkpoint_step(
     conn: &mut Connection,
     step: &WorkflowStepRun,
 ) -> Result<(), DurabilityError> {
-    // Infallible in practice — a `serde_json::Value` has no non-string map
-    // keys and no custom `Serialize` that can fail — so this is `expect`ed
-    // rather than given an error variant that could never be constructed.
+    // The unredacted accessor, deliberately: this column stores the real
+    // value (see `StepOutput`), and a redacted stand-in here would make a
+    // resumed or forked run compute different results from the original.
+    //
+    // The serialization is infallible in practice — a `serde_json::Value` has
+    // no non-string map keys and no custom `Serialize` that can fail — so it
+    // is `expect`ed rather than given an error variant that could never be
+    // constructed.
     let output_json = step.output.as_ref().map(|output| {
-        serde_json::to_string(output.value()).expect("a serde_json::Value always serializes")
+        serde_json::to_string(output.value_unredacted_for_resume())
+            .expect("a serde_json::Value always serializes")
     });
     let output_is_secret_derived = step
         .output
@@ -586,15 +716,16 @@ pub fn checkpoint_step(
     txn.execute(
         "INSERT INTO workflow_step_run
             (run_id, step_id, attempt, item_index, disposition, state,
-             first_task_seq, last_task_seq, output, output_is_secret_derived)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             first_task_seq, last_task_seq, output, output_is_secret_derived, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(run_id, step_id, attempt, item_index) DO UPDATE SET
              disposition = excluded.disposition,
              state = excluded.state,
              first_task_seq = COALESCE(workflow_step_run.first_task_seq, excluded.first_task_seq),
              last_task_seq = excluded.last_task_seq,
              output = excluded.output,
-             output_is_secret_derived = excluded.output_is_secret_derived",
+             output_is_secret_derived = excluded.output_is_secret_derived,
+             error = excluded.error",
         params![
             step.run_id.to_string(),
             step.step_id,
@@ -606,6 +737,7 @@ pub fn checkpoint_step(
             seq_to_sql(step.last_task_seq)?,
             output_json,
             output_is_secret_derived,
+            step.error,
         ],
     )?;
     txn.commit()?;
@@ -638,7 +770,7 @@ pub fn recover_run(conn: &Connection, run_id: RunId) -> Result<RecoveredRun, Dur
 
     let mut stmt = conn.prepare(
         "SELECT step_id, attempt, item_index, disposition, state,
-                first_task_seq, last_task_seq, output, output_is_secret_derived
+                first_task_seq, last_task_seq, output, output_is_secret_derived, error
          FROM workflow_step_run WHERE run_id = ?1
          ORDER BY step_id, attempt, item_index",
     )?;
@@ -653,6 +785,7 @@ pub fn recover_run(conn: &Connection, run_id: RunId) -> Result<RecoveredRun, Dur
             row.get::<_, Option<i64>>(6)?,
             row.get::<_, Option<String>>(7)?,
             row.get::<_, bool>(8)?,
+            row.get::<_, Option<String>>(9)?,
         ))
     })?;
 
@@ -668,6 +801,7 @@ pub fn recover_run(conn: &Connection, run_id: RunId) -> Result<RecoveredRun, Dur
             last_task_seq,
             output,
             output_is_secret_derived,
+            error,
         ) = row?;
         let disposition = StepDisposition::from_sql_str(&disposition)?;
         let mut state = StepRunState::from_sql_str(&state)?;
@@ -685,12 +819,13 @@ pub fn recover_run(conn: &Connection, run_id: RunId) -> Result<RecoveredRun, Dur
             run_id,
             step_id,
             attempt,
-            item_index: item_index_from_sql(item_index),
+            item_index: item_index_from_sql(item_index)?,
             disposition,
             state,
             first_task_seq: first_task_seq.map(seq_from_sql),
             last_task_seq: last_task_seq.map(seq_from_sql),
             output,
+            error,
         });
     }
     Ok(RecoveredRun { run, steps })
@@ -880,11 +1015,24 @@ fn item_index_to_sql(item_index: Option<u32>) -> i64 {
     }
 }
 
-/// The inverse of [`item_index_to_sql`]. Any negative value maps back to
-/// `None`; migration 0007's `CHECK (item_index >= -1)` is what keeps the only
-/// negative value writable through this crate the sentinel itself.
-fn item_index_from_sql(stored: i64) -> Option<u32> {
-    u32::try_from(stored).ok()
+/// The inverse of [`item_index_to_sql`], and fallible for the reason
+/// [`StepDisposition::from_sql_str`] is: the sentinel and an out-of-domain
+/// value are two different facts, and `u32::try_from(..).ok()` would collapse
+/// them into the same `None`. That is not merely lossy — it is lossy in the
+/// *aliasing* direction, so [`recover_run`] could return two
+/// [`WorkflowStepRun`]s with identical identity fields and different states,
+/// which is exactly the collision migration 0007's primary key exists to
+/// prevent. Migration 0007's
+/// `CHECK (item_index BETWEEN -1 AND 4294967295)` is the insert-time leg of
+/// the same rule; this is the read-back leg, and it is what catches a
+/// hand-edited or pre-`CHECK` row.
+fn item_index_from_sql(stored: i64) -> Result<Option<u32>, DurabilityError> {
+    if stored == TOP_LEVEL_ITEM_INDEX {
+        return Ok(None);
+    }
+    u32::try_from(stored)
+        .map(Some)
+        .map_err(|_| DurabilityError::ItemIndexOutOfRange { stored })
 }
 
 fn seq_to_sql(seq: Option<u64>) -> Result<Option<i64>, DurabilityError> {

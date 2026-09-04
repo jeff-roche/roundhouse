@@ -148,25 +148,75 @@ fn workflow_run_and_workflow_step_run_reject_unrecognized_discriminants() {
         "an unrecognized workflow_run.state must violate the CHECK constraint"
     );
 
-    let bogus_disposition = conn.execute(
-        "INSERT INTO workflow_step_run \
+    // The positive control for every workflow_step_run assertion below. Without
+    // it, a typo in the column list would make each of them fail for the wrong
+    // reason and still pass. It also pins the column list itself, and its
+    // 'skipped' state pins that a `when:`-skipped step — which Task 20 (B12)
+    // writes and `exec::StepStatus::Skipped` already produces — is storable
+    // without rebuilding a table SQLite cannot alter in place.
+    const STEP_RUN_INSERT: &str = "INSERT INTO workflow_step_run \
          (run_id, step_id, attempt, item_index, disposition, state, output_is_secret_derived) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params!["run-a", "s", 1i64, -1i64, "bogus", "running", 0i64],
-    );
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+    conn.execute(
+        STEP_RUN_INSERT,
+        rusqlite::params!["run-a", "s", 1i64, -1i64, "effectful", "skipped", 0i64],
+    )
+    .expect("a recognized disposition and state, with the sentinel item_index, is accepted");
+
+    let bogus_disposition = conn
+        .execute(
+            STEP_RUN_INSERT,
+            rusqlite::params!["run-a", "s2", 1i64, -1i64, "bogus", "running", 0i64],
+        )
+        .expect_err("an unrecognized workflow_step_run.disposition must be refused");
+    // Not `ErrorCode::ConstraintViolation`, which also covers PRIMARY KEY and
+    // NOT NULL and so would not discriminate between "the CHECK caught it" and
+    // "the insert was malformed".
     assert!(
-        bogus_disposition.is_err(),
-        "an unrecognized workflow_step_run.disposition must violate the CHECK constraint"
+        bogus_disposition
+            .to_string()
+            .contains("CHECK constraint failed"),
+        "expected a CHECK constraint failure, got: {bogus_disposition}"
     );
 
-    let tainted_without_output = conn.execute(
-        "INSERT INTO workflow_step_run \
-         (run_id, step_id, attempt, item_index, disposition, state, output_is_secret_derived) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params!["run-a", "s", 1i64, -1i64, "effectful", "running", 1i64],
-    );
+    let bogus_state = conn
+        .execute(
+            STEP_RUN_INSERT,
+            rusqlite::params!["run-a", "s3", 1i64, -1i64, "effectful", "bogus", 0i64],
+        )
+        .expect_err("an unrecognized workflow_step_run.state must be refused");
     assert!(
-        tainted_without_output.is_err(),
-        "a row with no output cannot claim its (absent) output is secret-derived"
+        bogus_state.to_string().contains("CHECK constraint failed"),
+        "expected a CHECK constraint failure, got: {bogus_state}"
     );
+
+    let tainted_without_output = conn
+        .execute(
+            STEP_RUN_INSERT,
+            rusqlite::params!["run-a", "s4", 1i64, -1i64, "effectful", "running", 1i64],
+        )
+        .expect_err("a row with no output cannot claim its (absent) output is secret-derived");
+    assert!(
+        tainted_without_output
+            .to_string()
+            .contains("CHECK constraint failed"),
+        "expected a CHECK constraint failure, got: {tainted_without_output}"
+    );
+
+    // item_index is bounded at BOTH ends. The upper bound exists because
+    // item_index is a u32 in Rust: an out-of-domain stored value would read
+    // back through the same "not a u32" path as the -1 sentinel, aliasing two
+    // rows with different states onto one identity.
+    for (label, index) in [("above u32::MAX", 4_294_967_296i64), ("below -1", -2i64)] {
+        let err = conn
+            .execute(
+                STEP_RUN_INSERT,
+                rusqlite::params!["run-a", "s5", 1i64, index, "effectful", "running", 0i64],
+            )
+            .expect_err(label);
+        assert!(
+            err.to_string().contains("CHECK constraint failed"),
+            "an item_index {label} must fail the CHECK constraint, got: {err}"
+        );
+    }
 }

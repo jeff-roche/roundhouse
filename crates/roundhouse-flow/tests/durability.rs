@@ -46,6 +46,7 @@ fn a_step_run(run_id: RunId, step_id: &str, disposition: StepDisposition) -> Wor
         first_task_seq: Some(10),
         last_task_seq: Some(12),
         output: None,
+        error: None,
     }
 }
 
@@ -240,9 +241,13 @@ fn two_map_items_of_the_same_step_and_attempt_are_distinct_rows_not_one_overwrit
 }
 
 /// The other half of B-2: a *top-level* step has no item index, and two
-/// checkpoints of it must still be one row. A NULL in a SQLite primary key
-/// compares distinct from every other NULL, so `item_index` is stored with a
-/// sentinel rather than NULL — this pins that.
+/// checkpoints of it must still be one row. `item_index` is stored with a
+/// sentinel rather than NULL because these are `STRICT` tables, where every
+/// `PRIMARY KEY` column is implicitly `NOT NULL` and a NULL therefore cannot
+/// be stored at all. (The "NULLs compare distinct in a PRIMARY KEY" behaviour
+/// is real, but it belongs to an ordinary rowid table; under `STRICT` the
+/// same mistake is an insert-time error instead of silent duplicate rows.)
+/// Either way the sentinel is required — this pins the one-row result.
 #[test]
 fn a_top_level_step_checkpointed_twice_is_one_row_not_two() {
     let mut conn = open_test_db();
@@ -342,7 +347,7 @@ fn step_output_and_its_taint_flag_round_trip_instead_of_being_re_derived() {
         .unwrap();
     let notify_output = notify.output.as_ref().expect("output was persisted");
     assert_eq!(
-        notify_output.value(),
+        notify_output.value_unredacted_for_resume(),
         &serde_json::json!({"body": "token sk-super-secret"}),
         "§8.13's fork inherits the real completed step output, not a redacted stand-in"
     );
@@ -357,7 +362,10 @@ fn step_output_and_its_taint_flag_round_trip_instead_of_being_re_derived() {
         .find(|s| s.step_id == "summary")
         .unwrap();
     let summary_output = summary.output.as_ref().unwrap();
-    assert_eq!(summary_output.value(), &serde_json::json!({"count": 3}));
+    assert_eq!(
+        summary_output.value_unredacted_for_resume(),
+        &serde_json::json!({"count": 3})
+    );
     assert!(!summary_output.is_secret_derived());
 
     // A step with no output at all is distinguishable from one whose output
@@ -463,4 +471,205 @@ fn checkpointing_a_step_of_a_run_that_was_never_inserted_is_refused_not_orphaned
     // reveal a step row written by the rejected call.
     insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
     assert!(recover_run(&conn, run_id).unwrap().steps.is_empty());
+}
+
+/// I-2 (fix round 1). `StepOutput` now has a **safe** accessor as well as an
+/// honestly-named hazardous one. `value_for_display` is the call a web
+/// handler or an inbox renderer reaches for, and it performs the taint check
+/// itself — so the leak shape the security lens described
+/// (`json!({ "output": step.output.as_ref().map(StepOutput::value) })`) has
+/// no innocent-looking spelling left.
+#[test]
+fn a_tainted_output_is_withheld_from_the_display_accessor_but_not_from_resume() {
+    let tainted = StepOutput::from_outcome(&StepOutcome {
+        step_id: "notify".into(),
+        output: serde_json::json!({"body": "sk-super-secret"}),
+        status: StepStatus::Completed,
+        output_is_secret_derived: true,
+        gate_condition_was_secret_derived: false,
+    });
+    assert_eq!(
+        tainted.value_for_display(),
+        None,
+        "a secret-derived output is not renderable"
+    );
+    assert_eq!(
+        tainted.value_unredacted_for_resume(),
+        &serde_json::json!({"body": "sk-super-secret"}),
+        "resume and §8.13's fork still need the real value"
+    );
+
+    let clean = StepOutput::from_outcome(&StepOutcome {
+        step_id: "summary".into(),
+        output: serde_json::json!({"count": 3}),
+        status: StepStatus::Completed,
+        output_is_secret_derived: false,
+        gate_condition_was_secret_derived: false,
+    });
+    assert_eq!(
+        clean.value_for_display(),
+        Some(&serde_json::json!({"count": 3})),
+        "an untainted output renders normally"
+    );
+}
+
+/// C-1 (fix round 1). A `when:`-skipped step is **finished**: on re-drive the
+/// run loop must not re-evaluate its `when:`, and downstream steps read
+/// `${{ steps.<id>.status }}`. `exec::StepStatus::Skipped` already exists, so
+/// migration 0007's CHECK and `StepRunState` carry `skipped` from the start
+/// rather than making Task 20 rebuild a table SQLite cannot alter in place.
+/// Nothing in this task writes it; this pins that it *can* be written.
+#[test]
+fn a_skipped_step_state_round_trips_through_the_schema() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    let mut skipped = a_step_run(run_id, "deploy", StepDisposition::Effectful);
+    skipped.state = StepRunState::Skipped;
+    skipped.error = Some("when: evaluated false".into());
+    checkpoint_step(&mut conn, &skipped).unwrap();
+
+    let recovered = recover_run(&conn, run_id).unwrap();
+    let deploy = recovered
+        .steps
+        .iter()
+        .find(|s| s.step_id == "deploy")
+        .expect("the skipped step was checkpointed");
+    assert_eq!(
+        deploy.state,
+        StepRunState::Skipped,
+        "skipped is a storable, recoverable state — not re-derived by re-evaluating `when:`"
+    );
+    assert_eq!(
+        deploy.error.as_deref(),
+        Some("when: evaluated false"),
+        "the skip reason survives the process that produced it"
+    );
+    assert_ne!(
+        deploy.state,
+        StepRunState::Indeterminate,
+        "an Effectful step that was skipped was never Running, so recovery must not mark it \
+         indeterminate"
+    );
+}
+
+/// C-3 (fix round 1). A failure message is persisted for the same reason the
+/// output is: it cannot be recomputed once the process that produced it is
+/// gone, and Task 20's `catch:` and the web Runs inbox both need it.
+#[test]
+fn a_failure_message_survives_the_checkpoint_instead_of_being_dropped() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    let mut failed = a_step_run(run_id, "build", StepDisposition::Effectful);
+    failed.state = StepRunState::Failed;
+    failed.error = Some("cargo build exited 101".into());
+    checkpoint_step(&mut conn, &failed).unwrap();
+
+    let build = recover_run(&conn, run_id).unwrap().steps.remove(0);
+    assert_eq!(build.state, StepRunState::Failed);
+    assert_eq!(build.error.as_deref(), Some("cargo build exited 101"));
+
+    // And a step that has not failed carries no error, rather than an empty
+    // string standing in for one.
+    let ok = a_step_run(run_id, "aaa_ok", StepDisposition::Pure);
+    checkpoint_step(&mut conn, &ok).unwrap();
+    let recovered = recover_run(&conn, run_id).unwrap();
+    let ok = recovered
+        .steps
+        .iter()
+        .find(|s| s.step_id == "aaa_ok")
+        .unwrap();
+    assert_eq!(ok.error, None);
+}
+
+/// `checkpoint_step`'s upsert makes `output` last-write-wins rather than
+/// `COALESCE`ing it, so a checkpoint carrying no output **clears** a stored
+/// one. That is deliberate on both counts: it keeps `output` and its taint
+/// flag moving together (a `COALESCE`d value beside a fresh `0` flag would be
+/// a leak), and it is the only mechanism by which a stored output can ever be
+/// erased — the erasure whose *caller* is a residual owned by Task 20. Pinned
+/// here so it is a decision rather than something rediscovered as a bug.
+#[test]
+fn a_checkpoint_with_no_output_clears_a_previously_stored_one() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    let mut row = a_step_run(run_id, "notify", StepDisposition::Effectful);
+    row.state = StepRunState::Completed;
+    row.output = Some(StepOutput::from_outcome(&StepOutcome {
+        step_id: "notify".into(),
+        output: serde_json::json!({"body": "sk-super-secret"}),
+        status: StepStatus::Completed,
+        output_is_secret_derived: true,
+        gate_condition_was_secret_derived: false,
+    }));
+    checkpoint_step(&mut conn, &row).unwrap();
+    assert!(recover_run(&conn, run_id).unwrap().steps[0]
+        .output
+        .is_some());
+
+    row.output = None;
+    checkpoint_step(&mut conn, &row).unwrap();
+    let recovered = recover_run(&conn, run_id).unwrap();
+    assert_eq!(recovered.steps.len(), 1, "still one row, not two");
+    assert!(
+        recovered.steps[0].output.is_none(),
+        "the stored output was cleared, and with it the taint flag"
+    );
+}
+
+/// C-2 (fix round 1). `item_index` is bounded at both ends. The lower bound
+/// keeps the `-1` sentinel the only negative value; the upper bound matters
+/// because `item_index` is a `u32` in Rust, so an out-of-domain stored value
+/// would otherwise read back through the same "not a u32" path as the
+/// sentinel — aliasing two rows with different states onto one identity.
+/// Insert-time rejection and read-back rejection are both pinned; the
+/// read-back leg is reached by suspending CHECK enforcement, which is the
+/// closest a test can get to a hand-edited or pre-CHECK row.
+#[test]
+fn an_out_of_domain_item_index_is_refused_on_write_and_on_read_never_aliased() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+    let run_text = run_id.to_string();
+
+    let insert = "INSERT INTO workflow_step_run \
+         (run_id, step_id, attempt, item_index, disposition, state, output_is_secret_derived) \
+         VALUES (?1, ?2, 1, ?3, 'effectful', 'running', 0)";
+
+    let too_big = conn.execute(insert, rusqlite::params![run_text, "m", 4_294_967_296i64]);
+    assert!(
+        too_big.is_err(),
+        "an item_index above u32::MAX must violate the CHECK constraint"
+    );
+    let too_small = conn.execute(insert, rusqlite::params![run_text, "m", -2i64]);
+    assert!(
+        too_small.is_err(),
+        "-1 is the only negative item_index the CHECK admits"
+    );
+
+    // A row that got in anyway: read-back must reject it rather than hand it
+    // back as the top-level sentinel, which is what `u32::try_from(..).ok()`
+    // used to do.
+    conn.pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    conn.execute(insert, rusqlite::params![run_text, "m", 4_294_967_296i64])
+        .expect("CHECK enforcement is suspended for this one insert");
+    conn.pragma_update(None, "ignore_check_constraints", false)
+        .unwrap();
+
+    let err = recover_run(&conn, run_id).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DurabilityError::ItemIndexOutOfRange {
+                stored: 4_294_967_296
+            }
+        ),
+        "expected ItemIndexOutOfRange, got {err:?}"
+    );
 }

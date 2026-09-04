@@ -157,10 +157,42 @@ CREATE UNIQUE INDEX trigger_event_dedupe
 ///
 /// No `FOREIGN KEY` constraints: no connection in this workspace sets
 /// `PRAGMA foreign_keys = ON` (see `pool.rs`, which sets only
-/// `journal_mode`/`synchronous`/`busy_timeout`), so declaring them would
-/// record an intention SQLite would not enforce. `workflow_run.session_id`,
-/// `parent_run_id`, `forked_from_run_id` and `trigger_event_id` are therefore
-/// documented references, checked by the application, not by the engine.
+/// `journal_mode`/`synchronous`/`busy_timeout`/`secure_delete`), so declaring
+/// them would record an intention SQLite would not enforce.
+/// `workflow_run.session_id`, `parent_run_id`, `forked_from_run_id` and
+/// `trigger_event_id` are therefore documented references, checked by the
+/// application, not by the engine.
+///
+/// # What protects `workflow_step_run.output` at rest — stated plainly
+///
+/// This is the first table in this database whose stored value may be
+/// **unredacted** secret-derived material. Every other write path redacts
+/// before storing (`redact.rs`: *"the stored row is always the already-redacted
+/// form, never the original"*), and `output` deliberately does not, because
+/// §8.13's fork *"inherit[s] completed step outputs"* and a redacted stand-in
+/// would make a resumed run compute different results from the original.
+///
+/// The protection that actually exists for the file is therefore worth naming
+/// rather than assuming:
+///
+/// - The **parent directory** is created `0700` by the daemon
+///   (`roundhouse-daemon/src/main.rs`'s `RUNTIME_DIR_MODE`). That is the whole
+///   of the access control.
+/// - The **database file itself** is created by SQLite under the process
+///   umask — this crate sets no mode on it — and the `-wal` and `-shm`
+///   sidecars are created the same way. A permissive umask therefore yields a
+///   world-readable db file inside a `0700` directory; the directory is what
+///   keeps other users out, not the file bits.
+/// - There is **no encryption at rest**, and none is implied anywhere here.
+/// - `pool.rs` sets `PRAGMA secure_delete = ON` so that clearing an `output`
+///   zeroes the freed bytes in the database file rather than leaving them
+///   there to be read back raw (measured — see that pragma's comment). It
+///   bounds residue in the main file only; an un-checkpointed `-wal` still
+///   holds the prior page image.
+///
+/// Erasing outputs that no fork can still target is a named residual owned by
+/// **Task 20 (B12)** — the mechanism exists (checkpoint the step with no
+/// output, which writes `output = NULL`), only the caller is missing.
 const MIGRATION_0007_WORKFLOW_RUN: &str = r#"
 CREATE TABLE workflow_run (
     id                 TEXT    PRIMARY KEY,
@@ -200,9 +232,16 @@ CREATE TABLE workflow_run (
 ) STRICT;
 
 -- The index behind `previous_run_for_binding` (§8.6's "the previous run of
--- this binding"), matching that query's `WHERE binding_id = ? ORDER BY
--- started_at DESC` exactly. Partial, because a manually-invoked run has no
--- binding and can never be an answer to that query.
+-- this binding"). It serves that query's `binding_id` seek and its
+-- `started_at` ordering, but not the whole ORDER BY: EXPLAIN QUERY PLAN on
+-- both real statements reports
+-- `SEARCH workflow_run USING INDEX workflow_run_binding_idx (binding_id=?)`
+-- -- with `AND started_at<?` added for the bounded form -- followed by
+-- `USE TEMP B-TREE FOR LAST TERM OF ORDER BY`, because the query breaks ties
+-- on `id`, which this index does not carry. So: an index seek rather than a
+-- table scan, plus a sort of only the matching rows on the tiebreak column.
+-- Partial, because a manually-invoked run has no binding and can never be an
+-- answer to that query.
 CREATE INDEX workflow_run_binding_idx
     ON workflow_run (binding_id, started_at)
     WHERE binding_id IS NOT NULL;
@@ -215,17 +254,34 @@ CREATE TABLE workflow_step_run (
     -- `exec::provenance::Provenance` is exactly
     -- (run_id, step_id, attempt, item_index): without it, two items of one
     -- `map` step collide and the second silently overwrites the first.
-    -- NOT NULL with a -1 sentinel for "not a map item", never NULL: SQLite
-    -- allows NULLs in a rowid table's PRIMARY KEY and compares every NULL
-    -- distinct, so a nullable column here would make repeated checkpoints of
-    -- one top-level step insert duplicate rows instead of updating one.
-    -- -1 is outside u32, so it cannot collide with a real item index.
-    item_index               INTEGER NOT NULL CHECK (item_index >= -1),
+    -- NOT NULL with a -1 sentinel for "not a map item", never NULL: this is
+    -- a STRICT table, which makes every PRIMARY KEY column implicitly
+    -- NOT NULL, so a "nullable" item_index would simply reject the insert
+    -- ("NOT NULL constraint failed") the first time a top-level step was
+    -- checkpointed. (In an ordinary rowid table the failure would instead be
+    -- silent duplicate rows, since SQLite permits NULLs in such a PRIMARY KEY
+    -- and compares every NULL as distinct -- verified both ways; STRICT is
+    -- what makes it the loud failure rather than the quiet one.) -1 is
+    -- outside u32, so it cannot collide with a real item index.
+    -- The upper bound is u32::MAX: item_index is a u32 in Rust, and without
+    -- a bound a larger stored value would read back through the same
+    -- "not a u32" path as the sentinel, aliasing two distinct rows onto one
+    -- identity. The read side rejects such a value rather than guessing; this
+    -- is the insert-time leg of the same rule.
+    item_index               INTEGER NOT NULL CHECK (item_index BETWEEN -1 AND 4294967295),
     disposition              TEXT    NOT NULL CHECK (disposition IN (
         'pure', 'idempotent', 'effectful'
     )),
+    -- 'skipped' is here although nothing writes it yet, for the same reason
+    -- workflow_run.state carries Task 17/20's states: a `when:`-skipped step
+    -- is FINISHED (the run loop must not re-evaluate `when:` on re-drive --
+    -- the condition may read differently by then -- and downstream steps
+    -- interpolate `${{ steps.<id>.status }}`), `exec/mod.rs` already produces
+    -- StepStatus::Skipped, and SQLite has no ALTER TABLE DROP/MODIFY
+    -- CONSTRAINT, so omitting it would force Task 20 (B12) to rebuild this
+    -- table. Shape now, behaviour later.
     state                    TEXT    NOT NULL CHECK (state IN (
-        'pending', 'running', 'completed', 'indeterminate', 'failed'
+        'pending', 'running', 'completed', 'indeterminate', 'failed', 'skipped'
     )),
     -- §8.10: "workflow_step_run.first_task_seq/last_task_seq join back to the
     -- log, so a step's full evidence is SELECT ... WHERE session_id = ? AND
@@ -244,6 +300,24 @@ CREATE TABLE workflow_step_run (
     -- rendering `output` must consult it.
     output                   TEXT,
     output_is_secret_derived INTEGER NOT NULL CHECK (output_is_secret_derived IN (0, 1)),
+    -- Why a step's failure message / skip reason is persisted rather than
+    -- recomputed: exactly the argument that justified `output` above. Once
+    -- the process that produced `StepStatus::Failed { message }` or
+    -- `Skipped { reason }` is gone, the text cannot be re-derived from
+    -- anything in this row -- and Task 20 (B12)'s `catch:` and the web Runs
+    -- inbox both need it. Nullable and unconstrained: a step that has not
+    -- failed or been skipped has no error, and a CHECK tying it to a state
+    -- set would be one more thing a later task could not alter.
+    --
+    -- Like `output`, this text is NOT redacted. `StepStatus`'s own Debug
+    -- bounds what a `{:?}` of a message prints, which is not the same as
+    -- bounding what is stored here -- this column holds it in full -- so
+    -- treat it with the same care as `output`. Unlike `output` there is no
+    -- taint flag, because the executor computes none for it.
+    error                    TEXT,
+    -- Table constraints below this line: SQLite's grammar allows no further
+    -- column definitions once one appears.
+    --
     -- No output means nothing to be tainted: keeps "no output yet" a single
     -- representable state rather than two.
     CHECK (output IS NOT NULL OR output_is_secret_derived = 0),

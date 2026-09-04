@@ -71,8 +71,9 @@ pub struct StorePool {
 
 /// Opens a WAL-mode SQLite connection pool at the given filesystem path. Applies all pending
 /// schema migrations on the first connection. Every pooled connection is configured with
-/// `journal_mode=WAL`, `synchronous=NORMAL`, and `busy_timeout=5000ms` for balanced
-/// performance, durability, and `SQLITE_BUSY` tolerance on the read path.
+/// `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000ms`, and `secure_delete=ON`
+/// for balanced performance, durability, `SQLITE_BUSY` tolerance on the read path, and
+/// erasure of freed pages that may have held unredacted step output (migration 0007).
 ///
 /// # Errors
 /// Returns `StoreError::Io` if the path is invalid or inaccessible; `StoreError::Sqlite` if
@@ -100,6 +101,22 @@ pub async fn open(path: &Path) -> Result<StorePool, StoreError> {
             // no such loop, so without this pragma they surface `SQLITE_BUSY` as a
             // hard error on any contention with the writer.
             conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)
+                .map_err(HookError::Backend)?;
+            // Also per-connection, and set here for that reason. As of store
+            // migration 0007 this database holds one column
+            // (`workflow_step_run.output`) whose stored value is deliberately
+            // NOT redacted, because §8.13's fork inherits real step outputs.
+            // Without `secure_delete`, freed cell content keeps its old bytes
+            // in the page, so clearing an output leaves the previous value
+            // sitting in the file. Measured, on exactly the path
+            // `checkpoint_step` uses (`UPDATE … SET output = NULL`, then a
+            // TRUNCATE checkpoint): a canary string was still present in the
+            // db file's bytes with the pragma OFF and absent with it ON. What
+            // that measurement does NOT cover: an un-checkpointed `-wal`
+            // still holds the pre-clear page image, so this bounds residue in
+            // the main database file, not in the WAL. It costs additional
+            // page writes on delete and update, unmeasured here.
+            conn.pragma_update(None, "secure_delete", true)
                 .map_err(HookError::Backend)
         }))
         .build()
@@ -110,6 +127,7 @@ pub async fn open(path: &Path) -> Result<StorePool, StoreError> {
         c.pragma_update(None, "journal_mode", "WAL")?;
         c.pragma_update(None, "synchronous", "NORMAL")?;
         c.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+        c.pragma_update(None, "secure_delete", true)?;
         MIGRATIONS.to_latest(c)?;
         // Security fix (Task 0.5 follow-up): backfill `tasks` rows for any task_id
         // already in the event log but missing from `tasks` — e.g. every task that
