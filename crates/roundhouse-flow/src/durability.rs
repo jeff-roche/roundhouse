@@ -161,6 +161,20 @@ pub enum DurabilityError {
     /// echoed because it is a bounded integer, not stored content.
     #[error("column workflow_step_run.item_index holds {stored}, which is neither the top-level sentinel nor a u32")]
     ItemIndexOutOfRange { stored: i64 },
+    /// [`insert_run_row`]'s guard (fix round 1, Task 20a): a run inserted with
+    /// a terminal [`RunState`] but no `ended_at`, or a non-terminal state with
+    /// one already set. [`transition_run`]'s own doc names "a run that looks
+    /// live forever" as the failure its writer prevents for an *existing*
+    /// row; without this guard, [`insert_workflow_run`] — a different, wider
+    /// writer — could produce exactly that row (or its mirror image, a
+    /// `Completed` run with `ended_at: None`) on the very first write.
+    #[error("run {run_id} has state {state:?} (terminal: {is_terminal}), but ended_at.is_some() is {ended_at_is_some}")]
+    TerminalStateEndedAtMismatch {
+        run_id: RunId,
+        state: RunState,
+        is_terminal: bool,
+        ended_at_is_some: bool,
+    },
 }
 
 /// §8.10 tier 2's crash-recovery classification of a step.
@@ -404,20 +418,30 @@ impl RunState {
 ///   shells, run `finally:`)"*. The same sentence is why there is **no**
 ///   `Running -> Cancelled` edge: the document says cancel *marks
 ///   `Cancelling`*, and the terminal state lands only after the drain.
-/// - `Running -> AwaitingHuman` and `AwaitingHuman -> AwaitingHuman`. §8.11
-///   parks a running run; the self-edge is not §8.11's, it is
-///   **pre-specified by `parking.rs`'s own doc** (*"it must be `state IN
-///   ('running', 'awaiting_human')`, not `= 'running'`"*) because re-driving
-///   a park is idempotent and a test pins it.
+/// - `AwaitingHuman -> AwaitingHuman`. **pre-specified by `parking.rs`'s own
+///   doc** (*"it must be `state IN ('running', 'awaiting_human')`, not
+///   `= 'running'`"*) because re-driving a park is idempotent and a test pins
+///   it. Both ends of this edge are the same named state, so — unlike the two
+///   edges fix round 1 moved out of this section below — there is no
+///   ordered-pair inference here at all.
+///
+/// **Inferred.** (Fix round 1, Task 20a: the following two edges used to sit
+/// under **Named** above with no quotation actually behind the *ordered
+/// pair* — only one end of each was named, which is the discipline this
+/// module's own opening paragraph exists to hold everything else to.)
+///
+/// - `Running -> AwaitingHuman`. §8.11 names `AwaitingHuman` and names three
+///   sources of human waits (a `gate:`, an `Escalate::Park`, a mid-step
+///   elicitation), but never names the *source run state* a park moves from.
+///   INFERRED: every one of those three sources fires from a step a run is
+///   actively executing, which is `Running`.
 /// - `AwaitingHuman -> {Running, Failed}` as a **pair**. §8.11 names four
-///   wait outcomes — *"`on_timeout: deny | fail | default(value) |
-///   approve`"* — of which `fail` ends the run and the others resolve the
-///   wait so the run continues. Which of the four maps to which target is
-///   the run loop's (B12c's) call, not this matrix's; the matrix only needs
-///   both targets to exist.
-///
-/// **Inferred.**
-///
+///   wait outcomes verbatim — *"`on_timeout: deny | fail | default(value) |
+///   approve`"* — so the *outcomes* are named, but mapping `fail` onto the
+///   *run* state `Failed`, and the other three onto `Running`, is this
+///   matrix's own reading, not the document's. Which of the four maps to
+///   which target is the run loop's (B12c's) call, not this matrix's; the
+///   matrix only needs both targets to exist.
 /// - `Running <-> Paused`. §8.13 names the controls *"**pause**; **resume**"*
 ///   and [`RunState::Paused`]'s own doc calls itself *"§8.13's `pause`"*, but
 ///   no document says pause writes `Paused` or that resume writes `Running`.
@@ -856,7 +880,28 @@ pub fn insert_workflow_run(
 /// [`fork_run`] can write a run row and its inherited step rows inside **one**
 /// transaction. Takes `&Connection` because `rusqlite::Transaction` derefs to
 /// it, so the same helper serves both call sites.
+///
+/// **Guards the same invariant [`transition`] enforces for an existing row,
+/// at the one other place `workflow_run.state` can be written** (fix round 1,
+/// Task 20a): [`insert_workflow_run`] is `pub`, so a caller — nothing in this
+/// workspace today, but nothing stops a future one — could insert
+/// `state: Completed, ended_at: None`, which is exactly the "run that looks
+/// live forever" [`transition_run`]'s doc names as the defect this module
+/// exists to prevent, just reached through the other writer instead. A
+/// `CHECK` constraint would enforce this at the schema level too, but adding
+/// one is a migration, and migrations are out of this task's scope (B12b's) —
+/// see this module's "What this task does NOT own".
 fn insert_run_row(conn: &Connection, run: &WorkflowRun) -> Result<(), DurabilityError> {
+    let is_terminal = run.state.is_terminal();
+    let ended_at_is_some = run.ended_at.is_some();
+    if is_terminal != ended_at_is_some {
+        return Err(DurabilityError::TerminalStateEndedAtMismatch {
+            run_id: run.id,
+            state: run.state,
+            is_terminal,
+            ended_at_is_some,
+        });
+    }
     conn.execute(
         "INSERT INTO workflow_run
             (id, job_id, job_version, content_hash, session_id, binding_id, trigger_event_id,
@@ -885,7 +930,18 @@ fn insert_run_row(conn: &Connection, run: &WorkflowRun) -> Result<(), Durability
 /// [`transition_run_to_awaiting_human`] sets the column, and only because
 /// §8.11's park deadline and the run state are one fact that must land in
 /// one transaction. `Leave` is not `Set(None)` — the first leaves whatever
-/// the row holds, the second writes `NULL` over it.
+/// the row holds **unless the transition is itself leaving `AwaitingHuman`**,
+/// in which case [`transition`] clears it (see that function's doc); the
+/// second unconditionally writes `NULL` over it.
+///
+/// Fix round 1 (Task 20a): before this, `Leave` really did always leave the
+/// column untouched, so `AwaitingHuman -> Running`, `-> Cancelling` and
+/// `-> Failed` all kept whatever deadline the park had written — the exact
+/// inverse of the discipline this same function applies to `ended_at`. A
+/// `parked_at`/deadline consumer (B12c or the daemon reaper) that selects
+/// `awaiting_until <= now` without *also* filtering `state = 'awaiting_human'`
+/// would then fire `on_timeout` against a run a human had already answered or
+/// an operator had already cancelled.
 enum AwaitingUntilWrite {
     Leave,
     Set(Option<Timestamp>),
@@ -895,14 +951,24 @@ enum AwaitingUntilWrite {
 /// [`WorkflowRun::ended_at`] when `to` is terminal. Returns the state the
 /// write displaced.
 ///
-/// **This is the only writer of `workflow_run.state`** (radius: `grep -rn
-/// "UPDATE workflow_run" --include=*.rs crates/` finds the two statements in
-/// this module's private `transition`, which only this function,
-/// [`transition_run_from`] and [`transition_run_to_awaiting_human`] reach,
-/// plus this comment; before Task 20a it also found `parking::park`'s own
-/// inline `UPDATE`, which now routes through here). Nothing in the tree could
-/// move a run to a terminal state at all before it existed, so `ended_at` was
-/// never written.
+/// **This is the only writer of an *existing* row's `workflow_run.state`**
+/// (radius: `grep -rn "UPDATE workflow_run" --include=*.rs crates/` finds the
+/// two statements in this module's private `transition`, which only this
+/// function, [`transition_run_from`] and [`transition_run_to_awaiting_human`]
+/// reach, plus this comment; before Task 20a it also found `parking::park`'s
+/// own inline `UPDATE`, which now routes through here). Nothing in the tree
+/// could move a run to a terminal state at all before it existed, so
+/// `ended_at` was never written.
+///
+/// That radius is narrower than "the only writer of `workflow_run.state`,
+/// full stop" — fix round 1 (Task 20a): [`insert_run_row`] also writes the
+/// column, by `INSERT`, not `UPDATE`, so the grep above does not find it.
+/// [`insert_workflow_run`] (and [`fork_run`]) establish a row's *initial*
+/// state; this function and its two callers above are the only writers of a
+/// state an existing row already holds. [`insert_run_row`]'s own guard is
+/// what keeps that initial write from producing the "run that looks live
+/// forever" this comment used to claim only this function prevented — see
+/// its doc.
 ///
 /// # Why the read and the write share one transaction
 ///
@@ -1037,7 +1103,25 @@ fn transition(
     // half — terminal states are absorbing, so no transition can follow the
     // one that stamped an instant.
     let ended_at = to.is_terminal().then(|| now.as_unix_nanos());
+    // Fix round 1 (Task 20a): the same discipline as `ended_at`, applied to
+    // `awaiting_until`. A `Leave` write is not a no-op write of that column
+    // when `from` is `AwaitingHuman` and `to` is not — that is a run *leaving*
+    // the park, and a stale deadline left behind is indistinguishable from a
+    // still-parked one to anything that reads the column alone. The
+    // `AwaitingHuman -> AwaitingHuman` self-edge is deliberately excluded
+    // (`to == AwaitingHuman` short-circuits this): that is a re-park, and it
+    // always carries its own `AwaitingUntilWrite::Set`, never `Leave`, so this
+    // branch cannot fire for it — but the guard is written on `from`/`to`
+    // rather than on which `AwaitingUntilWrite` arm was passed, so it stays
+    // correct even if a future caller reaches `Leave` on that self-edge.
+    let clear_stale_awaiting_until =
+        from == RunState::AwaitingHuman && to != RunState::AwaitingHuman;
     match awaiting_until {
+        AwaitingUntilWrite::Leave if clear_stale_awaiting_until => txn.execute(
+            "UPDATE workflow_run SET state = ?1, ended_at = ?2, awaiting_until = NULL
+             WHERE id = ?3",
+            params![to.as_sql_str(), ended_at, run_id.to_string()],
+        )?,
         AwaitingUntilWrite::Leave => txn.execute(
             "UPDATE workflow_run SET state = ?1, ended_at = ?2 WHERE id = ?3",
             params![to.as_sql_str(), ended_at, run_id.to_string()],

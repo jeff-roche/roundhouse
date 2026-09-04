@@ -416,10 +416,18 @@ fn awaiting_until_parent_run_and_forked_from_run_round_trip() {
     let parent = a_run(RunId::new(), Some(binding_id), 1_000);
     insert_workflow_run(&mut conn, &parent).unwrap();
 
+    // Terminal, not `AwaitingHuman`: `insert_run_row`'s fix-round-1 guard
+    // (item B) rejects a non-terminal state paired with a set `ended_at`, and
+    // this fixture wants to round-trip `ended_at` in the same row as
+    // `awaiting_until` — a stale-but-not-yet-cleared deadline on an ended run
+    // is exactly the shape a real row can have, since a terminal transition
+    // out of `AwaitingHuman` stamps `ended_at` and clears `awaiting_until`
+    // separately (see the `transition` fn); this row exercises the read path
+    // for both columns regardless of which one a given write actually set.
     let mut child = a_run(RunId::new(), Some(binding_id), 2_000);
     child.parent_run_id = Some(parent.id);
     child.forked_from_run_id = Some(parent.id);
-    child.state = RunState::AwaitingHuman;
+    child.state = RunState::Completed;
     child.awaiting_until = Some(Timestamp::from_unix_nanos(9_000_000_000));
     child.trigger_event_id = Some(42);
     child.ended_at = Some(Timestamp::from_unix_nanos(2_500));
@@ -774,6 +782,16 @@ const ALL_RUN_STATES: &[RunState] = &[
 
 #[test]
 fn the_legality_matrix_admits_exactly_fourteen_of_the_forty_nine_ordered_pairs() {
+    // Fix round 1 (Task 20a, item G): the test's own NAME was never actually
+    // asserted anywhere below — deleting a row from both `LEGAL_TRANSITIONS`
+    // and `transition_is_legal` left this test green with a name that was
+    // now false. State the count on both sides of the comparison.
+    assert_eq!(
+        LEGAL_TRANSITIONS.len(),
+        14,
+        "the table this test's name promises must actually hold fourteen pairs"
+    );
+    let mut admitted_pairs = 0;
     for &from in ALL_RUN_STATES {
         for &to in ALL_RUN_STATES {
             let expected = LEGAL_TRANSITIONS.contains(&(from, to));
@@ -783,8 +801,43 @@ fn the_legality_matrix_admits_exactly_fourteen_of_the_forty_nine_ordered_pairs()
                 "({from:?} -> {to:?}) should be {}",
                 if expected { "legal" } else { "refused" }
             );
+            if transition_is_legal(from, to) {
+                admitted_pairs += 1;
+            }
         }
     }
+    assert_eq!(
+        admitted_pairs, 14,
+        "transition_is_legal itself must admit exactly fourteen of the 7x7 ordered pairs"
+    );
+}
+
+/// Fix round 1 (Task 20a, item G): `ALL_RUN_STATES` is hand-written, so an
+/// eighth `RunState` variant could silently shrink what it (and the two tests
+/// keyed on it) actually cover, with no compile error. This match has no `_`
+/// arm, so adding a variant to `RunState` without adding it here fails the
+/// build instead of failing silently.
+#[test]
+fn all_run_states_is_exhaustive_over_run_state_so_an_eighth_variant_cannot_hide() {
+    fn assert_every_variant_is_named(state: RunState) {
+        match state {
+            RunState::Running
+            | RunState::Paused
+            | RunState::Cancelling
+            | RunState::AwaitingHuman
+            | RunState::Completed
+            | RunState::Failed
+            | RunState::Cancelled => {}
+        }
+    }
+    for &state in ALL_RUN_STATES {
+        assert_every_variant_is_named(state);
+    }
+    assert_eq!(
+        ALL_RUN_STATES.len(),
+        7,
+        "seven RunState variants exist today"
+    );
 }
 
 #[test]

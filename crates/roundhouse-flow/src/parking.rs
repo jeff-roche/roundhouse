@@ -324,6 +324,16 @@ pub enum ParkError {
     /// clause did not match, which for a run in a state that cannot be
     /// parked was a lie: the row was right there. That case is now
     /// `Durability(DurabilityError::IllegalTransition { .. })`.
+    ///
+    /// **This variant's twin, if the row vanishes between the two reads
+    /// instead of never existing** (fix round 1, Task 20a): this is
+    /// [`park`]'s own *pre-checkpoint* read finding no row; if the row is
+    /// present here but gone by the time the write's own read runs inside
+    /// [`durability::transition_run_to_awaiting_human`](crate::durability),
+    /// the same fact surfaces as
+    /// `Self::Durability(DurabilityError::RunNotFound)` instead — still
+    /// expressed as two different variants for one underlying condition, not
+    /// flattened into one taxonomy.
     #[error("no workflow_run row for run {run_id}")]
     RunNotFound { run_id: RunId },
     /// The durable write refused. Most importantly

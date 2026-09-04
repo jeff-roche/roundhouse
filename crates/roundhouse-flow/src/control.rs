@@ -94,6 +94,24 @@ pub enum ControlError {
     /// (the same log-only reasoning `parking::CheckpointError` records).
     #[error("step {step_id:?} is not a step of this run's job version")]
     UnknownStep { step_id: String },
+    /// [`retry_from_step`] found a `Completed` step in the original run whose
+    /// `step_id` the caller's `step_order` never names at all (fix round 1,
+    /// Task 20a).
+    ///
+    /// This is a different fact from [`Self::UnknownStep`], which is about
+    /// `from_step_id` itself. This is about a step [`recover_run`] returned as
+    /// `Completed` that `step_order` is simply silent on. Silently treating
+    /// that as "not before the cut, so it re-runs" would be wrong in the
+    /// dangerous direction for an `Effectful` step: it duplicates a side
+    /// effect the original run already had — the exact consequence
+    /// [`fork_run`]'s own doc says wrapping the whole fork in one transaction
+    /// exists to prevent, reached here by a `step_order` that does not
+    /// actually describe the run's history rather than by a partial write.
+    /// This is a caller-contract violation (the doc on `step_order` states the
+    /// contract it violates), not a legitimate fork of a run whose history
+    /// genuinely has fewer steps than the caller believes.
+    #[error("step {step_id:?} completed in run {run_id}, but step_order does not name it")]
+    StepOrderMissingCompletedStep { run_id: RunId, step_id: String },
 }
 
 /// §8.13's cooperative **cancel**: *"mark `Cancelling`, refuse new task
@@ -214,8 +232,25 @@ pub struct ForkedRun {
 ///
 /// A `from_step_id` that is not in `step_order` is
 /// [`ControlError::UnknownStep`], not a silent whole-run inheritance. A
-/// recovered row whose `step_id` is not in `step_order` is **not** inherited:
-/// nothing can place it relative to the cut.
+/// recovered `Completed` row whose `step_id` is not in `step_order` is
+/// refused ([`ControlError::StepOrderMissingCompletedStep`]) rather than
+/// silently dropped — see that variant's doc for why silently dropping it
+/// would be worse than refusing.
+///
+/// # `step_order`'s precondition (fix round 1, Task 20a — named, not checked)
+///
+/// `step_order` must be the step list of **the run's own pinned
+/// `content_hash`** (`original.run.content_hash`, inherited unchanged into
+/// the fork), not of the job's *current* definition. A retry can happen long
+/// after the original run started, and by then `(job_id, job_version)` may
+/// have been re-authored with a different step list; this function has no way
+/// to detect a `step_order` drawn from the wrong version, because — as the
+/// section above says — it cannot resolve `content_hash` back to a step list
+/// at all. [`ControlError::StepOrderMissingCompletedStep`] catches the one
+/// symptom that is detectable (a `Completed` step the caller's list does not
+/// mention at all); a caller that instead passes a same-length list in the
+/// *current* version's order, silently misaligned with the pinned one, is not
+/// caught by anything here.
 ///
 /// # What is inherited, and what is deliberately not
 ///
@@ -288,6 +323,21 @@ pub fn retry_from_step(
         return Err(ControlError::RunStillActive {
             run_id: original_run_id,
             state: original.run.state,
+        });
+    }
+
+    // Fix round 1 (Task 20a): a `Completed` step `step_order` never names at
+    // all is a caller-contract violation, not a legitimate "nothing to
+    // inherit" — see `ControlError::StepOrderMissingCompletedStep`'s doc.
+    // Checked before any row is written, over the same `original.steps` the
+    // inheritance filter below reads, so this cannot itself race against a
+    // partially-applied fork.
+    if let Some(missing) = original.steps.iter().find(|step| {
+        step.state == StepRunState::Completed && !step_order.contains(&step.step_id.as_str())
+    }) {
+        return Err(ControlError::StepOrderMissingCompletedStep {
+            run_id: original_run_id,
+            step_id: missing.step_id.clone(),
         });
     }
 

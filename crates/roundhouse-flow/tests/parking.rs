@@ -684,3 +684,53 @@ fn a_refused_park_leaves_its_checkpoint_behind_but_writes_nothing_durable() {
         RunState::Cancelling
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 20a fix round 1 (item A) — `awaiting_until` must not survive leaving
+// `AwaitingHuman`
+// ---------------------------------------------------------------------------
+
+/// A run parked and then cancelled must not keep the park's deadline in the
+/// row: a `parked_at`/deadline consumer that selects `awaiting_until <= now`
+/// without also filtering `state = 'awaiting_human'` would otherwise fire
+/// `on_timeout` against a run an operator already cancelled.
+#[test]
+fn park_then_cancel_clears_the_stale_awaiting_until_deadline() {
+    let session_id = SessionId::new();
+    let (mut conn, run_id) = a_running_run(session_id);
+    let step = gate_step("id: approve\ngate: { title: 'Ship it?', timeout: 1h, on_timeout: deny }");
+    let awaiting = awaiting_from_gate(&step);
+    let mut cp = FakeCheckpointer::new();
+
+    park(
+        &mut conn,
+        run_id,
+        &awaiting,
+        false,
+        Timestamp::from_unix_nanos(1_000 * NANOS_PER_SEC),
+        &mut cp,
+    )
+    .expect("park succeeds");
+    assert!(
+        recover_run(&conn, run_id)
+            .unwrap()
+            .run
+            .awaiting_until
+            .is_some(),
+        "sanity: the park actually wrote a deadline"
+    );
+
+    roundhouse_flow::control::cancel(
+        &mut conn,
+        run_id,
+        Timestamp::from_unix_nanos(2_000 * NANOS_PER_SEC),
+    )
+    .expect("a parked run remains cancellable");
+
+    let row = recover_run(&conn, run_id).unwrap().run;
+    assert_eq!(row.state, RunState::Cancelling);
+    assert_eq!(
+        row.awaiting_until, None,
+        "leaving AwaitingHuman must clear the deadline the park wrote"
+    );
+}

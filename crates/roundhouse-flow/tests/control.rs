@@ -419,6 +419,95 @@ fn forking_from_a_step_the_job_never_declared_is_refused_rather_than_inheriting_
     );
 }
 
+/// Fix round 1 (Task 20a, item E): a `Completed` step `step_order` never
+/// mentions must not be silently dropped from the fork — for an `Effectful`
+/// step that is a duplicate side effect on re-drive, the exact consequence
+/// `fork_run`'s own transaction exists to prevent for any other reason.
+#[test]
+fn a_completed_step_missing_from_step_order_is_refused_rather_than_dropped_and_rerun() {
+    let (mut conn, original) = a_finished_run_with_three_steps();
+    // "deploy" completed in the original run but the caller's step_order
+    // never names it — a wrong step_order reaching the fork with the
+    // transaction fully intact.
+    let incomplete_step_order: &[&str] = &["checkout", "build"];
+
+    let err = retry_from_step(
+        &mut conn,
+        original,
+        "build",
+        incomplete_step_order,
+        SessionId::new(),
+        at(6_000),
+    )
+    .expect_err("a completed step invisible to step_order would silently re-execute in the fork");
+
+    match err {
+        ControlError::StepOrderMissingCompletedStep {
+            run_id,
+            ref step_id,
+        } => {
+            assert_eq!(run_id, original);
+            assert_eq!(step_id, "deploy");
+        }
+        ref other => panic!("expected StepOrderMissingCompletedStep, got {other:?}"),
+    }
+    assert_eq!(
+        count_runs(&conn),
+        1,
+        "a refused retry writes no fork row at all"
+    );
+}
+
+/// Fix round 1 (Task 20a, item D): the one property `StepOutput`'s design
+/// exists to carry — `output_is_secret_derived` — must survive a fork.
+/// Every other fork fixture in this file builds `false`, so this is the only
+/// test that exercises the `true` path through `..step.clone()`.
+#[test]
+fn a_fork_preserves_a_secret_derived_output_flag() {
+    let (mut conn, run_id) = a_running_run();
+    let tainted = WorkflowStepRun {
+        run_id,
+        step_id: "fetch_secret".to_string(),
+        attempt: 1,
+        item_index: None,
+        disposition: StepDisposition::Effectful,
+        state: StepRunState::Completed,
+        first_task_seq: Some(1),
+        last_task_seq: Some(2),
+        output: Some(StepOutput::from_outcome(&StepOutcome {
+            step_id: "fetch_secret".to_string(),
+            output: serde_json::json!({"token": "abc"}),
+            status: StepStatus::Completed,
+            output_is_secret_derived: true,
+            gate_condition_was_secret_derived: false,
+        })),
+        error: None,
+    };
+    checkpoint_step(&mut conn, &tainted).unwrap();
+    transition_run(&mut conn, run_id, RunState::Failed, at(5_000)).unwrap();
+
+    let forked = retry_from_step(
+        &mut conn,
+        run_id,
+        "next",
+        &["fetch_secret", "next"],
+        SessionId::new(),
+        at(6_000),
+    )
+    .expect("a failed run with a tainted completed step can be forked");
+
+    let fork_steps = recover_run(&conn, forked.new_run_id).unwrap().steps;
+    assert_eq!(fork_steps.len(), 1);
+    assert!(
+        fork_steps[0]
+            .output
+            .as_ref()
+            .expect("the tainted output is the point of this test")
+            .is_secret_derived(),
+        "the fork must inherit the taint flag, not silently launder it"
+    );
+}
+
 #[test]
 fn retry_from_step_refuses_a_run_that_has_not_ended() {
     let (mut conn, original) = a_running_run();
