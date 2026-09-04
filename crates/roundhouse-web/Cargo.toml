@@ -210,3 +210,14 @@ tower = { version = "=0.5.3", features = ["util"] }
 # rather than the `"3"` range seven other crates use, for the exact-pin reason
 # stated throughout this manifest.
 tempfile = "=3.27.0"
+# Task 35 (Phase 5, Subsystem D6), ruling P96 §C: `tests/compile_fail.rs` pins
+# that `BoundedStore`'s pool is unreachable from outside this crate. That is a
+# property of what does *not* compile, so it has no runtime test and no
+# mutation can score it — see that file's docs.
+#
+# `"1"` and not an exact `=` pin, unlike every dependency above: `trybuild` is
+# already declared at `"1"` by `roundhouse-core`, `roundhouse-net` and
+# `roundhouse-secrets`, and a narrower requirement here would fragment the
+# workspace's one compile-fail harness across two resolved versions for no
+# benefit. It is also dev-only, so it reaches no shipped artefact.
+trybuild = "1"

@@ -81,7 +81,9 @@ pub fn api_version() -> roundhouse_proto::ApiVersion {
 ///
 /// D5 added the second field under the same three constraints, which is what
 /// makes it an `Option` and what makes it a [`roundhouse_store::StorePool`]
-/// rather than a connection:
+/// rather than a connection. (D6 wrapped that pool in [`BoundedStore`], which
+/// is a newtype and derives all three from it, so every reason below is
+/// unchanged and reads through the wrapper:)
 ///
 /// - **`Default`** rules out anything without one, which a bare
 ///   `rusqlite::Connection` (or an `Arc<Mutex<…>>` of one) has no way to
@@ -111,14 +113,70 @@ pub struct AppState {
     /// database behind it — every router in this crate's own test suite, and
     /// whatever a caller builds before it has opened one.
     ///
+    /// A [`BoundedStore`] and not a bare [`roundhouse_store::StorePool`], so
+    /// that this field being `pub` does not put `.pool` within a handler's
+    /// reach — see that type for why the difference is the whole bound.
+    ///
     /// **Nothing in this workspace constructs an `AppState` with a store in it
     /// yet**, because nothing links this crate at all; see this module's docs
     /// for what wiring the daemon up costs.
-    pub store: Option<roundhouse_store::StorePool>,
+    pub store: Option<BoundedStore>,
     /// How many API requests may hold a [`store`](Self::store) connection at
     /// once. See [`ApiPoolPermits`] — the field exists so that a handler cannot
     /// starve the event-log writer, and its [`Default`] is the bound.
     pub api_pool_permits: ApiPoolPermits,
+}
+
+/// The store pool with its `Pool` handle **out of reach**, so that
+/// [`AppState::store_connection`] is not merely the convenient way to take a
+/// connection but the only expressible one.
+///
+/// # Why a newtype rather than a doc note
+///
+/// [`AppState::store_connection`] exists because a handler that called
+/// `state.store.pool.get()` directly would hold a connection outside
+/// [`ApiPoolPermits`]' bound, and its docs say so. But [`AppState::store`] is
+/// `pub` — as it must be, since a future `roundhouse-daemon` constructs the
+/// state by struct literal — and a `pub` field of type
+/// [`roundhouse_store::StorePool`] hands every handler in this crate, and every
+/// caller outside it, a `deadpool` `Pool` with a public `get`. The bound was
+/// therefore held by nobody reaching for it, which is the same "invariant that
+/// holds because nothing has tested it yet" shape ruling P88 §A is about, and
+/// D6 adds four more `/api` handlers.
+///
+/// Wrapping the field is what makes it structural: `pool` is private to this
+/// module, so `store_connection` (immediately below, in this same module) can
+/// read it and **nothing else in this crate can**, whatever the field
+/// visibility on [`AppState`] says. Moving `AppState` into its own module would
+/// buy the same property at the cost of a module and an import churn across the
+/// crate; this buys it in one field.
+///
+/// [`new`](Self::new) is the whole public surface: a caller supplies a pool and
+/// gets back something it can only hand to [`AppState`]. There is deliberately
+/// no accessor — an `fn pool(&self)` would restore exactly what the private
+/// field removes.
+#[derive(Clone, Debug)]
+pub struct BoundedStore {
+    /// **Private, and that is the entire point of this type.** Read only by
+    /// [`AppState::store_connection`], which pairs it with a permit.
+    ///
+    /// Named `inner` rather than `pool` so that the one expression that reaches
+    /// through it reads `store.inner.pool.get()` — the outer name says "this is
+    /// the wrapper being unwrapped", and the inner one is
+    /// [`roundhouse_store::StorePool`]'s own field.
+    inner: roundhouse_store::StorePool,
+}
+
+impl BoundedStore {
+    /// Puts `pool` behind the bound.
+    ///
+    /// The only constructor, and it takes the pool by value: whoever opened the
+    /// store keeps their own clone if they want one (`StorePool` is a
+    /// reference-counted handle), but the clone *inside* an [`AppState`] is not
+    /// reachable through it.
+    pub fn new(pool: roundhouse_store::StorePool) -> Self {
+        Self { inner: pool }
+    }
 }
 
 /// A bound on how many API requests may hold a store connection at once,
@@ -258,6 +316,13 @@ impl AppState {
     /// connection comes back already wearing it — there is no ordering for a
     /// handler to get wrong and no step for it to skip.
     ///
+    /// **`state.store.pool.get()` is now a compile error**, which the paragraph
+    /// above could only ask for. [`AppState::store`] holds a [`BoundedStore`],
+    /// whose pool is private to this module — so this method is not the
+    /// preferred route to the pool from a handler, it is the only one that
+    /// exists. See [`BoundedStore`] for why the field was left `pub` and the
+    /// *type* changed instead.
+    ///
     /// Rejected, recorded so they are not re-derived: a doc note on
     /// [`AppState::store`] (ruling P88 §A *is* the record of a doc note not
     /// holding); a `tower` layer over `/api` (it would bound the SSE stream too,
@@ -304,7 +369,7 @@ impl AppState {
         // `_error` is discarded rather than rendered, for the reason
         // `runs::internal_error` states: a pool error can carry the database
         // path, and this response goes to whoever asked.
-        match store.pool.get().await {
+        match store.inner.pool.get().await {
             Ok(connection) => Ok(StoreConnection {
                 connection,
                 _permit: permit,
