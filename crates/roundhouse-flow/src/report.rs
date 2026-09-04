@@ -572,3 +572,92 @@ pub fn build_carry_over_seed(
         }
     })))
 }
+
+/// §8.6's report schema as a JSON Schema object — what a workflow **returns**
+/// when it is exposed as a tool (§8.12: *"`inputs` is the tool schema,
+/// `outputs` is the result"*).
+///
+/// # This is the answer to the `outputs:` gap, and it is "not a declared block"
+///
+/// [`crate::compose`]'s module doc records `outputs:` as a frozen-contract gap
+/// owned by B12c on the grounds that *"the first task with a run loop … is
+/// therefore the first that can observe what a workflow's result actually is
+/// and therefore judge whether `outputs:` should be a declared block in
+/// `parse/types.rs` or derived from the run's `report`/`finally` shape."* With
+/// the run loop built, the observation is available and it settles it:
+///
+/// - **Exactly one thing is produced by every run, in every terminal state.**
+///   Ruling P112 makes the `TaskKind::Report` task mandatory —
+///   [`crate::run_loop`] synthesises one when the author declares no `report:`
+///   step — so the report is the only value a caller of `workflow:<name>` can
+///   be promised.
+/// - **A declared `outputs:` block would be a promise with no mechanism
+///   behind it.** Nothing in the run loop assembles a *second*, author-shaped
+///   result value; a `call:` returns the child run, whose durable product is
+///   its report. An `outputs:` block would let an author declare a schema the
+///   crate has no way to populate or check — worse than the absent schema
+///   [`WorkflowToolRegistration::output_schema`](crate::compose::WorkflowToolRegistration::output_schema)
+///   refused to fabricate, because it would look authoritative.
+/// - **The extension half stays open**, exactly as §8.6 intends: this schema
+///   pins the core (*"precisely the fields the generic inbox touches"*) and
+///   leaves `additionalProperties` true, which is where a job's own result
+///   fields live. That is the author-declared part, and it needs no new
+///   keyword.
+///
+/// So the wire shape does **not** change for `outputs:`, and
+/// `register_as_tool` returns this instead of `None`. Recorded as a
+/// correction rather than as compliance: B12c's brief lists `outputs:` with
+/// `on_crash:` as *"one wire-shape slice"*, and only one of the two turns out
+/// to be one.
+///
+/// # Every constraint here mirrors [`validate_report`], and only those
+///
+/// The two must agree, so this enumerates §8.6's core and nothing else:
+/// `required` is [`CORE_TOP_LEVEL`], per-finding `required` is
+/// [`CORE_FINDING`], the two enum domains are [`Outcome`]'s and
+/// [`Severity`]'s wire spellings, and the three known collections are typed as
+/// arrays because `validate_report` rejects them present-with-the-wrong-type.
+/// It does **not** claim anything `validate_report` does not check — there is
+/// no `minLength` on `headline`, no bound on `findings`, and no pattern on
+/// `id`, because a schema that promised those would be describing a validator
+/// that does not exist.
+pub fn core_json_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": CORE_TOP_LEVEL,
+        "properties": {
+            "outcome": { "enum": ["nothing", "changed", "findings", "failed", "needs_human"] },
+            "severity": { "enum": ["low", "med", "high"] },
+            "headline": { "type": "string" },
+            "needs_human": { "type": "boolean" },
+            "cost": {
+                "type": "object",
+                "required": ["usd", "tokens"],
+                "properties": {
+                    "usd": { "type": "number" },
+                    "tokens": { "type": "integer", "minimum": 0 },
+                },
+            },
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": CORE_FINDING,
+                    "properties": {
+                        "id": { "type": "string" },
+                        "title": { "type": "string" },
+                        "severity": { "enum": ["low", "med", "high"] },
+                        "location": { "type": "string" },
+                    },
+                    "additionalProperties": true,
+                },
+            },
+            "artifacts": { "type": "array" },
+            "next_actions": { "type": "array", "items": { "type": "string" } },
+        },
+        // §8.6's extension half: "core+extension, with the core defined as
+        // precisely the fields the generic inbox touches". Closing this would
+        // reject every job-defined field the schema exists to permit.
+        "additionalProperties": true,
+    })
+}

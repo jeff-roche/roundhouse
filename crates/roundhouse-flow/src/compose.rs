@@ -29,30 +29,39 @@
 //! `exec/mod.rs`'s stale "Tasks 7/11" attribution in the same commit rather
 //! than leaving a second comment naming the wrong owner.
 //!
-//! # Named gap: `outputs:` is not authorable in the workflow format
+//! # Closed gap: `outputs:` is **not** a declared block, and does not need to be
 //!
 //! §8.12 writes *"registered as `workflow:<name>`; `inputs` **is** the tool
-//! schema, `outputs` **is** the result."* The first half is implementable
-//! today — [`crate::parse::types::WorkflowDef::inputs`] exists, and §8.9 says
-//! that schema *"becomes the JSON tool schema when the workflow is exposed as
-//! a sub-agent tool."* **The second half is not**: `WorkflowDef` has no
+//! schema, `outputs` **is** the result."* The first half was implementable
+//! immediately — [`crate::parse::types::WorkflowDef::inputs`] exists, and §8.9
+//! says that schema *"becomes the JSON tool schema when the workflow is
+//! exposed as a sub-agent tool."* The second half was recorded here as a
+//! frozen-contract gap owned by Task 20, because `WorkflowDef` has no
 //! `outputs` field and is `#[serde(deny_unknown_fields)]`, so a workflow that
 //! writes `outputs:` gets a hard parse error rather than an ignored key —
 //! pinned as an observed fact by
 //! `outputs_is_not_authorable_in_the_workflow_format_so_no_output_schema_is_registered`
 //! in `tests/compose.rs`, which asserts the `parse_workflow` failure directly.
 //!
-//! [`WorkflowToolRegistration::output_schema`] is therefore `Option` and is
-//! **always `None`** today. It is not filled with a fabricated
-//! `{"type": "object"}`: a schema that claims to describe a workflow's result
-//! while describing nothing is worse than an absent one, because a caller
-//! cannot tell the difference. Recorded as a **frozen-contract gap owned by
-//! Task 20 (B12)** — the first task with a run loop, hence the first that can
-//! observe what a workflow's result actually *is* and therefore judge whether
-//! `outputs:` should be a declared block in `parse/types.rs` or derived from
-//! the run's `report`/`finally` shape. Adding the field means touching
-//! `parse/types.rs`'s wire shape, which this task deliberately does not do.
-//! This is the same shape as `durability.rs`'s `on_crash:` gap (ruling P68 §D).
+//! **B12c makes the judgement that gap asked for, and the answer is that no
+//! wire-shape change is wanted.** A run's result is its mandatory
+//! `TaskKind::Report` task — ruling P112 makes exactly one of those exist in
+//! every terminal state, synthesised by [`crate::run_loop`] when the author
+//! declares no `report:` step — so
+//! [`crate::report::core_json_schema`] is the result schema, and
+//! [`WorkflowToolRegistration::output_schema`] returns it. §8.6's extension
+//! half is what carries a job's own result fields, so an author already has
+//! the declarative surface an `outputs:` block would have provided. The full
+//! reasoning, including why a declared block would be a promise with no
+//! mechanism behind it, is on [`crate::report::core_json_schema`].
+//!
+//! The parse error above is therefore kept, and the test that pins it keeps
+//! its meaning: `outputs:` is refused because it is not a key of this format,
+//! not because it is unimplemented.
+//!
+//! `durability.rs`'s `on_crash:` gap (ruling P68 §D) looked like the same
+//! shape and was not: that one *is* a declared per-step attribute in §8.10,
+//! and B12c adds it to the wire.
 //!
 //! # Named deferral: [`WorkflowToolRegistration`] plugs into nothing today
 //!
@@ -757,9 +766,20 @@ pub struct WorkflowToolRegistration {
     /// *"the `inputs:` schema does triple duty … becomes the JSON tool schema
     /// when the workflow is exposed as a sub-agent tool."*
     pub input_schema: Value,
-    /// **Always `None`.** §8.12 says `outputs` is the result, but the
-    /// workflow format has no `outputs:` block — see the module doc's "Named
-    /// gap" section. Not a fabricated `{"type": "object"}`.
+    /// §8.12's *"`outputs` **is** the result"*: [`crate::report::core_json_schema`],
+    /// because a run's result **is** its mandatory report task (ruling P112).
+    ///
+    /// This was `None` until B12c, on the reasoning that a schema claiming to
+    /// describe a workflow's result while describing nothing is worse than an
+    /// absent one. That reasoning still holds and is why this is not
+    /// `{"type": "object"}`; what changed is that there is now a real schema
+    /// to name. See [`crate::report::core_json_schema`] for the judgement the
+    /// module doc's "Named gap" section asked B12c to make, and for why the
+    /// answer is that `outputs:` is **not** a declared block.
+    ///
+    /// Still `Option`, because the type outlives this one producer: a future
+    /// registration for something that genuinely has no declarable result
+    /// should be able to say so rather than fabricate one.
     pub output_schema: Option<Value>,
 }
 
@@ -798,7 +818,7 @@ pub fn register_as_tool(
     Ok(WorkflowToolRegistration {
         name: format!("workflow:{}", def.name),
         input_schema: inputs_to_json_schema(&def.inputs),
-        output_schema: None,
+        output_schema: Some(crate::report::core_json_schema()),
     })
 }
 

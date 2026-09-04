@@ -4,9 +4,10 @@
 
 use roundhouse_core::{BindingId, JobId, SessionId, Timestamp};
 use roundhouse_flow::durability::{
-    checkpoint_step, derive_disposition, on_crash_policy, open_test_db, previous_run_for_binding,
-    recover_run, transition_is_legal, transition_run, CrashPolicy, DurabilityError, RunState,
-    StepDisposition, StepOutput, StepRunState, WorkflowRun, WorkflowStepRun,
+    checkpoint_step, crash_policy, derive_disposition, on_crash_policy, open_test_db,
+    previous_run_for_binding, recover_run, transition_is_legal, transition_run, CrashPolicy,
+    DurabilityError, RunState, StepDisposition, StepOutput, StepRunState, WorkflowRun,
+    WorkflowStepRun,
 };
 use roundhouse_flow::durability::{insert_workflow_run, TOP_LEVEL_ITEM_INDEX};
 use roundhouse_flow::exec::{Provenance, RunId, StepOutcome, StepStatus};
@@ -147,6 +148,89 @@ fn pure_and_idempotent_steps_rerun_on_crash_effectful_defaults_to_ask() {
     assert_eq!(
         on_crash_policy(StepDisposition::Effectful),
         CrashPolicy::Ask
+    );
+}
+
+/// §8.10 tier 2's `on_crash: rerun | fail | ask` as a **declared** attribute
+/// (B12c), which until now was a hard parse error against
+/// `StepDefWire`'s `deny_unknown_fields`.
+///
+/// The declaration wins outright, in both directions — over-riding an
+/// `Effectful` default *down* to `rerun` and a `Pure` default *up* to `ask` —
+/// because §8.10 writes it as an override and an override the reader
+/// second-guessed would not be one.
+#[test]
+fn a_declared_on_crash_overrides_the_derived_default_in_both_directions() {
+    // Nothing declared: the derivation stands, unchanged.
+    let shell = step("id: a\ntool: shell\nwith: { cmd: [ls] }");
+    assert_eq!(shell.on_crash, None);
+    assert_eq!(crash_policy(&shell), CrashPolicy::Ask);
+    let read = step("id: b\ntool: read\nwith: { path: x }");
+    assert_eq!(crash_policy(&read), CrashPolicy::Rerun);
+
+    // Declared down: an author asserting this particular shell is safe to
+    // repeat.
+    let rerun = step("id: c\ntool: shell\nwith: { cmd: [ls] }\non_crash: rerun");
+    assert_eq!(rerun.on_crash, Some(CrashPolicy::Rerun));
+    assert_eq!(crash_policy(&rerun), CrashPolicy::Rerun);
+
+    // Declared up: an author asserting this particular read is not.
+    let ask = step("id: d\ntool: read\nwith: { path: x }\non_crash: ask");
+    assert_eq!(crash_policy(&ask), CrashPolicy::Ask);
+
+    // And `fail`, which no derivation can produce: before the declared
+    // attribute existed, `CrashPolicy::Fail` was unreachable from any input.
+    let fail = step("id: e\ntool: read\nwith: { path: x }\non_crash: fail");
+    assert_eq!(crash_policy(&fail), CrashPolicy::Fail);
+    assert_ne!(
+        on_crash_policy(derive_disposition(&fail)),
+        CrashPolicy::Fail,
+        "so the declaration is doing the work, not the derivation"
+    );
+}
+
+/// The vocabulary is closed: §8.10 gives three words and a misspelling is a
+/// parse error, not a silently-ignored key that falls back to the default —
+/// the same rule every other enum in this parser follows.
+#[test]
+fn an_unrecognised_on_crash_value_is_a_parse_error_not_a_silent_default() {
+    let err = parse_step(
+        &serde_yaml::from_str("id: a\ntool: read\nwith: { path: x }\non_crash: reboot").unwrap(),
+    )
+    .expect_err("`reboot` is not one of rerun | fail | ask");
+    // The message names the three legal words rather than the key —
+    // `serde_yaml`'s unknown-variant error carries the variant list, not the
+    // field it was found under, which is the same shape every other closed
+    // enum in this parser produces. What matters is that an author is told
+    // what they may write.
+    let rendered = err.to_string();
+    for word in ["rerun", "fail", "ask"] {
+        assert!(
+            rendered.contains(word),
+            "the error should list {word} as a legal value, got {rendered}"
+        );
+    }
+}
+
+/// An `idempotency_key` wins over the *derivation*; a declared `on_crash:`
+/// wins over both. Two overrides on one step, and which one governs is worth
+/// pinning rather than leaving to be inferred from the call order.
+#[test]
+fn a_declared_on_crash_wins_over_an_idempotency_key_which_wins_over_the_kind() {
+    let keyed = step("id: a\ntool: shell\nwith: { cmd: [ls] }\nidempotency_key: k");
+    assert_eq!(derive_disposition(&keyed), StepDisposition::Idempotent);
+    assert_eq!(crash_policy(&keyed), CrashPolicy::Rerun);
+
+    let both = step("id: a\ntool: shell\nwith: { cmd: [ls] }\nidempotency_key: k\non_crash: ask");
+    assert_eq!(
+        derive_disposition(&both),
+        StepDisposition::Idempotent,
+        "the key still decides the disposition, which is a different question"
+    );
+    assert_eq!(
+        crash_policy(&both),
+        CrashPolicy::Ask,
+        "but the declaration decides what to do about a crash"
     );
 }
 

@@ -745,11 +745,13 @@ fn a_prompt_bodied_job_registers_under_the_name_the_caller_supplies() {
 }
 
 #[test]
-fn outputs_is_not_authorable_in_the_workflow_format_so_no_output_schema_is_registered() {
-    // The named frozen-contract gap: §8.12 says "`outputs` *is* the result",
-    // but `WorkflowDef` has no `outputs` field and is `deny_unknown_fields`,
-    // so authoring one is a hard parse error rather than an ignored key.
-    // This pins the gap as an observed fact, not a claim.
+fn outputs_is_not_authorable_in_the_workflow_format_and_the_result_schema_is_the_report() {
+    // §8.12 says "`outputs` *is* the result", and `WorkflowDef` has no
+    // `outputs` field and is `deny_unknown_fields`, so authoring one is a hard
+    // parse error rather than an ignored key. B12c keeps that refusal
+    // deliberately: a run's result is its mandatory report task (ruling P112),
+    // so there is a real result schema and nothing for a declared block to
+    // add. This pins the refusal as an observed fact, not a claim.
     let with_outputs = r#"
 name: has-outputs
 version: 1
@@ -764,15 +766,85 @@ steps:
     emit:
       done: true
 "#;
-    let err = parse_workflow(with_outputs).expect_err("`outputs:` must not parse today");
+    let err = parse_workflow(with_outputs).expect_err("`outputs:` must not parse");
     assert!(
         err.to_string().contains("outputs"),
         "the parse error should name the rejected key, got {:?}",
         err.to_string()
     );
 
-    // And so the registration carries no output schema at all, rather than a
-    // fabricated `{"type": "object"}`.
+    // And the registration carries §8.6's report schema — not `None`, and not
+    // a fabricated `{"type": "object"}`.
     let reg = register_as_tool(&workflow_job(PR_REVIEW_YAML), "n/a").expect("fixture parses");
-    assert_eq!(reg.output_schema, None);
+    assert_eq!(
+        reg.output_schema,
+        Some(roundhouse_flow::report::core_json_schema()),
+        "a workflow's result is its report"
+    );
+}
+
+/// The result schema must describe the validator that actually runs, or it is
+/// a promise nothing keeps. Every core field it marks `required` is one
+/// `validate_report` requires, and every enum domain it declares is one
+/// `validate_report` accepts — checked by feeding the schema's own vocabulary
+/// through the validator rather than by reading both and agreeing they look
+/// alike.
+#[test]
+fn the_registered_result_schema_agrees_with_the_report_validator() {
+    use roundhouse_flow::report::{core_json_schema, validate_report};
+
+    let schema = core_json_schema();
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .expect("required is an array")
+        .iter()
+        .map(|v| v.as_str().expect("a field name"))
+        .collect();
+    assert_eq!(
+        required,
+        ["outcome", "severity", "headline", "needs_human", "cost"],
+        "§8.6's core, and only it"
+    );
+
+    let minimal = serde_json::json!({
+        "outcome": "nothing",
+        "severity": "low",
+        "headline": "ok",
+        "needs_human": false,
+        "cost": { "usd": 0.0, "tokens": 0 },
+    });
+    validate_report(&minimal).expect("the schema's own required set validates");
+
+    // Dropping any one of them must fail the validator, so `required` is not
+    // wider than what is enforced.
+    for field in &required {
+        let mut short = minimal.clone();
+        short.as_object_mut().unwrap().remove(*field);
+        assert!(
+            validate_report(&short).is_err(),
+            "the schema calls {field} required, so the validator must too"
+        );
+    }
+
+    // Every declared `outcome` and `severity` spelling is one the validator
+    // accepts, so the enum domains cannot drift apart.
+    for outcome in schema["properties"]["outcome"]["enum"].as_array().unwrap() {
+        let mut candidate = minimal.clone();
+        candidate["outcome"] = outcome.clone();
+        validate_report(&candidate)
+            .unwrap_or_else(|e| panic!("outcome {outcome} is declared but rejected: {e}"));
+    }
+    for severity in schema["properties"]["severity"]["enum"].as_array().unwrap() {
+        let mut candidate = minimal.clone();
+        candidate["severity"] = severity.clone();
+        validate_report(&candidate)
+            .unwrap_or_else(|e| panic!("severity {severity} is declared but rejected: {e}"));
+    }
+
+    // And the extension half stays open, which is the whole point of §8.6's
+    // core+extension split.
+    assert_eq!(schema["additionalProperties"], serde_json::json!(true));
+    let mut extended = minimal.clone();
+    extended["pr_number"] = serde_json::json!(4471);
+    validate_report(&extended).expect("a job's own top-level field is not an error");
 }

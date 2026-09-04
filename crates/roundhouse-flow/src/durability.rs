@@ -72,19 +72,28 @@
 //!   `round workflow replay --dry` — unscheduled; recorded as phase
 //!   residuals, not silently assumed.
 //!
-//! # Named gap: `on_crash:` is not a declarable step attribute
+//! # Closed gap: `on_crash:` is a declarable step attribute (B12c)
 //!
 //! §8.10 tier 2 writes `on_crash: rerun | fail | ask` as a **declared
-//! per-step attribute**. [`crate::parse::steps::StepDef`] has no such field,
-//! and its wire struct is `#[serde(deny_unknown_fields)]`, so a workflow that
-//! writes `on_crash:` today gets a hard parse error. [`on_crash_policy`]
-//! below implements the **default** half of that contract (§8.10 does specify
-//! default `ask`); the author-declared override is **not implemented**, and
-//! is recorded as a residual owned by **B12c**, which owns the run loop
-//! that would act on it. (Task 20a owns retry-from-step, but a *declared*
-//! `on_crash:` is a wire-shape change with no reader until that loop
-//! exists.) Adding the field means touching `parse/steps.rs`'s wire shape, which
-//! this task deliberately does not do.
+//! per-step attribute**. Until B12c [`crate::parse::steps::StepDef`] had no
+//! such field, and its wire struct is `#[serde(deny_unknown_fields)]`, so a
+//! workflow that wrote `on_crash:` got a hard parse error; [`on_crash_policy`]
+//! implemented only the **default** half of the contract (§8.10 does specify
+//! default `ask`).
+//!
+//! B12c adds [`crate::parse::steps::StepDef::on_crash`] as an
+//! `Option<CrashPolicy>` — the same enum, not a second copy of the vocabulary
+//! — and [`crash_policy`] is the reader that prefers a declaration over the
+//! derivation. [`CrashPolicy::Fail`], which no derivation can produce, is
+//! reachable for the first time.
+//!
+//! **What still has no owner is the recovery path that acts on it.** A killed
+//! daemon writes nothing, so re-driving an interrupted run — reading each
+//! step's policy, re-running the `Rerun`s, queueing the `Ask`s as a gate,
+//! failing the `Fail`s, and synthesising the report the run loop never got to
+//! write (ruling P112 §5) — is daemon-side work over
+//! `roundhouse_store::recover_interrupted_tasks`, and ruling P77 §C leaves that
+//! owner unassigned. Named here, not built here.
 
 use crate::caps::ResourceCaps;
 use crate::exec::{RunId, StepOutcome};
@@ -565,15 +574,22 @@ pub fn transition_is_legal(from: RunState, to: RunState) -> bool {
     )
 }
 
-/// §8.10 tier 2's `on_crash` outcomes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// §8.10 tier 2's `on_crash` outcomes — one closed three-word vocabulary,
+/// used both as the **derived** default ([`on_crash_policy`]) and as the
+/// **declared** per-step attribute ([`crate::parse::steps::StepDef::on_crash`],
+/// which deserializes into this type rather than minting a second copy of the
+/// same set).
+///
+/// The wire spellings are §8.10's own words: `rerun`, `fail`, `ask`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CrashPolicy {
     Rerun,
-    /// Only a step that *declared* `on_crash: fail` produces this, and no
-    /// step can declare anything today — see this module's "Named gap"
-    /// section. [`on_crash_policy`] therefore never returns it; the variant
-    /// exists because §8.10 tier 2's vocabulary has three members, and a
-    /// two-member enum would misreport the contract as smaller than it is.
+    /// Only a step that *declared* `on_crash: fail` produces this —
+    /// [`on_crash_policy`] never returns it, because §8.10 gives no
+    /// disposition that defaults to failing. **Reachable since B12c**, which
+    /// added the declared attribute; before that the variant existed only so a
+    /// two-member enum would not misreport the contract as smaller than it is.
     Fail,
     Ask,
 }
@@ -581,17 +597,36 @@ pub enum CrashPolicy {
 /// §8.10 tier 2: `Pure`/`Idempotent` steps are safely re-run; an `Effectful`
 /// step defaults to `ask` (landing in the gate queue) rather than guessing.
 ///
-/// This is the **default** half of §8.10's `on_crash: rerun | fail | ask`.
-/// The author-declared per-step override does not exist — see this module's
-/// "Named gap" section, which records it as a residual rather than pretending
-/// derivation is declaration. [`CrashPolicy::Fail`] is consequently
-/// unreachable from this function today; it is part of the contract's
-/// vocabulary and the declared override is what would produce it.
+/// This is the **default** half of §8.10's `on_crash: rerun | fail | ask`, and
+/// only that half. Call [`crash_policy`] instead unless you specifically want
+/// the derivation with any authored override ignored: consulting this function
+/// alone on a step that declared `on_crash: rerun` silently discards the
+/// declaration.
 pub fn on_crash_policy(disposition: StepDisposition) -> CrashPolicy {
     match disposition {
         StepDisposition::Pure | StepDisposition::Idempotent => CrashPolicy::Rerun,
         StepDisposition::Effectful => CrashPolicy::Ask,
     }
+}
+
+/// §8.10 tier 2's crash policy for one step: **the author's declaration if
+/// there is one, otherwise the derived default.**
+///
+/// The declaration wins outright, exactly as an explicit `idempotency_key`
+/// already wins inside [`derive_disposition`] — §8.10 writes `on_crash:` as a
+/// declared attribute, and an override a run loop then second-guessed would
+/// not be one. That includes overriding *downwards*: `on_crash: ask` on a
+/// `tool: read` step is an author saying this particular read is not as safe
+/// to repeat as its kind suggests, and it is honoured.
+///
+/// This is the function a recovery path should call. [`on_crash_policy`] and
+/// [`derive_disposition`] remain `pub` because both are meaningful on their
+/// own — the *disposition* is recorded per step row in
+/// [`WorkflowStepRun::disposition`] and drives §8.10's `Indeterminate`
+/// reclassification, which is a different question from what to do about it.
+pub fn crash_policy(step: &StepDef) -> CrashPolicy {
+    step.on_crash
+        .unwrap_or_else(|| on_crash_policy(derive_disposition(step)))
 }
 
 /// A completed step's output together with the executor's own

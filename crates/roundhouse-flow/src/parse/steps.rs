@@ -235,6 +235,7 @@
 //! confirmed both hold.
 
 use super::ParseError;
+use crate::durability::CrashPolicy;
 use crate::parse::types::{IsolationDef, OnTimeout};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1113,10 +1114,10 @@ struct GateBodyDef {
     /// not list. This struct is `#[serde(deny_unknown_fields)]`, so before
     /// this field existed a workflow writing the attribute §8.11 documents
     /// got a hard parse error, and [`crate::parking::resolve_hold_ttl`]'s
-    /// whole TTL rule was unreachable from a document. Unlike §8.10's
-    /// `on_crash:` — the same class of gap, deferred to Task 20 because that
-    /// task owns crash policy — nothing later owns this one, so deferring it
-    /// would orphan it.
+    /// whole TTL rule was unreachable from a document. §8.10's `on_crash:` was
+    /// the same class of gap, deferred to Task 20 because that task owns crash
+    /// policy, and closed by B12c ([`StepDef::on_crash`]); nothing later owned
+    /// this one, so deferring it would have orphaned it.
     ///
     /// A defaulted `bool` and nothing more: this parser is hardened
     /// untrusted-input code with three rounds of fix history behind it, and
@@ -1148,6 +1149,10 @@ struct StepDefWire {
     continue_on_error: bool,
     #[serde(default)]
     idempotency_key: Option<String>,
+    /// §8.10 tier 2's declared `on_crash: rerun | fail | ask`. See
+    /// [`StepDef::on_crash`].
+    #[serde(default)]
+    on_crash: Option<CrashPolicy>,
     #[serde(default)]
     caps: Option<CapsDef>,
     /// Fix round 1, finding L2: was `Option<serde_json::Value>` (accepted
@@ -1269,6 +1274,30 @@ pub struct StepDef {
     pub needs: Vec<String>,
     pub continue_on_error: bool,
     pub idempotency_key: Option<String>,
+    /// §8.10 tier 2's **declared** crash policy: *"`on_crash: rerun | fail |
+    /// ask`"*, as a per-step attribute.
+    ///
+    /// `None` means the author declared nothing and the default half of the
+    /// contract applies — [`crate::durability::on_crash_policy`] over the
+    /// step's derived [`crate::durability::StepDisposition`]. Read the pair
+    /// together through [`crate::durability::crash_policy`], never one of them
+    /// alone: a step that declared `on_crash: rerun` on a `tool: shell` is an
+    /// author overriding the `Effectful` default on purpose, and consulting
+    /// only the derivation would silently discard that.
+    ///
+    /// # Why this names `durability`'s enum rather than minting its own
+    ///
+    /// §8.10 gives one closed three-word vocabulary, and
+    /// [`crate::durability::CrashPolicy`] already spells it — including the
+    /// `Fail` variant, which existed unreachable precisely because *"only a
+    /// step that declared `on_crash: fail` produces this"* and no step could
+    /// declare anything. A second enum here would be two spellings of one set
+    /// with nothing keeping them in step, which is the defect ruling P76
+    /// named one noun over (two ceilings over one chain). The import runs
+    /// parser -> durability, against this crate's usual direction; that is the
+    /// cost, and it buys the property that adding a fourth crash outcome is
+    /// one edit.
+    pub on_crash: Option<CrashPolicy>,
     pub caps: Option<CapsDef>,
     pub env: Option<BTreeMap<String, String>>,
     pub body: StepBody,
@@ -1429,6 +1458,7 @@ impl TryFrom<StepDefWire> for StepDef {
             needs: w.needs,
             continue_on_error: w.continue_on_error,
             idempotency_key: w.idempotency_key,
+            on_crash: w.on_crash,
             caps: w.caps,
             env: w.env,
             body,
@@ -1444,6 +1474,7 @@ impl From<StepDef> for StepDefWire {
             needs: def.needs,
             continue_on_error: def.continue_on_error,
             idempotency_key: def.idempotency_key,
+            on_crash: def.on_crash,
             caps: def.caps,
             env: def.env,
             tool: None,
