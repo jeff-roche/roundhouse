@@ -8,6 +8,7 @@
 //! `05-scheduling-and-workflows.md`.
 #![forbid(unsafe_code)]
 
+pub mod approval_policy;
 pub mod caps;
 pub mod compose;
 pub mod control;
