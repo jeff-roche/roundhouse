@@ -496,10 +496,14 @@ pub(super) enum Verdict {
 /// rounds each published a worst case the next reviewer beat — 5,960 ms,
 /// then 9,304.7 ms — because each pinned a *mantissa* payload; the
 /// maximiser puts the digits in the exponent and measures **~13.7 s
-/// admitted**. With the float charge in place the worst admitted **float**
-/// document measures **1,519.1 ms** (measured fix round 6 against a retuned
-/// 249,582 B shape; fix round 5 published 1,603.3 ms for the same family at
-/// 259,742 B, but *that tuning does not reproduce* — see
+/// admitted** (**reported by the fix-5 security review, not re-measured
+/// here**; the fix-5 report's own search of the same family, pinned to a
+/// mantissa payload rather than the review's tuned exponent one, found the
+/// higher **18,318.9 ms** cited as the pre-charge figure in [`super`]'s
+/// axis-inventory table). With the float charge in place the worst admitted
+/// **float** document measures **1,519.1 ms** (measured fix round 6 against
+/// a retuned 249,582 B shape; fix round 5 published 1,603.3 ms for the same
+/// family at 259,742 B, but *that tuning does not reproduce* — see
 /// [`super::MAX_FLOAT_SCALAR_VISITS`]' table).
 ///
 /// **Per-node work is still not bounded, and saying it was is what round 5
