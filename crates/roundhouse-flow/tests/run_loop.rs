@@ -1661,10 +1661,16 @@ fn a_re_drive_honours_every_kind_of_finished_row_and_re_runs_the_rest() {
 fn taint_crosses_a_step_boundary_inside_the_run_loop_too() {
     let mut conn = open_test_db();
     let (run_id, _) = seed_run(&mut conn);
+    // `source` emits a **field of** a JSON secret, not the secret itself, so
+    // what crosses the boundary is a derived leaf the whole-secret needle
+    // backstop structurally cannot match (`redact_known_secrets`'s own doc:
+    // it matches whole declared values and nothing else). Only the taint fold
+    // can keep it out of the log, which is what makes this test measure the
+    // fold rather than the backstop.
     let def = parse_workflow(&workflow(
         "steps:\n\
          \x20 - id: source\n\
-         \x20   emit: { body: \"${{ secrets.TOKEN }}\" }\n\
+         \x20   emit: { body: \"${{ json(secrets.TOKEN).inner }}\" }\n\
          \x20 - id: sink_step\n\
          \x20   needs: [source]\n\
          \x20   emit: { relayed: \"${{ steps.source.output.body }}\" }\n",
@@ -1673,11 +1679,12 @@ fn taint_crosses_a_step_boundary_inside_the_run_loop_too() {
     let mut sink = RecordingSink::default();
     let mut host = FakeHost::new();
     let mut run_ctx = ctx(run_id);
-    run_ctx
-        .secrets
-        .insert("TOKEN".into(), "sk-derived-leaf-value".into());
+    run_ctx.secrets.insert(
+        "TOKEN".into(),
+        "{\"inner\":\"derived-leaf-not-a-needle\"}".into(),
+    );
 
-    run_workflow(
+    let outcome = run_workflow(
         &mut conn,
         &def,
         run_id,
@@ -1689,9 +1696,25 @@ fn taint_crosses_a_step_boundary_inside_the_run_loop_too() {
     )
     .unwrap();
 
+    // The relay must actually have happened, or "the leaf is not in the log"
+    // is true for the uninteresting reason.
+    let RunOutcome::Terminal { state, steps, .. } = outcome else {
+        panic!("no gate")
+    };
+    assert_eq!(state, RunState::Completed, "both steps ran: {steps:?}");
+    assert_eq!(
+        steps
+            .iter()
+            .find(|s| s.step_id == "sink_step")
+            .expect("the relay ran")
+            .output["relayed"],
+        "derived-leaf-not-a-needle",
+        "and it really did relay the leaf, unredacted, for dispatch"
+    );
+
     let logged = format!("{:?}", sink.emitted);
     assert!(
-        !logged.contains("sk-derived-leaf-value"),
+        !logged.contains("derived-leaf-not-a-needle"),
         "a derived leaf must not reach the log in cleartext: {logged}"
     );
 }
