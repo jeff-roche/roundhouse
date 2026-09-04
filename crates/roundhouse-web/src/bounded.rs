@@ -98,16 +98,16 @@
 /// fails — an `fn pool(&self)` on this type, or anything on `StoreConnection`
 /// (again `pub(crate)`, so again no link) handing back the
 /// [`roundhouse_store::PooledConnection`] its forwarding method keeps to
-/// itself. With the `Deref` gone (ruling P103)
-/// that is the **sole** unguarded path, rather than one residual beside a
-/// method path believed closed, and it is worth stating at that weight rather
-/// than as a footnote: every other route above is either scanned or does not
-/// compile, and this one is held by a reader noticing.
+/// itself. With the `Deref` gone (ruling P103) that is the **sole** unguarded
+/// path, rather than one residual beside a method path believed closed, and it
+/// is worth stating at that weight rather than as a footnote: every other route
+/// above is either scanned or does not compile, and this one is held by a
+/// reader noticing.
 ///
-/// What makes it a smaller thing than what it replaced: it needs someone in
-/// this file to *write* the accessor. The `Deref` it replaces could have
-/// reopened silently, on an upstream release, with nothing in this repo
-/// changing at all.
+/// It is still a smaller thing than the hazard it is now alone in place of:
+/// this one needs someone in *this file* to write the accessor, where the
+/// `Deref` could have reopened silently, on an upstream release, with nothing
+/// in this repo changing at all.
 ///
 /// It stays disclosed rather than guarded, deliberately. Ruling P100 rejected a
 /// `grep` for the signature because a rename defeats it, and a guard that fails
@@ -349,7 +349,7 @@ pub(crate) struct StoreConnection {
 }
 
 impl StoreConnection {
-    /// Runs `f` against the checked-out `sqlite` connection on the pool's
+    /// Runs `f` against the checked-out SQLite connection on the pool's
     /// blocking thread — **the whole of what a handler can do with one.**
     ///
     /// # Why this is a method and not a `Deref`
@@ -385,10 +385,11 @@ impl StoreConnection {
     ///
     /// Rejected, so they are not re-derived: pinning `deadpool-sync` (it is
     /// transitive, and a pin is a dated fact that rots into a false assurance);
-    /// a source scan for `Deref` (to know which target is dangerous it would
-    /// have to enumerate the upstream API — the exact enumeration this stops
-    /// doing). What `tests/bounded_reach.rs` scans for instead is any `Deref`
-    /// impl at all, which needs to know nothing about `deadpool`.
+    /// and keeping a `Deref` under a scan that blesses one target, since to know
+    /// which target is safe that scan has to enumerate the upstream API — the
+    /// exact enumeration this stops doing, and the assertion the previous round
+    /// made. `tests/bounded_reach.rs` asserts an **absence** instead: no `Deref`
+    /// at all, which needs to know nothing about `deadpool`.
     ///
     /// # The cost, stated because it is the only cost
     ///
