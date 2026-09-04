@@ -279,7 +279,7 @@ pub enum RunOutcome {
     ///
     /// **This holds even when the workflow's `report:` step has already
     /// completed** — the document it produced is held, not emitted, until the
-    /// run reaches a terminal state (see [`super::ReportEmission`]). The park
+    /// run reaches a terminal state (see `super::ReportEmission`). The park
     /// that never gets answered is therefore the one terminal path with no
     /// report and no owner: `crate::report`'s module doc records that
     /// obligation for whoever builds §8.11's reaper.
@@ -320,9 +320,12 @@ struct ReportPersisted(ReportOrigin);
 ///
 /// # Preconditions
 ///
-/// `run_id` names an existing `workflow_run` row. It must be `Running`, or
-/// `AwaitingHuman` together with a `resume` answer for the gate it is parked
-/// on; anything else is [`RunLoopError::RunNotDrivable`]. Creating the row is
+/// `run_id` names an existing `workflow_run` row. It must be `Running`;
+/// `Cancelling`, which is drivable **because** §8.13's cancel is cooperative
+/// and this loop is what drains it (ruling P115 §A — refusing would leave
+/// `finally:` unrun and the mandatory report unwritten); or `AwaitingHuman`
+/// together with a `resume` answer for the gate it is parked on. Anything else
+/// is [`RunLoopError::RunNotDrivable`]. Creating the row is
 /// the caller's — [`crate::durability::insert_workflow_run`], which is also
 /// where a child run's grant is drawn from its parent.
 ///
