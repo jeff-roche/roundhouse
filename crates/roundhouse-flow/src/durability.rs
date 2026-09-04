@@ -1433,18 +1433,14 @@ pub fn previous_run_for_binding(
         )
         .optional()?;
 
-    const COLUMNS: &str =
-        "SELECT id, job_id, job_version, content_hash, session_id, binding_id, trigger_event_id,
-                state, parent_run_id, forked_from_run_id, awaiting_until, started_at, ended_at
-         FROM workflow_run
-         WHERE binding_id = ?1 AND id != ?2";
+    let columns = format!("{WORKFLOW_RUN_SELECT} WHERE binding_id = ?1 AND id != ?2");
     const ORDER: &str = " ORDER BY started_at DESC, id DESC LIMIT 1";
 
     let row = match asking {
         Some((started_at, id)) => {
             // Row-value comparison: strictly earlier by `started_at`, with
             // `id` as the same deterministic tiebreak the ORDER BY uses.
-            let sql = format!("{COLUMNS} AND (started_at, id) < (?3, ?4){ORDER}");
+            let sql = format!("{columns} AND (started_at, id) < (?3, ?4){ORDER}");
             conn.prepare(&sql)?
                 .query_row(
                     params![
@@ -1458,7 +1454,7 @@ pub fn previous_run_for_binding(
                 .optional()?
         }
         None => {
-            let sql = format!("{COLUMNS}{ORDER}");
+            let sql = format!("{columns}{ORDER}");
             conn.prepare(&sql)?
                 .query_row(
                     params![binding_id.to_string(), exclude_run_id.to_string()],
@@ -1477,11 +1473,7 @@ fn workflow_run_row(
     conn: &Connection,
     run_id: RunId,
 ) -> Result<Option<WorkflowRun>, DurabilityError> {
-    let mut stmt = conn.prepare(
-        "SELECT id, job_id, job_version, content_hash, session_id, binding_id, trigger_event_id,
-                state, parent_run_id, forked_from_run_id, awaiting_until, started_at, ended_at
-         FROM workflow_run WHERE id = ?1",
-    )?;
+    let mut stmt = conn.prepare(&format!("{WORKFLOW_RUN_SELECT} WHERE id = ?1"))?;
     let row = stmt
         .query_row(params![run_id.to_string()], workflow_run_columns)
         .optional()?;
@@ -1490,6 +1482,51 @@ fn workflow_run_row(
         None => Ok(None),
     }
 }
+
+/// The most recently started runs, newest first, at most `limit` of them.
+///
+/// The Runs inbox's outer query ([`crate::runs::load_run_summaries`], Task 34).
+/// `pub(crate)`: an unbounded "every run ever" listing is not something to hand
+/// out, and the only caller that wants this shape applies its own cap.
+///
+/// **The cap is the point, not a nicety.** `workflow_run` grows once per run
+/// forever, and the caller renders the result into an HTTP response body, so an
+/// uncapped `SELECT` is an unbounded response whose cost scales with how long
+/// the daemon has been running. Ordering ties break on `id`, deterministically
+/// but arbitrarily — the same convention (and the same non-temporal caveat) as
+/// [`previous_run_for_binding`].
+///
+/// A `limit` past `i64::MAX` saturates rather than failing: SQLite takes the
+/// bound as a signed 64-bit integer, and no caller can mean anything by a
+/// larger number than "all of them".
+pub(crate) fn recent_workflow_runs(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<WorkflowRun>, DurabilityError> {
+    let mut stmt = conn.prepare(&format!(
+        "{WORKFLOW_RUN_SELECT} ORDER BY started_at DESC, id DESC LIMIT ?1"
+    ))?;
+    let rows = stmt
+        .query_map(
+            params![i64::try_from(limit).unwrap_or(i64::MAX)],
+            workflow_run_columns,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter().map(workflow_run_from_columns).collect()
+}
+
+/// The `workflow_run` columns every reader in this module selects, in the exact
+/// order [`workflow_run_columns`] reads them back out of the row.
+///
+/// One definition rather than one per query: the tuple positions are what bind
+/// the `SELECT` list to [`WorkflowRunColumns`], and a hand-copied list per
+/// reader is a chance for one of them to drift into reading `binding_id` out of
+/// the `session_id` slot — a mismatch SQLite cannot catch, because both columns
+/// are `TEXT`.
+const WORKFLOW_RUN_SELECT: &str =
+    "SELECT id, job_id, job_version, content_hash, session_id, binding_id, trigger_event_id,
+            state, parent_run_id, forked_from_run_id, awaiting_until, started_at, ended_at
+     FROM workflow_run";
 
 /// The raw `workflow_run` columns, in query order. Extracted as a tuple
 /// inside the `rusqlite` closure (which can only produce `rusqlite::Error`)
