@@ -1,5 +1,8 @@
 //! Task 31 (Phase 5, Subsystem D2): the SSE endpoint and the `Last-Event-ID`
-//! <-> `(session_id, seq)` cursor mapping.
+//! <-> `(session_id, seq)` cursor mapping. Task 32 (D3) added §11.3's ring —
+//! what the cursor is answered *with* — to the same file rather than a second
+//! one, because the ring is inside the hub and every test of it is a test of
+//! this endpoint: same harness, same router, same frames.
 //!
 //! **Every test that matters here drives the real `axum::Router`** through
 //! `build_router` + `ServiceExt::oneshot`, with a real `Last-Event-ID` request
@@ -24,7 +27,9 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use roundhouse_core::{Delta, EventPayload, SessionId};
 use roundhouse_proto::ClientEvent;
-use roundhouse_web::sse::{format_event_id, parse_last_event_id, Cursor, SessionUpdate, SseHub};
+use roundhouse_web::sse::{
+    format_event_id, parse_last_event_id, Cursor, Retention, SessionUpdate, SseHub,
+};
 use roundhouse_web::{build_router, AppState};
 use tower::ServiceExt;
 
@@ -492,18 +497,29 @@ async fn a_hostile_last_event_id_is_rejected_without_panicking_the_handler() {
     }
 }
 
-/// §11.3: a client whose cursor predates what the daemon still holds is told
-/// `resync_required` and refetches a snapshot. The broadcast buffer
-/// overflowing is the same class of failure — the stream cannot produce the
-/// events the client is missing — so it gets the same answer. Continuing
-/// silently would hand the client a gap it has no way to detect.
+/// A gap the ring **cannot** cover is the one thing §11.3 answers with
+/// `resync_required`, and this is the live-stream half of it: a subscriber
+/// bumped out of the live queue whose missing events have also fallen off the
+/// ring's tail. Continuing silently would hand the client a gap it has no way
+/// to detect.
 ///
-/// **Mutation killed:** `Err(RecvError::Lagged(_)) => continue`, the shape
-/// this endpoint was drafted with. The body then contains only the surviving
-/// frames and no `resync_required` frame at all.
+/// The retention here is the degenerate one the constructor still allows —
+/// `live_queue == ring_events` — which gives a recovery band of exactly zero:
+/// every value the queue drops is one the ring has already evicted. That is
+/// what makes this the unrecoverable case rather than
+/// `a_subscriber_bumped_out_of_the_live_queue_recovers_the_gap_from_the_ring`.
+///
+/// **Mutations killed:** (a) `Err(RecvError::Lagged(_)) => continue` — the
+/// body then holds only the surviving frames and no `resync_required` at all;
+/// (b) treating an exhausted ring as "no tail, nothing missed" and going live
+/// — same silent gap.
 #[tokio::test]
-async fn a_subscriber_that_falls_behind_is_told_resync_required_rather_than_handed_a_silent_gap() {
-    let hub = SseHub::with_capacity(2);
+async fn a_lag_the_ring_cannot_cover_is_told_resync_required_rather_than_handed_a_silent_gap() {
+    let hub = SseHub::with_retention(Retention {
+        live_queue: 2,
+        ring_events: 2,
+        ..Retention::default()
+    });
     let session = SessionId::new();
 
     let streamed = stream(hub, &events_uri(session), None, |hub| {
@@ -522,7 +538,8 @@ async fn a_subscriber_that_falls_behind_is_told_resync_required_rather_than_hand
     assert_eq!(
         last.event.as_deref(),
         Some("resync_required"),
-        "falling behind must terminate the stream with §11.3's resync signal; body was:\n{}",
+        "falling behind past the ring must terminate the stream with §11.3's resync signal; \
+         body was:\n{}",
         streamed.body
     );
     assert_eq!(
@@ -534,16 +551,278 @@ async fn a_subscriber_that_falls_behind_is_told_resync_required_rather_than_hand
         serde_json::from_str::<serde_json::Value>(
             last.data
                 .as_deref()
-                .expect("the resync frame states how much was lost")
+                .expect("the resync frame states what it could not deliver")
         )
         .expect("JSON"),
-        serde_json::json!({ "dropped_events": 3 }),
+        // The client has seen nothing, so it still needs seq 0; the ring holds
+        // only the last two of the five published, so its tail is seq 3.
+        serde_json::json!({ "resume_from": 0, "oldest_retained": 3 }),
     );
     assert_eq!(
         frames.len(),
         1,
         "the resync frame is terminal: nothing is emitted after it. Body was:\n{}",
         streamed.body
+    );
+}
+
+// ── §11.3's ring: replay on reconnect, resync only on a tail miss ─────────
+//
+// Task 32 (Phase 5, Subsystem D3). These four tests are the ones D2 could not
+// write: they publish **before** the connection exists and assert on what the
+// reconnecting client is handed. Each holds a second subscription (`_keeper`)
+// for the same session, because a session's channel — and now its ring — lives
+// exactly as long as its last subscriber. That is the eviction rule, not an
+// accident of the harness; the residual it leaves is named in `sse.rs`.
+
+/// The point of the whole task, and the thing the endpoint could not do
+/// before it: a client that reconnects with a cursor still inside the ring is
+/// **replayed the gap**, not merely joined to the live stream.
+///
+/// Nothing is published after the request here. Every frame in the body was
+/// published before the connection existed, so a hub that only fans out live
+/// updates produces an empty body.
+///
+/// **Mutations killed:** (a) dropping the replay and going straight live (the
+/// D2 shape) — the body is empty; (b) replaying the whole ring instead of the
+/// suffix from the cursor — `:0` and `:1` reappear, which is the duplicate
+/// delivery the cursor exists to prevent; (c) replaying with the payloads
+/// mismatched against their ids — the second assertion fails.
+#[tokio::test]
+async fn a_reconnecting_client_is_replayed_the_gap_the_ring_still_holds() {
+    let hub = SseHub::new();
+    let session = SessionId::new();
+    // A second stream on the same session, holding the channel and its ring
+    // open across the reconnect this test is about.
+    let _keeper = hub.subscribe(session);
+
+    for (seq, text) in [
+        (0, "zeroth"),
+        (1, "first"),
+        (2, "second"),
+        (3, "third"),
+        (4, "fourth"),
+    ] {
+        publish(&hub, text_event(session, seq, text));
+    }
+
+    let resume_from = format_event_id(&Cursor {
+        session_id: session,
+        seq: 1,
+    });
+    let streamed = stream(
+        hub,
+        &events_uri(session),
+        Some(resume_from.as_bytes()),
+        |_| {},
+    )
+    .await;
+
+    assert_eq!(streamed.status, StatusCode::OK);
+    assert_eq!(
+        frame_ids(&streamed.body),
+        vec![
+            format!("{session}:2"),
+            format!("{session}:3"),
+            format!("{session}:4"),
+        ],
+        "the client has seq 0 and 1; the ring still holds 2, 3 and 4 and must replay exactly \
+         those. Body was:\n{}",
+        streamed.body
+    );
+
+    let expected: Vec<serde_json::Value> = [(2, "second"), (3, "third"), (4, "fourth")]
+        .into_iter()
+        .map(|(seq, text)| {
+            serde_json::to_value(text_event(session, seq, text).event).expect("serializes")
+        })
+        .collect();
+    assert_eq!(frame_payloads(&streamed.body), expected);
+}
+
+/// §11.3's own words: *"or if the cursor is older than the ring's tail, emits
+/// `resync_required` and the client refetches a snapshot."* This is that
+/// check, at reconnect time, which is the only place §11.3 describes it.
+///
+/// **Mutations killed:** (a) replaying whatever the ring happens to hold and
+/// calling it the gap — the body becomes frames `:6`..`:9`, silently skipping
+/// seq 1 through 5; (b) comparing the cursor against the ring's *newest* seq
+/// rather than its oldest — every reconnect then resyncs, and
+/// `a_reconnecting_client_is_replayed_the_gap_the_ring_still_holds` fails
+/// alongside this one, which is how the pair pins the boundary from both
+/// sides.
+#[tokio::test]
+async fn a_cursor_older_than_the_rings_tail_is_told_resync_required_rather_than_a_partial_replay() {
+    let hub = SseHub::with_retention(Retention {
+        live_queue: 1,
+        ring_events: 4,
+        ..Retention::default()
+    });
+    let session = SessionId::new();
+    let _keeper = hub.subscribe(session);
+
+    for seq in 0..10 {
+        publish(&hub, text_event(session, seq, "delta"));
+    }
+
+    let resume_from = format_event_id(&Cursor {
+        session_id: session,
+        seq: 0,
+    });
+    let streamed = stream(
+        hub,
+        &events_uri(session),
+        Some(resume_from.as_bytes()),
+        |_| {},
+    )
+    .await;
+
+    assert_eq!(streamed.status, StatusCode::OK);
+    let frames = parse_frames(&streamed.body);
+    assert_eq!(
+        frames.len(),
+        1,
+        "a tail miss is one terminal frame and nothing else; body was:\n{}",
+        streamed.body
+    );
+    assert_eq!(frames[0].event.as_deref(), Some("resync_required"));
+    assert_eq!(frames[0].id, None);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            frames[0].data.as_deref().expect("a stated payload")
+        )
+        .expect("JSON"),
+        // The client holds seq 0, so it needs seq 1; the ring holds the last
+        // four of the ten published, so its tail is seq 6.
+        serde_json::json!({ "resume_from": 1, "oldest_retained": 6 }),
+    );
+}
+
+/// A subscriber bumped out of the live queue is **recoverable**, not doomed.
+///
+/// D2 had to answer `Lagged` with a terminal `resync_required` because it held
+/// no history. The ring is that history, so falling behind the live queue is
+/// now a gap the server can fill — and `resync_required` goes back to naming
+/// the single condition §11.3 names.
+///
+/// The five events are published while nothing polls the response body, so the
+/// two-slot live queue is overrun by three; the sixteen-entry ring still holds
+/// every one of them.
+///
+/// **Mutations killed:** (a) the D2 shape, `Lagged` => terminal
+/// `resync_required` — the body becomes one resync frame and no events;
+/// (b) recovering from the ring but not filtering what the live channel then
+/// re-delivers — seq 3 and 4 are emitted twice, which the exact `frame_ids`
+/// comparison catches.
+#[tokio::test]
+async fn a_subscriber_bumped_out_of_the_live_queue_recovers_the_gap_from_the_ring() {
+    let hub = SseHub::with_retention(Retention {
+        live_queue: 2,
+        ring_events: 16,
+        ..Retention::default()
+    });
+    let session = SessionId::new();
+
+    let streamed = stream(hub, &events_uri(session), None, |hub| {
+        for seq in 0..5 {
+            publish(hub, text_event(session, seq, "delta"));
+        }
+    })
+    .await;
+
+    assert_eq!(streamed.status, StatusCode::OK);
+    assert!(
+        parse_frames(&streamed.body)
+            .iter()
+            .all(|frame| frame.event.is_none()),
+        "a gap the ring covers is not a resync; body was:\n{}",
+        streamed.body
+    );
+    assert_eq!(
+        frame_ids(&streamed.body),
+        (0..5)
+            .map(|seq| format!("{session}:{seq}"))
+            .collect::<Vec<_>>(),
+        "every event the live queue dropped is still in the ring and must be delivered \
+         exactly once. Body was:\n{}",
+        streamed.body
+    );
+}
+
+/// The ring is bounded by **bytes as well as entries**, because
+/// `ring_events` alone bounds nothing that matters: `EventPayload` has
+/// unbounded inline variants, so 4096 entries is 4096 x whatever the publisher
+/// sent — and the endpoint that creates a session's ring takes an arbitrary
+/// UUID with no authentication.
+///
+/// Both halves run the same three 4 KiB events past the same entry bound (64,
+/// far more than three) and differ only in `ring_bytes`. Under the 1 KiB
+/// budget each event on its own exceeds the whole budget, so the ring is left
+/// holding exactly the newest one — never nothing, because an empty ring has
+/// no tail to miss and would send the client live with a silent gap.
+///
+/// **Mutations killed:** (a) dropping the byte bound (or checking it before
+/// the push instead of after) — the first half replays all three events
+/// instead of resyncing; (b) evicting the newest rather than the oldest, or
+/// evicting down to empty — the first half's `oldest_retained` is wrong, or
+/// there is no resync frame at all; (c) applying the byte bound
+/// unconditionally — the second half, which is the control, loses events it
+/// has room for.
+#[tokio::test]
+async fn the_rings_byte_bound_evicts_where_its_entry_bound_would_not() {
+    let big = "x".repeat(4096);
+    let session = SessionId::new();
+    let no_cursor: Option<&[u8]> = None;
+
+    let hub = SseHub::with_retention(Retention {
+        live_queue: 1,
+        ring_events: 64,
+        ring_bytes: 1024,
+    });
+    let _keeper = hub.subscribe(session);
+    for seq in 0..3 {
+        publish(&hub, text_event(session, seq, &big));
+    }
+    let streamed = stream(hub, &events_uri(session), no_cursor, |_| {}).await;
+
+    let frames = parse_frames(&streamed.body);
+    assert_eq!(
+        frames.len(),
+        1,
+        "three events of 4 KiB do not fit a 1 KiB ring; body was {} bytes",
+        streamed.body.len()
+    );
+    assert_eq!(frames[0].event.as_deref(), Some("resync_required"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            frames[0].data.as_deref().expect("a stated payload")
+        )
+        .expect("JSON"),
+        // Each event alone is over budget, so the ring retains the newest and
+        // nothing else — rather than nothing at all, which would have no tail
+        // to miss.
+        serde_json::json!({ "resume_from": 0, "oldest_retained": 2 }),
+    );
+
+    // The control: the same events, the same entry bound, a byte budget that
+    // fits them. Without this, "always resync" would pass the half above.
+    let hub = SseHub::with_retention(Retention {
+        live_queue: 1,
+        ring_events: 64,
+        ring_bytes: 1024 * 1024,
+    });
+    let _keeper = hub.subscribe(session);
+    for seq in 0..3 {
+        publish(&hub, text_event(session, seq, &big));
+    }
+    let streamed = stream(hub, &events_uri(session), no_cursor, |_| {}).await;
+
+    assert_eq!(
+        frame_ids(&streamed.body),
+        (0..3)
+            .map(|seq| format!("{session}:{seq}"))
+            .collect::<Vec<_>>(),
+        "12 KiB of events fit a 1 MiB ring and must all be replayed"
     );
 }
 
@@ -572,7 +851,10 @@ async fn a_subscriber_that_falls_behind_is_told_resync_required_rather_than_hand
 async fn a_burst_on_another_session_does_not_lag_this_sessions_stream() {
     // Two slots, so five events on the other session would overrun a shared
     // buffer several times over.
-    let hub = SseHub::with_capacity(2);
+    let hub = SseHub::with_retention(Retention {
+        live_queue: 2,
+        ..Retention::default()
+    });
     let mine = SessionId::new();
     let theirs = SessionId::new();
     let mut receiver_counts = Vec::new();

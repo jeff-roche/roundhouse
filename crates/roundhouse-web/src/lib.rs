@@ -6,7 +6,10 @@
 //! `axum::Router` serving the `rust-embed`-embedded client from
 //! `assets/dist/`, with §11.1's SPA fallback. Task 31 (D2) added the first
 //! API route: §11.3's SSE stream, with `Last-Event-ID` carrying the
-//! `(session_id, seq)` cursor — see [`sse`]. **This crate still binds no
+//! `(session_id, seq)` cursor. Task 32 (D3) added the rest of §11.3 — the
+//! per-session ring the cursor is answered from, inside the same hub, so a
+//! reconnecting client's gap is replayed and `resync_required` is left naming
+//! the one condition §11.3 gives it. See [`sse`]. **This crate still binds no
 //! listener and starts no server**, and nothing links it yet.
 //!
 //! Wiring it up is a separate, later piece of work, and it is not free: it has
@@ -55,14 +58,17 @@ pub fn api_version() -> roundhouse_proto::ApiVersion {
 /// `tests/assets.rs::a_handler_taking_app_state_composes_with_the_asset_router`
 /// formats it with `{state:?}` and compares against a separately constructed
 /// `AppState::default()` — which holds because [`sse::SseHub`]'s `Debug` is its
-/// capacity plus its per-session channel map, and that map is **empty until
+/// [`sse::Retention`] plus its per-session map, and that map is **empty until
 /// something subscribes**. Two default hubs therefore format identically
-/// without either one carrying per-instance identity.
+/// without either one carrying per-instance identity. It is also why D3's ring
+/// lives behind the hub's own interior mutability rather than being a `&mut`
+/// field here: this type is cloned per request and can hold no exclusive state.
 #[derive(Clone, Debug, Default)]
 pub struct AppState {
-    /// Per-session fan-out of appended events to open SSE connections.
-    /// **Nothing in this workspace publishes into it yet** — see [`sse`]'s
-    /// module docs, which also record that it performs no redaction.
+    /// Per-session fan-out of appended events to open SSE connections, and the
+    /// §11.3 ring each one replays from. **Nothing in this workspace publishes
+    /// into it yet** — see [`sse`]'s module docs, which also record that it
+    /// performs no redaction.
     pub sse: sse::SseHub,
 }
 
