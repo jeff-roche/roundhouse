@@ -585,6 +585,68 @@ fn a_failure_message_survives_the_checkpoint_instead_of_being_dropped() {
     assert_eq!(ok.error, None);
 }
 
+/// Fix round 2 (M-2): `workflow_step_run.error` was a second, uncapped sink
+/// for `StepStatus::Failed`/`Skipped` text alongside `exec`'s
+/// `steps.<id>.error`, which is bounded at 512 bytes. `checkpoint_step` now
+/// bounds this column too, at its own independent constant. Payload: a
+/// 5,000-byte message of repeated `'e'`s.
+#[test]
+fn an_oversized_failure_message_is_truncated_before_it_reaches_the_column() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    let huge_message: String = std::iter::repeat_n('e', 5_000).collect();
+    let mut failed = a_step_run(run_id, "build", StepDisposition::Effectful);
+    failed.state = StepRunState::Failed;
+    failed.error = Some(huge_message.clone());
+    checkpoint_step(&mut conn, &failed).unwrap();
+
+    let build = recover_run(&conn, run_id).unwrap().steps.remove(0);
+    let stored = build.error.expect("a Failed step keeps its error");
+    assert!(
+        stored.len() < huge_message.len(),
+        "stored error ({} bytes) must be shorter than the original 5,000-byte \
+         message, got the same or longer",
+        stored.len()
+    );
+    assert!(
+        stored.ends_with("(5000 bytes total)"),
+        "truncated error should name the original byte length, got: {stored:?}"
+    );
+    assert!(
+        stored.starts_with(&"e".repeat(100)),
+        "truncation keeps a real prefix of the message, not just the suffix marker"
+    );
+}
+
+/// Fix round 2 (M-2): before this fix, `WorkflowStepRun` derived `Debug`, so
+/// a value that had never been through `checkpoint_step` (and so had no
+/// chance to be bounded at the storage layer) printed `error` at full
+/// length via `{:?}` — the same failure shape `exec::StepStatus`'s
+/// hand-written `Debug` was written to prevent for the in-memory value this
+/// column is copied from. Payload: a 5,000-byte message of repeated `'s'`s,
+/// never checkpointed.
+#[test]
+fn debug_formatting_a_step_run_bounds_an_unpersisted_error_field() {
+    let huge_message: String = std::iter::repeat_n('s', 5_000).collect();
+    let mut failed = a_step_run(RunId::new(), "build", StepDisposition::Effectful);
+    failed.state = StepRunState::Failed;
+    failed.error = Some(huge_message.clone());
+
+    let printed = format!("{failed:?}");
+    assert!(
+        printed.len() < huge_message.len(),
+        "the full 5,000-byte message must not reach Debug output verbatim, \
+         printed output was {} bytes",
+        printed.len()
+    );
+    assert!(
+        !printed.contains(&huge_message),
+        "Debug output must not contain the unbounded message as a substring"
+    );
+}
+
 /// `checkpoint_step`'s upsert makes `output` last-write-wins rather than
 /// `COALESCE`ing it, so a checkpoint carrying no output **clears** a stored
 /// one. That is deliberate on both counts: it keeps `output` and its taint

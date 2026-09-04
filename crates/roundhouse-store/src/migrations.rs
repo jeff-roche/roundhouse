@@ -185,14 +185,24 @@ CREATE UNIQUE INDEX trigger_event_dedupe
 ///   keeps other users out, not the file bits.
 /// - There is **no encryption at rest**, and none is implied anywhere here.
 /// - `pool.rs` sets `PRAGMA secure_delete = ON` so that clearing an `output`
-///   zeroes the freed bytes in the database file rather than leaving them
-///   there to be read back raw (measured — see that pragma's comment). It
-///   bounds residue in the main file only; an un-checkpointed `-wal` still
-///   holds the prior page image.
+///   zeroes the freed bytes rather than leaving them there to be read back
+///   raw (measured — see that pragma's comment for the full matrix, fix
+///   round 2 M-1). The guarantee is conditional, not unconditional: it
+///   bounds residue in the main database file only **once the clearing
+///   write has itself been checkpointed** (before that, the cleared page
+///   sits in `-wal` and the pre-clear bytes are still what's in the main
+///   file), and it bounds residue in `-wal` only **once that checkpoint is a
+///   TRUNCATE** — an ordinary PASSIVE autocheckpoint (SQLite's default)
+///   backfills the main file but does not truncate or zero `-wal`, so the
+///   pre-clear page image's raw bytes can still be sitting there.
 ///
 /// Erasing outputs that no fork can still target is a named residual owned by
 /// **Task 20 (B12)** — the mechanism exists (checkpoint the step with no
-/// output, which writes `output = NULL`), only the caller is missing.
+/// output, which writes `output = NULL`), only the caller is missing, and
+/// per the conditional guarantee above that caller must also issue
+/// `PRAGMA wal_checkpoint(TRUNCATE)` after the clear to actually reach
+/// `-wal` (see `roundhouse-flow`'s `durability` module doc for where this is
+/// tracked as part of that task's obligation).
 const MIGRATION_0007_WORKFLOW_RUN: &str = r#"
 CREATE TABLE workflow_run (
     id                 TEXT    PRIMARY KEY,

@@ -45,10 +45,21 @@
 //!   last-write-wins, so checkpointing a step with `output: None` already
 //!   writes `output = NULL, output_is_secret_derived = 0` and (with
 //!   `PRAGMA secure_delete = ON`, set in `roundhouse-store`'s pool) zeroes
-//!   the freed bytes. The **mechanism exists and is tested; what is missing
-//!   is a caller** — a retention policy deciding which completed runs can no
-//!   longer be forked. Until then, unredacted step output stays at rest for
-//!   the life of the row.
+//!   the freed bytes — but only once that clearing write is itself
+//!   checkpointed, and only as far as the main database file: an ordinary
+//!   `PASSIVE` autocheckpoint backfills the main file but does not truncate
+//!   or zero `-wal`, so the pre-clear page image can still be sitting there
+//!   in raw bytes (measured; see `roundhouse-store::pool`'s pragma comment
+//!   for the full matrix, fix round 2 M-1). **The eraser Task 20 writes
+//!   therefore owes one more step than the `UPDATE` alone**: after clearing
+//!   `output`, it must also issue `PRAGMA wal_checkpoint(TRUNCATE)` (not
+//!   rely on the default `PASSIVE` autocheckpoint) to actually reach `-wal`,
+//!   or the erasure is real only in the main database file and the prior
+//!   bytes remain recoverable from the WAL sidecar. The **mechanism for the
+//!   `UPDATE` half exists and is tested; what is missing is a caller** — a
+//!   retention policy deciding which completed runs can no longer be
+//!   forked, plus the `TRUNCATE` checkpoint named above. Until then,
+//!   unredacted step output stays at rest for the life of the row.
 //! - **§8.10 tier 3** (agent-step conversation reload) and
 //!   `round workflow replay --dry` — unscheduled; recorded as phase
 //!   residuals, not silently assumed.
@@ -522,7 +533,7 @@ pub const TOP_LEVEL_ITEM_INDEX: i64 = -1;
 /// `(run_id, step_id, attempt, item_index)` — and are exactly migration
 /// 0007's primary key. Keeping the three in step is what stops a `map` step's
 /// per-item rows from colliding.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct WorkflowStepRun {
     pub run_id: RunId,
     pub step_id: String,
@@ -549,11 +560,86 @@ pub struct WorkflowStepRun {
     /// skipped.
     ///
     /// Not redacted, and no taint flag: the executor computes none for a
-    /// status message. `exec::StepStatus`'s hand-written `Debug` bounds what
-    /// a `{:?}` of such a message *prints*, which is not the same as bounding
-    /// what is stored here — this column holds the message in full. Treat it
-    /// with the same care as [`Self::output`].
+    /// status message — no failure path formats a resolved `secrets.*` value
+    /// into one, so a taint flag would have nothing to compute from (see
+    /// `exec::StepStatus`'s doc comment). But before fix round 2 (M-2) this
+    /// column was a second, uncapped sink for the same text `exec`'s
+    /// `MAX_STEPS_CONTEXT_ERROR_LEN` was written to bound at its one funnel
+    /// (`steps_context_entry`): [`WorkflowStepRun`] derived `Debug`, so one
+    /// `tracing::debug!(?step)` printed `error` at full length, undoing for
+    /// the persisted copy exactly what `StepStatus`'s hand-written `Debug`
+    /// was written to prevent for the in-memory value it came from.
+    ///
+    /// Both legs are bounded now, independently of `exec`'s bound (this
+    /// task's scope excludes editing `exec/`, same reasoning as
+    /// [`ValueShape`]'s doc comment): [`checkpoint_step`] truncates this
+    /// field to [`MAX_STORED_STEP_ERROR_LEN`] before writing the column, and
+    /// this struct's own hand-written `Debug` impl (below) truncates the
+    /// same way when printing. A value built by a future caller and
+    /// inspected *before* its first [`checkpoint_step`] call — e.g. a
+    /// `WorkflowStepRun` constructed in memory but not yet persisted — is
+    /// covered by the `Debug` truncation but still carries whatever length
+    /// its constructor gave it as a plain `String`; only the persisted row
+    /// and `{:?}` output are bounded, not this field itself.
     pub error: Option<String>,
+}
+
+impl fmt::Debug for WorkflowStepRun {
+    /// Hand-written (fix round 2, M-2), not derived, so that `error` is
+    /// bounded by [`MAX_STORED_STEP_ERROR_LEN`] wherever a `WorkflowStepRun`
+    /// is printed — see the field's own doc comment above for what this
+    /// closes. Every other field already has a bounded `Debug` of its own
+    /// ([`StepOutput`]'s is hand-written for the same reason) or is a plain
+    /// scalar, so only `error` needs special handling here.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkflowStepRun")
+            .field("run_id", &self.run_id)
+            .field("step_id", &self.step_id)
+            .field("attempt", &self.attempt)
+            .field("item_index", &self.item_index)
+            .field("disposition", &self.disposition)
+            .field("state", &self.state)
+            .field("first_task_seq", &self.first_task_seq)
+            .field("last_task_seq", &self.last_task_seq)
+            .field("output", &self.output)
+            .field(
+                "error",
+                &self.error.as_deref().map(truncate_stored_step_error),
+            )
+            .finish()
+    }
+}
+
+/// Independent bound on [`WorkflowStepRun::error`] (fix round 2, M-2) — a
+/// second, previously-uncapped sink for the same `StepStatus::Failed
+/// { message }` / `Skipped { reason }` text `exec::MAX_STEPS_CONTEXT_ERROR_LEN`
+/// bounds at its own funnel, `exec::steps_context_entry`. Deliberately its
+/// own constant rather than reusing that one: this task's scope excludes
+/// editing `exec/` (that constant and its truncation helper are private to
+/// that module), and a near-duplicate here means a future change to one
+/// bound does not silently move the other — the same reasoning
+/// [`ValueShape`]'s doc comment gives for not promoting that helper either.
+/// Same value, chosen for the same reason: comfortably larger than this
+/// crate's own diagnostic text, comfortably smaller than the
+/// multi-hundred-KB amplification such a bound exists to rule out.
+const MAX_STORED_STEP_ERROR_LEN: usize = 512;
+
+/// Truncates `text` to at most [`MAX_STORED_STEP_ERROR_LEN`] bytes (at a
+/// valid UTF-8 boundary), appending the original byte length when
+/// truncation actually happens. Used both to bound what [`checkpoint_step`]
+/// writes into `workflow_step_run.error` and what
+/// [`WorkflowStepRun`]'s hand-written `Debug` prints for a value that has
+/// not gone through `checkpoint_step` yet — the same helper closes both
+/// legs of the M-2 gap.
+fn truncate_stored_step_error(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= MAX_STORED_STEP_ERROR_LEN {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut end = MAX_STORED_STEP_ERROR_LEN;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}... ({} bytes total)", &text[..end], text.len()))
 }
 
 /// One workflow run.
@@ -701,6 +787,14 @@ pub fn checkpoint_step(
         .output
         .as_ref()
         .is_some_and(StepOutput::is_secret_derived);
+    // Fix round 2 (M-2): bound what actually reaches the column, at this
+    // funnel — the sole INSERT/UPDATE call site for `workflow_step_run.error`
+    // — the same way `exec::steps_context_entry` bounds `steps.<id>.error`
+    // at its own sole funnel. Truncating rather than rejecting: the lens's
+    // rejected alternative, a length `CHECK` on the column, would turn an
+    // oversized diagnostic string into a failed checkpoint, losing the run's
+    // durability record over a message rather than the message itself.
+    let error_to_store = step.error.as_deref().map(truncate_stored_step_error);
 
     let txn = roundhouse_store::begin_immediate(conn)?;
     let run_exists: bool = txn.query_row(
@@ -737,7 +831,7 @@ pub fn checkpoint_step(
             seq_to_sql(step.last_task_seq)?,
             output_json,
             output_is_secret_derived,
-            step.error,
+            error_to_store.as_deref(),
         ],
     )?;
     txn.commit()?;
