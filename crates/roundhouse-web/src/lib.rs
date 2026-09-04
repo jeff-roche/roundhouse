@@ -19,7 +19,12 @@
 //! round added the second thing that registration point buys: an always-on
 //! `Host` check (`host_guard`), because a parameterless `/api` read makes DNS
 //! rebinding a working attack against the *ungated loopback* arm, which no
-//! token and no CORS header can defend (ruling P93 §A).
+//! token and no CORS header can defend (ruling P93 §A). Task 35 (D6) added the
+//! third, §11.4's four distinct interaction inputs, in [`interaction`] — merged
+//! into that same `api_router`, which is how it is gated and `Host`-checked
+//! without either being decided again. **It answers `501`**: the URL and
+//! request shape are real, and nothing in this workspace can yet deliver an
+//! interaction anywhere; that module's docs carry the whole argument.
 //! **This crate still binds no listener and starts no server**, and nothing
 //! links it yet — so [`lan_auth::BindConfig::bind_addr`] has no caller.
 //!
@@ -44,6 +49,7 @@
 
 pub mod assets;
 mod host_guard;
+pub mod interaction;
 pub mod lan_auth;
 pub mod runs;
 pub mod sse;
@@ -556,6 +562,7 @@ pub fn build_router(state: AppState, bind: &lan_auth::BindConfig) -> axum::Route
 fn api_router(bind: &lan_auth::BindConfig) -> axum::Router<AppState> {
     sse::router()
         .merge(runs::router())
+        .merge(interaction::router())
         .fallback(api_not_found)
         .layer(axum::middleware::from_fn_with_state(
             bind.allowed_hosts(),
@@ -570,9 +577,20 @@ fn api_router(bind: &lan_auth::BindConfig) -> axum::Router<AppState> {
 ///
 /// `GET /api/runs` answers `application/json` on success, so a client doing
 /// `res.json()` on a failure used to get a parse error where a reason belonged —
-/// and D6 adds four more endpoints to this namespace next, which is what makes
-/// now the cheapest moment to decide it. Used by [`api_not_found`]'s `404`, by
-/// [`lan_auth`]'s `401`, by `host_guard`'s `403` and by [`runs`]'s `503`/`500`.
+/// and D6 added the next endpoint to this namespace, which is what made the
+/// moment it landed the cheapest one to decide it. Used by [`api_not_found`]'s
+/// `404`, by [`lan_auth`]'s `401`, by `host_guard`'s `403`, by [`runs`]'s
+/// `503`/`500` and by [`interaction`]'s `400`/`501` — including the `axum`
+/// extractor rejection that route catches rather than lets `axum` answer in
+/// plain text, which is what keeps the claim true for a route taking a body.
+///
+/// **One exception, named rather than left to be discovered:** [`sse`]'s two
+/// `400`s (an unparsable path segment, an unusable `Last-Event-ID`) predate
+/// this function and still answer plain text. They are reachable, so the
+/// sentence above is a convention this crate now holds everywhere except
+/// there. Converting them is a behaviour change to a shipped route with its own
+/// test assertions and belongs to whoever next touches [`sse`], not to a
+/// drive-by.
 ///
 /// The text is a sentence for a person reading a console; the **status** is what
 /// a client branches on. Nothing derived from an error's `Display` reaches it —

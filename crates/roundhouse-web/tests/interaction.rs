@@ -1,0 +1,357 @@
+//! Task 35 (Phase 5, Subsystem D6) — §11.4's four distinct interaction inputs.
+//!
+//! # Half of this file exists because the plan's tests could not fail
+//!
+//! Worth stating, because it is the lesson rather than the ceremony. All three
+//! of this task's planned tests called `parse_interaction` directly and **none
+//! built a router**. The planned `router()` used `axum` 0.7's `/:session_id`,
+//! which `axum` 0.8 — pinned here at `=0.8.4` — rejects by **panicking inside
+//! `Router::route`**. So the suite would have been green over a crate that
+//! panicked the first time anything mounted the route, and no amount of
+//! strengthening the parse assertions would have found it.
+//!
+//! So the router tests below are not "integration coverage for completeness":
+//! `the_route_is_mounted_under_the_api_namespace` is the only test in this file
+//! that can observe an entire category of defect, and it observes it by
+//! **constructing** `build_router` at all.
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use roundhouse_web::interaction::{parse_interaction, InteractionError, InteractionInput};
+use roundhouse_web::lan_auth::BindConfig;
+use roundhouse_web::{build_router, AppState};
+use serde_json::json;
+use tower::ServiceExt;
+
+/// §11.4: *"interrupt vs queue vs steer are four distinct, unambiguous
+/// inputs."* Distinct is the assertion — four bodies, four different values,
+/// no two of them collapsing onto one variant.
+#[test]
+fn the_four_inputs_are_distinct_and_unambiguous() {
+    assert_eq!(
+        parse_interaction(&json!({"kind": "soft_interrupt"})).unwrap(),
+        InteractionInput::SoftInterrupt
+    );
+    assert_eq!(
+        parse_interaction(&json!({"kind": "hard_cancel"})).unwrap(),
+        InteractionInput::HardCancel
+    );
+    assert_eq!(
+        parse_interaction(&json!({"kind": "queue", "text": "also check the changelog"})).unwrap(),
+        InteractionInput::Queue {
+            text: "also check the changelog".to_string()
+        }
+    );
+    assert_eq!(
+        parse_interaction(&json!({"kind": "steer", "text": "stop, use the other branch"})).unwrap(),
+        InteractionInput::Steer {
+            text: "stop, use the other branch".to_string()
+        }
+    );
+}
+
+/// The asymmetry `InteractionInput`'s shape encodes: a message needs something
+/// to say, a stop signal does not.
+#[test]
+fn queue_and_steer_require_text_soft_and_hard_do_not() {
+    assert_eq!(
+        parse_interaction(&json!({"kind": "queue"})),
+        Err(InteractionError::MissingText("queue")),
+        "queue without text is meaningless"
+    );
+    assert_eq!(
+        parse_interaction(&json!({"kind": "steer"})),
+        Err(InteractionError::MissingText("steer"))
+    );
+    assert!(parse_interaction(&json!({"kind": "soft_interrupt", "text": "ignored"})).is_ok());
+    assert!(parse_interaction(&json!({"kind": "hard_cancel", "text": "ignored"})).is_ok());
+}
+
+/// An empty string is not text. `{"kind": "steer", "text": ""}` is a steer
+/// toward nothing, and accepting it would put an instruction with no content
+/// into whatever queue eventually exists — the one case where the `Option`
+/// shape of the parse could quietly produce a `Steer` nobody can act on.
+#[test]
+fn empty_text_is_not_text() {
+    assert_eq!(
+        parse_interaction(&json!({"kind": "steer", "text": ""})),
+        Err(InteractionError::MissingText("steer"))
+    );
+    assert_eq!(
+        parse_interaction(&json!({"kind": "queue", "text": ""})),
+        Err(InteractionError::MissingText("queue"))
+    );
+}
+
+/// A `kind` outside the four is refused rather than mapped onto the nearest
+/// one. Mapping is the failure worth naming: silently treating an unrecognised
+/// input as a soft interrupt would be a *stop* the caller never asked for.
+#[test]
+fn unknown_kind_is_rejected_rather_than_silently_mapped_to_something() {
+    assert_eq!(
+        parse_interaction(&json!({"kind": "pause_forever"})),
+        Err(InteractionError::UnknownKind("pause_forever".into()))
+    );
+    // Absent and non-string `kind`s land in the same arm rather than panicking
+    // or defaulting.
+    assert!(parse_interaction(&json!({})).is_err());
+    assert!(parse_interaction(&json!({"kind": 4})).is_err());
+}
+
+/// The case that decided the deny-unknown-fields question, and the reason the
+/// answer is visible to a caller: a misspelled *field* used to be reported as a
+/// missing one, so `{"kind": "queue", "txt": "…"}` answered *"queue requires
+/// non-empty text"* to a caller who had supplied text.
+#[test]
+fn a_misspelled_field_names_the_typo_instead_of_reporting_missing_text() {
+    assert_eq!(
+        parse_interaction(&json!({"kind": "queue", "txt": "also check the changelog"})),
+        Err(InteractionError::UnknownField("txt".into()))
+    );
+}
+
+/// A body that is not an object says so, rather than reporting an empty `kind`
+/// and sending the caller to look at a field they did not send.
+#[test]
+fn a_non_object_body_names_its_own_shape() {
+    assert_eq!(
+        parse_interaction(&json!([{"kind": "soft_interrupt"}])),
+        Err(InteractionError::NotAnObject("an array"))
+    );
+    assert_eq!(
+        parse_interaction(&json!(null)),
+        Err(InteractionError::NotAnObject("null"))
+    );
+    assert_eq!(
+        parse_interaction(&json!("soft_interrupt")),
+        Err(InteractionError::NotAnObject("a string"))
+    );
+}
+
+/// The offending value in an error message is the caller's own, so quoting it
+/// discloses nothing — but quoting it *unbounded* would let a request choose
+/// the size of its own error response.
+///
+/// The assertion is that the message **does not scale with the input**, stated
+/// as an equality between two inputs three orders of magnitude apart rather
+/// than as a byte-count threshold. A threshold would have to be re-tuned every
+/// time the wording changed, and would pass for a bound that was merely large.
+///
+/// Multi-byte on purpose: `&s[..64]` panics on this input, so this also pins
+/// that the truncation is by `char` and not by byte.
+#[test]
+fn a_rejected_value_is_echoed_back_bounded_and_on_a_char_boundary() {
+    let render = |repeats: usize| {
+        parse_interaction(&json!({ "kind": "é".repeat(repeats) }))
+            .expect_err("a run of 'é' is not one of the four")
+            .to_string()
+    };
+
+    let long = render(1_000);
+    assert_eq!(
+        long,
+        render(1_000_000),
+        "an error message must not grow with the value that provoked it"
+    );
+    assert!(
+        long.contains('…'),
+        "a truncated value must say it was truncated; got {long}"
+    );
+    // The same value under the bound is quoted whole, so the truncation is a
+    // bound and not an unconditional shortening.
+    assert!(render(3).contains("ééé"), "got {}", render(3));
+}
+
+async fn post(router: axum::Router, uri: &str, body: serde_json::Value) -> (StatusCode, String) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("host", "127.0.0.1")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("a POST request builds"),
+        )
+        .await
+        .expect("the router answers");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("the body fits");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn router() -> axum::Router {
+    build_router(AppState::default(), &BindConfig::loopback())
+}
+
+const SESSION: &str = "/api/sessions/9d1ad699-0000-4000-8000-000000000001/interactions";
+
+/// **The test the plan had no equivalent of, and the one that matters most.**
+///
+/// `build_router` is *constructed* here, which is the whole assertion: `axum`
+/// 0.8 panics inside `Router::route` on the 0.7 `/:param` form the plan
+/// specified, so a crate carrying that form fails this test by panicking before
+/// a single status is compared. Three unit tests on `parse_interaction` cannot
+/// see that at all.
+///
+/// The status assertions on top of it pin that the route is reached through the
+/// `/api` nest rather than falling through to the asset router's SPA fallback —
+/// `200` with an `index.html` body is what "not mounted" looks like here, and it
+/// is not obviously wrong from the outside.
+#[tokio::test]
+async fn the_route_is_mounted_under_the_api_namespace() {
+    let (status, body) = post(router(), SESSION, json!({"kind": "soft_interrupt"})).await;
+
+    assert_eq!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "a well-formed interaction reaches the handler; body was {body}"
+    );
+}
+
+/// **`501` and not `202`.** The plan returned `202 Accepted` after parsing the
+/// body and dropping the result. Nothing in this workspace can deliver an
+/// interaction anywhere — `roundhouse-web` holds no session-actor handle — so
+/// `202` would tell a client that pressed `Esc` that the interrupt landed while
+/// nothing received it.
+///
+/// The body is asserted, not just the status: a client that shows the reason to
+/// a human is the difference between "the agent ignored me" and "this daemon
+/// cannot do that yet", and it is what makes the residual visible from outside
+/// the source tree.
+#[tokio::test]
+async fn a_parsed_interaction_is_refused_honestly_rather_than_accepted_falsely() {
+    for kind in [
+        json!({"kind": "soft_interrupt"}),
+        json!({"kind": "hard_cancel"}),
+        json!({"kind": "queue", "text": "also check the changelog"}),
+        json!({"kind": "steer", "text": "stop, use the other branch"}),
+    ] {
+        let (status, body) = post(router(), SESSION, kind.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_IMPLEMENTED,
+            "{kind} must not report success while nothing receives it"
+        );
+        let body: serde_json::Value = serde_json::from_str(&body).expect("an /api error is JSON");
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("the error is a string")
+                .contains("nothing received it"),
+            "the refusal must say what is missing; got {body}"
+        );
+    }
+}
+
+/// Request-shape validation is live through the route, not only through
+/// `parse_interaction` — which is what lets a client build against the four
+/// inputs before dispatch exists.
+#[tokio::test]
+async fn a_malformed_interaction_is_a_400_through_the_route() {
+    let (status, body) = post(router(), SESSION, json!({"kind": "queue"})).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body).expect("an /api error is JSON");
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("the error is a string")
+            .contains("requires non-empty text"),
+        "got {body}"
+    );
+}
+
+/// A path segment that is not a session id is a `400`, not a `501`: `501` would
+/// say the request was fine and the server was not.
+#[tokio::test]
+async fn a_session_id_that_is_not_a_uuid_is_rejected_before_the_501() {
+    let (status, body) = post(
+        router(),
+        "/api/sessions/not-a-uuid/interactions",
+        json!({"kind": "soft_interrupt"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("session id is not a UUID"), "got {body}");
+}
+
+/// **Every error body under `/api` is `{"error": …}`** (`crate::api_error`),
+/// and an `axum` extractor rejection is the one path that would silently answer
+/// plain text instead — which is why the handler takes
+/// `Result<Json<_>, JsonRejection>` rather than `Json<_>`.
+///
+/// Both rejection shapes are exercised: a wrong content type, and a body that
+/// is not JSON at all. A client doing `res.json()` must not get a parse error
+/// where a reason belongs, on any path.
+#[tokio::test]
+async fn an_extractor_rejection_is_json_like_every_other_api_error() {
+    for (content_type, body) in [
+        ("text/plain", "{\"kind\": \"soft_interrupt\"}"),
+        ("application/json", "this is not json"),
+    ] {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(SESSION)
+                    .header("host", "127.0.0.1")
+                    .header("content-type", content_type)
+                    .body(Body::from(body))
+                    .expect("a POST request builds"),
+            )
+            .await
+            .expect("the router answers");
+
+        let status = response.status();
+        assert!(
+            status.is_client_error(),
+            "a rejected body is the caller's error; got {status}"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("the body fits");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            panic!(
+                "an /api rejection must be JSON, not axum's plain text; got {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        assert!(
+            parsed["error"].is_string(),
+            "the namespace's error shape is {{\"error\": …}}; got {parsed}"
+        );
+    }
+}
+
+/// The `/api` namespace fallback still answers, which is what ruling P88 §A's
+/// gate rests on.
+///
+/// This is the assertion the plan's `/{session_id}` path would have broken: a
+/// parameter at the root of the namespace matches `/api/no-such-route`, so a
+/// `GET` there would answer `405 Method Not Allowed` from the interaction route
+/// instead of reaching `api_not_found`'s `404`. The gate test one file over
+/// probes exactly that path.
+#[tokio::test]
+async fn the_namespace_fallback_is_not_swallowed_by_the_session_parameter() {
+    let response = router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/no-such-route")
+                .header("host", "127.0.0.1")
+                .body(Body::empty())
+                .expect("a GET request builds"),
+        )
+        .await
+        .expect("the router answers");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "an unmatched /api path must reach api_not_found, not a session route"
+    );
+}
