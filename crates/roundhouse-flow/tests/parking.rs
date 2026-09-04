@@ -8,7 +8,8 @@
 
 use roundhouse_core::{JobId, SessionId, TaskId, Timestamp};
 use roundhouse_flow::durability::{
-    insert_workflow_run, open_test_db, recover_run, RunState, WorkflowRun,
+    insert_workflow_run, open_test_db, recover_run, transition_run, DurabilityError, RunState,
+    WorkflowRun,
 };
 use roundhouse_flow::exec::RunId;
 use roundhouse_flow::hitl::{AwaitingHuman, HumanWaitSource, UncheckedOnTimeout};
@@ -544,4 +545,142 @@ fn a_park_timestamp_in_the_future_is_never_reaped_and_never_wraps() {
         Timestamp::from_unix_nanos(i64::MAX),
         Timestamp::from_unix_nanos(i64::MIN)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Task 20a (B12a) — the transition-legality check `park` used not to make
+// ---------------------------------------------------------------------------
+
+/// The concrete shape the security lens named for the gap `park`'s
+/// "# No transition-legality check" section used to describe: parking a run
+/// to dodge a cancellation already in flight.
+#[test]
+fn parking_a_cancelling_run_is_refused_so_a_park_cannot_evade_a_cancel() {
+    let session_id = SessionId::new();
+    let (mut conn, run_id) = a_running_run(session_id);
+    transition_run(
+        &mut conn,
+        run_id,
+        RunState::Cancelling,
+        Timestamp::from_unix_nanos(500 * NANOS_PER_SEC),
+    )
+    .expect("a running run can be marked cancelling");
+    let step = gate_step("id: approve\ngate: { title: 'Ship it?', timeout: 1h, on_timeout: deny }");
+    let awaiting = awaiting_from_gate(&step);
+    let mut cp = FakeCheckpointer::new();
+
+    let err = park(
+        &mut conn,
+        run_id,
+        &awaiting,
+        false,
+        Timestamp::from_unix_nanos(1_000 * NANOS_PER_SEC),
+        &mut cp,
+    )
+    .expect_err("a cancel in flight must not be silently un-cancelled by a park");
+
+    match err {
+        ParkError::Durability(DurabilityError::IllegalTransition { from, to, .. }) => {
+            assert_eq!(from, RunState::Cancelling);
+            assert_eq!(to, RunState::AwaitingHuman);
+        }
+        other => panic!("expected an illegal-transition error, got {other:?}"),
+    }
+    let row = recover_run(&conn, run_id).unwrap().run;
+    assert_eq!(
+        row.state,
+        RunState::Cancelling,
+        "the cancel stands: the run is still draining"
+    );
+    assert_eq!(
+        row.awaiting_until, None,
+        "no deadline was written for a park that was refused"
+    );
+}
+
+/// The other half of the resurrection gap: a run that already ended.
+#[test]
+fn parking_a_completed_run_is_refused_rather_than_resurrecting_it() {
+    let session_id = SessionId::new();
+    let (mut conn, run_id) = a_running_run(session_id);
+    transition_run(
+        &mut conn,
+        run_id,
+        RunState::Completed,
+        Timestamp::from_unix_nanos(500 * NANOS_PER_SEC),
+    )
+    .expect("a running run can complete");
+    let step = gate_step("id: approve\ngate: { title: 'Ship it?', timeout: 1h, on_timeout: deny }");
+    let awaiting = awaiting_from_gate(&step);
+    let mut cp = FakeCheckpointer::new();
+
+    let err = park(
+        &mut conn,
+        run_id,
+        &awaiting,
+        false,
+        Timestamp::from_unix_nanos(1_000 * NANOS_PER_SEC),
+        &mut cp,
+    )
+    .expect_err("a completed run has ended and cannot start waiting on a human");
+
+    assert!(
+        matches!(
+            err,
+            ParkError::Durability(DurabilityError::IllegalTransition {
+                from: RunState::Completed,
+                ..
+            })
+        ),
+        "\"wrong state\" must not be reported as \"run not found\": {err:?}"
+    );
+    let row = recover_run(&conn, run_id).unwrap().run;
+    assert_eq!(row.state, RunState::Completed);
+    assert_eq!(
+        row.ended_at,
+        Some(Timestamp::from_unix_nanos(500 * NANOS_PER_SEC)),
+        "the completed run keeps the instant it actually ended"
+    );
+    assert_eq!(row.awaiting_until, None);
+}
+
+/// A refused park still leaves the restore point the checkpoint took, and
+/// says so — the source-state check happens in the write, after §8.11's
+/// ordering has already run the checkpoint. Pinned so the residue is a known
+/// property rather than a surprise.
+#[test]
+fn a_refused_park_leaves_its_checkpoint_behind_but_writes_nothing_durable() {
+    let session_id = SessionId::new();
+    let (mut conn, run_id) = a_running_run(session_id);
+    transition_run(
+        &mut conn,
+        run_id,
+        RunState::Cancelling,
+        Timestamp::from_unix_nanos(500 * NANOS_PER_SEC),
+    )
+    .unwrap();
+    let step = gate_step("id: approve\ngate: { title: 'Ship it?', timeout: 1h, on_timeout: deny }");
+    let awaiting = awaiting_from_gate(&step);
+    let mut cp = FakeCheckpointer::new();
+
+    park(
+        &mut conn,
+        run_id,
+        &awaiting,
+        false,
+        Timestamp::from_unix_nanos(1_000 * NANOS_PER_SEC),
+        &mut cp,
+    )
+    .expect_err("refused");
+
+    assert_eq!(
+        cp.calls,
+        vec![(session_id, "awaiting_human_park".to_string())],
+        "the checkpoint runs before the write (§8.11's ordering), so a park \
+         refused by the state check has already taken one"
+    );
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::Cancelling
+    );
 }

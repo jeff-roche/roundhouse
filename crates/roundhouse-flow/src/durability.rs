@@ -34,16 +34,21 @@
 //!   TTL, the 7-day reaper, and writing [`WorkflowRun::awaiting_until`] —
 //!   **Task 17 (B9)**, since landed as [`crate::parking`]. The run loop that
 //!   *decides* to park, and the deadline registration/cancellation that
-//!   `awaiting_until` feeds, are still Task 20 (B12) and daemon work
+//!   `awaiting_until` feeds, are still **B12c** and daemon work
 //!   respectively.
-//! - **The run loop itself**: `catch:`/stop-on-failure, task admission, `map`
-//!   process spawn / `max_parallel`, the run-level budget ledger, and
-//!   cancel/pause/resume/retry-from-step — **Task 20 (B12)**. Writing
-//!   [`StepRunState::Skipped`] and [`WorkflowStepRun::error`] belongs to that
-//!   loop too: this task has the columns and the types, and produces neither
-//!   value.
-//! - **Clearing `output` for steps no fork can still target** — **Task 20
-//!   (B12)**. This is the one residual with a security edge, so it is named
+//! - **The run loop itself**: `catch:`/`finally:`/stop-on-failure, task
+//!   admission, `map` process spawn / `max_parallel`, and the run-level
+//!   budget ledger. Writing [`StepRunState::Skipped`] and
+//!   [`WorkflowStepRun::error`] belongs to that loop too: Task 16 shipped the
+//!   columns and the types, and produces neither value. Task 20 has since
+//!   been split (ruling P77): **Task 20a landed the state machine
+//!   ([`transition_is_legal`], [`transition_run`]) and §8.13's
+//!   cancel/pause/resume/retry-from-step in [`crate::control`]**; the ledger
+//!   and its migration are **B12b**, and the run loop itself is **B12c**.
+//!   `map` worktree spawn is not B12 at all — §5.2 gives this crate no git
+//!   and no `tokio`.
+//! - **Clearing `output` for steps no fork can still target** — **still
+//!   unowned after ruling P77's split; not B12a**. This is the one residual with a security edge, so it is named
 //!   rather than assumed: [`checkpoint_step`] deliberately makes `output`
 //!   last-write-wins, so checkpointing a step with `output: None` already
 //!   writes `output = NULL, output_is_secret_derived = 0` and (with
@@ -53,7 +58,7 @@
 //!   `PASSIVE` autocheckpoint backfills the main file but does not truncate
 //!   or zero `-wal`, so the pre-clear page image can still be sitting there
 //!   in raw bytes (measured; see `roundhouse-store::pool`'s pragma comment
-//!   for the full matrix, fix round 2 M-1). **The eraser Task 20 writes
+//!   for the full matrix, fix round 2 M-1). **The eraser whoever takes this
 //!   therefore owes one more step than the `UPDATE` alone**: after clearing
 //!   `output`, it must also issue `PRAGMA wal_checkpoint(TRUNCATE)` (not
 //!   rely on the default `PASSIVE` autocheckpoint) to actually reach `-wal`,
@@ -75,9 +80,10 @@
 //! writes `on_crash:` today gets a hard parse error. [`on_crash_policy`]
 //! below implements the **default** half of that contract (§8.10 does specify
 //! default `ask`); the author-declared override is **not implemented**, and
-//! is recorded as a residual owned by **Task 20 (B12)**, which owns
-//! retry-from-step and is the first task with a run loop that would act on
-//! it. Adding the field means touching `parse/steps.rs`'s wire shape, which
+//! is recorded as a residual owned by **B12c**, which owns the run loop
+//! that would act on it. (Task 20a owns retry-from-step, but a *declared*
+//! `on_crash:` is a wire-shape change with no reader until that loop
+//! exists.) Adding the field means touching `parse/steps.rs`'s wire shape, which
 //! this task deliberately does not do.
 
 use crate::exec::{RunId, StepOutcome};
@@ -125,6 +131,28 @@ pub enum DurabilityError {
     /// the value's only purpose is to join back to the log.
     #[error("task seq {seq} does not fit a SQLite INTEGER")]
     SeqOutOfRange { seq: u64 },
+    /// The run exists, but §8.13's run state machine does not permit this
+    /// move — see [`transition_is_legal`] for the matrix and where each edge
+    /// comes from. **Deliberately distinct from [`Self::RunNotFound`]**: "no
+    /// such run" and "that run is in the wrong state" are different facts,
+    /// and before Task 20a `park` reported the second as the first (its
+    /// `UPDATE` could only see a zero row count and had no way to tell them
+    /// apart).
+    #[error("run {run_id} cannot move from {from:?} to {to:?}")]
+    IllegalTransition {
+        run_id: RunId,
+        from: RunState,
+        to: RunState,
+    },
+    /// The run row exists but is not attached to the session the caller
+    /// required. Only [`transition_run_to_awaiting_human`] passes such a
+    /// requirement, and only because [`crate::parking::park`] reads
+    /// `session_id`, checkpoints *that* session, and must not then write a
+    /// row whose session has changed underneath it. Nothing in this
+    /// workspace updates `workflow_run.session_id` after insert, so this is
+    /// a checked precondition rather than an expected failure.
+    #[error("run {run_id} is not attached to the session the caller required")]
+    RunSessionMismatch { run_id: RunId },
     /// A stored `item_index` is neither [`TOP_LEVEL_ITEM_INDEX`] nor a `u32`.
     /// The same read-back rule as [`Self::UnrecognizedDiscriminant`], applied
     /// to a numeric column: mapping an out-of-domain value onto `None` would
@@ -234,8 +262,8 @@ pub enum StepRunState {
     /// [`recover_run`].
     Indeterminate,
     Failed,
-    /// A step whose `when:` guard evaluated false. **Written by Task 20
-    /// (B12)**, which owns the run loop; `exec::StepStatus::Skipped` is
+    /// A step whose `when:` guard evaluated false. **Written by B12c**,
+    /// which owns the run loop; `exec::StepStatus::Skipped` is
     /// already produced there.
     ///
     /// It is in the enum, and in migration 0007's `CHECK`, now rather than
@@ -243,7 +271,7 @@ pub enum StepRunState {
     /// *finished*, so on re-drive the run loop must not re-evaluate its
     /// `when:` (the condition may read differently by then, changing control
     /// flow) and downstream steps interpolate `${{ steps.<id>.status }}`. A
-    /// `CHECK` that omitted it would force Task 20 to rebuild the table —
+    /// `CHECK` that omitted it would force that task to rebuild the table —
     /// SQLite has no `ALTER TABLE … DROP/MODIFY CONSTRAINT`. Shape now,
     /// behaviour later.
     Skipped,
@@ -281,20 +309,21 @@ impl StepRunState {
 
 /// The state of a whole run.
 ///
-/// The set is deliberately wider than this task's own writes need: §8.13's
+/// The set was deliberately wider than Task 16's own writes needed: §8.13's
 /// controls (cancel — *"mark `Cancelling`"* — pause, resume) and §8.11's
-/// parking are **Task 17/Task 20** work, and a `CHECK` constraint that
-/// omitted their states would force one of them to migrate the table. Shape
-/// now, behaviour later.
+/// parking were **Task 17/Task 20** work, and a `CHECK` constraint that
+/// omitted their states would have forced one of them to migrate the table.
+/// Shape then, behaviour now: [`transition_is_legal`] is the state machine
+/// over these variants, and [`transition_run`] the only writer of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     Running,
-    /// §8.13's `pause`. Written by Task 20 (B12).
+    /// §8.13's `pause`. Written by [`crate::control::pause`].
     Paused,
     /// §8.13's cooperative `cancel`: new task admission is refused while
-    /// running work drains. Written by Task 20 (B12).
+    /// running work drains. Written by [`crate::control::cancel`].
     Cancelling,
-    /// §8.11's park. Written by Task 17 (B9), together with
+    /// §8.11's park. Written by [`crate::parking::park`], together with
     /// [`WorkflowRun::awaiting_until`].
     AwaitingHuman,
     Completed,
@@ -303,12 +332,26 @@ pub enum RunState {
 }
 
 impl RunState {
-    /// `pub(crate)` rather than private: [`crate::parking`] owns §8.11's park
-    /// write (`state = 'awaiting_human'` together with
-    /// [`WorkflowRun::awaiting_until`]) and must name the same discriminant
-    /// text this module reads back, rather than repeating the string
-    /// literal.
-    pub(crate) fn as_sql_str(self) -> &'static str {
+    /// A state a run can never leave: it has no outgoing transition in
+    /// [`transition_is_legal`], and reaching it stamps
+    /// [`WorkflowRun::ended_at`].
+    ///
+    /// `Cancelling` is **not** terminal — §8.13 is explicit that cancel is
+    /// cooperative (*"mark `Cancelling`"*), so the run is still draining and
+    /// has not ended.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            RunState::Completed | RunState::Failed | RunState::Cancelled
+        )
+    }
+
+    /// Private again as of Task 20a. It was `pub(crate)` because
+    /// [`crate::parking`] owned §8.11's park write and had to name the same
+    /// discriminant text this module reads back; that write now routes
+    /// through [`transition_run_to_awaiting_human`], so this module is once
+    /// more the only place a run-state discriminant is spelled.
+    fn as_sql_str(self) -> &'static str {
         match self {
             RunState::Running => "running",
             RunState::Paused => "paused",
@@ -337,6 +380,95 @@ impl RunState {
             }),
         }
     }
+}
+
+/// §8.13's run state machine, as an explicit matrix: may a run move from
+/// `from` to `to`?
+///
+/// Fourteen of the forty-nine ordered pairs are permitted. This predicate is
+/// pure so that the matrix can be reviewed and tested as a table rather than
+/// inferred from the writer's control flow; [`transition_run`] is the only
+/// thing that consults it against a real row.
+///
+/// # Where each edge comes from — named by the frozen docs, or inferred
+///
+/// The distinction matters more than the edges: this crate has already
+/// shipped comments that read as quotation while actually being inference.
+/// **Quoted text below is verbatim from `docs/architecture/`; everything
+/// marked INFERRED is this task's reading, not the document's words.**
+///
+/// **Named.**
+///
+/// - `Running -> Cancelling`. §8.13: *"**cancel** (cooperative — mark
+///   `Cancelling`, refuse new task admission, SIGTERM->SIGKILL running
+///   shells, run `finally:`)"*. The same sentence is why there is **no**
+///   `Running -> Cancelled` edge: the document says cancel *marks
+///   `Cancelling`*, and the terminal state lands only after the drain.
+/// - `Running -> AwaitingHuman` and `AwaitingHuman -> AwaitingHuman`. §8.11
+///   parks a running run; the self-edge is not §8.11's, it is
+///   **pre-specified by `parking.rs`'s own doc** (*"it must be `state IN
+///   ('running', 'awaiting_human')`, not `= 'running'`"*) because re-driving
+///   a park is idempotent and a test pins it.
+/// - `AwaitingHuman -> {Running, Failed}` as a **pair**. §8.11 names four
+///   wait outcomes — *"`on_timeout: deny | fail | default(value) |
+///   approve`"* — of which `fail` ends the run and the others resolve the
+///   wait so the run continues. Which of the four maps to which target is
+///   the run loop's (B12c's) call, not this matrix's; the matrix only needs
+///   both targets to exist.
+///
+/// **Inferred.**
+///
+/// - `Running <-> Paused`. §8.13 names the controls *"**pause**; **resume**"*
+///   and [`RunState::Paused`]'s own doc calls itself *"§8.13's `pause`"*, but
+///   no document says pause writes `Paused` or that resume writes `Running`.
+///   INFERRED from the control names and the enum's vocabulary.
+/// - `Cancelling -> Cancelled`. INFERRED: `cancel` is the only producer of
+///   either state and §8.13 describes the drain finishing, but no document
+///   spells the final write.
+/// - `Running -> {Completed, Failed}`. INFERRED. §8's run outcomes exist
+///   throughout (a report has an outcome, §8.10 re-drives to completion) but
+///   §8.13 discusses controls, not ordinary completion.
+/// - `Paused -> {Cancelling, Failed}` and `AwaitingHuman -> Cancelling`.
+///   INFERRED, and the second goes **beyond** the minimum matrix this task's
+///   brief listed: §8.13 states its controls unconditionally, and a run
+///   waiting on a human who never answers is exactly the run an operator
+///   most needs to cancel — §8.11's whole reaper exists because humans do
+///   not answer. Refusing it would leave such a run cancellable only by
+///   waiting out its deadline.
+/// - `Completed`/`Failed`/`Cancelled` are **absorbing** — no outgoing edge
+///   at all. INFERRED from §8.13's *"history is append-only, so we never
+///   rewrite it"*, which is said about retry-from-step rather than about run
+///   states; resurrecting a run that has ended would rewrite its recorded
+///   outcome, and retry-from-step's fork is the sanctioned way to continue
+///   from one.
+///
+/// **Deliberately absent, and named so the gap is a decision.**
+/// `AwaitingHuman -> Paused` (a parked run is already not executing; pausing
+/// it would overwrite the park state and lose `awaiting_until`'s meaning),
+/// `Paused -> AwaitingHuman` (a paused run runs no step, so it can reach no
+/// gate), `Cancelling -> Completed` (a cancelled run did not complete), and
+/// every self-edge except `AwaitingHuman`'s (a control that finds the run
+/// already in its target state is telling the caller something, and
+/// [`crate::control`] surfaces that rather than reporting a no-op as a fresh
+/// action).
+pub fn transition_is_legal(from: RunState, to: RunState) -> bool {
+    matches!(
+        (from, to),
+        (RunState::Running, RunState::Paused)
+            | (RunState::Running, RunState::Cancelling)
+            | (RunState::Running, RunState::AwaitingHuman)
+            | (RunState::Running, RunState::Completed)
+            | (RunState::Running, RunState::Failed)
+            | (RunState::Paused, RunState::Running)
+            | (RunState::Paused, RunState::Cancelling)
+            | (RunState::Paused, RunState::Failed)
+            | (RunState::AwaitingHuman, RunState::AwaitingHuman)
+            | (RunState::AwaitingHuman, RunState::Running)
+            | (RunState::AwaitingHuman, RunState::Cancelling)
+            | (RunState::AwaitingHuman, RunState::Failed)
+            | (RunState::Cancelling, RunState::Cancelled)
+            | (RunState::Cancelling, RunState::Failed)
+    )
 }
 
 /// §8.10 tier 2's `on_crash` outcomes.
@@ -396,7 +528,8 @@ pub fn on_crash_policy(disposition: StepDisposition) -> CrashPolicy {
 /// The consequence, stated plainly rather than left implicit: **the
 /// `workflow_step_run.output` column can contain secret-derived material at
 /// rest**, and every consumer that renders, logs, or ships it onward (the web
-/// Runs inbox, Task 20's fork) owes a taint check first.
+/// Runs inbox, [`crate::control::retry_from_step`]'s fork) owes a taint check
+/// first.
 ///
 /// That obligation is carried by the accessors rather than by this comment:
 /// [`Self::value_for_display`] performs the check and yields `None` when the
@@ -561,8 +694,8 @@ pub struct WorkflowStepRun {
     /// The message from `exec::StepStatus::Failed { message }` or the reason
     /// from `Skipped { reason }`, persisted because it cannot be recomputed
     /// once the process that produced it is gone — the same argument that
-    /// puts [`Self::output`] in the row. Task 20 (B12)'s `catch:` and the web
-    /// Runs inbox are the consumers; **Task 20 is also the writer**, since
+    /// puts [`Self::output`] in the row. **B12c**'s `catch:` and the web
+    /// Runs inbox are the consumers; **B12c is also the writer**, since
     /// this task owns no run loop and so never produces a `Failed`/`Skipped`
     /// status of its own. `None` for any step that neither failed nor was
     /// skipped.
@@ -674,11 +807,11 @@ pub struct WorkflowRun {
     pub trigger_event_id: Option<i64>,
     pub state: RunState,
     /// §8.12: set on the child run a `call:` sub-workflow creates. Written by
-    /// **Task 20 (B12)**, which owns composition's run loop.
+    /// **B12c**, which owns composition's run loop.
     pub parent_run_id: Option<RunId>,
     /// §8.13: set on the run that retry-from-step forks, linking back to the
-    /// run whose completed step outputs it inherits. Written by **Task 20
-    /// (B12)**.
+    /// run whose completed step outputs it inherits. Written by
+    /// [`crate::control::retry_from_step`] through [`fork_run`] (Task 20a).
     pub forked_from_run_id: Option<RunId>,
     /// The **absolute** instant a park expires. **Written by Task 17 (B9)**,
     /// which owns the relative-to-absolute conversion; this task creates the
@@ -714,7 +847,17 @@ pub fn insert_workflow_run(
     run: &WorkflowRun,
 ) -> Result<(), DurabilityError> {
     let txn = roundhouse_store::begin_immediate(conn)?;
-    txn.execute(
+    insert_run_row(&txn, run)?;
+    txn.commit()?;
+    Ok(())
+}
+
+/// The `INSERT` itself, without a transaction of its own, so that
+/// [`fork_run`] can write a run row and its inherited step rows inside **one**
+/// transaction. Takes `&Connection` because `rusqlite::Transaction` derefs to
+/// it, so the same helper serves both call sites.
+fn insert_run_row(conn: &Connection, run: &WorkflowRun) -> Result<(), DurabilityError> {
+    conn.execute(
         "INSERT INTO workflow_run
             (id, job_id, job_version, content_hash, session_id, binding_id, trigger_event_id,
              state, parent_run_id, forked_from_run_id, awaiting_until, started_at, ended_at)
@@ -735,6 +878,225 @@ pub fn insert_workflow_run(
             run.ended_at.map(|t| t.as_unix_nanos()),
         ],
     )?;
+    Ok(())
+}
+
+/// Which `awaiting_until` write a transition carries. Private: only
+/// [`transition_run_to_awaiting_human`] sets the column, and only because
+/// §8.11's park deadline and the run state are one fact that must land in
+/// one transaction. `Leave` is not `Set(None)` — the first leaves whatever
+/// the row holds, the second writes `NULL` over it.
+enum AwaitingUntilWrite {
+    Leave,
+    Set(Option<Timestamp>),
+}
+
+/// Moves a run to `to`, enforcing [`transition_is_legal`] and stamping
+/// [`WorkflowRun::ended_at`] when `to` is terminal. Returns the state the
+/// write displaced.
+///
+/// **This is the only writer of `workflow_run.state`** (radius: `grep -rn
+/// "UPDATE workflow_run" --include=*.rs crates/` finds the two statements in
+/// this module's private `transition`, which only this function,
+/// [`transition_run_from`] and [`transition_run_to_awaiting_human`] reach,
+/// plus this comment; before Task 20a it also found `parking::park`'s own
+/// inline `UPDATE`, which now routes through here). Nothing in the tree could
+/// move a run to a terminal state at all before it existed, so `ended_at` was
+/// never written.
+///
+/// # Why the read and the write share one transaction
+///
+/// A single `UPDATE ... WHERE state IN (...)` can report only a row count,
+/// which cannot distinguish "no such run" from "wrong state" — the
+/// conflation the brief for this task names as a lie, and exactly what
+/// `park` used to report. So the current state is read first and the two
+/// facts are separated as [`DurabilityError::RunNotFound`] and
+/// [`DurabilityError::IllegalTransition`]. Both statements run inside one
+/// `roundhouse_store::begin_immediate` transaction, which holds SQLite's
+/// single write lock across them, so the state the check saw is the state the
+/// `UPDATE` writes over. §8.10 tier 1's *"every transition one SQLite
+/// transaction"*, taken literally.
+///
+/// The `UPDATE`'s own row count is therefore not re-checked: the row was
+/// found inside this transaction, no other connection can hold the write lock
+/// concurrently, and nothing in this workspace ever deletes a `workflow_run`
+/// row (radius: `grep -rn "DELETE FROM workflow_run" --include=*.rs crates/`
+/// finds only this comment).
+///
+/// `now` is written **only** when `to` is terminal; every other target
+/// writes `ended_at = NULL`, which is what "the run has not ended" means and
+/// which no terminal stamp can be lost to, since terminal states are
+/// absorbing.
+pub fn transition_run(
+    conn: &mut Connection,
+    run_id: RunId,
+    to: RunState,
+    now: Timestamp,
+) -> Result<RunState, DurabilityError> {
+    transition(conn, run_id, to, now, AwaitingUntilWrite::Leave, None, None)
+}
+
+/// [`transition_run`] plus the caller's **own** precondition on the source
+/// state, checked in the same transaction.
+///
+/// The matrix is the system-wide rule; a caller may be narrower. The one
+/// caller that is, today, is [`crate::control::resume`]: the matrix admits
+/// `AwaitingHuman -> Running` because that is how a gate's answer releases a
+/// park, but pressing *resume* on a parked run must not release it. Without
+/// this, resume would have to read the state in a separate statement and act
+/// on a value that could already be stale.
+///
+/// A source state outside `permitted_from` is reported as
+/// [`DurabilityError::IllegalTransition`], the same as one the matrix
+/// rejects — from the row's point of view they are the same refusal, and the
+/// error carries the state actually found either way.
+pub(crate) fn transition_run_from(
+    conn: &mut Connection,
+    run_id: RunId,
+    permitted_from: &[RunState],
+    to: RunState,
+    now: Timestamp,
+) -> Result<RunState, DurabilityError> {
+    transition(
+        conn,
+        run_id,
+        to,
+        now,
+        AwaitingUntilWrite::Leave,
+        None,
+        Some(permitted_from),
+    )
+}
+
+/// §8.11's park, as a transition: `-> AwaitingHuman` together with the
+/// absolute `awaiting_until` deadline, in one transaction.
+///
+/// `pub(crate)` because [`crate::parking::park`] is the entry point that owns
+/// the relative-to-absolute conversion, the implicit checkpoint, and the
+/// workspace directive; this is only the write at the end of it.
+///
+/// `expect_session_id` is the precondition `park` needs and
+/// [`transition_run`] has no use for: `park` reads `session_id`, checkpoints
+/// **that** session outside any transaction, and must not then write a row
+/// whose session has changed underneath it. Previously this was a bound
+/// `AND session_id = ?` in `park`'s own `UPDATE`, whose only signal was a
+/// zero row count.
+pub(crate) fn transition_run_to_awaiting_human(
+    conn: &mut Connection,
+    run_id: RunId,
+    expect_session_id: SessionId,
+    awaiting_until: Option<Timestamp>,
+    now: Timestamp,
+) -> Result<RunState, DurabilityError> {
+    transition(
+        conn,
+        run_id,
+        RunState::AwaitingHuman,
+        now,
+        AwaitingUntilWrite::Set(awaiting_until),
+        Some(expect_session_id),
+        None,
+    )
+}
+
+fn transition(
+    conn: &mut Connection,
+    run_id: RunId,
+    to: RunState,
+    now: Timestamp,
+    awaiting_until: AwaitingUntilWrite,
+    expect_session_id: Option<SessionId>,
+    permitted_from: Option<&[RunState]>,
+) -> Result<RunState, DurabilityError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    let row: Option<(String, String)> = txn
+        .query_row(
+            "SELECT state, session_id FROM workflow_run WHERE id = ?1",
+            params![run_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (stored_state, stored_session) = row.ok_or(DurabilityError::RunNotFound { run_id })?;
+    let from = RunState::from_sql_str(&stored_state)?;
+
+    if let Some(expected) = expect_session_id {
+        let stored = SessionId::from_uuid(parse_uuid(&stored_session, "workflow_run.session_id")?);
+        if stored != expected {
+            return Err(DurabilityError::RunSessionMismatch { run_id });
+        }
+    }
+    let caller_permits = permitted_from.is_none_or(|states| states.contains(&from));
+    if !caller_permits || !transition_is_legal(from, to) {
+        return Err(DurabilityError::IllegalTransition { run_id, from, to });
+    }
+
+    // Written on every transition, not only the terminal ones: the instant
+    // for a terminal target and `NULL` otherwise, which makes "`ended_at` is
+    // NULL exactly while the run has not ended" a property this writer
+    // enforces rather than one it assumes. Nothing is lost by the `NULL`
+    // half — terminal states are absorbing, so no transition can follow the
+    // one that stamped an instant.
+    let ended_at = to.is_terminal().then(|| now.as_unix_nanos());
+    match awaiting_until {
+        AwaitingUntilWrite::Leave => txn.execute(
+            "UPDATE workflow_run SET state = ?1, ended_at = ?2 WHERE id = ?3",
+            params![to.as_sql_str(), ended_at, run_id.to_string()],
+        )?,
+        AwaitingUntilWrite::Set(deadline) => txn.execute(
+            "UPDATE workflow_run SET state = ?1, ended_at = ?2, awaiting_until = ?3
+             WHERE id = ?4",
+            params![
+                to.as_sql_str(),
+                ended_at,
+                deadline.map(|t| t.as_unix_nanos()),
+                run_id.to_string(),
+            ],
+        )?,
+    };
+    txn.commit()?;
+    Ok(from)
+}
+
+/// §8.13's retry-from-step fork, as one transaction: the new `workflow_run`
+/// row plus every step row it inherits.
+///
+/// *"forks a new run inheriting completed step outputs with a
+/// `forked_from_run_id` link — history is append-only, so we never rewrite
+/// it"*. Nothing here touches the run being forked; the only writes are
+/// inserts of new rows.
+///
+/// **All of it in one transaction on purpose.** Doing it as
+/// [`insert_workflow_run`] followed by N [`checkpoint_step`] calls would
+/// leave a half-populated fork behind on any failure between them — a run row
+/// in `Running` state missing some of the completed steps it was supposed to
+/// inherit, which on re-drive would re-execute effectful work the original
+/// had already done.
+///
+/// Every row in `inherited` is written under `fork.id`; a row's own
+/// [`WorkflowStepRun::run_id`] is **not read**, so a caller cannot
+/// accidentally file an inherited step under the run it came from.
+///
+/// `pub(crate)`: [`crate::control::retry_from_step`] is the entry point that
+/// decides *which* steps are inheritable, and a fork assembled any other way
+/// would bypass that policy.
+///
+/// **Precondition, not checked here:** `fork.forked_from_run_id` names a run
+/// that exists. [`checkpoint_step`]'s existence check has no counterpart in
+/// this function because `retry_from_step` establishes the property by
+/// construction — it [`recover_run`]s the origin (which errors when the row
+/// is absent) before assembling anything — and nothing in this workspace
+/// deletes a `workflow_run` row, so the property cannot lapse between the two
+/// calls. Re-querying it here would be an unreachable branch.
+pub(crate) fn fork_run(
+    conn: &mut Connection,
+    fork: &WorkflowRun,
+    inherited: &[WorkflowStepRun],
+) -> Result<(), DurabilityError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    insert_run_row(&txn, fork)?;
+    for step in inherited {
+        write_step_row(&txn, fork.id, step)?;
+    }
     txn.commit()?;
     Ok(())
 }
@@ -759,7 +1121,7 @@ pub fn insert_workflow_run(
 ///    honest.
 /// 2. This is the only mechanism by which a stored output can ever be
 ///    erased, and migration 0007 names erasing outputs no fork can still
-///    target as a residual owned by **Task 20 (B12)**. `COALESCE`ing here
+///    target as a residual that ruling P77's split left unowned. `COALESCE`ing here
 ///    would delete that mechanism before its caller was written.
 ///
 /// The erasure is pinned by a test rather than left to be rediscovered.
@@ -777,6 +1139,34 @@ pub fn insert_workflow_run(
 /// the missing run — a row that exists but can never be recovered.
 pub fn checkpoint_step(
     conn: &mut Connection,
+    step: &WorkflowStepRun,
+) -> Result<(), DurabilityError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    if !run_exists(&txn, step.run_id)? {
+        return Err(DurabilityError::RunNotFound {
+            run_id: step.run_id,
+        });
+    }
+    write_step_row(&txn, step.run_id, step)?;
+    txn.commit()?;
+    Ok(())
+}
+
+fn run_exists(conn: &Connection, run_id: RunId) -> Result<bool, DurabilityError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM workflow_run WHERE id = ?1)",
+        params![run_id.to_string()],
+        |row| row.get(0),
+    )?)
+}
+
+/// The upsert itself, without a transaction of its own and with `run_id`
+/// supplied separately — see [`insert_run_row`] for why the helpers are split
+/// out, and [`fork_run`] for why the run id is a parameter rather than
+/// `step.run_id`.
+fn write_step_row(
+    conn: &Connection,
+    run_id: RunId,
     step: &WorkflowStepRun,
 ) -> Result<(), DurabilityError> {
     // The unredacted accessor, deliberately: this column stores the real
@@ -804,18 +1194,7 @@ pub fn checkpoint_step(
     // durability record over a message rather than the message itself.
     let error_to_store = step.error.as_deref().map(truncate_stored_step_error);
 
-    let txn = roundhouse_store::begin_immediate(conn)?;
-    let run_exists: bool = txn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM workflow_run WHERE id = ?1)",
-        params![step.run_id.to_string()],
-        |row| row.get(0),
-    )?;
-    if !run_exists {
-        return Err(DurabilityError::RunNotFound {
-            run_id: step.run_id,
-        });
-    }
-    txn.execute(
+    conn.execute(
         "INSERT INTO workflow_step_run
             (run_id, step_id, attempt, item_index, disposition, state,
              first_task_seq, last_task_seq, output, output_is_secret_derived, error)
@@ -829,7 +1208,7 @@ pub fn checkpoint_step(
              output_is_secret_derived = excluded.output_is_secret_derived,
              error = excluded.error",
         params![
-            step.run_id.to_string(),
+            run_id.to_string(),
             step.step_id,
             step.attempt,
             item_index_to_sql(step.item_index),
@@ -842,7 +1221,6 @@ pub fn checkpoint_step(
             error_to_store.as_deref(),
         ],
     )?;
-    txn.commit()?;
     Ok(())
 }
 
@@ -857,7 +1235,7 @@ pub fn checkpoint_step(
 ///
 /// The reclassification is applied to what is **returned**, not written back
 /// to the row. Persisting the mark is a transition, and transitions belong to
-/// the run loop — **Task 20 (B12)**; doing it inside a read would also make a
+/// the run loop — **B12c**; doing it inside a read would also make a
 /// plain inspection of a run mutate it.
 ///
 /// Two statements (the run row, then its steps), not one snapshot: they are

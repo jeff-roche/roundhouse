@@ -85,13 +85,16 @@
 //!   owner of that work implements; this crate ships the trait, calls it in
 //!   §8.11's order, and a test fake.
 //! - **Active-vs-parked time accounting** (§8.4's `run_active_timeout`
-//!   "excludes `AwaitingHuman`") — **Task 20 (B12)**, which owns the
-//!   run-level ledger. It needs a durable column to live in; an in-memory
-//!   tracker would be lost on the first daemon restart, which is precisely
-//!   the case it exists to measure.
+//!   "excludes `AwaitingHuman`") — **B12b** (ruling P77 split Task 20 in
+//!   three), which owns the run-level ledger and its migration. It needs a
+//!   durable column to live in; an in-memory tracker would be lost on the
+//!   first daemon restart, which is precisely the case it exists to measure.
 //! - **The reaper's periodic runner, AND the durable `parked_at` it would
-//!   need to read** (ruling P72) — **Task 20 (B12)**, the same owner as the
-//!   run-level ledger above. Unlike the runner-only gap `blobs.rs`'s daily
+//!   need to read** (ruling P72) — the column is **B12b**'s, alongside the
+//!   ledger above; the periodic runner itself is **daemon-side and still
+//!   unowned** (ruling P77 §C moved it out of Task 20 entirely, since it
+//!   shares its missing machinery with `blobs.rs`'s daily GC and one owner
+//!   should take both). Unlike the runner-only gap `blobs.rs`'s daily
 //!   GC has, there is no column anywhere in the schema that records when a
 //!   run parked: `workflow_run.started_at` is the run's start, not its park
 //!   time, `workflow_step_run` has no timestamp column at all, and
@@ -140,13 +143,15 @@
 //!
 //! So whoever builds the periodic runner is not just adding a timer — they
 //! need a `roundhouse-store` migration first, to add a durable park-time
-//! column. That owner is **Task 20 (B12)**, which already owns the durable
-//! run-level ledger `caps.rs` points at. This task deliberately does not add
-//! that column: doing so here would be the same silent scope creep the
-//! `on_crash` deferral avoided elsewhere in this phase, and migration 0007
-//! belongs to Task 16.
+//! column. Ruling P77 splits that pair: **the `parked_at` column is B12b's**,
+//! carried by the one migration that also brings the run-level ledger
+//! `caps.rs` points at, while **the periodic runner is unowned daemon work**.
+//! Task 17 deliberately did not add that column, and **neither does Task
+//! 20a** — doing schema once, deliberately, in the slice whose whole job is
+//! the schema is the reason for the split; migration 0007 belongs to Task 16
+//! and 0008 to B12b.
 
-use crate::durability::RunState;
+use crate::durability::{transition_run_to_awaiting_human, DurabilityError};
 use crate::exec::RunId;
 use crate::hitl::AwaitingHuman;
 use roundhouse_core::{SessionId, Timestamp};
@@ -294,29 +299,43 @@ pub struct ParkResult {
 
 /// Why a park failed.
 ///
-/// **Every variant means nothing *durable* was written; the two variants
+/// **Every variant means nothing *durable* was written; the variants
 /// reachable after the checkpoint has already been taken may leave behind
-/// an unused restore point.** Those two are [`Sqlite`](Self::Sqlite), from
-/// the `UPDATE`/commit itself, and the post-`UPDATE` zero-row
-/// [`RunNotFound`](Self::RunNotFound) (see its doc for the two points it is
-/// actually raised from). `DeadlineOverflow`, `MalformedId`, `Checkpoint`,
-/// and the pre-read `RunNotFound` all fail before any checkpoint is taken,
-/// so for those four nothing at all is left behind, durable or not.
+/// an unused restore point.** Those are [`Sqlite`](Self::Sqlite) and
+/// [`Durability`](Self::Durability) — everything the write itself can
+/// report, including the transition-legality refusal. `DeadlineOverflow`,
+/// `MalformedId`, `Checkpoint`, and [`RunNotFound`](Self::RunNotFound) all
+/// fail before any checkpoint is taken, so for those four nothing at all is
+/// left behind, durable or not.
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ParkError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
-    /// The run has no `workflow_run` row — or, at the second of this
-    /// variant's two raise points, it did when [`park`] read it but no
-    /// longer matches (see [`run_session_id`] and [`park`]'s `UPDATE`,
-    /// which now binds `session_id` into its `WHERE` clause). The
-    /// application-level leg of the reference `durability::checkpoint_step`
-    /// also checks for the row's existence, for the same reason: no
-    /// connection in this workspace sets `PRAGMA foreign_keys = ON`, so a
-    /// declared `FOREIGN KEY` would be inert.
+    /// The run has no `workflow_run` row, as [`park`]'s own pre-checkpoint
+    /// read found (see [`run_session_id`]). The application-level leg of the
+    /// reference `durability::checkpoint_step` also checks for the row's
+    /// existence, for the same reason: no connection in this workspace sets
+    /// `PRAGMA foreign_keys = ON`, so a declared `FOREIGN KEY` would be
+    /// inert.
+    ///
+    /// **This variant no longer doubles as "wrong state"** (Task 20a). The
+    /// write's zero-row `UPDATE` used to raise it for a run whose `WHERE`
+    /// clause did not match, which for a run in a state that cannot be
+    /// parked was a lie: the row was right there. That case is now
+    /// `Durability(DurabilityError::IllegalTransition { .. })`.
     #[error("no workflow_run row for run {run_id}")]
     RunNotFound { run_id: RunId },
+    /// The durable write refused. Most importantly
+    /// [`DurabilityError::IllegalTransition`] — the source-state check
+    /// `park` did not used to make, which is what stops a park from
+    /// resurrecting a terminal run or un-cancelling a cancel in flight (see
+    /// [`park`]'s "Transition legality" section) — and
+    /// [`DurabilityError::RunSessionMismatch`], the session precondition
+    /// that used to be a bound `AND session_id = ?` with no signal of its
+    /// own.
+    #[error(transparent)]
+    Durability(#[from] DurabilityError),
     /// A stored id column does not parse as a UUID — the read-back leg of
     /// the same rule `durability::DurabilityError::MalformedId` states, and
     /// the offending text is withheld for the same reason: it is not needed
@@ -417,42 +436,47 @@ pub fn resolve_hold_ttl(gate_timeout: Option<Duration>) -> Duration {
 /// would block every other writer). The gap is safe in the only direction
 /// that matters: nothing in this workspace ever deletes a `workflow_run`
 /// row, and `session_id` is never updated after insert, so a row read here
-/// is still present and still carries the same session when the `UPDATE`
-/// runs. The `UPDATE` binds that same `session_id` into its own `WHERE`
-/// clause (`WHERE id = ?3 AND session_id = ?4`) rather than relying on the
-/// assumption alone — that is what actually turns "`session_id` never
-/// changes after insert" into a checked precondition rather than an
-/// unenforced one: the zero-row check catches a row that vanished between
-/// the two statements, but on its own it could not have told a row whose
-/// `session_id` changed out from under it from one that simply moved
-/// forward normally. One bind parameter, no extra statement, and no lock
-/// held any longer — the check happens inside the same `BEGIN IMMEDIATE`
-/// the `UPDATE` already opens.
+/// is still present and still carries the same session when the write runs.
+/// The write requires that same `session_id` as an explicit precondition
+/// rather than relying on the assumption alone — that is what turns
+/// "`session_id` never changes after insert" into a checked property rather
+/// than an unenforced one. Since Task 20a the check lives in
+/// [`durability::transition_run_to_awaiting_human`](crate::durability)'s
+/// `expect_session_id` and reports
+/// [`DurabilityError::RunSessionMismatch`] rather than being a bound
+/// `AND session_id = ?` whose only signal was a zero row count; either way
+/// it happens inside the same `BEGIN IMMEDIATE` the write already opens, at
+/// the cost of no extra lock time.
 ///
-/// # No transition-legality check
+/// # Transition legality (added by Task 20a)
 ///
-/// `park` does not check the run's *current* `state` before moving it to
-/// `AwaitingHuman` — it will move a `completed`, `failed`, `cancelled`, or
-/// `cancelling` run there just as readily as a `running` one, resurrecting
-/// a terminal run or silently un-cancelling a cancel in flight. There is no
-/// run state machine being bypassed by this: nothing else in this tree
-/// issues an `UPDATE workflow_run SET state`, so this is the first writer,
-/// not a writer that skipped a check others rely on.
-///
-/// **This is deliberately the caller's obligation, not this function's.**
-/// The run loop that decides *when* to park a run is Task 20 (B12)'s
-/// `exec::Executor` run loop, not this crate's `park`, and source-state
-/// validation belongs with the decision to park, not with the mechanism
-/// that records it — the same division `run_session_id` already draws for
-/// "which session". Task 20 must add this check before wiring `park` into
-/// the run loop; the security lens reviewing this task named cancel-evasion
-/// (parking a run to dodge an in-flight cancellation) as the concrete shape
-/// this gap takes once that wiring exists. **If a state predicate is added,
-/// it must be `state IN ('running', 'awaiting_human')`, not `= 'running'`**
-/// — re-parking an already-`awaiting_human` run is the idempotency
+/// The write goes through
+/// [`durability::transition_run_to_awaiting_human`](crate::durability), so
+/// the run's *current* state is checked against
+/// [`crate::durability::transition_is_legal`] inside the write's own
+/// transaction. `-> AwaitingHuman` is legal from `Running` and from
+/// `AwaitingHuman` and from nothing else, which is exactly the
+/// `state IN ('running', 'awaiting_human')` predicate this doc comment
+/// pre-specified — the `awaiting_human` half is not slack, it is the
+/// idempotency
 /// `a_re_driven_park_never_gets_a_fresh_window_it_moves_only_by_the_now_the_caller_supplied`
-/// in `tests/parking.rs` pins, and a bare `= 'running'` predicate would
-/// break it.
+/// in `tests/parking.rs` pins, which a bare `= 'running'` would break.
+///
+/// Until Task 20a this function moved a `completed`, `failed`, `cancelled`,
+/// or `cancelling` run to `AwaitingHuman` as readily as a `running` one —
+/// resurrecting a terminal run, or silently un-cancelling a cancel in
+/// flight, which the security lens reviewing Task 17 named as
+/// **cancel-evasion**. A refusal is now
+/// [`ParkError::Durability`]`(`[`DurabilityError::IllegalTransition`]`)`,
+/// which is deliberately *not* [`ParkError::RunNotFound`]: the old zero-row
+/// `UPDATE` could only report a row count, so it reported "wrong state" as
+/// "no such run".
+///
+/// **The checkpoint still runs first**, so a park refused by this check has
+/// already taken a restore point (§8.11's ordering gates the *release* on the
+/// checkpoint, and the release is the caller's). Nothing durable is written;
+/// the residue is one unused restore point, pinned by
+/// `a_refused_park_leaves_its_checkpoint_behind_but_writes_nothing_durable`.
 ///
 /// # The wait's deadline and the workspace hold are two different quantities
 ///
@@ -495,20 +519,7 @@ pub fn park(
     let session_id = run_session_id(conn, run_id)?;
     let checkpoint_ref = checkpointer.checkpoint(session_id, "awaiting_human_park")?;
 
-    let txn = roundhouse_store::begin_immediate(conn)?;
-    let updated = txn.execute(
-        "UPDATE workflow_run SET state = ?1, awaiting_until = ?2 WHERE id = ?3 AND session_id = ?4",
-        params![
-            RunState::AwaitingHuman.as_sql_str(),
-            awaiting_until.map(|t| t.as_unix_nanos()),
-            run_id.to_string(),
-            session_id.to_string(),
-        ],
-    )?;
-    if updated == 0 {
-        return Err(ParkError::RunNotFound { run_id });
-    }
-    txn.commit()?;
+    transition_run_to_awaiting_human(conn, run_id, session_id, awaiting_until, now)?;
 
     Ok(ParkResult {
         checkpoint_ref,

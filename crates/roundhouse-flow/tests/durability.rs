@@ -5,8 +5,8 @@
 use roundhouse_core::{BindingId, JobId, SessionId, Timestamp};
 use roundhouse_flow::durability::{
     checkpoint_step, derive_disposition, on_crash_policy, open_test_db, previous_run_for_binding,
-    recover_run, CrashPolicy, DurabilityError, RunState, StepDisposition, StepOutput, StepRunState,
-    WorkflowRun, WorkflowStepRun,
+    recover_run, transition_is_legal, transition_run, CrashPolicy, DurabilityError, RunState,
+    StepDisposition, StepOutput, StepRunState, WorkflowRun, WorkflowStepRun,
 };
 use roundhouse_flow::durability::{insert_workflow_run, TOP_LEVEL_ITEM_INDEX};
 use roundhouse_flow::exec::{Provenance, RunId, StepOutcome, StepStatus};
@@ -733,5 +733,215 @@ fn an_out_of_domain_item_index_is_refused_on_write_and_on_read_never_aliased() {
             }
         ),
         "expected ItemIndexOutOfRange, got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 20a (B12a) — the run-state transition writer (§8.13)
+// ---------------------------------------------------------------------------
+
+/// Every ordered pair `(from, to)` the matrix admits, written out here
+/// independently of the implementation rather than by calling it — so the
+/// test is a second statement of the contract, not a mirror of the code.
+/// See `durability::transition_is_legal`'s doc comment for which of these
+/// §8.13/§8.11 name and which are inferred.
+const LEGAL_TRANSITIONS: &[(RunState, RunState)] = &[
+    (RunState::Running, RunState::Paused),
+    (RunState::Running, RunState::Cancelling),
+    (RunState::Running, RunState::AwaitingHuman),
+    (RunState::Running, RunState::Completed),
+    (RunState::Running, RunState::Failed),
+    (RunState::Paused, RunState::Running),
+    (RunState::Paused, RunState::Cancelling),
+    (RunState::Paused, RunState::Failed),
+    (RunState::AwaitingHuman, RunState::AwaitingHuman),
+    (RunState::AwaitingHuman, RunState::Running),
+    (RunState::AwaitingHuman, RunState::Cancelling),
+    (RunState::AwaitingHuman, RunState::Failed),
+    (RunState::Cancelling, RunState::Cancelled),
+    (RunState::Cancelling, RunState::Failed),
+];
+
+const ALL_RUN_STATES: &[RunState] = &[
+    RunState::Running,
+    RunState::Paused,
+    RunState::Cancelling,
+    RunState::AwaitingHuman,
+    RunState::Completed,
+    RunState::Failed,
+    RunState::Cancelled,
+];
+
+#[test]
+fn the_legality_matrix_admits_exactly_fourteen_of_the_forty_nine_ordered_pairs() {
+    for &from in ALL_RUN_STATES {
+        for &to in ALL_RUN_STATES {
+            let expected = LEGAL_TRANSITIONS.contains(&(from, to));
+            assert_eq!(
+                transition_is_legal(from, to),
+                expected,
+                "({from:?} -> {to:?}) should be {}",
+                if expected { "legal" } else { "refused" }
+            );
+        }
+    }
+}
+
+#[test]
+fn every_terminal_state_is_absorbing_and_no_other_state_is() {
+    for &state in ALL_RUN_STATES {
+        let has_outgoing = ALL_RUN_STATES
+            .iter()
+            .any(|&to| transition_is_legal(state, to));
+        assert_eq!(
+            state.is_terminal(),
+            !has_outgoing,
+            "{state:?}: terminal iff it has no outgoing transition"
+        );
+    }
+    assert!(RunState::Completed.is_terminal());
+    assert!(RunState::Failed.is_terminal());
+    assert!(RunState::Cancelled.is_terminal());
+    assert!(!RunState::Cancelling.is_terminal());
+}
+
+#[test]
+fn a_terminal_transition_stamps_ended_at_and_a_non_terminal_one_leaves_it_null() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+
+    transition_run(
+        &mut conn,
+        run_id,
+        RunState::Paused,
+        Timestamp::from_unix_nanos(2_000),
+    )
+    .expect("running -> paused");
+    let paused = recover_run(&conn, run_id).unwrap().run;
+    assert_eq!(paused.state, RunState::Paused);
+    assert_eq!(
+        paused.ended_at, None,
+        "a run that is paused has not ended; nothing may stamp ended_at yet"
+    );
+
+    transition_run(
+        &mut conn,
+        run_id,
+        RunState::Running,
+        Timestamp::from_unix_nanos(3_000),
+    )
+    .expect("paused -> running");
+    transition_run(
+        &mut conn,
+        run_id,
+        RunState::Completed,
+        Timestamp::from_unix_nanos(4_000),
+    )
+    .expect("running -> completed");
+
+    let done = recover_run(&conn, run_id).unwrap().run;
+    assert_eq!(done.state, RunState::Completed);
+    assert_eq!(
+        done.ended_at,
+        Some(Timestamp::from_unix_nanos(4_000)),
+        "ended_at is the `now` the terminal transition was given — before Task \
+         20a nothing wrote this column at all"
+    );
+    assert_eq!(
+        done.started_at,
+        Timestamp::from_unix_nanos(1_000),
+        "started_at is untouched"
+    );
+}
+
+#[test]
+fn an_illegal_transition_is_refused_and_leaves_the_row_exactly_as_it_was() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+    transition_run(
+        &mut conn,
+        run_id,
+        RunState::Completed,
+        Timestamp::from_unix_nanos(4_000),
+    )
+    .unwrap();
+    let before = recover_run(&conn, run_id).unwrap().run;
+
+    let err = transition_run(
+        &mut conn,
+        run_id,
+        RunState::Running,
+        Timestamp::from_unix_nanos(5_000),
+    )
+    .expect_err("a completed run is absorbing; it cannot be resurrected");
+
+    match err {
+        DurabilityError::IllegalTransition {
+            run_id: r,
+            from,
+            to,
+        } => {
+            assert_eq!(r, run_id);
+            assert_eq!(from, RunState::Completed);
+            assert_eq!(to, RunState::Running);
+        }
+        other => panic!("expected IllegalTransition, got {other:?}"),
+    }
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run,
+        before,
+        "a refused transition writes nothing at all, ended_at included"
+    );
+}
+
+#[test]
+fn a_run_with_no_row_is_not_found_rather_than_an_illegal_transition() {
+    let mut conn = open_test_db();
+    let absent = RunId::new();
+    let err = transition_run(
+        &mut conn,
+        absent,
+        RunState::Cancelling,
+        Timestamp::from_unix_nanos(1),
+    )
+    .expect_err("no row means no transition");
+    match err {
+        DurabilityError::RunNotFound { run_id } => assert_eq!(run_id, absent),
+        other => panic!(
+            "\"run not found\" and \"wrong state\" are different facts a caller \
+             must be able to tell apart; got {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn a_transition_returns_the_state_it_displaced() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    insert_workflow_run(&mut conn, &a_run(run_id, None, 1_000)).unwrap();
+    let displaced = transition_run(
+        &mut conn,
+        run_id,
+        RunState::Cancelling,
+        Timestamp::from_unix_nanos(2_000),
+    )
+    .unwrap();
+    assert_eq!(
+        displaced,
+        RunState::Running,
+        "the previous state is read inside the same transaction as the write, \
+         so it is the one the write actually displaced"
+    );
+    assert_eq!(
+        transition_run(
+            &mut conn,
+            run_id,
+            RunState::Cancelled,
+            Timestamp::from_unix_nanos(3_000)
+        )
+        .unwrap(),
+        RunState::Cancelling
     );
 }

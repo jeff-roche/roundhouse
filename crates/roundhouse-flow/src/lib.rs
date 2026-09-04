@@ -10,6 +10,7 @@
 
 pub mod caps;
 pub mod compose;
+pub mod control;
 pub mod durability;
 pub mod exec;
 pub mod expr;

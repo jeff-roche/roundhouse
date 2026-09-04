@@ -1,0 +1,331 @@
+//! §8.13's run controls — **cancel**, **pause**, **resume**,
+//! **retry-from-step** (Task 20a, B12a).
+//!
+//! Every function here writes the `workflow_run` row through
+//! [`crate::durability`]'s transition writer. That is the whole point of the
+//! module: a control that flipped a `&mut RunState` would change nothing a
+//! restart, a second client, or the web Runs inbox could see, and §8.13's
+//! controls exist precisely to be issued from somewhere other than the run
+//! loop.
+//!
+//! # The controls are narrower than the state machine
+//!
+//! [`durability::transition_is_legal`] admits every move the run *loop* also
+//! needs — `AwaitingHuman -> Running` when a human answers a gate,
+//! `Running -> Completed` when the last step finishes. The three controls
+//! here admit strictly less:
+//!
+//! | control | permitted source states | target |
+//! |---|---|---|
+//! | [`cancel`] | `Running`, `Paused`, `AwaitingHuman` | `Cancelling` |
+//! | [`pause`] | `Running` | `Paused` |
+//! | [`resume`] | `Paused` | `Running` |
+//!
+//! [`resume`] deliberately does **not** move a parked run back to `Running`
+//! even though the matrix permits that edge: §8.11's park is released by the
+//! human answering (or by `on_timeout` firing), not by an operator pressing
+//! resume, and letting resume do it would discard the wait's answer.
+//!
+//! # What this module does NOT own
+//!
+//! - **`rerun`.** §8.13 lists it as a fifth control and the plan section's
+//!   own title promises it, but the plan's body never produced it and this
+//!   task does not either. It is a *new* run of the same pinned
+//!   `(job_id, job_version, content_hash)` with no inherited steps and no
+//!   `forked_from_run_id`, which needs the run loop to start it — recorded
+//!   here as an unowned residual rather than half-built.
+//! - **The cooperative half of cancel.** §8.13's cancel is *"refuse new task
+//!   admission, SIGTERM->SIGKILL running shells, run `finally:`"*; this
+//!   module writes the `Cancelling` mark that those three read, and nothing
+//!   else. Admission and `finally:` are the run loop (**B12c**); the signals
+//!   are `roundhouse-tools`, which already implements them for a task.
+//! - **Reaching `Cancelled`.** The drain ends the run, so the
+//!   `Cancelling -> Cancelled` write is the run loop's (**B12c**);
+//!   [`durability::transition_run`] is what it will call.
+//! - **Clearing inherited outputs a fork can no longer target.** Migration
+//!   0007 and `durability`'s module doc name that eraser as Task 20's; it
+//!   needs a retention policy deciding which runs are past forking, which is
+//!   a policy decision this slice does not make. [`retry_from_step`] widens
+//!   the set of rows holding unredacted output (a fork copies them), so the
+//!   obligation is louder now, not smaller.
+
+use crate::durability::{
+    self, fork_run, recover_run, DurabilityError, RunState, StepRunState, WorkflowRun,
+    WorkflowStepRun,
+};
+use crate::exec::RunId;
+use roundhouse_core::{SessionId, Timestamp};
+use thiserror::Error;
+
+/// Why a control could not be applied.
+///
+/// The three "wrong state" variants each carry the state the row was
+/// **actually** in, read inside the same transaction that refused the write.
+/// An operator (or the web Runs inbox) is then told what to do next rather
+/// than only that the call failed.
+#[non_exhaustive]
+#[derive(Debug, Error)]
+pub enum ControlError {
+    #[error(transparent)]
+    Durability(#[from] DurabilityError),
+    /// [`pause`] found a run that is not `Running`.
+    #[error("run {run_id} cannot be paused: it is {state:?}, not Running")]
+    NotRunning { run_id: RunId, state: RunState },
+    /// [`resume`] found a run that is not `Paused` — including a parked run,
+    /// which resume deliberately does not release (see the module doc).
+    #[error("run {run_id} cannot be resumed: it is {state:?}, not Paused")]
+    NotPaused { run_id: RunId, state: RunState },
+    /// [`cancel`] found a run that has already ended, or one whose cancel is
+    /// already in flight. Reported rather than treated as a no-op: an
+    /// operator pressing cancel twice is told the run is already draining,
+    /// which is different from a fresh cancel having landed.
+    #[error("run {run_id} cannot be cancelled: it is {state:?}")]
+    NotCancellable { run_id: RunId, state: RunState },
+    /// [`retry_from_step`] was asked to fork a run that has not ended.
+    #[error("run {run_id} is {state:?}, so it cannot be forked yet")]
+    RunStillActive { run_id: RunId, state: RunState },
+    /// [`retry_from_step`]'s `from_step_id` is not one of the step ids the
+    /// caller supplied for the run's pinned job version.
+    ///
+    /// Echoes the offending id because it is the caller's own input and
+    /// naming it is the whole diagnostic. Its length is whatever the caller
+    /// passed — this text reaches no database column, only `Display`, so
+    /// unlike `workflow_step_run.error` it carries no truncation of its own
+    /// (the same log-only reasoning `parking::CheckpointError` records).
+    #[error("step {step_id:?} is not a step of this run's job version")]
+    UnknownStep { step_id: String },
+}
+
+/// §8.13's cooperative **cancel**: *"mark `Cancelling`, refuse new task
+/// admission, SIGTERM->SIGKILL running shells, run `finally:`"*.
+///
+/// This writes the mark, durably. The other three clauses are the run loop's
+/// and the tools layer's — see the module doc — and all three read this row,
+/// which is why the mark has to be a row rather than a flag in whichever
+/// process happened to receive the control.
+///
+/// A parked run is cancellable: a run waiting on a human who never answers is
+/// exactly the one an operator needs to stop, and §8.11's reaper exists
+/// because that case is real.
+///
+/// `now` is forwarded to [`durability::transition_run`], which writes it to
+/// `ended_at` only for a terminal target. `Cancelling` is not terminal, so
+/// this call writes no instant; the parameter is here because this crate
+/// reads no clock and the run loop's own `Cancelling -> Cancelled` write does
+/// need one.
+pub fn cancel(
+    conn: &mut rusqlite::Connection,
+    run_id: RunId,
+    now: Timestamp,
+) -> Result<(), ControlError> {
+    match durability::transition_run(conn, run_id, RunState::Cancelling, now) {
+        Ok(_) => Ok(()),
+        Err(DurabilityError::IllegalTransition { from, .. }) => Err(ControlError::NotCancellable {
+            run_id,
+            state: from,
+        }),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// §8.13's **pause**, from `Running` only.
+///
+/// See [`cancel`] for why `now` is a parameter of a non-terminal transition.
+pub fn pause(
+    conn: &mut rusqlite::Connection,
+    run_id: RunId,
+    now: Timestamp,
+) -> Result<(), ControlError> {
+    match durability::transition_run(conn, run_id, RunState::Paused, now) {
+        Ok(_) => Ok(()),
+        Err(DurabilityError::IllegalTransition { from, .. }) => Err(ControlError::NotRunning {
+            run_id,
+            state: from,
+        }),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// §8.13's **resume**, from `Paused` only — never from `AwaitingHuman`, see
+/// the module doc.
+///
+/// The only control whose precondition is narrower than the matrix, so the
+/// only one that goes through [`durability::transition_run_from`]: the
+/// narrowing is checked inside the write's own transaction rather than by a
+/// separate read whose answer could already be stale. [`cancel`] and
+/// [`pause`] permit exactly what the matrix does for their targets, and
+/// restating that here would be a second copy of the matrix to drift from.
+///
+/// See [`cancel`] for why `now` is a parameter of a non-terminal transition.
+pub fn resume(
+    conn: &mut rusqlite::Connection,
+    run_id: RunId,
+    now: Timestamp,
+) -> Result<(), ControlError> {
+    match durability::transition_run_from(conn, run_id, &[RunState::Paused], RunState::Running, now)
+    {
+        Ok(_) => Ok(()),
+        Err(DurabilityError::IllegalTransition { from, .. }) => Err(ControlError::NotPaused {
+            run_id,
+            state: from,
+        }),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// What [`retry_from_step`] created.
+///
+/// The durable record is the two sets of rows; this is the in-process echo,
+/// in the shape the plan specified.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForkedRun {
+    pub new_run_id: RunId,
+    pub forked_from_run_id: RunId,
+    /// The rows written under the fork — not the originals. Their
+    /// `run_id` is [`Self::new_run_id`] and their task-seq ranges are
+    /// `None`; see [`retry_from_step`].
+    pub inherited_step_outputs: Vec<WorkflowStepRun>,
+}
+
+/// §8.13's **retry-from-step**: *"forks a new run inheriting completed step
+/// outputs with a `forked_from_run_id` link — history is append-only, so we
+/// never rewrite it"*.
+///
+/// The original run is read and never written. What is written is a new
+/// `workflow_run` row carrying `forked_from_run_id`, plus a copy of every
+/// completed step row strictly before `from_step_id` — one transaction, see
+/// [`fork_run`].
+///
+/// # Why `step_order` is a parameter
+///
+/// Which steps are *before* the retry point is a property of the job's
+/// declared step list (`parse::types::WorkflowDef::steps` is a `Vec` and
+/// there is no `needs:` graph, so declaration order is execution order), and
+/// **this crate cannot recover that list from the database**: there is no
+/// jobs table anywhere in the schema (radius: the `CREATE TABLE` statements
+/// in `roundhouse-store/src/migrations.rs` are `events`, `tasks`, `blobs`,
+/// `trigger_event`, `workflow_run`, `workflow_step_run` — a `Job`/`JobVersion`
+/// lives in [`crate::job`] as an in-memory type), so `(job_id, job_version,
+/// content_hash)` cannot be resolved back to its content here. The caller —
+/// which had to parse the workflow to run it in the first place — supplies
+/// the ids in declaration order. Ordering the recovered rows instead would
+/// not work: [`recover_run`] returns them sorted by `step_id`, which is
+/// alphabetical, not temporal.
+///
+/// A `from_step_id` that is not in `step_order` is
+/// [`ControlError::UnknownStep`], not a silent whole-run inheritance. A
+/// recovered row whose `step_id` is not in `step_order` is **not** inherited:
+/// nothing can place it relative to the cut.
+///
+/// # What is inherited, and what is deliberately not
+///
+/// - **Only `Completed` steps**, per §8.13's own words ("completed step
+///   outputs"). A step that failed, is pending, or was found
+///   `Indeterminate` after a crash re-runs.
+/// - `StepRunState::Skipped` rows are **not** inherited, and that is an open
+///   question rather than a settled rule: a skipped step is *finished*
+///   (migration 0007 says so, because the run loop must not re-evaluate
+///   `when:` on re-drive), so a fork arguably should carry the skip forward
+///   instead of re-evaluating a condition that may now read differently.
+///   Nothing writes `Skipped` yet (radius: `StepRunState::Skipped` appears in
+///   `durability.rs` and in tests only; `exec::StepStatus::Skipped` is
+///   produced but never checkpointed), so no such row can exist today. The
+///   decision belongs with **B12c**, which writes the first one.
+/// - **`attempt` is preserved, not renumbered.** An inherited step is not
+///   re-run, so its attempt count is a fact about how the original reached
+///   that output; rewriting it to 1 would claim the fork achieved in one
+///   attempt what actually took several. A `map` step's per-item rows come
+///   across the same way, each keeping its own `item_index`, because
+///   `(step_id, attempt, item_index)` is what makes them distinct rows at
+///   all.
+/// - **`first_task_seq`/`last_task_seq` are cleared.** §8.10's ranges join
+///   back to a *session's* task log, the inherited tasks live in the original
+///   run's session, and §8.6 gives the fork a new session — so copying the
+///   ranges would point the fork's join at seqs its own session never
+///   emitted. The evidence is still reachable, through
+///   `forked_from_run_id`.
+/// - `binding_id` and `trigger_event_id` **are** inherited: the fork is a
+///   continuation of the same firing, and `forked_from_run_id` is what
+///   distinguishes it from a fresh one. The visible consequence, stated
+///   rather than left to be discovered: a fork becomes a candidate answer for
+///   [`durability::previous_run_for_binding`], so `carry_over` sees the fork
+///   rather than the run it forked once the fork is the more recent row.
+/// - `parent_run_id` is inherited, so a forked `call:` child still names the
+///   run that called it. **Nothing yet sets that column to a run** (radius:
+///   `grep -rn parent_run_id --include=*.rs crates/` finds `durability`'s
+///   field and read/write, `compose`'s doc comments, this fork, and two test
+///   fixtures — §8.12's `call:` arm that would produce one is B12c), so the
+///   value copied here is always `None` today and the choice is reasoned,
+///   not exercised.
+///
+/// # Why the original must have ended
+///
+/// [`ControlError::RunStillActive`] refuses to fork a run that is not
+/// terminal. INFERRED, not stated by §8.13: forking a live run takes a
+/// snapshot of a moving target and starts a second run that will re-execute
+/// effectful steps the first is still executing. An operator cancels (or
+/// waits for) the run first. If a later task finds a real need to fork a
+/// paused run, this is the check to revisit — it is a policy in one `if`,
+/// not a structural assumption.
+pub fn retry_from_step(
+    conn: &mut rusqlite::Connection,
+    original_run_id: RunId,
+    from_step_id: &str,
+    step_order: &[&str],
+    new_session_id: SessionId,
+    now: Timestamp,
+) -> Result<ForkedRun, ControlError> {
+    let cut = step_order
+        .iter()
+        .position(|id| *id == from_step_id)
+        .ok_or_else(|| ControlError::UnknownStep {
+            step_id: from_step_id.to_string(),
+        })?;
+    let before_the_cut = &step_order[..cut];
+
+    let original = recover_run(conn, original_run_id)?;
+    if !original.run.state.is_terminal() {
+        return Err(ControlError::RunStillActive {
+            run_id: original_run_id,
+            state: original.run.state,
+        });
+    }
+
+    let new_run_id = RunId::new();
+    let inherited: Vec<WorkflowStepRun> = original
+        .steps
+        .iter()
+        .filter(|step| {
+            step.state == StepRunState::Completed && before_the_cut.contains(&step.step_id.as_str())
+        })
+        .map(|step| WorkflowStepRun {
+            run_id: new_run_id,
+            first_task_seq: None,
+            last_task_seq: None,
+            ..step.clone()
+        })
+        .collect();
+
+    let fork = WorkflowRun {
+        id: new_run_id,
+        job_id: original.run.job_id,
+        job_version: original.run.job_version,
+        content_hash: original.run.content_hash.clone(),
+        session_id: new_session_id,
+        binding_id: original.run.binding_id,
+        trigger_event_id: original.run.trigger_event_id,
+        state: RunState::Running,
+        parent_run_id: original.run.parent_run_id,
+        forked_from_run_id: Some(original_run_id),
+        awaiting_until: None,
+        started_at: now,
+        ended_at: None,
+    };
+    fork_run(conn, &fork, &inherited)?;
+
+    Ok(ForkedRun {
+        new_run_id,
+        forked_from_run_id: original_run_id,
+        inherited_step_outputs: inherited,
+    })
+}
