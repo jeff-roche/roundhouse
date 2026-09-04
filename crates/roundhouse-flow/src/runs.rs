@@ -176,9 +176,26 @@ pub fn load_run_summaries(conn: &Connection, limit: usize) -> Result<Vec<RunSumm
 /// the last one it produced; `run_id` is carried only to name the run in
 /// [`RunsError::InvalidReport`].
 ///
-/// The `ORDER BY … DESC` plus a lazy iterator means this stops at the first
-/// matching row, so a session with a long log costs one index seek and not a
-/// full scan of its events.
+/// # What the cost actually is, measured rather than reasoned about
+///
+/// An earlier version of this comment said the `ORDER BY … DESC` plus a lazy
+/// iterator "stops at the first matching row, so a session with a long log costs
+/// one index seek and not a full scan". The lazy iteration is real; the
+/// inference from it was not. `EXPLAIN QUERY PLAN` on this statement against the
+/// real migrations (SQLite 3.53.2) says:
+///
+/// ```text
+/// SEARCH t USING INDEX tasks_session_id_idx (session_id=?)
+/// SEARCH e USING INDEX events_task_id_idx (task_id=?)
+/// USE TEMP B-TREE FOR ORDER BY
+/// ```
+///
+/// No index supplies `e.seq DESC` over the *joined* rowset, so SQLite
+/// materialises and sorts it before yielding anything: the first row is not
+/// cheap because it is first. What is true, and is the part that matters, is
+/// that the sorted set is **bounded to this session's `Report`-task events** by
+/// the two index searches above — not to the session's whole log — and a session
+/// has a handful of those. The cost is fine; the mechanism was described wrongly.
 fn load_report(
     conn: &Connection,
     session_id: SessionId,
