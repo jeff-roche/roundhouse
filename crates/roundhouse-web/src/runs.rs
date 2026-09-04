@@ -231,7 +231,9 @@ impl From<RunSummary> for RunSummaryJson {
 async fn list_runs(State(state): State<crate::AppState>) -> Response {
     let connection = match state.store_connection().await {
         Ok(connection) => connection,
-        Err(response) => return response,
+        // Boxed by `store_connection` so its `Err` variant does not set the
+        // width of every `Ok` return; its docs say why.
+        Err(response) => return *response,
     };
 
     // The query is synchronous and lives in `roundhouse-flow`;

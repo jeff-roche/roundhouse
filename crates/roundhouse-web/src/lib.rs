@@ -215,17 +215,30 @@ impl AppState {
     ///
     /// A missing store is a `503` rather than an empty list because an empty
     /// inbox is a real and reassuring answer — see [`runs`]'s handler.
+    ///
+    /// # Why the `Err` variant is boxed
+    ///
+    /// An `axum::response::Response` is ~128 bytes, and a `Result` is as wide as
+    /// its widest variant — so an unboxed error would set the size of *every*
+    /// return, including the `Ok` one this method takes on every served request.
+    /// The box moves that width behind a pointer. It costs one allocation on the
+    /// rare path, which is already about to serialise a `503`, and nothing at all
+    /// on the common one. `clippy::result_large_err` is what flags the unboxed
+    /// form; the box is the fix rather than an `allow`, because the lint is right
+    /// about this shape.
     pub(crate) async fn store_connection(
         &self,
-    ) -> Result<StoreConnection, axum::response::Response> {
+    ) -> Result<StoreConnection, Box<axum::response::Response>> {
         use axum::response::IntoResponse;
 
         let unavailable = |reason: &str| {
-            (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                api_error(reason),
+            Box::new(
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    api_error(reason),
+                )
+                    .into_response(),
             )
-                .into_response()
         };
 
         let Some(store) = self.store.as_ref() else {
@@ -241,11 +254,13 @@ impl AppState {
                 "this API is at its concurrency bound; retry shortly (the store's connections are \
                  shared with the event log's writer)",
             )),
-            Err(ConnectionRefusal::PoolFailed) => Err((
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                api_error("this API failed while acquiring a store connection"),
-            )
-                .into_response()),
+            Err(ConnectionRefusal::PoolFailed) => Err(Box::new(
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    api_error("this API failed while acquiring a store connection"),
+                )
+                    .into_response(),
+            )),
         }
     }
 }
