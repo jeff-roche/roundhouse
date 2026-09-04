@@ -102,11 +102,40 @@ fn unknown_kind_is_rejected_rather_than_silently_mapped_to_something() {
 /// answer is visible to a caller: a misspelled *field* used to be reported as a
 /// missing one, so `{"kind": "queue", "txt": "…"}` answered *"queue requires
 /// non-empty text"* to a caller who had supplied text.
+///
+/// # Both ends of the object, and why the second fixture is not redundant
+///
+/// P92's amended rule 2 applied to the side of the search that was missed
+/// (ruling P99's fourth rule): a search has **two** collections — the keys being
+/// iterated and the known-field list they are matched against — and the
+/// cardinality set applies to both. The sweep enumerated mutations of
+/// `[KIND, TEXT]` and none of `object.keys()`, so
+/// `object.keys().skip(1).find(…)` survived: `txt` is the *last* key under
+/// either ordering, so skipping the first still finds it, still returns
+/// `UnknownField`, and every assertion above still passes. That mutant accepts
+/// `{"aaa": …, "kind": …}` with `aaa` silently ignored — reopening the exact
+/// failure this module spends twenty lines justifying.
+///
+/// `aim` is the second fixture's unknown key because it is index **0 under
+/// either `serde_json` map ordering**: it sorts before `kind` (the `BTreeMap`
+/// default) *and* is written first (with `preserve_order`). A fixture whose
+/// correctness depends on which of the two is compiled in is a live hazard here,
+/// not a theoretical one — the feature is reachable in this lock.
+///
+/// It also carries a valid `text`, so the mutant cannot be killed by the wrong
+/// thing: skipping `aim` yields a perfectly well-formed `queue`, and the only
+/// way to fail is to have not looked at the first key.
 #[test]
-fn a_misspelled_field_names_the_typo_instead_of_reporting_missing_text() {
+fn a_misspelled_field_names_the_typo_wherever_in_the_object_it_sits() {
     assert_eq!(
         parse_interaction(&json!({"kind": "queue", "txt": "also check the changelog"})),
-        Err(InteractionError::UnknownField("txt".into()))
+        Err(InteractionError::UnknownField("txt".into())),
+        "an unknown key last in the object"
+    );
+    assert_eq!(
+        parse_interaction(&json!({"aim": "left", "kind": "queue", "text": "x"})),
+        Err(InteractionError::UnknownField("aim".into())),
+        "an unknown key first in the object, beside a kind and a text that are both valid"
     );
 }
 
@@ -147,6 +176,15 @@ fn a_non_object_body_names_its_own_shape() {
 /// `€` is three bytes and `64 % 3 == 1`, so a byte slice at the bound splits a
 /// character and panics. Picking a multi-byte character is not enough; it has to
 /// be one whose width does not divide the bound.
+///
+/// # And the truncation keeps the bound, not a token prefix
+///
+/// The last assertion is what stops `chars().take(1)` passing. The sweep's
+/// mutations of `MAX_ECHOED` cannot see that one: the constant appears in
+/// *both* the `chars().count() <= MAX_ECHOED` guard and the `take`, so changing
+/// it moves them together and the three assertions above hold at any value. A
+/// mutation that decouples the take from the constant does not, and only an
+/// assertion about *how much* survived the cut can tell them apart.
 #[test]
 fn a_rejected_value_is_echoed_back_bounded_and_on_a_char_boundary() {
     let render = |repeats: usize| {
@@ -168,6 +206,15 @@ fn a_rejected_value_is_echoed_back_bounded_and_on_a_char_boundary() {
     // The same value under the bound is quoted whole, so the truncation is a
     // bound and not an unconditional shortening.
     assert!(render(3).contains("€€€"), "got {}", render(3));
+    // And what survives the cut is a bound's worth, not a token prefix. Stated
+    // as "more than ten" rather than as the exact bound because `MAX_ECHOED` is
+    // private, and a test that had to be re-tuned alongside it would be pinning
+    // the constant rather than the behaviour.
+    assert!(
+        long.matches('€').count() > 10,
+        "a truncated value keeps the bound's worth of the caller's text, not a token prefix; \
+         got {long}"
+    );
 }
 
 async fn post(router: axum::Router, uri: &str, body: serde_json::Value) -> (StatusCode, String) {
@@ -295,11 +342,28 @@ async fn a_session_id_that_is_not_a_uuid_is_rejected_before_the_501() {
 /// Both rejection shapes are exercised: a wrong content type, and a body that
 /// is not JSON at all. A client doing `res.json()` must not get a parse error
 /// where a reason belongs, on any path.
+///
+/// # The two statuses are asserted, not merely their class
+///
+/// The handler keeps `rejection.status()` rather than hardcoding one status, and
+/// the stated reason is that it distinguishes an unsupported content type from
+/// unparseable JSON. `is_client_error()` does not check that — hardcoding
+/// `BAD_REQUEST` passes it — so the distinction the code is written for is
+/// pinned here as the two statuses `axum` 0.8.4 actually chooses: `415` for the
+/// content type, `400` for the syntax.
 #[tokio::test]
 async fn an_extractor_rejection_is_json_like_every_other_api_error() {
-    for (content_type, body) in [
-        ("text/plain", "{\"kind\": \"soft_interrupt\"}"),
-        ("application/json", "this is not json"),
+    for (content_type, body, expected) in [
+        (
+            "text/plain",
+            "{\"kind\": \"soft_interrupt\"}",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (
+            "application/json",
+            "this is not json",
+            StatusCode::BAD_REQUEST,
+        ),
     ] {
         let response = router()
             .oneshot(
@@ -318,6 +382,11 @@ async fn an_extractor_rejection_is_json_like_every_other_api_error() {
         assert!(
             status.is_client_error(),
             "a rejected body is the caller's error; got {status}"
+        );
+        assert_eq!(
+            status, expected,
+            "the handler keeps axum's own status so that {content_type} is distinguishable from \
+             unparseable JSON; got {status}"
         );
 
         let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
