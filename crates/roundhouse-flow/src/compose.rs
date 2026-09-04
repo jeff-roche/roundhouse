@@ -7,15 +7,19 @@
 //! Four pure, testable, callable primitives — [`draw_child_budget`] /
 //! [`refund_child_budget`], [`child_call_depth`], [`admit_child_call`], and
 //! [`register_as_tool`].
-//! **Nothing calls them yet.** Composition's *run loop* — creating the child
-//! `workflow_run`, writing
+//! Composition's *run loop* — creating the child `workflow_run`, writing
 //! [`WorkflowRun::parent_run_id`](crate::durability::WorkflowRun::parent_run_id),
-//! creating the child Session, emitting §8.12's `agent`-kind task standing
-//! for the call, and calling all four of these — is **Task 20 (B12)**'s,
-//! and [`crate::exec::Executor::dispatch_step`]'s `StepBody::Call` arm stays
-//! a stub until then. Task 20 also owns *sourcing* the two numbers the bounds
-//! take: see [`MAX_CALL_DEPTH`]'s "What Task 20 must supply", which is about
-//! the **session** chain and not the `parent_run_id` chain.
+//! creating the child Session, and emitting §8.12's `agent`-kind task
+//! standing for the call — is **B12c**'s, and
+//! [`crate::exec::Executor::dispatch_step`]'s `StepBody::Call` arm stays a
+//! stub until then.
+//!
+//! **B12b closed the sourcing half.** [`crate::ledger::admit_call_from_run`]
+//! reads the parent run's `session_depth` (migration 0008) and calls both
+//! bounds, and [`crate::ledger::refund_child_run`] is the durable twin of the
+//! draw/refund pair — see [`MAX_CALL_DEPTH`]'s "What Task 20 must supply",
+//! which is about the **session** chain and not the `parent_run_id` chain,
+//! and [`ChildBudget`]'s two residuals, one of which that function closes.
 //!
 //! This is the same primitive/run-loop split the three preceding tasks used:
 //! Task 16 (B8) landed the durable state machine with no run loop, Task 17
@@ -202,10 +206,10 @@ use thiserror::Error;
 /// - **Fan-out as a budget pool** — §7.7's transfer model, which is
 ///   [`draw_child_budget`]: every `call:` withdraws from the parent's
 ///   remaining pool, so a subtree's total *spend* is capped by the root's
-///   grant. **That half is not enforced yet** — the ledger it would draw
-///   against is [`crate::exec::map_step::MapBudget::unenforced_placeholder`],
-///   and the admission chokepoint is Task 20's (see [`ResourceCaps`]'s own doc
-///   comment).
+///   grant. **The ledger that half draws against exists as of B12b** —
+///   [`crate::ledger::remaining_caps`] and [`crate::ledger::admit_spend`],
+///   over migration 0008's columns — but the thing that calls the chokepoint
+///   once per task is the run loop's, and that is B12c.
 ///
 /// **Not measured:** no `call:` chain of any depth or width has been executed,
 /// because the `StepBody::Call` arm is a stub, and neither predicate has a
@@ -231,11 +235,16 @@ use thiserror::Error;
 /// at every step.** Counting the session chain in both predicates closes that;
 /// counting two chains cannot, however carefully each is implemented.
 ///
-/// `workflow_run` carries no session-depth column today. Sourcing the number
-/// is Task 20's, since the child `Session` it creates is both where the number
-/// comes from and where the incremented one goes; this predicate takes the
-/// number rather than sourcing it. `u8` widens into `u32` losslessly, so a
-/// caller holding `agent_spawn`'s depth passes it through unchanged.
+/// **`workflow_run.session_depth` is that number, as of migration 0008**, and
+/// [`crate::ledger::admit_call_from_run`] is the chokepoint that reads it and
+/// calls both this predicate and [`admit_child_call`]. A run whose column is
+/// `NULL` — written before 0008, or by a caller that could not determine the
+/// depth — is **refused** rather than read as depth 0, which would be the
+/// same escape reached through the schema instead of through the wrong
+/// counter. This predicate itself still takes the number rather than sourcing
+/// it, so it stays pure and table-testable; `u8` widens into `u32`
+/// losslessly, so a caller holding `agent_spawn`'s depth passes it through
+/// unchanged.
 pub const MAX_CALL_DEPTH: u32 = limits::MAX_DEPTH as u32;
 
 /// Why a `call:` was refused before it created anything.
@@ -337,11 +346,18 @@ pub enum CallFanOutError {
 /// [`MAX_DIRECT_CHILD_CALLS`], so it is refused — pinned by
 /// `a_direct_child_count_at_the_integer_ceiling_is_refused_rather_than_wrapping_to_zero`.)
 ///
-/// **What Task 20 must supply:** how many direct `call:` children the parent
-/// run *already* has, counted over the same session tree
-/// [`child_call_depth`]'s depth is counted over — `agent_spawn`'s
-/// `parent_direct_children`, not a per-`map`-item tally that resets. This
-/// predicate takes the number rather than sourcing it.
+/// **What the caller must supply, and why B12b did not make it a column:**
+/// how many direct children the parent's *Session* already has, counted over
+/// the same session tree [`child_call_depth`]'s depth is counted over —
+/// `agent_spawn`'s `parent_direct_children`, not a per-`map`-item tally that
+/// resets, and **not** a `SELECT COUNT(*) FROM workflow_run WHERE
+/// parent_run_id = ?`. That count is the depth mistake one noun over: §7.7
+/// says *"≤8 direct children per session"*, and a Session's direct children
+/// include its sub-agent spawns, which have no `workflow_run` row at all — so
+/// a parent with 8 sub-agents and no child runs would count 0 and admit 8
+/// more. The correct number lives in `roundhouse-bus`'s roster, which §5.2
+/// does not let this crate read, so [`crate::ledger::admit_call_from_run`]
+/// takes it as a parameter rather than inventing a countable it can see.
 pub fn admit_child_call(existing_direct_children: u32) -> Result<u32, CallFanOutError> {
     let attempted = existing_direct_children.saturating_add(1);
     if attempted > MAX_DIRECT_CHILD_CALLS {
@@ -386,7 +402,7 @@ pub fn admit_child_call(existing_direct_children: u32) -> Result<u32, CallFanOut
 ///   whole point of this type is that it cannot be. See "residual" below for
 ///   what that costs.
 ///
-/// # Residual: the token names an amount, not a parent
+/// # Residual: the token names an amount, not a parent — closed durably by B12b
 ///
 /// [`refund_child_budget`] takes any `&mut ResourceCaps`, so
 /// `draw_child_budget(&mut a, ..)` followed by
@@ -394,13 +410,18 @@ pub fn admit_child_call(existing_direct_children: u32) -> Result<u32, CallFanOut
 /// that left `a`'s. The three properties above hold for each token
 /// individually and say nothing about *which* subtree a token returns to; the
 /// §8.12 invariant they support is per-subtree, and that half is still caller
-/// discipline.
+/// discipline **for this in-memory pair**.
 ///
 /// Closing it at the type level needs an identity [`ResourceCaps`] does not
 /// carry, and one that survives a daemon restart — which this deliberately
-/// non-`Deserialize` token cannot, for the same reason the park residual below
-/// exists. **Named, not closed; owner Task 20 (B12)**, which owns the run loop
-/// and is therefore the single call site that pairs a draw with its refund.
+/// non-`Deserialize` token cannot. B12b closed it by moving the transfer onto
+/// rows instead of onto a token: [`crate::ledger::refund_child_run`] reads the
+/// parent from the **child's own `parent_run_id`** rather than taking one as a
+/// parameter, so there is no wrong parent to pass, and stamps
+/// `workflow_run.refunded_at` so a second refund is a refusal rather than a
+/// second credit. That is the durable equivalent of this token's
+/// consumed-by-value property, and it is the pair a run loop should use;
+/// these two functions remain the in-process arithmetic they are built on.
 ///
 /// # `#[must_use]`, and what dropping one means
 ///
@@ -414,15 +435,23 @@ pub fn admit_child_call(existing_direct_children: u32) -> Result<u32, CallFanOut
 ///
 /// §8.12 says the draw is *"refunded on completion"*, which presumes
 /// completion. A child that parks on a `gate:` and is never answered has no
-/// defined refund behaviour, and this module cannot give it one: accounting
-/// for it needs the durable park-interval record that
-/// [`ResourceCaps`]'s own doc comment says **does not exist** and assigns to
-/// Task 20 (B12) — an in-process tracker would lose exactly the multi-day
-/// park it exists to measure across a daemon restart. Compounding it, this
-/// token is deliberately non-`Deserialize`, so a daemon restart loses the
-/// in-process grant record too and Task 20 must re-derive the refund from
-/// durable rows rather than from a rehydrated token. **Named, not closed;
-/// owner Task 20.**
+/// defined refund behaviour, and this module cannot give it one.
+///
+/// **Half of this is now closed and half is not**, and the two halves are
+/// worth keeping apart. The *durable record* the accounting needs exists:
+/// migration 0008's `parked_at`/`parked_nanos` are the park intervals
+/// [`ResourceCaps`]'s doc comment said did not exist, and
+/// [`crate::ledger::refund_child_run`] re-derives the refund from rows rather
+/// than from this deliberately non-`Deserialize` token. What is **still
+/// open** is the policy: `refund_child_run` refuses a child that has not
+/// reached a terminal state ([`crate::ledger::LedgerError::ChildNotFinished`]),
+/// because returning a live child's grant would let it spend budget its
+/// parent had reclaimed — so a child parked forever still holds its grant
+/// forever. Deciding that an unanswered park eventually *fails* the child run
+/// (which would make it terminal, and refundable through the existing path)
+/// is the reaper's call, and the reaper's periodic runner is unowned
+/// daemon-side work per ruling P77 §C. **Named, half-closed; the remaining
+/// half is a decision, not a mechanism.**
 #[derive(Debug, PartialEq)]
 #[must_use = "a drawn budget must be refunded to the parent, or it is forfeited"]
 pub struct ChildBudget {
@@ -480,9 +509,15 @@ impl ChildBudget {
 ///
 /// **Keeping the `Duration` fields meaning "remaining" is the caller's job.**
 /// This crate reads no clock at all (same rule as [`crate::parking`], whose
-/// `now` is a parameter everywhere), so it cannot decrement a window by
-/// elapsed time. Task 20 owns the run loop and therefore owns keeping
-/// `parent_remaining`'s timeouts honest between calls.
+/// `now` is a parameter everywhere), so *this function* cannot decrement a
+/// window by elapsed time. Since B12b the caller has somewhere to get an
+/// honest one: [`crate::ledger::remaining_caps`] takes a `now` and returns a
+/// `ResourceCaps` whose `run_wall_timeout` and `run_active_timeout` are the
+/// grant minus what the run has actually burned — the latter excluding parked
+/// time, per §8.4. Handing *that* value in as `parent_remaining` is what makes
+/// the clamp below mean "the child cannot outlive what is left of the
+/// parent's window" rather than "cannot outlive the parent's original
+/// window".
 ///
 /// # Residual: the pool a `call:` inside a `map` draws against replicates
 /// three run-level ceilings

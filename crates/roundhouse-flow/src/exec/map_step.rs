@@ -97,15 +97,34 @@ use serde_json::Value;
 /// have had no reason to look in `parse` for why.
 pub const MAX_MAP_ITEMS: usize = 2_000;
 
-/// A run's remaining resource budget as `map` sees it. Real, live tracking
-/// against actual task consumption is Task 8's durability layer's job (it
-/// owns the run-level ledger); this crate's job is to divide whatever
-/// `total_remaining` it is handed.
+/// A run's remaining resource budget as `map` sees it. This crate's job is to
+/// divide whatever `total_remaining` it is handed; the run-level ledger that
+/// produces a real one is [`crate::ledger`] (B12b).
 pub struct MapBudget {
     pub total_remaining: ResourceCaps,
 }
 
 impl MapBudget {
+    /// The run's **real** remaining budget, as of `now`:
+    /// [`crate::ledger::remaining_caps`] — its grant minus what it has
+    /// already spent, with the two elapsed-time windows decremented by the
+    /// time the run has burned.
+    ///
+    /// This is the constructor [`Self::unenforced_placeholder`]'s doc has
+    /// been pointing at since Task 14, and with it [`split_budget`]'s output
+    /// is a share of a real ceiling rather than of a default one. It refuses
+    /// rather than substituting a default for a run with no recorded grant —
+    /// see [`crate::ledger::LedgerError::CapsNotRecorded`].
+    pub fn from_run_ledger(
+        conn: &rusqlite::Connection,
+        run_id: crate::exec::RunId,
+        now: roundhouse_core::Timestamp,
+    ) -> Result<MapBudget, crate::ledger::LedgerError> {
+        Ok(MapBudget {
+            total_remaining: crate::ledger::remaining_caps(conn, run_id, now)?,
+        })
+    }
+
     /// A [`MapBudget`] that enforces **nothing** — `total_remaining` is
     /// [`ResourceCaps::default`], not sourced from any real run-level
     /// ledger. Fix round 1, item 3: `Executor::dispatch_map_step` used to
@@ -115,12 +134,24 @@ impl MapBudget {
     /// admits it isn't one. This constructor exists so that call site says
     /// so explicitly and is greppable.
     ///
-    /// **Task 8 must replace this call site with a `MapBudget` built from
-    /// the run's actual remaining budget** once real admission-time
-    /// enforcement exists. Until then, [`split_budget`]'s output
-    /// (`per_item_caps`, handed to `run_item`) is real and meaningful as an
-    /// *allocation* — it is only the *ceiling it is allocated from* that is
-    /// fake.
+    /// # The ledger now exists; this call site still cannot use it (B12b)
+    ///
+    /// [`Self::from_run_ledger`] above is the real sourcing, and it is built
+    /// and tested. [`Executor::dispatch_map_step`] nonetheless still calls
+    /// **this** constructor, for a structural reason and not an omission:
+    /// [`Executor`] holds a `WorkflowDef`, a `TaskSink` and an `ExprContext`,
+    /// and **no [`rusqlite::Connection`]**. Giving it one means threading a
+    /// database handle (or a `ResourceCaps` read from one before the run
+    /// starts) through `Executor::new` and every dispatch arm — which is the
+    /// run loop's own plumbing, and the run loop is **B12c**. Ruling P77 §C
+    /// draws that line, and this is what it looks like from inside `map`.
+    ///
+    /// **The swap B12c makes is one line here**, plus wherever it decides the
+    /// connection lives:
+    /// `MapBudget::from_run_ledger(conn, self.run_id, now)?`.
+    /// Until then, [`split_budget`]'s output (`per_item_caps`, handed to
+    /// `run_item`) is real and meaningful as an *allocation* — it is only the
+    /// *ceiling it is allocated from* that is still fake.
     pub fn unenforced_placeholder() -> MapBudget {
         MapBudget {
             total_remaining: ResourceCaps::default(),

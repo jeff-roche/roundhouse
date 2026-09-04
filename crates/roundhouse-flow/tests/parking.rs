@@ -79,6 +79,8 @@ fn a_run(id: RunId, session_id: SessionId) -> WorkflowRun {
         awaiting_until: None,
         started_at: Timestamp::from_unix_nanos(1_000 * NANOS_PER_SEC),
         ended_at: None,
+        session_depth: None,
+        caps: None,
     }
 }
 

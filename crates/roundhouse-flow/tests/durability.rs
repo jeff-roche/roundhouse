@@ -32,6 +32,11 @@ fn a_run(id: RunId, binding_id: Option<BindingId>, started_at: i64) -> WorkflowR
         awaiting_until: None,
         started_at: Timestamp::from_unix_nanos(started_at),
         ended_at: None,
+        // The default fixture records neither ledger fact, which is exactly a
+        // pre-migration-0008 row; the tests that care about them set them
+        // explicitly, on both sides of every boundary.
+        session_depth: None,
+        caps: None,
     }
 }
 

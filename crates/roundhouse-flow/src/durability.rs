@@ -36,17 +36,17 @@
 //!   *decides* to park, and the deadline registration/cancellation that
 //!   `awaiting_until` feeds, are still **B12c** and daemon work
 //!   respectively.
-//! - **The run loop itself**: `catch:`/`finally:`/stop-on-failure, task
-//!   admission, `map` process spawn / `max_parallel`, and the run-level
-//!   budget ledger. Writing [`StepRunState::Skipped`] and
-//!   [`WorkflowStepRun::error`] belongs to that loop too: Task 16 shipped the
-//!   columns and the types, and produces neither value. Task 20 has since
-//!   been split (ruling P77): **Task 20a landed the state machine
-//!   ([`transition_is_legal`], [`transition_run`]) and §8.13's
-//!   cancel/pause/resume/retry-from-step in [`crate::control`]**; the ledger
-//!   and its migration are **B12b**, and the run loop itself is **B12c**.
-//!   `map` worktree spawn is not B12 at all — §5.2 gives this crate no git
-//!   and no `tokio`.
+//! - **The run loop itself**: `catch:`/`finally:`/stop-on-failure, calling
+//!   task admission, and `map` process spawn / `max_parallel`. Writing
+//!   [`StepRunState::Skipped`] and [`WorkflowStepRun::error`] belongs to that
+//!   loop too: Task 16 shipped the columns and the types, and produces
+//!   neither value. Task 20 has since been split (ruling P77): **Task 20a
+//!   landed the state machine ([`transition_is_legal`], [`transition_run`])
+//!   and §8.13's cancel/pause/resume/retry-from-step in [`crate::control`];
+//!   B12b landed migration 0008 and the run-level ledger
+//!   ([`crate::ledger`]), including this module's own park-column writes**;
+//!   the run loop itself is **B12c**. `map` worktree spawn is not B12 at all
+//!   — §5.2 gives this crate no git and no `tokio`.
 //! - **Clearing `output` for steps no fork can still target** — **still
 //!   unowned after ruling P77's split; not B12a**. This is the one residual with a security edge, so it is named
 //!   rather than assumed: [`checkpoint_step`] deliberately makes `output`
@@ -86,6 +86,7 @@
 //! exists.) Adding the field means touching `parse/steps.rs`'s wire shape, which
 //! this task deliberately does not do.
 
+use crate::caps::ResourceCaps;
 use crate::exec::{RunId, StepOutcome};
 use crate::parse::steps::{StepBody, StepDef};
 use roundhouse_core::{BindingId, JobId, SessionId, Timestamp};
@@ -126,6 +127,26 @@ pub enum DurabilityError {
     /// be secret-derived material (see [`StepOutput`]).
     #[error("column output does not hold valid JSON")]
     MalformedStoredOutput,
+    /// A stored `caps_json` column does not deserialize as a
+    /// [`ResourceCaps`]. The read-back leg of migration 0008's `caps_json`,
+    /// which carries no `CHECK` of its own: a `json_valid()` constraint would
+    /// bind the schema to SQLite's JSON1 extension being present in every
+    /// future build, which is the same class of hazard as ruling P104's
+    /// `ADD CONSTRAINT` — works today, fails on a build that differs. The
+    /// text is not echoed, for [`Self::MalformedStoredOutput`]'s reason: a
+    /// caps block is not secret-derived, but it is stored content and the
+    /// query that produced it already names the row.
+    #[error("column workflow_run.caps_json does not hold a valid ResourceCaps")]
+    MalformedStoredCaps { run_id: RunId },
+    /// A stored `session_depth` is outside `u32`. Migration 0008's
+    /// `CHECK (session_depth IS NULL OR (session_depth BETWEEN 0 AND
+    /// 4294967295))` is the insert-time leg; this is the read-back leg, and
+    /// it catches a hand-edited or pre-`CHECK` row. Refused rather than
+    /// clamped: a depth silently clamped to `u32::MAX` would be refused by
+    /// [`crate::compose::child_call_depth`] anyway, but a depth clamped the
+    /// other way would hand a deep run a fresh budget.
+    #[error("column workflow_run.session_depth holds {stored}, which is not a u32")]
+    SessionDepthOutOfRange { stored: i64 },
     /// A task `seq` (a `u64` in `roundhouse-core`) does not fit SQLite's
     /// signed 64-bit `INTEGER`. Surfaced rather than silently wrapped, since
     /// the value's only purpose is to join back to the log.
@@ -379,7 +400,14 @@ impl RunState {
 
     /// See [`StepDisposition::from_sql_str`] for why this is fallible rather
     /// than defaulting.
-    fn from_sql_str(s: &str) -> Result<Self, DurabilityError> {
+    ///
+    /// `pub(crate)` for the read-back direction only (B12b):
+    /// [`crate::ledger`] selects its own projection of `workflow_run` and has
+    /// to decode the same column. The **write** direction stays private —
+    /// `as_sql_str` is still this module's alone, so there is exactly one
+    /// place in the crate where a run-state discriminant is *spelled*, which
+    /// is the property that comment was defending.
+    pub(crate) fn from_sql_str(s: &str) -> Result<Self, DurabilityError> {
         match s {
             "running" => Ok(RunState::Running),
             "paused" => Ok(RunState::Paused),
@@ -849,6 +877,41 @@ pub struct WorkflowRun {
     pub awaiting_until: Option<Timestamp>,
     pub started_at: Timestamp,
     pub ended_at: Option<Timestamp>,
+    /// How deep this run's **Session** sits in the session tree: the same
+    /// number `roundhouse_engine::agent_spawn` takes as its `parent_depth`,
+    /// widened to `u32`. Migration 0008's column, read by
+    /// [`crate::ledger::admit_call_from_run`].
+    ///
+    /// **Not a run depth.** It is deliberately not derived by walking
+    /// [`Self::parent_run_id`], because those are two independent counters
+    /// over one session tree: §8.12's `call:` creates a child *Session*, so a
+    /// sub-agent already at session depth 3 that starts a workflow run would
+    /// begin its `call:` chain at run-depth 0 and be granted four more —
+    /// session depth 7 against §7.7's limit of 4, with `check_depth` and
+    /// `child_call_depth` both returning `Ok` at every step (ruling P76 §1).
+    ///
+    /// `None` means *not recorded* — a row written before migration 0008, or
+    /// by a caller that could not determine the depth. It is **not** read as
+    /// zero: [`crate::ledger::admit_call_from_run`] refuses such a run rather
+    /// than treating it as a root, which is why the column is nullable
+    /// instead of `NOT NULL DEFAULT 0`.
+    pub session_depth: Option<u32>,
+    /// §8.4's run-level ceiling as **granted** when this run was created —
+    /// for a child run, exactly what [`crate::compose::draw_child_budget`]
+    /// withdrew from its parent. Migration 0008's `caps_json` column.
+    ///
+    /// Durable rather than in-process because §8.12's refund is
+    /// `grant - spent` and both operands must survive a daemon restart:
+    /// [`crate::compose::ChildBudget`] is deliberately non-`Deserialize`, so
+    /// the in-process token cannot be rehydrated, and its own doc names
+    /// re-deriving the refund from durable rows as this task's obligation.
+    ///
+    /// `None` means *not recorded*, and every ledger reader refuses rather
+    /// than substituting [`ResourceCaps::default`] — a default budget handed
+    /// to a run nobody granted one is the fail-open direction, and baking a
+    /// serialized default into an immutable migration string would have it
+    /// drift from `ResourceCaps::default` the moment either changed.
+    pub caps: Option<ResourceCaps>,
 }
 
 /// What §8.10's *"Recovery = load and resume"* loads: the run row plus every
@@ -888,9 +951,18 @@ pub fn insert_workflow_run(
 /// `state: Completed, ended_at: None`, which is exactly the "run that looks
 /// live forever" [`transition_run`]'s doc names as the defect this module
 /// exists to prevent, just reached through the other writer instead. A
-/// `CHECK` constraint would enforce this at the schema level too, but adding
-/// one is a migration, and migrations are out of this task's scope (B12b's) —
-/// see this module's "What this task does NOT own".
+/// `CHECK` constraint would enforce this at the schema level too, and **B12b
+/// deliberately did not add one** although it was the migration slice: a
+/// `state <> 'completed' OR ended_at IS NOT NULL` is a *table*-level
+/// constraint, and SQLite has no `ALTER TABLE … ADD CONSTRAINT` — the
+/// statement is accepted and enforced by today's parser, but it is outside
+/// the grammar and survives only as an artefact of how `ADD COLUMN` appends
+/// text, so a future parser would reject fresh installs while existing ones
+/// kept working (ruling P104). The real schema leg needs the 12-step
+/// create-copy-drop-rename rebuild, which is a materially different migration
+/// from the `ADD COLUMN`s around it and is **its own task**. Until then this
+/// guard and [`transition`]'s are the whole enforcement, which is why they
+/// are two guards and not one.
 fn insert_run_row(conn: &Connection, run: &WorkflowRun) -> Result<(), DurabilityError> {
     let is_terminal = run.state.is_terminal();
     let ended_at_is_some = run.ended_at.is_some();
@@ -902,11 +974,25 @@ fn insert_run_row(conn: &Connection, run: &WorkflowRun) -> Result<(), Durability
             ended_at_is_some,
         });
     }
+    // Migration 0008's ledger accumulators (`parked_nanos`, the seven
+    // `spent_*`) are deliberately absent from this statement: their column
+    // `DEFAULT 0` is the exact value for a run that has recorded nothing, and
+    // leaving them out of the caller-supplied `WorkflowRun` is what stops a
+    // caller inserting a run that claims five hours of parked time or a spend
+    // it never made. `parked_at`/`hold_until`/`refunded_at` are absent for the
+    // same reason: they are written only by this crate's own transitions.
+    // `session_depth` and `caps_json` *are* here, because both are facts only
+    // the run's creator knows.
+    let caps_json = run.caps.as_ref().map(|caps| {
+        serde_json::to_string(caps)
+            .expect("ResourceCaps is a plain struct of scalars and Durations")
+    });
     conn.execute(
         "INSERT INTO workflow_run
             (id, job_id, job_version, content_hash, session_id, binding_id, trigger_event_id,
-             state, parent_run_id, forked_from_run_id, awaiting_until, started_at, ended_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             state, parent_run_id, forked_from_run_id, awaiting_until, started_at, ended_at,
+             session_depth, caps_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             run.id.to_string(),
             run.job_id.to_string(),
@@ -921,30 +1007,53 @@ fn insert_run_row(conn: &Connection, run: &WorkflowRun) -> Result<(), Durability
             run.awaiting_until.map(|t| t.as_unix_nanos()),
             run.started_at.as_unix_nanos(),
             run.ended_at.map(|t| t.as_unix_nanos()),
+            run.session_depth,
+            caps_json,
         ],
     )?;
     Ok(())
 }
 
-/// Which `awaiting_until` write a transition carries. Private: only
-/// [`transition_run_to_awaiting_human`] sets the column, and only because
-/// §8.11's park deadline and the run state are one fact that must land in
-/// one transaction. `Leave` is not `Set(None)` — the first leaves whatever
-/// the row holds **unless the transition is itself leaving `AwaitingHuman`**,
-/// in which case [`transition`] clears it (see that function's doc); the
-/// second unconditionally writes `NULL` over it.
+/// Which **deadline** write a transition carries — §8.11's two, which are
+/// two different quantities (see [`crate::parking::park`]'s "The wait's
+/// deadline and the workspace hold are two different quantities"): the wait's
+/// own `awaiting_until` and the workspace's `hold_until`.
 ///
-/// Fix round 1 (Task 20a): before this, `Leave` really did always leave the
-/// column untouched, so `AwaitingHuman -> Running`, `-> Cancelling` and
-/// `-> Failed` all kept whatever deadline the park had written — the exact
+/// Private: only [`transition_run_to_awaiting_human`] sets either, and only
+/// because a park's deadlines and the run state are one fact that must land
+/// in one transaction. `Leave` is not `Set { .. : None }` — the first leaves
+/// whatever the row holds **unless the transition is itself leaving
+/// `AwaitingHuman`**, in which case [`transition`] clears both (see that
+/// function's doc); the second unconditionally writes over them.
+///
+/// Fix round 1 (Task 20a): before this, `Leave` really did always leave
+/// `awaiting_until` untouched, so `AwaitingHuman -> Running`, `-> Cancelling`
+/// and `-> Failed` all kept whatever deadline the park had written — the exact
 /// inverse of the discipline this same function applies to `ended_at`. A
-/// `parked_at`/deadline consumer (B12c or the daemon reaper) that selects
+/// deadline consumer (B12c or the daemon reaper) that selects
 /// `awaiting_until <= now` without *also* filtering `state = 'awaiting_human'`
 /// would then fire `on_timeout` against a run a human had already answered or
-/// an operator had already cancelled.
-enum AwaitingUntilWrite {
+/// an operator had already cancelled. B12b adds `hold_until` under the same
+/// rule, and for a sharper version of the same reason: a stale hold instant
+/// on a resumed run is a directive to keep a worktree for a run that is using
+/// it again.
+enum DeadlineWrite {
     Leave,
-    Set(Option<Timestamp>),
+    Set {
+        awaiting_until: Option<Timestamp>,
+        hold_until: Option<Timestamp>,
+    },
+}
+
+/// The park columns as this transaction found them, before the transition's
+/// own rules are applied to them. Read in the same `SELECT` as `state`, so
+/// the values the rules below compute from are the values the `UPDATE`
+/// writes over.
+struct StoredParkColumns {
+    parked_at: Option<i64>,
+    parked_nanos: i64,
+    awaiting_until: Option<i64>,
+    hold_until: Option<i64>,
 }
 
 /// Moves a run to `to`, enforcing [`transition_is_legal`] and stamping
@@ -999,7 +1108,7 @@ pub fn transition_run(
     to: RunState,
     now: Timestamp,
 ) -> Result<RunState, DurabilityError> {
-    transition(conn, run_id, to, now, AwaitingUntilWrite::Leave, None, None)
+    transition(conn, run_id, to, now, DeadlineWrite::Leave, None, None)
 }
 
 /// [`transition_run`] plus the caller's **own** precondition on the source
@@ -1028,14 +1137,14 @@ pub(crate) fn transition_run_from(
         run_id,
         to,
         now,
-        AwaitingUntilWrite::Leave,
+        DeadlineWrite::Leave,
         None,
         Some(permitted_from),
     )
 }
 
-/// §8.11's park, as a transition: `-> AwaitingHuman` together with the
-/// absolute `awaiting_until` deadline, in one transaction.
+/// §8.11's park, as a transition: `-> AwaitingHuman` together with both
+/// absolute deadlines, in one transaction.
 ///
 /// `pub(crate)` because [`crate::parking::park`] is the entry point that owns
 /// the relative-to-absolute conversion, the implicit checkpoint, and the
@@ -1047,11 +1156,19 @@ pub(crate) fn transition_run_from(
 /// whose session has changed underneath it. Previously this was a bound
 /// `AND session_id = ?` in `park`'s own `UPDATE`, whose only signal was a
 /// zero row count.
+///
+/// `hold_until` (B12b) is the durable half of
+/// [`crate::parking::WorkspaceDisposition::HoldUntil`], which until migration
+/// 0008 was an in-process return value that survived no restart. It travels
+/// with `awaiting_until` because a park writes both or neither, and they are
+/// deliberately **two different quantities**: only the hold is clamped to
+/// [`crate::parking::SYSTEM_WIDE_HOLD_CAP`].
 pub(crate) fn transition_run_to_awaiting_human(
     conn: &mut Connection,
     run_id: RunId,
     expect_session_id: SessionId,
     awaiting_until: Option<Timestamp>,
+    hold_until: Option<Timestamp>,
     now: Timestamp,
 ) -> Result<RunState, DurabilityError> {
     transition(
@@ -1059,7 +1176,10 @@ pub(crate) fn transition_run_to_awaiting_human(
         run_id,
         RunState::AwaitingHuman,
         now,
-        AwaitingUntilWrite::Set(awaiting_until),
+        DeadlineWrite::Set {
+            awaiting_until,
+            hold_until,
+        },
         Some(expect_session_id),
         None,
     )
@@ -1070,19 +1190,41 @@ fn transition(
     run_id: RunId,
     to: RunState,
     now: Timestamp,
-    awaiting_until: AwaitingUntilWrite,
+    deadlines: DeadlineWrite,
     expect_session_id: Option<SessionId>,
     permitted_from: Option<&[RunState]>,
 ) -> Result<RunState, DurabilityError> {
     let txn = roundhouse_store::begin_immediate(conn)?;
-    let row: Option<(String, String)> = txn
+    // B12b: the park columns are read in this same statement, inside this
+    // same `BEGIN IMMEDIATE`, so the values the rules below compute from are
+    // the values the `UPDATE` writes over. That is also why the three
+    // statement variants this function used to pick between collapsed into
+    // one: with `parked_at`, `parked_nanos` and `hold_until` joining
+    // `awaiting_until`, "which columns does this arm mention" stopped being a
+    // readable way to express the rules, and a `SET awaiting_until = ?` of the
+    // value just read is identical to omitting the column while the write lock
+    // is held.
+    let row: Option<(String, String, StoredParkColumns)> = txn
         .query_row(
-            "SELECT state, session_id FROM workflow_run WHERE id = ?1",
+            "SELECT state, session_id, parked_at, parked_nanos, awaiting_until, hold_until
+             FROM workflow_run WHERE id = ?1",
             params![run_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    StoredParkColumns {
+                        parked_at: row.get(2)?,
+                        parked_nanos: row.get(3)?,
+                        awaiting_until: row.get(4)?,
+                        hold_until: row.get(5)?,
+                    },
+                ))
+            },
         )
         .optional()?;
-    let (stored_state, stored_session) = row.ok_or(DurabilityError::RunNotFound { run_id })?;
+    let (stored_state, stored_session, stored) =
+        row.ok_or(DurabilityError::RunNotFound { run_id })?;
     let from = RunState::from_sql_str(&stored_state)?;
 
     if let Some(expected) = expect_session_id {
@@ -1103,40 +1245,81 @@ fn transition(
     // half — terminal states are absorbing, so no transition can follow the
     // one that stamped an instant.
     let ended_at = to.is_terminal().then(|| now.as_unix_nanos());
+
+    let entering_park = to == RunState::AwaitingHuman;
     // Fix round 1 (Task 20a): the same discipline as `ended_at`, applied to
-    // `awaiting_until`. A `Leave` write is not a no-op write of that column
-    // when `from` is `AwaitingHuman` and `to` is not — that is a run *leaving*
-    // the park, and a stale deadline left behind is indistinguishable from a
-    // still-parked one to anything that reads the column alone. The
+    // `awaiting_until`, and (B12b) to `hold_until` and `parked_at` with it. A
+    // `Leave` write is not a no-op write of those columns when `from` is
+    // `AwaitingHuman` and `to` is not — that is a run *leaving* the park, and
+    // a stale deadline left behind is indistinguishable from a still-parked
+    // one to anything that reads the column alone. The
     // `AwaitingHuman -> AwaitingHuman` self-edge is deliberately excluded
     // (`to == AwaitingHuman` short-circuits this): that is a re-park, and it
-    // always carries its own `AwaitingUntilWrite::Set`, never `Leave`, so this
+    // always carries its own `DeadlineWrite::Set`, never `Leave`, so this
     // branch cannot fire for it — but the guard is written on `from`/`to`
-    // rather than on which `AwaitingUntilWrite` arm was passed, so it stays
+    // rather than on which `DeadlineWrite` arm was passed, so it stays
     // correct even if a future caller reaches `Leave` on that self-edge.
-    let clear_stale_awaiting_until =
-        from == RunState::AwaitingHuman && to != RunState::AwaitingHuman;
-    match awaiting_until {
-        AwaitingUntilWrite::Leave if clear_stale_awaiting_until => txn.execute(
-            "UPDATE workflow_run SET state = ?1, ended_at = ?2, awaiting_until = NULL
-             WHERE id = ?3",
-            params![to.as_sql_str(), ended_at, run_id.to_string()],
-        )?,
-        AwaitingUntilWrite::Leave => txn.execute(
-            "UPDATE workflow_run SET state = ?1, ended_at = ?2 WHERE id = ?3",
-            params![to.as_sql_str(), ended_at, run_id.to_string()],
-        )?,
-        AwaitingUntilWrite::Set(deadline) => txn.execute(
-            "UPDATE workflow_run SET state = ?1, ended_at = ?2, awaiting_until = ?3
-             WHERE id = ?4",
-            params![
-                to.as_sql_str(),
-                ended_at,
-                deadline.map(|t| t.as_unix_nanos()),
-                run_id.to_string(),
-            ],
-        )?,
+    let leaving_park = from == RunState::AwaitingHuman && !entering_park;
+
+    // `parked_at` is the park's *start*, not its deadline, and the re-park
+    // self-edge must not move it: §8.11's 7-day cap is enforced "regardless of
+    // what any individual gate specifies", so a run that re-drives its own
+    // park every hour would otherwise reset the reaper's clock forever and
+    // hold a worktree indefinitely with every predicate returning `Ok`. This
+    // is the durable sibling of the idempotency `parking.rs` already pins for
+    // `awaiting_until`: a re-park moves the *wait's* deadline by exactly the
+    // delta the caller's `now` supplies, and moves the park's start not at
+    // all.
+    let parked_at = if leaving_park {
+        None
+    } else if entering_park {
+        stored.parked_at.or_else(|| Some(now.as_unix_nanos()))
+    } else {
+        stored.parked_at
     };
+
+    // §8.4's `run_active_timeout` "excludes `AwaitingHuman`", so the closed
+    // stretch is banked here, at the one edge where a park ends. A row whose
+    // `parked_at` is `NULL` while parked — a run that was already
+    // `awaiting_human` when migration 0008 landed — banks nothing, which
+    // *under*-counts parked time and therefore *over*-counts active time: the
+    // direction that makes a timeout fire sooner, not later.
+    let parked_nanos = if leaving_park {
+        let stretch = stored
+            .parked_at
+            .map_or(0, |start| now.as_unix_nanos().saturating_sub(start).max(0));
+        stored.parked_nanos.saturating_add(stretch)
+    } else {
+        stored.parked_nanos
+    };
+
+    let (awaiting_until, hold_until) = match deadlines {
+        DeadlineWrite::Set {
+            awaiting_until,
+            hold_until,
+        } => (
+            awaiting_until.map(|t| t.as_unix_nanos()),
+            hold_until.map(|t| t.as_unix_nanos()),
+        ),
+        DeadlineWrite::Leave if leaving_park => (None, None),
+        DeadlineWrite::Leave => (stored.awaiting_until, stored.hold_until),
+    };
+
+    txn.execute(
+        "UPDATE workflow_run
+            SET state = ?1, ended_at = ?2, awaiting_until = ?3, hold_until = ?4,
+                parked_at = ?5, parked_nanos = ?6
+          WHERE id = ?7",
+        params![
+            to.as_sql_str(),
+            ended_at,
+            awaiting_until,
+            hold_until,
+            parked_at,
+            parked_nanos,
+            run_id.to_string(),
+        ],
+    )?;
     txn.commit()?;
     Ok(from)
 }
@@ -1525,7 +1708,8 @@ pub(crate) fn recent_workflow_runs(
 /// are `TEXT`.
 const WORKFLOW_RUN_SELECT: &str =
     "SELECT id, job_id, job_version, content_hash, session_id, binding_id, trigger_event_id,
-            state, parent_run_id, forked_from_run_id, awaiting_until, started_at, ended_at
+            state, parent_run_id, forked_from_run_id, awaiting_until, started_at, ended_at,
+            session_depth, caps_json
      FROM workflow_run";
 
 /// The raw `workflow_run` columns, in query order. Extracted as a tuple
@@ -1545,6 +1729,8 @@ type WorkflowRunColumns = (
     Option<i64>,
     i64,
     Option<i64>,
+    Option<i64>,
+    Option<String>,
 );
 
 fn workflow_run_columns(row: &rusqlite::Row) -> rusqlite::Result<WorkflowRunColumns> {
@@ -1562,6 +1748,8 @@ fn workflow_run_columns(row: &rusqlite::Row) -> rusqlite::Result<WorkflowRunColu
         row.get(10)?,
         row.get(11)?,
         row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
     ))
 }
 
@@ -1580,9 +1768,12 @@ fn workflow_run_from_columns(c: WorkflowRunColumns) -> Result<WorkflowRun, Durab
         awaiting_until,
         started_at,
         ended_at,
+        session_depth,
+        caps_json,
     ) = c;
+    let run_id = RunId::from_uuid(parse_uuid(&id, "workflow_run.id")?);
     Ok(WorkflowRun {
-        id: RunId::from_uuid(parse_uuid(&id, "workflow_run.id")?),
+        id: run_id,
         job_id: JobId::from_uuid(parse_uuid(&job_id, "workflow_run.job_id")?),
         job_version,
         content_hash,
@@ -1601,7 +1792,22 @@ fn workflow_run_from_columns(c: WorkflowRunColumns) -> Result<WorkflowRun, Durab
         awaiting_until: awaiting_until.map(Timestamp::from_unix_nanos),
         started_at: Timestamp::from_unix_nanos(started_at),
         ended_at: ended_at.map(Timestamp::from_unix_nanos),
+        session_depth: session_depth.map(session_depth_from_sql).transpose()?,
+        caps: caps_json
+            .map(|text| {
+                serde_json::from_str(&text)
+                    .map_err(|_| DurabilityError::MalformedStoredCaps { run_id })
+            })
+            .transpose()?,
     })
+}
+
+/// The read-back leg of migration 0008's `session_depth` `CHECK`, fallible
+/// for the reason [`item_index_from_sql`] is: a value outside `u32` means the
+/// row does not say what this crate thinks it says, and clamping it would
+/// turn a corrupt row into a depth decision rather than an error.
+fn session_depth_from_sql(stored: i64) -> Result<u32, DurabilityError> {
+    u32::try_from(stored).map_err(|_| DurabilityError::SessionDepthOutOfRange { stored })
 }
 
 fn parse_uuid(text: &str, column: &'static str) -> Result<Uuid, DurabilityError> {

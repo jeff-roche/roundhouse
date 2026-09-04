@@ -85,24 +85,21 @@
 //!   owner of that work implements; this crate ships the trait, calls it in
 //!   §8.11's order, and a test fake.
 //! - **Active-vs-parked time accounting** (§8.4's `run_active_timeout`
-//!   "excludes `AwaitingHuman`") — **B12b** (ruling P77 split Task 20 in
-//!   three), which owns the run-level ledger and its migration. It needs a
-//!   durable column to live in; an in-memory tracker would be lost on the
-//!   first daemon restart, which is precisely the case it exists to measure.
-//! - **The reaper's periodic runner, AND the durable `parked_at` it would
-//!   need to read** (ruling P72) — the column is **B12b**'s, alongside the
-//!   ledger above; the periodic runner itself is **daemon-side and still
-//!   unowned** (ruling P77 §C moved it out of Task 20 entirely, since it
-//!   shares its missing machinery with `blobs.rs`'s daily GC and one owner
-//!   should take both). Unlike the runner-only gap `blobs.rs`'s daily
-//!   GC has, there is no column anywhere in the schema that records when a
-//!   run parked: `workflow_run.started_at` is the run's start, not its park
-//!   time, `workflow_step_run` has no timestamp column at all, and
-//!   [`WorkspaceDisposition::HoldUntil`] is an in-process value that does
-//!   not survive a daemon restart. `awaiting_until` cannot substitute — see
-//!   the next section. Whoever builds the runner needs a
-//!   `roundhouse-store` migration first; this task does not add one (see
-//!   "The reaper's periodic runner does not exist" below).
+//!   "excludes `AwaitingHuman`") — **built by B12b** (ruling P77 split Task
+//!   20 in three), which added migration 0008's `parked_at`/`parked_nanos`
+//!   and [`crate::ledger::active_elapsed`] over them. It needed a durable
+//!   column to live in; an in-memory tracker would be lost on the first
+//!   daemon restart, which is precisely the case it exists to measure. This
+//!   module's [`park`] is what starts a park interval, through
+//!   `durability`'s `transition`; nothing here reads the accumulator.
+//! - **The reaper's periodic runner** — **still daemon-side and unowned**
+//!   (ruling P77 §C moved it out of Task 20 entirely, since it shares its
+//!   missing machinery with `blobs.rs`'s daily GC and one owner should take
+//!   both). Its *input* is no longer missing: ruling P72's finding was that,
+//!   unlike `blobs.rs`'s runner-only gap, `reaper_cutoff(parked_at, now)` had
+//!   no durable source for `parked_at` anywhere in the schema — B12b added
+//!   the column and [`crate::ledger::parked_runs_past_hold_cap`], the query
+//!   in `gc_eligible_blobs`'s shape. What is left really is only the timer.
 //! - **A `Duration::ZERO` screen for `timeout_after`.** No document-driven
 //!   path produces one today — [`AwaitingHuman::from_gate`] rejects it and
 //!   `TryFrom<&UnattendedDef>` rejects it before `from_escalate` ever sees
@@ -117,7 +114,7 @@
 //!   `absolute_deadline`/`park` directly once one exists — recorded here
 //!   because neither exists yet.
 //!
-//! # The reaper's periodic runner does not exist — and its input is not durable either
+//! # The reaper's periodic runner does not exist — but since B12b its input does
 //!
 //! [`reaper_cutoff`] is a pure predicate in the shape of
 //! `roundhouse_store::blobs::gc_eligible_blobs`, and the periodic runner
@@ -125,31 +122,32 @@
 //! periodic-task machinery in `roundhouse-daemon` at all today (verified by
 //! grep: one `tokio::spawn`, the socket accept loop, and no call to
 //! `Scheduler::tick` anywhere). **That much of the comparison to
-//! `blobs.rs`'s daily GC holds** — both want the identical missing timer.
+//! `blobs.rs`'s daily GC always held** — both want the identical missing
+//! timer.
 //!
-//! **The rest of the comparison does not, and an earlier version of this
-//! note stated it as an unqualified "same as `blobs.rs`", which was wrong
-//! (ruling P72).** `gc_eligible_blobs` queries **real columns**; for it, the
-//! timer really is the only missing piece. `reaper_cutoff(parked_at, now)`
-//! has **no durable source for `parked_at` anywhere in the schema**:
-//! `workflow_run` carries `started_at` (run start, not park time) and
+//! **The rest of the comparison did not, and an earlier version of this note
+//! stated it as an unqualified "same as `blobs.rs`", which was wrong (ruling
+//! P72).** `gc_eligible_blobs` queries **real columns**; for it, the timer
+//! really was the only missing piece. `reaper_cutoff(parked_at, now)` had
+//! **no durable source for `parked_at` anywhere in the schema**:
+//! `workflow_run` carried `started_at` (run start, not park time) and
 //! `awaiting_until`; `workflow_step_run` has no timestamp column at all; and
-//! [`WorkspaceDisposition::HoldUntil`] is an in-process return value that
-//! survives no restart. `awaiting_until` cannot stand in for it — it is the
+//! [`WorkspaceDisposition::HoldUntil`] was an in-process return value that
+//! survived no restart. `awaiting_until` cannot stand in for it — it is the
 //! *wait's* own deadline, deliberately **not** clamped to
 //! [`SYSTEM_WIDE_HOLD_CAP`] (see [`park`]'s "two different quantities"
 //! section), and it is `NULL` in exactly the windowless-elicitation case
 //! that can still hold a workspace.
 //!
-//! So whoever builds the periodic runner is not just adding a timer — they
-//! need a `roundhouse-store` migration first, to add a durable park-time
-//! column. Ruling P77 splits that pair: **the `parked_at` column is B12b's**,
-//! carried by the one migration that also brings the run-level ledger
-//! `caps.rs` points at, while **the periodic runner is unowned daemon work**.
-//! Task 17 deliberately did not add that column, and **neither does Task
-//! 20a** — doing schema once, deliberately, in the slice whose whole job is
-//! the schema is the reason for the split; migration 0007 belongs to Task 16
-//! and 0008 to B12b.
+//! **B12b closed that half and only that half.** Migration 0008 adds
+//! `workflow_run.parked_at` (written here, through `durability`'s
+//! `transition`, and preserved across a re-park so the clock cannot be
+//! reset), `hold_until` — the durable form of
+//! [`WorkspaceDisposition::HoldUntil`] — and
+//! [`crate::ledger::parked_runs_past_hold_cap`], the query
+//! `gc_eligible_blobs`'s shape implies. So the two crates' remaining gaps are
+//! now genuinely identical, which is what the original analogy claimed
+//! prematurely: **a timer, and nothing else.**
 
 use crate::durability::{transition_run_to_awaiting_human, DurabilityError};
 use crate::exec::RunId;
@@ -272,6 +270,13 @@ pub enum WorkspaceDisposition {
     /// An absolute [`Timestamp`] rather than a TTL `Duration` for the reason
     /// in the module doc: a relative hold with no anchor is re-anchored on
     /// every read.
+    ///
+    /// Since B12b this value is also **persisted**, to
+    /// `workflow_run.hold_until` in the same transaction as the park itself
+    /// — so a daemon that restarts mid-hold can still find out which
+    /// worktrees it owes a teardown to, which this in-process directive alone
+    /// could never tell it. The directive is still a directive: nothing in
+    /// this crate can touch a worktree.
     HoldUntil(Timestamp),
 }
 
@@ -529,7 +534,16 @@ pub fn park(
     let session_id = run_session_id(conn, run_id)?;
     let checkpoint_ref = checkpointer.checkpoint(session_id, "awaiting_human_park")?;
 
-    transition_run_to_awaiting_human(conn, run_id, session_id, awaiting_until, now)?;
+    // B12b: the hold instant is written to `workflow_run.hold_until` in the
+    // same transaction as the state and the wait's deadline, so
+    // [`WorkspaceDisposition::HoldUntil`] is now an echo of a durable column
+    // rather than the only place the instant exists. `Release` writes `NULL`:
+    // "no hold" is a fact about the row, not an absence of information.
+    let hold_until = match workspace {
+        WorkspaceDisposition::HoldUntil(instant) => Some(instant),
+        WorkspaceDisposition::Release => None,
+    };
+    transition_run_to_awaiting_human(conn, run_id, session_id, awaiting_until, hold_until, now)?;
 
     Ok(ParkResult {
         checkpoint_ref,
@@ -575,8 +589,37 @@ fn run_session_id(conn: &Connection, run_id: RunId) -> Result<SessionId, ParkErr
 /// A `parked_at` in the future (a caller supplying instants out of order)
 /// returns `false` and cannot wrap: the subtraction saturates, so the
 /// elapsed time is never a huge positive value read out of a negative one.
+///
+/// Since B12b this predicate is expressed as a comparison against
+/// [`reaper_cutoff_instant`] rather than as its own subtraction, so that
+/// [`crate::ledger::parked_runs_past_hold_cap`] — which must do the
+/// comparison in SQL, over an index, rather than by loading every parked run
+/// and filtering in Rust — is comparing against the *same* instant this
+/// returns `true` for. Two hand-written forms of "at least seven days ago"
+/// are exactly the pair of legs ruling P72 warns about; one function feeding
+/// both is what stops them drifting a nanosecond apart.
 pub fn reaper_cutoff(parked_at: Timestamp, now: Timestamp) -> bool {
+    parked_at.as_unix_nanos() <= reaper_cutoff_instant(now)
+}
+
+/// The most recent park start that [`reaper_cutoff`] still calls expired:
+/// `now - `[`SYSTEM_WIDE_HOLD_CAP`], saturating.
+///
+/// `pub(crate)` because it is a query bound, not a predicate: the only caller
+/// outside this module is [`crate::ledger::parked_runs_past_hold_cap`], which
+/// binds it as the `parked_at <= ?` parameter of an index seek.
+///
+/// **Equivalent to the subtraction it replaces for every value the schema can
+/// hold**, which is what makes the rewrite above safe: migration 0008's
+/// `CHECK (parked_at IS NULL OR parked_at >= 0)` means `parked_at` is never
+/// negative, and for a non-negative `parked_at`, `now - parked_at >= CAP` and
+/// `parked_at <= now - CAP` agree — including at both saturating edges (a
+/// `now` smaller than the cap saturates this toward `i64::MIN`, which no
+/// non-negative `parked_at` is `<=`, matching the old form's "elapsed is
+/// under the cap"; a `parked_at` in the future exceeds this instant, matching
+/// the old form's saturating zero). `tests/parking.rs` pins the agreement on
+/// both sides of the boundary rather than leaving it to this paragraph.
+pub(crate) fn reaper_cutoff_instant(now: Timestamp) -> i64 {
     now.as_unix_nanos()
-        .saturating_sub(parked_at.as_unix_nanos())
-        >= SYSTEM_WIDE_HOLD_CAP_NANOS
+        .saturating_sub(SYSTEM_WIDE_HOLD_CAP_NANOS)
 }

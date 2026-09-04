@@ -1,12 +1,13 @@
 //! §8.4's `ResourceCaps` — the run-level resource ceiling
 //! (`docs/architecture/05-scheduling-and-workflows.md` §8.4), first needed
-//! by this crate for `map`'s per-item budget split (§8.9, Task 14). Real
-//! enforcement — the "caps enforced at task admission" chokepoint §8.4
-//! describes — is **Task 20 (B12)**'s job (it owns the run loop, the
-//! run-level ledger, and the one place every task passes through); this
-//! crate's job today is only to give the split a real, typed shape to
-//! divide. See [`ResourceCaps`]'s own doc comment for why that owner moved
-//! off Task 8.
+//! by this crate for `map`'s per-item budget split (§8.9, Task 14).
+//!
+//! The "caps enforced at task admission" chokepoint §8.4 describes is
+//! [`crate::ledger::admit_spend`] (B12b), which checks a request against this
+//! type's fields and records it in one transaction over migration 0008's
+//! columns. What is still missing is its *caller*: the run loop that invokes
+//! it once per task is **B12c**. See [`ResourceCaps`]'s own doc comment for
+//! why this owner moved twice — off Task 8, then across ruling P77's split.
 //!
 //! # Deviation from §8.4's illustrative code block: `max_cost_usd` is `f64`, not `Decimal`
 //!
@@ -33,23 +34,24 @@ use std::time::Duration;
 /// Mirrors §8.4's `ResourceCaps` (see the module doc comment for the one
 /// field-type deviation). Enforced at task admission — the one chokepoint
 /// every task already passes through, per the everything-is-a-task
-/// invariant — but the enforcement call site itself is **not built**: it
-/// belongs to **Task 20 (B12)**, which owns the run loop and the run-level
-/// budget ledger.
+/// invariant — by [`crate::ledger::admit_spend`]. What remains unbuilt is the
+/// **caller**: the run loop that calls it once per task is **B12c**.
 ///
-/// It used to say "Task 8's durability layer". That went stale when the
-/// ledger moved: Task 16 (B8) landed `durability` with the `workflow_run` /
-/// `workflow_step_run` state machine and deliberately no run-level ledger
-/// and no admission path (see that module's "What this task does NOT own").
+/// It used to say "Task 8's durability layer", then "Task 20". Both went
+/// stale as the ledger moved: Task 16 (B8) landed `durability` with the
+/// `workflow_run` / `workflow_step_run` state machine and deliberately no
+/// run-level ledger, and ruling P77 then split Task 20 in three, putting the
+/// ledger and its migration in B12b and the loop in B12c.
 ///
-/// [`run_active_timeout`](Self::run_active_timeout) is the field that makes
+/// [`run_active_timeout`](Self::run_active_timeout) is the field that made
 /// the owner matter rather than being a formality. Enforcing it as its own
 /// knob needs wall time *minus* the time a run spent `AwaitingHuman`, and
 /// tracking that requires a durable place to record park intervals — a
 /// column, not an in-process tracker, which a daemon restart would lose
 /// precisely across the multi-day park it exists to measure. Task 17 (B9)
-/// writes the park (`crate::parking`) but adds no such column and does no
-/// accounting; Task 20 owns both.
+/// writes the park (`crate::parking`) but added no such column; **migration
+/// 0008's `parked_at`/`parked_nanos` are that column**, and
+/// [`crate::ledger::active_elapsed`] is the arithmetic over them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResourceCaps {
     /// Includes parked time (e.g. time spent `AwaitingHuman` on an approval

@@ -43,6 +43,8 @@ fn completed_run(binding_id: Option<BindingId>, started_at: i64) -> WorkflowRun 
         awaiting_until: None,
         started_at: Timestamp::from_unix_nanos(started_at),
         ended_at: Some(Timestamp::from_unix_nanos(started_at + 1)),
+        session_depth: None,
+        caps: None,
     }
 }
 

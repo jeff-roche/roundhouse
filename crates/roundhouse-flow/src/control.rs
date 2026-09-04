@@ -370,6 +370,26 @@ pub fn retry_from_step(
         awaiting_until: None,
         started_at: now,
         ended_at: None,
+        // Inherited, not recomputed: §8.13's fork re-runs the *same* workflow
+        // from a step, so its Session sits exactly where the original's did
+        // in the session tree. Copying the number keeps
+        // `ledger::admit_call_from_run` bounding the fork's `call:` chain the
+        // way it bounded the original's; recomputing it as `0` would hand a
+        // deep run a fresh four levels every time an operator retried it,
+        // which is ruling P76 §1's escape reached through retry.
+        session_depth: original.run.session_depth,
+        // Also inherited — and the fork's own `spent_*` accumulators start at
+        // zero, so **a fork is a fresh grant, not a continuation of the
+        // original's remaining budget** (B12b). That is the usable reading:
+        // charging a fork the original's spend would make a retry-from-step
+        // of an expensive run fail immediately, which is the one thing retry
+        // exists to avoid. It is also a real ceiling on nothing —
+        // *n* retries cost *n* grants — so the bound on a retry is whoever
+        // may *authorise* one, not the ledger. Named here rather than
+        // discovered: §8.13 says nothing about a fork's budget, and this is
+        // an inference. Owner of the policy question: whoever gives
+        // `retry_from_step` an authorisation path.
+        caps: original.run.caps.clone(),
     };
     fork_run(conn, &fork, &inherited)?;
 

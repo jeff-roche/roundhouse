@@ -363,6 +363,12 @@ pub fn seed_completed_run_with_report(
         awaiting_until: None,
         started_at: Timestamp::from_unix_nanos(started_at_nanos),
         ended_at: Some(Timestamp::from_unix_nanos(started_at_nanos + 1)),
+        // Both `None` for the same reason the doc above gives for the whole
+        // helper: the inbox reads reports, not the ledger, so a seeded run
+        // that claimed a session depth or a budget grant would be asserting
+        // facts this fixture has no basis for. A ledger test seeds its own.
+        session_depth: None,
+        caps: None,
     };
     insert_workflow_run(conn, &run).expect("a fresh run row inserts");
 
