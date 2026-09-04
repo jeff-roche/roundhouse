@@ -258,47 +258,70 @@ approved_rule_ids: []
 /// reviewed strings mean (see
 /// `a_rule_id_that_merely_resembles_an_approved_one_is_not_approved`).
 ///
-/// The offending entry sits *second*, behind a well-formed one, so the
-/// fixture pins that validation runs over the whole list rather than only
-/// position 1 (P92).
+/// Checked in a list of two, with the offending entry once last and once
+/// first. One ordering pins only half of it (P92): with the bad id last, a
+/// validation loop truncated to `.take(1)` still passes; with it first, a
+/// loop starting at `.skip(1)` does. The measured sweep produced exactly
+/// that second survivor after the first ordering alone was added.
 #[test]
-fn a_bundle_rule_id_with_surrounding_whitespace_is_rejected() {
-    let doc = "
+fn a_bundle_rule_id_with_surrounding_whitespace_is_rejected_wherever_it_sits() {
+    for doc in [
+        "
 name: nightly-lint-bundle
 version: 1
 approved_rule_ids:
   - shell:cargo-test
   - \"shell:cargo-clippy \"
-";
-    let err = serde_yaml::from_str::<PreapprovedBundle>(doc)
-        .expect_err("an untrimmed rule id must be rejected");
-    let message = err.to_string();
-    assert!(
-        message.contains("shell:cargo-clippy "),
-        "the error must quote what the author wrote, got: {message}"
-    );
+",
+        "
+name: nightly-lint-bundle
+version: 1
+approved_rule_ids:
+  - \"shell:cargo-clippy \"
+  - shell:cargo-test
+",
+    ] {
+        let Err(err) = serde_yaml::from_str::<PreapprovedBundle>(doc) else {
+            panic!("an untrimmed rule id must be rejected, but this loaded: {doc}");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("shell:cargo-clippy "),
+            "the error must quote what the author wrote, got: {message} (from {doc})"
+        );
+    }
 }
 
 /// An empty rule id would approve a caller that passes `""` as its rule id,
 /// which is a broken caller rather than an authored grant.
 ///
-/// Second entry again, and for the same reason: with a single-entry fixture,
-/// a validation loop truncated to `.take(1)` passes (P92).
+/// Both orderings again, for the reason the whitespace test above records.
 #[test]
-fn a_bundle_with_an_empty_rule_id_is_rejected() {
-    let doc = "
+fn a_bundle_with_an_empty_rule_id_is_rejected_wherever_it_sits() {
+    for doc in [
+        "
 name: nightly-lint-bundle
 version: 1
 approved_rule_ids:
   - shell:cargo-test
   - ''
-";
-    let err = serde_yaml::from_str::<PreapprovedBundle>(doc)
-        .expect_err("an empty rule id must be rejected");
-    assert!(
-        err.to_string().contains("approved_rule_ids"),
-        "the error must name the field, got: {err}"
-    );
+",
+        "
+name: nightly-lint-bundle
+version: 1
+approved_rule_ids:
+  - ''
+  - shell:cargo-test
+",
+    ] {
+        let Err(err) = serde_yaml::from_str::<PreapprovedBundle>(doc) else {
+            panic!("an empty rule id must be rejected, but this loaded: {doc}");
+        };
+        assert!(
+            err.to_string().contains("approved_rule_ids"),
+            "the error must name the field, got: {err} (from {doc})"
+        );
+    }
 }
 
 /// A bundle that names no rules is deliberately *not* an error: it approves
