@@ -1052,7 +1052,7 @@ pub fn draw_child_run(
 /// A fork satisfies both refusals — it has no `drawn_at` *and*
 /// `durability::fork_run` stamps its `refunded_at` at creation — and *"no
 /// draw was recorded"* is the fact that explains why, where *"already refunded
-/// at <its own creation instant>"* reads as though a refund had happened. The
+/// at its own creation instant"* reads as though a refund had happened. The
 /// two guards cover different cases and neither is redundant: `drawn_at`
 /// catches every child that was never charged for, `refunded_at` catches the
 /// second refund of one that was.
