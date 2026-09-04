@@ -1083,20 +1083,22 @@ async fn a_client_that_reconnects_exactly_where_it_left_off_is_not_resynced_by_a
 /// assertion about the ring surviving the first connection's departure rather
 /// than about the live fan-out.
 ///
-/// **Mutation killed, and it is killed *only* here:** making
-/// `impl Drop for SessionSubscription` prune unconditionally instead of at
-/// `receiver_count() <= 1`. The first connection's disconnect then takes the
-/// session's entry — channel and ring — with it even though `_keeper` is still
-/// reading, and the publish of seq 3 reaches nobody: `publish`'s receiver-count
-/// assertion fires. `a_sessions_channel_is_dropped_with_its_last_subscriber`
-/// cannot see this, because every subscription it holds drops at the same
-/// closing brace; no other test in this file drops one while another lives.
+/// **Mutation killed, and the whole suite's only killers of it are this test
+/// and the one below it:** making `impl Drop for SessionSubscription` prune
+/// unconditionally instead of at `receiver_count() <= 1`. The first connection's
+/// disconnect then takes the session's entry — channel and ring — with it even
+/// though `_keeper` is still reading, and the publish of seq 3 reaches nobody:
+/// `publish`'s receiver-count assertion fires with `left: 0, right: 1`,
+/// measured. `a_sessions_channel_is_dropped_with_its_last_subscriber` cannot see
+/// it, because every subscription it holds drops at the same closing brace; no
+/// test written before this section drops one while another lives.
 ///
-/// **Mutations also killed, jointly with tests above:** replaying the whole ring
-/// rather than the suffix from the cursor — the second body becomes `:1`..`:4`;
-/// not reading the header on the second request — the same; resuming at
-/// `cursor.seq` rather than `cursor.seq + 1` — `:2` is delivered twice across
-/// the two bodies.
+/// **Mutations also killed, jointly with tests above** (measured, not reasoned —
+/// the sweep's full rows are in the task report): resuming at `cursor.seq`
+/// rather than `cursor.seq + 1`; a replay exclusive of the cursor rather than
+/// inclusive; a connection that never advances its own resume point; a replay
+/// that skips the ring's oldest entry; and `oldest_retained` read off the ring's
+/// newest end.
 #[tokio::test]
 async fn a_second_reconnect_resumes_after_the_first_ones_last_frame_rather_than_replaying_its_gap()
 {
@@ -1178,19 +1180,24 @@ async fn a_second_reconnect_resumes_after_the_first_ones_last_frame_rather_than_
 /// ring's tail. If that is not a usable cursor, the frame does not say enough to
 /// escape the loop, whatever else is true of it.
 ///
-/// **Mutation killed:** widening `Ring::replay_since`'s tail-miss test from
-/// `resume_from < oldest_retained` to `<=`. The first connection is unchanged —
-/// 1 is below 6 either way — and the second becomes a second `resync_required`
-/// carrying `{resume_from: 6, oldest_retained: 6}`, a client told to resync to
-/// where it already is. Neither
-/// `a_cursor_older_than_the_rings_tail_is_told_resync_required_rather_than_a_partial_replay`
-/// (whose cursor is far below the tail) nor
-/// `a_reconnecting_client_is_replayed_the_gap_the_ring_still_holds` (whose ring
-/// still holds seq 0, so its cursor is above the tail) is at the boundary. The
-/// ring's unit test
-/// `a_cursor_below_the_rings_tail_is_a_tail_miss_rather_than_a_partial_replay`
-/// does pin it, at that level; this is the same boundary through the endpoint,
-/// stated as the consequence a user experiences.
+/// **Mutation killed, and this is the only test in the workspace that kills
+/// it:** freeing the ring once a resync has been issued — the plausible
+/// optimisation, since the client was just told to refetch a snapshot and will
+/// not ask for that history again. Every other test performs one connection, so
+/// a ring emptied *by* a resync is invisible to all of them: the mutation
+/// changes nothing they can observe. Here the second connection's body collapses
+/// to `[]` against the four frames asserted (measured), because a client that
+/// did exactly as it was told finds the history it was promised gone.
+///
+/// **A mutation this test does *not* uniquely kill, recorded because the first
+/// draft of this comment claimed it did.** Widening `Ring::replay_since`'s
+/// tail-miss test from `resume_from < oldest_retained` to `<=` does produce the
+/// live-lock here — but it also fires on every connection whose cursor sits
+/// exactly at the ring's tail, which includes every fresh connection to a ring
+/// starting at seq 0, so it is killed by five other tests as well (two of
+/// `sse.rs`'s unit tests among them). It is a real defect and it is well pinned;
+/// it is simply not what makes this test worth having. Ruling P81: a mutation
+/// row is worth nothing if it drifts from what was measured.
 #[tokio::test]
 async fn a_client_that_reconnects_after_a_resync_required_gets_a_stream_rather_than_a_second_resync(
 ) {
