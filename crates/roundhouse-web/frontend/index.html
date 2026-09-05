@@ -2,11 +2,64 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <!--
+      Both meta tags below apply only to requests initiated AFTER they are
+      parsed, so they stay first in <head> — before the stylesheet link,
+      before anything else. Moving either one after `<link rel="stylesheet">`
+      would leave `/app.css`'s own request uncovered, which is exactly what
+      S2 below exists to close.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'"
+    />
+    <!--
+      S2 — a real, live leak, not a hypothetical. Under the default
+      `strict-origin-when-cross-origin` referrer policy, a same-origin
+      subresource request carries the FULL URL, credential query parameter
+      included. On the pairing navigation the browser fetches this page's own
+      `/app.css` and its module script DURING PARSE, before any client code —
+      including the token boot path — can run, each one carrying that full
+      URL as `Referer` to this same daemon. A future request logger that
+      records `Referer` would write the LAN token to disk with none of the
+      token file's own `0600` protection. This tag is the only fix that
+      reaches those two pre-script requests.
+    -->
+    <meta name="referrer" content="no-referrer" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Roundhouse</title>
     <link rel="stylesheet" href="/app.css" />
   </head>
   <body>
+    <!--
+      Hand-committed build INPUT (not the generated output): this comment is
+      passed through verbatim by Vite into the shipped `assets/dist/index.html`,
+      restoring the two-point warning the placeholder shell used to carry
+      before this directory became a real build. `crates/roundhouse-web/src/assets.rs`'s
+      module docs say the contract is "restated in `assets/dist/index.html`
+      itself" for whoever replaces this client and "touches no Rust" — that
+      claim is only true if this file keeps saying it.
+
+      1. THIS DIRECTORY IS PUBLIC CONTENT. When the daemon is bound to the LAN,
+         the shared-token gate covers `/api` only; everything served from this
+         directory reaches any unauthenticated peer on the network. That is
+         safe for exactly one reason: it is compile-time-constant and identical
+         in every install. Never let a built asset carry a real credential, a
+         real session or workspace id, a host name, or a generated per-install
+         settings file — those belong behind a gated `/api` route at runtime.
+         Nothing on the Rust side can detect a violation; it serves whatever is
+         in this directory.
+
+      2. THE CLIENT OWNS THE TOKEN HANDLING. Pairing a device means opening
+         this page with a query parameter carrying a credential — a top-level
+         navigation has no other way to present one. On boot the client must:
+         read it from the URL, hold it only in the browser's per-tab store (not
+         its persistent one — it should not outlive the tab), strip it from the
+         URL immediately with `history.replaceState` (the only mitigation for
+         browser history / account sync / URL-bar autocomplete, none of which
+         any server-side code can reach), and resend it as an
+         `Authorization: Bearer` header on every request that can carry one.
+    -->
     <div id="app"></div>
     <script type="module" src="/src/index.tsx"></script>
   </body>

@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+# S6 (Task 10 slice B security review): this is the only workflow in the repo
+# that executes third-party npm lifecycle scripts (`npm ci` runs `esbuild`'s
+# and `fsevents`' `hasInstallScript` postinstalls), so an inherited
+# read/write `GITHUB_TOKEN` is a worse default here than elsewhere. Nothing
+# in this job needs write access to anything.
+permissions:
+  contents: read
+
 jobs:
   frontend:
     name: Frontend
@@ -14,7 +22,11 @@ jobs:
       run:
         working-directory: crates/roundhouse-web/frontend
     steps:
-      - uses: actions/checkout@v4
+      # S7: pinned by commit SHA, not the mutable `@v4` tag, for the same
+      # reason `actions/setup-node` below and `ci.yml`'s
+      # `dtolnay/rust-toolchain` are pinned by SHA rather than a movable ref.
+      # Verified against GitHub's tags API: `refs/tags/v4` -> this commit.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # `@v4` resolves as a mutable tag (`v4` is repointed to new commits as
       # `actions/setup-node` releases patches), which is not reproducible
       # across runs and can silently change what gets installed — the same
@@ -24,6 +36,42 @@ jobs:
         with:
           node-version: 24
       - run: npm ci
+      # S5 (Task 10 slice B security review): a source-side guard, cheaper
+      # and far more robust than pattern-matching the built output. Vite
+      # auto-loads `.env`/`.env.local` from `frontend/` and inlines any
+      # referenced `VITE_*` value into the bundle at build time — the one
+      # build-time inlining mechanism live in this toolchain, and until now
+      # it was guarded only by nobody having used it yet. Runs before the
+      # build so a violation fails fast rather than after a build that would
+      # already have inlined the leak.
+      - name: Fail on any build-time env-inlining surface
+        run: |
+          set -euo pipefail
+
+          # `import.meta.env` is how a component would read an inlined
+          # value; `grep -rl` over source (never node_modules, which ships
+          # its own uses of this in library internals that are not this
+          # client's problem).
+          if grep -rl 'import\.meta\.env' src/; then
+            echo "::error::found 'import.meta.env' in frontend/src/ — nothing in this client should read a build-time-inlined value (see vite.config.ts's module docs)"
+            exit 1
+          fi
+
+          # A `define` key in vite.config.ts is the other way a per-install
+          # value could be baked into the bundle at build time.
+          if grep -E 'define\s*:' vite.config.ts; then
+            echo "::error::found a 'define' key in vite.config.ts — no per-install value may be inlined into this build"
+            exit 1
+          fi
+
+          # Any .env* file (excluding node_modules, which ships .env.example
+          # files as ordinary package content, not something Vite will load
+          # from this project root) would be auto-loaded by Vite and could
+          # inline a VITE_* value with no other change needed.
+          if find . -path ./node_modules -prune -o -name '.env*' -print | grep -q .; then
+            echo "::error::found a .env* file under frontend/ — Vite auto-loads these and inlines any VITE_* value referenced from src/"
+            exit 1
+          fi
       - run: npm run typecheck
       - run: npm test
       - run: npm run build

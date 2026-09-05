@@ -46,8 +46,8 @@ export function bootToken(): string | null {
   // deliberately does not use.
   window.sessionStorage.setItem(TOKEN_STORAGE_KEY, presented);
 
-  url.searchParams.delete(QUERY_PARAM);
-  window.history.replaceState(null, "", url.pathname + remainingSuffix(url) + url.hash);
+  const remaining = removeQueryParam(window.location.search, QUERY_PARAM);
+  window.history.replaceState(null, "", url.pathname + remaining + url.hash);
 
   return presented;
 }
@@ -57,8 +57,33 @@ export function getToken(): string | null {
   return window.sessionStorage.getItem(TOKEN_STORAGE_KEY);
 }
 
-/** `?a=b&c=d`, or `""` if nothing is left to carry. */
-function remainingSuffix(url: URL): string {
-  const remaining = url.searchParams.toString();
-  return remaining ? `?${remaining}` : "";
+/**
+ * Removes `key` from a raw query string by splitting on `&` and rejoining —
+ * deliberately not `url.searchParams.delete(key)` followed by
+ * `url.searchParams.toString()`. That round-trip re-serialises every
+ * *remaining* pair under `application/x-www-form-urlencoded` rules (a space
+ * becomes `+`, not `%20`; a valueless `?debug` becomes `?debug=`), which is
+ * semantically equivalent for anything reading the query through
+ * `URLSearchParams` but not byte-identical for anything reading
+ * `location.search` raw. Splitting the original string on `&` and dropping
+ * only the matched segments leaves every other pair exactly as the browser
+ * presented it.
+ *
+ * Known rough edge, accepted rather than fixed: this compares each segment
+ * against `key` literally, so a percent-encoded key (`%61ccess_token=...`)
+ * is not recognised as `access_token` and survives in the URL. `bootToken`
+ * itself only ever writes this parameter unencoded, so the edge is reachable
+ * only by a caller deliberately obfuscating it — not a normal pairing link.
+ */
+function removeQueryParam(rawSearch: string, key: string): string {
+  const withoutLeadingQuestion = rawSearch.startsWith("?") ? rawSearch.slice(1) : rawSearch;
+  if (withoutLeadingQuestion === "") {
+    return "";
+  }
+
+  const kept = withoutLeadingQuestion
+    .split("&")
+    .filter((pair) => pair !== key && !pair.startsWith(`${key}=`));
+
+  return kept.length > 0 ? `?${kept.join("&")}` : "";
 }

@@ -110,6 +110,14 @@ export type InteractionInput =
 
 export type InteractionResult =
   /**
+   * Every non-`501` status used to fall through to the error arm below,
+   * including a `2xx` — harmless while the handler only ever answers `501`,
+   * but the moment another lane wires a real sink this would silently report
+   * success as failure. So a `2xx` is its own first-class outcome, checked
+   * before `501`.
+   */
+  | { kind: "ok" }
+  /**
    * The handler parses every interaction correctly but has no
    * session-actor sink to dispatch to (ruling R6). A first-class, expected
    * outcome today — not an error to swallow, and not one to retry past.
@@ -127,6 +135,9 @@ export async function postInteraction(
     body: JSON.stringify(input),
   });
 
+  if (response.ok) {
+    return { kind: "ok" };
+  }
   if (response.status === 501) {
     return { kind: "not_implemented", reason: await errorReason(response) };
   }
@@ -171,16 +182,36 @@ export function asTaskDelta(payload: EventPayload): { delta: Delta } | undefined
   return asRecord(payload["TaskDelta"]) as { delta: Delta } | undefined;
 }
 
-/**
- * `Delta::Text { text }`. `Delta::Stdout`/`Stderr` serialise as JSON arrays
- * of byte numbers, not base64 or UTF-8 text, and have no accessor here —
- * nothing in this slice renders them yet.
- */
+/** `Delta::Text { text }`. */
 export function asTextDelta(delta: Delta): { text: string } | undefined {
   const value = delta["Text"];
   return isRecord(value) && typeof value.text === "string"
     ? (value as { text: string })
     : undefined;
+}
+
+/**
+ * `Delta::Stdout`/`Delta::Stderr` serialise as a JSON array of byte numbers
+ * (not base64, not a UTF-8 string), decoded here with `TextDecoder` rather
+ * than left to the caller — every consumer needs the same decode, and
+ * getting it wrong (treating the array as already-text) is the obvious
+ * mistake.
+ */
+export function asStdoutDelta(delta: Delta): { text: string } | undefined {
+  return decodeByteArrayDelta(delta, "Stdout");
+}
+
+/** See {@link asStdoutDelta}. */
+export function asStderrDelta(delta: Delta): { text: string } | undefined {
+  return decodeByteArrayDelta(delta, "Stderr");
+}
+
+function decodeByteArrayDelta(delta: Delta, key: "Stdout" | "Stderr"): { text: string } | undefined {
+  const value = delta[key];
+  if (!Array.isArray(value) || !value.every((byte) => typeof byte === "number")) {
+    return undefined;
+  }
+  return { text: new TextDecoder().decode(new Uint8Array(value as number[])) };
 }
 
 export interface ResyncRequired {

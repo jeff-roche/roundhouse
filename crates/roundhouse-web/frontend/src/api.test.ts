@@ -2,13 +2,17 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   asAck,
+  asStderrDelta,
+  asStdoutDelta,
   asTaskDelta,
   asTaskEvent,
   asTextDelta,
   connectSessionEvents,
   fetchRuns,
   postInteraction,
+  type Outcome,
   type RunSummary,
+  type Severity,
 } from "./api";
 
 function mockFetch(response: {
@@ -26,15 +30,18 @@ function mockFetch(response: {
   );
 }
 
-function run(id: string): RunSummary {
+function run(
+  id: string,
+  overrides: { severity?: Severity; outcome?: Outcome; needsHuman?: boolean } = {},
+): RunSummary {
   return {
     run_id: id,
     binding_id: null,
     report: {
-      outcome: "findings",
-      severity: "low",
+      outcome: overrides.outcome ?? "findings",
+      severity: overrides.severity ?? "low",
       headline: "h",
-      needs_human: false,
+      needs_human: overrides.needsHuman ?? false,
       cost: { usd: 0, tokens: 0 },
       findings: [],
       artifacts: [],
@@ -50,10 +57,38 @@ beforeEach(() => {
 
 describe("fetchRuns", () => {
   it("returns the server's array in the order it arrived, without re-sorting", async () => {
-    // Deliberately in an order that the client's own triage rule would
-    // reverse if it re-sorted: the server already applied
-    // `sort_for_triage` and the client must trust it verbatim.
-    const server = [run("z"), run("a"), run("m")];
+    // Four runs whose `severity`/`outcome`/`needs_human` all differ, laid
+    // out in the exact REVERSE of what `sort_for_triage`
+    // (`(!needs_human, Reverse(severity), outcome == Nothing)`) would
+    // produce from this set. A weaker fixture where every run shares the
+    // same severity/outcome/needs_human would let a *triage-consistent*
+    // client-side re-sort pass this test as a no-op — this one is
+    // deliberately not already triage-sorted, so re-sorting it with
+    // `sort_for_triage`'s own rule, or any other rule, changes the order
+    // and fails the assertion below.
+    const best = run("best-needs-human-high-findings", {
+      needsHuman: true,
+      severity: "high",
+      outcome: "findings",
+    });
+    const second = run("second-needs-human-low-findings", {
+      needsHuman: true,
+      severity: "low",
+      outcome: "findings",
+    });
+    const third = run("third-no-human-high-changed", {
+      needsHuman: false,
+      severity: "high",
+      outcome: "changed",
+    });
+    const worst = run("worst-no-human-low-nothing", {
+      needsHuman: false,
+      severity: "low",
+      outcome: "nothing",
+    });
+    // Correct triage order would be [best, second, third, worst]; the
+    // server response below is its exact reverse.
+    const server = [worst, third, second, best];
     mockFetch({ ok: true, status: 200, json: async () => server });
 
     const result = await fetchRuns();
@@ -132,6 +167,16 @@ describe("postInteraction", () => {
 
     expect(result.kind).toBe("not_implemented");
   });
+
+  it("reports a 2xx as ok, not as an error — the day another lane wires a real sink", async () => {
+    // Every non-501 status used to fall through to the error arm, which was
+    // harmless only because the handler answers nothing but 501 today.
+    mockFetch({ ok: true, status: 200, json: async () => ({}) });
+
+    const result = await postInteraction("sess-1", { kind: "hard_cancel" });
+
+    expect(result).toEqual({ kind: "ok" });
+  });
 });
 
 describe("tolerance of #[non_exhaustive] variants", () => {
@@ -166,6 +211,22 @@ describe("tolerance of #[non_exhaustive] variants", () => {
 
     const delta = asTaskDelta(envelope!.payload);
     expect(asTextDelta(delta!.delta)).toEqual({ text: "hi" });
+  });
+});
+
+describe("asStdoutDelta / asStderrDelta", () => {
+  it("decodes a JSON array of byte numbers as UTF-8 text, not base64", () => {
+    const bytes = Array.from(new TextEncoder().encode("hello\n"));
+
+    expect(asStdoutDelta({ Stdout: bytes })).toEqual({ text: "hello\n" });
+    expect(asStderrDelta({ Stderr: bytes })).toEqual({ text: "hello\n" });
+  });
+
+  it("does not throw and reports no match on a non-array or non-numeric value", () => {
+    expect(asStdoutDelta({ Stdout: "already-a-string" })).toBeUndefined();
+    expect(asStdoutDelta({ Stdout: [1, "not-a-number", 3] })).toBeUndefined();
+    expect(asStdoutDelta({})).toBeUndefined();
+    expect(asStderrDelta({ Text: { text: "not stderr" } })).toBeUndefined();
   });
 });
 
