@@ -965,3 +965,95 @@ fn a_secret_derived_base_ref_longer_than_gits_stderr_buffer_never_reaches_the_se
          serialized output"
     );
 }
+
+/// Final whole-branch round, item A1 — the **declared-secrets needle
+/// backstop**, which is a different guard from the withhold above and closes
+/// a hole the withhold cannot see.
+///
+/// The withhold fires on provenance: `base_ref` computed from
+/// `${{ secrets.T }}` is secret-*derived*, so `WorktreeError::safe_summary()`
+/// replaces `git`'s free text. This test drives the case where a **declared**
+/// secret's raw value reaches `base_ref` through a channel provenance treats
+/// as clean — here the workflow author pasting it literally into the YAML
+/// (`env('NAME')` is the other, kept deliberately clean by ruling W5-7). Then
+/// `base_ref_is_secret_derived` is `false`, no withhold happens, and the only
+/// thing standing between the raw value and the append-only `events` table is
+/// the needle scan every sibling dispatch arm applies
+/// (`exec/mod.rs:958`/`:1007`/`:1065`/`:1122`).
+///
+/// Task 34's fix round 3 deleted `redact_message` when it replaced scrubbing
+/// with withholding, taking that backstop off this branch with it; this pins
+/// the restoration. **Verified by removal, not by assertion:** with the
+/// `redact_message` call on the `else` branch dropped, the raw value appears
+/// in the serialized outcome twice — once as the echoed `base_ref` and once
+/// inside `git`'s own stderr — and this test fails.
+#[test]
+fn a_declared_secrets_raw_value_pasted_literally_into_base_ref_is_still_scrubbed() {
+    if !git_available() {
+        eprintln!("skipping: git not available on this host");
+        return;
+    }
+    // Long enough to clear `MIN_REDACTABLE_SECRET_LEN` (8) — a shorter
+    // secret is deliberately never made a needle — and shaped so `git`
+    // rejects it as a ref and quotes it back in stderr, which is what makes
+    // the leak reachable at all.
+    const SECRET_VALUE: &str = "not-a-real-git-ref-topsecret123";
+    let repo = TempRepo::new();
+    let provider = Arc::new(ObservingWorktreeProvider::new(repo.path.clone()));
+
+    // `base_ref` is the literal value, NOT `${{ secrets.T }}`: that is the
+    // whole point — provenance has nothing to mark, so the withhold branch
+    // never runs.
+    let yaml = format!(
+        "{WORKFLOW_PREAMBLE}secrets: [T]\nsteps:\n\
+         \x20\x20- id: per_item\n\
+         \x20\x20\x20\x20map:\n\
+         \x20\x20\x20\x20\x20\x20over: \"${{{{ inputs.items }}}}\"\n\
+         \x20\x20\x20\x20\x20\x20as: item\n\
+         \x20\x20\x20\x20\x20\x20max_parallel: 1\n\
+         \x20\x20\x20\x20\x20\x20on_item_error: continue\n\
+         \x20\x20\x20\x20\x20\x20isolation: {{ worktree: {{ base_ref: \"{SECRET_VALUE}\" }} }}\n\
+         \x20\x20\x20\x20steps:\n\
+         \x20\x20\x20\x20\x20\x20- id: emit_something\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20emit: {{ ok: true }}\n"
+    );
+    let def = parse_workflow(&yaml).expect("workflow must parse");
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(
+        serde_json::json!({"items": [1]}),
+        "T",
+        SECRET_VALUE,
+        Some(provider.clone() as Arc<dyn WorktreeProvider>),
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().expect("run must not error");
+
+    // Sanity: this must actually exercise the materialize-failure path, and
+    // it must be the *non*-withheld branch — otherwise the test would pass
+    // for the wrong reason (the withhold, not the backstop).
+    let items = outcomes[0].output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]["status"], "failed",
+        "expected git to reject this base_ref as invalid — got {:?}",
+        items[0]
+    );
+    let error = items[0]["error"].as_str().unwrap();
+    assert!(
+        !error.contains("withheld"),
+        "this must be the non-secret-derived branch (no withhold), or the test pins the \
+         wrong guard — got: {error:?}"
+    );
+    assert!(
+        error.contains("***"),
+        "the needle backstop must have replaced the pasted secret with `***`, got: {error:?}"
+    );
+
+    let serialized = serde_json::to_string(&outcomes[0].output).unwrap();
+    assert!(
+        !serialized.contains(SECRET_VALUE),
+        "a declared secret's raw value must not survive anywhere in the map step's \
+         serialized output just because it arrived through a channel provenance treats as \
+         clean, got: {serialized}"
+    );
+}

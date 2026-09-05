@@ -50,7 +50,9 @@
 //!   `roundhouse_sandbox::worktree`.
 
 use crate::caps::ResourceCaps;
-use crate::exec::{evaluate_when_gate, Executor, GateDecision, StepOutcome, StepStatus};
+use crate::exec::{
+    evaluate_when_gate, redact_with_needles, Executor, GateDecision, StepOutcome, StepStatus,
+};
 use crate::expr::{eval_delimited_expression, interpolate, TemplateSource};
 use crate::parse::steps::{parse_step, MapIsolationDef, OnItemError, StepBody, StepDef};
 use crate::worktree::{WorktreeProvider, WorktreeProviderError};
@@ -368,6 +370,40 @@ fn item_outcome_to_json(o: &ItemOutcome) -> Value {
 /// `StepOutcome`'s hand-written `Debug` impl for why: a resolved value can
 /// be secret-derived, so an error path must never format the value itself
 /// into a message).
+/// Scrubs every **declared** secret's raw value out of `message` — the same
+/// [`redact_with_needles`] needle scan every other dispatch arm's *logged*
+/// copy already goes through (`exec/mod.rs:958`/`:1007`/`:1065`/`:1122`),
+/// applied here to an `ItemOutcome::Failed` message instead of a sink-bound
+/// event.
+///
+/// # Why this is needed on top of the withhold (final round, item A1)
+///
+/// It exists because provenance and the needle list see different things.
+/// [`crate::expr::Interpolated`]'s provenance catches a `base_ref` that was
+/// *computed from* `${{ secrets.* }}`; the needle list catches a declared
+/// secret's *raw value* however it arrived. A declared secret's raw value
+/// can reach `base_ref` through a channel provenance treats as clean — the
+/// author pasting it literally into the YAML, or `env('NAME')`, which
+/// ruling W5-7 deliberately keeps clean — and then the withhold branch does
+/// not fire, because nothing about that `base_ref` is secret-*derived*.
+/// Without this scrub both layers are off at once and the raw value lands
+/// in the append-only `events` table (via `redacted_base_ref`, which is the
+/// literal itself in that case, and via `git`'s stderr echoing it back).
+///
+/// This function was deleted in Task 34's fix round 3, which replaced
+/// *scrubbing* with *withholding* on the secret-derived branch (ruling
+/// W5-36) and took the backstop off the non-secret-derived branch with it.
+/// The withhold is the right fix for its own branch and is unchanged; this
+/// restores the independent backstop the other branch always had.
+fn redact_message(message: String, needles: &[String]) -> String {
+    match redact_with_needles(&Value::String(message), needles) {
+        Value::String(s) => s,
+        other => unreachable!(
+            "redact_with_needles(Value::String(_), _) always returns Value::String, got {other:?}"
+        ),
+    }
+}
+
 fn value_type_name(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -1191,17 +1227,37 @@ impl<'a> Executor<'a> {
                                 // doc comment for the full reasoning. A
                                 // `base_ref` that is *not* secret-derived
                                 // still gets the full, unwithheld message —
-                                // behaviour here is unchanged for the common
-                                // case.
+                                // scrubbed through the declared-secrets
+                                // needle backstop below, which is a
+                                // different guard closing a different hole
+                                // (see [`redact_message`]'s own doc comment,
+                                // "Why this is needed on top of the
+                                // withhold"). Fix round 3 deleted that
+                                // backstop along with the scrub it was
+                                // replacing; the final round restored it.
                                 let detail = if base_ref_is_secret_derived {
                                     e.safe_summary().to_string()
                                 } else {
                                     e.to_string()
                                 };
-                                return ItemOutcome::Failed(format!(
+                                let message = format!(
                                     "map step `{step_id}`: materializing a worktree for \
                                      base_ref {redacted_base_ref:?}: {detail}"
-                                ));
+                                );
+                                return ItemOutcome::Failed(if base_ref_is_secret_derived {
+                                    // Nothing here for a needle to find:
+                                    // `safe_summary()` carries no text from
+                                    // outside this crate at all, and
+                                    // `redacted_base_ref` is already `***`
+                                    // because provenance caught it.
+                                    message
+                                } else {
+                                    // The whole assembled message, not just
+                                    // `detail`: `redacted_base_ref` IS the
+                                    // raw literal in the pasted-secret case
+                                    // that makes this branch reachable.
+                                    redact_message(message, &self.redaction_needles)
+                                });
                             }
                         }
                     }
@@ -1336,8 +1392,16 @@ impl<'a> Executor<'a> {
                 if let Some(guard) = worktree_guard.take() {
                     if let Err(e) = guard.release() {
                         if !matches!(last, ItemOutcome::Failed(_)) {
-                            last = ItemOutcome::Failed(format!(
-                                "map step `{step_id}`: releasing the item's worktree: {e}"
+                            // Same declared-secrets backstop as the
+                            // materialize arm above (final round, item A1):
+                            // `{e}` embeds `git`'s own stderr, which this
+                            // crate does not control, and a declared
+                            // secret's raw value can be in scope for this
+                            // run through a channel provenance treats as
+                            // clean. See [`redact_message`]'s doc comment.
+                            last = ItemOutcome::Failed(redact_message(
+                                format!("map step `{step_id}`: releasing the item's worktree: {e}"),
+                                &self.redaction_needles,
                             ));
                         }
                     }
