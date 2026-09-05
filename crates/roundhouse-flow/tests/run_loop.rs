@@ -22,6 +22,7 @@ use roundhouse_flow::exec::run_loop::{
     run_workflow, CalledWorkflow, GateAnswer, ReportOrigin, RunLoopError, RunOutcome, WorkflowHost,
 };
 use roundhouse_flow::exec::{RunContext, RunId, TaskSink};
+use roundhouse_flow::expr::EnvAllowlist;
 use roundhouse_flow::ledger::run_ledger;
 use roundhouse_flow::parking::{CheckpointError, CheckpointRef, Checkpointer};
 use roundhouse_flow::parse::parse_workflow;
@@ -235,6 +236,7 @@ fn ctx(run_id: RunId) -> RunContext {
         secrets: HashMap::new(),
         run_id,
         previous_report: None,
+        env_allowlist: EnvAllowlist::deny_all(),
     }
 }
 

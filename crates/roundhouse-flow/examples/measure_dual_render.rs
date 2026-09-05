@@ -35,6 +35,7 @@
 
 use roundhouse_core::{EventPayload, TaskId, TaskKind};
 use roundhouse_flow::exec::{Executor, RunContext, RunId, TaskSink};
+use roundhouse_flow::expr::EnvAllowlist;
 use roundhouse_flow::parse::parse_workflow;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -103,6 +104,7 @@ fn run_once(yaml: &str) -> (Duration, usize, usize) {
         secrets,
         run_id: RunId::new(),
         previous_report: None,
+        env_allowlist: EnvAllowlist::deny_all(),
     };
     let start = Instant::now();
     let mut exec = Executor::new(&def, &mut sink, run_ctx).expect("secrets clear the length floor");

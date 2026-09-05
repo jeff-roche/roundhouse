@@ -270,8 +270,8 @@ pub(crate) fn evaluate_when_gate(step: &StepDef, ctx: &ExprContext) -> GateDecis
 }
 
 use crate::expr::{
-    eval_delimited_expression, interpolate, interpolate_json, ExprContext, JsonTemplateSource,
-    TemplateSource,
+    eval_delimited_expression, interpolate, interpolate_json, EnvAllowlist, ExprContext,
+    JsonTemplateSource, TemplateSource,
 };
 use crate::parse::steps::{parse_step, topological_order, StepBody, StepDef};
 use crate::parse::{ParseError, WorkflowDef};
@@ -355,6 +355,16 @@ pub struct RunContext {
     /// in-memory sequencer, not a second copy of the run-start path), not an
     /// oversight of this task.
     pub previous_report: Option<Report>,
+    /// Which process-environment variable names this run's `env()` calls
+    /// may read (Task 33, ruling W5-7). **This crate only ever takes this
+    /// value — it never populates it.** [`EnvAllowlist::default`] (deny-all)
+    /// is what every construction site in this crate uses today; threading
+    /// an operator-authored list of readable names in from daemon config is
+    /// `roundhouse-daemon`'s job (lane W1's crate), not this one's. Until
+    /// that plumbing exists upstream, every `env()` call in a real run
+    /// denies every name — the correct, fail-closed direction for this
+    /// field to default to while that caller-side work is outstanding.
+    pub env_allowlist: EnvAllowlist,
 }
 
 impl fmt::Debug for RunContext {
@@ -387,6 +397,9 @@ impl fmt::Debug for RunContext {
             // `dbg!`/`tracing::debug!` from printing such material — see the
             // doc comment above.
             .field("previous_report_present", &self.previous_report.is_some())
+            // `EnvAllowlist` holds only variable *names*, never values —
+            // safe to print in full, unlike `secrets` above.
+            .field("env_allowlist", &self.env_allowlist)
             .finish()
     }
 }
@@ -733,6 +746,12 @@ impl<'a> Executor<'a> {
             ),
         );
         ctx.set_public("run", serde_json::json!({ "id": run_id.to_string() }));
+        // Task 33, ruling W5-7: thread the caller-supplied allowlist
+        // through unchanged. `ExprContext::new()` above already starts
+        // deny-all, so a `RunContext` built with the field left at its
+        // `EnvAllowlist::default()` (every construction site in this crate
+        // today) denies every `env()` name for this run.
+        ctx.allow_env(run_ctx.env_allowlist);
         Ok(Executor {
             def,
             run_id,

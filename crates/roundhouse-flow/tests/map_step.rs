@@ -45,6 +45,7 @@ use roundhouse_flow::exec::map_step::{
     run_map, split_budget, ItemOutcome, MapBudget, MAX_MAP_ITEMS,
 };
 use roundhouse_flow::exec::{Executor, RunContext, StepStatus, TaskSink};
+use roundhouse_flow::expr::EnvAllowlist;
 use roundhouse_flow::parse::parse_workflow;
 use roundhouse_flow::parse::steps::OnItemError;
 use std::collections::HashMap;
@@ -94,6 +95,7 @@ fn run_ctx(inputs: serde_json::Value) -> RunContext {
         secrets: HashMap::new(),
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
+        env_allowlist: EnvAllowlist::deny_all(),
     }
 }
 
@@ -106,6 +108,7 @@ fn secret_run_ctx(inputs: serde_json::Value, key: &str, value: &str) -> RunConte
         secrets,
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
+        env_allowlist: EnvAllowlist::deny_all(),
     }
 }
 

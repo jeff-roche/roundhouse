@@ -1,6 +1,7 @@
 use roundhouse_core::TaskId;
 use roundhouse_core::TaskKind;
 use roundhouse_flow::exec::{Executor, ExecutorError, RunContext, StepStatus, TaskSink};
+use roundhouse_flow::expr::EnvAllowlist;
 use roundhouse_flow::parse::{parse_workflow, ParseError};
 use std::collections::HashMap;
 
@@ -41,6 +42,7 @@ fn run_ctx(inputs: serde_json::Value) -> RunContext {
         secrets: HashMap::new(),
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
+        env_allowlist: EnvAllowlist::deny_all(),
     }
 }
 
@@ -555,6 +557,7 @@ steps:
         secrets,
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
+        env_allowlist: EnvAllowlist::deny_all(),
     };
     let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     let outcomes = exec.run_to_completion().unwrap();
@@ -594,6 +597,7 @@ fn secret_run_ctx(inputs: serde_json::Value, key: &str, value: &str) -> RunConte
         secrets,
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
+        env_allowlist: EnvAllowlist::deny_all(),
     }
 }
 
@@ -851,6 +855,7 @@ fn run_id_bound_into_the_expression_context_is_the_one_from_run_context() {
         secrets: HashMap::new(),
         run_id,
         previous_report: None,
+        env_allowlist: EnvAllowlist::deny_all(),
     };
     let yaml = r#"
 name: run-id-check
@@ -1202,6 +1207,12 @@ fn probe_emit(field: &str, secrets: &[(&str, &str)]) -> (serde_json::Value, serd
         secrets: secret_map,
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
+        // Task 33 (ruling W5-7): the one `env()`-exercising row in
+        // `TAINT_PROPAGATION_TABLE` reads this fixed, always-unset name —
+        // allowlisted here so that row keeps demonstrating "allowlisted but
+        // unset resolves to a clean `Null`", not "denied", which is a
+        // different `ExprError` this helper is not testing.
+        env_allowlist: EnvAllowlist::from_names(["ROUNDHOUSE_FLOW_DEFINITELY_UNSET_VARIABLE_XYZ"]),
     };
     let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     let outcomes = exec.run_to_completion().unwrap();
@@ -1714,7 +1725,12 @@ const TAINT_PROPAGATION_TABLE: &[TaintRow] = &[
         logged_is_redacted: false,
     },
     TaintRow {
-        operation: "function call: env() — deliberately unchanged, and clean",
+        // Task 33, ruling W5-7: `probe_emit` allowlists exactly this name
+        // (and nothing else), so this row exercises the "allowlisted but
+        // genuinely unset" case, which still resolves to a clean `Null` —
+        // the denied case is its own `ExprError`, not a taint-table row,
+        // and is pinned separately in `tests/expr.rs`.
+        operation: "function call: env() over an allowlisted, unset variable — clean and null",
         expr: "${{ env('ROUNDHOUSE_FLOW_DEFINITELY_UNSET_VARIABLE_XYZ') }}",
         real_contains: "null",
         logged_is_redacted: false,
@@ -1820,6 +1836,104 @@ fn the_taint_propagation_table_covers_both_directions() {
         redacting >= 14 && clean >= 8,
         "the table must exercise both propagation and non-propagation: {redacting} redacting, \
          {clean} clean"
+    );
+}
+
+// ---- Task 33, ruling W5-7: `env()` is scoped by an `EnvAllowlist` a
+// caller hands in through `RunContext::env_allowlist`, deny-all by
+// default. Exercised end to end through the real public API
+// (`parse_workflow` -> `Executor::new` -> `run_to_completion`), not a bare
+// `expr::eval` call — that coverage lives in `tests/expr.rs`. ----
+
+#[test]
+fn env_is_denied_through_the_executor_when_the_run_context_leaves_the_default_deny_all_allowlist() {
+    // `run_ctx` (this file's shared helper) leaves `env_allowlist` at its
+    // `EnvAllowlist::deny_all()` default — the same default every other
+    // construction site in this crate uses today. A real value is planted
+    // in the process environment under a distinctive canary name so this
+    // test would genuinely fail (by returning the value instead of
+    // erroring) if the scoping did not work.
+    std::env::set_var(
+        "ROUNDHOUSE_EXEC_TEST_ENV_CANARY_DENIED",
+        "sk-ant-PRETEND-KEY-CANARY",
+    );
+    let yaml = r#"
+name: env-denied
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: probe
+    emit: { probe: "${{ env('ROUNDHOUSE_EXEC_TEST_ENV_CANARY_DENIED') }}" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let mut exec = Executor::new(&def, &mut sink, run_ctx(serde_json::json!({}))).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    match &outcomes[0].status {
+        StepStatus::Failed { message } => {
+            assert!(
+                message.contains("ROUNDHOUSE_EXEC_TEST_ENV_CANARY_DENIED"),
+                "the error must name the denied variable: {message}"
+            );
+            assert!(
+                !message.contains("sk-ant-PRETEND-KEY-CANARY"),
+                "the error must never carry the real value: {message}"
+            );
+        }
+        other => panic!("expected the probe step to fail closed, got {other:?}"),
+    }
+    // The step failed before dispatch, so nothing about this run was ever
+    // persisted — the canary value never reached the sink at all.
+    assert!(
+        sink.0.is_empty(),
+        "a denied env() read must persist nothing, got {:?}",
+        sink.0
+    );
+}
+
+#[test]
+fn env_allowlist_threads_from_run_context_through_the_executor_to_a_real_value() {
+    // The regression the ruling requires: allowlisting a name through
+    // `RunContext::env_allowlist` (not directly through `ExprContext`,
+    // which no caller outside this crate can construct) must still let
+    // `env()` resolve it for real, through the executor's real dispatch
+    // path — proving the fix does not just break `env()` outright.
+    std::env::set_var("ROUNDHOUSE_EXEC_TEST_ENV_ALLOWED", "process-wide-value");
+    let yaml = r#"
+name: env-allowed
+version: 1
+inputs: {}
+defaults: { isolation: worktree }
+permissions: { default: deny, unattended: { escalate: fail } }
+steps:
+  - id: probe
+    emit: { probe: "${{ env('ROUNDHOUSE_EXEC_TEST_ENV_ALLOWED') }}" }
+"#;
+    let def = parse_workflow(yaml).unwrap();
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = RunContext {
+        inputs: serde_json::json!({}),
+        vars: serde_json::json!({}),
+        secrets: HashMap::new(),
+        run_id: roundhouse_flow::exec::RunId::new(),
+        previous_report: None,
+        env_allowlist: EnvAllowlist::from_names(["ROUNDHOUSE_EXEC_TEST_ENV_ALLOWED"]),
+    };
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().unwrap();
+
+    assert_eq!(
+        outcomes[0].status,
+        StepStatus::Completed,
+        "an allowlisted env() read must not fail the step, got {:?}",
+        outcomes[0].status
+    );
+    assert_eq!(
+        outcomes[0].output["probe"],
+        serde_json::json!("process-wide-value")
     );
 }
 
@@ -1938,6 +2052,7 @@ steps:
         secrets: HashMap::new(),
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
+        env_allowlist: EnvAllowlist::deny_all(),
     };
     let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     exec.run_to_completion().unwrap();
@@ -1987,6 +2102,7 @@ steps:
         secrets,
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
+        env_allowlist: EnvAllowlist::deny_all(),
     };
     let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     exec.run_to_completion().unwrap();
