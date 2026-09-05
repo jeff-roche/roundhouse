@@ -213,3 +213,29 @@ describe("SessionView interactions", () => {
     await vi.waitFor(() => expect(container.querySelector(".interaction-sent")).not.toBeNull());
   });
 });
+
+describe("SessionView with a non-UUID-shaped session id (fix round 1, M4)", () => {
+  it("renders neither the transcript nor the interaction buttons, only the invalid-id message", async () => {
+    // Before this fix, the four interaction buttons rendered (and could be
+    // clicked) even when `props.sessionId` was not UUID-shaped and the
+    // connection attempt had already bailed to `connection_error` —
+    // `sendInteraction`'s own defence-in-depth guard (mirroring this same
+    // `isUuidShaped` check) is exercised whenever `postInteraction` is
+    // reached at all, covered by the other `SessionView interactions`
+    // tests above using a valid session id; what was missing was gating
+    // the *rendering* of those buttons in the first place, which this pins.
+    const container = mount("not-a-uuid");
+
+    await vi.waitFor(() => expect(container.querySelector(".session-invalid-id")).not.toBeNull());
+
+    expect(container.querySelector(".transcript")).toBeNull();
+    expect(container.querySelector(".interactions")).toBeNull();
+    expect(container.querySelectorAll("button").length).toBe(0);
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+
+  it("never opens an SSE connection for a non-UUID-shaped id either", async () => {
+    mount("../etc/passwd");
+    await vi.waitFor(() => expect(instances.length).toBe(0));
+  });
+});
