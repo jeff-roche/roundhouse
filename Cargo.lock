@@ -3806,6 +3806,7 @@ dependencies = [
  "landlock",
  "libc",
  "roundhouse-core",
+ "roundhouse-sandbox",
  "seccompiler",
  "thiserror 2.0.20",
  "tokio",

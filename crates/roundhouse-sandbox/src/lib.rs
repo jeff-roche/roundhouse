@@ -12,10 +12,14 @@
 //! errors rather than warns — when the achieved tier is below what a session
 //! requested, and that genuinely applies bwrap namespace isolation and, on
 //! Linux when probed available, a real seccomp-BPF filter to every spawned
-//! child). It is not yet complete: real per-process Landlock enforcement on
-//! the spawned child (as opposed to Landlock's own probe, which is real) is a
-//! tracked follow-up — see `isolate::BwrapLandlockIsolate::achieved_tier`'s doc
-//! comment for exactly what each mechanism does and doesn't enforce today. See
+//! child). Task 27 (lane W5, ruling W5-9) closed the one remaining gap: real
+//! per-process Landlock enforcement on the spawned child itself, not just
+//! Landlock's own probe (which was always real) — see `landlock_wrap`'s
+//! module doc comment for the pre-exec wrapper mechanism this needed (bwrap
+//! has no native Landlock flag, unlike its native `--seccomp FD`) and why the
+//! more obvious `pre_exec`-on-bwrap approach is a dead end, and
+//! `isolate::BwrapLandlockIsolate::achieved_tier`'s doc comment for exactly
+//! what each mechanism enforces today. See
 //! `docs/architecture/02-system-architecture.md` §5.2 and
 //! `03-security-and-sandboxing.md` (S-ISO-1/2).
 //!
@@ -65,6 +69,7 @@ pub mod bounded_parse;
 pub mod bwrap;
 pub mod isolate;
 mod isolate_trait;
+mod landlock_wrap; // Task 27 (ruling W5-9): Route B, the round-landlock-exec pre-exec wrapper — no unsafe
 pub mod probe; // the only module permitted unsafe_code — see probe.rs's module-level allow
 mod types;
 pub mod worktree;
