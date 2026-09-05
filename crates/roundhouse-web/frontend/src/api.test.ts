@@ -9,6 +9,8 @@ import {
   asTextDelta,
   connectSessionEvents,
   fetchRuns,
+  isResyncRequired,
+  isStreamErrorShape,
   postInteraction,
   type Outcome,
   type RunSummary,
@@ -133,6 +135,18 @@ describe("fetchRuns", () => {
       status: 500,
       reason: "the runs inbox failed while loading the runs inbox",
     });
+  });
+
+  it("reports a non-array 200 body as an error, never as a silent empty inbox (fix round 2)", async () => {
+    // A 200 with, say, `{}` or a string body must never render the same
+    // as a real, successful empty inbox — that would reproduce exactly
+    // the confusion runs.rs's own docs argue against for the server side.
+    mockFetch({ ok: true, status: 200, json: async () => ({ not: "an array" }) });
+
+    const result = await fetchRuns();
+
+    expect(result.kind).toBe("error");
+    expect(result).not.toEqual({ kind: "ok", runs: [] });
   });
 });
 
@@ -402,5 +416,70 @@ describe("connectSessionEvents malformed frames (fix round 1, M5)", () => {
     source.emitNamed("resync_required", JSON.stringify({ resume_from: 5, oldest_retained: 10 }));
     expect(onResyncRequired).toHaveBeenCalledWith({ resume_from: 5, oldest_retained: 10 });
     expect(onStreamError).not.toHaveBeenCalled();
+  });
+
+  // Fix round 2: `JSON.parse` succeeds on a value that is syntactically
+  // valid JSON but not the expected shape — `null`, `42`, `[]`, `{}`, and
+  // a record with a wrong-typed field all parse without throwing. Round 1
+  // only checked for a JSON *syntax* error; these pin that a JSON-valid,
+  // wrong-shaped body takes the same terminal-fallback path.
+  const jsonValidButWrongShape = ["null", "42", "[]", "{}", JSON.stringify({ resume_from: "not-a-number" })];
+
+  it.each(jsonValidButWrongShape)(
+    "falls back to onStreamError for a JSON-valid but wrong-shaped resync_required body: %s",
+    (rawBody) => {
+      const onStreamError = vi.fn();
+      const onResyncRequired = vi.fn();
+      const source = connectSessionEvents("sess-1", {
+        onEvent: () => {},
+        onResyncRequired,
+        onStreamError,
+        onError: () => {},
+      }) as unknown as FakeEventSource;
+
+      expect(() => source.emitNamed("resync_required", rawBody)).not.toThrow();
+
+      expect(onResyncRequired).not.toHaveBeenCalled();
+      expect(onStreamError).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(jsonValidButWrongShape)(
+    "falls back to onStreamError for a JSON-valid but wrong-shaped stream_error body: %s",
+    (rawBody) => {
+      const onStreamError = vi.fn();
+      const source = connectSessionEvents("sess-1", {
+        onEvent: () => {},
+        onResyncRequired: () => {},
+        onStreamError,
+        onError: () => {},
+      }) as unknown as FakeEventSource;
+
+      expect(() => source.emitNamed("stream_error", rawBody)).not.toThrow();
+
+      // Called exactly once with a fallback message, never with the raw
+      // (wrong-shaped) parsed value itself.
+      expect(onStreamError).toHaveBeenCalledOnce();
+      const [reported] = onStreamError.mock.calls[0] as [{ error: string }];
+      expect(typeof reported.error).toBe("string");
+    },
+  );
+});
+
+describe("isResyncRequired / isStreamErrorShape", () => {
+  it("accepts only the correct shape", () => {
+    expect(isResyncRequired({ resume_from: 1, oldest_retained: 2 })).toBe(true);
+    expect(isResyncRequired({ resume_from: "1", oldest_retained: 2 })).toBe(false);
+    expect(isResyncRequired({ resume_from: 1 })).toBe(false);
+    expect(isResyncRequired(null)).toBe(false);
+    expect(isResyncRequired([])).toBe(false);
+    expect(isResyncRequired(42)).toBe(false);
+  });
+
+  it("accepts only the correct shape for StreamError", () => {
+    expect(isStreamErrorShape({ error: "boom" })).toBe(true);
+    expect(isStreamErrorShape({ error: 42 })).toBe(false);
+    expect(isStreamErrorShape({})).toBe(false);
+    expect(isStreamErrorShape(null)).toBe(false);
   });
 });

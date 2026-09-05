@@ -91,8 +91,20 @@ export async function fetchRuns(): Promise<RunsResult> {
     return { kind: "error", status: response.status, reason: await errorReason(response) };
   }
 
-  const runs = (await response.json()) as RunSummary[];
-  return { kind: "ok", runs };
+  // Fix round 2 (Minor, code review): the body used to be cast straight to
+  // `RunSummary[]` with no check. A non-array 200 body — a proxy's error
+  // page, a future route change, anything unexpected — would then render
+  // silently as an empty inbox, exactly the confusion `runs.rs`'s own
+  // module docs argue at length against for the server side ("an empty
+  // inbox is a real, common and reassuring answer... and it must never be
+  // what 'this daemon has no database attached' looks like"). The same
+  // argument applies here: an empty inbox must never be indistinguishable
+  // from a response this client could not actually understand.
+  const body: unknown = await response.json();
+  if (!Array.isArray(body)) {
+    return { kind: "error", status: response.status, reason: "expected an array of runs" };
+  }
+  return { kind: "ok", runs: body as RunSummary[] };
 }
 
 // ── `POST /api/sessions/{session_id}/interactions` ─────────────────────
@@ -219,8 +231,27 @@ export interface ResyncRequired {
   oldest_retained: number;
 }
 
+/**
+ * Runtime shape check for {@link ResyncRequired} — `JSON.parse` alone only
+ * proves a body is syntactically valid JSON, not that it has this shape.
+ * `null`, `42`, `[]` and `{}` all parse successfully and are none of them a
+ * `ResyncRequired`; `connectSessionEvents`'s `resync_required` listener
+ * uses this to fall back to a terminal error state for any of them, the
+ * same as an actual JSON syntax error (fix round 2).
+ */
+export function isResyncRequired(value: unknown): value is ResyncRequired {
+  return (
+    isRecord(value) && typeof value.resume_from === "number" && typeof value.oldest_retained === "number"
+  );
+}
+
 export interface StreamError {
   error: string;
+}
+
+/** Runtime shape check for {@link StreamError} — see {@link isResyncRequired}'s doc comment for why this exists. */
+export function isStreamErrorShape(value: unknown): value is StreamError {
+  return isRecord(value) && typeof value.error === "string";
 }
 
 export interface SessionStreamHandlers {
@@ -315,36 +346,49 @@ export function connectSessionEvents(
     // `oldest_retained`) have no sensible fallback value to invent, while
     // `onStreamError` only needs a human-readable string.
     //
-    // **The `try` covers only the parse, not the handler call.** Wrapping
-    // `handlers.onResyncRequired(...)` itself would also swallow a genuine
-    // bug inside that handler (e.g. a consumer's `setStream` throwing) and
-    // misreport it as "malformed resync_required frame" — a wrong
-    // diagnosis for a real error. Parsing and dispatching are kept as two
-    // separate steps so only an actual parse failure takes the fallback
-    // path.
-    let parsed: ResyncRequired;
+    // Fix round 2: "malformed" means more than "not valid JSON."
+    // `JSON.parse` succeeds on `null`, `42`, `[]` and `{}` — none of which
+    // is a `ResyncRequired` — so a JSON-syntax-only check let those reach
+    // `handlers.onResyncRequired` unvalidated. `isResyncRequired` checks
+    // the actual shape; anything that parses but doesn't match it takes
+    // the same fallback as a syntax error.
+    //
+    // **The `try`/shape check covers only the parse and validation, not
+    // the handler call.** Wrapping `handlers.onResyncRequired(...)` itself
+    // would also swallow a genuine bug inside that handler (e.g. a
+    // consumer's `setStream` throwing) and misreport it as a malformed
+    // frame — a wrong diagnosis for a real error.
+    let candidate: unknown;
     try {
-      parsed = JSON.parse((message as MessageEvent<string>).data) as ResyncRequired;
+      candidate = JSON.parse((message as MessageEvent<string>).data);
     } catch {
       handlers.onStreamError({ error: "received a malformed resync_required frame" });
       return;
     }
-    handlers.onResyncRequired(parsed);
+    if (!isResyncRequired(candidate)) {
+      handlers.onStreamError({ error: "received a resync_required frame with an unexpected shape" });
+      return;
+    }
+    handlers.onResyncRequired(candidate);
   });
 
   source.addEventListener("stream_error", (message) => {
     source.close();
-    // See the `resync_required` listener above for why this falls back to
-    // the same terminal state on a parse failure, and why only the parse
-    // itself (not the `onStreamError` call) is inside the `try`.
-    let parsed: StreamError;
+    // See the `resync_required` listener above for why this validates
+    // shape (not just JSON syntax) and why only the parse/validation, not
+    // the `onStreamError` call, is inside the `try`.
+    let candidate: unknown;
     try {
-      parsed = JSON.parse((message as MessageEvent<string>).data) as StreamError;
+      candidate = JSON.parse((message as MessageEvent<string>).data);
     } catch {
       handlers.onStreamError({ error: "received a malformed stream_error frame" });
       return;
     }
-    handlers.onStreamError(parsed);
+    if (!isStreamErrorShape(candidate)) {
+      handlers.onStreamError({ error: "received a stream_error frame with an unexpected shape" });
+      return;
+    }
+    handlers.onStreamError(candidate);
   });
 
   source.onerror = () => {
