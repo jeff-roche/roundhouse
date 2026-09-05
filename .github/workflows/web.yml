@@ -56,6 +56,13 @@ jobs:
       # it was guarded only by nobody having used it yet. Runs before the
       # build so a violation fails fast rather than after a build that would
       # already have inlined the leak.
+      #
+      # Fix round 2 (Important, security): this step's name used to promise
+      # "any" build-time env-inlining surface while covering only a subset —
+      # see the `%…%` check below for what changed and why. Left as "any"
+      # here because, after that fix, every mechanism Vite has for inlining
+      # a build-time value into this bundle (`import.meta.env`, `define`,
+      # `.env*`, and HTML `%…%` substitution) is now actually covered.
       - name: Fail on any build-time env-inlining surface
         run: |
           set -euo pipefail
@@ -65,12 +72,19 @@ jobs:
           # its own uses of this in library internals that are not this
           # client's problem).
           #
-          # `test -d src` first: fix round 1 (whole-branch security review,
+          # Precondition first: fix round 1 (whole-branch security review,
           # M2) found `grep -rl` exits 2 (not 1) when `src/` is missing, and
           # `if grep ...; then` cannot distinguish that from "ran cleanly,
           # found no match" (exit 1) — a missing directory would otherwise
-          # silently PASS this guard rather than fail it loudly.
-          test -d src
+          # silently PASS this guard rather than fail it loudly. A bare
+          # `test -d src` does fail closed here (fix round 2: annotated —
+          # an unannotated `exit 1` reads as "Process completed with exit
+          # code 1" in the Actions UI with no indication of which of this
+          # step's several checks caused it).
+          if [ ! -d src ]; then
+            echo "::error::frontend/src/ is missing — cannot verify there is no 'import.meta.env' reference without it"
+            exit 1
+          fi
           if grep -rl 'import\.meta\.env' src/; then
             echo "::error::found 'import.meta.env' in frontend/src/ — nothing in this client should read a build-time-inlined value (see vite.config.ts's module docs)"
             exit 1
@@ -84,6 +98,14 @@ jobs:
           # would silently pass if that exact file were ever renamed or
           # replaced, since `grep`'s exit 2 on a missing file reads the same
           # as "no match" to a bare `if`.
+          #
+          # `envPrefix` is checked alongside `define` (fix round 2): it is
+          # the other config-file lever that changes what the `%…%` check
+          # below actually catches — Vite's HTML substitution reads whatever
+          # prefix `resolveEnvPrefix` returns, default `VITE_`. Since the
+          # `%…%` check below no longer assumes a prefix at all, an
+          # `envPrefix` override does not reopen that hole by itself; this
+          # is additional insurance flagging the config change itself.
           found_config=0
           for config_ext in js mjs cjs ts mts cts; do
             config_file="vite.config.$config_ext"
@@ -93,10 +115,14 @@ jobs:
                 echo "::error::found a 'define' key in $config_file — no per-install value may be inlined into this build"
                 exit 1
               fi
+              if grep -E 'envPrefix\s*:' "$config_file"; then
+                echo "::error::found an 'envPrefix' key in $config_file — changes which environment variables Vite's HTML %…% substitution and import.meta.env expose; needs deliberate review, not a silent change"
+                exit 1
+              fi
             fi
           done
           if [ "$found_config" -eq 0 ]; then
-            echo "::error::no vite.config.{js,mjs,cjs,ts,mts,cts} file found under frontend/ — cannot verify there is no 'define' key without one"
+            echo "::error::no vite.config.{js,mjs,cjs,ts,mts,cts} file found under frontend/ — cannot verify there is no 'define'/'envPrefix' key without one"
             exit 1
           fi
 
@@ -117,19 +143,48 @@ jobs:
             exit 1
           fi
 
-          # Fix round 1 (M1, the most important finding): Vite substitutes
-          # `%VITE_NAME%` tokens found in `index.html` from ANY
-          # `VITE_`-prefixed PROCESS ENVIRONMENT VARIABLE at build time — no
-          # `.env` file and no `import.meta.env` reference needed, so none
-          # of the checks above catch it. Demonstrated PoC: a
-          # `%VITE_SECRET_HOST%` placeholder in `<title>` plus
-          # `VITE_SECRET_HOST=nas.internal.example vite build` ships that
-          # hostname to every unauthenticated LAN peer — and a bare hostname
-          # is not a hex run, a UUID, a scheme, a dotted quad, or a path, so
-          # `dist_public_content.rs` would not have caught it either.
-          test -f index.html
-          if grep -E '%VITE_[A-Za-z0-9_]*%' index.html; then
-            echo "::error::found a %VITE_...% placeholder in index.html — Vite substitutes this from ANY VITE_-prefixed environment variable at build time, independent of .env files or import.meta.env"
+          # Fix round 1 (M1, the most important finding) — corrected in fix
+          # round 2 after a second review demonstrated the round-1 pattern
+          # closed one spelling of the bypass, not the class it was meant
+          # to close.
+          #
+          # Vite's own HTML substitution (`htmlEnvHook`) matches
+          # `/%(\S+?)%/g` against `{...config.env}` — ANY non-whitespace
+          # key, not just `VITE_`-prefixed ones, and the prefix that decides
+          # which environment variables land in `config.env` comes from
+          # `resolveEnvPrefix({ envPrefix })`, which is itself configurable
+          # (default `VITE_`, but a project can set it to anything). The
+          # round-1 pattern `%VITE_[A-Za-z0-9_]*%` baked in both constraints
+          # Vite does not honour, and none of them are hypothetical:
+          #
+          #   (a) `envPrefix: "RH_"` in vite.config.ts + `%RH_SECRET_HOST%`
+          #       in index.html — a different prefix entirely.
+          #   (b) `%VITE_A-B%` + `VITE_A-B=nas.internal.example` — a hyphen
+          #       in the name, which `[A-Za-z0-9_]` does not match (and
+          #       which also defeats the `unset`-based scrub below, since
+          #       `grep -oE '^VITE_[A-Za-z0-9_]*'` would extract `VITE_A`,
+          #       the wrong name — plain `unset` cannot remove a hyphenated
+          #       shell variable name at all, only `env -u` can; the source
+          #       check below is the actual control for this, the scrub is
+          #       defense in depth only, and is deliberately left as-is).
+          #   (c) `%BASE_URL%` — one of Vite's own built-in substitutions,
+          #       no environment variable or config change required at all.
+          #
+          # Nothing in this client legitimately uses Vite's HTML env
+          # substitution mechanism (that module doc comment's own words),
+          # so the fix is not "widen the character class" but "stop
+          # assuming a prefix or a charset at all": ANY `%…%`-shaped token
+          # in this file is the defect, mirroring Vite's own matching
+          # pattern rather than a guess at what it might match. Verified
+          # against the current `frontend/index.html` and the shipped
+          # `assets/dist/index.html`: zero hits on either, so this does not
+          # false-positive on the CSP-rationale comment's own prose.
+          if [ ! -f index.html ]; then
+            echo "::error::frontend/index.html is missing — cannot verify there is no %...% placeholder without it"
+            exit 1
+          fi
+          if grep -E '%[^%[:space:]]+%' index.html; then
+            echo "::error::found a %...% placeholder in index.html — Vite's HTML env substitution matches ANY non-whitespace token between percent signs, sourced from a CONFIGURABLE prefix (default VITE_, see vite.config.*'s envPrefix) plus Vite's own built-ins (e.g. %BASE_URL%) — independent of .env files or import.meta.env"
             exit 1
           fi
       - run: npm run typecheck
