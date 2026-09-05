@@ -172,10 +172,21 @@ impl CredentialProvider for OAuthRefreshCredential {
                 })
                 .await
                 .map_err(|_e| {
-                    // Never interpolate `TransportError`'s `Display` here:
-                    // reqwest 0.13.4's error `Display` ends with
-                    // `" for url ({url})"`, and `Url`'s `Display` includes
-                    // any userinfo component — report the host only.
+                    // Never interpolate `TransportError`'s `Display` here.
+                    // Phase 7 U4 fix round 1 (Ruling R33) corrected this
+                    // comment's originally-stated reason, which was wrong:
+                    // `reqwest = 0.13.4`'s own error `Display` ends with
+                    // `" for url ({url})"`, but `reqwest` itself STRIPS
+                    // userinfo from that embedded URL before formatting the
+                    // error — executed: a request to
+                    // `http://user:pass@host/x` produces an error message
+                    // containing `http://host/x`, no credentials. What
+                    // `reqwest`'s `Display` does NOT strip is the QUERY
+                    // STRING: `http://host/x?api_key=...` survives verbatim.
+                    // So the real leak this guards against is a
+                    // `refresh_url` carrying a secret in its query (e.g.
+                    // `?client_secret=...`), not userinfo — report the host
+                    // only regardless.
                     CredentialError::RefreshFailed(format!(
                         "token request to {} failed",
                         record_base_url_override(&self.refresh_url)

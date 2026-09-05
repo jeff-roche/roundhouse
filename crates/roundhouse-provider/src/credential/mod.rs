@@ -84,24 +84,40 @@ pub enum CredentialError {
     ExecFailed(Option<i32>, String),
     #[error("sigv4 signing precondition failed: {0}")]
     SigningFailed(String),
-    /// Phase 7 U4, Task 31 item 5 (verified 2026-09-05): the only network
-    /// call among the six `CredentialProvider` impls is
+    /// Phase 7 U4, Task 31 item 5 (fix round 1, Ruling R33 — corrects this
+    /// comment's originally-stated leak vector, which was wrong): the only
+    /// network call among the six `CredentialProvider` impls is
     /// `roundhouse-secrets`'s `oauth_refresh.rs` (and `azure_entra.rs`,
     /// which delegates to it), and it deliberately does NOT construct this
-    /// variant via `?` — it maps every `TransportError` to a hand-built,
-    /// host-only `RefreshFailed` message instead, because
-    /// `TransportError::Io(String)` (`transport/mod.rs`) carries a raw
-    /// `reqwest` error `Display`, which can include a URL WITH userinfo
-    /// (`reqwest_transport.rs`'s `TransportError::Io(e.to_string())` call
-    /// sites never redact `e`). Every one of the 7 codec call sites that
-    /// invoke `CredentialProvider::apply` does redact the resulting error's
-    /// `.to_string()` before it becomes a `ProviderError::Transport`, so
-    /// constructing this variant there wouldn't leak in practice — but it
-    /// would remove `oauth_refresh.rs`'s first, already-security-reviewed
-    /// layer of redaction and rely on the second layer alone. That's a
-    /// defense-in-depth regression, not a residual fix, so this unit leaves
-    /// it untouched. Only constructed today in a test fixture
-    /// (`tests/conformance_cohere_v2.rs`).
+    /// variant via the naive `?` (`#[from] TransportError`) path — it maps
+    /// every `TransportError` to a hand-built, host-only `RefreshFailed`
+    /// message instead.
+    ///
+    /// **The vector, executed against the pinned `reqwest = 0.13.4` this
+    /// workspace builds:** `reqwest`'s own error `Display` STRIPS userinfo
+    /// (`http://user:pass@host/x` -> no `user`/`pass` in the message) but
+    /// PRESERVES the query string verbatim (`http://host/x?api_key=...` ->
+    /// `api_key=...` survives). So a `refresh_url` carrying `?client_secret=…`
+    /// or similar is the real, live leak shape a raw `TransportError::Io`
+    /// (`transport/mod.rs`) could carry — not userinfo, which this
+    /// transport already scrubs for free.
+    ///
+    /// **Which path is actually dangerous, precisely** (both are true, they
+    /// don't conflict): a *hand-built* `Transport(TransportError::Io(<the
+    /// same pre-redacted, host-only string `RefreshFailed` already uses>))`
+    /// would cost nothing — `TransportError::Io` is a plain public tuple
+    /// variant, so nothing stops a caller from wrapping an already-safe
+    /// string in it. What's dangerous is the naive `?`/`#[from]` path —
+    /// the one an author would actually reach for — which propagates the
+    /// RAW `TransportError` (query string and all) straight through. Every
+    /// one of the 7 codec call sites that invoke `CredentialProvider::apply`
+    /// does redact the resulting error's `.to_string()` before it becomes a
+    /// `ProviderError::Transport`, so even the naive path wouldn't leak
+    /// past that second layer today — but relying on the second layer alone
+    /// removes `oauth_refresh.rs`'s first, already-security-reviewed layer
+    /// of redaction. That's a defense-in-depth regression, not a residual
+    /// fix, so this unit leaves the naive path un-taken. Only constructed
+    /// today in a test fixture (`tests/conformance_cohere_v2.rs`).
     #[error("transport error while resolving credential: {0}")]
     Transport(#[from] TransportError),
     #[error("invalid base URL: {0}")]
