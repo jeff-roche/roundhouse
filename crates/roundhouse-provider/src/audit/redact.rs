@@ -361,6 +361,13 @@ mod redact_transport_error_text_tests {
     /// which an operator has no way to set.
     #[test]
     fn insecure_base_url_remediation_advice_survives_redaction() {
+        // N3 (Phase 7 U3 fix round 1 carry-forward, Ruling R31): a developer
+        // or CI environment with this var already set to opt in -- the exact
+        // scenario the var exists for -- would otherwise make `resolve_base_url`
+        // return `Ok(..)` here, and `.err().unwrap()` below would panic.
+        // Match every sibling test in `tests/credential_test.rs`, which already
+        // clears its env vars before asserting on `resolve_base_url`.
+        std::env::remove_var("ROUNDHOUSE_OPENAI_CHAT_ALLOW_INSECURE_BASE_URL");
         let err = crate::credential::resolve_base_url(
             "openai-chat",
             "https://default.example.com",

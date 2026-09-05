@@ -135,3 +135,38 @@ fn is_loopback_host(host: Option<url::Host<&str>>) -> bool {
         None => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::provider_env_key;
+
+    /// N2 (Phase 7 U3 fix round 1 carry-forward, Ruling R31): `provider_env_key`
+    /// uppercases and maps `-` -> `_`, so it is not injective in general --
+    /// hypothetical provider ids `foo-bar` and `foo_bar` would both collapse to
+    /// `ROUNDHOUSE_FOO_BAR_*`. That was always true for the pre-existing
+    /// `BASE_URL` lookup, but harmless there; this same transformation now also
+    /// gates `ALLOW_INSECURE_BASE_URL`, a control that disables an HTTPS
+    /// downgrade check, so a future colliding id would silently let one
+    /// provider's insecure-transport opt-in leak onto its sibling.
+    ///
+    /// This is a ratchet, not a behavior change: it drives the assertion off
+    /// the real shipped profile list (`crate::PROFILE_SOURCES`, populated by
+    /// build.rs from `profiles/*.toml`) rather than a hand-maintained copy, so
+    /// a newly added id that collides with an existing one fails this test the
+    /// moment it ships.
+    #[test]
+    fn every_shipped_profile_id_yields_a_distinct_env_key() {
+        let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+        for (id, _src) in crate::PROFILE_SOURCES.iter() {
+            let key = provider_env_key(id, "BASE_URL");
+            if let Some(prev) = seen.insert(key.clone(), id) {
+                panic!(
+                    "provider ids `{prev}` and `{id}` both map to env key `{key}` via \
+                     provider_env_key -- rename one of the ids so the mapping stays \
+                     injective (in particular, avoid introducing `_` into a provider id \
+                     that would otherwise be spelled with `-`)"
+                );
+            }
+        }
+    }
+}
