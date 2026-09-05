@@ -344,6 +344,16 @@ pub struct RunContext {
     /// `false` and there was nothing worth fetching). See
     /// [`run_loop::run_workflow`]'s use of this field for where the seed it
     /// produces is actually bound.
+    ///
+    /// **Only [`run_loop::run_workflow`] consumes this.**
+    /// [`Executor::run_to_completion`], the in-memory sequencer, does not
+    /// read it at all — a `carry_over: { last_report: true }` workflow run
+    /// through that path sees `carry_over` resolve to `null`
+    /// (`expr.rs`'s bare-identifier-unbound behavior), not the seed. That is
+    /// consistent with the rest of `run_to_completion`'s own doc comment
+    /// (no `workflow_run` row, no checkpoints, no admission — it is a pure
+    /// in-memory sequencer, not a second copy of the run-start path), not an
+    /// oversight of this task.
     pub previous_report: Option<Report>,
 }
 

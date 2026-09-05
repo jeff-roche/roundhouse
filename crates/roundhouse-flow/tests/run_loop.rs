@@ -3145,6 +3145,12 @@ fn no_carry_over_root_is_bound_when_the_job_does_not_opt_in() {
         extra: serde_json::Map::new(),
     };
 
+    // `null` on the right of `==` here is not a literal — this expression
+    // language has no `null` keyword (`expr.rs`'s `parse_primary` only
+    // handles string/number/array literals and identifiers). It is a bare,
+    // never-bound identifier, which resolves to `Value::Null` by the same
+    // unbound-root rule the doc comment above cites for `carry_over` itself
+    // — two applications of one rule, not a coincidence.
     let (conn, run_id, _sink, result) = drive_with_previous_report(
         "steps:\n\
          \x20 - id: unset\n\
