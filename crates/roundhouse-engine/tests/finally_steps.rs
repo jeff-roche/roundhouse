@@ -78,6 +78,7 @@ async fn spawn_test_actor(initial_state: SessionState) -> (SessionActor, tempfil
         isolate,
         handle,
         spec,
+        vec![],
     );
     (actor, dir)
 }

@@ -74,6 +74,7 @@ async fn admit_task_denies_a_sealed_write_through_the_real_admission_path() {
         isolate,
         handle,
         spec,
+        vec![],
     );
 
     // sealed.rs's own home-dir helper reads $HOME directly (no `dirs` crate
@@ -138,6 +139,7 @@ async fn admit_task_denies_writes_under_the_real_state_dir_and_daemon_binary() {
         isolate,
         handle,
         spec,
+        vec![],
     );
 
     let write_state_dir = TaskCreateRequest {
@@ -345,6 +347,7 @@ async fn a_legitimately_downgraded_session_does_not_deny_every_subsequent_task()
         isolate,
         handle,
         spec,
+        vec![],
     );
 
     let ordinary = TaskCreateRequest {
@@ -401,6 +404,7 @@ async fn admitting_a_task_with_the_sealed_floor_disabled_records_a_real_never_si
         isolate,
         handle,
         spec,
+        vec![],
     );
 
     let task = TaskCreateRequest {
@@ -481,6 +485,7 @@ async fn a_dead_or_unrecognized_handle_fails_closed_instead_of_permanently_disab
         isolate,
         dead_handle,
         spec,
+        vec![],
     );
 
     let task = TaskCreateRequest {
@@ -538,6 +543,7 @@ async fn unsealed_audit_note_accurately_reflects_a_denied_outcome_not_admitted()
         isolate,
         handle,
         spec,
+        vec![],
     );
 
     let task = TaskCreateRequest {

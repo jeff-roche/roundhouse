@@ -1,0 +1,304 @@
+//! The production `roundhouse_mcp::executor::TaskSpawner` — closes the gap
+//! `roundhouse-mcp`'s own doc comments flag repeatedly: every task minted
+//! through that trait before this module existed came from a test double
+//! (`RecordingTaskSpawner`/`NoopTaskSpawner`), so `McpExecutor`/`McpHost`
+//! could never actually mint a real, event-sourced task anywhere outside a
+//! unit test. `roundhouse-mcp` deliberately never touches
+//! `TaskRunner::record_*` directly (see `TaskSpawner`'s own doc comment in
+//! `roundhouse_mcp::executor`): those calls need a session's append-only
+//! `seq` counter and `schema_v`, both store/engine-owned state that crate
+//! has no business holding. This is the engine-side implementation that
+//! wraps `TaskRunner` + an `EventWriter` to close that seam for real.
+//!
+//! **Ordering is the whole point (S-LOG-1).** The entire reason
+//! `TaskSpawner` exists instead of a bare `TaskId::new()` is that the
+//! minted id must resolve through the real event-sourced task view — a
+//! fabricated id is precisely the bug this type closes. So [`spawn_task`]
+//! mints the [`roundhouse_core::TaskId`] and then, in the same call,
+//! durably appends its `TaskCreated` event *before* returning that id to
+//! the caller. If the append fails, the id must never be handed back
+//! anyway — see the panic note on [`EngineTaskSpawner`]'s methods below for
+//! why a failed append is treated as fatal here, not swallowed.
+//!
+//! # Every method has a real implementation
+//! `TaskSpawner` has four methods (`spawn_task`, `suspend_task`,
+//! `record_decision`, `record_terminal`) and all four are implemented here
+//! with real, durable behavior — none is a stub or a silent no-op. Every
+//! one of them mints exactly one `roundhouse_core` event through `runner`
+//! (the same sealed `record_*` constructors `chat.rs`/`session_actor.rs`
+//! already use) and appends it through `writer`.
+//!
+//! # Why every method panics on a failed append instead of returning `Err`
+//! None of `TaskSpawner`'s four methods return a `Result` — that's fixed by
+//! the trait, defined in `roundhouse-mcp`, which this crate cannot change
+//! (a breaking change to it is out of this lane's scope; see
+//! `LANE-CONTEXT.md`'s "no edit to `roundhouse-mcp` without a BLOCKED
+//! report" rule). So a failed `EventWriter::append` — e.g. the writer task
+//! having shut down, or a non-retryable SQLite error — has no channel to
+//! propagate through. Swallowing it (`let _ = ...`) would mean
+//! `spawn_task` could return a `TaskId` whose `TaskCreated` event never
+//! landed: exactly the fabricated-id bug `TaskSpawner` exists to close,
+//! now reintroduced one layer down. Panicking instead is the fail-closed
+//! choice, consistent with this crate's other "assert or expect on a
+//! violated invariant rather than launder it" call sites (e.g.
+//! `params_digest`'s `expect("TaskParams serialization cannot fail")` in
+//! `roundhouse-mcp`, or `SessionActor::new`'s path-shape asserts).
+
+use async_trait::async_trait;
+use roundhouse_core::{
+    Origin, PolicyDecision, SessionId, SuspendReason, TaskId, TaskKind, TaskRunner, Timestamp,
+};
+use roundhouse_mcp::config::McpServerConfig;
+use roundhouse_mcp::executor::{TaskInput as McpTaskInput, TaskSpawner, TerminalOutcome};
+use roundhouse_mcp::host::{McpHost, McpHostError};
+use roundhouse_policy::Policy;
+use roundhouse_provider::ToolDef;
+use roundhouse_store::EventWriter;
+use std::sync::Arc;
+
+/// `Timestamp` has no `now()` — read the wall clock ourselves and convert.
+/// Mirrors the identical helper in `chat.rs`/`session_actor.rs`.
+fn now_ts() -> Timestamp {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_nanos() as i64;
+    Timestamp::from_unix_nanos(nanos)
+}
+
+/// Converts `roundhouse-mcp`'s own local `TaskInput` (`Mcp`/`Elicit` — see
+/// that type's doc comment for why it can't live in `roundhouse_core`: it
+/// carries `roundhouse_policy::ServerId`, and `roundhouse-policy` already
+/// depends on `roundhouse-core`, so a core-side variant would be a
+/// dependency cycle) into the real, frozen `roundhouse_core::TaskInput`
+/// (`Json`/`Text`/`Blob` only, §4.1/§4.5) that `TaskRunner::record_task_created`
+/// actually accepts. Both MCP-local variants carry only JSON-serializable
+/// fields, so `Json` losslessly represents either one — nothing here is a
+/// lossy summary, just a re-encoding into the shape the frozen event log
+/// understands.
+fn to_core_task_input(input: McpTaskInput) -> roundhouse_core::TaskInput {
+    match input {
+        McpTaskInput::Mcp { server, tool, args } => {
+            roundhouse_core::TaskInput::Json(serde_json::json!({
+                "kind": "mcp",
+                "server": server.0,
+                "tool": tool,
+                "args": args,
+            }))
+        }
+        McpTaskInput::Elicit {
+            schema,
+            question,
+            mcp_resume_context,
+        } => roundhouse_core::TaskInput::Json(serde_json::json!({
+            "kind": "elicit",
+            "schema": schema,
+            "question": question,
+            "mcp_resume_context": mcp_resume_context,
+        })),
+    }
+}
+
+/// The production `TaskSpawner`: one instance per session, wrapping the
+/// process-wide `TaskRunner` singleton (`TaskRunner::bootstrap()`, held as a
+/// `'static` reference the same way `SessionActor` holds its own — see that
+/// struct's `runner` field doc comment) and the session's `EventWriter`.
+///
+/// `session_id` is stored because three of `TaskSpawner`'s four methods
+/// (`suspend_task`/`record_decision`/`record_terminal`) don't receive a
+/// session id as an argument — only a bare `TaskId` — but every
+/// `roundhouse_core::TaskRunner::record_*` call needs one. Since exactly one
+/// `EngineTaskSpawner` is built per session (see
+/// `SessionActor`'s construction path), this field is always the right
+/// session for every task this spawner ever mints or records against.
+/// `spawn_task` itself is handed a `session` argument by its caller too
+/// (`McpExecutor` always passes `ctx.session`); that argument is used
+/// directly there rather than `self.session_id`, since it is the more
+/// faithful read of the trait's own contract — in practice the two always
+/// agree for a correctly-constructed spawner.
+pub struct EngineTaskSpawner {
+    runner: &'static TaskRunner,
+    writer: EventWriter,
+    session_id: SessionId,
+}
+
+impl EngineTaskSpawner {
+    pub fn new(runner: &'static TaskRunner, writer: EventWriter, session_id: SessionId) -> Self {
+        Self {
+            runner,
+            writer,
+            session_id,
+        }
+    }
+}
+
+#[async_trait]
+impl TaskSpawner for EngineTaskSpawner {
+    async fn spawn_task(
+        &self,
+        session: SessionId,
+        parent: Option<TaskId>,
+        kind: TaskKind,
+        origin: Origin,
+        input: McpTaskInput,
+    ) -> TaskId {
+        let task_id = TaskId::new();
+        let event = self.runner.record_task_created(
+            session,
+            0, // ignored — EventWriter::append assigns the real per-session seq
+            now_ts(),
+            task_id,
+            kind,
+            parent,
+            origin,
+            to_core_task_input(input),
+            1,
+        );
+        // S-LOG-1: the id is only returned once its TaskCreated event is
+        // durably appended — see this module's doc comment for why a
+        // failed append panics here instead of silently handing back an
+        // id that resolves to nothing.
+        self.writer.append(event).await.expect(
+            "EngineTaskSpawner::spawn_task: TaskSpawner::spawn_task has no Result to propagate \
+             a store failure through, and returning a TaskId before its TaskCreated event is \
+             durably appended would silently reintroduce the fabricated-id bug this type exists \
+             to close (S-LOG-1)",
+        );
+        task_id
+    }
+
+    async fn suspend_task(&self, task: TaskId, reason: SuspendReason) {
+        let event = self.runner.record_task_suspended(
+            self.session_id,
+            0, // ignored — EventWriter::append assigns the real per-session seq
+            now_ts(),
+            task,
+            reason,
+            1,
+        );
+        self.writer.append(event).await.expect(
+            "EngineTaskSpawner::suspend_task: no Result to propagate a store failure through; \
+             see this module's doc comment for why a failed append is treated as fatal here",
+        );
+    }
+
+    async fn record_decision(&self, task: TaskId, decision: PolicyDecision) {
+        let event = self.runner.record_task_decided(
+            self.session_id,
+            0, // ignored — EventWriter::append assigns the real per-session seq
+            now_ts(),
+            task,
+            decision,
+            // `TaskSpawner::record_decision` carries no rule id (mirrors
+            // `PolicyDecision` itself, which has no payload on any variant
+            // — see `McpExecutor::gate`'s own comment on this).
+            None,
+            1,
+        );
+        self.writer.append(event).await.expect(
+            "EngineTaskSpawner::record_decision: no Result to propagate a store failure through; \
+             see this module's doc comment for why a failed append is treated as fatal here",
+        );
+    }
+
+    async fn record_terminal(&self, task: TaskId, outcome: TerminalOutcome) {
+        let event = match outcome {
+            TerminalOutcome::Completed { output, usage } => self.runner.record_task_completed(
+                self.session_id,
+                0, // ignored — EventWriter::append assigns the real per-session seq
+                now_ts(),
+                task,
+                output,
+                usage,
+                1,
+            ),
+            TerminalOutcome::Failed { error, retryable } => self.runner.record_task_failed(
+                self.session_id,
+                0, // ignored — EventWriter::append assigns the real per-session seq
+                now_ts(),
+                task,
+                error,
+                retryable,
+                1,
+            ),
+        };
+        self.writer.append(event).await.expect(
+            "EngineTaskSpawner::record_terminal: no Result to propagate a store failure through; \
+             see this module's doc comment for why a failed append is treated as fatal here",
+        );
+    }
+}
+
+/// Errors from [`start_session_mcp`]: either `McpHost::start` itself failed
+/// (a server refused to spawn, discovery failed, or the discovered tool
+/// namespace collided — see [`McpHostError`]), or the discovered tools
+/// collided by name with the built-in catalog or each other (Task 1's
+/// [`crate::tool_catalog::ToolCatalogError`]).
+#[derive(Debug, thiserror::Error)]
+pub enum StartSessionMcpError {
+    #[error(transparent)]
+    Host(#[from] McpHostError),
+    #[error(transparent)]
+    ToolCatalog(#[from] crate::tool_catalog::ToolCatalogError),
+}
+
+/// Spawns every configured MCP server for one session through the real
+/// task-creation authority (`McpHost::start`, using an [`EngineTaskSpawner`]
+/// built here as its `TaskSpawner` — S-LOG-1: the discovery task this mints
+/// is queryable, never a bare `TaskId::new()`), and merges the resulting
+/// MCP-discovered tools with the built-in catalog (Task 1's
+/// [`crate::tool_catalog::merged_tool_defs`]) into the one tool list an
+/// `infer` task's `ChatRequest.tools` should draw from.
+///
+/// **This is the "session creation calls `McpHost::start`" step Task 4's
+/// brief describes** — but it is deliberately a free function that runs
+/// *before* [`crate::SessionActor::new`], not code inside `new` itself:
+/// `McpHost::start` is async and fallible, while `SessionActor::new` is
+/// neither (it is a sync, infallible-except-panic constructor — see that
+/// function's own doc comment on its fail-closed path asserts). This
+/// mirrors the exact precedent already in `session_actor.rs`:
+/// `create_session_isolation`/`create_session_with_egress` are async free
+/// functions that build a `Handle`/`ProxyHandle` BEFORE `SessionActor::new`
+/// is called, rather than `new` doing that work itself. `SessionActor`
+/// itself stores the already-merged `Vec<ToolDef>` this function returns —
+/// see its `tool_defs` field and constructor parameter of the same name —
+/// not the raw `configs`.
+///
+/// An empty `configs` is a cheap, allocation-light no-op path (no server to
+/// spawn, no discovery to await): sessions configured with zero MCP servers
+/// — the common case — pay effectively nothing to call this.
+///
+/// Returns the started [`McpHost`] alongside the merged tool list, not just
+/// the list: whatever dispatches a real MCP tool call (Task 5's agent loop)
+/// needs `host.executor` to do so, and whatever tears a session down needs
+/// `host.shutdown()`.
+///
+/// # On `policy`
+/// `McpHost::start`'s dispatch gate wants a `roundhouse_policy::Policy`
+/// (`fn decide(&self, &PolicyInput) -> PolicyDecision`) — a different,
+/// simpler trait than the sealed-floor `PolicyEngine`
+/// (`decide_sealed(&TaskParams, &SealedContext)`) `SessionActor` itself
+/// holds. Bridging the two correctly needs a live `SealedContext` (built
+/// from a session's current isolation attestation — see
+/// `SessionActor::sealed_context`) AND a real per-dispatch `Taint` value
+/// (§6.8's "a session that reads untrusted content loses standing
+/// permission" mitigation) — both are dispatch-loop concerns this task does
+/// not own (compare the lane's own ruling that unattended-approval wiring
+/// stops at an additive hook here, not a full implementation). This
+/// function therefore takes `policy` as a plain `Arc<dyn Policy>` parameter
+/// rather than silently deriving one from a `PolicyEngine`; wiring a real,
+/// security-reviewed adapter is left to whichever task actually threads a
+/// session's sealed floor through to MCP dispatch.
+pub async fn start_session_mcp(
+    configs: Vec<McpServerConfig>,
+    session_id: SessionId,
+    runner: &'static TaskRunner,
+    writer: EventWriter,
+    policy: Arc<dyn Policy>,
+) -> Result<(Arc<McpHost>, Vec<ToolDef>), StartSessionMcpError> {
+    let spawner: Arc<dyn TaskSpawner> =
+        Arc::new(EngineTaskSpawner::new(runner, writer, session_id));
+    let host = McpHost::start(configs, session_id, policy, spawner).await?;
+    let tool_defs = crate::tool_catalog::merged_tool_defs(host.tool_defs())?;
+    Ok((Arc::new(host), tool_defs))
+}

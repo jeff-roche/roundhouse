@@ -10,10 +10,11 @@
 //! parts live in `roundhouse_daemon`'s lib target, next to this file.
 #![forbid(unsafe_code)]
 
-use roundhouse_core::TaskRunner;
+use roundhouse_bus::local_bus::LocalBus;
 use roundhouse_daemon::boot;
 use roundhouse_daemon::demo::{run_demo_session, DemoConfig, FakeEditProvider, NoopTransport};
 use roundhouse_daemon::socket_server::serve;
+use roundhouse_engine::EngineHandles;
 use roundhouse_provider::{AnthropicMessagesProvider, Provider, RequestCtx, ReqwestTransport};
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
@@ -40,70 +41,8 @@ async fn main() -> color_eyre::Result<()> {
     // vertical-slice crates run together. This binary runs exactly one scripted
     // demo session — against `demo::FakeEditProvider` by default, and against
     // the real `AnthropicMessagesProvider` when `ANTHROPIC_API_KEY` is set (see
-    // the provider selection below).
-    //
-    // `TaskRunner::bootstrap()` is called here, at the daemon's actual startup
-    // site, which is exactly the contract its doc comment states ("called
-    // exactly once ... at daemon startup, and threaded through from there") —
-    // it panics on a second call. `roundhouse_engine::EngineHandles::bootstrap`
-    // is the eventual home for this call, but it also demands an
-    // `Arc<dyn Bus>`, and no concrete `Bus` implementation exists yet (Phase 0
-    // shipped only the trait). Nothing in this demo uses the bus, so this
-    // bypasses `EngineHandles` rather than inventing a stub bus for it.
-    let runner = TaskRunner::bootstrap();
-    let _layers = roundhouse_config::default_layers(None);
-
-    // Every artifact below (socket, event log, scratch file) goes inside one
-    // private directory rather than straight into the shared temp dir. Writing
-    // predictable names into a world-writable `/tmp` lets any other local user
-    // pre-create one as a symlink; both `tokio::fs::write` and SQLite's
-    // `O_CREAT` open follow symlinks, so the daemon would truncate a file the
-    // attacker chose, as the victim.
-    let runtime_dir = roundhouse_tui::default_runtime_dir();
-    prepare_runtime_dir(&runtime_dir)?;
-
-    let socket_path = std::env::var_os("ROUND_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(roundhouse_tui::default_socket_path);
-    remove_stale_socket(&socket_path)?;
-
-    let store_path = runtime_dir.join("demo-events.db");
-    let edit_target = runtime_dir.join("demo-target.txt");
-    write_demo_file(&edit_target).await?;
-
-    // Boot sequence (S-SESS-4): reclassify any task left in `Created`/`Decided`/
-    // `Running` state by a previous daemon process that died mid-run, and
-    // enumerate tasks left `Suspended` (e.g. mid-approval) so they are at least
-    // visible again after a restart. Without the first half, a `round daemon`
-    // killed mid-session leaves those tasks stuck in the log forever. Task 15
-    // added the `ApprovalRegistry` constructed just below and threaded it
-    // through `run_boot_sequence` — this is the actual re-arm site: every
-    // persisted `Suspended{AwaitingApproval}` task gets registered live here,
-    // so a restarted daemon's registry isn't empty even though the approvals
-    // were always correctly sitting in the database. See `roundhouse_daemon::boot`
-    // for the re-arm loop itself. Runs once, here, between opening the store
-    // and starting the (possibly brand new) demo session — on a fresh
-    // `store_path` this is a cheap no-op scan over an empty `tasks` table.
-    let recovery_store = roundhouse_store::open(&store_path).await?;
-    let recovery_writer = roundhouse_store::spawn_writer(recovery_store).await;
-    let recovery_pool_for_scan = roundhouse_store::open(&store_path).await?;
-    let approval_registry = roundhouse_policy::registry::ApprovalRegistry::new();
-    let boot_report = boot::run_boot_sequence(
-        &recovery_pool_for_scan,
-        &recovery_writer,
-        &runner,
-        &approval_registry,
-    )
-    .await?;
-    if !boot_report.interrupted.is_empty() || !boot_report.suspended.is_empty() {
-        println!(
-            "boot recovery: {} task(s) interrupted, {} task(s) still suspended from a previous daemon run",
-            boot_report.interrupted.len(),
-            boot_report.suspended.len()
-        );
-    }
-
-    // The one switch between the hermetic demo and a real model call.
+    // the provider selection below, moved up here so it can feed
+    // `EngineHandles::bootstrap`).
     //
     // Keyed on the *presence* of `ANTHROPIC_API_KEY` rather than on a flag, so
     // the no-key path is the default: with no key set this binary opens zero
@@ -148,6 +87,70 @@ async fn main() -> color_eyre::Result<()> {
             ),
         };
 
+    // `EngineHandles::bootstrap` is `TaskRunner::bootstrap()`'s real, intended
+    // call site (its own doc comment: "called exactly once ... at daemon
+    // startup, and threaded through from there" — it panics on a second call).
+    // A prior version of this comment claimed no concrete `Bus` implementation
+    // existed yet and bypassed `EngineHandles` for that reason; that was stale
+    // even at the time Phase 3 wrote it — `roundhouse_bus::local_bus::LocalBus`
+    // has implemented `Bus` since Phase 4. Nothing in this demo dispatches
+    // through the bus yet, but there is no longer a reason to bypass
+    // `EngineHandles` to avoid inventing one: a real `LocalBus` is free to
+    // construct and this is the daemon's one real startup site.
+    let handles = EngineHandles::bootstrap(Arc::new(LocalBus::new()), vec![provider.clone()]);
+    let runner = &handles.task_runner;
+    let _layers = roundhouse_config::default_layers(None);
+
+    // Every artifact below (socket, event log, scratch file) goes inside one
+    // private directory rather than straight into the shared temp dir. Writing
+    // predictable names into a world-writable `/tmp` lets any other local user
+    // pre-create one as a symlink; both `tokio::fs::write` and SQLite's
+    // `O_CREAT` open follow symlinks, so the daemon would truncate a file the
+    // attacker chose, as the victim.
+    let runtime_dir = roundhouse_tui::default_runtime_dir();
+    prepare_runtime_dir(&runtime_dir)?;
+
+    let socket_path = std::env::var_os("ROUND_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(roundhouse_tui::default_socket_path);
+    remove_stale_socket(&socket_path)?;
+
+    let store_path = runtime_dir.join("demo-events.db");
+    let edit_target = runtime_dir.join("demo-target.txt");
+    write_demo_file(&edit_target).await?;
+
+    // Boot sequence (S-SESS-4): reclassify any task left in `Created`/`Decided`/
+    // `Running` state by a previous daemon process that died mid-run, and
+    // enumerate tasks left `Suspended` (e.g. mid-approval) so they are at least
+    // visible again after a restart. Without the first half, a `round daemon`
+    // killed mid-session leaves those tasks stuck in the log forever. Task 15
+    // added the `ApprovalRegistry` constructed just below and threaded it
+    // through `run_boot_sequence` — this is the actual re-arm site: every
+    // persisted `Suspended{AwaitingApproval}` task gets registered live here,
+    // so a restarted daemon's registry isn't empty even though the approvals
+    // were always correctly sitting in the database. See `roundhouse_daemon::boot`
+    // for the re-arm loop itself. Runs once, here, between opening the store
+    // and starting the (possibly brand new) demo session — on a fresh
+    // `store_path` this is a cheap no-op scan over an empty `tasks` table.
+    let recovery_store = roundhouse_store::open(&store_path).await?;
+    let recovery_writer = roundhouse_store::spawn_writer(recovery_store).await;
+    let recovery_pool_for_scan = roundhouse_store::open(&store_path).await?;
+    let approval_registry = roundhouse_policy::registry::ApprovalRegistry::new();
+    let boot_report = boot::run_boot_sequence(
+        &recovery_pool_for_scan,
+        &recovery_writer,
+        runner,
+        &approval_registry,
+    )
+    .await?;
+    if !boot_report.interrupted.is_empty() || !boot_report.suspended.is_empty() {
+        println!(
+            "boot recovery: {} task(s) interrupted, {} task(s) still suspended from a previous daemon run",
+            boot_report.interrupted.len(),
+            boot_report.suspended.len()
+        );
+    }
+
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
     // Nobody consumes `requests_out` yet: Task 3's real session registry is
     // what will read `ClientRequest`s off it and act on them. Held here
@@ -172,7 +175,7 @@ async fn main() -> color_eyre::Result<()> {
     // touches the network); with the real one it takes as long as one Anthropic
     // turn. Either way the two resulting messages sit buffered in the channel
     // until a `round` client connects and drains them below.
-    let outcome = run_demo_session(cfg, &runner, events_tx)
+    let outcome = run_demo_session(cfg, runner, events_tx)
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
 

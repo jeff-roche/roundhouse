@@ -43,6 +43,12 @@ color-eyre = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util"] }
 futures = "0.3"
 serde_json = { workspace = true }
+# Task 4 (Phase 7): `mcp_config.rs`'s `[[mcp_server]]` TOML table parse
+# deserializes `roundhouse_config::LoadedConfig::get`'s `&toml::Value`
+# directly — the typed parse cannot live in `roundhouse-config` itself
+# without giving that crate a `roundhouse-mcp` edge (not authorized; see
+# LANE-CONTEXT.md), so it lives here, which already depends on both.
+toml = "0.8"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

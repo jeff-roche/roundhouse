@@ -37,6 +37,7 @@ mod chat;
 pub mod compact;
 mod context;
 mod infer;
+pub mod mcp_spawner;
 pub mod message_render;
 mod session_actor;
 mod working_context;

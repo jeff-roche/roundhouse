@@ -233,6 +233,20 @@ pub struct SessionActor {
     /// report anyway — it just doesn't fail open when attestation can't
     /// find the handle.
     effective_tier: Tier,
+    /// Phase 7, Task 4: the merged model-facing tool catalog for this
+    /// session — the built-in executor `ToolDef`s (Task 1's
+    /// `tool_catalog::builtin_tool_defs`) plus whatever this session's
+    /// configured MCP servers discovered, already merged and collision-checked
+    /// by `tool_catalog::merged_tool_defs`. Computed BEFORE this
+    /// `SessionActor` is constructed — see
+    /// [`crate::mcp_spawner::start_session_mcp`], the async, fallible
+    /// free function that calls `McpHost::start` and produces this value —
+    /// and simply stored here so Task 5's agent loop has one place to read
+    /// the tool list an `infer` task's `ChatRequest.tools` should draw
+    /// from, without needing it threaded through by hand at every call
+    /// site. An empty `Vec` (a session with zero configured MCP servers,
+    /// still carrying the five builtins) is the common case, not an error.
+    tool_defs: Vec<roundhouse_provider::ToolDef>,
 }
 
 impl SessionActor {
@@ -260,6 +274,7 @@ impl SessionActor {
         isolate: Arc<dyn Isolate>,
         handle: Handle,
         session_spec: SessionSpec,
+        tool_defs: Vec<roundhouse_provider::ToolDef>,
     ) -> Self {
         assert!(
             state_dir.is_absolute(),
@@ -295,7 +310,15 @@ impl SessionActor {
             handle,
             session_spec,
             effective_tier,
+            tool_defs,
         }
+    }
+
+    /// The merged model-facing tool catalog this session was constructed
+    /// with — see the `tool_defs` field's own doc comment for how it's
+    /// computed and by whom.
+    pub fn tool_defs(&self) -> &[roundhouse_provider::ToolDef] {
+        &self.tool_defs
     }
 
     /// Builds the live `SealedContext` this session's tasks are judged
