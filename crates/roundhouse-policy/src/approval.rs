@@ -175,9 +175,10 @@ impl Grant {
 /// field so the underlying match requires full equality, not merely a
 /// prefix), `Mcp` binds server+tool (`args` binding is a known, out-of-scope
 /// gap — `Predicate::Mcp` has no field for it; tracked separately, not fixed
-/// here), and `Agent` caps `max_tier` at the tier that was actually
-/// requested (the `Tier`-ladder direction of that check is a separate,
-/// out-of-scope, frozen-`Predicate::Agent` issue — not fixed here either).
+/// here), and `Agent` pins `max_tier` to the tier actually requested (Task 21
+/// (W4) flipped that field's comparison to a floor rather than a ceiling —
+/// see its doc comment in `engine.rs` — so pinning it here means the grant
+/// never generalizes *below* the isolation actually requested).
 pub fn synthesize_grant(
     params: &TaskParams,
     scope: GrantScope,
@@ -237,7 +238,12 @@ pub fn synthesize_grant(
         ) => Predicate::Agent {
             provider: Some(provider.clone()),
             model: Some(model.clone()),
-            max_tier: *tier_request, // never generalized above the tier actually requested
+            // Task 21 (W4): `max_tier` is now a floor, not a ceiling (see its
+            // doc comment in `engine.rs`) — pinning it to the tier actually
+            // requested means the grant never generalizes *below* the
+            // isolation actually requested, i.e. it covers only requests at
+            // or above what this task asked for, never a less-isolated one.
+            max_tier: *tier_request,
         },
         // Task 20 (W4): exact scope+op bind, same least-privilege contract as
         // every other arm. Fix round 1 (Ruling W4-11): also binds the exact

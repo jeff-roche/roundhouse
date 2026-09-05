@@ -115,6 +115,21 @@ pub enum Predicate {
     Agent {
         provider: Option<ProviderId>,
         model: Option<String>,
+        /// **Task 21 (W4): this is now an isolation FLOOR, not a ceiling,
+        /// despite the name.** `Tier` (`roundhouse-core/src/tier.rs`) derives
+        /// `Ord` over ascending isolation (`None < Worktree < Sandbox <
+        /// Container < Remote`). `matches` used to require
+        /// `tier_request <= max_tier`, so a grant approved at, say,
+        /// `max_tier: Remote` also covered `tier_request: None` — approving
+        /// the *most*-isolated request silently permitted the *least*-isolated
+        /// one. The comparison is now `tier_request >= max_tier`: a request is
+        /// covered only if it asks for at least as much isolation as was
+        /// approved. The field is **deliberately not renamed** to something
+        /// like `min_tier` (orchestrator Ruling W4-5): another lane is
+        /// concurrently writing new `Predicate::Agent` construction sites
+        /// against this field's name on `main`, and a rename would hand that
+        /// merge a compile break for zero behavioural gain. A post-merge
+        /// rename is expected but out of scope here.
         max_tier: Tier,
     },
     /// Task 20 (W4): binds a config-authored or synthesized grant to an
@@ -384,7 +399,7 @@ impl Predicate {
                     .filter(|b| **b)
                     .count()
                     + 1;
-                (provider_ok && model_ok && *tier_request <= *max_tier).then_some((0, bound))
+                (provider_ok && model_ok && *tier_request >= *max_tier).then_some((0, bound))
             }
             (
                 Predicate::Memory {
