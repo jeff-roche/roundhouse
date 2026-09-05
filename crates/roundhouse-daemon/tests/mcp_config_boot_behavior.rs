@@ -1,23 +1,38 @@
-//! Fix round 3, MUST 3: `main`'s previous handling of `mcp_config::
-//! load_mcp_servers` propagated any `McpConfigError` straight out via `?`,
-//! which `color_eyre` renders to stderr — entirely bypassing the `tracing`
-//! subscriber (and therefore `tracing-subscriber` 0.3.23's own ANSI-escape
-//! sanitization, which only applies to lines that actually go through
-//! `tracing`). `McpConfigError::Parse`'s `Display` (via `toml::de::Error`)
-//! embeds a verbatim snippet of the offending source line — for
-//! `[[mcp_server]]` config, that line can be one of the OPERATOR'S OWN real
-//! secret values (an `env` entry with the wrong shape, say), printed
-//! verbatim to stderr and the journal on nothing worse than a config typo.
-//! This is CF-11(c) for the operator's own config, not the hostile-cloned-
-//! repo attack (project-scoped `[[mcp_server]]` layers are structurally
-//! dropped before any file is ever read).
+//! Fix round 3, MUST 3, as amended by fix round 4 (ruling W1-R109):
+//! `main`'s previous handling of `mcp_config::load_mcp_servers` propagated
+//! any `McpConfigError` straight out via `?`, which `color_eyre` renders to
+//! stderr — entirely bypassing the `tracing` subscriber (and therefore
+//! `tracing-subscriber` 0.3.23's own ANSI-escape sanitization, which only
+//! applies to lines that actually go through `tracing`). `McpConfigError::
+//! Parse`'s `Display` (via `toml::de::Error`) embeds a verbatim snippet of
+//! the offending source line — for `[[mcp_server]]` config, that line can
+//! be one of the OPERATOR'S OWN real secret values (an `env` entry with the
+//! wrong shape, say), printed verbatim to stderr and the journal on nothing
+//! worse than a config typo.
+//!
+//! **The boot-behavior half of fix round 3's original fix was reverted in
+//! fix round 4.** Round 3 made a malformed `[[mcp_server]]` config
+//! non-fatal (falls back to zero configured MCP servers). Round 4's ruling:
+//! unlike `[network]` config (whose non-fatal fallback specifically resists
+//! a hostile-repo DoS — a cloned repo's `.roundhouse/config.toml` really is
+//! read as a layer), `[[mcp_server]]` config structurally drops every
+//! non-`UserGlobal` layer before any file is ever opened (see
+//! `mcp_config`'s own module doc comment), so the only possible source of a
+//! malformed `[[mcp_server]]` config is the OPERATOR'S OWN file — never a
+//! hostile repository. For an operator's own config, refusing to boot is
+//! the more honest failure (comparable to `sshd`/`nginx` refusing to start
+//! on a malformed config file). So this daemon now refuses to boot on a
+//! malformed `[[mcp_server]]` config again — the fix that changed is
+//! purely the RENDERING: never `err`'s own `Display` (which can embed the
+//! config file's own text verbatim), only `err.kind()`, a short, static,
+//! never-attacker-influenced string, in both the log line and the
+//! `color_eyre` error `main` returns.
 //!
 //! This test proves the fix end to end against the real binary: a real
 //! secret-shaped string, placed in the operator's own user-global MCP
 //! config in a way that reliably produces a `toml::de::Error` embedding it,
-//! must never appear on either stream, and the daemon must still boot
-//! successfully (falling back to zero configured MCP servers) rather than
-//! refusing to start over one malformed table.
+//! must never appear on either stream, and the daemon must refuse to boot
+//! (non-zero exit, socket never bound) rather than silently continuing.
 //!
 //! **Deliberately does not call `mcp_config::load_mcp_servers_from_layers`
 //! directly** (fix round 3 self-review, after an earlier version of this
@@ -27,12 +42,11 @@
 //! function reachable from outside the crate" back door fix round 2's
 //! MUST 4 closed for `roundhouse-config`'s equivalent function. The
 //! equivalent sanity check (proving the hostile config really does make
-//! `McpConfigError`'s `Display` embed the secret) now lives in
+//! `McpConfigError`'s `Display` embed the secret) lives in
 //! `mcp_config.rs`'s own `#[cfg(test)]` module instead.
 
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 const SECRET: &str = "sk-ant-should-never-leak-12345";
 
@@ -49,14 +63,14 @@ fn hostile_mcp_config() -> String {
 }
 
 #[tokio::test]
-async fn a_malformed_operator_mcp_config_never_leaks_its_own_secret_and_the_daemon_still_boots() {
+async fn a_malformed_operator_mcp_config_refuses_to_boot_without_leaking_its_own_secret() {
     let dir = tempfile::tempdir().unwrap();
     let config_dir = dir.path().join(".config/roundhouse");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(config_dir.join("config.toml"), hostile_mcp_config()).unwrap();
 
     let socket_path = dir.path().join("round.sock");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_round-daemon-internal"))
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_round-daemon-internal"))
         .arg("--socket")
         .arg(&socket_path)
         .arg("--allow-degraded-to")
@@ -72,59 +86,37 @@ async fn a_malformed_operator_mcp_config_never_leaks_its_own_secret_and_the_daem
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let mut stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
 
-    // The real proof this didn't just refuse to boot instead of leaking:
-    // the socket must still come up, despite the malformed MCP config.
-    let bound = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if socket_path.exists() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .expect("a daemon that refuses to boot must exit promptly, not hang")
+        .expect("waiting on the child process must not itself fail");
+
     assert!(
-        bound.is_ok(),
-        "the daemon must still boot (falling back to zero configured MCP servers) despite \
-         a malformed [[mcp_server]] config, not refuse to start"
-    );
-
-    // Drain both streams for a settle window — long enough for the boot-time
-    // log line to have been written, short enough to keep the suite fast.
-    let mut stderr_lines = BufReader::new(stderr).lines();
-    let mut seen_stderr = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_millis(500), async {
-        while let Ok(Some(line)) = stderr_lines.next_line().await {
-            seen_stderr.push(line);
-        }
-    })
-    .await;
-    let mut stdout_buf = String::new();
-    let _ = tokio::time::timeout(
-        Duration::from_millis(200),
-        stdout.read_to_string(&mut stdout_buf),
-    )
-    .await;
-
-    let all_stderr = seen_stderr.join("\n");
-    assert!(
-        !all_stderr.contains(SECRET),
-        "the secret must never reach stderr; captured: {all_stderr:?}"
+        !output.status.success(),
+        "the daemon must refuse to boot (non-zero exit) on a malformed [[mcp_server]] \
+         config, got exit status: {:?}",
+        output.status
     );
     assert!(
-        !stdout_buf.contains(SECRET),
-        "the secret must never reach stdout; captured: {stdout_buf:?}"
-    );
-    assert!(
-        seen_stderr
-            .iter()
-            .any(|line| line.contains("mcp_server_section_parse_error")),
-        "expected the daemon to log the error's kind() naming the parse failure; saw: \
-         {seen_stderr:?}"
+        !socket_path.exists(),
+        "the daemon must never bind its socket when it refuses to boot over a malformed \
+         [[mcp_server]] config"
     );
 
-    let _ = child.kill().await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains(SECRET),
+        "the secret must never reach stdout; captured: {stdout:?}"
+    );
+    assert!(
+        !stderr.contains(SECRET),
+        "the secret must never reach stderr; captured: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("mcp_server_section_parse_error"),
+        "expected the daemon's stderr to name the error's kind() (both the tracing log \
+         line and the color_eyre report main returns); captured: {stderr:?}"
+    );
 }

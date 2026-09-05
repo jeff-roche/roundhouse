@@ -285,33 +285,53 @@ async fn main() -> color_eyre::Result<()> {
     // config, one who doesn't gets user-global only.
     let project_root = std::env::current_dir().ok();
 
-    // Fix round 3, MUST 3: this used to propagate `McpConfigError` straight
-    // out of `main` via `?`, which `color_eyre` then renders to stderr —
-    // entirely bypassing the `tracing` subscriber (and therefore 0.3.23's
-    // own ANSI-escape sanitization). `McpConfigError::Parse`'s `Display`
-    // (via `toml::de::Error`) embeds a verbatim snippet of the offending
-    // source line at the parse-error location — for `[[mcp_server]]`
-    // config specifically, that line can be an `env = [["KEY", "sk-…"]]`
-    // entry, i.e. one of the OPERATOR'S OWN real secret values (project-
-    // scoped `[[mcp_server]]` layers are structurally dropped before any
-    // file is ever read — see `mcp_config`'s own module doc comment — so
-    // this is not the hostile-cloned-repo attack; it is CF-11(c) for the
-    // operator's own config, printing a credential verbatim to stderr and
-    // the journal on a config typo). Same `kind()`-only logging discipline
-    // as the `[network]` config fallback just below, and the same
-    // fail-closed-but-non-fatal decision: a malformed `[[mcp_server]]`
-    // config degrades this boot to zero configured MCP servers rather than
-    // refusing to boot at all — strictly less capability, never more.
+    // Fix round 3, MUST 3, as amended by fix round 4 (ruling W1-R109): this
+    // used to propagate `McpConfigError` straight out of `main` via `?`,
+    // which `color_eyre` then renders to stderr — entirely bypassing the
+    // `tracing` subscriber (and therefore 0.3.23's own ANSI-escape
+    // sanitization). `McpConfigError::Parse`'s `Display` (via `toml::de::
+    // Error`) embeds a verbatim snippet of the offending source line at the
+    // parse-error location — for `[[mcp_server]]` config specifically, that
+    // line can be an `env = [["KEY", "sk-…"]]` entry, i.e. one of the
+    // OPERATOR'S OWN real secret values.
+    //
+    // **This still refuses to boot on a malformed config — only the
+    // rendering changed, not the fail-closed shape.** Fix round 3 also
+    // switched this to a non-fatal fallback (zero configured MCP servers),
+    // reasoned from the `[network]` config fallback's own precedent just
+    // below. Fix round 4 corrected that: the `[network]` fallback's
+    // rationale is a hostile-repo DoS — a cloned repo's own
+    // `.roundhouse/config.toml` really is read as a (narrow-only) layer,
+    // so refusing to boot over a malformed PROJECT layer would let any
+    // repository stop the daemon from starting at all. `[[mcp_server]]`
+    // config has no such exposure: `load_mcp_servers_from_layers`
+    // structurally drops every non-`UserGlobal` layer before any file is
+    // ever opened (see `mcp_config`'s own module doc comment), so the only
+    // possible source of a malformed `[[mcp_server]]` config is the
+    // OPERATOR'S OWN user-global file — never a hostile repository. For an
+    // operator's own config, refusing to boot is the more honest failure
+    // (matching comparable daemons, e.g. `sshd`/`nginx` refusing to start
+    // on a malformed config file) than silently disabling every configured
+    // MCP server with only a log line — a log line fix round 3's own MUST 1
+    // proved is filterable by a plausible `RUST_LOG` an operator might
+    // actually set. So: still refuses to boot, but the error `color_eyre`
+    // renders is built from `err.kind()` alone — a short, static, never-
+    // attacker-influenced string — never `err`'s own `Display`.
     let mcp_configs = match mcp_config::load_mcp_servers(project_root.as_deref()) {
         Ok(configs) => configs,
         Err(err) => {
             tracing::error!(
                 target: "roundhouse_daemon::boot",
                 error_kind = err.kind(),
-                "failed to load [[mcp_server]] config; falling back to no configured MCP \
-                 servers for every session rather than failing the whole daemon boot"
+                "failed to load [[mcp_server]] config; refusing to boot"
             );
-            Vec::new()
+            return Err(color_eyre::eyre::eyre!(
+                "failed to load [[mcp_server]] config ({}); the underlying parser's own \
+                 error text is deliberately not rendered here (it can embed this config \
+                 file's own text verbatim, including a secret in a malformed `env` entry) \
+                 — see the daemon's own log output for this `error_kind`",
+                err.kind()
+            ));
         }
     };
 
