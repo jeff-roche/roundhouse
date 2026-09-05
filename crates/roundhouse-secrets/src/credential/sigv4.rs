@@ -176,11 +176,32 @@ fn percent_decode(s: &str) -> String {
 /// re-encoding *that* string is.
 fn canonical_uri(path: &str, service: &str) -> String {
     let path = if path.is_empty() { "/" } else { path };
-    if service.eq_ignore_ascii_case("s3") {
+    if is_s3_family_service(service) {
         path.to_string()
     } else {
         uri_encode(path, true)
     }
+}
+
+/// `true` for a SigV4 `service` name in the S3 family — every one of which
+/// shares S3's literal-path canonicalization (see [`canonical_uri`]'s doc
+/// comment). Widened (Task 31 item 6, Phase 7 U4) from an exact match on
+/// `"s3"`, which missed two real, currently-shipped-elsewhere AWS service
+/// names: `s3-outposts` (S3 on Outposts) and `s3express` (S3 Express One
+/// Zone). Both would have silently fallen through to the generic
+/// double-encoding branch, producing a signature AWS rejects for any
+/// request whose path contains a character URI-encoding changes (`%`, a
+/// space, or a pre-encoded `%2F` inside one segment).
+///
+/// A **prefix** match, not a `contains` match, is the deliberate choice:
+/// AWS reserves an `s3`-prefixed SigV4 service name for exactly this
+/// family — there is no unrelated AWS service whose signing name happens to
+/// start with `s3` — so a prefix check covers `s3-outposts`/`s3express`
+/// without also matching a service name that merely has `s3` somewhere
+/// *inside* it (e.g. a hypothetical `costs3-reports`), which `contains`
+/// would incorrectly pull into S3's canonicalization.
+fn is_s3_family_service(service: &str) -> bool {
+    service.len() >= 2 && service.as_bytes()[..2].eq_ignore_ascii_case(b"s3")
 }
 
 /// AWS's "CanonicalQueryString": every parameter name/value URI-encoded
@@ -322,4 +343,40 @@ pub fn sign(
         ),
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonical_uri, uri_encode};
+
+    /// Task 31 item 6, Phase 7 U4: real S3-family services with a signing
+    /// name other than the bare `"s3"` must get S3's literal-path
+    /// treatment, not the generic double-encoding path the old exact match
+    /// fell back to.
+    #[test]
+    fn s3_outposts_and_s3express_get_s3s_literal_path_treatment() {
+        let path = "/bucket/key%2Fwith-percent and space";
+        let s3_treatment = canonical_uri(path, "s3");
+        assert_eq!(canonical_uri(path, "s3-outposts"), s3_treatment);
+        assert_eq!(canonical_uri(path, "s3express"), s3_treatment);
+        assert_eq!(canonical_uri(path, "S3EXPRESS"), s3_treatment);
+        // Sanity: the literal-path treatment is actually observably
+        // different from the generic branch for this path, so the
+        // assertions above are not vacuously true.
+        assert_ne!(s3_treatment, uri_encode(path, true));
+    }
+
+    /// The widened match must stay a PREFIX match, not a `contains` match:
+    /// a service name that merely has `s3` somewhere inside it, but doesn't
+    /// start with it, must still get the generic (non-S3) treatment.
+    #[test]
+    fn a_service_name_merely_containing_s3_is_not_treated_as_s3() {
+        let path = "/bucket/key%2Fwith-percent and space";
+        let generic = canonical_uri(path, "execute-api");
+        assert_eq!(canonical_uri(path, "costs3-reports"), generic);
+        assert_ne!(
+            canonical_uri(path, "costs3-reports"),
+            canonical_uri(path, "s3")
+        );
+    }
 }
