@@ -55,6 +55,7 @@ pub use working_context::{ContextStateId, TokenBudget, WorkingContext};
 
 pub mod system_prompt;
 pub mod test_support;
+pub mod tool_catalog;
 pub mod tools;
 
 use roundhouse_bus::Bus;
