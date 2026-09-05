@@ -93,14 +93,18 @@ pub enum CredentialError {
     /// every `TransportError` to a hand-built, host-only `RefreshFailed`
     /// message instead.
     ///
-    /// **The vector, executed against the pinned `reqwest = 0.13.4` this
-    /// workspace builds:** `reqwest`'s own error `Display` STRIPS userinfo
-    /// (`http://user:pass@host/x` -> no `user`/`pass` in the message) but
-    /// PRESERVES the query string verbatim (`http://host/x?api_key=...` ->
-    /// `api_key=...` survives). So a `refresh_url` carrying `?client_secret=…`
-    /// or similar is the real, live leak shape a raw `TransportError::Io`
-    /// (`transport/mod.rs`) could carry — not userinfo, which this
-    /// transport already scrubs for free.
+    /// **The vector, verified against the pinned `reqwest = 0.13.4` this
+    /// workspace builds's actual source (fix round 2, Ruling CF15
+    /// sharpened this further — see `oauth_refresh.rs`'s call site for the
+    /// full mechanism):** userinfo is not a `Display`-time redaction —
+    /// `reqwest` moves it into an `Authorization: Basic` header at
+    /// Request-build time, CONDITIONALLY (only when the percent-encoded
+    /// username is valid UTF-8), before either `Display` or `Debug` ever
+    /// sees the URL. What NEITHER format ever strips is the query string:
+    /// `http://host/x?api_key=...` survives verbatim regardless. So a
+    /// `refresh_url` carrying `?client_secret=…` or similar is the real,
+    /// always-live leak shape a raw `TransportError::Io`
+    /// (`transport/mod.rs`) could carry.
     ///
     /// **Which path is actually dangerous, precisely** (both are true, they
     /// don't conflict): a *hand-built* `Transport(TransportError::Io(<the
