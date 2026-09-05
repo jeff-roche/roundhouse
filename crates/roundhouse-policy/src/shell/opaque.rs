@@ -274,6 +274,25 @@ fn find_opaque_in_compound_command(cmd: &ast::CompoundCommand, found: &mut Vec<O
         // for-loop body was invisible to this hard-deny walk — matching the
         // exact bug `pipeline.rs`'s own "fix-round-1 Critical 1" already
         // closed for its own (different) walk.
+        //
+        // B5 (review round 2), **not fixed here (orchestrator Ruling
+        // W4-18)**: no *commands* live in an `Arithmetic` node, but its raw
+        // expression string is never inspected by this walk either.
+        // `ArithmeticForClauseCommand`'s `initializer`/`condition`/`updater`
+        // and `ArithmeticCommand::expr` are `UnexpandedArithmeticExpr {
+        // value: String }` — this module's own doc comment above calls
+        // command substitution irreducibly opaque, yet `(( x = $(id) ))` and
+        // the initializer of `for ((i=$(id -u); i<1; i++))` (the very
+        // construct this arm's own fix just started walking the *body* of)
+        // both classify as `Program`, not `HardDeny`. Not fixed because
+        // treating any `$`-bearing arithmetic expression as opaque would
+        // also reclassify ordinary, legitimate expressions like `(( x = $y
+        // ))` or `(( i < ${n} ))` — a broad behavioural change belonging to
+        // this classifier's owner, not a rider on this task. Not currently
+        // reachable either: `roundhouse-tools` executes per-`ResolvedNode`
+        // via `execve` and never starts a shell, and `Arithmetic` produces
+        // no `ResolvedNode` at all. This becomes a real gap the moment a
+        // shell-backed executor lands — tracked, not fixed, here.
         ast::CompoundCommand::Arithmetic(_) => {}
         ast::CompoundCommand::ArithmeticForClause(c) => {
             find_opaque_in_compound_list(&c.body.list, found)

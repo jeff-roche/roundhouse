@@ -165,6 +165,121 @@ fn a_directory_grant_disjoint_from_the_workspace_boundary_fails_closed() {
     );
 }
 
+/// B2 (review round 2): `Path::starts_with` returns `true` for both `/` and
+/// `""` against any absolute path — so before this fix, a `workspace_boundary`
+/// of either degenerate value made the "dir at or below the boundary" branch
+/// always taken, restoring exact pre-Task-24 behaviour with no error and no
+/// log: a shallow ancestor like `/home`, granted for a task that only ever
+/// touched one file under it, would produce an unbounded `FsPrefix` reaching
+/// every other user's home directory. All three degenerate boundaries below
+/// must instead fail closed to the exact-path downgrade.
+#[test]
+fn a_root_workspace_boundary_does_not_disable_the_clamp() {
+    let task_path = PathBuf::from("/home/alice/project/src/main.rs");
+    let params = roundhouse_policy::TaskParams::Fs {
+        op: FsOp::Write,
+        path: task_path.clone(),
+        canonical: Ok(task_path.clone()),
+    };
+
+    let grant = synthesize_grant(
+        &params,
+        GrantScope::Directory {
+            path: PathBuf::from("/home"),
+        },
+        provenance(),
+        Path::new("/"),
+    );
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Directory scope installs cleanly")]);
+
+    let other_users_key = roundhouse_policy::TaskParams::Fs {
+        op: FsOp::Write,
+        path: PathBuf::from("/home/bob/.ssh/id_rsa"),
+        canonical: Ok(PathBuf::from("/home/bob/.ssh/id_rsa")),
+    };
+    assert_ne!(
+        engine.decide(&other_users_key).outcome,
+        Outcome::Allow,
+        "a `/` workspace boundary must not be treated as \"no clamp\" and let a shallow \
+         /home grant reach another user's home directory"
+    );
+
+    // The task's own write is still Allow — the downgrade to FsExact never
+    // makes the grant narrower than what was actually approved.
+    assert_eq!(engine.decide(&params).outcome, Outcome::Allow);
+}
+
+#[test]
+fn an_empty_workspace_boundary_does_not_disable_the_clamp() {
+    let task_path = PathBuf::from("/home/alice/project/src/main.rs");
+    let params = roundhouse_policy::TaskParams::Fs {
+        op: FsOp::Write,
+        path: task_path.clone(),
+        canonical: Ok(task_path.clone()),
+    };
+
+    let grant = synthesize_grant(
+        &params,
+        GrantScope::Directory {
+            path: PathBuf::from("/home"),
+        },
+        provenance(),
+        Path::new(""),
+    );
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Directory scope installs cleanly")]);
+
+    let other_users_key = roundhouse_policy::TaskParams::Fs {
+        op: FsOp::Write,
+        path: PathBuf::from("/home/bob/.ssh/id_rsa"),
+        canonical: Ok(PathBuf::from("/home/bob/.ssh/id_rsa")),
+    };
+    assert_ne!(
+        engine.decide(&other_users_key).outcome,
+        Outcome::Allow,
+        "an empty workspace boundary must not be treated as \"no clamp\" either"
+    );
+    assert_eq!(engine.decide(&params).outcome, Outcome::Allow);
+}
+
+#[test]
+fn a_relative_workspace_boundary_does_not_disable_the_clamp() {
+    let task_path = PathBuf::from("/home/alice/project/src/main.rs");
+    let params = roundhouse_policy::TaskParams::Fs {
+        op: FsOp::Write,
+        path: task_path.clone(),
+        canonical: Ok(task_path.clone()),
+    };
+
+    let grant = synthesize_grant(
+        &params,
+        GrantScope::Directory {
+            path: PathBuf::from("/home"),
+        },
+        provenance(),
+        Path::new("workspace"),
+    );
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Directory scope installs cleanly")]);
+
+    let other_users_key = roundhouse_policy::TaskParams::Fs {
+        op: FsOp::Write,
+        path: PathBuf::from("/home/bob/.ssh/id_rsa"),
+        canonical: Ok(PathBuf::from("/home/bob/.ssh/id_rsa")),
+    };
+    assert_ne!(
+        engine.decide(&other_users_key).outcome,
+        Outcome::Allow,
+        "a relative workspace boundary can't meaningfully bound an absolute path and must \
+         not be treated as \"no clamp\""
+    );
+    assert_eq!(engine.decide(&params).outcome, Outcome::Allow);
+}
+
 /// The literal filesystem-root special case (finding 3, Task 15) must keep
 /// working under the new boundary-aware code path.
 #[test]

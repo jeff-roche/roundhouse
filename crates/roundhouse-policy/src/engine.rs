@@ -142,6 +142,34 @@ pub enum Predicate {
         /// against this field's name on `main`, and a rename would hand that
         /// merge a compile break for zero behavioural gain. A post-merge
         /// rename is expected but out of scope here.
+        ///
+        /// **B3 (review round 2) — this same floor comparison applies to
+        /// `Deny` rules too, and it inverts the meaning an operator is most
+        /// likely to expect from one.** `Predicate::matches` doesn't know or
+        /// care what `Outcome` its rule carries — a matching `Deny` wins
+        /// outright, same as a matching `Allow`. An operator writing "deny
+        /// agent spawns that ask for weak isolation" would naturally author
+        /// `Deny` with `max_tier: Sandbox`, expecting it to deny
+        /// `None`/`Worktree`/`Sandbox`. What it actually denies is
+        /// `tier_request >= Sandbox`, i.e. `Sandbox`/`Container`/`Remote` —
+        /// and lets `None`/`Worktree` (the actually-weak requests) through.
+        /// To deny weak isolation, the operator must instead author the
+        /// floor at `None` (which denies everything, being the universal
+        /// floor) — there is no config shape today that expresses "deny
+        /// anything below X" directly.
+        ///
+        /// This is a documented limit, not something to fix by making the
+        /// comparison direction depend on `outcome` (orchestrator Ruling
+        /// W4-17 rejected that: one field meaning two opposite things
+        /// depending on its own rule's outcome is a worse footgun than the
+        /// one it would close). There is also no live exposure today: the
+        /// only `Predicate::Agent` construction sites in the workspace are
+        /// `synthesize_grant` (always `Allow`-shaped) and this crate's own
+        /// tests, and there is no config→`Predicate` compiler for `Agent` at
+        /// all yet. The real fix, when a rule compiler for `Agent` exists,
+        /// is a shape change — two separate optional bounds (a floor for
+        /// `Allow`, a ceiling for `Deny`, or similar) — not a same-field
+        /// direction flip.
         max_tier: Tier,
     },
     /// Task 20 (W4): binds a config-authored or synthesized grant to an
@@ -218,6 +246,19 @@ pub enum ArgsPattern {
     /// The candidate `args` must be a JSON object containing every key in
     /// this map with an equal value. A non-object candidate never matches —
     /// fail closed, not a vacuous match.
+    ///
+    /// **B4 (review round 2), operator footgun:** this only checks that the
+    /// listed keys are present with the listed values — it does not check
+    /// that the candidate has *no other* keys. `Prefix({"path": "/tmp/x"})`
+    /// is also satisfied by `{"path": "/tmp/x", "recursive": true}`. An
+    /// operator authoring a `Prefix` rule for a tool where an unlisted key
+    /// can widen the operation (a `recursive`/`force`/`overwrite`-style flag,
+    /// for instance) must list every key that matters, or use `Exact`
+    /// instead — `Prefix` alone does not bound the operation to what was
+    /// actually intended. Not reachable from grant synthesis today (grant
+    /// synthesis always emits `Exact` — see `synthesize_grant`'s `Mcp` arm),
+    /// so this is purely a hazard for a human- or config-authored `Prefix`
+    /// rule, not a live bypass.
     Prefix(serde_json::Map<String, serde_json::Value>),
 }
 
@@ -496,6 +537,16 @@ pub struct CompiledRule {
 }
 
 impl CompiledRule {
+    /// Public (not `pub(crate)`) because `roundhouse-engine`'s tests
+    /// construct `CompiledRule`s directly through this constructor — another
+    /// lane's crate, so this stays `pub`. `#[doc(hidden)]` only hides it from
+    /// generated docs so it doesn't read as a sanctioned way to build a rule
+    /// for production use; it does not restrict who can call it. (B1, review
+    /// round 2: this constructor plus `Predicate: Clone` is why
+    /// `Grant::predicate()` cannot promise that an out-of-crate caller
+    /// cannot reconstruct an installable rule — see that method's doc
+    /// comment in `approval.rs`.)
+    #[doc(hidden)]
     pub fn test_new(scope: Scope, outcome: Outcome, predicate: Predicate) -> Self {
         Self {
             scope,

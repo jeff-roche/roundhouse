@@ -132,12 +132,27 @@ impl Grant {
     /// here, because it errors for `Once`/`Session`/`ExactArgv` scopes (see
     /// its own doc comment), and inspecting the synthesized predicate is a
     /// legitimate thing to want to do even for a scope with no installable
-    /// rule yet. This accessor deliberately hands back only the immutable
-    /// `&Predicate`, never the `CompiledRule` itself (which also carries
-    /// `scope`/`outcome`/`id` and — via [`Grant::into_rule_for_installation`]
-    /// — a path to actual installation) — so it cannot be used to reconstruct
-    /// an installable rule and does not reopen the hole narrowing `rule`
-    /// closes.
+    /// rule yet.
+    ///
+    /// **This is narrower than a guarantee, not a guarantee itself (B1,
+    /// review round 2):** narrowing `Grant.rule` to `pub(crate)` removes the
+    /// *convenient* bypass of reading `.rule` directly, but `Predicate`
+    /// derives `Clone` and `CompiledRule`'s fields (including `test_new`,
+    /// `pub fn`) are all `pub`, so three lines from outside this crate can
+    /// still do `CompiledRule::test_new(scope, outcome,
+    /// grant.predicate().clone())` and hand the result to
+    /// `PolicyEngine::from_rules`, reconstructing an installable rule from a
+    /// `Once`/`Session`/`ExactArgv` grant without ever going through
+    /// [`Grant::into_rule_for_installation`]. Note this accessor is not
+    /// *required* for that bypass either — `Predicate` is a fully public
+    /// enum, so a determined caller could hand-construct an equivalent
+    /// predicate without `Grant` at all — so removing `predicate()` would
+    /// not close anything either. What narrowing `rule` and keeping this
+    /// accessor read-only-typed actually buys is removing the one-line
+    /// bypass and making the intended path (`into_rule_for_installation`)
+    /// the obvious one; it is a known limit of this crate's current
+    /// enforcement, not a guarantee that a determined out-of-crate caller
+    /// cannot reconstruct an installable rule.
     pub fn predicate(&self) -> &Predicate {
         &self.rule.predicate
     }
@@ -213,6 +228,11 @@ impl Grant {
 /// entirely caller/task-supplied and must not be trusted to bound itself).
 /// Only consulted for the `GrantScope::Directory` + `TaskParams::Fs` arm; see
 /// `fs_predicate_for_directory_grant`'s doc comment for what it does with it.
+/// B2 (review round 2): this parameter itself is not further validated by
+/// `synthesize_grant` — it is still trusted to actually be the caller's real
+/// workspace root — but `effective_directory_prefix` (reached from the arm
+/// above) does now refuse to treat a degenerate value (`/`, `""`, or a
+/// relative path) as "no boundary"; see its doc comment.
 /// Orchestrator Ruling W4-7: this is a plain parameter, not a `SealedContext`
 /// field — `synthesize_grant` has no callers outside this crate, so the
 /// signature change is free, and `SealedContext` is lane W1's actively-edited
@@ -411,9 +431,17 @@ fn fs_predicate_for_directory_grant(
 /// Called only after the caller has already verified `dir` is a genuine
 /// ancestor of the task's own canonical path `canonical_task_path` — this
 /// function only decides how far `dir` may be widened relative to the
-/// workspace boundary, not whether it is valid at all.
+/// workspace boundary, not whether `dir` itself is valid at all.
 ///
-/// Three cases, by real containment:
+/// `workspace_boundary` itself IS validated here, and is the caller's one
+/// piece of trusted input this function does check before using it (B2,
+/// review round 2): a boundary that is not absolute, or whose `parent()` is
+/// `None` (i.e. `/` or `""`, the only two paths for which `Path::starts_with`
+/// is trivially true against everything), fails closed to `None` rather than
+/// silently acting as "no clamp" — see the guard at the top of the function
+/// body.
+///
+/// Otherwise, three cases, by real containment:
 /// - `dir` is already at or below `workspace_boundary`
 ///   (`dir.starts_with(workspace_boundary)`, which is also true when they're
 ///   equal): no widening beyond the workspace is possible through this path
@@ -438,6 +466,22 @@ fn effective_directory_prefix(
     workspace_boundary: &std::path::Path,
     canonical_task_path: &std::path::Path,
 ) -> Option<PathBuf> {
+    // B2 (review round 2): `Path::starts_with` returns `true` for both `/`
+    // and `""` against any absolute path, so an unvalidated `workspace_boundary`
+    // of either makes the first branch below always taken, restoring exact
+    // pre-Task-24 behaviour — an ancestor as shallow as `/home` yields an
+    // unbounded `FsPrefix` over every user's home directory — with no error
+    // and no log. A relative boundary can't meaningfully contain an absolute
+    // canonical path either. Guard all three degenerate forms here, at the
+    // one place every caller in this crate funnels through, and fail closed
+    // to `None` — the same downgrade-to-`FsExact` choice the disjoint-trees
+    // case below already makes — rather than trust an unvalidated boundary.
+    let boundary_is_degenerate =
+        !workspace_boundary.is_absolute() || workspace_boundary.parent().is_none();
+    if boundary_is_degenerate {
+        return None;
+    }
+
     if dir.starts_with(workspace_boundary) {
         Some(dir.to_path_buf())
     } else if workspace_boundary.starts_with(dir) {
@@ -672,6 +716,43 @@ mod directory_boundary_tests {
             None,
             "neither tree is an ancestor of the other — must fail closed, not guess"
         );
+    }
+
+    /// B2 (review round 2): a `workspace_boundary` of `/` must not be treated
+    /// as "no clamp" — `Path::starts_with` is trivially true against `/` for
+    /// any absolute path, so without this guard `dir` (however shallow) would
+    /// always be used as-is, silently restoring exact pre-Task-24 behaviour.
+    #[test]
+    fn a_root_boundary_is_degenerate_and_fails_closed() {
+        let dir = Path::new("/home");
+        let boundary = Path::new("/");
+        let task_path = Path::new("/home/alice/project/src/main.rs");
+        assert_eq!(
+            effective_directory_prefix(dir, boundary, task_path),
+            None,
+            "a `/` boundary must be treated as unvalidated input, not as an unbounded workspace"
+        );
+    }
+
+    /// B2 (review round 2): an empty `workspace_boundary` behaves exactly
+    /// like `/` under `Path::starts_with` (`Path::new("").parent()` is also
+    /// `None`), so it must be caught by the same guard.
+    #[test]
+    fn an_empty_boundary_is_degenerate_and_fails_closed() {
+        let dir = Path::new("/home");
+        let boundary = Path::new("");
+        let task_path = Path::new("/home/alice/project/src/main.rs");
+        assert_eq!(effective_directory_prefix(dir, boundary, task_path), None);
+    }
+
+    /// B2 (review round 2): a relative `workspace_boundary` cannot
+    /// meaningfully bound an absolute canonical path at all.
+    #[test]
+    fn a_relative_boundary_is_degenerate_and_fails_closed() {
+        let dir = Path::new("/home");
+        let boundary = Path::new("workspace");
+        let task_path = Path::new("/home/alice/project/src/main.rs");
+        assert_eq!(effective_directory_prefix(dir, boundary, task_path), None);
     }
 
     #[test]

@@ -685,6 +685,13 @@ fn expand_in_compound_command(cmd: &mut CompoundCommand, env: &SessionEnv) {
         // `body: DoGroupCommand` full of real words to expand, exactly like
         // `ForClause` below — grouping it with `Arithmetic` here (Task 26,
         // W4) left a plain `$VAR` inside a C-style for-loop body unexpanded.
+        //
+        // B5 (review round 2), not fixed (orchestrator Ruling W4-18): "no
+        // Words at this layer" is true of the AST's `Word` type, but the raw
+        // arithmetic expression string itself (`UnexpandedArithmeticExpr`)
+        // is a plain, unexpanded `String` this function never touches —
+        // see `opaque.rs`'s `find_opaque_in_compound_command` for the full
+        // writeup of what that leaves uninspected.
         CompoundCommand::Arithmetic(_) => {}
         CompoundCommand::ArithmeticForClause(c) => expand_in_do_group(&mut c.body, env),
         CompoundCommand::BraceGroup(g) => expand_in_compound_list(&mut g.list, env),
@@ -1244,6 +1251,13 @@ fn any_word_piece_in_compound_command(
         // word piece (including an unresolved command substitution) hidden
         // inside a C-style for-loop body, exactly the bug this function's
         // sibling walks (`pipeline.rs`'s, already fixed) exist to avoid.
+        //
+        // B5 (review round 2), not fixed (orchestrator Ruling W4-18): "no
+        // words at this layer" is true of the AST's `Word` type, but the raw
+        // arithmetic expression string itself (`UnexpandedArithmeticExpr`)
+        // is a plain `String` this predicate never inspects — see
+        // `opaque.rs`'s `find_opaque_in_compound_command` for the full
+        // writeup.
         CompoundCommand::Arithmetic(_) => false,
         CompoundCommand::ArithmeticForClause(c) => {
             any_word_piece_in_compound_list(&c.body.list, predicate)

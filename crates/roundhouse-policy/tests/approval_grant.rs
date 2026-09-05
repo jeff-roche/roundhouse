@@ -23,15 +23,31 @@ use roundhouse_policy::{
     FsOp, Method, ParsedCommand, PolicyEngine, ProviderId, ServerId, TaskParams,
 };
 use roundhouse_store::{open, spawn_writer, suspended_tasks};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// A maximally permissive workspace boundary ("/") for tests in this file
-/// that exercise something other than Task 24's directory-grant boundary
-/// clamp — passing "/" means `synthesize_grant`'s boundary clamp never
-/// narrows anything (every path `starts_with` "/"), preserving this file's
-/// pre-Task-24 assertions unchanged. `grantscope_directory_boundary.rs`
-/// covers the clamp itself with real, meaningful boundaries.
-fn unbounded_workspace() -> &'static std::path::Path {
+/// A placeholder `workspace_boundary` for tests in this file that don't
+/// exercise Task 24's directory-grant boundary clamp at all —
+/// `workspace_boundary` is only ever consulted for the combination of
+/// `GrantScope::Directory` and `TaskParams::Fs` (see `synthesize_grant`'s
+/// doc comment), so for every other combination (`Shell`/`Http`/`Mcp`/`Git`/
+/// `Agent` params, or `Once`/`Session`/`ExactArgv`/`Always` scopes) its
+/// value is inert and this placeholder is fine.
+///
+/// **Not a "no boundary" value — do not reach for this outside this file, or
+/// for a `GrantScope::Directory` + `TaskParams::Fs` case here.** It used to
+/// be named `unbounded_workspace` on the (pre-B2) theory that `"/"` makes the
+/// boundary clamp a no-op, since `Path::starts_with` is trivially true
+/// against `"/"`. That theory is exactly the bug B2 (review round 2) fixed:
+/// `effective_directory_prefix` now treats a boundary of `"/"` (or `""`, or
+/// any relative path) as degenerate/unvalidated input and fails closed to
+/// `None` — downgrading the synthesized predicate to `FsExact` on the task's
+/// own canonical path — rather than treating it as "no clamp." A test that
+/// actually needs a `Directory`-scope grant to widen to a real `FsPrefix`
+/// must pass a genuine, non-degenerate boundary (see
+/// `directory_grant_with_a_real_ancestor_path_still_covers_the_directory`
+/// below, and `grantscope_directory_boundary.rs`, which covers the clamp
+/// itself with real, meaningful boundaries and the three degenerate cases).
+fn placeholder_boundary_irrelevant_to_this_test() -> &'static std::path::Path {
     std::path::Path::new("/")
 }
 
@@ -212,7 +228,7 @@ fn grant_is_generalised_downward_never_broader_than_the_originating_task() {
             path: PathBuf::from("/workspace"),
         },
         provenance,
-        unbounded_workspace(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
 
     // Directory scope must not broaden to the filesystem root or beyond
@@ -244,7 +260,7 @@ fn shell_grant_generalizes_to_the_matched_argv_never_a_wildcard() {
         &params,
         GrantScope::Session,
         provenance,
-        unbounded_workspace(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
     // Task 23 (W4): `Grant.rule` is `pub(crate)` now — inspect the
     // synthesized predicate through `Grant::predicate()` instead of reading
@@ -281,7 +297,7 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         },
         GrantScope::Once,
         provenance(),
-        unbounded_workspace(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
     assert!(matches!(http.predicate(), Predicate::Http { .. }));
 
@@ -293,7 +309,7 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         },
         GrantScope::Once,
         provenance(),
-        unbounded_workspace(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
     assert!(matches!(mcp.predicate(), Predicate::Mcp { .. }));
 
@@ -305,7 +321,7 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         },
         GrantScope::Once,
         provenance(),
-        unbounded_workspace(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
     assert!(matches!(git.predicate(), Predicate::Git { .. }));
 
@@ -317,7 +333,7 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         },
         GrantScope::Once,
         provenance(),
-        unbounded_workspace(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
     assert!(matches!(agent.predicate(), Predicate::Agent { .. }));
 }
@@ -358,7 +374,7 @@ fn http_grant_never_widens_past_the_exact_approved_url() {
         &params,
         GrantScope::Always,
         provenance,
-        unbounded_workspace(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
     let engine = PolicyEngine::from_rules(vec![grant
         .into_rule_for_installation()
@@ -417,7 +433,7 @@ fn git_grant_never_widens_past_the_exact_approved_argv() {
         &params,
         GrantScope::Always,
         provenance,
-        unbounded_workspace(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
     let engine = PolicyEngine::from_rules(vec![grant
         .into_rule_for_installation()
@@ -471,7 +487,7 @@ fn git_grant_for_bare_subcommand_does_not_degenerate_to_matching_any_argv() {
         &params,
         GrantScope::Always,
         provenance,
-        unbounded_workspace(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
     let engine = PolicyEngine::from_rules(vec![grant
         .into_rule_for_installation()
@@ -517,7 +533,7 @@ fn directory_grant_with_unrelated_or_root_path_does_not_widen_to_filesystem_wide
             path: PathBuf::from("/"),
         },
         provenance,
-        unbounded_workspace(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
     let engine = PolicyEngine::from_rules(vec![grant
         .into_rule_for_installation()
@@ -570,13 +586,20 @@ fn directory_grant_with_a_real_ancestor_path_still_covers_the_directory() {
         task_id: TaskId::new(),
         ts: Timestamp::from_unix_nanos(0),
     };
+    // Unlike most tests in this file, this one actually exercises the
+    // Directory-scope boundary clamp (it needs the synthesized predicate to
+    // be a real `FsPrefix` covering a sibling file, not the exact-path
+    // downgrade a degenerate placeholder boundary now produces per B2) — so
+    // it passes a genuine, non-degenerate boundary at `/workspace` (the
+    // requested directory itself), not
+    // `placeholder_boundary_irrelevant_to_this_test()`.
     let grant = synthesize_grant(
         &params,
         GrantScope::Directory {
             path: PathBuf::from("/workspace"),
         },
         provenance,
-        unbounded_workspace(),
+        Path::new("/workspace"),
     );
     let engine = PolicyEngine::from_rules(vec![grant
         .into_rule_for_installation()
@@ -621,7 +644,7 @@ fn into_rule_for_installation_refuses_unenforced_scopes_and_allows_standing_ones
             &params,
             GrantScope::Once,
             provenance(),
-            unbounded_workspace()
+            placeholder_boundary_irrelevant_to_this_test()
         )
         .into_rule_for_installation()
         .is_err(),
@@ -632,7 +655,7 @@ fn into_rule_for_installation_refuses_unenforced_scopes_and_allows_standing_ones
             &params,
             GrantScope::Session,
             provenance(),
-            unbounded_workspace()
+            placeholder_boundary_irrelevant_to_this_test()
         )
         .into_rule_for_installation()
         .is_err(),
@@ -643,7 +666,7 @@ fn into_rule_for_installation_refuses_unenforced_scopes_and_allows_standing_ones
             &params,
             GrantScope::ExactArgv { hash: [0u8; 32] },
             provenance(),
-            unbounded_workspace()
+            placeholder_boundary_irrelevant_to_this_test()
         )
         .into_rule_for_installation()
         .is_err(),
@@ -654,7 +677,7 @@ fn into_rule_for_installation_refuses_unenforced_scopes_and_allows_standing_ones
             &params,
             GrantScope::Always,
             provenance(),
-            unbounded_workspace()
+            placeholder_boundary_irrelevant_to_this_test()
         )
         .into_rule_for_installation()
         .is_ok(),
@@ -667,7 +690,7 @@ fn into_rule_for_installation_refuses_unenforced_scopes_and_allows_standing_ones
                 path: PathBuf::from("/workspace")
             },
             provenance(),
-            unbounded_workspace()
+            placeholder_boundary_irrelevant_to_this_test()
         )
         .into_rule_for_installation()
         .is_ok(),
