@@ -182,7 +182,20 @@ impl LocalBus {
         let ttl_hops = decrement_ttl(envelope.ttl_hops)?;
         self.rate_limiter
             .try_acquire(envelope.from, std::time::Instant::now())?;
-        {
+
+        // §7.7's repetition damper exists to kill *agent* repetition storms — a
+        // human breaking glass four times on the same stuck session is not that,
+        // and must not be jammed identically to one (orchestrator Ruling W4-8). The
+        // damper key itself is unchanged (still `(from, to, subject)`); a human send
+        // simply skips the check entirely. The two conditions are OR'd because
+        // `human_sessions` is the non-spoofable signal but may not be populated on
+        // every path, while `Provenance` is already trusted in-process by the rest
+        // of this crate. (Rejected alternative: folding `in_reply_to` into the
+        // damper key — that would let an *agent* evade the damper by varying which
+        // message it replies to, which is the opposite of what the damper is for.)
+        let is_human_originated = self.human_sessions.contains(&envelope.from)
+            || envelope.provenance.origin == roundhouse_core::Origin::User;
+        if !is_human_originated {
             let mut damper = self
                 .damper
                 .lock()
@@ -801,5 +814,99 @@ mod send_wiring_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, crate::types::BusError::TeamDraining { .. }));
+    }
+}
+
+#[cfg(test)]
+mod break_glass_damper_tests {
+    use super::*;
+    use crate::mailbox::MailboxKind;
+    use crate::types::{Address, Envelope, MessageId, Provenance, Trust};
+    use roundhouse_core::{Origin, SessionId};
+    use uuid::Uuid;
+
+    /// Mirrors `answer_as_peer`'s (roundhouse-engine's break-glass reply path) fixed
+    /// subject, so these tests exercise exactly the shape that jams today: a human
+    /// operator answering the same stuck wait four times in a row.
+    fn break_glass_envelope(from: SessionId, to: SessionId, origin: Origin) -> Envelope {
+        Envelope {
+            id: MessageId(Uuid::new_v4()),
+            from,
+            to,
+            to_requested: Address::Session { id: to },
+            subject: "[human override] answer as peer".into(),
+            body: "x".into(),
+            attachments: vec![],
+            expect_reply: None,
+            in_reply_to: None,
+            ttl_hops: 8,
+            provenance: Provenance {
+                origin,
+                trust: Trust::Trusted,
+                task: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registered_human_session_is_exempt_from_the_damper_even_with_non_user_origin() {
+        // Covers the first half of the OR: `human_sessions` is the non-spoofable
+        // signal, checked independently of provenance in case a path forgets to set
+        // Origin::User.
+        let bus = LocalBus::new();
+        let human = SessionId::new();
+        let to = SessionId::new();
+        bus.register_human(human);
+        bus.register_mailbox(to, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        for _ in 0..4 {
+            bus.send(break_glass_envelope(human, to, Origin::Peer))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_sender_with_origin_user_is_exempt_from_the_damper() {
+        // Covers the second half of the OR: `Provenance.origin == Origin::User` is
+        // trusted in-process even when `human_sessions` was never populated for this
+        // sender on this path.
+        let bus = LocalBus::new();
+        let from = SessionId::new(); // deliberately never registered as human
+        let to = SessionId::new();
+        bus.register_mailbox(to, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        for _ in 0..4 {
+            bus.send(break_glass_envelope(from, to, Origin::User))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_agent_sender_is_still_damped_on_the_fourth_identical_send() {
+        // Control: neither condition holds, so the damper's ordinary behavior for an
+        // agent repetition storm is unchanged.
+        let bus = LocalBus::new();
+        let from = SessionId::new();
+        let to = SessionId::new();
+        bus.register_mailbox(to, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            bus.send(break_glass_envelope(from, to, Origin::Peer))
+                .await
+                .unwrap();
+        }
+        let err = bus
+            .send(break_glass_envelope(from, to, Origin::Peer))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::Repetitive { .. }));
     }
 }
