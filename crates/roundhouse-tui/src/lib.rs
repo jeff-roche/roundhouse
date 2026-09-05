@@ -18,12 +18,12 @@ mod protocol;
 mod render;
 mod rope;
 
-pub use client::{connect, DaemonClient};
+pub use client::{connect, ConnectIntent, DaemonClient};
 pub use coalesce::{Coalescer, SessionSummary};
 pub use dashboard::Dashboard;
 pub use dirty::{DirtyFlags, Region};
 pub use paths::{default_runtime_dir, default_socket_path};
-pub use protocol::{ServerMessage, TuiError};
+pub use protocol::TuiError;
 pub use render::render_tick;
 pub use rope::RopeStore;
 

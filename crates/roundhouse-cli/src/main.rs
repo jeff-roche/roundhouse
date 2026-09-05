@@ -91,8 +91,11 @@ fn print_enable_instructions(os: service_install::OsFamily) {
     }
 }
 
-/// Phase 1's attach path, unchanged: connect to the daemon's Unix socket and
-/// render every incoming `ServerMessage` through `roundhouse_tui::Dashboard`.
+/// Phase 1's attach path: connect to the daemon's Unix socket and render
+/// every incoming `roundhouse_proto::ClientEvent` through
+/// `roundhouse_tui::Dashboard`. Phase 7 Task 2 retired the hand-rolled
+/// `ServerMessage` this used to render; the wire now carries real
+/// `roundhouse-proto`/`roundhouse-core` types end to end.
 async fn attach() -> color_eyre::Result<()> {
     // Phase 0's placeholder `roundhouse_tui::client_schema()`: not yet consumed
     // for anything beyond proving the wire-schema call site exists.
@@ -108,9 +111,18 @@ async fn attach() -> color_eyre::Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(roundhouse_tui::default_socket_path);
 
-    let mut client = roundhouse_tui::connect(&socket_path)
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+    // No session-selection UI exists yet (Phase 5): every `round` invocation
+    // asks the daemon to mint a fresh session. Task 3's real session registry
+    // is what will act on this request; today's daemon only forwards it, so
+    // this is a placeholder intent rather than a meaningful workspace name.
+    let mut client = roundhouse_tui::connect(
+        &socket_path,
+        roundhouse_tui::ConnectIntent::CreateSession {
+            workspace_name: "default".into(),
+        },
+    )
+    .await
+    .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
 
     // Deliberately no `enable_raw_mode()` here, despite that being the usual
     // ratatui preamble. Raw mode clears `ISIG`, so Ctrl+C stops generating
@@ -155,13 +167,23 @@ where
     // `io::Error` satisfies them.
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    while let Some(message) = client
+    while let Some(event) = client
         .recv()
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?
     {
-        dashboard.apply(message);
-        dashboard.tick(terminal)?;
+        // `ClientEvent` is `#[non_exhaustive]` (Phase 0) and today carries
+        // only `TaskEvent`/`Ack`; `Ack` — no protocol-version negotiation UI
+        // exists yet (Phase 5) — falls through untouched.
+        if let roundhouse_proto::ClientEvent::TaskEvent {
+            session_id,
+            payload,
+            ..
+        } = event
+        {
+            dashboard.apply(session_id, *payload);
+            dashboard.tick(terminal)?;
+        }
     }
     Ok(())
 }

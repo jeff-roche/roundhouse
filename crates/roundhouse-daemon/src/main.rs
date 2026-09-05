@@ -13,7 +13,7 @@
 use roundhouse_core::TaskRunner;
 use roundhouse_daemon::boot;
 use roundhouse_daemon::demo::{run_demo_session, DemoConfig, FakeEditProvider, NoopTransport};
-use roundhouse_daemon::socket_server::serve_ndjson;
+use roundhouse_daemon::socket_server::serve;
 use roundhouse_provider::{AnthropicMessagesProvider, Provider, RequestCtx, ReqwestTransport};
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
@@ -148,8 +148,16 @@ async fn main() -> color_eyre::Result<()> {
             ),
         };
 
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let server = serve_ndjson(&socket_path, rx)?;
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
+    // Nobody consumes `requests_out` yet: Task 3's real session registry is
+    // what will read `ClientRequest`s off it and act on them. Held here
+    // (rather than dropped) so `serve`'s forwarding send doesn't fail against
+    // a closed channel the moment a client's handshake request arrives.
+    let (requests_tx, _requests_rx) = tokio::sync::mpsc::channel(16);
+    let server = tokio::spawn({
+        let socket_path = socket_path.clone();
+        async move { serve(&socket_path, requests_tx, events_rx).await }
+    });
 
     let cfg = DemoConfig {
         store_path,
@@ -164,7 +172,7 @@ async fn main() -> color_eyre::Result<()> {
     // touches the network); with the real one it takes as long as one Anthropic
     // turn. Either way the two resulting messages sit buffered in the channel
     // until a `round` client connects and drains them below.
-    let outcome = run_demo_session(cfg, &runner, tx)
+    let outcome = run_demo_session(cfg, &runner, events_tx)
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
 
@@ -180,7 +188,20 @@ async fn main() -> color_eyre::Result<()> {
 
     // Blocks on `listener.accept()` until a `round` client attaches, then
     // drains the buffered messages and exits once the channel closes.
-    server.await.ok();
+    //
+    // `server` is a `JoinHandle<io::Result<()>>` now, not `JoinHandle<()>`:
+    // `serve`'s `bind`/`set_permissions` can fail, and since `serve` is
+    // spawned rather than called and unwrapped synchronously (unlike Phase
+    // 1's `serve_ndjson`, which propagated a bind failure via `?` before the
+    // demo ever ran), that failure only surfaces here, after the demo has
+    // already completed. Still surfaced as a real error rather than
+    // swallowed, so a socket that failed to bind is not reported as a
+    // successful run.
+    match server.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(err.into()),
+        Err(join_err) => return Err(color_eyre::eyre::eyre!(join_err.to_string())),
+    }
 
     // Unlink on the way out: a bound Unix socket outlives the process that
     // created it, and a leftover one makes the next run's `bind` fail with

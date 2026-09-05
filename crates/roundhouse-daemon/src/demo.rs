@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::stream;
-use roundhouse_core::{SessionId, TaskRunner};
+use roundhouse_core::{Delta, EventPayload, SessionId, SessionState, TaskRunner};
 use roundhouse_engine::{assemble_context, run_chat_turn, AgentError};
+use roundhouse_proto::ClientEvent;
 use roundhouse_provider::{
     BlockDelta, BlockKind, Capabilities, ChatRequest, ChatStream, ContentBlock, HttpRequest,
     HttpResponseStream, HttpTransport, Message, MessageRole, ModelId, ModelInfo, Plan, Provider,
@@ -14,7 +15,6 @@ use roundhouse_provider::{
 };
 use roundhouse_store::{open, spawn_writer, StoreError};
 use roundhouse_tools::{edit_file, ToolError};
-use roundhouse_tui::ServerMessage;
 use tokio::sync::mpsc;
 
 /// Stand-in for a real concrete `Provider`. Track B's Tasks 7-10 built only
@@ -154,9 +154,13 @@ pub enum DemoError {
 
 /// The testable core of the Phase 1 exit criterion: open the real event
 /// log, run one chat turn against `cfg.provider`, apply its one scripted
-/// tool call via `roundhouse-tools`, and push a `ServerMessage` per
-/// resulting content block to `updates` so an attached `roundhouse-tui`
-/// client sees it live.
+/// tool call via `roundhouse-tools`, and push a `ClientEvent` wrapping a raw
+/// `EventPayload` per resulting content block to `updates` so an attached
+/// `roundhouse-tui` client sees it live. Phase 7 Task 2 retired the
+/// hand-rolled, daemon-pre-summarized `ServerMessage` this used to build
+/// instead: the daemon now hands the TUI real `roundhouse-proto`/
+/// `roundhouse-core` types and lets `Dashboard::apply` do its own
+/// presentation-level reduction.
 ///
 /// `runner` is threaded in rather than created here because
 /// `TaskRunner::bootstrap()` panics on its second call per process: the sole
@@ -175,7 +179,7 @@ pub enum DemoError {
 pub async fn run_demo_session(
     cfg: DemoConfig,
     runner: &TaskRunner,
-    updates: mpsc::Sender<ServerMessage>,
+    updates: mpsc::Sender<ClientEvent>,
 ) -> Result<DemoOutcome, DemoError> {
     let store = open(&cfg.store_path).await?;
     let writer = spawn_writer(store).await;
@@ -235,9 +239,12 @@ pub async fn run_demo_session(
         if let ContentBlock::Text { text, .. } = block {
             send_update(
                 &updates,
-                ServerMessage::TaskDelta {
-                    task_id: session_id.to_string(),
-                    text: text.clone(),
+                ClientEvent::TaskEvent {
+                    session_id,
+                    task_id: None,
+                    payload: Box::new(EventPayload::TaskDelta {
+                        delta: Delta::Text { text: text.clone() },
+                    }),
                 },
             )
             .await;
@@ -245,10 +252,13 @@ pub async fn run_demo_session(
     }
     send_update(
         &updates,
-        ServerMessage::SessionSummary {
-            session_id: session_id.to_string(),
-            running_tasks: 0,
-            blocked: false,
+        ClientEvent::TaskEvent {
+            session_id,
+            task_id: None,
+            payload: Box::new(EventPayload::SessionStateChanged {
+                state: SessionState::Closed,
+                reason: None,
+            }),
         },
     )
     .await;
@@ -263,8 +273,8 @@ pub async fn run_demo_session(
 
 /// Best-effort push to the attached client. `send` only fails when the receiver
 /// is gone, which just means nobody is watching — worth a debug line, not an error.
-async fn send_update(updates: &mpsc::Sender<ServerMessage>, message: ServerMessage) {
-    if updates.send(message).await.is_err() {
+async fn send_update(updates: &mpsc::Sender<ClientEvent>, event: ClientEvent) {
+    if updates.send(event).await.is_err() {
         tracing::debug!("no attached client; dropping session update");
     }
 }

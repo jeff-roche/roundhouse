@@ -3910,6 +3910,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "ratatui",
+ "roundhouse-core",
  "roundhouse-proto",
  "schemars 1.2.2",
  "serde",
