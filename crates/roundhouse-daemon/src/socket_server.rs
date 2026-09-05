@@ -43,9 +43,13 @@ use tokio::sync::mpsc;
 /// `JoinHandle` — a client that dials immediately after `tokio::spawn` may
 /// still race the bind.
 ///
-/// The spawned connection's loop exits when both the read half hits EOF (or
-/// errors) and `events_in` closes (or every write to the peer fails); nothing
-/// here panics on a hostile or vanished peer.
+/// The spawned connection's loop exits the moment *either* direction ends —
+/// the peer disconnects (or a read errors), or `events_in` closes (the
+/// normal shutdown order once whatever owns the sender, e.g. a finished
+/// `run_demo_session` or Task 3's session registry tearing down, drops it) —
+/// tearing the whole connection down rather than waiting for both to finish.
+/// See [`serve_connection`]'s doc comment for why "wait for both" was a real
+/// deadlock. Nothing here panics on a hostile or vanished peer.
 ///
 /// # Errors
 /// Returns the `bind` error if the path is already in use, unwritable, or too
@@ -102,13 +106,40 @@ pub async fn serve(
 /// integration test (its own crate) needs the same visibility a same-crate
 /// caller would.
 ///
-/// Uses `tokio::select!` between the read and write halves so a slow or
-/// absent peer on one side (e.g. a client that never sends a second request)
-/// can never block delivery on the other (the `events_in` → socket
-/// direction), and vice versa. Every write error ends its half of the loop
-/// rather than panicking; a `ClientRequest` line that fails to parse, or a
-/// `ClientEvent` that fails to serialize, is dropped with a warning instead
-/// of taking the connection down.
+/// **Exit-on-first-done, not wait-for-both.** An earlier version of this
+/// function tracked independent `read_done`/`write_done` flags and looped
+/// until *both* were set — which deadlocked in the single most common
+/// shutdown order there is: `events_in`'s sender drops (a session finishing,
+/// e.g. `run_demo_session` returning) while the peer is still connected and
+/// has nothing more to send. `write_done` went true, `read_done` stayed
+/// false forever, the loop never exited, the write half was never closed,
+/// and the peer's own blocked `recv()` — waiting on exactly that closure for
+/// its clean EOF — hung right alongside it. This version instead returns the
+/// instant *either* direction ends, for any reason: peer EOF/error, a
+/// forwarding target gone, the event stream closing, or a write failing.
+/// Returning drops both split halves together (neither is held anywhere
+/// else), which fully closes the underlying socket and gives the peer a
+/// clean EOF — the same thing Phase 1's `serve_ndjson` got for free by
+/// holding the *unsplit* `stream` in one task and letting `Drop` close it.
+/// This also closes the mirror case a "keep serving the direction that still
+/// works" fix would reopen: if the peer disconnects first, this function
+/// must not sit parked on `events_in.recv()` forever — every sender Task 3's
+/// registry hands out lives as long as the registry entry, not as long as
+/// any one connection, so "wait for the session to end before this task
+/// exits" would leak one blocked task per dropped connection.
+///
+/// Uses `tokio::select!` so waiting for the *next* line or event on one side
+/// never blocks the other. That independence is not absolute, though:
+/// `requests_out.send(..).await` and `writer.write_all(..).await` run inside
+/// their branch's handler body once a line/event has already arrived, so a
+/// full `requests_out` (bounded, and nobody drains it in `main.rs` today —
+/// see its own comment) would stall the read side mid-forward. Harmless
+/// while at most one handshake request ever flows through it; Task 3's real
+/// multi-request registry is what needs to actually drain it. Every write
+/// error ends the connection rather than panicking; a `ClientRequest` line
+/// that fails to parse, or a `ClientEvent` that fails to serialize, is
+/// dropped with a warning and the connection keeps running — those are the
+/// two conditions that do **not** end it.
 pub async fn serve_connection(
     stream: UnixStream,
     requests_out: mpsc::Sender<ClientRequest>,
@@ -130,20 +161,18 @@ pub async fn serve_connection(
     let mut lines = BufReader::new(read_half).lines();
     let mut writer = write_half;
 
-    let mut read_done = false;
-    let mut write_done = false;
-
-    while !(read_done && write_done) {
+    loop {
         tokio::select! {
-            result = lines.next_line(), if !read_done => {
+            result = lines.next_line() => {
                 match result {
                     Ok(Some(line)) => {
                         match serde_json::from_str::<ClientRequest>(&line) {
                             Ok(request) => {
                                 if requests_out.send(request).await.is_err() {
                                     // Nobody is listening for requests anymore
-                                    // — nothing left to forward them to.
-                                    read_done = true;
+                                    // — nothing left to forward them to, and
+                                    // nothing more this connection can do.
+                                    return;
                                 }
                             }
                             Err(err) => {
@@ -154,16 +183,16 @@ pub async fn serve_connection(
                             }
                         }
                     }
-                    Ok(None) => {
-                        // Clean EOF: the peer closed its write half.
-                        read_done = true;
-                    }
-                    Err(_) => {
-                        read_done = true;
+                    Ok(None) | Err(_) => {
+                        // Clean EOF, or a read error: either way the peer is
+                        // gone. Return now rather than sit parked on
+                        // `events_in.recv()` for a peer that will never read
+                        // anything else.
+                        return;
                     }
                 }
             }
-            maybe_event = events_in.recv(), if !write_done => {
+            maybe_event = events_in.recv() => {
                 match maybe_event {
                     Some(event) => {
                         // `ClientEvent` is a plain serde enum, so this cannot
@@ -182,11 +211,15 @@ pub async fn serve_connection(
                         if writer.write_all(serialized.as_bytes()).await.is_err()
                             || writer.write_all(b"\n").await.is_err()
                         {
-                            write_done = true;
+                            return;
                         }
                     }
                     None => {
-                        write_done = true;
+                        // The event stream ended — the normal shutdown order
+                        // once whatever owned the sender is done with this
+                        // connection. Return so the peer gets a clean EOF
+                        // instead of a hang.
+                        return;
                     }
                 }
             }

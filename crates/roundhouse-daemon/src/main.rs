@@ -190,7 +190,12 @@ async fn main() -> color_eyre::Result<()> {
     );
 
     // Blocks on `listener.accept()` until a `round` client attaches, then
-    // drains the buffered messages and exits once the channel closes.
+    // serves that one connection until either side ends it: the client
+    // disconnecting, or `events_tx` above closing (it was moved into
+    // `run_demo_session`, which drops it on return — the normal shutdown
+    // order once the scripted session is done sending updates). See
+    // `socket_server::serve_connection`'s doc comment for why "wait for the
+    // client to also disconnect before exiting" was a real deadlock.
     //
     // `server` is a `JoinHandle<io::Result<()>>` now, not `JoinHandle<()>`:
     // `serve`'s `bind`/`set_permissions` can fail, and since `serve` is

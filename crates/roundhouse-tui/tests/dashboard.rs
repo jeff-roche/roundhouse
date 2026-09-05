@@ -10,7 +10,8 @@
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use roundhouse_core::{
-    Delta, EventPayload, Handle, IsolationAttestation, SessionId, SessionState, Tier,
+    Delta, EventPayload, Handle, IsolationAttestation, Origin, SessionId, SessionOutcome,
+    SessionState, SuspendReason, Tier,
 };
 use roundhouse_tui::Dashboard;
 
@@ -35,6 +36,16 @@ fn task_started() -> EventPayload {
         },
         handle: None::<Handle>,
     }
+}
+
+fn task_suspended() -> EventPayload {
+    EventPayload::TaskSuspended {
+        reason: SuspendReason::AwaitingReply,
+    }
+}
+
+fn task_resumed() -> EventPayload {
+    EventPayload::TaskResumed { by: Origin::User }
 }
 
 #[test]
@@ -139,5 +150,71 @@ fn a_summary_refused_by_the_coalescer_is_retained_and_shown_on_a_later_tick() {
     assert!(
         content.contains("running: 3") && content.contains("blocked: true"),
         "status pane must show the newer summary, not the stale one: {content}"
+    );
+}
+
+/// Ruling W1-R13 regression test: `blocked` is a per-session *counter* of
+/// suspended tasks, not a bool a single `TaskResumed` can clear. Two tasks
+/// suspend; only one resumes; the session must still read `blocked: true`
+/// (a bool implementation would wrongly report `false` the moment either
+/// one resumed).
+#[test]
+fn two_suspended_tasks_stay_blocked_until_both_resume() {
+    let backend = TestBackend::new(100, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut dashboard = Dashboard::new();
+    let session = SessionId::new();
+
+    dashboard.apply(session, task_suspended());
+    dashboard.apply(session, task_suspended());
+    // Only one of the two suspended tasks resumes.
+    dashboard.apply(session, task_resumed());
+
+    // Cross the coalescer's 250ms window so the retained summary from the
+    // burst above (all three offers landed within microseconds of each
+    // other) is due for promotion, then tick to flush and draw it.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    dashboard.tick(&mut terminal).unwrap();
+
+    let content = rendered(&terminal);
+    assert!(
+        content.contains("blocked: true"),
+        "one task still suspended must keep the session blocked: {content}"
+    );
+}
+
+/// Ruling W1-R13 regression test: `EventPayload::SessionClosed` (`roundhouse-
+/// core`'s dedicated terminal event, distinct from
+/// `SessionStateChanged{state: Closed, ..}`) must reset `running_tasks` and
+/// `blocked` rather than falling into the catch-all `_ => {}` arm and
+/// leaving a stale non-zero/blocked status line forever. Nothing emits this
+/// variant in production yet (Task 7 is what would wire a real caller), but
+/// `Dashboard::apply` must handle it correctly the moment something does.
+#[test]
+fn session_closed_resets_running_and_blocked_even_though_nothing_emits_it_yet() {
+    let backend = TestBackend::new(100, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut dashboard = Dashboard::new();
+    let session = SessionId::new();
+
+    dashboard.apply(session, task_started());
+    dashboard.apply(session, task_suspended());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    dashboard.tick(&mut terminal).unwrap();
+    assert!(rendered(&terminal).contains("running: 1"));
+
+    dashboard.apply(
+        session,
+        EventPayload::SessionClosed {
+            outcome: SessionOutcome::Completed,
+        },
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    dashboard.tick(&mut terminal).unwrap();
+
+    let content = rendered(&terminal);
+    assert!(
+        content.contains("running: 0") && content.contains("blocked: false"),
+        "SessionClosed must reset the status line, not leave it stuck: {content}"
     );
 }

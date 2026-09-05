@@ -48,9 +48,21 @@ pub struct Dashboard {
     /// `TaskStarted`, decremented (saturating) on `TaskCompleted`/`TaskFailed`/
     /// `TaskCancelled`, reset to zero when a session closes.
     running_tasks: HashMap<SessionId, u32>,
-    /// Whether a session is currently blocked, per session. Set by
-    /// `TaskSuspended`/`TaskResumed` and by `SessionStateChanged`.
-    blocked: HashMap<SessionId, bool>,
+    /// Count of tasks currently believed suspended, per session. A counter,
+    /// not a bool (ruling W1-R13): if tasks A and B both suspend and only A
+    /// resumes, the session is still blocked on B. Incremented on
+    /// `TaskSuspended`, decremented (saturating) on `TaskResumed`, reset to
+    /// zero when a session closes.
+    suspended_tasks: HashMap<SessionId, u32>,
+    /// Whether the *session itself* (as opposed to any one task) is
+    /// suspended, per `SessionStateChanged`. Kept separate from
+    /// `suspended_tasks` rather than folded into one counter: a
+    /// session-level suspension and a task-level one are different events at
+    /// different granularities, and collapsing them would make "0 suspended
+    /// tasks but session suspended" indistinguishable from "both clear." A
+    /// session's overall blocked status (see `offer_summary`) is the OR of
+    /// the two.
+    session_suspended: HashMap<SessionId, bool>,
     /// The most recent summary that survived coalescing, or `None` before the
     /// first one arrives.
     summary: Option<SessionSummary>,
@@ -74,7 +86,8 @@ impl Dashboard {
             coalescer: Coalescer::new(Duration::from_millis(250)),
             last_session_id: None,
             running_tasks: HashMap::new(),
-            blocked: HashMap::new(),
+            suspended_tasks: HashMap::new(),
+            session_suspended: HashMap::new(),
             summary: None,
             pending_summary: None,
         }
@@ -117,26 +130,36 @@ impl Dashboard {
                 self.offer_summary(session_id);
             }
             EventPayload::TaskSuspended { .. } => {
-                self.blocked.insert(session_id, true);
+                *self.suspended_tasks.entry(session_id).or_insert(0) += 1;
                 self.offer_summary(session_id);
             }
             EventPayload::TaskResumed { .. } => {
-                self.blocked.insert(session_id, false);
+                let count = self.suspended_tasks.entry(session_id).or_insert(0);
+                *count = count.saturating_sub(1);
                 self.offer_summary(session_id);
             }
             EventPayload::SessionStateChanged { state, .. } => {
                 match state {
                     SessionState::Suspended => {
-                        self.blocked.insert(session_id, true);
+                        self.session_suspended.insert(session_id, true);
                     }
                     SessionState::Closed => {
-                        self.running_tasks.insert(session_id, 0);
-                        self.blocked.insert(session_id, false);
+                        self.reset_session(session_id);
                     }
                     SessionState::Created | SessionState::Running | SessionState::Cancelling => {
-                        self.blocked.insert(session_id, false);
+                        self.session_suspended.insert(session_id, false);
                     }
                 }
+                self.offer_summary(session_id);
+            }
+            // `roundhouse-core`'s dedicated terminal event (distinct from
+            // `SessionStateChanged{state: Closed, ..}` above — nothing emits
+            // this one yet, but the moment something does, this session's
+            // `running_tasks`/blocked counters must not be left stuck at
+            // whatever they last were, showing a permanently stale status
+            // line.
+            EventPayload::SessionClosed { .. } => {
+                self.reset_session(session_id);
                 self.offer_summary(session_id);
             }
             // Every other variant — non-text `Delta`s, session configuration,
@@ -146,12 +169,29 @@ impl Dashboard {
         }
     }
 
+    /// Zeroes every per-session counter this dashboard tracks: `running_tasks`,
+    /// `suspended_tasks`, and `session_suspended`. Shared by
+    /// `SessionStateChanged{state: Closed, ..}` and `SessionClosed` — both mean
+    /// "this session is over," and a status line that kept showing a stale
+    /// non-zero `running_tasks` or `blocked: true` after that would be a real
+    /// misrepresentation of state, not just a cosmetic staleness.
+    fn reset_session(&mut self, session_id: SessionId) {
+        self.running_tasks.insert(session_id, 0);
+        self.suspended_tasks.insert(session_id, 0);
+        self.session_suspended.insert(session_id, false);
+    }
+
     /// Offers `session_id`'s current `(running_tasks, blocked)` snapshot to
     /// the `Coalescer`, updating `summary`/`pending_summary` exactly as the
-    /// old `ServerMessage::SessionSummary` arm used to.
+    /// old `ServerMessage::SessionSummary` arm used to. `blocked` is the OR of
+    /// "at least one task is suspended" and "the session itself is suspended"
+    /// — see `suspended_tasks`/`session_suspended`'s field docs for why these
+    /// stay two separate pieces of state rather than one counter.
     fn offer_summary(&mut self, session_id: SessionId) {
         let running_tasks = *self.running_tasks.get(&session_id).unwrap_or(&0);
-        let blocked = *self.blocked.get(&session_id).unwrap_or(&false);
+        let suspended_tasks = *self.suspended_tasks.get(&session_id).unwrap_or(&0);
+        let session_suspended = *self.session_suspended.get(&session_id).unwrap_or(&false);
+        let blocked = suspended_tasks > 0 || session_suspended;
         let summary = SessionSummary {
             session_id: session_id.to_string(),
             running_tasks,
