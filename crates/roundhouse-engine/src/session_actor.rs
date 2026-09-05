@@ -38,12 +38,15 @@ use roundhouse_core::{
     CancelReason, NoteLevel, OnDegrade, Origin, SessionId, SessionSpec, SessionState, TaskInput,
     TaskKind, TaskRunner, Tier, Timestamp,
 };
-use roundhouse_net::policy::EgressPolicy;
+use roundhouse_mcp::config::{McpServerConfig, McpTransportKind};
+use roundhouse_net::policy::{EgressPolicy, HostPattern};
 use roundhouse_net::proxy::{LoopbackProxy, ProxyHandle, ProxyNotServingError};
 use roundhouse_policy::engine::{Outcome, PolicyEngine, RuleId};
 use roundhouse_policy::sealed::SealedContext;
 use roundhouse_policy::TaskParams;
+use roundhouse_provider::RequestCtx;
 use roundhouse_sandbox::{Handle, Isolate, IsolationError};
+use roundhouse_store::redact::Redactor;
 use roundhouse_store::{EventWriter, StoreError};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -803,4 +806,263 @@ pub enum CreateSessionError {
     Isolation(#[from] IsolationError),
     #[error(transparent)]
     ProxyNotServing(#[from] ProxyNotServingError),
+}
+
+/// Phase 7, Task 6 — closes the gap flagged by this task's own brief:
+/// `roundhouse-store/src/writer.rs` builds every `EventWriter`'s `Redactor`
+/// as `Redactor::build(&[])` at construction time (`spawn_writer`) — an
+/// empty secret list, so redaction runs on every write but redacts
+/// nothing — and `EventWriter::set_redactor` had zero non-test callers
+/// anywhere in the workspace before this function existed.
+///
+/// A minimum-length guard is applied before the secrets ever reach
+/// `Redactor::build`: `Redactor::build`'s own doc comment already filters
+/// empty-string patterns (an empty pattern matches at every position and
+/// pathologically mangles output), but a *short*, non-empty value is its
+/// own hazard the automaton doesn't guard against — the demo daemon's own
+/// placeholder `RequestCtx.api_key` is the literal string `"demo"`
+/// (`roundhouse-daemon/src/main.rs`), and registering a 4-byte value as a
+/// "secret" would redact every literal occurrence of the word "demo"
+/// anywhere in this session's event log (including, e.g., "demo session
+/// complete" / "demo file" Note text), destroying real, non-secret log
+/// content. No real provider API key is anywhere near this short, so a
+/// conservative minimum length excludes exactly the placeholder case
+/// without weakening protection for any real credential.
+const MIN_REDACTABLE_SECRET_LEN: usize = 12;
+
+/// Installs a `Redactor` built from `secrets` onto `writer`, hot-swapping
+/// whatever `Redactor` it was constructed with (`spawn_writer`'s
+/// `Redactor::build(&[])` empty default, on every real call site today).
+///
+/// **Caller's responsibility — ordering is the entire point:** this must be
+/// called before any event that could reference one of `secrets` is ever
+/// appended through `writer`. `EventWriter::set_redactor` takes effect only
+/// for writes from that point forward (`ArcSwap::store`, see its own doc
+/// comment) — a write that already landed before this call is `EventWriter`
+/// appended it in already-redacted-or-not form permanently: the `events`
+/// table physically rejects `UPDATE`/`DELETE` (S-LOG-2), so there is no way
+/// to retroactively redact a row once committed. See this function's real
+/// call site in `roundhouse-daemon/src/demo.rs` (`run_demo_session`, called
+/// immediately after `spawn_writer` and strictly before the first
+/// `run_chat_turn`/`append`) for a concrete proof that nothing appends
+/// in between.
+pub fn wire_redaction_for_session(writer: &EventWriter, secrets: &[String]) {
+    let filtered: Vec<String> = secrets
+        .iter()
+        .filter(|s| s.len() >= MIN_REDACTABLE_SECRET_LEN)
+        .cloned()
+        .collect();
+    writer.set_redactor(Redactor::build(&filtered));
+}
+
+/// Collects every live secret value this session's creation already knows
+/// about, for [`wire_redaction_for_session`]'s `secrets` argument.
+///
+/// Two sources today:
+/// - `ctx.api_key` — Phase 1's original, simplified credential path,
+///   always populated (every `RequestCtx` construction site sets it, even
+///   the demo's harmless placeholder — filtered out downstream by
+///   `wire_redaction_for_session`'s minimum-length guard, not here, so this
+///   function stays an honest, unfiltered inventory of what it found).
+/// - Every MCP `Stdio` server's `env` values (`McpTransportKind::Stdio.env:
+///   Vec<(String, String)>`) — passed literally to the spawned child's
+///   environment via `Command::envs` (`roundhouse-mcp/src/transport/
+///   stdio.rs`), with no secret-ref resolution step in between. Whether a
+///   given value is a raw secret or a reference string like
+///   `"keyring:github"`, it is exactly what reaches the child process
+///   verbatim, so it belongs in the redaction set regardless — nothing
+///   downstream can distinguish the two shapes, and the brief itself names
+///   MCP env values as in scope ("any resolved MCP server env-var
+///   secrets").
+///
+/// **Documented seam, not a silent gap:** `ctx.credentials: Option<Arc<dyn
+/// CredentialProvider>>` (Phase 6) is deliberately NOT a source here.
+/// `CredentialProvider`'s only method, `apply(&self, req: &mut HttpRequest,
+/// ctx: &CredentialCtx)`, mutates an outbound `HttpRequest` in place and
+/// returns `Result<(), CredentialError>` — it has no accessor that exposes
+/// the underlying secret material to a caller, by design (`roundhouse-
+/// secrets`' six concrete implementations hold it, never this crate). There
+/// is nothing to extract here today. Whoever gives `CredentialProvider` (or
+/// a sibling trait) a value-exposing method next should feed its result
+/// into this `Vec` alongside `ctx.api_key`.
+///
+/// **Never logs, `Debug`-prints, or echoes any value it collects** —
+/// `RequestCtx` deliberately derives neither `Debug` nor `Serialize`
+/// (§9.9), and this function does not add either.
+pub fn live_secret_values(ctx: &RequestCtx, mcp_configs: &[McpServerConfig]) -> Vec<String> {
+    let mut secrets = vec![ctx.api_key.clone()];
+    for config in mcp_configs {
+        let McpTransportKind::Stdio { env, .. } = &config.transport;
+        secrets.extend(env.iter().map(|(_, value)| value.clone()));
+    }
+    secrets
+}
+
+/// Converts a plain, config-sourced allowlist (`roundhouse_config::network::
+/// NetworkConfig.allowed_hosts`) into a real `roundhouse_net::policy::
+/// EgressPolicy` — the conversion `roundhouse-config` cannot perform itself
+/// (it must stay free of every `roundhouse-*` dependency; see that crate's
+/// `network` module doc comment), so it lives here, above config, at the
+/// one crate every real session-creation call site already depends on.
+///
+/// An empty `allowed_hosts` produces an `EgressPolicy` that denies every
+/// host (`EgressPolicy::matches` is `self.allowed_hosts.iter().any(..)`,
+/// vacuously `false` over an empty `Vec` — confirmed by this module's own
+/// test, not just by reading the body) — fail-closed, matching
+/// `load_network_config`'s own documented default.
+///
+/// Each entry becomes an exact-hostname match, **except** a `"*."`-prefixed
+/// entry, which becomes a wildcard-suffix match over the text after the
+/// prefix — with one deliberate guard: an entry of exactly `"*"` or `"*."`
+/// (empty suffix) is skipped rather than converted. `HostPattern::
+/// wildcard_suffix("")`'s own `match_kind` treats an empty suffix as
+/// matching *every* host unconditionally (`suffix.is_empty()` in its match
+/// arm) — silently turning one config line into "allow all egress,"
+/// almost certainly not what a config author who wrote `"*"` intended
+/// (probably a typo for a real suffix, or a mistaken belief that it means
+/// "no restriction" — the actual no-restriction spelling is simply not
+/// configuring `[network]` at all, which this task's default already
+/// happens to deny, not allow). Fail-closed here means skipping the
+/// malformed entry (denying whatever it would have matched) rather than
+/// silently promoting it to allow-everything.
+pub fn egress_policy_from_allowed_hosts(allowed_hosts: &[String]) -> EgressPolicy {
+    let mut patterns = Vec::with_capacity(allowed_hosts.len());
+    for host in allowed_hosts {
+        if host == "*" {
+            continue;
+        }
+        match host.strip_prefix("*.") {
+            Some("") => continue,
+            Some(suffix) => patterns.push(HostPattern::wildcard_suffix(suffix)),
+            None => patterns.push(HostPattern::exact(host)),
+        }
+    }
+    EgressPolicy {
+        allowed_hosts: patterns,
+    }
+}
+
+#[cfg(test)]
+mod redaction_and_egress_tests {
+    use super::*;
+
+    #[test]
+    fn empty_allowlist_denies_every_host() {
+        let policy = egress_policy_from_allowed_hosts(&[]);
+        assert!(!policy.matches("example.com"));
+        assert!(!policy.matches("api.anthropic.com"));
+    }
+
+    #[test]
+    fn an_exact_host_entry_matches_only_that_host() {
+        let policy = egress_policy_from_allowed_hosts(&["api.anthropic.com".to_string()]);
+        assert!(policy.matches("api.anthropic.com"));
+        assert!(!policy.matches("evil.example.com"));
+        assert!(!policy.matches("anthropic.com"));
+    }
+
+    #[test]
+    fn a_wildcard_suffix_entry_matches_the_suffix_and_subdomains() {
+        let policy = egress_policy_from_allowed_hosts(&["*.example.com".to_string()]);
+        assert!(policy.matches("example.com"));
+        assert!(policy.matches("api.example.com"));
+        assert!(!policy.matches("evilexample.com"));
+    }
+
+    /// The foot-gun `HostPattern::wildcard_suffix("")` would otherwise
+    /// create: a bare `"*"` or `"*."` entry must not silently become
+    /// "allow every host."
+    #[test]
+    fn a_bare_wildcard_entry_is_skipped_not_promoted_to_allow_all() {
+        let policy = egress_policy_from_allowed_hosts(&["*".to_string()]);
+        assert!(!policy.matches("example.com"));
+        assert!(!policy.matches("literally-anything.invalid"));
+
+        let policy = egress_policy_from_allowed_hosts(&["*.".to_string()]);
+        assert!(!policy.matches("example.com"));
+    }
+
+    fn stdio_config(id: &str, env: Vec<(&str, &str)>) -> McpServerConfig {
+        McpServerConfig {
+            id: roundhouse_policy::ServerId(id.to_string()),
+            transport: McpTransportKind::Stdio {
+                command: "some-mcp-server".to_string(),
+                args: vec![],
+                env: env
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                pinned_binary_hash: None,
+            },
+        }
+    }
+
+    fn fake_ctx(api_key: &str) -> RequestCtx {
+        RequestCtx {
+            trace_id: None,
+            transport: Arc::new(roundhouse_provider::ReqwestTransport::new()),
+            api_key: api_key.to_string(),
+            credentials: None,
+        }
+    }
+
+    #[test]
+    fn live_secret_values_collects_the_api_key_and_every_mcp_env_value() {
+        let ctx = fake_ctx("sk-live-abc123");
+        let configs = vec![
+            stdio_config("github", vec![("GITHUB_TOKEN", "gh-secret-value")]),
+            stdio_config("other", vec![("A", "one"), ("B", "two")]),
+        ];
+        let secrets = live_secret_values(&ctx, &configs);
+        assert!(secrets.contains(&"sk-live-abc123".to_string()));
+        assert!(secrets.contains(&"gh-secret-value".to_string()));
+        assert!(secrets.contains(&"one".to_string()));
+        assert!(secrets.contains(&"two".to_string()));
+    }
+
+    #[test]
+    fn live_secret_values_with_no_mcp_servers_is_just_the_api_key() {
+        let ctx = fake_ctx("sk-live-abc123");
+        let secrets = live_secret_values(&ctx, &[]);
+        assert_eq!(secrets, vec!["sk-live-abc123".to_string()]);
+    }
+
+    /// `wire_redaction_for_session`'s minimum-length guard: a short value
+    /// (like the demo daemon's literal `"demo"` `api_key` placeholder) must
+    /// not become a redaction pattern, or it would mangle unrelated,
+    /// non-secret log text that happens to contain the same short string.
+    #[tokio::test]
+    async fn a_short_secret_is_not_installed_as_a_redaction_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+        let store = roundhouse_store::open(&db_path).await.unwrap();
+        let writer = roundhouse_store::spawn_writer(store).await;
+
+        wire_redaction_for_session(&writer, &["demo".to_string()]);
+
+        let runner = roundhouse_core::TaskRunner::bootstrap();
+        let session_id = SessionId::new();
+        let event = runner.record_note(
+            session_id,
+            0,
+            now_ts(),
+            None,
+            NoteLevel::Info,
+            "demo session complete".to_string(),
+            1,
+        );
+        writer.append(event).await.unwrap();
+
+        let read_store = roundhouse_store::open(&db_path).await.unwrap();
+        let events = roundhouse_store::session_events(&read_store, session_id)
+            .await
+            .unwrap();
+        let roundhouse_core::EventPayload::Note { text, .. } = &events[0].payload else {
+            panic!("expected a Note payload");
+        };
+        assert_eq!(
+            text, "demo session complete",
+            "a short non-secret-shaped value must not have redacted unrelated text"
+        );
+    }
 }

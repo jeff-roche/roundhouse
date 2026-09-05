@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use futures::stream;
 use roundhouse_core::{Delta, EventPayload, SessionId, SessionState, TaskRunner};
-use roundhouse_engine::{assemble_context, run_chat_turn, AgentError};
+use roundhouse_engine::{
+    assemble_context, live_secret_values, run_chat_turn, wire_redaction_for_session, AgentError,
+};
 use roundhouse_proto::ClientEvent;
 use roundhouse_provider::{
     BlockDelta, BlockKind, Capabilities, ChatRequest, ChatStream, ContentBlock, HttpRequest,
@@ -183,6 +185,18 @@ pub async fn run_demo_session(
 ) -> Result<DemoOutcome, DemoError> {
     let store = open(&cfg.store_path).await?;
     let writer = spawn_writer(store).await;
+
+    // Phase 7, Task 6: install a real redactor for this session's live
+    // secret values BEFORE anything is appended through `writer` — nothing
+    // has appended through it yet (the very first append below is
+    // `run_chat_turn`'s), so this is the earliest point at which this
+    // session's writer exists at all, and there is no window in which an
+    // event could reference `cfg.request_ctx.api_key` before this call
+    // takes effect. This demo has no configured MCP servers, so
+    // `live_secret_values` is called with an empty slice — `spawn_writer`'s
+    // own default (`Redactor::build(&[])`) previously left this session's
+    // provider API key completely unprotected in the persisted log.
+    wire_redaction_for_session(&writer, &live_secret_values(&cfg.request_ctx, &[]));
 
     let session_id = SessionId::new();
     // A real user turn, not an empty `messages` array. `FakeEditProvider`
