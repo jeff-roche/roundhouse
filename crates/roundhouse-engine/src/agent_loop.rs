@@ -22,44 +22,51 @@
 //! dispatched tool call is queryable in the session's event log, not a
 //! bypass around it.
 //!
-//! **MCP arm: deliberately NOT wired, by design, not oversight.**
-//! `roundhouse_mcp::executor::McpExecutor`'s real dispatch (`impl
+//! **MCP arm: wired as of fix round C2.** Rounds A/B/C1 left it deliberately
+//! unwired: `roundhouse_mcp::executor::McpExecutor`'s real dispatch (`impl
 //! TaskExecutor::execute`, `executor.rs:506`) needs a `TaskInput::Mcp {
 //! server: ServerId, tool, args }`, and `execute` uses that `server` field
 //! *directly* for its policy gate (`executor.rs:531`) — it is **not**
-//! derived from resolving `tool`. The only authoritative source of the
-//! right `ServerId` for a given namespaced tool name is
-//! `ToolNamespace::resolve` (`namespace.rs:113`), and `McpExecutor.namespace`
-//! is private with no accessor; `McpHost` exposes only
-//! `tool_defs()`/`shutdown()` (`host.rs:212-330`). There is therefore no
-//! honest way, from this crate, to build a correct `TaskInput::Mcp` for an
-//! arbitrary namespaced tool name.
+//! derived from resolving `tool`, and `McpExecutor` exposed no way to
+//! resolve a namespaced tool name to its authoritative `ServerId` (CF-3) or
+//! to tell which servers had actually completed a handshake as opposed to
+//! merely being configured (CF-9, the CF-8(b) sealed-context-bypass shape).
+//! Round C2 closed both with two narrow, additive `McpExecutor` accessors —
+//! [`roundhouse_mcp::executor::McpExecutor::resolve`] and
+//! [`roundhouse_mcp::executor::McpExecutor::resolved_servers`] — and this
+//! module's [`dispatch_mcp`] now builds a real `TaskInput::Mcp` using
+//! `resolve`'s **`server`** half only: `tool` is set to the namespaced name
+//! unchanged, because `execute` re-resolves `tool` itself internally
+//! (`executor.rs:517`) and would reject an already-resolved original name as
+//! unknown. `resolve` exists solely so the caller can learn `server` —
+//! `execute` never re-derives it and uses whatever the caller passed
+//! directly for its policy gate (`executor.rs:531`). This module never
+//! parses a `ServerId` out of the namespaced name itself and never
+//! substitutes a permissive policy (the two things this module always
+//! refused to do to fake "working" MCP dispatch — CF-7 item 2). An MCP call
+//! still fails
+//! closed with a named `ToolResult { is_error: true }` when: no MCP host is
+//! configured for the session; the namespaced name doesn't resolve to any
+//! known server/tool; the dispatch panics (a spawned-task boundary — see
+//! [`dispatch_mcp`]'s doc comment); it exceeds its wall-clock bound; or the
+//! server itself returns an `InputRequired`/elicitation result — the MRTR
+//! retry loop is explicitly OUT OF SCOPE for this round (see
+//! [`dispatch_mcp`]'s `Suspended` arm), so a suspended MCP task is reported
+//! honestly rather than silently hung or faked as failed.
 //!
-//! Two things this module deliberately does **not** do to work around that:
-//! it does not parse a `ServerId` out of the namespaced name (the
-//! sanitization scheme in `roundhouse_mcp::namespace` makes that silently
-//! wrong, not merely imprecise — see [`crate::tool_catalog::ToolTarget`]'s
-//! doc comment), and it does not substitute a permissive policy to make MCP
-//! dispatch "work" (exactly the failure carry-forward CF-7 item 2 warns
-//! against). Instead, an MCP-targeted tool call always fails closed with a
-//! named, honest `ToolResult { is_error: true }` explaining why — see
-//! [`mcp_dispatch_refusal`]. This is reported BLOCKED, with this evidence,
-//! in Task 5's report (`.superpowers/sdd/W1/task-5-report.md`); per that
-//! task's brief, landing the built-in arm correctly and reporting the MCP
-//! arm's gap explicitly is the intended outcome of this dispatch, not a
-//! shortfall.
-//!
-//! # Unbounded results fold into context uncapped (carry-forward CF-7 item 4)
-//! `run_agent_loop` folds every dispatched tool's result — built-in or
-//! (were it wired) MCP — into `transcript` and into the next turn's
-//! `request.messages` below with no size cap of its own. Combined with
-//! `tool_dispatch`'s own note (see that module's doc comment) that none of
-//! the built-in executors cap their output either, a call against a very
-//! large file or a chatty shell command grows this loop's context
-//! unboundedly, exactly the shape CF-7 item 4 flags for the MCP arm's
-//! `stdio.rs:206`. Pre-existing/inherited, not introduced by this task; a
-//! cap would belong here or in `tool_dispatch::execute_builtin`, whichever
-//! task adds one.
+//! # Unbounded results are now capped for the MCP arm; still uncapped for built-ins
+//! `run_agent_loop` folds every dispatched tool's result into `transcript`
+//! and into the next turn's `request.messages`. [`dispatch_mcp`] caps the
+//! rendered text it returns (see [`MAX_MCP_RESULT_TEXT_BYTES`]) — CF-7 item
+//! 4's own concern, since `stdio.rs:206` reads with no cap of its own and
+//! `TaskInput::Json` has no size cap either, so an untrusted server could
+//! otherwise grow context unboundedly on every subsequent turn. The
+//! built-in arm's own executors (`tool_dispatch`'s own doc comment) still
+//! cap NOTHING of their own beyond the shell arm's stdout/stderr byte cap
+//! (round B's I1/M2 fix) — a `read` against a very large file still grows
+//! this loop's context unboundedly. Pre-existing/inherited for the
+//! built-in arm, not introduced by this round; closing it there belongs to
+//! whichever task next touches `tool_dispatch::execute_builtin`.
 
 use crate::session_actor::{SessionActor, TaskCreateRequest};
 use crate::tool_catalog::{resolve_tool_target, ToolTarget};
@@ -67,11 +74,14 @@ use roundhouse_core::{
     IsolationAttestation, Origin, TaskError, TaskId, TaskInput, TaskKind, TaskOutput, TaskRunner,
     Tier, Timestamp, Usage,
 };
+use roundhouse_mcp::executor::TaskExecutor as _;
 use roundhouse_provider::{
     ChatRequest, ContentBlock, Message, MessageRole, Provider, RequestCtx, ToolCallId, ToolDef,
     ToolResultPart,
 };
 use roundhouse_store::EventWriter;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// A hard ceiling on how many tool-call turns one [`run_agent_loop`] call may
 /// take. The loop terminates on "no `ToolUse` blocks left" OR this many
@@ -134,11 +144,11 @@ fn now_ts() -> Timestamp {
 /// asserted against.
 pub async fn run_agent_loop(
     actor: &SessionActor,
-    runner: &TaskRunner,
+    runner: &'static TaskRunner,
     provider: &dyn Provider,
     ctx: &RequestCtx,
     tools: &[ToolDef],
-    mcp: Option<&roundhouse_mcp::executor::McpExecutor>,
+    mcp: Option<Arc<roundhouse_mcp::executor::McpExecutor>>,
     mut request: ChatRequest,
     config: AgentLoopConfig,
 ) -> Result<Vec<ContentBlock>, AgentLoopError> {
@@ -187,9 +197,16 @@ pub async fn run_agent_loop(
 
         let mut tool_results = Vec::with_capacity(tool_uses.len());
         for (id, name, input) in tool_uses {
-            let outcome =
-                dispatch_one_tool_call(actor, writer, runner, mcp, &name, &input, chat_task_id)
-                    .await;
+            let outcome = dispatch_one_tool_call(
+                actor,
+                writer,
+                runner,
+                mcp.as_ref(),
+                &name,
+                &input,
+                chat_task_id,
+            )
+            .await;
             let (content, is_error) = match outcome {
                 Ok(content) => (content, false),
                 Err(message) => (vec![ToolResultPart { text: message }], true),
@@ -245,8 +262,8 @@ pub async fn run_agent_loop(
 async fn dispatch_one_tool_call(
     actor: &SessionActor,
     writer: &EventWriter,
-    runner: &TaskRunner,
-    mcp: Option<&roundhouse_mcp::executor::McpExecutor>,
+    runner: &'static TaskRunner,
+    mcp: Option<&Arc<roundhouse_mcp::executor::McpExecutor>>,
     name: &str,
     input: &serde_json::Value,
     parent: TaskId,
@@ -255,33 +272,40 @@ async fn dispatch_one_tool_call(
         Some(ToolTarget::Builtin(kind)) => {
             dispatch_builtin(actor, writer, runner, kind, input, parent).await
         }
-        Some(ToolTarget::Mcp { namespaced_name }) => {
-            let message = mcp_dispatch_refusal(mcp, &namespaced_name);
-            // Fix round A, SHOULD item F10 (audit asymmetry): a built-in
-            // denial mints a real TaskCreated/TaskFailed pair (see
-            // `dispatch_builtin`'s doc comment), but this MCP-refusal arm
-            // previously minted nothing at all — a model probing for MCP
-            // tool names left zero trace. `TaskKind::Mcp` is the honest
-            // categorization here (this IS a namespaced MCP-shaped tool
-            // call, just not one this dispatch can execute).
-            let recorded = record_unadmitted_refusal(
-                writer,
-                runner,
-                actor.session_id(),
-                TaskKind::Mcp,
-                parent,
-                input,
-                "mcp_not_wired",
-                message,
-            )
-            .await;
-            // fix round B, ruling W1-R65: whichever string comes back — the
-            // original refusal message (`Ok`) or a description of the
-            // primary `TaskCreated` append itself failing (`Err`) — this
-            // arm is always a refusal, so it always becomes `Err` to the
-            // caller.
-            Err(recorded.unwrap_or_else(|e| e))
-        }
+        Some(ToolTarget::Mcp { namespaced_name }) => match mcp {
+            Some(mcp) => {
+                dispatch_mcp(actor, writer, runner, mcp, &namespaced_name, input, parent).await
+            }
+            None => {
+                // Fix round A, SHOULD item F10 (audit asymmetry): a built-in
+                // denial mints a real TaskCreated/TaskFailed pair (see
+                // `dispatch_builtin`'s doc comment), but this MCP-refusal arm
+                // previously minted nothing at all — a model probing for MCP
+                // tool names left zero trace. `TaskKind::Mcp` is the honest
+                // categorization here (this IS a namespaced MCP-shaped tool
+                // call, just not one this session has any server for).
+                let message = format!(
+                    "no MCP servers are configured for this session (tool `{namespaced_name}`)"
+                );
+                let recorded = record_unadmitted_refusal(
+                    writer,
+                    runner,
+                    actor.session_id(),
+                    TaskKind::Mcp,
+                    parent,
+                    input,
+                    "mcp_not_configured",
+                    message,
+                )
+                .await;
+                // fix round B, ruling W1-R65: whichever string comes back —
+                // the original refusal message (`Ok`) or a description of
+                // the primary `TaskCreated` append itself failing (`Err`) —
+                // this arm is always a refusal, so it always becomes `Err`
+                // to the caller.
+                Err(recorded.unwrap_or_else(|e| e))
+            }
+        },
         None => {
             // The unknown-tool case has no natural `TaskKind` to record
             // under (unlike the MCP arm above) — recording it as some
@@ -357,26 +381,418 @@ async fn record_unadmitted_refusal(
     Ok(message)
 }
 
-/// See this module's doc comment ("MCP arm: deliberately NOT wired") for the
-/// full evidence trail. This never touches `mcp` beyond checking whether a
-/// host is configured at all — it never calls `McpExecutor::execute`, never
-/// guesses a `ServerId`, and never substitutes a permissive policy to make
-/// the denial go away.
-fn mcp_dispatch_refusal(
-    mcp: Option<&roundhouse_mcp::executor::McpExecutor>,
-    namespaced_name: &str,
-) -> String {
-    match mcp {
-        None => {
-            format!("no MCP servers are configured for this session (tool `{namespaced_name}`)")
+/// Wall-clock bound on one MCP tool-call dispatch (fix round C2, CF-7 item
+/// 2): `McpExecutor::execute` takes no cancellation token of its own and
+/// `stdio.rs`'s tool-call path has no timeout either, so a hostile or
+/// merely-wedged server that never replies would otherwise hang this
+/// dispatch (and, absent the spawned-task boundary below, the whole
+/// session actor) forever — the same shape fix round B's I1 closed for the
+/// shell arm. Same value as [`crate::tool_dispatch`]'s `SHELL_TIMEOUT`: no
+/// evidence favors a different bound for a tool-call round trip over a
+/// shell command's. Dropping the timed-out `execute` future stops US from
+/// waiting on it, but does not confirm the transport itself has abandoned
+/// the in-flight request the way `cancel_running_shell` confirms a killed
+/// process group — a residual gap noted, not solved, here (closing it
+/// belongs to `roundhouse-mcp`, out of this lane's charter).
+const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Bound on how many bytes of rendered MCP tool-result TEXT this arm folds
+/// into the next turn's `request.messages` (fix round C2, CF-7 item 4):
+/// `stdio.rs:206` reads an MCP server's response with an unbounded
+/// `BufReader::lines()` and `TaskInput`/`TaskOutput::Json` has no size cap
+/// of its own, so an untrusted server could otherwise grow this loop's
+/// context without bound on every subsequent turn — the same shape fix
+/// round B's shell-output cap and M2's JSON-depth cap already closed
+/// elsewhere in this lane. Deliberately much smaller than
+/// `tool_dispatch::MAX_SHELL_OUTPUT_BYTES` (10 MiB): that cap bounds bytes
+/// retained in a `ToolResultPart` of their own, not text folded into the
+/// model's own context window on every remaining turn of this loop — this
+/// codebase has no existing precedent sizing a context-bound text cap, so
+/// 256 KiB is a conservative, explicitly-documented judgment call for this
+/// round, not a measured constant.
+const MAX_MCP_RESULT_TEXT_BYTES: usize = 256 * 1024;
+
+/// Renders MCP result content blocks down to the plain text a
+/// `ToolResultPart` can carry, capped at [`MAX_MCP_RESULT_TEXT_BYTES`] with
+/// a visible truncation marker appended when the cap is hit (never silent
+/// — mirrors M2's own "truncation must be visible" principle).
+///
+/// `Text` blocks render verbatim. `Document` blocks whose `mime_type`
+/// starts with `text/` (`McpExecutor::decode_content`'s own shape for a
+/// resource that carried inline text, e.g. `text/plain`/`text/uri-list`)
+/// render their real text too, prefixed with `title` when present — this
+/// is genuinely useful information a model asked for, not something to
+/// throw away out of excess caution. Every other block (`Image`, and any
+/// `Document` whose `mime_type` is NOT `text/*` — i.e. carries real binary
+/// data) renders as a short, honest placeholder instead of being inlined:
+/// base64-encoding raw image/binary bytes into the model's text context is
+/// enormous (roughly 4/3 the original size) for a shape most models cannot
+/// usefully consume as inline text anyway, and it is exactly the kind of
+/// unbounded-growth vector this function's own cap exists to bound.
+/// `ToolUse`/`ToolResult`/`Thinking`/`Opaque` never appear here in
+/// practice (`decode_content` only ever produces `Text`/`Image`/
+/// `Document`), but are handled with the same placeholder fallback rather
+/// than a panic, since this function's input ultimately traces back to
+/// untrusted server output.
+fn render_mcp_content(content: Vec<(ContentBlock, roundhouse_core::Provenance)>) -> String {
+    let mut rendered = String::new();
+    let mut truncated = false;
+    for (block, _provenance) in content {
+        // §6.8: every block here is `Trust::Untrusted` regardless of
+        // provenance details — nothing about `_provenance` changes how a
+        // block is rendered, so it is intentionally unused beyond being
+        // part of `decode_content`'s real return shape.
+        let piece = match block {
+            ContentBlock::Text { text, .. } => text,
+            ContentBlock::Document { source, title, .. }
+                if source.mime_type.starts_with("text/") =>
+            {
+                let text = String::from_utf8_lossy(&source.data);
+                match title {
+                    Some(title) => format!("[{title}]\n{text}"),
+                    None => text.into_owned(),
+                }
+            }
+            ContentBlock::Image { source, .. } => {
+                format!(
+                    "[image: {}, {} bytes — not rendered into context]",
+                    source.mime_type,
+                    source.data.len()
+                )
+            }
+            ContentBlock::Document { source, title, .. } => format!(
+                "[document: {}, {} bytes{} — not rendered into context]",
+                source.mime_type,
+                source.data.len(),
+                title.map(|t| format!(", title: {t}")).unwrap_or_default()
+            ),
+            other => format!("[unsupported MCP content block: {other:?}]"),
+        };
+        if truncated {
+            continue;
         }
-        Some(_) => format!(
-            "MCP tool dispatch for `{namespaced_name}` is not wired in this build: resolving the \
-             authoritative ServerId this tool's policy gate requires needs a `roundhouse-mcp` \
-             accessor (a public reader over McpExecutor's private tool namespace) that does not \
-             exist yet — refusing to guess a server id rather than silently bypassing that gate \
-             (see Task 5's report, carry-forward CF-3 STRENGTHENED)"
-        ),
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        if rendered.len() + piece.len() > MAX_MCP_RESULT_TEXT_BYTES {
+            let remaining = MAX_MCP_RESULT_TEXT_BYTES.saturating_sub(rendered.len());
+            // Never split a UTF-8 char boundary — floor(remaining) to the
+            // nearest valid boundary rather than panic on a mid-codepoint
+            // cut.
+            let mut cut = remaining.min(piece.len());
+            while cut > 0 && !piece.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            rendered.push_str(&piece[..cut]);
+            truncated = true;
+        } else {
+            rendered.push_str(&piece);
+        }
+    }
+    if truncated {
+        rendered.push_str(&format!(
+            "\n[MCP result truncated at {MAX_MCP_RESULT_TEXT_BYTES} bytes]"
+        ));
+    }
+    rendered
+}
+
+/// Admits and dispatches one MCP tool call through the real
+/// `roundhouse_mcp::executor::McpExecutor::execute` (fix round C2 — see
+/// this module's own doc comment for the CF-3/CF-9 accessors that made this
+/// possible, and everything it still refuses to do).
+///
+/// **S-LOG-1, mirroring `dispatch_builtin`'s own precedent:** `TaskCreated`
+/// is minted and durably appended BEFORE dispatch, so an unresolvable
+/// namespaced name or a spawned-task panic still leaves a real, queryable
+/// attempt in the log rather than nothing at all.
+///
+/// **The spawned-task boundary (CF-7 item 1):** `execute` runs inside
+/// `tokio::spawn`, and this function `.await`s the `JoinHandle` rather than
+/// calling `execute` in-process. `execute`'s only internal writes
+/// (`suspend_for_elicitation`'s `spawn_task`/`suspend_task` calls, reached
+/// only on an `InputRequired` result) go through the SAME `EngineTaskSpawner`
+/// this `McpExecutor` was constructed with (`mcp_spawner.rs`), which PANICS
+/// on a failed `EventWriter` append by design (see that module's own doc
+/// comment) rather than swallowing it. Without the spawned-task boundary,
+/// that panic would unwind straight through this function into whatever
+/// called `run_agent_loop` — the session actor itself. `tokio::spawn`
+/// catches it as an `Err(JoinError)` on the handle instead, so ONE
+/// dispatch panicking fails only that dispatch: this function still
+/// records a real `TaskFailed` for the task it minted (a panic mid-`execute`
+/// leaves no guarantee ANY terminal state was recorded for THIS task,
+/// unlike `Completed`/`Failed`/`Suspended`, all of which are fully resolved
+/// before `execute` ever returns) and returns an honest error to the model,
+/// rather than the whole session actor going down.
+///
+/// **`Suspended` (an `InputRequired`/elicitation result): reports honestly,
+/// records nothing further.** `execute`'s `suspend_for_elicitation` path
+/// already durably wrote `TaskSuspended` for this task (via the injected
+/// `TaskSpawner`, synchronously, before returning) — writing another
+/// terminal event here would be a double-write for the same task. The
+/// MRTR retry loop (resuming a suspended MCP task with
+/// `ResumptionInput::ElicitationAnswers` once a human answers the
+/// elicitation) is explicitly OUT OF SCOPE for this round: nothing in
+/// `run_agent_loop` today re-visits a suspended task, so this arm reports
+/// an honest `is_error: true` result explaining that the tool call requires
+/// input this loop cannot yet supply, rather than silently hanging or
+/// mischaracterizing a genuine suspension as a failure.
+///
+/// # Turns a spawned MCP dispatch's `JoinHandle` result into an `ExecutorOutcome`
+/// Split out from [`dispatch_mcp`] so the CF-7 item 1 boundary — what
+/// happens when the spawned task panicked or was cancelled instead of
+/// returning normally — is independently unit-testable without needing to
+/// reproduce the one real internal condition that can trigger it inside
+/// `McpExecutor` (an `EventWriter` append failure inside
+/// `suspend_for_elicitation`, which this crate has no clean way to force
+/// from outside `roundhouse-mcp`). `join_result` is accepted as a plain
+/// parameter rather than a `JoinHandle` for exactly this reason: a test can
+/// hand it the result of `tokio::spawn(async { panic!(..) }).await` — an
+/// artificially panicking task, unrelated to any real MCP internals — and
+/// still be testing the REAL logic this function shares with production.
+///
+/// `pub`, not private (fix round C2): the only way to exercise this branch
+/// from a test is to hand it a genuine `Err(JoinError)` from an
+/// artificially panicking task, and every `#[test]`/`#[tokio::test]` in
+/// this crate's OWN `--lib` binary shares one process with
+/// `session_actor.rs`'s single `TaskRunner::bootstrap()` call (which panics
+/// on a second call per process) — a second internal unit test bootstrapping
+/// its own `TaskRunner` would collide with it. Exposing this one narrow,
+/// already-self-contained seam lets `tests/agent_loop_dispatch.rs` (its own,
+/// independent process, with its own `static RUNNER`) test it directly
+/// instead.
+pub async fn resolve_mcp_join_result(
+    writer: &EventWriter,
+    runner: &TaskRunner,
+    session_id: roundhouse_core::SessionId,
+    task_id: TaskId,
+    join_result: Result<roundhouse_mcp::executor::ExecutorOutcome, tokio::task::JoinError>,
+) -> Result<roundhouse_mcp::executor::ExecutorOutcome, String> {
+    match join_result {
+        Ok(outcome) => Ok(outcome),
+        Err(join_err) => {
+            // CF-7 item 1: the spawned dispatch panicked (or was
+            // cancelled) — this task never reached a terminal state on its
+            // own, so record one now rather than leaving it dangling at
+            // `TaskStarted` forever.
+            let message = format!("MCP tool call dispatch panicked or was cancelled: {join_err}");
+            let failed = runner.record_task_failed(
+                session_id,
+                0,
+                now_ts(),
+                task_id,
+                TaskError {
+                    message: message.clone(),
+                    category: "mcp_dispatch_panic".into(),
+                },
+                false,
+                1,
+            );
+            if let Err(e) = writer.append(failed).await {
+                tracing::warn!(
+                    error = %e,
+                    "failed to record TaskFailed for a panicked MCP dispatch"
+                );
+            }
+            Err(message)
+        }
+    }
+}
+
+/// The real MCP dispatch arm (fix round C2). Resolves `namespaced_name` via
+/// [`roundhouse_mcp::executor::McpExecutor::resolve`] to learn the
+/// authoritative `server` for `execute`'s policy gate — but passes
+/// `namespaced_name` itself, unchanged, as `TaskInput::Mcp.tool`, because
+/// `execute` re-resolves `tool` internally and rejects an already-resolved
+/// original name as unknown (see this module's top-level doc comment for the
+/// full explanation of that split). Records `TaskCreated`/`TaskStarted`
+/// before dispatch and `TaskCompleted`/`TaskFailed` after, per S-LOG-1.
+///
+/// CF-7 item 1 — the spawned-task boundary: the actual `execute` call runs
+/// inside `tokio::spawn`, wrapped in a `MCP_CALL_TIMEOUT` timeout, so that an
+/// `EventWriter` append panic inside `McpExecutor`'s injected `TaskSpawner`
+/// (which panics by design on a failed append — see `mcp_spawner.rs`) is
+/// caught as an `Err(JoinError)` on the `JoinHandle` rather than unwinding
+/// into the session actor and killing every other task in flight.
+/// [`resolve_mcp_join_result`] turns that `Err` into a durable `TaskFailed`
+/// so the task never dangles at `TaskStarted` forever.
+async fn dispatch_mcp(
+    actor: &SessionActor,
+    writer: &EventWriter,
+    runner: &'static TaskRunner,
+    mcp: &Arc<roundhouse_mcp::executor::McpExecutor>,
+    namespaced_name: &str,
+    input: &serde_json::Value,
+    parent: TaskId,
+) -> Result<Vec<ToolResultPart>, String> {
+    // CF-3: the only authoritative source of the ServerId `execute`'s
+    // policy gate uses directly — never parsed out of the namespaced name.
+    // Only `server` is needed from this resolution: `execute` takes the
+    // NAMESPACED name as `TaskInput::Mcp.tool` and resolves it to the
+    // original tool name AGAIN, internally, for its own dispatch
+    // (`executor.rs:517`) — this call exists solely to learn the
+    // authoritative `server`, which `execute` uses directly and never
+    // re-derives itself.
+    let server = match mcp.resolve(namespaced_name) {
+        Some((server, _original_tool)) => server.clone(),
+        None => {
+            let message = format!(
+                "unknown MCP tool `{namespaced_name}` — no server registered this namespaced \
+                 name, refusing to forward an unresolved name to the transport"
+            );
+            let recorded = record_unadmitted_refusal(
+                writer,
+                runner,
+                actor.session_id(),
+                TaskKind::Mcp,
+                parent,
+                input,
+                "mcp_unresolved_tool",
+                message,
+            )
+            .await;
+            return Err(recorded.unwrap_or_else(|e| e));
+        }
+    };
+
+    // S-LOG-1: mint and durably record the real task this dispatch is
+    // ATTEMPTING before dispatch runs — see this function's own doc
+    // comment for why a panic mid-dispatch must not leave this task
+    // permanently dangling with no terminal record.
+    let task_id = TaskId::new();
+    let recorded_input = serde_json::json!({ "tool": namespaced_name, "args": input });
+    let created = runner.record_task_created(
+        actor.session_id(),
+        0, // ignored — EventWriter::append assigns the real per-session seq
+        now_ts(),
+        task_id,
+        TaskKind::Mcp,
+        Some(parent),
+        Origin::Model,
+        TaskInput::Json(recorded_input),
+        1,
+    );
+    writer
+        .append(created)
+        .await
+        .map_err(|e| format!("failed to record the dispatched MCP tool call: {e}"))?;
+
+    let started = runner.record_task_started(
+        actor.session_id(),
+        0,
+        now_ts(),
+        task_id,
+        // Mirrors `dispatch_builtin`'s identical placeholder attestation:
+        // this dispatch runs the MCP transport in-process (a subprocess
+        // the daemon itself spawned at MCP-host-startup time, not a fresh
+        // sandboxed child per call), not through `Isolate::spawn` — nothing
+        // here claims a sandbox tier this call didn't actually run under.
+        IsolationAttestation {
+            tier: Tier::None,
+            digest: String::new(),
+            net_enforced: false,
+        },
+        None,
+        1,
+    );
+    writer
+        .append(started)
+        .await
+        .map_err(|e| format!("failed to record the dispatched MCP tool call starting: {e}"))?;
+
+    // Taint: `Taint::Tainted` (the conservative of the two values §6.8
+    // defines) — this codebase has no live per-session taint tracker today
+    // (nothing populates one across turns), so this is a fail-closed
+    // default for a field some future config rule may consult, not a
+    // measured "this session is untrustworthy" judgment. Revisit once a
+    // real taint tracker exists.
+    let ctx = roundhouse_mcp::executor::TaskCtx {
+        task: task_id,
+        session: actor.session_id(),
+        parent: Some(parent),
+        taint: roundhouse_policy::Taint::Tainted,
+    };
+    let mcp_input = roundhouse_mcp::executor::TaskInput::Mcp {
+        server,
+        // The NAMESPACED name, not an already-resolved original one —
+        // `execute` resolves `tool` itself (`executor.rs:517`) to find the
+        // original tool name it actually dispatches to the transport.
+        tool: namespaced_name.to_string(),
+        args: input.clone(),
+    };
+
+    let mcp_for_task = Arc::clone(mcp);
+    let join_result = tokio::spawn(async move {
+        match tokio::time::timeout(
+            MCP_CALL_TIMEOUT,
+            mcp_for_task.execute(&ctx, &mcp_input, None),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => roundhouse_mcp::executor::ExecutorOutcome::Failed {
+                error: TaskError {
+                    message: format!(
+                        "MCP tool call exceeded its {MCP_CALL_TIMEOUT:?} wall-clock bound"
+                    ),
+                    category: "mcp_timeout".into(),
+                },
+                retryable: true,
+            },
+        }
+    })
+    .await;
+
+    let outcome =
+        resolve_mcp_join_result(writer, runner, actor.session_id(), task_id, join_result).await?;
+
+    match outcome {
+        roundhouse_mcp::executor::ExecutorOutcome::Completed { output, usage } => {
+            let roundhouse_mcp::executor::TaskOutput::Mcp { content, is_error } = output;
+            let rendered = render_mcp_content(content);
+            let completed = runner.record_task_completed(
+                actor.session_id(),
+                0,
+                now_ts(),
+                task_id,
+                TaskOutput::Text(rendered.clone()),
+                usage,
+                1,
+            );
+            writer.append(completed).await.map_err(|e| {
+                format!("failed to record the dispatched MCP tool call completing: {e}")
+            })?;
+            if is_error {
+                Err(rendered)
+            } else {
+                Ok(vec![ToolResultPart { text: rendered }])
+            }
+        }
+        roundhouse_mcp::executor::ExecutorOutcome::Failed { error, .. } => {
+            let message = error.message.clone();
+            let failed = runner.record_task_failed(
+                actor.session_id(),
+                0,
+                now_ts(),
+                task_id,
+                error,
+                false,
+                1,
+            );
+            writer.append(failed).await.map_err(|e| {
+                format!("failed to record the dispatched MCP tool call failing: {e}")
+            })?;
+            Err(message)
+        }
+        roundhouse_mcp::executor::ExecutorOutcome::Suspended { .. } => {
+            // Already durably recorded by `execute` itself — see this
+            // function's own doc comment. Nothing more to append here.
+            Err(format!(
+                "MCP tool `{namespaced_name}` requires additional input (an elicitation) this \
+                 dispatch loop cannot yet resume — the task is suspended, not failed, but MRTR \
+                 resume is out of this round's scope"
+            ))
+        }
     }
 }
 

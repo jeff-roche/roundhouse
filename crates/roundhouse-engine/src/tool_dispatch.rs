@@ -1229,6 +1229,57 @@ mod tests {
     }
 
     #[test]
+    fn task_params_for_shell_a_symlink_to_a_sealed_program_outside_root_is_rejected_by_containment_first(
+    ) {
+        // Fix round C2 (W1-R70 item 2): the `./shim` containment property
+        // has existed only as a comment since fix round B (`resolve_shell_program`'s
+        // own doc comment, "e.g. `./shim` symlinked to something outside
+        // root"), never as a test — exactly the shape this lane's own M4
+        // finding warned about ("a commented-but-untested property gets
+        // silently absorbed by a later check"). The security lens verified
+        // it holds by execution in round C1's review; this makes that a
+        // standing regression test rather than a one-time manual check.
+        //
+        // The interesting case, not the trivial one: `./mytool` is a
+        // symlink to a REAL, SEALED priv-escalation binary
+        // (`/usr/bin/sudo` — `sealed_program`'s own basename list) sitting
+        // OUTSIDE the workspace root. If containment ran after basename
+        // matching, this would look identical to the already-covered
+        // `a_fully_qualified_sealed_program_path_is_still_denied_by_the_sealed_floor`
+        // case and prove nothing new. Containment must fire FIRST, before
+        // `sealed_program`'s basename check ever gets a chance to matter —
+        // proven here by asserting the rejection reason is explicitly
+        // "outside the workspace root", not merely that `task_params_for`
+        // returned some error.
+        let sudo_path = Path::new("/usr/bin/sudo");
+        assert!(
+            sudo_path.is_file(),
+            "this test needs a real binary outside the workspace root to symlink to; \
+             /usr/bin/sudo is absent on this machine"
+        );
+
+        let cwd = workspace_temp_dir();
+        std::os::unix::fs::symlink(sudo_path, cwd.path().join("mytool")).unwrap();
+
+        let err = task_params_for(
+            TaskKind::Shell,
+            &serde_json::json!({
+                "program": "./mytool",
+                "argv": [],
+                "cwd": cwd.path().to_string_lossy(),
+            }),
+        )
+        .unwrap_err();
+        match err {
+            ToolDispatchError::ShellProgramRejected(msg) => assert!(
+                msg.contains("outside the workspace root"),
+                "expected containment to fire before basename matching ever runs, got: {msg}"
+            ),
+            other => panic!("expected ShellProgramRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn task_params_for_shell_rejects_a_directory_as_program() {
         // Fix round B, finding M4 (ruling W1-R69): `program="/"` (the
         // finding's own example, generalized to any directory) must not
