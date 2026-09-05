@@ -5,6 +5,18 @@
 //! a wall-clock ceiling (every platform), or an output-size ceiling (every
 //! platform).
 //!
+//! **Descendants do not outlive a call to [`run_bounded_subprocess`]**
+//! (ruling W5-26, fix round 3, Linux only): on every exit path — the child
+//! finishing on its own included, not only a bound firing — this function
+//! kills the child's entire process group before returning, so a
+//! grandchild the direct child forked and backgrounded (a `git` credential
+//! helper or hook, for example) cannot keep running, and cannot keep this
+//! call's own stdout/stderr pipes open, past the point this function
+//! returns. See `kill_child_and_descendants` and `wait_bounded`'s doc
+//! comment for the mechanism and its one accepted residual (a `setsid`
+//! escapee, or a vanishingly narrow PID-recycling race on the group-kill
+//! itself).
+//!
 //! # What this does NOT bound: memory / address space (ruling W5-25, finding 4)
 //!
 //! **These are the complete three bounds — CPU, wall-clock, output size —
@@ -238,6 +250,16 @@ pub fn run_bounded_subprocess(
         source,
     })?;
 
+    // Ruling W5-26 (fix round 3): captured once, immediately after spawn,
+    // rather than re-read via `child.id()` at each kill site below.
+    // `Child::id()` is just a stored field (Rust does not re-query the OS
+    // for it), so re-reading it later would not itself be wrong — this is
+    // about tying every kill call to the pgid this call actually created
+    // at spawn time, so the accepted-residual note on `kill_child_and_descendants`
+    // below is precisely about *this* value, not about whatever `id()`
+    // might return if `Child`'s internals ever changed.
+    let pgid = child.id() as i32;
+
     let stdin = child.stdin.take();
     let mut stdout = child.stdout.take().expect("stdout was requested as piped");
     let mut stderr = child.stderr.take().expect("stderr was requested as piped");
@@ -270,6 +292,7 @@ pub fn run_bounded_subprocess(
 
         let outcome = wait_bounded(
             &mut child,
+            pgid,
             wall_limit,
             max_output_bytes,
             &output_exceeded,
@@ -355,28 +378,50 @@ enum WaitOutcome {
 /// either way (the wall-clock bound still applied), so this is a
 /// promptness fix, not a bypass fix like finding 1's.
 ///
-/// **Residual (f), found during this round's self-review, not fixed:** the
-/// `Exited` arm below returns as soon as `try_wait()` reports the *direct*
-/// child gone — it does not call [`kill_child_and_descendants`] first. A
-/// child that forks a descendant, hands it the inherited stdout write end,
-/// and then exits itself (e.g. `sh -c "sleep infinity &"`) leaves that
-/// descendant holding the pipe open with nothing left to kill it: this loop
-/// has already returned, and `run_bounded_subprocess`'s `thread::scope`
-/// blocks forever inside `read_capped`'s `.read()` waiting for an EOF the
-/// orphan never sends — a hang with *no* bound applying at all, not even
-/// `wall_limit`. Distinct from finding 2 (which covers the three paths that
-/// already call `kill_child_and_descendants`: timeout, stdout overflow,
-/// stderr overflow) and from the item-2 residual above (a `setsid` escapee):
-/// this one is reachable through the *ordinary* exit path with no evasion
-/// needed, for any child that legitimately backgrounds work and returns
-/// before that work finishes. Not fixed this round — ruling W5-25 scoped
-/// item 2 to "the kill paths" and adding a `killpg` here changes the
-/// contract for a child that intentionally backgrounds a helper and exits
-/// (killing a legitimate grandchild is different from killing a hung one),
-/// which needs its own ruling rather than a silent addition in a Minor-item
-/// pass.
+/// **Ruling W5-26 (fix round 3) — the `Exited` arm now also tears down the
+/// process group, closing what fix round 2's report recorded as residual
+/// (f).** Before this fix, the arm returned the instant `try_wait()`
+/// reaped the *direct* child, without calling
+/// [`kill_child_and_descendants`] first. A child that forks a descendant,
+/// hands it the inherited stdout write end, and exits itself before that
+/// descendant does (e.g. `sh -c "sleep 30 &"` — no foreground command left,
+/// so the shell exits 0 immediately once the background job is launched)
+/// left that descendant holding the pipe open with nothing left to close
+/// it: `run_bounded_subprocess`'s `thread::scope` blocked forever inside
+/// `read_capped`'s `.read()` waiting for an EOF the orphan never sends — an
+/// unbounded hang with *no* bound applying at all, reachable with no
+/// adversarial behaviour, just an ordinary child that legitimately
+/// backgrounds work and returns before that work finishes.
+/// `run_bounded_subprocess` is a synchronous, all-or-nothing,
+/// resource-bounded execution: a descendant outliving the call already
+/// violates the contract this function advertises, so terminating the
+/// group on **every** exit path — not only the three paths that already
+/// killed on a bound firing — is the correct semantics, not a policy
+/// tradeoff. **Descendants do not outlive a call to
+/// [`run_bounded_subprocess`].**
+///
+/// **Accepted residual, documented rather than chased:** `try_wait()`
+/// reaps the direct child before this arm issues the group-wide kill, so
+/// the `killpg(pgid, ...)` below targets a pgid whose leader is already
+/// gone. If that exact PID value were recycled and made the leader of an
+/// unrelated new process group in the (microseconds-wide) window between
+/// the reap and the `killpg` call, this would signal the wrong group.
+/// Against a large PID space this is a vanishingly narrow race, and every
+/// supervisor that calls `killpg` after reaping (rather than detecting exit
+/// without reaping, e.g. via `waitid(..., WNOWAIT)`) has the identical
+/// window — closing it needs a different wait primitive, not a bigger
+/// `killpg` call, and is not attempted here.
+///
+/// **`stderr_exceeded` is consulted here since ruling W5-25, finding 5** —
+/// before, nothing read it: a child that flooded stderr past
+/// `STDERR_CAPTURE_CAP` stopped being drained, blocked on its own `write`
+/// once the pipe filled, and simply sat until `wall_limit` fired instead of
+/// getting the same prompt kill a stdout flood already got. Fail-closed
+/// either way (the wall-clock bound still applied), so this is a
+/// promptness fix, not a bypass fix like finding 1's.
 fn wait_bounded(
     child: &mut Child,
+    pgid: i32,
     wall_limit: Duration,
     max_output_bytes: usize,
     output_exceeded: &AtomicBool,
@@ -385,24 +430,30 @@ fn wait_bounded(
     let start = Instant::now();
     loop {
         if let Ok(Some(status)) = child.try_wait() {
+            // Ruling W5-26: the direct child exiting on its own is not
+            // proof nothing it forked is still running — see this
+            // function's doc comment for why the group is torn down here
+            // too, and the accepted residual around the reap-then-kill
+            // ordering.
+            kill_child_and_descendants(child, pgid);
             return WaitOutcome::Exited(status);
         }
         if output_exceeded.load(Ordering::SeqCst) {
-            kill_child_and_descendants(child);
+            kill_child_and_descendants(child, pgid);
             let _ = child.wait();
             return WaitOutcome::OutputExceeded {
                 limit: max_output_bytes,
             };
         }
         if stderr_exceeded.load(Ordering::SeqCst) {
-            kill_child_and_descendants(child);
+            kill_child_and_descendants(child, pgid);
             let _ = child.wait();
             return WaitOutcome::OutputExceeded {
                 limit: STDERR_CAPTURE_CAP,
             };
         }
         if start.elapsed() >= wall_limit {
-            kill_child_and_descendants(child);
+            kill_child_and_descendants(child, pgid);
             let _ = child.wait();
             return WaitOutcome::TimedOut;
         }
@@ -421,17 +472,37 @@ fn wait_bounded(
 /// sends — hanging the parent *after* this function believes it has
 /// enforced a bound.
 ///
+/// Called from every path that ends [`wait_bounded`]'s loop (ruling W5-26,
+/// fix round 3 added the `Exited` path to that list — see `wait_bounded`'s
+/// doc comment for why a cleanly-exiting direct child is not proof nothing
+/// it forked is still running).
+///
 /// **Residual, recorded rather than chased (explicitly out of scope this
 /// round):** a descendant that calls `setsid` itself leaves the group and
 /// escapes this kill. Closing that needs a different mechanism (e.g. a
 /// PID-namespace or cgroup boundary), not a bigger `killpg` call.
-fn kill_child_and_descendants(child: &mut Child) {
+///
+/// `pgid` is the value [`run_bounded_subprocess`] captured immediately
+/// after spawning `child` (ruling W5-26) — not re-read from `child.id()`
+/// here, so every call site is provably using the pgid this call actually
+/// created, regardless of whether `child` has since been reaped. See
+/// `wait_bounded`'s doc comment for the accepted PID-recycling residual
+/// this implies.
+fn kill_child_and_descendants(child: &mut Child, pgid: i32) {
     #[cfg(target_os = "linux")]
     {
-        crate::probe::kill_process_group(child.id() as i32);
+        // The process group, not `child` itself, is what needs signalling
+        // here — `child` stays a parameter only for the non-Linux fallback
+        // below, so it is otherwise unused on this path.
+        let _ = &child;
+        crate::probe::kill_process_group(pgid);
     }
     #[cfg(not(target_os = "linux"))]
     {
+        // No process-group support off Linux (ruling W5-3): `pgid` plays
+        // no part here, so the direct `Child::kill()` carries the whole
+        // load, same as before this round.
+        let _ = pgid;
         let _ = child.kill();
     }
 }
