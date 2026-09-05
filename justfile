@@ -44,3 +44,13 @@ run *args:
 # Remove build artifacts.
 clean:
     cargo clean
+
+# Rebuild the web frontend into crates/roundhouse-web/assets/dist/, which is
+# committed (`rust-embed` needs it at Rust compile time, and CI has no npm
+# step — see `.gitignore`'s comment on the same directory).
+web-build:
+    cd crates/roundhouse-web/frontend && npm ci && npm run build
+
+# Run the web frontend's Vitest suite.
+web-test:
+    cd crates/roundhouse-web/frontend && npm ci && npm test

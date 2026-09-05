@@ -1,0 +1,48 @@
+name: Web
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/roundhouse-web/frontend
+    steps:
+      - uses: actions/checkout@v4
+      # `@v4` resolves as a mutable tag (`v4` is repointed to new commits as
+      # `actions/setup-node` releases patches), which is not reproducible
+      # across runs and can silently change what gets installed — the same
+      # reason `ci.yml` pins `dtolnay/rust-toolchain` by commit SHA rather
+      # than `@stable`. v7.0.0, pinned 2026-09-04.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      # `crates/roundhouse-web/assets/dist/` is committed (ruling R1 —
+      # `rust-embed` needs it at Rust compile time, and the `cargo` jobs in
+      # `ci.yml` have no npm step to build it themselves). Nothing else in
+      # this workspace can notice that committed output drifting from
+      # `frontend/src`; this is the one place that can, and — since the Vite
+      # build is deterministic — the one place the criterion-1
+      # (`dist_public_content.rs`) and criterion-2 (`token.test.ts`) guards'
+      # *inputs* are freshly regenerated and checked against what is checked
+      # in, rather than trusted from a previous commit.
+      - name: Fail if the committed build output is stale
+        working-directory: .
+        run: |
+          # `--exit-code` alone only catches a *changed* tracked file — a
+          # chunk Vite starts emitting under a new content hash shows up as
+          # untracked, not modified, and `diff` says nothing about it.
+          # `status --porcelain` catches both directions: a stale hash and a
+          # stale file that should no longer be here at all.
+          git diff --exit-code -- crates/roundhouse-web/assets/dist
+          test -z "$(git status --porcelain -- crates/roundhouse-web/assets/dist)"
