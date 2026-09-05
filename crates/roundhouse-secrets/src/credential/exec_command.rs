@@ -2,6 +2,7 @@ use crate::secret::Secret;
 use roundhouse_provider::credential::{CredentialCtx, CredentialError, CredentialProvider};
 use roundhouse_provider::{BoxFut, HttpRequest};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 /// Ceiling on how long a credential helper may run before it's killed. A
 /// hung helper must not wedge the request indefinitely — Phase 2 did real
@@ -81,15 +82,109 @@ impl CredentialProvider for ExecCommandCredential {
                 .env_clear()
                 .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                // Phase 7 U4 (Ruling R14): put the helper (and anything it
+                // forks) in its own new process group rather than the
+                // daemon's, so a terminal signal delivered to the daemon's
+                // foreground process group (e.g. Ctrl-C's SIGINT) never also
+                // lands directly on a credential helper mid-run. A pgid of 0
+                // makes the child the leader of that new group (see
+                // `tokio::process::Command::process_group`'s own doc
+                // example). This is a plain `std`-mirroring API — no
+                // `unsafe` needed, unlike a raw `kill(-pgid, ..)` FFI call,
+                // which this crate's `#![forbid(unsafe_code)]` would reject.
+                .process_group(0)
                 // If the timeout below fires and this future is dropped
                 // before the child exits, tokio kills the child on drop
                 // instead of leaving it running as an orphan.
                 .kill_on_drop(true);
 
-            let output = match tokio::time::timeout(self.timeout, command.output()).await {
-                Ok(result) => {
-                    result.map_err(|e| CredentialError::ExecFailed(None, e.to_string()))?
+            let run = async {
+                let mut child = command
+                    .spawn()
+                    .map_err(|e| CredentialError::ExecFailed(None, e.to_string()))?;
+                let mut stdout = child
+                    .stdout
+                    .take()
+                    .expect("stdout was configured as piped above");
+                let mut stderr = child
+                    .stderr
+                    .take()
+                    .expect("stderr was configured as piped above");
+
+                // Stream stdout instead of buffering it to completion and
+                // only checking its length afterward (Ruling R14): a helper
+                // that emits far more than `MAX_STDOUT_BYTES` before exiting
+                // — or one that never exits at all, e.g. because it forked a
+                // grandchild that inherited and holds open the stdout pipe —
+                // would otherwise be read into memory in full, bounded only
+                // by the whole-call timeout below. Reading in bounded chunks
+                // and failing the instant the running total crosses the cap
+                // means a misbehaving helper is killed and rejected within
+                // one chunk's read latency, not the full timeout, and this
+                // process never holds more than one chunk past the cap in
+                // memory.
+                let mut stdout_buf: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = stdout
+                        .read(&mut chunk)
+                        .await
+                        .map_err(|e| CredentialError::ExecFailed(None, e.to_string()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    stdout_buf.extend_from_slice(&chunk[..n]);
+                    if stdout_buf.len() > MAX_STDOUT_BYTES {
+                        // Kill immediately rather than draining a possibly
+                        // unbounded stream to EOF first. `kill_on_drop`
+                        // alone wouldn't fire until this whole async block
+                        // is dropped (i.e. not until the outer timeout
+                        // elapses), so an explicit kill here is what makes
+                        // detection fast rather than timeout-bounded.
+                        let _ = child.kill().await;
+                        return Err(CredentialError::ExecFailed(
+                            None,
+                            format!("credential helper stdout exceeded {MAX_STDOUT_BYTES} bytes"),
+                        ));
+                    }
                 }
+
+                let status = child
+                    .wait()
+                    .await
+                    .map_err(|e| CredentialError::ExecFailed(None, e.to_string()))?;
+
+                if !status.success() {
+                    // A helper's stderr is not vetted content: it can carry
+                    // diagnostics that echo token material (e.g. under
+                    // `set -x`, or a partial-write bug). `redact_error_body`'s
+                    // shape-based patterns are the only thing that ever sees
+                    // this text, and it is hard-truncated regardless, since a
+                    // persisted `CredentialError` derives `Display`/`Debug`.
+                    let mut stderr_buf = Vec::new();
+                    let _ = stderr.read_to_end(&mut stderr_buf).await;
+                    let redacted = roundhouse_provider::audit::redact_error_body(
+                        &String::from_utf8_lossy(&stderr_buf),
+                    );
+                    let truncated: String = redacted.chars().take(MAX_STDERR_CHARS).collect();
+                    return Err(CredentialError::ExecFailed(status.code(), truncated));
+                }
+
+                let token = String::from_utf8_lossy(&stdout_buf).trim().to_string();
+                if token.is_empty() {
+                    return Err(CredentialError::ExecFailed(
+                        status.code(),
+                        "credential helper produced empty stdout".to_string(),
+                    ));
+                }
+
+                Ok(token)
+            };
+
+            let token = match tokio::time::timeout(self.timeout, run).await {
+                Ok(result) => result?,
                 Err(_) => {
                     return Err(CredentialError::ExecFailed(
                         None,
@@ -100,35 +195,6 @@ impl CredentialProvider for ExecCommandCredential {
                     ));
                 }
             };
-
-            if !output.status.success() {
-                // A helper's stderr is not vetted content: it can carry
-                // diagnostics that echo token material (e.g. under `set -x`,
-                // or a partial-write bug). `redact_error_body`'s shape-based
-                // patterns are the only thing that ever sees this text, and
-                // it is hard-truncated regardless, since a persisted
-                // `CredentialError` derives `Display`/`Debug`.
-                let redacted = roundhouse_provider::audit::redact_error_body(
-                    &String::from_utf8_lossy(&output.stderr),
-                );
-                let truncated: String = redacted.chars().take(MAX_STDERR_CHARS).collect();
-                return Err(CredentialError::ExecFailed(output.status.code(), truncated));
-            }
-
-            if output.stdout.len() > MAX_STDOUT_BYTES {
-                return Err(CredentialError::ExecFailed(
-                    output.status.code(),
-                    format!("credential helper stdout exceeded {MAX_STDOUT_BYTES} bytes"),
-                ));
-            }
-
-            let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if token.is_empty() {
-                return Err(CredentialError::ExecFailed(
-                    output.status.code(),
-                    "credential helper produced empty stdout".to_string(),
-                ));
-            }
 
             // Wrapped in a `Secret` immediately, and read only through the
             // shared `apply_bearer_secret` exposure site — never held as a

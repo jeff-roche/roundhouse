@@ -621,6 +621,37 @@ async fn exec_command_rejects_stdout_over_the_size_cap() {
 }
 
 #[tokio::test]
+async fn exec_command_streams_the_stdout_cap_and_never_buffers_an_unbounded_producer() {
+    // Phase 7 U4, Ruling R14: `yes` never exits and writes far faster than
+    // `MAX_STDOUT_BYTES` (8 KiB) can be consumed. A `.output()`-based
+    // implementation buffers stdout to completion before ever checking its
+    // length, and a process that never exits is only ever caught by the
+    // whole-call timeout below -- so a buffer-then-truncate implementation
+    // would hold megabytes of memory and fail with "timed out", never
+    // "exceeded". A streaming implementation must detect the cap being
+    // crossed as bytes arrive and kill the helper well within the generous
+    // 2s timeout, failing with "exceeded" instead.
+    let cred = ExecCommandCredential::new("/usr/bin/yes".into(), vec![], vec![])
+        .unwrap()
+        .with_timeout(Duration::from_secs(2));
+    let t = NullTransport;
+    let mut req = empty_request();
+    let started = Instant::now();
+    let err = cred.apply(&mut req, &ctx(&t)).await.unwrap_err();
+    assert!(
+        err.to_string().contains("exceeded"),
+        "an unbounded producer must be caught by the streaming cap check, not the \
+         whole-call timeout: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the cap must be detected as bytes arrive rather than by waiting out the \
+         2s timeout: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
 async fn exec_command_kills_a_hung_helper_after_its_timeout() {
     let cred = ExecCommandCredential::new("/usr/bin/sleep".into(), vec!["5".into()], vec![])
         .unwrap()
