@@ -59,7 +59,10 @@ async fn an_openai_responses_incomplete_stream_names_the_real_reason_not_a_blank
         "an operator must be able to tell truncation-at-max-tokens apart from content \
          filtering -- the whole point of this task"
     );
-    assert_eq!(loss.description, "max_output_tokens");
+    // Fix round 1, K1: `description` is sanitized (truncated +
+    // `{:?}`-escaped) before it lands in the `LossEvent`, even for a
+    // known-safe short literal like this one.
+    assert_eq!(loss.description, "\"max_output_tokens\"");
 }
 
 /// The other named reason value: `content_filter` must map to a distinct

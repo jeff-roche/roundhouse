@@ -44,7 +44,10 @@ pub struct LossEvent {
 /// `EventPayload::Loss` (`crates/roundhouse-core/src/event.rs:188`) as "a
 /// short machine-stable tag" -- free text belongs in `LossEvent.description`,
 /// never here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Deliberately does NOT `#[derive(Debug)]` -- see the manual `impl Debug`
+/// below.
+#[derive(Clone, PartialEq, Eq)]
 pub enum LossKind {
     DroppedThinkingSignature,
     DroppedCacheControl,
@@ -57,6 +60,20 @@ pub enum LossKind {
     /// `String` is free text and belongs in `description`, never in the
     /// persisted `kind` tag -- see [`LossKind::tag`] and Ruling R6.
     Other(String),
+}
+
+/// Fix round 1, Fix 2: makes Ruling R6 structural instead of merely
+/// conventional. A derived `Debug` would print `Other("<wrapped text>")`
+/// verbatim -- exactly the leak `tag()` exists to prevent, just reachable
+/// through a different formatter (`{:?}`/`?loss.kind` in a `tracing` call,
+/// instead of `{}`/`Display`). This manual impl makes every variant --
+/// `Other` included -- print the same [`tag`](LossKind::tag) its persisted
+/// `EventPayload::Loss.kind` uses, so there is no formatter left that can
+/// leak `Other`'s wrapped text.
+impl std::fmt::Debug for LossKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.tag())
+    }
 }
 
 impl LossKind {
@@ -158,5 +175,22 @@ mod tests {
             EventPayload::Loss { kind, .. } => assert_eq!(kind, "TruncatedAtMaxTokens"),
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    /// Fix round 1, Fix 2: makes Ruling R6 structural, not just conventional
+    /// -- a derived `Debug` on `LossKind` would print `Other`'s wrapped text
+    /// verbatim through `{:?}`/`?loss.kind` (e.g. inside a future
+    /// `tracing::warn!` call), reopening exactly the leak `tag()` exists to
+    /// close for `Display`/persistence. The manual `impl Debug` must make
+    /// `{:?}` agree with `tag()` for every variant, `Other` included.
+    #[test]
+    fn debug_format_never_leaks_others_wrapped_text() {
+        let kind = LossKind::Other("upstream said: sk-live-abc123 is over budget".into());
+        let debug_text = format!("{kind:?}");
+        assert_eq!(
+            debug_text, "other",
+            "Debug must agree with tag(), not print the wrapped text"
+        );
+        assert!(!debug_text.contains("sk-live-abc123"));
     }
 }

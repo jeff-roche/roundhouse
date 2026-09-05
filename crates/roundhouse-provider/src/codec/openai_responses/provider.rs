@@ -262,10 +262,16 @@ impl Provider for OpenAiResponsesProvider {
             // which is exactly what `StreamFailure.loss` names
             // (`decode.rs`'s doc comment). Route it to
             // `ProviderError::StreamInterrupted` instead of `classify`,
-            // matching every sibling codec's convention for this same shape
-            // (`cohere_v2`, `openai_chat`, `anthropic_messages` all map
-            // max-tokens/content-filter to `StreamInterrupted`, never a bare
-            // `BadRequest`). `response.failed`/bare `error` (`loss: None`)
+            // matching every sibling codec's choice of ERROR VARIANT for this
+            // same shape (`cohere_v2`, `openai_chat`, `anthropic_messages`
+            // all map max-tokens/content-filter to `StreamInterrupted`, never
+            // a bare `BadRequest`) -- though not their `partial` field:
+            // siblings populate it with real partial text reconstructed from
+            // already-decoded events, while `partial: String::new()` below
+            // is a hardcode, since this codec's `StreamFailure` never
+            // plumbed partial text through (pre-existing, not a regression,
+            // and not in this task's scope to fix). `response.failed`/bare
+            // `error` (`loss: None`)
             // keep the original `classify`-through-the-`[errors]`-table
             // path, using the response's real status (200) since there is
             // no other status to report -- a code that happens to match one
@@ -288,7 +294,17 @@ impl Provider for OpenAiResponsesProvider {
                     Some(loss) => {
                         tracing::warn!(
                             kind = loss.kind.tag(),
-                            description = %loss.description,
+                            // Fix round 1, K2 (log-site redaction, matching
+                            // `cohere_v2`/`openai_chat`/`azure_provider`/
+                            // `anthropic_messages`/`anthropic_provider`'s
+                            // identical precedent): never rely on the
+                            // construction site alone to have sanitized this
+                            // -- `description` is decoder-controlled free
+                            // text (`loss_kind_for_incomplete_reason`'s
+                            // `Other` arm accepts any wire value), so redact
+                            // it again here regardless of what
+                            // `decode.rs` already did to it.
+                            description = %redact_transport_error_text(&loss.description),
                             blocks_affected = loss.blocks_affected,
                             "openai-responses stream ended lossy (response.incomplete) with no \
                              EventWriter channel yet to persist this as EventPayload::Loss"

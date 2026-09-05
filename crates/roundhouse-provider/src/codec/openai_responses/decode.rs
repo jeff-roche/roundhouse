@@ -157,9 +157,18 @@ fn terminal_failure(raw: &str) -> Option<StreamFailure> {
             Some(StreamFailure {
                 code: None,
                 message: reason.to_string(),
+                // Fix round 1, K1 (construction-site defense-in-depth):
+                // `reason` is provider-controlled wire text with no length
+                // or shape guarantee -- classify the kind against the RAW
+                // value (so the two known short literals still match
+                // exactly), but the text that actually lands in the
+                // `LossEvent` (both `description` here and inside
+                // `LossKind::Other` for an unrecognized reason) is always
+                // the sanitized form. See `sanitize_loss_description`'s doc
+                // comment for why this can't be left to the log site alone.
                 loss: Some(LossEvent {
                     kind: loss_kind_for_incomplete_reason(reason),
-                    description: reason.to_string(),
+                    description: sanitize_loss_description(reason),
                     blocks_affected: 1,
                 }),
             })
@@ -195,8 +204,38 @@ fn loss_kind_for_incomplete_reason(reason: &str) -> LossKind {
     match reason {
         "max_output_tokens" => LossKind::TruncatedAtMaxTokens,
         "content_filter" => LossKind::ContentFiltered,
-        other => LossKind::Other(other.to_string()),
+        other => LossKind::Other(sanitize_loss_description(other)),
     }
+}
+
+/// Length cap for `reason` text landing in a [`LossEvent`], mirroring
+/// `codec::openai_chat::decode`'s identical `MAX_UNTRUSTED_STRING_ECHO_LEN`.
+const MAX_UNTRUSTED_REASON_ECHO_LEN: usize = 200;
+
+/// Fix round 1, K1: `reason` (`/response/incomplete_details/reason`) is
+/// provider-controlled wire text with no length or shape guarantee --
+/// `loss_kind_for_incomplete_reason`'s `Other` arm accepts ANY value here,
+/// not a closed vocabulary. Two independent layers exist for this, matching
+/// the codebase's own K1/K2 split (see `provider.rs`'s `stream_chat` for the
+/// K2 log-site half): this is K1, the construction-site half, run before the
+/// text ever reaches `LossEvent.description` or `LossKind::Other`.
+///
+/// `roundhouse-store`'s `Redactor` (the persistence-boundary redactor
+/// `commit 1` of this task wired `Loss.description` through) is literal-value
+/// matching over ALREADY-RESOLVED live secrets -- it structurally cannot
+/// catch a mistyped or unresolved key, which shape-based redaction (this
+/// function, via `redact_error_body`) can. Truncating and `{:?}`-escaping
+/// (mirroring `codec::openai_chat::decode::sanitize_untrusted_wire_string`)
+/// additionally bounds the length and makes an embedded newline/ANSI escape
+/// visible rather than able to forge a log line once this reaches
+/// `tracing::warn!` at the `stream_chat` boundary.
+fn sanitize_loss_description(raw: &str) -> String {
+    let redacted = crate::audit::redact_error_body(raw);
+    let truncated: String = redacted
+        .chars()
+        .take(MAX_UNTRUSTED_REASON_ECHO_LEN)
+        .collect();
+    format!("{truncated:?}")
 }
 
 /// Decodes one `data: {...}` frame's JSON payload into zero or more
@@ -402,6 +441,7 @@ mod usage_tests {
 #[cfg(test)]
 mod terminal_failure_tests {
     use super::terminal_failure;
+    use crate::loss_event::LossKind;
 
     #[test]
     fn response_failed_extracts_the_error_code_and_message() {
@@ -440,7 +480,11 @@ mod terminal_failure_tests {
             failure.loss,
             Some(crate::loss_event::LossEvent {
                 kind: crate::loss_event::LossKind::TruncatedAtMaxTokens,
-                description: "max_output_tokens".into(),
+                // Fix round 1, K1: `description` is now sanitized
+                // (truncated + `{:?}`-escaped) before it lands in the
+                // `LossEvent`, even for a known-safe short literal like
+                // this one -- see `sanitize_loss_description`.
+                description: "\"max_output_tokens\"".into(),
                 blocks_affected: 1,
             }),
             "response.incomplete must name the real reason as a LossEvent, not discard it"
@@ -466,6 +510,60 @@ mod terminal_failure_tests {
             Some(crate::loss_event::LossKind::ContentFiltered),
             "an operator must be able to tell content filtering apart from truncation"
         );
+    }
+
+    /// Fix round 1, K1: `incomplete_details.reason` is NOT a closed
+    /// vocabulary -- `loss_kind_for_incomplete_reason`'s `Other` arm accepts
+    /// any provider-controlled wire value. An unrecognized reason carrying a
+    /// secret-shaped value and an embedded newline must not reach either
+    /// `LossEvent.description` or `LossKind::Other`'s wrapped text verbatim
+    /// -- the secret shape must be redacted, and the newline must be
+    /// escaped (not literal), so it cannot forge a log line once this
+    /// reaches `tracing::warn!` at the `stream_chat` boundary.
+    #[test]
+    fn an_unrecognized_reason_with_a_secret_and_embedded_newline_is_sanitized() {
+        let raw = serde_json::json!({
+            "type": "response.incomplete",
+            "sequence_number": 9,
+            "response": {
+                "id": "resp_1",
+                "status": "incomplete",
+                "incomplete_details": {
+                    "reason": "weird_reason\nlevel=CRITICAL forged log line api_key=sk-live-abcdefghijklmnop123456"
+                }
+            }
+        })
+        .to_string();
+        let failure =
+            terminal_failure(&raw).expect("response.incomplete must be a terminal failure");
+        let loss = failure
+            .loss
+            .expect("an unrecognized reason is still a LossEvent");
+
+        assert!(
+            !loss.description.contains("sk-live-abcdefghijklmnop123456"),
+            "a secret-shaped value in an unrecognized reason must never survive verbatim: \
+             {loss:?}"
+        );
+        assert!(
+            !loss.description.contains('\n'),
+            "an embedded newline must be escaped, not literal, or it could forge a log line: \
+             {loss:?}"
+        );
+        match &loss.kind {
+            LossKind::Other(text) => {
+                assert!(
+                    !text.contains("sk-live-abcdefghijklmnop123456"),
+                    "LossKind::Other's wrapped text must be sanitized too, not just \
+                     description: {loss:?}"
+                );
+                assert!(
+                    !text.contains('\n'),
+                    "and must not carry a literal newline either"
+                );
+            }
+            other => panic!("expected LossKind::Other for an unrecognized reason, got {other:?}"),
+        }
     }
 
     #[test]

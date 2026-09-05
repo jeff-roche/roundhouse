@@ -158,7 +158,15 @@ impl Provider for BedrockConverseProvider {
             for loss in &losses {
                 tracing::warn!(
                     kind = loss.kind.tag(),
-                    description = %loss.description,
+                    // Fix round 1, K2: today's two `stopReason` values this
+                    // module names (`guardrail_intervened`/`content_filtered`)
+                    // are a closed, hardcoded vocabulary, so `description` is
+                    // provably safe right now -- but this redacts anyway, for
+                    // parity with `openai_responses` and so a future
+                    // `_ => LossKind::Other(reason)` catch-all arm here can't
+                    // silently reopen the same exposure by relying on this
+                    // log site's construction-time safety alone.
+                    description = %redact_transport_error_text(&loss.description),
                     blocks_affected = loss.blocks_affected,
                     "bedrock-converse stream stopped lossy (messageStop.stopReason) with no \
                      EventWriter channel yet to persist this as EventPayload::Loss"
