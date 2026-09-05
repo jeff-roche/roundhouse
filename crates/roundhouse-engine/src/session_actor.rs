@@ -1040,18 +1040,27 @@ pub fn live_secret_values(ctx: &RequestCtx, mcp_configs: &[McpServerConfig]) -> 
 /// through: `strip_prefix("*.")` on `"*.."` yields `Some(".")`, non-empty
 /// so not skipped, and `normalize_host(".")` then strips that one
 /// trailing dot down to `""`, landing on the exact allow-all
-/// `WildcardSuffix("")` this guard exists to prevent. The fix strips
-/// exactly one trailing dot off the suffix here too, before the emptiness
-/// test — deliberately `strip_suffix('.')`, mirroring `normalize_host`'s
-/// own single-strip shape exactly (not `trim_end_matches('.')`, which
-/// would strip every trailing dot and skip a strictly-longer run like
-/// `"*..."` that `roundhouse-net`'s real single-strip normalization would
-/// NOT actually reduce to an allow-all `WildcardSuffix("")` — that
-/// difference would make this guard over-deny cases `roundhouse-net`
-/// itself never treats as allow-all, silently drifting the two apart).
-/// This is the same order-of-operations rule R21/R26 restates for
-/// `roundhouse-config`'s intersection, applied here to this module's own
-/// allow-all foot-gun instead.
+/// `WildcardSuffix("")` this guard exists to prevent. The fix trims every
+/// trailing dot off the suffix here, before the emptiness test —
+/// `trim_end_matches('.')`, deliberately over-stripping relative to
+/// `normalize_host`'s own single-dot strip. `roundhouse-net`'s
+/// `normalize_host` strips only one trailing dot today, so a strictly
+/// longer run like `"*..."` (suffix `".."`) does not currently reduce to
+/// an allow-all `WildcardSuffix("")` there either way — but this guard's
+/// entire job is to be the backstop if that ever changes (e.g. someone
+/// makes `normalize_host` itself `trim_end_matches('.')`, the obvious
+/// "more robust" edit, made in a different crate by someone not looking
+/// at this guard). Matching `normalize_host`'s CURRENT single-strip
+/// behavior exactly here would make this guard's safety depend on
+/// `normalize_host` never changing; over-stripping instead means this
+/// guard stays correct — skipping strictly more malformed entries than
+/// strictly necessary today — no matter how many trailing dots
+/// `normalize_host` ever strips. Fail-closed here means skipping the
+/// malformed entry (denying whatever it would have matched), which is
+/// always the safe direction for a guard whose only job is preventing
+/// allow-all. This is the same order-of-operations rule R21/R26 restates
+/// for `roundhouse-config`'s intersection, applied here to this module's
+/// own allow-all foot-gun instead.
 pub fn egress_policy_from_allowed_hosts(allowed_hosts: &[String]) -> EgressPolicy {
     let mut patterns = Vec::with_capacity(allowed_hosts.len());
     for host in allowed_hosts {
@@ -1059,7 +1068,7 @@ pub fn egress_policy_from_allowed_hosts(allowed_hosts: &[String]) -> EgressPolic
             continue;
         }
         match host.strip_prefix("*.") {
-            Some(suffix) if suffix.strip_suffix('.').unwrap_or(suffix).is_empty() => continue,
+            Some(suffix) if suffix.trim_end_matches('.').is_empty() => continue,
             Some(suffix) => patterns.push(HostPattern::wildcard_suffix(suffix)),
             None => patterns.push(HostPattern::exact(host)),
         }
@@ -1097,59 +1106,47 @@ mod redaction_and_egress_tests {
     }
 
     /// The foot-gun `HostPattern::wildcard_suffix("")` would otherwise
-    /// create: a bare `"*"` or `"*."` entry must not silently become
-    /// "allow every host."
+    /// create: a bare `"*"`, `"*."`, `"*.."`, or `"*..."` entry must not
+    /// silently become "allow every host."
+    ///
+    /// `"*.."` is the actual W1-R23 finding: the guard used to check
+    /// emptiness BEFORE normalization while `roundhouse-net` normalizes
+    /// AFTER (`HostPattern::wildcard_suffix` -> `normalize_host` strips a
+    /// trailing dot). `"*.."`.`strip_prefix("*.")` yields `Some(".")` —
+    /// non-empty, so the old guard let it through — and
+    /// `normalize_host(".")` then strips that trailing dot down to `""`,
+    /// landing on `WildcardSuffix("")`, which `policy.rs`'s
+    /// `suffix.is_empty()` arm matches against EVERY host: a plausible
+    /// operator typo (`allowed_hosts = ["*.."]`) silently became
+    /// allow-all egress. Confirmed empirically (security review) by
+    /// extracting `normalize_host` and this guard into a standalone
+    /// binary: `"*"` skipped, `"*."` skipped, `"*.."` -> ALLOW_ALL.
+    ///
+    /// `"*..."` is the case that distinguishes the two candidate fixes.
+    /// `roundhouse-net`'s `normalize_host` strips only ONE trailing dot
+    /// today, so `"*..."` (suffix `".."`) does not currently reduce to
+    /// `WildcardSuffix("")` there either way — a fix that mirrored
+    /// `normalize_host`'s CURRENT single-strip behavior exactly would
+    /// therefore NOT skip `"*..."`, and would only stay correct as long as
+    /// `normalize_host` never changes. This guard deliberately
+    /// over-strips instead (`trim_end_matches('.')`, every trailing dot,
+    /// not just one) so it remains the backstop even if `normalize_host`
+    /// itself is later changed to strip more than one dot (the obvious
+    /// "more robust" edit, made in a different crate, by someone not
+    /// looking at this guard) — see this function's own doc comment.
     #[test]
-    fn a_bare_wildcard_entry_is_skipped_not_promoted_to_allow_all() {
-        let policy = egress_policy_from_allowed_hosts(&["*".to_string()]);
-        assert!(!policy.matches("example.com"));
-        assert!(!policy.matches("literally-anything.invalid"));
-
-        let policy = egress_policy_from_allowed_hosts(&["*.".to_string()]);
-        assert!(!policy.matches("example.com"));
-    }
-
-    /// W1-R23: the guard above checked emptiness BEFORE normalization
-    /// while `roundhouse-net` normalizes AFTER (`HostPattern::
-    /// wildcard_suffix` -> `normalize_host` strips exactly one trailing
-    /// dot). `"*.."`.`strip_prefix("*.")` yields `Some(".")` — non-empty,
-    /// so the old guard let it through — and `normalize_host(".")` then
-    /// strips that one trailing dot down to `""`, landing on
-    /// `WildcardSuffix("")`, which `policy.rs`'s `suffix.is_empty()` arm
-    /// matches against EVERY host: a plausible operator typo
-    /// (`allowed_hosts = ["*.."]`) silently became allow-all egress.
-    /// Confirmed empirically (security review) by extracting
-    /// `normalize_host` and this guard into a standalone binary:
-    /// `"*"` skipped, `"*."` skipped, `"*.."` -> ALLOW_ALL.
-    #[test]
-    fn a_double_dot_wildcard_entry_is_skipped_not_promoted_to_allow_all() {
-        let policy = egress_policy_from_allowed_hosts(&["*..".to_string()]);
-        assert!(
-            !policy.matches("example.com"),
-            "\"*..\" must not silently become allow-all egress"
-        );
-        assert!(!policy.matches("literally-anything.invalid"));
-    }
-
-    /// Pins the fix's exact shape: the guard strips exactly ONE trailing
-    /// dot before the emptiness test, mirroring `roundhouse-net`'s real
-    /// `normalize_host` (single strip) rather than stripping every
-    /// trailing dot. `"*..."` -> suffix `".."` after `strip_prefix("*.")`
-    /// -> ONE dot stripped -> `"."`, not empty, so this is NOT skipped —
-    /// and `roundhouse-net`'s own `normalize_host` applied to that same
-    /// suffix agrees: it strips exactly one trailing dot too, landing on
-    /// the same non-empty `"."`, never on allow-all. A guard that instead
-    /// stripped every trailing dot (`trim_end_matches('.')`) would skip
-    /// this entry too, silently over-denying a case `roundhouse-net`
-    /// itself never treats as allow-all — drifting the two apart.
-    #[test]
-    fn a_triple_dot_wildcard_entry_is_not_skipped_and_does_not_become_allow_all() {
-        let policy = egress_policy_from_allowed_hosts(&["*...".to_string()]);
-        assert!(
-            !policy.matches("example.com"),
-            "\"*...\" must not become allow-all — it isn't the allow-all shape either"
-        );
-        assert!(!policy.matches("literally-anything.invalid"));
+    fn bare_and_multi_dot_wildcard_entries_are_skipped_not_promoted_to_allow_all() {
+        for entry in ["*", "*.", "*..", "*..."] {
+            let policy = egress_policy_from_allowed_hosts(&[entry.to_string()]);
+            assert!(
+                !policy.matches("example.com"),
+                "{entry:?} must not silently become allow-all egress"
+            );
+            assert!(
+                !policy.matches("literally-anything.invalid"),
+                "{entry:?} must not silently become allow-all egress"
+            );
+        }
     }
 
     fn stdio_config(id: &str, env: Vec<(&str, &str)>) -> McpServerConfig {
