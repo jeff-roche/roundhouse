@@ -782,11 +782,11 @@ mod tests {
 
     /// A fake reproducing `bedrock_converse`'s exact non-monotonic shape:
     /// `Ok` + `MessageStop` the instant the real terminal's bytes are fully
-    /// present (byte 8 here), `Err` while a LEGITIMATE later frame (the
+    /// present (byte 3 here), `Err` while a LEGITIMATE later frame (the
     /// post-terminal metadata frame bedrock always sends) is mid-flight,
     /// and `Ok` + `MessageStop` again once the whole body -- metadata frame
     /// included -- is present. "Does this prefix decode with a MessageStop"
-    /// is therefore `false, ..., true (at 8), false, ..., true (at 16)` --
+    /// is therefore `false, ..., true (at 3), false, ..., true (at 20)` --
     /// NOT a single false-then-true transition.
     struct NonMonotonicTerminalProvider;
 
@@ -868,8 +868,8 @@ mod tests {
     /// Pins the exact defect found in review: bisection over a
     /// non-monotonic "did we reach the terminal" signal silently converges
     /// on the WRONG (later) true point. This test is RED against a binary
-    /// search (it returns `Some(16)`, the whole body) and GREEN against a
-    /// linear scan (it returns `Some(8)`, the real, minimal terminal).
+    /// search (it returns `Some(20)`, the whole body) and GREEN against a
+    /// linear scan (it returns `Some(3)`, the real, minimal terminal).
     #[tokio::test]
     async fn locate_terminal_end_finds_the_minimal_terminal_not_a_later_one_past_a_gap() {
         let full = CassetteTransport {

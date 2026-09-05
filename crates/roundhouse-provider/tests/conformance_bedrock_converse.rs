@@ -231,8 +231,10 @@ async fn bedrock_converse_is_conformant() {
 /// truncated before its real binary `messageStop` frame) AND the specific
 /// codec Ruling R3 named as sending real, correct bytes (a `metadata`/usage
 /// frame) AFTER its own terminal -- proving the check's terminal-locating
-/// binary search (not a flat byte-fraction split) is what keeps this from
-/// false-failing a correct decoder.
+/// linear scan (not a flat byte-fraction split, and not a binary search --
+/// the "did we reach the terminal" signal is non-monotonic here, so
+/// bisection would silently converge on the wrong, later point) is what
+/// keeps this from false-failing a correct decoder.
 #[tokio::test]
 async fn text_cassette_is_never_indistinguishable_from_a_clean_completion_when_truncated() {
     let failures = checks::check_truncate_mid_stream(
