@@ -61,6 +61,15 @@ impl LocalBus {
         self
     }
 
+    /// Test/tuning seam: swaps in a `RateLimiter` built with different numbers (e.g.
+    /// a small global cap) so a test can exhaust the global bucket without needing
+    /// hundreds of real sends. Not used by any non-test caller today.
+    #[cfg(test)]
+    pub(crate) fn with_rate_limiter(mut self, rate_limiter: RateLimiter) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
     /// Shares one `TeamRegistry` between the `Bus` (for fan-out resolution) and
     /// whatever else holds it (e.g. `agent_spawn`/`team_create`, Tasks 15-16) — those
     /// call sites take `&TeamRegistry` directly, so callers pass the same `Arc` both
@@ -183,10 +192,14 @@ impl LocalBus {
     /// §7.7: rate cap, repetition damper, and `ttl_hops` decrement, all checked before
     /// the message is queued — regardless of whether the recipient is an ordinary
     /// session or a registered human (a spamming session shouldn't get to flood a
-    /// human's notification feed either), with one deliberate exception: the
-    /// repetition damper alone is skipped for human-*originated* sends (see the
-    /// `is_human_originated` check below) so a human breaking glass repeatedly on
-    /// the same stuck session isn't jammed like an agent repetition storm. Task 10
+    /// human's notification feed either), with two deliberate exceptions for
+    /// human-*originated* sends (see the `is_human_originated` check below,
+    /// computed up front so both exceptions can consult it): the repetition damper
+    /// is skipped entirely, so a human breaking glass repeatedly on the same stuck
+    /// session isn't jammed like an agent repetition storm; and the rate cap's
+    /// *global* bucket (but never the per-session bucket) is skipped, so agent load
+    /// against the shared global bucket can't starve a human's break-glass send
+    /// (A1 — see `RateLimiter::try_acquire_session_only`'s doc comment). Task 10
     /// built and unit-tested all three checks in isolation; this is the first place
     /// anything actually calls them, which is exactly why
     /// `BusError::RateLimited`/`Repetitive`/`TtlExpired` were unreachable before
@@ -200,21 +213,45 @@ impl LocalBus {
         let msg_id = envelope.id;
 
         let ttl_hops = decrement_ttl(envelope.ttl_hops)?;
-        self.rate_limiter
-            .try_acquire(envelope.from, std::time::Instant::now())?;
+
+        // Computed before the rate-limiter call (not after, as originally written)
+        // so the global-bucket exemption below can consult it — see A1. The two
+        // conditions are OR'd because `human_sessions` is the non-spoofable signal
+        // but may not be populated on every path, while `Origin::User` is the
+        // disjunct that is, in practice, load-bearing *alone*: `register_human`/
+        // `mark_human` have zero non-test callers repo-wide, so `human_sessions` is
+        // always empty in a real daemon today. The real precedent for trusting
+        // `Origin::User` as a break-glass marker isn't anything pre-existing in
+        // this crate — before this task nothing in `roundhouse-bus` read
+        // `provenance` for any decision at all (`git grep provenance\. <pre-Task-9
+        // rev> -- crates/roundhouse-bus/src/` turns up exactly one hit, a unit-test
+        // assertion in `types.rs`). The actual precedent is
+        // `roundhouse-engine/src/tools/message_wait.rs`, which already treats
+        // `provenance.origin == Origin::User` as authority to bypass its
+        // expected-sender anti-forgery check for quorum replies — the check whose
+        // own comment warns that "a forged reply from some other member must not
+        // satisfy `Quorum::All`." If `origin` ever became model-settable, the
+        // blast radius is exactly *two* privileges: damper-free repetition and
+        // (unchanged) global-rate-cap exemption here, and quorum-reply forgery via
+        // `message_wait`. (Rejected alternative: folding `in_reply_to` into the
+        // damper key — that would let an *agent* evade the damper by varying which
+        // message it replies to, which is the opposite of what the damper is for.)
+        let is_human_originated = self.human_sessions.contains(&envelope.from)
+            || envelope.provenance.origin == roundhouse_core::Origin::User;
+
+        if is_human_originated {
+            self.rate_limiter
+                .try_acquire_session_only(envelope.from, std::time::Instant::now())?;
+        } else {
+            self.rate_limiter
+                .try_acquire(envelope.from, std::time::Instant::now())?;
+        }
 
         // §7.7's repetition damper exists to kill *agent* repetition storms — a
         // human breaking glass four times on the same stuck session is not that,
         // and must not be jammed identically to one (orchestrator Ruling W4-8). The
         // damper key itself is unchanged (still `(from, to, subject)`); a human send
-        // simply skips the check entirely. The two conditions are OR'd because
-        // `human_sessions` is the non-spoofable signal but may not be populated on
-        // every path, while `Provenance` is already trusted in-process by the rest
-        // of this crate. (Rejected alternative: folding `in_reply_to` into the
-        // damper key — that would let an *agent* evade the damper by varying which
-        // message it replies to, which is the opposite of what the damper is for.)
-        let is_human_originated = self.human_sessions.contains(&envelope.from)
-            || envelope.provenance.origin == roundhouse_core::Origin::User;
+        // simply skips the check entirely.
         if !is_human_originated {
             let mut damper = self
                 .damper
@@ -928,6 +965,112 @@ mod break_glass_damper_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, crate::types::BusError::Repetitive { .. }));
+    }
+}
+
+#[cfg(test)]
+mod break_glass_global_rate_cap_tests {
+    // A1: the global rate-cap bucket must not starve a human-originated send —
+    // agent load pinning the global bucket at zero is exactly the failure mode
+    // break-glass exists to defeat. These tests use `with_rate_limiter` to install
+    // a tiny global cap (rather than sending ~1280 real messages) so the exhausted
+    // state is reachable directly.
+    use super::*;
+    use crate::mailbox::MailboxKind;
+    use crate::rate_limit::RateLimiter;
+    use crate::types::{Address, Envelope, MessageId, Provenance, Trust};
+    use roundhouse_core::{Origin, SessionId};
+    use uuid::Uuid;
+
+    fn envelope(from: SessionId, to: SessionId, subject: &str, origin: Origin) -> Envelope {
+        Envelope {
+            id: MessageId(Uuid::new_v4()),
+            from,
+            to,
+            to_requested: Address::Session { id: to },
+            subject: subject.into(),
+            body: "x".into(),
+            attachments: vec![],
+            expect_reply: None,
+            in_reply_to: None,
+            ttl_hops: 8,
+            provenance: Provenance {
+                origin,
+                trust: Trust::Trusted,
+                task: None,
+            },
+        }
+    }
+
+    /// Per-session numbers left generous (burst 10) so only the global bucket is
+    /// ever the constraint in these tests; global burst pinned to 0 so it starts
+    /// already exhausted and a real-time refill can't flake the test.
+    fn bus_with_exhausted_global_bucket() -> LocalBus {
+        LocalBus::new().with_rate_limiter(RateLimiter::new_with_global(20, 10, 6000, 0))
+    }
+
+    #[tokio::test]
+    async fn a_human_originated_send_succeeds_when_the_global_bucket_is_exhausted() {
+        let bus = bus_with_exhausted_global_bucket();
+        let from = SessionId::new();
+        let to = SessionId::new();
+        bus.register_mailbox(to, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        // Different subjects per send so the repetition damper (a separate check)
+        // can't also be the reason this passes.
+        for i in 0..3 {
+            bus.send(envelope(
+                from,
+                to,
+                &format!("break-glass-{i}"),
+                Origin::User,
+            ))
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_send_is_still_refused_when_the_global_bucket_is_exhausted() {
+        let bus = bus_with_exhausted_global_bucket();
+        let from = SessionId::new();
+        let to = SessionId::new();
+        bus.register_mailbox(to, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        let err = bus
+            .send(envelope(from, to, "ordinary", Origin::Peer))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::RateLimited { .. }));
+    }
+
+    #[tokio::test]
+    async fn the_per_session_bucket_still_applies_to_a_human_sender() {
+        // The global bucket is NOT exhausted here — plenty of room — so this
+        // isolates the per-session bucket, proving A1's exemption is scoped to the
+        // global bucket only and does not hand humans an unmetered channel.
+        let bus = LocalBus::new();
+        let from = SessionId::new();
+        let to = SessionId::new();
+        bus.register_mailbox(to, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        // §7.7 default per-session: 20/min, burst 10.
+        for i in 0..10 {
+            bus.send(envelope(from, to, &format!("s{i}"), Origin::User))
+                .await
+                .unwrap();
+        }
+        let err = bus
+            .send(envelope(from, to, "s10", Origin::User))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::RateLimited { .. }));
     }
 }
 

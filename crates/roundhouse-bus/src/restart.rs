@@ -212,9 +212,11 @@ mod tests {
     /// The gap: `Mailbox` is a purely in-memory `VecDeque<Envelope>`;
     /// `RestartSnapshot` carries only `live_sessions: Vec<SessionId>` and
     /// `suspended_waits: Vec<SuspendedWait>` — no envelope payloads anywhere in it;
-    /// and `InMemoryEventSink` (the idempotency ledger) is likewise in-memory-only,
-    /// with a real, durable `SqliteEventSink` living in roundhouse-store, outside
-    /// this crate. A genuine process restart constructs a brand-new `LocalBus`;
+    /// and `InMemoryEventSink` (the idempotency ledger) is likewise in-memory-only.
+    /// A durable `SqliteEventSink` would live in roundhouse-store, outside this
+    /// crate, but as of this writing does not yet exist — there is no mailbox
+    /// table in `roundhouse-store` at all. A genuine process restart constructs a
+    /// brand-new `LocalBus`;
     /// `restart_from` re-registers mailboxes for `live_sessions` via
     /// `register_mailbox`, which creates them empty — there was never any old
     /// content for it to carry over. So a message already sitting, unconsumed, in a
@@ -325,5 +327,63 @@ mod tests {
 
         let delivered = bus.poll(recipient).await.unwrap().unwrap();
         assert_eq!(delivered.id, replayed_id);
+    }
+
+    /// A7: `restart_from` calls `register_mailbox`, which uses
+    /// `entry().or_insert_with(...)` — so re-running `restart_from` against an
+    /// already-populated *live* bus (as opposed to the brand-new bus every other
+    /// test in this file constructs) must not clear out a mailbox's existing,
+    /// unconsumed contents. This is a real, non-destructive property of
+    /// `restart_from` as written; it was untested.
+    #[tokio::test]
+    async fn restart_from_against_an_already_populated_live_bus_does_not_clear_existing_mailbox_contents(
+    ) {
+        let bus = LocalBus::new();
+        let sender = SessionId::new();
+        let recipient = SessionId::new();
+
+        bus.register_mailbox(recipient, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+        bus.send(crate::types::Envelope {
+            id: crate::types::MessageId(uuid::Uuid::new_v4()),
+            from: sender,
+            to: recipient,
+            to_requested: crate::types::Address::Session { id: recipient },
+            subject: "s".into(),
+            body: "already sitting in the mailbox before restart_from runs".into(),
+            attachments: vec![],
+            expect_reply: None,
+            in_reply_to: None,
+            ttl_hops: 8,
+            provenance: crate::types::Provenance {
+                origin: roundhouse_core::Origin::Peer,
+                trust: crate::types::Trust::Untrusted,
+                task: None,
+            },
+        })
+        .await
+        .unwrap();
+
+        // Re-run restart_from against this same, already-populated, live bus —
+        // not a brand-new one.
+        let outcomes = bus
+            .restart_from(
+                RestartSnapshot {
+                    live_sessions: vec![recipient],
+                    suspended_waits: vec![],
+                },
+                0,
+            )
+            .await;
+
+        assert!(outcomes.is_empty());
+        // The pre-existing message must still be there: `register_mailbox`'s
+        // `or_insert_with` is a no-op against an already-present mailbox.
+        let delivered = bus.poll(recipient).await.unwrap().unwrap();
+        assert_eq!(
+            delivered.body,
+            "already sitting in the mailbox before restart_from runs"
+        );
     }
 }

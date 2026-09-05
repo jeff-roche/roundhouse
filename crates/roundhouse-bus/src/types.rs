@@ -13,6 +13,16 @@ pub enum Trust {
     Untrusted,
 }
 
+/// SECURITY: `Envelope` derives `Deserialize` (via this struct), and no transport
+/// deserializes an `Envelope` off the wire today — every current sender constructs
+/// one in-process. The moment a remote-bus bridge, an ACP peer path, or store replay
+/// starts deserializing envelopes from outside this process, `origin` becomes
+/// wire-controlled, and both `Origin::User` checks that currently trust it
+/// unconditionally become forgeable at once: `LocalBus::send`'s repetition-damper
+/// and global-rate-cap exemptions (`local_bus.rs`), and
+/// `roundhouse-engine/src/tools/message_wait.rs`'s expected-sender anti-forgery
+/// bypass for quorum replies. Neither check has any independent signing or
+/// transport-level authentication on `origin` to fall back on.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Provenance {
     pub origin: roundhouse_core::Origin,

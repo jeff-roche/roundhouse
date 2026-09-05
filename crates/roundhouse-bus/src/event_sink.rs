@@ -35,8 +35,9 @@ pub trait EventSink: Send + Sync {
 }
 
 /// Test double. A real `SqliteEventSink` (roundhouse-store, `INSERT ... ON CONFLICT
-/// (session_id, inbound_msg_id) DO NOTHING` under `BEGIN IMMEDIATE`) is wired at the
-/// daemon-assembly layer, not in this crate.
+/// (session_id, inbound_msg_id) DO NOTHING` under `BEGIN IMMEDIATE`) would be wired
+/// at the daemon-assembly layer, not in this crate — but as of this writing it does
+/// not yet exist; there is no mailbox table in `roundhouse-store` at all.
 pub struct InMemoryEventSink {
     seen: Mutex<HashSet<(SessionId, MessageId)>>,
     outbound: Mutex<HashSet<(SessionId, MessageId)>>,
