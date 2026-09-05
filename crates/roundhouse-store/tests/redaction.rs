@@ -471,35 +471,74 @@ async fn task_created_text_input_is_redacted() {
 
 /// M2 (ruling W1-R69): `redact_json_value` must not stack-overflow on a pathologically
 /// deep `TaskInput::Json` — the security lens reproduced the ORIGINAL (unbounded) bug at
-/// depth 10,000. This test uses depth 1,000 instead — a deliberate choice, not a
-/// weakening: even independent of this crate's own logic, merely CONSTRUCTING (and, if
-/// dropped normally, tearing down) a bare depth-10,000 `serde_json::Value` overflows this
-/// test binary's own per-test thread stack in this environment (confirmed empirically —
-/// with every line of `Redactor` logic removed from the picture, a bare `drop()` of such a
-/// value still overflows). That is an orthogonal, environment-specific limit on how deep a
-/// `Value` this test binary can even HOLD, not a property of the fix under test. Depth
-/// 1,000 is unaffected by that limit, is still ~16x past this method's own
-/// `MAX_JSON_REDACT_DEPTH` (64) and ~8x past `serde_json`'s own parser depth limit (128,
-/// meaning a value this deep could never arrive by DESERIALIZING untrusted input in the
-/// first place), and is more than sufficient to prove the fix: `redact_event_payload`
-/// completes without crashing, and the secret sitting far below the depth cap does not
-/// leak into the output — it is discarded outright once the cap is reached (replaced with
-/// a fixed placeholder, torn down iteratively rather than via ordinary recursive `Drop`),
-/// not redacted via the substring automaton.
+/// depth 10,000.
+///
+/// **Fix round C1 correction (ruling W1-R75, and this lane's sixth comment-accuracy
+/// fix) — the mechanism behind round B's depth-1,000 scale-down was misdiagnosed.**
+/// Round B built this test's fixture with `value = serde_json::json!([value])` in a
+/// loop and concluded the resulting stack overflow at depth 10,000 was an
+/// "environment-specific limit on how deep a `Value` this test binary can even hold."
+/// That is wrong: `json!([value])`'s expansion for an already-evaluated `Value`
+/// argument falls through to `serde_json::to_value(&value)`, which re-serializes the
+/// ENTIRE existing structure via `Value`'s own recursive `Serialize` impl on every
+/// single loop iteration — an O(current-depth) recursion per step, with much larger
+/// per-frame stack usage than a plain enum move. That is what overflowed at depth
+/// 10,000, not construction or drop of the value itself. Confirmed with a
+/// differential probe on an explicit 2 MiB thread (matching this test binary's
+/// per-test stack): building via the `json!` macro overflows during BUILD at depth
+/// 10,000; building via plain `Value::Array(vec![value])` (no macro, no
+/// re-serialization) survives BOTH build and a bare, non-iterative `drop()` at depth
+/// 10,000, and overflows only during drop at depth 50,000 — which matches the
+/// security lens's own measurement exactly, using the mechanism the lens actually
+/// meant (bare drop of an already-built value), not the one round B accidentally
+/// measured (macro-driven reconstruction on every iteration). This also retroactively
+/// explains round B's other note that a debug `eprintln!` placed right after
+/// construction "never printed" — construction was where the crash was, just not for
+/// the reason stated.
+///
+/// The fixture below therefore builds with `Value::Array(vec![value])` directly, and
+/// now safely uses depth 10,000 — the actual number the security lens reproduced the
+/// original bug at — which is ~156x past this method's own `MAX_JSON_REDACT_DEPTH`
+/// (64) and ~78x past `serde_json`'s own parser depth limit (128, meaning a value
+/// this deep could never arrive by DESERIALIZING untrusted input in the first place).
+/// `redact_event_payload` must complete without crashing, and the secret sitting far
+/// below the depth cap must not leak into the output — it is discarded outright once
+/// the cap is reached (replaced with a fixed placeholder, torn down iteratively rather
+/// than via ordinary recursive `Drop`), not redacted via the substring automaton.
+///
+/// This test's own name is accurate against real evidence, not just intent (ruling
+/// W1-R72's third bullet): run against round A's uncapped recursion (`eea22f0`) at
+/// this exact depth, this exact fixture aborts with a genuine stack overflow
+/// (`SIGABRT`, confirmed empirically) — a real crash, not merely a missed-marker
+/// assertion failure as round B's depth-1,000 version of this test produced.
 #[test]
 fn redact_json_value_does_not_stack_overflow_on_pathological_nesting_and_never_leaks() {
     let mut value = serde_json::json!("sk-live-abc123");
-    for _ in 0..1_000 {
-        value = serde_json::json!([value]);
+    for _ in 0..10_000 {
+        value = serde_json::Value::Array(vec![value]);
     }
 
     let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
-    let (redacted, _count) = redactor.redact_event_payload(EventPayload::TaskCreated {
+    let (redacted, count) = redactor.redact_event_payload(EventPayload::TaskCreated {
         kind: TaskKind::Read,
         parent: None,
         origin: Origin::Model,
         input: TaskInput::Json(value),
     });
+    // Fix round C1 (ruling W1-R72): `count` must be asserted, not merely bound and
+    // ignored. It is correctly 0 here, NOT because nothing was found, but because the
+    // secret was past the depth cap and got DISCARDED wholesale rather than redacted
+    // (see `redact_json_value_at_depth`'s own doc comment) — the same on-disk shape
+    // `03-security-and-sandboxing.md:333` describes for redaction *failure*. This test
+    // exists precisely to show that shape is the deliberate, cap-triggered outcome
+    // here, not a silent miss; the sibling test below covers the complementary case
+    // (a secret ABOVE the cap, counted normally, with pathological nesting only
+    // below it).
+    assert_eq!(
+        count, 0,
+        "a secret past the depth cap is discarded, not redacted — 0 is correct here, \
+         not a miss"
+    );
 
     // The redacted value itself is now shallow (truncated at the depth
     // cap), so serializing it back is safe and cannot itself overflow.
@@ -511,6 +550,60 @@ fn redact_json_value_does_not_stack_overflow_on_pathological_nesting_and_never_l
     assert!(
         serialized.contains("TRUNCATED"),
         "the truncation must be visible, not silent: {serialized}"
+    );
+}
+
+/// Complements the test above (fix round C1, ruling W1-R72's second bullet): a secret
+/// placed ABOVE the depth cap must still be found and counted normally, even when the
+/// value also contains pathological nesting BELOW the cap alongside it — proving the
+/// cap only ever discards what is genuinely past it, and does not accidentally starve
+/// redaction of secrets that were always reachable.
+#[test]
+fn a_secret_above_the_depth_cap_is_still_redacted_even_with_pathological_nesting_below_it() {
+    let mut deep_but_secret_free =
+        serde_json::Value::String("just some deeply nested filler".to_string());
+    for _ in 0..10_000 {
+        deep_but_secret_free = serde_json::Value::Array(vec![deep_but_secret_free]);
+    }
+    // The secret sits at depth 1 (well above MAX_JSON_REDACT_DEPTH), as a sibling to
+    // the pathologically deep branch above, inside an object with two keys. Built by
+    // hand via `Map`/`Value::Object`, NOT the `json!` macro (embedding an
+    // already-built `Value` field inside a `json!({...})` object literal hits the
+    // exact same macro-driven-reserialization trap described in the test above it —
+    // confirmed by hitting it here first).
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "note".to_string(),
+        serde_json::Value::String("the key is sk-live-abc123".to_string()),
+    );
+    map.insert("nested".to_string(), deep_but_secret_free);
+    let value = serde_json::Value::Object(map);
+
+    let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+    let (redacted, count) = redactor.redact_event_payload(EventPayload::TaskCreated {
+        kind: TaskKind::Read,
+        parent: None,
+        origin: Origin::Model,
+        input: TaskInput::Json(value),
+    });
+    assert_eq!(
+        count, 1,
+        "a secret above the depth cap must still be found and counted, regardless of \
+         how deep an unrelated sibling branch happens to be"
+    );
+
+    let serialized = serde_json::to_string(&redacted).unwrap();
+    assert!(
+        !serialized.contains("sk-live-abc123"),
+        "the above-cap secret must be redacted: {serialized}"
+    );
+    assert!(
+        serialized.contains("[REDACTED]"),
+        "must show the normal redaction placeholder for the above-cap secret: {serialized}"
+    );
+    assert!(
+        serialized.contains("TRUNCATED"),
+        "the below-cap sibling branch must still show the truncation marker: {serialized}"
     );
 }
 

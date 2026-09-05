@@ -332,11 +332,28 @@ fn resolve_shell_cwd(raw_cwd: &str) -> Result<PathBuf, ToolDispatchError> {
 
 /// Resolves the model-supplied `program` to the absolute binary that will
 /// actually run (fix round A, finding F2 / rulings W1-R56/W1-R57; corrected
-/// in fix round B, finding I2 / ruling W1-R67) — this value, not the raw
-/// model string, is what [`task_params_for`] puts into
-/// `ParsedCommand.program`, so policy judges the real binary rather than a
-/// string the model's own choice of `cwd` could silently redirect
+/// in fix round B, finding I2 / ruling W1-R67; the bare-name branch brought
+/// into agreement with the rest in fix round C1, ruling W1-R71/MUST 1) —
+/// this value, not the raw model string, is what [`task_params_for`] puts
+/// into `ParsedCommand.program`, so policy judges the real binary rather
+/// than a string the model's own choice of `cwd` could silently redirect
 /// elsewhere.
+///
+/// **The precise, single rule (fix round C1, ruling W1-R75): in BOTH
+/// branches below, `ParsedCommand.program` is the canonicalized DIRECTORY
+/// containing the binary, joined with the LITERAL, model/PATH-supplied
+/// final path component — never a fully symlink-resolved path.** CF-16's
+/// own ledger entry previously called this a "canonical absolute path,"
+/// which is imprecise enough to mislead an operator. Concretely: an
+/// operator running `readlink -f` (or any other full-resolution tool) on
+/// the binary they intend to allow/deny will NOT, in general, get a
+/// string that matches. Measured on this repo's own dev environment:
+/// `/bin/sh` resolves to `/usr/bin/bash`, `python3` to
+/// `/usr/bin/python3.14`, `awk` to `/usr/bin/gawk` — yet the value this
+/// function returns for `program: "sh"` or `program: "/bin/sh"` is
+/// `/usr/bin/sh` (directory resolved, name preserved), not
+/// `/usr/bin/bash`. Operator-facing docs must state THIS rule, not the
+/// "canonical absolute path" one.
 ///
 /// Splits on shape (ruling W1-R56): `spawn_cancellable`'s `env_clear()`
 /// (fix round A, finding F1) removes `PATH` from the CHILD's own
@@ -379,10 +396,23 @@ fn resolve_shell_cwd(raw_cwd: &str) -> Result<PathBuf, ToolDispatchError> {
 ///   judged is the binary that runs), reimplemented here rather than
 ///   reached across the crate boundary (that function is private and
 ///   `roundhouse-mcp` is out of this lane's charter for anything beyond the
-///   narrow, ruled `roundhouse-tools`/`roundhouse-store` additions). Never
-///   needed symlink resolution for F2 at all — a PATH lookup is under the
-///   daemon's own control, not the model's, so there is no cwd-smuggling
-///   vector for this branch to defend against.
+///   narrow, ruled `roundhouse-tools`/`roundhouse-store` additions). This
+///   branch never needed symlink resolution to defend against F2's
+///   cwd-smuggling vector — a PATH lookup is under the daemon's own
+///   control, not the model's. **But it still needs the identical
+///   directory/final-component split as the `/`-containing branch above**
+///   (fix round C1, finding from ruling W1-R71/MUST 1 — round B fixed only
+///   the `/`-containing branch and left this one fully canonicalizing,
+///   which both (a) defeats `is_interpreter`/`sealed_program`'s basename
+///   matching exactly as I2 described, measured post-round-B:
+///   `python3` -> `/usr/bin/python3.14`, `awk` -> `/usr/bin/gawk`, and (b)
+///   is strictly worse than round A: the two branches now produce
+///   DIFFERENT canonical strings for the identical binary, so
+///   `Predicate::Shell`'s exact-string match (`engine.rs:292`) lets the
+///   model choose which string policy sees by deciding whether to spell
+///   the program with a `/` — an operator's `Deny /usr/bin/python3` is
+///   evaded by sending `program: "python3"`). See
+///   [`resolve_bare_program_on_path`].
 fn resolve_shell_program(
     raw_program: &str,
     canonical_cwd: &Path,
@@ -462,21 +492,45 @@ fn resolve_shell_program(
                 "PATH is not set in the daemon's own environment".to_string(),
             )
         })?;
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join(raw_program);
-            if candidate.is_file() {
-                return candidate.canonicalize().map_err(|e| {
-                    ToolDispatchError::ShellProgramRejected(format!(
-                        "program {raw_program:?} resolved to {candidate:?} but could not be \
-                         canonicalized: {e}"
-                    ))
-                });
-            }
-        }
-        Err(ToolDispatchError::ShellProgramRejected(format!(
-            "program {raw_program:?} not found on the daemon's PATH"
-        )))
+        resolve_bare_program_on_path(raw_program, &path_var)
     }
+}
+
+/// The bare-name half of [`resolve_shell_program`], split out so tests can
+/// inject a controlled `PATH` value directly rather than mutating the
+/// process-global `PATH` env var — `std::env::set_var` on `PATH` would race
+/// every other test in this binary run in parallel (fix round C1, ruling
+/// W1-R71/MUST 1's own guidance).
+///
+/// Walks `path_var` for the first entry containing a regular file named
+/// `raw_program`, exactly as before — but the value returned is now, like
+/// the `/`-containing branch, the PATH **directory** canonicalized with the
+/// **literal** `raw_program` name appended, never the fully-resolved
+/// target. A distro shipping `python3 -> python3.14` must not silently
+/// launder a bare `python3` invocation past `is_interpreter`/
+/// `sealed_program`'s basename matching, and the two branches must agree on
+/// one canonical string per binary so an operator's exact-match
+/// `Predicate::Shell` rule can't be dodged by a model choosing which
+/// spelling (`python3` vs `./python3`) to send.
+fn resolve_bare_program_on_path(
+    raw_program: &str,
+    path_var: &std::ffi::OsStr,
+) -> Result<PathBuf, ToolDispatchError> {
+    for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join(raw_program);
+        if candidate.is_file() {
+            let canonical_dir = dir.canonicalize().map_err(|e| {
+                ToolDispatchError::ShellProgramRejected(format!(
+                    "cannot resolve the PATH directory {dir:?} containing program \
+                     {raw_program:?}: {e}"
+                ))
+            })?;
+            return Ok(canonical_dir.join(raw_program));
+        }
+    }
+    Err(ToolDispatchError::ShellProgramRejected(format!(
+        "program {raw_program:?} not found on the daemon's PATH"
+    )))
 }
 
 /// The names of environment variables re-added to a dispatched shell's
@@ -695,12 +749,10 @@ pub async fn execute_builtin(
 }
 
 /// Bound on how many bytes of stdout/stderr each `run_shell_dispatch` call
-/// will buffer (fix round B, ruling W1-R66 + carry-forward CF-7 item 4).
-/// `AsyncReadExt::take` makes a capped read behave as if EOF were reached
-/// once the cap is hit, so this also participates in closing I1: a stream
-/// that keeps producing bytes forever now terminates on its own once it has
-/// produced this many, rather than only ever being bounded by the outer
-/// race.
+/// will **retain** (fix round B, ruling W1-R66 + carry-forward CF-7 item 4;
+/// failure mode corrected in fix round C1, ruling W1-R71 — see
+/// [`drain_to_end`]'s doc comment for why this is no longer a hard read
+/// limit).
 const MAX_SHELL_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Runs a dispatched `shell` call through `roundhouse_tools::spawn_cancellable`
@@ -728,10 +780,17 @@ const MAX_SHELL_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 /// future against `timeout`/cancellation in the outer `select!` preempts
 /// the drain exactly the same way it already preempted `wait()` — dropping
 /// `completion` when a sibling branch wins drops the in-progress drains
-/// too. The size cap ([`MAX_SHELL_OUTPUT_BYTES`]) is a second, independent
-/// bound: even within the allotted window, a stream that never closes but
-/// keeps producing bytes now terminates on its own once capped, rather
-/// than depending solely on the outer race.
+/// too. The size cap ([`MAX_SHELL_OUTPUT_BYTES`]) bounds how much of
+/// stdout/stderr is **retained** in memory, independent of the outer race
+/// — but, as of fix round C1 (ruling W1-R71), it does NOT bound how long a
+/// still-producing stream keeps this dispatch running: [`drain_to_end`]
+/// deliberately keeps reading (and discarding) past the cap until the
+/// pipe reaches genuine EOF, rather than dropping the reader once the cap
+/// is hit (see that function's own doc comment for why an early drop is
+/// itself a bug, not a feature — it SIGPIPE-kills a child still writing).
+/// A producer that never closes its own end is therefore bounded ONLY by
+/// `timeout`/cancellation in the outer race, exactly like `wait()` always
+/// was — the cap is a memory bound, not a time bound.
 async fn run_shell_dispatch(
     program: &str,
     argv: &[String],
@@ -803,17 +862,81 @@ async fn wait_for_session_cancel(cancel: &mut Option<watch::Receiver<SessionStat
     }
 }
 
-/// Reads a piped child stdio handle to the end (or up to `cap` bytes,
-/// whichever comes first — see [`MAX_SHELL_OUTPUT_BYTES`]), or returns an
-/// empty buffer if the pipe was never present (stdio wasn't piped, or
-/// `take_stdio` was never called) — never fails the whole dispatch over a
-/// drain error.
+/// Reads a piped child stdio handle to its natural EOF, retaining at most
+/// `cap` bytes (see [`MAX_SHELL_OUTPUT_BYTES`]) and discarding the rest —
+/// or returns an empty buffer if the pipe was never present (stdio wasn't
+/// piped, or `take_stdio` was never called). Never fails the whole
+/// dispatch over a drain error.
+///
+/// **Fix round C1, ruling W1-R71 (finding invited by round B's own "cap
+/// its size" instruction, which never specified the failure mode):** the
+/// previous version used `AsyncReadExt::take(cap)` and dropped the limited
+/// reader once `read_to_end` returned. `Take` simulates EOF for the
+/// CALLER once the cap is hit, but does nothing to the underlying pipe —
+/// dropping `io` while the writer is still mid-write **closes our read
+/// end early**, which delivers `SIGPIPE` to a child still writing to it.
+/// The default `SIGPIPE` disposition terminates the process, so the
+/// child dies as an unannounced SIDE EFFECT of a cap meant to bound
+/// OUTPUT, not to kill the PROCESS — `wait()` then reports `exit_code:
+/// None` (signal-terminated) with exactly `cap` bytes of output and no
+/// marker explaining why, indistinguishable from the command having
+/// crashed on its own. It also directly contradicts this same fix
+/// round's own M2 principle that truncation must be VISIBLE, not silent.
+/// And a child that ignores `SIGPIPE` isn't bounded by the cap at all —
+/// it would just keep blocking on a full OS pipe buffer forever, since
+/// nothing is still reading from our end.
+///
+/// The fix: keep reading (and, once past the cap, discarding) until the
+/// pipe reaches genuine EOF — i.e. until the writer itself closes it,
+/// exactly as an uncapped drain would — so the child always gets to exit
+/// on its own terms, and append an explicit, visible truncation marker to
+/// whatever was retained. This costs nothing extra in the common case
+/// (well under `cap` bytes): the loop still exits on the first natural
+/// EOF, same as before.
+///
+/// `scratch` is heap-allocated (`vec![0u8; N]`), deliberately NOT a fixed
+/// stack array (`[0u8; N]`): a byte array held across an `.await` point
+/// inside a loop becomes part of this async fn's generated state machine,
+/// which is itself nested several layers deep here (this future is
+/// `tokio::join!`'d with `wait()` and a second `drain_to_end` inside
+/// `run_shell_dispatch`'s `completion`, which is itself one arm of an
+/// outer `tokio::select!`, called from `execute_builtin`, called from a
+/// test's own `#[tokio::test]` future) — reproduced empirically: an
+/// initial version of this fix used a 64 KiB stack array here and
+/// overflowed the 2 MiB per-test thread stack on ANY shell call that ran
+/// to natural completion (i.e. never hit the `select!`'s other branches),
+/// even for something as small as `echo`. A `Vec`'s buffer lives on the
+/// heap; only its 24-byte (ptr/len/cap) header is part of the future's
+/// inline state, regardless of how deeply this future ends up nested.
 async fn drain_to_end<R: tokio::io::AsyncRead + Unpin>(io: Option<R>, cap: u64) -> Vec<u8> {
+    let Some(mut io) = io else {
+        return Vec::new();
+    };
+    use tokio::io::AsyncReadExt;
+
+    let cap = cap as usize;
     let mut buf = Vec::new();
-    if let Some(io) = io {
-        use tokio::io::AsyncReadExt;
-        let mut limited = io.take(cap);
-        let _ = limited.read_to_end(&mut buf).await;
+    let mut scratch = vec![0u8; 64 * 1024];
+    let mut truncated = false;
+    loop {
+        let n = match io.read(&mut scratch).await {
+            Ok(0) => break, // natural EOF -- the writer closed its end
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if buf.len() < cap {
+            let remaining = cap - buf.len();
+            let take = remaining.min(n);
+            buf.extend_from_slice(&scratch[..take]);
+            if take < n {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+    if truncated {
+        buf.extend_from_slice(format!("\n[output truncated at {cap} bytes]").as_bytes());
     }
     buf
 }
@@ -1333,11 +1456,81 @@ mod tests {
             .trim()
             .parse()
             .expect("pid file must contain a valid pid");
-        tokio::time::sleep(Duration::from_millis(300)).await; // let SIGKILL land
+
+        // Fix round C1 (ruling W1-R72's second bullet): a fixed sleep-then-check-once
+        // here flakes under load even when cancellation genuinely worked — after
+        // SIGKILL, the grandchild is a ZOMBIE (its `/proc/{pid}/stat` entry still
+        // exists, with state `Z`) until whatever reaps it (its re-parented-to
+        // subreaper/init, since its direct parent `sh` already exited) actually does
+        // so, which this test does not control and has no business waiting on. A
+        // bounded retry loop that accepts "gone" OR "zombie" as proof of death avoids
+        // both a fixed-sleep race AND a dependency on reaping timing — this lane
+        // already carries one wall-clock flake (issue #12) and must not add a second.
+        let mut confirmed_dead = false;
+        for _ in 0..100 {
+            if pid_is_dead_or_zombie(pid) {
+                confirmed_dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(
-            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_err(),
-            "the backgrounded grandchild must be killed along with the rest of the process \
-             group, not left running"
+            confirmed_dead,
+            "the backgrounded grandchild (pid {pid}) must be killed along with the rest of \
+             the process group, not left running"
+        );
+    }
+
+    /// True once `pid` is either gone entirely from `/proc` or sitting as a zombie
+    /// (state `Z`) awaiting reap by whatever process it was re-parented to — both
+    /// count as "killed" for [`execute_builtin_shell_is_bounded_even_when_a_backgrounded_grandchild_outlives_the_direct_child`]'s
+    /// purposes (fix round C1, ruling W1-R72): this test asserts the process GROUP
+    /// was actually torn down, not that some unrelated reaper has already run.
+    /// `/proc/{pid}/stat`'s format is `pid (comm) state ...` — `comm` itself may
+    /// contain spaces or parentheses, so the state field is found by splitting on the
+    /// LAST `)`, not the first.
+    fn pid_is_dead_or_zombie(pid: i32) -> bool {
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => return true,
+            Ok(s) => s,
+        };
+        match stat.rsplit_once(')') {
+            Some((_, rest)) => rest.trim_start().starts_with('Z'),
+            None => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_to_end_reads_past_the_cap_to_natural_eof_and_marks_truncation() {
+        // Fix round C1 (ruling W1-R71): a small cap deliberately far below what `yes`
+        // will produce, so the child is still writing well after the cap is hit. If
+        // `drain_to_end` dropped the reader early (the round B bug), the child would
+        // be SIGPIPE-killed and `status.success()` would be false.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("yes | head -c 200000") // ~200 KB, far past the tiny cap below
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawning sh must succeed");
+        let stdout = child.stdout.take();
+
+        let cap = 10u64;
+        let buf = drain_to_end(stdout, cap).await;
+        let status = child
+            .wait()
+            .await
+            .expect("waiting on the child must succeed");
+
+        assert!(
+            status.success(),
+            "the child must exit normally (head closing its own stdout), not be \
+             SIGPIPE-killed by us closing the read end early — got {status:?}"
+        );
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains(&format!("[output truncated at {cap} bytes]")),
+            "must contain a visible truncation marker, got {text:?}"
         );
     }
 
@@ -1514,6 +1707,113 @@ mod tests {
             decision.outcome,
             roundhouse_policy::engine::Outcome::Deny,
             "a fully-qualified path to a sealed priv-escalation program must still be denied"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Fix round C1 — MUST 1 (ruling W1-R71): the bare-name branch was left fully
+    // canonicalizing in round B, defeating basename-matching security controls and,
+    // worse, making the bare-name and `/`-qualified forms of the identical binary
+    // canonicalize to two DIFFERENT strings — letting the model dodge an exact-match
+    // policy rule by choosing which spelling to send. `resolve_bare_program_on_path`
+    // takes an injected `PATH` value (an `OsStr`, built from a tempdir) rather than
+    // mutating the process-global `PATH` env var, which would race every other test in
+    // this binary running in parallel.
+    // -----------------------------------------------------------------------------------
+
+    #[test]
+    fn bare_name_program_preserves_the_final_component_across_a_symlink_but_still_canonicalizes_its_path_dir(
+    ) {
+        let path_dir = tempfile::tempdir().unwrap();
+        let real_binary = path_dir.path().join("real-interpreter-binary");
+        std::fs::write(&real_binary, "not a real binary").unwrap();
+        let symlink_path = path_dir.path().join("python3");
+        std::os::unix::fs::symlink(&real_binary, &symlink_path).unwrap();
+
+        let path_var = std::ffi::OsString::from(path_dir.path());
+        let resolved = resolve_bare_program_on_path("python3", &path_var).unwrap();
+
+        assert_eq!(
+            resolved.file_name().and_then(|n| n.to_str()),
+            Some("python3"),
+            "the final component must be the literal bare name, not the symlink's \
+             target basename — got {resolved:?}"
+        );
+        assert!(
+            roundhouse_policy::shell::interpreter::is_interpreter(&resolved.to_string_lossy()),
+            "is_interpreter must still recognize this as `python3` after resolution — got \
+             {resolved:?}"
+        );
+        assert_eq!(
+            resolved.parent(),
+            Some(path_dir.path().canonicalize().unwrap().as_path()),
+            "the PATH directory portion must still be canonicalized"
+        );
+    }
+
+    #[test]
+    fn bare_name_program_named_sudo_is_still_denied_by_the_sealed_floor() {
+        // Mirrors `a_fully_qualified_sealed_program_path_is_still_denied_by_the_sealed_floor`
+        // above, but for the bare-name branch specifically — the branch round B's I2 fix
+        // left untouched. Deliberately a SYMLINK named `sudo` (not a plain regular
+        // file): a plain file's `canonicalize()` is a no-op regardless of whether this
+        // fix exists, so it would not actually discriminate round B's bug from this
+        // fix (a mistake this same round's own M4 test-coverage correction, and now
+        // this one, both caught before landing) — the real property under test only
+        // shows up when the final component is a symlink whose target has a different
+        // basename.
+        let path_dir = tempfile::tempdir().unwrap();
+        let real_binary = path_dir.path().join("not-sudo-at-all");
+        std::fs::write(&real_binary, "not a real binary").unwrap();
+        std::os::unix::fs::symlink(&real_binary, path_dir.path().join("sudo")).unwrap();
+        let path_var = std::ffi::OsString::from(path_dir.path());
+
+        let resolved = resolve_bare_program_on_path("sudo", &path_var).unwrap();
+        let params = TaskParams::Shell(ParsedCommand {
+            program: resolved.to_string_lossy().to_string(),
+            argv: vec![],
+        });
+        let policy = roundhouse_policy::engine::PolicyEngine::from_rules(vec![]);
+        let ctx = roundhouse_policy::sealed::default_context();
+        let decision = policy.decide_sealed(&params, &ctx);
+        assert_eq!(
+            decision.outcome,
+            roundhouse_policy::engine::Outcome::Deny,
+            "a bare-name invocation of a sealed priv-escalation program must still be denied"
+        );
+    }
+
+    #[test]
+    fn bare_name_and_relative_path_forms_of_the_same_program_canonicalize_to_the_same_string() {
+        // The exact evasion the security lens named: round B's half-fix let
+        // `program: "python3"` (bare) and `program: "./python3"` (path-qualified)
+        // canonicalize to two DIFFERENT strings for the identical binary, so a model
+        // could dodge an operator's exact-match `Predicate::Shell` rule (`Deny
+        // /usr/bin/python3`) just by omitting the slash. Both forms must now agree,
+        // using one directory as both the PATH entry and the shell's `cwd` — a real
+        // workspace-root-contained tempdir (`workspace_temp_dir`, not a bare system
+        // `/tmp` one), since the relative-path form's own containment check would
+        // otherwise reject it before the two resolutions could even be compared.
+        // `mytool` is deliberately a SYMLINK, not a plain file: a plain file's
+        // `canonicalize()` is a no-op regardless of this fix, so it would not
+        // actually discriminate round B's bug (both forms would trivially agree
+        // either way) — this needs a symlinked final component to be a real test.
+        let dir = workspace_temp_dir();
+        let real_binary = dir.path().join("not-mytool-at-all");
+        std::fs::write(&real_binary, "not a real binary").unwrap();
+        std::os::unix::fs::symlink(&real_binary, dir.path().join("mytool")).unwrap();
+
+        let path_var = std::ffi::OsString::from(dir.path());
+        let via_bare_name = resolve_bare_program_on_path("mytool", &path_var).unwrap();
+
+        let canonical_cwd = dir.path().canonicalize().unwrap();
+        let via_relative_path = resolve_shell_program("./mytool", &canonical_cwd).unwrap();
+
+        assert_eq!(
+            via_bare_name, via_relative_path,
+            "the bare-name and `/`-qualified forms of the identical binary must \
+             canonicalize to the same string, or an exact-match policy rule can be \
+             evaded by choosing which spelling to send"
         );
     }
 }

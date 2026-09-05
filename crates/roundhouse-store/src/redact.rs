@@ -288,12 +288,21 @@ impl Redactor {
             // `serde_json::Value` has no custom `Drop` (confirmed by
             // reading its source), so letting it fall out of scope here
             // and drop normally would hit the SAME stack overflow this
-            // whole cap exists to prevent — verified empirically: a bare
-            // `drop()` of a depth-10,000 `Value`, with NO redaction logic
-            // involved at all, overflows a 2 MiB thread stack (the size
-            // `cargo test` gives each test). Tear it down iteratively,
-            // off the call stack, instead of letting normal `Drop` recurse
-            // into it.
+            // whole cap exists to prevent — verified empirically on an
+            // explicit 2 MiB thread (the size `cargo test` gives each
+            // test): a bare `drop()` of an already-built depth-10,000
+            // `Value`, with NO redaction logic involved at all, survives;
+            // a depth-50,000 one aborts (fix round C1, ruling W1-R75 — a
+            // round B comment here cited depth 10,000 as the overflow
+            // point, which does not reproduce; that number came from a
+            // different, unrelated overflow in how round B's own TEST
+            // fixture was built, not from dropping an already-built
+            // value — see the test's own doc comment for the corrected
+            // mechanism). The exact threshold is unimportant; what matters
+            // is that ordinary recursive `Drop` on a sufficiently deep
+            // value does overflow, at a depth this cap makes unreachable
+            // in the first place. Tear it down iteratively, off the call
+            // stack, instead of letting normal `Drop` recurse into it.
             drop_iteratively(value);
             return (
                 serde_json::Value::String(
@@ -413,8 +422,11 @@ pub enum SecretLeakDisposition {
 /// depth cap: `Value` has no custom `Drop` of its own, so a value that is
 /// still arbitrarily deep below the cap would otherwise overflow the stack
 /// on ordinary drop, defeating the entire point of capping traversal depth
-/// in the first place (verified empirically, not assumed: a bare `drop()`
-/// of a depth-10,000 `Value` alone overflows a 2 MiB thread stack).
+/// in the first place (verified empirically, not assumed, on an explicit
+/// 2 MiB thread: an already-built depth-10,000 `Value` survives a bare
+/// `drop()`; an already-built depth-50,000 one aborts. See
+/// `redact_json_value_at_depth`'s own doc comment, and the corresponding
+/// test's, for fix round C1's correction of an earlier, wrong number here).
 fn drop_iteratively(value: serde_json::Value) {
     let mut stack = vec![value];
     while let Some(v) = stack.pop() {
