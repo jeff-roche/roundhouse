@@ -11,11 +11,33 @@ use std::path::Path;
 
 use roundhouse_core::{EventPayload, SessionId};
 use roundhouse_proto::{ClientEvent, ClientRequest};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
 use crate::protocol::TuiError;
+
+/// Maximum length, in bytes, of a single NDJSON line [`DaemonClient::recv`]
+/// will accept before treating the connection as unusable (security review
+/// Minor 7 / ruling W1-R33): this is the client-side mirror of
+/// `roundhouse-daemon`'s `socket_server::MAX_FRAME_BYTES` fix for the
+/// identical unbounded-`read_line` shape, pre-existing but put on this
+/// crate's new `connect_create`/`connect_attach` path by this diff — and
+/// `connect_create`'s `Some(_) => continue` loop reads frames indefinitely,
+/// so an unbounded daemon reply would drive this client's memory the same
+/// way an unbounded client request drove the daemon's.
+///
+/// `roundhouse-tui` does not depend on `tokio-util` (unlike
+/// `roundhouse-daemon`, which added its `codec` feature for this exact
+/// problem), so this bounds `read_until` directly via `AsyncReadExt::take`
+/// rather than pulling in a new dependency for one crate to save one
+/// `Vec`/`String` allocation shape. Same value as the daemon side
+/// (1 MiB, matching `roundhouse_acp::registry::MAX_RESPONSE_BYTES`'s
+/// precedent) for the same reason: generous enough for any real
+/// `ClientEvent` frame (including `SessionCreated`'s echoed
+/// `workspace_name`), while still bounding the worst case to a fixed
+/// multiple of this client's own buffering.
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// What `connect` should announce itself as on a fresh handshake: mint a new
 /// session, or attach to one that already exists.
@@ -219,16 +241,52 @@ impl DaemonClient {
     /// Each message is one line of JSON, terminated by `\n`.
     /// Reads a line, parses it, and returns the [`ClientEvent`].
     ///
+    /// Bounded at [`MAX_FRAME_BYTES`] (security review Minor 7 / ruling
+    /// W1-R33): an earlier version of this method used
+    /// `AsyncBufReadExt::read_line` directly, which — like the daemon's own
+    /// pre-fix read side — grows its `String` without limit until it finds a
+    /// `\n`. Wrapping `&mut self.reader` in `AsyncReadExt::take` for the
+    /// duration of one call caps how many bytes `read_until` will pull
+    /// before giving up, without needing a new dependency (see
+    /// [`MAX_FRAME_BYTES`]'s doc comment) and without disturbing
+    /// `self.reader`'s own buffered state across calls — `take` here wraps
+    /// `&mut self.reader`, not `self.reader` itself, so the next call starts
+    /// from wherever this one left off, exactly as `read_line` already did.
+    ///
     /// # Returns
     /// - `Ok(Some(event))` if a complete message was read and parsed.
-    /// - `Ok(None)` if EOF was reached (the connection closed gracefully).
-    /// - `Err(TuiError)` if I/O fails or JSON is malformed.
+    /// - `Ok(None)` if EOF was reached (the connection closed gracefully)
+    ///   before any bytes of a new frame arrived.
+    /// - `Err(TuiError)` if I/O fails, the frame exceeds [`MAX_FRAME_BYTES`]
+    ///   with no `\n` found, or JSON is malformed.
     pub async fn recv(&mut self) -> Result<Option<ClientEvent>, TuiError> {
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line).await?;
+        let mut buf = Vec::new();
+        // `MAX_FRAME_BYTES + 1`: reading exactly one byte past the cap is
+        // what lets this method tell "a line that is exactly at the cap,
+        // terminated by `\n`" (fine) apart from "a line that hit the cap
+        // with no `\n` in sight yet" (over length) — both would otherwise
+        // read exactly `MAX_FRAME_BYTES` bytes and be indistinguishable.
+        let n = (&mut self.reader)
+            .take(MAX_FRAME_BYTES as u64 + 1)
+            .read_until(b'\n', &mut buf)
+            .await?;
         if n == 0 {
             return Ok(None);
         }
+        if buf.len() > MAX_FRAME_BYTES && buf.last() != Some(&b'\n') {
+            return Err(TuiError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("daemon frame exceeded the {MAX_FRAME_BYTES}-byte limit with no newline"),
+            )));
+        }
+        // `String::from_utf8`, not `_lossy`: `read_line` used to reject
+        // invalid UTF-8 as an `io::Error`, and silently substituting
+        // replacement characters instead would change what a malformed
+        // frame does from "this connection ends with a clear error" to
+        // "this connection keeps running against corrupted data."
+        let line = String::from_utf8(buf).map_err(|err| {
+            TuiError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        })?;
         let event = serde_json::from_str(line.trim_end())?;
         Ok(Some(event))
     }

@@ -9,14 +9,18 @@
 //! `ClientRequest` lines and writes `ClientEvent` lines, `roundhouse-proto`'s
 //! real, versioned client↔daemon wire types.
 
+use futures::StreamExt;
 use roundhouse_core::{EventPayload, OnDegrade, SessionSpec, Tier, WorkspaceId};
 use roundhouse_proto::{ApiVersion, ClientEvent, ClientRequest};
+use std::io::ErrorKind;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
+use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use crate::session_registry::SessionRegistry;
 
@@ -30,6 +34,52 @@ const REQUEST_CHANNEL_CAPACITY: usize = 64;
 /// socket via [`serve_connection`] has no reason to buffer more than a
 /// subscriber channel already does.
 const EVENT_CHANNEL_CAPACITY: usize = 64;
+
+/// Maximum length, in bytes, of a single NDJSON line this daemon will accept
+/// on either direction of the wire before closing that one connection
+/// (security review Important 1 / ruling W1-R33): `BufReader::lines()`
+/// (the pre-fix read side) accumulated an **uncapped** `String`, and the
+/// reviewer measured 512 MiB of no-newline input driving RSS from
+/// 3,764 KiB to 529,228 KiB against the process holding every live session's
+/// registry state — 1:1 attacker-controlled amplification with no ceiling.
+///
+/// 1 MiB, matching the precedent this workspace already set for exactly this
+/// kind of cap (`roundhouse_acp::registry::MAX_RESPONSE_BYTES`). Generous
+/// enough that no current frame comes close — `ClientRequest::CreateSession`
+/// only carries a `workspace_name`, and `placeholder_session_spec` echoes it
+/// straight back in the handshake reply, so the cap must not be so tight it
+/// breaks a legitimate (if unusually long) workspace name — while still
+/// bounding the worst case to a fixed, small multiple of one connection's own
+/// buffering, not to whatever an attacker is willing to send.
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Default ceiling on concurrent accepted connections one `accept_loop` will
+/// serve at once (security review Important 3 / ruling W1-R33). Bounds the
+/// worst-case fd and per-connection memory (two 64-slot channels, one task)
+/// a hostile or merely enthusiastic set of peers can force this daemon to
+/// hold, while sitting comfortably below the default `ulimit -n` on any
+/// system that would actually run this daemon (leaving headroom for the
+/// listener itself, the store, and log files) — this is a circuit breaker,
+/// not an expected operational ceiling.
+const DEFAULT_MAX_CONNECTIONS: usize = 256;
+
+/// Default timeout on a freshly accepted connection's *first* request
+/// (security review Important 3 / ruling W1-R33): without one, a peer that
+/// connects and sends nothing parks a task forever holding an fd — classic
+/// slowloris, and the direct feeder for accept()'s own `EMFILE` (fix 3).
+/// 30 seconds is generous for a human-driven client dialing in over a local
+/// Unix socket (no network latency to account for) while still bounding how
+/// long one silent peer can hold a connection slot open.
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Smallest backoff `accept_loop` sleeps after a transient `accept()` error
+/// (security review Important 2 / ruling W1-R33) before retrying.
+const MIN_ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
+/// Largest backoff `accept_loop` will back off to; doubles from
+/// [`MIN_ACCEPT_BACKOFF`] on each consecutive transient error, capped here so
+/// a sustained fd-exhaustion episode still retries roughly once a second
+/// rather than drifting arbitrarily slow.
+const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Binds a Unix socket at `socket_path` and tightens its permissions to
 /// owner-only, but accepts nothing — that is [`serve`]'s or [`accept_loop`]'s
@@ -157,51 +207,92 @@ pub async fn serve(
 /// exits" would leak one blocked task per dropped connection.
 ///
 /// Uses `tokio::select!` so waiting for the *next* line or event on one side
-/// never blocks the other. That independence is not absolute, though:
-/// `requests_out.send(..).await` and `writer.write_all(..).await` run inside
-/// their branch's handler body once a line/event has already arrived, so a
-/// full `requests_out` (bounded, and nobody drains it in `main.rs` today —
-/// see its own comment) would stall the read side mid-forward. Harmless
-/// while at most one handshake request ever flows through it; Task 3's real
-/// multi-request registry is what needs to actually drain it. Every write
-/// error ends the connection rather than panicking; a `ClientRequest` line
-/// that fails to parse, or a `ClientEvent` that fails to serialize, is
-/// dropped with a warning and the connection keeps running — those are the
-/// two conditions that do **not** end it.
+/// never blocks the other — and, since a fix round (ruling W1-R31/W1-R32),
+/// that independence is now actually load-bearing rather than aspirational.
+///
+/// # No branch body ever blocks on `requests_out` (rulings W1-R31/W1-R32/W1-R38)
+///
+/// An earlier version of this function sent a freshly parsed `ClientRequest`
+/// via `requests_out.send(..).await` **inside** the read arm's branch body.
+/// Once `tokio::select!` commits to a branch, that branch's body is no
+/// longer racing the other arm — a task parked in that `.await` has stopped
+/// polling `events_in.recv()` entirely. Paired with `drive_session`
+/// (`socket_server.rs`'s other half of this same connection, joined in
+/// [`handle_connection`]) blocking symmetrically on `events_tx.send(..)`
+/// inside *its* own branch body, the two form a circular wait: this
+/// function stops draining `events_in` (which `drive_session` needs to send
+/// into), and `drive_session` stops draining `requests_rx` (which this
+/// function needs to send into) — both parked forever, inside one
+/// `tokio::join!`, with 64 slots on each side. The connection wedges
+/// permanently and never observes peer EOF; see `drive_session`'s doc
+/// comment for the registry-level consequence (a subscription that is never
+/// `detach`ed because `publish` sees `Full`, not `Closed`).
+///
+/// The fix holds a parsed request in a `pending_request: Option<..>` slot
+/// instead of sending it immediately, and only *reserves* capacity —
+/// `mpsc::Sender::reserve()`, cancel-safe and awaited as its own `select!`
+/// **arm**, gated by `if pending_request.is_some()` — rather than blocking
+/// on `send()` in a body. Reserving is fair: it competes with `events_in`'s
+/// own arm on equal footing, so `events_in` keeps draining for the entire
+/// time this function is waiting for `requests_out` capacity. Once a permit
+/// resolves, handing the pending value to it (`Permit::send`) is
+/// synchronous and cannot block. The naive alternative — reserve, then
+/// `.await` the *next* line inside that same arm's body — merely moves the
+/// bug: it stops draining `events_in`'s counterpart in the idle case
+/// instead (see `drive_session`'s doc comment for why that trap matters,
+/// and this crate's `serve_connection_drains_pending_events_while_idle`
+/// test for the regression it would otherwise reintroduce silently).
+///
+/// **This is a property of the loop's shape, not a one-time patch**
+/// (ruling W1-R38): today, `drive_session` discards every post-handshake
+/// request as a no-op, so nothing in *this* function's own body ever blocks
+/// indefinitely either. The invariant that must survive whoever replaces
+/// that no-op: no `select!` branch body in this connection's loop may await
+/// anything that can block indefinitely — hand the work to a spawned task,
+/// or reserve capacity as a `select!` arm the way this function now does.
+///
+/// Every write error ends the connection rather than panicking; a
+/// `ClientRequest` line that fails to parse, or a `ClientEvent` that fails
+/// to serialize, is dropped with a warning and the connection keeps running
+/// — those are the two conditions that do **not** end it. An over-length
+/// line (see [`MAX_FRAME_BYTES`]) does end the connection — closing this one
+/// peer's connection, not the accept loop — since there is no way to resync
+/// to the next line boundary inside a frame that was itself rejected for
+/// having none.
 pub async fn serve_connection(
     stream: UnixStream,
     requests_out: mpsc::Sender<ClientRequest>,
     mut events_in: mpsc::Receiver<ClientEvent>,
 ) {
     let (read_half, write_half) = stream.into_split();
-    // `Lines::next_line` (not a bare `BufReader` + `String` +
-    // `AsyncBufReadExt::read_line`) specifically because it is documented
-    // cancellation-safe: it keeps its partially-read line inside `Lines`
-    // across calls, whereas `read_line` takes the caller's `String` by
-    // `&mut` and only appends to it on completion. Racing `read_line` inside
-    // `tokio::select!` against `events_in.recv()` would drop a half-read
-    // `ClientRequest` line on the floor the instant `events_in` won a race
-    // mid-line — silently, as a "malformed" line once the tail of it showed
-    // up next. `roundhouse-cli/src/main.rs` already documents this exact
-    // hazard for `DaemonClient::recv`; this loop is the daemon-side mirror
-    // of it, and Task 3 builds its real accept loop directly on this
-    // function, so it must not carry the bug forward.
-    let mut lines = BufReader::new(read_half).lines();
+    // `FramedRead` + `LinesCodec` (not a bare `BufReader` + `String` +
+    // `AsyncBufReadExt::read_line`, and not the unbounded `Lines` this
+    // function used before fix 2) for two reasons at once: `LinesCodec`
+    // enforces [`MAX_FRAME_BYTES`] (security review Important 1 / ruling
+    // W1-R33) instead of accumulating an uncapped `String`, and — just like
+    // `Lines::next_line` before it — `FramedRead` keeps its
+    // partially-decoded buffer inside itself across polls, so racing it
+    // inside `tokio::select!` against `events_in.recv()` cannot drop a
+    // half-read `ClientRequest` line on the floor the instant `events_in`
+    // wins a race mid-line. `roundhouse-cli/src/main.rs` already documents
+    // this exact hazard for `DaemonClient::recv`; this loop is the
+    // daemon-side mirror of it, and Task 3 builds its real accept loop
+    // directly on this function, so it must not carry the bug forward.
+    let mut lines = FramedRead::new(read_half, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
     let mut writer = write_half;
+    // Holds one parsed request between "read it" and "forward it" so this
+    // function never blocks on `requests_out.send(..)` inside a branch body
+    // — see this function's doc comment.
+    let mut pending_request: Option<ClientRequest> = None;
 
     loop {
         tokio::select! {
-            result = lines.next_line() => {
+            result = lines.next(), if pending_request.is_none() => {
                 match result {
-                    Ok(Some(line)) => {
+                    Some(Ok(line)) => {
                         match serde_json::from_str::<ClientRequest>(&line) {
                             Ok(request) => {
-                                if requests_out.send(request).await.is_err() {
-                                    // Nobody is listening for requests anymore
-                                    // — nothing left to forward them to, and
-                                    // nothing more this connection can do.
-                                    return;
-                                }
+                                pending_request = Some(request);
                             }
                             Err(err) => {
                                 tracing::warn!(
@@ -211,7 +302,14 @@ pub async fn serve_connection(
                             }
                         }
                     }
-                    Ok(None) | Err(_) => {
+                    Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
+                        tracing::warn!(
+                            max_frame_bytes = MAX_FRAME_BYTES,
+                            "closing connection: ClientRequest line exceeded the maximum frame length"
+                        );
+                        return;
+                    }
+                    Some(Err(LinesCodecError::Io(_))) | None => {
                         // Clean EOF, or a read error: either way the peer is
                         // gone. Return now rather than sit parked on
                         // `events_in.recv()` for a peer that will never read
@@ -220,25 +318,26 @@ pub async fn serve_connection(
                     }
                 }
             }
+            permit = requests_out.reserve(), if pending_request.is_some() => {
+                match permit {
+                    Ok(permit) => {
+                        let request = pending_request.take().expect(
+                            "select! arm guarded by pending_request.is_some()"
+                        );
+                        permit.send(request);
+                    }
+                    Err(_) => {
+                        // Nobody is listening for requests anymore — nothing
+                        // left to forward them to, and nothing more this
+                        // connection can do.
+                        return;
+                    }
+                }
+            }
             maybe_event = events_in.recv() => {
                 match maybe_event {
                     Some(event) => {
-                        // `ClientEvent` is a plain serde enum, so this cannot
-                        // fail in practice — but a serialization bug must
-                        // drop one event, not take down the connection.
-                        let serialized = match serde_json::to_string(&event) {
-                            Ok(line) => line,
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    "dropping unserializable ClientEvent"
-                                );
-                                continue;
-                            }
-                        };
-                        if writer.write_all(serialized.as_bytes()).await.is_err()
-                            || writer.write_all(b"\n").await.is_err()
-                        {
+                        if write_event(&mut writer, &event).await.is_err() {
                             return;
                         }
                     }
@@ -255,9 +354,124 @@ pub async fn serve_connection(
     }
 }
 
+/// Serializes `event` as one NDJSON line and writes it to `writer`.
+///
+/// A serialization failure drops just this one event with a warning rather
+/// than ending the connection (`ClientEvent` is a plain serde enum, so this
+/// cannot fail in practice, but a bug here must not be allowed to take the
+/// connection down); a write failure is the caller's signal to end the
+/// connection, since the socket itself is no longer usable.
+async fn write_event(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    event: &ClientEvent,
+) -> std::io::Result<()> {
+    let serialized = match serde_json::to_string(event) {
+        Ok(line) => line,
+        Err(err) => {
+            tracing::warn!(error = %err, "dropping unserializable ClientEvent");
+            return Ok(());
+        }
+    };
+    writer.write_all(serialized.as_bytes()).await?;
+    writer.write_all(b"\n").await
+}
+
+/// Classifies an `accept()` error as transient (worth retrying after a
+/// backoff) or fatal (worth propagating) — security review Important 2 /
+/// ruling W1-R33, and `code Minor 2` independently.
+///
+/// Standalone and free of any actual I/O so it can be unit-tested directly
+/// against synthetic `io::Error`s rather than only via an end-to-end
+/// reproduction. The reviewer proved the pre-fix failure mode under
+/// `ulimit -n 200`: 94 connections accepted, then `EMFILE`, propagated
+/// straight out of the old `accept_loop` via `?` — the loop **terminated**,
+/// and once every client fd was released a fresh connect returned
+/// `ECONNREFUSED` **permanently**. The process was still alive with its
+/// socket file still on disk: to an operator that is indistinguishable from
+/// a crash, `boot`/recovery never runs again, and no session is ever cleaned
+/// up.
+///
+/// `EMFILE`/`ENFILE` (this process, or the whole system, is out of file
+/// descriptors) and `ConnectionAborted`/`Interrupted` (a connection that died
+/// between the kernel accepting it and this call returning, or a signal
+/// interrupting the syscall) are all conditions that resolve themselves as
+/// load eases or the interrupted call is retried. Everything else is treated
+/// as fatal: busy-looping `accept()` against a listener that is genuinely
+/// broken (e.g. its underlying fd was closed out from under it) would be its
+/// own, worse availability problem than returning.
+fn classify_accept_error(err: &std::io::Error) -> AcceptDisposition {
+    match err.kind() {
+        ErrorKind::ConnectionAborted | ErrorKind::Interrupted => AcceptDisposition::Retry,
+        _ => match err.raw_os_error() {
+            // EMFILE (24) / ENFILE (23) — stable across Linux and every
+            // other unix this daemon targets, but neither has a stable
+            // `ErrorKind` variant, hence matching the raw errno.
+            Some(24) | Some(23) => AcceptDisposition::Retry,
+            _ => AcceptDisposition::Fatal,
+        },
+    }
+}
+
+/// [`classify_accept_error`]'s verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptDisposition {
+    /// Transient: log, back off, and try `accept()` again without tearing
+    /// the listener down.
+    Retry,
+    /// Not recoverable: propagate the error and let the caller decide.
+    Fatal,
+}
+
+/// Availability limits [`accept_loop`] enforces (security review
+/// Important 3 / ruling W1-R33): a cap on concurrently accepted connections
+/// and a timeout on a freshly accepted connection's first request.
+///
+/// `Default` gives the production values ([`DEFAULT_MAX_CONNECTIONS`],
+/// [`DEFAULT_HANDSHAKE_TIMEOUT`]); tests that need to actually observe a
+/// limit being hit construct one directly with much smaller numbers rather
+/// than needing thousands of connections to exercise
+/// [`DEFAULT_MAX_CONNECTIONS`].
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptLimits {
+    pub max_connections: usize,
+    pub handshake_timeout: Duration,
+}
+
+impl Default for AcceptLimits {
+    fn default() -> Self {
+        AcceptLimits {
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+        }
+    }
+}
+
+/// Reads this process's own uid via `/proc/self` — the same dependency-free
+/// idiom `main.rs`'s `check_owned_by_current_user` already uses for the
+/// runtime directory ownership check (see its doc comment for why
+/// `/proc/self`, and why `metadata` rather than `symlink_metadata`, is the
+/// right call). Linux-only for the same reason that function is: there is no
+/// `/proc` to read on other unix platforms without taking on `libc`/`rustix`
+/// for one syscall.
+#[cfg(target_os = "linux")]
+fn current_process_uid() -> std::io::Result<u32> {
+    Ok(std::fs::metadata("/proc/self")?.uid())
+}
+
+/// Non-Linux fallback: there is no `/proc/self` to read. Returning an error
+/// here (rather than, say, `Ok(0)` or skipping the check) is exactly the
+/// point of ruling W1-R34 — see [`accept_loop_with`]'s doc comment.
+#[cfg(not(target_os = "linux"))]
+fn current_process_uid() -> std::io::Result<u32> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "cannot determine this process's own uid without /proc (non-Linux platform)",
+    ))
+}
+
 /// Accepts connections from an already-bound `listener` forever, spawning
-/// one task per connection against `registry`, until `accept` itself returns
-/// an error.
+/// one task per connection against `registry`, until a fatal `accept` error
+/// occurs or this process's own uid cannot be determined.
 ///
 /// # Restores Phase 1's synchronous-bind guarantee (ruling W1-R12)
 ///
@@ -273,100 +487,177 @@ pub async fn serve_connection(
 /// — no sleep needed, and this crate's `multi_client_attach` test dials
 /// immediately after `tokio::spawn(accept_loop(..))` to prove it.
 ///
-/// # Peer-credential verification (the `SO_PEERCRED` TODO, resolved)
-///
-/// [`serve`]'s single-connection shape carried forward a `TODO(Phase 2)` for
-/// `SO_PEERCRED` peer-credential verification
-/// (docs/architecture/03-security-and-sandboxing.md §6.4) without ever
-/// implementing it, standing on the 0600 socket mode and 0700 parent
-/// directory as the only real barrier. That was an acceptable gap for a
-/// function that serves *one* connection to whichever single client the
-/// operator starts by hand in the same terminal session; it stops being
-/// acceptable the moment this function starts accepting an unbounded number
-/// of connections from any local process in a loop; the filesystem
-/// permissions alone would not tell two connecting local processes apart.
-///
-/// This function closes the gap using `tokio::net::UnixStream::peer_cred`
-/// (a safe wrapper tokio already ships around exactly the `SO_PEERCRED`
-/// getsockopt call the frozen contract names — no new dependency, and no
-/// `unsafe`) rather than leaving the TODO for a later task: every accepted
-/// connection's peer uid is compared against the uid that owns the bound
-/// socket path (i.e. this daemon process's own uid, read back off the
-/// filesystem rather than via a `/proc`-only trick, so this works on every
-/// unix `peer_cred` supports, not just Linux); a mismatch is logged and the
-/// connection is dropped before it is ever handed to [`handle_connection`].
-/// If the listener was not bound to a filesystem path (`local_addr` has no
-/// `as_pathname`) or that path's metadata can't be read, this check is
-/// skipped entirely rather than rejecting every connection — a degraded,
-/// filesystem-permissions-only posture identical to what `serve` already
-/// shipped, not a new failure mode.
+/// This is a thin, non-configurable wrapper over [`accept_loop_with`] using
+/// [`current_process_uid`] and [`AcceptLimits::default`] — see that
+/// function's doc comment for the peer-credential fix, the connection cap,
+/// and the handshake timeout.
 ///
 /// # Errors
-/// Returns the first `accept` error, if any — no local process ever caused
-/// `serve_connection`'s own errors to escape *this* function, since every
-/// per-connection failure is contained inside its own spawned task.
+/// See [`accept_loop_with`].
 pub async fn accept_loop(
     listener: UnixListener,
     registry: Arc<SessionRegistry>,
 ) -> std::io::Result<()> {
-    let expected_uid = listener
-        .local_addr()
-        .ok()
-        .and_then(|addr| addr.as_pathname().map(Path::to_path_buf))
-        .and_then(|path| std::fs::metadata(path).ok())
-        .map(|meta| meta.uid());
+    accept_loop_with(
+        listener,
+        registry,
+        current_process_uid(),
+        AcceptLimits::default(),
+    )
+    .await
+}
 
-    if expected_uid.is_none() {
-        // Not silent: a caller relying on this check (every real caller —
-        // this branch only triggers for a listener bound to something other
-        // than a filesystem path, or whose path's metadata is unreadable,
-        // neither of which `bind_socket`'s own callers produce) needs to
-        // know peer-credential verification is not actually happening for
-        // this listener, not discover it later as an unexplained gap.
-        tracing::warn!(
-            "accept_loop: could not determine the bound socket's owner uid; \
-             skipping SO_PEERCRED verification for every connection this \
-             listener accepts (falling back to filesystem-permission-only \
-             authorization)"
+/// [`accept_loop`]'s real body, with the two things a test would otherwise
+/// need root or a `/proc`-less platform to exercise made injectable:
+/// `expected_uid` (so a test can force the "undeterminable" branch) and
+/// `limits` (so a test can hit a cap with a handful of connections instead
+/// of [`DEFAULT_MAX_CONNECTIONS`]). `pub`, not `pub(crate)`, for the same
+/// reason [`serve_connection`] is: this crate's integration tests are their
+/// own crate.
+///
+/// # Peer-credential verification, fixed at the root (security review
+/// Important 4 / ruling W1-R34)
+///
+/// An earlier version of this check computed its expected uid from the
+/// *bound socket path's owner* (a mutable filesystem attribute), read once,
+/// inside this spawned future. Three branches followed: a uid mismatch and a
+/// `peer_cred()` error both correctly `continue`d — real, fail-**closed**
+/// denies, and this fix leaves both exactly as they were. But the third
+/// branch — the path's metadata being unreadable — skipped the *entire*
+/// `if let Some(expected_uid)` check, silently, for every connection that
+/// listener would ever accept: fail-**open**, for the listener's whole
+/// lifetime. The trigger was not even adversarial: `main.rs`'s
+/// `remove_stale_socket` unlinks whatever sits at the configured path before
+/// a fresh `bind`, so a *second* daemon starting at the same path silently
+/// disarmed the *first* one's peer-credential check while its listener kept
+/// serving — a mutable-filesystem-attribute dependency is simply the wrong
+/// root of trust for "who am I."
+///
+/// The fix compares against **this process's own uid** (`expected_uid`,
+/// `std::io::Result<u32>` — computed once by [`accept_loop`] via
+/// [`current_process_uid`]'s `/proc/self` idiom) instead, and refuses to run
+/// at all when it cannot be determined: an `Err` here returns **before this
+/// function ever calls `accept()`**, rather than silently downgrading to
+/// "skip the check." There is no more fail-open branch — every connection
+/// this function accepts is peer-credential checked, or nothing is accepted.
+///
+/// # Availability limits (security review Important 3 / ruling W1-R33)
+///
+/// `grep -rn "Semaphore\|max_conn\|MAX_\|timeout\|limit"` over this crate
+/// once returned nothing: connections were accepted without bound, and a
+/// peer that connected and sent nothing parked a task on the handshake read
+/// forever, holding an fd open — slowloris, and the direct feeder for the
+/// `EMFILE` [`classify_accept_error`]'s doc comment describes. This function
+/// now holds a `Semaphore` sized to `limits.max_connections` (acquired via
+/// `try_acquire_owned`, never an awaited `acquire` — see the inline comment
+/// at that call for why blocking here would just move the hang rather than
+/// fix it) and threads `limits.handshake_timeout` into [`drive_session`] to
+/// bound that first read. `SessionRegistry`'s own `max_sessions` and
+/// `max_subscribers_per_session` caps close the remaining two gaps the
+/// review named (unbounded sessions, and `publish`'s per-subscriber clone
+/// being an unbounded amplifier).
+///
+/// # Errors
+/// Returns immediately if `expected_uid` is `Err` — this process's own uid
+/// could not be determined, and running an unauthenticated listener is worse
+/// than not running one. Otherwise returns the first *fatal* `accept` error
+/// (see [`classify_accept_error`]); transient errors are logged and retried
+/// with an exponential backoff rather than ending the loop. No local
+/// process ever caused `serve_connection`'s own errors to escape *this*
+/// function, since every per-connection failure is contained inside its own
+/// spawned task.
+pub async fn accept_loop_with(
+    listener: UnixListener,
+    registry: Arc<SessionRegistry>,
+    expected_uid: std::io::Result<u32>,
+    limits: AcceptLimits,
+) -> std::io::Result<()> {
+    let expected_uid = expected_uid.map_err(|err| {
+        tracing::error!(
+            error = %err,
+            "accept_loop: could not determine this process's own uid; \
+             refusing to accept any connection rather than run without \
+             SO_PEERCRED verification"
         );
-    }
+        err
+    })?;
+
+    let connection_slots = Arc::new(Semaphore::new(limits.max_connections));
+    let mut backoff = MIN_ACCEPT_BACKOFF;
 
     loop {
-        let (stream, _peer_addr) = listener.accept().await?;
-
-        if let Some(expected_uid) = expected_uid {
-            match stream.peer_cred() {
-                Ok(cred) if cred.uid() == expected_uid => {}
-                Ok(cred) => {
-                    tracing::warn!(
-                        peer_uid = cred.uid(),
-                        expected_uid,
-                        "rejecting connection: peer uid does not own this socket"
-                    );
-                    continue;
-                }
-                Err(err) => {
+        let (stream, _peer_addr) = match listener.accept().await {
+            Ok(pair) => {
+                // A successful accept means the listener is healthy again;
+                // do not let a stale, larger backoff linger into the next
+                // unrelated transient error.
+                backoff = MIN_ACCEPT_BACKOFF;
+                pair
+            }
+            Err(err) => match classify_accept_error(&err) {
+                AcceptDisposition::Retry => {
                     tracing::warn!(
                         error = %err,
-                        "rejecting connection: SO_PEERCRED lookup failed"
+                        backoff_ms = backoff.as_millis() as u64,
+                        "accept() failed transiently; backing off and retrying \
+                         rather than ending the accept loop"
                     );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_ACCEPT_BACKOFF);
                     continue;
                 }
+                AcceptDisposition::Fatal => return Err(err),
+            },
+        };
+
+        match stream.peer_cred() {
+            Ok(cred) if cred.uid() == expected_uid => {}
+            Ok(cred) => {
+                tracing::warn!(
+                    peer_uid = cred.uid(),
+                    expected_uid,
+                    "rejecting connection: peer uid does not match this process's own uid"
+                );
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "rejecting connection: SO_PEERCRED lookup failed"
+                );
+                continue;
             }
         }
 
+        // `try_acquire_owned`, never an awaited `acquire`: at capacity,
+        // awaiting would park this very loop — leaving every further peer
+        // queued in the kernel's listen backlog with nothing ever calling
+        // `accept()` again — which is a hang, not the clean per-connection
+        // refusal this cap exists to provide. The permit moves into the
+        // spawned task and is dropped (freeing the slot) whenever that
+        // connection ends, for any reason.
+        let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
+            tracing::warn!(
+                max_connections = limits.max_connections,
+                "rejecting connection: at the concurrent connection limit"
+            );
+            continue;
+        };
+
         let registry = registry.clone();
+        let handshake_timeout = limits.handshake_timeout;
         tokio::spawn(async move {
-            handle_connection(stream, registry).await;
+            let _permit = permit;
+            handle_connection(stream, registry, handshake_timeout).await;
         });
     }
 }
 
 /// Runs one accepted connection end to end: wires up a fresh pair of
-/// request/event channels, hands the socket itself to [`serve_connection`]
-/// (unmodified — see that function's doc comment), and hands the channel
-/// ends to [`drive_session`], which speaks the `CreateSession`/`Attach`
-/// handshake and routes the connection into [`SessionRegistry`].
+/// request/event channels, hands the socket itself to [`serve_connection`],
+/// and hands the channel ends to [`drive_session`], which speaks the
+/// `CreateSession`/`Attach` handshake and routes the connection into
+/// [`SessionRegistry`].
 ///
 /// Runs both futures concurrently *within this one spawned task* (via
 /// `tokio::join!`, not a second `tokio::spawn`) — [`accept_loop`] spawns
@@ -376,12 +667,16 @@ pub async fn accept_loop(
 /// the other one exit too (see both functions' doc comments), so `join!`
 /// waiting for both never waits for a connection that has nothing left to
 /// do.
-async fn handle_connection(stream: UnixStream, registry: Arc<SessionRegistry>) {
+async fn handle_connection(
+    stream: UnixStream,
+    registry: Arc<SessionRegistry>,
+    handshake_timeout: Duration,
+) {
     let (requests_tx, requests_rx) = mpsc::channel(REQUEST_CHANNEL_CAPACITY);
     let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     tokio::join!(
         serve_connection(stream, requests_tx, events_rx),
-        drive_session(requests_rx, events_tx, registry),
+        drive_session(requests_rx, events_tx, registry, handshake_timeout),
     );
 }
 
@@ -391,20 +686,55 @@ async fn handle_connection(stream: UnixStream, registry: Arc<SessionRegistry>) {
 /// session produces down `events_tx` — which [`serve_connection`] is, at the
 /// same time, draining and writing to the socket — until either side ends.
 ///
-/// # This is what actually drains `requests_rx` (carry-forward CF-4)
+/// # No branch body ever blocks on `events_tx` (rulings W1-R31/W1-R32/W1-R38)
 ///
-/// Task 2's review flagged that nothing in `main.rs` ever drained
-/// `serve_connection`'s `requests_out`, so a full channel there was a latent
-/// stall waiting to happen the moment more than a handshake's worth of
-/// requests ever flowed through one connection. This function's `select!`
-/// loop is that drain: it always has an outstanding `requests_rx.recv()` in
-/// flight, so `serve_connection`'s `requests_out.send(..).await` can never
-/// find that channel permanently full. Everything received past the
-/// handshake is currently discarded (a placeholder — Task 5/7's real
-/// `SessionActor` is the eventual consumer, see `SessionRegistry`'s module
-/// doc comment), but "discarded immediately" and "never read at all" are
-/// very different failure modes for the sender blocked on the other end of
-/// that channel.
+/// **This carry-forward corrects an earlier version of this very doc
+/// comment.** That version claimed: "this function's `select!` loop ...
+/// always has an outstanding `requests_rx.recv()` in flight, so
+/// `serve_connection`'s `requests_out.send(..).await` can never find that
+/// channel permanently full." That claim is false, and it is exactly the
+/// mechanism a security-lens review round independently asserted (as CF-4
+/// being closed) and this lane's adjudication (ruling W1-R31) rejected after
+/// reading the source directly: the loop's first arm sent a received session
+/// event via `events_tx.send(event).await` **inside that arm's branch
+/// body**. Once `tokio::select!` commits to a branch, the body is no longer
+/// racing the other arm — a task parked in that `.await` is *not* polling
+/// `requests_rx.recv()` at all, "outstanding" or not, for as long as the
+/// send is pending. Paired with `serve_connection` blocking symmetrically on
+/// `requests_out.send(..)` inside its own read-arm body, the two form a
+/// circular wait — both parked forever, inside one `tokio::join!`
+/// ([`handle_connection`]), 64 slots deep on each side: this function stops
+/// draining `requests_rx` (which `serve_connection` needs to send into), and
+/// `serve_connection` stops draining `events_in` (which this function needs
+/// to send into). The connection wedges permanently and never observes peer
+/// EOF — and the sharp registry-level consequence is that this
+/// subscription's `detach` (below) never runs, while `publish` sees the
+/// subscriber channel as `Full`, not `Closed`, so it is never pruned either:
+/// a zombie registry entry that `attach` keeps succeeding against.
+///
+/// The fix (mirroring [`serve_connection`]'s own, symmetric fix) holds a
+/// received session event in a `pending_event: Option<..>` slot and only
+/// *reserves* `events_tx` capacity — `reserve()`, cancel-safe, awaited as
+/// its own `select!` **arm**, gated by `if pending_event.is_some()` — rather
+/// than blocking on `send()` in a body. `requests_rx.recv()` stays a live,
+/// unconditional arm the entire time, so `serve_connection`'s
+/// `requests_out.send(..)` (a `reserve()`+permit pair, post-fix) can always
+/// make progress. The naive alternative — reserve, then `.await`
+/// `session_events.recv()` inside that same arm's body — merely relocates
+/// the bug: it starves `requests_rx` draining the moment the session goes
+/// idle with `events_tx` capacity available, since the permit is grabbed
+/// speculatively before there is anything to send (see this crate's
+/// `drive_session_keeps_draining_requests_while_the_session_is_idle` test).
+///
+/// **This is a property of the loop's shape, not a one-time patch**
+/// (ruling W1-R38). Everything received past the handshake is *currently*
+/// discarded (see the `Some(_request)` arm below) — a placeholder, since
+/// Task 5/7's real `SessionActor` is the eventual consumer. That no-op is
+/// exactly why nothing in this loop's body can block indefinitely *today*.
+/// The invariant that must survive whoever replaces it: no `select!` branch
+/// body in this loop may await anything that can block indefinitely — hand
+/// the work to a spawned task, or reserve capacity as a `select!` arm the
+/// way this function now does for `events_tx`.
 ///
 /// # Handshake framing (ruling W1-R6)
 ///
@@ -416,21 +746,59 @@ async fn handle_connection(stream: UnixStream, registry: Arc<SessionRegistry>) {
 /// EventPayload::SessionCreated { spec } }` — a variant that already exists
 /// for exactly this purpose — and `roundhouse_tui::connect_create` reads the
 /// minted `session_id` off of it.
-async fn drive_session(
+///
+/// # Handshake timeout (security review Important 3 / ruling W1-R33)
+///
+/// The very first `requests_rx.recv()` below is wrapped in
+/// `tokio::time::timeout(handshake_timeout, ..)`: without it, a peer that
+/// connects and never sends anything parks this task forever, holding an fd
+/// open — slowloris, and the direct feeder for `accept()`'s own `EMFILE`
+/// (see [`classify_accept_error`]'s doc comment). A timeout here fires
+/// before any registration has happened, so there is nothing to `detach`;
+/// returning simply ends this function, which (via [`handle_connection`]'s
+/// `join!`) drops `events_tx`, which is exactly the signal
+/// `serve_connection` already treats as "end this connection."
+///
+/// `pub`, not `pub(crate)`, for the same reason [`serve_connection`] is:
+/// fix round 1's deadlock-invariant tests drive this function directly, with
+/// test-owned channels of a deliberately small capacity, rather than through
+/// the full three-channel `accept_loop`/`handle_connection` stack — a full
+/// end-to-end wedge would interleave three channels and be racy (see this
+/// crate's `deadlock_invariant` test file for why).
+pub async fn drive_session(
     mut requests_rx: mpsc::Receiver<ClientRequest>,
     events_tx: mpsc::Sender<ClientEvent>,
     registry: Arc<SessionRegistry>,
+    handshake_timeout: Duration,
 ) {
-    let Some(first_request) = requests_rx.recv().await else {
-        // The peer vanished before ever sending a handshake request —
-        // nothing to register and no one to answer.
-        return;
+    let first_request = match tokio::time::timeout(handshake_timeout, requests_rx.recv()).await {
+        Ok(Some(request)) => request,
+        Ok(None) => {
+            // The peer vanished before ever sending a handshake request —
+            // nothing to register and no one to answer.
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(
+                ?handshake_timeout,
+                "closing connection: no handshake request received within the timeout"
+            );
+            return;
+        }
     };
 
     let (session_id, subscription, mut session_events) = match first_request {
         ClientRequest::CreateSession { workspace_name } => {
-            let (session_id, subscription, session_events) =
-                registry.create(workspace_name.clone());
+            let Some((session_id, subscription, session_events)) =
+                registry.create(workspace_name.clone())
+            else {
+                // At `max_sessions` (security review Important 3 / ruling
+                // W1-R33) — `ClientRequest` has no error-response variant to
+                // report that over the wire with (the same constraint ruling
+                // W1-R6 already accepted for "unknown session"), so ending
+                // the connection is the most honest thing left to do.
+                return;
+            };
             let created = ClientEvent::TaskEvent {
                 session_id,
                 task_id: None,
@@ -447,6 +815,21 @@ async fn drive_session(
             }
             (session_id, subscription, session_events)
         }
+        // # Attach is authenticated, not authorized (security review
+        // Important 5 / ruling W1-R35 — escalated to the operator, not a
+        // Task 3 defect) — the frozen design
+        // (`docs/architecture/03-security-and-sandboxing.md:174`) intends
+        // approvals to broadcast to every attached client, "first responder
+        // wins". `registry.attach(session_id)` is a bare, unauthenticated
+        // map lookup: any local peer that learns a `SessionId` (a UUIDv4, so
+        // not enumerable, but not secret either — `main.rs` logs it, and the
+        // unredacted event stream that follows is not access-controlled
+        // beyond that) can attach to it. That is bounded *today* only
+        // because this function discards every post-handshake request
+        // below as a no-op — see the `Some(_request)` arm's own comment for
+        // why replacing that discard with a real `SessionActor` must not be
+        // done without an attach capability distinct from the routing key,
+        // or an explicit operator decision to accept broadcast-approval.
         ClientRequest::Attach { session_id } => match registry.attach(session_id) {
             Some((subscription, session_events)) => {
                 // `roundhouse_tui::connect_attach` waits for this `Ack`
@@ -469,9 +852,13 @@ async fn drive_session(
                 }
                 (session_id, subscription, session_events)
             }
-            // Unknown (or no-longer-live) session, and `ClientRequest` has no
-            // error-response variant to report that over the wire with — the
-            // most honest thing this connection can do is end.
+            // Unknown/no-longer-live session, or already at
+            // `max_subscribers_per_session` (security review Important 3 /
+            // ruling W1-R33) — `ClientRequest` has no error-response variant
+            // to report either over the wire with; the most honest thing
+            // this connection can do is end, the same as `SessionRegistry::
+            // attach`'s doc comment already documents for the first two
+            // cases.
             None => return,
         },
         // `ClientRequest` is `#[non_exhaustive]`; any future variant is not a
@@ -479,20 +866,41 @@ async fn drive_session(
         _ => return,
     };
 
+    let mut pending_event: Option<ClientEvent> = None;
     loop {
         tokio::select! {
-            maybe_event = session_events.recv() => {
+            maybe_event = session_events.recv(), if pending_event.is_none() => {
                 match maybe_event {
                     Some(event) => {
-                        if events_tx.send(event).await.is_err() {
-                            break;
-                        }
+                        pending_event = Some(event);
                     }
-                    // Every `Sender` for this subscription was dropped —
-                    // only possible via `registry` itself being dropped
-                    // entirely, since this loop is the only thing that ever
-                    // detaches this subscription's own `Sender`.
+                    // Every `Sender` for this subscription is either the one
+                    // `registry` stores in this session's subscriber list
+                    // (removed only by *this* function's own `detach` call
+                    // below, which does not run until this loop returns) or
+                    // the one wrapped in `subscription`, held by this very
+                    // stack frame and not dropped until this function
+                    // returns. Nothing else ever touches either clone while
+                    // this loop runs, so `None` here is unreachable for the
+                    // loop's whole lifetime — not, as an earlier version of
+                    // this comment claimed, because `registry` would need to
+                    // be dropped entirely (`drive_session` holds an
+                    // `Arc<SessionRegistry>` for its whole lifetime, so that
+                    // can never happen either — true, but not the operative
+                    // reason).
                     None => break,
+                }
+            }
+            permit = events_tx.reserve(), if pending_event.is_some() => {
+                match permit {
+                    Ok(permit) => {
+                        let event = pending_event.take().expect(
+                            "select! arm guarded by pending_event.is_some()"
+                        );
+                        permit.send(event);
+                    }
+                    // `serve_connection` already gave up on this connection.
+                    Err(_) => break,
                 }
             }
             maybe_request = requests_rx.recv() => {
@@ -502,7 +910,17 @@ async fn drive_session(
                     // cancellation, ...) into anything. Draining it here,
                     // unconditionally, is what keeps `requests_out` from
                     // ever backing up and wedging `serve_connection`'s read
-                    // side — see this function's doc comment.
+                    // side (see this function's doc comment) — and, per the
+                    // `Attach` comment above, it is also what keeps `Attach`
+                    // read-only today. Ruling W1-R37 pre-rules the safe
+                    // default the next implementer inherits: an attached
+                    // connection's post-handshake requests must stay
+                    // refused (it still *receives* the broadcast the frozen
+                    // design mandates) — only the connection that ran
+                    // `CreateSession` gets its requests honored, until W5
+                    // makes "first responder wins among attached responders"
+                    // a deliberate decision rather than something this lane
+                    // concedes by defaulting this open.
                     Some(_request) => {}
                     None => break,
                 }
@@ -528,5 +946,59 @@ fn placeholder_session_spec(workspace_name: String) -> SessionSpec {
         name: Some(workspace_name),
         requested_tier: Tier::Sandbox,
         on_degrade: OnDegrade::Refuse,
+    }
+}
+
+#[cfg(test)]
+mod classify_accept_error_tests {
+    //! Unit-level proof for fix 3 (security review Important 2 / ruling
+    //! W1-R33): the reviewer's end-to-end reproduction ran `ulimit -n 200`
+    //! by hand against a real listener, which is not something this suite
+    //! automates. `classify_accept_error` is pulled out specifically so the
+    //! *decision* — which errors are worth retrying — can be proven
+    //! directly against synthetic `io::Error`s instead.
+
+    use super::*;
+
+    #[test]
+    fn emfile_and_enfile_are_retried_not_fatal() {
+        // 24 = EMFILE, 23 = ENFILE on Linux and every other unix this
+        // daemon targets.
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(24)),
+            AcceptDisposition::Retry,
+            "EMFILE must be retried — this is the exact error that took the \
+             pre-fix accept loop down permanently under `ulimit -n 200`"
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(23)),
+            AcceptDisposition::Retry
+        );
+    }
+
+    #[test]
+    fn connection_aborted_and_interrupted_are_retried() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from(ErrorKind::ConnectionAborted)),
+            AcceptDisposition::Retry
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from(ErrorKind::Interrupted)),
+            AcceptDisposition::Retry
+        );
+    }
+
+    #[test]
+    fn other_errors_are_fatal() {
+        // EBADF (9): a genuinely broken listener. Busy-looping `accept()`
+        // against it forever would be its own, worse availability problem.
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(9)),
+            AcceptDisposition::Fatal
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from(ErrorKind::PermissionDenied)),
+            AcceptDisposition::Fatal
+        );
     }
 }

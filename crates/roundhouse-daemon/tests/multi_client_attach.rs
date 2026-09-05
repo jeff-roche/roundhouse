@@ -151,3 +151,95 @@ async fn a_session_with_no_more_subscribers_is_reaped_rather_than_kept_forever()
          subscriber disconnects, not linger forever"
     );
 }
+
+/// Fix round 1, fix 6 (code review Important 2): the existing tests above
+/// prove `Attach` finds a session by id and that an unknown id fails, but
+/// neither proves *isolation* — a registry that broadcast every event to
+/// every live connection regardless of `session_id` would pass both of them
+/// identically. This test creates two independent sessions, attaches a
+/// watcher to only one of them, and publishes to *both* — asserting the
+/// watcher never sees the event meant for the other session, and that the
+/// one event it does see actually carries its own session's id (not just
+/// `matches!(.., TaskEvent { .. })`, which any `TaskEvent` would satisfy).
+///
+/// Publishes to the *other* session first, deliberately: if events were
+/// broadcast by socket rather than routed by `SessionId`, that would be the
+/// event the watcher saw *first* — so ordering alone (not a timeout, which
+/// this lane treats as inherently racy) is what proves isolation
+/// deterministically.
+#[tokio::test]
+async fn attach_routes_by_session_id_and_never_leaks_another_sessions_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("round.sock");
+    let registry = Arc::new(roundhouse_daemon::session_registry::SessionRegistry::new());
+    let listener = roundhouse_daemon::socket_server::bind_socket(&socket_path).unwrap();
+    tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
+        listener,
+        registry.clone(),
+    ));
+
+    let session_a = tokio::time::timeout(
+        Duration::from_secs(2),
+        roundhouse_tui::connect_create(&socket_path, "session-a"),
+    )
+    .await
+    .expect("connect_create must not hang")
+    .unwrap();
+    let session_id_a = session_a.session_id();
+
+    let session_b = tokio::time::timeout(
+        Duration::from_secs(2),
+        roundhouse_tui::connect_create(&socket_path, "session-b"),
+    )
+    .await
+    .expect("connect_create must not hang")
+    .unwrap();
+    let session_id_b = session_b.session_id();
+    assert_ne!(session_id_a, session_id_b, "sanity: two distinct sessions");
+
+    let mut watcher = tokio::time::timeout(
+        Duration::from_secs(2),
+        roundhouse_tui::connect_attach(&socket_path, session_id_a),
+    )
+    .await
+    .expect("connect_attach must not hang")
+    .unwrap();
+
+    let note = |session_id: roundhouse_core::SessionId, text: &str| ClientEvent::TaskEvent {
+        session_id,
+        task_id: None,
+        payload: Box::new(EventPayload::Note {
+            level: NoteLevel::Info,
+            text: text.into(),
+        }),
+    };
+    // Session B first: if routing were broken (broadcast by socket instead
+    // of by SessionId), this is the event the watcher would see first.
+    registry.publish(session_id_b, note(session_id_b, "for-b"));
+    registry.publish(session_id_a, note(session_id_a, "for-a"));
+
+    let seen = tokio::time::timeout(Duration::from_secs(2), watcher.recv())
+        .await
+        .expect("watcher must see an event before timing out")
+        .unwrap()
+        .expect("watcher must see an event");
+    match seen {
+        ClientEvent::TaskEvent { session_id, .. } => {
+            assert_eq!(
+                session_id, session_id_a,
+                "the watcher attached to session A must never see session \
+                 B's event first (or at all) — routing must be by \
+                 SessionId, not by socket"
+            );
+        }
+        other => panic!("expected a TaskEvent, got {other:?}"),
+    }
+
+    // And session B's event must never arrive on this connection at all.
+    let should_not_arrive = tokio::time::timeout(Duration::from_millis(200), watcher.recv()).await;
+    assert!(
+        should_not_arrive.is_err(),
+        "the watcher attached to session A must not receive session B's \
+         event at all, got {should_not_arrive:?}"
+    );
+}

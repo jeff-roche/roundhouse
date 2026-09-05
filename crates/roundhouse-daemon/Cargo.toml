@@ -41,6 +41,13 @@ color-eyre = { workspace = true }
 # file back and the socket server writes NDJSON lines. Declared here rather than
 # relied on via cross-crate feature unification, which is not a guarantee.
 tokio = { workspace = true, features = ["fs", "io-util"] }
+# Fix round 1 (security review Important 1 / ruling W1-R33): `FramedRead` +
+# `LinesCodec::new_with_max_length` cap `socket_server`'s NDJSON read side at
+# a fixed frame length instead of accumulating an unbounded `String`.
+# `tokio-util` is already a workspace dependency (root `Cargo.toml`); this
+# only turns on its `codec` feature (default feature set is empty), so it
+# adds no new dependency.
+tokio-util = { workspace = true, features = ["codec"] }
 futures = "0.3"
 serde_json = { workspace = true }
 # Task 4 (Phase 7): `mcp_config.rs`'s `[[mcp_server]]` TOML table parse
