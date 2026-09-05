@@ -52,8 +52,9 @@ struct BucketState {
 }
 
 impl RateLimiter {
-    /// Per-session cap only; the global cap is sized per `GLOBAL_RATE_PER_MIN`/
-    /// `GLOBAL_BURST` above.
+    /// Takes only the per-session numbers; the global cap is always installed at
+    /// the `GLOBAL_RATE_PER_MIN`/`GLOBAL_BURST` defaults above. Use
+    /// `new_with_global` to override the global numbers too (e.g. in tests).
     pub fn new(rate_per_min: u32, burst: u32) -> Self {
         Self::new_with_global(rate_per_min, burst, GLOBAL_RATE_PER_MIN, GLOBAL_BURST)
     }

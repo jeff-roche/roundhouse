@@ -181,13 +181,17 @@ impl LocalBus {
     /// needing a separate index.
     ///
     /// §7.7: rate cap, repetition damper, and `ttl_hops` decrement, all checked before
-    /// the message is queued — uniformly, regardless of whether the recipient is an
-    /// ordinary session or a registered human (a spamming session shouldn't get to
-    /// flood a human's notification feed either). Task 10 built and unit-tested all
-    /// three in isolation; this is the first place anything actually calls them, which
-    /// is exactly why `BusError::RateLimited`/`Repetitive`/`TtlExpired` were
-    /// unreachable before this task (see `send_wiring_tests`, which exercises this
-    /// through `send` itself rather than the isolated `rate_limit` functions).
+    /// the message is queued — regardless of whether the recipient is an ordinary
+    /// session or a registered human (a spamming session shouldn't get to flood a
+    /// human's notification feed either), with one deliberate exception: the
+    /// repetition damper alone is skipped for human-*originated* sends (see the
+    /// `is_human_originated` check below) so a human breaking glass repeatedly on
+    /// the same stuck session isn't jammed like an agent repetition storm. Task 10
+    /// built and unit-tested all three checks in isolation; this is the first place
+    /// anything actually calls them, which is exactly why
+    /// `BusError::RateLimited`/`Repetitive`/`TtlExpired` were unreachable before
+    /// this task (see `send_wiring_tests`, which exercises this through `send`
+    /// itself rather than the isolated `rate_limit` functions).
     /// After those checks, human recipients (§7.2/Task 6) route to
     /// `human_notifications` instead of a `Mailbox` — checked *before* the mailbox
     /// lookup, since a human session never has one.
