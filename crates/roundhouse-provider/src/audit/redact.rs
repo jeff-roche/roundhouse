@@ -146,6 +146,42 @@ static GOOGLE_API_KEY: LazyLock<Regex> =
 /// itself a word character, so `\bkey` correctly does not match there while
 /// still matching a `key` that starts right after a quote, brace, `&`, or
 /// whitespace.
+///
+/// **This over-redacts other `\bkey`-anchored spellings, deliberately (fix
+/// round 1, Ruling R25 / security S6).** `-` is a non-word character, so
+/// `\b` also fires right after it: any `<word>-key` label (`Idempotency-Key:
+/// ...`, `partition key=...`, `x-key=...`) and any bare `"key"` JSON field
+/// (`{"key":"claude-sonnet-4-20250514"}`, `{"key":"projects/.../models/
+/// gemini-2.5-pro"}`) is redacted too, even though none of those values is
+/// actually secret. This is accepted as fail-closed, not fixed: a persisted
+/// `events` row physically rejects `UPDATE`/`DELETE`, so under-redacting a
+/// real secret is permanent in a way over-redacting a model id or an
+/// idempotency key is merely inconvenient. Three narrowings were considered
+/// and rejected — do not re-propose them without addressing why each one
+/// fails:
+///
+/// 1. **A trailing `\bkey\b` is a provable no-op.** The pattern already
+///    requires `["']?\s*[:=]` immediately after the label, so the character
+///    following `key` is always `"`, `'`, whitespace, `:`, or `=` — every
+///    one of those is already non-word, so the trailing boundary the label
+///    would need is always already satisfied. Adding it changes nothing.
+/// 2. **Constraining the value's character class (e.g. excluding `/`)
+///    regresses AWS.** The value class `[A-Za-z0-9/_+.~-]{16,}` is shared by
+///    *every* alternative in this one regex, not just `key`'s — `/` and `+`
+///    are in it precisely because AWS `secret_access_key` values are
+///    base64. Narrowing it to fix `key` breaks the label this pattern was
+///    originally built for.
+/// 3. **Excluding a preceding `-` (so `\bkey` can't fire right after a
+///    hyphen) is fail-*open* on a real secret.** A gateway that names its
+///    header `gateway-key: <secret>` — a real, plausible label shape — would
+///    then never be redacted at all. Fail-open on an unproven-safe label is
+///    strictly worse than fail-closed over-redaction on a proven-safe one.
+///
+/// A narrowing that *would* work — lifting the bare-`key` alternative into
+/// its own regex with its own value class and its own preceding-delimiter
+/// set (one that excludes `-` but keeps `"`/`'`/whitespace/`{`/`&`),
+/// re-emitting the delimiter in the replacement — is a separate task, not a
+/// tweak to this line, since it touches the replacement closure's shape too.
 static LABELED_SECRET_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?i)(client[_-]?secret|secret[_-]?access[_-]?key|api[_-]?key|access[_-]?token|\bkey)["']?\s*[:=]\s*["']?[A-Za-z0-9/_+.~-]{16,}[^\s"',&}]*"#,
