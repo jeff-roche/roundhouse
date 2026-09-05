@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 /// than Phase 1's `serve_ndjson` had (a plain, non-async function that bound
 /// synchronously *before returning control to its caller*, because it did its
 /// own internal `tokio::spawn`): here, the caller is the one who spawns
-/// `serve` (see the doctest-style caller in `main.rs` and this crate's
+/// `serve` (see `main.rs`'s startup wiring and this crate's
 /// `socket_wire_format` test), so there is now a scheduling gap between
 /// `tokio::spawn(serve(..))` returning and this function's body actually
 /// running. Callers that need the old hard guarantee should not rely on
@@ -98,7 +98,9 @@ pub async fn serve(
 /// Standalone rather than inlined into [`serve`] so Task 3's real `accept()`
 /// loop — one spawned task per connection, keyed into a `SessionId`-keyed
 /// registry — can call this directly per connection instead of
-/// reimplementing the read/write body.
+/// reimplementing the read/write body. `pub`, not `pub(crate)`: an
+/// integration test (its own crate) needs the same visibility a same-crate
+/// caller would.
 ///
 /// Uses `tokio::select!` between the read and write halves so a slow or
 /// absent peer on one side (e.g. a client that never sends a second request)
@@ -107,32 +109,36 @@ pub async fn serve(
 /// rather than panicking; a `ClientRequest` line that fails to parse, or a
 /// `ClientEvent` that fails to serialize, is dropped with a warning instead
 /// of taking the connection down.
-pub(crate) async fn serve_connection(
+pub async fn serve_connection(
     stream: UnixStream,
     requests_out: mpsc::Sender<ClientRequest>,
     mut events_in: mpsc::Receiver<ClientEvent>,
 ) {
     let (read_half, write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    // `Lines::next_line` (not a bare `BufReader` + `String` +
+    // `AsyncBufReadExt::read_line`) specifically because it is documented
+    // cancellation-safe: it keeps its partially-read line inside `Lines`
+    // across calls, whereas `read_line` takes the caller's `String` by
+    // `&mut` and only appends to it on completion. Racing `read_line` inside
+    // `tokio::select!` against `events_in.recv()` would drop a half-read
+    // `ClientRequest` line on the floor the instant `events_in` won a race
+    // mid-line — silently, as a "malformed" line once the tail of it showed
+    // up next. `roundhouse-cli/src/main.rs` already documents this exact
+    // hazard for `DaemonClient::recv`; this loop is the daemon-side mirror
+    // of it, and Task 3 builds its real accept loop directly on this
+    // function, so it must not carry the bug forward.
+    let mut lines = BufReader::new(read_half).lines();
     let mut writer = write_half;
 
-    let mut line = String::new();
     let mut read_done = false;
     let mut write_done = false;
 
     while !(read_done && write_done) {
         tokio::select! {
-            result = reader.read_line(&mut line), if !read_done => {
+            result = lines.next_line(), if !read_done => {
                 match result {
-                    Ok(0) => {
-                        // Clean EOF: the peer closed its write half.
-                        read_done = true;
-                    }
-                    Ok(_) => {
-                        let parsed: Result<ClientRequest, _> =
-                            serde_json::from_str(line.trim_end());
-                        line.clear();
-                        match parsed {
+                    Ok(Some(line)) => {
+                        match serde_json::from_str::<ClientRequest>(&line) {
                             Ok(request) => {
                                 if requests_out.send(request).await.is_err() {
                                     // Nobody is listening for requests anymore
@@ -147,6 +153,10 @@ pub(crate) async fn serve_connection(
                                 );
                             }
                         }
+                    }
+                    Ok(None) => {
+                        // Clean EOF: the peer closed its write half.
+                        read_done = true;
                     }
                     Err(_) => {
                         read_done = true;
