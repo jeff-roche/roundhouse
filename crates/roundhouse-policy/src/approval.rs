@@ -70,14 +70,19 @@ pub struct GrantProvenance {
 /// The output of [`synthesize_grant`]: a policy rule generalised from one
 /// approved task, plus the scope and provenance that produced it.
 ///
-/// `rule` is `pub` so tests (and [`Grant::into_rule_for_installation`]
-/// itself) can inspect the synthesized predicate directly, but a caller that
-/// wants to actually **install** this grant into a live `PolicyEngine`
-/// should go through [`Grant::into_rule_for_installation`], not read `rule`
-/// directly — see that method's doc comment and finding 5's fix.
+/// Task 23 (W4): `rule` is `pub(crate)`, not `pub` — it used to be `pub`
+/// specifically so tests (and [`Grant::into_rule_for_installation`] itself)
+/// could inspect the synthesized predicate directly, but that made
+/// `into_rule_for_installation`'s loud `Once`/`Session`-scope error trivially
+/// bypassable by reading `.rule` directly, which this crate's own test suite
+/// did. A caller that wants to actually **install** this grant into a live
+/// `PolicyEngine` must go through [`Grant::into_rule_for_installation`]; a
+/// caller (in-crate or, via [`Grant::predicate`], out-of-crate) that only
+/// needs to inspect what was synthesized — never install it — has that
+/// narrower accessor instead.
 pub struct Grant {
     pub scope: GrantScope,
-    pub rule: CompiledRule,
+    pub(crate) rule: CompiledRule,
     pub provenance: GrantProvenance,
 }
 
@@ -101,8 +106,9 @@ impl Grant {
     /// synthesized from a `Shell`/`Http`/`Mcp`/`Git`/`Agent` task (i.e. the
     /// predicate is not `FsPrefix`/`FsExact`), this always returns `false`;
     /// it is not a general-purpose "does this grant cover this task" check
-    /// for those kinds. Callers working with non-`Fs` `TaskParams` must
-    /// match on `self.rule.predicate` directly instead.
+    /// for those kinds. Callers working with non-`Fs` `TaskParams` must use
+    /// [`Grant::predicate`] and match on it directly instead (Task 23 (W4):
+    /// `self.rule.predicate` is no longer reachable from outside this crate).
     ///
     /// **Security fix round 1, finding 4:** now also checks `op` (previously
     /// only compared the path, so e.g. a grant synthesized for `FsOp::Read`
@@ -117,6 +123,40 @@ impl Grant {
         }
     }
 
+    /// The synthesized predicate this grant's `CompiledRule` was built with —
+    /// read-only inspection, never installation. Task 23 (W4): added
+    /// alongside narrowing `Grant.rule` to `pub(crate)`, specifically for
+    /// callers (this crate's own non-`Fs` tests, chiefly) that need to see
+    /// what [`synthesize_grant`] produced regardless of the grant's
+    /// [`GrantScope`] — `into_rule_for_installation` is *not* a substitute
+    /// here, because it errors for `Once`/`Session`/`ExactArgv` scopes (see
+    /// its own doc comment), and inspecting the synthesized predicate is a
+    /// legitimate thing to want to do even for a scope with no installable
+    /// rule yet.
+    ///
+    /// **This is narrower than a guarantee, not a guarantee itself (B1,
+    /// review round 2):** narrowing `Grant.rule` to `pub(crate)` removes the
+    /// *convenient* bypass of reading `.rule` directly, but `Predicate`
+    /// derives `Clone` and `CompiledRule`'s fields (including `test_new`,
+    /// `pub fn`) are all `pub`, so three lines from outside this crate can
+    /// still do `CompiledRule::test_new(scope, outcome,
+    /// grant.predicate().clone())` and hand the result to
+    /// `PolicyEngine::from_rules`, reconstructing an installable rule from a
+    /// `Once`/`Session`/`ExactArgv` grant without ever going through
+    /// [`Grant::into_rule_for_installation`]. Note this accessor is not
+    /// *required* for that bypass either — `Predicate` is a fully public
+    /// enum, so a determined caller could hand-construct an equivalent
+    /// predicate without `Grant` at all — so removing `predicate()` would
+    /// not close anything either. What narrowing `rule` and keeping this
+    /// accessor read-only-typed actually buys is removing the one-line
+    /// bypass and making the intended path (`into_rule_for_installation`)
+    /// the obvious one; it is a known limit of this crate's current
+    /// enforcement, not a guarantee that a determined out-of-crate caller
+    /// cannot reconstruct an installable rule.
+    pub fn predicate(&self) -> &Predicate {
+        &self.rule.predicate
+    }
+
     /// The only sanctioned way to obtain this grant's `CompiledRule` for
     /// installation into a live `PolicyEngine`. **Security fix round 1,
     /// finding 5:** errors loudly, rather than silently handing back a rule
@@ -128,15 +168,17 @@ impl Grant {
     /// that are genuinely meant to become standing rules, so those pass
     /// through unchanged.
     ///
-    /// This exists because `Grant.rule` is `pub` (kept so tests and this
-    /// method itself can inspect the synthesized predicate) — a future
-    /// caller reaching for the obvious thing, `grant.rule`, to install into
-    /// `PolicyEngine::from_rules` would otherwise silently reproduce exactly
-    /// the "one-time approval becomes a permanent rule" bug this synthesis
-    /// module exists to prevent. Real TTL/use-count/session-binding
-    /// *enforcement* inside `PolicyEngine` itself is out of scope for this
-    /// task — this method only makes the current absence of that
-    /// enforcement impossible to silently misuse.
+    /// Task 23 (W4) closed the hole this method's earlier doc comment
+    /// flagged: `Grant.rule` is now `pub(crate)`, not `pub`, so a caller
+    /// outside this crate reaching for the obvious thing, `grant.rule`, to
+    /// install into `PolicyEngine::from_rules` gets a compile error instead
+    /// of silently reproducing the "one-time approval becomes a permanent
+    /// rule" bug this synthesis module exists to prevent — this method is
+    /// now the *only* way to obtain a `CompiledRule` from a `Grant` at all,
+    /// in-crate or out. Real TTL/use-count/session-binding *enforcement*
+    /// inside `PolicyEngine` itself remains out of scope for this task —
+    /// this method only makes the current absence of that enforcement
+    /// impossible to silently misuse.
     pub fn into_rule_for_installation(&self) -> Result<CompiledRule, GrantInstallError> {
         match &self.scope {
             GrantScope::Once => Err(GrantInstallError::UnenforcedLifetime("Once")),
@@ -173,15 +215,33 @@ impl Grant {
 /// string to an approved URL, or extra flags to an approved git invocation —
 /// now they set the new `Predicate::Http`/`Predicate::Git` `exact: true`
 /// field so the underlying match requires full equality, not merely a
-/// prefix), `Mcp` binds server+tool (`args` binding is a known, out-of-scope
-/// gap — `Predicate::Mcp` has no field for it; tracked separately, not fixed
-/// here), and `Agent` caps `max_tier` at the tier that was actually
-/// requested (the `Tier`-ladder direction of that check is a separate,
-/// out-of-scope, frozen-`Predicate::Agent` issue — not fixed here either).
+/// prefix), `Mcp` binds server+tool+exact args (Task 22 (W4) added
+/// `Predicate::Mcp`'s `args: Option<ArgsPattern>` field; this arm defaults to
+/// `ArgsPattern::Exact` so approving one call never covers a future call
+/// with different arguments), and `Agent` pins `max_tier` to the tier
+/// actually requested (Task 21
+/// (W4) flipped that field's comparison to a floor rather than a ceiling —
+/// see its doc comment in `engine.rs` — so pinning it here means the grant
+/// never generalizes *below* the isolation actually requested).
+/// Task 24 (W4): `workspace_boundary` is the session's real workspace root,
+/// threaded in by the caller — never derived from `params` (which is
+/// entirely caller/task-supplied and must not be trusted to bound itself).
+/// Only consulted for the `GrantScope::Directory` + `TaskParams::Fs` arm; see
+/// `fs_predicate_for_directory_grant`'s doc comment for what it does with it.
+/// B2 (review round 2): this parameter itself is not further validated by
+/// `synthesize_grant` — it is still trusted to actually be the caller's real
+/// workspace root — but `effective_directory_prefix` (reached from the arm
+/// above) does now refuse to treat a degenerate value (`/`, `""`, or a
+/// relative path) as "no boundary"; see its doc comment.
+/// Orchestrator Ruling W4-7: this is a plain parameter, not a `SealedContext`
+/// field — `synthesize_grant` has no callers outside this crate, so the
+/// signature change is free, and `SealedContext` is lane W1's actively-edited
+/// file.
 pub fn synthesize_grant(
     params: &TaskParams,
     scope: GrantScope,
     provenance: GrantProvenance,
+    workspace_boundary: &std::path::Path,
 ) -> Grant {
     let predicate = match (&scope, params) {
         (
@@ -191,7 +251,7 @@ pub fn synthesize_grant(
                 path: task_path,
                 canonical,
             },
-        ) => fs_predicate_for_directory_grant(op, task_path, canonical, path),
+        ) => fs_predicate_for_directory_grant(op, task_path, canonical, path, workspace_boundary),
         (
             _,
             TaskParams::Fs {
@@ -213,9 +273,15 @@ pub fn synthesize_grant(
             url_prefix: url.clone(),
             exact: true, // finding 1: exact URL, never a starts_with-widenable prefix
         },
-        (_, TaskParams::Mcp { server, tool, .. }) => Predicate::Mcp {
+        // Task 22 (W4): defaults to `ArgsPattern::Exact` binding, per the
+        // least-privilege principle every other grant type in this file
+        // already follows — a human approving one specific MCP call must
+        // not also grant every future call to that tool regardless of
+        // arguments.
+        (_, TaskParams::Mcp { server, tool, args }) => Predicate::Mcp {
             server: server.clone(),
             tool: Some(tool.clone()),
+            args: Some(crate::engine::ArgsPattern::Exact(args.clone())),
         },
         (
             _,
@@ -237,7 +303,51 @@ pub fn synthesize_grant(
         ) => Predicate::Agent {
             provider: Some(provider.clone()),
             model: Some(model.clone()),
-            max_tier: *tier_request, // never generalized above the tier actually requested
+            // Task 21 (W4): `max_tier` is now a floor, not a ceiling (see its
+            // doc comment in `engine.rs`) — pinning it to the tier actually
+            // requested means the grant never generalizes *below* the
+            // isolation actually requested, i.e. it covers only requests at
+            // or above what this task asked for, never a less-isolated one.
+            //
+            // That framing is safe only on the isolation axis, not the
+            // egress axis (see `Predicate::Agent::max_tier`'s doc comment in
+            // `engine.rs` for the full argument): `Tier::Remote` ships the
+            // `CommandSpec` over the network
+            // (`docs/architecture/03-security-and-sandboxing.md:213`), a
+            // property `Tier::None` lacks. Pinning `max_tier` to an approved
+            // `Tier::None` request covers all five tiers, including
+            // `Remote`, because `None` is the universal floor — so a human
+            // approving one local, unisolated spawn would, once agent-spawn
+            // policy wiring lands, silently authorize a `Tier::Remote` spawn
+            // too. Tracked as defect (A), not implemented here (orchestrator
+            // Ruling W4-23 — see `engine.rs`): an `exact: bool` on
+            // `Predicate::Agent`, matching `Predicate::Http`/`Predicate::Git`,
+            // where matching would become `tier_request == max_tier`.
+            //
+            // A second, separate tracked defect (B, orchestrator Ruling
+            // W4-24) also touches this field: `max_tier` is excluded from
+            // `matches`'s specificity `bound`, so two `Agent` rules
+            // differing only in floor tie-break by `file_order` instead of
+            // by specificity. Its fix component is making the floor
+            // `Option<Tier>`. (A) and (B) are distinct bugs — closing one
+            // does not close the other; see `Predicate::Agent::max_tier`'s
+            // doc comment in `engine.rs` for the full argument.
+            max_tier: *tier_request,
+        },
+        // Task 20 (W4): exact scope+op bind, same least-privilege contract as
+        // every other arm. Fix round 1 (Ruling W4-11): also binds the exact
+        // requesting `session` (`Some(session)`, never `None`) — a grant
+        // synthesized from one session's approved request must not also
+        // match a different session's identical request, since
+        // `PolicyEngine` is shared across every session actor behind an
+        // `Arc`. Inert for `Team` scope regardless of what grant is
+        // synthesized here — `PolicyEngine::decide` never consults rules for
+        // `MemoryScope::Team` Allow, only `TeamMembership` (see
+        // `Predicate::Memory`'s doc comment in `engine.rs`).
+        (_, TaskParams::Memory { scope, op, session }) => Predicate::Memory {
+            scope: scope.clone(),
+            op: *op,
+            session: Some(*session),
         },
     };
     let rule = CompiledRule {
@@ -284,25 +394,28 @@ pub fn synthesize_grant(
 /// broader — so this never violates the "never broader" contract even when
 /// it silently narrows a caller's mistaken request.
 ///
-/// **Residual gap, not closed here:** this only rejects the literal
-/// filesystem root and genuinely unrelated (non-ancestor) directories. A
-/// caller could still request a shallow-but-non-root ancestor that is
-/// technically a real ancestor of the task's path yet still far broader than
-/// what a human plausibly meant to approve (e.g. `path: "/home"` for a task
-/// that wrote `/home/alice/project/notes.txt` — a genuine ancestor, not the
-/// filesystem root, but still covers every other user's home directory).
-/// Fully closing that requires threading a workspace/session boundary into
-/// `synthesize_grant` (so directory grants can be bounded to "at or below
-/// the session's workspace root," not just "somewhere above the task's own
-/// path") — no such parameter exists on this function today, and adding one
-/// is a real signature/caller-surface change beyond this fix round's scope.
-/// Flagged here loudly, and in the Task 15 fix-round report, rather than
-/// silently left implicit.
+/// **Task 24 (W4) closed the residual gap this comment used to flag:** the
+/// checks above rejected the literal filesystem root and genuinely unrelated
+/// (non-ancestor) directories, but a caller could still request a
+/// shallow-but-non-root ancestor that is technically a real ancestor of the
+/// task's path yet still far broader than what a human plausibly meant to
+/// approve (e.g. `path: "/home"` for a task that wrote
+/// `/home/alice/project/notes.txt` — a genuine ancestor, not the filesystem
+/// root, but still covers every other user's home directory). Now that
+/// `synthesize_grant` threads `workspace_boundary` through, this function
+/// clamps the effective prefix to whichever of `{dir, workspace_boundary}` is
+/// deeper **by real containment**, not depth arithmetic — a path can be
+/// deeper without being inside another, so this uses `starts_with` in both
+/// directions rather than counting path components. See
+/// [`effective_directory_prefix`] for the three-way case analysis (dir at/
+/// below the boundary; dir a shallower ancestor of the boundary; disjoint
+/// trees, which fail closed).
 fn fs_predicate_for_directory_grant(
     op: &FsOp,
     task_path: &std::path::Path,
     canonical: &Result<PathBuf, PathErr>,
     dir: &std::path::Path,
+    workspace_boundary: &std::path::Path,
 ) -> Predicate {
     // `/`'s parent is `None`; every non-root absolute directory has `Some`
     // parent. This is the targeted check that closes the literal
@@ -310,10 +423,18 @@ fn fs_predicate_for_directory_grant(
     // cannot, since `/` is trivially an ancestor of everything.
     let is_filesystem_root = dir.parent().is_none();
     match canonical {
-        Ok(c) if !is_filesystem_root && c.starts_with(dir) => Predicate::FsPrefix {
-            op: clone_op(op),
-            prefix: dir.to_path_buf(),
-        },
+        Ok(c) if !is_filesystem_root && c.starts_with(dir) => {
+            match effective_directory_prefix(dir, workspace_boundary, c) {
+                Some(prefix) => Predicate::FsPrefix {
+                    op: clone_op(op),
+                    prefix,
+                },
+                None => Predicate::FsExact {
+                    op: clone_op(op),
+                    path: c.clone(),
+                },
+            }
+        }
         Ok(c) => Predicate::FsExact {
             op: clone_op(op),
             path: c.clone(),
@@ -322,6 +443,79 @@ fn fs_predicate_for_directory_grant(
             op: clone_op(op),
             path: task_path.to_path_buf(),
         },
+    }
+}
+
+/// Clamps a requested directory-grant ancestor `dir` to never be shallower
+/// than `workspace_boundary`, using real path containment (`starts_with`) in
+/// both directions rather than component-count depth arithmetic — a path can
+/// have more components without being an ancestor/descendant of another at
+/// all (e.g. `/home/alice/other-project` has as many components as
+/// `/home/alice/project/src` but is not "deeper" in any meaningful sense).
+/// Called only after the caller has already verified `dir` is a genuine
+/// ancestor of the task's own canonical path `canonical_task_path` — this
+/// function only decides how far `dir` may be widened relative to the
+/// workspace boundary, not whether `dir` itself is valid at all.
+///
+/// `workspace_boundary` itself IS validated here, and is the caller's one
+/// piece of trusted input this function does check before using it (B2,
+/// review round 2): a boundary that is not absolute, or whose `parent()` is
+/// `None` (i.e. `/` or `""`, the only two paths for which `Path::starts_with`
+/// is trivially true against everything), fails closed to `None` rather than
+/// silently acting as "no clamp" — see the guard at the top of the function
+/// body.
+///
+/// Otherwise, three cases, by real containment:
+/// - `dir` is already at or below `workspace_boundary`
+///   (`dir.starts_with(workspace_boundary)`, which is also true when they're
+///   equal): no widening beyond the workspace is possible through this path
+///   anyway, so `dir` is used as-is — this is the common case for a
+///   legitimately-scoped directory grant.
+/// - `dir` is a shallower ancestor of `workspace_boundary`
+///   (`workspace_boundary.starts_with(dir)`): clamp **up** to
+///   `workspace_boundary` itself, never granting the shallower `dir`.
+///   Additionally verified that `canonical_task_path` is actually inside
+///   `workspace_boundary` — the task's own path should always be inside its
+///   own workspace, but this function never trusts a caller-supplied `dir`
+///   (or a mismatched boundary) to imply that on its own; if it somehow
+///   isn't, this fails closed to `None` rather than granting a boundary the
+///   task itself isn't even under.
+/// - Disjoint trees — neither is an ancestor of the other. `dir` cannot be
+///   trusted at all relative to this workspace: fails closed to `None`
+///   (the caller downgrades to `FsExact` on the task's own canonical path),
+///   the same fail-closed choice `fs_predicate_for_directory_grant` already
+///   makes when `dir` isn't even an ancestor of the task's path.
+fn effective_directory_prefix(
+    dir: &std::path::Path,
+    workspace_boundary: &std::path::Path,
+    canonical_task_path: &std::path::Path,
+) -> Option<PathBuf> {
+    // B2 (review round 2): `Path::starts_with` returns `true` for both `/`
+    // and `""` against any absolute path, so an unvalidated `workspace_boundary`
+    // of either makes the first branch below always taken, restoring exact
+    // pre-Task-24 behaviour — an ancestor as shallow as `/home` yields an
+    // unbounded `FsPrefix` over every user's home directory — with no error
+    // and no log. A relative boundary can't meaningfully contain an absolute
+    // canonical path either. Guard all three degenerate forms here, at the
+    // one place every caller in this crate funnels through, and fail closed
+    // to `None` — the same downgrade-to-`FsExact` choice the disjoint-trees
+    // case below already makes — rather than trust an unvalidated boundary.
+    let boundary_is_degenerate =
+        !workspace_boundary.is_absolute() || workspace_boundary.parent().is_none();
+    if boundary_is_degenerate {
+        return None;
+    }
+
+    if dir.starts_with(workspace_boundary) {
+        Some(dir.to_path_buf())
+    } else if workspace_boundary.starts_with(dir) {
+        if canonical_task_path.starts_with(workspace_boundary) {
+            Some(workspace_boundary.to_path_buf())
+        } else {
+            None
+        }
+    } else {
+        None
     }
 }
 
@@ -475,5 +669,150 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(arr.into_iter().map(canonicalize_json).collect())
         }
         other => other,
+    }
+}
+
+/// Task 24 (W4) direct-unit tests against the private
+/// `fs_predicate_for_directory_grant`/`effective_directory_prefix` — kept
+/// in-module rather than widening the crate's public surface to reach them
+/// (Ruling W4-4: Task 23 in this same bundle exists to *narrow* this crate's
+/// public surface, so widening it elsewhere here would contradict the
+/// bundle's own point). `grantscope_directory_boundary.rs` covers the same
+/// security property through the public `synthesize_grant` +
+/// `PolicyEngine::decide` path.
+#[cfg(test)]
+mod directory_boundary_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn dir_at_or_below_the_boundary_is_used_as_is() {
+        let dir = Path::new("/workspace/sub");
+        let boundary = Path::new("/workspace");
+        let task_path = Path::new("/workspace/sub/notes.txt");
+        assert_eq!(
+            effective_directory_prefix(dir, boundary, task_path),
+            Some(dir.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn dir_equal_to_the_boundary_is_used_as_is() {
+        let dir = Path::new("/workspace");
+        let boundary = Path::new("/workspace");
+        let task_path = Path::new("/workspace/notes.txt");
+        assert_eq!(
+            effective_directory_prefix(dir, boundary, task_path),
+            Some(dir.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn a_shallower_dir_is_clamped_up_to_the_boundary() {
+        let dir = Path::new("/home");
+        let boundary = Path::new("/home/alice/project");
+        let task_path = Path::new("/home/alice/project/src/main.rs");
+        assert_eq!(
+            effective_directory_prefix(dir, boundary, task_path),
+            Some(boundary.to_path_buf()),
+            "a shallow ancestor must clamp up to the workspace boundary, never grant the shallower dir"
+        );
+    }
+
+    #[test]
+    fn a_shallower_dir_fails_closed_when_the_task_path_is_outside_the_boundary() {
+        // The workspace boundary is deeper than `dir`, but the task's own
+        // canonical path isn't even inside that boundary — never trust `dir`
+        // to imply that on its own.
+        let dir = Path::new("/home");
+        let boundary = Path::new("/home/alice/project");
+        let task_path = Path::new("/home/bob/other.txt");
+        assert_eq!(effective_directory_prefix(dir, boundary, task_path), None);
+    }
+
+    #[test]
+    fn disjoint_trees_fail_closed() {
+        let dir = Path::new("/home/alice/project");
+        let boundary = Path::new("/var/other-workspace");
+        let task_path = Path::new("/home/alice/project/notes.txt");
+        assert_eq!(
+            effective_directory_prefix(dir, boundary, task_path),
+            None,
+            "neither tree is an ancestor of the other — must fail closed, not guess"
+        );
+    }
+
+    /// B2 (review round 2): a `workspace_boundary` of `/` must not be treated
+    /// as "no clamp" — `Path::starts_with` is trivially true against `/` for
+    /// any absolute path, so without this guard `dir` (however shallow) would
+    /// always be used as-is, silently restoring exact pre-Task-24 behaviour.
+    #[test]
+    fn a_root_boundary_is_degenerate_and_fails_closed() {
+        let dir = Path::new("/home");
+        let boundary = Path::new("/");
+        let task_path = Path::new("/home/alice/project/src/main.rs");
+        assert_eq!(
+            effective_directory_prefix(dir, boundary, task_path),
+            None,
+            "a `/` boundary must be treated as unvalidated input, not as an unbounded workspace"
+        );
+    }
+
+    /// B2 (review round 2): an empty `workspace_boundary` behaves exactly
+    /// like `/` under `Path::starts_with` (`Path::new("").parent()` is also
+    /// `None`), so it must be caught by the same guard.
+    #[test]
+    fn an_empty_boundary_is_degenerate_and_fails_closed() {
+        let dir = Path::new("/home");
+        let boundary = Path::new("");
+        let task_path = Path::new("/home/alice/project/src/main.rs");
+        assert_eq!(effective_directory_prefix(dir, boundary, task_path), None);
+    }
+
+    /// B2 (review round 2): a relative `workspace_boundary` cannot
+    /// meaningfully bound an absolute canonical path at all.
+    #[test]
+    fn a_relative_boundary_is_degenerate_and_fails_closed() {
+        let dir = Path::new("/home");
+        let boundary = Path::new("workspace");
+        let task_path = Path::new("/home/alice/project/src/main.rs");
+        assert_eq!(effective_directory_prefix(dir, boundary, task_path), None);
+    }
+
+    #[test]
+    fn filesystem_root_request_still_downgrades_to_fs_exact_regardless_of_boundary() {
+        let canonical: Result<PathBuf, PathErr> = Ok(PathBuf::from("/workspace/notes.txt"));
+        let predicate = fs_predicate_for_directory_grant(
+            &FsOp::Write,
+            Path::new("/workspace/notes.txt"),
+            &canonical,
+            Path::new("/"),
+            Path::new("/workspace"),
+        );
+        match predicate {
+            Predicate::FsExact { path, .. } => {
+                assert_eq!(path, PathBuf::from("/workspace/notes.txt"));
+            }
+            other => panic!("expected FsExact downgrade for the filesystem root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shallow_ancestor_beyond_the_boundary_produces_an_fs_prefix_clamped_to_the_boundary() {
+        let canonical: Result<PathBuf, PathErr> =
+            Ok(PathBuf::from("/home/alice/project/src/main.rs"));
+        let predicate = fs_predicate_for_directory_grant(
+            &FsOp::Write,
+            Path::new("/home/alice/project/src/main.rs"),
+            &canonical,
+            Path::new("/home"),
+            Path::new("/home/alice/project"),
+        );
+        match predicate {
+            Predicate::FsPrefix { prefix, .. } => {
+                assert_eq!(prefix, PathBuf::from("/home/alice/project"));
+            }
+            other => panic!("expected FsPrefix clamped to the boundary, got {other:?}"),
+        }
     }
 }

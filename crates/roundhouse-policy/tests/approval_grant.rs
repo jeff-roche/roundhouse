@@ -23,7 +23,33 @@ use roundhouse_policy::{
     FsOp, Method, ParsedCommand, PolicyEngine, ProviderId, ServerId, TaskParams,
 };
 use roundhouse_store::{open, spawn_writer, suspended_tasks};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// A placeholder `workspace_boundary` for tests in this file that don't
+/// exercise Task 24's directory-grant boundary clamp at all —
+/// `workspace_boundary` is only ever consulted for the combination of
+/// `GrantScope::Directory` and `TaskParams::Fs` (see `synthesize_grant`'s
+/// doc comment), so for every other combination (`Shell`/`Http`/`Mcp`/`Git`/
+/// `Agent` params, or `Once`/`Session`/`ExactArgv`/`Always` scopes) its
+/// value is inert and this placeholder is fine.
+///
+/// **Not a "no boundary" value — do not reach for this outside this file, or
+/// for a `GrantScope::Directory` + `TaskParams::Fs` case here.** It used to
+/// be named `unbounded_workspace` on the (pre-B2) theory that `"/"` makes the
+/// boundary clamp a no-op, since `Path::starts_with` is trivially true
+/// against `"/"`. That theory is exactly the bug B2 (review round 2) fixed:
+/// `effective_directory_prefix` now treats a boundary of `"/"` (or `""`, or
+/// any relative path) as degenerate/unvalidated input and fails closed to
+/// `None` — downgrading the synthesized predicate to `FsExact` on the task's
+/// own canonical path — rather than treating it as "no clamp." A test that
+/// actually needs a `Directory`-scope grant to widen to a real `FsPrefix`
+/// must pass a genuine, non-degenerate boundary (see
+/// `directory_grant_with_a_real_ancestor_path_still_covers_the_directory`
+/// below, and `grantscope_directory_boundary.rs`, which covers the clamp
+/// itself with real, meaningful boundaries and the three degenerate cases).
+fn placeholder_boundary_irrelevant_to_this_test() -> &'static std::path::Path {
+    std::path::Path::new("/")
+}
 
 /// `TaskRunner::bootstrap()` panics on a second call per process (S-LOG-1) —
 /// this file has multiple `#[tokio::test]` functions, so a shared
@@ -196,12 +222,24 @@ fn grant_is_generalised_downward_never_broader_than_the_originating_task() {
         ts: Timestamp::from_unix_nanos(0),
     };
 
+    // A real, non-degenerate boundary is required here (not
+    // `placeholder_boundary_irrelevant_to_this_test()`): per B2,
+    // `effective_directory_prefix` treats a degenerate `"/"` boundary as
+    // unvalidated input and fails closed to `None`, which downgrades the
+    // synthesized predicate to `FsExact` on the task's own canonical path —
+    // silently defeating the very generalization this test's name claims to
+    // exercise (its three original assertions all held trivially under
+    // `FsExact`, so the test would have passed unchanged even if directory
+    // generalization were completely broken). Same real boundary as
+    // `directory_grant_with_a_real_ancestor_path_still_covers_the_directory`
+    // below.
     let grant = synthesize_grant(
         &params,
         GrantScope::Directory {
             path: PathBuf::from("/workspace"),
         },
         provenance,
+        Path::new("/workspace"),
     );
 
     // Directory scope must not broaden to the filesystem root or beyond
@@ -209,6 +247,11 @@ fn grant_is_generalised_downward_never_broader_than_the_originating_task() {
     // under the granted directory.
     assert!(grant.rule_covers_path(FsOp::Write, &PathBuf::from("/workspace/exact-file.txt")));
     assert!(!grant.rule_covers_path(FsOp::Write, &PathBuf::from("/etc/passwd")));
+
+    // The actual property this test is named for: generalization to a
+    // *sibling* path inside the granted directory, not just the originating
+    // task's own exact path (which `FsExact` would also satisfy).
+    assert!(grant.rule_covers_path(FsOp::Write, &PathBuf::from("/workspace/sibling-file.txt")));
 
     // Security fix round 1, finding 4: rule_covers_path must also gate on op
     // — a Write-scoped grant must not report covering a Read of the same path.
@@ -229,15 +272,23 @@ fn shell_grant_generalizes_to_the_matched_argv_never_a_wildcard() {
         task_id: TaskId::new(),
         ts: Timestamp::from_unix_nanos(0),
     };
-    let grant = synthesize_grant(&params, GrantScope::Session, provenance);
-    match grant.rule.predicate {
+    let grant = synthesize_grant(
+        &params,
+        GrantScope::Session,
+        provenance,
+        placeholder_boundary_irrelevant_to_this_test(),
+    );
+    // Task 23 (W4): `Grant.rule` is `pub(crate)` now — inspect the
+    // synthesized predicate through `Grant::predicate()` instead of reading
+    // `.rule.predicate` directly.
+    match grant.predicate() {
         Predicate::Shell {
             program,
             matcher: ArgMatcher::Exact(argv),
             ..
         } => {
             assert_eq!(program, "cargo");
-            assert_eq!(argv, vec!["test".to_string(), "--lib".to_string()]);
+            assert_eq!(argv, &vec!["test".to_string(), "--lib".to_string()]);
         }
         other => panic!(
             "Shell grant must synthesize a Shell predicate bound to the exact observed argv, \
@@ -262,8 +313,9 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         },
         GrantScope::Once,
         provenance(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
-    assert!(matches!(http.rule.predicate, Predicate::Http { .. }));
+    assert!(matches!(http.predicate(), Predicate::Http { .. }));
 
     let mcp = synthesize_grant(
         &TaskParams::Mcp {
@@ -273,8 +325,9 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         },
         GrantScope::Once,
         provenance(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
-    assert!(matches!(mcp.rule.predicate, Predicate::Mcp { .. }));
+    assert!(matches!(mcp.predicate(), Predicate::Mcp { .. }));
 
     let git = synthesize_grant(
         &TaskParams::Git {
@@ -284,8 +337,9 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         },
         GrantScope::Once,
         provenance(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
-    assert!(matches!(git.rule.predicate, Predicate::Git { .. }));
+    assert!(matches!(git.predicate(), Predicate::Git { .. }));
 
     let agent = synthesize_grant(
         &TaskParams::Agent {
@@ -295,8 +349,9 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         },
         GrantScope::Once,
         provenance(),
+        placeholder_boundary_irrelevant_to_this_test(),
     );
-    assert!(matches!(agent.rule.predicate, Predicate::Agent { .. }));
+    assert!(matches!(agent.predicate(), Predicate::Agent { .. }));
 }
 
 // ---------------------------------------------------------------------
@@ -325,8 +380,21 @@ fn http_grant_never_widens_past_the_exact_approved_url() {
         task_id: TaskId::new(),
         ts: Timestamp::from_unix_nanos(0),
     };
-    let grant = synthesize_grant(&params, GrantScope::Once, provenance);
-    let engine = PolicyEngine::from_rules(vec![grant.rule.clone()]);
+    // Task 23 (W4): `GrantScope::Always` here, not `Once` — this test is
+    // about `Predicate::Http`'s exact-URL narrowing, not `Once`'s (still
+    // unenforced) one-shot lifetime, and `Grant::into_rule_for_installation`
+    // (the only sanctioned way to obtain an installable `CompiledRule`, now
+    // that `Grant.rule` is `pub(crate)`) refuses `Once`/`Session`/`ExactArgv`
+    // by design.
+    let grant = synthesize_grant(
+        &params,
+        GrantScope::Always,
+        provenance,
+        placeholder_boundary_irrelevant_to_this_test(),
+    );
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Always scope installs cleanly")]);
 
     // The exact approved call is still Allow.
     assert_eq!(engine.decide(&params).outcome, Outcome::Allow);
@@ -375,8 +443,17 @@ fn git_grant_never_widens_past_the_exact_approved_argv() {
         task_id: TaskId::new(),
         ts: Timestamp::from_unix_nanos(0),
     };
-    let grant = synthesize_grant(&params, GrantScope::Once, provenance);
-    let engine = PolicyEngine::from_rules(vec![grant.rule.clone()]);
+    // Task 23 (W4): `Always`, not `Once` — see the comment on the same
+    // substitution in `http_grant_never_widens_past_the_exact_approved_url`.
+    let grant = synthesize_grant(
+        &params,
+        GrantScope::Always,
+        provenance,
+        placeholder_boundary_irrelevant_to_this_test(),
+    );
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Always scope installs cleanly")]);
 
     assert_eq!(engine.decide(&params).outcome, Outcome::Allow);
 
@@ -420,8 +497,17 @@ fn git_grant_for_bare_subcommand_does_not_degenerate_to_matching_any_argv() {
         task_id: TaskId::new(),
         ts: Timestamp::from_unix_nanos(0),
     };
-    let grant = synthesize_grant(&params, GrantScope::Once, provenance);
-    let engine = PolicyEngine::from_rules(vec![grant.rule.clone()]);
+    // Task 23 (W4): `Always`, not `Once` — see the comment on the same
+    // substitution in `http_grant_never_widens_past_the_exact_approved_url`.
+    let grant = synthesize_grant(
+        &params,
+        GrantScope::Always,
+        provenance,
+        placeholder_boundary_irrelevant_to_this_test(),
+    );
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Always scope installs cleanly")]);
 
     assert_eq!(engine.decide(&params).outcome, Outcome::Allow);
 
@@ -463,8 +549,11 @@ fn directory_grant_with_unrelated_or_root_path_does_not_widen_to_filesystem_wide
             path: PathBuf::from("/"),
         },
         provenance,
+        placeholder_boundary_irrelevant_to_this_test(),
     );
-    let engine = PolicyEngine::from_rules(vec![grant.rule.clone()]);
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Directory scope installs cleanly")]);
 
     // The originating task's own write is still Allow (never broader than
     // what was actually approved means never *narrower* than the task
@@ -513,14 +602,24 @@ fn directory_grant_with_a_real_ancestor_path_still_covers_the_directory() {
         task_id: TaskId::new(),
         ts: Timestamp::from_unix_nanos(0),
     };
+    // Unlike most tests in this file, this one actually exercises the
+    // Directory-scope boundary clamp (it needs the synthesized predicate to
+    // be a real `FsPrefix` covering a sibling file, not the exact-path
+    // downgrade a degenerate placeholder boundary now produces per B2) — so
+    // it passes a genuine, non-degenerate boundary at `/workspace` (the
+    // requested directory itself), not
+    // `placeholder_boundary_irrelevant_to_this_test()`.
     let grant = synthesize_grant(
         &params,
         GrantScope::Directory {
             path: PathBuf::from("/workspace"),
         },
         provenance,
+        Path::new("/workspace"),
     );
-    let engine = PolicyEngine::from_rules(vec![grant.rule.clone()]);
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Directory scope installs cleanly")]);
 
     let sibling = TaskParams::Fs {
         op: FsOp::Write,
@@ -557,31 +656,47 @@ fn into_rule_for_installation_refuses_unenforced_scopes_and_allows_standing_ones
     };
 
     assert!(
-        synthesize_grant(&params, GrantScope::Once, provenance())
-            .into_rule_for_installation()
-            .is_err(),
+        synthesize_grant(
+            &params,
+            GrantScope::Once,
+            provenance(),
+            placeholder_boundary_irrelevant_to_this_test()
+        )
+        .into_rule_for_installation()
+        .is_err(),
         "Once has no real lifetime enforcement yet and must refuse installation"
     );
     assert!(
-        synthesize_grant(&params, GrantScope::Session, provenance())
-            .into_rule_for_installation()
-            .is_err(),
+        synthesize_grant(
+            &params,
+            GrantScope::Session,
+            provenance(),
+            placeholder_boundary_irrelevant_to_this_test()
+        )
+        .into_rule_for_installation()
+        .is_err(),
         "Session has no real lifetime enforcement yet and must refuse installation"
     );
     assert!(
         synthesize_grant(
             &params,
             GrantScope::ExactArgv { hash: [0u8; 32] },
-            provenance()
+            provenance(),
+            placeholder_boundary_irrelevant_to_this_test()
         )
         .into_rule_for_installation()
         .is_err(),
         "ExactArgv has no real lifetime enforcement yet and must refuse installation"
     );
     assert!(
-        synthesize_grant(&params, GrantScope::Always, provenance())
-            .into_rule_for_installation()
-            .is_ok(),
+        synthesize_grant(
+            &params,
+            GrantScope::Always,
+            provenance(),
+            placeholder_boundary_irrelevant_to_this_test()
+        )
+        .into_rule_for_installation()
+        .is_ok(),
         "Always is meant to be a standing rule and must be installable"
     );
     assert!(
@@ -590,7 +705,8 @@ fn into_rule_for_installation_refuses_unenforced_scopes_and_allows_standing_ones
             GrantScope::Directory {
                 path: PathBuf::from("/workspace")
             },
-            provenance()
+            provenance(),
+            placeholder_boundary_irrelevant_to_this_test()
         )
         .into_rule_for_installation()
         .is_ok(),

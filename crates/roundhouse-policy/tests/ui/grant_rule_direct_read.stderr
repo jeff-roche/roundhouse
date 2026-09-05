@@ -1,0 +1,5 @@
+error[E0616]: field `rule` of struct `roundhouse_policy::approval::Grant` is private
+  --> tests/ui/grant_rule_direct_read.rs:13:19
+   |
+13 |     let _ = grant.rule;
+   |                   ^^^^ private field
