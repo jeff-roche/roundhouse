@@ -38,7 +38,9 @@ use std::time::Duration;
 
 use roundhouse_core::{EventPayload, NoteLevel};
 use roundhouse_daemon::session_registry::SessionRegistry;
-use roundhouse_daemon::socket_server::{drive_session, serve_connection};
+use roundhouse_daemon::socket_server::{
+    drive_session, serve_connection, FailedConstructionLimiter,
+};
 use roundhouse_proto::{ApiVersion, ClientEvent, ClientRequest};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -67,6 +69,8 @@ async fn drive_session_keeps_draining_requests_while_events_tx_is_stuck_full() {
         registry.clone(),
         resources,
         Duration::from_secs(5),
+        0,
+        Arc::new(FailedConstructionLimiter::default()),
     ));
 
     // Handshake: mint a session, and read back its one reply frame to learn
@@ -224,6 +228,8 @@ async fn drive_session_keeps_draining_requests_while_the_session_is_idle() {
         registry.clone(),
         resources,
         Duration::from_secs(5),
+        0,
+        Arc::new(FailedConstructionLimiter::default()),
     ));
 
     // Attach (rather than create) so there is no handshake reply to drain

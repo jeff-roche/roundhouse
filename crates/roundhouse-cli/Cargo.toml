@@ -59,7 +59,10 @@ serde_json = { workspace = true }
 # dropped the same way the daemon's were. Same exact pin as
 # `roundhouse-daemon`'s manifest.
 tracing = { workspace = true }
-tracing-subscriber = { version = "=0.3.19", features = ["env-filter"] }
+# Fix round 2, MUST 1: bumped from `=0.3.19` to `=0.3.23` — see
+# `roundhouse-daemon`'s identical manifest comment for why (0.3.20 fixed an
+# ANSI-escape log-injection issue; 0.3.19 sat exactly one release below it).
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 # Same exact-pin discipline as the `clap` addition above.

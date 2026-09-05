@@ -174,6 +174,40 @@ pub struct RealSession {
     pub proxy_handle: ProxyHandle,
 }
 
+/// Tears down every real resource a successfully-built [`RealSession`]
+/// holds: this session's isolation handle
+/// ([`SessionActor::teardown`](roundhouse_engine::SessionActor::teardown)),
+/// its MCP host (if it configured any servers —
+/// `McpHost::shutdown` confirms every child process is actually gone, not
+/// merely asked to stop), and its egress-proxy registration
+/// (`LoopbackProxy::deregister_session`).
+///
+/// Fix round 2, MUST 2: before this function existed, `grep -rn
+/// "\.teardown\("` found exactly one caller workspace-wide and
+/// `McpHost::shutdown` had zero — every path that built a real session and
+/// then discarded it (the connection lost the `is_full` race against
+/// `SessionRegistry::create`, session construction outlived the connection
+/// that asked for it and was torn down instead of kept, or the session's
+/// own actor later reached `SessionState::Closed`) leaked the real
+/// isolation resource and every real MCP child process forever. This
+/// function is the one place all three teardown calls happen together, so
+/// every caller that decides "this `RealSession` is not going to be used"
+/// has exactly one thing to call.
+///
+/// Takes `real_session` by value (not `&RealSession`) so a caller cannot
+/// accidentally call this and then go on to use `actor`/`mcp_host` as if
+/// they were still live — teardown and continued use are mutually
+/// exclusive by construction, not merely by convention.
+pub async fn teardown_real_session(proxy: &LoopbackProxy, real_session: RealSession) {
+    real_session.actor.teardown().await;
+    if let Some(host) = &real_session.mcp_host {
+        if let Err(err) = host.shutdown().await {
+            tracing::warn!(error = %err, "failed to shut down this session's MCP host");
+        }
+    }
+    proxy.deregister_session(real_session.proxy_handle.token());
+}
+
 /// Builds one real session end to end: isolation, a per-session
 /// `PolicyEngine` with a real, actor-mirroring sealed-context provider,
 /// this session's configured MCP servers (if any), redaction, and egress
@@ -269,15 +303,28 @@ pub async fn create_real_session(
     let (mcp_host, mcp, tool_defs) = if resources.mcp_configs.is_empty() {
         (None, None, Vec::new())
     } else {
-        let (host, mcp, tool_defs) = start_session_mcp(
+        match start_session_mcp(
             resources.mcp_configs.clone(),
             session_id,
             resources.runner,
             writer.clone(),
             policy.clone(),
         )
-        .await?;
-        (Some(host), Some(mcp), tool_defs)
+        .await
+        {
+            Ok((host, mcp, tool_defs)) => (Some(host), Some(mcp), tool_defs),
+            Err(err) => {
+                // Fix round 2, MUST 2: isolation and egress registration
+                // already succeeded by this point (we hold a real `handle`
+                // and `proxy_handle`) — no `SessionActor` exists yet to
+                // call `teardown()` on, so tear down directly rather than
+                // leaking a real bwrap mount and an orphaned proxy-session
+                // entry through this early return.
+                let _ = resources.isolate.teardown(handle).await;
+                resources.proxy.deregister_session(proxy_handle.token());
+                return Err(err.into());
+            }
+        }
     };
 
     let actor = Arc::new(SessionActor::new(
@@ -326,7 +373,23 @@ fn apply_resolved_mcp_servers(
     mcp: &SessionMcp,
 ) {
     actor.register_mcp(mcp);
-    *mirrored_mcp_resolved.write().unwrap() = mcp.resolved_servers().into_iter().collect();
+    let resolved: HashSet<String> = mcp.resolved_servers().into_iter().collect();
+    // Fix round 2 (SHOULD item): symmetric with `register_mcp`'s own
+    // poisoned-lock handling immediately above (`.write().unwrap()` here
+    // would panic this whole task on a poisoned lock instead of failing
+    // closed the same way). The mirrored set stays as it was (empty,
+    // unless a previous registration succeeded) — every `TaskParams::Mcp`
+    // this session's `PolicyEngine` sealed-context provider judges still
+    // sealed-denies, the same fail-closed consequence `register_mcp`'s own
+    // doc comment describes for the actor's own copy.
+    match mirrored_mcp_resolved.write() {
+        Ok(mut guard) => *guard = resolved,
+        Err(_) => tracing::error!(
+            "mirrored_mcp_resolved lock is poisoned; refusing to update the PolicyEngine's \
+             resolved-server input — every MCP task in this session will be denied by the \
+             sealed floor"
+        ),
+    }
 }
 
 /// Builds this session's `EgressPolicy` from the daemon's loaded
@@ -532,6 +595,115 @@ mod tests {
 
         assert!(real_session.mcp_host.is_none());
         assert_eq!(real_session.actor.state(), SessionState::Running);
+    }
+
+    /// Fix round 2, MUST 6: `create_real_session`'s OWN MCP-configured
+    /// branch (`start_session_mcp` → `McpHost::start`, the real subprocess
+    /// spawn) had zero coverage — the doc comment on `apply_resolved_mcp_
+    /// servers` above claimed "too heavy for this crate's unit tests," but
+    /// the workspace already has precedent for standing up a real
+    /// lightweight MCP subprocess in a test:
+    /// `roundhouse-mcp/tests/host_integration.rs`'s `fake-mcp-stdio-server`
+    /// binary. This drives `create_real_session` itself, with one real
+    /// configured server, through the real (non-test-gated) path — proving
+    /// `start_session_mcp`'s spawn/discovery AND the `apply_resolved_mcp_
+    /// servers` call site inside `create_real_session` both actually ran,
+    /// not just the extracted helper in isolation.
+    mod real_mcp_configured_tests {
+        use super::*;
+        use roundhouse_core::{Origin, TaskKind};
+        use roundhouse_engine::{AdmitError, TaskCreateRequest};
+        use roundhouse_mcp::config::{McpServerConfig, McpTransportKind};
+        use roundhouse_policy::{ServerId, TaskParams};
+
+        const FAKE_SERVER: &str = "fake";
+
+        /// `CARGO_BIN_EXE_fake-mcp-stdio-server` is only set by Cargo for
+        /// `roundhouse-mcp`'s OWN tests (the crate that owns that `[[bin]]`
+        /// target) — not for this crate's. `cargo test --workspace` (this
+        /// repo's required test gate) builds every workspace member's
+        /// binaries into the same shared `target/<profile>/` directory
+        /// before running any test binary, and this test binary itself
+        /// lives at `target/<profile>/deps/<this-crate>-<hash>`, two
+        /// directories below that same root — so walk up to it and look for
+        /// the sibling binary there, the same way `roundhouse_cli::commands
+        /// ::daemon::daemon_binary_path` locates its own sibling
+        /// `round-daemon-internal`. This is fragile only under a standalone
+        /// `cargo test -p roundhouse-daemon` run with nothing else in the
+        /// workspace ever built — the assert below names the exact path
+        /// searched rather than failing with a bare "file not found" if
+        /// that happens.
+        fn fake_mcp_stdio_server_path() -> PathBuf {
+            let test_exe = std::env::current_exe().expect("current test executable path");
+            let profile_dir = test_exe
+                .parent() // target/<profile>/deps
+                .and_then(|p| p.parent()) // target/<profile>
+                .expect("test executable has a target/<profile>/deps parent");
+            let bin = profile_dir.join("fake-mcp-stdio-server");
+            assert!(
+                bin.exists(),
+                "{} not found — this test needs `roundhouse-mcp`'s \
+                 `fake-mcp-stdio-server` binary already built alongside this test \
+                 binary; run via `cargo test --workspace`, not a standalone \
+                 `cargo test -p roundhouse-daemon` with nothing else built",
+                bin.display()
+            );
+            bin
+        }
+
+        fn mcp_task(server: &str) -> TaskCreateRequest {
+            TaskCreateRequest {
+                kind: TaskKind::Mcp,
+                origin: Origin::Model,
+                is_finally_step: false,
+                params: TaskParams::Mcp {
+                    server: ServerId(server.to_string()),
+                    tool: "whoami".to_string(),
+                    args: serde_json::Value::Null,
+                },
+            }
+        }
+
+        #[tokio::test]
+        async fn a_real_configured_mcp_server_is_spawned_and_registered_so_its_task_is_not_sealed_denied(
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut resources = resources(dir.path()).await;
+            resources.mcp_configs = vec![McpServerConfig {
+                id: ServerId(FAKE_SERVER.to_string()),
+                transport: McpTransportKind::Stdio {
+                    command: fake_mcp_stdio_server_path().to_string_lossy().into_owned(),
+                    args: vec![],
+                    env: vec![],
+                    pinned_binary_hash: None,
+                },
+            }];
+
+            let real_session = create_real_session(&resources, "test-workspace".into())
+                .await
+                .expect("a real, working configured MCP server must not fail session creation");
+
+            assert!(
+                real_session.mcp_host.is_some(),
+                "a configured MCP server must produce a real McpHost, not the \
+                 `mcp_configs.is_empty()` no-op branch"
+            );
+
+            // `sealed_mcp_unresolved` (roundhouse-policy) denies an MCP task
+            // unless its server appears in `SealedContext.resolved_mcp_servers` —
+            // which only `apply_resolved_mcp_servers`'s `SessionActor::
+            // register_mcp` call populates (ruling W1-R85). A regression that
+            // drops either that call OR the real `start_session_mcp` spawn
+            // above would leave this server unresolved and this task denied.
+            let result = real_session.actor.admit_task(&mcp_task(FAKE_SERVER)).await;
+            assert!(
+                !matches!(result, Err(AdmitError::Denied(_))),
+                "an MCP task naming the real server create_real_session just spawned and \
+                 resolved must not be denied by sealed_mcp_unresolved, got {result:?}"
+            );
+
+            teardown_real_session(&resources.proxy, real_session).await;
+        }
     }
 
     /// `build_sealed_ctx_provider`'s attestation half, proven directly

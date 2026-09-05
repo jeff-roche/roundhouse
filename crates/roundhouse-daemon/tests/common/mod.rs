@@ -137,6 +137,15 @@ impl HttpTransport for NoopTransport {
 /// end (`socket_server::accept_loop`/`accept_loop_with`, now that they
 /// require a real `Arc<DaemonResources>`).
 pub async fn real_resources(dir: &Path) -> Arc<DaemonResources> {
+    resources_with_isolate(dir, available_isolate()).await
+}
+
+/// [`real_resources`]'s body, factored out (fix round 2, MUST 2) so a test
+/// that needs `create_real_session` to fail deterministically and cheaply —
+/// proving the per-peer failed-construction limiter actually engages —
+/// can supply its own `Isolate` (e.g. one whose `prepare` always errors)
+/// instead of the always-succeeding [`available_isolate`].
+pub async fn resources_with_isolate(dir: &Path, isolate: Arc<dyn Isolate>) -> Arc<DaemonResources> {
     let store = roundhouse_store::open(&dir.join("events.db"))
         .await
         .unwrap();
@@ -152,7 +161,7 @@ pub async fn real_resources(dir: &Path) -> Arc<DaemonResources> {
         .unwrap();
     Arc::new(DaemonResources::new(
         store,
-        available_isolate(),
+        isolate,
         proxy,
         dir.join("state"),
         dir.join("daemon-binary"),

@@ -463,6 +463,33 @@ impl SessionActor {
         }
     }
 
+    /// Tears down this session's real isolation handle (fix round 2, MUST 2:
+    /// `grep -rn "\.teardown(" crates/*/src/` found exactly one caller
+    /// workspace-wide before this method existed — every path that
+    /// discards a constructed `SessionActor` without ever calling this
+    /// leaks whatever real resource `Isolate::prepare` allocated for it,
+    /// e.g. a real bwrap mount namespace). Best-effort and never panics:
+    /// a caller tearing down a session it is about to discard has no
+    /// further use for a teardown failure beyond logging it — the
+    /// resource is being abandoned either way, and propagating an error
+    /// here would just add a second failure mode to an already-failing or
+    /// already-ending session.
+    ///
+    /// Idempotent from THIS type's perspective (it never mutates any of
+    /// `SessionActor`'s own state), but `Isolate::teardown` itself is not
+    /// guaranteed idempotent — callers should call this at most once per
+    /// actor, exactly like every other real teardown path in this
+    /// workspace.
+    pub async fn teardown(&self) {
+        if let Err(err) = self.isolate.teardown(self.handle.clone()).await {
+            tracing::warn!(
+                session_id = %self.session_id,
+                error = %err,
+                "failed to tear down this session's isolation handle"
+            );
+        }
+    }
+
     /// The session's current state, as of the last `cancel()` call (or
     /// whatever `initial_state` was constructed with, if none yet).
     pub fn state(&self) -> SessionState {

@@ -75,7 +75,14 @@ tracing = { workspace = true }
 # fallback and `wire_redaction_for_session`'s dropped-secret-count warning.
 # Exact pin, matching this lane's own discipline for other net-new
 # additions (`clap`, `uuid`).
-tracing-subscriber = { version = "=0.3.19", features = ["env-filter"] }
+#
+# Fix round 2, MUST 1: bumped from the fix-round-1 pin of `=0.3.19` to
+# `=0.3.23` (the version `Cargo.lock` already resolved to pre-fix-round-1,
+# so this is not a new resolution) — `0.3.19` sits exactly ONE release
+# below `0.3.20`, whose changelog reads "Fixed — Escape ANSI escape
+# sequences in logs (#3368)". Pinning one release below a log-injection fix
+# with no stated reason was itself part of the defect this round closes.
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"

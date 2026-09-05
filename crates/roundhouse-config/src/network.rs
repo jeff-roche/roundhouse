@@ -92,6 +92,35 @@ struct NetworkSection {
     allowed_hosts: Option<Vec<String>>,
 }
 
+impl NetworkConfigError {
+    /// A short, static, never-attacker-influenced name for the SHAPE of
+    /// this error — deliberately never the error's own `Display` (fix
+    /// round 2, MUST 1). `ConfigError::Parse`'s `Display` (and, one layer
+    /// up, `NetworkConfigError::Parse`'s) embeds `toml::de::Error`'s own
+    /// rendering, which includes a verbatim snippet of the offending
+    /// file's text at the parse-error location. For a rejected PROJECT
+    /// layer, that text is authored by whoever wrote the cloned
+    /// repository — logging it is a real ANSI/terminal-escape injection
+    /// primitive into the operator's own terminal, proven against the
+    /// built binary (a `.roundhouse/config.toml` with clear-screen and
+    /// cursor-home sequences rendered a credible fake password prompt the
+    /// moment the log line ran). `pub` so both this crate's own logging
+    /// and `roundhouse-daemon`'s (the operator's OWN `[network]` config
+    /// error, at boot — CF-11(c) applies there too, and copy-pasted or
+    /// journal-displayed operator config is not immune to the same class
+    /// of injection) can log a fact about the error without ever risking
+    /// its `Display`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            NetworkConfigError::Load(ConfigError::Io { .. }) => "io_error",
+            NetworkConfigError::Load(ConfigError::Parse { .. }) => "toml_parse_error",
+            NetworkConfigError::Load(ConfigError::NotARegularFile { .. }) => "not_a_regular_file",
+            NetworkConfigError::Load(ConfigError::TooLarge { .. }) => "too_large",
+            NetworkConfigError::Parse(_) => "network_section_parse_error",
+        }
+    }
+}
+
 /// Reads one scope's `[network] allowed_hosts`, in isolation, via its own
 /// single-layer `ConfigLoader` — never through the shared multi-layer
 /// merge, so the result is unambiguously "what this one scope's file (if
@@ -183,18 +212,23 @@ pub fn load_network_config(
 ///   genuinely denies all egress rather than being read as "unset, allow
 ///   all."
 ///
-/// `#[doc(hidden)]`, and dropped from this crate's root re-export (fix
-/// round 1, MUST 5): CF-11(b)'s whole point was "no label to get wrong" —
-/// leaving this raw, caller-labeled function as easily reachable as the
-/// safe [`load_network_config`] wrapper (one `use` away, and appearing
-/// in `cargo doc`'s crate-root index) is exactly the kind of back door
-/// that requirement was meant to close. Still `pub` (not `pub(crate)`),
-/// because this crate's own `tests/network_policy_config.rs` integration
-/// test needs it — reachable via the fully-qualified
-/// `roundhouse_config::network::load_network_config_from_layers`, not the
-/// crate root.
-#[doc(hidden)]
-pub fn load_network_config_from_layers(
+/// `pub(crate)`, dropped from this crate's root re-export (fix round 1,
+/// MUST 5), and no longer merely `#[doc(hidden)]` (fix round 2, MUST 4):
+/// CF-11(b)'s whole point was "no label to get wrong," and `#[doc(hidden)]`
+/// alone never delivered that — it is documentation-only and leaves the
+/// item fully callable via its full path
+/// (`roundhouse_config::network::load_network_config_from_layers`) from any
+/// crate, which the previous `tests/network_policy_config.rs` compiling and
+/// calling it that way proved directly. `pub(crate)` is the real fix: this
+/// function is now unreachable from outside this crate by any path,
+/// qualified or not. Its tests (previously that external integration file,
+/// standing in for "an external caller using the public API") were moved
+/// into this module's own `#[cfg(test)]` block below, which can still call
+/// a `pub(crate)` item directly — the raw, per-scope-labeled shape this
+/// function exposes was never something a real external caller should
+/// reach for anyway (see [`load_network_config`]'s doc comment), so nothing
+/// of value was lost by no longer exercising it from outside the crate.
+pub(crate) fn load_network_config_from_layers(
     layers: Vec<(ConfigScope, PathBuf)>,
 ) -> Result<NetworkConfig, NetworkConfigError> {
     let mut sorted = layers;
@@ -231,10 +265,25 @@ pub fn load_network_config_from_layers(
             // attack to defend against.
             Err(err) => match scope {
                 ConfigScope::Project | ConfigScope::Workspace => {
+                    // Fix round 2, MUST 1: `error = %err` used to render
+                    // this error's own `Display`, and `NetworkConfigError::Parse`/
+                    // `ConfigError::Parse`'s `Display` (via `toml::de::Error`)
+                    // embeds a verbatim snippet of the OFFENDING FILE'S OWN
+                    // TEXT at the error location — for this exact code
+                    // path, a hostile PROJECT config's own content, chosen
+                    // by whoever authored the cloned repository. Proven
+                    // against the built binary: a `.roundhouse/config.toml`
+                    // containing raw ANSI escape sequences (clear-screen,
+                    // cursor-home) rendered a credible fake password prompt
+                    // in the operator's terminal the moment this line ran.
+                    // `error_kind` below names only the error SHAPE — never
+                    // any text the parser extracted from the file — so
+                    // nothing this daemon did not itself author can ever
+                    // reach a terminal through this log line.
                     tracing::warn!(
                         scope = ?scope,
                         path = %path.display(),
-                        error = %err,
+                        error_kind = err.kind(),
                         "a narrower [network] config layer failed to load; treating it as \
                          absent rather than discarding the wider scope's own allowlist"
                     );
@@ -340,6 +389,19 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    /// Fix round 2, MUST 4: folded in from the now-deleted
+    /// `tests/network_policy_config.rs` — the one case there that wasn't
+    /// already duplicated by an existing test here: zero layers at all
+    /// (as opposed to `absent_network_section_means_empty_allowlist_fail_
+    /// closed` below, which has one present layer whose file just doesn't
+    /// set `[network]`).
+    #[test]
+    fn no_layers_at_all_default_to_a_fail_closed_empty_allowlist() {
+        let cfg = load_network_config_from_layers(vec![]).unwrap();
+        assert_eq!(cfg, NetworkConfig::default());
+        assert!(cfg.allowed_hosts.is_empty());
     }
 
     #[test]
@@ -674,6 +736,45 @@ mod tests {
             result.is_err(),
             "a broken operator (UserGlobal) layer must still be a hard error, not silently \
              skipped"
+        );
+    }
+
+    /// Fix round 2, MUST 1's acceptance test: a hostile file containing a
+    /// real ANSI escape byte (`0x1b`) — the exact clear-screen/cursor-home/
+    /// fake-password-prompt shape proven against the built binary — must
+    /// never survive into `NetworkConfigError::kind()`, the only thing this
+    /// module hands to `tracing`. Proven against the real error the hostile
+    /// content produces (a TOML type error — `allowed_hosts` as a string,
+    /// not an array — whose `Display` DOES embed the raw source line,
+    /// asserted below so this test cannot pass by accident), not merely
+    /// argued from `kind()`'s `&'static str` return type.
+    #[test]
+    fn a_hostile_ansi_escape_sequence_never_reaches_the_logged_error_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let hostile = write(
+            dir.path(),
+            "config.toml",
+            "[network]\nallowed_hosts = \"\u{1b}[2J\u{1b}[H*** ROUNDHOUSE: enter your sudo password ***\"\n",
+        );
+
+        let err = hosts_for_layer(ConfigScope::Project, &hostile).unwrap_err();
+
+        // Sanity: this test actually exercises the hostile content — the
+        // error's own `Display` (never logged, after this fix) really does
+        // carry the escape byte, proving the reproduction is real.
+        assert!(
+            format!("{err}").contains('\u{1b}'),
+            "sanity check failed: the error's Display should embed the hostile source line"
+        );
+        // The load-bearing assertion: whatever this module actually hands
+        // to `tracing` must be clean.
+        assert!(
+            !err.kind().contains('\u{1b}'),
+            "NetworkConfigError::kind() must never contain a byte from the offending file"
+        );
+        assert!(
+            !err.kind().contains("sudo"),
+            "NetworkConfigError::kind() must never contain any of the offending file's own text"
         );
     }
 }

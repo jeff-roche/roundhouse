@@ -53,9 +53,21 @@ use roundhouse_mcp::executor::{
     McpExecutor, TaskInput as McpTaskInput, TaskSpawner, TerminalOutcome,
 };
 use roundhouse_mcp::host::{McpHost, McpHostError};
+// Fix round 2 (spotted alongside MUST 4): these three are used only by
+// `SessionMcp::from_parts` below, itself gated
+// `#[cfg(any(test, feature = "test-util"))]` (ruling W1-R87). Ungated, a
+// plain `cargo build -p roundhouse-daemon --bin round-daemon-internal` (no
+// `test-util`, no test target — the actual production binary build) warns
+// `unused_imports` on all three; `cargo clippy --workspace --all-targets`
+// doesn't catch it because building the whole workspace in one invocation
+// unifies `test-util` in from other members' dev-dependencies. Gate the
+// imports the same way as the function that needs them.
+#[cfg(any(test, feature = "test-util"))]
 use roundhouse_mcp::namespace::ToolNamespace;
+#[cfg(any(test, feature = "test-util"))]
 use roundhouse_mcp::transport::McpTransport;
 use roundhouse_policy::engine::PolicyEngine;
+#[cfg(any(test, feature = "test-util"))]
 use roundhouse_policy::ServerId;
 use roundhouse_provider::ToolDef;
 use roundhouse_store::EventWriter;

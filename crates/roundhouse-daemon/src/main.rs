@@ -87,7 +87,14 @@ struct Args {
     /// `Degradation` `Note` event by `create_session_isolation` (§6.5 rule
     /// 3) regardless of this flag — this only controls whether a shortfall
     /// refuses the session or is merely recorded. Accepts (case-insensitive):
-    /// `none`, `worktree`, `sandbox`, `container`, `remote`.
+    /// `none`, `worktree`, `sandbox`, `container`, `remote`. Setting this
+    /// logs a warning naming the chosen floor on every boot, for the
+    /// process's whole life — and setting it to `none` specifically logs a
+    /// distinct, louder warning, because that value permanently disarms
+    /// `sealed_tier_shortfall` (the sealed-floor rule that detects a live
+    /// mid-session isolation downgrade): with a floor of `Tier::None`,
+    /// `attested_tier < requested_tier` can never hold, for any tier, so
+    /// that detector goes dark for the rest of the process.
     #[arg(long, value_parser = parse_tier)]
     allow_degraded_to: Option<Tier>,
 }
@@ -300,8 +307,16 @@ async fn main() -> color_eyre::Result<()> {
     let network_config = match roundhouse_config::load_network_config(project_root.as_deref()) {
         Ok(cfg) => cfg,
         Err(err) => {
+            // Fix round 2, MUST 1: `err.kind()`, never `err`'s own
+            // `Display` — by the time an error reaches here it's the
+            // OPERATOR's own (Builtin/UserGlobal) config (a rejected
+            // PROJECT layer no longer propagates at all — fix round 1's
+            // own SHOULD item), but `NetworkConfigError::kind`'s own doc
+            // comment states why that still isn't a reason to render a
+            // parser snippet into a log line (CF-11(c), copy-pasted or
+            // journal-displayed operator config).
             tracing::error!(
-                error = %err,
+                error_kind = err.kind(),
                 "failed to load [network] config; falling back to an empty \
                  (deny-all) egress allowlist for every session rather than \
                  failing the whole daemon boot"
@@ -335,8 +350,40 @@ async fn main() -> color_eyre::Result<()> {
     proxy.clone().serve(runner, proxy_writer.clone()).await?;
 
     let session_store = roundhouse_store::open(&store_path).await?;
+    // Fix round 2, MUST 3: make an operator's `--allow-degraded-to` choice
+    // loud, on every boot, for the process's whole life — proven, before
+    // this fix, that starting with the flag printed NOTHING about it on
+    // either stream, so the downgrade escape hatch was silently armed with
+    // no operator-visible trace anywhere. `Tier::None` gets a distinct,
+    // louder line naming the specific rule it disarms
+    // (`sealed_tier_shortfall`) — see `create_real_session`'s own doc
+    // comment on `OnDegrade::AllowDownTo(Tier::None)` for exactly what that
+    // means. The flag itself is NOT rejected or narrowed here: it exists
+    // precisely for a host that cannot achieve `Sandbox`, and refusing the
+    // value that workflow needs would just push operators back toward
+    // patching the default instead.
     let default_on_degrade = match args.allow_degraded_to {
-        Some(tier) => OnDegrade::AllowDownTo(tier),
+        Some(tier) => {
+            if tier == Tier::None {
+                tracing::warn!(
+                    "--allow-degraded-to none is set: EVERY session on this daemon may run \
+                     with NO isolation at all, and sealed_tier_shortfall (the sealed-floor rule \
+                     that detects a live mid-session isolation downgrade) is PERMANENTLY \
+                     DISARMED for the life of this process — attested_tier can never be lower \
+                     than a floor of Tier::None, so the comparison is unsatisfiable for every \
+                     tier. This is an explicit operator decision for a host that cannot achieve \
+                     Tier::Sandbox; if that is not what you intended, restart without this flag."
+                );
+            } else {
+                tracing::warn!(
+                    ?tier,
+                    "--allow-degraded-to is set: sessions on this daemon may run with an \
+                     isolation tier as low as {tier:?} instead of the requested Tier::Sandbox, \
+                     recorded as a Degradation note per session rather than refusing to start"
+                );
+            }
+            OnDegrade::AllowDownTo(tier)
+        }
         None => OnDegrade::Refuse,
     };
     let resources = Arc::new(DaemonResources::new(

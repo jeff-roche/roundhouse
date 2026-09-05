@@ -505,6 +505,109 @@ impl Default for AcceptLimits {
     }
 }
 
+/// Fix round 2, MUST 2 (remainder): bounds how many FAILED `CreateSession`
+/// constructions one peer can trigger inside a trailing window, before
+/// `construct_real_session_bounded` — not after.
+///
+/// `SessionRegistry::is_full`'s pre-check (`drive_session`, just above where
+/// this is consulted) only counts *registered*, successfully built sessions
+/// — it does nothing to bound a peer that loops `CreateSession` against a
+/// host where construction always fails (e.g. this daemon's own documented
+/// default, `OnDegrade::Refuse`, on a host with no working isolation
+/// mechanism at all). Every such attempt still runs a real `Isolate::
+/// prepare`/`probe` and appends a `Degradation` note to the append-only
+/// `events` table before failing — restoring `Refuse` as the default (fix
+/// round 1) fixed a worse bug but did not, by itself, bound what a failing
+/// attempt costs. This does: once a peer accumulates `max_failures` failed
+/// constructions inside `window`, further attempts are refused immediately,
+/// with no `prepare()`/`probe()`/event append at all, until the window
+/// rolls over. A successful construction clears that peer's streak — only
+/// *sustained* failure loops are throttled, not an operator's normal mix of
+/// working sessions with the occasional unrelated failure.
+///
+/// Keyed by peer uid, not a single hardcoded global bucket: today
+/// `accept_loop_with`'s own peer-credential check means every connection
+/// this daemon accepts already shares exactly one uid (this process's own —
+/// see that function's doc comment), so this reduces to one bucket in
+/// practice. Keying by uid keeps the mechanism correct instead of merely
+/// adequate if that check is ever relaxed to admit more than one uid, at no
+/// extra cost today.
+///
+/// `pub`, and `#[doc(hidden)]`, for the same reason [`AcceptLimits`] is:
+/// [`drive_session`] takes one as a parameter, and this crate's integration
+/// tests (`tests/deadlock_invariant.rs`, a separate crate) call
+/// `drive_session` directly rather than through the full `accept_loop`
+/// stack, so they must be able to construct one too.
+#[doc(hidden)]
+pub struct FailedConstructionLimiter {
+    max_failures: u32,
+    window: Duration,
+    state: std::sync::Mutex<std::collections::HashMap<u32, (u32, std::time::Instant)>>,
+}
+
+impl FailedConstructionLimiter {
+    fn new(max_failures: u32, window: Duration) -> Self {
+        FailedConstructionLimiter {
+            max_failures,
+            window,
+            state: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// `true` if `peer_uid` is still within its failure budget for the
+    /// current window — a `CreateSession` attempt may proceed. `false` if it
+    /// has already hit `max_failures` failures inside the trailing `window`
+    /// and must be refused before any real construction work starts.
+    fn allow(&self, peer_uid: u32, now: std::time::Instant) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("FailedConstructionLimiter mutex poisoned");
+        match state.get(&peer_uid) {
+            Some((count, window_start)) if now.duration_since(*window_start) < self.window => {
+                *count < self.max_failures
+            }
+            _ => true,
+        }
+    }
+
+    /// Records one failed construction for `peer_uid`, starting a fresh
+    /// window if the previous one has already elapsed.
+    fn record_failure(&self, peer_uid: u32, now: std::time::Instant) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("FailedConstructionLimiter mutex poisoned");
+        let entry = state.entry(peer_uid).or_insert((0, now));
+        if now.duration_since(entry.1) >= self.window {
+            *entry = (0, now);
+        }
+        entry.0 += 1;
+    }
+
+    /// Clears `peer_uid`'s failure streak entirely — called after a
+    /// successful construction, so only *sustained* failure loops are ever
+    /// throttled.
+    fn record_success(&self, peer_uid: u32) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("FailedConstructionLimiter mutex poisoned");
+        state.remove(&peer_uid);
+    }
+}
+
+impl Default for FailedConstructionLimiter {
+    /// 5 failed constructions per peer per 10 seconds — generous enough not
+    /// to interfere with an operator's own legitimate retries, tight enough
+    /// that a tight failure loop cannot run more than a handful of real
+    /// `prepare()`/`probe()` calls (and `Degradation` event appends) before
+    /// being cut off.
+    fn default() -> Self {
+        FailedConstructionLimiter::new(5, Duration::from_secs(10))
+    }
+}
+
 /// Reads this process's own uid via `/proc/self` — the same dependency-free
 /// idiom `main.rs`'s `check_owned_by_current_user` already uses for the
 /// runtime directory ownership check (see its doc comment for why
@@ -654,6 +757,7 @@ pub async fn accept_loop_with(
     })?;
 
     let connection_slots = Arc::new(Semaphore::new(limits.max_connections));
+    let failed_construction_limiter = Arc::new(FailedConstructionLimiter::default());
     let mut backoff = MIN_ACCEPT_BACKOFF;
 
     loop {
@@ -681,8 +785,8 @@ pub async fn accept_loop_with(
             },
         };
 
-        match stream.peer_cred() {
-            Ok(cred) if cred.uid() == expected_uid => {}
+        let peer_uid = match stream.peer_cred() {
+            Ok(cred) if cred.uid() == expected_uid => cred.uid(),
             Ok(cred) => {
                 tracing::warn!(
                     peer_uid = cred.uid(),
@@ -698,7 +802,7 @@ pub async fn accept_loop_with(
                 );
                 continue;
             }
-        }
+        };
 
         // `try_acquire_owned`, never an awaited `acquire`: at capacity,
         // awaiting would park this very loop — leaving every further peer
@@ -718,9 +822,18 @@ pub async fn accept_loop_with(
         let registry = registry.clone();
         let resources = resources.clone();
         let handshake_timeout = limits.handshake_timeout;
+        let failed_construction_limiter = failed_construction_limiter.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            handle_connection(stream, registry, resources, handshake_timeout).await;
+            handle_connection(
+                stream,
+                registry,
+                resources,
+                handshake_timeout,
+                peer_uid,
+                failed_construction_limiter,
+            )
+            .await;
         });
     }
 }
@@ -744,6 +857,8 @@ async fn handle_connection(
     registry: Arc<SessionRegistry>,
     resources: Arc<DaemonResources>,
     handshake_timeout: Duration,
+    peer_uid: u32,
+    failed_construction_limiter: Arc<FailedConstructionLimiter>,
 ) {
     let (requests_tx, requests_rx) = mpsc::channel(REQUEST_CHANNEL_CAPACITY);
     let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -754,7 +869,9 @@ async fn handle_connection(
             events_tx,
             registry,
             resources,
-            handshake_timeout
+            handshake_timeout,
+            peer_uid,
+            failed_construction_limiter,
         ),
     );
 }
@@ -854,6 +971,8 @@ pub async fn drive_session(
     registry: Arc<SessionRegistry>,
     resources: Arc<DaemonResources>,
     handshake_timeout: Duration,
+    peer_uid: u32,
+    failed_construction_limiter: Arc<FailedConstructionLimiter>,
 ) {
     let first_request = match tokio::time::timeout(handshake_timeout, requests_rx.recv()).await {
         Ok(Some(request)) => request,
@@ -904,14 +1023,33 @@ pub async fn drive_session(
                 return;
             }
 
-            let real_session = match tokio::time::timeout(
-                SESSION_CONSTRUCTION_TIMEOUT,
-                session_bootstrap::create_real_session(&resources, workspace_name),
-            )
-            .await
+            // Fix round 2, MUST 2 (remainder): a second cheap pre-check,
+            // ahead of `is_full`'s own — `is_full` only bounds *registered*
+            // sessions, so it does nothing against a peer that loops
+            // `CreateSession` against a host where construction always
+            // fails (every attempt still runs a real `Isolate::prepare`/
+            // `probe` and appends a `Degradation` note to the append-only
+            // `events` table before failing). See
+            // `FailedConstructionLimiter`'s own doc comment.
+            if !failed_construction_limiter.allow(peer_uid, std::time::Instant::now()) {
+                tracing::warn!(
+                    peer_uid,
+                    "closing connection: this peer has exceeded its failed-session-construction \
+                     budget for the current window; refusing before doing any real \
+                     session-construction work"
+                );
+                return;
+            }
+
+            let real_session = match construct_real_session_bounded(&resources, workspace_name)
+                .await
             {
-                Ok(Ok(real_session)) => real_session,
-                Ok(Err(err)) => {
+                Ok(real_session) => {
+                    failed_construction_limiter.record_success(peer_uid);
+                    real_session
+                }
+                Err(ConstructionOutcome::Failed(err)) => {
+                    failed_construction_limiter.record_failure(peer_uid, std::time::Instant::now());
                     // No `ClientRequest`/`ClientEvent` error variant exists to
                     // report this over the wire with (the same constraint
                     // ruling W1-R6 already accepted for "unknown session");
@@ -923,26 +1061,41 @@ pub async fn drive_session(
                     tracing::error!(error = %err, "failed to construct a real session; refusing CreateSession");
                     return;
                 }
-                Err(_elapsed) => {
-                    // Fix round 1 (SHOULD item): a wedged MCP server startup
-                    // (or a hung isolation probe) must not park this
-                    // connection's whole handling task forever — see
-                    // `SESSION_CONSTRUCTION_TIMEOUT`'s own doc comment.
+                Err(ConstructionOutcome::TimedOut) => {
+                    failed_construction_limiter.record_failure(peer_uid, std::time::Instant::now());
+                    // Fix round 1 (SHOULD item), refined in fix round 2
+                    // (MUST 2): a wedged MCP server startup (or a hung
+                    // isolation probe) must not park this connection's whole
+                    // handling task forever — see
+                    // `construct_real_session_bounded`'s own doc comment for
+                    // why this does NOT cancel the construction itself
+                    // (which would leak a real isolation handle) and instead
+                    // lets it finish and self-teardown in the background.
                     tracing::error!(
                         timeout = ?SESSION_CONSTRUCTION_TIMEOUT,
                         "session construction did not complete within the timeout; refusing \
-                         CreateSession"
+                         CreateSession (construction continues in the background and will be \
+                         torn down on completion, not left running)"
+                    );
+                    return;
+                }
+                Err(ConstructionOutcome::TaskEnded) => {
+                    failed_construction_limiter.record_failure(peer_uid, std::time::Instant::now());
+                    tracing::error!(
+                        "session construction task ended unexpectedly (panicked or was \
+                         dropped) before reporting an outcome; refusing CreateSession"
                     );
                     return;
                 }
             };
             let spec = real_session.actor.session_spec().clone();
-            // Cloned/copied BEFORE the actor and proxy handle move into
-            // `registry.create`/get dropped below, so the reaper spawned
-            // after a successful `create` can watch the SAME actor's state
-            // and deregister the SAME proxy token, independent of whatever
-            // `registry` does with its own copy of the actor.
+            // Cloned BEFORE the actor/mcp_host move into `registry.create`
+            // below, so both the "lost the `is_full` race" teardown path
+            // AND the reaper spawned after a successful `create` have their
+            // own independent copies of exactly what they each need,
+            // regardless of what `registry`/`session_events` do with theirs.
             let actor_for_reaper = real_session.actor.clone();
+            let mcp_host_for_reaper = real_session.mcp_host.clone();
             let proxy_token_for_reaper = real_session.proxy_handle.token().to_string();
 
             let Some((session_id, subscription, session_events)) =
@@ -950,11 +1103,24 @@ pub async fn drive_session(
             else {
                 // At `max_sessions` (security review Important 3 / ruling
                 // W1-R33) — same "no wire error variant" constraint as
-                // above. The isolation handle/MCP host `real_session` just
-                // built are torn down by nothing here (a known, accepted
-                // gap at `DEFAULT_MAX_SESSIONS` — see the task report): this
-                // is the daemon's least-realistic failure path, hit only at
-                // ten thousand concurrently live sessions.
+                // above. Fix round 2, MUST 2: this used to leak the
+                // isolation handle/MCP host/proxy registration
+                // `real_session` had already built (a real, if rare, gap —
+                // this is the daemon's least-realistic failure path, hit
+                // only at ten thousand concurrently live sessions); now
+                // torn down explicitly via the same clones the reaper would
+                // otherwise have used.
+                tracing::warn!(
+                    "lost the race against max_sessions after real session construction \
+                     already completed; tearing down rather than leaking the isolation \
+                     handle/MCP host/proxy registration"
+                );
+                let discarded = session_bootstrap::RealSession {
+                    actor: actor_for_reaper,
+                    mcp_host: mcp_host_for_reaper,
+                    proxy_handle: real_session.proxy_handle,
+                };
+                session_bootstrap::teardown_real_session(&resources.proxy, discarded).await;
                 return;
             };
             // Ruling W1-R99 (fix round 1): the "do-reap-when-the-actor-ends"
@@ -964,17 +1130,16 @@ pub async fn drive_session(
             // caller: watches this session's own `SessionState` for
             // `Closed` and reaps the registry entry the moment it's
             // observed, independent of this connection's (or any
-            // connection's) own lifetime. Also deregisters this session's
-            // egress-proxy token at the same time (SHOULD item): before
-            // this, `real_session.proxy_handle` was discarded entirely at
-            // construction, and nothing ever called
-            // `LoopbackProxy::deregister_session` — an unbounded leak of
-            // the proxy's own internal session table, one entry per session
-            // ever created, for the daemon's whole life.
+            // connection's) own lifetime. Fix round 2, MUST 2: also tears
+            // down the actor's real isolation handle and shuts down its MCP
+            // host (previously only `SessionRegistry::remove`/
+            // `LoopbackProxy::deregister_session` ran here — the bookkeeping
+            // was cleared, but the real resources behind it were not).
             spawn_session_reaper(
                 registry.clone(),
                 session_id,
-                actor_for_reaper.subscribe(),
+                actor_for_reaper,
+                mcp_host_for_reaper,
                 resources.proxy.clone(),
                 proxy_token_for_reaper,
             );
@@ -1156,6 +1321,94 @@ pub async fn drive_session(
     registry.detach(session_id, &subscription);
 }
 
+/// Why [`construct_real_session_bounded`] exists, in one line: real session
+/// construction must be BOUNDED without ever being CANCELLED.
+///
+/// [`ConstructionOutcome`] distinguishes the two non-success outcomes so
+/// `drive_session` can log each honestly rather than collapsing both into
+/// one message.
+enum ConstructionOutcome {
+    /// `session_bootstrap::create_real_session` itself returned `Err` —
+    /// its own error paths are responsible for tearing down whatever they
+    /// had already built (see that function's own doc comments; fix round
+    /// 2, MUST 2 closed the one gap that existed there).
+    Failed(session_bootstrap::CreateRealSessionError),
+    /// Construction did not report an outcome within
+    /// [`SESSION_CONSTRUCTION_TIMEOUT`]. It is still running in the
+    /// background and will tear itself down on completion — see this
+    /// function's own doc comment.
+    TimedOut,
+    /// The construction task ended (panicked, or was somehow dropped)
+    /// without ever sending a result.
+    TaskEnded,
+}
+
+/// Runs `session_bootstrap::create_real_session` to completion in its own
+/// spawned task and returns its outcome, bounded by
+/// [`SESSION_CONSTRUCTION_TIMEOUT`] — WITHOUT ever cancelling the
+/// construction future itself (fix round 2, MUST 2).
+///
+/// An earlier version of this function raced `create_real_session` directly
+/// inside a `tokio::time::timeout`, which — on elapse — DROPS the losing
+/// future mid-`.await`. That is unsound for this specific future:
+/// `Isolate::prepare`'s real implementation (`BwrapLandlockIsolate`) inserts
+/// a handle into its own internal map BEFORE the async work backing it
+/// fully resolves, so a future dropped between that insert and its own
+/// return leaves an orphaned entry — a real resource with no `Handle` this
+/// process ever hands back to anyone, so nothing can ever call
+/// `Isolate::teardown` on it. The fix is not to make `prepare` itself
+/// cancellation-safe (`roundhouse-sandbox` is lane W5's crate, not this
+/// lane's) — it is to never cancel it from here: this function spawns
+/// `create_real_session` as an independent task that always runs to
+/// completion, and races only a [`tokio::sync::oneshot`] receiver (never
+/// the construction future itself) against the timeout. If the timeout
+/// wins, the spawned task keeps running; when it eventually finishes, it
+/// notices its `oneshot::Sender::send` failed (the receiver was dropped
+/// with the elapsed `timeout`) and tears down whatever it built via
+/// [`session_bootstrap::teardown_real_session`] instead of leaking it.
+async fn construct_real_session_bounded(
+    resources: &Arc<DaemonResources>,
+    workspace_name: String,
+) -> Result<session_bootstrap::RealSession, ConstructionOutcome> {
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let construction_resources = resources.clone();
+    tokio::spawn(async move {
+        let outcome =
+            session_bootstrap::create_real_session(&construction_resources, workspace_name).await;
+        match outcome {
+            Ok(real_session) => {
+                if let Err(Ok(real_session)) = result_tx.send(Ok(real_session)) {
+                    tracing::warn!(
+                        "session construction finished after its caller gave up on the \
+                         timeout; tearing down the real session it built instead of leaking it"
+                    );
+                    session_bootstrap::teardown_real_session(
+                        &construction_resources.proxy,
+                        real_session,
+                    )
+                    .await;
+                }
+            }
+            Err(err) => {
+                // A construction error carries no real resource for THIS
+                // function to tear down: `create_real_session`'s own error
+                // paths already tear down whatever they had built before
+                // returning `Err` (fix round 2, MUST 2). Best-effort send —
+                // if nobody's listening either, there is nothing further
+                // to do with the error but drop it.
+                let _ = result_tx.send(Err(err));
+            }
+        }
+    });
+
+    match tokio::time::timeout(SESSION_CONSTRUCTION_TIMEOUT, result_rx).await {
+        Ok(Ok(Ok(real_session))) => Ok(real_session),
+        Ok(Ok(Err(err))) => Err(ConstructionOutcome::Failed(err)),
+        Ok(Err(_recv_error)) => Err(ConstructionOutcome::TaskEnded),
+        Err(_elapsed) => Err(ConstructionOutcome::TimedOut),
+    }
+}
+
 /// The "do-reap-when-the-actor-ends" half of ruling W1-R51 (fix round 1,
 /// ruling W1-R99): watches `session_id`'s own `SessionState` for its
 /// terminal `Closed` value and calls [`SessionRegistry::remove`] the moment
@@ -1180,19 +1433,31 @@ pub async fn drive_session(
 fn spawn_session_reaper(
     registry: Arc<SessionRegistry>,
     session_id: roundhouse_core::SessionId,
-    mut state: tokio::sync::watch::Receiver<roundhouse_core::SessionState>,
+    actor: Arc<roundhouse_engine::SessionActor>,
+    mcp_host: Option<Arc<roundhouse_mcp::host::McpHost>>,
     proxy: Arc<roundhouse_net::proxy::LoopbackProxy>,
     proxy_token: String,
 ) {
+    let mut state = actor.subscribe();
     tokio::spawn(async move {
         loop {
             if *state.borrow() == roundhouse_core::SessionState::Closed {
                 registry.remove(session_id);
-                // Fix round 1 (SHOULD item): the other half of this
-                // session's teardown — without this, `LoopbackProxy`'s own
-                // internal session table (keyed by this token) never sheds
-                // an entry for the daemon's whole life, regardless of how
-                // many sessions come and go.
+                // Fix round 2, MUST 2: before this, only the BOOKKEEPING
+                // was cleared here (the registry entry, the proxy's
+                // session-token map entry) — the REAL resources behind
+                // them (a real bwrap isolation handle, real MCP child
+                // processes) were never torn down on this path at all.
+                actor.teardown().await;
+                if let Some(host) = &mcp_host {
+                    if let Err(err) = host.shutdown().await {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %err,
+                            "failed to shut down this session's MCP host"
+                        );
+                    }
+                }
                 proxy.deregister_session(&proxy_token);
                 return;
             }
@@ -1287,6 +1552,72 @@ mod classify_accept_error_tests {
     }
 }
 
+/// Fix round 2, MUST 2 (remainder): direct, fast unit coverage of
+/// `FailedConstructionLimiter`'s own logic — window rollover and the
+/// success-clears-the-streak rule — separate from
+/// `tests/failed_construction_rate_limit.rs`'s slower, real-`Isolate`
+/// end-to-end proof that this type is actually wired into `drive_session`.
+#[cfg(test)]
+mod failed_construction_limiter_tests {
+    use super::*;
+
+    #[test]
+    fn refuses_once_the_budget_is_exhausted_within_the_window() {
+        let limiter = FailedConstructionLimiter::new(3, Duration::from_secs(10));
+        let t0 = std::time::Instant::now();
+        assert!(limiter.allow(1, t0));
+        limiter.record_failure(1, t0);
+        assert!(limiter.allow(1, t0));
+        limiter.record_failure(1, t0);
+        assert!(limiter.allow(1, t0));
+        limiter.record_failure(1, t0);
+        assert!(
+            !limiter.allow(1, t0),
+            "a 4th attempt within the window must be refused after 3 recorded failures"
+        );
+    }
+
+    #[test]
+    fn a_different_peer_has_its_own_independent_budget() {
+        let limiter = FailedConstructionLimiter::new(1, Duration::from_secs(10));
+        let t0 = std::time::Instant::now();
+        assert!(limiter.allow(1, t0));
+        limiter.record_failure(1, t0);
+        assert!(!limiter.allow(1, t0), "peer 1 exhausted its own budget");
+        assert!(
+            limiter.allow(2, t0),
+            "peer 2's budget must be independent of peer 1's"
+        );
+    }
+
+    #[test]
+    fn the_window_rolls_over_and_the_budget_resets() {
+        let limiter = FailedConstructionLimiter::new(1, Duration::from_secs(10));
+        let t0 = std::time::Instant::now();
+        limiter.record_failure(1, t0);
+        assert!(!limiter.allow(1, t0));
+        let after_window = t0 + Duration::from_secs(11);
+        assert!(
+            limiter.allow(1, after_window),
+            "the budget must reset once the window has elapsed"
+        );
+    }
+
+    #[test]
+    fn a_successful_construction_clears_the_failure_streak() {
+        let limiter = FailedConstructionLimiter::new(1, Duration::from_secs(10));
+        let t0 = std::time::Instant::now();
+        limiter.record_failure(1, t0);
+        assert!(!limiter.allow(1, t0));
+        limiter.record_success(1);
+        assert!(
+            limiter.allow(1, t0),
+            "a successful construction must clear the peer's failure streak, even \
+             within the same window"
+        );
+    }
+}
+
 #[cfg(test)]
 mod session_reaper_tests {
     //! Ruling W1-R99 (fix round 1): `spawn_session_reaper` is the
@@ -1300,23 +1631,59 @@ mod session_reaper_tests {
     //! that it observes it.
 
     use super::*;
-    use crate::test_support::real_actor_with_state;
+    use crate::test_support::{real_actor_with_state, runner};
+    use roundhouse_net::policy::EgressPolicy;
+    use roundhouse_net::proxy::LoopbackProxy;
+
+    /// A real `LoopbackProxy`, actually `serve()`d (so `register_session`
+    /// can succeed — it requires a bound address), plus one real, freshly
+    /// registered session token. Fix round 2, MUST 5: the previous version
+    /// of both tests below passed the literal `"test-token"`, never
+    /// registered with the proxy at all — `deregister_session` on an
+    /// unknown token is a harmless no-op, so those tests passed regardless
+    /// of whether the reaper ever called it. This helper makes the
+    /// registration real so the tests can assert on its actual removal.
+    async fn real_proxy_with_registered_token(
+        dir: &std::path::Path,
+    ) -> (Arc<LoopbackProxy>, String) {
+        let proxy = Arc::new(LoopbackProxy::new());
+        let store = roundhouse_store::open(&dir.join("proxy-events.db"))
+            .await
+            .unwrap();
+        let writer = roundhouse_store::spawn_writer(store).await;
+        proxy.clone().serve(runner(), writer).await.unwrap();
+        let handle = proxy
+            .register_session(
+                roundhouse_core::SessionId::new(),
+                EgressPolicy {
+                    allowed_hosts: vec![],
+                },
+            )
+            .unwrap();
+        let token = handle.token().to_string();
+        (proxy, token)
+    }
 
     #[tokio::test]
     async fn a_session_already_closed_at_registration_is_reaped_promptly() {
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(SessionRegistry::new());
         let actor = real_actor_with_state(dir.path(), roundhouse_core::SessionState::Closed).await;
-        let state_rx = actor.subscribe();
+        let actor_for_reaper = actor.clone();
         let (session_id, _subscription, _events) = registry.create(actor, None).unwrap();
 
-        let proxy = Arc::new(roundhouse_net::proxy::LoopbackProxy::new());
+        let (proxy, token) = real_proxy_with_registered_token(dir.path()).await;
+        assert!(
+            proxy.is_registered(&token),
+            "sanity: the token is really registered"
+        );
         spawn_session_reaper(
             registry.clone(),
             session_id,
-            state_rx,
-            proxy,
-            "test-token".into(),
+            actor_for_reaper,
+            None,
+            proxy.clone(),
+            token.clone(),
         );
 
         let reaped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1333,6 +1700,12 @@ mod session_reaper_tests {
             "an already-Closed session must be reaped by spawn_session_reaper, \
              not left registered forever"
         );
+        // MUST 5: proves the reaper actually called `deregister_session`,
+        // not merely that a no-op on an unregistered token didn't panic.
+        assert!(
+            !proxy.is_registered(&token),
+            "the reaper must deregister this session's real proxy token"
+        );
     }
 
     /// The mirror case: an actor that never reaches `Closed` must NOT be
@@ -1343,22 +1716,28 @@ mod session_reaper_tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(SessionRegistry::new());
         let actor = real_actor_with_state(dir.path(), roundhouse_core::SessionState::Running).await;
-        let state_rx = actor.subscribe();
+        let actor_for_reaper = actor.clone();
         let (session_id, _subscription, _events) = registry.create(actor, None).unwrap();
 
-        let proxy = Arc::new(roundhouse_net::proxy::LoopbackProxy::new());
+        let (proxy, token) = real_proxy_with_registered_token(dir.path()).await;
         spawn_session_reaper(
             registry.clone(),
             session_id,
-            state_rx,
-            proxy,
-            "test-token".into(),
+            actor_for_reaper,
+            None,
+            proxy.clone(),
+            token.clone(),
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
             registry.attach(session_id).is_some(),
             "a session that never reaches Closed must remain attachable"
+        );
+        assert!(
+            proxy.is_registered(&token),
+            "a session that never reaches Closed must not have its proxy token deregistered \
+             either"
         );
     }
 }
