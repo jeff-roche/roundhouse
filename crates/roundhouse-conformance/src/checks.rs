@@ -292,20 +292,32 @@ pub async fn check_fold_determinism<P: Provider>(
 /// SSE): replaying a byte-for-byte PREFIX of the cassette body through the
 /// subject's own `Provider::stream_chat` and folding the result is exactly
 /// what a truncated connection looks like from the codec's point of view,
-/// for any wire format. "Does this prefix length decode to an `Ok` stream
-/// containing `MessageStop`" is monotonic in prefix length (once the
-/// terminal frame's bytes are fully present, every longer prefix still
-/// contains them), so a binary search over prefix lengths finds the
-/// *minimal* prefix that reaches the terminal — call it `terminal_end` —
-/// without ever having to parse the wire format itself or know what its
-/// terminal marker looks like. Truncating at fractions of `terminal_end`
-/// (rather than of the whole body, which is what the task's original,
-/// rejected design did) guarantees every truncation point this check tests
-/// lands strictly before the terminal, so a codec that correctly sends
-/// bytes AFTER its own terminal (`bedrock_converse`'s post-`messageStop`
-/// metadata frame; `openai_chat`'s trailing `data: [DONE]`) can never be
-/// false-failed by a truncation point that actually retained the terminal
-/// and only dropped trailing bytes.
+/// for any wire format. [`locate_terminal_end`] finds the *minimal* prefix
+/// length that reaches the terminal via a linear scan — **not** a binary
+/// search: "does this prefix decode to an `Ok` stream containing
+/// `MessageStop`" is NOT monotonic in prefix length for every codec. A
+/// binary-framed codec whose wire format legitimately sends bytes AFTER its
+/// own terminal (`bedrock_converse`'s post-`messageStop` metadata frame) is
+/// `true` at the terminal, `false` again while that later frame is
+/// mid-flight (`EventStreamDecoder::is_mid_frame`), then `true` once more
+/// at the full body — verified empirically against this exact codec during
+/// review: a binary search over that shape silently converged on
+/// `terminal_end == n` (the whole body), defeating the entire point of
+/// locating the terminal, while every one of its self-tests and wired-in
+/// codec checks still reported green (the located-wrong terminal happened
+/// to fall in Ruling R3's own "safe" region for the wired cassette, a
+/// coverage gap rather than a wrong verdict — see
+/// `locate_terminal_end`'s own unit test for a case that pins the
+/// difference directly rather than relying on `check_truncate_mid_stream`'s
+/// output to reveal it). Cassettes here are on the order of 1 KB, so an
+/// O(n) scan of cheap in-memory decodes costs nothing.
+///
+/// Truncating at fractions of `terminal_end` (rather than of the whole
+/// body, which is what the task's original, rejected design did)
+/// guarantees every truncation point this check tests lands strictly
+/// before the terminal, so a codec that correctly sends bytes after its
+/// own terminal can never be false-failed by a truncation point that
+/// actually retained the terminal and only dropped trailing bytes.
 ///
 /// If the whole cassette never decodes to a `MessageStop` at all, there is
 /// no terminal to truncate before — not this check's job (an ordinary
@@ -330,32 +342,12 @@ pub async fn check_truncate_mid_stream<P: Provider>(
         }
     };
 
-    let n = full.body.len();
-    if !decode_prefix_saw_message_stop(provider, request, &full, n, &credentials).await {
+    let Some(terminal_end) = locate_terminal_end(provider, request, &full, &credentials).await
+    else {
         // The whole (untruncated) cassette never reaches a MessageStop at
         // all — nothing to locate a terminal before.
         return failures;
-    }
-
-    // Binary search for the minimal prefix length that reaches the
-    // terminal: invariant `decode_prefix_saw_message_stop(lo)` is false,
-    // `decode_prefix_saw_message_stop(hi)` is true (established by the `n`
-    // check above), narrowing until they're adjacent.
-    let mut lo = 0usize;
-    let mut hi = n;
-    if decode_prefix_saw_message_stop(provider, request, &full, lo, &credentials).await {
-        hi = lo;
-    } else {
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if decode_prefix_saw_message_stop(provider, request, &full, mid, &credentials).await {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-    }
-    let terminal_end = hi;
+    };
 
     for pct in [25u64, 50, 75] {
         let cut = (terminal_end as u64 * pct / 100) as usize;
@@ -370,6 +362,27 @@ pub async fn check_truncate_mid_stream<P: Provider>(
     }
 
     failures
+}
+
+/// The minimal prefix length of `full`'s body that decodes to an `Ok`
+/// stream containing `MessageStop`, or `None` if no prefix (including the
+/// whole body) ever does. A linear scan, deliberately not a binary search
+/// — see [`check_truncate_mid_stream`]'s doc comment for why bisection
+/// silently gives the wrong answer for a codec whose "did we reach the
+/// terminal" signal isn't monotonic in prefix length.
+async fn locate_terminal_end<P: Provider>(
+    provider: &P,
+    request: &ChatRequest,
+    full: &CassetteTransport,
+    credentials: &Option<std::sync::Arc<dyn roundhouse_provider::credential::CredentialProvider>>,
+) -> Option<usize> {
+    let n = full.body.len();
+    for len in 0..=n {
+        if decode_prefix_saw_message_stop(provider, request, full, len, credentials).await {
+            return Some(len);
+        }
+    }
+    None
 }
 
 /// Replays the first `len` bytes of `full`'s body and reports whether the
@@ -764,6 +777,118 @@ mod tests {
                 .any(|f| f.contains("fold determinism violated")),
             "expected a fold-determinism failure for a decoder whose output depends on chunk \
              boundaries, got: {failures:#?}"
+        );
+    }
+
+    /// A fake reproducing `bedrock_converse`'s exact non-monotonic shape:
+    /// `Ok` + `MessageStop` the instant the real terminal's bytes are fully
+    /// present (byte 8 here), `Err` while a LEGITIMATE later frame (the
+    /// post-terminal metadata frame bedrock always sends) is mid-flight,
+    /// and `Ok` + `MessageStop` again once the whole body -- metadata frame
+    /// included -- is present. "Does this prefix decode with a MessageStop"
+    /// is therefore `false, ..., true (at 8), false, ..., true (at 16)` --
+    /// NOT a single false-then-true transition.
+    struct NonMonotonicTerminalProvider;
+
+    /// Byte offset at which this fake's terminal is fully present.
+    const NON_MONOTONIC_TERMINAL_END: usize = 3;
+    /// Total body length (terminal + a trailing, legitimate "metadata"
+    /// frame after it).
+    const NON_MONOTONIC_BODY_LEN: usize = 20;
+
+    impl Provider for NonMonotonicTerminalProvider {
+        fn capabilities(
+            &self,
+            _model: &roundhouse_provider::ModelId,
+        ) -> roundhouse_provider::Capabilities {
+            roundhouse_provider::Capabilities::default()
+        }
+
+        fn resolve(
+            &self,
+            _req: &ChatRequest,
+        ) -> Result<roundhouse_provider::Plan, roundhouse_provider::ProviderError> {
+            Ok(roundhouse_provider::Plan {
+                endpoint: "https://fake.invalid".into(),
+            })
+        }
+
+        fn stream_chat<'a>(
+            &'a self,
+            _req: &'a ChatRequest,
+            ctx: &'a RequestCtx,
+        ) -> roundhouse_provider::BoxFut<'a, Result<ChatStream, roundhouse_provider::ProviderError>>
+        {
+            Box::pin(async move {
+                let resp = ctx
+                    .transport
+                    .send(roundhouse_provider::HttpRequest {
+                        method: "POST".into(),
+                        url: "https://fake.invalid".into(),
+                        headers: vec![],
+                        body: vec![],
+                    })
+                    .await
+                    .expect("cassette transport never fails");
+                let mut received_len = 0usize;
+                let mut body = resp.body;
+                while let Some(chunk) = body.next().await {
+                    received_len += chunk
+                        .expect("CassetteTransport never yields a transport error")
+                        .len();
+                }
+                match received_len {
+                    len if len == NON_MONOTONIC_TERMINAL_END || len == NON_MONOTONIC_BODY_LEN => {
+                        Ok(ChatStream(Box::pin(futures::stream::iter(vec![
+                            StreamEvent::MessageStop,
+                        ]))))
+                    }
+                    len if len > NON_MONOTONIC_TERMINAL_END && len < NON_MONOTONIC_BODY_LEN => {
+                        Err(roundhouse_provider::ProviderError::StreamInterrupted {
+                            partial: String::new(),
+                        })
+                    }
+                    _ => Ok(ChatStream(Box::pin(futures::stream::iter(Vec::new())))),
+                }
+            })
+        }
+
+        fn count_tokens<'a>(
+            &'a self,
+            _req: &'a ChatRequest,
+            _ctx: &'a RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<roundhouse_provider::TokenCount, roundhouse_provider::ProviderError>,
+        > {
+            Box::pin(async { Ok(roundhouse_provider::TokenCount::default()) })
+        }
+    }
+
+    /// Pins the exact defect found in review: bisection over a
+    /// non-monotonic "did we reach the terminal" signal silently converges
+    /// on the WRONG (later) true point. This test is RED against a binary
+    /// search (it returns `Some(16)`, the whole body) and GREEN against a
+    /// linear scan (it returns `Some(8)`, the real, minimal terminal).
+    #[tokio::test]
+    async fn locate_terminal_end_finds_the_minimal_terminal_not_a_later_one_past_a_gap() {
+        let full = CassetteTransport {
+            status: 200,
+            headers: vec![],
+            body: vec![0u8; NON_MONOTONIC_BODY_LEN],
+            chunk_size: 0,
+        };
+        let request = crate::fixtures::simple_request();
+
+        let terminal_end =
+            locate_terminal_end(&NonMonotonicTerminalProvider, &request, &full, &None).await;
+
+        assert_eq!(
+            terminal_end,
+            Some(NON_MONOTONIC_TERMINAL_END),
+            "must locate the real, minimal terminal (byte {NON_MONOTONIC_TERMINAL_END}), not \
+             the whole body (byte {NON_MONOTONIC_BODY_LEN}) a binary search wrongly converges \
+             on when the signal isn't monotonic"
         );
     }
 }
