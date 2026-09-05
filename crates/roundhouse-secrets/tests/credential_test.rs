@@ -752,6 +752,43 @@ async fn sigv4_applies_signature_with_identifier_kept_out_of_secret_wrapper() {
 }
 
 #[tokio::test]
+async fn sigv4_credential_scope_carries_the_configured_service_not_a_hardcoded_bedrock() {
+    // Phase 7 Task 30 (Ruling R13): the audit's "hardcoded service" finding
+    // has no production instance today -- `SigV4Credential::new` has zero
+    // production callers (every reference is a test fixture), and the
+    // call site the audit blamed (`AnthropicMessagesProfileProvider::
+    // stream_chat`) does not exist anywhere in this codebase. This
+    // regression test pins the real contract directly at the type that
+    // does exist: `SigV4Credential` must thread whatever `service` it was
+    // constructed with into the signed request's credential scope, never
+    // a literal `"bedrock"` -- so a future call site that DOES hardcode
+    // `"bedrock"` (the specific regression the audit was worried about)
+    // fails this test immediately, regardless of where that call site
+    // ends up living.
+    let cred = SigV4Credential::new(
+        "AKIAEXAMPLE",
+        Secret::new("wJalrXUtnFEMI".to_string()),
+        None,
+        "us-east-1",
+        "some-other-aws-service",
+    );
+    let t = NullTransport;
+    let mut req = empty_request();
+    cred.apply(&mut req, &ctx(&t)).await.unwrap();
+    let auth = header(&req, "authorization").expect("SigV4 must set an Authorization header");
+    assert!(
+        auth.contains("/us-east-1/some-other-aws-service/aws4_request"),
+        "credential scope must carry the configured service, not a hardcoded \
+         value: {auth}"
+    );
+    assert!(
+        !auth.contains("/bedrock/"),
+        "a non-bedrock service must never silently become bedrock in the \
+         credential scope: {auth}"
+    );
+}
+
+#[tokio::test]
 async fn sigv4_carries_session_token_header_when_present() {
     let cred = SigV4Credential::new(
         "AKIAEXAMPLE",
