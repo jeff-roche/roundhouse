@@ -1,5 +1,16 @@
-//! The bound on anchor/alias expansion that closes the denial-of-service
-//! finding recorded in [`super`]'s module doc comment.
+//! The bound on anchor/alias expansion, recorded against the
+//! denial-of-service finding in [`super`]'s module doc comment.
+//!
+//! **Task 14 (lane W5) update.** What actually closes that finding
+//! structurally, as of Task 14, is `roundhouse_sandbox::bounded_parse`'s
+//! out-of-process CPU/wall-clock/output-size bound around the real
+//! `serde_yaml` deserialize (see [`super`]'s module doc, "the recommended
+//! remedy above is now implemented") — not this module. This module is
+//! still exactly what it always was: a real, well-tested fast-path
+//! rejection for the shapes it understands, now sitting in front of that
+//! real bound rather than standing in as the boundary itself. Nothing
+//! below changed to reflect that; it is accurate as a description of the
+//! mechanism either way.
 //!
 //! # The mechanism: use the real deserializer as its own budget meter
 //!

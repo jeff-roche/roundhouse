@@ -7,6 +7,15 @@ license.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+# Task 14 (lane W5, ruling W5-4): the out-of-process YAML-parsing helper
+# `parse::helper` spawns under `roundhouse-sandbox`'s
+# `bounded_parse::run_bounded_subprocess`. Named following the existing
+# `round-` prefix convention (`round`, `round-daemon-internal`). Deliberately
+# tiny — see `src/bin/round_yaml_parse_helper.rs`'s own doc comment.
+name = "round-yaml-parse-helper"
+path = "src/bin/round_yaml_parse_helper.rs"
+
 [features]
 # L7 (security ruling, first applied to `roundhouse-sched`): gates
 # `durability::open_test_db` so daemon code can never reach for it as if it
@@ -53,6 +62,19 @@ serde_yaml = "0.9"
 # `serde` impls in non-test code. Same version/feature set
 # `roundhouse-core`'s own `Cargo.toml` already pins for the same purpose.
 uuid = { version = "1", features = ["v4", "serde"] }
+# Task 14 (lane W5, ruling W5-1): the one new Cargo edge this task adds.
+# `parse::helper` spawns `round-yaml-parse-helper` under this crate's
+# `bounded_parse::run_bounded_subprocess` to run `serde_yaml`'s
+# quadratic-cost anchor/alias expansion out of process, under a real
+# CPU/wall-clock/output-size bound, rather than trust an in-process byte
+# cap against it (see `src/parse/mod.rs`'s module doc comment for the
+# measured cost and the residual this closes). Landed atomically with the
+# `docs/architecture/02-system-architecture.md` §5.2 row update for this
+# crate — `xtask`'s workspace-shape drift guard asserts the two agree.
+# `roundhouse-sandbox` exposes only concrete, synchronous, dependency-light
+# primitives here and never learns what a workflow is; this crate provides
+# the YAML-specific caller on top.
+roundhouse-sandbox = { path = "../roundhouse-sandbox" }
 
 [dev-dependencies]
 # Self dev-dependency, activating the `test-util` feature for this crate's own

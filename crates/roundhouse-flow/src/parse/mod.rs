@@ -317,6 +317,43 @@
 //! workflow YAML) inherits the *residual* above, which is smaller than what
 //! it inherited before but is not nothing.
 //!
+//! ## Task 14 (lane W5): the recommended remedy above is now implemented
+//!
+//! The "parse out of process under `RLIMIT_CPU`" remedy this section
+//! recommended and left unimplemented is now real:
+//! [`helper::parse_via_helper`] runs the actual `serde_yaml` deserialization
+//! in a separate `round-yaml-parse-helper` process, spawned under
+//! `roundhouse_sandbox::bounded_parse::run_bounded_subprocess`'s CPU
+//! (Linux), wall-clock (every platform) and output-size bound. This closes
+//! both rows the axis inventory above still called open:
+//!
+//! - **Tokenizing** and **integer decode** are now genuinely bounded — not
+//!   by a smarter in-process meter (none was found), but because the whole
+//!   process doing that work is killed once it exceeds a real resource
+//!   ceiling, regardless of which internal stage is spending it. The
+//!   9,435.7 ms admitted integer-decode maximiser this section describes is
+//!   exactly the shape `crates/roundhouse-flow/tests/bounded_parse_out_of_process.rs`
+//!   exercises: admitted past every guard below, and killed by the
+//!   out-of-process bound instead of running to completion.
+//! - **The structural doubling** paragraph's concern — that `WorkflowDef`'s
+//!   `serde_yaml::Value` fields force a second, unmetered `serde_yaml::from_str`
+//!   over the original alias structure — is also gone: the helper
+//!   deserializes into a `serde_yaml::Value` (which is where the expensive
+//!   alias-following work actually happens, now inside the bounded child)
+//!   and re-serializes it alias-free. The parent's own second `serde_yaml`
+//!   call, in [`parse_workflow`], runs over *that* alias-free output, so it
+//!   is a plain linear parse, not a second walk of the original structure.
+//!
+//! **What this does not close (ruling W5-6):** the three checks below —
+//! [`MAX_YAML_BYTES`], [`nesting_depth_bound_violation`], and
+//! `expansion::check_expansion` — are untouched. They remain exactly as
+//! best-effort as they were, over-rejection bug included (see
+//! `nesting_depth_bound_violation`'s own doc comment). They are now a
+//! fast-path rejection layered in *front of* a real resource bound, not
+//! the security boundary itself; Phase 5's parked over-rejection regression
+//! is **not** addressed by this task; see each constant/function's own doc
+//! comment for the same statement made locally.
+//!
 //! # Bounds this module does enforce, and exactly what each is worth
 //!
 //! - **Anchors/aliases ("billion laughs"):** `serde_yaml` 0.9's event
@@ -449,6 +486,7 @@
 //!   size-shaped ones interact on purpose: see [`MAX_YAML_BYTES`].
 
 mod expansion;
+mod helper;
 pub mod steps;
 pub mod types;
 
@@ -521,6 +559,17 @@ use thiserror::Error;
 /// [`expansion::FLOAT_SCALAR_WEIGHT_BYTES`]' residual section.
 ///
 /// For scale: the frozen §8.9 fixture is 2,271 bytes.
+///
+/// **Task 14 (lane W5) update.** The 9,435.7 ms P63 residual this doc
+/// comment describes is now bounded for a different reason than this
+/// constant: the real `serde_yaml` deserialize that pays it runs out of
+/// process, under `roundhouse_sandbox::bounded_parse`'s CPU/wall-clock
+/// bound (see [`super`]'s module doc, "the recommended remedy above is now
+/// implemented"). This constant, and the interim-lever advice above, are
+/// **defence in depth now** — a cheap fast-path rejection layered in front
+/// of that real bound, not the thing standing between an admitted document
+/// and an unbounded cost. P63's "accepted residual" framing is superseded
+/// by that bound rather than by this constant changing.
 pub const MAX_YAML_BYTES: usize = 262_144;
 
 /// The maximum **expanded byte weight** a workflow document may produce once
@@ -903,6 +952,24 @@ pub enum ParseError {
     #[error("workflow YAML parse error: {0}")]
     Yaml(#[from] serde_yaml::Error),
 
+    /// The out-of-process YAML-parsing helper (Task 14, lane W5) could not
+    /// be located or spawned. Deliberately never a silent fallback to an
+    /// in-process `serde_yaml::from_str` — see `helper`'s module doc
+    /// comment for why.
+    #[error("workflow YAML helper is unavailable: {0}")]
+    HelperUnavailable(String),
+
+    /// The out-of-process helper (Task 14, lane W5) hit its own CPU,
+    /// wall-clock, or output-size bound and was killed. Reaching this
+    /// variant means the document passed every in-process guard above but
+    /// still cost more than the real resource bound allows once actually
+    /// deserialized — exactly the residual this task closes (see this
+    /// module's doc comment's axis inventory, integer-decode row).
+    #[error(
+        "workflow YAML exceeded the out-of-process parsing resource bound and was rejected: {0}"
+    )]
+    ExceededParseResourceBound(#[source] roundhouse_sandbox::bounded_parse::BoundedParseError),
+
     #[error("step id {id:?} is invalid: {reason}")]
     InvalidStepId { id: String, reason: String },
 
@@ -993,7 +1060,20 @@ pub fn parse_workflow(yaml: &str) -> Result<WorkflowDef, ParseError> {
         expansion::Verdict::Malformed(err) => return Err(ParseError::Yaml(err)),
     }
 
-    let def: WorkflowDef = serde_yaml::from_str(yaml)?;
+    // Task 14 (lane W5): the real `serde_yaml` deserialization — the stage
+    // that actually walks and materializes every anchor/alias expansion,
+    // and the one no in-process check above can bound the *cost* of, only
+    // reject some shapes of before paying it — runs out of process, under
+    // a real CPU/wall-clock/output-size bound (`helper::parse_via_helper`).
+    // The three checks above remain load-bearing as a fast-path rejection
+    // for the shapes they understand; see each of their own doc comments
+    // for why none of them is the security boundary any more. The bytes
+    // that come back are already alias-free (the helper deserializes into
+    // a `serde_yaml::Value` and re-serializes it), so this second
+    // `serde_yaml` call is a plain linear parse, not a second unmetered
+    // walk of the original alias structure.
+    let expanded_yaml = helper::parse_via_helper(yaml)?;
+    let def: WorkflowDef = serde_yaml::from_slice(&expanded_yaml)?;
 
     if def.steps.len() > MAX_TOP_LEVEL_STEPS {
         return Err(ParseError::TooManySteps {
@@ -1057,6 +1137,17 @@ enum NestingViolation {
 /// them; it is not claimed to catch everything, and a future crafted input
 /// finding a new way past it would not be a regression of any promise this
 /// function makes.
+///
+/// **Task 14 (lane W5) update.** This was already true before Task 14 and
+/// remains exactly as true after it: this function is still best-effort
+/// defence in depth, not a security boundary, and the known false positive
+/// below is untouched — ruling W5-6 explicitly did not authorize touching
+/// it. What changed is what stands *behind* it: the tokenizing cost this
+/// comment says nothing bounds is now capped anyway, because the real
+/// `serde_yaml` deserialize that would pay it runs out of process under
+/// `roundhouse_sandbox::bounded_parse`'s CPU/wall-clock bound (see
+/// [`super`]'s module doc). This function is a fast-path rejection in
+/// front of that real bound now, exactly as best-effort as ever.
 ///
 /// # Known false positive (fix round 4 on Task 10): documented, not fixed
 ///

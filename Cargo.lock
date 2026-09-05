@@ -3688,6 +3688,7 @@ dependencies = [
  "roundhouse-core",
  "roundhouse-engine",
  "roundhouse-flow",
+ "roundhouse-sandbox",
  "roundhouse-store",
  "rusqlite",
  "serde",
