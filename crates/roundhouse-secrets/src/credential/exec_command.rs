@@ -28,6 +28,29 @@ const MAX_STDERR_CHARS: usize = 200;
 /// concurrency note on `apply`.
 const MAX_STDERR_BYTES_BUFFERED: usize = 4 * 1024;
 
+/// Sends `SIGKILL` to a helper's entire process group (see `process_group(0)`
+/// on the spawned `Command` below), not just the immediate child — so a
+/// grandchild the helper forked that's still holding the stdout pipe open
+/// (the exact case `process_group(0)` alone does not reach) is torn down
+/// too, rather than remaining bounded only by the whole-call timeout.
+///
+/// `rustix::process::kill_process_group` is a **safe fn** (fix round 1,
+/// Ruling R34 — an earlier version of this fix wrongly believed group-kill
+/// needed `unsafe` or a new dependency; neither is true: `rustix` is already
+/// a dependency here, used in `resolve.rs`, and this crate's
+/// `#![forbid(unsafe_code)]` binds only this crate's own code, not a
+/// dependency's internals). It wraps `kill(-pgid, SIGKILL)`.
+///
+/// `pgid` must be `child.id()` captured **immediately after `spawn()`**,
+/// before any `.wait()`/`.kill()` call — `Child::id()` returns `None` once
+/// the child has been reaped, which is exactly when a caller on an error
+/// path would otherwise be tempted to fetch it.
+fn kill_helper_process_group(pgid: u32) {
+    if let Some(pid) = rustix::process::Pid::from_raw(pgid as i32) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+}
+
 /// Runs a configured external helper command and treats its stdout (trimmed)
 /// as a bearer token. Common for credential helpers that print a
 /// short-lived token to stdout (e.g. a cloud CLI's `print-access-token`).
@@ -101,19 +124,24 @@ impl CredentialProvider for ExecCommandCredential {
                 // lands directly on a credential helper mid-run. A pgid of 0
                 // makes the child the leader of that new group (see
                 // `tokio::process::Command::process_group`'s own doc
-                // example). This is a plain `std`-mirroring API — no
-                // `unsafe` needed, unlike a raw `kill(-pgid, ..)` FFI call,
-                // which this crate's `#![forbid(unsafe_code)]` would reject.
+                // example) — and gives `kill_helper_process_group` below a
+                // group it can address deliberately, rather than relying on
+                // whatever group the daemon itself happens to be in.
                 .process_group(0)
                 // If the timeout below fires and this future is dropped
-                // before the child exits, tokio kills the child on drop
-                // instead of leaving it running as an orphan.
+                // before the child exits, tokio kills the direct child on
+                // drop — but see `kill_helper_process_group`'s doc comment
+                // for why that alone doesn't reach a grandchild.
                 .kill_on_drop(true);
 
+            let mut child = command
+                .spawn()
+                .map_err(|e| CredentialError::ExecFailed(None, e.to_string()))?;
+            // Capture NOW, before any `.wait()`/`.kill()` below can reap the
+            // child and make `child.id()` start returning `None`.
+            let pgid = child.id();
+
             let run = async {
-                let mut child = command
-                    .spawn()
-                    .map_err(|e| CredentialError::ExecFailed(None, e.to_string()))?;
                 let mut stdout = child
                     .stdout
                     .take()
@@ -165,7 +193,13 @@ impl CredentialProvider for ExecCommandCredential {
                             // whole async block is dropped (i.e. not until
                             // the outer timeout elapses), so an explicit
                             // kill here is what makes detection fast rather
-                            // than timeout-bounded.
+                            // than timeout-bounded. Kill the whole process
+                            // GROUP, not just the direct child — a
+                            // grandchild the helper forked may be the one
+                            // actually still holding this pipe open.
+                            if let Some(pgid) = pgid {
+                                kill_helper_process_group(pgid);
+                            }
                             let _ = child.kill().await;
                             return Err(CredentialError::ExecFailed(
                                 None,
@@ -238,6 +272,15 @@ impl CredentialProvider for ExecCommandCredential {
             let token = match tokio::time::timeout(self.timeout, run).await {
                 Ok(result) => result?,
                 Err(_) => {
+                    // `run` (and its borrow of `child`) was just dropped by
+                    // `timeout` elapsing, so `child` is usable again here.
+                    // Same reasoning as the cap-exceeded branch above: kill
+                    // the whole process group, not just the direct child,
+                    // so a hung grandchild doesn't outlive this call.
+                    if let Some(pgid) = pgid {
+                        kill_helper_process_group(pgid);
+                    }
+                    let _ = child.kill().await;
                     return Err(CredentialError::ExecFailed(
                         None,
                         format!(

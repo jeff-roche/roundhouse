@@ -698,6 +698,58 @@ async fn exec_command_kills_a_hung_helper_after_its_timeout() {
 }
 
 #[tokio::test]
+async fn exec_command_kills_a_grandchild_holding_the_stdout_pipe_open_via_process_group() {
+    // Phase 7 U4 fix round 1 (Ruling R34): `process_group(0)` alone does
+    // NOT let this code reach a grandchild the helper forked that's still
+    // holding the stdout pipe open after the helper itself exits -- only
+    // killing the whole process group does. This helper's immediate
+    // process (`sh`) backgrounds a `sleep` in a subshell (which, under a
+    // non-interactive `sh -c`'s lack of job control, stays in the SAME
+    // process group as `sh` itself -- the same group `process_group(0)`
+    // put `sh` in) and then exits almost immediately. The backgrounded
+    // `sleep` keeps the write end of the stdout pipe open, so
+    // `stdout.read()` never sees EOF on its own -- only the whole-call
+    // timeout, followed by a real process-GROUP kill, can end this call
+    // and actually reap the leaked grandchild.
+    let cred = ExecCommandCredential::new(
+        "/usr/bin/sh".into(),
+        vec!["-c".into(), "(sleep 876.543 &); printf tok".into()],
+        vec![],
+    )
+    .unwrap()
+    .with_timeout(Duration::from_millis(300));
+    let t = NullTransport;
+    let mut req = empty_request();
+    let err = cred.apply(&mut req, &ctx(&t)).await.unwrap_err();
+    assert!(
+        err.to_string().contains("timed out"),
+        "a grandchild holding the pipe open must force the whole-call \
+         timeout (the helper itself already exited successfully): {err}"
+    );
+
+    // Give the SIGKILL a brief moment to actually remove the process from
+    // the process table, then confirm the grandchild is really gone -- not
+    // merely unreachable from this process, but dead.
+    let mut still_alive = true;
+    for _ in 0..20 {
+        let out = std::process::Command::new("pgrep")
+            .args(["-f", "sleep 876.543"])
+            .output()
+            .expect("pgrep must be runnable in this environment");
+        if !out.status.success() {
+            still_alive = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !still_alive,
+        "the grandchild `sleep 876.543` must be killed via the \
+         process-group kill, not merely orphaned and left running"
+    );
+}
+
+#[tokio::test]
 async fn exec_command_does_not_inherit_the_calling_processs_environment() {
     // A3: the helper must never receive the daemon's ambient environment.
     // `/usr/bin/env` with no arguments prints every env var it can see; with
