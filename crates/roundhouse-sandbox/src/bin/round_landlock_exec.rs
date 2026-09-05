@@ -11,19 +11,23 @@
 //! ```
 //!
 //! By the time this binary starts, bwrap's namespace, mounts, and `--proc`/
-//! `--dev` setup already exist. It applies a real Landlock ruleset — `ReadFile`
-//! and `Execute` on `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc` (enough
-//! for the dynamic linker and any interpreter/shell to load and run);
-//! `ReadFile`+`WriteFile` on `/dev` and `ReadFile`+`ReadDir` on `/proc` (fix
-//! round 1, item 3 — bounded by bwrap's own curated `--dev`/`--proc` mounts,
-//! never the real host device nodes or process table; without this, ordinary
-//! tooling that touches `/dev/null` or `/proc/self/...` failed outright, e.g.
-//! `git --version` exiting 128); full read/write on the workspace root
-//! (`ABI::V1`, matching `probe.rs`'s existing baseline) — via the *safe*
-//! `RulesetCreated::restrict_self()` (`probe.rs`'s module doc comment: this
-//! call needs no `unsafe`), then `CommandExt::exec()`s the real program.
-//! `CommandExt::exec` is also safe, so this binary needs **zero** `unsafe`
-//! code and does not widen `probe.rs`'s carve-out as the crate's one
+//! `--dev` setup already exist. It applies a real Landlock ruleset — `ReadFile`,
+//! `Execute`, and `ReadDir` on `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc`
+//! (enough for the dynamic linker and any interpreter/shell to load and run,
+//! *and* to enumerate a directory the way CPython's `FileFinder` walks
+//! `sys.path` — `ReadDir` added fix round 3, item 1; see
+//! `roundhouse_sandbox::landlock_wrap::SYSTEM_READ_EXEC_DIRS`'s doc comment for
+//! why it was missing and why granting it is bounded, not a blind widening);
+//! `ReadFile`+`WriteFile`+`ReadDir` on `/dev` and `ReadFile`+`ReadDir` on
+//! `/proc` (fix round 1, item 3 — bounded by bwrap's own curated `--dev`/
+//! `--proc` mounts, never the real host device nodes or process table; without
+//! this, ordinary tooling that touches `/dev/null` or `/proc/self/...` failed
+//! outright, e.g. `git --version` exiting 128); full read/write on the
+//! workspace root (`ABI::V1`, matching `probe.rs`'s existing baseline) — via
+//! the *safe* `RulesetCreated::restrict_self()` (`probe.rs`'s module doc
+//! comment: this call needs no `unsafe`), then `CommandExt::exec()`s the real
+//! program. `CommandExt::exec` is also safe, so this binary needs **zero**
+//! `unsafe` code and does not widen `probe.rs`'s carve-out as the crate's one
 //! `unsafe_code`-permitted module.
 //!
 //! # Fail-closed: never execs the real program without a confirmed ruleset
@@ -96,8 +100,11 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
 }
 
 // `SYSTEM_READ_EXEC_DIRS` (imported above): the directories granted `ReadFile`+
-// `Execute` (never write) below — enough for the dynamic linker, an interpreter, or a
-// shell to load and run, nothing more. Not every entry exists on every Linux layout
+// `Execute`+`ReadDir` (never write) below — enough for the dynamic linker, an
+// interpreter, or a shell to load, run, and enumerate (`ReadDir` added fix round 3,
+// item 1 — see this constant's own doc comment in `roundhouse_sandbox::landlock_wrap`
+// for why it was missing and why granting it is bounded). Not every entry exists on
+// every Linux layout
 // (e.g. `/lib64` does not exist on most arm64 distributions) — a missing directory is
 // tolerated (see the `NotFound` handling below), because there is no filesystem
 // object to grant or deny access to in the first place. Any *other* open failure
@@ -114,7 +121,9 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
 /// writing`). Granting access here is bounded, not a blind widening: `bwrap.rs`'s
 /// `--dev /dev` has already replaced the host's real `/dev` with its own minimal,
 /// curated tmpfs before `round-landlock-exec` ever runs, so this rule reaches only
-/// that curated mount, never real host device nodes.
+/// that curated mount, never real host device nodes. `ReadDir` added fix round 3, item
+/// 1 (Ruling W5-42), for the identical reason `SYSTEM_READ_EXEC_DIRS` needed it —
+/// directory enumeration under `/dev`, not just individual-file access.
 const DEV_READ_WRITE_DIR: &str = "/dev";
 
 /// Fix round 1 (Ruling W5-40), item 3: `/proc`, granted `ReadFile`+`ReadDir` (never
@@ -135,8 +144,12 @@ fn apply_landlock_ruleset(workspace: &str) -> Result<(), String> {
     // `probe.rs::landlock_probe_body` uses — do not silently pick a
     // different ABI (Ruling W5-9).
     let abi = ABI::V1;
-    let read_exec = AccessFs::ReadFile | AccessFs::Execute;
-    let dev_read_write = AccessFs::ReadFile | AccessFs::WriteFile;
+    // Fix round 3, item 1 (Ruling W5-42): `ReadDir` added to both — see the module
+    // doc comment and `SYSTEM_READ_EXEC_DIRS`'s and `DEV_READ_WRITE_DIR`'s doc
+    // comments for why this was missing and what it actually costs (nothing: it is
+    // strictly weaker than the `ReadFile` already granted on the identical trees).
+    let read_exec = AccessFs::ReadFile | AccessFs::Execute | AccessFs::ReadDir;
+    let dev_read_write = AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir;
     let proc_read = AccessFs::ReadFile | AccessFs::ReadDir;
     let full_access = AccessFs::from_all(abi);
 

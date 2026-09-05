@@ -94,17 +94,17 @@ pub(crate) fn wrapper_binary_path() -> Result<PathBuf, IsolationError> {
         ))
     })?;
 
-    let sibling = dir.join(WRAPPER_BINARY_NAME);
-    if sibling.is_file() {
+    if let Some(sibling) = resolve_existing_candidate(dir, WRAPPER_BINARY_NAME) {
         return Ok(sibling);
     }
 
     #[cfg(feature = "test-util")]
     {
         if let Some(grandparent) = dir.parent() {
-            let candidate = grandparent.join(WRAPPER_BINARY_NAME);
-            if candidate.is_file() && is_inside_a_target_tree(&candidate) {
-                return Ok(candidate);
+            if let Some(candidate) = resolve_existing_candidate(grandparent, WRAPPER_BINARY_NAME) {
+                if is_inside_a_target_tree(&candidate) {
+                    return Ok(candidate);
+                }
             }
         }
     }
@@ -117,6 +117,32 @@ pub(crate) fn wrapper_binary_path() -> Result<PathBuf, IsolationError> {
     )))
 }
 
+/// Resolves `dir.join(name)` to its **canonical** path if it exists as a file (symlinks
+/// followed), `None` otherwise. Shared by both branches of [`wrapper_binary_path`]
+/// above.
+///
+/// **Task 27 fix round 3, item 2 (Ruling W5-42):** `wrapper_binary_path` used to
+/// return `dir.join(WRAPPER_BINARY_NAME)` *un*-canonicalized while `is_file()` follows
+/// symlinks to decide whether that path exists — so a wrapper reached only through a
+/// symlink was returned as the symlink's own path, not its real target.
+/// [`wrapper_is_inside_workspace`]'s `starts_with` containment check operates on
+/// whatever path string it is handed, so a symlink sitting *outside* the workspace
+/// (passing that check) whose target sits *inside* it was never caught — reproduced
+/// end to end by making the real sibling location a symlink into the workspace: the
+/// spawn was allowed, a confined child overwrote the symlink's target, and the next
+/// session exec'd attacker-controlled code. Canonicalizing here, at resolution time,
+/// makes the doc claim on [`wrapper_is_inside_workspace`] ("both arguments are
+/// expected already canonicalized") actually true for the `wrapper` side, for both the
+/// production sibling lookup and the `test-util` grandparent fallback.
+fn resolve_existing_candidate(dir: &Path, name: &str) -> Option<PathBuf> {
+    let candidate = dir.join(name);
+    if candidate.is_file() {
+        std::fs::canonicalize(&candidate).ok()
+    } else {
+        None
+    }
+}
+
 /// See `roundhouse-flow`'s identical helper (`parse/helper.rs`,
 /// `is_inside_a_target_tree`, ruling W5-25) for the full rationale — copied
 /// rather than shared across a crate boundary neither crate otherwise needs.
@@ -127,9 +153,26 @@ fn is_inside_a_target_tree(path: &Path) -> bool {
 }
 
 /// The system directories `round_landlock_exec.rs`'s ruleset grants `ReadFile`+
-/// `Execute` on, and the same list [`validate_workspace_root`] below consults to
-/// refuse a workspace root that would swallow one of them under the workspace's own,
-/// much broader grant.
+/// `Execute`+`ReadDir` on, and the same list [`validate_workspace_root`] below
+/// consults to refuse a workspace root that would swallow one of them under the
+/// workspace's own, much broader grant.
+///
+/// **Task 27 fix round 3, item 1 (Ruling W5-42): `ReadDir` was missing, so nothing
+/// that enumerates a directory here could run — attribution, stated plainly.** Fix
+/// round 1's own brief blamed a `python3 -c 'print(1)'` failure on the `/dev`/`/proc`
+/// denial that round then fixed; that diagnosis came from the security lens's first
+/// pass, was transcribed into the brief without independently isolating the cause,
+/// and was wrong. The fix-round-1 implementation matched its brief's Definition of
+/// Done exactly (`git --version`, a `/dev/null` consumer, was the stated bar, and it
+/// was met) — the *finding as originally stated* ("no real session can run at Sandbox
+/// tier") is what stayed open. Isolated cause: `AccessFs::ReadFile | AccessFs::Execute`
+/// grants none of `ReadDir`, so `ls /usr/lib` — and CPython's `FileFinder`, which
+/// calls `listdir()` on every `sys.path` entry to locate its own stdlib — both got
+/// `Permission denied` even though every individual file underneath was already
+/// readable. Adding `ReadDir` is bounded, not the careless widening item 3 of fix
+/// round 1 warned against: it is strictly *weaker* than the `ReadFile` this list
+/// already grants on these same trees — enumerating a directory whose every file you
+/// may already read discloses nothing new.
 ///
 /// **Task 27 fix round 2 (Ruling W5-40 item, escalated by Ruling W5-20's precedent):**
 /// fix round 1 shipped this as two separately-maintained copies — one here (consulted
@@ -176,6 +219,22 @@ pub const SYSTEM_READ_EXEC_DIRS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "
 /// otherwise silently hand `round-landlock-exec` a path that was never the real one,
 /// which then fails downstream (a missing/wrong path) with an error naming the wrong
 /// value instead of naming the actual problem.
+///
+/// **Task 27 fix round 3, item 3 (Ruling W5-42):** the checks above compare
+/// canonicalized *paths*, but Landlock's own rules key on the **inode** a `PathFd` was
+/// opened against, not the path string used to open it. A bind-mount alias of `/` (or
+/// of a system directory) is, to the kernel, indistinguishable from the real thing —
+/// `PathFd::new("<alias>")` *is* a rule on `/` — while `realpath`/`canonicalize` of the
+/// alias returns the alias's own path unchanged (canonicalize only resolves symlinks,
+/// never bind mounts), so it is neither `"/"` nor a prefix of any system directory to
+/// the checks above. Reproduced: with the workspace being a bind alias of `/`, reads
+/// through the alias's sibling *real* paths (`/etc`, `~/.bashrc`, ...) all succeeded —
+/// item 1's exact fail-open, just reached through the inode rather than the path.
+/// [`same_inode`] below is the backstop: it compares `(st_dev, st_ino)` directly,
+/// which a bind mount cannot hide. Kept *alongside* the path-based checks above, not
+/// instead of them — those give a clearer, path-naming error message for the ordinary
+/// (non-bind-mount) case that is the overwhelming majority of real refusals; this is
+/// the inode-level guarantee underneath it.
 pub(crate) fn validate_workspace_root(workspace_root: &Path) -> Result<PathBuf, IsolationError> {
     let canonical = std::fs::canonicalize(workspace_root).map_err(|err| {
         IsolationError::Unsupported(format!(
@@ -192,6 +251,14 @@ pub(crate) fn validate_workspace_root(workspace_root: &Path) -> Result<PathBuf, 
                 .to_string(),
         ));
     }
+    if same_inode(&canonical, Path::new("/")) {
+        return Err(IsolationError::Unsupported(format!(
+            "refusing to apply Landlock: workspace root {} is the same inode as \"/\" (e.g. a \
+             bind-mount alias) — Landlock keys rules on the inode, not the path string, so a \
+             grant here would restrict nothing even though the paths look unrelated",
+            canonical.display()
+        )));
+    }
     for sys_dir in SYSTEM_READ_EXEC_DIRS {
         if let Ok(sys_canonical) = std::fs::canonicalize(sys_dir) {
             if sys_canonical.starts_with(&canonical) {
@@ -199,6 +266,15 @@ pub(crate) fn validate_workspace_root(workspace_root: &Path) -> Result<PathBuf, 
                     "refusing to apply Landlock: workspace root {} contains the system \
                      directory {sys_dir}, which must stay read/execute-only under this \
                      ruleset rather than receive the workspace's full read-write grant",
+                    canonical.display()
+                )));
+            }
+            if same_inode(&canonical, &sys_canonical) {
+                return Err(IsolationError::Unsupported(format!(
+                    "refusing to apply Landlock: workspace root {} is the same inode as the \
+                     system directory {sys_dir} (e.g. a bind-mount alias) — Landlock keys \
+                     rules on the inode, not the path string, so the prefix check above cannot \
+                     see this case",
                     canonical.display()
                 )));
             }
@@ -215,6 +291,20 @@ pub(crate) fn validate_workspace_root(workspace_root: &Path) -> Result<PathBuf, 
     }
 
     Ok(canonical)
+}
+
+/// `true` if `a` and `b` name the same underlying filesystem object — same device and
+/// inode number — even when their paths are textually unrelated, which is exactly
+/// what a bind-mount alias produces and a symlink-resolving [`std::fs::canonicalize`]
+/// cannot see. `false`, rather than erroring, if either path's metadata can't be read
+/// (fix round 3, item 3's use of this treats that as "no evidence of aliasing," not as
+/// license to skip the caller's own path-based checks, which still run regardless).
+fn same_inode(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(meta_a), Ok(meta_b)) => meta_a.dev() == meta_b.dev() && meta_a.ino() == meta_b.ino(),
+        _ => false,
+    }
 }
 
 /// Task 27 fix round 1, item 2 (Ruling W5-40): `true` if `wrapper` lies inside
@@ -387,5 +477,114 @@ mod tests {
             Path::new("/usr/libexec/roundhouse/round-landlock-exec"),
             Path::new("/home/user/workspace"),
         ));
+    }
+
+    // Fix round 3, item 2: `resolve_existing_candidate` (now used by both branches of
+    // `wrapper_binary_path`) must canonicalize through a symlink, not just check
+    // `is_file()` and return the symlink's own path — the exact bug that let a
+    // workspace-contained symlink target evade `wrapper_is_inside_workspace`'s
+    // `starts_with` check. This reproduces the real mechanism (a symlink whose target
+    // sits inside a workspace) using a self-contained temp directory rather than the
+    // shared `target/debug/` build output, so this test never mutates build state
+    // other tests depend on.
+    #[test]
+    fn resolve_existing_candidate_follows_a_symlink_to_its_canonical_target() {
+        let base = std::env::temp_dir().join(format!(
+            "roundhouse-landlock-symlink-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+        let real_wrapper = workspace.join("real-wrapper");
+        std::fs::write(&real_wrapper, b"stand-in binary").expect("write real wrapper");
+        // The symlink itself sits in `base`, a sibling of (not inside) `workspace` —
+        // exactly the ordinary-dev-layout shape (wrapper sibling of the daemon binary)
+        // — but its *target* is inside `workspace`.
+        std::os::unix::fs::symlink(&real_wrapper, base.join(WRAPPER_BINARY_NAME))
+            .expect("create symlink");
+
+        let resolved = resolve_existing_candidate(&base, WRAPPER_BINARY_NAME)
+            .expect("the symlink resolves to a real file");
+        let canonical_workspace = std::fs::canonicalize(&workspace).unwrap();
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&real_wrapper).unwrap(),
+            "must return the symlink's real target, not the symlink's own path"
+        );
+        assert!(
+            wrapper_is_inside_workspace(&resolved, &canonical_workspace),
+            "the canonicalized wrapper path must be detected as inside the workspace"
+        );
+        // Sanity: the un-resolved symlink path itself is NOT lexically inside the
+        // workspace — this is exactly the gap that canonicalizing at resolution time
+        // closes. Before this fix, `wrapper_binary_path` returned this un-resolved
+        // path and this containment check would have missed the real hazard entirely.
+        assert!(!wrapper_is_inside_workspace(
+            &base.join(WRAPPER_BINARY_NAME),
+            &canonical_workspace
+        ));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_existing_candidate_returns_none_when_nothing_exists_there() {
+        let base = std::env::temp_dir().join(format!(
+            "roundhouse-landlock-missing-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("create base dir");
+        assert!(resolve_existing_candidate(&base, WRAPPER_BINARY_NAME).is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Fix round 3, item 3: `same_inode` is the backstop for a bind-mount alias, which
+    // Landlock (and the kernel generally) resolves by inode rather than by path.
+    // Directory hard links are refused by the kernel itself (`EPERM`) and creating a
+    // real bind mount needs mount-namespace privileges this test environment does not
+    // reliably have (verified: `unshare --user --map-root-user --mount` bind-mounting
+    // `/` itself fails here even though bind-mounting an ordinary directory like
+    // `/etc` succeeds) — so this exercises the exact comparison `same_inode` performs
+    // using a **file** hard link instead, which the kernel does allow. `dev()`/`ino()`
+    // equality is file-type-agnostic: this is the identical property a directory
+    // bind-mount alias has, tested the one way this environment can produce it
+    // without privilege.
+    #[test]
+    fn same_inode_detects_two_distinct_canonical_paths_sharing_one_inode() {
+        let base = std::env::temp_dir().join(format!(
+            "roundhouse-landlock-inode-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("create base dir");
+        let original = base.join("original");
+        std::fs::write(&original, b"x").expect("write original");
+        let alias = base.join("alias");
+        std::fs::hard_link(&original, &alias).expect("create hard link");
+
+        let canonical_original = std::fs::canonicalize(&original).unwrap();
+        let canonical_alias = std::fs::canonicalize(&alias).unwrap();
+        assert_ne!(
+            canonical_original, canonical_alias,
+            "a hard link keeps two textually distinct paths — canonicalize() has no \
+             symlink to resolve here, which is exactly why the path-based checks above \
+             cannot see this case on their own"
+        );
+        assert!(same_inode(&canonical_original, &canonical_alias));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn same_inode_is_false_for_two_genuinely_unrelated_paths() {
+        assert!(!same_inode(Path::new("/"), &std::env::temp_dir()));
+    }
+
+    // Fix round 3, item 3: wiring — `validate_workspace_root` refuses "/" via the
+    // inode backstop as well as the literal-path check above it (both fire for this
+    // exact input; this pins that the inode branch alone, in isolation, agrees).
+    #[test]
+    fn same_inode_confirms_the_filesystem_root_is_its_own_inode() {
+        assert!(same_inode(Path::new("/"), Path::new("/")));
     }
 }

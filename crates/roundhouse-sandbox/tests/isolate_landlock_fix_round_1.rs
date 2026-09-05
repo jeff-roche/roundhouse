@@ -16,6 +16,15 @@
 //!   Neither of these two tests ever reaches real bwrap — `wrap_for_landlock_if_available`
 //!   fails closed before `spawn_under_bwrap` is called, so there is no risk of actually
 //!   overwriting anything in `target/debug/`.
+//!
+//!   **Fix round 3, item 4 (Ruling W5-42):** both of the tests above originally
+//!   asserted only `result.is_err()`. That cannot detect a regression that deletes the
+//!   `/`-specific guard alone: `wrapper_is_inside_workspace`'s check refuses `cwd = "/"`
+//!   too, since every absolute wrapper path `starts_with("/")` — so
+//!   `spawn_refuses_a_workspace_root_of_the_filesystem_root` would keep passing, for
+//!   the wrong guard's reason, even with `validate_workspace_root`'s own `"/"` check
+//!   deleted. Both tests now match on the specific error text each guard alone
+//!   produces, so each fails if *its own* guard — and only its own — stops firing.
 //! - Item 3: the ruleset used to deny `/dev` and `/proc` outright, so no real workload
 //!   could run at Sandbox tier — reproduced pre-fix: `git --version` exited 128
 //!   (`could not open '/dev/null'... Permission denied`), and reads under `/proc`
@@ -26,7 +35,7 @@
 use roundhouse_core::{OnDegrade, SessionSpec, Tier};
 use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
 use roundhouse_sandbox::probe::{self, MechanismStatus};
-use roundhouse_sandbox::{CommandSpec, Isolate};
+use roundhouse_sandbox::{CommandSpec, Isolate, IsolationError};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -112,11 +121,24 @@ async fn spawn_refuses_a_workspace_root_of_the_filesystem_root() {
         cwd: Some("/".into()),
     };
     let result = isolate.spawn(&handle, cmd).await;
-    assert!(
-        result.is_err(),
-        "spawn must refuse a workspace root of \"/\" rather than emit a Landlock ruleset \
-         that grants every handled access and restricts nothing"
-    );
+    // Fix round 3, item 4: match on the specific text `validate_workspace_root`'s own
+    // "/" check produces, not just `is_err()` — a bare `is_err()` cannot distinguish
+    // this guard from item 2's wrapper-containment guard, which also happens to fire
+    // for `cwd = "/"` (every absolute wrapper path `starts_with("/")`), so it would
+    // keep this test passing even if the "/" check itself were deleted.
+    match result {
+        Err(IsolationError::Unsupported(msg)) => {
+            assert!(
+                msg.contains("workspace root is \"/\""),
+                "expected the \"/\"-specific guard (validate_workspace_root) to fire; got a \
+                 different Unsupported message instead: {msg}"
+            );
+        }
+        other => panic!(
+            "spawn must refuse a workspace root of \"/\" with IsolationError::Unsupported \
+             carrying the \"/\"-specific message, got: {other:?}"
+        ),
+    }
 }
 
 #[tokio::test]
@@ -157,14 +179,27 @@ async fn spawn_refuses_when_the_workspace_contains_the_wrapper_binary() {
         cwd: Some(workspace.to_string_lossy().into_owned()),
     };
     let result = isolate.spawn(&handle, cmd).await;
-    assert!(
-        result.is_err(),
-        "spawn must refuse when the resolved wrapper binary ({}) lies inside the workspace \
-         root ({}) that this ruleset would grant full read-write access to — a correctly \
-         confined child could overwrite it before any ruleset applies to the next spawn",
-        wrapper_path.display(),
-        workspace.display()
-    );
+    // Fix round 3, item 4: match on the specific text `wrapper_is_inside_workspace`'s
+    // guard produces, so this test fails if *that* guard specifically stops firing —
+    // this scenario's workspace root (`target/debug/`) is neither "/" nor a system
+    // directory, so `validate_workspace_root` cannot be what's refusing here; a bare
+    // `is_err()` would not distinguish that from this test's own intended guard.
+    match result {
+        Err(IsolationError::Unsupported(msg)) => {
+            assert!(
+                msg.contains("lies inside the workspace root"),
+                "expected the wrapper-containment guard (wrapper_is_inside_workspace) to \
+                 fire; got a different Unsupported message instead: {msg}"
+            );
+        }
+        other => panic!(
+            "spawn must refuse when the resolved wrapper binary ({}) lies inside the \
+             workspace root ({}) with IsolationError::Unsupported carrying the \
+             containment-specific message, got: {other:?}",
+            wrapper_path.display(),
+            workspace.display()
+        ),
+    }
 }
 
 #[tokio::test]
