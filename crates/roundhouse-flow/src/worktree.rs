@@ -60,6 +60,25 @@ pub trait WorktreeProvider: Send + Sync {
     /// to `git` as a single, discrete argv element — never interpolated
     /// into a shell string — regardless of what it contains. See that
     /// function's own doc comment for the full guarantee.
+    ///
+    /// # Error obligation an implementor MUST honour
+    ///
+    /// `base_ref` may be **secret-derived**, and the caller persists this
+    /// error's [`WorktreeProviderError::safe_summary`] into an append-only
+    /// event log it can never redact afterwards. So: **an implementation
+    /// whose error may embed free text from outside its own control — its
+    /// subprocess's stderr, an OS error string, an echoed argv, or the
+    /// `base_ref` it was handed — MUST construct that error with
+    /// [`WorktreeProviderError::with_safe_summary`], never with
+    /// [`WorktreeProviderError::new`].**
+    ///
+    /// [`WorktreeProviderError::new`] sets the safe rendering equal to the
+    /// full one, which is correct only for a message the implementation
+    /// wrote entirely itself. Getting this wrong defeats ruling W5-36's
+    /// withhold end to end, silently: there is no compile-time or runtime
+    /// signal, and the caller has no way to tell the two constructors
+    /// apart. See [`WorktreeProviderError::safe_summary`]'s own doc
+    /// comment for why a needle-based scrub is not an alternative here.
     fn materialize(&self, base_ref: &str) -> Result<PathBuf, WorktreeProviderError>;
 
     /// Removes a worktree previously returned by [`Self::materialize`].
@@ -72,6 +91,15 @@ pub trait WorktreeProvider: Send + Sync {
     /// (`crate::exec::Executor::dispatch_map_step`) holds the
     /// path in a guard it never reconstructs from other data — see that
     /// function's own doc comment for how it guarantees this.
+    ///
+    /// # Error obligation an implementor MUST honour
+    ///
+    /// The same one [`Self::materialize`] states in full, and for the same
+    /// reason: **an implementation whose error may embed free text from
+    /// outside its own control MUST construct it with
+    /// [`WorktreeProviderError::with_safe_summary`], never with
+    /// [`WorktreeProviderError::new`].** A release failure is persisted on
+    /// the same append-only path as a materialize failure.
     fn release(&self, worktree_path: &Path) -> Result<(), WorktreeProviderError>;
 }
 
@@ -85,7 +113,6 @@ pub trait WorktreeProvider: Send + Sync {
 /// W5-36) — see [`Self::safe_summary`]'s own doc comment for why a single
 /// message cannot serve both a caller that knows the failing call involved
 /// no secret-derived input and one that cannot make that assumption.
-#[derive(Debug)]
 pub struct WorktreeProviderError {
     /// The full message — for a caller that has established the inputs to
     /// the failing call carry no secret-derived material. May embed
@@ -102,6 +129,13 @@ impl WorktreeProviderError {
     /// for a failure this implementation knows carries no text from
     /// outside its own control (nothing derived from a workflow-authored,
     /// possibly-secret-influenced value).
+    ///
+    /// **Not the default choice, despite the name.** If the message may
+    /// embed a subprocess's stderr, an OS error string, an echoed argv, or
+    /// the `base_ref` the call was handed, use
+    /// [`Self::with_safe_summary`] instead — see
+    /// [`WorktreeProvider::materialize`]'s "Error obligation an implementor
+    /// MUST honour".
     pub fn new(message: impl Into<String>) -> Self {
         let message = message.into();
         Self {
@@ -143,6 +177,25 @@ impl WorktreeProviderError {
     /// doc comment for the sandbox-crate half of this same reasoning.
     pub fn safe_summary(&self) -> &str {
         &self.safe
+    }
+}
+
+/// Prints the **safe** rendering only (final round, item A4) — the same
+/// convention [`crate::expr::Interpolated`]'s own hand-written `Debug`
+/// sets, and for the same reason: the hazardous rendering must not be
+/// reachable by typing the innocent thing.
+///
+/// `#[derive(Debug)]` here printed `full`, which is exactly the text
+/// ruling W5-36 exists to keep out of a persisted log. No non-test call
+/// site formats this type via `Debug`/`unwrap`/`expect` today, so this
+/// closes a path before it opens rather than fixing a live leak — but the
+/// type is `pub`, `.unwrap()` prints `Debug`, and lane W1's daemon wiring
+/// is the obvious next consumer.
+impl std::fmt::Debug for WorktreeProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorktreeProviderError")
+            .field("safe_summary", &self.safe)
+            .finish_non_exhaustive()
     }
 }
 
@@ -245,5 +298,31 @@ impl WorktreeProvider for SandboxWorktreeProvider {
                 ),
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Final round, item A4: pins the hand-written `Debug` above. A future
+    /// `#[derive(Debug)]` would restore the full rendering — the text
+    /// ruling W5-36 exists to keep out of the append-only log — and
+    /// nothing else in this crate would notice.
+    #[test]
+    fn debug_prints_the_safe_summary_and_never_the_full_rendering() {
+        let error = WorktreeProviderError::with_safe_summary(
+            "git said: MARKER-FULL-RENDERING",
+            "CommandFailed: withheld",
+        );
+        let debug = format!("{error:?}");
+        assert!(
+            !debug.contains("MARKER-FULL-RENDERING"),
+            "Debug must not print the full rendering, got: {debug}"
+        );
+        assert!(
+            debug.contains("CommandFailed: withheld"),
+            "Debug must still identify the failure via its safe summary, got: {debug}"
+        );
     }
 }
