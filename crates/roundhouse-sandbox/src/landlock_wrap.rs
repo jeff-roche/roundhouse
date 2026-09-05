@@ -388,10 +388,23 @@ pub(crate) fn wrapper_is_inside_workspace(wrapper: &Path, workspace_root: &Path)
 
 /// Rewrites `cmd` so bwrap execs `round-landlock-exec --allow <workspace> --
 /// <original program> <original argv...>` instead of the real program
-/// directly. `workspace_root` is the same path `bwrap.rs::spawn_under_bwrap`
-/// binds read-write into the sandbox, passed through unchanged as the one
-/// directory `round-landlock-exec`'s ruleset grants full read/write access
-/// to. Callers must pass an already-[`validate_workspace_root`]-checked path — this
+/// directly. `workspace_root` names the one directory
+/// `round-landlock-exec`'s ruleset grants full read/write access to.
+///
+/// **It is the same *location* `bwrap.rs::spawn_under_bwrap` binds
+/// read-write into the sandbox, not necessarily the same string.** An
+/// earlier version of this sentence said "passed through unchanged", which
+/// stopped being true in Task 27's fix round 1: `spawn()` hands bwrap the
+/// **raw** `cmd.cwd`-derived path while this function receives the
+/// **canonicalized** one. Harmless — the two resolve to the same real
+/// directory at the OS level, which is what both the bind and the Landlock
+/// rule key on (Landlock rules key on the inode a `PathFd` opened, not on
+/// the path text) — but worth stating precisely, because
+/// [`wrapper_is_inside_workspace`]'s "sufficient as well as necessary"
+/// argument rests on the read-write bind and this grant covering the same
+/// directory.
+///
+/// Callers must pass an already-[`validate_workspace_root`]-checked path — this
 /// function itself does no validation and is infallible.
 pub(crate) fn wrap_for_landlock(
     cmd: crate::CommandSpec,

@@ -136,8 +136,20 @@
 //!    common `.git` directory (not inside any one worktree's own checkout),
 //!    governed by **neither** `core.attributesFile` **nor** anything
 //!    tracked in the tree. Reproduced directly, with **no** `.gitattributes`
-//!    file anywhere in the tree at all: `* filter=evil` written there is
-//!    enough on its own.
+//!    file anywhere in the tree at all. **Precision, corrected in the final
+//!    round after an earlier version of this line said the write "is enough
+//!    on its own":** it is enough on its own only where the repository
+//!    already carries a matching `filter.<name>.smudge` entry in its local
+//!    config. Measured: `* filter=evil` in `.git/info/attributes` with no
+//!    `filter.*` config entry produced **0** executions; adding the config
+//!    entry produced **1**. So this route needs **two** writes on a bare
+//!    repository — but only **one** on a repository where such an entry
+//!    already exists, which `git lfs install --local` writes as a matter of
+//!    course, so the realistic case this section warns about stands
+//!    unchanged. What is distinctive about route 2 is not the write count:
+//!    it is that the attributes half lives outside both
+//!    `core.attributesFile`'s reach and the tracked tree, so neither the
+//!    `-c` override above nor a tree-level review sees it.
 //! 3. A `core.attributesFile` entry written into the repository's own
 //!    **shared, local** `.git/config` — the one thing `-c
 //!    core.attributesFile=/dev/null` above actually closes, by overriding
@@ -146,15 +158,18 @@
 //!    `env_clear()` above means this module's own invocations never had a
 //!    `$HOME`, so `~/.config/git/attributes` was never reachable through
 //!    them in the first place. The real route this `-c` flag blocks is the
-//!    *shared-config* write, identical in shape to every other single-write
-//!    primitive this section describes.)
+//!    *shared-config* write, identical in shape to the `filter.*` config
+//!    write route 1 relies on.)
 //!
 //! One attacker write of `git config --local filter.lfs.smudge
-//! /tmp/evil.sh` (or the `.git/info/attributes` write above, which needs no
-//! companion `filter.*` config write reachable through the tree at all)
-//! causes the **next** `add_worktree` call, with this module's full current
-//! argv, to execute `/tmp/evil.sh` during the checkout `worktree add`
-//! performs by design. Reproduced directly for all three routes, against
+//! /tmp/evil.sh` — against a repository whose tracked `.gitattributes`
+//! already declares `* filter=lfs`, i.e. route 1, which is the ubiquitous
+//! real-world case — causes the **next** `add_worktree` call, with this
+//! module's full current argv, to execute `/tmp/evil.sh` during the
+//! checkout `worktree add` performs by design. Route 2 reaches the same
+//! place with one write against a repository that already has a `filter.*`
+//! driver configured, and two otherwise (see route 2 above for the
+//! measurement). Reproduced directly for all three routes, against
 //! both the pre- and post-`core.attributesFile=/dev/null` argv where
 //! applicable — routes 1 and 2 fire under **both**. There is no `filter.*`
 //! wildcard `-c` override. The root cause — the shared, write-through

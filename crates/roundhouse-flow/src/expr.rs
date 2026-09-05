@@ -194,7 +194,7 @@
 //! | any function call `f(a, b)` | **secret** iff any argument is, read or not |
 //! | comparison `a == b` (and `!=`, `<`, `<=`, `>`, `>=`) | **secret** iff either side is — the resulting `Bool` is a one-bit oracle on the secret |
 //! | ternary `c ? a : b` | **secret** iff `c` is, or iff the *selected* branch is; the untaken branch's value never appears in the result so its taint is not propagated |
-//! | `env('NAME')` with no secret argument | **clean** — see the section below; `env()` is a separately escalated, unowned surface and its behaviour is deliberately unchanged here |
+//! | `env('NAME')` with no secret argument | **clean** — the *taint* verdict, not a statement about access: since Task 33 (ruling W5-7) `env()` is allowlist-scoped and deny-by-default, so most reads never return a value at all; a permitted read is one an operator vouched for, and its result is deliberately not marked secret. See the section below |
 //!
 //! Two consequences worth stating plainly. First, this is **deliberately
 //! conservative**: a value merely *computed from* a secret (its length, a
@@ -231,7 +231,9 @@
 //! (`ExprContext::new`) permits `env()` to read nothing at all — and a
 //! caller opts specific, exact, case-sensitive names in via
 //! [`ExprContext::allow_env`]. A denied read is [`ExprError::EnvVarNotAllowed`],
-//! naming the variable but never its value; an allowlisted-but-unset
+//! naming the call's **source text** (a bounded prefix of what the workflow
+//! author wrote, captured before evaluation — never the resolved name and
+//! never a value); an allowlisted-but-unset
 //! variable still resolves to `Value::Null`, exactly as before this task —
 //! the two conditions ("not permitted" and "permitted but unset") are
 //! deliberately distinguishable, so a workflow author debugging a blank
@@ -906,6 +908,23 @@ impl EnvAllowlist {
     /// reinventing the same suffix heuristic itself. Living next to
     /// `EnvAllowlist` keeps it discoverable to whoever writes that config
     /// loader in a way a line buried in another lane's brief is not.
+    ///
+    /// # Not exhaustive — the output is advisory, not complete
+    ///
+    /// This matches exactly the five suffixes below, so a bare `KEY`, the
+    /// plurals (`API_KEYS`, `SECRETS`), `CREDENTIALS`, and every name that
+    /// is credential-shaped only in its own vocabulary (`PAT`, `SESSION`,
+    /// `COOKIE`, a bare service name) all pass through unmentioned. An
+    /// empty return is therefore **not** evidence that an allowlist holds
+    /// no credentials.
+    ///
+    /// That is by design rather than an oversight to widen later: ruling
+    /// W5-17 forbids this from rejecting anything, precisely because a
+    /// name heuristic is not a security boundary and treating it as one
+    /// would make the miss above dangerous. It exists to catch the
+    /// canonical mistake (`ANTHROPIC_API_KEY` allowlisted by accident)
+    /// loudly and cheaply; a caller must not read its silence as an
+    /// all-clear.
     pub fn credential_shaped_names(&self) -> Vec<&str> {
         const CREDENTIAL_SUFFIXES: &[&str] =
             &["_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIAL"];
