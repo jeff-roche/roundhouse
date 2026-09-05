@@ -185,14 +185,18 @@ impl ConformanceSubject for OpenAiResponsesSubject {
                 cassette_path: cassette_path("response_incomplete.cassette"),
                 mask: mask.clone(),
                 declared_loss_events: vec![],
-                // `response.incomplete` carries only a `reason` string, no
-                // error `code` -- nothing in this profile's `[errors]` table
-                // has "max_output_tokens" as a key, so this falls through to
-                // `classify`'s HTTP-status default tier for the real 200
-                // status this response actually had.
-                expected_error: Some(|e| {
-                    matches!(e, ProviderError::BadRequest { status: 200, .. })
-                }),
+                // Phase 7 Task 13b: `response.incomplete` is a lossy-but-real
+                // completion (truncated at `max_output_tokens`), not a
+                // genuine provider-side failure, so it now maps to
+                // `StreamInterrupted` instead of falling through to
+                // `classify`'s HTTP-status default tier as a generic
+                // `BadRequest{200,""}` that discarded the real reason --
+                // matching every sibling codec's convention for this same
+                // shape (`cohere_v2`, `openai_chat`, `anthropic_messages`).
+                // The real reason now survives as a `LossEvent` returned
+                // in-band from `decode_openai_responses_stream` (Ruling R4)
+                // -- see `codec::openai_responses::decode::StreamFailure::loss`.
+                expected_error: Some(|e| matches!(e, ProviderError::StreamInterrupted { .. })),
             },
             ConformanceCase {
                 name: "in_band_error",

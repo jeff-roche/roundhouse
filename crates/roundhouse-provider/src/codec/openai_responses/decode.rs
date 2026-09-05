@@ -50,6 +50,7 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 use sse_stream::SseStream;
 
+use crate::loss_event::{LossEvent, LossKind};
 use crate::stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 use crate::TransportError;
 
@@ -68,6 +69,19 @@ pub struct StreamFailure {
     /// the `incomplete_details.reason`, or a fallback naming the event type
     /// when the payload carried neither.
     pub message: String,
+    /// Phase 7 Task 13b: `response.incomplete` is a **lossy, not a
+    /// genuine, failure** -- the model actually produced output, just less
+    /// of it than requested (truncated at `max_output_tokens`, or cut short
+    /// by `content_filter`). `Some(LossEvent)` here names that distinction
+    /// (Ruling R4: in-band, as data returned from this decode call) so
+    /// `provider.rs` can route it to `ProviderError::StreamInterrupted`
+    /// instead of `classify`'s generic HTTP-status-default `BadRequest`,
+    /// matching every sibling codec's convention for a mid-stream
+    /// max-tokens/content-filter cutoff (`cohere_v2`, `openai_chat`,
+    /// `anthropic_messages`). `None` for `response.failed`/bare `error`,
+    /// which are genuine provider-side failures, not a lossy-but-real
+    /// completion.
+    pub loss: Option<LossEvent>,
 }
 
 /// Decodes an Open Responses SSE response body into normalized
@@ -132,6 +146,7 @@ fn terminal_failure(raw: &str) -> Option<StreamFailure> {
                     .and_then(Value::as_str)
                     .unwrap_or("response.failed with no error detail in the response body")
                     .to_string(),
+                loss: None,
             })
         }
         "response.incomplete" => {
@@ -142,6 +157,11 @@ fn terminal_failure(raw: &str) -> Option<StreamFailure> {
             Some(StreamFailure {
                 code: None,
                 message: reason.to_string(),
+                loss: Some(LossEvent {
+                    kind: loss_kind_for_incomplete_reason(reason),
+                    description: reason.to_string(),
+                    blocks_affected: 1,
+                }),
             })
         }
         "error" => {
@@ -156,9 +176,26 @@ fn terminal_failure(raw: &str) -> Option<StreamFailure> {
                     .and_then(Value::as_str)
                     .unwrap_or("openai-responses stream emitted an error event with no message")
                     .to_string(),
+                loss: None,
             })
         }
         _ => None,
+    }
+}
+
+/// Maps `response.incomplete`'s `incomplete_details.reason` onto a
+/// [`LossKind`]. The two real, documented values for this field are
+/// `"max_output_tokens"` and `"content_filter"` (not present in this
+/// module's own vendored spec excerpt -- `docs/decisions/2026-08-27-open-
+/// responses-spec-verification.md` -- but part of the public Responses API
+/// surface); anything else becomes `LossKind::Other` so a future or
+/// unrecognized reason still names itself in `description` rather than
+/// silently collapsing into one of the two known tags.
+fn loss_kind_for_incomplete_reason(reason: &str) -> LossKind {
+    match reason {
+        "max_output_tokens" => LossKind::TruncatedAtMaxTokens,
+        "content_filter" => LossKind::ContentFiltered,
+        other => LossKind::Other(other.to_string()),
     }
 }
 
@@ -399,6 +436,51 @@ mod terminal_failure_tests {
             terminal_failure(&raw).expect("response.incomplete must be a terminal failure");
         assert_eq!(failure.code, None);
         assert_eq!(failure.message, "max_output_tokens");
+        assert_eq!(
+            failure.loss,
+            Some(crate::loss_event::LossEvent {
+                kind: crate::loss_event::LossKind::TruncatedAtMaxTokens,
+                description: "max_output_tokens".into(),
+                blocks_affected: 1,
+            }),
+            "response.incomplete must name the real reason as a LossEvent, not discard it"
+        );
+    }
+
+    #[test]
+    fn response_incomplete_with_content_filter_reason_is_a_content_filtered_loss() {
+        let raw = serde_json::json!({
+            "type": "response.incomplete",
+            "sequence_number": 9,
+            "response": {
+                "id": "resp_1",
+                "status": "incomplete",
+                "incomplete_details": { "reason": "content_filter" }
+            }
+        })
+        .to_string();
+        let failure =
+            terminal_failure(&raw).expect("response.incomplete must be a terminal failure");
+        assert_eq!(
+            failure.loss.map(|l| l.kind),
+            Some(crate::loss_event::LossKind::ContentFiltered),
+            "an operator must be able to tell content filtering apart from truncation"
+        );
+    }
+
+    #[test]
+    fn response_failed_and_bare_error_carry_no_loss_event() {
+        let failed = serde_json::json!({
+            "type": "response.failed",
+            "sequence_number": 9,
+            "response": { "id": "resp_1", "status": "failed", "error": { "code": "x", "message": "y" } }
+        })
+        .to_string();
+        assert_eq!(
+            terminal_failure(&failed).unwrap().loss,
+            None,
+            "response.failed is a genuine failure, not a lossy-but-real completion"
+        );
     }
 
     #[test]

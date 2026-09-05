@@ -27,6 +27,7 @@ pub mod decode_guard;
 pub mod errors;
 pub mod fallback;
 mod ir;
+pub mod loss_event;
 pub mod pricing;
 pub mod profile;
 mod provider_trait;
@@ -45,6 +46,7 @@ pub use ir::{
     RequestPolicy, ResponseFormat, ShellToolParams, Signature, SystemBlock, TokenCount, ToolCallId,
     ToolChoice, ToolDef, ToolResultPart,
 };
+pub use loss_event::{LossEvent, LossKind};
 pub use provider_trait::{BoxFut, Provider};
 pub use reqwest_transport::ReqwestTransport;
 pub use stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};

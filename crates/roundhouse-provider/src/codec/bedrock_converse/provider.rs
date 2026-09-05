@@ -130,7 +130,7 @@ impl Provider for BedrockConverseProvider {
             }
 
             let headers = to_header_map(&response.headers);
-            let events = decode_bedrock_converse_stream(response.body)
+            let (events, losses) = decode_bedrock_converse_stream(response.body)
                 .await
                 .map_err(|failure| {
                     classify(
@@ -140,6 +140,30 @@ impl Provider for BedrockConverseProvider {
                         &headers,
                     )
                 })?;
+            // Phase 7 Task 13b: `guardrail_intervened`/`content_filtered`
+            // `messageStop.stopReason` values now surface as `LossEvent`s
+            // returned in-band from `decode_bedrock_converse_stream`
+            // (Ruling R4) alongside the real, actually-observed
+            // `MessageStop` -- this is a successful completion, not an
+            // error, so there is no `ProviderError` to remap it into.
+            //
+            // Known gap (see `LossEvent::into_payload`'s doc comment): no
+            // channel out of `stream_chat` exists yet to carry this to a
+            // persisted `EventPayload::Loss` -- `Provider`/`ChatStream`/
+            // `StreamEvent` are all frozen Phase 0 contracts with no field
+            // for it. Logging it here is strictly better than the pre-13b
+            // silence (every `stopReason` produced an identical bare
+            // `MessageStop`); giving it a real return channel is lane W1's
+            // engine-wiring call.
+            for loss in &losses {
+                tracing::warn!(
+                    kind = loss.kind.tag(),
+                    description = %loss.description,
+                    blocks_affected = loss.blocks_affected,
+                    "bedrock-converse stream stopped lossy (messageStop.stopReason) with no \
+                     EventWriter channel yet to persist this as EventPayload::Loss"
+                );
+            }
             let stream = ChatStream(Box::pin(futures::stream::iter(events)));
             Ok(stream)
         })
