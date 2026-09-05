@@ -97,6 +97,18 @@ pub enum Predicate {
     Mcp {
         server: ServerId,
         tool: Option<String>,
+        /// Task 22 (W4): binds the approved call's arguments. `None` means
+        /// unscoped — matches any `args`, the pre-fix behaviour, retained as
+        /// an explicit opt-in for genuinely argument-independent approvals
+        /// (e.g. a read-only discovery tool where the arguments never carry
+        /// anything sensitive). Before this field existed, approving one MCP
+        /// call with specific arguments silently granted every future call
+        /// to that tool regardless of arguments — the real least-privilege
+        /// bug every sibling grant type (`Http`/`Git`/`Shell`) was already
+        /// fixed for. Same idiom as `Predicate::Memory`'s `session` field:
+        /// `matches`'s specificity `bound` is bumped when this is `Some`, so
+        /// a more specific (args-bound) grant outranks a less specific one.
+        args: Option<ArgsPattern>,
     },
     Git {
         subcommand: String,
@@ -192,6 +204,39 @@ pub enum ArgMatcher {
     Glob(Vec<String>),
 }
 
+/// How a `Predicate::Mcp`'s `args` binds against `TaskParams::Mcp`'s
+/// `args: serde_json::Value` (Task 22, W4). `Prefix` is an **object-subset
+/// match** — every key/value in the pattern must be present and equal in the
+/// candidate; extra keys in the candidate are allowed. This is deliberately
+/// not JSON-schema matching (no wildcards, no type constraints, no nested
+/// subset matching) — sufficient for "these specific keys must match"
+/// without building a schema engine.
+#[derive(Debug, Clone)]
+pub enum ArgsPattern {
+    /// The candidate `args` must equal this value exactly.
+    Exact(serde_json::Value),
+    /// The candidate `args` must be a JSON object containing every key in
+    /// this map with an equal value. A non-object candidate never matches —
+    /// fail closed, not a vacuous match.
+    Prefix(serde_json::Map<String, serde_json::Value>),
+}
+
+impl ArgsPattern {
+    fn matches(&self, candidate: &serde_json::Value) -> bool {
+        match self {
+            ArgsPattern::Exact(expected) => candidate == expected,
+            ArgsPattern::Prefix(required) => match candidate {
+                serde_json::Value::Object(obj) => {
+                    required.iter().all(|(k, v)| obj.get(k) == Some(v))
+                }
+                // Fail closed: a Prefix pattern is meaningless against a
+                // non-object candidate, so it must never match one.
+                _ => false,
+            },
+        }
+    }
+}
+
 impl Predicate {
     /// A bare program-name match: any argv is accepted (empty required prefix).
     pub fn program(p: &str) -> Self {
@@ -241,8 +286,16 @@ impl Predicate {
             exact: false,
         }
     }
+    /// Unscoped by arguments (`args: None`) — the convenience constructor
+    /// config-authored rules use, which have no specific approved call to
+    /// bind to. A synthesized grant (`approval::synthesize_grant`) builds
+    /// `Predicate::Mcp` directly instead, defaulting to `ArgsPattern::Exact`.
     pub fn mcp(server: ServerId, tool: Option<String>) -> Self {
-        Predicate::Mcp { server, tool }
+        Predicate::Mcp {
+            server,
+            tool,
+            args: None,
+        }
     }
     pub fn git(subcommand: &str, argv_prefix: &[&str]) -> Self {
         Predicate::Git {
@@ -307,14 +360,21 @@ impl Predicate {
                     .then(|| (url_prefix.len(), if method.is_some() { 2 } else { 1 }))
             }
             (
-                Predicate::Mcp { server, tool },
+                Predicate::Mcp { server, tool, args },
                 TaskParams::Mcp {
-                    server: s, tool: t, ..
+                    server: s,
+                    tool: t,
+                    args: a,
                 },
             ) => {
                 let tool_ok = tool.as_ref().map(|x| x == t).unwrap_or(true);
-                (server == s && tool_ok)
-                    .then(|| (server.0.len(), if tool.is_some() { 2 } else { 1 }))
+                let args_ok = args.as_ref().map(|p| p.matches(a)).unwrap_or(true);
+                let bound = [tool.is_some(), args.is_some()]
+                    .iter()
+                    .filter(|b| **b)
+                    .count()
+                    + 1;
+                (server == s && tool_ok && args_ok).then_some((server.0.len(), bound))
             }
             (
                 Predicate::Git {

@@ -173,9 +173,11 @@ impl Grant {
 /// string to an approved URL, or extra flags to an approved git invocation —
 /// now they set the new `Predicate::Http`/`Predicate::Git` `exact: true`
 /// field so the underlying match requires full equality, not merely a
-/// prefix), `Mcp` binds server+tool (`args` binding is a known, out-of-scope
-/// gap — `Predicate::Mcp` has no field for it; tracked separately, not fixed
-/// here), and `Agent` pins `max_tier` to the tier actually requested (Task 21
+/// prefix), `Mcp` binds server+tool+exact args (Task 22 (W4) added
+/// `Predicate::Mcp`'s `args: Option<ArgsPattern>` field; this arm defaults to
+/// `ArgsPattern::Exact` so approving one call never covers a future call
+/// with different arguments), and `Agent` pins `max_tier` to the tier
+/// actually requested (Task 21
 /// (W4) flipped that field's comparison to a floor rather than a ceiling —
 /// see its doc comment in `engine.rs` — so pinning it here means the grant
 /// never generalizes *below* the isolation actually requested).
@@ -214,9 +216,15 @@ pub fn synthesize_grant(
             url_prefix: url.clone(),
             exact: true, // finding 1: exact URL, never a starts_with-widenable prefix
         },
-        (_, TaskParams::Mcp { server, tool, .. }) => Predicate::Mcp {
+        // Task 22 (W4): defaults to `ArgsPattern::Exact` binding, per the
+        // least-privilege principle every other grant type in this file
+        // already follows — a human approving one specific MCP call must
+        // not also grant every future call to that tool regardless of
+        // arguments.
+        (_, TaskParams::Mcp { server, tool, args }) => Predicate::Mcp {
             server: server.clone(),
             tool: Some(tool.clone()),
+            args: Some(crate::engine::ArgsPattern::Exact(args.clone())),
         },
         (
             _,

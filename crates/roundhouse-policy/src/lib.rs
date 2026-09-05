@@ -20,8 +20,8 @@ mod policy_trait;
 mod task_params;
 
 pub use engine::{
-    ArgMatcher, CompiledRule, Decision, Outcome, PolicyEngine, Predicate, RuleId, Scope,
-    TeamMembership,
+    ArgMatcher, ArgsPattern, CompiledRule, Decision, Outcome, PolicyEngine, Predicate, RuleId,
+    Scope, TeamMembership,
 };
 pub use policy_trait::Policy;
 pub use task_params::{
