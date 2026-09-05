@@ -114,6 +114,166 @@ async fn recovers_500_sessions_times_200_tasks_within_five_seconds() {
     }
 }
 
+/// The concrete, hardware-independent half of S-SESS-4's guarantee.
+///
+/// The budget test above measures *how fast* recovery is; this one measures
+/// *what it actually does*, which is the property the budget was defending in
+/// the first place. Per this file's own history, the original
+/// `recover_interrupted_tasks` did a full `events` table scan with one
+/// `writer.append()` per interrupted task; the rewrite made it `tasks`-driven
+/// and batched. Only the rewrite can pass this test, and it passes or fails
+/// identically on a fast laptop and a contended CI runner.
+///
+/// The trick is to make the event log **unreadable** and then require recovery
+/// to succeed anyway. Every `events` row here carries a payload that is not
+/// valid JSON, so any implementation that reads and deserializes the event log
+/// to decide what to recover must error out. One that drives off the `tasks`
+/// table never looks, and returns the full set.
+#[tokio::test]
+async fn recovery_never_reads_the_event_log_so_a_corrupt_log_cannot_break_it() {
+    const SESSIONS: usize = 20;
+    const TASKS_PER_SESSION: usize = 25;
+    const TOTAL: usize = SESSIONS * TASKS_PER_SESSION;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("corrupt-log.db");
+    drop(open(&db_path).await.unwrap());
+
+    // Same shape as `seed_non_terminal_tasks`, except every payload is
+    // deliberately not JSON.
+    {
+        let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert_event = tx
+                .prepare(
+                    "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .unwrap();
+            let mut insert_task = tx
+                .prepare(
+                    "INSERT INTO tasks (task_id, session_id, kind, state, parent, created_seq, updated_seq) \
+                     VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?5)",
+                )
+                .unwrap();
+            for _ in 0..SESSIONS {
+                let session_id_str = SessionId::new().to_string();
+                for task_idx in 0..TASKS_PER_SESSION {
+                    let task_id_str = TaskId::new().to_string();
+                    let seq = task_idx as i64;
+                    insert_event
+                        .execute(rusqlite::params![
+                            session_id_str,
+                            seq,
+                            0i64,
+                            task_id_str,
+                            "}{ this is not JSON and never was",
+                            1i64
+                        ])
+                        .unwrap();
+                    let state = match task_idx % 3 {
+                        0 => "Created",
+                        1 => "Decided",
+                        _ => "Running",
+                    };
+                    insert_task
+                        .execute(rusqlite::params![
+                            task_id_str,
+                            session_id_str,
+                            "Shell",
+                            state,
+                            seq
+                        ])
+                        .unwrap();
+                }
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+    let recovery_store = open(&db_path).await.unwrap();
+
+    let interrupted = recover_interrupted_tasks(&recovery_store, &writer, &RUNNER)
+        .await
+        .expect(
+            "recovery must not read the event log: it is `tasks`-table-driven, so a payload \
+             it never deserializes cannot fail it",
+        );
+
+    assert_eq!(
+        interrupted.len(),
+        TOTAL,
+        "every non-terminal task must be recovered from the `tasks` table alone"
+    );
+}
+
+/// The `state IN (...)` filter must be applied by SQLite, not by loading every
+/// task into Rust and filtering there — the difference is invisible in the
+/// return value but is exactly the difference between O(non-terminal) and
+/// O(all tasks) work. Seeds a large *terminal* population alongside a small
+/// non-terminal one and requires the terminal rows to be untouched.
+#[tokio::test]
+async fn recovery_returns_only_non_terminal_tasks_from_a_mostly_terminal_table() {
+    const NON_TERMINAL: usize = 50;
+    const TERMINAL: usize = 5_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("mostly-terminal.db");
+    drop(open(&db_path).await.unwrap());
+
+    {
+        let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert_task = tx
+                .prepare(
+                    "INSERT INTO tasks (task_id, session_id, kind, state, parent, created_seq, updated_seq) \
+                     VALUES (?1, ?2, ?3, ?4, NULL, 0, 0)",
+                )
+                .unwrap();
+            let session_id_str = SessionId::new().to_string();
+            for i in 0..(NON_TERMINAL + TERMINAL) {
+                let state = if i < NON_TERMINAL {
+                    "Running"
+                } else {
+                    // Terminal and suspended states recovery must skip.
+                    match i % 3 {
+                        0 => "Completed",
+                        1 => "Failed",
+                        _ => "Cancelled",
+                    }
+                };
+                insert_task
+                    .execute(rusqlite::params![
+                        TaskId::new().to_string(),
+                        session_id_str,
+                        "Shell",
+                        state
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+    let recovery_store = open(&db_path).await.unwrap();
+
+    let interrupted = recover_interrupted_tasks(&recovery_store, &writer, &RUNNER)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        interrupted.len(),
+        NON_TERMINAL,
+        "recovery must return only the non-terminal tasks, leaving {TERMINAL} terminal rows alone"
+    );
+}
+
 /// Bulk-seeds `SESSIONS * TASKS_PER_SESSION` tasks, each with one `TaskCreated`
 /// event and a matching `tasks` row left in a non-terminal state (`Created`,
 /// `Decided`, or `Running`, rotated so the query's `IN (...)` clause is
