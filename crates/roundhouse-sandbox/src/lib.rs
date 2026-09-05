@@ -18,6 +18,14 @@
 //! comment for exactly what each mechanism does and doesn't enforce today. See
 //! `docs/architecture/02-system-architecture.md` §5.2 and
 //! `03-security-and-sandboxing.md` (S-ISO-1/2).
+//!
+//! Task 14 (lane W5) added [`bounded_parse`], a second and unrelated kind of
+//! confinement: a generic, synchronous, resource-bounded subprocess
+//! primitive (CPU time on Linux, wall clock and output size everywhere),
+//! consumed by `roundhouse-flow` to run third-party YAML deserialization
+//! out of process rather than trust an in-process byte cap against a
+//! quadratic-cost parser. This crate takes no dependency on `roundhouse-flow`
+//! or anything YAML-shaped in return — see that module's doc comment.
 
 // NOTE: unsafe_code is `deny`, not `forbid`, at the crate level — see
 // Cargo.toml. The only module permitted to use it is `probe` (Phase 2:
@@ -27,6 +35,7 @@
 // `#![allow(unsafe_code)]` on that module alone.
 #![deny(unsafe_code)]
 
+pub mod bounded_parse;
 pub mod bwrap;
 pub mod isolate;
 mod isolate_trait;

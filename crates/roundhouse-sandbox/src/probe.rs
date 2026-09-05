@@ -713,6 +713,67 @@ pub async fn probe_cached(cache_dir: &Path) -> MechanismProbeReport {
 }
 
 // ---------------------------------------------------------------------------------
+// Task 14 (lane W5, ruling W5-3): a second, unrelated reason this module needs to
+// stay the crate's one `unsafe_code`-permitted module. `bounded_parse.rs`'s
+// `run_bounded_subprocess` needs a Linux `RLIMIT_CPU` on the child it spawns, and
+// the only way to install an `rlimit` before a `std::process::Command` execs is
+// `CommandExt::pre_exec` — itself `unsafe`, for the same reason `fork()` above is:
+// its closure runs in the forked child between `fork()` and `exec()`, a window
+// where (per this module's top doc comment) some other thread's inherited,
+// still-locked allocator mutex could wedge the first allocation the closure makes.
+// `set_cpu_limit_pre_exec` keeps the closure itself allocation-free — the `rlimit`
+// struct is built by the caller, before the fork, and the closure's only job is the
+// syscall — so it does not introduce a second copy of that hazard, just reuses the
+// module's existing justification for owning it.
+// ---------------------------------------------------------------------------------
+
+/// Installs a `RLIMIT_CPU` (Linux-only; see [`crate::bounded_parse`]'s module doc
+/// for the non-Linux behaviour) of `limit` CPU-seconds on `cmd`, taking effect the
+/// moment `cmd` execs. Both the soft and hard limit are set to the same value, so
+/// the kernel delivers `SIGXCPU` essentially as soon as the limit is reached; since
+/// [`crate::bounded_parse::run_bounded_subprocess`]'s helper children install no
+/// `SIGXCPU` handler, the default disposition (terminate) applies, and the parent
+/// observes it as a signal-terminated [`std::process::ExitStatus`]
+/// (`BoundedParseError::ResourceExhausted`), not a graceful exit.
+///
+/// Sub-second `Duration`s are rounded up to 1 whole second — `RLIMIT_CPU` has no
+/// finer resolution than whole seconds, and a limit of literal `0` risks reading
+/// as "already exceeded" rather than "one second's grace" on some kernels.
+///
+/// A safe function despite installing an `unsafe` `pre_exec` hook internally: the
+/// `rlimit` value is computed here, before any fork happens, so the closure
+/// `pre_exec` runs later touches no caller-provided state and performs exactly one
+/// syscall.
+#[cfg(target_os = "linux")]
+pub fn set_cpu_limit_pre_exec(cmd: &mut std::process::Command, limit: std::time::Duration) {
+    use std::os::unix::process::CommandExt;
+
+    let seconds = limit.as_secs().max(1);
+    let rlim = libc::rlimit {
+        rlim_cur: seconds,
+        rlim_max: seconds,
+    };
+
+    // SAFETY: this closure runs in the forked child between `fork()` and `exec()`
+    // (the same async-signal-safe-only window `forked_probe::run` documents at the
+    // top of this file) and must not allocate or take a lock. `rlim` is a plain
+    // `Copy` struct built above, outside the closure, so capturing it by value
+    // allocates nothing; `libc::setrlimit` is the closure's only call and is on
+    // POSIX's async-signal-safe function list. `std::io::Error::last_os_error()` on
+    // the failure path reads `errno` and constructs a small enum — no allocation
+    // either (`std::io::Error` on this path is a bare OS error code).
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setrlimit(libc::RLIMIT_CPU, &rlim) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------------
 // Internal regression tests for `forked_probe::run` itself (needs crate-internal
 // access to the private `forked_probe` module, so this lives here rather than in
 // `tests/probe.rs`).
