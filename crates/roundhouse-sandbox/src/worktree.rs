@@ -165,17 +165,56 @@
 //! to run inner steps with a shell inside a materialized worktree at all).
 //! Recorded here as a known, open route, not chased further this round.
 //!
-//! # What this does not attempt
+//! # What this bounds, and what it does not (final round, item A2)
 //!
-//! No CPU/wall-clock/output-size bound, unlike
-//! [`crate::bounded_parse::run_bounded_subprocess`]. That primitive exists
-//! because `roundhouse-flow` hands a bounded subprocess **untrusted
-//! third-party YAML** to deserialize, with a genuinely adversarial cost
-//! profile (quadratic-cost anchor/alias expansion). `git worktree add`/
-//! `remove` run against a repository this process itself manages, with
-//! fixed, small argument lists this module constructs — there is no
-//! untrusted-input resource-exhaustion shape here to bound against, and
-//! adding one would just be unexercised complexity.
+//! **An earlier version of this section declined any bound at all, on the
+//! grounds that "there is no untrusted-input resource-exhaustion shape
+//! here". That could not be true alongside the section above**, which
+//! establishes the opposite: one attacker write to the shared
+//! `.git/config` or `.git/info/attributes` makes the **next**
+//! `add_worktree` call run attacker-chosen code during checkout. Both
+//! final whole-branch review lenses found the contradiction
+//! independently.
+//!
+//! The consequence does not even depend on that route ever being closed.
+//! `Command::output()` returns only when **both** pipes reach EOF, so a
+//! child that forks and backgrounds anything holding stdout blocks it
+//! forever — the ordinary, non-adversarial `sh -c 'thing &'` shape. In
+//! `roundhouse-flow` that wedges the executor thread running
+//! `dispatch_map_step`, the item's `WorktreeGuard` never releases, and the
+//! identical hang is reachable from `WorktreeGuard::drop` mid-unwind,
+//! where it cannot even be reported.
+//!
+//! So `run_program` now spawns the child into **its own process group**
+//! and enforces a wall-clock deadline (`WORKTREE_WALL_LIMIT`), tearing
+//! the whole group down on **every** path out of the wait — including the
+//! one where the direct child exited cleanly, which is precisely the
+//! backgrounding shape above and the same conclusion ruling W5-26 reached
+//! for [`crate::bounded_parse::run_bounded_subprocess`]. Descendants do
+//! not outlive a call. Stdout and stderr are read capped-and-discarding so
+//! a hook that floods output cannot turn the deadline into unbounded
+//! memory growth.
+//!
+//! **What is deliberately still not bounded here, and why it differs from
+//! `run_bounded_subprocess`:** no `RLIMIT_CPU`. That primitive bounds CPU
+//! because it hands a child **untrusted third-party YAML** with a
+//! genuinely adversarial cost profile (quadratic-cost anchor/alias
+//! expansion) and a legitimate parse is cheap. Here a legitimate
+//! `git worktree add` on a large repository is honestly CPU-heavy — a
+//! checkout of every tracked file — so CPU is the wrong axis and a CPU
+//! bound would fail real work. Wall-clock is the axis that separates
+//! "still checking out" from "wedged", and it is generous for that reason.
+//!
+//! This module still does not route through
+//! [`crate::bounded_parse::run_bounded_subprocess`] itself, which would
+//! otherwise be preferable to two spawn conventions in one crate: that
+//! function takes neither a working directory nor an environment (it is
+//! `env_clear()` with no `PATH` — its own doc comment names "Task 34 is
+//! the live case" for exactly this), and its `HelperCrashed` carries the
+//! exit status as a `String`, where [`WorktreeError::CommandFailed`] and
+//! [`WorktreeError::safe_summary`] hold a real `ExitStatus`. Adding two
+//! parameters across thirteen call sites and weakening that type to reuse
+//! the wait loop is a worse trade than the ~40 lines below.
 //!
 //! This module also never validates that `worktree_path` sits under
 //! `repo_root`, or that the two calls forming one worktree's lifecycle
@@ -187,8 +226,34 @@
 //! validates the `program`/`args` its own caller supplies.
 
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// How long any one `git` invocation this module makes may run before its
+/// whole process group is killed and the call fails with
+/// [`WorktreeError::TimedOut`].
+///
+/// Deliberately generous: a legitimate `git worktree add` on a large
+/// repository does a full checkout of every tracked file, and an LFS smudge
+/// filter on top of that can take minutes on a slow network. This bound
+/// exists to separate "wedged forever" from "still working", not to
+/// second-guess how long a real checkout takes — see the module doc
+/// comment's "What this bounds, and what it does not".
+const WORKTREE_WALL_LIMIT: Duration = Duration::from_secs(300);
+
+/// How often the wait loop polls the child. Same interval, for the same
+/// reason (responsiveness against wakeup cost), as `bounded_parse`'s own
+/// poll loop.
+const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// How much of the child's stdout and stderr this module keeps. `git
+/// worktree add`/`remove` emit a line or two; the cap exists so a
+/// repository-controlled hook that floods a pipe cannot turn the wall-clock
+/// bound into unbounded memory growth in this process.
+const OUTPUT_CAP: usize = 64 * 1024;
 
 /// Everything that can go wrong materializing or releasing a git worktree.
 #[derive(Debug, thiserror::Error)]
@@ -224,6 +289,27 @@ pub enum WorktreeError {
         args: Vec<String>,
         status: std::process::ExitStatus,
         stderr: String,
+    },
+    /// The child (or something it forked) was still holding the call open
+    /// once `WORKTREE_WALL_LIMIT` elapsed, and its whole process group was
+    /// killed — see the module doc comment's "What this bounds" section.
+    ///
+    /// Separate from [`WorktreeError::CommandFailed`] rather than folded
+    /// into it: there is no `ExitStatus` to report on this path (the child
+    /// never produced one of its own), and inventing one would misreport a
+    /// bound firing as `git` having decided something.
+    ///
+    /// Carries no text from outside this module, so
+    /// [`WorktreeError::safe_summary`] has nothing to withhold from it.
+    #[error(
+        "`{program}` in {} exceeded the {wall_limit:?} wall-clock bound and its process group \
+         was killed",
+        .repo_root.display()
+    )]
+    TimedOut {
+        program: String,
+        repo_root: PathBuf,
+        wall_limit: std::time::Duration,
     },
 }
 
@@ -272,6 +358,19 @@ impl WorktreeError {
                     repo_root.display()
                 )
             }
+            WorktreeError::TimedOut {
+                program,
+                repo_root,
+                wall_limit,
+            } => {
+                // Every field here is this module's own: the program name
+                // it chose, the caller-supplied `repo_root`, and a constant.
+                // No argv, no stderr — nothing to withhold.
+                format!(
+                    "TimedOut: `{program}` in {} exceeded the {wall_limit:?} wall-clock bound",
+                    repo_root.display()
+                )
+            }
             WorktreeError::CommandFailed {
                 program,
                 repo_root,
@@ -298,10 +397,14 @@ fn run_git(repo_root: &Path, args: &[&OsStr]) -> Result<(), WorktreeError> {
 /// Runs `program` with `args` inside `repo_root`, under `env_clear()` plus
 /// an explicit `PATH` (see the module doc comment's "Environment" section
 /// for why both are required together), returning its captured stdout on
-/// success. Synchronous; no bound of any kind — see the module doc
-/// comment's "What this does not attempt". [`run_git`] (the only non-test
-/// caller) discards the returned bytes — `git worktree add`/`remove`'s
-/// stdout carries nothing this crate needs.
+/// success. Synchronous, and bounded by [`WORKTREE_WALL_LIMIT`] — see the
+/// module doc comment's "What this bounds, and what it does not" for why
+/// this primitive spawns and waits by hand rather than calling
+/// `Command::output()`, and why a wall-clock bound plus a process-group
+/// teardown is the right pair here where `run_bounded_subprocess` also
+/// bounds CPU. [`run_git`] (the only non-test caller) discards the returned
+/// bytes — `git worktree add`/`remove`'s stdout carries nothing this crate
+/// needs.
 ///
 /// Generic over `program` (rather than hard-coding `"git"` inline in
 /// [`run_git`]) purely so this module's own unit tests
@@ -310,6 +413,19 @@ fn run_git(repo_root: &Path, args: &[&OsStr]) -> Result<(), WorktreeError> {
 /// and actually inspect what the child saw — `git` has no "print your own
 /// environment" mode to assert against directly.
 fn run_program(repo_root: &Path, program: &str, args: &[&OsStr]) -> Result<Vec<u8>, WorktreeError> {
+    run_program_bounded(repo_root, program, args, WORKTREE_WALL_LIMIT)
+}
+
+/// [`run_program`] with the wall-clock bound as a parameter, so this
+/// module's own tests can drive the bound in seconds rather than minutes.
+/// Nothing else about the two differs — production always goes through
+/// [`run_program`] and therefore always uses [`WORKTREE_WALL_LIMIT`].
+fn run_program_bounded(
+    repo_root: &Path,
+    program: &str,
+    args: &[&OsStr],
+    wall_limit: Duration,
+) -> Result<Vec<u8>, WorktreeError> {
     let path = std::env::var_os("PATH").ok_or(WorktreeError::NoPath)?;
 
     let mut command = Command::new(program);
@@ -323,29 +439,187 @@ fn run_program(repo_root: &Path, program: &str, args: &[&OsStr]) -> Result<Vec<u
     // path.
     command.env_clear();
     command.env("PATH", &path);
+    // `Command::output()` would set all three of these itself. Spawning by
+    // hand does not, so they are explicit here — and `stdin(null)`
+    // especially: inheriting the daemon's stdin would let a `git`
+    // credential prompt block this call forever, which is a *new* stall of
+    // exactly the kind this function now exists to prevent.
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    // Ruling W5-25's finding 2 and ruling W5-26, applied to this module's
+    // spawn site: makes the child the leader of its own new process group
+    // (pgid == its own pid) so the teardown below can reach everything it
+    // forked, not just the one process `Child::kill()` names. Safe Rust —
+    // no `unsafe` here, so `probe.rs` stays this crate's sole carve-out.
+    // Gated the same way `bounded_parse` gates it (ruling W5-3's off-Linux
+    // convention): off Linux the wall-clock bound still applies to the
+    // direct child, just without group-wide reach.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 
     let arg_strings: Vec<String> = args
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
 
-    let output = command.output().map_err(|source| WorktreeError::Spawn {
+    let mut child = command.spawn().map_err(|source| WorktreeError::Spawn {
         program: program.to_string(),
         repo_root: repo_root.to_path_buf(),
         args: arg_strings.clone(),
         source,
     })?;
 
-    if !output.status.success() {
+    // Captured once, at spawn, rather than re-read at each kill site — the
+    // same discipline (and for the same reason) as ruling W5-26's capture in
+    // `bounded_parse`: every kill below is provably aimed at the group this
+    // call created, not at whatever `child.id()` might return later.
+    let pgid = child.id() as i32;
+    debug_assert!(pgid > 0, "pgid must be a real, positive process-group id");
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout was requested as piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was requested as piped");
+
+    let (timed_out, status, stdout_buf, stderr_buf) = thread::scope(|scope| {
+        // Both pipes are read concurrently with the wait: a child that
+        // fills one while this thread waits on the other would otherwise
+        // deadlock, which is the same reason `bounded_parse` reads on
+        // scoped threads.
+        let stdout_reader = scope.spawn(|| read_capped_discarding(&mut stdout_pipe, OUTPUT_CAP));
+        let stderr_reader = scope.spawn(|| read_capped_discarding(&mut stderr_pipe, OUTPUT_CAP));
+
+        let (timed_out, status) = wait_with_wall_limit(&mut child, pgid, wall_limit);
+
+        // Joined only after the wait has torn the process group down, so
+        // the readers see EOF even when a descendant inherited a pipe.
+        (
+            timed_out,
+            status,
+            stdout_reader.join().unwrap_or_default(),
+            stderr_reader.join().unwrap_or_default(),
+        )
+    });
+
+    if timed_out {
+        return Err(WorktreeError::TimedOut {
+            program: program.to_string(),
+            repo_root: repo_root.to_path_buf(),
+            wall_limit,
+        });
+    }
+    let status =
+        status.expect("wait_with_wall_limit returns a status whenever it did not time out");
+
+    if !status.success() {
         return Err(WorktreeError::CommandFailed {
             program: program.to_string(),
             repo_root: repo_root.to_path_buf(),
             args: arg_strings,
-            status: output.status,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status,
+            stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
         });
     }
-    Ok(output.stdout)
+    Ok(stdout_buf)
+}
+
+/// Polls `child` until it exits on its own or `wall_limit` elapses,
+/// returning `(timed_out, status)`.
+///
+/// **Tears the process group down on both paths, including the one where
+/// the direct child exited cleanly.** That second case is the whole point,
+/// and it is ruling W5-26's finding transplanted to this module: a child
+/// that forks, hands the descendant its inherited stdout, and exits itself
+/// (`sh -c 'thing &'` — an ordinary backgrounding shell, no adversarial
+/// behaviour required) leaves that orphan holding the pipe's write end with
+/// nothing left to close it, and the reader in [`run_program_bounded`]
+/// waits forever for an EOF that never comes. Killing the group is what
+/// closes those inherited descriptors. Descendants do not outlive a call.
+///
+/// **Accepted residual, the same one `bounded_parse::wait_bounded`
+/// documents:** `try_wait()` reaps the direct child before the group kill
+/// is issued, so the kill targets a pgid whose leader is already gone. A
+/// PID recycled into a new group leader inside that microseconds-wide
+/// window would be signalled instead. Closing it needs a different wait
+/// primitive (`waitid(..., WNOWAIT)`), not a bigger kill.
+///
+/// **Second accepted residual:** a descendant that calls `setsid` itself
+/// leaves the group and escapes the kill, which then leaves the reader
+/// blocked until... nothing. This is why the wall-clock bound and the group
+/// kill are both needed and neither is sufficient alone — but a `setsid`
+/// descendant holding a pipe still blocks the join after the timeout fires.
+/// Closing that needs a PID namespace or cgroup, which this module does not
+/// have; it is the same boundary `bounded_parse` records.
+fn wait_with_wall_limit(
+    child: &mut Child,
+    pgid: i32,
+    wall_limit: Duration,
+) -> (bool, Option<ExitStatus>) {
+    let start = Instant::now();
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            kill_process_group_or_child(child, pgid);
+            return (false, Some(status));
+        }
+        if start.elapsed() >= wall_limit {
+            kill_process_group_or_child(child, pgid);
+            // Reap, so a killed child is never left a zombie.
+            let _ = child.wait();
+            return (true, None);
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Kills `child`'s whole process group on Linux, falling back to the direct
+/// child elsewhere — the same split, for the same reason, as
+/// `bounded_parse`'s own kill helper (ruling W5-3's off-Linux convention:
+/// no process-group reach off Linux, so the direct kill carries the load).
+fn kill_process_group_or_child(child: &mut Child, pgid: i32) {
+    #[cfg(target_os = "linux")]
+    {
+        // The group, not `child` itself, is what needs signalling here.
+        let _ = &child;
+        crate::probe::kill_process_group(pgid);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pgid;
+        let _ = child.kill();
+    }
+}
+
+/// Reads `pipe` to EOF, keeping at most `cap` bytes and discarding the
+/// rest.
+///
+/// Draining rather than stopping at the cap matters: a reader that simply
+/// stopped would leave the child blocked on a full pipe until the wall
+/// limit, turning a chatty hook into a guaranteed timeout. Capping rather
+/// than reading it all matters too: with a multi-minute wall limit, a hook
+/// that floods stdout would otherwise be an unbounded-memory shape this
+/// change itself introduced. Same shape as
+/// `bounded_parse::read_stderr_draining`, which is private to that module.
+///
+/// The cap never becomes a verdict: nothing here can fail the call or kill
+/// the child. It bounds what this process buffers, nothing more — the same
+/// distinction ruling W5-28 drew between a caller-declared bound and an
+/// internal capture-buffer size.
+fn read_capped_discarding(pipe: &mut impl Read, cap: usize) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => return kept,
+            Ok(n) => {
+                if kept.len() < cap {
+                    let room = cap - kept.len();
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+        }
+    }
 }
 
 /// Creates a real git worktree at `worktree_path`, detached at `base_ref`,
@@ -466,6 +740,93 @@ mod tests {
             "the child inherited the parent's environment — `env_clear()` is not being \
              applied, and any secret in the daemon's environment (ANTHROPIC_API_KEY and \
              friends) is exposed to every `git` child this module spawns"
+        );
+    }
+
+    /// Final round, item A2 — the reason this module stopped using
+    /// `Command::output()`. Both final whole-branch review lenses found this
+    /// independently, and it is ruling W5-26's finding transplanted from
+    /// `bounded_parse` to this module's own spawn site.
+    ///
+    /// `sh -c 'sleep 30 &'` backgrounds a descendant that inherits the
+    /// stdout pipe's write end, then the shell itself exits 0 immediately
+    /// (no foreground command is left to run) — leaving that descendant
+    /// holding the pipe open with nothing left to close it. `output()`
+    /// returns only when both pipes reach EOF, so pre-fix the call sat there
+    /// for as long as the descendant lived. In `roundhouse-flow` that wedges
+    /// the executor thread running `dispatch_map_step`, the item's
+    /// `WorktreeGuard` never releases, and the same hang is reachable from
+    /// `WorktreeGuard::drop` mid-unwind where it cannot even be reported.
+    ///
+    /// Shaped like `tests/bounded_parse.rs`'s sibling hang test: the call
+    /// runs on its own thread under a **hard, test-level** `recv_timeout`
+    /// ceiling, deliberately independent of the primitive's own
+    /// `wall_limit` — the defect under test is "the bound never fires", so
+    /// ending the test with that same bound would prove nothing. A
+    /// regression fails at the ceiling rather than wedging the suite; the
+    /// leaked thread is reaped when the test binary exits.
+    ///
+    /// **Verified by removal:** with the group kill deleted from
+    /// `wait_with_wall_limit`'s exited path, this call blocks until the
+    /// orphaned `sleep 30` exits on its own and the test fails at the 10s
+    /// ceiling.
+    #[test]
+    fn a_backgrounded_descendant_cannot_wedge_the_call_when_the_direct_child_exits_cleanly() {
+        let repo_root = std::env::temp_dir();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = run_program_bounded(
+                &repo_root,
+                "sh",
+                &[OsStr::new("-c"), OsStr::new("sleep 30 &")],
+                Duration::from_secs(5),
+            );
+            // The receiver is gone if the ceiling below already fired —
+            // ignore the send failure rather than panicking on this thread.
+            let _ = tx.send(result);
+        });
+
+        let result = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "run_program must return well within 10s even when the direct child exits \
+             cleanly while a backgrounded descendant still holds the stdout pipe open — \
+             a hang here is the `Command::output()` wedge item A2 closed",
+        );
+        assert_eq!(
+            result.expect("a cleanly-exiting child must still succeed once its group is torn down"),
+            Vec::<u8>::new(),
+            "the shell itself writes nothing to stdout; expected empty stdout, not a hang"
+        );
+    }
+
+    /// The other half of item A2's bound: a child that simply never exits is
+    /// killed once `wall_limit` elapses and reported as
+    /// [`WorktreeError::TimedOut`] — never as a `CommandFailed` with an
+    /// invented exit status, and never as a hang.
+    ///
+    /// The `recv_timeout` ceiling is again the real assertion (a regression
+    /// fails the suite instead of hanging CI); the returned variant is what
+    /// pins the behaviour, so no wall-clock number is asserted beyond it.
+    #[test]
+    fn a_child_that_never_exits_is_killed_at_the_wall_limit_and_reported_as_timed_out() {
+        let repo_root = std::env::temp_dir();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = run_program_bounded(
+                &repo_root,
+                "sh",
+                &[OsStr::new("-c"), OsStr::new("sleep 30")],
+                Duration::from_secs(2),
+            );
+            let _ = tx.send(result);
+        });
+
+        let result = rx.recv_timeout(Duration::from_secs(15)).expect(
+            "a child that never exits must be killed at the wall limit, not waited on \
+             forever",
+        );
+        assert!(
+            matches!(result, Err(WorktreeError::TimedOut { .. })),
+            "expected a TimedOut error, got {result:?}"
         );
     }
 
