@@ -736,9 +736,14 @@ pub async fn probe_cached(cache_dir: &Path) -> MechanismProbeReport {
 /// observes it as a signal-terminated [`std::process::ExitStatus`]
 /// (`BoundedParseError::ResourceExhausted`), not a graceful exit.
 ///
-/// Sub-second `Duration`s are rounded up to 1 whole second — `RLIMIT_CPU` has no
-/// finer resolution than whole seconds, and a limit of literal `0` risks reading
-/// as "already exceeded" rather than "one second's grace" on some kernels.
+/// Sub-second `Duration`s are truncated to whole seconds, with a floor of 1
+/// (ruling W5-25, finding 6 — an earlier version of this sentence said
+/// "rounded up", which `limit.as_secs().max(1)` does not do: a 1.9 s limit
+/// becomes 1 s, not 2. The behaviour is safe, tighter than what was
+/// documented, never looser — only the sentence was wrong). The floor
+/// exists because `RLIMIT_CPU` has no finer resolution than whole seconds,
+/// and a limit of literal `0` risks reading as "already exceeded" rather
+/// than "one second's grace" on some kernels.
 ///
 /// A safe function despite installing an `unsafe` `pre_exec` hook internally: the
 /// `rlimit` value is computed here, before any fork happens, so the closure
@@ -770,6 +775,43 @@ pub fn set_cpu_limit_pre_exec(cmd: &mut std::process::Command, limit: std::time:
                 Err(std::io::Error::last_os_error())
             }
         });
+    }
+}
+
+/// Sends `SIGKILL` to every process in the process group `pgid` (Linux only;
+/// see [`crate::bounded_parse`]'s module doc for the non-Linux behaviour).
+/// `libc::killpg` with a positive `pgid` is exactly this — POSIX `kill(2)`
+/// with a negative pid, wrapped — so this is not a raw `kill()` call the
+/// caller has to remember to negate.
+///
+/// Used by [`crate::bounded_parse::run_bounded_subprocess`] (ruling W5-25,
+/// finding 2) to kill a subprocess spawned with `CommandExt::process_group(0)`
+/// (making it the leader of its own new group, `pgid == pid`) **and
+/// everything it forked**, not just the direct child: `Child::kill()` alone
+/// signals only the one process it names, so a single `fork()` inside a
+/// bounded child would otherwise defeat every bound this primitive
+/// enforces — the descendant keeps running (and keeps the stdout pipe's
+/// write end open) after the direct child is killed. Killing the whole
+/// group also closes every descendant's copy of that write end, which is
+/// what lets the concurrent stdout/stderr readers in
+/// `run_bounded_subprocess` observe EOF and its caller's `thread::scope`
+/// unblock, rather than hanging forever on a pipe an orphan still holds.
+///
+/// A safe function despite the `unsafe` FFI call inside, unlike
+/// [`set_cpu_limit_pre_exec`]: `libc::killpg` is an ordinary syscall
+/// wrapper taking two plain integers, with no pointer or lifetime contract
+/// to uphold, and this runs on the calling thread *after* the child
+/// already exists — not in the fork/exec window `pre_exec` runs in, so
+/// none of that function's async-signal-safety constraints apply here.
+/// Errors (e.g. the group already reaped) are deliberately ignored: this
+/// is a best-effort kill on a shutdown path, not a fallible operation
+/// whose failure the caller can usefully act on.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_process_group(pgid: i32) {
+    // SAFETY: see the doc comment above — no preconditions beyond passing
+    // plain integers.
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
     }
 }
 

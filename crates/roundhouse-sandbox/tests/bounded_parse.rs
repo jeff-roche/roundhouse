@@ -144,6 +144,80 @@ fn a_flooding_child_is_killed_once_output_exceeds_the_cap() {
     );
 }
 
+/// Ruling W5-25, finding 5 — before this fix, `stderr_exceeded` was set by
+/// the stderr reader thread and never consulted anywhere, so a child that
+/// flooded stderr past the (private, 64 KiB) capture cap simply blocked on
+/// its own `write` once the pipe filled and sat until `wall_limit`, rather
+/// than getting the same prompt kill a stdout flood already got. Fail-
+/// closed either way, so this proves promptness, not a bypass: `yes 1>&2`
+/// floods stderr forever while stdout stays empty, so only the newly
+/// consulted flag can be what ends this call before the 10 s wall clock.
+#[test]
+fn a_child_that_floods_stderr_is_also_killed_promptly_not_at_the_wall_clock_ceiling() {
+    let start = Instant::now();
+    let result = run_bounded_subprocess(
+        Path::new("sh"),
+        &[OsStr::new("-c"), OsStr::new("yes 1>&2")],
+        &[],
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+        4096,
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "must be killed promptly once the stderr capture cap is hit, not at the \
+         wall-clock ceiling: took {elapsed:?}"
+    );
+    match result {
+        Err(BoundedParseError::OutputTooLarge { max_output_bytes }) => {
+            assert_ne!(
+                max_output_bytes, 4096,
+                "the reported cap must be the stderr capture cap, not the unrelated \
+                 stdout cap this call passed in — stdout never received any bytes"
+            );
+        }
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+/// Ruling W5-25, finding 1 — the security lens's fail-open finding,
+/// verified here rather than taken on trust (the lens was read-only and
+/// built no test). `wait_bounded`'s poll loop checks `try_wait()` before
+/// `output_exceeded`, and the `Exited` arm hands straight to
+/// `classify_exit`, which never consults the flag at all: a child that
+/// overshoots `max_output_bytes` by less than one pipe buffer (~64 KiB on
+/// Linux) can have its whole write already sitting in the kernel pipe
+/// buffer, exit with status 0, and be reaped by `try_wait()` before the
+/// flag is ever checked on the success path — returning `Ok` with a
+/// buffer that exceeds the declared cap. `head -c 4096 /dev/zero` writes
+/// one 4096-byte payload (comfortably under a 64 KiB pipe, so the write
+/// never blocks) against a 100-byte cap, then exits immediately: the exact
+/// "small overshoot, prompt exit" shape the finding names.
+#[test]
+fn a_small_output_overshoot_with_a_prompt_exit_is_still_rejected() {
+    let start = Instant::now();
+    let result = run_bounded_subprocess(
+        Path::new("sh"),
+        &[OsStr::new("-c"), OsStr::new("head -c 4096 /dev/zero")],
+        &[],
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+        100,
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a prompt-exiting child must not need the wall-clock ceiling to be rejected: took {elapsed:?}"
+    );
+    assert!(
+        matches!(result, Err(BoundedParseError::OutputTooLarge { .. })),
+        "a small overshoot from a child that exits promptly must still be rejected as \
+         OutputTooLarge, never silently accepted with a buffer over the declared cap — \
+         got {result:?}"
+    );
+}
+
 /// A program that doesn't exist must be a clean, typed error — never a
 /// panic, and never silently treated as any of the resource-bound variants.
 #[test]

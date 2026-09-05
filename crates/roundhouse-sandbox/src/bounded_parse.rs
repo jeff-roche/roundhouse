@@ -5,6 +5,35 @@
 //! a wall-clock ceiling (every platform), or an output-size ceiling (every
 //! platform).
 //!
+//! # What this does NOT bound: memory / address space (ruling W5-25, finding 4)
+//!
+//! **These are the complete three bounds — CPU, wall-clock, output size —
+//! and memory/address space is a real, uncovered fourth axis, stated
+//! plainly rather than left for a reader to discover.** A security review
+//! found no `RLIMIT_AS`/`RLIMIT_DATA` installed anywhere in this module and
+//! flagged the omission; the project owner ruled against adding one this
+//! round (not against ever adding one): `RLIMIT_AS` counts *virtual*
+//! address space and interacts badly with allocator reservations (glibc's
+//! per-thread arenas, jemalloc worse), so there is no obviously-generous
+//! number, and guessing low kills a legitimate parse in CI rather than
+//! stopping an attacker. `RLIMIT_DATA` is the better-targeted primitive but
+//! its coverage of `mmap`-backed allocations depends on kernel >=4.7
+//! semantics, and the natural regression test for either (a child
+//! allocating until killed) is a flake generator, not a reliable CI check.
+//! Shipping an untuned memory rlimit now would trade a real but bounded gap
+//! for a mistuned one with worse failure modes.
+//!
+//! Practical exposure today is small for this primitive's first caller:
+//! `roundhouse-flow`'s `expansion::check_expansion` runs *inside* the
+//! bounded child, before the typed deserialize, and caps expanded weight
+//! before any large allocation happens; the review measured the largest
+//! reachable helper output at 1.92 MB. **Named follow-up, not implemented
+//! here:** a tuned `RLIMIT_DATA`, landing with its own measurement pass
+//! against real workloads rather than a guess. Until then, a sufficiently
+//! memory-hungry child is only caught if it also runs long enough to hit
+//! `wall_limit`/`cpu_limit` or writes enough to hit `max_output_bytes` —
+//! not by anything in this module that bounds memory directly.
+//!
 //! # Why this exists (ruling W5-2)
 //!
 //! `roundhouse-flow`'s workflow-YAML parser measured `serde_yaml`/
@@ -131,7 +160,7 @@ pub enum BoundedParseError {
 
     /// The child exited on its own, without being killed by either bound
     /// above, but with a failure status. `stderr` (bounded to
-    /// [`STDERR_CAPTURE_CAP`]) is included for diagnosis.
+    /// `STDERR_CAPTURE_CAP`) is included for diagnosis.
     #[error("helper process exited with {status}: {stderr}")]
     HelperCrashed { status: String, stderr: String },
 }
@@ -156,6 +185,18 @@ pub fn run_bounded_subprocess(
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    // Ruling W5-25, finding 3: this primitive's own children read nothing
+    // from the process environment (`roundhouse-flow`'s helper resolves
+    // itself via `current_exe()`, never `$PATH`), and the daemon's
+    // environment is exactly where secrets like `ANTHROPIC_API_KEY` live.
+    // A new spawn site inheriting the whole thing by default is a
+    // foothold-to-disclosure path a future helper substitution could use;
+    // `env_clear()` closes it. `std::process::Command` on Unix resolves a
+    // bare (slash-free) program name against the *caller's* real `PATH`
+    // before exec, not the child's cleared environment, so this does not
+    // break locating bare-name test children like `cat`/`sh`/`sleep`/`yes`
+    // (verified: every existing test in this module still passes).
+    command.env_clear();
 
     #[cfg(target_os = "linux")]
     crate::probe::set_cpu_limit_pre_exec(&mut command, cpu_limit);
@@ -166,6 +207,22 @@ pub fn run_bounded_subprocess(
         // load. Named explicitly rather than silently unused so a reader
         // does not mistake this for an oversight.
         let _ = cpu_limit;
+    }
+
+    // Ruling W5-25, finding 2: makes the child the leader of its own new
+    // process group (pgid == its own pid), so a subsequent kill can target
+    // the whole group — everything the child forks — not just the one
+    // process `Child::kill()` names. Safe Rust; no `unsafe` needed here.
+    // See `kill_child_and_descendants` and `crate::probe::kill_process_group`'s
+    // doc for why one `fork()` inside the child would otherwise defeat every
+    // bound this primitive enforces. Gated the same as `RLIMIT_CPU` above
+    // (ruling W5-3's off-Linux convention): off Linux this primitive still
+    // enforces `wall_limit` and `max_output_bytes` on the direct child, just
+    // without group-wide reach.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
     }
 
     let mut child = command.spawn().map_err(|source| BoundedParseError::Spawn {
@@ -203,35 +260,98 @@ pub fn run_bounded_subprocess(
         let stderr_reader =
             scope.spawn(|| read_capped(&mut stderr, STDERR_CAPTURE_CAP, &stderr_exceeded));
 
-        let outcome = wait_bounded(&mut child, wall_limit, &output_exceeded);
+        let outcome = wait_bounded(
+            &mut child,
+            wall_limit,
+            max_output_bytes,
+            &output_exceeded,
+            &stderr_exceeded,
+        );
 
-        let stdout_buf = stdout_reader.join().unwrap_or_default();
-        let stderr_buf = stderr_reader.join().unwrap_or_default();
+        // Ruling W5-25, finding 8a: `.join()`'s `Err` (the reader thread
+        // panicked) used to be silently swallowed by `unwrap_or_default`,
+        // which would turn a panicking reader into a successful-looking
+        // `Ok(vec![])` for a child that exited 0 with real output — silent
+        // truncation instead of a propagated error. Unreachable today
+        // (`read_capped` has no panicking operations), so a `debug_assert`
+        // is proportionate: it makes a future regression loud in tests and
+        // debug builds without adding a new public `BoundedParseError`
+        // variant for a case that cannot happen yet.
+        let stdout_join = stdout_reader.join();
+        debug_assert!(
+            stdout_join.is_ok(),
+            "read_capped's stdout reader thread panicked; read_capped has no \
+             panicking operations today, so reaching this means that invariant broke"
+        );
+        let stdout_buf = stdout_join.unwrap_or_default();
+
+        let stderr_join = stderr_reader.join();
+        debug_assert!(
+            stderr_join.is_ok(),
+            "read_capped's stderr reader thread panicked; see the stdout debug_assert above"
+        );
+        let stderr_buf = stderr_join.unwrap_or_default();
+
         (outcome, stdout_buf, stderr_buf)
     });
 
     match outcome {
         WaitOutcome::TimedOut => Err(BoundedParseError::Timeout { wall_limit }),
-        WaitOutcome::OutputExceeded => Err(BoundedParseError::OutputTooLarge { max_output_bytes }),
-        WaitOutcome::Exited(status) => classify_exit(status, stdout_buf, stderr_buf),
+        WaitOutcome::OutputExceeded { limit } => Err(BoundedParseError::OutputTooLarge {
+            max_output_bytes: limit,
+        }),
+        WaitOutcome::Exited(status) => {
+            // Ruling W5-25, finding 1: `wait_bounded`'s poll loop checks
+            // `try_wait()` before `output_exceeded`, so a child that
+            // overshoots `max_output_bytes` by less than one pipe buffer
+            // and exits promptly can be reaped as `Exited` before that
+            // loop ever notices the flag — `classify_exit` on its own has
+            // no way to know the cap was exceeded. By the time
+            // `thread::scope` above returns, `stdout_reader` has already
+            // been joined (finished reading, and setting the flag if it
+            // saw more than `max_output_bytes`), so re-checking the flag
+            // here, once, before classifying the exit, is authoritative
+            // regardless of which way the exit-vs-flag race went inside
+            // the poll loop. This must win over a successful exit status:
+            // an attacker-controlled child cannot un-exceed the cap by
+            // also exiting 0.
+            if output_exceeded.load(Ordering::SeqCst) {
+                Err(BoundedParseError::OutputTooLarge { max_output_bytes })
+            } else {
+                classify_exit(status, stdout_buf, stderr_buf)
+            }
+        }
     }
 }
 
-/// What ended the wait loop in [`run_bounded_subprocess`].
+/// What ended the wait loop in [`run_bounded_subprocess`]. `OutputExceeded`
+/// carries which cap fired (`max_output_bytes` for stdout,
+/// `STDERR_CAPTURE_CAP` for stderr — ruling W5-25, finding 5) so the
+/// caller's error message names the byte count that was actually crossed.
 enum WaitOutcome {
     Exited(ExitStatus),
     TimedOut,
-    OutputExceeded,
+    OutputExceeded { limit: usize },
 }
 
-/// Polls `child` until it exits on its own, `wall_limit` elapses, or
-/// `output_exceeded` is set by the concurrent stdout reader — killing (and
-/// reaping, so no zombie is left behind) the child on either of the latter
-/// two paths before returning.
+/// Polls `child` until it exits on its own, `wall_limit` elapses, or either
+/// `output_exceeded` or `stderr_exceeded` is set by its respective
+/// concurrent reader — killing (and reaping, so no zombie is left behind)
+/// the child on any of the latter three paths before returning.
+///
+/// **`stderr_exceeded` is consulted here since ruling W5-25, finding 5** —
+/// before, nothing read it: a child that flooded stderr past
+/// `STDERR_CAPTURE_CAP` stopped being drained, blocked on its own `write`
+/// once the pipe filled, and simply sat until `wall_limit` fired instead of
+/// getting the same prompt kill a stdout flood already got. Fail-closed
+/// either way (the wall-clock bound still applied), so this is a
+/// promptness fix, not a bypass fix like finding 1's.
 fn wait_bounded(
     child: &mut Child,
     wall_limit: Duration,
+    max_output_bytes: usize,
     output_exceeded: &AtomicBool,
+    stderr_exceeded: &AtomicBool,
 ) -> WaitOutcome {
     let start = Instant::now();
     loop {
@@ -239,16 +359,51 @@ fn wait_bounded(
             return WaitOutcome::Exited(status);
         }
         if output_exceeded.load(Ordering::SeqCst) {
-            let _ = child.kill();
+            kill_child_and_descendants(child);
             let _ = child.wait();
-            return WaitOutcome::OutputExceeded;
+            return WaitOutcome::OutputExceeded {
+                limit: max_output_bytes,
+            };
+        }
+        if stderr_exceeded.load(Ordering::SeqCst) {
+            kill_child_and_descendants(child);
+            let _ = child.wait();
+            return WaitOutcome::OutputExceeded {
+                limit: STDERR_CAPTURE_CAP,
+            };
         }
         if start.elapsed() >= wall_limit {
-            let _ = child.kill();
+            kill_child_and_descendants(child);
             let _ = child.wait();
             return WaitOutcome::TimedOut;
         }
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Kills `child` — and, on Linux, every process in its process group, not
+/// only the one process `Child::kill()` names (ruling W5-25, finding 2).
+/// `run_bounded_subprocess` puts the child in its own new group
+/// (`CommandExt::process_group(0)`) precisely so this can reach anything it
+/// forked: without it, a descendant survives the direct child being
+/// killed, keeps the stdout/stderr pipes' write ends open, and
+/// `run_bounded_subprocess`'s `thread::scope` would block forever joining
+/// readers that are waiting for an EOF that a still-running orphan never
+/// sends — hanging the parent *after* this function believes it has
+/// enforced a bound.
+///
+/// **Residual, recorded rather than chased (explicitly out of scope this
+/// round):** a descendant that calls `setsid` itself leaves the group and
+/// escapes this kill. Closing that needs a different mechanism (e.g. a
+/// PID-namespace or cgroup boundary), not a bigger `killpg` call.
+fn kill_child_and_descendants(child: &mut Child) {
+    #[cfg(target_os = "linux")]
+    {
+        crate::probe::kill_process_group(child.id() as i32);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = child.kill();
     }
 }
 

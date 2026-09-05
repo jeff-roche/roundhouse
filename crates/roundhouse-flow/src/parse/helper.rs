@@ -218,6 +218,21 @@ fn map_helper_failure(yaml: &str, stderr: &str) -> ParseError {
 /// but whose *grandparent* is `target/debug/` — exactly where Cargo places
 /// `round-yaml-parse-helper`. This is what keeps the existing fixture
 /// tests under `tests/` passing with zero edits.
+///
+/// **The fallback is gated by [`is_inside_a_target_tree`], not
+/// `debug_assertions` (ruling W5-25, finding 4).** `test-util` is not a
+/// default feature, so an ordinary `cargo build --release` never compiles
+/// this branch in at all — but `cargo build --release --all-features` is a
+/// plausible packaging command that does, and release test builds are
+/// real, so gating on `debug_assertions` would not have closed this.
+/// Without the containment check, an absent sibling in that build would
+/// resolve the fallback to the *installed* binary's own grandparent — e.g.
+/// `/usr/local/round-yaml-parse-helper` for a binary installed to
+/// `/usr/local/bin`, and `/usr/local` is group/user-writable on
+/// Homebrew-style installs, making an absent file there a foothold for a
+/// substituted helper. Requiring the resolved candidate to sit inside a
+/// `target` tree is what the fallback is actually for; anywhere else, it
+/// declines rather than trusting the path.
 fn helper_binary_path() -> Result<PathBuf, ParseError> {
     let exe = std::env::current_exe().map_err(|err| {
         ParseError::HelperUnavailable(format!("could not resolve current_exe(): {err}"))
@@ -244,7 +259,7 @@ fn helper_binary_path() -> Result<PathBuf, ParseError> {
     {
         if let Some(grandparent) = dir.parent() {
             let candidate = grandparent.join(HELPER_BINARY_NAME);
-            if candidate.is_file() {
+            if candidate.is_file() && is_inside_a_target_tree(&candidate) {
                 return Ok(candidate);
             }
         }
@@ -255,6 +270,19 @@ fn helper_binary_path() -> Result<PathBuf, ParseError> {
          parent directory) — is roundhouse built/installed correctly?",
         exe.display()
     )))
+}
+
+/// True if `path` has a path component literally named `target` — see
+/// [`helper_binary_path`]'s doc for why the `test-util` fallback candidate
+/// must clear this before being trusted (ruling W5-25, finding 4). Cargo's
+/// build output always sits under a `target/` root regardless of profile
+/// or workspace layout, so this is a cheap, name-based containment check
+/// rather than a hardcoded absolute path — it stays correct for any
+/// `CARGO_TARGET_DIR` and any workspace nesting depth.
+#[cfg(feature = "test-util")]
+fn is_inside_a_target_tree(path: &std::path::Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == std::ffi::OsStr::new("target"))
 }
 
 #[cfg(test)]
@@ -382,5 +410,24 @@ mod tests {
             }
             other => panic!("expected a plain fallback Yaml error, got {other:?}"),
         }
+    }
+
+    // Ruling W5-25, finding 4: pins `is_inside_a_target_tree`'s containment
+    // check directly, so a future edit can't silently widen it back into
+    // trusting an arbitrary grandparent path.
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn a_target_tree_path_is_accepted() {
+        assert!(is_inside_a_target_tree(std::path::Path::new(
+            "/home/me/repo/target/debug/round-yaml-parse-helper"
+        )));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn an_installed_path_outside_any_target_tree_is_rejected() {
+        assert!(!is_inside_a_target_tree(std::path::Path::new(
+            "/usr/local/round-yaml-parse-helper"
+        )));
     }
 }

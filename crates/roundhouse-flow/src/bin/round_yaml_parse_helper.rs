@@ -60,6 +60,35 @@ const VERDICT_TOO_MANY_NUMERIC_SCALARS_PREFIX: &str = "ROUND_VERDICT:TOO_MANY_NU
 /// See `roundhouse_flow::parse::helper`'s copy — the two must match.
 const VERDICT_YAML_ERROR_PREFIX: &str = "ROUND_VERDICT:YAML_ERROR:";
 
+/// Tags and reports a real `serde_yaml::Error` on stderr, then exits 1.
+/// Shared by both places a genuine YAML error can surface — the
+/// `check_expansion` walk's own `Malformed` verdict, and the typed
+/// `serde_yaml::from_str` below it — so the wire protocol has no untagged
+/// `serde_yaml`-error path left (ruling W5-25, finding 7; before this fix
+/// the second call site wrote a bare `eprintln!("{err}")` with no prefix
+/// at all, which cost nothing security-relevant — there is no `Ok` arm
+/// reachable from a non-zero exit, so this could only ever misreport
+/// *which* rejection happened — but is now closed anyway, since a fully
+/// tagged protocol is cheaper to reason about than a documented
+/// exception). `serde_yaml::Error` cannot cross the process boundary (no
+/// public constructor reattaches a `Location` to a bare message — see
+/// `parse::helper`'s module doc), so the line and column, when there are
+/// any, are sent as plain integers ahead of the message text rather than
+/// losing them.
+fn emit_yaml_error_and_exit(err: &serde_yaml::Error) -> ! {
+    match err.location() {
+        Some(loc) => {
+            eprintln!(
+                "{VERDICT_YAML_ERROR_PREFIX}{}:{}:{err}",
+                loc.line(),
+                loc.column()
+            );
+        }
+        None => eprintln!("{VERDICT_YAML_ERROR_PREFIX}-:-:{err}"),
+    }
+    std::process::exit(1);
+}
+
 fn main() {
     let mut input = Vec::new();
     if let Err(err) = io::stdin().lock().read_to_end(&mut input) {
@@ -91,32 +120,12 @@ fn main() {
             eprintln!("{VERDICT_EXPANDS_TOO_LARGE}");
             std::process::exit(1);
         }
-        Verdict::Malformed(err) => {
-            // `serde_yaml::Error` cannot cross the process boundary (no
-            // public constructor reattaches a `Location` to a bare
-            // message — see `parse::helper`'s module doc), so the line and
-            // column, when there are any, are sent as plain integers ahead
-            // of the message text rather than losing them.
-            match err.location() {
-                Some(loc) => {
-                    eprintln!(
-                        "{VERDICT_YAML_ERROR_PREFIX}{}:{}:{err}",
-                        loc.line(),
-                        loc.column()
-                    );
-                }
-                None => eprintln!("{VERDICT_YAML_ERROR_PREFIX}-:-:{err}"),
-            }
-            std::process::exit(1);
-        }
+        Verdict::Malformed(err) => emit_yaml_error_and_exit(&err),
     }
 
     let value: serde_yaml::Value = match serde_yaml::from_str(yaml) {
         Ok(value) => value,
-        Err(err) => {
-            eprintln!("{err}");
-            std::process::exit(1);
-        }
+        Err(err) => emit_yaml_error_and_exit(&err),
     };
 
     let output = match serde_yaml::to_string(&value) {
