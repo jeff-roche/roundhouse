@@ -25,8 +25,20 @@ jobs:
       # S7: pinned by commit SHA, not the mutable `@v4` tag, for the same
       # reason `actions/setup-node` below and `ci.yml`'s
       # `dtolnay/rust-toolchain` are pinned by SHA rather than a movable ref.
-      # Verified against GitHub's tags API: `refs/tags/v4` -> this commit.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Verified against GitHub's tags API: this SHA is the concrete patch
+      # release `v4.4.0` (fix round 1: naming the immutable patch tag here,
+      # not the mutable major tag `v4`, so a future re-verification of this
+      # pin against the tags API is unambiguous about which release it is).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # D4 (fix round 1 security review): this job deliberately runs
+          # third-party npm lifecycle scripts (`npm ci` triggers `esbuild`'s
+          # and `fsevents`' `hasInstallScript` postinstalls, per S6 above) —
+          # leaving a GITHUB_TOKEN credential helper configured in
+          # `.git/config` for that to reach is a worse default here than
+          # elsewhere. Nothing in this job ever needs to authenticate back
+          # to GitHub as itself.
+          persist-credentials: false
       # `@v4` resolves as a mutable tag (`v4` is repointed to new commits as
       # `actions/setup-node` releases patches), which is not reproducible
       # across runs and can silently change what gets installed — the same
@@ -52,15 +64,39 @@ jobs:
           # value; `grep -rl` over source (never node_modules, which ships
           # its own uses of this in library internals that are not this
           # client's problem).
+          #
+          # `test -d src` first: fix round 1 (whole-branch security review,
+          # M2) found `grep -rl` exits 2 (not 1) when `src/` is missing, and
+          # `if grep ...; then` cannot distinguish that from "ran cleanly,
+          # found no match" (exit 1) — a missing directory would otherwise
+          # silently PASS this guard rather than fail it loudly.
+          test -d src
           if grep -rl 'import\.meta\.env' src/; then
             echo "::error::found 'import.meta.env' in frontend/src/ — nothing in this client should read a build-time-inlined value (see vite.config.ts's module docs)"
             exit 1
           fi
 
-          # A `define` key in vite.config.ts is the other way a per-install
-          # value could be baked into the bundle at build time.
-          if grep -E 'define\s*:' vite.config.ts; then
-            echo "::error::found a 'define' key in vite.config.ts — no per-install value may be inlined into this build"
+          # A `define` key in whichever `vite.config.*` file actually exists
+          # is the other way a per-install value could be baked into the
+          # bundle at build time. Vite loads any of six extensions
+          # (js/mjs/cjs/ts/mts/cts); fix round 1 (M2) found the prior version
+          # named only `vite.config.ts` and — like the `grep -rl` above —
+          # would silently pass if that exact file were ever renamed or
+          # replaced, since `grep`'s exit 2 on a missing file reads the same
+          # as "no match" to a bare `if`.
+          found_config=0
+          for config_ext in js mjs cjs ts mts cts; do
+            config_file="vite.config.$config_ext"
+            if [ -f "$config_file" ]; then
+              found_config=1
+              if grep -E 'define\s*:' "$config_file"; then
+                echo "::error::found a 'define' key in $config_file — no per-install value may be inlined into this build"
+                exit 1
+              fi
+            fi
+          done
+          if [ "$found_config" -eq 0 ]; then
+            echo "::error::no vite.config.{js,mjs,cjs,ts,mts,cts} file found under frontend/ — cannot verify there is no 'define' key without one"
             exit 1
           fi
 
@@ -80,9 +116,36 @@ jobs:
             echo "::error::found a .env* file under frontend/ ($found_env_file) — Vite auto-loads these and inlines any VITE_* value referenced from src/"
             exit 1
           fi
+
+          # Fix round 1 (M1, the most important finding): Vite substitutes
+          # `%VITE_NAME%` tokens found in `index.html` from ANY
+          # `VITE_`-prefixed PROCESS ENVIRONMENT VARIABLE at build time — no
+          # `.env` file and no `import.meta.env` reference needed, so none
+          # of the checks above catch it. Demonstrated PoC: a
+          # `%VITE_SECRET_HOST%` placeholder in `<title>` plus
+          # `VITE_SECRET_HOST=nas.internal.example vite build` ships that
+          # hostname to every unauthenticated LAN peer — and a bare hostname
+          # is not a hex run, a UUID, a scheme, a dotted quad, or a path, so
+          # `dist_public_content.rs` would not have caught it either.
+          test -f index.html
+          if grep -E '%VITE_[A-Za-z0-9_]*%' index.html; then
+            echo "::error::found a %VITE_...% placeholder in index.html — Vite substitutes this from ANY VITE_-prefixed environment variable at build time, independent of .env files or import.meta.env"
+            exit 1
+          fi
       - run: npm run typecheck
       - run: npm test
-      - run: npm run build
+      # Fix round 1 (M1): scrubbed as defense in depth alongside the source
+      # check above. Even if a `%VITE_...%` placeholder somehow reached
+      # `index.html` undetected, Vite can only substitute a `VITE_`-prefixed
+      # environment variable that is actually set when it builds — this job
+      # never intentionally sets one, but nothing enforced that before now.
+      - name: Build (with any VITE_* environment variable scrubbed first)
+        run: |
+          set -euo pipefail
+          for var_name in $(env | grep -oE '^VITE_[A-Za-z0-9_]*' || true); do
+            unset "$var_name"
+          done
+          npm run build
       # `crates/roundhouse-web/assets/dist/` is committed (ruling R1 —
       # `rust-embed` needs it at Rust compile time, and the `cargo` jobs in
       # `ci.yml` have no npm step to build it themselves). Nothing else in
