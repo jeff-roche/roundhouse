@@ -78,10 +78,13 @@ impl Provider for CohereV2Provider {
         Box::pin(async move {
             let body = encode(req, &self.profile)?;
 
-            let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
-                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
-                )?;
+            let (base_url, _host_only) = resolve_base_url(
+                &self.profile.id,
+                &self.profile.defaults.base_url,
+                None,
+                false,
+            )
+            .map_err(|e| ProviderError::Transport(redact_transport_error_text(&e.to_string())))?;
             let endpoint_url = build_endpoint_url(&base_url);
 
             let mut http_req = HttpRequest {

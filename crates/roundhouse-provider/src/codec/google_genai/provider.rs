@@ -77,10 +77,13 @@ impl Provider for GoogleGenAiProvider {
         Box::pin(async move {
             let body = encode(req, &self.profile, self.mode)?;
 
-            let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
-                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
-                )?;
+            let (base_url, _host_only) = resolve_base_url(
+                &self.profile.id,
+                &self.profile.defaults.base_url,
+                None,
+                false,
+            )
+            .map_err(|e| ProviderError::Transport(redact_transport_error_text(&e.to_string())))?;
             // Task 17: `vertex-gemini`'s request envelope (not its content
             // shape -- `encode_generate_content` needs no changes) genuinely
             // diverges from `EndpointMode::GenerateContent`'s otherwise-

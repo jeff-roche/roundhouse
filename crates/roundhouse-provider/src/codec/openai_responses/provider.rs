@@ -103,10 +103,13 @@ impl Provider for OpenAiResponsesProvider {
             // `Url::set_path` (not `Url::join`, which would drop that query
             // entirely per WHATWG relative-URL resolution) preserves it
             // untouched.
-            let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
-                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
-                )?;
+            let (base_url, _host_only) = resolve_base_url(
+                &self.profile.id,
+                &self.profile.defaults.base_url,
+                None,
+                false,
+            )
+            .map_err(|e| ProviderError::Transport(redact_transport_error_text(&e.to_string())))?;
             let endpoint_url = append_path_segment(&base_url, "responses");
 
             let mut http_req = HttpRequest {

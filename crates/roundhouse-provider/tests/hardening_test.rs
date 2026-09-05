@@ -231,3 +231,45 @@ fn a_bare_token_key_with_no_prefix_label_or_bearer_anchor_is_not_redacted_a_know
          redacted here: {redacted}"
     );
 }
+
+/// Phase 7 Task 16: `LABELED_SECRET_VALUE`'s alternation had no bare `key`
+/// label -- only `client_secret`/`secret_access_key`/`api_key`/
+/// `access_token`. A gateway or provider that echoes a bare `key=<value>`
+/// (not one of the four existing labels) back in an error body survived
+/// redaction untouched until this alternative was added.
+#[test]
+fn a_bare_key_equals_label_is_redacted() {
+    // Deliberately NOT `sk-`/`pk-`/etc.-prefixed -- this must be caught by
+    // `LABELED_SECRET_VALUE`'s new bare-`key` alternative, not incidentally
+    // by `API_KEY_SHAPED`.
+    let body = r#"{"error":"request failed","key":"zQ7mN2xK9vR5tL8yH4cA6bD1fE0g"}"#;
+    let redacted = redact_error_body(body);
+    assert!(
+        !redacted.contains("zQ7mN2xK9vR5tL8yH4cA6bD1fE0g"),
+        "a bare `key=`/`key:`-labeled secret must be redacted: {redacted}"
+    );
+    assert!(
+        redacted.contains("request failed"),
+        "non-secret content must survive redaction: {redacted}"
+    );
+}
+
+/// Phase 7 Task 16, the stated trap: `LABELED_SECRET_VALUE` is `(?i)` with no
+/// leading word boundary, so naively adding `key` to the alternation would
+/// also fire inside `monkey=`, `pubkey=`, `hostkey=` -- words that merely
+/// *end* in `key`, not the bare label itself. The fix must anchor `key` on a
+/// word boundary so these are left alone.
+#[test]
+fn a_word_merely_ending_in_key_is_not_mangled() {
+    let body = concat!(
+        r#"{"monkey":"1234567890123456","#,
+        r#""pubkey":"abcdefghijklmnopqrst","#,
+        r#""hostkey":"zyxwvutsrqponmlkjihg"}"#
+    );
+    let redacted = redact_error_body(body);
+    assert_eq!(
+        redacted, body,
+        "a label that merely ends in `key` (monkey/pubkey/hostkey) must not be treated as \
+         the bare `key` label: {redacted}"
+    );
+}

@@ -105,10 +105,13 @@ impl Provider for AzureOpenAiProvider {
             // profile carries), not by `{base_url}/chat/completions` with
             // the model id in the JSON body.
             let deployment = resolve_deployment_name(&self.profile, &req.model.0)?;
-            let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
-                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
-                )?;
+            let (base_url, _host_only) = resolve_base_url(
+                &self.profile.id,
+                &self.profile.defaults.base_url,
+                None,
+                false,
+            )
+            .map_err(|e| ProviderError::Transport(redact_transport_error_text(&e.to_string())))?;
             let endpoint_url =
                 azure_deployment_url(base_url.as_str(), deployment, AZURE_API_VERSION)?;
 

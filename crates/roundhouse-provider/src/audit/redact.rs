@@ -132,9 +132,23 @@ static GOOGLE_API_KEY: LazyLock<Regex> =
 /// secret. This is bounded to the value's own delimiters instead, so it
 /// stops at the actual end of the value the way the surrounding
 /// `["']?`/`\s*[:=]\s*` context already implies one exists.
+/// Phase 7 Task 16: `key` on its own (no `client_secret`/`api_key`/etc.
+/// prefix) is a genuine, separately-observed label some gateways use. It's
+/// added as its own alternative, anchored with a leading `\b`, rather than
+/// folded into the existing prefixed alternatives — those already sit at a
+/// word start in every real body this pattern has ever matched, so they
+/// don't need the anchor, but a bare `key` does: this pattern is `(?i)` with
+/// no leading anchor at all, so an unanchored `key` alternative would also
+/// fire inside `monkey=`, `pubkey=`, `hostkey=` — words that merely *end* in
+/// `key`, not the label itself. `\b` only matches between a word and a
+/// non-word character (or string start/end), and every character in
+/// `monkey`/`pubkey`/`hostkey` immediately before its trailing `key` is
+/// itself a word character, so `\bkey` correctly does not match there while
+/// still matching a `key` that starts right after a quote, brace, `&`, or
+/// whitespace.
 static LABELED_SECRET_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)(client[_-]?secret|secret[_-]?access[_-]?key|api[_-]?key|access[_-]?token)["']?\s*[:=]\s*["']?[A-Za-z0-9/_+.~-]{16,}[^\s"',&}]*"#,
+        r#"(?i)(client[_-]?secret|secret[_-]?access[_-]?key|api[_-]?key|access[_-]?token|\bkey)["']?\s*[:=]\s*["']?[A-Za-z0-9/_+.~-]{16,}[^\s"',&}]*"#,
     )
     .unwrap()
 });

@@ -71,6 +71,12 @@ pub enum CredentialError {
     Transport(#[from] TransportError),
     #[error("invalid base URL: {0}")]
     InvalidBaseUrl(String),
+    /// Phase 7 Task 16, Ruling R9: an operator-supplied (explicit override
+    /// or `ROUNDHOUSE_<PROVIDER>_BASE_URL` env var) base URL used a
+    /// non-loopback `http://` scheme without `allow_insecure`. See
+    /// `base_url::resolve_base_url`'s doc comment for the full policy.
+    #[error("insecure base URL: {0}")]
+    InsecureBaseUrl(String),
 }
 
 /// Applies this credential to an outbound request IN PLACE. Implementations

@@ -127,6 +127,7 @@ fn base_url_resolution_order_is_override_then_env_then_profile_default() {
         "testprov",
         "https://default.example.com",
         None,
+        false,
     )
     .unwrap();
     assert_eq!(url.as_str(), "https://default.example.com/");
@@ -136,6 +137,7 @@ fn base_url_resolution_order_is_override_then_env_then_profile_default() {
         "testprov",
         "https://default.example.com",
         None,
+        false,
     )
     .unwrap();
     assert_eq!(url.as_str(), "https://env.example.com/");
@@ -144,6 +146,7 @@ fn base_url_resolution_order_is_override_then_env_then_profile_default() {
         "testprov",
         "https://default.example.com",
         Some("https://override.example.com/v1?api_key=sk-should-never-appear"),
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -173,6 +176,7 @@ fn base_url_parse_failure_never_echoes_the_malformed_override_verbatim() {
         "testprov",
         "https://default.example.com",
         Some(malformed),
+        false,
     )
     .err()
     .unwrap();
@@ -185,6 +189,95 @@ fn base_url_parse_failure_never_echoes_the_malformed_override_verbatim() {
         !message.contains("sk-should-never-appear"),
         "parse-failure error must never carry the malformed override's secret-shaped value: {message}"
     );
+}
+
+/// Ruling R9 (Phase 7 Task 16): the HTTPS gate applies only to
+/// operator-supplied values -- an explicit `resolve_base_url` override or the
+/// `ROUNDHOUSE_<PROVIDER>_BASE_URL` env var -- never to a profile's own
+/// shipped `profile_default`. Five shipped local-runtime profiles declare an
+/// `http://localhost` default; a blanket scheme check on the resolved URL
+/// would break all five, so a plain-`http` *profile default* must still
+/// resolve successfully even with `allow_insecure: false`.
+#[test]
+fn a_plain_http_profile_default_is_never_gated_even_when_insecure_is_disallowed() {
+    std::env::remove_var("ROUNDHOUSE_TESTPROV2_BASE_URL");
+    let (url, _recorded) = roundhouse_provider::credential::resolve_base_url(
+        "testprov2",
+        "http://localhost:11434/v1",
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(url.as_str(), "http://localhost:11434/v1");
+}
+
+/// Ruling R9: a non-loopback, operator-supplied `http://` override must be
+/// rejected unless `allow_insecure` opts in -- the threat this gate exists
+/// for is a typo'd `ROUNDHOUSE_<PROVIDER>_BASE_URL` (or explicit override)
+/// silently downgrading a credentialed request to cleartext.
+#[test]
+fn a_non_loopback_http_explicit_override_is_rejected_unless_allow_insecure() {
+    let rejected = roundhouse_provider::credential::resolve_base_url(
+        "testprov3",
+        "https://default.example.com",
+        Some("http://gateway.example.com/v1"),
+        false,
+    );
+    assert!(
+        rejected.is_err(),
+        "a non-loopback http:// operator override must be rejected by default"
+    );
+
+    let allowed = roundhouse_provider::credential::resolve_base_url(
+        "testprov3",
+        "https://default.example.com",
+        Some("http://gateway.example.com/v1"),
+        true,
+    );
+    assert!(
+        allowed.is_ok(),
+        "allow_insecure: true must let the same override through"
+    );
+}
+
+/// Ruling R9: the same gate applies to the `ROUNDHOUSE_<PROVIDER>_BASE_URL`
+/// env var, not just an explicit override -- both are operator-supplied.
+#[test]
+fn a_non_loopback_http_env_override_is_rejected_unless_allow_insecure() {
+    std::env::set_var(
+        "ROUNDHOUSE_TESTPROV4_BASE_URL",
+        "http://gateway.example.com/v1",
+    );
+    let rejected = roundhouse_provider::credential::resolve_base_url(
+        "testprov4",
+        "https://default.example.com",
+        None,
+        false,
+    );
+    assert!(
+        rejected.is_err(),
+        "a non-loopback http:// env override must be rejected by default"
+    );
+    std::env::remove_var("ROUNDHOUSE_TESTPROV4_BASE_URL");
+}
+
+/// Ruling R9: an operator override that merely re-points one loopback port
+/// to another (still `localhost`/`127.0.0.1`/`::1`) is exempt from the gate
+/// even though it's operator-supplied -- it never leaves the local machine.
+#[test]
+fn a_loopback_http_operator_override_is_never_gated() {
+    for host in ["http://localhost:9001/v1", "http://127.0.0.1:9001/v1"] {
+        let result = roundhouse_provider::credential::resolve_base_url(
+            "testprov5",
+            "https://default.example.com",
+            Some(host),
+            false,
+        );
+        assert!(
+            result.is_ok(),
+            "a loopback operator override must never be gated: {host} -> {result:?}"
+        );
+    }
 }
 
 #[test]
