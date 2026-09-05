@@ -41,6 +41,7 @@
 //! `--allow <workspace-path> -- <program> [args...]`. No other flags. The `--`
 //! separator is required so a `<program>`/`<args>` that itself looks like a
 //! flag is never mistaken for one of this binary's own.
+use roundhouse_sandbox::SYSTEM_READ_EXEC_DIRS;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
@@ -94,17 +95,15 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
     })
 }
 
-/// Directories granted `ReadFile`+`Execute` (never write) — enough for the
-/// dynamic linker, an interpreter, or a shell to load and run, nothing more.
-/// Not every entry exists on every Linux layout (e.g. `/lib64` does not exist
-/// on most arm64 distributions, which have no 64-bit-vs-32-bit split to name)
-/// — a missing directory here is tolerated (see the `NotFound` handling
-/// below), because there is no filesystem object to grant or deny access to
-/// in the first place, so skipping it changes nothing about what the
-/// restriction covers. Any *other* failure to open one of these (permission
-/// denied, a path that exists but isn't a directory, ...) is still a hard
-/// error — only "doesn't exist" is tolerated.
-const SYSTEM_READ_EXEC_DIRS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
+// `SYSTEM_READ_EXEC_DIRS` (imported above): the directories granted `ReadFile`+
+// `Execute` (never write) below — enough for the dynamic linker, an interpreter, or a
+// shell to load and run, nothing more. Not every entry exists on every Linux layout
+// (e.g. `/lib64` does not exist on most arm64 distributions) — a missing directory is
+// tolerated (see the `NotFound` handling below), because there is no filesystem
+// object to grant or deny access to in the first place. Any *other* open failure
+// (permission denied, a path that exists but isn't a directory, ...) is still a hard
+// error — only "doesn't exist" is tolerated. See its definition in
+// `roundhouse_sandbox::landlock_wrap` for why this is a shared, not duplicated, list.
 
 /// Fix round 1 (Ruling W5-40), item 3: `/dev`, granted `ReadFile`+`WriteFile` (never
 /// `Execute` — nothing under it needs to run). Reproduced pre-fix: with `/dev` absent

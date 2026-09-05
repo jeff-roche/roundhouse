@@ -77,3 +77,14 @@ pub mod worktree;
 pub use isolate_trait::Isolate;
 pub use roundhouse_core::Tier;
 pub use types::{Attestation, Child, CommandSpec, Handle, IsolationError, ProbeResult};
+
+// Task 27 fix round 2 (Ruling W5-40, following Ruling W5-20's precedent):
+// `round-landlock-exec` (`src/bin/round_landlock_exec.rs`) is a separate crate that
+// links this crate's *library* and can therefore only reach `pub` items, so this is
+// re-exported here rather than duplicated as a second copy — see
+// `landlock_wrap::SYSTEM_READ_EXEC_DIRS`'s own doc comment for why the two prior
+// copies (one validating, one granting) were a fail-open hazard, not just a
+// maintenance nuisance. `#[doc(hidden)]` keeps it out of this crate's advertised
+// public API — it exists for exactly one external caller.
+#[doc(hidden)]
+pub use landlock_wrap::SYSTEM_READ_EXEC_DIRS;

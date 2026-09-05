@@ -126,16 +126,31 @@ fn is_inside_a_target_tree(path: &Path) -> bool {
         .any(|component| component.as_os_str() == std::ffi::OsStr::new("target"))
 }
 
-/// Mirrors `round_landlock_exec.rs`'s own `SYSTEM_READ_EXEC_DIRS` list (kept as a
-/// separate copy rather than shared across the lib/bin crate boundary — `pub(crate)`
-/// items in the library are not visible from a `[[bin]]` target, which links against
-/// the library as an ordinary external dependency and only sees `pub` items; adding a
-/// new `pub` export for six static strings was judged not worth the extra surface for
-/// this fix round). Consulted only by [`validate_workspace_root`] below, to refuse a
-/// workspace root that would swallow one of these directories under the workspace's
-/// own, much broader grant. If `round_landlock_exec.rs`'s list ever changes, update
-/// this copy too.
-const SYSTEM_READ_EXEC_DIRS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
+/// The system directories `round_landlock_exec.rs`'s ruleset grants `ReadFile`+
+/// `Execute` on, and the same list [`validate_workspace_root`] below consults to
+/// refuse a workspace root that would swallow one of them under the workspace's own,
+/// much broader grant.
+///
+/// **Task 27 fix round 2 (Ruling W5-40 item, escalated by Ruling W5-20's precedent):**
+/// fix round 1 shipped this as two separately-maintained copies — one here (consulted
+/// by the *validator*) and one in `round_landlock_exec.rs` (consulted by the
+/// *ruleset-builder*) — with a comment asking a future editor to update both. That is
+/// exactly the shape Ruling W5-20 (Task 14's `check_expansion`/`Verdict`, same
+/// lib/`[[bin]]` visibility wall) already ruled out: "inventing a second copy of the
+/// guard is not acceptable." Here the stakes are sharper than a maintenance nuisance —
+/// the two copies don't merely mirror each other, they check *opposite sides of the
+/// same fact*. If they drifted, a workspace root could pass validation (this copy)
+/// while the ruleset still handed that same directory a broad grant (the other copy),
+/// which is a fail-open path created purely by the duplication. `#[doc(hidden)] pub`
+/// (the identical fix Ruling W5-20 applied) keeps this out of the crate's advertised
+/// public API — it exists for exactly one external caller — while letting
+/// `round_landlock_exec.rs`, a separate crate that links this library and can
+/// therefore only reach `pub` items, use this single definition instead of a second
+/// copy. Re-exported at the crate root (`lib.rs`) rather than left unreachable behind
+/// the private `landlock_wrap` module, the same shape `roundhouse-flow`'s
+/// `parse/mod.rs` uses for `check_expansion`/`Verdict`.
+#[doc(hidden)]
+pub const SYSTEM_READ_EXEC_DIRS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
 
 /// Task 27 fix round 1, item 1 (Ruling W5-40): refuses a `workspace_root` that would
 /// make `round-landlock-exec`'s ruleset restrict nothing. `wrap_for_landlock_if_available`
