@@ -224,13 +224,28 @@ const MAX_UNTRUSTED_REASON_ECHO_LEN: usize = 200;
 /// `commit 1` of this task wired `Loss.description` through) is literal-value
 /// matching over ALREADY-RESOLVED live secrets -- it structurally cannot
 /// catch a mistyped or unresolved key, which shape-based redaction (this
-/// function, via `redact_error_body`) can. Truncating and `{:?}`-escaping
-/// (mirroring `codec::openai_chat::decode::sanitize_untrusted_wire_string`)
-/// additionally bounds the length and makes an embedded newline/ANSI escape
-/// visible rather than able to forge a log line once this reaches
-/// `tracing::warn!` at the `stream_chat` boundary.
+/// function) can.
+///
+/// Fix round 2: uses [`crate::audit::redact_transport_error_text`], not bare
+/// [`crate::audit::redact_error_body`]. `redact_error_body` alone does NOT
+/// strip a URL's userinfo or query string (it only matches a labeled
+/// `api_key`/`access_token`/`client_secret`-shaped field of at least 16
+/// chars -- see that function's own doc comment) -- so a gateway URL
+/// embedded in an unrecognized `reason`, credentials and all
+/// (`https://user:pass@gateway.example.com/v1?key=abc123`), would have
+/// survived verbatim under fix round 1's version of this function.
+/// `redact_transport_error_text` reduces any embedded URL to `host[:port]`
+/// first, THEN runs `redact_error_body` on top, closing that gap. Running
+/// URL-shortening before the length cap below also means the cap eats less
+/// useful text.
+///
+/// Truncating and `{:?}`-escaping (mirroring
+/// `codec::openai_chat::decode::sanitize_untrusted_wire_string`) additionally
+/// bounds the length and makes an embedded newline/ANSI escape visible
+/// rather than able to forge a log line once this reaches `tracing::warn!`
+/// at the `stream_chat` boundary.
 fn sanitize_loss_description(raw: &str) -> String {
-    let redacted = crate::audit::redact_error_body(raw);
+    let redacted = crate::audit::redact_transport_error_text(raw);
     let truncated: String = redacted
         .chars()
         .take(MAX_UNTRUSTED_REASON_ECHO_LEN)
@@ -560,6 +575,54 @@ mod terminal_failure_tests {
                 assert!(
                     !text.contains('\n'),
                     "and must not carry a literal newline either"
+                );
+            }
+            other => panic!("expected LossKind::Other for an unrecognized reason, got {other:?}"),
+        }
+    }
+
+    /// Fix round 2: `redact_error_body` alone does NOT strip a URL's
+    /// userinfo or query string (it only matches a labeled
+    /// `api_key`/`access_token`/`client_secret`-shaped field of at least 16
+    /// chars -- see `audit::redact_transport_error_text`'s doc comment) --
+    /// so a gateway URL embedded in an unrecognized `reason`, credentials
+    /// and all, survived verbatim under the fix-round-1 sanitizer. This is
+    /// the precise leak shape `sanitize_loss_description` must close by
+    /// using `redact_transport_error_text` instead.
+    #[test]
+    fn an_unrecognized_reason_embedding_a_credentialed_url_is_host_only() {
+        let raw = serde_json::json!({
+            "type": "response.incomplete",
+            "sequence_number": 9,
+            "response": {
+                "id": "resp_1",
+                "status": "incomplete",
+                "incomplete_details": {
+                    "reason": "https://user:pass@gateway.example.com/v1?key=abc123 rejected the request"
+                }
+            }
+        })
+        .to_string();
+        let failure =
+            terminal_failure(&raw).expect("response.incomplete must be a terminal failure");
+        let loss = failure
+            .loss
+            .expect("an unrecognized reason is still a LossEvent");
+
+        assert!(
+            !loss.description.contains("user:pass"),
+            "URL userinfo must never survive in description: {loss:?}"
+        );
+        assert!(
+            !loss.description.contains("key=abc123"),
+            "a bare query-string credential must never survive in description: {loss:?}"
+        );
+        match &loss.kind {
+            LossKind::Other(text) => {
+                assert!(
+                    !text.contains("user:pass") && !text.contains("key=abc123"),
+                    "LossKind::Other's wrapped text must be host-only too, not just \
+                     description: {loss:?}"
                 );
             }
             other => panic!("expected LossKind::Other for an unrecognized reason, got {other:?}"),
