@@ -61,7 +61,9 @@
 
 use serde_json::Value;
 
-use super::{decode_anthropic_messages_stream, encode_anthropic_messages};
+use super::{
+    decode_anthropic_messages_stream, encode_anthropic_messages, StreamFailure, StreamFailureKind,
+};
 use crate::audit::redact_transport_error_text;
 use crate::credential::{resolve_base_url, CredentialCtx};
 use crate::errors::classify;
@@ -142,10 +144,13 @@ impl Provider for AnthropicMessagesProfileProvider {
                 ));
             }
 
-            let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
-                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
-                )?;
+            let (base_url, _host_only) = resolve_base_url(
+                &self.profile.id,
+                &self.profile.defaults.base_url,
+                None,
+                false,
+            )
+            .map_err(|e| ProviderError::Transport(redact_transport_error_text(&e.to_string())))?;
 
             let is_vertex = self.profile.id == "vertex-anthropic";
 
@@ -255,7 +260,19 @@ impl Provider for AnthropicMessagesProfileProvider {
             if !(200..300).contains(&response.status) {
                 // §9.8: never `?` on JSON parsing in the error path.
                 let headers = to_header_map(&response.headers);
-                let body_bytes = collect_body(response.body).await;
+                let body_bytes = match crate::body_cap::collect_body_capped(
+                    response.body,
+                    crate::body_cap::MAX_RESPONSE_BODY_BYTES,
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        return Err(ProviderError::Transport(redact_transport_error_text(
+                            &e.to_string(),
+                        )))
+                    }
+                };
                 return Err(classify(
                     &self.profile.error_profile(),
                     response.status,
@@ -264,7 +281,9 @@ impl Provider for AnthropicMessagesProfileProvider {
                 ));
             }
 
-            let events = decode_anthropic_messages_stream(response.body).await;
+            let events = decode_anthropic_messages_stream(response.body)
+                .await
+                .map_err(stream_failure_to_provider_error)?;
             Ok(ChatStream(Box::pin(futures::stream::iter(events))))
         })
     }
@@ -391,6 +410,26 @@ fn contains_unencodable_content(req: &ChatRequest) -> bool {
     })
 }
 
+/// Ruling R17, item 3: modeled on `codec::cohere_v2::provider`'s identical
+/// `stream_failure_to_provider_error` — mirrors
+/// `crate::anthropic_provider`'s copy of the same mapping (that crate's
+/// Phase 1 provider and this one are two independent `Provider` impls
+/// sharing one decode function, per this module's own doc comment on why
+/// there are two wrapper types).
+fn stream_failure_to_provider_error(failure: StreamFailure) -> ProviderError {
+    tracing::warn!(
+        kind = ?failure.kind,
+        message = %redact_transport_error_text(&failure.message),
+        "anthropic-messages stream failed mid-generation"
+    );
+    match failure.kind {
+        StreamFailureKind::Transport => ProviderError::Transport(failure.message),
+        StreamFailureKind::Truncated => ProviderError::StreamInterrupted {
+            partial: failure.partial_text,
+        },
+    }
+}
+
 fn to_header_map(raw: &[(String, String)]) -> http::HeaderMap {
     let mut headers = http::HeaderMap::new();
     for (name, value) in raw {
@@ -402,24 +441,6 @@ fn to_header_map(raw: &[(String, String)]) -> http::HeaderMap {
         }
     }
     headers
-}
-
-async fn collect_body(
-    mut body: std::pin::Pin<
-        Box<
-            dyn futures::Stream<Item = Result<bytes::Bytes, crate::transport::TransportError>>
-                + Send,
-        >,
-    >,
-) -> Vec<u8> {
-    use futures::StreamExt;
-    let mut out = Vec::new();
-    while let Some(chunk) = body.next().await {
-        if let Ok(chunk) = chunk {
-            out.extend_from_slice(&chunk);
-        }
-    }
-    out
 }
 
 #[cfg(test)]

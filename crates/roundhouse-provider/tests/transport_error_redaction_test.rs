@@ -65,6 +65,26 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                  `redact_transport_error_text`, not raw here",
     },
     AllowlistEntry {
+        file: "anthropic_provider.rs",
+        line_contains: "StreamFailureKind::Transport => ProviderError::Transport(failure.message)",
+        reason: "already redacted at construction: `failure.message` for the \
+                 `Transport` kind is built by \
+                 `codec::anthropic_messages::decode` via \
+                 `redact_transport_error_text`, not raw here \
+                 (Phase 7, Task 11/Ruling R17: this codec joined the strict \
+                 truncation-signaling group, mirroring cohere_v2/openai_chat)",
+    },
+    AllowlistEntry {
+        file: "codec/anthropic_messages/provider.rs",
+        line_contains: "StreamFailureKind::Transport => ProviderError::Transport(failure.message)",
+        reason: "already redacted at construction: `failure.message` for the \
+                 `Transport` kind is built by \
+                 `codec::anthropic_messages::decode` via \
+                 `redact_transport_error_text`, not raw here \
+                 (Phase 7, Task 11/Ruling R17: this codec joined the strict \
+                 truncation-signaling group, mirroring cohere_v2/openai_chat)",
+    },
+    AllowlistEntry {
         file: "retry.rs",
         line_contains:
             "ProviderError::Server { .. } | ProviderError::Timeout | ProviderError::Transport(_)",

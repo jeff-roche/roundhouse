@@ -172,10 +172,50 @@ impl CredentialProvider for OAuthRefreshCredential {
                 })
                 .await
                 .map_err(|_e| {
-                    // Never interpolate `TransportError`'s `Display` here:
-                    // reqwest 0.13.4's error `Display` ends with
-                    // `" for url ({url})"`, and `Url`'s `Display` includes
-                    // any userinfo component — report the host only.
+                    // Never interpolate `TransportError`'s `Display` here.
+                    // Phase 7 U4 fix round 2 (Ruling CF15) sharpened this
+                    // comment further after fix round 1 (Ruling R33)
+                    // corrected its first, wrong claim (that userinfo was
+                    // the leak) -- both corrections verified against
+                    // `reqwest = 0.13.4`'s actual vendored source, not
+                    // inferred.
+                    //
+                    // The userinfo strip is NOT a `Display`/error-
+                    // formatting guarantee: `reqwest::Error`'s `Display`
+                    // just writes `self.inner.url` verbatim
+                    // (`error.rs:279-281`). The strip happens earlier and
+                    // separately, at Request-BUILD time:
+                    // `extract_authority` (`async_impl/request.rs:582-606`)
+                    // moves userinfo out of the URL and into an
+                    // `Authorization: Basic` header before the request is
+                    // ever sent, so by the time a `send()` failure
+                    // constructs an error, the URL it captures has already
+                    // had userinfo removed -- for both `Display` AND
+                    // `Debug` (verified: neither is more or less safe than
+                    // the other on this axis, since both read the same
+                    // already-stripped field).
+                    //
+                    // **That strip is CONDITIONAL, not unconditional**:
+                    // `extract_authority` percent-decodes the username and
+                    // early-returns (leaving userinfo in the URL
+                    // untouched) if that decode fails. Executed: a
+                    // percent-encoded username with invalid UTF-8
+                    // (`http://%ff%fe:pw@host/x`) survives verbatim in
+                    // BOTH `Display` and `Debug`.
+                    //
+                    // What is NEVER stripped, by any of the above, is the
+                    // QUERY STRING: `http://host/x?api_key=...` survives
+                    // verbatim regardless. That -- not userinfo -- is the
+                    // real, always-live vector a raw `TransportError`
+                    // could carry, and why this closure reports the host
+                    // only rather than ever touching `_e`.
+                    //
+                    // One more asymmetry worth naming even though nothing
+                    // in this codebase does it today: `reqwest::Error`'s
+                    // `Debug` additionally prints its `source` error chain
+                    // (`error.rs:225-227`), which `Display` does not --
+                    // don't assume a future switch to `{:?}` is as safe as
+                    // this analysis of `Display` without re-verifying it.
                     CredentialError::RefreshFailed(format!(
                         "token request to {} failed",
                         record_base_url_override(&self.refresh_url)

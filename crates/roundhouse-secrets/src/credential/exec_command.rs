@@ -2,6 +2,7 @@ use crate::secret::Secret;
 use roundhouse_provider::credential::{CredentialCtx, CredentialError, CredentialProvider};
 use roundhouse_provider::{BoxFut, HttpRequest};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 /// Ceiling on how long a credential helper may run before it's killed. A
 /// hung helper must not wedge the request indefinitely — Phase 2 did real
@@ -17,6 +18,39 @@ const MAX_STDOUT_BYTES: usize = 8 * 1024;
 /// redaction — see `apply`'s error path).
 const MAX_STDERR_CHARS: usize = 200;
 
+/// Ceiling on how many raw stderr bytes are ever *buffered* while draining
+/// the pipe (before the `MAX_STDERR_CHARS` truncation on the redacted,
+/// decoded text is applied). Far larger than `MAX_STDERR_CHARS` needs, but
+/// the point of this constant is different: the drain loop keeps reading
+/// (and discarding) stderr past this point rather than stopping, so a
+/// helper that writes a large amount of stderr can never block on a full
+/// pipe waiting for a reader that has stopped listening — see the
+/// concurrency note on `apply`.
+const MAX_STDERR_BYTES_BUFFERED: usize = 4 * 1024;
+
+/// Sends `SIGKILL` to a helper's entire process group (see `process_group(0)`
+/// on the spawned `Command` below), not just the immediate child — so a
+/// grandchild the helper forked that's still holding the stdout pipe open
+/// (the exact case `process_group(0)` alone does not reach) is torn down
+/// too, rather than remaining bounded only by the whole-call timeout.
+///
+/// `rustix::process::kill_process_group` is a **safe fn** (fix round 1,
+/// Ruling R34 — an earlier version of this fix wrongly believed group-kill
+/// needed `unsafe` or a new dependency; neither is true: `rustix` is already
+/// a dependency here, used in `resolve.rs`, and this crate's
+/// `#![forbid(unsafe_code)]` binds only this crate's own code, not a
+/// dependency's internals). It wraps `kill(-pgid, SIGKILL)`.
+///
+/// `pgid` must be `child.id()` captured **immediately after `spawn()`**,
+/// before any `.wait()`/`.kill()` call — `Child::id()` returns `None` once
+/// the child has been reaped, which is exactly when a caller on an error
+/// path would otherwise be tempted to fetch it.
+fn kill_helper_process_group(pgid: u32) {
+    if let Some(pid) = rustix::process::Pid::from_raw(pgid as i32) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+}
+
 /// Runs a configured external helper command and treats its stdout (trimmed)
 /// as a bearer token. Common for credential helpers that print a
 /// short-lived token to stdout (e.g. a cloud CLI's `print-access-token`).
@@ -26,10 +60,15 @@ const MAX_STDERR_CHARS: usize = 200;
 /// configured helper); the child process runs with a cleared environment
 /// plus only the caller's explicit allow-list (never the daemon's full
 /// environment, which would otherwise hand every secret in the process's env
-/// to an arbitrary configured helper); it is killed if it outruns
-/// `DEFAULT_TIMEOUT` (or a `with_timeout` override); and its stdout is
-/// rejected outright — not silently truncated-and-used — if it exceeds
-/// `MAX_STDOUT_BYTES` or is empty.
+/// to an arbitrary configured helper); it runs in its own process group
+/// (fix round 1, Ruling R34), and both the stdout-size-cap and whole-call
+/// timeout paths send `SIGKILL` to that ENTIRE group, not just the direct
+/// child — so a grandchild the helper forked (e.g. one still holding the
+/// stdout pipe open after the helper itself exits) is torn down too,
+/// rather than being left running or merely bounded by the timeout; it is
+/// killed if it outruns `DEFAULT_TIMEOUT` (or a `with_timeout` override);
+/// and its stdout is rejected outright — not silently truncated-and-used —
+/// if it exceeds `MAX_STDOUT_BYTES` or is empty.
 pub struct ExecCommandCredential {
     command: String,
     args: Vec<String>,
@@ -81,16 +120,241 @@ impl CredentialProvider for ExecCommandCredential {
                 .env_clear()
                 .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                // Phase 7 U4 (Ruling R14): put the helper (and anything it
+                // forks) in its own new process group rather than the
+                // daemon's, so a terminal signal delivered to the daemon's
+                // foreground process group (e.g. Ctrl-C's SIGINT) never also
+                // lands directly on a credential helper mid-run. A pgid of 0
+                // makes the child the leader of that new group (see
+                // `tokio::process::Command::process_group`'s own doc
+                // example) — and gives `kill_helper_process_group` below a
+                // group it can address deliberately, rather than relying on
+                // whatever group the daemon itself happens to be in.
+                .process_group(0)
                 // If the timeout below fires and this future is dropped
-                // before the child exits, tokio kills the child on drop
-                // instead of leaving it running as an orphan.
+                // before the child exits, tokio kills the direct child on
+                // drop — but see `kill_helper_process_group`'s doc comment
+                // for why that alone doesn't reach a grandchild.
+                //
+                // **Neither error path below calls `child.wait()` after
+                // killing** (cap-exceeded, and the timeout branch's
+                // `start_kill`). That's deliberate, not an oversight: once
+                // a signal has been sent, `child` is simply dropped when
+                // this function returns its `Err`, and tokio's runtime
+                // reaps it via its background "orphan" queue regardless —
+                // the same mechanism `kill_on_drop(true)` itself relies on
+                // for the drop-via-timeout case above. An explicit
+                // `.wait()` here would buy nothing and, worse, would be
+                // exactly the kind of blocking await Ruling R37 (fix round
+                // 2) had to remove from the timeout branch.
                 .kill_on_drop(true);
 
-            let output = match tokio::time::timeout(self.timeout, command.output()).await {
-                Ok(result) => {
-                    result.map_err(|e| CredentialError::ExecFailed(None, e.to_string()))?
+            let mut child = command
+                .spawn()
+                .map_err(|e| CredentialError::ExecFailed(None, e.to_string()))?;
+            // Capture NOW, before any `.wait()`/`.kill()` below can reap the
+            // child and make `child.id()` start returning `None`.
+            let pgid = child.id();
+
+            let run = async {
+                let mut stdout = child
+                    .stdout
+                    .take()
+                    .expect("stdout was configured as piped above");
+                let mut stderr = child
+                    .stderr
+                    .take()
+                    .expect("stderr was configured as piped above");
+
+                // Stream stdout instead of buffering it to completion and
+                // only checking its length afterward (Ruling R14): a helper
+                // that emits far more than `MAX_STDOUT_BYTES` before exiting
+                // — or one that never exits at all, e.g. because it forked a
+                // grandchild that inherited and holds open the stdout pipe —
+                // would otherwise be read into memory in full, bounded only
+                // by the whole-call timeout below. Reading in bounded chunks
+                // and failing the instant the running total crosses the cap
+                // means a misbehaving helper is killed and rejected within
+                // one chunk's read latency, not the full timeout, and this
+                // process never holds more than one chunk past the cap in
+                // memory.
+                //
+                // Stdout and stderr are drained CONCURRENTLY (`tokio::join!`
+                // below), not sequentially. A pipe has a finite OS buffer
+                // (~64 KiB on Linux); a helper that writes more than that to
+                // stderr before it finishes writing stdout blocks on that
+                // write until something reads the other end. Draining stdout
+                // to EOF first (a naive streaming rewrite's first instinct)
+                // would then hang until the whole-call timeout — a helper
+                // that would have succeeded gets misreported as "timed out"
+                // instead. `.output()`, what this replaced, always drained
+                // both concurrently for exactly this reason.
+                let mut stdout_buf: Vec<u8> = Vec::new();
+                let stdout_fut = async {
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = stdout
+                            .read(&mut chunk)
+                            .await
+                            .map_err(|e| CredentialError::ExecFailed(None, e.to_string()))?;
+                        if n == 0 {
+                            break;
+                        }
+                        stdout_buf.extend_from_slice(&chunk[..n]);
+                        if stdout_buf.len() > MAX_STDOUT_BYTES {
+                            // Kill immediately rather than draining a
+                            // possibly unbounded stream to EOF first.
+                            // `kill_on_drop` alone wouldn't fire until this
+                            // whole async block is dropped (i.e. not until
+                            // the outer timeout elapses), so an explicit
+                            // kill here is what makes detection fast rather
+                            // than timeout-bounded. Kill the whole process
+                            // GROUP, not just the direct child — a
+                            // grandchild the helper forked may be the one
+                            // actually still holding this pipe open.
+                            if let Some(pgid) = pgid {
+                                kill_helper_process_group(pgid);
+                            }
+                            let _ = child.kill().await;
+                            return Err(CredentialError::ExecFailed(
+                                None,
+                                format!(
+                                    "credential helper stdout exceeded {MAX_STDOUT_BYTES} bytes"
+                                ),
+                            ));
+                        }
+                    }
+                    Ok(())
+                };
+
+                // Bounded, not `read_to_end`: this drain runs for as long as
+                // the pipe stays open, independent of whatever `stdout_fut`
+                // decides above, so it must never itself grow unboundedly.
+                // It keeps consuming (and discarding) bytes past the cap
+                // rather than stopping, since stopping early would recreate
+                // the exact full-pipe stall this concurrent drain exists to
+                // avoid.
+                let stderr_fut = async {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match stderr.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if buf.len() < MAX_STDERR_BYTES_BUFFERED {
+                                    let take = (MAX_STDERR_BYTES_BUFFERED - buf.len()).min(n);
+                                    buf.extend_from_slice(&chunk[..take]);
+                                }
+                            }
+                        }
+                    }
+                    buf
+                };
+
+                let (stdout_result, stderr_buf) = tokio::join!(stdout_fut, stderr_fut);
+                stdout_result?;
+
+                let status = child
+                    .wait()
+                    .await
+                    .map_err(|e| CredentialError::ExecFailed(None, e.to_string()))?;
+
+                if !status.success() {
+                    // A helper's stderr is not vetted content: it can carry
+                    // diagnostics that echo token material (e.g. under
+                    // `set -x`, or a partial-write bug). `redact_error_body`'s
+                    // shape-based patterns are the only thing that ever sees
+                    // this text, and it is hard-truncated regardless, since a
+                    // persisted `CredentialError` derives `Display`/`Debug`.
+                    //
+                    // **This is the WEAKER of `roundhouse-provider::audit`'s
+                    // two redactors, deliberately, not by oversight (fix
+                    // round 3, Ruling R38 / security M1).** The stronger
+                    // `redact_transport_error_text` is `pub(crate)` inside
+                    // `roundhouse-provider`, and this crate is downstream of
+                    // it (`roundhouse-secrets` -> `roundhouse-provider`), so
+                    // it structurally cannot be called from here without
+                    // making it `pub` — which this unit declines to do: it
+                    // would reverse a recorded visibility decision to widen
+                    // a public API for a call site with zero production
+                    // callers today (`ExecCommandCredential` is only ever
+                    // constructed in tests), and the preferred long-term fix
+                    // (CF12: put only the exit code plus fixed text in
+                    // `ExecFailed`, route redacted stderr to
+                    // `tracing::debug!` instead of a persisted field) would
+                    // make this redactor's strength irrelevant anyway rather
+                    // than needing a stronger one here.
+                    //
+                    // Consequence, executed: `redact_error_body` leaves
+                    // `curl: (7) Failed to connect to
+                    // https://svcacct:PASSWORD@gw.example.com/token`
+                    // COMPLETELY UNCHANGED — the stronger redactor would
+                    // reduce it to a host-only form. So embedded URL
+                    // userinfo in a helper's stderr survives into this
+                    // (truncated, but not host-reduced) error text today.
+                    // **This is gated on zero production callers and MUST
+                    // be closed — by the CF12 fix above, or by finally
+                    // making the stronger redactor reachable across this
+                    // crate boundary — before `ExecCommandCredential` gains
+                    // its first one.**
+                    let redacted = roundhouse_provider::audit::redact_error_body(
+                        &String::from_utf8_lossy(&stderr_buf),
+                    );
+                    let truncated: String = redacted.chars().take(MAX_STDERR_CHARS).collect();
+                    return Err(CredentialError::ExecFailed(status.code(), truncated));
                 }
+
+                let token = String::from_utf8_lossy(&stdout_buf).trim().to_string();
+                if token.is_empty() {
+                    return Err(CredentialError::ExecFailed(
+                        status.code(),
+                        "credential helper produced empty stdout".to_string(),
+                    ));
+                }
+
+                Ok(token)
+            };
+
+            let token = match tokio::time::timeout(self.timeout, run).await {
+                Ok(result) => result?,
                 Err(_) => {
+                    // `run` (and its borrow of `child`) was just dropped by
+                    // `timeout` elapsing, so `child` is usable again here.
+                    // Same reasoning as the cap-exceeded branch above: kill
+                    // the whole process group, not just the direct child,
+                    // so a hung grandchild doesn't outlive this call.
+                    if let Some(pgid) = pgid {
+                        kill_helper_process_group(pgid);
+                    }
+                    // Fix round 2 (Ruling R37): `start_kill`, NOT
+                    // `kill().await`. This branch runs AFTER
+                    // `self.timeout` has already elapsed, with nothing
+                    // left to bound a further wait — and
+                    // `Child::kill().await` is `start_kill()` followed by
+                    // `.wait().await` (tokio 1.53.1's own
+                    // `src/process/mod.rs`), which blocks until the OS
+                    // actually reaps the process. A helper wedged in
+                    // uninterruptible (`D`) state — realistically, a hung
+                    // NFS/FUSE read partway through fetching a token —
+                    // does not die the instant SIGKILL is sent; the kernel
+                    // only delivers it once the blocking syscall returns.
+                    // `kill().await` here would make `apply` (and the
+                    // request using it) wedge for exactly as long as that
+                    // syscall stays blocked, which is precisely what
+                    // `DEFAULT_TIMEOUT` exists to prevent.
+                    // `start_kill` sends the signal and returns
+                    // immediately without waiting for exit, restoring the
+                    // non-blocking semantics this branch had before this
+                    // unit (`kill_on_drop(true)` on the `Command` still
+                    // reaps `child` once it does exit — see the comment on
+                    // `kill_on_drop` above). The group SIGKILL just above
+                    // already does the work that matters for the
+                    // grandchild case; this direct-child signal is
+                    // best-effort belt-and-braces, so a failure here is
+                    // deliberately ignored rather than blocking on it.
+                    let _ = child.start_kill();
                     return Err(CredentialError::ExecFailed(
                         None,
                         format!(
@@ -100,35 +364,6 @@ impl CredentialProvider for ExecCommandCredential {
                     ));
                 }
             };
-
-            if !output.status.success() {
-                // A helper's stderr is not vetted content: it can carry
-                // diagnostics that echo token material (e.g. under `set -x`,
-                // or a partial-write bug). `redact_error_body`'s shape-based
-                // patterns are the only thing that ever sees this text, and
-                // it is hard-truncated regardless, since a persisted
-                // `CredentialError` derives `Display`/`Debug`.
-                let redacted = roundhouse_provider::audit::redact_error_body(
-                    &String::from_utf8_lossy(&output.stderr),
-                );
-                let truncated: String = redacted.chars().take(MAX_STDERR_CHARS).collect();
-                return Err(CredentialError::ExecFailed(output.status.code(), truncated));
-            }
-
-            if output.stdout.len() > MAX_STDOUT_BYTES {
-                return Err(CredentialError::ExecFailed(
-                    output.status.code(),
-                    format!("credential helper stdout exceeded {MAX_STDOUT_BYTES} bytes"),
-                ));
-            }
-
-            let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if token.is_empty() {
-                return Err(CredentialError::ExecFailed(
-                    output.status.code(),
-                    "credential helper produced empty stdout".to_string(),
-                ));
-            }
 
             // Wrapped in a `Secret` immediately, and read only through the
             // shared `apply_bearer_secret` exposure site — never held as a

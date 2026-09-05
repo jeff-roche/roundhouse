@@ -24,7 +24,7 @@
 //! `ProviderError` variant is via this profile's own error-code
 //! classification.
 
-use roundhouse_conformance::{run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
+use roundhouse_conformance::{checks, run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
 use roundhouse_provider::codec::openai_responses::encode::encode;
 use roundhouse_provider::codec::openai_responses::OpenAiResponsesProvider;
 use roundhouse_provider::profile::ProviderProfile;
@@ -185,14 +185,18 @@ impl ConformanceSubject for OpenAiResponsesSubject {
                 cassette_path: cassette_path("response_incomplete.cassette"),
                 mask: mask.clone(),
                 declared_loss_events: vec![],
-                // `response.incomplete` carries only a `reason` string, no
-                // error `code` -- nothing in this profile's `[errors]` table
-                // has "max_output_tokens" as a key, so this falls through to
-                // `classify`'s HTTP-status default tier for the real 200
-                // status this response actually had.
-                expected_error: Some(|e| {
-                    matches!(e, ProviderError::BadRequest { status: 200, .. })
-                }),
+                // Phase 7 Task 13b: `response.incomplete` is a lossy-but-real
+                // completion (truncated at `max_output_tokens`), not a
+                // genuine provider-side failure, so it now maps to
+                // `StreamInterrupted` instead of falling through to
+                // `classify`'s HTTP-status default tier as a generic
+                // `BadRequest{200,""}` that discarded the real reason --
+                // matching every sibling codec's convention for this same
+                // shape (`cohere_v2`, `openai_chat`, `anthropic_messages`).
+                // The real reason now survives as a `LossEvent` returned
+                // in-band from `decode_openai_responses_stream` (Ruling R4)
+                // -- see `codec::openai_responses::decode::StreamFailure::loss`.
+                expected_error: Some(|e| matches!(e, ProviderError::StreamInterrupted { .. })),
             },
             ConformanceCase {
                 name: "in_band_error",
@@ -225,6 +229,27 @@ impl ConformanceSubject for OpenAiResponsesSubject {
 #[tokio::test]
 async fn openai_responses_is_conformant() {
     run::<OpenAiResponsesSubject>().await.assert_green();
+}
+
+/// Task 12 (Cross-Cutting #2, Ruling R16): mandatory truncate-mid-stream
+/// check -- this codec is in the "absence" truncation-signaling group
+/// (`decode_guard.rs`'s module doc): it returns `Ok` without a `MessageStop`
+/// when truncated before its real `response.completed` terminal, which the
+/// check must accept (only a FABRICATED `MessageStop` fails it).
+#[tokio::test]
+async fn text_cassette_is_never_indistinguishable_from_a_clean_completion_when_truncated() {
+    let failures = checks::check_truncate_mid_stream(
+        &OpenAiResponsesSubject::provider(),
+        &fixtures::single_turn_text(),
+        &cassette_path("text.cassette"),
+        OpenAiResponsesSubject::credentials(),
+    )
+    .await;
+    assert!(
+        failures.is_empty(),
+        "openai-responses must never report a clean completion for a stream truncated before \
+         its real terminal: {failures:#?}"
+    );
 }
 
 fn error_body(code: &str) -> Vec<u8> {

@@ -50,6 +50,7 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 use sse_stream::SseStream;
 
+use crate::loss_event::{LossEvent, LossKind};
 use crate::stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 use crate::TransportError;
 
@@ -68,6 +69,19 @@ pub struct StreamFailure {
     /// the `incomplete_details.reason`, or a fallback naming the event type
     /// when the payload carried neither.
     pub message: String,
+    /// Phase 7 Task 13b: `response.incomplete` is a **lossy, not a
+    /// genuine, failure** -- the model actually produced output, just less
+    /// of it than requested (truncated at `max_output_tokens`, or cut short
+    /// by `content_filter`). `Some(LossEvent)` here names that distinction
+    /// (Ruling R4: in-band, as data returned from this decode call) so
+    /// `provider.rs` can route it to `ProviderError::StreamInterrupted`
+    /// instead of `classify`'s generic HTTP-status-default `BadRequest`,
+    /// matching every sibling codec's convention for a mid-stream
+    /// max-tokens/content-filter cutoff (`cohere_v2`, `openai_chat`,
+    /// `anthropic_messages`). `None` for `response.failed`/bare `error`,
+    /// which are genuine provider-side failures, not a lossy-but-real
+    /// completion.
+    pub loss: Option<LossEvent>,
 }
 
 /// Decodes an Open Responses SSE response body into normalized
@@ -132,6 +146,7 @@ fn terminal_failure(raw: &str) -> Option<StreamFailure> {
                     .and_then(Value::as_str)
                     .unwrap_or("response.failed with no error detail in the response body")
                     .to_string(),
+                loss: None,
             })
         }
         "response.incomplete" => {
@@ -142,6 +157,20 @@ fn terminal_failure(raw: &str) -> Option<StreamFailure> {
             Some(StreamFailure {
                 code: None,
                 message: reason.to_string(),
+                // Fix round 1, K1 (construction-site defense-in-depth):
+                // `reason` is provider-controlled wire text with no length
+                // or shape guarantee -- classify the kind against the RAW
+                // value (so the two known short literals still match
+                // exactly), but the text that actually lands in the
+                // `LossEvent` (both `description` here and inside
+                // `LossKind::Other` for an unrecognized reason) is always
+                // the sanitized form. See `sanitize_loss_description`'s doc
+                // comment for why this can't be left to the log site alone.
+                loss: Some(LossEvent {
+                    kind: loss_kind_for_incomplete_reason(reason),
+                    description: sanitize_loss_description(reason),
+                    blocks_affected: 1,
+                }),
             })
         }
         "error" => {
@@ -156,10 +185,72 @@ fn terminal_failure(raw: &str) -> Option<StreamFailure> {
                     .and_then(Value::as_str)
                     .unwrap_or("openai-responses stream emitted an error event with no message")
                     .to_string(),
+                loss: None,
             })
         }
         _ => None,
     }
+}
+
+/// Maps `response.incomplete`'s `incomplete_details.reason` onto a
+/// [`LossKind`]. The two real, documented values for this field are
+/// `"max_output_tokens"` and `"content_filter"` (not present in this
+/// module's own vendored spec excerpt -- `docs/decisions/2026-08-27-open-
+/// responses-spec-verification.md` -- but part of the public Responses API
+/// surface); anything else becomes `LossKind::Other` so a future or
+/// unrecognized reason still names itself in `description` rather than
+/// silently collapsing into one of the two known tags.
+fn loss_kind_for_incomplete_reason(reason: &str) -> LossKind {
+    match reason {
+        "max_output_tokens" => LossKind::TruncatedAtMaxTokens,
+        "content_filter" => LossKind::ContentFiltered,
+        other => LossKind::Other(sanitize_loss_description(other)),
+    }
+}
+
+/// Length cap for `reason` text landing in a [`LossEvent`], mirroring
+/// `codec::openai_chat::decode`'s identical `MAX_UNTRUSTED_STRING_ECHO_LEN`.
+const MAX_UNTRUSTED_REASON_ECHO_LEN: usize = 200;
+
+/// Fix round 1, K1: `reason` (`/response/incomplete_details/reason`) is
+/// provider-controlled wire text with no length or shape guarantee --
+/// `loss_kind_for_incomplete_reason`'s `Other` arm accepts ANY value here,
+/// not a closed vocabulary. Two independent layers exist for this, matching
+/// the codebase's own K1/K2 split (see `provider.rs`'s `stream_chat` for the
+/// K2 log-site half): this is K1, the construction-site half, run before the
+/// text ever reaches `LossEvent.description` or `LossKind::Other`.
+///
+/// `roundhouse-store`'s `Redactor` (the persistence-boundary redactor
+/// `commit 1` of this task wired `Loss.description` through) is literal-value
+/// matching over ALREADY-RESOLVED live secrets -- it structurally cannot
+/// catch a mistyped or unresolved key, which shape-based redaction (this
+/// function) can.
+///
+/// Fix round 2: uses [`crate::audit::redact_transport_error_text`], not bare
+/// [`crate::audit::redact_error_body`]. `redact_error_body` alone does NOT
+/// strip a URL's userinfo or query string (it only matches a labeled
+/// `api_key`/`access_token`/`client_secret`-shaped field of at least 16
+/// chars -- see that function's own doc comment) -- so a gateway URL
+/// embedded in an unrecognized `reason`, credentials and all
+/// (`https://user:pass@gateway.example.com/v1?key=abc123`), would have
+/// survived verbatim under fix round 1's version of this function.
+/// `redact_transport_error_text` reduces any embedded URL to `host[:port]`
+/// first, THEN runs `redact_error_body` on top, closing that gap. Running
+/// URL-shortening before the length cap below also means the cap eats less
+/// useful text.
+///
+/// Truncating and `{:?}`-escaping (mirroring
+/// `codec::openai_chat::decode::sanitize_untrusted_wire_string`) additionally
+/// bounds the length and makes an embedded newline/ANSI escape visible
+/// rather than able to forge a log line once this reaches `tracing::warn!`
+/// at the `stream_chat` boundary.
+fn sanitize_loss_description(raw: &str) -> String {
+    let redacted = crate::audit::redact_transport_error_text(raw);
+    let truncated: String = redacted
+        .chars()
+        .take(MAX_UNTRUSTED_REASON_ECHO_LEN)
+        .collect();
+    format!("{truncated:?}")
 }
 
 /// Decodes one `data: {...}` frame's JSON payload into zero or more
@@ -365,6 +456,7 @@ mod usage_tests {
 #[cfg(test)]
 mod terminal_failure_tests {
     use super::terminal_failure;
+    use crate::loss_event::LossKind;
 
     #[test]
     fn response_failed_extracts_the_error_code_and_message() {
@@ -399,6 +491,157 @@ mod terminal_failure_tests {
             terminal_failure(&raw).expect("response.incomplete must be a terminal failure");
         assert_eq!(failure.code, None);
         assert_eq!(failure.message, "max_output_tokens");
+        assert_eq!(
+            failure.loss,
+            Some(crate::loss_event::LossEvent {
+                kind: crate::loss_event::LossKind::TruncatedAtMaxTokens,
+                // Fix round 1, K1: `description` is now sanitized
+                // (truncated + `{:?}`-escaped) before it lands in the
+                // `LossEvent`, even for a known-safe short literal like
+                // this one -- see `sanitize_loss_description`.
+                description: "\"max_output_tokens\"".into(),
+                blocks_affected: 1,
+            }),
+            "response.incomplete must name the real reason as a LossEvent, not discard it"
+        );
+    }
+
+    #[test]
+    fn response_incomplete_with_content_filter_reason_is_a_content_filtered_loss() {
+        let raw = serde_json::json!({
+            "type": "response.incomplete",
+            "sequence_number": 9,
+            "response": {
+                "id": "resp_1",
+                "status": "incomplete",
+                "incomplete_details": { "reason": "content_filter" }
+            }
+        })
+        .to_string();
+        let failure =
+            terminal_failure(&raw).expect("response.incomplete must be a terminal failure");
+        assert_eq!(
+            failure.loss.map(|l| l.kind),
+            Some(crate::loss_event::LossKind::ContentFiltered),
+            "an operator must be able to tell content filtering apart from truncation"
+        );
+    }
+
+    /// Fix round 1, K1: `incomplete_details.reason` is NOT a closed
+    /// vocabulary -- `loss_kind_for_incomplete_reason`'s `Other` arm accepts
+    /// any provider-controlled wire value. An unrecognized reason carrying a
+    /// secret-shaped value and an embedded newline must not reach either
+    /// `LossEvent.description` or `LossKind::Other`'s wrapped text verbatim
+    /// -- the secret shape must be redacted, and the newline must be
+    /// escaped (not literal), so it cannot forge a log line once this
+    /// reaches `tracing::warn!` at the `stream_chat` boundary.
+    #[test]
+    fn an_unrecognized_reason_with_a_secret_and_embedded_newline_is_sanitized() {
+        let raw = serde_json::json!({
+            "type": "response.incomplete",
+            "sequence_number": 9,
+            "response": {
+                "id": "resp_1",
+                "status": "incomplete",
+                "incomplete_details": {
+                    "reason": "weird_reason\nlevel=CRITICAL forged log line api_key=sk-live-abcdefghijklmnop123456"
+                }
+            }
+        })
+        .to_string();
+        let failure =
+            terminal_failure(&raw).expect("response.incomplete must be a terminal failure");
+        let loss = failure
+            .loss
+            .expect("an unrecognized reason is still a LossEvent");
+
+        assert!(
+            !loss.description.contains("sk-live-abcdefghijklmnop123456"),
+            "a secret-shaped value in an unrecognized reason must never survive verbatim: \
+             {loss:?}"
+        );
+        assert!(
+            !loss.description.contains('\n'),
+            "an embedded newline must be escaped, not literal, or it could forge a log line: \
+             {loss:?}"
+        );
+        match &loss.kind {
+            LossKind::Other(text) => {
+                assert!(
+                    !text.contains("sk-live-abcdefghijklmnop123456"),
+                    "LossKind::Other's wrapped text must be sanitized too, not just \
+                     description: {loss:?}"
+                );
+                assert!(
+                    !text.contains('\n'),
+                    "and must not carry a literal newline either"
+                );
+            }
+            other => panic!("expected LossKind::Other for an unrecognized reason, got {other:?}"),
+        }
+    }
+
+    /// Fix round 2: `redact_error_body` alone does NOT strip a URL's
+    /// userinfo or query string (it only matches a labeled
+    /// `api_key`/`access_token`/`client_secret`-shaped field of at least 16
+    /// chars -- see `audit::redact_transport_error_text`'s doc comment) --
+    /// so a gateway URL embedded in an unrecognized `reason`, credentials
+    /// and all, survived verbatim under the fix-round-1 sanitizer. This is
+    /// the precise leak shape `sanitize_loss_description` must close by
+    /// using `redact_transport_error_text` instead.
+    #[test]
+    fn an_unrecognized_reason_embedding_a_credentialed_url_is_host_only() {
+        let raw = serde_json::json!({
+            "type": "response.incomplete",
+            "sequence_number": 9,
+            "response": {
+                "id": "resp_1",
+                "status": "incomplete",
+                "incomplete_details": {
+                    "reason": "https://user:pass@gateway.example.com/v1?key=abc123 rejected the request"
+                }
+            }
+        })
+        .to_string();
+        let failure =
+            terminal_failure(&raw).expect("response.incomplete must be a terminal failure");
+        let loss = failure
+            .loss
+            .expect("an unrecognized reason is still a LossEvent");
+
+        assert!(
+            !loss.description.contains("user:pass"),
+            "URL userinfo must never survive in description: {loss:?}"
+        );
+        assert!(
+            !loss.description.contains("key=abc123"),
+            "a bare query-string credential must never survive in description: {loss:?}"
+        );
+        match &loss.kind {
+            LossKind::Other(text) => {
+                assert!(
+                    !text.contains("user:pass") && !text.contains("key=abc123"),
+                    "LossKind::Other's wrapped text must be host-only too, not just \
+                     description: {loss:?}"
+                );
+            }
+            other => panic!("expected LossKind::Other for an unrecognized reason, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_failed_and_bare_error_carry_no_loss_event() {
+        let failed = serde_json::json!({
+            "type": "response.failed",
+            "sequence_number": 9,
+            "response": { "id": "resp_1", "status": "failed", "error": { "code": "x", "message": "y" } }
+        })
+        .to_string();
+        assert_eq!(
+            terminal_failure(&failed).unwrap().loss,
+            None,
+            "response.failed is a genuine failure, not a lossy-but-real completion"
+        );
     }
 
     #[test]

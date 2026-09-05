@@ -31,6 +31,7 @@ use std::collections::HashSet;
 // Fix round 4, R4: hoisted again, to `crate::audit`, so `openai_chat` can
 // share the same real implementation instead of its own weaker one.
 use crate::audit::{redact_error_body, redact_transport_error_text};
+use crate::decode_guard::DecodeLoopGuard;
 use crate::stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 use crate::TransportError;
 
@@ -232,6 +233,7 @@ pub async fn decode_cohere_v2_stream(
     let mut sse = SseStream::from_bytes_stream(body);
     let mut keyer = IndexKeyer::new();
     let mut events = Vec::new();
+    let mut guard = DecodeLoopGuard::new();
 
     while let Some(frame) = sse.next().await {
         // A mid-stream transport/SSE-framing error must not be swallowed as
@@ -315,7 +317,7 @@ pub async fn decode_cohere_v2_stream(
             // `google_genai::decode`'s precedent for step types with no IR
             // equivalent (its `user_input`/built-in-tool step kinds).
             "tool-plan-delta" => {}
-            "message-end" => return decode_message_end(&payload, events),
+            "message-end" => return decode_message_end(&payload, events, &mut guard),
             // Genuinely unrecognized frame shape (a future event type this
             // spec revision doesn't document) -- skipped, matching this
             // crate's established malformed-frame precedent.
@@ -334,13 +336,23 @@ pub async fn decode_cohere_v2_stream(
     // genuinely reset connection, already caught): a graceful proxy
     // termination or a final frame missing its blank-line terminator (which
     // `sse-stream` drops silently) never surfaces there.
-    Err(StreamFailure {
+    //
+    // Ruling R1/"DecodeLoopGuard scope" (Phase 7, Addendum 2): routed
+    // through the shared `DecodeLoopGuard` rather than an unconditionally
+    // hand-built `Err` -- `guard` can only be non-`Truncated` here if
+    // `decode_message_end` observed `MessageStop` AND returned without an
+    // early `return` reaching the caller first, which cannot happen (that
+    // function always returns before control reaches this line), so this
+    // is provably always `Err`, but expressed via the same structural
+    // helper `anthropic_messages`/`openai_chat` use rather than re-derived.
+    guard.finish().map_err(|_| StreamFailure {
         kind: StreamFailureKind::Truncated,
         message: "cohere-v2 chat stream ended without ever observing a message-end event -- \
                    the generation was truncated"
             .into(),
         partial_text: partial_text_from_events(&events),
-    })
+    })?;
+    Ok(events)
 }
 
 /// `message-end`: `{type, delta: {finish_reason, usage}}`. Verified
@@ -359,6 +371,7 @@ pub async fn decode_cohere_v2_stream(
 fn decode_message_end(
     payload: &Value,
     mut events: Vec<StreamEvent>,
+    guard: &mut DecodeLoopGuard,
 ) -> Result<Vec<StreamEvent>, StreamFailure> {
     if let Some(usage) = payload.pointer("/delta/usage") {
         events.push(usage_delta(usage));
@@ -371,6 +384,7 @@ fn decode_message_end(
     match finish_reason {
         "COMPLETE" | "STOP_SEQUENCE" | "TOOL_CALL" => {
             events.push(StreamEvent::MessageStop);
+            guard.observe(&StreamEvent::MessageStop);
             Ok(events)
         }
         "MAX_TOKENS" => Err(StreamFailure {
@@ -657,7 +671,11 @@ mod terminal_tests {
             "type": "message-end",
             "delta": { "finish_reason": "MAX_TOKENS" }
         });
-        let err = expect_failure(decode_message_end(&payload, Vec::new()));
+        let err = expect_failure(decode_message_end(
+            &payload,
+            Vec::new(),
+            &mut super::DecodeLoopGuard::new(),
+        ));
         assert!(err.message.contains("MAX_TOKENS"));
         assert_eq!(err.kind, super::StreamFailureKind::MaxTokens);
     }
@@ -668,7 +686,11 @@ mod terminal_tests {
             "type": "message-end",
             "delta": { "finish_reason": "ERROR" }
         });
-        let err = expect_failure(decode_message_end(&payload, Vec::new()));
+        let err = expect_failure(decode_message_end(
+            &payload,
+            Vec::new(),
+            &mut super::DecodeLoopGuard::new(),
+        ));
         assert!(err.message.contains("ERROR"));
         assert_eq!(err.kind, super::StreamFailureKind::Error);
     }
@@ -679,7 +701,11 @@ mod terminal_tests {
             "type": "message-end",
             "delta": { "finish_reason": "TIMEOUT" }
         });
-        let err = expect_failure(decode_message_end(&payload, Vec::new()));
+        let err = expect_failure(decode_message_end(
+            &payload,
+            Vec::new(),
+            &mut super::DecodeLoopGuard::new(),
+        ));
         assert!(err.message.contains("TIMEOUT"));
         assert_eq!(err.kind, super::StreamFailureKind::Timeout);
     }
@@ -702,7 +728,11 @@ mod terminal_tests {
             "type": "message-end",
             "delta": { "finish_reason": "MAX_TOKENS" }
         });
-        let err = expect_failure(decode_message_end(&payload, events));
+        let err = expect_failure(decode_message_end(
+            &payload,
+            events,
+            &mut super::DecodeLoopGuard::new(),
+        ));
         assert_eq!(err.partial_text, "partial answer");
     }
 
@@ -715,7 +745,11 @@ mod terminal_tests {
             "type": "message-end",
             "delta": { "finish_reason": huge }
         });
-        let err = expect_failure(decode_message_end(&payload, Vec::new()));
+        let err = expect_failure(decode_message_end(
+            &payload,
+            Vec::new(),
+            &mut super::DecodeLoopGuard::new(),
+        ));
         assert!(
             err.message.len() < 200,
             "message must be capped, got {} bytes",
@@ -733,7 +767,11 @@ mod terminal_tests {
             "type": "message-end",
             "delta": { "finish_reason": "weird\nvalue" }
         });
-        let err = expect_failure(decode_message_end(&payload, Vec::new()));
+        let err = expect_failure(decode_message_end(
+            &payload,
+            Vec::new(),
+            &mut super::DecodeLoopGuard::new(),
+        ));
         assert!(!err.message.contains('\n'));
         assert!(err.message.contains("\\n"));
     }
@@ -744,7 +782,8 @@ mod terminal_tests {
             "type": "message-end",
             "delta": { "finish_reason": "COMPLETE" }
         });
-        let events = decode_message_end(&payload, Vec::new()).expect("must succeed");
+        let events = decode_message_end(&payload, Vec::new(), &mut super::DecodeLoopGuard::new())
+            .expect("must succeed");
         assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStop)));
     }
 
@@ -754,7 +793,8 @@ mod terminal_tests {
             "type": "message-end",
             "delta": { "finish_reason": "TOOL_CALL" }
         });
-        let events = decode_message_end(&payload, Vec::new()).expect("must succeed");
+        let events = decode_message_end(&payload, Vec::new(), &mut super::DecodeLoopGuard::new())
+            .expect("must succeed");
         assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStop)));
     }
 
@@ -764,14 +804,19 @@ mod terminal_tests {
             "type": "message-end",
             "delta": { "finish_reason": "STOP_SEQUENCE" }
         });
-        let events = decode_message_end(&payload, Vec::new()).expect("must succeed");
+        let events = decode_message_end(&payload, Vec::new(), &mut super::DecodeLoopGuard::new())
+            .expect("must succeed");
         assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStop)));
     }
 
     #[test]
     fn a_missing_finish_reason_is_a_stream_failure_not_a_silent_success() {
         let payload = serde_json::json!({ "type": "message-end", "delta": {} });
-        let err = expect_failure(decode_message_end(&payload, Vec::new()));
+        let err = expect_failure(decode_message_end(
+            &payload,
+            Vec::new(),
+            &mut super::DecodeLoopGuard::new(),
+        ));
         assert_eq!(err.kind, super::StreamFailureKind::UnrecognizedFinishReason);
     }
 

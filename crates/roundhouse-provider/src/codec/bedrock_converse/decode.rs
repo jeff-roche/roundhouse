@@ -28,6 +28,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::audit::redact_transport_error_text;
+use crate::loss_event::{LossEvent, LossKind};
 use crate::stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 use crate::transport::eventstream::{EventStreamDecodeError, EventStreamDecoder};
 use crate::TransportError;
@@ -103,19 +104,23 @@ fn payload_message_field(payload: &Value) -> Option<&str> {
     payload.get("message").and_then(Value::as_str)
 }
 
-/// Decodes `body` into normalized [`StreamEvent`]s, or a [`StreamFailure`]
-/// if the eventstream itself fails to frame correctly, or if a modeled
-/// exception / generic error frame arrives. Malformed or genuinely
-/// unrecognized `:event-type` values are skipped (matching this crate's
-/// established precedent), but the failure/terminal signals enumerated in
-/// this module's doc comment are never in that "skip" bucket.
+/// Decodes `body` into normalized [`StreamEvent`]s plus any [`LossEvent`]s
+/// observed along the way (Ruling R4: in-band, as data returned from this
+/// decode call -- see this module's `messageStop` handling in
+/// [`decode_event`]), or a [`StreamFailure`] if the eventstream itself fails
+/// to frame correctly, or if a modeled exception / generic error frame
+/// arrives. Malformed or genuinely unrecognized `:event-type` values are
+/// skipped (matching this crate's established precedent), but the
+/// failure/terminal signals enumerated in this module's doc comment are
+/// never in that "skip" bucket.
 pub async fn decode_bedrock_converse_stream(
     mut body: impl Stream<Item = Result<Bytes, TransportError>> + Send + Unpin,
-) -> Result<Vec<StreamEvent>, StreamFailure> {
+) -> Result<(Vec<StreamEvent>, Vec<LossEvent>), StreamFailure> {
     let mut decoder = EventStreamDecoder::new();
     let mut keyer = DeltaKeyer::new();
     let mut opened_kinds: HashMap<u32, BlockKind> = HashMap::new();
     let mut events = Vec::new();
+    let mut losses = Vec::new();
 
     while let Some(chunk) = body.next().await {
         let chunk = match chunk {
@@ -160,7 +165,13 @@ pub async fn decode_bedrock_converse_stream(
             if let Some(failure) = terminal_failure(message) {
                 return Err(failure);
             }
-            decode_event(message, &mut keyer, &mut opened_kinds, &mut events);
+            decode_event(
+                message,
+                &mut keyer,
+                &mut opened_kinds,
+                &mut events,
+                &mut losses,
+            );
         }
     }
 
@@ -183,7 +194,7 @@ pub async fn decode_bedrock_converse_stream(
         });
     }
 
-    Ok(events)
+    Ok((events, losses))
 }
 
 /// Recognizes a `:message-type: exception` frame (one of the 5 modeled
@@ -254,6 +265,7 @@ fn decode_event(
     keyer: &mut DeltaKeyer,
     opened_kinds: &mut HashMap<u32, BlockKind>,
     events: &mut Vec<StreamEvent>,
+    losses: &mut Vec<LossEvent>,
 ) {
     let Some(event_type) = header_str(message, ":event-type") else {
         return;
@@ -266,7 +278,12 @@ fn decode_event(
         "contentBlockStart" => decode_content_block_start(&payload, keyer, opened_kinds, events),
         "contentBlockDelta" => decode_content_block_delta(&payload, keyer, opened_kinds, events),
         "contentBlockStop" => decode_content_block_stop(&payload, keyer, opened_kinds, events),
-        "messageStop" => events.push(StreamEvent::MessageStop),
+        "messageStop" => {
+            events.push(StreamEvent::MessageStop);
+            if let Some(loss) = loss_for_stop_reason(&payload) {
+                losses.push(loss);
+            }
+        }
         "metadata" => {
             if let Some(usage) = payload.get("usage") {
                 events.push(usage_delta(usage));
@@ -280,6 +297,31 @@ fn decode_event(
         "messageStart" => {}
         _ => {}
     }
+}
+
+/// `messageStop`'s `stopReason` was, until Phase 7 Task 13b, never read at
+/// all -- every value (`end_turn`, `tool_use`, `max_tokens`,
+/// `stop_sequence`, `guardrail_intervened`, `content_filtered`) produced an
+/// identical bare `MessageStop`, indistinguishable from a clean completion.
+/// This distinguishes the two safety-relevant values this task names --
+/// `guardrail_intervened`/`content_filtered` -- as a [`LossEvent`] returned
+/// alongside the (real, actually-observed) `MessageStop` (Ruling R4:
+/// in-band). `end_turn`/`tool_use`/`stop_sequence` are ordinary clean stops;
+/// `max_tokens` is a real truncation too but is not one of the two values
+/// this task names, so it is deliberately left alone here rather than
+/// inventing scope this unit wasn't asked for.
+fn loss_for_stop_reason(payload: &Value) -> Option<LossEvent> {
+    let reason = payload.get("stopReason").and_then(Value::as_str)?;
+    let kind = match reason {
+        "guardrail_intervened" => LossKind::GuardrailIntervened,
+        "content_filtered" => LossKind::ContentFiltered,
+        _ => return None,
+    };
+    Some(LossEvent {
+        kind,
+        description: reason.to_string(),
+        blocks_affected: 1,
+    })
 }
 
 fn wire_index(payload: &Value) -> Option<u32> {
@@ -581,6 +623,7 @@ mod stream_decode_tests {
     //! a hand-computed-CRC fixture) rather than only exercising this logic
     //! indirectly through a `.cassette` file.
     use super::decode_bedrock_converse_stream;
+    use crate::loss_event::LossEvent;
     use crate::stream_event::{BlockDelta, BlockKind, StreamEvent};
     use aws_smithy_eventstream::frame::write_message_to;
     use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
@@ -639,7 +682,7 @@ mod stream_decode_tests {
                 serde_json::json!({ "contentBlockIndex": 0, "delta": { "text": "partial" } }),
             ),
         ];
-        let events = decode_bedrock_converse_stream(body(&messages))
+        let (events, _losses) = decode_bedrock_converse_stream(body(&messages))
             .await
             .expect("an unterminated stream is not itself an error");
         assert!(
@@ -743,10 +786,62 @@ mod stream_decode_tests {
                 serde_json::json!({ "stopReason": "end_turn" }),
             ),
         ];
-        let events = decode_bedrock_converse_stream(body(&messages))
+        let (events, losses) = decode_bedrock_converse_stream(body(&messages))
             .await
             .expect("must decode successfully");
         assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStop)));
+        assert!(
+            losses.is_empty(),
+            "end_turn is an ordinary clean stop, not a loss: {losses:?}"
+        );
+    }
+
+    /// Phase 7 Task 13b: before this task, `stopReason` was never read at
+    /// all -- every value produced an identical bare `MessageStop`. This
+    /// pins the fix: `guardrail_intervened` must now surface as a
+    /// `GuardrailIntervened` `LossEvent` returned alongside the (real,
+    /// actually-observed) `MessageStop`, distinguishing it from an ordinary
+    /// `end_turn`.
+    #[tokio::test]
+    async fn a_guardrail_intervened_stop_reason_is_a_distinct_loss_event() {
+        let messages = [event(
+            "messageStop",
+            serde_json::json!({ "stopReason": "guardrail_intervened" }),
+        )];
+        let (events, losses) = decode_bedrock_converse_stream(body(&messages))
+            .await
+            .expect("must decode successfully -- this is a real, observed MessageStop");
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStop)));
+        assert_eq!(
+            losses,
+            vec![LossEvent {
+                kind: crate::loss_event::LossKind::GuardrailIntervened,
+                description: "guardrail_intervened".into(),
+                blocks_affected: 1,
+            }]
+        );
+    }
+
+    /// Same fix, the other named value: `content_filtered` must be
+    /// distinguishable from both `end_turn` and `guardrail_intervened`.
+    #[tokio::test]
+    async fn a_content_filtered_stop_reason_is_a_distinct_loss_event() {
+        let messages = [event(
+            "messageStop",
+            serde_json::json!({ "stopReason": "content_filtered" }),
+        )];
+        let (events, losses) = decode_bedrock_converse_stream(body(&messages))
+            .await
+            .expect("must decode successfully -- this is a real, observed MessageStop");
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStop)));
+        assert_eq!(
+            losses,
+            vec![LossEvent {
+                kind: crate::loss_event::LossKind::ContentFiltered,
+                description: "content_filtered".into(),
+                blocks_affected: 1,
+            }]
+        );
     }
 
     /// Divergence 2 (this codec's `mod.rs` doc comment): a text block has no
@@ -758,7 +853,7 @@ mod stream_decode_tests {
             "contentBlockDelta",
             serde_json::json!({ "contentBlockIndex": 0, "delta": { "text": "hi" } }),
         )];
-        let events = decode_bedrock_converse_stream(body(&messages))
+        let (events, _losses) = decode_bedrock_converse_stream(body(&messages))
             .await
             .expect("must decode successfully");
         assert!(matches!(
@@ -787,7 +882,7 @@ mod stream_decode_tests {
             "contentBlockDelta",
             serde_json::json!({ "contentBlockIndex": 0, "delta": { "toolUse": { "input": "{}" } } }),
         )];
-        let events = decode_bedrock_converse_stream(body(&messages))
+        let (events, _losses) = decode_bedrock_converse_stream(body(&messages))
             .await
             .expect("must decode successfully");
         assert!(
@@ -803,7 +898,7 @@ mod stream_decode_tests {
     /// `google_genai`/`conformance_openai_responses.rs`'s identical
     /// `expect_err`/`expect_stream_failure` helper precedent.
     fn expect_stream_failure(
-        result: Result<Vec<StreamEvent>, super::StreamFailure>,
+        result: Result<(Vec<StreamEvent>, Vec<LossEvent>), super::StreamFailure>,
     ) -> super::StreamFailure {
         match result {
             Ok(_) => panic!("expected a StreamFailure, got a successful decode"),

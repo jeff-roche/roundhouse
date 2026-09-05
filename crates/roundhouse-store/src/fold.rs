@@ -71,6 +71,11 @@ pub fn fold_task<E: EventFields>(events: &[E]) -> Option<Task> {
             origin,
             ..
         } => Some((e.task_id()?, e.session_id(), kind.clone(), *parent, *origin)),
+        // Phase 7 Task 13b (sanctioned lane-boundary exception, see the commit message):
+        // a `Loss` event never carries `TaskCreated`'s identity fields, so it can never
+        // be the event this search is looking for. Written down deliberately rather
+        // than silently absorbed by the wildcard below.
+        EventPayload::Loss { .. } => None,
         _ => None,
     })?;
 
@@ -100,6 +105,12 @@ pub fn fold_task<E: EventFields>(events: &[E]) -> Option<Task> {
                 roundhouse_core::CancelReason::DaemonRestart => TaskState::Interrupted,
                 _ => TaskState::Cancelled,
             },
+            // Phase 7 Task 13b (sanctioned lane-boundary exception, see the commit
+            // message): a recorded `Loss` doesn't change whether the task is
+            // created/running/terminal — it's a side-band annotation about fidelity,
+            // not a lifecycle transition. Genuinely a no-op, but written down
+            // deliberately rather than silently absorbed by the wildcard below.
+            EventPayload::Loss { .. } => state,
             // Session-level and message/note events don't affect task state
             _ => state,
         };

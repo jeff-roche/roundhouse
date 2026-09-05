@@ -51,6 +51,13 @@ pub enum TransportError {
     Io(String),
     #[error("cassette exhausted: no more recorded chunks")]
     CassetteExhausted,
+    /// Phase 7 Task 15: a response body's running total exceeded
+    /// [`crate::body_cap::MAX_RESPONSE_BODY_BYTES`] (or whatever cap the
+    /// caller passed to `collect_body_capped`) before the stream completed.
+    /// Additive to this enum — no existing call site matched on it, so
+    /// adding it doesn't break any previously-exhaustive `match`.
+    #[error("response body exceeded the {limit}-byte cap before completing")]
+    ResponseTooLarge { limit: usize },
 }
 
 /// Trait for HTTP transport implementations, allowing for both real network

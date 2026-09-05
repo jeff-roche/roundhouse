@@ -68,10 +68,13 @@ impl Provider for BedrockConverseProvider {
         Box::pin(async move {
             let body = try_encode(req, &self.profile)?;
 
-            let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
-                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
-                )?;
+            let (base_url, _host_only) = resolve_base_url(
+                &self.profile.id,
+                &self.profile.defaults.base_url,
+                None,
+                false,
+            )
+            .map_err(|e| ProviderError::Transport(redact_transport_error_text(&e.to_string())))?;
             let endpoint_url = build_endpoint_url(&base_url, &req.model.0)?;
 
             let mut http_req = HttpRequest {
@@ -119,7 +122,19 @@ impl Provider for BedrockConverseProvider {
             if !(200..300).contains(&response.status) {
                 // §9.8: never `?` on JSON parsing in the error path.
                 let headers = to_header_map(&response.headers);
-                let body_bytes = collect_body(response.body).await;
+                let body_bytes = match crate::body_cap::collect_body_capped(
+                    response.body,
+                    crate::body_cap::MAX_RESPONSE_BODY_BYTES,
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        return Err(ProviderError::Transport(redact_transport_error_text(
+                            &e.to_string(),
+                        )))
+                    }
+                };
                 let remapped = remap_http_error_body(&body_bytes, &headers);
                 return Err(classify(
                     &self.profile.error_profile(),
@@ -130,7 +145,7 @@ impl Provider for BedrockConverseProvider {
             }
 
             let headers = to_header_map(&response.headers);
-            let events = decode_bedrock_converse_stream(response.body)
+            let (events, losses) = decode_bedrock_converse_stream(response.body)
                 .await
                 .map_err(|failure| {
                     classify(
@@ -140,6 +155,38 @@ impl Provider for BedrockConverseProvider {
                         &headers,
                     )
                 })?;
+            // Phase 7 Task 13b: `guardrail_intervened`/`content_filtered`
+            // `messageStop.stopReason` values now surface as `LossEvent`s
+            // returned in-band from `decode_bedrock_converse_stream`
+            // (Ruling R4) alongside the real, actually-observed
+            // `MessageStop` -- this is a successful completion, not an
+            // error, so there is no `ProviderError` to remap it into.
+            //
+            // Known gap (see `LossEvent::into_payload`'s doc comment): no
+            // channel out of `stream_chat` exists yet to carry this to a
+            // persisted `EventPayload::Loss` -- `Provider`/`ChatStream`/
+            // `StreamEvent` are all frozen Phase 0 contracts with no field
+            // for it. Logging it here is strictly better than the pre-13b
+            // silence (every `stopReason` produced an identical bare
+            // `MessageStop`); giving it a real return channel is lane W1's
+            // engine-wiring call.
+            for loss in &losses {
+                tracing::warn!(
+                    kind = loss.kind.tag(),
+                    // Fix round 1, K2: today's two `stopReason` values this
+                    // module names (`guardrail_intervened`/`content_filtered`)
+                    // are a closed, hardcoded vocabulary, so `description` is
+                    // provably safe right now -- but this redacts anyway, for
+                    // parity with `openai_responses` and so a future
+                    // `_ => LossKind::Other(reason)` catch-all arm here can't
+                    // silently reopen the same exposure by relying on this
+                    // log site's construction-time safety alone.
+                    description = %redact_transport_error_text(&loss.description),
+                    blocks_affected = loss.blocks_affected,
+                    "bedrock-converse stream stopped lossy (messageStop.stopReason) with no \
+                     EventWriter channel yet to persist this as EventPayload::Loss"
+                );
+            }
             let stream = ChatStream(Box::pin(futures::stream::iter(events)));
             Ok(stream)
         })
@@ -274,24 +321,6 @@ fn to_header_map(raw: &[(String, String)]) -> http::HeaderMap {
         }
     }
     headers
-}
-
-async fn collect_body(
-    mut body: std::pin::Pin<
-        Box<
-            dyn futures::Stream<Item = Result<bytes::Bytes, crate::transport::TransportError>>
-                + Send,
-        >,
-    >,
-) -> Vec<u8> {
-    use futures::StreamExt;
-    let mut out = Vec::new();
-    while let Some(chunk) = body.next().await {
-        if let Ok(chunk) = chunk {
-            out.extend_from_slice(&chunk);
-        }
-    }
-    out
 }
 
 #[cfg(test)]

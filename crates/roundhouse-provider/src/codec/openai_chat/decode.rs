@@ -22,6 +22,7 @@ use sse_stream::SseStream;
 use std::collections::HashSet;
 
 use crate::audit::{redact_error_body, redact_transport_error_text};
+use crate::decode_guard::DecodeLoopGuard;
 use crate::stream_event::{BlockDelta, BlockKind, DeltaKeyer, StreamEvent};
 use crate::TransportError;
 
@@ -229,6 +230,7 @@ fn finalize(
     mut events: Vec<StreamEvent>,
     started: &[u32],
     finish_reason: Option<String>,
+    guard: &mut DecodeLoopGuard,
 ) -> Result<Vec<StreamEvent>, StreamFailure> {
     match finish_reason.as_deref() {
         // `"stop"`: an ordinary clean ending. `"tool_calls"`: ALSO a
@@ -239,6 +241,7 @@ fn finalize(
                 events.push(StreamEvent::BlockStop { index });
             }
             events.push(StreamEvent::MessageStop);
+            guard.observe(&StreamEvent::MessageStop);
             Ok(events)
         }
         Some("length") => Err(StreamFailure {
@@ -298,6 +301,7 @@ pub async fn decode_openai_chat_stream(
     let mut started_set: HashSet<u32> = HashSet::new();
     let mut events = Vec::new();
     let mut finish_reason: Option<String> = None;
+    let mut guard = DecodeLoopGuard::new();
 
     while let Some(frame) = sse.next().await {
         // Fix round 3, Q1: a mid-stream transport/SSE-framing error must
@@ -331,7 +335,7 @@ pub async fn decode_openai_chat_stream(
         let Some(data) = frame.data else { continue };
         let data = data.trim();
         if data == "[DONE]" {
-            return finalize(events, &started_order, finish_reason);
+            return finalize(events, &started_order, finish_reason, &mut guard);
         }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             continue;
@@ -452,13 +456,21 @@ pub async fn decode_openai_chat_stream(
     // it as `TaskCompleted` with plausible-looking partial output on an
     // immutable row. Mirrors `cohere_v2::decode`'s identical `Truncated`
     // fix.
-    Err(StreamFailure {
+    //
+    // Ruling R1/"DecodeLoopGuard scope" (Phase 7, Addendum 2): routed
+    // through the shared `DecodeLoopGuard` rather than an unconditionally
+    // hand-built `Err` -- provably always `Err` here (the only place that
+    // ever observes `MessageStop`, `finalize`'s success arm, always returns
+    // before control reaches this line), but expressed via the same
+    // structural helper `anthropic_messages`/`cohere_v2` use.
+    guard.finish().map_err(|_| StreamFailure {
         kind: StreamFailureKind::Truncated,
         message: "openai-chat chat stream ended without ever observing a [DONE] terminator -- \
                    the generation was truncated"
             .into(),
         partial_text: partial_text_from_events(&events),
-    })
+    })?;
+    Ok(events)
 }
 
 #[cfg(test)]

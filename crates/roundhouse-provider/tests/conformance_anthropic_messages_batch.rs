@@ -20,7 +20,7 @@
 //! blank line (REALITY-CORRECTIONS §13b item 1), verified for the whole
 //! `testdata/cassettes/` tree by `every_sse_cassette_has_a_terminator_test.rs`.
 
-use roundhouse_conformance::{run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
+use roundhouse_conformance::{checks, run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
 use roundhouse_provider::codec::anthropic_messages::{
     encode_anthropic_messages, AnthropicMessagesProfileProvider,
 };
@@ -301,6 +301,30 @@ impl ConformanceSubject for BedrockAnthropicMessagesSubject {
 #[tokio::test]
 async fn vertex_anthropic_is_conformant() {
     run::<VertexAnthropicSubject>().await.assert_green();
+}
+
+/// Task 12 (Cross-Cutting #2, Ruling R16): mandatory truncate-mid-stream
+/// check, wired here (rather than a standalone `conformance_anthropic_
+/// messages.rs`, which doesn't exist) since this file already IS this
+/// codec's `roundhouse-conformance` wiring. `anthropic_messages` is in the
+/// "strict" truncation-signaling group (`decode_guard.rs`'s module doc,
+/// Ruling R17): it must `Err`, never fabricate a `MessageStop`, when
+/// truncated before its real `message_stop` terminal.
+#[tokio::test]
+async fn vertex_anthropic_text_cassette_is_never_indistinguishable_from_a_clean_completion_when_truncated(
+) {
+    let failures = checks::check_truncate_mid_stream(
+        &VertexAnthropicSubject::provider(),
+        &fixtures::single_turn_text("claude-sonnet-5"),
+        &cassette_path("vertex-anthropic", "text.cassette"),
+        VertexAnthropicSubject::credentials(),
+    )
+    .await;
+    assert!(
+        failures.is_empty(),
+        "anthropic-messages must never report a clean completion for a stream truncated before \
+         its real terminal: {failures:#?}"
+    );
 }
 #[tokio::test]
 async fn microsoft_foundry_is_conformant() {

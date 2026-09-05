@@ -148,6 +148,12 @@ pub fn fold_task_state(events: &[EventPayload]) -> Option<TaskState> {
                 CancelReason::DaemonRestart => TaskState::Interrupted,
                 _ => TaskState::Cancelled,
             }),
+            // Phase 7 Task 13b (sanctioned lane-boundary exception, see the commit
+            // message): a recorded `Loss` doesn't change task lifecycle state — it's a
+            // side-band annotation about fidelity, not a transition. Genuinely a no-op,
+            // but written down deliberately rather than silently absorbed by the
+            // wildcard below.
+            EventPayload::Loss { .. } => state,
             _ => state,
         };
     }

@@ -152,10 +152,17 @@ fn every_local_runtime_profile_can_still_have_its_base_url_overridden() {
     // module) — not a bare `Url`, so this destructures the tuple.
     for name in ["lm-studio", "vllm", "sglang", "llama-cpp", "ollama"] {
         let p = load(name);
+        // `allow_insecure: true` -- these are the local-runtime family
+        // (ollama, vllm, sglang, llama-cpp, lm-studio), which by design run
+        // over plain HTTP even when pointed at a real (non-loopback) box on
+        // an internal network (Ruling R9); this test overrides one loopback
+        // default with another non-TLS host to prove overriding still
+        // works, not to exercise the HTTPS gate itself.
         let (resolved, _host_only) = roundhouse_provider::credential::resolve_base_url(
             &p.id,
             &p.defaults.base_url,
             Some("http://gpu-box.internal:9000/v1"),
+            true,
         )
         .unwrap();
         assert_eq!(resolved.as_str(), "http://gpu-box.internal:9000/v1");

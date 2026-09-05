@@ -4,7 +4,7 @@
 
 use crate::audit::redact_transport_error_text;
 use crate::codec::anthropic_messages::{
-    decode_anthropic_messages_stream, encode_anthropic_messages,
+    decode_anthropic_messages_stream, encode_anthropic_messages, StreamFailure, StreamFailureKind,
 };
 // Note: `Capabilities`/`ModelInfo`/`Plan`/`ProviderError`/`TokenCount` live in
 // `ir`, not in `provider_trait` — `provider_trait` re-exports nothing and
@@ -189,7 +189,9 @@ impl Provider for AnthropicMessagesProvider {
                 return Err(classify_status(response.status));
             }
 
-            let events = decode_anthropic_messages_stream(response.body).await;
+            let events = decode_anthropic_messages_stream(response.body)
+                .await
+                .map_err(stream_failure_to_provider_error)?;
             let stream = ChatStream(Box::pin(futures::stream::iter(events)));
             Ok(stream)
         })
@@ -215,4 +217,23 @@ impl Provider for AnthropicMessagesProvider {
     // `/v1/models` is wired; an override returning `Ok(vec![])` would instead
     // assert "this provider offers no models at all", which a caller enumerating
     // providers would believe.
+}
+
+/// Ruling R17, item 3: modeled on `codec::cohere_v2::provider`'s identical
+/// `stream_failure_to_provider_error` — `decode_anthropic_messages_stream`
+/// now knows, at decode time, exactly which real wire condition produced a
+/// failure, so this function trusts `StreamFailure::kind` rather than
+/// re-deriving a disposition from an always-200 HTTP status.
+fn stream_failure_to_provider_error(failure: StreamFailure) -> ProviderError {
+    tracing::warn!(
+        kind = ?failure.kind,
+        message = %redact_transport_error_text(&failure.message),
+        "anthropic-messages stream failed mid-generation"
+    );
+    match failure.kind {
+        StreamFailureKind::Transport => ProviderError::Transport(failure.message),
+        StreamFailureKind::Truncated => ProviderError::StreamInterrupted {
+            partial: failure.partial_text,
+        },
+    }
 }
