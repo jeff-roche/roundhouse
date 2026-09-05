@@ -112,9 +112,33 @@ function isDigitOrDot(byte: number | undefined): boolean {
   return isAsciiDigit(byte) || byte === 0x2e;
 }
 
-/** `http://`/`https://` not immediately followed by `www.w3.org/`. */
+/**
+ * ASCII-lowercases a copy of `bytes`, byte-for-byte (so length and every
+ * other offset are unchanged) — used only for case-insensitive matching,
+ * never for anything that reads back as text.
+ */
+function toAsciiLowerCopy(bytes: Buffer): Buffer {
+  const copy = Buffer.from(bytes);
+  for (let i = 0; i < copy.length; i++) {
+    const byte = copy[i];
+    if (byte >= 0x41 && byte <= 0x5a) {
+      copy[i] = byte + 0x20;
+    }
+  }
+  return copy;
+}
+
+/**
+ * `http://`/`https://` not immediately followed by `www.w3.org/`, matched
+ * case-insensitively (fix round 1, D6 — mirrors
+ * `dist_public_content.rs::contains_disallowed_scheme`: URL schemes are
+ * case-insensitive per RFC 3986, and a lowercase-only match let
+ * `Http://evil.example.com/` slip past this guard entirely).
+ */
 function containsDisallowedScheme(bytes: Buffer, scheme: string): boolean {
-  return findAll(bytes, scheme).some((index) => !startsWithAscii(bytes, index + scheme.length, "www.w3.org/"));
+  const lower = toAsciiLowerCopy(bytes);
+  const lowerScheme = scheme.toLowerCase();
+  return findAll(lower, lowerScheme).some((index) => !startsWithAscii(lower, index + lowerScheme.length, "www.w3.org/"));
 }
 
 /** `://` immediately followed by an ASCII digit — an IP-literal host under any scheme. */
@@ -252,6 +276,12 @@ describe("self_tests (mirroring dist_public_content.rs's self_tests module)", ()
     expect(containsDisallowedScheme(Buffer.from("xmlns=http://www.w3.org/2000/svg"), "http://")).toBe(false);
     expect(containsDisallowedScheme(Buffer.from('fetch("http://evil.example.com/")'), "http://")).toBe(true);
     expect(containsDisallowedScheme(Buffer.from('fetch("https://evil.example.com/")'), "https://")).toBe(true);
+  });
+
+  it("containsDisallowedScheme matches case-insensitively (fix round 1, D6)", () => {
+    expect(containsDisallowedScheme(Buffer.from('fetch("Http://evil.example.com/")'), "http://")).toBe(true);
+    expect(containsDisallowedScheme(Buffer.from('fetch("HTTPS://EVIL.EXAMPLE.COM/")'), "https://")).toBe(true);
+    expect(containsDisallowedScheme(Buffer.from("xmlns=HTTP://WWW.W3.ORG/2000/svg"), "http://")).toBe(false);
   });
 
   it("containsSchemeWithDigitHost matches any scheme over an IP literal", () => {

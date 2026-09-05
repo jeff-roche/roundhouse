@@ -342,10 +342,20 @@ fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
 /// immediately followed by `www.w3.org/` — SolidJS's runtime legitimately
 /// embeds `http://www.w3.org/2000/svg` (the SVG namespace URI); everything
 /// else shaped like this is a plausible absolute origin.
+///
+/// **Matched case-insensitively (fix round 1, D6).** URL schemes are
+/// case-insensitive per RFC 3986 — `Http://evil.example.com/` is exactly as
+/// live an absolute origin as the lowercase spelling — and a lowercase-only
+/// match let it slip past every guard here. `bytes.to_ascii_lowercase()`
+/// preserves length (ASCII case-folding never changes byte count), so every
+/// index found in the lowercased copy still lines up with the same offset
+/// in the original.
 fn contains_disallowed_scheme(bytes: &[u8], scheme: &[u8]) -> bool {
     const ALLOWED_AFTER: &[u8] = b"www.w3.org/";
-    find_all(bytes, scheme).into_iter().any(|index| {
-        let after = &bytes[index + scheme.len()..];
+    let lower = bytes.to_ascii_lowercase();
+    let lower_scheme = scheme.to_ascii_lowercase();
+    find_all(&lower, &lower_scheme).into_iter().any(|index| {
+        let after = &lower[index + lower_scheme.len()..];
         !after.starts_with(ALLOWED_AFTER)
     })
 }
@@ -489,6 +499,27 @@ mod self_tests {
         assert!(contains_disallowed_scheme(
             b"fetch(\"https://evil.example.com/\")",
             b"https://"
+        ));
+    }
+
+    #[test]
+    fn contains_disallowed_scheme_matches_case_insensitively() {
+        // Fix round 1 (D6): URL schemes are case-insensitive per RFC 3986;
+        // a lowercase-only match let `Http://evil.example.com/` sail past
+        // this guard entirely.
+        assert!(contains_disallowed_scheme(
+            b"fetch(\"Http://evil.example.com/\")",
+            b"http://"
+        ));
+        assert!(contains_disallowed_scheme(
+            b"fetch(\"HTTPS://EVIL.EXAMPLE.COM/\")",
+            b"https://"
+        ));
+        // The w3.org exemption is also case-insensitive, so it still holds
+        // for a differently-cased namespace URI.
+        assert!(!contains_disallowed_scheme(
+            b"xmlns=HTTP://WWW.W3.ORG/2000/svg",
+            b"http://"
         ));
     }
 
