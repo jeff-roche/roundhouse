@@ -51,6 +51,14 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// breaks a legitimate (if unusually long) workspace name — while still
 /// bounding the worst case to a fixed, small multiple of one connection's own
 /// buffering, not to whatever an attacker is willing to send.
+///
+/// **The aggregate, not just the per-connection cap, is what's bounded**
+/// (fix round 2, M3): at [`DEFAULT_MAX_CONNECTIONS`] connections each
+/// retaining one frame near this cap, the worst case is on the order of
+/// `DEFAULT_MAX_CONNECTIONS × MAX_FRAME_BYTES` ≈ 256 MiB (measured ~1.05 MiB
+/// retained per connection once `FramedRead`'s own buffering overhead is
+/// included, so closer to ~267 MiB in practice) — a known, fixed ceiling
+/// rather than something that scales with how many peers happen to connect.
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Default ceiling on concurrent accepted connections one `accept_loop` will
@@ -392,21 +400,31 @@ async fn write_event(
 /// up.
 ///
 /// `EMFILE`/`ENFILE` (this process, or the whole system, is out of file
-/// descriptors) and `ConnectionAborted`/`Interrupted` (a connection that died
-/// between the kernel accepting it and this call returning, or a signal
-/// interrupting the syscall) are all conditions that resolve themselves as
-/// load eases or the interrupted call is retried. Everything else is treated
-/// as fatal: busy-looping `accept()` against a listener that is genuinely
-/// broken (e.g. its underlying fd was closed out from under it) would be its
-/// own, worse availability problem than returning.
+/// descriptors), `ENOMEM`/`ENOBUFS` (transient kernel memory/buffer
+/// exhaustion — `accept(2)` documents both alongside `EMFILE`/`ENFILE` as
+/// conditions a caller should retry, not treat as fatal; fix round 1's list
+/// omitted them), and `ConnectionAborted`/`Interrupted`/`WouldBlock` (a
+/// connection that died between the kernel accepting it and this call
+/// returning, a signal interrupting the syscall, or a spurious non-blocking
+/// wakeup — tokio already absorbs `WouldBlock` internally before this
+/// function ever sees it, but classifying it as `Retry` here rather than
+/// falling through to `Fatal` costs nothing and removes any doubt) are all
+/// conditions that resolve themselves as load eases or the interrupted call
+/// is retried. Everything else is treated as fatal: busy-looping `accept()`
+/// against a listener that is genuinely broken (e.g. its underlying fd was
+/// closed out from under it) would be its own, worse availability problem
+/// than returning.
 fn classify_accept_error(err: &std::io::Error) -> AcceptDisposition {
     match err.kind() {
-        ErrorKind::ConnectionAborted | ErrorKind::Interrupted => AcceptDisposition::Retry,
+        ErrorKind::ConnectionAborted | ErrorKind::Interrupted | ErrorKind::WouldBlock => {
+            AcceptDisposition::Retry
+        }
         _ => match err.raw_os_error() {
-            // EMFILE (24) / ENFILE (23) — stable across Linux and every
-            // other unix this daemon targets, but neither has a stable
-            // `ErrorKind` variant, hence matching the raw errno.
-            Some(24) | Some(23) => AcceptDisposition::Retry,
+            // EMFILE (24) / ENFILE (23) / ENOMEM (12) / ENOBUFS (105) —
+            // stable across Linux and every other unix this daemon targets,
+            // but none of the four has a stable `ErrorKind` variant, hence
+            // matching the raw errno.
+            Some(24) | Some(23) | Some(12) | Some(105) => AcceptDisposition::Retry,
             _ => AcceptDisposition::Fatal,
         },
     }
@@ -431,6 +449,18 @@ enum AcceptDisposition {
 /// limit being hit construct one directly with much smaller numbers rather
 /// than needing thousands of connections to exercise
 /// [`DEFAULT_MAX_CONNECTIONS`].
+///
+/// # This is a test seam, not production API (fix round 2, M4)
+///
+/// `pub`, and its fields `pub`, only because this crate's integration tests
+/// (a separate crate) need to construct one with small numbers — see
+/// [`accept_loop_with`]'s own doc comment. `#[doc(hidden)]` keeps it out of
+/// rendered docs and off the surface a downstream consumer of this crate
+/// would discover by browsing: nothing about this type is hardened against
+/// misuse (`AcceptLimits { max_connections: usize::MAX, .. }` panics inside
+/// `Semaphore::new` before `accept_loop_with` ever reaches its loop), and it
+/// is not meant to be tuned by anything other than a test.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 pub struct AcceptLimits {
     pub max_connections: usize,
@@ -566,6 +596,15 @@ pub async fn accept_loop(
 /// process ever caused `serve_connection`'s own errors to escape *this*
 /// function, since every per-connection failure is contained inside its own
 /// spawned task.
+///
+/// `#[doc(hidden)]` (fix round 2, M4): this exists purely as a test seam so
+/// [`accept_loop`]'s two otherwise-hard-to-drive branches (an undeterminable
+/// uid, a hit connection/handshake limit) can be exercised directly with
+/// small numbers. It is not meant to be a tuned production entry point —
+/// [`accept_loop`] is — and `#[doc(hidden)]` keeps it (and [`AcceptLimits`])
+/// off the API surface a downstream consumer would discover browsing docs,
+/// without needing a `test-support` Cargo feature just for this.
+#[doc(hidden)]
 pub async fn accept_loop_with(
     listener: UnixListener,
     registry: Arc<SessionRegistry>,
@@ -999,6 +1038,32 @@ mod classify_accept_error_tests {
         assert_eq!(
             classify_accept_error(&std::io::Error::from(ErrorKind::PermissionDenied)),
             AcceptDisposition::Fatal
+        );
+    }
+
+    /// Fix round 2, M1: `accept(2)` documents `ENOMEM`/`ENOBUFS` as
+    /// transient kernel resource exhaustion alongside `EMFILE`/`ENFILE` —
+    /// fix round 1's list omitted them, and `Fatal` here means the same
+    /// permanent-`ECONNREFUSED` zombie `EMFILE` used to cause.
+    #[test]
+    fn enomem_and_enobufs_are_retried_not_fatal() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(12)),
+            AcceptDisposition::Retry,
+            "ENOMEM (12) must be retried, not treated as fatal"
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(105)),
+            AcceptDisposition::Retry,
+            "ENOBUFS (105) must be retried, not treated as fatal"
+        );
+    }
+
+    #[test]
+    fn would_block_is_retried() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from(ErrorKind::WouldBlock)),
+            AcceptDisposition::Retry
         );
     }
 }

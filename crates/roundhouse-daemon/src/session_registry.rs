@@ -188,16 +188,43 @@ impl SessionRegistry {
     /// `CreateSession`. Otherwise returns the new id, a [`Subscription`] to
     /// hand back to [`Self::detach`] once the creating connection ends, and
     /// the `Receiver` half the caller forwards to that connection's socket.
+    ///
+    /// # `SessionId::new()` and the channel are minted *before* the lock is
+    /// taken (fix round 2, M2)
+    ///
+    /// An earlier version of this method minted `session_id` and the
+    /// channel *after* acquiring `self.sessions`'s lock, so that adding the
+    /// `max_sessions` check above could sit ahead of both in one `if`
+    /// without restructuring anything else. That was a real regression:
+    /// `SessionId::new()` calls `Uuid::new_v4()`, which panics if the OS RNG
+    /// is unavailable (`getrandom::fill(..).unwrap_or_else(|err|
+    /// panic!(..))`) — a condition this process cannot rule out, however
+    /// unlikely. A panic while holding a `std::sync::Mutex` poisons it, and
+    /// every other method here does a bare `.lock().unwrap()`: one poisoned
+    /// lock would make `create`/`attach`/`detach`/`publish` panic forever
+    /// afterward. Because each connection runs in its own spawned task,
+    /// tokio would contain each of those panics individually rather than
+    /// taking the process down — so the daemon would keep accepting
+    /// connections and *look* healthy while every subsequent session leaks
+    /// (registrations never complete, `detach` never runs cleanly). Minting
+    /// both values before the lock is ever acquired keeps a mint-time panic
+    /// from being able to poison anything.
+    ///
+    /// The `max_sessions` check and the `insert` still happen under this
+    /// one lock acquisition — only the id/channel minting moved, not the
+    /// check-then-insert pairing. See the module doc comment's "Locking"
+    /// section (ruling W1-R8) for the TOCTOU that pairing avoids.
     pub fn create(
         &self,
         _workspace_name: String,
     ) -> Option<(SessionId, Subscription, mpsc::Receiver<ClientEvent>)> {
+        let session_id = SessionId::new();
+        let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
+
         let mut sessions = self.sessions.lock().unwrap();
         if sessions.len() >= self.max_sessions {
             return None;
         }
-        let session_id = SessionId::new();
-        let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
         // `SessionId::new()` mints a fresh UUIDv4, so this can never collide
         // with an existing entry — a plain `insert` (not `entry(..).or_default()`)
         // is correct and makes that non-collision assumption visible here
