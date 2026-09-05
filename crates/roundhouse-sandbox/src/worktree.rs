@@ -620,13 +620,20 @@ fn read_capped_discarding(pipe: &mut impl Read, cap: usize) -> Vec<u8> {
     let mut chunk = [0u8; 8192];
     loop {
         match pipe.read(&mut chunk) {
-            Ok(0) | Err(_) => return kept,
+            Ok(0) => return kept,
             Ok(n) => {
                 if kept.len() < cap {
                     let room = cap - kept.len();
                     kept.extend_from_slice(&chunk[..n.min(room)]);
                 }
             }
+            // Retried, not treated as EOF — the same handling
+            // `bounded_parse::read_stderr_draining` gives it. No signal
+            // handler is installed today, so this is unreachable in
+            // practice; treating it as EOF would silently truncate if one
+            // ever were.
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return kept,
         }
     }
 }

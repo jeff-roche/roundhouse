@@ -1005,8 +1005,8 @@ fn a_secret_derived_base_ref_longer_than_gits_stderr_buffer_never_reaches_the_se
 /// with withholding, taking that backstop off this branch with it; this pins
 /// the restoration. **Verified by removal, not by assertion:** with the
 /// `redact_message` call on the `else` branch dropped, the raw value appears
-/// in the serialized outcome twice — once as the echoed `base_ref` and once
-/// inside `git`'s own stderr — and this test fails.
+/// in the serialized outcome three times — as the echoed `base_ref`, inside
+/// the echoed argv, and inside `git`'s own stderr — and this test fails.
 #[test]
 fn a_declared_secrets_raw_value_pasted_literally_into_base_ref_is_still_scrubbed() {
     if !git_available() {
