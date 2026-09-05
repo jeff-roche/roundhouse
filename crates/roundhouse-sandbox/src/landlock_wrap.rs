@@ -342,14 +342,24 @@ pub(crate) fn validate_workspace_root(workspace_root: &Path) -> Result<PathBuf, 
 /// `true` if `a` and `b` name the same underlying filesystem object — same device and
 /// inode number — even when their paths are textually unrelated, which is exactly
 /// what a bind-mount alias produces and a symlink-resolving [`std::fs::canonicalize`]
-/// cannot see. `false`, rather than erroring, if either path's metadata can't be read
-/// (fix round 3, item 3's use of this treats that as "no evidence of aliasing," not as
-/// license to skip the caller's own path-based checks, which still run regardless).
+/// cannot see.
+///
+/// **`true`, not `false`, if either path's metadata can't be read (fix round 4, item 4
+/// — Ruling W5-44).** Fix round 3 returned `false` there, reading an inconclusive
+/// `stat` as "no evidence of aliasing". That is the fail-open direction: this function
+/// exists only as a refusal predicate for [`validate_workspace_root`], so returning
+/// `false` on missing evidence *permits* a workspace root the guard could not clear.
+/// The architecture doc's position is that fail-open is structurally impossible in this
+/// project, so an inconclusive stat refuses. Both call sites reach this only after
+/// `canonicalize` has just succeeded on the same absolute path (and `/` cannot fail to
+/// stat), so no reachable case changes behaviour today — the direction is what matters,
+/// since the only route here is a TOCTOU race, and a race is precisely when you want
+/// the guard to refuse rather than wave the root through.
 fn same_inode(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (std::fs::metadata(a), std::fs::metadata(b)) {
         (Ok(meta_a), Ok(meta_b)) => meta_a.dev() == meta_b.dev() && meta_a.ino() == meta_b.ino(),
-        _ => false,
+        _ => true,
     }
 }
 
@@ -633,6 +643,19 @@ mod tests {
     // Fix round 3, item 3: wiring — `validate_workspace_root` refuses "/" via the
     // inode backstop as well as the literal-path check above it (both fire for this
     // exact input; this pins that the inode branch alone, in isolation, agrees).
+    // Fix round 4, item 4: an inconclusive `stat` must refuse, not permit — this is a
+    // refusal predicate, so returning `false` on missing evidence is the fail-open
+    // direction.
+    #[test]
+    fn same_inode_treats_an_unreadable_path_as_aliased_rather_than_as_not_aliased() {
+        let missing = std::env::temp_dir().join(format!(
+            "roundhouse-landlock-absent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(!missing.exists());
+        assert!(same_inode(&missing, Path::new("/")));
+    }
+
     #[test]
     fn same_inode_confirms_the_filesystem_root_is_its_own_inode() {
         assert!(same_inode(Path::new("/"), Path::new("/")));

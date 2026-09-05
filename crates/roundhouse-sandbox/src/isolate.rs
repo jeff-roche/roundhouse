@@ -292,12 +292,26 @@ impl Isolate for BwrapLandlockIsolate {
     /// child. A `Tier::Sandbox` attestation reached via `achieved_tier()`'s OR
     /// because Landlock probed `Available` — rather than because Seatbelt or
     /// seccomp did — really is bwrap namespace isolation plus a real,
-    /// kernel-confirmed Landlock ruleset restricting the spawned child to
-    /// `ReadFile`+`Execute` on the system directories, bwrap's own curated `/dev`
-    /// and `/proc` mounts (fix round 1, item 3), and read/write on the workspace
-    /// root, applied via `round-landlock-exec` (`landlock_wrap`'s module
-    /// doc comment has the full mechanism and why it's a pre-exec wrapper binary
-    /// rather than `pre_exec` on bwrap itself). See `achieved_tier()`'s doc
+    /// kernel-confirmed Landlock ruleset restricting the spawned child to exactly
+    /// four grants (`round_landlock_exec.rs::apply_landlock_ruleset`, out of a
+    /// handled set of `AccessFs::from_all(ABI::V1)` — every other access on every
+    /// other path is denied):
+    ///
+    /// - `ReadFile`+`Execute`+`ReadDir` on the six `SYSTEM_READ_EXEC_DIRS`
+    ///   (`/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc`) — never write;
+    /// - `ReadFile`+`WriteFile`+`ReadDir` on `/dev` — never execute, and reaching
+    ///   only bwrap's own curated `--dev` tmpfs, not host device nodes;
+    /// - `ReadFile`+`ReadDir` on `/proc` — never write or execute, and reaching
+    ///   only bwrap's own pidns-isolated `--proc` mount;
+    /// - full access on the workspace root, which
+    ///   `landlock_wrap::validate_workspace_root` has already refused if it is,
+    ///   contains, or is a bind-mount alias of `/` or of a system directory.
+    ///
+    /// (`/dev` and `/proc` are fix round 1, item 3; the three `ReadDir`s are fix
+    /// round 3, item 1 — this doc was the one the round missed, corrected in fix
+    /// round 4, item 3.) Applied via `round-landlock-exec` — `landlock_wrap`'s
+    /// module doc comment has the full mechanism and why it's a pre-exec wrapper
+    /// binary rather than `pre_exec` on bwrap itself. See `achieved_tier()`'s doc
     /// comment for the full per-mechanism breakdown.
     fn attest(&self, h: &Handle) -> Attestation {
         // Mutable borrow (not just `get`): fix-round-2 security-review finding —
