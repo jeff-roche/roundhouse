@@ -377,3 +377,55 @@ fn a_nonexistent_program_returns_a_clean_spawn_error_not_a_panic() {
         "unexpected result: {result:?}"
     );
 }
+
+/// Ruling W5-28, item 8 — a **direct** test for `env_clear()`. Until now its
+/// only coverage was "every existing test still passes", which item 2 of the
+/// same ruling demonstrated is not coverage at all: those tests pass for a
+/// reason unrelated to the environment (their children all live in the
+/// default system path), and they passed identically while the comment
+/// explaining `env_clear()` was factually wrong.
+///
+/// What this closes is a credential-disclosure vector — the module doc names
+/// `ANTHROPIC_API_KEY` as exactly the kind of thing living in the daemon's
+/// environment — and the regression it catches is mundane: someone
+/// reordering `env_clear()` after `spawn()`, or dropping it while chasing a
+/// `NotFound` from the tighter `PATH` behaviour item 2 documents. Either
+/// would go completely undetected today.
+///
+/// The parent's own read of the variable is asserted first so the test
+/// cannot pass vacuously by never having set it. Nothing here races other
+/// tests in this binary: every spawn in this file goes through
+/// `env_clear()`, so no other test can observe the parent's environment
+/// either way.
+#[test]
+fn a_child_cannot_see_the_parents_environment() {
+    const NAME: &str = "ROUNDHOUSE_SANDBOX_ENV_CLEAR_PROBE";
+
+    std::env::set_var(NAME, "a-secret-the-child-must-never-see");
+    assert_eq!(
+        std::env::var(NAME).as_deref(),
+        Ok("a-secret-the-child-must-never-see"),
+        "the parent must actually hold this variable, or the assertion below \
+         would pass without proving anything"
+    );
+
+    let result = run_bounded_subprocess(
+        Path::new("sh"),
+        &[
+            OsStr::new("-c"),
+            OsStr::new("printf %s \"${ROUNDHOUSE_SANDBOX_ENV_CLEAR_PROBE:-<unset>}\""),
+        ],
+        &[],
+        CPU_LIMIT,
+        WALL_LIMIT,
+        MAX_OUTPUT,
+    );
+
+    assert_eq!(
+        result.expect("the probe child must run and exit cleanly"),
+        b"<unset>".to_vec(),
+        "the child inherited the parent's environment — `env_clear()` is not being \
+         applied, and any secret in the daemon's environment is exposed to every \
+         child this primitive spawns"
+    );
+}

@@ -279,6 +279,20 @@ fn helper_binary_path() -> Result<PathBuf, ParseError> {
 /// or workspace layout, so this is a cheap, name-based containment check
 /// rather than a hardcoded absolute path — it stays correct for any
 /// `CARGO_TARGET_DIR` and any workspace nesting depth.
+///
+/// **Its boundary, written down rather than left to be inferred (ruling
+/// W5-28, item 5).** Being name-based, it accepts *any* canonical path with
+/// a component literally named `target` — including an install prefix that
+/// happens to contain one, e.g. a binary installed to `/opt/target/bin/`.
+/// Such a layout would re-open the very `test-util` fallback this check
+/// exists to close. That is accepted, not overlooked, and the heuristic is
+/// deliberately **not** tightened: reaching it needs that unusual install
+/// layout *and* a build with the non-default `test-util` feature compiled in
+/// *and* an attacker-writable absent sibling at the fallback location, and
+/// ruling W5-25 asked for exactly this cheap containment check rather than a
+/// stricter one. A stricter alternative (matching Cargo's own target
+/// directory rather than the name) would be the fix if the threat model ever
+/// changes; today it would buy nothing over the three conditions above.
 #[cfg(feature = "test-util")]
 fn is_inside_a_target_tree(path: &std::path::Path) -> bool {
     path.components()

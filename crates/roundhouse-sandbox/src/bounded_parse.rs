@@ -17,6 +17,18 @@
 //! escapee, or a vanishingly narrow PID-recycling race on the group-kill
 //! itself).
 //!
+//! **The corollary, stated rather than left to be inferred (ruling W5-28,
+//! item 3): output a descendant would have written *after* the direct child
+//! exited is discarded, and the call still returns `Ok`.** The group kill
+//! on the success path can land mid-write, so a partial result is
+//! returnable as success and which bytes make it back is not deterministic
+//! for a child that backgrounds work writing to the shared stdout pipe.
+//! That is the designed trade (ruling W5-26): bounded, all-or-nothing
+//! execution is what this primitive advertises, and waiting on a descendant
+//! the direct child chose not to wait for would mean no bound applied at
+//! all. A caller that needs a descendant's output must have the direct
+//! child wait for it.
+//!
 //! # What this does NOT bound: memory / address space (ruling W5-25, finding 4)
 //!
 //! **These are the complete three bounds — CPU, wall-clock, output size —
@@ -110,12 +122,17 @@
 //! Linux-only guarantee.** `wall_limit` and `max_output_bytes` are still
 //! enforced against the direct child's own output and the wall clock in
 //! full — a real, smaller bound, never a silent no-op for the direct
-//! child — but a child that forks a descendant holding its inherited
-//! stdout/stderr pipe open can still block `run_bounded_subprocess` past
-//! `wall_limit` off Linux, on both the timeout path and the clean-exit
-//! path this file's tests exercise. No caller of this primitive spawns a
-//! forking child off Linux today, so this is a real, named gap rather than
-//! an exercised one, not a claim that it can't happen.
+//! child — but a child that forks a descendant holding an inherited pipe
+//! open can still block `run_bounded_subprocess` past `wall_limit` off
+//! Linux, on both the timeout path and the clean-exit path this file's
+//! tests exercise. **Any** of the three inherited pipe ends is enough
+//! (ruling W5-28, item 4): a descendant holding the **stdin read end**
+//! blocks the scoped writer thread exactly as one holding the
+//! stdout/stderr write end blocks a scoped reader thread. Same class, same
+//! `killpg` closes it on Linux, same gap off it. No caller of this
+//! primitive spawns a forking child off Linux today, so this is a real,
+//! named gap rather than an exercised one, not a claim that it can't
+//! happen.
 
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
@@ -237,11 +254,31 @@ pub fn run_bounded_subprocess(
     // environment is exactly where secrets like `ANTHROPIC_API_KEY` live.
     // A new spawn site inheriting the whole thing by default is a
     // foothold-to-disclosure path a future helper substitution could use;
-    // `env_clear()` closes it. `std::process::Command` on Unix resolves a
-    // bare (slash-free) program name against the *caller's* real `PATH`
-    // before exec, not the child's cleared environment, so this does not
-    // break locating bare-name test children like `cat`/`sh`/`sleep`/`yes`
-    // (verified: every existing test in this module still passes).
+    // `env_clear()` closes it. Directly covered by
+    // `tests/bounded_parse.rs`'s
+    // `a_child_cannot_see_the_parents_environment`.
+    //
+    // **What this does to bare program names (ruling W5-28, item 2 — the
+    // previous comment here had this backwards).** `std::process::Command`
+    // does *not* resolve a bare (slash-free) name against the caller's real
+    // `PATH`: std installs the cleared `envp` as the child's `environ`
+    // before `execvp`, so `execvp` falls back to glibc's
+    // `confstr(_CS_PATH)` default — `/bin:/usr/bin` — and a program that
+    // lives anywhere else fails to spawn with `NotFound`. Verified
+    // empirically against a program on the caller's `PATH` but outside the
+    // default path, with and without a `pre_exec` hook attached (this
+    // module's exact configuration). The behaviour is *tighter* than the
+    // old comment claimed, so nothing here is broken by it: every child in
+    // this module's tests (`sh`, `cat`, `yes`, `sleep`, `head`) happens to
+    // live in the default path — which is exactly why "all existing tests
+    // still pass" concealed the wrong claim for two rounds.
+    //
+    // A future caller that genuinely needs `PATH` resolution must pass an
+    // explicit `.env("PATH", <allowlist>)` rather than reverting
+    // `env_clear()` — losing the whole-environment isolation to locate one
+    // binary is not a trade this primitive should make. Task 34 is the live
+    // case: `git` is often in `/usr/local/bin`, and its credential helpers
+    // and hooks are themselves `PATH`-resolved.
     command.env_clear();
 
     #[cfg(target_os = "linux")]
@@ -285,6 +322,13 @@ pub fn run_bounded_subprocess(
     // below is precisely about *this* value, not about whatever `id()`
     // might return if `Child`'s internals ever changed.
     let pgid = child.id() as i32;
+    // Ruling W5-28, item 6: unreachable in practice (`pid_max` is capped at
+    // 2^22 on 64-bit Linux, so this cast never goes negative), but the
+    // consequence if it ever were is severe enough to make the invariant
+    // explicit at the point of capture: `killpg` with a non-positive pgid
+    // signals the *caller's own* process group, so the daemon calling this
+    // would SIGKILL itself.
+    debug_assert!(pgid > 0, "pgid must be a real, positive process-group id");
 
     let stdin = child.stdin.take();
     let mut stdout = child.stdout.take().expect("stdout was requested as piped");
