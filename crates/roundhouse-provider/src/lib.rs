@@ -23,6 +23,7 @@ pub mod audit;
 mod cassette;
 pub mod codec;
 pub mod credential;
+pub mod decode_guard;
 pub mod errors;
 pub mod fallback;
 mod ir;

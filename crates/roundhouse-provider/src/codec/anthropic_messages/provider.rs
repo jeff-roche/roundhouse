@@ -61,7 +61,9 @@
 
 use serde_json::Value;
 
-use super::{decode_anthropic_messages_stream, encode_anthropic_messages};
+use super::{
+    decode_anthropic_messages_stream, encode_anthropic_messages, StreamFailure, StreamFailureKind,
+};
 use crate::audit::redact_transport_error_text;
 use crate::credential::{resolve_base_url, CredentialCtx};
 use crate::errors::classify;
@@ -264,7 +266,9 @@ impl Provider for AnthropicMessagesProfileProvider {
                 ));
             }
 
-            let events = decode_anthropic_messages_stream(response.body).await;
+            let events = decode_anthropic_messages_stream(response.body)
+                .await
+                .map_err(stream_failure_to_provider_error)?;
             Ok(ChatStream(Box::pin(futures::stream::iter(events))))
         })
     }
@@ -389,6 +393,26 @@ fn contains_unencodable_content(req: &ChatRequest) -> bool {
             )
         })
     })
+}
+
+/// Ruling R17, item 3: modeled on `codec::cohere_v2::provider`'s identical
+/// `stream_failure_to_provider_error` — mirrors
+/// `crate::anthropic_provider`'s copy of the same mapping (that crate's
+/// Phase 1 provider and this one are two independent `Provider` impls
+/// sharing one decode function, per this module's own doc comment on why
+/// there are two wrapper types).
+fn stream_failure_to_provider_error(failure: StreamFailure) -> ProviderError {
+    tracing::warn!(
+        kind = ?failure.kind,
+        message = %redact_transport_error_text(&failure.message),
+        "anthropic-messages stream failed mid-generation"
+    );
+    match failure.kind {
+        StreamFailureKind::Transport => ProviderError::Transport(failure.message),
+        StreamFailureKind::Truncated => ProviderError::StreamInterrupted {
+            partial: failure.partial_text,
+        },
+    }
 }
 
 fn to_header_map(raw: &[(String, String)]) -> http::HeaderMap {

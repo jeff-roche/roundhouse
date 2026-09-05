@@ -1,6 +1,9 @@
-use roundhouse_provider::codec::anthropic_messages::decode_anthropic_messages_stream;
+use roundhouse_provider::codec::anthropic_messages::{
+    decode_anthropic_messages_stream, StreamFailureKind,
+};
 use roundhouse_provider::{
     BlockDelta, BlockKind, CassetteTransport, HttpRequest, HttpTransport, StreamEvent,
+    TransportError,
 };
 
 #[tokio::test]
@@ -23,7 +26,9 @@ async fn decodes_thinking_signature_and_normalizes_cache_read_usage() {
         .await
         .unwrap();
 
-    let events = decode_anthropic_messages_stream(resp.body).await;
+    let events = decode_anthropic_messages_stream(resp.body)
+        .await
+        .expect("a well-formed stream ending in message_stop must decode as Ok");
 
     assert!(matches!(
         events[0],
@@ -65,4 +70,51 @@ async fn decodes_thinking_signature_and_normalizes_cache_read_usage() {
     );
 
     assert!(matches!(events.last(), Some(StreamEvent::MessageStop)));
+}
+
+/// Task 11 (Ruling R17): `anthropic_messages` joins the strict group
+/// (`openai_chat`, `cohere_v2`) -- a stream that ends (a clean EOF) without
+/// ever observing a `message_stop` event must be an `Err`, matching every
+/// other strict-group codec's fixed behavior, not a silent `Ok` that a
+/// caller cannot distinguish from a real completion on a physically-
+/// immutable event log.
+#[tokio::test]
+async fn a_connection_closed_mid_stream_with_no_message_stop_is_an_error_not_a_clean_completion() {
+    let body = futures::stream::iter(vec![Ok(bytes::Bytes::from(
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+    ))]);
+    let result = decode_anthropic_messages_stream(body).await;
+    assert!(
+        result.is_err(),
+        "a stream that never saw message_stop must be an error, matching every other strict-\
+         group codec's fixed behavior"
+    );
+}
+
+/// Ruling R17, item 1: `decode.rs`'s `let Ok(frame) = frame else { continue
+/// };` used to silently swallow a mid-stream transport/SSE-framing error,
+/// making a reset connection indistinguishable from a benign skipped
+/// keep-alive frame. It must now surface as `StreamFailureKind::Transport`,
+/// carrying whatever text was already decoded before the failure
+/// (`partial_text`) -- mirrors `cohere_v2`/`openai_chat`'s identical fix.
+#[tokio::test]
+async fn a_mid_stream_transport_error_is_surfaced_not_silently_dropped() {
+    let body = futures::stream::iter(vec![
+        Ok(bytes::Bytes::from(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+        )),
+        Ok(bytes::Bytes::from(
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"cut off here\"}}\n\n",
+        )),
+        Err(TransportError::Io("connection reset by peer".into())),
+    ]);
+    let failure = match decode_anthropic_messages_stream(body).await {
+        Ok(events) => panic!(
+            "a mid-stream transport error must not decode as Ok ({} events decoded)",
+            events.len()
+        ),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.kind, StreamFailureKind::Transport);
+    assert_eq!(failure.partial_text, "cut off here");
 }
