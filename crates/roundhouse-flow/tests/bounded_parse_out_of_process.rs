@@ -16,23 +16,19 @@
 //! `nesting_depth_bound_violation`) — that guard is untouched, still
 //! best-effort, still capable of over-rejecting.
 //!
-//! **A second, narrower scope gap found while writing this test, not
-//! authorized by the brief to fix here (see the task report):**
-//! `expansion::check_expansion` — the fast-path guard that runs *before*
-//! `parse_via_helper` — constructs a real `serde_yaml::Deserializer` and
-//! walks it via `deserialize_any`, so for a numeric scalar it incurs
-//! `serde_yaml`'s real `from_str_radix`/`dec2flt` decode (the same
-//! O(token-length) cost the typed deserialize pays), once per alias
-//! expansion, **in process**, before `parse_via_helper` is ever called.
-//! `src/parse/mod.rs`'s own "structural doubling" paragraph already says an
-//! admitted document costs "roughly twice its metered walk" — this task
-//! moves only the *second* walk (the typed deserialize) out of process.
-//! The *first* walk's identical per-decode cost is untouched and remains
-//! exactly as unbounded as before Task 14. This test's payload is sized so
-//! that walk still finishes in a few seconds rather than dozens, but the
-//! test does not (and cannot, without changing `expansion.rs`, which
-//! ruling W5-6 did not authorize) prove that first walk is bounded — only
-//! that the second one now is.
+//! **Task 14 fix round 1 (ruling W5-20) closed the gap this file's own
+//! comment used to record here.** `expansion::check_expansion` — the
+//! fast-path guard that used to run *before* `parse_via_helper`, in this
+//! process — is itself a real `serde_yaml` walk over attacker-controlled
+//! input (it builds a real `serde_yaml::Deserializer` and drives
+//! `deserialize_any`, paying the same `from_str_radix`/`dec2flt` decode
+//! cost per alias expansion that the typed deserialize pays). It now runs
+//! *inside* `round-yaml-parse-helper`, alongside the typed deserialize, so
+//! both of `src/parse/mod.rs`'s "structural doubling" walks are under the
+//! same `RLIMIT_CPU` bound. `an_admitted_but_expensive_alias_document_is_rejected_by_the_out_of_process_bound`
+//! below now asserts a tight wall-clock ceiling rather than only a 60s
+//! hang-guard, because there is no longer an unbounded in-process cost the
+//! assertion has to stay clear of.
 
 use roundhouse_flow::parse::parse_workflow;
 use roundhouse_flow::parse::ParseError;
@@ -48,14 +44,13 @@ use std::time::{Duration, Instant};
 /// (`MAX_EXPANDED_WEIGHT`/`MAX_INTEGER_SCALAR_VISITS`) — i.e. it is
 /// **admitted**, not rejected, by every guard that ran before Task 14.
 ///
-/// Sized at 150,000 zeros / 6,000 aliases rather than the 262,143-byte,
-/// 43,673-alias maximiser the axis inventory measures at 9,435.7 ms
-/// (release) / tens of seconds (debug): this shape's *typed-deserialize*
-/// half alone reliably exceeds `helper::HELPER_CPU_LIMIT` (2s) with a
-/// comfortable margin, while keeping the *first* (in-process,
-/// `expansion::check_expansion`) walk's identical decode cost — see the
-/// module doc comment above — down to single-digit seconds rather than
-/// dozens, so this test stays fast without changing what it proves.
+/// Sized at 230,000 zeros / 10,000 aliases — the orchestrator's original
+/// pre-fix measurement payload (see the module doc comment above) —
+/// restored by Task 14 fix round 1: both `serde_yaml` walks now run inside
+/// the same bounded child, under the same `RLIMIT_CPU`, so there is no
+/// longer an unbounded in-process first walk whose cost this test had to
+/// stay under. The shape reliably exceeds `helper::HELPER_CPU_LIMIT` (2s)
+/// well before either walk completes.
 fn hex_zero_run(zeros: usize, k: usize) -> String {
     let mut y = String::with_capacity(zeros + 3 * k + 256);
     y.push_str(
@@ -78,7 +73,7 @@ fn hex_zero_run(zeros: usize, k: usize) -> String {
 
 #[test]
 fn an_admitted_but_expensive_alias_document_is_rejected_by_the_out_of_process_bound() {
-    let pathological = hex_zero_run(150_000, 6_000);
+    let pathological = hex_zero_run(230_000, 10_000);
     // Sanity: this must actually be *admitted* past every pre-parse guard,
     // not rejected by one of them — otherwise this test would pass for the
     // wrong reason (a cheap rejection, not the out-of-process bound firing
@@ -89,22 +84,93 @@ fn an_admitted_but_expensive_alias_document_is_rejected_by_the_out_of_process_bo
     let result = parse_workflow(&pathological);
     let elapsed = start.elapsed();
 
-    // A generous sanity ceiling, not a precision timing assertion: the
-    // *first* (in-process) walk's cost is untouched by this task (see the
-    // module doc comment) and is not itself bounded by anything this test
-    // can assert on, so this only guards against a genuine hang — it is
-    // not proof the whole call is fast, only that it terminates.
+    // Task 14 fix round 1 (ruling W5-20): now a meaningful precision
+    // assertion, not just a hang-guard. Before this fix round,
+    // `expansion::check_expansion` ran unbounded in this process ahead of
+    // the helper, so the whole call's wall-clock time was dominated by an
+    // in-process cost this test could not bound — hence the old 60s
+    // hang-guard. Now both `serde_yaml` walks run inside the same bounded
+    // child, under the same `RLIMIT_CPU`, so the whole `parse_workflow`
+    // call should finish in roughly `helper::HELPER_CPU_LIMIT` (2s) plus
+    // process-spawn/stdin-write/signal-delivery overhead. **Measured on the
+    // implementer's machine, debug build, five consecutive runs:
+    // 2.0075-2.0100s** — the 2-second CPU bound is what fires here (not
+    // the 5s wall-clock backstop), confirming this payload's cost is
+    // genuinely CPU-bound rather than blocked on I/O. 8s leaves generous
+    // headroom above the measured figure for a loaded CI box (roughly 4x)
+    // while remaining far tighter than the old 60s hang-guard or the
+    // 10-11s the orchestrator measured failing against this same payload
+    // before this fix round landed.
     assert!(
-        elapsed < Duration::from_secs(60),
-        "must terminate, not hang: took {elapsed:?}"
+        elapsed < Duration::from_secs(8),
+        "expected the whole call to finish in roughly the CPU bound plus spawn overhead \
+         now that no unbounded walk remains in this process, took {elapsed:?}"
     );
-    // The real assertion: the *typed-deserialize* half was killed by the
-    // out-of-process bound specifically — not merely "some error", which
-    // would also pass for the wrong reason (e.g. `HelperUnavailable` from
-    // a missing binary, an infrastructure failure this test is not about).
+    // The real assertion: the out-of-process bound fired specifically —
+    // not merely "some error", which would also pass for the wrong reason
+    // (e.g. `HelperUnavailable` from a missing binary, an infrastructure
+    // failure this test is not about).
     assert!(
         matches!(result, Err(ParseError::ExceededParseResourceBound(_))),
         "expected the out-of-process resource bound to fire, got {result:?}"
+    );
+}
+
+#[test]
+fn a_moderate_fan_out_of_cheap_scalars_is_rejected_by_the_moved_guard_not_the_resource_bound() {
+    // Ruling W5-20: "`check_expansion` is NOT redundant with the CPU
+    // bound — do not drop it in favour of the bound. A moderate fan-out of
+    // cheap scalars can exceed `MAX_EXPANDED_WEIGHT` while staying well
+    // under 2 CPU-seconds; only the guard rejects that shape." This test
+    // pins exactly that, now that the guard runs inside the bounded child
+    // rather than in this process: the failure mode must still be
+    // `ExpandsTooLarge`, fired cheaply by the guard doing its own job in
+    // its new home — not `ExceededParseResourceBound`, which would mean
+    // the guard stopped running (or stopped mattering) and the CPU bound
+    // is doing the guard's job for it, which the ruling says it cannot.
+    //
+    // Same construction as `tests/parse_top_level.rs`'s
+    // `a_large_anchored_scalar_aliased_many_times_is_rejected` (one
+    // anchored 60,000-byte scalar aliased 40,000 times in a flat
+    // sequence, so `serde_yaml`'s own alias-jump guard never fires):
+    // measured there at 3.2ms release / 23.3ms debug through the whole
+    // `parse_workflow` call, when the check ran in the parent — cheap
+    // scalars (a repeated literal byte), a large fan-out, nowhere near the
+    // 2-second CPU bound.
+    let l = 60_000usize;
+    let k = 40_000usize;
+    let mut yaml = format!(
+        "name: t\nversion: 1\nsecrets: &big [\"{}\"]\npermissions:\n  unattended: {{ escalate: fail }}\nsteps:\n  - id: s\n    b: [",
+        "z".repeat(l)
+    );
+    for i in 0..k {
+        if i > 0 {
+            yaml.push(',');
+        }
+        yaml.push_str("*big");
+    }
+    yaml.push_str("]\n");
+    assert!(
+        yaml.len() < roundhouse_flow::parse::MAX_YAML_BYTES,
+        "payload must stay under the byte cap so this exercises the expansion-weight \
+         ceiling, not MAX_YAML_BYTES: {} bytes",
+        yaml.len()
+    );
+
+    let start = Instant::now();
+    let result = parse_workflow(&yaml);
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(result, Err(ParseError::ExpandsTooLarge { .. })),
+        "expected the moved expansion-weight guard to fire inside the child as \
+         ExpandsTooLarge, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the guard's own rejection must land well under the CPU bound it now shares a \
+         process with, proving it fires on its own terms rather than being caught by \
+         the resource bound instead: took {elapsed:?}"
     );
 }
 

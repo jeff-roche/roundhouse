@@ -317,9 +317,8 @@
 //! workflow YAML) inherits the *residual* above, which is smaller than what
 //! it inherited before but is not nothing.
 //!
-//! ## Task 14 (lane W5): the recommended remedy is now implemented for
-//! ## the *second* walk only — read this before assuming the residual is
-//! ## fully closed, because it is not
+//! ## Task 14 (lane W5), completed by fix round 1: both `serde_yaml`
+//! ## walks over untrusted input now run out of process
 //!
 //! The "parse out of process under `RLIMIT_CPU`" remedy this section
 //! recommended is now real for the stage that used to be
@@ -329,45 +328,62 @@
 //! `roundhouse_sandbox::bounded_parse::run_bounded_subprocess`'s CPU
 //! (Linux), wall-clock (every platform) and output-size bound.
 //!
-//! **What that closes: the *structural doubling* this section describes,
-//! by construction.** The helper deserializes into a `serde_yaml::Value`
-//! (where the real alias-following and numeric-decode work happens) and
-//! re-serializes it alias-free; [`parse_workflow`]'s own second
-//! `serde_yaml` call then runs over *that* alias-free output — a plain
-//! linear parse, not a second walk of the original alias structure. That
-//! second walk's share of the tokenizing/integer-decode cost is now genuinely
-//! bounded: it happens inside the killed child, under a real ceiling,
-//! regardless of which internal stage was spending it.
+//! **What Task 14's original commits closed: the *structural doubling*
+//! this section describes, by construction.** The helper deserializes into
+//! a `serde_yaml::Value` (where the real alias-following and
+//! numeric-decode work happens) and re-serializes it alias-free;
+//! [`parse_workflow`]'s own second `serde_yaml` call then runs over *that*
+//! alias-free output — a plain linear parse, not a second walk of the
+//! original alias structure.
 //!
-//! **What this does NOT close, found while writing this task's own
-//! tests, and not authorized by ruling W5-6 to fix here:**
-//! `expansion::check_expansion` — the fast-path guard that still runs
-//! *before* [`helper::parse_via_helper`], entirely in process — is not a
-//! cheap approximation of the real parse. It builds a real
-//! `serde_yaml::Deserializer` and drives it with `deserialize_any`
-//! (`expansion.rs`'s own doc comment: "use the real deserializer as its
-//! own budget meter"), so for every numeric scalar it triggers the exact
-//! same `from_str_radix`/`dec2flt` decode the typed deserialize does, once
-//! per alias expansion — the identical cost this whole module doc is
-//! about, paid a *first* time, in the daemon's own process, before this
-//! task's out-of-process bound is ever reached. This task moves the
-//! *second* walk's copy of that cost out of process; the *first* walk's
-//! copy is exactly as unbounded as it was before Task 14. Concretely: the
-//! axis inventory's 9,435.7 ms admitted integer-decode maximiser was, and
-//! still is, spent inside `check_expansion` alone, in process, before
-//! `parse_via_helper` is ever called — Task 14 does not change that number.
-//! Whether `check_expansion` itself should also move into the bounded
-//! child (which would mean the helper takes over the fast-path guards too,
-//! not just the typed deserialize) is a scope decision this task's brief
-//! did not authorize and this comment does not make; see the task report.
+//! **What Task 14's original commits left open, and what fix round 1
+//! (ruling W5-20) closed:** `expansion::check_expansion` — the fast-path
+//! guard that at the time still ran *before* [`helper::parse_via_helper`],
+//! entirely in this process — is not a cheap approximation of the real
+//! parse. It builds a real `serde_yaml::Deserializer` and drives it with
+//! `deserialize_any` (`expansion.rs`'s own doc comment: "use the real
+//! deserializer as its own budget meter"), so for every numeric scalar it
+//! triggers the exact same `from_str_radix`/`dec2flt` decode the typed
+//! deserialize does, once per alias expansion — the identical cost this
+//! whole module doc is about, paid a *first* time. Task 14's original
+//! commits moved only the *second* walk's copy of that cost out of
+//! process, leaving the first exactly as unbounded as before Task 14 —
+//! measured by the orchestrator at ~10-11s wall clock on a payload whose
+//! bounded half alone should have finished in ~2s. Fix round 1 moves
+//! `check_expansion` itself into `round-yaml-parse-helper`, alongside the
+//! typed deserialize it used to run ahead of (see
+//! `src/bin/round_yaml_parse_helper.rs` and `parse::helper`'s module doc
+//! for the verdict protocol this needed, since a bare exit code cannot
+//! carry [`ParseError::TooManyNumericScalars`]'s or
+//! [`ParseError::ExpandsTooLarge`]'s data). Both walks now run inside the
+//! same child, under the same `RLIMIT_CPU`/wall-clock/output bound — see
+//! `tests/bounded_parse_out_of_process.rs`'s
+//! `an_admitted_but_expensive_alias_document_is_rejected_by_the_out_of_process_bound`,
+//! which measures the same pathological payload finishing in ~2.01s
+//! post-fix, against 9.79s pre-fix on the same machine.
 //!
-//! **What this does not close (ruling W5-6, independent of the point
-//! above):** the three checks below — [`MAX_YAML_BYTES`],
-//! [`nesting_depth_bound_violation`], and `expansion::check_expansion` —
-//! are functionally untouched. They remain exactly as best-effort as they
-//! were, over-rejection bug included (see
+//! **`check_expansion` moving does not make it redundant with the CPU
+//! bound, and ruling W5-20 is explicit that it must not be dropped in
+//! favour of it:** a moderate fan-out of cheap scalars can exceed
+//! [`MAX_EXPANDED_WEIGHT`] while staying well under the helper's 2-second
+//! CPU bound — only the guard rejects that shape, which is what
+//! `tests/bounded_parse_out_of_process.rs`'s
+//! `a_moderate_fan_out_of_cheap_scalars_is_rejected_by_the_moved_guard_not_the_resource_bound`
+//! pins.
+//!
+//! **What is still not closed (ruling W5-6, independent of the point
+//! above, and unaffected by fix round 1):** [`MAX_YAML_BYTES`] and
+//! [`nesting_depth_bound_violation`] remain functionally untouched — still
+//! best-effort, over-rejection bug included (see
 //! `nesting_depth_bound_violation`'s own doc comment); Phase 5's parked
-//! over-rejection regression is **not** addressed by this task.
+//! over-rejection regression is **not** addressed by this task. Those two
+//! checks are the only `serde_yaml`-adjacent guards that still run in this
+//! process — and neither one is itself a `serde_yaml` call: the first is a
+//! byte-length comparison, the second a linear scan of the raw text. Every
+//! actual `serde_yaml` walk over attacker-controlled input now happens
+//! inside the bounded child; the only `serde_yaml` call left in this
+//! process is [`parse_workflow`]'s final linear parse of the helper's
+//! already-alias-free output.
 //!
 //! # Bounds this module does enforce, and exactly what each is worth
 //!
@@ -505,6 +521,17 @@ mod helper;
 pub mod steps;
 pub mod types;
 
+// Task 14 fix round 1 (ruling W5-20): `check_expansion` now runs inside
+// `round-yaml-parse-helper`, not in this process — see this module's doc
+// comment and `parse_workflow`'s body below. The helper binary is a
+// separate crate that links this crate's *library* and can therefore only
+// reach `pub` items, so these two are re-exported here rather than
+// duplicated (a second copy of the guard is exactly what ruling W5-20's
+// "reachability" note forbids). `#[doc(hidden)]` keeps them out of this
+// crate's advertised public API — they exist for exactly one caller.
+#[doc(hidden)]
+pub use expansion::{check_expansion, Verdict};
+
 pub use types::WorkflowDef;
 use types::{UnattendedDef, UnattendedEscalate};
 
@@ -575,22 +602,24 @@ use thiserror::Error;
 ///
 /// For scale: the frozen §8.9 fixture is 2,271 bytes.
 ///
-/// **Task 14 (lane W5) update — read the caveat, do not assume this is
-/// fully closed.** The 9,435.7 ms P63 figure is the cost of *one* real
-/// `serde_yaml` walk over the maximiser. Before Task 14 that walk happened
-/// twice in process (`expansion::check_expansion`'s metered pass, then the
-/// typed deserialize — see the module doc's "structural doubling"
-/// paragraph); Task 14 moved only the *second* one out of process, under
+/// **Task 14 (lane W5) update, fix round 1 (ruling W5-20).** The
+/// 9,435.7 ms P63 figure is the cost of *one* real `serde_yaml` walk over
+/// the maximiser, and the module doc's "structural doubling" paragraph
+/// records that an admitted document pays it twice: once in
+/// `expansion::check_expansion`'s metered pass, once in the typed
+/// deserialize. Task 14's original commits moved only the *second* walk
+/// out of process, leaving the first — and with it, roughly half of
+/// P63's accepted cost — genuinely unbounded in this process. **Fix round
+/// 1 closed that gap**: `check_expansion` now runs inside
+/// `round-yaml-parse-helper` too, so both walks are under
 /// `roundhouse_sandbox::bounded_parse`'s CPU/wall-clock bound (see
-/// [`super`]'s module doc). **The first walk's copy of the 9,435.7 ms cost
-/// is untouched and still runs in process** — `check_expansion` builds a
-/// real `serde_yaml::Deserializer` and pays the identical
-/// `from_str_radix`/`dec2flt` decode cost per alias expansion that the
-/// typed deserialize does. This constant, and the interim-lever advice
-/// above, are defence in depth in front of the *bounded* half of that
-/// cost; they are not in front of the unbounded half, because there still
-/// is one. P63's "accepted residual" framing is roughly halved, not
-/// superseded.
+/// [`super`]'s module doc's fix-round-1 section). P63's accepted residual
+/// is therefore no longer "roughly halved, not superseded" as the previous
+/// version of this paragraph said — the whole 9,435.7 ms admitted figure
+/// (were `MAX_YAML_BYTES` ever raised enough to reproduce it again) would
+/// now run to completion inside the same ~2-CPU-second-plus-overhead
+/// bound `tests/bounded_parse_out_of_process.rs` measures, not half of it
+/// in this process and half of it bounded.
 pub const MAX_YAML_BYTES: usize = 262_144;
 
 /// The maximum **expanded byte weight** a workflow document may produce once
@@ -924,11 +953,72 @@ pub const MAX_FLOW_NESTING_DEPTH: usize = 256;
 /// close to it.
 pub const MAX_LEADING_INDENT_CHARS: usize = 512;
 
+/// The payload of [`ParseError::Yaml`]. Almost always [`YamlFailure::Direct`]
+/// — a genuine `serde_yaml::Error` produced by a real `serde_yaml` call in
+/// *this* process (there is exactly one left: [`parse_workflow`]'s final
+/// linear parse of the helper's already-alias-free output).
+///
+/// **[`YamlFailure::FromHelper`] exists because of Task 14 fix round 1
+/// (ruling W5-20).** `expansion::check_expansion` now runs inside
+/// `round-yaml-parse-helper`, a separate process, and a `serde_yaml::Error`
+/// cannot cross that boundary: the crate exposes no public constructor that
+/// reattaches a [`serde_yaml::Error::location`] to a bare message (its
+/// `Location`/`Pos`/`Mark` types are private to `serde_yaml` itself — see
+/// `parse::helper`'s module doc for the wire format). So a syntax error the
+/// helper catches is sent back as plain text plus, when the original error
+/// had one, its `(line, column)` pair — [`ParseError::location`] returns
+/// that pair for [`YamlFailure::FromHelper`] exactly as it would have
+/// returned the equivalent `serde_yaml::Error`'s own location before this
+/// fix, which is what keeps `yaml_syntax_error_reports_a_line_and_column`
+/// passing unchanged.
+#[derive(Debug)]
+pub enum YamlFailure {
+    /// A `serde_yaml::Error` this process produced itself.
+    Direct(serde_yaml::Error),
+    /// Reconstructed from `round-yaml-parse-helper`'s tagged stderr line:
+    /// the original error's `Display` text, and its `(line, column)` if it
+    /// had one.
+    FromHelper {
+        message: String,
+        location: Option<(usize, usize)>,
+    },
+}
+
+impl std::fmt::Display for YamlFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            YamlFailure::Direct(err) => write!(f, "{err}"),
+            YamlFailure::FromHelper { message, .. } => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for YamlFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            YamlFailure::Direct(err) => Some(err),
+            YamlFailure::FromHelper { .. } => None,
+        }
+    }
+}
+
+// Deliberately NOT `#[from]` on the `ParseError::Yaml` field (see below) —
+// this is a second, independent `From` impl for a different source type
+// (`serde_yaml::Error`, not `YamlFailure`), which is what every remaining
+// real `serde_yaml` call site in this crate needs `?` to keep working
+// exactly as before this fix.
+impl From<serde_yaml::Error> for ParseError {
+    fn from(err: serde_yaml::Error) -> Self {
+        ParseError::Yaml(YamlFailure::Direct(err))
+    }
+}
+
 /// Why [`parse_workflow`] rejected a document. Every variant names what was
 /// wrong; [`ParseError::Yaml`] additionally carries a line/column when the
-/// underlying `serde_yaml` error has one (see [`ParseError::location`]) —
-/// `serde_yaml::Error`'s own `Display` already includes it, since this
-/// module's `#[error(...)]` message wraps `{0}` verbatim.
+/// underlying error has one (see [`ParseError::location`]) —
+/// [`YamlFailure`]'s own `Display` already includes it for the
+/// [`YamlFailure::Direct`] case, since this module's `#[error(...)]`
+/// message wraps `{0}` verbatim.
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error(
@@ -971,7 +1061,7 @@ pub enum ParseError {
     TooManyNumericScalars { kind: &'static str, max: usize },
 
     #[error("workflow YAML parse error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] YamlFailure),
 
     /// The out-of-process YAML-parsing helper (Task 14, lane W5) could not
     /// be located or spawned. Deliberately never a silent fallback to an
@@ -1027,7 +1117,10 @@ impl ParseError {
     /// location in the document.
     pub fn location(&self) -> Option<(usize, usize)> {
         match self {
-            ParseError::Yaml(err) => err.location().map(|loc| (loc.line(), loc.column())),
+            ParseError::Yaml(YamlFailure::Direct(err)) => {
+                err.location().map(|loc| (loc.line(), loc.column()))
+            }
+            ParseError::Yaml(YamlFailure::FromHelper { location, .. }) => *location,
             _ => None,
         }
     }
@@ -1061,38 +1154,33 @@ pub fn parse_workflow(yaml: &str) -> Result<WorkflowDef, ParseError> {
         None => {}
     }
 
-    // Bound anchor/alias expansion BEFORE deserializing for real. This is
-    // the check that closes the fan-out denial of service; see the module
-    // doc comment's history section and `expansion`'s own. A `Malformed`
-    // verdict is returned rather than passed through to the real parse: any
-    // document that errors cheaply here but would parse expensively for
-    // real is otherwise a complete bypass of the ceiling.
-    match expansion::check_expansion(yaml, MAX_EXPANDED_WEIGHT) {
-        expansion::Verdict::WithinBudget => {}
-        expansion::Verdict::TooManyNumericScalars { kind, max } => {
-            return Err(ParseError::TooManyNumericScalars { kind, max });
-        }
-        expansion::Verdict::OverBudget => {
-            return Err(ParseError::ExpandsTooLarge {
-                actual_bytes: yaml.len(),
-                max: MAX_EXPANDED_WEIGHT,
-            });
-        }
-        expansion::Verdict::Malformed(err) => return Err(ParseError::Yaml(err)),
-    }
-
+    // Task 14 fix round 1 (ruling W5-20): `expansion::check_expansion` used
+    // to run HERE, in this process, before the real deserialization below.
+    // It no longer does — it runs inside `round-yaml-parse-helper` now,
+    // alongside the deserialize it used to only guard, because it is
+    // itself a real `serde_yaml` walk over attacker-controlled input (see
+    // `expansion`'s own module doc and this module's doc comment's history
+    // section) and was therefore the "first walk" of the structural-
+    // doubling residual Task 14 did not close. `parse_via_helper` below now
+    // runs the guard and the typed deserialize as one bounded unit;
+    // `TooManyNumericScalars` and `ExpandsTooLarge` are reconstructed from
+    // the helper's tagged stderr on the way back (`parse::helper`'s module
+    // doc has the wire format) — the two variants are unchanged, only where
+    // they are produced moved.
+    //
     // Task 14 (lane W5): the real `serde_yaml` deserialization — the stage
     // that actually walks and materializes every anchor/alias expansion,
     // and the one no in-process check above can bound the *cost* of, only
     // reject some shapes of before paying it — runs out of process, under
     // a real CPU/wall-clock/output-size bound (`helper::parse_via_helper`).
-    // The three checks above remain load-bearing as a fast-path rejection
-    // for the shapes they understand; see each of their own doc comments
-    // for why none of them is the security boundary any more. The bytes
-    // that come back are already alias-free (the helper deserializes into
-    // a `serde_yaml::Value` and re-serializes it), so this second
-    // `serde_yaml` call is a plain linear parse, not a second unmetered
-    // walk of the original alias structure.
+    // The two checks above ([`MAX_YAML_BYTES`], [`nesting_depth_bound_violation`])
+    // remain load-bearing as a fast-path rejection for the shapes they
+    // understand — see each of their own doc comments for why neither is
+    // the security boundary; that boundary is now entirely inside the
+    // bounded child. The bytes that come back are already alias-free (the
+    // helper deserializes into a `serde_yaml::Value` and re-serializes
+    // it), so this second `serde_yaml` call is a plain linear parse, not a
+    // second unmetered walk of the original alias structure.
     let expanded_yaml = helper::parse_via_helper(yaml)?;
     let def: WorkflowDef = serde_yaml::from_slice(&expanded_yaml)?;
 
@@ -1163,15 +1251,17 @@ enum NestingViolation {
 /// This function is still best-effort defence in depth, not a security
 /// boundary, and the known false positive below is untouched — ruling
 /// W5-6 explicitly did not authorize touching it. **The tokenizing cost
-/// this comment says nothing bounds is only *partly* capped now, not
-/// "capped anyway":** the typed deserialize that used to pay it in process
-/// now runs out of process, under `roundhouse_sandbox::bounded_parse`'s
-/// CPU/wall-clock bound (see [`super`]'s module doc) — but
-/// `expansion::check_expansion`, which still runs entirely in process
-/// *before* this function's caller ever reaches that bound, builds its own
-/// real `serde_yaml::Deserializer` and pays the same tokenizing cost a
-/// second, earlier, unbounded time. See `expansion.rs`'s own doc comment
-/// and [`super`]'s module doc for that residual.
+/// this comment says nothing bounds is now capped, as of Task 14 fix
+/// round 1 (ruling W5-20):** both the typed deserialize and
+/// `expansion::check_expansion` — the latter of which used to run
+/// entirely in this process, before this function's caller ever reached
+/// any out-of-process bound, and pay the same tokenizing cost a second,
+/// earlier, unbounded time — now run inside the same
+/// `roundhouse_sandbox::bounded_parse`-bounded child (see [`super`]'s
+/// module doc's fix-round-1 section). This function itself is still not
+/// what closes that: it remains a best-effort pre-parse rejection, not the
+/// thing that bounds the cost when it doesn't reject. See `expansion.rs`'s
+/// own doc comment and [`super`]'s module doc for the current state.
 ///
 /// # Known false positive (fix round 4 on Task 10): documented, not fixed
 ///

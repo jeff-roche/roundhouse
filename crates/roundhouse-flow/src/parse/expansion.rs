@@ -1,25 +1,37 @@
 //! The bound on anchor/alias expansion, recorded against the
 //! denial-of-service finding in [`super`]'s module doc comment.
 //!
-//! **Task 14 (lane W5) update — read before assuming this module got
-//! cheaper or safer, because it did not change at all.**
-//! `roundhouse_sandbox::bounded_parse`'s new out-of-process CPU/wall-clock/
-//! output-size bound (see [`super`]'s module doc) wraps the *typed*
-//! `serde_yaml::from_slice::<WorkflowDef>` deserialize that used to follow
-//! this check — not this module. **This module still runs entirely in
-//! process, before that bound is ever reached, and it is not a cheap
-//! approximation of the real parse: [`check_expansion`] builds an actual
-//! `serde_yaml::Deserializer` and drives it, so for a numeric scalar it
-//! pays the exact same `from_str_radix`/`dec2flt` decode cost the typed
-//! deserialize does, once per alias expansion.** For the admitted-residual
-//! shape this module's own doc below discusses (the integer-decode
-//! maximiser, ~9,435.7 ms), that cost is paid here, in the daemon's own
-//! process, *before* Task 14's bound is reached at all — this module is
-//! not "sitting in front of" that residual in a way that makes it safe;
-//! it *is* half of that residual, unmoved. Nothing below changed, and
-//! nothing below needed to: it is still an accurate description of a
-//! mechanism that still has this cost, now alongside a second copy of the
-//! same cost that moved out of process.
+//! **Task 14 (lane W5) update, then fix round 1 (ruling W5-20) — read
+//! before assuming this module's *mechanism* changed, because it did not;
+//! only *where it runs* did.**
+//! `roundhouse_sandbox::bounded_parse`'s out-of-process CPU/wall-clock/
+//! output-size bound (see [`super`]'s module doc) originally wrapped only
+//! the *typed* `serde_yaml::from_slice::<WorkflowDef>` deserialize that
+//! used to follow this check, leaving [`check_expansion`] itself running
+//! unbounded in the daemon's own process — a real gap, because
+//! [`check_expansion`] is not a cheap approximation of the real parse: it
+//! builds an actual `serde_yaml::Deserializer` and drives it, so for a
+//! numeric scalar it pays the exact same `from_str_radix`/`dec2flt` decode
+//! cost the typed deserialize does, once per alias expansion. For the
+//! admitted-residual shape this module's own doc below discusses (the
+//! integer-decode maximiser, ~9,435.7 ms), that cost used to be paid in
+//! the daemon's own process, before the bound was ever reached.
+//!
+//! **Fix round 1 moved [`check_expansion`] itself into
+//! `round-yaml-parse-helper`**, the same bounded child the typed
+//! deserialize already ran in — see `src/bin/round_yaml_parse_helper.rs`
+//! and `crate::parse::helper`'s module doc for the verdict protocol this
+//! needed (a bare exit code cannot carry
+//! [`super::ParseError::TooManyNumericScalars`]'s or
+//! [`super::ParseError::ExpandsTooLarge`]'s data). This module's own
+//! mechanism — the metered walk described below — is completely
+//! unchanged; only its caller moved from `crate::parse::parse_workflow`
+//! (in this process) to `main()` in the helper binary (in the bounded
+//! child). [`check_expansion`] and [`Verdict`] widened from `pub(super)`
+//! to `#[doc(hidden)] pub` so that separate binary — which links this
+//! crate's library and can therefore see only `pub` items — can call the
+//! one real implementation rather than a second copy of it. Everything
+//! below is still an accurate description of that unchanged mechanism.
 //!
 //! # The mechanism: use the real deserializer as its own budget meter
 //!
@@ -474,7 +486,19 @@ pub const INTEGER_SCALAR_WEIGHT_BYTES: usize = 32;
 /// What [`check_expansion`] found. Every variant is a decision
 /// [`super::parse_workflow`] acts on directly; there is no "proceed anyway"
 /// case.
-pub(super) enum Verdict {
+///
+/// **Task 14 fix round 1 (ruling W5-20): widened from `pub(super)` to
+/// `#[doc(hidden)] pub`**, so `src/bin/round_yaml_parse_helper.rs` — a
+/// separate crate that links this crate's *library* and can therefore see
+/// only `pub` items — can call [`check_expansion`] directly instead of a
+/// second copy of it drifting out of sync with this one. `#[doc(hidden)]`
+/// keeps it out of this crate's advertised public API surface; it is not
+/// part of this crate's contract with anyone but that one binary. Not
+/// re-exported at the crate root — reached via
+/// `roundhouse_flow::parse::{check_expansion, Verdict}` (see `parse/mod.rs`'s
+/// `pub use`).
+#[doc(hidden)]
+pub enum Verdict {
     /// The ceiling was passed and the dominant cost was decoded numbers, so
     /// the caller can say which limit an author actually hit rather than
     /// talking about anchors and aliases. `kind` is `"float"` or `"integer"`.
@@ -533,7 +557,8 @@ pub(super) enum Verdict {
 /// [`super::MAX_INTEGER_SCALAR_VISITS`] so the charge never fires. See
 /// [`INTEGER_SCALAR_WEIGHT_BYTES`], [`FLOAT_SCALAR_WEIGHT_BYTES`]'s residual
 /// section, and [`super`]'s axis inventory.
-pub(super) fn check_expansion(yaml: &str, max: usize) -> Verdict {
+#[doc(hidden)]
+pub fn check_expansion(yaml: &str, max: usize) -> Verdict {
     let weighed = Cell::new(0usize);
     let over_budget = Cell::new(false);
     let floats = Cell::new(0usize);
