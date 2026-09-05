@@ -498,7 +498,7 @@ fn run_program_bounded(
     let mut stdout_pipe = child.stdout.take().expect("stdout was requested as piped");
     let mut stderr_pipe = child.stderr.take().expect("stderr was requested as piped");
 
-    let (timed_out, status, stdout_buf, stderr_buf) = thread::scope(|scope| {
+    let (status, stdout_buf, stderr_buf) = thread::scope(|scope| {
         // Both pipes are read concurrently with the wait: a child that
         // fills one while this thread waits on the other would otherwise
         // deadlock, which is the same reason `bounded_parse` reads on
@@ -506,27 +506,24 @@ fn run_program_bounded(
         let stdout_reader = scope.spawn(|| read_capped_discarding(&mut stdout_pipe, OUTPUT_CAP));
         let stderr_reader = scope.spawn(|| read_capped_discarding(&mut stderr_pipe, OUTPUT_CAP));
 
-        let (timed_out, status) = wait_with_wall_limit(&mut child, pgid, wall_limit);
+        let status = wait_with_wall_limit(&mut child, pgid, wall_limit);
 
         // Joined only after the wait has torn the process group down, so
         // the readers see EOF even when a descendant inherited a pipe.
         (
-            timed_out,
             status,
             stdout_reader.join().unwrap_or_default(),
             stderr_reader.join().unwrap_or_default(),
         )
     });
 
-    if timed_out {
+    let Some(status) = status else {
         return Err(WorktreeError::TimedOut {
             program: program.to_string(),
             repo_root: repo_root.to_path_buf(),
             wall_limit,
         });
-    }
-    let status =
-        status.expect("wait_with_wall_limit returns a status whenever it did not time out");
+    };
 
     if !status.success() {
         return Err(WorktreeError::CommandFailed {
@@ -540,8 +537,9 @@ fn run_program_bounded(
     Ok(stdout_buf)
 }
 
-/// Polls `child` until it exits on its own or `wall_limit` elapses,
-/// returning `(timed_out, status)`.
+/// Polls `child` until it exits on its own or `wall_limit` elapses.
+/// `Some(status)` is the child's own exit status; `None` means the bound
+/// fired and the child (with its whole process group) was killed.
 ///
 /// **Tears the process group down on both paths, including the one where
 /// the direct child exited cleanly.** That second case is the whole point,
@@ -567,22 +565,18 @@ fn run_program_bounded(
 /// descendant holding a pipe still blocks the join after the timeout fires.
 /// Closing that needs a PID namespace or cgroup, which this module does not
 /// have; it is the same boundary `bounded_parse` records.
-fn wait_with_wall_limit(
-    child: &mut Child,
-    pgid: i32,
-    wall_limit: Duration,
-) -> (bool, Option<ExitStatus>) {
+fn wait_with_wall_limit(child: &mut Child, pgid: i32, wall_limit: Duration) -> Option<ExitStatus> {
     let start = Instant::now();
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             kill_process_group_or_child(child, pgid);
-            return (false, Some(status));
+            return Some(status);
         }
         if start.elapsed() >= wall_limit {
             kill_process_group_or_child(child, pgid);
             // Reap, so a killed child is never left a zombie.
             let _ = child.wait();
-            return (true, None);
+            return None;
         }
         thread::sleep(POLL_INTERVAL);
     }
