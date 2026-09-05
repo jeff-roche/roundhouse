@@ -72,8 +72,13 @@ pub enum CredentialError {
     /// call site" would mean inventing that resolution layer from scratch —
     /// real, but out of a residual-hardening unit's scope, and its
     /// config-driven call site is `roundhouse-config`, out of this lane.
-    /// Only constructed today in a test fixture
-    /// (`tests/conformance_cohere_v2.rs`).
+    /// Fix round 3 correction (Ruling R39/K1): unlike `Transport` below,
+    /// this variant is constructed **nowhere at all today, not even in a
+    /// test** — `grep -rn "CredentialError::NotFound"` outside this enum's
+    /// own definition returns zero hits. An earlier draft of this comment
+    /// wrongly said "only constructed today in a test fixture" for both
+    /// variants; that claim is true of `Transport` (see below) but false
+    /// of this one.
     #[error(
         "no credential material found for provider `{0}` (checked keyring, env, profile default)"
     )]
@@ -91,7 +96,15 @@ pub enum CredentialError {
     /// which delegates to it), and it deliberately does NOT construct this
     /// variant via the naive `?` (`#[from] TransportError`) path — it maps
     /// every `TransportError` to a hand-built, host-only `RefreshFailed`
-    /// message instead.
+    /// message instead. Unlike `NotFound` above, this variant IS
+    /// implicitly constructible today: `#[from]` means the compiler
+    /// derives a `From<TransportError>` impl, so a bare `?` on any
+    /// `TransportError` inside a `Result<_, CredentialError>` function
+    /// constructs it for free, with no explicit call needed — which is
+    /// exactly why `oauth_refresh.rs`'s avoidance is a deliberate,
+    /// load-bearing choice rather than an incidental one; the easy path
+    /// is one `?` away, not something a future author would have to go
+    /// out of their way to write.
     ///
     /// **The vector, verified against the pinned `reqwest = 0.13.4` this
     /// workspace builds's actual source (fix round 2, Ruling CF15
