@@ -1,8 +1,18 @@
-//! Task 25 (Phase 7 lane W0 unit 2): `decide_sealed`, `decide_pipeline`, and
-//! `decide_shell_command` must derive `unsealed` from the `PolicyEngine` they
-//! are given, never accept it as a caller-supplied bool — that parameter is
-//! exactly the API shape that made Phase 2's round-1 divergence possible
-//! (`PolicyEngine::unsealed()` is the one correct source; see `engine.rs`).
+//! Task 25 (Phase 7 lane W0 unit 2): `decide_sealed` and `decide_shell_command`
+//! must derive `unsealed` from the `PolicyEngine` they are given, never accept
+//! it as a caller-supplied bool — that parameter is exactly the API shape that
+//! made Phase 2's round-1 divergence possible (`PolicyEngine::unsealed()` is
+//! the one correct source; see `engine.rs`).
+//!
+//! `decide_pipeline` dropped the same parameter (Ruling P5) but is
+//! deliberately NOT exercised directly here: `pipeline.rs`'s own doc comment
+//! says every real call site and every test must go through
+//! `decide_shell_command` instead, an invariant `shell_adversarial_pipeline.rs`
+//! (audit finding 11) exists to protect. `decide_shell_command`'s test below
+//! already covers the identical Deny/Allow pair through that composed entry
+//! point, and `decide_pipeline`'s new arity is compile-enforced by its only
+//! caller (`pipeline.rs`'s `decide_shell_command`) — a direct test would add
+//! nothing but a second way to violate that invariant.
 //!
 //! Each test below asserts BOTH directions on the same rule set: the sealed
 //! (default) engine must still deny via the sealed floor even though a
@@ -13,15 +23,14 @@
 //! always ran `decide`/config matching; the sealed-direction assertion is
 //! what pins the derivation to the real source.
 //!
-//! Compiling this file at all is also load-bearing: it calls all three
-//! functions at their new, `unsealed`-free arities.
+//! Compiling this file at all is also load-bearing: it calls both functions
+//! at their new, `unsealed`-free arities.
 
 use roundhouse_core::Tier;
 use roundhouse_policy::engine::{CompiledRule, Outcome, PolicyEngine, Predicate, Scope};
 use roundhouse_policy::sealed::{home_dir, SealedContext};
 use roundhouse_policy::shell::classify::SessionEnv;
-use roundhouse_policy::shell::opaque::{classify_shell, ShellClassification};
-use roundhouse_policy::shell::pipeline::{decide_pipeline, decide_shell_command};
+use roundhouse_policy::shell::pipeline::decide_shell_command;
 use roundhouse_policy::{FsOp, TaskParams};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -77,7 +86,7 @@ fn decide_sealed_derives_unsealed_from_the_engine_not_a_parameter() {
 }
 
 /// `/usr/bin/sudo` hits `sealed:priv-escalation-program` (§6.2) regardless of
-/// any config rule. Deliberately NOT a filesystem-write command: `decide_pipeline`
+/// any config rule. Deliberately NOT a filesystem-write command: the pipeline
 /// canonicalizes redirection targets for real, so a redirection-based fixture
 /// would need an actually-existing target file to ever reach `Outcome::Allow`.
 /// A plain program/argv match has no such filesystem dependency.
@@ -110,39 +119,6 @@ fn decide_shell_command_derives_unsealed_from_the_engine_not_a_parameter() {
 
     let unsealed = engine_allowing_sudo().with_unsealed(true);
     let decision = decide_shell_command(&unsealed, &ctx(), &cmdline, &env);
-    assert_eq!(
-        decision.outcome,
-        Outcome::Allow,
-        "flipping the ENGINE's with_unsealed(true) must be what falls through to \
-         the config Allow rule"
-    );
-}
-
-#[test]
-fn decide_pipeline_derives_unsealed_from_the_engine_not_a_parameter() {
-    let cmdline = format!("{PRIV_ESCALATION_PROGRAM} whoami");
-    let env = SessionEnv::default();
-    let ast = match classify_shell(&cmdline, &env) {
-        ShellClassification::Program(cmd) => cmd,
-        ShellClassification::HardDeny(_) => {
-            panic!("expected a Program classification for {cmdline:?}")
-        }
-    };
-
-    // Compile-shape: decide_pipeline now takes only
-    // (&PolicyEngine, &SealedContext, &ParsedShellAst) — no `unsealed` bool.
-    let sealed = engine_allowing_sudo();
-    let decision = decide_pipeline(&sealed, &ctx(), &ast);
-    assert_eq!(
-        decision.outcome,
-        Outcome::Deny,
-        "the priv-escalation program must still hit the sealed floor when the \
-         engine was built without with_unsealed(true)"
-    );
-    assert_eq!(decision.rule.unwrap().0, "sealed:priv-escalation-program");
-
-    let unsealed = engine_allowing_sudo().with_unsealed(true);
-    let decision = decide_pipeline(&unsealed, &ctx(), &ast);
     assert_eq!(
         decision.outcome,
         Outcome::Allow,
