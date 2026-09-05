@@ -109,6 +109,23 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// bounded-for-a-hang reasoning.
 const SESSION_CONSTRUCTION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Fix round 3, SHOULD 2: a background construction that outlives its
+/// caller's own [`SESSION_CONSTRUCTION_TIMEOUT`] (see
+/// `construct_real_session_bounded`'s own doc comment — it deliberately
+/// keeps running rather than being cancelled, to avoid orphaning a real
+/// isolation handle) is otherwise uncounted: nothing bounds how many such
+/// tasks can be in flight at once, each holding a real, in-progress
+/// `Isolate::prepare`/`probe` (and, when MCP servers are configured, a real
+/// spawned subprocess) for up to the full timeout. `FailedConstructionLimiter`
+/// bounds how many NEW attempts one peer can start per window, but a peer
+/// at that limit's own budget (5 failures / 10s, by default) could still
+/// accumulate on the order of `5 * (SESSION_CONSTRUCTION_TIMEOUT / 10s)` ≈
+/// 15-ish lingering background tasks from itself alone, and
+/// `DEFAULT_MAX_CONNECTIONS` concurrent peers multiply that further. This
+/// caps the number of constructions genuinely in flight — including ones
+/// whose caller already gave up — at once, daemon-wide, regardless of peer.
+const MAX_CONCURRENT_SESSION_CONSTRUCTIONS: usize = 64;
+
 /// Smallest backoff `accept_loop` sleeps after a transient `accept()` error
 /// (security review Important 2 / ruling W1-R33) before retrying.
 const MIN_ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
@@ -758,6 +775,7 @@ pub async fn accept_loop_with(
 
     let connection_slots = Arc::new(Semaphore::new(limits.max_connections));
     let failed_construction_limiter = Arc::new(FailedConstructionLimiter::default());
+    let construction_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_SESSION_CONSTRUCTIONS));
     let mut backoff = MIN_ACCEPT_BACKOFF;
 
     loop {
@@ -823,6 +841,7 @@ pub async fn accept_loop_with(
         let resources = resources.clone();
         let handshake_timeout = limits.handshake_timeout;
         let failed_construction_limiter = failed_construction_limiter.clone();
+        let construction_slots = construction_slots.clone();
         tokio::spawn(async move {
             let _permit = permit;
             handle_connection(
@@ -832,6 +851,7 @@ pub async fn accept_loop_with(
                 handshake_timeout,
                 peer_uid,
                 failed_construction_limiter,
+                construction_slots,
             )
             .await;
         });
@@ -859,6 +879,7 @@ async fn handle_connection(
     handshake_timeout: Duration,
     peer_uid: u32,
     failed_construction_limiter: Arc<FailedConstructionLimiter>,
+    construction_slots: Arc<Semaphore>,
 ) {
     let (requests_tx, requests_rx) = mpsc::channel(REQUEST_CHANNEL_CAPACITY);
     let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -872,6 +893,7 @@ async fn handle_connection(
             handshake_timeout,
             peer_uid,
             failed_construction_limiter,
+            construction_slots,
         ),
     );
 }
@@ -973,6 +995,7 @@ pub async fn drive_session(
     handshake_timeout: Duration,
     peer_uid: u32,
     failed_construction_limiter: Arc<FailedConstructionLimiter>,
+    construction_slots: Arc<Semaphore>,
 ) {
     let first_request = match tokio::time::timeout(handshake_timeout, requests_rx.recv()).await {
         Ok(Some(request)) => request,
@@ -1041,8 +1064,12 @@ pub async fn drive_session(
                 return;
             }
 
-            let real_session = match construct_real_session_bounded(&resources, workspace_name)
-                .await
+            let real_session = match construct_real_session_bounded(
+                &resources,
+                workspace_name,
+                &construction_slots,
+            )
+            .await
             {
                 Ok(real_session) => {
                     failed_construction_limiter.record_success(peer_uid);
@@ -1084,6 +1111,20 @@ pub async fn drive_session(
                     tracing::error!(
                         "session construction task ended unexpectedly (panicked or was \
                          dropped) before reporting an outcome; refusing CreateSession"
+                    );
+                    return;
+                }
+                Err(ConstructionOutcome::AtCapacity) => {
+                    // Fix round 3, SHOULD 2: a daemon-wide capacity limit,
+                    // not this peer's fault — deliberately does NOT count
+                    // against `failed_construction_limiter`, the same way
+                    // `is_full`'s own pre-check above does not.
+                    tracing::warn!(
+                        max_concurrent = MAX_CONCURRENT_SESSION_CONSTRUCTIONS,
+                        "closing connection: at the concurrent session-construction limit \
+                         (including constructions still running in the background for a \
+                         caller that already gave up); refusing before doing any real \
+                         session-construction work"
                     );
                     return;
                 }
@@ -1341,6 +1382,13 @@ enum ConstructionOutcome {
     /// The construction task ended (panicked, or was somehow dropped)
     /// without ever sending a result.
     TaskEnded,
+    /// Fix round 3, SHOULD 2: [`MAX_CONCURRENT_SESSION_CONSTRUCTIONS`] real
+    /// constructions (including ones whose own caller already gave up on
+    /// the timeout) are already in flight daemon-wide — refused before
+    /// spawning a new one at all, the same "refuse before doing the real
+    /// work" shape `SessionRegistry::is_full` and
+    /// `FailedConstructionLimiter` already use.
+    AtCapacity,
 }
 
 /// Runs `session_bootstrap::create_real_session` to completion in its own
@@ -1351,28 +1399,70 @@ enum ConstructionOutcome {
 /// An earlier version of this function raced `create_real_session` directly
 /// inside a `tokio::time::timeout`, which — on elapse — DROPS the losing
 /// future mid-`.await`. That is unsound for this specific future:
-/// `Isolate::prepare`'s real implementation (`BwrapLandlockIsolate`) inserts
-/// a handle into its own internal map BEFORE the async work backing it
-/// fully resolves, so a future dropped between that insert and its own
-/// return leaves an orphaned entry — a real resource with no `Handle` this
-/// process ever hands back to anyone, so nothing can ever call
-/// `Isolate::teardown` on it. The fix is not to make `prepare` itself
-/// cancellation-safe (`roundhouse-sandbox` is lane W5's crate, not this
-/// lane's) — it is to never cancel it from here: this function spawns
-/// `create_real_session` as an independent task that always runs to
-/// completion, and races only a [`tokio::sync::oneshot`] receiver (never
-/// the construction future itself) against the timeout. If the timeout
-/// wins, the spawned task keeps running; when it eventually finishes, it
-/// notices its `oneshot::Sender::send` failed (the receiver was dropped
-/// with the elapsed `timeout`) and tears down whatever it built via
-/// [`session_bootstrap::teardown_real_session`] instead of leaking it.
+/// `create_real_session` awaits repeatedly (isolation `prepare`, `probe`,
+/// egress registration, potentially a real `McpHost::start` subprocess
+/// spawn) AFTER `Isolate::prepare` itself has already returned a live
+/// `Handle` — dropping the outer future at any of those later await points
+/// still orphans that handle, because dropping a future never runs
+/// `Isolate::teardown` on a resource it already finished acquiring; nothing
+/// in `Drop` can await. (Correction to an earlier version of this comment:
+/// the claim that `prepare` itself inserts into an internal map before its
+/// own final `.await` was investigated and found incorrect — `prepare` has
+/// no `.await` of its own at all. The fix below is right regardless, for
+/// the simpler reason just stated.) The fix is not to make `create_real_session`
+/// itself cancellation-safe end to end — it is to never cancel it from
+/// here: this function spawns `create_real_session` as an independent task
+/// that always runs to completion, and races only a
+/// [`tokio::sync::oneshot`] receiver (never the construction future itself)
+/// against the timeout. If the timeout wins, the spawned task keeps
+/// running; when it eventually finishes, it notices its
+/// `oneshot::Sender::send` failed (the receiver was dropped or closed) and
+/// tears down whatever it built via [`session_bootstrap::teardown_real_session`]
+/// instead of leaking it.
+///
+/// # The send/drop race (fix round 3, SHOULD 1)
+///
+/// The self-teardown above fires only when `send` returns `Err` — which,
+/// per `tokio::sync::oneshot`'s own semantics, only happens if the receiver
+/// was ALREADY dropped or closed at the moment `send` runs. Racing
+/// `result_rx` directly inside `tokio::time::timeout` (as an earlier
+/// version of this function did) polls the inner future first and the
+/// timer second; a `send` landing in the sub-microsecond window between
+/// "inner future polled Pending" and "timer fires and `timeout` drops
+/// `result_rx`" lands successfully (the channel slot is still open), and
+/// that already-`Ok`-sent `RealSession` is then dropped, unread, along with
+/// `result_rx` itself the instant `timeout` returns — with nothing to tear
+/// it down. This function avoids that by racing `result_rx` via `select!`
+/// against a bare `sleep` instead, which keeps `result_rx` alive (borrowed,
+/// not moved) past the timeout arm: on elapse, it explicitly `close()`s the
+/// receiver (so any `send` racing right at this instant is not silently
+/// swallowed either) and then drains `try_recv()` for a value that may have
+/// already landed in that same narrow window, tearing it down here if so.
+/// This is not attacker-steerable (the window is sub-microsecond, entirely
+/// a function of scheduler timing, not of anything a peer controls) — the
+/// honest characterization is "close to cancellation-safe," not "provably
+/// so," which is why this is documented rather than asserted away.
 async fn construct_real_session_bounded(
     resources: &Arc<DaemonResources>,
     workspace_name: String,
+    construction_slots: &Arc<Semaphore>,
 ) -> Result<session_bootstrap::RealSession, ConstructionOutcome> {
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    // Fix round 3, SHOULD 2: `try_acquire_owned`, never an awaited
+    // `acquire` — same reasoning as `accept_loop_with`'s own
+    // `connection_slots`: blocking here would just move the problem rather
+    // than bound it. The permit moves into the spawned task below and is
+    // held for that task's ENTIRE lifetime, including any time it spends
+    // running in the background after this function itself has already
+    // returned `TimedOut` to its caller — that lingering time is exactly
+    // what this cap exists to bound.
+    let Ok(construction_permit) = construction_slots.clone().try_acquire_owned() else {
+        return Err(ConstructionOutcome::AtCapacity);
+    };
+
+    let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
     let construction_resources = resources.clone();
     tokio::spawn(async move {
+        let _construction_permit = construction_permit;
         let outcome =
             session_bootstrap::create_real_session(&construction_resources, workspace_name).await;
         match outcome {
@@ -1401,11 +1491,38 @@ async fn construct_real_session_bounded(
         }
     });
 
-    match tokio::time::timeout(SESSION_CONSTRUCTION_TIMEOUT, result_rx).await {
-        Ok(Ok(Ok(real_session))) => Ok(real_session),
-        Ok(Ok(Err(err))) => Err(ConstructionOutcome::Failed(err)),
-        Ok(Err(_recv_error)) => Err(ConstructionOutcome::TaskEnded),
-        Err(_elapsed) => Err(ConstructionOutcome::TimedOut),
+    // Fix round 3, SHOULD 1: `&mut result_rx` here (not moving `result_rx`
+    // into `tokio::time::timeout`) is what makes the post-elapse `close()`/
+    // `try_recv()` below possible at all — `timeout` takes its future by
+    // value and drops it internally on elapse, so there would be no
+    // `result_rx` left to call anything on afterward.
+    tokio::select! {
+        recv = &mut result_rx => {
+            match recv {
+                Ok(Ok(real_session)) => Ok(real_session),
+                Ok(Err(err)) => Err(ConstructionOutcome::Failed(err)),
+                Err(_recv_error) => Err(ConstructionOutcome::TaskEnded),
+            }
+        }
+        _ = tokio::time::sleep(SESSION_CONSTRUCTION_TIMEOUT) => {
+            // Close first: any `send` racing exactly this instant now
+            // observably fails, so the spawned task's own self-teardown
+            // path (above) fires normally for it. `try_recv` then drains
+            // whatever may have already landed in the channel's slot in
+            // the narrow window before `close()` ran — a value `close()`
+            // alone would otherwise leave to be silently dropped, unread,
+            // the moment this function returns.
+            result_rx.close();
+            if let Ok(Ok(real_session)) = result_rx.try_recv() {
+                tracing::warn!(
+                    "session construction finished (racing the timeout in the narrow \
+                     send/drop window) after this caller already gave up; tearing down \
+                     the real session it built instead of leaking it"
+                );
+                session_bootstrap::teardown_real_session(&resources.proxy, real_session).await;
+            }
+            Err(ConstructionOutcome::TimedOut)
+        }
     }
 }
 

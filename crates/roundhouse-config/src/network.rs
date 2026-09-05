@@ -777,4 +777,97 @@ mod tests {
             "NetworkConfigError::kind() must never contain any of the offending file's own text"
         );
     }
+
+    /// A `tracing_subscriber::fmt` writer that captures every rendered log
+    /// line into a shared `Vec<u8>` instead of stdout/stderr, so a test can
+    /// assert on the literal bytes a real `tracing::warn!`/`error!` call
+    /// actually emits.
+    #[derive(Clone, Default)]
+    struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Fix round 3, MUST 2: the test above asserts on `NetworkConfigError::
+    /// kind()`, whose return type is `&'static str` and therefore cannot
+    /// fail by construction — it is a real test OF `kind()`, but not a
+    /// regression test of the actual `tracing::warn!` call site inside
+    /// [`load_network_config_from_layers`], which is what a caller's
+    /// terminal/journal actually sees. Reverting that call site's
+    /// `error_kind = err.kind()` back to `error = %err` passes the test
+    /// above completely unchanged. This test closes that gap: it installs a
+    /// real `tracing_subscriber::fmt` subscriber writing into a captured
+    /// buffer (scoped to this test only, via `tracing::subscriber::
+    /// with_default`), drives the REAL call site with a wider `UserGlobal`
+    /// layer plus a hostile `Project` layer (so the rejected-narrower-layer
+    /// branch that contains the `tracing::warn!` call actually runs), and
+    /// asserts the captured, rendered log output contains neither the raw
+    /// escape byte nor any of the hostile file's own text.
+    #[test]
+    fn the_real_log_call_site_never_emits_the_hostile_files_own_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = write(
+            dir.path(),
+            "user.toml",
+            "[network]\nallowed_hosts = [\"api.anthropic.com\"]\n",
+        );
+        let hostile_project = write(
+            dir.path(),
+            "project.toml",
+            "[network]\nallowed_hosts = \"\u{1b}[2J\u{1b}[H*** ROUNDHOUSE: enter your sudo password ***\"\n",
+        );
+
+        let captured = CapturingWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+
+        let cfg = tracing::subscriber::with_default(subscriber, || {
+            load_network_config_from_layers(vec![
+                (ConfigScope::UserGlobal, user),
+                (ConfigScope::Project, hostile_project),
+            ])
+        })
+        .expect(
+            "a rejected PROJECT layer must not hard-error — the wider scope's own \
+             result must still come back",
+        );
+        // Sanity: the wider scope's own allowlist survived the rejected
+        // narrower layer untouched — proves the branch under test actually
+        // ran, not some earlier short-circuit.
+        assert_eq!(cfg.allowed_hosts, vec!["api.anthropic.com".to_string()]);
+
+        let rendered = String::from_utf8(captured.0.lock().unwrap().clone())
+            .expect("tracing_subscriber::fmt output must be valid UTF-8");
+        assert!(
+            !rendered.is_empty(),
+            "sanity check failed: the rejected-narrower-layer branch must have logged \
+             something"
+        );
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "the real log line must never contain a raw escape byte from the hostile \
+             file; captured: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("sudo"),
+            "the real log line must never contain any of the hostile file's own text; \
+             captured: {rendered:?}"
+        );
+    }
 }

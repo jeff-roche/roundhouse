@@ -20,3 +20,17 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Fix round 3, MUST 2: the ANSI-injection acceptance test needs to assert on
+# the actual rendered log LINE `load_network_config_from_layers` emits, not
+# on `NetworkConfigError::kind()` in isolation (whose `&'static str` return
+# type cannot fail by construction, so asserting on it alone is a test of
+# `kind()`, not a regression test of the log call site itself — reverting
+# `error_kind = err.kind()` back to `error = %err` at the call site passed
+# the old version of this test unchanged). A capturing `tracing_subscriber`
+# `fmt` subscriber, installed only for the duration of one test via
+# `tracing::subscriber::with_default`, is what makes that possible. Same
+# exact pin as `roundhouse-daemon`/`roundhouse-cli`'s own manifests, for the
+# same reason (0.3.20 fixed an ANSI-escape log-injection issue; this crate
+# is testing that exact class of defect, so pinning below the fix here of
+# all places would be a real error, not just inconsistent).
+tracing-subscriber = "=0.3.23"

@@ -412,9 +412,36 @@ fn egress_policy_for(resources: &DaemonResources) -> EgressPolicy {
 /// wholesale (W1-R25), so passing anything less than the full accumulated
 /// set here would silently un-redact an earlier session's secrets from the
 /// proxy's own event stream.
+///
+/// # Fail-closed on a poisoned lock (fix round 3, MUST 4)
+///
+/// `create_real_session` calls this UNCONDITIONALLY, after
+/// `create_session_with_egress` has already succeeded — a real isolation
+/// handle and a real proxy registration both already exist by this point.
+/// The old `.lock().unwrap()` here would panic on a poisoned mutex,
+/// unwinding out of `create_real_session` with no `SessionActor` yet built
+/// to call `teardown()` on — orphaning both, every time, for every future
+/// `CreateSession` this daemon process ever handles: a `std::sync::Mutex`
+/// stays poisoned forever once poisoned, so the very first panic here would
+/// have permanently broken session creation for the rest of the process's
+/// life. Matches `apply_resolved_mcp_servers`'s identical poisoned-lock
+/// handling (match-and-continue rather than panic) for the same reason —
+/// this session's own secrets (if any) simply don't get redacted from the
+/// shared proxy's traffic on that path, which is a narrower, session-scoped
+/// gap rather than a daemon-wide one.
 fn register_proxy_secrets(resources: &DaemonResources, ctx: &RequestCtx) {
     let this_session_secrets = roundhouse_engine::live_secret_values(ctx, &resources.mcp_configs);
-    let mut all_secrets = resources.proxy_secrets.lock().unwrap();
+    let mut all_secrets = match resources.proxy_secrets.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            tracing::error!(
+                "proxy_secrets lock is poisoned; refusing to update the daemon-wide egress \
+                 proxy's redaction set for this session — this session's own live secrets, if \
+                 any, will not be redacted from traffic proxied through the shared egress proxy"
+            );
+            return;
+        }
+    };
     let mut changed = false;
     for secret in this_session_secrets {
         if !all_secrets.contains(&secret) {
@@ -595,6 +622,42 @@ mod tests {
 
         assert!(real_session.mcp_host.is_none());
         assert_eq!(real_session.actor.state(), SessionState::Running);
+    }
+
+    /// Fix round 3, MUST 4: a poisoned `proxy_secrets` mutex must not panic
+    /// `register_proxy_secrets` — it did before this fix
+    /// (`.lock().unwrap()`), and since `std::sync::Mutex` stays poisoned
+    /// forever once poisoned, the very first panic would have permanently
+    /// broken every future `CreateSession` this daemon process ever
+    /// handled (this function runs unconditionally inside
+    /// `create_real_session`, after real isolation + proxy resources
+    /// already exist with no `SessionActor` yet built to tear them down
+    /// on unwind).
+    #[tokio::test]
+    async fn register_proxy_secrets_does_not_panic_on_a_poisoned_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = resources(dir.path()).await;
+
+        // Poison the lock the same way any real panic while holding it
+        // would: panic inside the critical section, caught so the test
+        // itself survives.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = resources.proxy_secrets.lock().unwrap();
+            panic!("deliberately poisoning proxy_secrets for this test");
+        }));
+        assert!(
+            resources.proxy_secrets.is_poisoned(),
+            "sanity check failed: the mutex should be poisoned by now"
+        );
+
+        let ctx = resources.clone_request_ctx();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            register_proxy_secrets(&resources, &ctx);
+        }));
+        assert!(
+            outcome.is_ok(),
+            "register_proxy_secrets must not panic on a poisoned proxy_secrets lock"
+        );
     }
 
     /// Fix round 2, MUST 6: `create_real_session`'s OWN MCP-configured

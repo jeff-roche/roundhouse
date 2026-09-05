@@ -74,6 +74,7 @@ async fn a_peer_looping_create_session_against_a_failing_host_is_cut_off() {
 
     let peer_uid = 4242;
     let limiter = Arc::new(FailedConstructionLimiter::default());
+    let construction_slots = Arc::new(tokio::sync::Semaphore::new(64));
 
     // `FailedConstructionLimiter::default()` allows 5 failures per 10s
     // window (see its own doc comment) — drive one more attempt than that
@@ -100,6 +101,7 @@ async fn a_peer_looping_create_session_against_a_failing_host_is_cut_off() {
             Duration::from_secs(5),
             peer_uid,
             limiter.clone(),
+            construction_slots.clone(),
         )
         .await;
         // Every attempt here fails one way or another (real prepare()

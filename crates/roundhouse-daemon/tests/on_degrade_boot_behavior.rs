@@ -132,6 +132,20 @@ async fn refuse_is_the_production_default_and_actually_refuses_on_a_degraded_hos
 /// `sealed_tier_shortfall` is disarmed — on every boot, unconditionally,
 /// before any client ever connects (the warning fires once, at the
 /// `default_on_degrade` binding in `main`, not per session).
+///
+/// Fix round 3, MUST 1: `RUST_LOG=info` (this test's original filter) is
+/// exactly the ONE value that could not have caught the regression the
+/// review found — this warning lives in `main.rs`, whose target is the
+/// BINARY crate name (`round_daemon_internal`, from `[[bin]] name`), not
+/// the library crate name (`roundhouse_daemon`) every other module logs
+/// under. `RUST_LOG=roundhouse_daemon=info` — the obvious "show me
+/// everything this daemon does" filter an operator would actually reach
+/// for — silently dropped this exact warning before the `target:
+/// "roundhouse_daemon::boot"` fix (proven manually: reverting that `target`
+/// argument reproduces zero matching lines under this exact filter, while
+/// `RUST_LOG=info`/`warn`/unset all still find it, hiding the regression).
+/// Using the crate-scoped filter here is what makes this test capable of
+/// catching that class of regression at all.
 #[tokio::test]
 async fn allow_degraded_to_none_logs_that_sealed_tier_shortfall_is_disarmed() {
     let dir = tempfile::tempdir().unwrap();
@@ -142,7 +156,7 @@ async fn allow_degraded_to_none_logs_that_sealed_tier_shortfall_is_disarmed() {
         .arg("--allow-degraded-to")
         .arg("none")
         .env("HOME", dir.path())
-        .env("RUST_LOG", "info")
+        .env("RUST_LOG", "roundhouse_daemon=info")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

@@ -66,6 +66,35 @@ pub enum McpConfigError {
     Parse(#[from] toml::de::Error),
 }
 
+impl McpConfigError {
+    /// A short, static, never-attacker-influenced name for the SHAPE of
+    /// this error — never this error's own `Display` (fix round 3, MUST 3).
+    ///
+    /// `toml::de::Error`'s `Display` embeds a verbatim snippet of the
+    /// offending source line at the parse-error location — for
+    /// `[[mcp_server]]` config specifically, that line can be a
+    /// `env = [["KEY", "sk-…"]]` entry, i.e. one of the operator's own real
+    /// secret values, appearing in the config file precisely because it is
+    /// the operator's OWN config (project-scoped `[[mcp_server]]` layers are
+    /// structurally dropped before any file is ever read — see this
+    /// module's own doc comment — so this is not the hostile-cloned-repo
+    /// attack; it is CF-11(c) for the operator's own config, same as
+    /// `NetworkConfigError::kind`). Mirrors that method's shape exactly.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            McpConfigError::Load(roundhouse_config::ConfigError::Io { .. }) => "io_error",
+            McpConfigError::Load(roundhouse_config::ConfigError::Parse { .. }) => {
+                "toml_parse_error"
+            }
+            McpConfigError::Load(roundhouse_config::ConfigError::NotARegularFile { .. }) => {
+                "not_a_regular_file"
+            }
+            McpConfigError::Load(roundhouse_config::ConfigError::TooLarge { .. }) => "too_large",
+            McpConfigError::Parse(_) => "mcp_server_section_parse_error",
+        }
+    }
+}
+
 /// Builds `layers` itself via [`roundhouse_config::default_layers`], so
 /// there is no `ConfigScope` label for a caller to attach — and therefore
 /// none to get wrong (Phase 7, Task 7, CF-11(b) / Task 4's M2).

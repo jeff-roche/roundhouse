@@ -285,7 +285,35 @@ async fn main() -> color_eyre::Result<()> {
     // config, one who doesn't gets user-global only.
     let project_root = std::env::current_dir().ok();
 
-    let mcp_configs = mcp_config::load_mcp_servers(project_root.as_deref())?;
+    // Fix round 3, MUST 3: this used to propagate `McpConfigError` straight
+    // out of `main` via `?`, which `color_eyre` then renders to stderr —
+    // entirely bypassing the `tracing` subscriber (and therefore 0.3.23's
+    // own ANSI-escape sanitization). `McpConfigError::Parse`'s `Display`
+    // (via `toml::de::Error`) embeds a verbatim snippet of the offending
+    // source line at the parse-error location — for `[[mcp_server]]`
+    // config specifically, that line can be an `env = [["KEY", "sk-…"]]`
+    // entry, i.e. one of the OPERATOR'S OWN real secret values (project-
+    // scoped `[[mcp_server]]` layers are structurally dropped before any
+    // file is ever read — see `mcp_config`'s own module doc comment — so
+    // this is not the hostile-cloned-repo attack; it is CF-11(c) for the
+    // operator's own config, printing a credential verbatim to stderr and
+    // the journal on a config typo). Same `kind()`-only logging discipline
+    // as the `[network]` config fallback just below, and the same
+    // fail-closed-but-non-fatal decision: a malformed `[[mcp_server]]`
+    // config degrades this boot to zero configured MCP servers rather than
+    // refusing to boot at all — strictly less capability, never more.
+    let mcp_configs = match mcp_config::load_mcp_servers(project_root.as_deref()) {
+        Ok(configs) => configs,
+        Err(err) => {
+            tracing::error!(
+                target: "roundhouse_daemon::boot",
+                error_kind = err.kind(),
+                "failed to load [[mcp_server]] config; falling back to no configured MCP \
+                 servers for every session rather than failing the whole daemon boot"
+            );
+            Vec::new()
+        }
+    };
 
     // CF-12(c): `load_network_config` has zero production callers before
     // this task. Fail-closed decision (stated explicitly, per the task
@@ -315,7 +343,20 @@ async fn main() -> color_eyre::Result<()> {
             // comment states why that still isn't a reason to render a
             // parser snippet into a log line (CF-11(c), copy-pasted or
             // journal-displayed operator config).
+            //
+            // Fix round 3, MUST 1: `target: "roundhouse_daemon::boot"` —
+            // without an explicit target, every `tracing` call in this file
+            // logs under this BINARY's own crate name
+            // (`round_daemon_internal`, from `[[bin]] name` in this crate's
+            // `Cargo.toml`), not the library crate name
+            // (`roundhouse_daemon`) every other module in this crate logs
+            // under. Proven: `RUST_LOG=roundhouse_daemon=debug` — the
+            // obvious "show me everything this daemon does" filter — shows
+            // every OTHER line in this codebase and silently drops every
+            // line in `main.rs` specifically. Every `tracing` call in this
+            // file gets the same explicit target for the same reason.
             tracing::error!(
+                target: "roundhouse_daemon::boot",
                 error_kind = err.kind(),
                 "failed to load [network] config; falling back to an empty \
                  (deny-all) egress allowlist for every session rather than \
@@ -366,6 +407,7 @@ async fn main() -> color_eyre::Result<()> {
         Some(tier) => {
             if tier == Tier::None {
                 tracing::warn!(
+                    target: "roundhouse_daemon::boot",
                     "--allow-degraded-to none is set: EVERY session on this daemon may run \
                      with NO isolation at all, and sealed_tier_shortfall (the sealed-floor rule \
                      that detects a live mid-session isolation downgrade) is PERMANENTLY \
@@ -376,6 +418,7 @@ async fn main() -> color_eyre::Result<()> {
                 );
             } else {
                 tracing::warn!(
+                    target: "roundhouse_daemon::boot",
                     ?tier,
                     "--allow-degraded-to is set: sessions on this daemon may run with an \
                      isolation tier as low as {tier:?} instead of the requested Tier::Sandbox, \
