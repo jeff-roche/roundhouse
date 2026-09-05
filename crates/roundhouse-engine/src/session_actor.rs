@@ -777,6 +777,36 @@ pub async fn create_session_isolation(
 /// (`ProxyNotServingError`), the isolation handle that was just created is
 /// torn down (best-effort) before returning the error, rather than leaked
 /// in the isolate's internal handle map.
+///
+/// **Fix round 1 (W1-R22 as amended by W1-R28):** this now takes `ctx` and
+/// `mcp_configs` and installs the session's real `Redactor` (via
+/// [`live_secret_values`]/[`wire_redaction_for_session`]) as the very
+/// FIRST thing it does — before `create_session_isolation` runs (which can
+/// itself append a Degradation `Note`) and before any `Handle` a caller
+/// could append against is ever returned. Before this fix, neither this
+/// function nor `SessionActor::new` called `wire_redaction_for_session` at
+/// all; the only call site anywhere in the workspace was a manual one in
+/// `roundhouse-daemon/src/demo.rs`, which reproduced the exact bug class
+/// this phase exists to fix (`set_redactor` was orphaned in production
+/// precisely because calling it was somebody's job to remember). Creating
+/// a session and installing real redaction are now one atomic act with
+/// nothing to forget — the same principle `roundhouse-web`'s
+/// `BoundedStore::connection` was built on under Phase 5 ruling P88 §A:
+/// "make the safe act and the only act the same one."
+///
+/// **`SessionActor::new` deliberately does NOT change** (W1-R28) —
+/// threading `ctx` on into the actor is the tempting adjacent move and is
+/// this lane's named internal hazard; only this function is extended.
+///
+/// **A second forget-path this fix leaves open, by design (named for
+/// Task 5/7 to rule on, not fixed here):** [`create_session_isolation`]
+/// remains callable directly, with no redaction wiring of its own — a
+/// caller that reaches for it instead of this function still gets a
+/// session with whatever `Redactor` `writer` already had (`spawn_writer`'s
+/// empty default, absent some other caller having wired one up). Always
+/// prefer this function, never `create_session_isolation` alone, for any
+/// session expected to reach the network (this is also CF-11(e)).
+#[allow(clippy::too_many_arguments)]
 pub async fn create_session_with_egress(
     writer: &EventWriter,
     runner: &TaskRunner,
@@ -785,7 +815,10 @@ pub async fn create_session_with_egress(
     spec: &SessionSpec,
     proxy: &Arc<LoopbackProxy>,
     egress_policy: EgressPolicy,
+    ctx: &RequestCtx,
+    mcp_configs: &[McpServerConfig],
 ) -> Result<(Handle, ProxyHandle), CreateSessionError> {
+    wire_redaction_for_session(writer, &live_secret_values(ctx, mcp_configs));
     let handle = create_session_isolation(writer, runner, session_id, isolate, spec).await?;
     match proxy.register_session(session_id, egress_policy) {
         Ok(proxy_handle) => Ok((handle, proxy_handle)),
@@ -815,20 +848,26 @@ pub enum CreateSessionError {
 /// nothing — and `EventWriter::set_redactor` had zero non-test callers
 /// anywhere in the workspace before this function existed.
 ///
-/// A minimum-length guard is applied before the secrets ever reach
-/// `Redactor::build`: `Redactor::build`'s own doc comment already filters
-/// empty-string patterns (an empty pattern matches at every position and
-/// pathologically mangles output), but a *short*, non-empty value is its
-/// own hazard the automaton doesn't guard against — the demo daemon's own
-/// placeholder `RequestCtx.api_key` is the literal string `"demo"`
-/// (`roundhouse-daemon/src/main.rs`), and registering a 4-byte value as a
-/// "secret" would redact every literal occurrence of the word "demo"
-/// anywhere in this session's event log (including, e.g., "demo session
-/// complete" / "demo file" Note text), destroying real, non-secret log
-/// content. No real provider API key is anywhere near this short, so a
-/// conservative minimum length excludes exactly the placeholder case
-/// without weakening protection for any real credential.
-const MIN_REDACTABLE_SECRET_LEN: usize = 12;
+/// **Fix-round-1 correction (W1-R24 as resolved by W1-R27):** this used to
+/// be `12`, sized as a de facto *production security threshold* chosen to
+/// accommodate exactly one test fixture — the demo daemon's placeholder
+/// `RequestCtx.api_key`, the literal string `"demo"`
+/// (`roundhouse-daemon/src/main.rs`). That meant a real, short secret (a
+/// 7-byte legacy `DB_PASSWORD`, an 8-char legacy token) was silently never
+/// redacted, with no signal that anything was dropped — a live secret
+/// reaching `Note.text`/`TaskFailed.error.message` verbatim in a log the
+/// `events` table's `UPDATE`/`DELETE` rejection (S-LOG-2) can never
+/// repair. The real fix for the placeholder is at its source (the demo's
+/// `api_key` fixture no longer collides with anything, see `main.rs`),
+/// and MCP env values are now filtered by variable NAME before they ever
+/// reach this function (see [`live_secret_values`]) rather than by
+/// length. What survives here is only a **destructive-pattern guard**: a
+/// 1-3 byte pattern would match at nearly every position in realistic
+/// text and pathologically mangle unrelated log content (the same hazard
+/// `Redactor::build`'s own empty-string filter guards for zero-byte
+/// patterns) — this floor extends that same guard one step further, not a
+/// meaningful line of security defense on its own.
+const MIN_REDACTABLE_SECRET_LEN: usize = 4;
 
 /// Installs a `Redactor` built from `secrets` onto `writer`, hot-swapping
 /// whatever `Redactor` it was constructed with (`spawn_writer`'s
@@ -841,39 +880,102 @@ const MIN_REDACTABLE_SECRET_LEN: usize = 12;
 /// comment) — a write that already landed before this call is `EventWriter`
 /// appended it in already-redacted-or-not form permanently: the `events`
 /// table physically rejects `UPDATE`/`DELETE` (S-LOG-2), so there is no way
-/// to retroactively redact a row once committed. See this function's real
-/// call site in `roundhouse-daemon/src/demo.rs` (`run_demo_session`, called
-/// immediately after `spawn_writer` and strictly before the first
-/// `run_chat_turn`/`append`) for a concrete proof that nothing appends
-/// in between.
+/// to retroactively redact a row once committed. This function's primary
+/// real call site is now [`create_session_with_egress`], which calls it
+/// itself as the very first thing IT does — before `create_session_with_
+/// egress` itself ever appends anything through `writer` (including the
+/// Degradation `Note` `create_session_isolation` may record) — so creating
+/// a session and installing real redaction are one atomic act (W1-R22).
+/// This says nothing about what a caller may already have done with
+/// `writer` before invoking `create_session_with_egress` at all — that
+/// remains the caller's own responsibility, same as always. The
+/// legacy hermetic demo path in `roundhouse-daemon/src/demo.rs`
+/// (`run_demo_session`) calls neither `create_session_with_egress` nor
+/// `create_session_isolation` at all (no isolation, no egress proxy in
+/// that path), so it keeps its own direct call, immediately after
+/// `spawn_writer` and strictly before the first `run_chat_turn`/`append` —
+/// removing it would silently re-expose that path's own `api_key`.
+///
+/// **W1-R25 — replace, not extend.** `EventWriter::set_redactor` is
+/// `ArcSwap::store`: a full replacement of whatever `Redactor` was
+/// installed before, and the `Redactor` this function builds is built
+/// from `secrets` ALONE — nothing already installed is preserved or
+/// merged in. A second call to this function (an MCP server started
+/// mid-session, a credential refresh) with anything less than the
+/// COMPLETE, still-live secret set silently **un-redacts** every secret
+/// that isn't re-passed, from that call forward. `Redactor` exposes no
+/// pattern accessor, so a caller cannot extend the running set — it must
+/// retain the full set itself and pass it, complete, on every call.
+///
+/// Any secret shorter than [`MIN_REDACTABLE_SECRET_LEN`] is dropped before
+/// reaching `Redactor::build` (see that constant's own doc comment for
+/// why this floor is a destructive-pattern guard only, not a security
+/// threshold). A drop is never silent: this logs the **count** of dropped
+/// values, never the values themselves, so an operator can tell a value
+/// was excluded without this function ever becoming a place a secret
+/// could leak through a log line.
 pub fn wire_redaction_for_session(writer: &EventWriter, secrets: &[String]) {
     let filtered: Vec<String> = secrets
         .iter()
         .filter(|s| s.len() >= MIN_REDACTABLE_SECRET_LEN)
         .cloned()
         .collect();
+    let dropped = secrets.len() - filtered.len();
+    if dropped > 0 {
+        tracing::warn!(
+            dropped_count = dropped,
+            min_len = MIN_REDACTABLE_SECRET_LEN,
+            "wire_redaction_for_session: dropped {dropped} secret value(s) shorter than the \
+             {MIN_REDACTABLE_SECRET_LEN}-byte destructive-pattern floor (values themselves are \
+             never logged)"
+        );
+    }
     writer.set_redactor(Redactor::build(&filtered));
+}
+
+/// Variable-NAME suffixes (case-insensitive) that mark an MCP `Stdio`
+/// server's env entry as a declared secret for [`live_secret_values`]'s
+/// purposes. W1-R24 as resolved by **W1-R27**: filtering by name, not by
+/// value length, is what stops an env var like `HOME` (a 13-byte value,
+/// well past the old length floor) from being registered as a "secret"
+/// and turning every path in the session log into `[REDACTED]` (Minor 4)
+/// — while still catching a short, real credential like a 7-byte
+/// `DB_PASSWORD` that a length-only filter would have silently let
+/// through unprotected (Minor 2).
+const SECRET_ENV_NAME_SUFFIXES: [&str; 4] = ["_TOKEN", "_KEY", "_SECRET", "_PASSWORD"];
+
+/// Whether `name` looks like a declared-secret env var by W1-R27's ruled
+/// name suffixes, case-insensitively (`GITHUB_TOKEN`, `github_token`, and
+/// `Github_Token` are all treated the same).
+fn is_secret_env_var_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SECRET_ENV_NAME_SUFFIXES
+        .iter()
+        .any(|suffix| upper.ends_with(suffix))
 }
 
 /// Collects every live secret value this session's creation already knows
 /// about, for [`wire_redaction_for_session`]'s `secrets` argument.
 ///
 /// Two sources today:
-/// - `ctx.api_key` — Phase 1's original, simplified credential path,
-///   always populated (every `RequestCtx` construction site sets it, even
-///   the demo's harmless placeholder — filtered out downstream by
-///   `wire_redaction_for_session`'s minimum-length guard, not here, so this
-///   function stays an honest, unfiltered inventory of what it found).
-/// - Every MCP `Stdio` server's `env` values (`McpTransportKind::Stdio.env:
-///   Vec<(String, String)>`) — passed literally to the spawned child's
+/// - `ctx.api_key` — Phase 1's original, simplified credential path. It
+///   has no variable name of its own, so no name test applies to it: it
+///   is **unconditionally** a secret and is always included, full stop
+///   (W1-R27). `wire_redaction_for_session`'s own length floor still
+///   applies to it downstream, purely as a destructive-pattern guard —
+///   see that function's doc comment.
+/// - Every MCP `Stdio` server's `env` entries whose variable **NAME**
+///   matches [`SECRET_ENV_NAME_SUFFIXES`] (`McpTransportKind::Stdio.env:
+///   Vec<(String, String)>`), passed literally to the spawned child's
 ///   environment via `Command::envs` (`roundhouse-mcp/src/transport/
 ///   stdio.rs`), with no secret-ref resolution step in between. Whether a
-///   given value is a raw secret or a reference string like
+///   matched value is a raw secret or a reference string like
 ///   `"keyring:github"`, it is exactly what reaches the child process
 ///   verbatim, so it belongs in the redaction set regardless — nothing
-///   downstream can distinguish the two shapes, and the brief itself names
-///   MCP env values as in scope ("any resolved MCP server env-var
-///   secrets").
+///   downstream can distinguish the two shapes. An env var whose name
+///   does NOT match (`HOME`, `AWS_REGION`, a bespoke `AUTH` with no
+///   ruled suffix) is accepted as a known, named limitation of this name
+///   list rather than silently redacting it by accident — see W1-R27.
 ///
 /// **Documented seam, not a silent gap:** `ctx.credentials: Option<Arc<dyn
 /// CredentialProvider>>` (Phase 6) is deliberately NOT a source here.
@@ -893,7 +995,11 @@ pub fn live_secret_values(ctx: &RequestCtx, mcp_configs: &[McpServerConfig]) -> 
     let mut secrets = vec![ctx.api_key.clone()];
     for config in mcp_configs {
         let McpTransportKind::Stdio { env, .. } = &config.transport;
-        secrets.extend(env.iter().map(|(_, value)| value.clone()));
+        secrets.extend(
+            env.iter()
+                .filter(|(name, _)| is_secret_env_var_name(name))
+                .map(|(_, value)| value.clone()),
+        );
     }
     secrets
 }
@@ -913,18 +1019,39 @@ pub fn live_secret_values(ctx: &RequestCtx, mcp_configs: &[McpServerConfig]) -> 
 ///
 /// Each entry becomes an exact-hostname match, **except** a `"*."`-prefixed
 /// entry, which becomes a wildcard-suffix match over the text after the
-/// prefix — with one deliberate guard: an entry of exactly `"*"` or `"*."`
-/// (empty suffix) is skipped rather than converted. `HostPattern::
-/// wildcard_suffix("")`'s own `match_kind` treats an empty suffix as
-/// matching *every* host unconditionally (`suffix.is_empty()` in its match
-/// arm) — silently turning one config line into "allow all egress,"
-/// almost certainly not what a config author who wrote `"*"` intended
-/// (probably a typo for a real suffix, or a mistaken belief that it means
-/// "no restriction" — the actual no-restriction spelling is simply not
-/// configuring `[network]` at all, which this task's default already
-/// happens to deny, not allow). Fail-closed here means skipping the
-/// malformed entry (denying whatever it would have matched) rather than
-/// silently promoting it to allow-everything.
+/// prefix — with one deliberate guard: an entry whose suffix is empty
+/// **after normalization** is skipped rather than converted.
+/// `HostPattern::wildcard_suffix("")`'s own `match_kind` treats an empty
+/// suffix as matching *every* host unconditionally (`suffix.is_empty()` in
+/// its match arm) — silently turning one config line into "allow all
+/// egress," almost certainly not what a config author who wrote `"*"`
+/// intended (probably a typo for a real suffix, or a mistaken belief that
+/// it means "no restriction" — the actual no-restriction spelling is
+/// simply not configuring `[network]` at all, which this task's default
+/// already happens to deny, not allow). Fail-closed here means skipping
+/// the malformed entry (denying whatever it would have matched) rather
+/// than silently promoting it to allow-everything.
+///
+/// **W1-R23 fix-round-1 correction:** the original guard checked
+/// `Some("")` — emptiness of the RAW text after `strip_prefix("*.")` —
+/// before any normalization, while `roundhouse-net` normalizes (strips
+/// exactly ONE trailing dot, then lowercases) AFTER, inside
+/// `HostPattern::wildcard_suffix` itself. That mismatch let `"*.."`
+/// through: `strip_prefix("*.")` on `"*.."` yields `Some(".")`, non-empty
+/// so not skipped, and `normalize_host(".")` then strips that one
+/// trailing dot down to `""`, landing on the exact allow-all
+/// `WildcardSuffix("")` this guard exists to prevent. The fix strips
+/// exactly one trailing dot off the suffix here too, before the emptiness
+/// test — deliberately `strip_suffix('.')`, mirroring `normalize_host`'s
+/// own single-strip shape exactly (not `trim_end_matches('.')`, which
+/// would strip every trailing dot and skip a strictly-longer run like
+/// `"*..."` that `roundhouse-net`'s real single-strip normalization would
+/// NOT actually reduce to an allow-all `WildcardSuffix("")` — that
+/// difference would make this guard over-deny cases `roundhouse-net`
+/// itself never treats as allow-all, silently drifting the two apart).
+/// This is the same order-of-operations rule R21/R26 restates for
+/// `roundhouse-config`'s intersection, applied here to this module's own
+/// allow-all foot-gun instead.
 pub fn egress_policy_from_allowed_hosts(allowed_hosts: &[String]) -> EgressPolicy {
     let mut patterns = Vec::with_capacity(allowed_hosts.len());
     for host in allowed_hosts {
@@ -932,7 +1059,7 @@ pub fn egress_policy_from_allowed_hosts(allowed_hosts: &[String]) -> EgressPolic
             continue;
         }
         match host.strip_prefix("*.") {
-            Some("") => continue,
+            Some(suffix) if suffix.strip_suffix('.').unwrap_or(suffix).is_empty() => continue,
             Some(suffix) => patterns.push(HostPattern::wildcard_suffix(suffix)),
             None => patterns.push(HostPattern::exact(host)),
         }
@@ -982,6 +1109,49 @@ mod redaction_and_egress_tests {
         assert!(!policy.matches("example.com"));
     }
 
+    /// W1-R23: the guard above checked emptiness BEFORE normalization
+    /// while `roundhouse-net` normalizes AFTER (`HostPattern::
+    /// wildcard_suffix` -> `normalize_host` strips exactly one trailing
+    /// dot). `"*.."`.`strip_prefix("*.")` yields `Some(".")` — non-empty,
+    /// so the old guard let it through — and `normalize_host(".")` then
+    /// strips that one trailing dot down to `""`, landing on
+    /// `WildcardSuffix("")`, which `policy.rs`'s `suffix.is_empty()` arm
+    /// matches against EVERY host: a plausible operator typo
+    /// (`allowed_hosts = ["*.."]`) silently became allow-all egress.
+    /// Confirmed empirically (security review) by extracting
+    /// `normalize_host` and this guard into a standalone binary:
+    /// `"*"` skipped, `"*."` skipped, `"*.."` -> ALLOW_ALL.
+    #[test]
+    fn a_double_dot_wildcard_entry_is_skipped_not_promoted_to_allow_all() {
+        let policy = egress_policy_from_allowed_hosts(&["*..".to_string()]);
+        assert!(
+            !policy.matches("example.com"),
+            "\"*..\" must not silently become allow-all egress"
+        );
+        assert!(!policy.matches("literally-anything.invalid"));
+    }
+
+    /// Pins the fix's exact shape: the guard strips exactly ONE trailing
+    /// dot before the emptiness test, mirroring `roundhouse-net`'s real
+    /// `normalize_host` (single strip) rather than stripping every
+    /// trailing dot. `"*..."` -> suffix `".."` after `strip_prefix("*.")`
+    /// -> ONE dot stripped -> `"."`, not empty, so this is NOT skipped —
+    /// and `roundhouse-net`'s own `normalize_host` applied to that same
+    /// suffix agrees: it strips exactly one trailing dot too, landing on
+    /// the same non-empty `"."`, never on allow-all. A guard that instead
+    /// stripped every trailing dot (`trim_end_matches('.')`) would skip
+    /// this entry too, silently over-denying a case `roundhouse-net`
+    /// itself never treats as allow-all — drifting the two apart.
+    #[test]
+    fn a_triple_dot_wildcard_entry_is_not_skipped_and_does_not_become_allow_all() {
+        let policy = egress_policy_from_allowed_hosts(&["*...".to_string()]);
+        assert!(
+            !policy.matches("example.com"),
+            "\"*...\" must not become allow-all — it isn't the allow-all shape either"
+        );
+        assert!(!policy.matches("literally-anything.invalid"));
+    }
+
     fn stdio_config(id: &str, env: Vec<(&str, &str)>) -> McpServerConfig {
         McpServerConfig {
             id: roundhouse_policy::ServerId(id.to_string()),
@@ -1006,18 +1176,59 @@ mod redaction_and_egress_tests {
         }
     }
 
+    /// W1-R24 as resolved by W1-R27: MCP env values are included only
+    /// when the variable NAME matches `*_TOKEN`/`*_KEY`/`*_SECRET`/
+    /// `*_PASSWORD` — this is what stops an unrelated env var like `HOME`
+    /// from turning every path in the session log into `[REDACTED]`
+    /// (Minor 4). `ctx.api_key` has no variable name and is always
+    /// included, unconditionally.
     #[test]
-    fn live_secret_values_collects_the_api_key_and_every_mcp_env_value() {
+    fn live_secret_values_collects_the_api_key_and_only_name_matched_mcp_env_values() {
         let ctx = fake_ctx("sk-live-abc123");
         let configs = vec![
             stdio_config("github", vec![("GITHUB_TOKEN", "gh-secret-value")]),
-            stdio_config("other", vec![("A", "one"), ("B", "two")]),
+            stdio_config(
+                "other",
+                vec![("HOME", "/home/jeroche"), ("DB_PASSWORD", "shortpw")],
+            ),
         ];
         let secrets = live_secret_values(&ctx, &configs);
         assert!(secrets.contains(&"sk-live-abc123".to_string()));
         assert!(secrets.contains(&"gh-secret-value".to_string()));
-        assert!(secrets.contains(&"one".to_string()));
-        assert!(secrets.contains(&"two".to_string()));
+        assert!(secrets.contains(&"shortpw".to_string()));
+        assert!(
+            !secrets.contains(&"/home/jeroche".to_string()),
+            "an env var whose NAME doesn't look secret-shaped (HOME) must never be treated as \
+             a live secret value — Minor 4's exact complaint"
+        );
+    }
+
+    /// Every name suffix W1-R27 names, plus one deliberately unmatched
+    /// name, in one place.
+    #[test]
+    fn live_secret_values_matches_every_ruled_name_suffix_and_nothing_else() {
+        let ctx = fake_ctx("sk-live-abc123");
+        let configs = vec![stdio_config(
+            "svc",
+            vec![
+                ("API_KEY", "key-val"),
+                ("CLIENT_SECRET", "secret-val"),
+                ("AUTH_TOKEN", "token-val"),
+                ("DB_PASSWORD", "password-val"),
+                ("AWS_REGION", "us-east-1"),
+            ],
+        )];
+        let secrets = live_secret_values(&ctx, &configs);
+        for expected in ["key-val", "secret-val", "token-val", "password-val"] {
+            assert!(
+                secrets.contains(&expected.to_string()),
+                "{expected:?} came from a name-matched env var and must be collected"
+            );
+        }
+        assert!(
+            !secrets.contains(&"us-east-1".to_string()),
+            "AWS_REGION does not match any of the ruled name suffixes"
+        );
     }
 
     #[test]
@@ -1027,42 +1238,131 @@ mod redaction_and_egress_tests {
         assert_eq!(secrets, vec!["sk-live-abc123".to_string()]);
     }
 
-    /// `wire_redaction_for_session`'s minimum-length guard: a short value
-    /// (like the demo daemon's literal `"demo"` `api_key` placeholder) must
-    /// not become a redaction pattern, or it would mangle unrelated,
-    /// non-secret log text that happens to contain the same short string.
+    /// W1-R24 as resolved by W1-R27: `MIN_REDACTABLE_SECRET_LEN` survives
+    /// ONLY as a destructive-pattern guard against a pathologically short
+    /// (1-3 byte) value — never again as the production security
+    /// threshold it used to be (the old 12-byte floor was sized only to
+    /// exclude the daemon's own 4-byte `"demo"` placeholder, now fixed at
+    /// its source in `roundhouse-daemon/src/main.rs` instead). This one
+    /// test proves both halves: a pathologically short value is still
+    /// filtered (the guard survives), and a realistic-but-short secret the
+    /// OLD floor silently let through unredacted (Minor 2's own 7-byte
+    /// `DB_PASSWORD` example) is now genuinely protected.
     #[tokio::test]
-    async fn a_short_secret_is_not_installed_as_a_redaction_pattern() {
+    async fn min_secret_len_is_a_destructive_pattern_guard_not_a_security_threshold() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("events.db");
         let store = roundhouse_store::open(&db_path).await.unwrap();
         let writer = roundhouse_store::spawn_writer(store).await;
-
-        wire_redaction_for_session(&writer, &["demo".to_string()]);
-
         let runner = roundhouse_core::TaskRunner::bootstrap();
-        let session_id = SessionId::new();
+
+        // A pathologically short (2-byte) value must still be dropped —
+        // installing it as a redaction pattern would match at nearly
+        // every position and destroy unrelated log content.
+        wire_redaction_for_session(&writer, &["ab".to_string()]);
+        let short_session = SessionId::new();
         let event = runner.record_note(
-            session_id,
+            short_session,
             0,
             now_ts(),
             None,
             NoteLevel::Info,
-            "demo session complete".to_string(),
+            "ab appears harmlessly in unrelated text".to_string(),
+            1,
+        );
+        writer.append(event).await.unwrap();
+
+        // A realistic 7-byte secret — Minor 2's own example — must now be
+        // redacted. Under the retired 12-byte security-threshold floor
+        // this was silently never protected.
+        let secret = "abcd123";
+        assert_eq!(secret.len(), 7);
+        wire_redaction_for_session(&writer, &[secret.to_string()]);
+        let long_session = SessionId::new();
+        let event = runner.record_note(
+            long_session,
+            0,
+            now_ts(),
+            None,
+            NoteLevel::Info,
+            format!("password is {secret}"),
             1,
         );
         writer.append(event).await.unwrap();
 
         let read_store = roundhouse_store::open(&db_path).await.unwrap();
-        let events = roundhouse_store::session_events(&read_store, session_id)
+
+        let short_events = roundhouse_store::session_events(&read_store, short_session)
             .await
             .unwrap();
-        let roundhouse_core::EventPayload::Note { text, .. } = &events[0].payload else {
+        let roundhouse_core::EventPayload::Note {
+            text: short_text, ..
+        } = &short_events[0].payload
+        else {
             panic!("expected a Note payload");
         };
         assert_eq!(
-            text, "demo session complete",
-            "a short non-secret-shaped value must not have redacted unrelated text"
+            short_text, "ab appears harmlessly in unrelated text",
+            "a 2-byte value must not have been installed as a redaction pattern"
+        );
+
+        let long_events = roundhouse_store::session_events(&read_store, long_session)
+            .await
+            .unwrap();
+        let roundhouse_core::EventPayload::Note {
+            text: long_text, ..
+        } = &long_events[0].payload
+        else {
+            panic!("expected a Note payload");
+        };
+        assert!(
+            !long_text.contains(secret),
+            "a 7-byte secret must now be redacted — Minor 2's exact complaint: got {long_text:?}"
+        );
+        assert!(
+            long_text.contains("[REDACTED]"),
+            "expected the redaction placeholder in place of the secret, got: {long_text:?}"
+        );
+    }
+
+    /// W1-R25: `set_redactor` is `ArcSwap::store` — a full replacement —
+    /// and `wire_redaction_for_session` builds its automaton from its
+    /// `secrets` argument alone, so a SECOND call with anything less than
+    /// the complete, still-live secret set silently un-redacts every
+    /// secret not re-passed. `Redactor` exposes no pattern accessor, so a
+    /// caller cannot extend the running set — it must retain the full set
+    /// itself. Before this fix, `wire_redaction_for_session`'s doc comment
+    /// covered call-ordering thoroughly but never stated this contract at
+    /// all (verified against `e43834d`'s text, which has no such
+    /// sentence). This is a source-level pin, not a behavior test — the
+    /// behavior (`ArcSwap::store`'s full-replace semantics) is unchanged
+    /// by design; only the two acceptable fixes the ruling names are
+    /// "state it explicitly" (chosen here) or "hold the accumulated set in
+    /// the engine" (rejected as YAGNI: no second call site exists in this
+    /// workspace today).
+    #[test]
+    fn wire_redaction_for_session_doc_states_the_replace_not_extend_contract() {
+        let src = include_str!("session_actor.rs");
+        let doc_start = src
+            .find("/// Installs a `Redactor` built from `secrets` onto `writer`")
+            .expect("wire_redaction_for_session's doc comment must still start with this line");
+        let fn_marker = "pub fn wire_redaction_for_session(";
+        let fn_pos = src[doc_start..]
+            .find(fn_marker)
+            .map(|offset| doc_start + offset)
+            .expect("wire_redaction_for_session's definition must follow its doc comment");
+        let doc_comment = &src[doc_start..fn_pos];
+        assert!(
+            doc_comment.contains("replace, not extend")
+                || doc_comment.contains("replace-not-extend"),
+            "wire_redaction_for_session's doc comment must state the replace-not-extend \
+             contract explicitly (W1-R25) — a caller must pass the COMPLETE secret set on \
+             every call, not just what's new"
+        );
+        assert!(
+            doc_comment.contains("COMPLETE") || doc_comment.contains("complete, still-live"),
+            "the doc comment must say to pass the complete accumulated set, not just the \
+             newly-added secrets"
         );
     }
 }

@@ -196,6 +196,19 @@ pub async fn run_demo_session(
     // `live_secret_values` is called with an empty slice — `spawn_writer`'s
     // own default (`Redactor::build(&[])`) previously left this session's
     // provider API key completely unprotected in the persisted log.
+    //
+    // Fix round 1 (W1-R22 as amended by W1-R28) folded this exact call
+    // into `roundhouse_engine::create_session_with_egress`, so that
+    // production session-creation path can no longer forget it. This
+    // demo path is NOT that path: `run_demo_session` never calls
+    // `create_session_with_egress` or `create_session_isolation` at all
+    // (no isolation handle, no egress proxy — this is Phase 1's hermetic
+    // exit-criterion path, kept as-is for offline/CI use). This manual
+    // call therefore stays — it is the ONLY redaction wiring this path
+    // has, and removing it on the assumption the fold covers it would
+    // silently re-expose this demo's own `api_key`. A future retirement
+    // of this fake-provider path (Task 7) is where this call site goes
+    // away, not before.
     wire_redaction_for_session(&writer, &live_secret_values(&cfg.request_ctx, &[]));
 
     let session_id = SessionId::new();

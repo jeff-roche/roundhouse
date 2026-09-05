@@ -81,7 +81,21 @@ async fn main() -> color_eyre::Result<()> {
                 RequestCtx {
                     trace_id: None,
                     transport: Arc::new(NoopTransport),
-                    api_key: "demo".into(),
+                    // Phase 7, Task 6 fix round 1 (W1-R24 as resolved by
+                    // W1-R27): this used to be the bare literal `"demo"`,
+                    // a 4-byte placeholder a production security
+                    // threshold (`session_actor::MIN_REDACTABLE_SECRET_LEN`,
+                    // formerly 12) was shaped around solely to exclude —
+                    // registering `"demo"` itself as a redaction pattern
+                    // would have mangled every unrelated occurrence of the
+                    // word "demo" in this session's own log text (e.g.
+                    // "demo session complete"). Fixed at the source
+                    // instead: a placeholder distinctive enough that it
+                    // never collides with this demo's own log text, so the
+                    // length floor no longer needs to be shaped around it.
+                    // Full retirement of this fake-provider path is
+                    // Task 7's.
+                    api_key: "demo-mode-fake-api-key".into(),
                     credentials: None,
                 },
             ),

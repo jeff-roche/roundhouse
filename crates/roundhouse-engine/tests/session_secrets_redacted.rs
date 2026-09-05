@@ -30,13 +30,16 @@ async fn a_provider_api_key_present_at_session_creation_is_redacted_from_a_later
     // `admission_integration.rs` uses for a multi-test file) is safe.
     let runner = roundhouse_core::TaskRunner::bootstrap();
 
-    // A secret at least `MIN_REDACTABLE_SECRET_LEN` bytes long — realistic
-    // API-key shape, and long enough not to be filtered out by
-    // `wire_redaction_for_session`'s short-value guard (see that
-    // function's own doc comment for why a value as short as the daemon's
-    // `"demo"` placeholder is deliberately excluded).
+    // A realistic API-key-shaped secret, comfortably past
+    // `wire_redaction_for_session`'s `MIN_REDACTABLE_SECRET_LEN`
+    // destructive-pattern-guard floor (fix round 1, W1-R24/W1-R27: that
+    // floor is 4 bytes today and exists only to reject a pathologically
+    // short, 1-3 byte pattern that would mangle unrelated log text — it is
+    // no longer a production security threshold, and the daemon's own
+    // `"demo"` placeholder is fixed at its source in `main.rs` instead of
+    // relying on this floor to exclude it).
     let secret = "sk-live-super-secret-key-value";
-    assert!(secret.len() >= 12);
+    assert!(secret.len() >= 4);
 
     // Session creation's new code path: install the redactor BEFORE any
     // event referencing the secret is appended. This is the exact ordering
