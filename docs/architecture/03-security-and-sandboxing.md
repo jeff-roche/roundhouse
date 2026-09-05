@@ -57,7 +57,8 @@ override you edit the deny. Among non-deny matches: higher scope, then specifici
 (`(exact_argv, literal_prefix_len, bound_predicate_count)`), then file order.
 
 **What distinguishes `Project` from `Workspace` (both are per-repo, but differ in who
-can write them and where the files live):**
+can write them and where the files live — the term `Workspace` is overloaded; see the
+naming note below):**
 - **`Project`** is the repo-committed config: `.roundhouse/policy.toml` and
   `.roundhouse/config.toml` inside the repo itself, checked in, visible to every clone —
   and, critically, **a file the agent working in that repo could itself have written**.

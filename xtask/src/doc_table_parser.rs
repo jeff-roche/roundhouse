@@ -47,6 +47,15 @@ pub enum ParseError {
     /// A dependency token, once normalized, doesn't correspond to any
     /// `crates/<name>` directory in the workspace.
     UnknownDependency { crate_name: String, token: String },
+    /// A `Depends on` cell's comma-separated token list contains an empty
+    /// entry (a stray leading/trailing/double comma) — a malformed cell,
+    /// not an unrecognized crate name, so this gets its own variant rather
+    /// than being misreported as `UnknownDependency { token: "" }`.
+    EmptyDependencyToken { crate_name: String, cell: String },
+    /// Two rows in the table named the same crate. Reported rather than
+    /// silently letting the second row's dependency set overwrite the
+    /// first's in the returned map.
+    DuplicateRow { crate_name: String },
 }
 
 impl fmt::Display for ParseError {
@@ -67,6 +76,15 @@ impl fmt::Display for ParseError {
                 f,
                 "{crate_name}: doc claims a dependency on {token:?}, which does not normalize \
                  to an existing crates/<name> directory"
+            ),
+            ParseError::EmptyDependencyToken { crate_name, cell } => write!(
+                f,
+                "{crate_name}: 'Depends on' cell {cell:?} contains an empty comma-separated \
+                 entry (stray leading/trailing/double comma)"
+            ),
+            ParseError::DuplicateRow { crate_name } => write!(
+                f,
+                "{crate_name} appears in more than one row of §5.2's table"
             ),
         }
     }
@@ -104,6 +122,9 @@ pub fn parse_dependency_table(doc_text: &str) -> Result<HashMap<String, Vec<Stri
         let [crate_cell, _responsibility_cell, deps_cell] = split_row(trimmed)?;
         let crate_name = normalize_token(crate_cell);
         let deps = parse_deps_cell(&crate_name, deps_cell)?;
+        if result.contains_key(&crate_name) {
+            return Err(ParseError::DuplicateRow { crate_name });
+        }
         result.insert(crate_name, deps);
     }
 
@@ -194,9 +215,13 @@ fn parse_deps_cell(crate_name: &str, cell: &str) -> Result<Vec<String>, ParseErr
     let mut deps = Vec::new();
     for token in before_dash.split(',') {
         if token.trim().is_empty() {
-            return Err(ParseError::UnknownDependency {
+            // A stray leading/trailing/double comma in the cell — a
+            // malformed-cell condition, not an unrecognized crate name, so
+            // this gets its own variant rather than reporting `token: ""`
+            // as though "" were a crate someone claimed a dependency on.
+            return Err(ParseError::EmptyDependencyToken {
                 crate_name: crate_name.to_string(),
-                token: token.to_string(),
+                cell: cell.to_string(),
             });
         }
         let normalized = normalize_token(token);
@@ -335,5 +360,36 @@ mod tests {
     fn missing_header_is_a_parse_error() {
         let err = parse_dependency_table("no table here at all").unwrap_err();
         assert_eq!(err, ParseError::TableNotFound);
+    }
+
+    #[test]
+    fn a_duplicate_row_for_the_same_crate_is_a_parse_error_not_a_silent_overwrite() {
+        let doc = format!(
+            "{HEADER_ROW}\n|---|---|---|\n\
+             | `roundhouse-x` | does things | core |\n\
+             | `roundhouse-x` | does things again | store |\n"
+        );
+        let err = parse_dependency_table(&doc).unwrap_err();
+        match err {
+            ParseError::DuplicateRow { crate_name } => {
+                assert_eq!(crate_name, "roundhouse-x");
+            }
+            other => panic!("expected DuplicateRow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stray_comma_producing_an_empty_token_is_a_parse_error_distinct_from_unknown_dependency() {
+        let err = parse_dependency_table(&table("core,, store")).unwrap_err();
+        match err {
+            ParseError::EmptyDependencyToken { crate_name, .. } => {
+                assert_eq!(crate_name, "roundhouse-x");
+            }
+            other => panic!("expected EmptyDependencyToken, got {other:?}"),
+        }
+
+        // A trailing comma hits the same variant.
+        let err2 = parse_dependency_table(&table("core, store,")).unwrap_err();
+        assert!(matches!(err2, ParseError::EmptyDependencyToken { .. }));
     }
 }
