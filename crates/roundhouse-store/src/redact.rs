@@ -95,9 +95,12 @@ impl Redactor {
         (out, count)
     }
 
-    /// Covers exactly three fields today: `TaskDelta{delta: Delta::Text}` (streamed
-    /// model/tool text output), `Note.text`, and `TaskFailed.error.message` (an error
-    /// message that quotes back part of the failing input, e.g. a shell command).
+    /// Covers exactly four fields today: `TaskDelta{delta: Delta::Text}` (streamed
+    /// model/tool text output), `Note.text`, `TaskFailed.error.message` (an error message
+    /// that quotes back part of the failing input, e.g. a shell command), and (Phase 7
+    /// Task 13b) `Loss.description` (free text that can carry a provider error message
+    /// verbatim). `Loss.kind` is a short machine-stable tag, never free text, and is left
+    /// untouched.
     ///
     /// **Known, tracked gap — NOT a safety property, just an honest inventory of what's
     /// unprotected today:** every other `EventPayload` field that can carry free text
@@ -150,11 +153,26 @@ impl Redactor {
                     n,
                 )
             }
-            // `EventPayload::Loss.description` will carry provider error text once
-            // Phase 7 Task 13b fills it in — exactly the free-text shape this method
-            // exists to protect. Nothing constructs `Loss` yet, so no redaction arm is
-            // added here in this commit; Task 13b must route it through `self.redact`
-            // the same way `TaskFailed.error.message` is above, not let it fall through.
+            // Phase 7 Task 13b: `description` carries provider error text verbatim (e.g.
+            // an upstream response body quoting back part of the request) — the same
+            // free-text shape `TaskFailed.error.message` is redacted above. `kind` is a
+            // short machine-stable tag (never free text — see `LossKind::Other`'s
+            // handling in `roundhouse-provider`) and is left untouched.
+            EventPayload::Loss {
+                kind,
+                description,
+                blocks_affected,
+            } => {
+                let (redacted_description, n) = self.redact(&description);
+                (
+                    EventPayload::Loss {
+                        kind,
+                        description: redacted_description,
+                        blocks_affected,
+                    },
+                    n,
+                )
+            }
             other => (other, 0),
         }
     }

@@ -110,6 +110,52 @@ async fn redaction_count_is_zero_when_nothing_matches_making_failure_visible() {
     }
 }
 
+/// Phase 7 Task 13b: `EventPayload::Loss.description` is free text that can carry a
+/// provider error message verbatim (e.g. an upstream 400 body quoting back part of the
+/// request) — exactly the shape `redact_event_payload` exists to protect. W0 left an
+/// explicit comment at the `other => (other, 0)` catch-all in `redact.rs` naming this as
+/// the site Task 13b must close before any `Loss` emit site exists; this test is the
+/// proof that it was actually closed, not just commented on.
+#[tokio::test]
+async fn loss_description_carrying_a_secret_is_redacted_like_task_failed_error_message() {
+    let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+    let (redacted, count) = redactor.redact_event_payload(EventPayload::Loss {
+        kind: "TruncatedAtMaxTokens".into(),
+        description: "upstream rejected request: key sk-live-abc123 is over budget".into(),
+        blocks_affected: 3,
+    });
+    assert_eq!(
+        count, 1,
+        "a Loss.description containing a live secret must be counted as redacted, the same \
+         way TaskFailed.error.message already is"
+    );
+    match redacted {
+        EventPayload::Loss {
+            kind,
+            description,
+            blocks_affected,
+        } => {
+            assert!(
+                !description.contains("sk-live-abc123"),
+                "the live secret must never survive in the redacted description: {description}"
+            );
+            assert!(
+                description.contains("[REDACTED]"),
+                "the redacted placeholder must appear in its place: {description}"
+            );
+            assert_eq!(
+                kind, "TruncatedAtMaxTokens",
+                "kind must pass through untouched"
+            );
+            assert_eq!(
+                blocks_affected, 3,
+                "blocks_affected must pass through untouched"
+            );
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+}
+
 /// Proves the redaction-count accumulation runs on a path INDEPENDENT of
 /// `upsert_for_event`'s early-return for `TaskDelta`/`Note` (Task 19 addendum, Ruling 5's
 /// gotcha) — this test would fail (`redactions` would stay 0) if the accumulation had been
