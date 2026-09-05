@@ -50,6 +50,18 @@ pub struct ProviderId(pub String);
 /// is gated separately from `Write`/`Append`/`Delete` in
 /// `PolicyEngine::decide`'s `Team`-scope handling (§15.2's read/write
 /// asymmetry) — see `TeamMembership`.
+///
+/// Orchestrator Ruling W4-13: this is deliberately a **keyless** policy-side
+/// projection of §15.1's own, keyed `MemoryOp` (`Read { key }`,
+/// `Write { key, content }`, `Append { key, .. }`, `Delete { key }`, `List`).
+/// Do not add a `key` field here. Consequence a future memory-executor
+/// author must know: because this type carries no key, `PolicyEngine`
+/// cannot distinguish which memory key a request touches — an `Allow`
+/// decision for a given `(scope, op)` authorizes **every** key in that
+/// scope, not the one key the underlying request actually names. That gap
+/// is intentional and out of scope for this task; a future unit that wants
+/// per-key policy will need to widen this type (and `TaskParams::Memory`,
+/// and every `Predicate::Memory`/`TeamMembership` call site) deliberately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryOp {
     Read,
@@ -96,6 +108,32 @@ pub enum TaskParams {
     /// `can_write` would have no session to check without this field.
     /// Fabricating a placeholder session id would be a fail-closed violation;
     /// this variant is brand new, so carrying its own session breaks nothing.
+    ///
+    /// **SECURITY INVARIANT (fix round 1, Ruling W4-6 follow-up):** `session`
+    /// is the sole *who* — the only input `TeamMembership::can_read`/
+    /// `can_write` are given to decide identity — inside an object this
+    /// crate otherwise treats as pure *what* (every other `TaskParams`
+    /// variant describes only an action, never an actor). `TaskParams`
+    /// derives `Deserialize`, so nothing at the type level stops a caller
+    /// from populating this field from attacker-reachable input. `session`
+    /// MUST be the dispatching `SessionActor`'s own session id, as that actor
+    /// holds it — **never** a value taken from task input, model output, or
+    /// anything read off the wire. Passing a client-supplied or
+    /// model-supplied session id straight through hands a non-member
+    /// session's forged identity to `can_read`/`can_write` and gets `Allow`
+    /// — a classic confused-deputy bypass of the membership gate this
+    /// variant exists to enforce. (Compare
+    /// `roundhouse-engine`'s `TaskCreateRequest::params` SECURITY INVARIANT
+    /// on `TaskParams::Fs.canonical`, the same shape of "this field must be
+    /// derived by the trusted dispatcher, never passed through" contract.)
+    ///
+    /// The same caller-trust gap applies to `MemoryScope::Project
+    /// { workspace }`: `PolicyEngine` has no session→workspace membership
+    /// mapping and cannot itself verify that the requesting `session`
+    /// actually belongs to `workspace`. That binding, too, is entirely
+    /// caller-trusted — whoever constructs a `Project`-scoped `TaskParams::
+    /// Memory` is responsible for having already verified the requesting
+    /// session's workspace membership before this type is ever built.
     Memory {
         scope: MemoryScope,
         op: MemoryOp,

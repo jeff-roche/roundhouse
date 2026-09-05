@@ -57,10 +57,10 @@ pub struct Decision {
     pub rule: Option<RuleId>,
 }
 
-/// Covers all six `TaskParams` variants (Phase 0, frozen) from the start — the
-/// audit's "only Fs*/Shell predicates ever get defined" bug meant no rule could
-/// ever Allow a git/http/mcp/agent task regardless of config; every variant
-/// gets a matcher here.
+/// Covers all seven `TaskParams` variants — the audit's "only Fs*/Shell
+/// predicates ever get defined" bug meant no rule could ever Allow a
+/// git/http/mcp/agent task regardless of config; every variant gets a
+/// matcher here.
 #[derive(Debug, Clone)]
 pub enum Predicate {
     FsPrefix {
@@ -119,21 +119,41 @@ pub enum Predicate {
     },
     /// Task 20 (W4): binds a config-authored or synthesized grant to an
     /// exact `(scope, op)` pair, matching every sibling variant's
-    /// least-privilege contract. Deliberately has no `session` field —
-    /// session is a *who*, not a *what*; `GrantScope::Session` already scopes
-    /// installation and `GrantProvenance` already carries the granting
-    /// session, so binding it here too would make a config-authored rule
-    /// (which has no session at all) impossible to write.
+    /// least-privilege contract.
     ///
-    /// A `Team`-scoped rule of this kind is inert for the read/write
+    /// Fix round 1 (Ruling W4-11): `session` binds the requesting session —
+    /// `None` means "any session" (what a config-authored rule, which has no
+    /// session to name, must use), `Some(s)` requires the request's `session`
+    /// to equal `s` exactly. This is not optional polish: `PolicyEngine` is
+    /// held behind an `Arc` shared across every session actor, so a rule with
+    /// no session binding matches every session's identical request. Before
+    /// this field existed, a durable `Always`-scoped grant synthesized from
+    /// session A's `MemoryScope::User` request also matched session B's
+    /// (including an untrusted sub-agent's) — `synthesize_grant` binds
+    /// `Some(session)` from the params being generalized, the same
+    /// least-privilege contract `Http`/`Git`/`Shell` already follow for their
+    /// own fields.
+    ///
+    /// Correcting an earlier, incorrect claim in this comment: this field is
+    /// *not* redundant with `GrantScope::Session` or `GrantProvenance`.
+    /// `GrantScope::Session` is documented elsewhere in this crate as "not
+    /// enforced yet" and `into_rule_for_installation` refuses to install a
+    /// rule for it at all; `GrantProvenance` is folded into the rule's id
+    /// string for audit purposes only and is never read by `matches`. This
+    /// `session` field is the only thing that actually restricts which
+    /// session a `Predicate::Memory` rule matches.
+    ///
+    /// A `Team`-scoped rule of this kind is still inert for the read/write
     /// asymmetry the security model actually relies on: `PolicyEngine::decide`
     /// short-circuits `MemoryScope::Team` before rule matching is ever
     /// reached (see `decide`'s `TaskParams::Memory` arm), so this predicate
-    /// can never be used to route around `TeamMembership`. It only ever
-    /// participates in ordinary rule matching for `User`/`Project` scope.
+    /// can never be used to route around `TeamMembership` regardless of how
+    /// `session` is bound. It only ever participates in ordinary rule
+    /// matching for `User`/`Project` scope, where this binding is live.
     Memory {
         scope: MemoryScope,
         op: MemoryOp,
+        session: Option<SessionId>,
     },
 }
 
@@ -370,9 +390,14 @@ impl Predicate {
                 Predicate::Memory {
                     scope: pscope,
                     op: pop,
+                    session: psession,
                 },
-                TaskParams::Memory { scope, op, .. },
-            ) => (pscope == scope && pop == op).then_some((0, 2)),
+                TaskParams::Memory { scope, op, session },
+            ) => {
+                let session_ok = psession.as_ref().map(|s| s == session).unwrap_or(true);
+                (pscope == scope && pop == op && session_ok)
+                    .then_some((0, if psession.is_some() { 3 } else { 2 }))
+            }
             _ => None,
         }
     }
@@ -546,17 +571,57 @@ impl PolicyEngine {
         }
 
         // Task 20 (W4), orchestrator Ruling W4-6: `Team`-scoped memory ops
-        // are decided entirely by `TeamMembership`, never by ordinary rule
-        // matching — a config-authored or synthesized `Predicate::Memory`
-        // rule cannot be used to route around the membership gate.
-        // `User`/`Project` scope falls through unchanged to the rule loop
-        // and the engine's existing default below.
+        // are decided by `TeamMembership`, not by ordinary rule matching
+        // (except for an operator `Deny`, handled first below) — a
+        // config-authored or synthesized `Predicate::Memory` rule cannot be
+        // used to route around the membership gate for Allow. `User`/
+        // `Project` scope falls through unchanged to the rule loop and the
+        // engine's existing default below.
+        //
+        // **Documented deviation from frozen `docs/architecture/
+        // 12-memory-subsystem.md` §15.2** (fix round 1, Ruling W4-12b):
+        // §15.2 says a team write is "a distinct, explicit grant, evaluated
+        // by the same policy engine as everything else (§6.2)" — i.e. it
+        // expects `Team` scope to go through ordinary rule matching like
+        // every other scope, ending in `Ask` when nothing matches so a
+        // human can approve it. This arm instead decides `Team` almost
+        // entirely by `TeamMembership` and normally never consults rules at
+        // all. Concretely, `roundhouse-bus`'s `can_write_team_memory` (G5)
+        // is hardcoded to always return `false`, so once a real
+        // `TeamMembership` adapter is wired in, every team write Denies
+        // permanently: no `Ask` is ever raised, and no human can approve
+        // one. This deviation runs in the safe direction (fail-closed,
+        // never a silent Allow) and is deliberate, not an oversight — do
+        // not "fix" it by simply letting rules decide `Team` scope again;
+        // that is only safe now because `Predicate::Memory` binds the
+        // requesting `session` (fix round 1, Ruling W4-11) — without that
+        // binding, a single approved grant for one session's team op would
+        // silently cover every other session's identical request, since
+        // `PolicyEngine` is shared behind an `Arc` across session actors.
+        // Reconciling this arm with §15.2 (e.g. giving team writes a real
+        // `Ask` path) is an escalation for the orchestrator/operator, not a
+        // unilateral change to make here.
         if let TaskParams::Memory {
             scope: MemoryScope::Team { team },
             op,
             session,
         } = params
         {
+            // Fix round 1 (Ruling W4-12a): an operator-authored `Deny` must
+            // still win over the membership check, exactly as the
+            // interpreter-suppression logic below excludes `Outcome::Allow`
+            // (not `Deny`) so "an operator-authored `Deny python` has to
+            // still produce Deny." Checked first, before consulting
+            // `TeamMembership` at all.
+            if let Some(rule) = self.rules.iter().find(|r| {
+                r.outcome == Outcome::Deny && r.predicate.matches(params, r.outcome).is_some()
+            }) {
+                return Decision {
+                    outcome: Outcome::Deny,
+                    rule: Some(RuleId(rule.id.0.clone())),
+                };
+            }
+
             let Some(membership) = self.team_membership.as_ref() else {
                 // Unverifiable membership is not a reason to allow — fail
                 // closed for every op, including Read.
