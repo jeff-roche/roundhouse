@@ -97,7 +97,7 @@ use crate::ledger::{
 use crate::parking::{park, CheckpointError, Checkpointer, ParkError, ParkResult};
 use crate::parse::steps::{parse_step, topological_order, StepBody, StepDef};
 use crate::parse::{ParseError, WorkflowDef};
-use crate::report::validate_report;
+use crate::report::{build_carry_over_seed, validate_report};
 
 /// What a `call:` step's target resolves to: the child run's pinned job
 /// identity, plus the Session the host has **already created** for it.
@@ -415,6 +415,15 @@ pub fn run_workflow<H: WorkflowHost>(
         ensure_gate_step(&main, answer)?;
     }
 
+    // Task 19a: computed before `run_ctx` moves into `Executor::new` below,
+    // since `RunContext::previous_report` is what feeds it. `None` when
+    // `defaults.carry_over.last_report` is unset, or when it is set but the
+    // caller found no previous report (a binding's first-ever run) — see
+    // `build_carry_over_seed`'s own doc comment for why that is `None`, not
+    // an error.
+    let carry_over_seed =
+        build_carry_over_seed(&def.defaults.carry_over, run_ctx.previous_report.as_ref());
+
     // `Executor::new`'s only refusal is a secret too short to redact, which is
     // a run-level configuration fault — see `RunLoopError::Executor`.
     let mut executor = Executor::new(def, sink, run_ctx)?;
@@ -422,6 +431,28 @@ pub fn run_workflow<H: WorkflowHost>(
     // `ensure_report`, after the terminal state is known, so that the document
     // can carry it. See `super::ReportEmission`.
     executor.report_emission = ReportEmission::Deferred(None);
+
+    // Task 19a: bind the carry-over seed as a root a workflow expression can
+    // read (`${{ carry_over.previous_report.headline }}`, etc.) — a seed
+    // that is computed and dropped is not wired. `"carry_over"` is not a
+    // name the architecture doc (§8.6) or `build_carry_over_seed`'s own doc
+    // comment spells out as the binding name, so this task picked it as the
+    // obvious match for the `defaults.carry_over` config key that produced
+    // it; see this task's report.
+    //
+    // Bound through `set_secret`, the same conservative choice `secrets`
+    // itself uses, and for the reason ruling P35 gives for it: this binding
+    // site does not know the previous report's provenance. The previous
+    // run's `headline`/`findings` are model-authored text that run may have
+    // derived from its own `secrets`, and nothing here can tell clean
+    // content apart from content quietly derived from a credential. Taint
+    // only affects the *logged* rendering (`interpolate`/`interpolate_json`
+    // replace the whole tainted value with `***`); the real value still
+    // reaches the dispatched task, so a workflow can still act on the prior
+    // report — it just cannot make it appear in cleartext in the log.
+    if let Some(seed) = carry_over_seed {
+        executor.ctx.set_secret("carry_over", seed);
+    }
 
     let mut run = Loop {
         conn,

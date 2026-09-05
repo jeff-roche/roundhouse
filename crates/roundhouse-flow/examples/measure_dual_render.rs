@@ -102,6 +102,7 @@ fn run_once(yaml: &str) -> (Duration, usize, usize) {
         vars: serde_json::json!({}),
         secrets,
         run_id: RunId::new(),
+        previous_report: None,
     };
     let start = Instant::now();
     let mut exec = Executor::new(&def, &mut sink, run_ctx).expect("secrets clear the length floor");

@@ -275,6 +275,7 @@ use crate::expr::{
 };
 use crate::parse::steps::{parse_step, topological_order, StepBody, StepDef};
 use crate::parse::{ParseError, WorkflowDef};
+use crate::report::Report;
 use roundhouse_core::{EventPayload, Origin, TaskId, TaskInput, TaskKind, TaskOutput, Usage};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -331,6 +332,19 @@ pub struct RunContext {
     pub vars: Value,
     pub secrets: HashMap<String, String>,
     pub run_id: RunId,
+    /// Task 19a (§8.6's `carry_over: { last_report: true }`): the report of
+    /// "the previous run of this binding", already loaded by the caller —
+    /// [`crate::durability::previous_run_for_binding`] finds *which* run
+    /// that is, but loading *its report* is a `roundhouse-store`
+    /// `tasks`/`events` query this crate does not have (see
+    /// [`crate::report`]'s module doc), so it cannot be resolved from
+    /// inside `roundhouse-flow`. `None` for a binding's first-ever run, a
+    /// manually-invoked run with no binding at all, or simply because the
+    /// caller did not look it up (e.g. `defaults.carry_over.last_report` is
+    /// `false` and there was nothing worth fetching). See
+    /// [`run_loop::run_workflow`]'s use of this field for where the seed it
+    /// produces is actually bound.
+    pub previous_report: Option<Report>,
 }
 
 impl fmt::Debug for RunContext {
@@ -355,6 +369,14 @@ impl fmt::Debug for RunContext {
             .field("vars", &self.vars)
             .field("secrets", &secret_names)
             .field("run_id", &self.run_id)
+            // Same caution as `secrets`, and for the same reason `carry_over`
+            // is bound through `set_secret` rather than `set_public` in
+            // `run_loop::run_workflow`: a prior run's report can contain
+            // model-authored text derived from that run's own secrets, and
+            // this type's whole `Debug` impl exists to keep a stray
+            // `dbg!`/`tracing::debug!` from printing such material — see the
+            // doc comment above.
+            .field("previous_report_present", &self.previous_report.is_some())
             .finish()
     }
 }

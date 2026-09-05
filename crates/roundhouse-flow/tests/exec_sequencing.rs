@@ -40,6 +40,7 @@ fn run_ctx(inputs: serde_json::Value) -> RunContext {
         vars: serde_json::json!({}),
         secrets: HashMap::new(),
         run_id: roundhouse_flow::exec::RunId::new(),
+        previous_report: None,
     }
 }
 
@@ -553,6 +554,7 @@ steps:
         vars: serde_json::json!({}),
         secrets,
         run_id: roundhouse_flow::exec::RunId::new(),
+        previous_report: None,
     };
     let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     let outcomes = exec.run_to_completion().unwrap();
@@ -591,6 +593,7 @@ fn secret_run_ctx(inputs: serde_json::Value, key: &str, value: &str) -> RunConte
         vars: serde_json::json!({}),
         secrets,
         run_id: roundhouse_flow::exec::RunId::new(),
+        previous_report: None,
     }
 }
 
@@ -847,6 +850,7 @@ fn run_id_bound_into_the_expression_context_is_the_one_from_run_context() {
         vars: serde_json::json!({}),
         secrets: HashMap::new(),
         run_id,
+        previous_report: None,
     };
     let yaml = r#"
 name: run-id-check
@@ -1197,6 +1201,7 @@ fn probe_emit(field: &str, secrets: &[(&str, &str)]) -> (serde_json::Value, serd
         vars: serde_json::json!({"list": [10, 11, 12]}),
         secrets: secret_map,
         run_id: roundhouse_flow::exec::RunId::new(),
+        previous_report: None,
     };
     let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     let outcomes = exec.run_to_completion().unwrap();
@@ -1932,6 +1937,7 @@ steps:
         vars: serde_json::json!({"carried": "VARSCARRIEDSECRET"}),
         secrets: HashMap::new(),
         run_id: roundhouse_flow::exec::RunId::new(),
+        previous_report: None,
     };
     let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     exec.run_to_completion().unwrap();
@@ -1980,6 +1986,7 @@ steps:
         vars: serde_json::json!({}),
         secrets,
         run_id: roundhouse_flow::exec::RunId::new(),
+        previous_report: None,
     };
     let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     exec.run_to_completion().unwrap();

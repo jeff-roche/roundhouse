@@ -93,6 +93,7 @@ fn run_ctx(inputs: serde_json::Value) -> RunContext {
         vars: serde_json::json!({}),
         secrets: HashMap::new(),
         run_id: roundhouse_flow::exec::RunId::new(),
+        previous_report: None,
     }
 }
 
@@ -104,6 +105,7 @@ fn secret_run_ctx(inputs: serde_json::Value, key: &str, value: &str) -> RunConte
         vars: serde_json::json!({}),
         secrets,
         run_id: roundhouse_flow::exec::RunId::new(),
+        previous_report: None,
     }
 }
 
