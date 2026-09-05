@@ -45,6 +45,18 @@ async fn round_daemon_boots_the_real_accept_loop_not_the_scripted_demo() {
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_round-daemon-internal"))
         .arg("--socket")
         .arg(&socket_path)
+        // Ruling W1-R95 (fix round 1): the default `OnDegrade::Refuse`
+        // means a `CreateSession` on a host that cannot achieve
+        // `Tier::Sandbox` refuses outright — genuinely true of this test
+        // environment (real `bwrap` isn't installed at the hardcoded
+        // production path, `/usr/libexec/roundhouse/bwrap`). This is a
+        // smoke test proving the accept loop is real, not a test of
+        // isolation-tier enforcement, so it opts into the explicit,
+        // operator-only degradation escape hatch rather than silently
+        // relying on the (now-reverted, and actively wrong) permissive
+        // default.
+        .arg("--allow-degraded-to")
+        .arg("none")
         .env("HOME", dir.path())
         // Never inherit this test's own stdout/stderr: the daemon runs
         // forever (it's the accept loop), so an inherited pipe stays open —

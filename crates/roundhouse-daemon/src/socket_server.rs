@@ -95,6 +95,20 @@ const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// long one silent peer can hold a connection slot open.
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bounds `session_bootstrap::create_real_session` as a whole (fix round 1,
+/// SHOULD item): that function's own `handshake_timeout` — the one wrapping
+/// `requests_rx.recv()` above — has ALREADY resolved (successfully) by the
+/// time this runs, since a `CreateSession` request was, by definition,
+/// received. Real isolation `prepare()` and — when this session has any
+/// configured MCP servers — `McpHost::start` (spawning a real child process
+/// and awaiting its `discover()` handshake) run inside it, and neither is
+/// bounded by anything else: a wedged MCP server, or a `bwrap`/landlock
+/// probe that hangs, would otherwise park this connection's whole handling
+/// task forever with nothing else timing it out. 30 seconds matches
+/// [`DEFAULT_HANDSHAKE_TIMEOUT`]'s own generous-for-a-human,
+/// bounded-for-a-hang reasoning.
+const SESSION_CONSTRUCTION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Smallest backoff `accept_loop` sleeps after a transient `accept()` error
 /// (security review Important 2 / ruling W1-R33) before retrying.
 const MIN_ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
@@ -830,6 +844,10 @@ async fn handle_connection(
 /// the full three-channel `accept_loop`/`handle_connection` stack — a full
 /// end-to-end wedge would interleave three channels and be racy (see this
 /// crate's `deadlock_invariant` test file for why).
+///
+/// Every successful `CreateSession` branch also spawns [`spawn_session_reaper`]
+/// — see that function's own doc comment for why (ruling W1-R99, the
+/// previously-unwired half of W1-R51).
 pub async fn drive_session(
     mut requests_rx: mpsc::Receiver<ClientRequest>,
     events_tx: mpsc::Sender<ClientEvent>,
@@ -876,14 +894,24 @@ pub async fn drive_session(
                 return;
             }
 
-            let real_session = match session_bootstrap::create_real_session(
-                &resources,
-                workspace_name,
+            // Fix round 1 (SHOULD item): a cheap pre-check before the
+            // expensive work below (real isolation `prepare`, proxy
+            // registration, potentially a real `McpHost::start` subprocess
+            // spawn) — see `SessionRegistry::is_full`'s own doc comment for
+            // exactly what this does and does not close.
+            if registry.is_full() {
+                tracing::warn!("closing connection: at max_sessions, refusing before doing any real session-construction work");
+                return;
+            }
+
+            let real_session = match tokio::time::timeout(
+                SESSION_CONSTRUCTION_TIMEOUT,
+                session_bootstrap::create_real_session(&resources, workspace_name),
             )
             .await
             {
-                Ok(real_session) => real_session,
-                Err(err) => {
+                Ok(Ok(real_session)) => real_session,
+                Ok(Err(err)) => {
                     // No `ClientRequest`/`ClientEvent` error variant exists to
                     // report this over the wire with (the same constraint
                     // ruling W1-R6 already accepted for "unknown session");
@@ -895,8 +923,27 @@ pub async fn drive_session(
                     tracing::error!(error = %err, "failed to construct a real session; refusing CreateSession");
                     return;
                 }
+                Err(_elapsed) => {
+                    // Fix round 1 (SHOULD item): a wedged MCP server startup
+                    // (or a hung isolation probe) must not park this
+                    // connection's whole handling task forever — see
+                    // `SESSION_CONSTRUCTION_TIMEOUT`'s own doc comment.
+                    tracing::error!(
+                        timeout = ?SESSION_CONSTRUCTION_TIMEOUT,
+                        "session construction did not complete within the timeout; refusing \
+                         CreateSession"
+                    );
+                    return;
+                }
             };
             let spec = real_session.actor.session_spec().clone();
+            // Cloned/copied BEFORE the actor and proxy handle move into
+            // `registry.create`/get dropped below, so the reaper spawned
+            // after a successful `create` can watch the SAME actor's state
+            // and deregister the SAME proxy token, independent of whatever
+            // `registry` does with its own copy of the actor.
+            let actor_for_reaper = real_session.actor.clone();
+            let proxy_token_for_reaper = real_session.proxy_handle.token().to_string();
 
             let Some((session_id, subscription, session_events)) =
                 registry.create(real_session.actor, real_session.mcp_host)
@@ -910,6 +957,27 @@ pub async fn drive_session(
                 // ten thousand concurrently live sessions.
                 return;
             };
+            // Ruling W1-R99 (fix round 1): the "do-reap-when-the-actor-ends"
+            // half of W1-R51 — `SessionRegistry::remove` existed but had no
+            // production caller, so entry lifetime was actually
+            // daemon-process lifetime, not actor lifetime. This is the
+            // caller: watches this session's own `SessionState` for
+            // `Closed` and reaps the registry entry the moment it's
+            // observed, independent of this connection's (or any
+            // connection's) own lifetime. Also deregisters this session's
+            // egress-proxy token at the same time (SHOULD item): before
+            // this, `real_session.proxy_handle` was discarded entirely at
+            // construction, and nothing ever called
+            // `LoopbackProxy::deregister_session` — an unbounded leak of
+            // the proxy's own internal session table, one entry per session
+            // ever created, for the daemon's whole life.
+            spawn_session_reaper(
+                registry.clone(),
+                session_id,
+                actor_for_reaper.subscribe(),
+                resources.proxy.clone(),
+                proxy_token_for_reaper,
+            );
             let created = ClientEvent::TaskEvent {
                 session_id,
                 task_id: None,
@@ -1088,6 +1156,57 @@ pub async fn drive_session(
     registry.detach(session_id, &subscription);
 }
 
+/// The "do-reap-when-the-actor-ends" half of ruling W1-R51 (fix round 1,
+/// ruling W1-R99): watches `session_id`'s own `SessionState` for its
+/// terminal `Closed` value and calls [`SessionRegistry::remove`] the moment
+/// it's observed.
+///
+/// Spawned once per successfully created session, independent of any one
+/// connection's lifetime — it must keep running after the connection that
+/// called `CreateSession` (and `drive_session` itself) has returned, since a
+/// session's actor can outlive every connection that ever touched it (that
+/// is the entire point of `SessionEntry`'s "entry lifetime = actor
+/// lifetime" rule this reaper closes the other half of).
+///
+/// Nothing in this crate currently drives an actor to `SessionState::Closed`
+/// (there is no live work-submission path yet — see `main.rs`'s own module
+/// doc comment), so this loop simply never observes that value today and the
+/// task sits parked on `state.changed()` for the daemon's whole life,
+/// exactly as inert as `remove`'s previous zero-caller state was loud about
+/// being unwired. The difference is that the mechanism is now real and
+/// wired at the one call site that creates a session, so the moment a
+/// future task adds a real terminal transition, this reaper closes the loop
+/// with no further wiring needed.
+fn spawn_session_reaper(
+    registry: Arc<SessionRegistry>,
+    session_id: roundhouse_core::SessionId,
+    mut state: tokio::sync::watch::Receiver<roundhouse_core::SessionState>,
+    proxy: Arc<roundhouse_net::proxy::LoopbackProxy>,
+    proxy_token: String,
+) {
+    tokio::spawn(async move {
+        loop {
+            if *state.borrow() == roundhouse_core::SessionState::Closed {
+                registry.remove(session_id);
+                // Fix round 1 (SHOULD item): the other half of this
+                // session's teardown — without this, `LoopbackProxy`'s own
+                // internal session table (keyed by this token) never sheds
+                // an entry for the daemon's whole life, regardless of how
+                // many sessions come and go.
+                proxy.deregister_session(&proxy_token);
+                return;
+            }
+            if state.changed().await.is_err() {
+                // The actor's own `state_tx` sender has been dropped — the
+                // actor itself is gone. If that happened through some other
+                // path than reaching `Closed`, there is nothing meaningful
+                // left to watch; just stop.
+                return;
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod classify_accept_error_tests {
     //! Unit-level proof for fix 3 (security review Important 2 / ruling
@@ -1164,6 +1283,82 @@ mod classify_accept_error_tests {
         assert_eq!(
             classify_accept_error(&std::io::Error::from(ErrorKind::WouldBlock)),
             AcceptDisposition::Retry
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_reaper_tests {
+    //! Ruling W1-R99 (fix round 1): `spawn_session_reaper` is the
+    //! previously-unwired "do-reap-when-the-actor-ends" half of W1-R51.
+    //! Nothing in production code transitions a `SessionActor` to
+    //! `SessionState::Closed` yet (there is no live work-submission path —
+    //! see `main.rs`'s own module doc comment), so these tests construct an
+    //! actor already `Closed` at birth (`SessionActor::new`'s own
+    //! `initial_state` parameter) rather than driving a real one there —
+    //! the reaper's own logic doesn't care how `Closed` was reached, only
+    //! that it observes it.
+
+    use super::*;
+    use crate::test_support::real_actor_with_state;
+
+    #[tokio::test]
+    async fn a_session_already_closed_at_registration_is_reaped_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(SessionRegistry::new());
+        let actor = real_actor_with_state(dir.path(), roundhouse_core::SessionState::Closed).await;
+        let state_rx = actor.subscribe();
+        let (session_id, _subscription, _events) = registry.create(actor, None).unwrap();
+
+        let proxy = Arc::new(roundhouse_net::proxy::LoopbackProxy::new());
+        spawn_session_reaper(
+            registry.clone(),
+            session_id,
+            state_rx,
+            proxy,
+            "test-token".into(),
+        );
+
+        let reaped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if registry.attach(session_id).is_none() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            reaped.is_ok(),
+            "an already-Closed session must be reaped by spawn_session_reaper, \
+             not left registered forever"
+        );
+    }
+
+    /// The mirror case: an actor that never reaches `Closed` must NOT be
+    /// reaped — proving the reaper doesn't just remove everything on a
+    /// timer, only sessions that actually reach the terminal state.
+    #[tokio::test]
+    async fn a_session_that_never_closes_is_never_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(SessionRegistry::new());
+        let actor = real_actor_with_state(dir.path(), roundhouse_core::SessionState::Running).await;
+        let state_rx = actor.subscribe();
+        let (session_id, _subscription, _events) = registry.create(actor, None).unwrap();
+
+        let proxy = Arc::new(roundhouse_net::proxy::LoopbackProxy::new());
+        spawn_session_reaper(
+            registry.clone(),
+            session_id,
+            state_rx,
+            proxy,
+            "test-token".into(),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            registry.attach(session_id).is_some(),
+            "a session that never reaches Closed must remain attachable"
         );
     }
 }

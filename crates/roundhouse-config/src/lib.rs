@@ -20,8 +20,12 @@ mod scope;
 mod secret_ref;
 
 pub use loader::{default_layers, ConfigError, ConfigLoader, LoadedConfig};
-pub use network::{
-    load_network_config, load_network_config_from_layers, NetworkConfig, NetworkConfigError,
-};
+// Fix round 1, MUST 5: `load_network_config_from_layers` (the raw,
+// caller-labeled function CF-11(b) exists to keep out of easy reach) is
+// deliberately NOT re-exported here — only the safe, project-root-taking
+// `load_network_config` is. The raw function is still reachable, for this
+// crate's own integration test, via the fully-qualified
+// `roundhouse_config::network::load_network_config_from_layers`.
+pub use network::{load_network_config, NetworkConfig, NetworkConfigError};
 pub use scope::ConfigScope;
 pub use secret_ref::SecretRef;

@@ -158,6 +158,7 @@ pub async fn real_resources(dir: &Path) -> Arc<DaemonResources> {
         dir.join("daemon-binary"),
         Vec::new(),
         roundhouse_config::NetworkConfig::default(),
+        roundhouse_core::OnDegrade::Refuse,
         runner(),
         Arc::new(NoopProvider),
         RequestCtx {

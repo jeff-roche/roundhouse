@@ -31,6 +31,7 @@
 
 use clap::Parser;
 use roundhouse_bus::local_bus::LocalBus;
+use roundhouse_core::{OnDegrade, Tier};
 use roundhouse_daemon::mcp_config;
 use roundhouse_daemon::session_bootstrap::DaemonResources;
 use roundhouse_daemon::session_registry::SessionRegistry;
@@ -73,6 +74,63 @@ struct Args {
     /// sees no behavior change.
     #[arg(long)]
     socket: Option<PathBuf>,
+
+    /// Ruling W1-R95: every real session asks for `Tier::Sandbox`, and by
+    /// default (`OnDegrade::Refuse`, §6.5's documented default) this daemon
+    /// refuses to create a session at all on a host that cannot achieve it —
+    /// fail closed. Setting this flag is an explicit, operator-made
+    /// decision to instead allow a session to run at a lower tier, down to
+    /// the one named here (`OnDegrade::AllowDownTo`), on a host where
+    /// `Sandbox` genuinely isn't available (no `bwrap` at the production
+    /// install path, no landlock support, a container missing the right
+    /// capabilities). Every real degradation is still recorded as a
+    /// `Degradation` `Note` event by `create_session_isolation` (§6.5 rule
+    /// 3) regardless of this flag — this only controls whether a shortfall
+    /// refuses the session or is merely recorded. Accepts (case-insensitive):
+    /// `none`, `worktree`, `sandbox`, `container`, `remote`.
+    #[arg(long, value_parser = parse_tier)]
+    allow_degraded_to: Option<Tier>,
+}
+
+/// Ruling W1-R96 (fix round 1): installs a real `tracing` subscriber before
+/// anything else runs. Before this, `grep -rn "tracing_subscriber\|
+/// set_global_default" crates/` returned nothing workspace-wide — every
+/// `tracing::warn!`/`error!` this binary (and `roundhouse-engine`, which
+/// runs inside this same process) emits was a discarded no-op. That
+/// silently dropped, among others: the CF-12(c) `NetworkConfigError`
+/// fallback that degrades every session's egress to deny-all (whose own
+/// in-code justification is "loud (logged) and safe" — it was not loud);
+/// a `CreateSession` construction failure; the `MAX_WORKSPACE_NAME_BYTES`
+/// rejection; and `wire_redaction_for_session`'s "dropped N secret
+/// value(s)" warning, which is W1-R27's entire observability requirement
+/// for a value too short to safely redact.
+///
+/// Writes to stderr (not stdout, which this binary's own `println!` lines
+/// use for operator status) and defaults to `info` level — showing
+/// `warn`/`error` without the operator needing to know `RUST_LOG` exists —
+/// while still honoring `$RUST_LOG` for anyone who wants `debug`/`trace`.
+fn install_tracing_subscriber() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .init();
+}
+
+/// `clap` value-parser for `--allow-degraded-to`.
+fn parse_tier(raw: &str) -> Result<Tier, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "none" => Ok(Tier::None),
+        "worktree" => Ok(Tier::Worktree),
+        "sandbox" => Ok(Tier::Sandbox),
+        "container" => Ok(Tier::Container),
+        "remote" => Ok(Tier::Remote),
+        other => Err(format!(
+            "{other:?} is not a valid tier (expected one of: none, worktree, sandbox, \
+             container, remote)"
+        )),
+    }
 }
 
 /// The one process-wide `TaskRunner`, obtained exactly once via
@@ -88,6 +146,7 @@ static HANDLES: std::sync::OnceLock<EngineHandles> = std::sync::OnceLock::new();
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
+    install_tracing_subscriber();
     let args = Args::parse();
 
     // Keyed on the *presence* of `ANTHROPIC_API_KEY` rather than on a flag, so
@@ -224,9 +283,14 @@ async fn main() -> color_eyre::Result<()> {
     // CF-12(c): `load_network_config` has zero production callers before
     // this task. Fail-closed decision (stated explicitly, per the task
     // brief, since nothing in the code constrains this choice): a
-    // `NetworkConfigError` (a malformed `[network]` table in an otherwise
-    // loadable config file) does NOT fail the whole daemon boot — it falls
-    // back to `NetworkConfig::default()` (an empty allowlist, which
+    // `NetworkConfigError` this call still surfaces (a malformed OPERATOR
+    // config, i.e. the Builtin/UserGlobal layer specifically — fix round 1,
+    // SHOULD item: `load_network_config_from_layers` now absorbs a broken
+    // NARROWER project/workspace layer internally, falling back to the
+    // wider scope's own result rather than erroring at all, so a hostile
+    // cloned repo's config can no longer collapse this whole call to an
+    // error) does NOT fail the whole daemon boot — it falls back to
+    // `NetworkConfig::default()` (an empty allowlist, which
     // `EgressPolicy::matches` treats as deny-all), the same fail-closed
     // default an absent `[network]` section already gets. A config typo
     // degrading every session's egress to "denied" is loud (logged) and
@@ -271,6 +335,10 @@ async fn main() -> color_eyre::Result<()> {
     proxy.clone().serve(runner, proxy_writer.clone()).await?;
 
     let session_store = roundhouse_store::open(&store_path).await?;
+    let default_on_degrade = match args.allow_degraded_to {
+        Some(tier) => OnDegrade::AllowDownTo(tier),
+        None => OnDegrade::Refuse,
+    };
     let resources = Arc::new(DaemonResources::new(
         session_store,
         isolate,
@@ -279,6 +347,7 @@ async fn main() -> color_eyre::Result<()> {
         daemon_binary,
         mcp_configs,
         network_config,
+        default_on_degrade,
         runner,
         provider,
         request_ctx,
@@ -516,5 +585,37 @@ fn remove_stale_socket(path: &Path) -> std::io::Result<()> {
         )),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tier_accepts_every_real_tier_case_insensitively() {
+        assert_eq!(parse_tier("none"), Ok(Tier::None));
+        assert_eq!(parse_tier("NONE"), Ok(Tier::None));
+        assert_eq!(parse_tier("Worktree"), Ok(Tier::Worktree));
+        assert_eq!(parse_tier("sandbox"), Ok(Tier::Sandbox));
+        assert_eq!(parse_tier("Container"), Ok(Tier::Container));
+        assert_eq!(parse_tier("REMOTE"), Ok(Tier::Remote));
+    }
+
+    #[test]
+    fn parse_tier_rejects_an_unknown_value() {
+        assert!(parse_tier("supersandbox").is_err());
+    }
+
+    #[test]
+    fn args_parse_allow_degraded_to() {
+        let args = Args::parse_from(["round-daemon-internal", "--allow-degraded-to", "worktree"]);
+        assert_eq!(args.allow_degraded_to, Some(Tier::Worktree));
+    }
+
+    #[test]
+    fn args_default_to_no_degradation_allowed() {
+        let args = Args::parse_from(["round-daemon-internal"]);
+        assert_eq!(args.allow_degraded_to, None);
     }
 }

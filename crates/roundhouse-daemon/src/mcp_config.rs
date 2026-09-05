@@ -105,6 +105,13 @@ pub fn load_mcp_servers(
 /// additionally closes. Kept `pub` (rather than `pub(crate)`/test-only) for
 /// this module's own tests, which need to inject arbitrary per-scope paths
 /// to prove the drop is unconditional.
+///
+/// `#[doc(hidden)]` (fix round 1, MUST 5's principle applied symmetrically —
+/// the reviewer named `roundhouse-config`'s equivalent function by name, but
+/// the same "no label to get wrong" requirement applies here too): keeps
+/// this raw, caller-labeled function off the surface `cargo doc`/IDE
+/// autocomplete would otherwise offer as readily as [`load_mcp_servers`].
+#[doc(hidden)]
 pub fn load_mcp_servers_from_layers(
     layers: Vec<(ConfigScope, PathBuf)>,
 ) -> Result<Vec<McpServerConfig>, McpConfigError> {

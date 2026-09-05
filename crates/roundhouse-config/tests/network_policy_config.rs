@@ -9,7 +9,8 @@
 //! widen — or, worse, unilaterally establish — the egress allowlist a real
 //! caller ends up with.
 
-use roundhouse_config::{load_network_config_from_layers, ConfigScope, NetworkConfig};
+use roundhouse_config::network::load_network_config_from_layers;
+use roundhouse_config::{ConfigScope, NetworkConfig};
 
 fn write(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
     let path = dir.join(name);

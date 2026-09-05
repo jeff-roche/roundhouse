@@ -11,6 +11,12 @@ workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }
 toml = "0.8"
+# Fix round 1 (SHOULD item): `load_network_config_from_layers` logs when it
+# treats a rejected narrower config layer as absent rather than discarding
+# the wider scope's own allowlist — an external (non-`roundhouse-*`)
+# dependency, so this does not touch this crate's "no internal
+# `roundhouse-*` dependency" rule (§5.2).
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

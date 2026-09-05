@@ -282,6 +282,24 @@ impl SessionRegistry {
         self.sessions.lock().unwrap().remove(&session_id);
     }
 
+    /// Whether this registry is already at `max_sessions` — a cheap,
+    /// best-effort pre-check (fix round 1, SHOULD item) for a caller about
+    /// to do expensive work (`session_bootstrap::create_real_session`:
+    /// real isolation `prepare`, proxy registration, and potentially
+    /// `McpHost::start` spawning real subprocesses) before ever calling
+    /// [`Self::create`]. This is deliberately advisory, not a replacement
+    /// for `create`'s own atomic check-then-insert: a peer racing many
+    /// connections concurrently could still see `false` here and then lose
+    /// the real race inside `create` (whose isolation/MCP work, already
+    /// done by then, is a separate, documented, accepted gap — see the
+    /// task report). What this DOES close: a single peer looping
+    /// `CreateSession` sequentially past the cap no longer does a full
+    /// isolation-prepare/MCP-spawn for every rejected attempt, only for the
+    /// ones that make it past this check.
+    pub fn is_full(&self) -> bool {
+        self.sessions.lock().unwrap().len() >= self.max_sessions
+    }
+
     /// Looks up an existing session and registers a brand new subscriber
     /// channel for it, so a *different* connection than the one that ran
     /// [`Self::create`] can watch the same session's events.
@@ -419,13 +437,9 @@ mod tests {
     //! behavior, not the log line, for exactly this kind of drop-count fix).
 
     use super::*;
-    use roundhouse_core::{EventPayload, NoteLevel, OnDegrade, SessionSpec, SessionState, Tier};
-    use roundhouse_policy::engine::PolicyEngine;
-    use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
-    use roundhouse_sandbox::probe::{MechanismProbeReport, MechanismStatus};
-    use roundhouse_sandbox::Isolate;
+    use roundhouse_core::{EventPayload, NoteLevel};
 
-    use crate::test_support::runner;
+    use crate::test_support::real_actor;
 
     fn note(session_id: SessionId, text: &str) -> ClientEvent {
         ClientEvent::TaskEvent {
@@ -436,44 +450,6 @@ mod tests {
                 text: text.into(),
             }),
         }
-    }
-
-    /// A minimal but real `SessionActor` — every mechanism it wraps
-    /// (isolation, policy, redaction) is real; only the isolate's probe
-    /// result is faked (`test_with_probe`, no real bwrap/landlock syscalls),
-    /// matching `roundhouse-engine`'s own `admission_integration.rs` test
-    /// helper.
-    async fn real_actor(dir: &std::path::Path) -> Arc<SessionActor> {
-        let store = roundhouse_store::open(&dir.join("events.db"))
-            .await
-            .unwrap();
-        let writer = roundhouse_store::spawn_writer(store).await;
-        let policy = Arc::new(PolicyEngine::from_rules(vec![]));
-        let isolate: Arc<dyn Isolate> = Arc::new(BwrapLandlockIsolate::test_with_probe(
-            MechanismProbeReport {
-                landlock: MechanismStatus::Available,
-                bwrap: MechanismStatus::Available,
-                seccomp: MechanismStatus::Available,
-                seatbelt: MechanismStatus::Unavailable {
-                    reason: "n/a".into(),
-                },
-            },
-        ));
-        let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
-        let handle = isolate.prepare(&spec).await.unwrap();
-        Arc::new(SessionActor::new(
-            SessionId::new(),
-            writer,
-            SessionState::Running,
-            runner(),
-            policy,
-            dir.join("state"),
-            dir.join("daemon-binary"),
-            isolate,
-            handle,
-            spec,
-            vec![],
-        ))
     }
 
     #[tokio::test]

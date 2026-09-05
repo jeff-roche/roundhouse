@@ -68,6 +68,30 @@ serde_json = { workspace = true }
 toml = "0.8"
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Ruling W1-R96 (fix round 1): no `tracing` subscriber exists anywhere in
+# this workspace, so every `tracing::warn!`/`error!` this crate (and
+# `roundhouse-engine`, which runs inside this same process) relies on was a
+# discarded no-op — including the CF-12(c) fail-closed `NetworkConfigError`
+# fallback and `wire_redaction_for_session`'s dropped-secret-count warning.
+# Exact pin, matching this lane's own discipline for other net-new
+# additions (`clap`, `uuid`).
+tracing-subscriber = { version = "=0.3.19", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Ruling W1-R99 (fix round 1): this crate's own tests need
+# `roundhouse_engine::mcp_spawner::SessionMcp::from_parts` — gated behind
+# `roundhouse-engine`'s `test-util` feature — to build a real `SessionMcp`
+# without spawning a real MCP subprocess, so `apply_resolved_mcp_servers`
+# (the `register_mcp` call W1-R85 requires) can be tested directly. Adding
+# a feature-enabled entry here, alongside the feature-less `[dependencies]`
+# entry the library code uses, is the same mechanism `roundhouse-engine`
+# already uses on itself (`crates/roundhouse-engine/Cargo.toml`) and is
+# confirmed NOT to unify into normal (non-test) builds under this
+# workspace's `resolver = "2"` (verified directly for that self-dependency
+# case; same resolver, same mechanism, applies identically here).
+roundhouse-engine = { path = "../roundhouse-engine", features = ["test-util"] }
+# `McpTransport` is an `#[async_trait::async_trait]` trait (`roundhouse-mcp`);
+# any external `impl` (this crate's fake test transport) needs the same
+# macro to match its desugared method signatures.
+async-trait = "0.1"

@@ -52,6 +52,14 @@ uuid = "1"
 # line per event. Not a new dependency to the workspace (every other crate
 # already depends on it via the workspace pin), just a new consumer here.
 serde_json = { workspace = true }
+# Ruling W1-R96 (fix round 1): install a `tracing` subscriber in both
+# binaries, not just the daemon — this crate has no `tracing::*` call sites
+# of its own today, but the review named "both `main`s" explicitly, and a
+# future one (e.g. inside `roundhouse-tui`) would otherwise be silently
+# dropped the same way the daemon's were. Same exact pin as
+# `roundhouse-daemon`'s manifest.
+tracing = { workspace = true }
+tracing-subscriber = { version = "=0.3.19", features = ["env-filter"] }
 
 [dev-dependencies]
 # Same exact-pin discipline as the `clap` addition above.

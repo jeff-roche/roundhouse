@@ -37,9 +37,71 @@ pub mod socket_server;
 /// one shared instance both reach for instead.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::sync::Arc;
+
+    use roundhouse_core::{OnDegrade, SessionId, SessionSpec, SessionState, Tier};
+    use roundhouse_engine::SessionActor;
+    use roundhouse_policy::engine::PolicyEngine;
+    use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
+    use roundhouse_sandbox::probe::{MechanismProbeReport, MechanismStatus};
+    use roundhouse_sandbox::Isolate;
+
     static RUNNER: std::sync::OnceLock<roundhouse_core::TaskRunner> = std::sync::OnceLock::new();
 
     pub(crate) fn runner() -> &'static roundhouse_core::TaskRunner {
         RUNNER.get_or_init(roundhouse_core::TaskRunner::bootstrap)
+    }
+
+    /// A `BwrapLandlockIsolate` that deterministically achieves `Tier::Sandbox`
+    /// with no real bwrap/landlock syscalls (`test_with_probe`).
+    pub(crate) fn available_isolate() -> Arc<dyn Isolate> {
+        Arc::new(BwrapLandlockIsolate::test_with_probe(
+            MechanismProbeReport {
+                landlock: MechanismStatus::Available,
+                bwrap: MechanismStatus::Available,
+                seccomp: MechanismStatus::Available,
+                seatbelt: MechanismStatus::Unavailable {
+                    reason: "n/a".into(),
+                },
+            },
+        ))
+    }
+
+    /// A minimal but fully real `SessionActor`, constructed with
+    /// `initial_state` rather than always `Running` — needed by
+    /// `socket_server`'s `spawn_session_reaper` test, which has no other way
+    /// to observe a `Closed` actor (nothing in production code transitions
+    /// one there yet — see that test's own doc comment).
+    pub(crate) async fn real_actor_with_state(
+        dir: &std::path::Path,
+        initial_state: SessionState,
+    ) -> Arc<SessionActor> {
+        let store = roundhouse_store::open(&dir.join("events.db"))
+            .await
+            .unwrap();
+        let writer = roundhouse_store::spawn_writer(store).await;
+        let policy = Arc::new(PolicyEngine::from_rules(vec![]));
+        let isolate = available_isolate();
+        let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+        let handle = isolate.prepare(&spec).await.unwrap();
+        Arc::new(SessionActor::new(
+            SessionId::new(),
+            writer,
+            initial_state,
+            runner(),
+            policy,
+            dir.join("state"),
+            dir.join("daemon-binary"),
+            isolate,
+            handle,
+            spec,
+            vec![],
+        ))
+    }
+
+    /// [`real_actor_with_state`] with the ordinary `Running` initial state —
+    /// what every session actually starts as.
+    pub(crate) async fn real_actor(dir: &std::path::Path) -> Arc<SessionActor> {
+        real_actor_with_state(dir, SessionState::Running).await
     }
 }

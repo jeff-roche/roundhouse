@@ -34,14 +34,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use roundhouse_core::{
     OnDegrade, SessionId, SessionSpec, SessionState, TaskRunner, Tier, WorkspaceId,
 };
-use roundhouse_engine::mcp_spawner::{start_session_mcp, StartSessionMcpError};
+use roundhouse_engine::mcp_spawner::{start_session_mcp, SessionMcp, StartSessionMcpError};
 use roundhouse_engine::{
     create_session_with_egress, effective_tier, CreateSessionError, SessionActor,
 };
 use roundhouse_mcp::config::McpServerConfig;
 use roundhouse_mcp::host::McpHost;
 use roundhouse_net::policy::EgressPolicy;
-use roundhouse_net::proxy::LoopbackProxy;
+use roundhouse_net::proxy::{LoopbackProxy, ProxyHandle};
 use roundhouse_policy::engine::PolicyEngine;
 use roundhouse_policy::sealed::SealedContext;
 use roundhouse_provider::{Provider, RequestCtx};
@@ -69,6 +69,14 @@ pub struct DaemonResources {
     /// (CF-12(c)) — see `main.rs` for the fail-closed decision on a load
     /// error.
     pub network_config: roundhouse_config::NetworkConfig,
+    /// The `OnDegrade` every real session is created with (ruling W1-R95).
+    /// `OnDegrade::Refuse` — §6.5's documented default — unless the
+    /// operator explicitly opts into `OnDegrade::AllowDownTo(tier)` via
+    /// `round-daemon-internal --allow-degraded-to <TIER>`. See
+    /// `create_real_session`'s own doc comment for why the OTHER default
+    /// (`AllowDownTo(Tier::None)`) is actively wrong, not merely stricter
+    /// than necessary.
+    pub default_on_degrade: OnDegrade,
     pub runner: &'static TaskRunner,
     pub provider: Arc<dyn Provider>,
     request_ctx: RequestCtx,
@@ -90,6 +98,7 @@ impl DaemonResources {
         daemon_binary: PathBuf,
         mcp_configs: Vec<McpServerConfig>,
         network_config: roundhouse_config::NetworkConfig,
+        default_on_degrade: OnDegrade,
         runner: &'static TaskRunner,
         provider: Arc<dyn Provider>,
         request_ctx: RequestCtx,
@@ -103,6 +112,7 @@ impl DaemonResources {
             daemon_binary,
             mcp_configs,
             network_config,
+            default_on_degrade,
             runner,
             provider,
             request_ctx,
@@ -137,13 +147,31 @@ pub enum CreateRealSessionError {
 }
 
 /// The result of successfully constructing a real session: the actor
-/// [`crate::session_registry::SessionRegistry::create`] indexes on, and the
+/// [`crate::session_registry::SessionRegistry::create`] indexes on, the
 /// MCP host (if this session configured any servers) that must be kept
 /// alive for at least as long as the actor is — see [`crate::session_registry`]'s
-/// `SessionEntry`, which holds both for exactly that reason.
+/// `SessionEntry`, which holds both for exactly that reason — and this
+/// session's `ProxyHandle` (bearer token + the daemon-wide proxy's bound
+/// address).
+///
+/// **`proxy_handle` has exactly one consumer today: session teardown**
+/// (fix round 1, SHOULD item) — `socket_server::spawn_session_reaper` calls
+/// `LoopbackProxy::deregister_session(token)` when this session's actor
+/// reaches `SessionState::Closed`, closing what would otherwise be an
+/// unbounded leak of the proxy's own internal session table (nothing
+/// deregistered a session's egress-policy entry there before this fix). It
+/// is NOT yet retrievable by anything that would actually ROUTE traffic
+/// through the proxy — no `http` tool executor is wired to a real dispatch
+/// chokepoint in this daemon yet (the same "no live work-submission path"
+/// gap this whole task names elsewhere), so there is currently nowhere for
+/// such a consumer to reach this value from even if one existed. When that
+/// wiring lands, `proxy_handle` needs a home a running tool dispatch can
+/// read from (most plausibly a field on `SessionActor` itself) — not
+/// discarded here, and not stored only for teardown as it is today.
 pub struct RealSession {
     pub actor: Arc<SessionActor>,
     pub mcp_host: Option<Arc<McpHost>>,
+    pub proxy_handle: ProxyHandle,
 }
 
 /// Builds one real session end to end: isolation, a per-session
@@ -164,19 +192,33 @@ pub async fn create_real_session(
 
     // `ClientRequest::CreateSession` carries no tier/`on_degrade` field (it
     // is `workspace_name` only), so the daemon picks the default policy
-    // itself: ask for `Sandbox`, but `AllowDownTo(Tier::None)` rather than
-    // `Refuse` — a real host frequently cannot achieve `Sandbox` (bwrap not
-    // installed at the production path, no landlock support, a container
-    // without the right capabilities), and `Refuse` would mean this daemon
-    // creates zero sessions on such a host. `create_session_isolation`
-    // already records a real `Degradation` `Note` event whenever the
-    // achieved tier falls short (§6.5 rule 3) — that is the honest signal
-    // for this, not refusing to start at all.
+    // itself.
+    //
+    // **Ruling W1-R95 (fix round 1): `OnDegrade::Refuse` is the default, not
+    // `AllowDownTo(Tier::None)`.** An earlier version of this function used
+    // `AllowDownTo(Tier::None)`, reasoned as "safer than refusing to create
+    // any session on a host without bwrap." That reasoning was backwards:
+    // `SealedContext.requested_tier` is populated from `effective_tier`
+    // (`roundhouse_engine::effective_tier`), not `spec.requested_tier`
+    // directly, and `effective_tier` for `AllowDownTo(floor)` IS `floor`.
+    // `Tier::None` is the first variant of a derived-`Ord` enum, so
+    // `attested_tier < requested_tier` (`sealed_tier_shortfall`,
+    // §6.2/§6.5) becomes unsatisfiable for every `Tier` — that setting
+    // PERMANENTLY DISARMS the one sealed rule that detects a live
+    // mid-session isolation downgrade, for every task, in every session,
+    // for the daemon's whole life. `session_actor.rs`'s own doc comment on
+    // `effective_tier` already records a previous round fixing a bug with
+    // this exact symptom as "a genuine fail-open regression." §6.5 also
+    // names `Refuse` as the documented default and requires a downgrade be
+    // an explicit human decision at creation — `resources.default_on_degrade`
+    // (below) is that decision, made once by the operator via
+    // `round-daemon-internal --allow-degraded-to <TIER>`, never silently by
+    // this function.
     let spec = SessionSpec {
         workspace: WorkspaceId::new(),
         name: Some(workspace_name),
         requested_tier: Tier::Sandbox,
-        on_degrade: OnDegrade::AllowDownTo(Tier::None),
+        on_degrade: resources.default_on_degrade,
     };
 
     let egress_policy = egress_policy_for(resources);
@@ -185,7 +227,7 @@ pub async fn create_real_session(
     // Isolation + egress registration + this session's real `Redactor` —
     // CF-11(e): always the `_with_egress` path, never `create_session_isolation`
     // alone, for a session that must be able to reach the network.
-    let (handle, _proxy_handle) = create_session_with_egress(
+    let (handle, proxy_handle) = create_session_with_egress(
         &writer,
         resources.runner,
         session_id,
@@ -253,14 +295,38 @@ pub async fn create_real_session(
     ));
 
     if let Some(mcp) = &mcp {
-        // Ruling W1-R85 — the ONLY writer of `mcp_resolved`; skipping this
-        // would deny every MCP call in this session (see that method's own
-        // doc comment for the full consequence).
-        actor.register_mcp(mcp);
-        *mirrored_mcp_resolved.write().unwrap() = mcp.resolved_servers().into_iter().collect();
+        apply_resolved_mcp_servers(&actor, &mirrored_mcp_resolved, mcp);
     }
 
-    Ok(RealSession { actor, mcp_host })
+    Ok(RealSession {
+        actor,
+        mcp_host,
+        proxy_handle,
+    })
+}
+
+/// Ruling W1-R85 — the ONLY writer of `mcp_resolved`; skipping this call
+/// denies every MCP call in this session (see `SessionActor::register_mcp`'s
+/// own doc comment for the full consequence). Also updates the mirrored
+/// `resolved_mcp` set the session's `PolicyEngine` sealed-context provider
+/// reads (CF-9(i)), from the SAME `SessionMcp::resolved_servers()` call.
+///
+/// Pulled out of [`create_real_session`] as its own function (fix round 1,
+/// ruling W1-R99) specifically so this exact wiring can be tested directly
+/// — `create_real_session`'s own MCP-configured path necessarily spawns a
+/// real subprocess (`McpHost::start`), which this crate's tests cannot
+/// stand up cheaply, so the previous test suite exercised only
+/// `mcp_configs: Vec::new()` and never called this function at all. A
+/// regression that deletes the `register_mcp` call is now caught by
+/// `tests::apply_resolved_mcp_servers_registers_and_mirrors`, which builds
+/// a real `SessionMcp` via the test-gated `SessionMcp::from_parts` instead.
+fn apply_resolved_mcp_servers(
+    actor: &SessionActor,
+    mirrored_mcp_resolved: &Arc<RwLock<HashSet<String>>>,
+    mcp: &SessionMcp,
+) {
+    actor.register_mcp(mcp);
+    *mirrored_mcp_resolved.write().unwrap() = mcp.resolved_servers().into_iter().collect();
 }
 
 /// Builds this session's `EgressPolicy` from the daemon's loaded
@@ -377,6 +443,7 @@ mod tests {
             dir.join("daemon-binary"),
             Vec::new(),
             roundhouse_config::NetworkConfig::default(),
+            OnDegrade::Refuse,
             runner(),
             Arc::new(NoopProvider),
             RequestCtx {
@@ -494,5 +561,209 @@ mod tests {
         assert_eq!(ctx.attested_tier, expected_tier);
         assert_eq!(ctx.requested_tier, Tier::Sandbox);
         assert!(ctx.resolved_mcp_servers.contains("github"));
+    }
+
+    /// Ruling W1-R99 (fix round 1): `create_real_session`'s only prior test
+    /// passed `mcp_configs: Vec::new()`, so the branch containing the
+    /// `register_mcp` call (ruling W1-R85) was never exercised — a
+    /// regression deleting that call would have passed every test in this
+    /// crate. `create_real_session`'s own MCP-configured path necessarily
+    /// spawns a real subprocess (`McpHost::start`), which is too heavy for
+    /// this crate's unit tests, so this proves the extracted
+    /// `apply_resolved_mcp_servers` directly: a real actor, a real
+    /// `SessionMcp` (built via the test-gated `SessionMcp::from_parts`, not
+    /// `start_session_mcp`), and confirms the actor actually admits an MCP
+    /// task naming the resolved server — proving `register_mcp` really ran,
+    /// not just that `resolved_servers()` was called on something.
+    ///
+    /// The `_without_it` mirror test proves this is a REAL regression
+    /// check, not a vacuously-true one: the identical task is denied when
+    /// `apply_resolved_mcp_servers` is never called.
+    mod apply_resolved_mcp_servers_tests {
+        use super::*;
+        use roundhouse_core::{Origin, TaskKind};
+        use roundhouse_engine::mcp_spawner::{EngineTaskSpawner, SessionMcp};
+        use roundhouse_engine::{AdmitError, TaskCreateRequest};
+        use roundhouse_mcp::executor::TaskSpawner as McpTaskSpawner;
+        use roundhouse_mcp::namespace::ToolNamespace;
+        use roundhouse_mcp::transport::McpTransport;
+        use roundhouse_mcp::wire::{DiscoverResult, McpError, McpResult, ToolCallRequest};
+        use roundhouse_policy::engine::{CompiledRule, Outcome, Predicate, Scope};
+        use roundhouse_policy::{ServerId, TaskParams};
+
+        const FAKE_SERVER: &str = "fake-server";
+
+        /// A transport that discovers one tool and is never actually
+        /// called — `apply_resolved_mcp_servers` only reads
+        /// `resolved_servers()`, which reflects the CONNECTIONS
+        /// `SessionMcp` was built from, not any real traffic over them.
+        struct FakeTransport;
+
+        #[async_trait::async_trait]
+        impl McpTransport for FakeTransport {
+            async fn discover(&self) -> Result<DiscoverResult, McpError> {
+                unreachable!("not exercised by this test")
+            }
+            async fn call_tool(&self, _req: ToolCallRequest) -> Result<McpResult, McpError> {
+                unreachable!("not exercised by this test")
+            }
+            async fn shutdown(&self) -> Result<(), McpError> {
+                Ok(())
+            }
+        }
+
+        /// Builds a real `SessionMcp` claiming `FAKE_SERVER` resolved, wired
+        /// to `policy` — mirrors `create_real_session`'s own construction
+        /// order (policy built first, `SessionMcp` built against it) without
+        /// needing a real `McpHost::start`.
+        fn fake_resolved_session_mcp(
+            runner: &'static roundhouse_core::TaskRunner,
+            writer: roundhouse_store::EventWriter,
+            session_id: SessionId,
+            policy: Arc<PolicyEngine>,
+        ) -> SessionMcp {
+            let server = ServerId(FAKE_SERVER.to_string());
+            let connections: Vec<(ServerId, Arc<dyn McpTransport>)> =
+                vec![(server, Arc::new(FakeTransport))];
+            let namespace = ToolNamespace::build(&[]).unwrap();
+            let task_spawner: Arc<dyn McpTaskSpawner> =
+                Arc::new(EngineTaskSpawner::new(runner, writer, session_id));
+            SessionMcp::from_parts(connections, namespace, policy, task_spawner)
+                .expect("the test's PolicyEngine has a real sealed_ctx_provider installed")
+        }
+
+        fn mcp_task(server: &str) -> TaskCreateRequest {
+            TaskCreateRequest {
+                kind: TaskKind::Mcp,
+                origin: Origin::Model,
+                is_finally_step: false,
+                params: TaskParams::Mcp {
+                    server: ServerId(server.to_string()),
+                    tool: "whoami".to_string(),
+                    args: serde_json::Value::Null,
+                },
+            }
+        }
+
+        #[tokio::test]
+        async fn registers_on_the_actor_so_an_mcp_task_naming_that_server_is_admitted() {
+            let dir = tempfile::tempdir().unwrap();
+            let isolate = available_isolate();
+            let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+            let handle = isolate.prepare(&spec).await.unwrap();
+            let session_id = SessionId::new();
+            let store = roundhouse_store::open(&dir.path().join("events.db"))
+                .await
+                .unwrap();
+            let writer = spawn_writer(store).await;
+
+            let mirrored: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+            // An explicit `Allow` rule for this one tool: with zero
+            // configured rules, an unmatched-but-not-sealed-denied task
+            // falls through to `Ask` (`AdmitError::RequiresApproval`), not
+            // `Allow` — this test is about proving `register_mcp` clears
+            // the SEALED `sealed_mcp_unresolved` denial specifically, so a
+            // real allow rule is needed to reach `Ok(())` rather than a
+            // different, unrelated non-`Ok` outcome.
+            let allow_whoami = CompiledRule::test_new(
+                Scope::Builtin,
+                Outcome::Allow,
+                Predicate::mcp(
+                    ServerId(FAKE_SERVER.to_string()),
+                    Some("whoami".to_string()),
+                ),
+            );
+            let policy = Arc::new(
+                PolicyEngine::from_rules(vec![allow_whoami]).with_sealed_ctx_provider(
+                    build_sealed_ctx_provider(
+                        dir.path().join("state"),
+                        dir.path().join("daemon-binary"),
+                        None,
+                        isolate.clone(),
+                        handle.clone(),
+                        Tier::Sandbox,
+                        mirrored.clone(),
+                    ),
+                ),
+            );
+
+            let actor = SessionActor::new(
+                session_id,
+                writer.clone(),
+                SessionState::Running,
+                runner(),
+                policy.clone(),
+                dir.path().join("state"),
+                dir.path().join("daemon-binary"),
+                isolate,
+                handle,
+                spec,
+                vec![],
+            );
+
+            let mcp = fake_resolved_session_mcp(runner(), writer, session_id, policy);
+            apply_resolved_mcp_servers(&actor, &mirrored, &mcp);
+
+            let result = actor.admit_task(&mcp_task(FAKE_SERVER)).await;
+            assert!(
+                result.is_ok(),
+                "an MCP task naming a server apply_resolved_mcp_servers just \
+                 registered as resolved must be admitted, got {result:?}"
+            );
+            assert!(mirrored.read().unwrap().contains(FAKE_SERVER));
+        }
+
+        /// The regression-catching mirror: WITHOUT calling
+        /// `apply_resolved_mcp_servers`, the identical task must be denied
+        /// by `sealed_mcp_unresolved` — proving the test above is a real
+        /// check, not one that would pass regardless of whether
+        /// `register_mcp` ran.
+        #[tokio::test]
+        async fn without_registering_the_identical_mcp_task_is_denied() {
+            let dir = tempfile::tempdir().unwrap();
+            let isolate = available_isolate();
+            let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+            let handle = isolate.prepare(&spec).await.unwrap();
+            let session_id = SessionId::new();
+            let store = roundhouse_store::open(&dir.path().join("events.db"))
+                .await
+                .unwrap();
+            let writer = spawn_writer(store).await;
+
+            let mirrored: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+            let policy = Arc::new(PolicyEngine::from_rules(vec![]).with_sealed_ctx_provider(
+                build_sealed_ctx_provider(
+                    dir.path().join("state"),
+                    dir.path().join("daemon-binary"),
+                    None,
+                    isolate.clone(),
+                    handle.clone(),
+                    Tier::Sandbox,
+                    mirrored.clone(),
+                ),
+            ));
+
+            let actor = SessionActor::new(
+                session_id,
+                writer,
+                SessionState::Running,
+                runner(),
+                policy,
+                dir.path().join("state"),
+                dir.path().join("daemon-binary"),
+                isolate,
+                handle,
+                spec,
+                vec![],
+            );
+
+            // Deliberately no `apply_resolved_mcp_servers` call.
+            let result = actor.admit_task(&mcp_task(FAKE_SERVER)).await;
+            assert!(
+                matches!(result, Err(AdmitError::Denied(_))),
+                "an MCP task must be denied by sealed_mcp_unresolved when no \
+                 server was ever registered as resolved, got {result:?}"
+            );
+        }
     }
 }

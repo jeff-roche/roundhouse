@@ -182,6 +182,18 @@ pub fn load_network_config(
 ///   makes `any` vacuously `false`), so an empty [`NetworkConfig`]
 ///   genuinely denies all egress rather than being read as "unset, allow
 ///   all."
+///
+/// `#[doc(hidden)]`, and dropped from this crate's root re-export (fix
+/// round 1, MUST 5): CF-11(b)'s whole point was "no label to get wrong" —
+/// leaving this raw, caller-labeled function as easily reachable as the
+/// safe [`load_network_config`] wrapper (one `use` away, and appearing
+/// in `cargo doc`'s crate-root index) is exactly the kind of back door
+/// that requirement was meant to close. Still `pub` (not `pub(crate)`),
+/// because this crate's own `tests/network_policy_config.rs` integration
+/// test needs it — reachable via the fully-qualified
+/// `roundhouse_config::network::load_network_config_from_layers`, not the
+/// crate root.
+#[doc(hidden)]
 pub fn load_network_config_from_layers(
     layers: Vec<(ConfigScope, PathBuf)>,
 ) -> Result<NetworkConfig, NetworkConfigError> {
@@ -190,8 +202,46 @@ pub fn load_network_config_from_layers(
 
     let mut allowed_hosts: Vec<String> = Vec::new();
     for (scope, path) in &sorted {
-        let Some(hosts) = hosts_for_layer(*scope, path)? else {
-            continue;
+        let hosts = match hosts_for_layer(*scope, path) {
+            Ok(Some(hosts)) => hosts,
+            Ok(None) => continue,
+            // Fix round 1 (SHOULD item): a rejected NARROWER (Project/
+            // Workspace) layer — a symlink, an oversized file, malformed
+            // TOML — must not collapse the WIDER scope's own, already-valid
+            // allowlist to nothing. A hostile cloned repository's
+            // `.roundhouse/config.toml` being, say, a symlink to `/dev/zero`
+            // (CF-11(a)'s attack) must not ALSO be able to turn "deny one
+            // specific egress narrowing" into "deny all egress for this
+            // session," which is the practical effect a hard error here
+            // would have — this loop's caller (`load_network_config`)
+            // otherwise falls back to `NetworkConfig::default()` (empty,
+            // deny-all) on ANY error from this function. Treating a broken
+            // narrower layer as "contributes nothing" (same as absent) is
+            // the honest, minimal-blast-radius response: the operator's own
+            // wider allowlist survives untouched, and the broken project
+            // layer simply fails to narrow it — which is a safe direction
+            // to fail in (an over-permissive project layer was never
+            // capable of being honored here anyway, per the narrow-only
+            // rule this function already enforces).
+            //
+            // A rejected WIDER (Builtin/UserGlobal) layer — the operator's
+            // OWN config — is NOT given this treatment: that error still
+            // propagates, since silently ignoring a broken operator config
+            // would mask a real mistake the operator needs to see, not an
+            // attack to defend against.
+            Err(err) => match scope {
+                ConfigScope::Project | ConfigScope::Workspace => {
+                    tracing::warn!(
+                        scope = ?scope,
+                        path = %path.display(),
+                        error = %err,
+                        "a narrower [network] config layer failed to load; treating it as \
+                         absent rather than discarding the wider scope's own allowlist"
+                    );
+                    continue;
+                }
+                ConfigScope::Builtin | ConfigScope::UserGlobal => return Err(err),
+            },
         };
         match scope {
             ConfigScope::Builtin | ConfigScope::UserGlobal => {
@@ -565,5 +615,65 @@ mod tests {
                  ({wider_strings:?}) — a project-authored string reached the final allowlist"
             );
         }
+    }
+
+    /// Fix round 1 (SHOULD item): a rejected NARROWER layer (here, a
+    /// symlink — the exact CF-11(a) shape) must not collapse the wider
+    /// scope's own, already-valid allowlist to empty. Before this fix,
+    /// `load_network_config_from_layers` propagated ANY layer's error
+    /// via `?`, so a hostile cloned repo's `.roundhouse/config.toml` being
+    /// a symlink (which `ConfigLoader::load` now refuses outright) would
+    /// turn "deny one narrowing" into "deny all egress for every session."
+    #[cfg(unix)]
+    #[test]
+    fn a_rejected_project_layer_falls_back_to_the_user_global_result_rather_than_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = write(
+            dir.path(),
+            "user.toml",
+            "[network]\nallowed_hosts = [\"api.anthropic.com\"]\n",
+        );
+        let real_target = write(
+            dir.path(),
+            "real-target.toml",
+            "[network]\nallowed_hosts = []\n",
+        );
+        let project = dir.path().join("project.toml");
+        std::os::unix::fs::symlink(&real_target, &project).unwrap();
+
+        let cfg = load_network_config_from_layers(vec![
+            (ConfigScope::UserGlobal, user),
+            (ConfigScope::Project, project),
+        ])
+        .expect("a broken PROJECT layer must not turn into a hard error");
+        assert_eq!(
+            cfg.allowed_hosts,
+            vec!["api.anthropic.com".to_string()],
+            "the user-global allowlist must survive a rejected project layer untouched"
+        );
+    }
+
+    /// The mirror case: a rejected WIDER (`UserGlobal`) layer is NOT given
+    /// the same treatment — that is the operator's own config, and
+    /// silently ignoring it would mask a real mistake rather than defend
+    /// against an attack.
+    #[cfg(unix)]
+    #[test]
+    fn a_rejected_user_global_layer_still_hard_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_target = write(
+            dir.path(),
+            "real-target.toml",
+            "[network]\nallowed_hosts = []\n",
+        );
+        let user = dir.path().join("user.toml");
+        std::os::unix::fs::symlink(&real_target, &user).unwrap();
+
+        let result = load_network_config_from_layers(vec![(ConfigScope::UserGlobal, user)]);
+        assert!(
+            result.is_err(),
+            "a broken operator (UserGlobal) layer must still be a hard error, not silently \
+             skipped"
+        );
     }
 }

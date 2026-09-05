@@ -24,6 +24,7 @@ use roundhouse_tui::{DaemonClient, Dashboard, SessionId};
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
+    install_tracing_subscriber();
 
     match Cli::parse().command {
         Some(Command::Daemon) => run_daemon().await,
@@ -33,6 +34,21 @@ async fn main() -> color_eyre::Result<()> {
         Some(Command::Run { workspace }) => run_headless(workspace).await,
         None => create_and_attach(DEFAULT_WORKSPACE_NAME.to_string()).await,
     }
+}
+
+/// Ruling W1-R96 (fix round 1): installs a real `tracing` subscriber before
+/// anything else runs — see `round-daemon-internal`'s identical function
+/// for the full rationale. This crate has no `tracing::*` call site of its
+/// own today, but the review named "both `main`s" explicitly: without this,
+/// a future one (most plausibly inside `roundhouse-tui`) would be silently
+/// dropped the same way the daemon's were before this fix round.
+fn install_tracing_subscriber() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .init();
 }
 
 /// `round daemon`: runs the real daemon binary in the foreground and exits
