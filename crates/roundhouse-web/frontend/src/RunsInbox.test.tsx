@@ -49,6 +49,15 @@ describe("bucketLabel", () => {
     expect(bucketLabel({ outcome: "findings", needs_human: false } as never)).toBe("FINDINGS");
     expect(bucketLabel({ outcome: "changed", needs_human: false } as never)).toBe("LANDED");
   });
+
+  it("handles the needs_human OUTCOME variant explicitly rather than falling through to the default arm", () => {
+    // `"needs_human"` is one of Outcome's five closed wire variants
+    // (api.ts), reachable through this file's own type — not the
+    // unreachable case a prior version's comment claimed. This pins the
+    // `needs_human: false` case (the `true` case is already covered above,
+    // since the boolean wins regardless of outcome).
+    expect(bucketLabel({ outcome: "needs_human", needs_human: false } as never)).toBe("NEEDS HUMAN (OUTCOME)");
+  });
 });
 
 describe("buildDisplayRows", () => {
@@ -72,6 +81,23 @@ describe("buildDisplayRows", () => {
   it("produces no collapsed row at all when nothing is a no-op", () => {
     const a = run("a", { outcome: "changed" });
     expect(buildDisplayRows([a])).toEqual([{ kind: "run", run: a }]);
+  });
+
+  it("never collapses a nothing-outcome run that also needs a human (ruling R15, amended)", () => {
+    // {"outcome":"nothing","needs_human":true} is a legal combination — the
+    // two fields are orthogonal axes on the server — and it is, by
+    // definition, not a no-op: something about it wants a human's
+    // attention. Fix round 1 (whole-branch review): the prior version
+    // collapsed on `outcome` alone and buried this run.
+    const needsHumanButNothing = run("nh", { outcome: "nothing", needs_human: true });
+    const genuineNoOp = run("noop", { outcome: "nothing", needs_human: false });
+
+    const rows = buildDisplayRows([needsHumanButNothing, genuineNoOp]);
+
+    expect(rows).toEqual([
+      { kind: "run", run: needsHumanButNothing },
+      { kind: "collapsed", runs: [genuineNoOp] },
+    ]);
   });
 });
 

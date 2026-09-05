@@ -7,9 +7,17 @@
 // independently of the other. Every row below renders in the exact index
 // order `res.runs` arrived in. What this component *is* allowed to do —
 // and does — is label each row with its bucket (derived, never used to
-// reorder) and collapse the `nothing`-outcome runs into one line (§11.4:
+// reorder) and collapse the genuinely no-op runs into one line (§11.4:
 // "no-op runs must cost zero attention"; `runs.rs`'s own docs call this
 // collapsing a client rendering job, not a server one).
+//
+// **"No-op" means `outcome === "nothing"` AND `needs_human === false`
+// (ruling R15, amended) — not `outcome` alone.** The two fields are
+// orthogonal axes on the server (`roundhouse_flow::report::Outcome`'s own
+// doc comment), so a run can legally report `{"outcome":"nothing",
+// "needs_human":true}`; collapsing on `outcome` alone would bury exactly
+// the run this section's own rule exists to surface. See
+// `isCollapsibleNoOp` and `bucketLabel` below.
 
 import { createResource, createSignal, For, Show } from "solid-js";
 
@@ -33,13 +41,18 @@ const FINDING_KNOWN_KEYS = ["id", "title", "severity", "location"];
  * — never from position. `Report.needs_human` and `Outcome` are orthogonal
  * axes (`roundhouse_flow::report::Outcome`'s own doc comment: "what the run
  * *found*" vs. "where the run *is*"), so `needs_human` is checked first,
- * matching the sort's own primary key, and `outcome` only decides the label
- * among runs that do not need a human.
+ * matching the sort's own primary key (`sort_for_triage`'s own comment:
+ * "`!needs_human` puts the runs wanting a human first" — `needs_human` is
+ * the PRIMARY key, `outcome == Nothing` only tertiary), and `outcome` only
+ * decides the label among runs that do not need a human.
  *
- * The `default` arm is defensive, not reachable through this file's own
- * `Outcome` type: a wire value this client does not recognise renders its
- * own text rather than throwing, the same tolerance `asTaskEvent` and
- * friends apply to open enums elsewhere in this client.
+ * **This is why a run must never be treated as a no-op on `outcome` alone**
+ * (see `buildDisplayRows` below): `outcome: "needs_human"` is itself one of
+ * the five closed wire variants of `Outcome`, reachable through this
+ * client's own type — a run can legally report `{"outcome":"nothing",
+ * "needs_human":true}`, and `validate_report` ties neither field to the
+ * other. The `default` arm below is the only genuinely defensive one, for a
+ * sixth wire value this client does not yet know about.
  */
 export function bucketLabel(report: Report): string {
   if (report.needs_human) {
@@ -54,9 +67,27 @@ export function bucketLabel(report: Report): string {
       return "FINDINGS";
     case "changed":
       return "LANDED";
+    case "needs_human":
+      // `needs_human: false` with `outcome: "needs_human"` is a
+      // theoretically legal but unusual combination (the two are
+      // orthogonal axes) — the boolean already won the label above when it
+      // is true, so this arm exists only for the false case, and the
+      // outcome value itself is the honest label for it.
+      return "NEEDS HUMAN (OUTCOME)";
     default:
       return `OUTCOME: ${String(report.outcome)}`;
   }
+}
+
+/** Ruling R15 (amended): a run collapses into the no-op summary only when
+ * it is BOTH `outcome === "nothing"` AND `needs_human === false`. A run
+ * that needs a human is, by definition, not a no-op — collapsing on
+ * `outcome` alone would bury exactly the run §11.4's "no-op runs must cost
+ * zero attention" rule exists to surface (`report.rs`'s own warning:
+ * "the Runs inbox would silently omit precisely the runs an operator most
+ * needs to see"). */
+function isCollapsibleNoOp(run: RunSummary): boolean {
+  return run.report.outcome === "nothing" && !run.report.needs_human;
 }
 
 export type DisplayRow =
@@ -65,20 +96,29 @@ export type DisplayRow =
 
 /**
  * Builds the rendered row sequence from the server's own order. Every
- * `nothing`-outcome run is pulled out of its individual position and merged
- * into ONE collapsed row, placed where the *first* such run appeared —
- * because `nothing` runs are not necessarily contiguous (the sort key is
- * `(!needs_human, Reverse(severity), outcome == Nothing)`, so a high-severity
- * no-op sorts ahead of a low-severity `changed` run), and §11.4 asks for the
- * collapse regardless. Every non-`nothing` run keeps its exact relative
- * order and position around that one collapsed row — nothing else moves.
+ * genuinely no-op run (`isCollapsibleNoOp`: `outcome === "nothing"` AND
+ * `needs_human === false`) is pulled out of its individual position and
+ * merged into ONE collapsed row, placed where the *first* such run
+ * appeared — because no-op runs are not necessarily contiguous (the sort
+ * key is `(!needs_human, Reverse(severity), outcome == Nothing)`, so a
+ * high-severity run sorts ahead of a low-severity `changed` run regardless
+ * of outcome), and §11.4 asks for the collapse regardless. Every other run
+ * keeps its exact relative order and position around that one collapsed
+ * row — nothing else moves.
+ *
+ * **Checking `needs_human` here, not just `outcome`, is the whole point.**
+ * A run reporting `{"outcome":"nothing","needs_human":true}` is — by
+ * definition — not a no-op: something about it wants a human's attention
+ * even though nothing changed. Collapsing it into "N no-op runs" would bury
+ * exactly the run §11.4's "no-op runs must cost zero attention" rule exists
+ * to surface.
  */
 export function buildDisplayRows(runs: RunSummary[]): DisplayRow[] {
   const rows: DisplayRow[] = [];
   let collapsed: RunSummary[] | null = null;
 
   for (const run of runs) {
-    if (run.report.outcome === "nothing") {
+    if (isCollapsibleNoOp(run)) {
       if (collapsed === null) {
         collapsed = [];
         rows.push({ kind: "collapsed", runs: collapsed });
