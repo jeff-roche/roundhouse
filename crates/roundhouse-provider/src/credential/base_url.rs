@@ -61,7 +61,7 @@ pub fn resolve_base_url(
     if operator_supplied
         && !allow_insecure
         && parsed.scheme() == "http"
-        && !is_loopback_host(parsed.host_str())
+        && !is_loopback_host(parsed.host())
     {
         return Err(CredentialError::InsecureBaseUrl(format!(
             "operator-supplied base URL for provider `{provider_id}` uses insecure http:// \
@@ -75,9 +75,20 @@ pub fn resolve_base_url(
 }
 
 /// `true` for the loopback hosts an operator-supplied `http://` override is
-/// exempted for (see [`resolve_base_url`]'s doc comment). `Url::host_str`
-/// returns an IPv6 literal without its `[...]` brackets, so `::1` (not
-/// `[::1]`) is the right literal to compare against here.
-fn is_loopback_host(host: Option<&str>) -> bool {
-    matches!(host, Some("localhost") | Some("127.0.0.1") | Some("::1"))
+/// exempted for (see [`resolve_base_url`]'s doc comment). Uses the *typed*
+/// `Url::host()` rather than `Url::host_str()`'s string form: `host_str`
+/// serializes an IPv6 address WITH its `[...]` brackets (`"[::1]"`, not
+/// `"::1"`), so a literal string comparison against `"::1"` silently never
+/// matches -- this was caught by
+/// `credential_test.rs::a_loopback_http_operator_override_is_never_gated`'s
+/// `http://[::1]:9001/v1` case failing before this switched to `Ipv6Addr::
+/// is_loopback()`. The typed form also correctly covers all of 127.0.0.0/8
+/// via `Ipv4Addr::is_loopback()`, not just the single `127.0.0.1` literal.
+fn is_loopback_host(host: Option<url::Host<&str>>) -> bool {
+    match host {
+        Some(url::Host::Domain(d)) => d == "localhost",
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
 }

@@ -266,7 +266,11 @@ fn a_non_loopback_http_env_override_is_rejected_unless_allow_insecure() {
 /// even though it's operator-supplied -- it never leaves the local machine.
 #[test]
 fn a_loopback_http_operator_override_is_never_gated() {
-    for host in ["http://localhost:9001/v1", "http://127.0.0.1:9001/v1"] {
+    for host in [
+        "http://localhost:9001/v1",
+        "http://127.0.0.1:9001/v1",
+        "http://[::1]:9001/v1",
+    ] {
         let result = roundhouse_provider::credential::resolve_base_url(
             "testprov5",
             "https://default.example.com",
