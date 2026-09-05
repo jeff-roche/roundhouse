@@ -148,7 +148,7 @@ pub async fn run_agent_loop(
     let mut transcript: Vec<ContentBlock> = Vec::new();
 
     loop {
-        let blocks = crate::run_chat_turn(
+        let (chat_task_id, blocks) = crate::run_chat_turn(
             writer,
             runner,
             provider,
@@ -187,7 +187,9 @@ pub async fn run_agent_loop(
 
         let mut tool_results = Vec::with_capacity(tool_uses.len());
         for (id, name, input) in tool_uses {
-            let outcome = dispatch_one_tool_call(actor, writer, runner, mcp, &name, &input).await;
+            let outcome =
+                dispatch_one_tool_call(actor, writer, runner, mcp, &name, &input, chat_task_id)
+                    .await;
             let (content, is_error) = match outcome {
                 Ok(content) => (content, false),
                 Err(message) => (vec![ToolResultPart { text: message }], true),
@@ -234,6 +236,12 @@ pub async fn run_agent_loop(
 /// real executor error) — the caller turns `Err` into a
 /// `ContentBlock::ToolResult { is_error: true }`, never a panic or a
 /// silently-dropped call.
+///
+/// `parent` is the `chat` task id of the turn that issued this call (fix
+/// round B, ruling W1-R53/W1-R64) — threaded into every task this dispatch
+/// mints, so the session's task log is a real tree (a tool call is a child
+/// of the turn that asked for it), not the flat list it was before this
+/// round.
 async fn dispatch_one_tool_call(
     actor: &SessionActor,
     writer: &EventWriter,
@@ -241,10 +249,11 @@ async fn dispatch_one_tool_call(
     mcp: Option<&roundhouse_mcp::executor::McpExecutor>,
     name: &str,
     input: &serde_json::Value,
+    parent: TaskId,
 ) -> Result<Vec<ToolResultPart>, String> {
     match resolve_tool_target(name) {
         Some(ToolTarget::Builtin(kind)) => {
-            dispatch_builtin(actor, writer, runner, kind, input).await
+            dispatch_builtin(actor, writer, runner, kind, input, parent).await
         }
         Some(ToolTarget::Mcp { namespaced_name }) => {
             let message = mcp_dispatch_refusal(mcp, &namespaced_name);
@@ -255,16 +264,23 @@ async fn dispatch_one_tool_call(
             // tool names left zero trace. `TaskKind::Mcp` is the honest
             // categorization here (this IS a namespaced MCP-shaped tool
             // call, just not one this dispatch can execute).
-            Err(record_unadmitted_refusal(
+            let recorded = record_unadmitted_refusal(
                 writer,
                 runner,
                 actor.session_id(),
                 TaskKind::Mcp,
+                parent,
                 input,
                 "mcp_not_wired",
                 message,
             )
-            .await)
+            .await;
+            // fix round B, ruling W1-R65: whichever string comes back — the
+            // original refusal message (`Ok`) or a description of the
+            // primary `TaskCreated` append itself failing (`Err`) — this
+            // arm is always a refusal, so it always becomes `Err` to the
+            // caller.
+            Err(recorded.unwrap_or_else(|e| e))
         }
         None => {
             // The unknown-tool case has no natural `TaskKind` to record
@@ -285,15 +301,26 @@ async fn dispatch_one_tool_call(
 /// unconditionally by `TaskFailed`, mirroring `dispatch_builtin`'s own
 /// "a refused call is still a real, queryable attempt" posture for the
 /// built-in arm.
+///
+/// **Fix round B, ruling W1-R65:** the primary `TaskCreated` append's
+/// failure is now propagated (`Err`) rather than logged-and-continued —
+/// this helper exists specifically to make F10's "a refused call is still
+/// a real, queryable attempt" guarantee hold, so silently proceeding past a
+/// failure to record that attempt would defeat the fix's own point (and was
+/// inconsistent with `dispatch_builtin`'s sibling append at
+/// `dispatch_builtin`, which already propagates via `?`). The secondary
+/// `TaskFailed` append stays best-effort, matching `record_denial`'s
+/// existing pattern.
 async fn record_unadmitted_refusal(
     writer: &EventWriter,
     runner: &TaskRunner,
     session_id: roundhouse_core::SessionId,
     kind: TaskKind,
+    parent: TaskId,
     input: &serde_json::Value,
     category: &str,
     message: String,
-) -> String {
+) -> Result<String, String> {
     let task_id = TaskId::new();
     let created = runner.record_task_created(
         session_id,
@@ -301,14 +328,15 @@ async fn record_unadmitted_refusal(
         now_ts(),
         task_id,
         kind,
-        None,
+        Some(parent),
         Origin::Model,
         TaskInput::Json(input.clone()),
         1,
     );
-    if let Err(e) = writer.append(created).await {
-        tracing::warn!(error = %e, "failed to record TaskCreated for an unadmitted refusal");
-    }
+    writer
+        .append(created)
+        .await
+        .map_err(|e| format!("failed to record an unadmitted refusal: {e}"))?;
 
     let failed = runner.record_task_failed(
         session_id,
@@ -326,7 +354,7 @@ async fn record_unadmitted_refusal(
         tracing::warn!(error = %e, "failed to record TaskFailed for an unadmitted refusal");
     }
 
-    message
+    Ok(message)
 }
 
 /// See this module's doc comment ("MCP arm: deliberately NOT wired") for the
@@ -370,6 +398,7 @@ async fn dispatch_builtin(
     runner: &TaskRunner,
     kind: TaskKind,
     input: &serde_json::Value,
+    parent: TaskId,
 ) -> Result<Vec<ToolResultPart>, String> {
     let (params, extras) =
         crate::tool_dispatch::task_params_for(kind.clone(), input).map_err(|e| e.to_string())?;
@@ -377,6 +406,8 @@ async fn dispatch_builtin(
     // S-LOG-1: mint and durably record the real task this dispatch is
     // ATTEMPTING, before admission decides its fate — see this function's
     // own doc comment for why a denied call must still be queryable.
+    // `parent` (fix round B, W1-R53/W1-R64) links this task back to the
+    // chat turn that issued it, making the session's task log a real tree.
     let task_id = TaskId::new();
     let created = runner.record_task_created(
         actor.session_id(),
@@ -384,7 +415,7 @@ async fn dispatch_builtin(
         now_ts(),
         task_id,
         kind.clone(),
-        None,
+        Some(parent),
         Origin::Model,
         TaskInput::Json(input.clone()),
         1,

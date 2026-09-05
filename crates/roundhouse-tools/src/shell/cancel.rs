@@ -198,6 +198,19 @@ pub async fn spawn_cancellable(
             .current_dir(cwd)
             .env_clear()
             .envs(env.iter().cloned())
+            // Fix round B, M1 (ruling W1-R69): without this, the child
+            // inherits the DAEMON's own stdin (reproduced: a spawned child
+            // saw the daemon's controlling tty). That's a real regression
+            // from `run_shell`'s `.output()` (which gives a null stdin by
+            // default) and from `roundhouse-mcp`'s `build_command` (which
+            // this fix explicitly claims to copy and which pipes stdin
+            // explicitly). It also feeds finding I1: under
+            // `ProcessGroup::leader()`, a child that tries to read from a
+            // terminal stdin raises SIGTTIN and STOPS rather than exiting —
+            // a stopped child never reaches EOF on its own, so a dispatch
+            // racing `wait()`/drains against a timeout would never see it
+            // finish on that path either.
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
     });

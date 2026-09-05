@@ -26,6 +26,13 @@ use crate::StoreError;
 
 const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
 
+/// Recursion depth cap for [`Redactor::redact_json_value`] (fix round B, M2
+/// / ruling W1-R69) — see that method's own doc comment for the reproduced
+/// stack overflow (depth 10,000) this closes and why the cap sits well
+/// under `serde_json`'s own default parse recursion limit (128) rather than
+/// relying on it.
+const MAX_JSON_REDACT_DEPTH: usize = 64;
+
 /// An Aho-Corasick automaton over live secret values. `redact`/`redact_event_payload` are
 /// pure (never touch the database themselves) — the persistence-boundary guarantee comes
 /// from *where* they're called (`writer::append_one`/`append_batch`, before
@@ -115,13 +122,27 @@ impl Redactor {
     /// for the first time. This closes that gap for those two fields.
     ///
     /// **Object KEYS in a `TaskInput`/`TaskOutput::Json` value are NOT redacted, only
-    /// string VALUES (recursively, through arrays and nested objects).** Every built-in
-    /// tool call's JSON keys are this codebase's own fixed field names (`"path"`,
-    /// `"contents"`, `"find"`, `"replace"`, `"root"`, `"pattern"`, `"program"`, `"argv"`,
-    /// `"cwd"`) — never model-echoed content a live secret could appear in — so
-    /// redacting keys would cost real correctness (a key literally matching a live
-    /// secret substring would corrupt the JSON's own shape) for no coverage benefit
-    /// against the actual threat (a secret value the model echoes back verbatim).
+    /// string VALUES (recursively, through arrays and nested objects).** The decision
+    /// is a deliberate, accepted trade-off; **an earlier version of this comment's
+    /// STATED REASON for it was factually wrong, and is corrected here (fix round B, M3
+    /// / ruling W1-R69 — the third time this lane has hit a comment that misstates a
+    /// security property, after W1-R39 and Task 6's M3).** The earlier claim was that
+    /// object keys are "this codebase's own fixed field names … never model-echoed
+    /// content a live secret could appear in." That is false: `dispatch_builtin`
+    /// records the model's ENTIRE raw JSON argument object verbatim
+    /// (`TaskInput::Json(input.clone())`) — nothing validates that it contains only the
+    /// schema's named keys, so a model-authored object with an EXTRA key
+    /// (`{"path": "x", "sk-live-abc123": "irrelevant"}`) would carry that key straight
+    /// into the log, unredacted, verbatim, demonstrated. The decision to still not
+    /// redact keys stands on a narrower, honest basis instead: redacting a key would
+    /// corrupt the JSON's own shape (a key literally matching a secret substring stops
+    /// being a stable, round-trippable field name), and no built-in tool's schema today
+    /// gives the model a way to CHOOSE an arbitrary key that then gets read back by
+    /// name — an extra key is inert cargo, not something anything downstream
+    /// interprets. **That residual narrows to a real gap the moment MCP tool arguments
+    /// (round C) make model-chosen keys routine** (an MCP tool's input schema can name
+    /// an object-valued parameter with caller-chosen keys) — revisit then, not assumed
+    /// safe indefinitely.
     ///
     /// **Known, tracked gap — NOT a safety property, just an honest inventory of what's
     /// still unprotected:** `Delta::Thinking.text`, `Delta::ToolArgs.fragment`,
@@ -228,6 +249,59 @@ impl Redactor {
     /// module's Aho-Corasick substring automaton needs to reach inside of rather than
     /// skip over.
     fn redact_json_value(&self, value: serde_json::Value) -> (serde_json::Value, u32) {
+        self.redact_json_value_at_depth(value, 0)
+    }
+
+    /// `depth`-tracking implementation of [`Self::redact_json_value`] (fix
+    /// round B, M2 / ruling W1-R69): reproduced a real stack overflow at
+    /// recursion depth 10,000 with no explicit bound of our own — today's
+    /// safety rests entirely on `serde_json`'s own default parse recursion
+    /// limit (128, confirmed: 120 parses, 128/200/5000 are rejected before
+    /// this method ever runs), which is an undocumented dependency on a
+    /// third-party default for a check on the hot path of every event
+    /// write. [`MAX_JSON_REDACT_DEPTH`] is deliberately well under that
+    /// limit, so this bound is reached first and on our own terms.
+    ///
+    /// At the cap, this does NOT recurse, serialize, or otherwise walk
+    /// whatever remains below it — an earlier version of this fix tried
+    /// serializing the remaining sub-value to a flat string and redacting
+    /// that, but `serde_json::to_string` is ITSELF unbounded recursion over
+    /// the very structure that's already too deep, so that "fix" merely
+    /// moved the same stack overflow one call frame down (caught by this
+    /// method's own test). Instead, the remaining sub-value is discarded
+    /// outright and replaced with a fixed placeholder string — O(1), no
+    /// further traversal of any kind, so no depth of nesting below the cap
+    /// can affect this method's own stack usage. This means a secret nested
+    /// past the cap is not redacted so much as REMOVED ENTIRELY, never
+    /// round-tripped as structured JSON. Not reachable by any built-in tool
+    /// call today (their JSON shapes are shallow, fixed-schema objects —
+    /// see this module's `TaskCreated`/`TaskCompleted` doc comment), so
+    /// this is a resource bound holding a line, not a live threat this fix
+    /// round found exploited.
+    fn redact_json_value_at_depth(
+        &self,
+        value: serde_json::Value,
+        depth: usize,
+    ) -> (serde_json::Value, u32) {
+        if depth >= MAX_JSON_REDACT_DEPTH {
+            // `value` may still be arbitrarily deep below this point.
+            // `serde_json::Value` has no custom `Drop` (confirmed by
+            // reading its source), so letting it fall out of scope here
+            // and drop normally would hit the SAME stack overflow this
+            // whole cap exists to prevent — verified empirically: a bare
+            // `drop()` of a depth-10,000 `Value`, with NO redaction logic
+            // involved at all, overflows a 2 MiB thread stack (the size
+            // `cargo test` gives each test). Tear it down iteratively,
+            // off the call stack, instead of letting normal `Drop` recurse
+            // into it.
+            drop_iteratively(value);
+            return (
+                serde_json::Value::String(
+                    "[TRUNCATED: exceeded the JSON redaction depth cap]".to_string(),
+                ),
+                0,
+            );
+        }
         match value {
             serde_json::Value::String(s) => {
                 let (redacted, n) = self.redact(&s);
@@ -238,7 +312,7 @@ impl Redactor {
                 let redacted = items
                     .into_iter()
                     .map(|v| {
-                        let (v, n) = self.redact_json_value(v);
+                        let (v, n) = self.redact_json_value_at_depth(v, depth + 1);
                         total += n;
                         v
                     })
@@ -250,7 +324,7 @@ impl Redactor {
                 let redacted = map
                     .into_iter()
                     .map(|(k, v)| {
-                        let (v, n) = self.redact_json_value(v);
+                        let (v, n) = self.redact_json_value_at_depth(v, depth + 1);
                         total += n;
                         (k, v)
                     })
@@ -330,6 +404,28 @@ impl Redactor {
 pub enum SecretLeakDisposition {
     Ask,
     Deny,
+}
+
+/// Tears down a `serde_json::Value` OFF the call stack, one level at a time,
+/// via an explicit heap-allocated work-list — never Rust's default
+/// (recursive) `Drop`. `Redactor::redact_json_value_at_depth` (M2, fix
+/// round B, ruling W1-R69) uses this when it discards a sub-value at the
+/// depth cap: `Value` has no custom `Drop` of its own, so a value that is
+/// still arbitrarily deep below the cap would otherwise overflow the stack
+/// on ordinary drop, defeating the entire point of capping traversal depth
+/// in the first place (verified empirically, not assumed: a bare `drop()`
+/// of a depth-10,000 `Value` alone overflows a 2 MiB thread stack).
+fn drop_iteratively(value: serde_json::Value) {
+    let mut stack = vec![value];
+    while let Some(v) = stack.pop() {
+        match v {
+            serde_json::Value::Array(items) => stack.extend(items),
+            serde_json::Value::Object(map) => stack.extend(map.into_values()),
+            // Scalars (String/Number/Bool/Null) drop trivially — no
+            // nested `Value`s to worry about.
+            _ => {}
+        }
+    }
 }
 
 /// `Timestamp` (Phase 0, frozen) exposes only `from_unix_nanos`/`as_unix_nanos` — no

@@ -966,12 +966,15 @@ pub fn wire_redaction_for_session(writer: &EventWriter, secrets: &[String]) {
 /// — while still catching a short, real credential like a 7-byte
 /// `DB_PASSWORD` that a length-only filter would have silently let
 /// through unprotected (Minor 2).
-const SECRET_ENV_NAME_SUFFIXES: [&str; 4] = ["_TOKEN", "_KEY", "_SECRET", "_PASSWORD"];
+pub(crate) const SECRET_ENV_NAME_SUFFIXES: [&str; 4] = ["_TOKEN", "_KEY", "_SECRET", "_PASSWORD"];
 
 /// Whether `name` looks like a declared-secret env var by W1-R27's ruled
 /// name suffixes, case-insensitively (`GITHUB_TOKEN`, `github_token`, and
-/// `Github_Token` are all treated the same).
-fn is_secret_env_var_name(name: &str) -> bool {
+/// `Github_Token` are all treated the same). `pub(crate)` (fix round B,
+/// ruling W1-R69's allowlist-hardening item): `tool_dispatch.rs`'s shell
+/// env allowlist reuses this exact check as a guardrail against widening
+/// that allowlist with a secret-shaped name by mistake.
+pub(crate) fn is_secret_env_var_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     SECRET_ENV_NAME_SUFFIXES
         .iter()

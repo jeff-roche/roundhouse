@@ -83,3 +83,23 @@ async fn spawn_cancellable_does_not_leak_the_daemon_process_env_into_the_child()
         "the explicitly allowlisted PATH entry must still reach the child — got: {stdout:?}"
     );
 }
+
+/// Fix round B, M1 (ruling W1-R69): `spawn_cancellable` never explicitly set
+/// stdin, so the child inherited the DAEMON's own stdin — reproduced with a
+/// real controlling tty. `cat` with no arguments reads until it sees EOF on
+/// stdin; on a null stdin it sees EOF immediately and exits right away. A
+/// bounded wait proves this rather than assuming it — if stdin were still
+/// inherited (a live, still-open pipe/tty), `cat` would block waiting for
+/// input and this test would time out.
+#[tokio::test]
+async fn spawn_cancellable_gives_the_child_a_null_stdin_not_the_daemons() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut handle = spawn_cancellable("cat", &[], dir.path(), &path_env())
+        .await
+        .unwrap();
+    let status = tokio::time::timeout(std::time::Duration::from_secs(3), handle.wait())
+        .await
+        .expect("cat must see immediate EOF on a null stdin, not block waiting for input")
+        .unwrap();
+    assert!(status.success());
+}

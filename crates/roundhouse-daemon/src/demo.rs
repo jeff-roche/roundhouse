@@ -238,7 +238,11 @@ pub async fn run_demo_session(
     }];
     let request = assemble_context("claude-sonnet-5", "You are careful.", &[], &user_turn);
 
-    let blocks = run_chat_turn(
+    // fix round B (W1-R53/W1-R64): run_chat_turn now also returns its own
+    // chat_task_id (for callers that link dispatched tool calls to the
+    // turn that issued them) — this demo doesn't dispatch any tools, so it
+    // has no use for it.
+    let (_chat_task_id, blocks) = run_chat_turn(
         &writer,
         runner,
         cfg.provider.as_ref(),

@@ -464,3 +464,97 @@ async fn task_created_text_input_is_redacted() {
     );
     assert!(raw_row_text.contains("[REDACTED]"), "got: {raw_row_text}");
 }
+
+// ---------------------------------------------------------------------------------------
+// Fix Round B — M2 (depth cap) and M3 (object-key gap, characterized not fixed)
+// ---------------------------------------------------------------------------------------
+
+/// M2 (ruling W1-R69): `redact_json_value` must not stack-overflow on a pathologically
+/// deep `TaskInput::Json` — the security lens reproduced the ORIGINAL (unbounded) bug at
+/// depth 10,000. This test uses depth 1,000 instead — a deliberate choice, not a
+/// weakening: even independent of this crate's own logic, merely CONSTRUCTING (and, if
+/// dropped normally, tearing down) a bare depth-10,000 `serde_json::Value` overflows this
+/// test binary's own per-test thread stack in this environment (confirmed empirically —
+/// with every line of `Redactor` logic removed from the picture, a bare `drop()` of such a
+/// value still overflows). That is an orthogonal, environment-specific limit on how deep a
+/// `Value` this test binary can even HOLD, not a property of the fix under test. Depth
+/// 1,000 is unaffected by that limit, is still ~16x past this method's own
+/// `MAX_JSON_REDACT_DEPTH` (64) and ~8x past `serde_json`'s own parser depth limit (128,
+/// meaning a value this deep could never arrive by DESERIALIZING untrusted input in the
+/// first place), and is more than sufficient to prove the fix: `redact_event_payload`
+/// completes without crashing, and the secret sitting far below the depth cap does not
+/// leak into the output — it is discarded outright once the cap is reached (replaced with
+/// a fixed placeholder, torn down iteratively rather than via ordinary recursive `Drop`),
+/// not redacted via the substring automaton.
+#[test]
+fn redact_json_value_does_not_stack_overflow_on_pathological_nesting_and_never_leaks() {
+    let mut value = serde_json::json!("sk-live-abc123");
+    for _ in 0..1_000 {
+        value = serde_json::json!([value]);
+    }
+
+    let redactor = Redactor::build(&["sk-live-abc123".to_string()]);
+    let (redacted, _count) = redactor.redact_event_payload(EventPayload::TaskCreated {
+        kind: TaskKind::Read,
+        parent: None,
+        origin: Origin::Model,
+        input: TaskInput::Json(value),
+    });
+
+    // The redacted value itself is now shallow (truncated at the depth
+    // cap), so serializing it back is safe and cannot itself overflow.
+    let serialized = serde_json::to_string(&redacted).unwrap();
+    assert!(
+        !serialized.contains("sk-live-abc123"),
+        "must not leak the secret even past the depth cap: {serialized}"
+    );
+    assert!(
+        serialized.contains("TRUNCATED"),
+        "the truncation must be visible, not silent: {serialized}"
+    );
+}
+
+/// M3 (ruling W1-R69): characterizes the ACCEPTED residual gap, not a vulnerability this
+/// task closes — object keys are never redacted, so a model-authored JSON object with an
+/// extra key that happens to look like a live secret carries that key verbatim into the
+/// log. This is expected today (see `redact_event_payload`'s doc comment for the honest,
+/// corrected reasoning); it exists so a future change either closes the gap deliberately
+/// or this test forces an explicit decision to accept it again.
+#[tokio::test]
+async fn a_live_secret_used_as_an_object_key_survives_in_the_key_position_by_design() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+    writer.set_redactor(Redactor::build(&["sk-live-abc123".to_string()]));
+
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    writer
+        .append(RUNNER.record_task_created(
+            session_id,
+            0,
+            now_ts(),
+            task_id,
+            TaskKind::Write,
+            None,
+            Origin::Model,
+            TaskInput::Json(serde_json::json!({
+                "path": "/tmp/x",
+                "sk-live-abc123": "an extra, model-authored key"
+            })),
+            1,
+        ))
+        .await
+        .unwrap();
+
+    let query_store = open(&db_path).await.unwrap();
+    let raw_row_text = debug_read_raw_payload_text(&query_store, session_id, task_id)
+        .await
+        .unwrap();
+    assert!(
+        raw_row_text.contains("sk-live-abc123"),
+        "documented, accepted residual: a secret used as an OBJECT KEY is not redacted \
+         today — got: {raw_row_text}"
+    );
+}

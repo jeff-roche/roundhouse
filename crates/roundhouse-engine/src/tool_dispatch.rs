@@ -36,6 +36,16 @@
 //! different one in under a relative name (finding F2's other half; see
 //! ruling W1-R57).
 //!
+//! **Honesty caveat (fix round B, finding I3 / ruling W1-R68), so this
+//! containment isn't over-claimed: `argv` is never validated as paths.**
+//! `cat ../../../etc/shadow` is unaffected by the `cwd` gate in ANY
+//! configuration — the gate only ever inspects `cwd`/`program` themselves,
+//! never what a resolved, policy-admitted program is then told to operate
+//! on via its arguments. The `cwd` gate closes F2's specific "which binary
+//! runs" vector, not "what that binary can touch." Real per-argument path
+//! containment would need policy visibility into shell arguments, out of
+//! this task's scope.
+//!
 //! Real process-level sandboxing of the dispatched executor call itself
 //! (running it through the session's `Isolate::spawn` rather than
 //! in-process) remains out of this task's scope (see `agent_loop.rs`'s
@@ -245,23 +255,56 @@ fn fs_params(op: FsOp, raw_path: &str) -> TaskParams {
 }
 
 /// The containment boundary a dispatched `shell` call's `cwd` (and, for a
-/// relative `/`-containing `program`, its resolved binary too) must stay
-/// inside (ruling W1-R58). Nothing in the workspace today defines a
-/// per-session or per-workspace filesystem root — `SessionSpec.workspace` is
-/// an opaque `WorkspaceId`, not a path — so this dispatch uses the daemon
-/// process's own current working directory as its stand-in: `round daemon`
-/// is meant to be launched from within the project/repo it's operating on
-/// (the same assumption `roundhouse-config`'s project-scope loading already
-/// makes), so this is the most direct real boundary available without
-/// inventing new session-wide state or touching `SessionActor::new`'s
-/// signature. **This is a judgment call, not something W1-R58 ruled on
-/// directly — flagged in the fix-round report for confirmation.** Read
-/// fresh on every call rather than cached: nothing in this daemon ever
-/// calls `std::env::set_current_dir`, so it is effectively invariant for the
+/// relative `/`-containing `program`, its containment check — never the
+/// value actually stored, see [`resolve_shell_program`]) must stay inside
+/// (ruling W1-R58). Nothing in the workspace today defines a per-session or
+/// per-workspace filesystem root — `SessionSpec.workspace` is an opaque
+/// `WorkspaceId`, not a path — so this dispatch uses the daemon process's
+/// own current working directory as its stand-in: `round daemon` is meant
+/// to be launched from within the project/repo it's operating on (the same
+/// assumption `roundhouse-config`'s project-scope loading already makes),
+/// so this is the most direct real boundary available without inventing
+/// new session-wide state or touching `SessionActor::new`'s signature.
+/// **This is a judgment call, not something W1-R58 ruled on directly —
+/// flagged in the fix-round report for confirmation.** Read fresh on every
+/// call rather than cached: nothing in this daemon ever calls
+/// `std::env::set_current_dir`, so it is effectively invariant for the
 /// process's lifetime, but reading it fresh costs nothing and doesn't rely
 /// on that invariant silently.
+///
+/// **Fails closed at `/` (fix round B, finding I3 / ruling W1-R68).** A
+/// root of `/` makes every `starts_with` check in [`resolve_shell_cwd`]/
+/// [`resolve_shell_program`] vacuously true — measured: `root=/ cwd=/etc`
+/// and `root=/ cwd=/home` both passed containment pre-fix. This is not a
+/// contrived setup: a systemd unit with no `WorkingDirectory=` defaults to
+/// `/`. Nothing in `roundhouse-policy` inspects a working directory at all
+/// (confirmed: `grep -rn "cwd" crates/roundhouse-policy/src/` is zero
+/// hits), so `resolve_shell_cwd` is the ONLY gate `cwd` ever passes through
+/// — unlike `program`, where policy is still the real backstop even when
+/// this boundary is weak. A vacuous boundary here is therefore
+/// indistinguishable from no boundary at all, and must fail closed rather
+/// than silently degrade. **A real per-session workspace root (CF-17)
+/// remains the durable fix** — this is a floor, not a replacement for one.
 fn workspace_root() -> Result<PathBuf, ToolDispatchError> {
-    std::env::current_dir().map_err(|e| ToolDispatchError::WorkspaceRootUnavailable(e.to_string()))
+    let root = std::env::current_dir()
+        .map_err(|e| ToolDispatchError::WorkspaceRootUnavailable(e.to_string()))?;
+    reject_root_of_slash(root)
+}
+
+/// The `/`-rejection itself, split out from [`workspace_root`] so it's
+/// directly unit-testable without mutating this process's real working
+/// directory (which — being global, process-wide state — would race every
+/// other concurrently-running test in this binary).
+fn reject_root_of_slash(root: PathBuf) -> Result<PathBuf, ToolDispatchError> {
+    if root == Path::new("/") {
+        return Err(ToolDispatchError::WorkspaceRootUnavailable(
+            "the daemon's current working directory is '/' — refusing to use it as the shell \
+             containment boundary, since that collapses cwd/program containment to no boundary \
+             at all (fix round B, ruling W1-R68)"
+                .to_string(),
+        ));
+    }
+    Ok(root)
 }
 
 /// Resolves and validates the model-supplied `cwd`: canonicalized (a real,
@@ -287,12 +330,13 @@ fn resolve_shell_cwd(raw_cwd: &str) -> Result<PathBuf, ToolDispatchError> {
     Ok(canonical)
 }
 
-/// Resolves the model-supplied `program` to the absolute, canonical binary
-/// that will actually run (fix round A, finding F2 / rulings
-/// W1-R56/W1-R57) — this value, not the raw model string, is what
-/// [`task_params_for`] puts into `ParsedCommand.program`, so policy judges
-/// the real binary rather than a string the model's own choice of `cwd`
-/// could silently redirect elsewhere.
+/// Resolves the model-supplied `program` to the absolute binary that will
+/// actually run (fix round A, finding F2 / rulings W1-R56/W1-R57; corrected
+/// in fix round B, finding I2 / ruling W1-R67) — this value, not the raw
+/// model string, is what [`task_params_for`] puts into
+/// `ParsedCommand.program`, so policy judges the real binary rather than a
+/// string the model's own choice of `cwd` could silently redirect
+/// elsewhere.
 ///
 /// Splits on shape (ruling W1-R56): `spawn_cancellable`'s `env_clear()`
 /// (fix round A, finding F1) removes `PATH` from the CHILD's own
@@ -300,22 +344,34 @@ fn resolve_shell_cwd(raw_cwd: &str) -> Result<PathBuf, ToolDispatchError> {
 /// resolving it against `cwd` would simply fail to find anything.
 /// - **Contains `/`:** joined against `canonical_cwd` (an already-absolute
 ///   `program` replaces the join entirely, matching `Path::join`'s own
-///   semantics) and canonicalized.
-///   - If the ORIGINAL string was relative (`./gradlew`,
-///     `node_modules/.bin/foo`), the canonicalized result is additionally
-///     required to stay inside the workspace root — this is exactly the
-///     vector F2 proved: the model's choice of `cwd` selecting which binary
-///     of a relative name actually runs.
-///   - If the original string was already absolute (`/usr/bin/git`), it is
-///     NOT additionally confined to the workspace root: its resolution
-///     never depended on `cwd` in the first place, so `cwd` gives the model
-///     no leverage over which binary a fully-qualified path names, and
-///     confining it would only break legitimate calls to system binaries
-///     with no corresponding security benefit. **Not spelled out verbatim
-///     in W1-R56/57's text — a deliberate, documented narrowing, flagged in
-///     the fix-round report.** (CF-16 itself only anticipates *relative*
-///     program allow-rules breaking, not absolute ones, which is consistent
-///     with this reading.)
+///   semantics), then resolved in TWO different ways for two different
+///   purposes (ruling W1-R67 — do not collapse these back into one):
+///   - **Containment check:** the join is FULLY canonicalized (every
+///     symlink resolved, including the final component) and required to be
+///     a regular file (M4). If the original string was relative
+///     (`./gradlew`, `node_modules/.bin/foo`), that fully-resolved target
+///     is additionally required to stay inside the workspace root — this
+///     is exactly the vector F2 proved: the model's choice of `cwd`
+///     selecting which binary of a relative name actually runs. An
+///     already-absolute original string (`/usr/bin/git`) is NOT confined to
+///     the workspace root: its resolution never depended on `cwd` in the
+///     first place, so `cwd` gives the model no leverage over which binary
+///     a fully-qualified path names, and confining it would only break
+///     legitimate calls to system binaries with no corresponding security
+///     benefit. (CF-16 itself only anticipates *relative* program
+///     allow-rules breaking, not absolute ones — consistent with this
+///     reading. Not spelled out verbatim in W1-R56/57's original text; a
+///     deliberate, documented narrowing.)
+///   - **The value actually returned:** the DIRECTORY portion of the join,
+///     canonicalized, with the ORIGINAL final path component preserved
+///     VERBATIM (never the fully-resolved target above). Canonicalizing the
+///     directory is what defeats a model-controlled `cwd`; preserving the
+///     final component is what keeps `is_interpreter`
+///     (`shell/interpreter.rs:30`) and `sealed_program`'s basename
+///     semantics intact — both match on basename, and resolving a symlinked
+///     final component (`python3` -> `/usr/bin/python3.14`) would silently
+///     defeat both once an operator followed CF-16 and rewrote a rule to
+///     the canonical path (finding I2).
 /// - **Bare name (no `/`):** resolved via the **daemon's own** `PATH`
 ///   (deterministic, never model-controlled) to an absolute path — mirrors
 ///   `roundhouse-mcp/src/transport/stdio.rs`'s `resolve_command` shape for
@@ -323,7 +379,10 @@ fn resolve_shell_cwd(raw_cwd: &str) -> Result<PathBuf, ToolDispatchError> {
 ///   judged is the binary that runs), reimplemented here rather than
 ///   reached across the crate boundary (that function is private and
 ///   `roundhouse-mcp` is out of this lane's charter for anything beyond the
-///   narrow, ruled `roundhouse-tools`/`roundhouse-store` additions).
+///   narrow, ruled `roundhouse-tools`/`roundhouse-store` additions). Never
+///   needed symlink resolution for F2 at all — a PATH lookup is under the
+///   daemon's own control, not the model's, so there is no cwd-smuggling
+///   vector for this branch to defend against.
 fn resolve_shell_program(
     raw_program: &str,
     canonical_cwd: &Path,
@@ -331,20 +390,72 @@ fn resolve_shell_program(
     if raw_program.contains('/') {
         let was_absolute = Path::new(raw_program).is_absolute();
         let joined = canonical_cwd.join(raw_program);
-        let canonical = joined.canonicalize().map_err(|e| {
+
+        // Fully resolve — following every symlink, including the final
+        // component — ONLY for the containment check below (fix round B,
+        // ruling W1-R67): a program whose ultimate target escapes the
+        // workspace root must still be rejected (e.g. `./shim` symlinked to
+        // something outside root) — that property must not be lost.
+        let fully_resolved = joined.canonicalize().map_err(|e| {
             ToolDispatchError::ShellProgramRejected(format!(
                 "program {raw_program:?} not accessible: {e}"
             ))
         })?;
+        // M4 (ruling W1-R69): a directory (or anything else that isn't a
+        // regular file) is never a valid program — `program="/"` must not
+        // silently pass containment and then fail confusingly at exec.
+        if !fully_resolved.is_file() {
+            return Err(ToolDispatchError::ShellProgramRejected(format!(
+                "program {raw_program:?} does not resolve to a regular file"
+            )));
+        }
         if !was_absolute {
             let root = workspace_root()?;
-            if !canonical.starts_with(&root) {
+            if !fully_resolved.starts_with(&root) {
                 return Err(ToolDispatchError::ShellProgramRejected(format!(
-                    "resolved program {canonical:?} is outside the workspace root {root:?}"
+                    "resolved program {fully_resolved:?} is outside the workspace root {root:?}"
                 )));
             }
         }
-        Ok(canonical)
+
+        // **The value actually returned is deliberately NOT `fully_resolved`
+        // above (fix round B, finding I2 / ruling W1-R67).** Canonicalizing
+        // the FULL path — including the final component — resolves
+        // symlinks, and both `is_interpreter` (`shell/interpreter.rs:30`)
+        // and `sealed_program` (`roundhouse-policy/src/sealed.rs`) match on
+        // BASENAME. Measured: `python3` canonicalizes to
+        // `/usr/bin/python3.14` and `awk` to `/usr/bin/gawk` on a real
+        // distro — `is_interpreter` on either canonical form is `false`.
+        // Storing the fully-resolved path in `ParsedCommand.program` would
+        // have meant that once an operator followed CF-16 and rewrote their
+        // rule to the canonical path, `python3 -c '<anything>'` would be
+        // admitted without `allow_interpreter` ever being set — a named
+        // §6.3 security control silently losing coverage as a side effect
+        // of the very fix meant to close a different hole. The same
+        // mechanism would let a distro shipping `sudo -> sudo-rs` evade
+        // `sealed_program`'s basename check identically.
+        //
+        // The fix: canonicalize only the DIRECTORY portion — this is what
+        // actually defeats a model-controlled `cwd` (F2's real mechanism
+        // has nothing to do with the final path component) — and preserve
+        // the ORIGINAL final path component verbatim, so basename-matching
+        // security controls keep seeing the name the model/operator
+        // actually used.
+        let file_name = joined.file_name().ok_or_else(|| {
+            ToolDispatchError::ShellProgramRejected(format!(
+                "program {raw_program:?} has no file name component"
+            ))
+        })?;
+        let parent = joined
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let canonical_parent = parent.canonicalize().map_err(|e| {
+            ToolDispatchError::ShellProgramRejected(format!(
+                "cannot resolve the directory containing program {raw_program:?}: {e}"
+            ))
+        })?;
+        Ok(canonical_parent.join(file_name))
     } else {
         let path_var = std::env::var_os("PATH").ok_or_else(|| {
             ToolDispatchError::ShellProgramRejected(
@@ -368,20 +479,44 @@ fn resolve_shell_program(
     }
 }
 
+/// The names of environment variables re-added to a dispatched shell's
+/// otherwise `env_clear()`'d environment (fix round A, finding F1; named
+/// const per fix round B, ruling W1-R69's allowlist-hardening item).
+///
+/// **The exclusion rule this list must never violate, stated so a future
+/// widening has something concrete to check itself against:** never add a
+/// name matching [`crate::session_actor::SECRET_ENV_NAME_SUFFIXES`]
+/// (`_KEY`/`_TOKEN`/`_SECRET`/`_PASSWORD`, case-insensitive), and never add
+/// a name whose live VALUE `session_actor::live_secret_values` collects for
+/// this session — [`shell_env_allowlist`] enforces the former with a
+/// `debug_assert!` so a careless future edit fails loudly in every test run
+/// rather than silently.
+///
+/// PATH-only **will** be widened eventually (a real-world consequence, not
+/// hypothetical: `git` cannot read `~/.gitconfig` and `cargo`/`npm` fail
+/// outright without `HOME`), and the risk named explicitly is that the
+/// inevitable next addition becomes something as broad as
+/// `envs(std::env::vars())` instead of one more named, reviewed entry.
+const SHELL_ENV_ALLOWLIST_NAMES: &[&str] = &["PATH"];
+
 /// The explicit, `env_clear()`-safe environment allowlist for a dispatched
-/// shell call (fix round A, finding F1) — copies the shape
+/// shell call — copies the shape
 /// `roundhouse-mcp/src/transport/stdio.rs:119`'s `build_command` already
 /// uses ("explicit allowlist only, never inherits the daemon's own env").
-/// **Contains exactly `PATH`, read from the daemon's own environment, and
-/// nothing else** — the minimal addition `resolve_shell_program`'s bare-name
-/// branch needs to keep working post-`env_clear()` (ruling W1-R56), chosen
-/// deliberately narrow: every other env var (`ANTHROPIC_API_KEY` among them
-/// — the exact finding F1 reproduced) is a daemon secret or daemon-internal
-/// detail the dispatched child has no legitimate need for.
+/// Built from [`SHELL_ENV_ALLOWLIST_NAMES`] — see that const's doc comment
+/// for the exclusion rule this function asserts against on every call.
 fn shell_env_allowlist() -> Vec<(String, String)> {
     let mut env = Vec::new();
-    if let Some(path) = std::env::var_os("PATH") {
-        env.push(("PATH".to_string(), path.to_string_lossy().to_string()));
+    for name in SHELL_ENV_ALLOWLIST_NAMES {
+        debug_assert!(
+            !crate::session_actor::is_secret_env_var_name(name),
+            "SHELL_ENV_ALLOWLIST_NAMES contains {name:?}, which looks like a declared-secret \
+             env var name — see that const's own doc comment for the exclusion rule this \
+             violates"
+        );
+        if let Some(value) = std::env::var_os(name) {
+            env.push(((*name).to_string(), value.to_string_lossy().to_string()));
+        }
     }
     env
 }
@@ -559,6 +694,15 @@ pub async fn execute_builtin(
     }
 }
 
+/// Bound on how many bytes of stdout/stderr each `run_shell_dispatch` call
+/// will buffer (fix round B, ruling W1-R66 + carry-forward CF-7 item 4).
+/// `AsyncReadExt::take` makes a capped read behave as if EOF were reached
+/// once the cap is hit, so this also participates in closing I1: a stream
+/// that keeps producing bytes forever now terminates on its own once it has
+/// produced this many, rather than only ever being bounded by the outer
+/// race.
+const MAX_SHELL_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Runs a dispatched `shell` call through `roundhouse_tools::spawn_cancellable`
 /// (never the uncancellable `run_shell` — fix round A, finding F6), racing
 /// its natural completion against `timeout` and, when `cancel` is `Some`,
@@ -568,11 +712,26 @@ pub async fn execute_builtin(
 /// returning [`ToolDispatchError::ShellCancelled`] — this function never
 /// reports success without the process having genuinely exited on its own.
 ///
-/// stdout/stderr are drained concurrently via spawned tasks
-/// ([`ShellHandle::take_stdio`]'s own doc comment explains why: `wait`
-/// alone never reads the pipes, so a chatty child could deadlock against a
-/// full OS pipe buffer while this function is busy racing the other two
-/// conditions instead of reading).
+/// **Fix round B, ruling W1-R66 (finding I1 — F6 was NOT actually closed):**
+/// the direct child's own exit is not proof that its output is fully
+/// buffered — a backgrounded grandchild that inherits the piped stdout/
+/// stderr fds (e.g. `sh -c "sleep 900 & exit 0"`) keeps those pipes open
+/// long after `wait()` resolves, and `read_to_end` does not return until
+/// *every* writer closes. The previous version awaited the stdout/stderr
+/// drain **inside** the `handle.wait()` branch body — i.e. AFTER the outer
+/// `select!` had already committed to that branch — so once the direct
+/// child exited, neither `sleep(timeout)` nor the cancellation watch could
+/// still preempt the drain. Reproduced: such a script left this dispatch
+/// running at 146s against a 120s `SHELL_TIMEOUT`, with the grandchild
+/// never signalled. The fix: `wait()` and both drains are now one single
+/// future (`tokio::join!` inside `completion`, below), so racing that ONE
+/// future against `timeout`/cancellation in the outer `select!` preempts
+/// the drain exactly the same way it already preempted `wait()` — dropping
+/// `completion` when a sibling branch wins drops the in-progress drains
+/// too. The size cap ([`MAX_SHELL_OUTPUT_BYTES`]) is a second, independent
+/// bound: even within the allotted window, a stream that never closes but
+/// keeps producing bytes now terminates on its own once capped, rather
+/// than depending solely on the outer race.
 async fn run_shell_dispatch(
     program: &str,
     argv: &[String],
@@ -583,28 +742,30 @@ async fn run_shell_dispatch(
 ) -> Result<roundhouse_tools::ShellOutput, ToolDispatchError> {
     let mut handle = roundhouse_tools::spawn_cancellable(program, argv, cwd, env).await?;
     let (stdout, stderr) = handle.take_stdio();
-    let stdout_task = tokio::spawn(drain_to_end(stdout));
-    let stderr_task = tokio::spawn(drain_to_end(stderr));
 
     let mut cancel = cancel;
+    let completion = async {
+        // A single future combining wait() with BOTH drains — see this
+        // function's own doc comment for why this must be one future, not
+        // three raced independently. `join!` polls all three concurrently
+        // (never sequentially), which is also what avoids a chatty child
+        // deadlocking against a full OS pipe buffer while `wait()` alone is
+        // being awaited.
+        let (status, stdout, stderr) = tokio::join!(
+            handle.wait(),
+            drain_to_end(stdout, MAX_SHELL_OUTPUT_BYTES),
+            drain_to_end(stderr, MAX_SHELL_OUTPUT_BYTES),
+        );
+        status.map(|status| roundhouse_tools::ShellOutput {
+            stdout,
+            stderr,
+            exit_code: status.code(),
+        })
+    };
+
     let cancel_reason = tokio::select! {
-        result = handle.wait() => {
-            return match result {
-                Ok(status) => {
-                    // A panic in a plain read-to-end loop is not expected;
-                    // treat a lost reader task the same as "read nothing"
-                    // rather than propagating a JoinError through a shell
-                    // result the model is waiting on.
-                    let stdout = stdout_task.await.unwrap_or_default();
-                    let stderr = stderr_task.await.unwrap_or_default();
-                    Ok(roundhouse_tools::ShellOutput {
-                        stdout,
-                        stderr,
-                        exit_code: status.code(),
-                    })
-                }
-                Err(e) => Err(ToolDispatchError::Tool(e)),
-            };
+        result = completion => {
+            return result.map_err(ToolDispatchError::Tool);
         }
         () = tokio::time::sleep(timeout) => {
             format!("exceeded its {timeout:?} wall-clock bound")
@@ -642,14 +803,17 @@ async fn wait_for_session_cancel(cancel: &mut Option<watch::Receiver<SessionStat
     }
 }
 
-/// Reads a piped child stdio handle to the end, or returns an empty buffer
-/// if the pipe was never present (stdio wasn't piped, or `take_stdio` was
-/// never called) — never fails the whole dispatch over a drain error.
-async fn drain_to_end<R: tokio::io::AsyncRead + Unpin>(io: Option<R>) -> Vec<u8> {
+/// Reads a piped child stdio handle to the end (or up to `cap` bytes,
+/// whichever comes first — see [`MAX_SHELL_OUTPUT_BYTES`]), or returns an
+/// empty buffer if the pipe was never present (stdio wasn't piped, or
+/// `take_stdio` was never called) — never fails the whole dispatch over a
+/// drain error.
+async fn drain_to_end<R: tokio::io::AsyncRead + Unpin>(io: Option<R>, cap: u64) -> Vec<u8> {
     let mut buf = Vec::new();
-    if let Some(mut io) = io {
+    if let Some(io) = io {
         use tokio::io::AsyncReadExt;
-        let _ = io.read_to_end(&mut buf).await;
+        let mut limited = io.take(cap);
+        let _ = limited.read_to_end(&mut buf).await;
     }
     buf
 }
@@ -810,6 +974,60 @@ mod tests {
         );
     }
 
+    /// Fix round B, finding I2 (ruling W1-R67): resolving a relative
+    /// program name must NOT resolve a symlink in the final component —
+    /// `python3 -> python3.14` (or any interpreter-shaped basename symlink
+    /// to a differently-named real binary) must still be admitted, and
+    /// still judged, as `python3` — never silently rewritten to a name
+    /// `is_interpreter`/`sealed_program`'s basename checks no longer
+    /// recognize.
+    #[test]
+    fn task_params_for_shell_preserves_the_final_component_across_a_symlink_but_still_contains_its_directory(
+    ) {
+        let dir = workspace_temp_dir();
+        // The symlink's TARGET has a completely different basename —
+        // proving the returned program name comes from the ORIGINAL
+        // string, not from resolving the link.
+        let real_binary = dir.path().join("real-interpreter-binary");
+        std::fs::write(&real_binary, "not a real binary").unwrap();
+        let symlink_path = dir.path().join("python3");
+        std::os::unix::fs::symlink(&real_binary, &symlink_path).unwrap();
+
+        let (params, _extras) = task_params_for(
+            TaskKind::Shell,
+            &serde_json::json!({
+                "program": "./python3",
+                "argv": ["-c", "print('hi')"],
+                "cwd": dir.path().to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let TaskParams::Shell(cmd) = params else {
+            panic!("expected TaskParams::Shell");
+        };
+        assert_eq!(
+            Path::new(&cmd.program).file_name().and_then(|n| n.to_str()),
+            Some("python3"),
+            "the final path component must be preserved verbatim across a symlink, not \
+             resolved to the link's target basename — got {:?}",
+            cmd.program
+        );
+        assert!(
+            roundhouse_policy::shell::interpreter::is_interpreter(&cmd.program),
+            "is_interpreter must still recognize this as `python3` after resolution, not \
+             `real-interpreter-binary` — got {:?}",
+            cmd.program
+        );
+        // The directory portion must still be the real, canonical one
+        // (this is what actually defeats a model-controlled cwd — the
+        // point of resolving at all).
+        assert_eq!(
+            Path::new(&cmd.program).parent(),
+            Some(dir.path().canonicalize().unwrap().as_path())
+        );
+    }
+
     #[test]
     fn task_params_for_shell_cwd_outside_the_workspace_root_is_rejected() {
         // fix round A, finding F2 / ruling W1-R58: a cwd escaping the
@@ -825,6 +1043,26 @@ mod tests {
             matches!(err, ToolDispatchError::ShellCwdRejected(_)),
             "expected ShellCwdRejected, got {err:?}"
         );
+    }
+
+    /// Fix round B, finding I3 (ruling W1-R68): a workspace root of `/`
+    /// makes every containment `starts_with` check vacuously true — this is
+    /// not a contrived setup (a systemd unit with no `WorkingDirectory=`
+    /// defaults to `/`) — so it must fail closed rather than silently
+    /// degrade to no boundary at all.
+    #[test]
+    fn a_workspace_root_of_slash_is_rejected_outright() {
+        let err = reject_root_of_slash(PathBuf::from("/")).unwrap_err();
+        assert!(matches!(
+            err,
+            ToolDispatchError::WorkspaceRootUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_workspace_root_is_accepted() {
+        let root = reject_root_of_slash(PathBuf::from("/tmp")).unwrap();
+        assert_eq!(root, PathBuf::from("/tmp"));
     }
 
     #[test]
@@ -990,6 +1228,72 @@ mod tests {
         assert!(
             matches!(result, Err(ToolDispatchError::ShellCancelled(_))),
             "a runaway process must be cancelled and reported, got {result:?}"
+        );
+    }
+
+    /// Fix round B, finding I1 (ruling W1-R66): the round-A fix for F6 only
+    /// raced `handle.wait()` against the timeout/cancellation — the
+    /// stdout/stderr drain ran AFTER that race had already resolved, so a
+    /// direct child that exits quickly but backgrounds a grandchild
+    /// inheriting the piped stdio (an entirely ordinary shape: "start a dev
+    /// server in the background") left the drain blocked on that
+    /// grandchild's still-open pipe long past the wall-clock bound —
+    /// reproduced pre-fix at 146s against a 120s timeout. This is the exact
+    /// reproduction, scaled down: the direct `sh` exits in milliseconds,
+    /// but a backgrounded `sleep 30` inherits the piped stdout/stderr, so
+    /// pre-fix this test would take ~30s; post-fix it must return within a
+    /// few hundred milliseconds of the timeout.
+    #[tokio::test]
+    async fn execute_builtin_shell_is_bounded_even_when_a_backgrounded_grandchild_outlives_the_direct_child(
+    ) {
+        let dir = workspace_temp_dir();
+        let env = shell_env_allowlist();
+        let pid_file = dir.path().join("grandchild.pid");
+
+        let start = std::time::Instant::now();
+        let result = run_shell_dispatch(
+            "sh",
+            &[
+                "-c".to_string(),
+                format!("sleep 30 & echo $! > {} ; exit 0", pid_file.display()),
+            ],
+            dir.path(),
+            &env,
+            Duration::from_millis(300),
+            None,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(ToolDispatchError::ShellCancelled(_))),
+            "must report cancellation, not silently hang or succeed, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must return promptly once the wall-clock bound is exceeded, not block on a \
+             backgrounded grandchild's still-open pipe — took {elapsed:?}"
+        );
+
+        // Confirm the grandchild was actually killed too, not just that
+        // this function returned — cancel_running_shell's whole point is
+        // process-GROUP-wide cancellation, not merely "stop waiting."
+        for _ in 0..50 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the backgrounded grandchild must have written its pid")
+            .trim()
+            .parse()
+            .expect("pid file must contain a valid pid");
+        tokio::time::sleep(Duration::from_millis(300)).await; // let SIGKILL land
+        assert!(
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_err(),
+            "the backgrounded grandchild must be killed along with the rest of the process \
+             group, not left running"
         );
     }
 

@@ -949,3 +949,85 @@ async fn a_mcp_shaped_tool_call_is_recorded_as_a_real_attempt_even_though_it_is_
         "the refusal must be recorded as a real TaskFailed, not left dangling"
     );
 }
+
+/// Fix round B, ruling W1-R53/W1-R64: a dispatched tool call's `TaskCreated`
+/// must be a real CHILD of the chat turn that issued it — before this fix,
+/// every dispatched tool task was recorded with `parent: None`, making the
+/// session's task log a flat list rather than the queryable tree this
+/// repo's core bet (`AGENTS.md`) describes.
+#[tokio::test]
+async fn a_dispatched_tool_calls_task_is_a_real_child_of_the_chat_turn_that_issued_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("fixture.txt");
+    std::fs::write(&fixture, "hello from the fixture file").unwrap();
+
+    let (actor, _writer, db_path, session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            Outcome::Allow,
+            Predicate::FsPrefix {
+                op: FsOp::Read,
+                prefix: dir.path().canonicalize().unwrap(),
+            },
+        )],
+    )
+    .await;
+
+    let tools = actor.tool_defs().to_vec();
+    let provider = ScriptedToolCallProvider::new(
+        "read",
+        serde_json::json!({ "path": fixture.to_string_lossy() }),
+    );
+    let ctx = fake_ctx();
+
+    run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    let reopened = open(&db_path).await.unwrap();
+    let events = session_events(&reopened, session_id).await.unwrap();
+
+    let chat_task_id = events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::TaskCreated {
+                kind: TaskKind::Chat,
+                ..
+            } => e.task_id,
+            _ => None,
+        })
+        .expect("a chat task must have been recorded");
+
+    let read_task_parent = events
+        .iter()
+        .find_map(|e| match &e.payload {
+            EventPayload::TaskCreated {
+                kind: TaskKind::Read,
+                parent,
+                ..
+            } => Some(*parent),
+            _ => None,
+        })
+        .expect("a read task must have been recorded");
+
+    assert_eq!(
+        read_task_parent,
+        Some(chat_task_id),
+        "the dispatched read task's parent must be the chat turn that issued it, not None"
+    );
+}
