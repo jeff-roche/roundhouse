@@ -16,7 +16,8 @@
 //! (currently unwired) integration status.
 
 use roundhouse_core::{
-    Delta, EventPayload, NoteLevel, SessionId, TaskError, TaskId, TaskRunner, Timestamp,
+    Delta, EventPayload, NoteLevel, SessionId, TaskError, TaskId, TaskInput, TaskOutput,
+    TaskRunner, Timestamp,
 };
 
 use crate::pool::StorePool;
@@ -95,25 +96,42 @@ impl Redactor {
         (out, count)
     }
 
-    /// Covers exactly three fields today: `TaskDelta{delta: Delta::Text}` (streamed
-    /// model/tool text output), `Note.text`, and `TaskFailed.error.message` (an error
-    /// message that quotes back part of the failing input, e.g. a shell command).
+    /// Covers six fields as of fix round A (Phase 7, Task 5): `TaskDelta{delta:
+    /// Delta::Text}` (streamed model/tool text output), `Note.text`,
+    /// `TaskFailed.error.message` (an error message that quotes back part of the
+    /// failing input, e.g. a shell command), `TaskCreated.input` (both
+    /// `TaskInput::Text` and, recursively over every string leaf, `TaskInput::Json` —
+    /// see [`Self::redact_json_value`]), and `TaskCompleted.output` (both
+    /// `TaskOutput::Text` and, likewise recursively, `TaskOutput::Json`).
+    ///
+    /// **`TaskCreated`/`TaskCompleted` expansion, and why now:** the original version
+    /// of this doc comment listed both as an open gap, "not exploitable ... only
+    /// because current production code doesn't yet emit real text into most of these
+    /// fields." `roundhouse-engine`'s agent-loop dispatch (`agent_loop.rs`'s
+    /// `dispatch_builtin`) is exactly that follow-up: it records a model's raw tool-call
+    /// arguments as `TaskInput::Json` (whole file contents on `write`, for instance) and
+    /// a tool's result as `TaskOutput::Text` (full command stdout/stderr on `shell`) —
+    /// real, model-influenced free text landing in this append-only, unscrubbable log
+    /// for the first time. This closes that gap for those two fields.
+    ///
+    /// **Object KEYS in a `TaskInput`/`TaskOutput::Json` value are NOT redacted, only
+    /// string VALUES (recursively, through arrays and nested objects).** Every built-in
+    /// tool call's JSON keys are this codebase's own fixed field names (`"path"`,
+    /// `"contents"`, `"find"`, `"replace"`, `"root"`, `"pattern"`, `"program"`, `"argv"`,
+    /// `"cwd"`) — never model-echoed content a live secret could appear in — so
+    /// redacting keys would cost real correctness (a key literally matching a live
+    /// secret substring would corrupt the JSON's own shape) for no coverage benefit
+    /// against the actual threat (a secret value the model echoes back verbatim).
     ///
     /// **Known, tracked gap — NOT a safety property, just an honest inventory of what's
-    /// unprotected today:** every other `EventPayload` field that can carry free text
-    /// passes through completely unredacted (redaction count 0), including
-    /// `TaskCreated.input` (a task's actual prompt/command, when `TaskInput::Text`),
-    /// `TaskCompleted.output` (a task's actual output, same shape), `Delta::Thinking.text`,
-    /// `Delta::ToolArgs.fragment`, `Delta::Stdout`/`Delta::Stderr` (raw byte arrays —
-    /// substring text-matching doesn't apply to them the same way and would need a
-    /// different approach), `TaskFailed.error.category`, `Message{envelope}`,
-    /// `SessionStateChanged.reason`, `TaskSuspended.reason`, and `SessionCreated.spec`. A
-    /// live secret in any of those fields reaches the append-only log unredacted and
-    /// permanently, the moment something actually writes real (non-empty, non-placeholder)
-    /// text into them. Not exploitable in the shipped daemon today only because current
-    /// production code doesn't yet emit real text into most of these fields — expanding
-    /// coverage to close this gap is real follow-up work, not something this method's
-    /// current match arms claim to already handle.
+    /// still unprotected:** `Delta::Thinking.text`, `Delta::ToolArgs.fragment`,
+    /// `Delta::Stdout`/`Delta::Stderr` (raw byte arrays — substring text-matching
+    /// doesn't apply to them the same way and would need a different approach),
+    /// `TaskFailed.error.category`, `Message{envelope}`, `SessionStateChanged.reason`,
+    /// `TaskSuspended.reason`, and `SessionCreated.spec` still pass through completely
+    /// unredacted. A live secret in any of those fields reaches the append-only log
+    /// unredacted and permanently, the moment something actually writes real
+    /// (non-empty, non-placeholder) text into them.
     pub fn redact_event_payload(&self, payload: EventPayload) -> (EventPayload, u32) {
         match payload {
             EventPayload::TaskDelta {
@@ -150,11 +168,95 @@ impl Redactor {
                     n,
                 )
             }
+            EventPayload::TaskCreated {
+                kind,
+                parent,
+                origin,
+                input,
+            } => {
+                let (input, n) = match input {
+                    TaskInput::Text(text) => {
+                        let (redacted, n) = self.redact(&text);
+                        (TaskInput::Text(redacted), n)
+                    }
+                    TaskInput::Json(value) => {
+                        let (redacted, n) = self.redact_json_value(value);
+                        (TaskInput::Json(redacted), n)
+                    }
+                    // No text to scan in a blob reference (it's a content
+                    // hash + size, not inline text).
+                    other @ TaskInput::Blob(_) => (other, 0),
+                };
+                (
+                    EventPayload::TaskCreated {
+                        kind,
+                        parent,
+                        origin,
+                        input,
+                    },
+                    n,
+                )
+            }
+            EventPayload::TaskCompleted { output, usage } => {
+                let (output, n) = match output {
+                    TaskOutput::Text(text) => {
+                        let (redacted, n) = self.redact(&text);
+                        (TaskOutput::Text(redacted), n)
+                    }
+                    TaskOutput::Json(value) => {
+                        let (redacted, n) = self.redact_json_value(value);
+                        (TaskOutput::Json(redacted), n)
+                    }
+                    other @ TaskOutput::Blob(_) => (other, 0),
+                };
+                (EventPayload::TaskCompleted { output, usage }, n)
+            }
             // `EventPayload::Loss.description` will carry provider error text once
             // Phase 7 Task 13b fills it in — exactly the free-text shape this method
             // exists to protect. Nothing constructs `Loss` yet, so no redaction arm is
             // added here in this commit; Task 13b must route it through `self.redact`
             // the same way `TaskFailed.error.message` is above, not let it fall through.
+            other => (other, 0),
+        }
+    }
+
+    /// Recursively redacts every string LEAF in a `serde_json::Value` — object/array
+    /// structure and non-string scalars (numbers, bools, null) pass through unchanged,
+    /// and object KEYS are deliberately never touched (see
+    /// [`Self::redact_event_payload`]'s doc comment for why). Used for
+    /// `TaskInput`/`TaskOutput::Json`, the two JSON-carrying payload shapes this
+    /// module's Aho-Corasick substring automaton needs to reach inside of rather than
+    /// skip over.
+    fn redact_json_value(&self, value: serde_json::Value) -> (serde_json::Value, u32) {
+        match value {
+            serde_json::Value::String(s) => {
+                let (redacted, n) = self.redact(&s);
+                (serde_json::Value::String(redacted), n)
+            }
+            serde_json::Value::Array(items) => {
+                let mut total = 0u32;
+                let redacted = items
+                    .into_iter()
+                    .map(|v| {
+                        let (v, n) = self.redact_json_value(v);
+                        total += n;
+                        v
+                    })
+                    .collect();
+                (serde_json::Value::Array(redacted), total)
+            }
+            serde_json::Value::Object(map) => {
+                let mut total = 0u32;
+                let redacted = map
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let (v, n) = self.redact_json_value(v);
+                        total += n;
+                        (k, v)
+                    })
+                    .collect();
+                (serde_json::Value::Object(redacted), total)
+            }
             other => (other, 0),
         }
     }

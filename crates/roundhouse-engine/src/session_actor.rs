@@ -333,6 +333,21 @@ impl SessionActor {
         self.session_id
     }
 
+    /// This session's `EventWriter`. A read-only getter over an
+    /// already-private field (fix round A, ruling W1-R60's writer-mismatch
+    /// hazard): before this accessor existed, `run_agent_loop` took its own
+    /// `writer` parameter independently of this actor's own, with nothing
+    /// checking the two were the same instance — a caller could pass one
+    /// whose `set_redactor` was never called, silently un-redacting every
+    /// event the loop appends. `run_agent_loop` now sources its writer from
+    /// here instead of accepting a second, independently-suppliable one, so
+    /// the mismatch is structurally unrepresentable rather than merely
+    /// asserted against. Cheap to clone (`EventWriter` wraps an
+    /// `mpsc::Sender` + `Arc<ArcSwap<Redactor>>`).
+    pub fn writer(&self) -> &EventWriter {
+        &self.writer
+    }
+
     /// Builds the live `SealedContext` this session's tasks are judged
     /// against — the exact wiring finding 3's `sealed_tier_shortfall` check
     /// needed and never had before Task 25: reads the CURRENT isolation

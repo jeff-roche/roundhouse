@@ -106,6 +106,35 @@ pub struct ShellHandle {
     pgid: Pid,
 }
 
+impl ShellHandle {
+    /// Takes the child's piped stdout/stderr handles so a caller can drain
+    /// them concurrently with [`ShellHandle::wait`] (Fix round A, F6):
+    /// `wait` alone never reads these pipes, so a chatty child could fill
+    /// the OS pipe buffer and deadlock against a caller that isn't racing a
+    /// timeout/cancellation signal at the same time it's waiting for exit.
+    /// Must be called at most once, right after spawn, before `wait`/
+    /// `cancel_running_shell` — the underlying `Option`s are taken, not
+    /// cloned.
+    pub fn take_stdio(
+        &mut self,
+    ) -> (
+        Option<tokio::process::ChildStdout>,
+        Option<tokio::process::ChildStderr>,
+    ) {
+        (self.child.stdout().take(), self.child.stderr().take())
+    }
+
+    /// Waits for the process to exit and returns its exit status —
+    /// deliberately NOT `wait_with_output` (which takes `self` by value):
+    /// a caller racing this against a timeout/cancellation signal in
+    /// `tokio::select!` needs to retain `&mut self` afterward so it can
+    /// still call [`cancel_running_shell`] on the same handle if a
+    /// competing branch wins instead.
+    pub async fn wait(&mut self) -> Result<std::process::ExitStatus, ToolError> {
+        self.child.wait().await.map_err(ToolError::from)
+    }
+}
+
 /// How a cancelled [`ShellHandle`] actually stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitDisposition {
@@ -146,13 +175,31 @@ pub enum CancelError {
 /// never through a shell interpreter — into its own process group, and
 /// returns a [`ShellHandle`] that [`cancel_running_shell`] can later
 /// terminate.
+///
+/// **Fix round A (Phase 7, Task 5, findings F1/F6):** `env` is an explicit
+/// allowlist applied after `env_clear()` — the same shape
+/// `roundhouse-mcp/src/transport/stdio.rs`'s `build_command` already uses
+/// ("explicit allowlist only, never inherits the daemon's own env"). Before
+/// this fix, this function spawned with the daemon's FULL environment
+/// inherited (no `env_clear()` at all), which is exactly as leaky as
+/// `run_shell` was for the same `ANTHROPIC_API_KEY` reproduction. stdout and
+/// stderr are now piped (previously unset/inherited) so a caller can capture
+/// them via [`ShellHandle::take_stdio`] — this handle has no other way to
+/// report a completed process's output back to a caller.
 pub async fn spawn_cancellable(
     program: &str,
     argv: &[String],
     cwd: &Path,
+    env: &[(String, String)],
 ) -> Result<ShellHandle, ToolError> {
     let mut wrap = CommandWrap::with_new(program, |command| {
-        command.args(argv).current_dir(cwd);
+        command
+            .args(argv)
+            .current_dir(cwd)
+            .env_clear()
+            .envs(env.iter().cloned())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
     });
     wrap.wrap(KillOnDrop).wrap(ProcessGroup::leader());
 

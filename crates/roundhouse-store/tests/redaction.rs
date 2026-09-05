@@ -322,3 +322,145 @@ async fn task_delta_with_no_prior_task_created_row_hard_errors_instead_of_silent
          not silently commit while dropping the redaction count"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Fix Round A (Phase 7, Task 5) — F3: TaskCreated.input / TaskCompleted.output coverage
+// ---------------------------------------------------------------------------------------
+
+/// F3: `TaskCreated.input` as `TaskInput::Json` — the shape
+/// `agent_loop.rs::dispatch_builtin` now emits for every dispatched tool call — must have
+/// its string VALUES redacted, recursively through nested objects/arrays, before it ever
+/// reaches the append-only log. Pre-fix, this event's whole `input` passed through
+/// `redact_event_payload`'s catch-all `other => (other, 0)` arm untouched.
+#[tokio::test]
+async fn task_created_json_input_is_redacted_recursively_through_nested_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+    writer.set_redactor(Redactor::build(&["sk-live-abc123".to_string()]));
+
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    writer
+        .append(RUNNER.record_task_created(
+            session_id,
+            0,
+            now_ts(),
+            task_id,
+            TaskKind::Write,
+            None,
+            Origin::Model,
+            TaskInput::Json(serde_json::json!({
+                "path": "/tmp/notes.txt",
+                "contents": "the key is sk-live-abc123 — keep it safe",
+                "nested": { "tags": ["public", "sk-live-abc123"] },
+            })),
+            1,
+        ))
+        .await
+        .unwrap();
+
+    let query_store = open(&db_path).await.unwrap();
+    let raw_row_text = debug_read_raw_payload_text(&query_store, session_id, task_id)
+        .await
+        .unwrap();
+    assert!(
+        !raw_row_text.contains("sk-live-abc123"),
+        "a live secret nested anywhere inside TaskInput::Json must never reach the stored \
+         row: {raw_row_text}"
+    );
+    assert!(
+        raw_row_text.contains("[REDACTED]"),
+        "the redacted placeholder must appear in its place: {raw_row_text}"
+    );
+    // The field name itself ("contents") is a fixed schema key, not model-echoed
+    // content — object keys are deliberately never redacted (see
+    // `Redactor::redact_event_payload`'s doc comment) — so it must survive verbatim.
+    assert!(
+        raw_row_text.contains("\"contents\""),
+        "object keys must survive untouched — only string VALUES are redacted: \
+         {raw_row_text}"
+    );
+}
+
+/// F3, the other half: `TaskCompleted.output` as `TaskOutput::Text` — what
+/// `dispatch_builtin` records for every completed builtin tool call, including a `shell`
+/// call's full captured stdout/stderr — must be redacted before it reaches the log.
+#[tokio::test]
+async fn task_completed_text_output_is_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+    writer.set_redactor(Redactor::build(&["sk-live-abc123".to_string()]));
+
+    let session_id = SessionId::new();
+    let task_id = create_task(&writer, session_id).await;
+
+    writer
+        .append(RUNNER.record_task_completed(
+            session_id,
+            0,
+            now_ts(),
+            task_id,
+            roundhouse_core::TaskOutput::Text(
+                "exit_code=Some(0)\nstdout:\nyour key is sk-live-abc123\nstderr:\n".into(),
+            ),
+            roundhouse_core::Usage::default(),
+            1,
+        ))
+        .await
+        .unwrap();
+
+    let query_store = open(&db_path).await.unwrap();
+    let raw_row_text = debug_read_raw_payload_text(&query_store, session_id, task_id)
+        .await
+        .unwrap();
+    assert!(
+        !raw_row_text.contains("sk-live-abc123"),
+        "a live secret in a completed task's captured output must never reach the stored \
+         row: {raw_row_text}"
+    );
+    assert!(raw_row_text.contains("[REDACTED]"), "got: {raw_row_text}");
+}
+
+/// F3: `TaskInput::Text` (the plain-string variant, not the `Json` shape) must also be
+/// covered — this closes the ORIGINAL doc comment's other named gap
+/// ("`TaskCreated.input` (a task's actual prompt/command, when `TaskInput::Text`)") in the
+/// same pass.
+#[tokio::test]
+async fn task_created_text_input_is_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+    writer.set_redactor(Redactor::build(&["sk-live-abc123".to_string()]));
+
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    writer
+        .append(RUNNER.record_task_created(
+            session_id,
+            0,
+            now_ts(),
+            task_id,
+            TaskKind::Chat,
+            None,
+            Origin::User,
+            TaskInput::Text("please use sk-live-abc123 to log in".into()),
+            1,
+        ))
+        .await
+        .unwrap();
+
+    let query_store = open(&db_path).await.unwrap();
+    let raw_row_text = debug_read_raw_payload_text(&query_store, session_id, task_id)
+        .await
+        .unwrap();
+    assert!(
+        !raw_row_text.contains("sk-live-abc123"),
+        "got: {raw_row_text}"
+    );
+    assert!(raw_row_text.contains("[REDACTED]"), "got: {raw_row_text}");
+}

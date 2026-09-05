@@ -80,12 +80,22 @@ use roundhouse_store::EventWriter;
 /// `ToolUse` cannot spin the loop forever.
 pub struct AgentLoopConfig {
     pub max_turns: u32,
+    /// Fix round A, SHOULD item F7: `max_turns` bounds provider round-trips
+    /// only — a single response carrying an unbounded number of `ToolUse`
+    /// blocks would otherwise dispatch all of them within one turn. Each
+    /// call is still individually gated through `admit_task` (this is a
+    /// resource bound, not an authorization gap — nothing here weakens
+    /// admission), but an unbounded fan-out per turn is its own
+    /// resource-exhaustion vector this ceiling closes.
+    pub max_tool_calls_per_turn: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentLoopError {
     #[error("chat turn failed: {0}")]
     Chat(#[from] crate::chat::AgentError),
+    #[error("one turn issued {0} tool calls, exceeding the per-turn ceiling of {1}")]
+    TooManyToolCallsInOneTurn(usize, u32),
     #[error("exceeded the maximum number of tool-call turns ({0}) in one agent loop")]
     MaxTurnsExceeded(u32),
 }
@@ -112,9 +122,18 @@ fn now_ts() -> Timestamp {
 /// dispatched tool's `ToolResult`), not just the final turn's blocks — so a
 /// denial or an intermediate tool result is visible to the caller even when
 /// the loop goes on to a further turn afterward.
+///
+/// **No separate `writer` parameter (fix round A, ruling W1-R60):** every
+/// append this loop makes goes through `actor.writer()` — the session's own
+/// `EventWriter` — rather than a second, independently-suppliable one. An
+/// earlier version took `writer: &EventWriter` as its own parameter with
+/// nothing checking it was the same instance `actor` was constructed with;
+/// a caller could pass one whose `set_redactor` was never called, silently
+/// un-redacting every event this loop appends. Sourcing it from `actor`
+/// makes that mismatch structurally unrepresentable instead of merely
+/// asserted against.
 pub async fn run_agent_loop(
     actor: &SessionActor,
-    writer: &EventWriter,
     runner: &TaskRunner,
     provider: &dyn Provider,
     ctx: &RequestCtx,
@@ -123,6 +142,7 @@ pub async fn run_agent_loop(
     mut request: ChatRequest,
     config: AgentLoopConfig,
 ) -> Result<Vec<ContentBlock>, AgentLoopError> {
+    let writer = actor.writer();
     request.tools = tools.to_vec();
     let mut turns: u32 = 0;
     let mut transcript: Vec<ContentBlock> = Vec::new();
@@ -158,25 +178,42 @@ pub async fn run_agent_loop(
         if turns > config.max_turns {
             return Err(AgentLoopError::MaxTurnsExceeded(config.max_turns));
         }
+        if tool_uses.len() as u64 > u64::from(config.max_tool_calls_per_turn) {
+            return Err(AgentLoopError::TooManyToolCallsInOneTurn(
+                tool_uses.len(),
+                config.max_tool_calls_per_turn,
+            ));
+        }
 
         let mut tool_results = Vec::with_capacity(tool_uses.len());
         for (id, name, input) in tool_uses {
             let outcome = dispatch_one_tool_call(actor, writer, runner, mcp, &name, &input).await;
-            let block = match outcome {
-                Ok(content) => ContentBlock::ToolResult {
-                    tool_use_id: id,
-                    content,
-                    is_error: false,
-                    cache: None,
-                },
-                Err(message) => ContentBlock::ToolResult {
-                    tool_use_id: id,
-                    content: vec![ToolResultPart { text: message }],
-                    is_error: true,
-                    cache: None,
-                },
+            let (content, is_error) = match outcome {
+                Ok(content) => (content, false),
+                Err(message) => (vec![ToolResultPart { text: message }], true),
             };
-            tool_results.push(block);
+            // Fix round A, ruling W1-R59 ("redact, don't ask" — the `Ask`
+            // escalation the frozen `SecretLeak` behavior calls for needs
+            // lane W5's approval hook, out of this lane's charter): every
+            // tool result is scanned through the SAME live redactor this
+            // session's own `EventWriter` already applies at the
+            // persistence boundary, BEFORE it is folded into the next
+            // turn's `request.messages` — the direct path a leaked secret
+            // (e.g. F1's `ANTHROPIC_API_KEY` reproduction) would otherwise
+            // cross the network boundary to the provider on the very next
+            // call.
+            let content: Vec<ToolResultPart> = content
+                .into_iter()
+                .map(|part| ToolResultPart {
+                    text: writer.redact_outbound(&part.text).0,
+                })
+                .collect();
+            tool_results.push(ContentBlock::ToolResult {
+                tool_use_id: id,
+                content,
+                is_error,
+                cache: None,
+            });
         }
 
         transcript.extend(tool_results.iter().cloned());
@@ -210,12 +247,86 @@ async fn dispatch_one_tool_call(
             dispatch_builtin(actor, writer, runner, kind, input).await
         }
         Some(ToolTarget::Mcp { namespaced_name }) => {
-            Err(mcp_dispatch_refusal(mcp, &namespaced_name))
+            let message = mcp_dispatch_refusal(mcp, &namespaced_name);
+            // Fix round A, SHOULD item F10 (audit asymmetry): a built-in
+            // denial mints a real TaskCreated/TaskFailed pair (see
+            // `dispatch_builtin`'s doc comment), but this MCP-refusal arm
+            // previously minted nothing at all — a model probing for MCP
+            // tool names left zero trace. `TaskKind::Mcp` is the honest
+            // categorization here (this IS a namespaced MCP-shaped tool
+            // call, just not one this dispatch can execute).
+            Err(record_unadmitted_refusal(
+                writer,
+                runner,
+                actor.session_id(),
+                TaskKind::Mcp,
+                input,
+                "mcp_not_wired",
+                message,
+            )
+            .await)
         }
-        None => Err(format!(
-            "unknown tool `{name}` — not in this session's tool catalog"
-        )),
+        None => {
+            // The unknown-tool case has no natural `TaskKind` to record
+            // under (unlike the MCP arm above) — recording it as some
+            // other kind would misclassify it, which is worse than the
+            // residual audit gap. Left as a named, deliberate partial (see
+            // fix round A's report) rather than guessed at.
+            Err(format!(
+                "unknown tool `{name}` — not in this session's tool catalog"
+            ))
+        }
     }
+}
+
+/// Records a refusal that never reached `admit_task` at all (no policy
+/// decision was made — there is nothing to gate here, only a real dispatch
+/// capability that doesn't exist) as a real `TaskCreated` followed
+/// unconditionally by `TaskFailed`, mirroring `dispatch_builtin`'s own
+/// "a refused call is still a real, queryable attempt" posture for the
+/// built-in arm.
+async fn record_unadmitted_refusal(
+    writer: &EventWriter,
+    runner: &TaskRunner,
+    session_id: roundhouse_core::SessionId,
+    kind: TaskKind,
+    input: &serde_json::Value,
+    category: &str,
+    message: String,
+) -> String {
+    let task_id = TaskId::new();
+    let created = runner.record_task_created(
+        session_id,
+        0,
+        now_ts(),
+        task_id,
+        kind,
+        None,
+        Origin::Model,
+        TaskInput::Json(input.clone()),
+        1,
+    );
+    if let Err(e) = writer.append(created).await {
+        tracing::warn!(error = %e, "failed to record TaskCreated for an unadmitted refusal");
+    }
+
+    let failed = runner.record_task_failed(
+        session_id,
+        0,
+        now_ts(),
+        task_id,
+        TaskError {
+            message: message.clone(),
+            category: category.into(),
+        },
+        false,
+        1,
+    );
+    if let Err(e) = writer.append(failed).await {
+        tracing::warn!(error = %e, "failed to record TaskFailed for an unadmitted refusal");
+    }
+
+    message
 }
 
 /// See this module's doc comment ("MCP arm: deliberately NOT wired") for the
@@ -260,7 +371,7 @@ async fn dispatch_builtin(
     kind: TaskKind,
     input: &serde_json::Value,
 ) -> Result<Vec<ToolResultPart>, String> {
-    let params =
+    let (params, extras) =
         crate::tool_dispatch::task_params_for(kind.clone(), input).map_err(|e| e.to_string())?;
 
     // S-LOG-1: mint and durably record the real task this dispatch is
@@ -323,7 +434,9 @@ async fn dispatch_builtin(
         .await
         .map_err(|e| format!("failed to record the dispatched tool call starting: {e}"))?;
 
-    match crate::tool_dispatch::execute_builtin(&params, input).await {
+    match crate::tool_dispatch::execute_builtin(&params, &extras, input, Some(actor.subscribe()))
+        .await
+    {
         Ok(parts) => {
             let summary = parts
                 .iter()

@@ -16,7 +16,9 @@ use roundhouse_core::{
 };
 use roundhouse_engine::agent_loop::{run_agent_loop, AgentLoopConfig, AgentLoopError};
 use roundhouse_engine::{tool_catalog, SessionActor};
-use roundhouse_policy::engine::{CompiledRule, Outcome, PolicyEngine, Predicate, Scope};
+use roundhouse_policy::engine::{
+    ArgMatcher, CompiledRule, Outcome, PolicyEngine, Predicate, Scope,
+};
 use roundhouse_policy::FsOp;
 use roundhouse_provider::{
     BlockDelta, BlockKind, BoxFut, Capabilities, ChatRequest, ChatStream, ContentBlock,
@@ -28,6 +30,8 @@ use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
 use roundhouse_sandbox::probe::{MechanismProbeReport, MechanismStatus};
 use roundhouse_sandbox::Isolate;
 use roundhouse_store::{open, session_events, spawn_writer};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// `TaskRunner::bootstrap()` panics on a second call per-process, and every
 /// test in this binary shares one process — one shared `&'static TaskRunner`
@@ -285,7 +289,7 @@ async fn a_model_issued_tool_use_is_admitted_dispatched_and_its_result_folded_ba
     let fixture = dir.path().join("fixture.txt");
     std::fs::write(&fixture, "hello from the fixture file").unwrap();
 
-    let (actor, writer, db_path, session_id) = new_actor(
+    let (actor, _writer, db_path, session_id) = new_actor(
         dir.path(),
         dir.path().join("state"),
         dir.path().join("daemon-binary"),
@@ -309,14 +313,16 @@ async fn a_model_issued_tool_use_is_admitted_dispatched_and_its_result_folded_ba
 
     let blocks = run_agent_loop(
         &actor,
-        &writer,
         &RUNNER,
         &provider,
         &ctx,
         &tools,
         None,
         empty_request(),
-        AgentLoopConfig { max_turns: 4 },
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
     )
     .await
     .unwrap();
@@ -380,7 +386,7 @@ async fn a_sealed_floor_denial_on_a_dispatched_tool_call_surfaces_as_a_tool_resu
     std::fs::create_dir_all(&state_dir).unwrap();
     let malicious_target = state_dir.join("events.db");
 
-    let (actor, writer, db_path, session_id) = new_actor(
+    let (actor, _writer, db_path, session_id) = new_actor(
         dir.path(),
         state_dir,
         dir.path().join("daemon-binary"),
@@ -400,14 +406,16 @@ async fn a_sealed_floor_denial_on_a_dispatched_tool_call_surfaces_as_a_tool_resu
 
     let blocks = run_agent_loop(
         &actor,
-        &writer,
         &RUNNER,
         &provider,
         &ctx,
         &tools,
         None,
         empty_request(),
-        AgentLoopConfig { max_turns: 4 },
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
     )
     .await
     .unwrap();
@@ -459,7 +467,7 @@ async fn max_turns_is_a_hard_ceiling_against_a_provider_that_never_stops_calling
     let fixture = dir.path().join("fixture.txt");
     std::fs::write(&fixture, "content").unwrap();
 
-    let (actor, writer, _db_path, _session_id) = new_actor(
+    let (actor, _writer, _db_path, _session_id) = new_actor(
         dir.path(),
         dir.path().join("state"),
         dir.path().join("daemon-binary"),
@@ -483,19 +491,461 @@ async fn max_turns_is_a_hard_ceiling_against_a_provider_that_never_stops_calling
 
     let result = run_agent_loop(
         &actor,
-        &writer,
         &RUNNER,
         &provider,
         &ctx,
         &tools,
         None,
         empty_request(),
-        AgentLoopConfig { max_turns: 3 },
+        AgentLoopConfig {
+            max_turns: 3,
+            max_tool_calls_per_turn: 10,
+        },
     )
     .await;
 
     assert!(
         matches!(result, Err(AgentLoopError::MaxTurnsExceeded(3))),
         "a provider that never stops calling tools must hit the hard ceiling, got {result:?}"
+    );
+}
+
+/// Fix round A, MUST item 3: the highest-consequence built-in (`shell`) had
+/// zero coverage through the real dispatch path — `tool_dispatch.rs`'s own
+/// `execute_builtin_shell_*` tests all call `execute_builtin` directly,
+/// bypassing `admit_task` entirely, and every `agent_loop_dispatch.rs` test
+/// above uses `FsPrefix{Read}`. These two tests drive a model `ToolUse{name:
+/// "shell"}` through `run_agent_loop` -> `admit_task` -> the real
+/// `spawn_cancellable`-based executor, for both an allowed and a denied
+/// case.
+///
+/// The workspace-root-contained fixture (a real, executable script inside a
+/// tempdir under this test binary's own `std::env::current_dir()`) exists
+/// because fix round A's `resolve_shell_cwd`/`resolve_shell_program`
+/// (`tool_dispatch.rs`) require a shell dispatch's `cwd` — and any relative
+/// `program` resolved against it — to stay inside the daemon's own working
+/// directory (ruling W1-R58); an ordinary `tempfile::tempdir()` under
+/// `/tmp` would be rejected before ever reaching `admit_task`.
+fn workspace_contained_script(
+    contents: &str,
+    name: &str,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let script = dir.path().join(name);
+    std::fs::write(&script, contents).unwrap();
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    (dir, script)
+}
+
+#[tokio::test]
+async fn a_model_issued_shell_tool_use_is_admitted_dispatched_through_the_real_gate() {
+    let (dir, script) =
+        workspace_contained_script("#!/bin/sh\necho shell-ran-for-real\n", "safe.sh");
+    // `task_params_for` resolves the model's relative `./safe.sh` against
+    // `cwd` to this exact canonical path — the config Allow rule below must
+    // match that resolved, canonicalized string (ruling W1-R57: policy
+    // judges the real binary, never the raw model string).
+    let canonical_script = script.canonicalize().unwrap();
+
+    let (actor, _writer, db_path, session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            Outcome::Allow,
+            Predicate::Shell {
+                program: canonical_script.to_string_lossy().to_string(),
+                matcher: ArgMatcher::ArgvPrefix(vec![]),
+                allow_interpreter: false,
+            },
+        )],
+    )
+    .await;
+
+    let tools = actor.tool_defs().to_vec();
+    let provider = ScriptedToolCallProvider::new(
+        "shell",
+        serde_json::json!({
+            "program": "./safe.sh",
+            "argv": [],
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let ctx = fake_ctx();
+
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        blocks.iter().any(|b| matches!(
+            b,
+            ContentBlock::ToolResult { is_error: false, content, .. }
+                if content.iter().any(|p| p.text.contains("shell-ran-for-real"))
+        )),
+        "the real script's stdout must come back as a non-error tool result, got {blocks:?}"
+    );
+
+    let reopened = open(&db_path).await.unwrap();
+    let events = session_events(&reopened, session_id).await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::TaskCreated {
+                kind: TaskKind::Shell,
+                ..
+            }
+        )),
+        "an admitted shell call must produce a real Shell task, not a bypass"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(&e.payload, EventPayload::TaskCompleted { .. })),
+        "the admitted shell call must complete, not just be created"
+    );
+}
+
+#[tokio::test]
+async fn a_model_issued_shell_tool_use_with_no_matching_policy_rule_is_denied_through_the_real_gate(
+) {
+    let (dir, _script) =
+        workspace_contained_script("#!/bin/sh\necho should-never-run\n", "unapproved.sh");
+
+    // Zero config rules: an unmatched TaskParams::Shell falls to the
+    // documented default (`Ask` -> refused, engine.rs's own "unattended
+    // default" framing) — the real admission gate denying a shell call
+    // nothing authorized, not a sealed-floor-specific case.
+    let (actor, _writer, db_path, session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+
+    let tools = actor.tool_defs().to_vec();
+    let provider = ScriptedToolCallProvider::new(
+        "shell",
+        serde_json::json!({
+            "program": "./unapproved.sh",
+            "argv": [],
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let ctx = fake_ctx();
+
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. })),
+        "a shell call with no matching policy rule must be denied as a real tool error, got \
+         {blocks:?}"
+    );
+
+    let reopened = open(&db_path).await.unwrap();
+    let events = session_events(&reopened, session_id).await.unwrap();
+    let shell_task_id = events
+        .iter()
+        .find(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::TaskCreated {
+                    kind: TaskKind::Shell,
+                    ..
+                }
+            )
+        })
+        .and_then(|e| e.task_id)
+        .expect("a denied shell call must still be recorded as a real, queryable TaskCreated");
+    // The session's chat/infer task pair also completes normally (the
+    // provider's second turn returns a final text block) — this assertion
+    // is scoped to the SHELL task's own id specifically, not "any
+    // TaskCompleted event in the session."
+    assert!(
+        !events.iter().any(|e| e.task_id == Some(shell_task_id)
+            && matches!(&e.payload, EventPayload::TaskCompleted { .. })),
+        "a denied shell call must never reach TaskCompleted — the script must never have run"
+    );
+}
+
+/// Fix round A, ruling W1-R59 ("redact, don't ask"): a dispatched tool's
+/// result must be scanned through the session's own live redactor BEFORE
+/// it is folded into the next turn's `request.messages` — the direct path
+/// F1's leaked-key reproduction would otherwise cross the network boundary
+/// to the provider. This drives a real `read` call whose file content is a
+/// registered live secret, and asserts the SECOND provider call (the one
+/// carrying the first call's tool result) never sees the raw secret.
+#[tokio::test]
+async fn a_leaked_secret_in_a_tool_result_is_redacted_before_it_reaches_the_next_provider_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret_file = dir.path().join("secret.txt");
+    let live_secret = "sk-ant-DAEMON-SECRET-abc123";
+    std::fs::write(&secret_file, live_secret).unwrap();
+
+    let (actor, writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            Outcome::Allow,
+            Predicate::FsPrefix {
+                op: FsOp::Read,
+                prefix: dir.path().canonicalize().unwrap(),
+            },
+        )],
+    )
+    .await;
+    writer.set_redactor(roundhouse_store::redact::Redactor::build(&[
+        live_secret.to_string()
+    ]));
+
+    let tools = actor.tool_defs().to_vec();
+    let provider = ScriptedToolCallProvider::new(
+        "read",
+        serde_json::json!({ "path": secret_file.to_string_lossy() }),
+    );
+    let ctx = fake_ctx();
+
+    run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the provider must be called exactly twice"
+    );
+    let second_request_text = requests[1]
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { content, .. } => Some(
+                content
+                    .iter()
+                    .map(|p| p.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !second_request_text.contains(live_secret),
+        "a live secret in a tool's result must never reach the next outbound provider \
+         request unredacted, got: {second_request_text:?}"
+    );
+    assert!(
+        second_request_text.contains("[REDACTED]"),
+        "the redaction placeholder must appear in its place, got: {second_request_text:?}"
+    );
+}
+
+/// A scripted `Provider` that returns `count` `ToolUse` blocks in a single
+/// turn — used to prove `max_tool_calls_per_turn` (fix round A, SHOULD item
+/// F7) bounds fan-out WITHIN one turn, independent of `max_turns`.
+struct ManyToolUsesInOneTurnProvider {
+    count: usize,
+}
+
+impl Provider for ManyToolUsesInOneTurnProvider {
+    fn capabilities(&self, _model: &ModelId) -> Capabilities {
+        Capabilities::default()
+    }
+    fn resolve(&self, _req: &ChatRequest) -> Result<Plan, ProviderError> {
+        Ok(Plan {
+            endpoint: "fake".into(),
+        })
+    }
+    fn stream_chat<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<ChatStream, ProviderError>> {
+        let count = self.count;
+        Box::pin(async move {
+            let mut events = Vec::new();
+            for i in 0..count {
+                events.push(StreamEvent::BlockStart {
+                    index: i as u32,
+                    kind: BlockKind::ToolUse {
+                        name: "read".to_string(),
+                        provider_id: Some(format!("call_{i}")),
+                    },
+                });
+                events.push(StreamEvent::BlockDelta {
+                    index: i as u32,
+                    delta: BlockDelta::ToolArgsFragment(
+                        serde_json::json!({ "path": "/nonexistent" }).to_string(),
+                    ),
+                });
+                events.push(StreamEvent::BlockStop { index: i as u32 });
+            }
+            events.push(StreamEvent::MessageStop);
+            Ok(ChatStream(Box::pin(stream::iter(events))))
+        })
+    }
+    fn count_tokens<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<TokenCount, ProviderError>> {
+        Box::pin(async { Ok(TokenCount::default()) })
+    }
+}
+
+#[tokio::test]
+async fn max_tool_calls_per_turn_is_a_hard_ceiling_independent_of_max_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let (actor, _writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+
+    let tools = actor.tool_defs().to_vec();
+    // 5 ToolUse blocks in the model's ONE turn, with a per-turn ceiling of 3
+    // — max_turns is generous (10) so only the per-turn cap can be what
+    // fires.
+    let provider = ManyToolUsesInOneTurnProvider { count: 5 };
+    let ctx = fake_ctx();
+
+    let result = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 10,
+            max_tool_calls_per_turn: 3,
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(AgentLoopError::TooManyToolCallsInOneTurn(5, 3))),
+        "5 tool calls in one turn must exceed a per-turn ceiling of 3, got {result:?}"
+    );
+}
+
+/// Fix round A, SHOULD item F10 (audit asymmetry): an MCP-shaped tool call
+/// must be recorded as a real, queryable attempt too, even though this
+/// dispatch cannot execute it (the MCP arm is deliberately unwired — see
+/// `agent_loop.rs`'s module doc comment). Before this fix, `mcp_dispatch_refusal`
+/// minted nothing at all.
+#[tokio::test]
+async fn a_mcp_shaped_tool_call_is_recorded_as_a_real_attempt_even_though_it_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (actor, _writer, db_path, session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+
+    let tools = actor.tool_defs().to_vec();
+    // "__" makes this resolve as an MCP-shaped namespaced tool name per
+    // `tool_catalog::resolve_tool_target`'s own invariant.
+    let provider = ScriptedToolCallProvider::new("github__search", serde_json::json!({}));
+    let ctx = fake_ctx();
+
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. })),
+        "an MCP-shaped call must still surface as a real tool error, got {blocks:?}"
+    );
+
+    let reopened = open(&db_path).await.unwrap();
+    let events = session_events(&reopened, session_id).await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::TaskCreated {
+                kind: TaskKind::Mcp,
+                ..
+            }
+        )),
+        "an MCP-shaped tool call must be recorded as a real, queryable TaskCreated even \
+         though the MCP arm refuses to dispatch it"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(&e.payload, EventPayload::TaskFailed { .. })),
+        "the refusal must be recorded as a real TaskFailed, not left dangling"
     );
 }
