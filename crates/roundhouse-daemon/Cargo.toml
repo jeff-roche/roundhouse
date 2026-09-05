@@ -82,6 +82,21 @@ tracing = { workspace = true }
 # below `0.3.20`, whose changelog reads "Fixed — Escape ANSI escape
 # sequences in logs (#3368)". Pinning one release below a log-injection fix
 # with no stated reason was itself part of the defect this round closes.
+#
+# **Correction (fix round 5, MUST 2): this bump is NOT a second layer of
+# defense on top of `NetworkConfigError::kind()`/`McpConfigError::kind()`.**
+# Proven directly against 0.3.23: `tracing::warn!(field = %hostile, "msg
+# {hostile}")` escapes the literal MESSAGE BODY text but passes a raw
+# `0x1b` byte straight through in a `field = %value`-style FIELD VALUE,
+# under both `with_ansi(true)` and `with_ansi(false)`. 0.3.20's fix covers
+# message-body interpolation only. This bump is still worth keeping (it is
+# strictly not worse, and does close the message-body case), but the
+# `kind()` discipline — never render a value that can carry attacker- or
+# operator-file-controlled bytes into ANY `tracing` field or message,
+# static strings only — is the ENTIRE defense for field values, not a
+# backstop this library provides. Treat that as a BINDING INVARIANT for
+# every new `tracing` call site in this workspace that touches a config- or
+# file-derived error, not merely a style preference.
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]

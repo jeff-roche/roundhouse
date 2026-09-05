@@ -33,4 +33,17 @@ tempfile = "3"
 # same reason (0.3.20 fixed an ANSI-escape log-injection issue; this crate
 # is testing that exact class of defect, so pinning below the fix here of
 # all places would be a real error, not just inconsistent).
+#
+# Correction (fix round 5, MUST 2): 0.3.20's fix escapes only a `tracing`
+# event's literal MESSAGE BODY text — proven directly that a raw `0x1b`
+# byte in a `field = %value`-style FIELD VALUE (e.g. `error = %err`) still
+# passes through verbatim under 0.3.23, regardless of `with_ansi`. This
+# module's own `the_real_log_call_site_never_emits_the_hostile_files_own_
+# bytes` test renders `error_kind = err.kind()` as a field, not the
+# message body — its passing is entirely because `err.kind()` never
+# carries hostile bytes to begin with (the `kind()` discipline), not
+# because this dependency escapes it. `kind()`-only rendering is a BINDING
+# INVARIANT for every new `tracing` call site touching a config- or
+# file-derived error in this workspace, not a style preference backed by
+# a library-level safety net.
 tracing-subscriber = "=0.3.23"

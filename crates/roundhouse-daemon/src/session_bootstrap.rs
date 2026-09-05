@@ -144,6 +144,8 @@ pub enum CreateRealSessionError {
     Session(#[from] CreateSessionError),
     #[error("starting this session's configured MCP servers failed: {0}")]
     Mcp(#[from] StartSessionMcpError),
+    #[error(transparent)]
+    ProxySecretsPoisoned(#[from] ProxySecretsPoisonedError),
 }
 
 /// The result of successfully constructing a real session: the actor
@@ -278,7 +280,19 @@ pub async fn create_real_session(
     // boundary with any one session (`LoopbackProxy::serve` runs once, at
     // boot, before any session exists) — refresh it to the UNION of every
     // live secret registered by any session so far, this one included.
-    register_proxy_secrets(resources, &request_ctx);
+    //
+    // Fix round 5, MUST 4: fails this session (rather than silently
+    // proceeding unredacted) on a poisoned `proxy_secrets` lock — tearing
+    // down the real isolation handle and proxy registration
+    // `create_session_with_egress` already built, the same shape the
+    // `start_session_mcp` failure branch below already uses (fix round 2,
+    // MUST 2). No `SessionActor` exists yet at this point to call
+    // `teardown()` on, so tear down directly.
+    if let Err(err) = register_proxy_secrets(resources, &request_ctx) {
+        let _ = resources.isolate.teardown(handle).await;
+        resources.proxy.deregister_session(proxy_handle.token());
+        return Err(err.into());
+    }
 
     // The set this session's `PolicyEngine` sealed-context provider reads
     // for `resolved_mcp_servers` — written to, below, by the exact same
@@ -413,33 +427,47 @@ fn egress_policy_for(resources: &DaemonResources) -> EgressPolicy {
 /// set here would silently un-redact an earlier session's secrets from the
 /// proxy's own event stream.
 ///
-/// # Fail-closed on a poisoned lock (fix round 3, MUST 4)
+/// # Fail-closed on a poisoned lock (fix round 3, MUST 4; corrected to fail
+/// CLOSED rather than fail OPEN in fix round 5)
 ///
 /// `create_real_session` calls this UNCONDITIONALLY, after
 /// `create_session_with_egress` has already succeeded — a real isolation
 /// handle and a real proxy registration both already exist by this point.
-/// The old `.lock().unwrap()` here would panic on a poisoned mutex,
+/// The original `.lock().unwrap()` here would panic on a poisoned mutex,
 /// unwinding out of `create_real_session` with no `SessionActor` yet built
 /// to call `teardown()` on — orphaning both, every time, for every future
 /// `CreateSession` this daemon process ever handles: a `std::sync::Mutex`
 /// stays poisoned forever once poisoned, so the very first panic here would
 /// have permanently broken session creation for the rest of the process's
-/// life. Matches `apply_resolved_mcp_servers`'s identical poisoned-lock
-/// handling (match-and-continue rather than panic) for the same reason —
-/// this session's own secrets (if any) simply don't get redacted from the
-/// shared proxy's traffic on that path, which is a narrower, session-scoped
-/// gap rather than a daemon-wide one.
-fn register_proxy_secrets(resources: &DaemonResources, ctx: &RequestCtx) {
+/// life. Fix round 3 replaced the panic with match-and-continue, matching
+/// `apply_resolved_mcp_servers`'s own poisoned-lock handling shape — but
+/// that sibling function fails CLOSED (denies the MCP task rather than
+/// admitting it unverified), while this one, on poison, PROCEEDED with the
+/// session anyway. That is fail-OPEN: this session's own
+/// `live_secret_values` (the provider API key, any MCP server `env`
+/// secrets) then never enter `resources.proxy_secrets`, silently, for
+/// every subsequent session too (the poisoned lock never un-poisons
+/// itself) — a real, if session-scoped, secret-leak risk through the
+/// shared egress proxy's own traffic, not merely "MCP redaction missing."
+/// Fixed: this now returns `Err` on a poisoned lock, and
+/// `create_real_session` routes that into the SAME teardown path fix
+/// round 2's MUST 2 built for `start_session_mcp`'s failure branch — the
+/// real isolation handle and proxy registration this call comes after are
+/// torn down rather than left running unredacted.
+fn register_proxy_secrets(
+    resources: &DaemonResources,
+    ctx: &RequestCtx,
+) -> Result<(), ProxySecretsPoisonedError> {
     let this_session_secrets = roundhouse_engine::live_secret_values(ctx, &resources.mcp_configs);
     let mut all_secrets = match resources.proxy_secrets.lock() {
         Ok(guard) => guard,
         Err(_) => {
             tracing::error!(
-                "proxy_secrets lock is poisoned; refusing to update the daemon-wide egress \
-                 proxy's redaction set for this session — this session's own live secrets, if \
-                 any, will not be redacted from traffic proxied through the shared egress proxy"
+                "proxy_secrets lock is poisoned; refusing to create this session rather than \
+                 leave its live secrets, if any, unredacted from traffic proxied through the \
+                 shared egress proxy"
             );
-            return;
+            return Err(ProxySecretsPoisonedError);
         }
     };
     let mut changed = false;
@@ -452,7 +480,18 @@ fn register_proxy_secrets(resources: &DaemonResources, ctx: &RequestCtx) {
     if changed {
         roundhouse_engine::wire_redaction_for_session(&resources.proxy_writer, &all_secrets);
     }
+    Ok(())
 }
+
+/// The daemon-wide `DaemonResources::proxy_secrets` mutex is poisoned —
+/// see [`register_proxy_secrets`]'s own doc comment for why this fails
+/// the whole session rather than merely skipping the redaction update.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "this daemon's shared proxy-secrets lock is poisoned; refusing to create a new session \
+     rather than risk leaving a live secret unredacted in the shared egress proxy's traffic"
+)]
+pub struct ProxySecretsPoisonedError;
 
 /// Builds a `PolicyEngine::with_sealed_ctx_provider` closure that reads the
 /// SAME facts `SessionActor::sealed_context()` (private to `roundhouse-engine`)
@@ -634,7 +673,7 @@ mod tests {
     /// already exist with no `SessionActor` yet built to tear them down
     /// on unwind).
     #[tokio::test]
-    async fn register_proxy_secrets_does_not_panic_on_a_poisoned_lock() {
+    async fn register_proxy_secrets_fails_closed_rather_than_panicking_on_a_poisoned_lock() {
         let dir = tempfile::tempdir().unwrap();
         let resources = resources(dir.path()).await;
 
@@ -651,13 +690,50 @@ mod tests {
         );
 
         let ctx = resources.clone_request_ctx();
+        let mut result = None;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            register_proxy_secrets(&resources, &ctx);
+            result = Some(register_proxy_secrets(&resources, &ctx));
         }));
         assert!(
             outcome.is_ok(),
             "register_proxy_secrets must not panic on a poisoned proxy_secrets lock"
         );
+        // Fix round 5, MUST 4: fail CLOSED, not open — a poisoned lock must
+        // return `Err`, not silently proceed as though nothing happened.
+        assert!(
+            result.unwrap().is_err(),
+            "register_proxy_secrets must return Err on a poisoned lock, not Ok"
+        );
+    }
+
+    /// Fix round 5, MUST 4: end-to-end proof that `create_real_session`
+    /// itself fails closed on a poisoned `proxy_secrets` lock — tearing
+    /// down the real isolation handle and proxy registration it had
+    /// already built, rather than (as the pre-fix version did) silently
+    /// continuing to build a full session with that session's own secrets
+    /// never entering the shared proxy's redaction set.
+    #[tokio::test]
+    async fn create_real_session_fails_closed_and_tears_down_on_a_poisoned_proxy_secrets_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = resources(dir.path()).await;
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = resources.proxy_secrets.lock().unwrap();
+            panic!("deliberately poisoning proxy_secrets for this test");
+        }));
+        assert!(resources.proxy_secrets.is_poisoned());
+
+        match create_real_session(&resources, "test-workspace".into()).await {
+            Err(CreateRealSessionError::ProxySecretsPoisoned(_)) => {}
+            Err(other) => panic!(
+                "create_real_session must fail with ProxySecretsPoisoned on a poisoned \
+                 lock, got a different error: {other}"
+            ),
+            Ok(_) => panic!(
+                "create_real_session must fail with ProxySecretsPoisoned on a poisoned \
+                 lock, got Ok"
+            ),
+        }
     }
 
     /// Fix round 2, MUST 6: `create_real_session`'s OWN MCP-configured

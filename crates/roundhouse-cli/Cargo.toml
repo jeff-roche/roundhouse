@@ -62,6 +62,13 @@ tracing = { workspace = true }
 # Fix round 2, MUST 1: bumped from `=0.3.19` to `=0.3.23` — see
 # `roundhouse-daemon`'s identical manifest comment for why (0.3.20 fixed an
 # ANSI-escape log-injection issue; 0.3.19 sat exactly one release below it).
+# Correction (fix round 5, MUST 2): that 0.3.20 fix only escapes a
+# `tracing` event's literal MESSAGE BODY text — a raw `0x1b` byte in a
+# `field = %value`-style FIELD VALUE still passes through verbatim under
+# 0.3.23, proven directly, regardless of `with_ansi`. This bump is not a
+# second layer of defense; the `kind()`-only-rendering discipline (see
+# `roundhouse-daemon`'s identical comment) is the entire defense for field
+# values.
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]

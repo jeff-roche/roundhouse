@@ -206,74 +206,24 @@ async fn main() -> color_eyre::Result<()> {
     });
     let runner = &handles.task_runner;
 
-    // Every artifact below (socket, event log, scratch state) goes inside
-    // one private directory rather than straight into the shared temp dir.
-    // Writing predictable names into a world-writable `/tmp` lets any other
-    // local user pre-create one as a symlink; both `tokio::fs::write` and
-    // SQLite's `O_CREAT` open follow symlinks, so the daemon would truncate
-    // a file the attacker chose, as the victim.
-    let runtime_dir = roundhouse_tui::default_runtime_dir();
-    prepare_runtime_dir(&runtime_dir)?;
-
-    let socket_path = args
-        .socket
-        .or_else(|| std::env::var_os("ROUND_SOCKET").map(PathBuf::from))
-        .unwrap_or_else(roundhouse_tui::default_socket_path);
-    remove_stale_socket(&socket_path)?;
-
-    // Absolute by construction (`default_runtime_dir`'s own contract) and
-    // asserted as such by `SessionActor::new` — this session-independent
-    // path anchors both `sealed_state_dir_write` and, via
-    // `session_bootstrap::create_real_session`, every session's `SealedContext`.
-    let state_dir = runtime_dir.clone();
-    // The REAL, canonicalized path of this running binary — what
-    // `sealed_daemon_binary_write` protects. `std::env::current_exe()`
-    // itself may return a symlink (e.g. `/proc/self/exe` on some
-    // platforms); canonicalizing resolves to the real underlying file, the
-    // same pattern `commands::daemon::daemon_binary_path` already uses in
-    // `roundhouse-cli`.
-    let daemon_binary = std::fs::canonicalize(std::env::current_exe()?)?;
-
-    let store_path = runtime_dir.join("events.db");
-
-    // Boot sequence (S-SESS-4): reclassify any task left in `Created`/`Decided`/
-    // `Running` state by a previous daemon process that died mid-run, and
-    // enumerate tasks left `Suspended` (e.g. mid-approval) so they are at least
-    // visible again after a restart. Without the first half, a `round daemon`
-    // killed mid-session leaves those tasks stuck in the log forever. Task 15
-    // added the `ApprovalRegistry` constructed just below and threaded it
-    // through `run_boot_sequence` — this is the actual re-arm site: every
-    // persisted `Suspended{AwaitingApproval}` task gets registered live here,
-    // so a restarted daemon's registry isn't empty even though the approvals
-    // were always correctly sitting in the database. Runs once, here, between
-    // opening the store and starting the accept loop — on a fresh
-    // `store_path` this is a cheap no-op scan over an empty `tasks` table.
-    let recovery_store = roundhouse_store::open(&store_path).await?;
-    let recovery_writer = roundhouse_store::spawn_writer(recovery_store).await;
-    let recovery_pool_for_scan = roundhouse_store::open(&store_path).await?;
-    let approval_registry = roundhouse_policy::registry::ApprovalRegistry::new();
-    let boot_report = roundhouse_daemon::boot::run_boot_sequence(
-        &recovery_pool_for_scan,
-        &recovery_writer,
-        runner,
-        &approval_registry,
-    )
-    .await?;
-    if !boot_report.interrupted.is_empty() || !boot_report.suspended.is_empty() {
-        println!(
-            "boot recovery: {} task(s) interrupted, {} task(s) still suspended from a previous daemon run",
-            boot_report.interrupted.len(),
-            boot_report.suspended.len()
-        );
-    }
-    // CF-12(a): `recovery_writer` keeps `spawn_writer`'s empty default
-    // redactor — deliberately. `recover_interrupted_tasks` (called above)
-    // only ever appends synthetic `Interrupted` markers keyed by task/session
-    // id (`roundhouse-store/src/recovery.rs`), never user- or
-    // model-controlled text, so there is nothing here for a `Redactor` to
-    // protect. Named explicitly in the task report as one of the three
-    // `EventWriter`s this daemon can append through.
-
+    // Fix round 5, W1-R111: this whole config-loading block (`project_root`
+    // through `network_config`, below) runs BEFORE `prepare_runtime_dir`/
+    // `remove_stale_socket` — deliberately, and this ordering is itself the
+    // fix, not incidental. `remove_stale_socket` unlinks whatever socket
+    // sits at the target path with no liveness probe at all (see its own
+    // doc comment for the still-open root cause), so a `round daemon`
+    // re-invoked with a typo'd `[[mcp_server]]` config used to unlink a
+    // LIVE daemon's socket via `remove_stale_socket`, THEN refuse to boot
+    // over the bad config — leaving the original, still-running daemon
+    // (holding real isolation handles, an egress-proxy registration, and
+    // any MCP subprocesses) with no control channel at all, un-killable by
+    // anything short of `kill`. Config is now fully validated (this block
+    // can `return Err` before EITHER `prepare_runtime_dir` or
+    // `remove_stale_socket` ever runs) before this process makes any
+    // filesystem mutation of its own — the same ordering `nginx -t`/`sshd`
+    // use validate-before-touch for, which W1-R109 cited as precedent
+    // without also ordering the sequence that precedent actually implies.
+    //
     // CF-11: `project_root` is what makes `default_layers`'s Project scope
     // (and therefore `mcp_config::load_mcp_servers`'s/`load_network_config`'s
     // own narrow-only project-scope handling) reachable at all — this daemon
@@ -386,6 +336,74 @@ async fn main() -> color_eyre::Result<()> {
         }
     };
 
+    // Every artifact below (socket, event log, scratch state) goes inside
+    // one private directory rather than straight into the shared temp dir.
+    // Writing predictable names into a world-writable `/tmp` lets any other
+    // local user pre-create one as a symlink; both `tokio::fs::write` and
+    // SQLite's `O_CREAT` open follow symlinks, so the daemon would truncate
+    // a file the attacker chose, as the victim.
+    let runtime_dir = roundhouse_tui::default_runtime_dir();
+    prepare_runtime_dir(&runtime_dir)?;
+
+    let socket_path = args
+        .socket
+        .or_else(|| std::env::var_os("ROUND_SOCKET").map(PathBuf::from))
+        .unwrap_or_else(roundhouse_tui::default_socket_path);
+    remove_stale_socket(&socket_path)?;
+
+    // Absolute by construction (`default_runtime_dir`'s own contract) and
+    // asserted as such by `SessionActor::new` — this session-independent
+    // path anchors both `sealed_state_dir_write` and, via
+    // `session_bootstrap::create_real_session`, every session's `SealedContext`.
+    let state_dir = runtime_dir.clone();
+    // The REAL, canonicalized path of this running binary — what
+    // `sealed_daemon_binary_write` protects. `std::env::current_exe()`
+    // itself may return a symlink (e.g. `/proc/self/exe` on some
+    // platforms); canonicalizing resolves to the real underlying file, the
+    // same pattern `commands::daemon::daemon_binary_path` already uses in
+    // `roundhouse-cli`.
+    let daemon_binary = std::fs::canonicalize(std::env::current_exe()?)?;
+
+    let store_path = runtime_dir.join("events.db");
+
+    // Boot sequence (S-SESS-4): reclassify any task left in `Created`/`Decided`/
+    // `Running` state by a previous daemon process that died mid-run, and
+    // enumerate tasks left `Suspended` (e.g. mid-approval) so they are at least
+    // visible again after a restart. Without the first half, a `round daemon`
+    // killed mid-session leaves those tasks stuck in the log forever. Task 15
+    // added the `ApprovalRegistry` constructed just below and threaded it
+    // through `run_boot_sequence` — this is the actual re-arm site: every
+    // persisted `Suspended{AwaitingApproval}` task gets registered live here,
+    // so a restarted daemon's registry isn't empty even though the approvals
+    // were always correctly sitting in the database. Runs once, here, between
+    // opening the store and starting the accept loop — on a fresh
+    // `store_path` this is a cheap no-op scan over an empty `tasks` table.
+    let recovery_store = roundhouse_store::open(&store_path).await?;
+    let recovery_writer = roundhouse_store::spawn_writer(recovery_store).await;
+    let recovery_pool_for_scan = roundhouse_store::open(&store_path).await?;
+    let approval_registry = roundhouse_policy::registry::ApprovalRegistry::new();
+    let boot_report = roundhouse_daemon::boot::run_boot_sequence(
+        &recovery_pool_for_scan,
+        &recovery_writer,
+        runner,
+        &approval_registry,
+    )
+    .await?;
+    if !boot_report.interrupted.is_empty() || !boot_report.suspended.is_empty() {
+        println!(
+            "boot recovery: {} task(s) interrupted, {} task(s) still suspended from a previous daemon run",
+            boot_report.interrupted.len(),
+            boot_report.suspended.len()
+        );
+    }
+    // CF-12(a): `recovery_writer` keeps `spawn_writer`'s empty default
+    // redactor — deliberately. `recover_interrupted_tasks` (called above)
+    // only ever appends synthetic `Interrupted` markers keyed by task/session
+    // id (`roundhouse-store/src/recovery.rs`), never user- or
+    // model-controlled text, so there is nothing here for a `Redactor` to
+    // protect. Named explicitly in the task report as one of the three
+    // `EventWriter`s this daemon can append through.
+
     // A real probe of THIS host's actual isolation mechanisms (landlock,
     // bwrap, seccomp, seatbelt) — `probe_cached` genuinely exercises each
     // one via real syscalls (§6.5 rule 1: fail-open is made structurally
@@ -449,6 +467,25 @@ async fn main() -> color_eyre::Result<()> {
         }
         None => OnDegrade::Refuse,
     };
+    // Fix round 5, MUST 3: the `tracing::warn!`s above are the ONLY
+    // channel W1-R102 left for this — and `tracing` is filterable by
+    // definition (`RUST_LOG=error` yields zero indication of either
+    // warning; `RUST_LOG=round_daemon_internal=info`, the process name
+    // `ps` shows an operator, hides the boot-target-scoped ones fix round
+    // 3 added). This summary rides the UNCONDITIONAL `println!` just below
+    // instead — no `RUST_LOG` value can filter a `println!` — so the
+    // degrade state is visible on every boot regardless of logging
+    // configuration.
+    let degrade_summary = match default_on_degrade {
+        OnDegrade::Refuse => {
+            "refuse (default: sessions refuse to start below Tier::Sandbox)".to_string()
+        }
+        OnDegrade::AllowDownTo(Tier::None) => {
+            "allow-down-to=none (sealed_tier_shortfall PERMANENTLY DISARMED for every session)"
+                .to_string()
+        }
+        OnDegrade::AllowDownTo(tier) => format!("allow-down-to={tier:?}"),
+    };
     let resources = Arc::new(DaemonResources::new(
         session_store,
         isolate,
@@ -474,7 +511,7 @@ async fn main() -> color_eyre::Result<()> {
     let listener = bind_socket(&socket_path)?;
 
     println!(
-        "round daemon listening: socket={} state_dir={}",
+        "round daemon listening: socket={} state_dir={} degrade={degrade_summary}",
         socket_path.display(),
         resources.state_dir.display()
     );
@@ -683,6 +720,24 @@ impl HttpTransport for NoTransportConfigured {
 /// mistake. `symlink_metadata` does not follow symlinks, so a symlink at this
 /// path is reported as a symlink (not a socket) and is refused rather than
 /// followed.
+///
+/// # Named root cause, not yet fixed (fix round 5, W1-R111)
+///
+/// This function has no LIVENESS probe: it unlinks whatever socket sits at
+/// `path` unconditionally, without ever checking whether a daemon is still
+/// alive and actually listening on it. `main`'s call site is now ordered
+/// so this never runs before `[[mcp_server]]`/`[network]` config has
+/// already been validated (a malformed config used to make this unlink a
+/// LIVE daemon's socket and then refuse to boot, stranding the original
+/// daemon with no control channel) — but that ordering fix only closes
+/// ONE trigger. Every fallible operation between this call and
+/// `bind_socket` (any `?` in `main`, e.g. `std::fs::canonicalize`,
+/// `roundhouse_store::open`, `run_boot_sequence`, `LoopbackProxy::serve`)
+/// shares the identical exposure: this process unlinks the socket first,
+/// then can still exit before ever re-binding it. A `connect()` probe here
+/// (refuse to remove a path that a peer actually accepts a connection on)
+/// would close all of them at the root, not just the one this round fixed
+/// — worth a follow-up, out of scope for this fix.
 fn remove_stale_socket(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path),
