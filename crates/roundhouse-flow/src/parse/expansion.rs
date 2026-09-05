@@ -1,16 +1,25 @@
 //! The bound on anchor/alias expansion, recorded against the
 //! denial-of-service finding in [`super`]'s module doc comment.
 //!
-//! **Task 14 (lane W5) update.** What actually closes that finding
-//! structurally, as of Task 14, is `roundhouse_sandbox::bounded_parse`'s
-//! out-of-process CPU/wall-clock/output-size bound around the real
-//! `serde_yaml` deserialize (see [`super`]'s module doc, "the recommended
-//! remedy above is now implemented") — not this module. This module is
-//! still exactly what it always was: a real, well-tested fast-path
-//! rejection for the shapes it understands, now sitting in front of that
-//! real bound rather than standing in as the boundary itself. Nothing
-//! below changed to reflect that; it is accurate as a description of the
-//! mechanism either way.
+//! **Task 14 (lane W5) update — read before assuming this module got
+//! cheaper or safer, because it did not change at all.**
+//! `roundhouse_sandbox::bounded_parse`'s new out-of-process CPU/wall-clock/
+//! output-size bound (see [`super`]'s module doc) wraps the *typed*
+//! `serde_yaml::from_slice::<WorkflowDef>` deserialize that used to follow
+//! this check — not this module. **This module still runs entirely in
+//! process, before that bound is ever reached, and it is not a cheap
+//! approximation of the real parse: [`check_expansion`] builds an actual
+//! `serde_yaml::Deserializer` and drives it, so for a numeric scalar it
+//! pays the exact same `from_str_radix`/`dec2flt` decode cost the typed
+//! deserialize does, once per alias expansion.** For the admitted-residual
+//! shape this module's own doc below discusses (the integer-decode
+//! maximiser, ~9,435.7 ms), that cost is paid here, in the daemon's own
+//! process, *before* Task 14's bound is reached at all — this module is
+//! not "sitting in front of" that residual in a way that makes it safe;
+//! it *is* half of that residual, unmoved. Nothing below changed, and
+//! nothing below needed to: it is still an accurate description of a
+//! mechanism that still has this cost, now alongside a second copy of the
+//! same cost that moved out of process.
 //!
 //! # The mechanism: use the real deserializer as its own budget meter
 //!

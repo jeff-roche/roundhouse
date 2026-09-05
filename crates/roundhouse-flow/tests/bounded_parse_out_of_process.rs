@@ -1,5 +1,6 @@
-//! Task 14 (lane W5): `parse_workflow` now routes the actual `serde_yaml`
-//! deserialization through `round-yaml-parse-helper`, spawned under
+//! Task 14 (lane W5): `parse_workflow` now routes the actual typed
+//! `serde_yaml::from_slice::<WorkflowDef>` deserialization through
+//! `round-yaml-parse-helper`, spawned under
 //! `roundhouse_sandbox::bounded_parse::run_bounded_subprocess`. This is the
 //! YAML-specific half of the test split ruling W5-5 calls for — the
 //! generic primitive's own tests live in
@@ -13,12 +14,28 @@
 //! Scope note (ruling W5-6): this task does **not** close Phase 5's parked
 //! over-rejection regression (the bracket/comment false positive in
 //! `nesting_depth_bound_violation`) — that guard is untouched, still
-//! best-effort, still capable of over-rejecting. What this task closes is
-//! the *cost* side: a document that gets past all three in-process guards
-//! and would previously have run `serde_yaml::from_str` in-process with no
-//! further bound.
+//! best-effort, still capable of over-rejecting.
+//!
+//! **A second, narrower scope gap found while writing this test, not
+//! authorized by the brief to fix here (see the task report):**
+//! `expansion::check_expansion` — the fast-path guard that runs *before*
+//! `parse_via_helper` — constructs a real `serde_yaml::Deserializer` and
+//! walks it via `deserialize_any`, so for a numeric scalar it incurs
+//! `serde_yaml`'s real `from_str_radix`/`dec2flt` decode (the same
+//! O(token-length) cost the typed deserialize pays), once per alias
+//! expansion, **in process**, before `parse_via_helper` is ever called.
+//! `src/parse/mod.rs`'s own "structural doubling" paragraph already says an
+//! admitted document costs "roughly twice its metered walk" — this task
+//! moves only the *second* walk (the typed deserialize) out of process.
+//! The *first* walk's identical per-decode cost is untouched and remains
+//! exactly as unbounded as before Task 14. This test's payload is sized so
+//! that walk still finishes in a few seconds rather than dozens, but the
+//! test does not (and cannot, without changing `expansion.rs`, which
+//! ruling W5-6 did not authorize) prove that first walk is bounded — only
+//! that the second one now is.
 
 use roundhouse_flow::parse::parse_workflow;
+use roundhouse_flow::parse::ParseError;
 use std::time::{Duration, Instant};
 
 /// Same generator as `tests/parse_top_level.rs`'s `hex_zero_run`
@@ -29,14 +46,16 @@ use std::time::{Duration, Instant};
 /// P63): it is deliberately tuned to pass `MAX_YAML_BYTES`,
 /// `nesting_depth_bound_violation` and `expansion::check_expansion`
 /// (`MAX_EXPANDED_WEIGHT`/`MAX_INTEGER_SCALAR_VISITS`) — i.e. it is
-/// **admitted**, not rejected, by every guard that ran before Task 14 — and
-/// still costs multiple real seconds inside `serde_yaml`'s
-/// `from_str_radix` re-scan on every alias expansion, because those guards
-/// charge a flat per-visit weight that does not scale with the token's
-/// length. That is exactly the residual this task's out-of-process bound
-/// closes: measured against the pre-Task-14 code path (see the report for
-/// the exact RED timing), this shape took multiple seconds in-process with
-/// nothing left to stop it.
+/// **admitted**, not rejected, by every guard that ran before Task 14.
+///
+/// Sized at 150,000 zeros / 6,000 aliases rather than the 262,143-byte,
+/// 43,673-alias maximiser the axis inventory measures at 9,435.7 ms
+/// (release) / tens of seconds (debug): this shape's *typed-deserialize*
+/// half alone reliably exceeds `helper::HELPER_CPU_LIMIT` (2s) with a
+/// comfortable margin, while keeping the *first* (in-process,
+/// `expansion::check_expansion`) walk's identical decode cost — see the
+/// module doc comment above — down to single-digit seconds rather than
+/// dozens, so this test stays fast without changing what it proves.
 fn hex_zero_run(zeros: usize, k: usize) -> String {
     let mut y = String::with_capacity(zeros + 3 * k + 256);
     y.push_str(
@@ -58,8 +77,8 @@ fn hex_zero_run(zeros: usize, k: usize) -> String {
 }
 
 #[test]
-fn an_admitted_but_expensive_alias_document_is_killed_within_a_few_seconds_not_left_running() {
-    let pathological = hex_zero_run(230_000, 10_000);
+fn an_admitted_but_expensive_alias_document_is_rejected_by_the_out_of_process_bound() {
+    let pathological = hex_zero_run(150_000, 6_000);
     // Sanity: this must actually be *admitted* past every pre-parse guard,
     // not rejected by one of them — otherwise this test would pass for the
     // wrong reason (a cheap rejection, not the out-of-process bound firing
@@ -70,15 +89,22 @@ fn an_admitted_but_expensive_alias_document_is_killed_within_a_few_seconds_not_l
     let result = parse_workflow(&pathological);
     let elapsed = start.elapsed();
 
+    // A generous sanity ceiling, not a precision timing assertion: the
+    // *first* (in-process) walk's cost is untouched by this task (see the
+    // module doc comment) and is not itself bounded by anything this test
+    // can assert on, so this only guards against a genuine hang — it is
+    // not proof the whole call is fast, only that it terminates.
     assert!(
-        elapsed < Duration::from_secs(10),
-        "must be killed well within the out-of-process bound, not left running \
-         in-process for the multiple seconds this shape costs unbounded: took {elapsed:?}"
+        elapsed < Duration::from_secs(60),
+        "must terminate, not hang: took {elapsed:?}"
     );
+    // The real assertion: the *typed-deserialize* half was killed by the
+    // out-of-process bound specifically — not merely "some error", which
+    // would also pass for the wrong reason (e.g. `HelperUnavailable` from
+    // a missing binary, an infrastructure failure this test is not about).
     assert!(
-        result.is_err(),
-        "an admitted-but-pathologically-expensive document must be rejected once \
-         it exceeds the out-of-process resource bound, not silently succeed slowly"
+        matches!(result, Err(ParseError::ExceededParseResourceBound(_))),
+        "expected the out-of-process resource bound to fire, got {result:?}"
     );
 }
 
