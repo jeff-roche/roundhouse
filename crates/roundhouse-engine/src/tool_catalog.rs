@@ -34,11 +34,23 @@ pub enum ToolTarget {
 /// registry or a model. A builtin name therefore can never collide with an
 /// MCP name by construction: the builtin set is closed and enumerated
 /// below, so any input matching one of those five literals is a builtin,
-/// and any other input containing `"__"` is presumptively MCP-shaped and
-/// split on the first occurrence into `(server, tool)`. Anything matching
-/// neither shape (bare unknown name, or `"__"` absent) resolves to `None`
-/// — an unresolvable tool name, which the caller must treat as a dispatch
-/// error rather than guessing.
+/// and any other input containing `"__"` is presumptively MCP-shaped.
+/// Anything matching neither shape (bare unknown name, or `"__"` absent)
+/// resolves to `None` — an unresolvable tool name, which the caller must
+/// treat as a dispatch error rather than guessing.
+///
+/// **The `(server, tool)` split below is a shape test, not authoritative
+/// recovery of the original names.** It splits on the *first* `"__"`,
+/// but `build_namespaced_name` does not guarantee that's the only `"__"`
+/// in the string: a server id may itself sanitize to something containing
+/// `__`, and a name that would exceed 64 chars is truncated and suffixed
+/// with an 8-hex-char blake3 hash, which no longer round-trips to the
+/// original tool name at all. A real caller that needs the actual
+/// `(ServerId, original tool name)` pair for dispatch must resolve it
+/// through `ToolNamespace::resolve`'s lookup table (built at discovery
+/// time), not by re-parsing the namespaced string — this function only
+/// tells the caller "this name is MCP-shaped, go look it up," it is not a
+/// substitute for that lookup.
 pub fn resolve_tool_target(name: &str) -> Option<ToolTarget> {
     match name {
         "read" => Some(ToolTarget::Builtin(TaskKind::Read)),
