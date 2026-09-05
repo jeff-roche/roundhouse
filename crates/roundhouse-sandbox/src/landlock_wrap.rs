@@ -76,7 +76,10 @@ pub(crate) const WRAPPER_BINARY_NAME: &str = "round-landlock-exec";
 /// the fallback location must not resolve to an *installed* binary's own
 /// grandparent (e.g. `/usr/local`, group/user-writable on Homebrew-style
 /// installs) — the fallback declines rather than trusting a path outside a
-/// `target` tree.
+/// `target` tree. That decision lives in
+/// [`resolve_grandparent_fallback`], which checks **both** the literal
+/// `grandparent.join(name)` and the canonical path it resolves to; see its doc
+/// comment for why checking only one of the two is a fail-open.
 pub(crate) fn wrapper_binary_path() -> Result<PathBuf, IsolationError> {
     let exe = std::env::current_exe().map_err(|err| {
         IsolationError::Unsupported(format!("could not resolve current_exe(): {err}"))
@@ -101,10 +104,9 @@ pub(crate) fn wrapper_binary_path() -> Result<PathBuf, IsolationError> {
     #[cfg(feature = "test-util")]
     {
         if let Some(grandparent) = dir.parent() {
-            if let Some(candidate) = resolve_existing_candidate(grandparent, WRAPPER_BINARY_NAME) {
-                if is_inside_a_target_tree(&candidate) {
-                    return Ok(candidate);
-                }
+            if let Some(candidate) = resolve_grandparent_fallback(grandparent, WRAPPER_BINARY_NAME)
+            {
+                return Ok(candidate);
             }
         }
     }
@@ -141,6 +143,50 @@ fn resolve_existing_candidate(dir: &Path, name: &str) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+/// The whole `test-util` grandparent fallback decision of [`wrapper_binary_path`],
+/// extracted (Task 27 fix round 4, item 1 — Ruling W5-44) so the trust decision can be
+/// exercised against a synthetic tempdir layout rather than only against whatever
+/// `target/` tree the test binary happens to be built into.
+///
+/// Returns the **canonical** wrapper path only if `name` exists as a file under
+/// `grandparent` *and* [`is_inside_a_target_tree`] holds for **both** the literal
+/// `grandparent.join(name)` and the canonical path that resolves to.
+///
+/// **Why both, and not just one (the regression this restores).** Before fix round 3
+/// the guard ran on the literal `grandparent.join(NAME)`, so it asked "does the
+/// *candidate sit* inside a `target` tree" — which, since `grandparent` is already
+/// canonical here (`wrapper_binary_path` canonicalizes `current_exe()` before taking
+/// `.parent()`), is the same question as "is the fallback *directory* a `target`
+/// tree", exactly the property the doc on [`wrapper_binary_path`] promises. Fix round
+/// 3 moved canonicalization inside [`resolve_existing_candidate`], which silently
+/// changed the guard's subject to "where does a symlink *point*". Reproduced through
+/// the real `Isolate::spawn`: with the daemon at `<S>/bin/`, `<S>` containing no
+/// `target` component but writable, a symlink `<S>/round-landlock-exec` aimed at an
+/// attacker-owned `<X>/target/payload` was accepted and executed with no ruleset ever
+/// applied, while `attest()` still reported `Tier::Sandbox`. That needs write access
+/// only to the *grandparent* of the daemon's directory (`/usr/local` for a daemon at
+/// `/usr/local/bin/` — the Homebrew-style case the doc names), which does not imply
+/// write access to the daemon's own directory.
+///
+/// Checking both is strictly fail-closed relative to both prior shapes: it keeps fix
+/// round 3's canonicalization (which closed a real symlink bypass — see
+/// [`resolve_existing_candidate`]) and keeps the pre-round-3 meaning of the guard.
+#[cfg(feature = "test-util")]
+fn resolve_grandparent_fallback(grandparent: &Path, name: &str) -> Option<PathBuf> {
+    // Where the candidate *sits*. `grandparent` is already canonical, so this asks
+    // whether the fallback directory itself is inside a `target` tree.
+    if !is_inside_a_target_tree(&grandparent.join(name)) {
+        return None;
+    }
+    let canonical = resolve_existing_candidate(grandparent, name)?;
+    // Where the candidate *points*. Redundant for a plain file; load-bearing when the
+    // candidate is a symlink out of the target tree.
+    if !is_inside_a_target_tree(&canonical) {
+        return None;
+    }
+    Some(canonical)
 }
 
 /// See `roundhouse-flow`'s identical helper (`parse/helper.rs`,
@@ -586,5 +632,154 @@ mod tests {
     #[test]
     fn same_inode_confirms_the_filesystem_root_is_its_own_inode() {
         assert!(same_inode(Path::new("/"), Path::new("/")));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 27 fix round 4, item 1 (Ruling W5-44): the `test-util` grandparent trust
+    // decision, exercised against synthetic tempdir layouts.
+    //
+    // These deliberately drive `resolve_grandparent_fallback` — the whole decision —
+    // rather than `is_inside_a_target_tree` alone. The pre-existing
+    // `an_installed_path_outside_any_target_tree_is_rejected` above calls that helper
+    // directly and never the call site, which is why it stayed green straight through
+    // fix round 3 silently changing the guard's subject from "where the candidate
+    // sits" to "where a symlink points".
+    // ---------------------------------------------------------------------------
+
+    /// A canonical, freshly-created base directory with no `target` component of its
+    /// own — asserted, not assumed, so a `TMPDIR` that happened to sit under a
+    /// `target/` tree fails these tests loudly instead of passing them vacuously.
+    #[cfg(feature = "test-util")]
+    fn grandparent_case_base(label: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "roundhouse-landlock-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("create base dir");
+        let base = std::fs::canonicalize(&base).expect("canonicalize base dir");
+        assert!(
+            !is_inside_a_target_tree(&base),
+            "precondition: the temp dir used to build these layouts must not itself sit \
+             inside a `target` tree, or every case below passes for the wrong reason: {}",
+            base.display()
+        );
+        base
+    }
+
+    /// Case D from the fix-round-4 brief, reproduced end to end through the real
+    /// `Isolate::spawn` by the security lens: an install-style grandparent with **no**
+    /// `target` component, holding a symlink named `round-landlock-exec` whose target
+    /// *does* sit under a `target` tree. Accepted at HEAD `6debf7e` (payload executed,
+    /// no ruleset applied, `attest()` still claiming `Tier::Sandbox`); must be refused.
+    ///
+    /// **This is the test whose failure the literal-path check in
+    /// `resolve_grandparent_fallback` is responsible for.** Removing that check must
+    /// make this test fail.
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn a_grandparent_outside_any_target_tree_is_refused_even_when_the_symlink_points_into_one() {
+        let base = grandparent_case_base("grandparent-case-d");
+        // The install location: `<base>/usr-local/bin`'s parent, no `target` anywhere.
+        let install_grandparent = base.join("usr-local");
+        std::fs::create_dir_all(&install_grandparent).expect("create install grandparent");
+        // The attacker-owned payload, deliberately under a `target` component.
+        let payload_dir = base.join("attacker/target");
+        std::fs::create_dir_all(&payload_dir).expect("create payload dir");
+        let payload = payload_dir.join("payload");
+        std::fs::write(&payload, b"stand-in payload").expect("write payload");
+        std::os::unix::fs::symlink(&payload, install_grandparent.join(WRAPPER_BINARY_NAME))
+            .expect("create symlink");
+
+        // Sanity: the symlink really does resolve, so `None` below is the guard's
+        // decision and not merely a missing file.
+        assert!(
+            resolve_existing_candidate(&install_grandparent, WRAPPER_BINARY_NAME).is_some(),
+            "the symlink must resolve to a real file, or this test proves nothing"
+        );
+        assert_eq!(
+            resolve_grandparent_fallback(&install_grandparent, WRAPPER_BINARY_NAME),
+            None,
+            "a wrapper reached from a grandparent outside any `target` tree must be \
+             refused however target-ish the symlink's destination looks"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Case D2: the same install-style grandparent, but the symlink's destination has
+    /// no `target` component either. Refused at both `722be5b` and HEAD; pinned here as
+    /// the control that makes case D's contrast meaningful.
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn a_grandparent_outside_any_target_tree_is_refused_when_the_symlink_also_points_outside_one() {
+        let base = grandparent_case_base("grandparent-case-d2");
+        let install_grandparent = base.join("usr-local");
+        std::fs::create_dir_all(&install_grandparent).expect("create install grandparent");
+        let payload_dir = base.join("attacker/plain");
+        std::fs::create_dir_all(&payload_dir).expect("create payload dir");
+        let payload = payload_dir.join("payload");
+        std::fs::write(&payload, b"stand-in payload").expect("write payload");
+        std::os::unix::fs::symlink(&payload, install_grandparent.join(WRAPPER_BINARY_NAME))
+            .expect("create symlink");
+
+        assert_eq!(
+            resolve_grandparent_fallback(&install_grandparent, WRAPPER_BINARY_NAME),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The mirror image of case D, and the check the *canonical* half is responsible
+    /// for: the grandparent is a genuine `target/debug`, but the wrapper there is a
+    /// symlink out to a path with no `target` component. Recorded in the fix-round-4
+    /// brief as "fail-closed, breaks only a plausible dev layout rather than a
+    /// boundary" — it was accepted at `722be5b`, is refused at HEAD, and stays refused.
+    ///
+    /// Removing the canonical-path check must make this test fail.
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn a_target_tree_grandparent_is_refused_when_its_wrapper_symlinks_out_of_the_target_tree() {
+        let base = grandparent_case_base("grandparent-case-out");
+        let grandparent = base.join("target/debug");
+        std::fs::create_dir_all(&grandparent).expect("create target/debug");
+        let payload_dir = base.join("elsewhere");
+        std::fs::create_dir_all(&payload_dir).expect("create payload dir");
+        let payload = payload_dir.join("payload");
+        std::fs::write(&payload, b"stand-in payload").expect("write payload");
+        std::os::unix::fs::symlink(&payload, grandparent.join(WRAPPER_BINARY_NAME))
+            .expect("create symlink");
+
+        assert!(
+            is_inside_a_target_tree(&grandparent.join(WRAPPER_BINARY_NAME)),
+            "the literal path must pass, so `None` below is the canonical check's doing"
+        );
+        assert_eq!(
+            resolve_grandparent_fallback(&grandparent, WRAPPER_BINARY_NAME),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The layout the fallback exists for: a `tests/*.rs` binary in
+    /// `target/debug/deps/` finding the real `round-landlock-exec` at its grandparent
+    /// `target/debug/`. Both checks must pass, and the canonical path comes back — the
+    /// both-sides guard must not become a blanket refusal.
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn the_ordinary_target_debug_grandparent_layout_is_still_accepted() {
+        let base = grandparent_case_base("grandparent-case-ok");
+        let grandparent = base.join("target/debug");
+        std::fs::create_dir_all(&grandparent).expect("create target/debug");
+        let wrapper = grandparent.join(WRAPPER_BINARY_NAME);
+        std::fs::write(&wrapper, b"stand-in binary").expect("write wrapper");
+
+        assert_eq!(
+            resolve_grandparent_fallback(&grandparent, WRAPPER_BINARY_NAME),
+            Some(std::fs::canonicalize(&wrapper).unwrap())
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
