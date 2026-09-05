@@ -314,22 +314,37 @@ export function connectSessionEvents(
     // `onStreamError` — `onResyncRequired`'s own fields (`resume_from`,
     // `oldest_retained`) have no sensible fallback value to invent, while
     // `onStreamError` only needs a human-readable string.
+    //
+    // **The `try` covers only the parse, not the handler call.** Wrapping
+    // `handlers.onResyncRequired(...)` itself would also swallow a genuine
+    // bug inside that handler (e.g. a consumer's `setStream` throwing) and
+    // misreport it as "malformed resync_required frame" — a wrong
+    // diagnosis for a real error. Parsing and dispatching are kept as two
+    // separate steps so only an actual parse failure takes the fallback
+    // path.
+    let parsed: ResyncRequired;
     try {
-      handlers.onResyncRequired(JSON.parse((message as MessageEvent<string>).data) as ResyncRequired);
+      parsed = JSON.parse((message as MessageEvent<string>).data) as ResyncRequired;
     } catch {
       handlers.onStreamError({ error: "received a malformed resync_required frame" });
+      return;
     }
+    handlers.onResyncRequired(parsed);
   });
 
   source.addEventListener("stream_error", (message) => {
     source.close();
     // See the `resync_required` listener above for why this falls back to
-    // the same terminal state on a parse failure rather than throwing.
+    // the same terminal state on a parse failure, and why only the parse
+    // itself (not the `onStreamError` call) is inside the `try`.
+    let parsed: StreamError;
     try {
-      handlers.onStreamError(JSON.parse((message as MessageEvent<string>).data) as StreamError);
+      parsed = JSON.parse((message as MessageEvent<string>).data) as StreamError;
     } catch {
       handlers.onStreamError({ error: "received a malformed stream_error frame" });
+      return;
     }
+    handlers.onStreamError(parsed);
   });
 
   source.onerror = () => {
