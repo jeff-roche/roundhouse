@@ -17,6 +17,7 @@
 //! `00-overview.md` §3.1.
 #![forbid(unsafe_code)]
 
+pub mod agent_loop;
 pub mod agent_spawn;
 pub mod break_glass;
 
@@ -58,6 +59,7 @@ pub use working_context::{ContextStateId, TokenBudget, WorkingContext};
 pub mod system_prompt;
 pub mod test_support;
 pub mod tool_catalog;
+pub mod tool_dispatch;
 pub mod tools;
 
 use roundhouse_bus::Bus;

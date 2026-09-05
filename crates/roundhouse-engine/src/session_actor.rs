@@ -324,6 +324,15 @@ impl SessionActor {
         &self.tool_defs
     }
 
+    /// This session's id. A read-only getter over an already-private field
+    /// (Phase 7, Task 5) — `run_agent_loop` needs it to call
+    /// [`crate::run_chat_turn`] and to mint per-dispatch task events, and
+    /// nothing before this task needed to read it back off a constructed
+    /// `SessionActor` from outside this module.
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
     /// Builds the live `SealedContext` this session's tasks are judged
     /// against — the exact wiring finding 3's `sealed_tier_shortfall` check
     /// needed and never had before Task 25: reads the CURRENT isolation

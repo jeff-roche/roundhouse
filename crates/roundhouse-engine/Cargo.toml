@@ -21,6 +21,11 @@ roundhouse-bus = { path = "../roundhouse-bus" }
 # `docs/architecture/02-system-architecture.md` §5.2, amended in the same
 # commit as this edge (ruling W1-R1).
 roundhouse-mcp = { path = "../roundhouse-mcp" }
+# Task 5 (Phase 7, ruling W1-R1): `src/tool_dispatch.rs` dispatches a
+# model-issued `ToolUse` to `roundhouse_tools`' real read/write/edit/find/shell
+# executors — the agent loop's built-in tool arm — so this crate needs a real
+# dependency on `roundhouse-tools`, not just a same-workspace sibling.
+roundhouse-tools = { path = "../roundhouse-tools" }
 schemars = { workspace = true }
 serde_json = { workspace = true }
 futures = "0.3"
