@@ -68,8 +68,16 @@ jobs:
           # files as ordinary package content, not something Vite will load
           # from this project root) would be auto-loaded by Vite and could
           # inline a VITE_* value with no other change needed.
-          if find . -path ./node_modules -prune -o -name '.env*' -print | grep -q .; then
-            echo "::error::found a .env* file under frontend/ — Vite auto-loads these and inlines any VITE_* value referenced from src/"
+          #
+          # `-print -quit` rather than piping to `grep -q .`: under
+          # `pipefail`, `grep -q` can exit (and close its end of the pipe)
+          # before `find` finishes walking, which delivers `find` a SIGPIPE
+          # and a non-zero exit that `pipefail` would then report as *this*
+          # check's failure — silently skipping the `if` body on a security
+          # guard is the one failure mode worse than a false alarm here.
+          found_env_file="$(find . -path ./node_modules -prune -o -name '.env*' -print -quit)"
+          if [ -n "$found_env_file" ]; then
+            echo "::error::found a .env* file under frontend/ ($found_env_file) — Vite auto-loads these and inlines any VITE_* value referenced from src/"
             exit 1
           fi
       - run: npm run typecheck

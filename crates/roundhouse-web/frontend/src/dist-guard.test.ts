@@ -13,9 +13,12 @@ import { describe, expect, it } from "vitest";
 // alone (no `cargo` invocation) catches an obvious regression before a push
 // round-trips through CI.
 //
-// Keep this file's six checks textually close to `dist_public_content.rs`'s
+// Keep this file's checks textually close to `dist_public_content.rs`'s
 // checks so a reader can see the two lists agree. If one grows a pattern the
-// other should grow too, even though only the Rust one is binding.
+// other should grow too, even though only the Rust one is binding. Slice B's
+// security review added three more Rust-side checks (S4: absolute origin,
+// build-machine path, an `sk-`-prefixed key shape) in the same commit that
+// built this file — mirrored below for the same reason.
 
 const DIST_DIR = join(__dirname, "..", "..", "assets", "dist");
 
@@ -79,6 +82,99 @@ function containsUuid(bytes: Buffer): boolean {
   return false;
 }
 
+// ── S4 additions (mirroring dist_public_content.rs's three newer checks) ──
+
+function findAll(haystack: Buffer, needle: string): number[] {
+  const indices: number[] = [];
+  let from = 0;
+  for (;;) {
+    const index = haystack.indexOf(needle, from, "latin1");
+    if (index === -1) break;
+    indices.push(index);
+    from = index + 1;
+  }
+  return indices;
+}
+
+function startsWithAscii(bytes: Buffer, offset: number, literal: string): boolean {
+  if (offset < 0 || offset + literal.length > bytes.length) return false;
+  for (let i = 0; i < literal.length; i++) {
+    if (bytes[offset + i] !== literal.charCodeAt(i)) return false;
+  }
+  return true;
+}
+
+function isAsciiDigit(byte: number | undefined): boolean {
+  return byte !== undefined && byte >= 0x30 && byte <= 0x39;
+}
+
+function isDigitOrDot(byte: number | undefined): boolean {
+  return isAsciiDigit(byte) || byte === 0x2e;
+}
+
+/** `http://`/`https://` not immediately followed by `www.w3.org/`. */
+function containsDisallowedScheme(bytes: Buffer, scheme: string): boolean {
+  return findAll(bytes, scheme).some((index) => !startsWithAscii(bytes, index + scheme.length, "www.w3.org/"));
+}
+
+/** `://` immediately followed by an ASCII digit — an IP-literal host under any scheme. */
+function containsSchemeWithDigitHost(bytes: Buffer): boolean {
+  return findAll(bytes, "://").some((index) => isAsciiDigit(bytes[index + 3]));
+}
+
+/** A bare dotted quad: four 1-3-digit groups separated by `.`, bounded on both sides. */
+function matchDottedQuadAt(bytes: Buffer, start: number): number | null {
+  let pos = start;
+  for (let group = 0; group < 4; group++) {
+    let len = 0;
+    while (pos < bytes.length && isAsciiDigit(bytes[pos]) && len < 3) {
+      pos += 1;
+      len += 1;
+    }
+    if (len === 0) return null;
+    if (isAsciiDigit(bytes[pos])) return null;
+    if (group < 3) {
+      if (bytes[pos] !== 0x2e) return null;
+      pos += 1;
+    }
+  }
+  return pos;
+}
+
+function containsDottedQuad(bytes: Buffer): boolean {
+  for (let index = 0; index < bytes.length; index++) {
+    const boundedBefore = index === 0 || !isDigitOrDot(bytes[index - 1]);
+    if (isAsciiDigit(bytes[index]) && boundedBefore) {
+      const end = matchDottedQuadAt(bytes, index);
+      if (end !== null && (end >= bytes.length || !isDigitOrDot(bytes[end]))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isWordByte(byte: number | undefined): boolean {
+  if (byte === undefined) return false;
+  return (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5a) || (byte >= 0x61 && byte <= 0x7a) || byte === 0x5f;
+}
+
+/** `sk-` not preceded by a word byte, followed by `ant-` or 16+ further word bytes. */
+function containsSkPrefixedKey(bytes: Buffer): boolean {
+  const MIN_KEY_TAIL = 16;
+  return findAll(bytes, "sk-").some((index) => {
+    if (isWordByte(bytes[index - 1])) return false;
+    if (startsWithAscii(bytes, index + 3, "ant-")) return true;
+    let run = 0;
+    let pos = index + 3;
+    while (isWordByte(bytes[pos])) {
+      run += 1;
+      pos += 1;
+    }
+    return run >= MIN_KEY_TAIL;
+  });
+}
+
 describe("dist/ public-content canary (mirrors dist_public_content.rs)", () => {
   const files = distFiles();
 
@@ -123,5 +219,56 @@ describe("dist/ public-content canary (mirrors dist_public_content.rs)", () => {
     for (const [path] of files) {
       expect(path.endsWith(".map"), `${path} is a source map`).toBe(false);
     }
+  });
+
+  it("names no absolute origin (S4)", () => {
+    for (const [path, bytes] of files) {
+      expect(containsDisallowedScheme(bytes, "http://"), `${path} contains a disallowed http:// reference`).toBe(
+        false,
+      );
+      expect(containsDisallowedScheme(bytes, "https://"), `${path} contains an https:// reference`).toBe(false);
+      expect(containsSchemeWithDigitHost(bytes), `${path} contains a scheme://<digit> reference`).toBe(false);
+      expect(containsDottedQuad(bytes), `${path} contains a bare dotted-quad IP address`).toBe(false);
+    }
+  });
+
+  it("discloses no build-machine path (S4)", () => {
+    for (const [path, bytes] of files) {
+      for (const needle of ["/home/", "/Users/", "C:\\"]) {
+        expect(bytes.includes(needle), `${path} contains ${JSON.stringify(needle)}`).toBe(false);
+      }
+    }
+  });
+
+  it("contains no sk-prefixed key shape (S4)", () => {
+    for (const [path, bytes] of files) {
+      expect(containsSkPrefixedKey(bytes), `${path} contains an sk--prefixed key shape`).toBe(false);
+    }
+  });
+});
+
+describe("self_tests (mirroring dist_public_content.rs's self_tests module)", () => {
+  it("containsDisallowedScheme allows only the w3.org SVG namespace", () => {
+    expect(containsDisallowedScheme(Buffer.from("xmlns=http://www.w3.org/2000/svg"), "http://")).toBe(false);
+    expect(containsDisallowedScheme(Buffer.from('fetch("http://evil.example.com/")'), "http://")).toBe(true);
+    expect(containsDisallowedScheme(Buffer.from('fetch("https://evil.example.com/")'), "https://")).toBe(true);
+  });
+
+  it("containsSchemeWithDigitHost matches any scheme over an IP literal", () => {
+    expect(containsSchemeWithDigitHost(Buffer.from("ws://192.168.1.5:9000"))).toBe(true);
+    expect(containsSchemeWithDigitHost(Buffer.from("http://www.w3.org/2000/svg"))).toBe(false);
+  });
+
+  it("containsDottedQuad matches a bare IP but not a semver string", () => {
+    expect(containsDottedQuad(Buffer.from("target host 192.168.1.5 reached"))).toBe(true);
+    expect(containsDottedQuad(Buffer.from("solid-js 1.9.15"))).toBe(false);
+    expect(containsDottedQuad(Buffer.from("9.192.168.1.5.9"))).toBe(false);
+  });
+
+  it("containsSkPrefixedKey is anchored against ordinary hyphenated identifiers", () => {
+    expect(containsSkPrefixedKey(Buffer.from('class="task-row"'))).toBe(false);
+    expect(containsSkPrefixedKey(Buffer.from("sk-ant-api03-abcdefghijklmnop"))).toBe(true);
+    expect(containsSkPrefixedKey(Buffer.from("sk-1234567890abcdef1234567890"))).toBe(true);
+    expect(containsSkPrefixedKey(Buffer.from("sk-short"))).toBe(false);
   });
 });

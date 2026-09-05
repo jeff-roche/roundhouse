@@ -59,7 +59,9 @@
          URL immediately with `history.replaceState` (the only mitigation for
          browser history / account sync / URL-bar autocomplete, none of which
          any server-side code can reach), and resend it as an
-         `Authorization: Bearer` header on every request that can carry one.
+         `Authorization: Bearer` header on every request that can carry one —
+         except a streaming connection, which cannot set request headers at
+         all and instead resends it as a query parameter for that one case.
     -->
     <div id="app"></div>
   </body>
