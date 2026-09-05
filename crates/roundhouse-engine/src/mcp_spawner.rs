@@ -51,7 +51,7 @@ use roundhouse_core::{
 use roundhouse_mcp::config::McpServerConfig;
 use roundhouse_mcp::executor::{TaskInput as McpTaskInput, TaskSpawner, TerminalOutcome};
 use roundhouse_mcp::host::{McpHost, McpHostError};
-use roundhouse_policy::Policy;
+use roundhouse_policy::engine::PolicyEngine;
 use roundhouse_provider::ToolDef;
 use roundhouse_store::EventWriter;
 use std::sync::Arc;
@@ -229,13 +229,32 @@ impl TaskSpawner for EngineTaskSpawner {
     }
 }
 
-/// Errors from [`start_session_mcp`]: either `McpHost::start` itself failed
-/// (a server refused to spawn, discovery failed, or the discovered tool
-/// namespace collided — see [`McpHostError`]), or the discovered tools
-/// collided by name with the built-in catalog or each other (Task 1's
+/// Errors from [`start_session_mcp`]: either the supplied `PolicyEngine`
+/// has no real sealed-context provider installed
+/// ([`StartSessionMcpError::UnconfiguredSealedContext`] — checked BEFORE
+/// anything is spawned), `McpHost::start` itself failed (a server refused
+/// to spawn, discovery failed, or the discovered tool namespace collided —
+/// see [`McpHostError`]), or the discovered tools collided by name with the
+/// built-in catalog or each other (Task 1's
 /// [`crate::tool_catalog::ToolCatalogError`]).
 #[derive(Debug, thiserror::Error)]
 pub enum StartSessionMcpError {
+    /// Security review fix round 1 (ruling W1-R17): `policy.sealed_ctx()`
+    /// still returns `roundhouse_policy::sealed::default_context()`'s
+    /// placeholder (`state_dir`/`daemon_binary` empty, not absolute) —
+    /// nothing has called `PolicyEngine::with_sealed_ctx_provider` with a
+    /// real provider. See this error variant's `Display` message for why
+    /// this is checked and refused rather than silently proceeding.
+    #[error(
+        "PolicyEngine has no real sealed_ctx_provider installed (sealed_ctx() still returns \
+         the empty/non-absolute placeholder from roundhouse_policy::sealed::default_context) — \
+         refusing to start this session's MCP servers under a policy that cannot resolve real \
+         sealed-floor context. Every TaskParams::Mcp would currently be denied by \
+         sealed_mcp_unresolved (fail-closed, but a trap: install a real provider via \
+         PolicyEngine::with_sealed_ctx_provider(...) rather than swapping in a permissive \
+         Policy to work around the denials"
+    )]
+    UnconfiguredSealedContext,
     #[error(transparent)]
     Host(#[from] McpHostError),
     #[error(transparent)]
@@ -273,29 +292,56 @@ pub enum StartSessionMcpError {
 /// needs `host.executor` to do so, and whatever tears a session down needs
 /// `host.shutdown()`.
 ///
-/// # On `policy`
-/// `McpHost::start`'s dispatch gate wants a `roundhouse_policy::Policy`
-/// (`fn decide(&self, &PolicyInput) -> PolicyDecision`) — a different,
-/// simpler trait than the sealed-floor `PolicyEngine`
-/// (`decide_sealed(&TaskParams, &SealedContext)`) `SessionActor` itself
-/// holds. Bridging the two correctly needs a live `SealedContext` (built
-/// from a session's current isolation attestation — see
-/// `SessionActor::sealed_context`) AND a real per-dispatch `Taint` value
-/// (§6.8's "a session that reads untrusted content loses standing
-/// permission" mitigation) — both are dispatch-loop concerns this task does
-/// not own (compare the lane's own ruling that unattended-approval wiring
-/// stops at an additive hook here, not a full implementation). This
-/// function therefore takes `policy` as a plain `Arc<dyn Policy>` parameter
-/// rather than silently deriving one from a `PolicyEngine`; wiring a real,
-/// security-reviewed adapter is left to whichever task actually threads a
-/// session's sealed floor through to MCP dispatch.
+/// # On `policy` (security review fix round 1, ruling W1-R15)
+/// An earlier version of this function took `policy: Arc<dyn Policy>` and
+/// this doc comment claimed bridging `SessionActor`'s sealed-floor
+/// `PolicyEngine` to `McpHost::start`'s `Policy` trait needed new adapter
+/// code this task didn't own. **That premise was wrong** — the real
+/// `impl crate::Policy for PolicyEngine` already exists
+/// (`roundhouse-policy/src/engine.rs`), routes through `decide_sealed()`
+/// against `self.sealed_ctx()`, and its own doc comment states the intent
+/// outright: "so `PolicyEngine` is a drop-in `Box<dyn Policy>` ... the
+/// sealed floor is never bypassable through the trait-object call path
+/// either." So `Arc<PolicyEngine>` unsize-coerces to `Arc<dyn Policy>` for
+/// free, with zero bridging code.
+///
+/// Taking the CONCRETE `Arc<PolicyEngine>` here (rather than `Arc<dyn
+/// Policy>`) is deliberately the tighter, security-relevant choice, not a
+/// typing preference: a permissive `AllowAllPolicy` test double genuinely
+/// exists in `roundhouse-mcp`'s own test suite
+/// (`tests/host_integration.rs`, `tests/integration.rs`). Declaring this
+/// parameter as `Arc<dyn Policy>` would let a future caller pass one of
+/// those in without the compiler noticing; declaring it as the concrete
+/// `PolicyEngine` type makes doing so a compile error instead.
+///
+/// The REAL residual gap this function does guard against explicitly: refer
+/// to [`StartSessionMcpError::UnconfiguredSealedContext`]. `PolicyEngine`'s
+/// `sealed_ctx()` is driven by a caller-installed provider
+/// (`with_sealed_ctx_provider`) that nothing in this codebase installs yet
+/// — so an un-configured `PolicyEngine` always judges MCP dispatch against
+/// `roundhouse_policy::sealed::default_context()`'s empty placeholder
+/// (`state_dir`/`daemon_binary` empty, `resolved_mcp_servers` empty). That
+/// currently denies every `TaskParams::Mcp` closed via
+/// `sealed_mcp_unresolved` — safe, but a trap for whoever wires this up
+/// next: seeing 100% of MCP calls denied and reaching for a permissive
+/// `Policy` instead of installing a real provider would be exactly the
+/// fail-open shortcut this type signature is designed to make impossible.
+/// This function instead detects the placeholder up front (the same
+/// non-absolute-path shape `SessionActor::new`'s own asserts already treat
+/// as invalid) and returns a named, typed error rather than either
+/// panicking or silently running every dispatch through a floor that can
+/// never resolve any server.
 pub async fn start_session_mcp(
     configs: Vec<McpServerConfig>,
     session_id: SessionId,
     runner: &'static TaskRunner,
     writer: EventWriter,
-    policy: Arc<dyn Policy>,
+    policy: Arc<PolicyEngine>,
 ) -> Result<(Arc<McpHost>, Vec<ToolDef>), StartSessionMcpError> {
+    let ctx = policy.sealed_ctx();
+    if !ctx.state_dir.is_absolute() || !ctx.daemon_binary.is_absolute() {
+        return Err(StartSessionMcpError::UnconfiguredSealedContext);
+    }
     let spawner: Arc<dyn TaskSpawner> =
         Arc::new(EngineTaskSpawner::new(runner, writer, session_id));
     let host = McpHost::start(configs, session_id, policy, spawner).await?;

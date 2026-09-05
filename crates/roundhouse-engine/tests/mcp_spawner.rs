@@ -9,11 +9,15 @@
 //! `chat_infer_tree.rs`'s own follow-on assertion does.
 
 use once_cell::sync::Lazy;
-use roundhouse_core::{Origin, SessionId, TaskId, TaskKind, TaskRunner};
-use roundhouse_engine::mcp_spawner::EngineTaskSpawner;
+use roundhouse_core::{Origin, SessionId, TaskId, TaskKind, TaskRunner, Tier};
+use roundhouse_engine::mcp_spawner::{start_session_mcp, EngineTaskSpawner, StartSessionMcpError};
 use roundhouse_mcp::executor::{TaskInput as McpTaskInput, TaskSpawner};
+use roundhouse_policy::engine::PolicyEngine;
+use roundhouse_policy::sealed::SealedContext;
 use roundhouse_policy::ServerId;
 use roundhouse_store::{fold_task, open, spawn_writer, StoredEvent};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 /// `TaskRunner::bootstrap()` panics if called more than once per process
 /// (S-LOG-1's single-authority guarantee) — this test binary is one
@@ -176,4 +180,82 @@ async fn suspend_decision_and_terminal_are_all_recorded_durably() {
         &e.payload,
         roundhouse_core::EventPayload::TaskCompleted { .. }
     )));
+}
+
+/// A `PolicyEngine` with a real `sealed_ctx_provider` installed — the
+/// "past the new guard" shape `start_session_mcp` requires as of security
+/// review fix round 1 (ruling W1-R17). Absolute, non-empty `state_dir`/
+/// `daemon_binary` (real filesystem paths under `dir`, mirroring what
+/// `SessionActor::new`'s own asserts require), matching the same
+/// non-placeholder shape check `start_session_mcp` performs.
+fn policy_with_real_sealed_ctx(dir: &std::path::Path) -> Arc<PolicyEngine> {
+    let state_dir = dir.join("state");
+    let daemon_binary = dir.join("daemon-binary");
+    Arc::new(
+        PolicyEngine::from_rules(vec![]).with_sealed_ctx_provider(Arc::new(move || {
+            SealedContext {
+                state_dir: state_dir.clone(),
+                daemon_binary: daemon_binary.clone(),
+                resolved_mcp_servers: HashSet::new(),
+                requested_tier: Tier::None,
+                attested_tier: Tier::None,
+                home: None,
+            }
+        })),
+    )
+}
+
+#[tokio::test]
+async fn start_session_mcp_with_no_configured_servers_yields_the_full_builtin_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+    let session_id = SessionId::new();
+    let policy = policy_with_real_sealed_ctx(dir.path());
+
+    let (host, tool_defs) = start_session_mcp(vec![], session_id, &RUNNER, writer, policy)
+        .await
+        .expect("zero configured MCP servers must not fail startup");
+
+    assert!(
+        host.tool_defs().is_empty(),
+        "no MCP servers were configured, so the host discovered nothing"
+    );
+    // Proves the EngineTaskSpawner -> McpHost::start -> merged_tool_defs
+    // composition actually composes, not just type-checks: the five
+    // builtins came out the other end of a real (if server-less) McpHost
+    // startup + Task 1 merge, not a bypass.
+    let names: HashSet<&str> = tool_defs.iter().map(|d| d.name()).collect();
+    for builtin in ["read", "write", "edit", "find", "shell"] {
+        assert!(names.contains(builtin), "missing builtin tool {builtin}");
+    }
+    assert_eq!(
+        tool_defs.len(),
+        5,
+        "no MCP tools to merge in, so just the builtins"
+    );
+}
+
+#[tokio::test]
+async fn start_session_mcp_refuses_a_policy_engine_with_no_real_sealed_ctx_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+    let session_id = SessionId::new();
+
+    // The default `PolicyEngine::from_rules` installs no real
+    // `sealed_ctx_provider` — `sealed_ctx()` returns
+    // `roundhouse_policy::sealed::default_context()`'s empty placeholder.
+    let policy = Arc::new(PolicyEngine::from_rules(vec![]));
+
+    let result = start_session_mcp(vec![], session_id, &RUNNER, writer, policy).await;
+    // `McpHost` (the `Ok` payload) has no `Debug` impl, so match explicitly
+    // rather than `{result:?}` in an assertion message.
+    match result {
+        Err(StartSessionMcpError::UnconfiguredSealedContext) => {}
+        Ok(_) => panic!("expected UnconfiguredSealedContext, got Ok(_)"),
+        Err(other) => panic!("expected UnconfiguredSealedContext, got {other:?}"),
+    }
 }
