@@ -8,11 +8,41 @@
       before anything else. Moving either one after `<link rel="stylesheet">`
       would leave `/app.css`'s own request uncovered, which is exactly what
       S2 below exists to close.
+
+      Fix round 1 correction: an earlier draft of this rationale named
+      `connect-src` as the load-bearing directive against exfiltration. It
+      is not. `connect-src` governs `fetch`/`XHR`/`EventSource`/
+      `sendBeacon` — it says nothing about a TOP-LEVEL NAVIGATION, which no
+      CSP directive covers at all (`navigate-to` was proposed and withdrawn
+      from the spec). So setting `location` to an attacker's origin plus the
+      held token as a query parameter would sail past every directive here.
+      What actually stops an injection in a rendered `Report`/`Finding`
+      field or SSE text from running in the first place is
+      `default-src 'self'` falling through to `script-src` — no inline
+      `<script>`, no `javascript:` URL, no dynamically injected
+      cross-origin `<script src>` can execute. That is this policy's real
+      defence: stopping the injection from becoming code at all, not
+      containing what code it could reach afterward. `connect-src 'self'`
+      is real hardening too (it blocks a *legitimate* script from being
+      coerced into calling an unexpected origin, and costs nothing since
+      this client is same-origin-only anyway) — it is just not the
+      load-bearing half.
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'"
+      content="default-src 'self'; connect-src 'self'; form-action 'self'; object-src 'none'; base-uri 'none'"
     />
+    <!--
+      `frame-ancestors`, `sandbox`, and `report-uri`/`report-to` are all
+      DROPPED by the HTML spec when a CSP is delivered via a meta tag rather
+      than a response header (see the HTML spec's own note on the
+      `http-equiv` content-security-policy attribute: certain directives
+      are ignored outside a real header). Clickjacking defence is therefore
+      NOT covered here and cannot be — it needs a real
+      `Content-Security-Policy`/`X-Frame-Options` response header, which
+      only `crates/roundhouse-web/src/assets.rs` can set, and this lane may
+      not edit that file. Comment only; not attempted here.
+    -->
     <!--
       S2 — a real, live leak, not a hypothetical. Under the default
       `strict-origin-when-cross-origin` referrer policy, a same-origin
@@ -29,7 +59,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Roundhouse</title>
     <link rel="stylesheet" href="/app.css" />
-    <script type="module" crossorigin src="/assets/index-DqHbEKrg.js"></script>
+    <script type="module" crossorigin src="/assets/index-nxkd7fqd.js"></script>
   </head>
   <body>
     <!--
