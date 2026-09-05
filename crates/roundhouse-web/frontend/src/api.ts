@@ -92,15 +92,31 @@ export async function fetchRuns(): Promise<RunsResult> {
   }
 
   // Fix round 2 (Minor, code review): the body used to be cast straight to
-  // `RunSummary[]` with no check. A non-array 200 body — a proxy's error
-  // page, a future route change, anything unexpected — would then render
+  // `RunSummary[]` with no check. A non-array 200 body — a future route
+  // change, anything unexpected but still valid JSON — would then render
   // silently as an empty inbox, exactly the confusion `runs.rs`'s own
   // module docs argue at length against for the server side ("an empty
   // inbox is a real, common and reassuring answer... and it must never be
   // what 'this daemon has no database attached' looks like"). The same
   // argument applies here: an empty inbox must never be indistinguishable
   // from a response this client could not actually understand.
-  const body: unknown = await response.json();
+  //
+  // Fix round 3 (BLOCKING, code review): a 200 response that is not JSON at
+  // all — a proxy's error page in front of `apiFetch`, most plausibly, the
+  // exact case `errorReason` below already guards against — used to throw
+  // a `SyntaxError` straight out of `response.json()`, uncaught, so
+  // `fetchRuns` rejected instead of returning the `error` outcome the
+  // `Array.isArray` check below exists to produce. `RunsInbox` reads this
+  // through `createResource` with no `ErrorBoundary`, so that rejection
+  // surfaced as an uncaught render error rather than the "Loading the runs
+  // inbox failed" state — worse than the empty-inbox confusion this same
+  // fix round 2 comment describes. Mirrors `errorReason`'s own try/catch.
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return { kind: "error", status: response.status, reason: "response body was not valid JSON" };
+  }
   if (!Array.isArray(body)) {
     return { kind: "error", status: response.status, reason: "expected an array of runs" };
   }

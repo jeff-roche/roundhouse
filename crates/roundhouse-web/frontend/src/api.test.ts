@@ -148,6 +148,28 @@ describe("fetchRuns", () => {
     expect(result.kind).toBe("error");
     expect(result).not.toEqual({ kind: "ok", runs: [] });
   });
+
+  // Fix round 3 (BLOCKING, code review): a 200 whose body isn't JSON at all
+  // — a proxy's error page in front of `apiFetch`, the exact case
+  // `errorReason` already guards against — used to make `response.json()`
+  // throw a `SyntaxError` straight out of `fetchRuns`, uncaught, which
+  // `RunsInbox`'s `createResource` (no `ErrorBoundary`) would have
+  // surfaced as an uncaught render error rather than the `error` outcome.
+  it("reports a 200 body that isn't JSON at all as an error, rather than rejecting (fix round 3)", async () => {
+    mockFetch({
+      ok: true,
+      status: 200,
+      json: async () => {
+        throw new SyntaxError("Unexpected token < in JSON at position 0");
+      },
+    });
+
+    await expect(fetchRuns()).resolves.toEqual({
+      kind: "error",
+      status: 200,
+      reason: "response body was not valid JSON",
+    });
+  });
 });
 
 describe("postInteraction", () => {
@@ -437,6 +459,46 @@ describe("connectSessionEvents malformed frames (fix round 1, M5)", () => {
     source.emitNamed("resync_required", JSON.stringify({ resume_from: 5, oldest_retained: 10 }));
     expect(onResyncRequired).toHaveBeenCalledWith({ resume_from: 5, oldest_retained: 10 });
     expect(onStreamError).not.toHaveBeenCalled();
+  });
+
+  // Fix round 3 (code review): the "malformed frame" try/catch above is
+  // deliberately narrowed to the parse and shape check only, NOT the
+  // handler call — a genuine bug inside `onResyncRequired`/`onStreamError`
+  // itself must propagate rather than be misdiagnosed as a malformed
+  // frame. Every regression test to this point pins the OTHER direction
+  // (`not.toThrow()`); a refactor that moved the handler call back inside
+  // the try would still pass every one of them while silently swallowing a
+  // real handler bug. These pin the direction nothing else here does.
+  it("propagates (does not swallow) a throw from a genuine onResyncRequired bug", () => {
+    const onResyncRequired = vi.fn(() => {
+      throw new Error("a real bug inside the consumer's own handler");
+    });
+    const source = connectSessionEvents("sess-1", {
+      onEvent: () => {},
+      onResyncRequired,
+      onStreamError: () => {},
+      onError: () => {},
+    }) as unknown as FakeEventSource;
+
+    expect(() =>
+      source.emitNamed("resync_required", JSON.stringify({ resume_from: 5, oldest_retained: 10 })),
+    ).toThrow("a real bug inside the consumer's own handler");
+  });
+
+  it("propagates (does not swallow) a throw from a genuine onStreamError bug", () => {
+    const onStreamError = vi.fn(() => {
+      throw new Error("a real bug inside the consumer's own handler");
+    });
+    const source = connectSessionEvents("sess-1", {
+      onEvent: () => {},
+      onResyncRequired: () => {},
+      onStreamError,
+      onError: () => {},
+    }) as unknown as FakeEventSource;
+
+    expect(() => source.emitNamed("stream_error", JSON.stringify({ error: "a real stream error" }))).toThrow(
+      "a real bug inside the consumer's own handler",
+    );
   });
 
   // Fix round 2: `JSON.parse` succeeds on a value that is syntactically
