@@ -16,12 +16,31 @@ use roundhouse_core::TaskKind;
 use roundhouse_provider::{tool_def_from_schema, ToolDef};
 
 /// Where a resolved tool name dispatches to: one of the five built-in
-/// executors (carrying the `TaskKind` that names it), or a specific tool on
-/// a specific MCP server.
+/// executors (carrying the `TaskKind` that names it), or an MCP-discovered
+/// tool.
+///
+/// `Mcp`'s field is deliberately a single opaque `namespaced_name`, not a
+/// split `{server, tool}` pair (orchestrator ruling W1-R10). Splitting on
+/// `"__"` is not a safe way to recover the original server/tool names:
+/// `sanitize` (`crates/roundhouse-mcp/src/namespace.rs`) maps every
+/// non-alphanumeric, non-`-`/`_` character to `_`, so a server id like
+/// `"a..b"` sanitizes to `"a__b"`, and the resulting namespaced name
+/// `"a__b__search"` would split-on-first-`__` as `("a", "b__search")` —
+/// silently wrong, not merely imprecise. `ToolNamespace::resolve` (same
+/// file) is the only authoritative source of the real `(&ServerId, &str)`
+/// pair, keyed by the *whole* namespaced string. And the real MCP
+/// dispatch consumer, `McpExecutor::execute`
+/// (`crates/roundhouse-mcp/src/executor.rs`), expects exactly that: its
+/// `TaskInput::Mcp { tool, .. }` field is documented and used as the full
+/// namespaced name, which it hands to `self.namespace.resolve(tool)`
+/// itself and fails closed if that lookup misses. So keeping the
+/// namespaced name intact and opaque here is both safer (no
+/// lossy/incorrect re-derivation) and a closer match to what the real
+/// consumer wants than a split pair would be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolTarget {
     Builtin(TaskKind),
-    Mcp { server: String, tool: String },
+    Mcp { namespaced_name: String },
 }
 
 /// Resolves a model-facing tool name to its dispatch target.
@@ -39,18 +58,14 @@ pub enum ToolTarget {
 /// resolves to `None` — an unresolvable tool name, which the caller must
 /// treat as a dispatch error rather than guessing.
 ///
-/// **The `(server, tool)` split below is a shape test, not authoritative
-/// recovery of the original names.** It splits on the *first* `"__"`,
-/// but `build_namespaced_name` does not guarantee that's the only `"__"`
-/// in the string: a server id may itself sanitize to something containing
-/// `__`, and a name that would exceed 64 chars is truncated and suffixed
-/// with an 8-hex-char blake3 hash, which no longer round-trips to the
-/// original tool name at all. A real caller that needs the actual
-/// `(ServerId, original tool name)` pair for dispatch must resolve it
-/// through `ToolNamespace::resolve`'s lookup table (built at discovery
-/// time), not by re-parsing the namespaced string — this function only
-/// tells the caller "this name is MCP-shaped, go look it up," it is not a
-/// substitute for that lookup.
+/// This is a **pure shape test** — it decides "is this a builtin, or does
+/// it look like a namespaced MCP name?" and nothing more. It never
+/// inspects, splits, or otherwise interprets the interior of an MCP name:
+/// the whole string is carried through unmodified as
+/// `ToolTarget::Mcp { namespaced_name }`, a lookup key. The only correct
+/// way to turn that key into a real `(server, original tool)` pair is
+/// `ToolNamespace::resolve(namespaced_name)` — see `ToolTarget`'s doc
+/// comment for why splitting on `"__"` here instead would be unsafe.
 pub fn resolve_tool_target(name: &str) -> Option<ToolTarget> {
     match name {
         "read" => Some(ToolTarget::Builtin(TaskKind::Read)),
@@ -58,12 +73,10 @@ pub fn resolve_tool_target(name: &str) -> Option<ToolTarget> {
         "edit" => Some(ToolTarget::Builtin(TaskKind::Edit)),
         "find" => Some(ToolTarget::Builtin(TaskKind::Find)),
         "shell" => Some(ToolTarget::Builtin(TaskKind::Shell)),
-        other => other
-            .split_once("__")
-            .map(|(server, tool)| ToolTarget::Mcp {
-                server: server.to_string(),
-                tool: tool.to_string(),
-            }),
+        other if other.contains("__") => Some(ToolTarget::Mcp {
+            namespaced_name: other.to_string(),
+        }),
+        _ => None,
     }
 }
 

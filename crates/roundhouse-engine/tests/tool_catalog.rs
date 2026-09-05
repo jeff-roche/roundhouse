@@ -52,7 +52,24 @@ fn every_builtin_executor_has_exactly_one_tool_def_with_a_resolvable_target() {
 fn a_namespaced_mcp_name_resolves_to_the_mcp_target_not_a_builtin() {
     assert!(matches!(
         resolve_tool_target("github__create_issue"),
-        Some(ToolTarget::Mcp { server, tool }) if server == "github" && tool == "create_issue"
+        Some(ToolTarget::Mcp { namespaced_name }) if namespaced_name == "github__create_issue"
+    ));
+}
+
+#[test]
+fn a_namespaced_name_containing_extra_double_underscores_is_preserved_verbatim_not_split() {
+    // Regression test for W1-R10: `sanitize` in roundhouse-mcp's namespace
+    // module maps every non-alphanumeric, non-`-`/`_` character to `_`, so a
+    // server id like "a..b" sanitizes to "a__b", and the resulting
+    // namespaced name "a__b__search" has more than one "__" in it.
+    // Splitting on the *first* occurrence would silently misparse this as
+    // server "a", tool "b__search" — wrong. `resolve_tool_target` must not
+    // attempt that split at all: the whole string is an opaque lookup key,
+    // to be resolved later via `ToolNamespace::resolve`, not re-derived here.
+    let name = "a__b__search";
+    assert!(matches!(
+        resolve_tool_target(name),
+        Some(ToolTarget::Mcp { namespaced_name }) if namespaced_name == name
     ));
 }
 
