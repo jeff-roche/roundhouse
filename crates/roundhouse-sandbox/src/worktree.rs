@@ -1,14 +1,18 @@
 //! Concrete, synchronous git-worktree materialization (Task 34, lane W5,
 //! rulings W5-8/W5-22): the primitive that actually calls `git worktree
 //! add`/`git worktree remove`, so that `roundhouse-flow`'s
-//! `map.isolation: worktree` can give a workflow's fan-out items real
-//! filesystem isolation instead of merely parsing to declared data with
-//! nothing behind it (Phase 5 ruling P42). This module has no idea what a
-//! workflow, a `map` step, or an expression context is — it is two plain
-//! functions, [`add_worktree`] and [`remove_worktree`], over a `repo_root`
-//! and a `worktree_path` the caller supplies, exactly the same
-//! `roundhouse-flow`-never-a-dependency shape [`crate::bounded_parse`]
-//! already established for this crate's other spawn-a-child primitive.
+//! `map.isolation: worktree` can give a workflow's fan-out items a real,
+//! separate working directory each, instead of merely parsing to declared
+//! data with nothing behind it (Phase 5 ruling P42). **Fix round 1, item
+//! 5: not called "isolation" here** — see this crate's own top-level
+//! module doc comment, and this module's "Config and hooks" section below,
+//! for why a git worktree is a separate directory, not a confinement
+//! boundary. This module has no idea what a workflow, a `map` step, or an
+//! expression context is — it is two plain functions, [`add_worktree`] and
+//! [`remove_worktree`], over a `repo_root` and a `worktree_path` the
+//! caller supplies, exactly the same `roundhouse-flow`-never-a-dependency
+//! shape [`crate::bounded_parse`] already established for this crate's
+//! other spawn-a-child primitive.
 //!
 //! # Security: `base_ref` reaches `git` as one discrete argv element, after `--`
 //!
@@ -23,13 +27,19 @@
 //! runtime-evaluated value — hostile or not, validated or not — from ever
 //! being able to smuggle a second flag into `git`'s command line. `git
 //! worktree add`'s own `--` end-of-options marker, placed immediately
-//! before `base_ref`, is what makes that guarantee: everything after `--`
-//! is a positional argument to git, never re-parsed as an option, no
-//! matter what it contains (verified directly against this git binary: a
+//! before **both** positional arguments (`worktree_path` and `base_ref`,
+//! fix round 1, item 4 — an earlier version placed it only before
+//! `base_ref`, which left `worktree_path` unprotected too, code-derived
+//! and therefore not exploitable today but with no reason to leave it
+//! that way), is what makes that guarantee: everything after `--` is a
+//! positional argument to git, never re-parsed as an option, no matter
+//! what it contains (verified directly against this git binary: a
 //! `base_ref` of `"--upload-pack=/tmp/evil"` after `--` is rejected by git
-//! itself as `fatal: invalid reference`, not executed as a flag). This
-//! module never builds a shell string and never calls `sh -c` — `base_ref`
-//! is always exactly one [`std::ffi::OsStr`] handed to one `.arg()` call.
+//! itself as `fatal: invalid reference`, not executed as a flag, and git
+//! accepts `--` in the `worktree add --detach -- <path> <commit-ish>`
+//! position identically for `remove --force -- <path>`). This module
+//! never builds a shell string and never calls `sh -c` — `base_ref` is
+//! always exactly one [`std::ffi::OsStr`] handed to one `.arg()` call.
 //!
 //! # Environment: `env_clear()` plus an explicit `PATH` allowlist, nothing else
 //!
@@ -58,13 +68,51 @@
 //! happens to live in the default path.
 //!
 //! No other environment variable is added back. `git worktree add`/
-//! `remove` need no author identity, no `core.*` configuration, and no
-//! `HOME` — verified directly (`env -i PATH="$PATH" git worktree add
-//! --detach <path> -- <ref>` and the matching `remove` both succeed against
-//! a repository this process owns). If a future caller of this module
-//! needs `git` to read `~/.gitconfig` (a `safe.directory` entry, say), that
-//! is an explicit addition to make there, not something this module
-//! provides speculatively.
+//! `remove` need no author identity and no `HOME` to be *supplied* — verified
+//! directly (`env -i PATH="$PATH" git worktree add --detach <path> -- <ref>`
+//! and the matching `remove` both succeed against a repository this process
+//! owns). If a future caller of this module needs `git` to read
+//! `~/.gitconfig` (a `safe.directory` entry, say), that is an explicit
+//! addition to make there, not something this module provides speculatively.
+//!
+//! **This says nothing about what `git` reads and executes on its own,
+//! regardless of environment — see "Config and hooks" below, which fix
+//! round 1 added after an earlier version of this paragraph conflated the
+//! two.**
+//!
+//! # Config and hooks: `-c` overrides, not environment, close this (Task 34 fix round 1, item 2)
+//!
+//! A git worktree shares one `.git/config` and one `hooksPath` with the
+//! repository it was created from — worktrees are not independent
+//! repositories. `git worktree add`/`remove` genuinely **run** repo-local
+//! hooks (`post-checkout` on `add`, for one) as the invoking user, with
+//! whatever `PATH` the process has, **regardless of `env_clear()`** — that
+//! bounds what `git` inherits from *this process's environment*, not what
+//! `git` reads from the repository's own on-disk config, which is a
+//! different trust boundary entirely. Reproduced directly against this git
+//! binary: a repo-local `core.hooksPath` pointing at a script touches a
+//! marker file on a plain `env -i PATH="$PATH" git worktree add --detach
+//! -- <path> <ref>`, with no environment variable involved at all.
+//!
+//! The security consequence is a real, chained one, not merely a stray
+//! hook firing: because a worktree's `.git` is a write-through pointer back
+//! at the *shared* config, anything with a shell inside one worktree (an
+//! `agent`/`tool: shell` inner step, say) can run
+//! `git config --local core.hooksPath /somewhere/attacker-controlled` and
+//! have it apply to **every subsequent `git worktree add`/`remove` call
+//! against that same `repo_root`** — including this module's own calls for
+//! the *next* fan-out item. That is a cross-item escape from the boundary
+//! this feature exists to provide, reaching arbitrary code execution as
+//! whatever user runs the daemon.
+//!
+//! **Fix: three `-c` overrides on every invocation, applied to that one
+//! invocation only — never written to the repository's own config file:**
+//! `-c core.hooksPath=/dev/null` (the direct fix — no hook path resolves to
+//! anything runnable), `-c core.fsmonitor=false` (`core.fsmonitor` can also
+//! name an arbitrary executable git runs), and `-c protocol.allow=never`
+//! (defense in depth against any implicit network operation this or a
+//! future call shape might trigger). None of the three change
+//! `add`/`remove`'s own observable behavior — verified directly.
 //!
 //! # What this does not attempt
 //!
@@ -206,11 +254,25 @@ pub fn add_worktree(
     run_git(
         repo_root,
         &[
+            // Fix round 1, item 2: three discrete `-c` overrides, applied
+            // to *this* invocation only (never written to the repo's own
+            // config) — see the module doc comment's "Config and hooks"
+            // section for why these are required, not merely defensive.
+            OsStr::new("-c"),
+            OsStr::new("core.hooksPath=/dev/null"),
+            OsStr::new("-c"),
+            OsStr::new("core.fsmonitor=false"),
+            OsStr::new("-c"),
+            OsStr::new("protocol.allow=never"),
             OsStr::new("worktree"),
             OsStr::new("add"),
             OsStr::new("--detach"),
-            worktree_path.as_os_str(),
+            // Fix round 1, item 4: `--` now precedes BOTH positionals, not
+            // just `base_ref` — see the module doc comment's "Security"
+            // section for why `worktree_path` needed it too even though
+            // nothing exploits it today.
             OsStr::new("--"),
+            worktree_path.as_os_str(),
             OsStr::new(base_ref),
         ],
     )
@@ -227,6 +289,14 @@ pub fn remove_worktree(repo_root: &Path, worktree_path: &Path) -> Result<(), Wor
     run_git(
         repo_root,
         &[
+            // See `add_worktree`'s identical `-c` overrides and the module
+            // doc comment's "Config and hooks" section.
+            OsStr::new("-c"),
+            OsStr::new("core.hooksPath=/dev/null"),
+            OsStr::new("-c"),
+            OsStr::new("core.fsmonitor=false"),
+            OsStr::new("-c"),
+            OsStr::new("protocol.allow=never"),
             OsStr::new("worktree"),
             OsStr::new("remove"),
             OsStr::new("--force"),

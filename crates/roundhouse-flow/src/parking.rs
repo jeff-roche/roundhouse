@@ -67,12 +67,20 @@
 //! simulated — a `workspace_released: true` flag from a crate that cannot
 //! touch a worktree would be a claim, not a release:
 //!
-//! - **Releasing the worktree** — no worktree creation *or* teardown code
-//!   exists anywhere in `crates/`; `exec::map_step`'s module doc already
-//!   records that this crate has no git or process-spawning dependency and
-//!   so cannot invoke `git worktree`. [`ParkResult::workspace`] is therefore
-//!   a *directive to the caller* ([`WorkspaceDisposition`]), not a report of
-//!   something done.
+//! - **Releasing the worktree** — **narrowed by Task 34 fix round 1, item 8
+//!   (ruling W5-31): false as of `94a809e`, not narrowed away.** Real
+//!   worktree creation/teardown code exists now
+//!   (`roundhouse_sandbox::worktree`, `crate::worktree::WorktreeProvider`,
+//!   consumed by `exec::map_step::Executor::dispatch_map_step`'s per-item
+//!   fan-out) — but nothing on *this file's* parking path calls it: parking
+//!   a run (`park`, below) neither materializes nor releases a worktree, and
+//!   nothing here holds a `WorktreeProvider` to call one through. §8.11's
+//!   "releases … the worktree" is therefore still not performed or
+//!   simulated *by this module*, for a narrower reason than before —
+//!   `dispatch_map_step` proves this crate reaches `git` for a `map` item's
+//!   own worktree, but that path and this parking path do not connect.
+//!   [`ParkResult::workspace`] is therefore still a *directive to the
+//!   caller* ([`WorkspaceDisposition`]), not a report of something done.
 //! - **Releasing the worker slot** — there is no admission or slot concept
 //!   in this crate (`roundhouse-sched`'s `admission` is trigger *overlap*, a
 //!   different thing). Unowned.

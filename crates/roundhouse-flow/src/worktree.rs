@@ -114,6 +114,28 @@ impl SandboxWorktreeProvider {
 /// Where generated worktrees live under `repo_root`, kept out of the way
 /// of the repository's own tracked tree. Not `.git/roundhouse-worktrees`:
 /// `git worktree add` refuses a path inside `.git`.
+///
+/// **Recorded, not fixed, this round (Task 34 fix round 1's "Record, do not
+/// fix" list):** this directory lives *inside* the main repository's
+/// working tree, so from that repository's own point of view it is an
+/// ordinary untracked directory — nothing here adds a `.gitignore` entry
+/// for it. A workflow step that runs `git clean -ffdx` or `git add -A`
+/// against `repo_root` itself (as opposed to inside one of the per-item
+/// worktrees) would therefore delete or stage live, in-use worktrees.
+/// Whoever wires a real `repo_root` in (`roundhouse-daemon`, lane W1) should
+/// account for this — a `.gitignore` line, or relocating this directory
+/// outside the tracked tree entirely — rather than this module silently
+/// assuming it away. Relocating it is a design change, deliberately not
+/// made in this fix round.
+///
+/// **Also recorded:** under `on_item_error: continue`, an item whose
+/// [`WorktreeProvider::release`] call fails leaves its checkout behind and
+/// the fan-out keeps going, so repeated release failures across many items
+/// accumulate checkouts under this directory rather than being bounded.
+/// `remove_worktree`'s `--force` makes an ordinary (non-git-level) release
+/// failure unlikely, but it is not eliminated — see
+/// `roundhouse_sandbox::worktree::remove_worktree`'s own doc comment for
+/// what `--force` does and does not cover.
 const WORKTREE_SUBDIR: &str = ".roundhouse-worktrees";
 
 impl WorktreeProvider for SandboxWorktreeProvider {

@@ -178,6 +178,87 @@ fn a_leading_dash_base_ref_cannot_inject_a_git_flag() {
     );
 }
 
+/// Security regression (fix round 1, item 2): a repo-local `post-checkout`
+/// hook (set via repo-local `core.hooksPath`, which `env_clear()` cannot
+/// touch — it lives in `.git/config`, not the process environment) must not
+/// run when `add_worktree` checks a new worktree out. Reproduced against
+/// this exact git binary before the fix: without the `-c core.hooksPath=
+/// /dev/null` override, the identical hook fired on a plain
+/// `env -i PATH="$PATH" git worktree add`.
+#[test]
+fn add_worktree_does_not_run_the_repos_post_checkout_hook() {
+    if !git_available() {
+        eprintln!("skipping: git not available on this host");
+        return;
+    }
+    let repo = TempRepo::new();
+    let wt = worktree_path(&repo, "wt-hook");
+
+    let hooks_dir = repo.path.join("my-hooks");
+    std::fs::create_dir_all(&hooks_dir).expect("create hooks dir");
+    let marker = repo.path.join("HOOK_RAN");
+    let hook_path = hooks_dir.join("post-checkout");
+    std::fs::write(
+        &hook_path,
+        format!("#!/bin/sh\ntouch {:?}\n", marker.to_str().unwrap()),
+    )
+    .expect("write hook script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))
+            .expect("make hook executable");
+    }
+    let status = Command::new("git")
+        .args(["config", "core.hooksPath", hooks_dir.to_str().unwrap()])
+        .current_dir(&repo.path)
+        .status()
+        .expect("set core.hooksPath for test setup");
+    assert!(status.success());
+
+    add_worktree(&repo.path, &wt, "mybranch").expect("add_worktree must still succeed");
+
+    assert!(
+        !marker.exists(),
+        "the repo-local post-checkout hook must not run during add_worktree \
+         (core.hooksPath must be overridden to /dev/null for this invocation)"
+    );
+
+    let _ = remove_worktree(&repo.path, &wt);
+    let _ = std::fs::remove_dir_all(&wt);
+}
+
+/// Security regression (fix round 1, item 4): `--` now precedes both
+/// positionals, so a `worktree_path` shaped like a flag also cannot be
+/// misread as an option — even though this argument is code-derived, not
+/// workflow-author-controlled, today.
+#[test]
+fn a_leading_dash_worktree_path_cannot_inject_a_git_flag() {
+    if !git_available() {
+        eprintln!("skipping: git not available on this host");
+        return;
+    }
+    let repo = TempRepo::new();
+    let wt = repo.path.parent().unwrap().join("-f");
+
+    let result = add_worktree(&repo.path, &wt, "mybranch");
+
+    // Whatever git makes of a literal `-f`-named path after `--`, it must
+    // not be read as git's own `-f`/`--force` flag — the call must not
+    // silently succeed against some *other* path than the one requested.
+    assert!(
+        result.is_ok(),
+        "a flag-shaped worktree_path after `--` must be treated as a literal path, got {result:?}"
+    );
+    assert!(
+        wt.is_dir(),
+        "the worktree must have been created at the literal `-f` path, not misread as a flag"
+    );
+
+    let _ = remove_worktree(&repo.path, &wt);
+    let _ = std::fs::remove_dir_all(&wt);
+}
+
 #[test]
 fn add_worktree_defaults_are_reasonable_when_git_is_unavailable() {
     // Not gated on `git_available()` — this asserts behaviour when `git`

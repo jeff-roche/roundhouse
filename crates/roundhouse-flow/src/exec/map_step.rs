@@ -47,7 +47,9 @@
 //!   `roundhouse_sandbox::worktree`.
 
 use crate::caps::ResourceCaps;
-use crate::exec::{evaluate_when_gate, Executor, GateDecision, StepOutcome, StepStatus};
+use crate::exec::{
+    evaluate_when_gate, redact_with_needles, Executor, GateDecision, StepOutcome, StepStatus,
+};
 use crate::expr::{eval_delimited_expression, interpolate, TemplateSource};
 use crate::parse::steps::{parse_step, MapIsolationDef, OnItemError, StepBody, StepDef};
 use crate::worktree::{WorktreeProvider, WorktreeProviderError};
@@ -373,6 +375,37 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::String(_) => "a string",
         Value::Object(_) => "an object",
         Value::Array(_) => "an array",
+    }
+}
+
+/// Scrubs every known secret's raw value out of `message` (Task 34 fix
+/// round 1, item 1) — the same [`redact_with_needles`] needle-based scan
+/// every other dispatch arm's *logged* copy already goes through, applied
+/// here to an `ItemOutcome::Failed` message instead of a sink-bound event.
+/// Needed because a provider/sandbox error's own `Display` can echo
+/// caller-supplied text back verbatim (an exact argv, or a rejected value
+/// quoted in a subprocess's stderr) — text this crate's own evaluator never
+/// touches, so [`crate::expr::Interpolated::redacted_for_logging`] has no
+/// visibility into it and cannot be the only guard.
+fn redact_message(message: String, needles: &[String]) -> String {
+    match redact_with_needles(&Value::String(message), needles) {
+        Value::String(s) => s,
+        other => unreachable!(
+            "redact_with_needles(Value::String(_), _) always returns Value::String, got {other:?}"
+        ),
+    }
+}
+
+/// Names a `MapIsolationDef` tier for an error message — never its
+/// contents (this enum's own variants carry no attacker/secret-influenced
+/// data besides `Worktree`'s `base_ref`, which this function never touches).
+fn map_isolation_tier_name(def: &MapIsolationDef) -> &'static str {
+    match def {
+        MapIsolationDef::None => "none",
+        MapIsolationDef::Worktree { .. } => "worktree",
+        MapIsolationDef::Sandbox => "sandbox",
+        MapIsolationDef::Container => "container",
+        MapIsolationDef::Remote => "remote",
     }
 }
 
@@ -873,12 +906,20 @@ impl<'a> Executor<'a> {
     /// on the item's ordinary `Completed`/`Failed`/`Skipped` return *and*
     /// during unwinding if anything in the item's inner-step dispatch
     /// panics — with no explicit cleanup call needed on any of those paths.
-    /// A release failure is folded into that item's `Failed` outcome; it is
-    /// never silently swallowed, and never panics-during-panic (no
-    /// double-drop hazard: [`WorktreeGuard::drop`] extracts the path with
-    /// [`Option::take`], so a second drop — there isn't one here, but the
-    /// guard is written to be safe if a future refactor introduced one — is
-    /// a no-op rather than a double release).
+    /// **On the ordinary, non-panicking path**, a release failure is folded
+    /// into that item's `Failed` outcome rather than silently swallowed —
+    /// see the explicit [`WorktreeGuard::release`] call below, run after the
+    /// inner-step loop, whose own doc comment covers this. **Fix round 1,
+    /// item 7, scoping a claim that used to say this unconditionally:** on
+    /// the *panicking* path the guard's `Drop` impl is the only thing that
+    /// ever runs, and it deliberately swallows a release failure there (`let
+    /// _ = self.provider.release(&path);` — see [`WorktreeGuard::drop`]'s
+    /// own doc comment) rather than panicking during an unwind already in
+    /// progress. Never a double-drop hazard either way:
+    /// [`WorktreeGuard::drop`] extracts the path with [`Option::take`], so a
+    /// second drop — there isn't one here, but the guard is written to be
+    /// safe if a future refactor introduced one — is a no-op rather than a
+    /// double release.
     ///
     /// **The path materialized and the path released are always the same
     /// value** — [`WorktreeGuard`] stores exactly what
@@ -1011,53 +1052,132 @@ impl<'a> Executor<'a> {
                 // 34: `isolation: worktree` materialization", for the full
                 // reasoning (fail-closed on a missing provider, per-item
                 // `base_ref` interpolation, the binding mechanism, and the
-                // cleanup guarantee `worktree_guard` below provides).
+                // cleanup guarantee `worktree_guard` below provides), and
+                // "Fix round 1, item 1" for the taint-leak fix below.
                 let mut worktree_guard: Option<WorktreeGuard> = None;
-                if let Some(MapIsolationDef::Worktree { base_ref }) = isolation {
-                    let provider = match &self.worktree_provider {
-                        Some(provider) => Arc::clone(provider),
-                        None => {
-                            return ItemOutcome::Failed(format!(
-                                "map step `{step_id}` declares `isolation: worktree`, but no \
-                                 WorktreeProvider is configured for this run \
-                                 (RunContext::worktree_provider is None) — refusing to run this \
-                                 item without the isolation it explicitly asked for, rather than \
-                                 silently running it unisolated"
-                            ));
-                        }
-                    };
-                    let resolved_base_ref = match base_ref {
-                        Some(text) => {
-                            match interpolate(TemplateSource::from_workflow_file(text), &self.ctx) {
-                                Ok(interpolated) => interpolated.into_unredacted_for_dispatch(),
-                                Err(e) => {
-                                    return ItemOutcome::Failed(format!(
-                                        "map step `{step_id}`: resolving \
-                                         `isolation.worktree.base_ref`: {e}"
-                                    ));
+                match isolation {
+                    // Fix round 1, item 6: `None` (the field absent) and an
+                    // explicit `isolation: none` are the only two shapes
+                    // that do nothing here — see the match arm below for
+                    // the other three tiers, which this crate cannot
+                    // deliver and must not silently ignore.
+                    None | Some(MapIsolationDef::None) => {}
+                    Some(MapIsolationDef::Worktree { base_ref }) => {
+                        let provider = match &self.worktree_provider {
+                            Some(provider) => Arc::clone(provider),
+                            None => {
+                                return ItemOutcome::Failed(format!(
+                                    "map step `{step_id}` declares `isolation: worktree`, but no \
+                                     WorktreeProvider is configured for this run \
+                                     (RunContext::worktree_provider is None) — refusing to run \
+                                     this item without the isolation it explicitly asked for, \
+                                     rather than silently running it unisolated"
+                                ));
+                            }
+                        };
+                        // Fix round 1, item 1 (CRITICAL): `base_ref` may
+                        // contain `${{ secrets.* }}`, and `interpolate`
+                        // computes both renderings from one evaluation
+                        // (ruling P33) precisely so a caller never has to
+                        // evaluate twice to get a safe-to-log copy. The
+                        // *redacted* rendering is what goes into every
+                        // message this arm can return; the *unredacted*
+                        // one is used strictly for the
+                        // `provider.materialize` call itself — mirroring
+                        // `Executor::dispatch_step`'s own `Agent`/`Tool`
+                        // arms (`resolved_prompt`/`resolved_with` vs.
+                        // `logged_prompt`/`logged_with`), which this arm
+                        // did not follow the first time it was written.
+                        let (unredacted_base_ref, redacted_base_ref) = match base_ref {
+                            Some(text) => {
+                                match interpolate(
+                                    TemplateSource::from_workflow_file(text),
+                                    &self.ctx,
+                                ) {
+                                    Ok(interpolated) => {
+                                        // The part that actually repairs
+                                        // the persisted taint flag — see
+                                        // this function's own doc comment.
+                                        // Folded in unconditionally, before
+                                        // `materialize` is even attempted,
+                                        // so it is set on both the success
+                                        // and the failure path below.
+                                        any_item_secret_derived |= interpolated.is_secret_derived();
+                                        let redacted = interpolated.redacted_for_logging().clone();
+                                        (interpolated.into_unredacted_for_dispatch(), redacted)
+                                    }
+                                    Err(e) => {
+                                        return ItemOutcome::Failed(format!(
+                                            "map step `{step_id}`: resolving \
+                                             `isolation.worktree.base_ref`: {e}"
+                                        ));
+                                    }
                                 }
                             }
+                            None => (
+                                DEFAULT_WORKTREE_BASE_REF.to_string(),
+                                DEFAULT_WORKTREE_BASE_REF.to_string(),
+                            ),
+                        };
+                        match provider.materialize(&unredacted_base_ref) {
+                            Ok(path) => {
+                                // Derived from `item_evaluated`, not
+                                // asserted fresh via
+                                // `set_public`/`set_secret` — see this
+                                // function's own doc comment for why, even
+                                // though the path's own content is never
+                                // secret material.
+                                let workspace_evaluated = item_evaluated.derive(
+                                    serde_json::json!({ "path": path.display().to_string() }),
+                                );
+                                self.ctx.set_from(WORKTREE_ROOT_NAME, &workspace_evaluated);
+                                worktree_guard = Some(WorktreeGuard::new(provider, path));
+                            }
+                            Err(e) => {
+                                // Fix round 1, item 1: the *other* two
+                                // copies of a secret-derived `base_ref`
+                                // this brief found — `WorktreeError::
+                                // CommandFailed`'s `Display` echoes the
+                                // exact argv `git` was called with, and
+                                // git's own stderr quotes a rejected ref
+                                // back — both live inside `{e}`'s text, not
+                                // in `redacted_base_ref` above. Scrubbing
+                                // the whole assembled message through the
+                                // same needle-based redaction every other
+                                // dispatch arm's *logged* copy goes through
+                                // closes both at once, regardless of which
+                                // part of `{e}`'s text the secret landed in.
+                                return ItemOutcome::Failed(redact_message(
+                                    format!(
+                                        "map step `{step_id}`: materializing a worktree for \
+                                         base_ref {redacted_base_ref:?}: {e}"
+                                    ),
+                                    &self.redaction_needles,
+                                ));
+                            }
                         }
-                        None => DEFAULT_WORKTREE_BASE_REF.to_string(),
-                    };
-                    match provider.materialize(&resolved_base_ref) {
-                        Ok(path) => {
-                            // Derived from `item_evaluated`, not asserted
-                            // fresh via `set_public`/`set_secret` — see this
-                            // function's own doc comment for why, even
-                            // though the path's own content is never secret
-                            // material.
-                            let workspace_evaluated = item_evaluated
-                                .derive(serde_json::json!({ "path": path.display().to_string() }));
-                            self.ctx.set_from(WORKTREE_ROOT_NAME, &workspace_evaluated);
-                            worktree_guard = Some(WorktreeGuard::new(provider, path));
-                        }
-                        Err(e) => {
-                            return ItemOutcome::Failed(format!(
-                                "map step `{step_id}`: materializing a worktree for base_ref \
-                                 {resolved_base_ref:?}: {e}"
-                            ));
-                        }
+                    }
+                    // Fix round 1, item 6: `sandbox`/`container`/`remote`
+                    // parse successfully (`parse/steps.rs` accepts all five
+                    // tiers) but this crate can only ever materialize
+                    // `worktree` — falling through silently here would be
+                    // exactly Phase 5 ruling P42's shape for three of the
+                    // four non-`none` tiers, in a diff whose own docs now
+                    // claim P42 is closed. Fails the item closed, the same
+                    // way a missing `WorktreeProvider` does, rather than
+                    // running it with no isolation and no warning.
+                    Some(
+                        other @ (MapIsolationDef::Sandbox
+                        | MapIsolationDef::Container
+                        | MapIsolationDef::Remote),
+                    ) => {
+                        return ItemOutcome::Failed(format!(
+                            "map step `{step_id}` declares `isolation: {}`, but this crate can \
+                             only materialize `worktree` isolation today — refusing to run this \
+                             item with no isolation at all rather than silently ignoring the \
+                             tier it explicitly asked for",
+                            map_isolation_tier_name(other)
+                        ));
                     }
                 }
 

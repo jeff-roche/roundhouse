@@ -211,6 +211,25 @@ fn run_ctx(
     }
 }
 
+fn secret_run_ctx(
+    inputs: serde_json::Value,
+    key: &str,
+    value: &str,
+    worktree_provider: Option<Arc<dyn WorktreeProvider>>,
+) -> RunContext {
+    let mut secrets = HashMap::new();
+    secrets.insert(key.to_string(), value.to_string());
+    RunContext {
+        inputs,
+        vars: serde_json::json!({}),
+        secrets,
+        run_id: roundhouse_flow::exec::RunId::new(),
+        previous_report: None,
+        env_allowlist: EnvAllowlist::deny_all(),
+        worktree_provider,
+    }
+}
+
 const WORKFLOW_PREAMBLE: &str = r#"
 name: worktree-fanout
 version: 1
@@ -563,5 +582,165 @@ fn a_release_failure_is_folded_into_an_otherwise_successful_items_outcome() {
     assert!(
         error.contains("releasing"),
         "the failure message must name the release failure, got: {error:?}"
+    );
+}
+
+/// Fix round 1, item 1 (CRITICAL): a secret-derived `base_ref` must never
+/// reach the map step's persisted, displayable output as cleartext, and the
+/// item's own `output_is_secret_derived` must be `true`. Drives the
+/// materialize-*failure* path specifically (git rejects "not-a-real-ref" as
+/// an invalid reference and quotes it back in stderr) because that is the
+/// path the security lens reproduced the leak through: the secret appeared
+/// three times — the direct interpolation-result echo, the argv echo inside
+/// `WorktreeError::CommandFailed`'s `Display`, and git's own stderr quoting
+/// the rejected ref.
+#[test]
+fn a_secret_derived_base_ref_never_reaches_the_serialized_outcome_and_taints_the_item() {
+    if !git_available() {
+        eprintln!("skipping: git not available on this host");
+        return;
+    }
+    const SECRET_VALUE: &str = "not-a-real-git-ref-topsecret123";
+    let repo = TempRepo::new();
+    let provider = Arc::new(ObservingWorktreeProvider::new(repo.path.clone()));
+
+    let yaml = format!(
+        "{WORKFLOW_PREAMBLE}secrets: [T]\nsteps:\n\
+         \x20\x20- id: per_item\n\
+         \x20\x20\x20\x20map:\n\
+         \x20\x20\x20\x20\x20\x20over: \"${{{{ inputs.items }}}}\"\n\
+         \x20\x20\x20\x20\x20\x20as: item\n\
+         \x20\x20\x20\x20\x20\x20max_parallel: 1\n\
+         \x20\x20\x20\x20\x20\x20on_item_error: continue\n\
+         \x20\x20\x20\x20\x20\x20isolation: {{ worktree: {{ base_ref: \"${{{{ secrets.T }}}}\" }} }}\n\
+         \x20\x20\x20\x20steps:\n\
+         \x20\x20\x20\x20\x20\x20- id: emit_something\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20emit: {{ ok: true }}\n"
+    );
+    let def = parse_workflow(&yaml).expect("workflow must parse");
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(
+        serde_json::json!({"items": [1]}),
+        "T",
+        SECRET_VALUE,
+        Some(provider.clone() as Arc<dyn WorktreeProvider>),
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().expect("run must not error");
+
+    // Sanity: this must actually exercise the materialize-failure path —
+    // otherwise the test proves nothing.
+    let items = outcomes[0].output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]["status"], "failed",
+        "expected git to reject this base_ref as invalid — got {:?}",
+        items[0]
+    );
+    let error = items[0]["error"].as_str().unwrap();
+    assert!(
+        !error.contains(SECRET_VALUE),
+        "the raw secret value must never appear in the item's own error message, got: {error:?}"
+    );
+
+    // The whole serialized outcome — not just the one field this test
+    // happens to look at — must never contain the secret, matching the
+    // brief's "the secret string appears nowhere in the serialized outcome"
+    // requirement.
+    let serialized = serde_json::to_string(&outcomes[0].output).unwrap();
+    assert!(
+        !serialized.contains(SECRET_VALUE),
+        "the raw secret value must not appear anywhere in the map step's serialized output, \
+         got: {serialized}"
+    );
+
+    assert!(
+        outcomes[0].output_is_secret_derived,
+        "output_is_secret_derived must be true once a secret-derived base_ref was read, so \
+         durability.rs's value_for_display() redacts this output rather than showing it \
+         verbatim"
+    );
+}
+
+/// Fix round 1, item 6: `isolation: sandbox|container|remote` all parse
+/// (`parse/steps.rs` accepts all five tiers), but this crate can only ever
+/// materialize `worktree`. Before this fix the other three silently fell
+/// through with no worktree, no error, and no warning — exactly the P42
+/// shape this whole task exists to close, for three of the four non-`none`
+/// tiers. Grepped the fixture suite and every test file first (per the
+/// brief's explicit instruction): no fixture or test declares
+/// `isolation: sandbox|container|remote` at the map level, so this fix does
+/// not need to accommodate one.
+#[test]
+fn the_other_three_isolation_tiers_fail_closed_rather_than_silently_doing_nothing() {
+    for tier in ["sandbox", "container", "remote"] {
+        let yaml = format!(
+            "{WORKFLOW_PREAMBLE}steps:\n\
+             \x20\x20- id: per_item\n\
+             \x20\x20\x20\x20map:\n\
+             \x20\x20\x20\x20\x20\x20over: \"${{{{ inputs.items }}}}\"\n\
+             \x20\x20\x20\x20\x20\x20as: item\n\
+             \x20\x20\x20\x20\x20\x20max_parallel: 1\n\
+             \x20\x20\x20\x20\x20\x20on_item_error: continue\n\
+             \x20\x20\x20\x20\x20\x20isolation: {tier}\n\
+             \x20\x20\x20\x20steps:\n\
+             \x20\x20\x20\x20\x20\x20- id: emit_something\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20emit: {{ ok: true }}\n"
+        );
+        let def =
+            parse_workflow(&yaml).unwrap_or_else(|e| panic!("{tier}: workflow must parse: {e}"));
+        let mut sink = RecordingSink(Vec::new());
+        let ctx = run_ctx(serde_json::json!({"items": [1]}), None);
+        let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+        let outcomes = exec.run_to_completion().expect("run must not error");
+
+        let items = outcomes[0].output["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "tier {tier}");
+        assert_eq!(
+            items[0]["status"], "failed",
+            "tier {tier}: a declared-but-undeliverable isolation tier must fail the item \
+             closed, not silently run it unisolated — got {:?}",
+            items[0]
+        );
+        let error = items[0]["error"].as_str().unwrap();
+        assert!(
+            error.contains(tier),
+            "tier {tier}: the failure message must name the tier it could not deliver, got: \
+             {error:?}"
+        );
+    }
+}
+
+/// `isolation: none` — as opposed to the field being absent — is a
+/// legitimately deliverable choice (this crate can always deliver "no
+/// isolation": doing nothing) and must remain a true no-op, not fail
+/// closed like `sandbox`/`container`/`remote`.
+#[test]
+fn isolation_none_explicitly_set_is_still_a_deliverable_no_op() {
+    let yaml = format!(
+        "{WORKFLOW_PREAMBLE}steps:\n\
+         \x20\x20- id: per_item\n\
+         \x20\x20\x20\x20map:\n\
+         \x20\x20\x20\x20\x20\x20over: \"${{{{ inputs.items }}}}\"\n\
+         \x20\x20\x20\x20\x20\x20as: item\n\
+         \x20\x20\x20\x20\x20\x20max_parallel: 1\n\
+         \x20\x20\x20\x20\x20\x20on_item_error: continue\n\
+         \x20\x20\x20\x20\x20\x20isolation: none\n\
+         \x20\x20\x20\x20steps:\n\
+         \x20\x20\x20\x20\x20\x20- id: emit_something\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20emit: {{ ok: true }}\n"
+    );
+    let def = parse_workflow(&yaml).expect("workflow must parse");
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = run_ctx(serde_json::json!({"items": [1]}), None);
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().expect("run must not error");
+
+    let items = outcomes[0].output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]["status"], "completed",
+        "explicit `isolation: none` must remain a deliverable no-op — got {:?}",
+        items[0]
     );
 }

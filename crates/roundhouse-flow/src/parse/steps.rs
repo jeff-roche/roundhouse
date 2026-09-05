@@ -272,10 +272,26 @@ pub const MAX_NEEDS_PER_STEP: usize = 64;
 pub const MAX_GIT_REF_LEN: usize = 128;
 
 /// Reserved expression-language context roots (§8.9's own vocabulary:
-/// `secrets.*`, `steps.*`, `inputs.*`, `run.*`, `vars.*`, `env.*`) that a
-/// `map`'s `as:` loop-item binding must not shadow — see
-/// [`validate_map_as`]'s doc comment (fix round 1, finding M3).
-const RESERVED_EXPRESSION_ROOTS: &[&str] = &["secrets", "steps", "inputs", "run", "vars", "env"];
+/// `secrets.*`, `steps.*`, `inputs.*`, `run.*`, `vars.*`, `env.*`, plus
+/// `worktree.*` since Task 34 fix round 1) that a `map`'s `as:` loop-item
+/// binding must not shadow — see [`validate_map_as`]'s doc comment (fix
+/// round 1, finding M3).
+///
+/// **`"worktree"` (Task 34 fix round 1, item 3):** `map_step.rs`'s
+/// `WORKTREE_ROOT_NAME` binds a materialized worktree's path under this
+/// name, alongside `as_name` — a seventh implicit root this list did not
+/// account for when Task 34 landed. Without it here, `as: worktree` let
+/// `self.ctx.set_from(as_name, &item_evaluated)` bind the item first and
+/// `self.ctx.set_from(WORKTREE_ROOT_NAME, &workspace_evaluated)` silently
+/// overwrite it for the rest of that item's inner steps — so `${{ worktree }}`
+/// read the path object, not the item, and any `when:`/inner-step expression
+/// written against the item's own fields would evaluate against the wrong
+/// value with no error at all. Rejecting `as: worktree` at parse time is
+/// cheaper and clearer than trying to make the two roots coexist under one
+/// name at runtime.
+const RESERVED_EXPRESSION_ROOTS: &[&str] = &[
+    "secrets", "steps", "inputs", "run", "vars", "env", "worktree",
+];
 
 fn default_max_parallel() -> u32 {
     1

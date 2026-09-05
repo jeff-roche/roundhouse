@@ -27,12 +27,23 @@
 //! quadratic-cost parser. This crate takes no dependency on `roundhouse-flow`
 //! or anything YAML-shaped in return — see that module's doc comment.
 //!
-//! Task 34 (lane W5, rulings W5-8/W5-22) added [`worktree`], a third kind
-//! of confinement in the same spirit: a generic, synchronous
-//! `git worktree add`/`remove` primitive, consumed by `roundhouse-flow`'s
-//! `map.isolation: worktree` to give a workflow's per-item fan-out real
-//! filesystem isolation. Like [`bounded_parse`], this module knows nothing
-//! about workflows or `map` steps — see its own module doc comment.
+//! Task 34 (lane W5, rulings W5-8/W5-22) added [`worktree`], a generic,
+//! synchronous `git worktree add`/`remove` primitive, consumed by
+//! `roundhouse-flow`'s `map.isolation: worktree` to give each fan-out item
+//! its own working directory (a separate checkout, bound into the
+//! expression context as `${{ worktree.path }}`). **Reworded in fix round
+//! 1, item 5 — this is deliberately not called "confinement" or
+//! "isolation" here, the way [`bounded_parse`] above genuinely is one:**
+//! nothing in this crate or `roundhouse-flow` sets an inner step's working
+//! directory to the materialized path, no enforcer confines any process to
+//! it, and every worktree it creates shares one `.git/config` and one
+//! `hooksPath` with the repository it came from — a worktree is a separate
+//! *directory*, not a separate *repository* or a security boundary. Like
+//! [`bounded_parse`], this module knows nothing about workflows or `map`
+//! steps — see its own module doc comment, and see
+//! `roundhouse_flow::exec::map_step::Executor::dispatch_map_step`'s doc
+//! comment for what "isolation" means in the workflow-YAML vocabulary this
+//! feature is named after versus what this primitive actually delivers.
 
 // NOTE: unsafe_code is `deny`, not `forbid`, at the crate level — see
 // Cargo.toml. The only module permitted to use it is `probe` (Phase 2:
