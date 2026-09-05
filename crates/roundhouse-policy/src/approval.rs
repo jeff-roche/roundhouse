@@ -319,10 +319,19 @@ pub fn synthesize_grant(
             // `Remote`, because `None` is the universal floor — so a human
             // approving one local, unisolated spawn would, once agent-spawn
             // policy wiring lands, silently authorize a `Tier::Remote` spawn
-            // too. Tracked carry-forward, not implemented here (orchestrator
+            // too. Tracked as defect (A), not implemented here (orchestrator
             // Ruling W4-23 — see `engine.rs`): an `exact: bool` on
             // `Predicate::Agent`, matching `Predicate::Http`/`Predicate::Git`,
             // where matching would become `tier_request == max_tier`.
+            //
+            // A second, separate tracked defect (B, orchestrator Ruling
+            // W4-24) also touches this field: `max_tier` is excluded from
+            // `matches`'s specificity `bound`, so two `Agent` rules
+            // differing only in floor tie-break by `file_order` instead of
+            // by specificity. Its fix component is making the floor
+            // `Option<Tier>`. (A) and (B) are distinct bugs — closing one
+            // does not close the other; see `Predicate::Agent::max_tier`'s
+            // doc comment in `engine.rs` for the full argument.
             max_tier: *tier_request,
         },
         // Task 20 (W4): exact scope+op bind, same least-privilege contract as

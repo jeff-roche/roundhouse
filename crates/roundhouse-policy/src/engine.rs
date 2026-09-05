@@ -150,21 +150,22 @@ pub enum Predicate {
         /// exactly `{None}`. So a human approving one local, unisolated
         /// sub-agent spawn would — once agent-spawn policy wiring lands —
         /// silently authorize a spawn at `Tier::Remote` that ships the
-        /// command off-box. Tracked carry-forward: an `exact: bool` on this
+        /// command off-box. This is tracked as defect **(A)** (orchestrator
+        /// Ruling W4-23): the fix component is an `exact: bool` on this
         /// variant, matching the idiom `Predicate::Http`/`Predicate::Git`
         /// already carry, where a synthesized grant sets `true` and matching
-        /// becomes `tier_request == max_tier` instead of `>=`.
+        /// becomes `tier_request == max_tier` instead of `>=`. Ruling W4-23
+        /// also defers implementing it here: adding the field breaks every
+        /// `Predicate::Agent` construction site at merge time, and lane W1
+        /// is writing new ones against this branch right now — the same
+        /// reason Ruling W4-5 (above) kept the `max_tier` name instead of
+        /// renaming it. It is also unreachable today: `TaskParams::Agent`
+        /// has no production constructor.
         ///
-        /// **Deliberately not added here (orchestrator Ruling W4-23):**
-        /// adding the field breaks every `Predicate::Agent` construction
-        /// site at merge time, and lane W1 is writing new ones against this
-        /// branch right now — the same reason Ruling W4-5 (above) kept the
-        /// `max_tier` name instead of renaming it. It is also unreachable
-        /// today: `TaskParams::Agent` has no production constructor.
-        ///
-        /// **A second, independent reason the same tracked shape change is
-        /// needed:** `max_tier` is excluded from the specificity `bound`
-        /// `matches` computes for this variant (`bound` counts only
+        /// **A second, separate tracked defect — (B), orchestrator Ruling
+        /// W4-24 — has a different fix component and was deferred for the
+        /// same reason.** `max_tier` is excluded from the specificity
+        /// `bound` `matches` computes for this variant (`bound` counts only
         /// `provider.is_some()` and `model.is_some()`, plus a constant
         /// offset — see the `Agent` arm of `matches` below). Two same-scope
         /// `Agent` rules differing *only* in floor therefore produce
@@ -175,13 +176,27 @@ pub enum Predicate {
         /// one. This cannot be fixed by bumping `bound` for `max_tier`:
         /// `max_tier: Tier` is not an `Option`, so counting it would apply
         /// to *every* `Agent` predicate uniformly and change nothing
-        /// relative to other `Agent` rules. The already-tracked shape change
-        /// (an `Option<Tier>` floor) fixes this for free: `None` would mean
-        /// unbound and score lower than `Some(Remote)` in the specificity
-        /// comparison. `Agent` is the only variant with this gap —
-        /// `Http`/`Git` also omit their `exact` bool from `bound`, but a
-        /// correlated maximal-prefix-length win stands in for it there, and
-        /// `Agent`'s floor has no such correlate.
+        /// relative to other `Agent` rules. (B)'s fix component is instead
+        /// making the floor `Option<Tier>`: `None` would mean unbound and
+        /// score lower than `Some(Remote)` in the specificity comparison.
+        /// `Agent` is the only variant with this gap — `Http`/`Git` also
+        /// omit their `exact` bool from `bound`, but a correlated
+        /// maximal-prefix-length win stands in for it there, and `Agent`'s
+        /// floor has no such correlate.
+        ///
+        /// **(A) and (B) are two different bugs with two related but
+        /// distinct fix components. Fixing one does not fix the other.**
+        /// `exact: bool` alone closes (A) — matching becomes
+        /// `tier_request == max_tier` — but leaves `max_tier` a non-`Option`,
+        /// so (B)'s specificity tie-break gap survives untouched. An
+        /// `Option<Tier>` floor alone closes (B) — an unbound `None` now
+        /// scores lower than a bound `Some(_)` — but matching stays `>=` on
+        /// whatever `Some(_)` value is present, so a grant synthesized at
+        /// `Some(Tier::None)` still covers all five tiers and (A) survives
+        /// unchanged. Closing both requires *both* halves together: the
+        /// floor becomes `Option<Tier>` **and** the `>=` comparison gains an
+        /// exactness component (e.g. an `exact: bool` alongside it) so a
+        /// synthesized grant matches only the tier it was approved for.
         ///
         /// The field is **deliberately not renamed** to something
         /// like `min_tier` (orchestrator Ruling W4-5): another lane is
