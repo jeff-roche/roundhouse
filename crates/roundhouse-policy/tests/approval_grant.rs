@@ -222,13 +222,24 @@ fn grant_is_generalised_downward_never_broader_than_the_originating_task() {
         ts: Timestamp::from_unix_nanos(0),
     };
 
+    // A real, non-degenerate boundary is required here (not
+    // `placeholder_boundary_irrelevant_to_this_test()`): per B2,
+    // `effective_directory_prefix` treats a degenerate `"/"` boundary as
+    // unvalidated input and fails closed to `None`, which downgrades the
+    // synthesized predicate to `FsExact` on the task's own canonical path —
+    // silently defeating the very generalization this test's name claims to
+    // exercise (its three original assertions all held trivially under
+    // `FsExact`, so the test would have passed unchanged even if directory
+    // generalization were completely broken). Same real boundary as
+    // `directory_grant_with_a_real_ancestor_path_still_covers_the_directory`
+    // below.
     let grant = synthesize_grant(
         &params,
         GrantScope::Directory {
             path: PathBuf::from("/workspace"),
         },
         provenance,
-        placeholder_boundary_irrelevant_to_this_test(),
+        Path::new("/workspace"),
     );
 
     // Directory scope must not broaden to the filesystem root or beyond
@@ -236,6 +247,11 @@ fn grant_is_generalised_downward_never_broader_than_the_originating_task() {
     // under the granted directory.
     assert!(grant.rule_covers_path(FsOp::Write, &PathBuf::from("/workspace/exact-file.txt")));
     assert!(!grant.rule_covers_path(FsOp::Write, &PathBuf::from("/etc/passwd")));
+
+    // The actual property this test is named for: generalization to a
+    // *sibling* path inside the granted directory, not just the originating
+    // task's own exact path (which `FsExact` would also satisfy).
+    assert!(grant.rule_covers_path(FsOp::Write, &PathBuf::from("/workspace/sibling-file.txt")));
 
     // Security fix round 1, finding 4: rule_covers_path must also gate on op
     // — a Write-scoped grant must not report covering a Read of the same path.

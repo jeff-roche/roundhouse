@@ -202,7 +202,12 @@ impl TeamRegistry {
     /// policy engine as everything else." This registry holds no write-grant state at
     /// all and never will — it always answers `false`, so joining a team can never be
     /// mistaken for a write grant. The real grant (if any) lives entirely in Phase 2's
-    /// policy engine, outside this crate.
+    /// policy engine, outside this crate, via the `TeamMembership` trait
+    /// (`roundhouse-policy`'s `engine.rs`) that this method is the intended adapter
+    /// target for. Consequence, documented on `PolicyEngine::decide`'s `Team`-scope
+    /// arm: because this always returns `false`, once a `TeamMembership` adapter
+    /// wraps this method and is wired in, every team-memory write Denies
+    /// permanently — no `Ask` is ever raised, and no human can ever approve one.
     pub fn can_write_team_memory(&self, _team: TeamId, _session: SessionId) -> bool {
         false
     }

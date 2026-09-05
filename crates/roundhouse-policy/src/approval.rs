@@ -308,6 +308,21 @@ pub fn synthesize_grant(
             // requested means the grant never generalizes *below* the
             // isolation actually requested, i.e. it covers only requests at
             // or above what this task asked for, never a less-isolated one.
+            //
+            // That framing is safe only on the isolation axis, not the
+            // egress axis (see `Predicate::Agent::max_tier`'s doc comment in
+            // `engine.rs` for the full argument): `Tier::Remote` ships the
+            // `CommandSpec` over the network
+            // (`docs/architecture/03-security-and-sandboxing.md:213`), a
+            // property `Tier::None` lacks. Pinning `max_tier` to an approved
+            // `Tier::None` request covers all five tiers, including
+            // `Remote`, because `None` is the universal floor — so a human
+            // approving one local, unisolated spawn would, once agent-spawn
+            // policy wiring lands, silently authorize a `Tier::Remote` spawn
+            // too. Tracked carry-forward, not implemented here (orchestrator
+            // Ruling W4-23 — see `engine.rs`): an `exact: bool` on
+            // `Predicate::Agent`, matching `Predicate::Http`/`Predicate::Git`,
+            // where matching would become `tier_request == max_tier`.
             max_tier: *tier_request,
         },
         // Task 20 (W4): exact scope+op bind, same least-privilege contract as

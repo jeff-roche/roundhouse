@@ -34,8 +34,8 @@ pub const DEFAULT_BURST: u32 = 10;
 pub const GLOBAL_BURST: u32 = 2 * crate::limits::MAX_TEAM_SIZE * DEFAULT_BURST;
 pub const GLOBAL_RATE_PER_MIN: u32 = 2 * crate::limits::MAX_TEAM_SIZE * DEFAULT_RATE_PER_MIN;
 
-/// Per-session token bucket, plus a process-scoped global bucket (see
-/// `GLOBAL_RATE_PER_MIN`/`GLOBAL_BURST` above). §7.7: "Message rate cap — token
+/// Per-session token bucket, plus a per-`LocalBus`-instance global bucket, not
+/// process-scoped (see `GLOBAL_RATE_PER_MIN`/`GLOBAL_BURST` above). §7.7: "Message rate cap — token
 /// bucket per session (default 20/min, burst 10) plus a global cap; exceeding
 /// returns Refused, never silently queues."
 ///

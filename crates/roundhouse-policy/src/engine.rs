@@ -136,7 +136,54 @@ pub enum Predicate {
         /// the *most*-isolated request silently permitted the *least*-isolated
         /// one. The comparison is now `tier_request >= max_tier`: a request is
         /// covered only if it asks for at least as much isolation as was
-        /// approved. The field is **deliberately not renamed** to something
+        /// approved.
+        ///
+        /// **This "more isolation is safer" framing holds only on the
+        /// isolation axis. It does not hold on the egress axis.**
+        /// `docs/architecture/03-security-and-sandboxing.md:213` documents
+        /// that `Tier::Remote` sends the `CommandSpec` over the network to a
+        /// remote host — a property `Tier::None` (same process) does not
+        /// have. Concretely, `synthesize_grant` (`approval.rs`) pins
+        /// `max_tier: *tier_request`, so a grant synthesized from an
+        /// approved `Tier::None` spawn now covers **all five tiers**,
+        /// because `None` is the universal floor — pre-flip it covered
+        /// exactly `{None}`. So a human approving one local, unisolated
+        /// sub-agent spawn would — once agent-spawn policy wiring lands —
+        /// silently authorize a spawn at `Tier::Remote` that ships the
+        /// command off-box. Tracked carry-forward: an `exact: bool` on this
+        /// variant, matching the idiom `Predicate::Http`/`Predicate::Git`
+        /// already carry, where a synthesized grant sets `true` and matching
+        /// becomes `tier_request == max_tier` instead of `>=`.
+        ///
+        /// **Deliberately not added here (orchestrator Ruling W4-23):**
+        /// adding the field breaks every `Predicate::Agent` construction
+        /// site at merge time, and lane W1 is writing new ones against this
+        /// branch right now — the same reason Ruling W4-5 (above) kept the
+        /// `max_tier` name instead of renaming it. It is also unreachable
+        /// today: `TaskParams::Agent` has no production constructor.
+        ///
+        /// **A second, independent reason the same tracked shape change is
+        /// needed:** `max_tier` is excluded from the specificity `bound`
+        /// `matches` computes for this variant (`bound` counts only
+        /// `provider.is_some()` and `model.is_some()`, plus a constant
+        /// offset — see the `Agent` arm of `matches` below). Two same-scope
+        /// `Agent` rules differing *only* in floor therefore produce
+        /// identical `(literal_prefix_len, bound)` and fall through to
+        /// `file_order`, meaning an earlier broad `Allow { max_tier: None }`
+        /// can outrank a later, narrower `Ask { max_tier: Remote }` on a
+        /// `Remote` request — a less specific rule beating a more specific
+        /// one. This cannot be fixed by bumping `bound` for `max_tier`:
+        /// `max_tier: Tier` is not an `Option`, so counting it would apply
+        /// to *every* `Agent` predicate uniformly and change nothing
+        /// relative to other `Agent` rules. The already-tracked shape change
+        /// (an `Option<Tier>` floor) fixes this for free: `None` would mean
+        /// unbound and score lower than `Some(Remote)` in the specificity
+        /// comparison. `Agent` is the only variant with this gap —
+        /// `Http`/`Git` also omit their `exact` bool from `bound`, but a
+        /// correlated maximal-prefix-length win stands in for it there, and
+        /// `Agent`'s floor has no such correlate.
+        ///
+        /// The field is **deliberately not renamed** to something
         /// like `min_tier` (orchestrator Ruling W4-5): another lane is
         /// concurrently writing new `Predicate::Agent` construction sites
         /// against this field's name on `main`, and a rename would hand that
