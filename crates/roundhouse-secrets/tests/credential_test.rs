@@ -652,6 +652,36 @@ async fn exec_command_streams_the_stdout_cap_and_never_buffers_an_unbounded_prod
 }
 
 #[tokio::test]
+async fn exec_command_does_not_deadlock_on_a_helper_that_fills_the_stderr_pipe_before_stdout() {
+    // A helper that writes more than one pipe buffer (~64 KiB on Linux) to
+    // stderr before finishing its stdout write will block on that stderr
+    // write until something drains it. If stdout and stderr aren't drained
+    // concurrently, reading stdout to EOF first (as a naive streaming
+    // rewrite of the old `.output()` call might do) never returns: the
+    // helper is stuck writing stderr, stdout never closes, and this only
+    // ever resolves by hitting the whole-call timeout below and being
+    // reported as "timed out" -- even though the helper would have
+    // succeeded (and produced a real token) if its stderr had been drained
+    // promptly, exactly as `.output()` always did.
+    let cred = ExecCommandCredential::new(
+        "/usr/bin/sh".into(),
+        vec![
+            "-c".into(),
+            "head -c 100000 /dev/zero >&2; printf tok".into(),
+        ],
+        vec![],
+    )
+    .unwrap()
+    .with_timeout(Duration::from_secs(3));
+    let t = NullTransport;
+    let mut req = empty_request();
+    cred.apply(&mut req, &ctx(&t))
+        .await
+        .expect("a helper that eventually writes a valid token to stdout must succeed even if it fills the stderr pipe first");
+    assert_eq!(header(&req, "authorization"), Some("Bearer tok"));
+}
+
+#[tokio::test]
 async fn exec_command_kills_a_hung_helper_after_its_timeout() {
     let cred = ExecCommandCredential::new("/usr/bin/sleep".into(), vec!["5".into()], vec![])
         .unwrap()

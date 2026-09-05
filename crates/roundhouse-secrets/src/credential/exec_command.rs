@@ -18,6 +18,16 @@ const MAX_STDOUT_BYTES: usize = 8 * 1024;
 /// redaction — see `apply`'s error path).
 const MAX_STDERR_CHARS: usize = 200;
 
+/// Ceiling on how many raw stderr bytes are ever *buffered* while draining
+/// the pipe (before the `MAX_STDERR_CHARS` truncation on the redacted,
+/// decoded text is applied). Far larger than `MAX_STDERR_CHARS` needs, but
+/// the point of this constant is different: the drain loop keeps reading
+/// (and discarding) stderr past this point rather than stopping, so a
+/// helper that writes a large amount of stderr can never block on a full
+/// pipe waiting for a reader that has stopped listening — see the
+/// concurrency note on `apply`.
+const MAX_STDERR_BYTES_BUFFERED: usize = 4 * 1024;
+
 /// Runs a configured external helper command and treats its stdout (trimmed)
 /// as a bearer token. Common for credential helpers that print a
 /// short-lived token to stdout (e.g. a cloud CLI's `print-access-token`).
@@ -125,31 +135,75 @@ impl CredentialProvider for ExecCommandCredential {
                 // one chunk's read latency, not the full timeout, and this
                 // process never holds more than one chunk past the cap in
                 // memory.
+                //
+                // Stdout and stderr are drained CONCURRENTLY (`tokio::join!`
+                // below), not sequentially. A pipe has a finite OS buffer
+                // (~64 KiB on Linux); a helper that writes more than that to
+                // stderr before it finishes writing stdout blocks on that
+                // write until something reads the other end. Draining stdout
+                // to EOF first (a naive streaming rewrite's first instinct)
+                // would then hang until the whole-call timeout — a helper
+                // that would have succeeded gets misreported as "timed out"
+                // instead. `.output()`, what this replaced, always drained
+                // both concurrently for exactly this reason.
                 let mut stdout_buf: Vec<u8> = Vec::new();
-                let mut chunk = [0u8; 4096];
-                loop {
-                    let n = stdout
-                        .read(&mut chunk)
-                        .await
-                        .map_err(|e| CredentialError::ExecFailed(None, e.to_string()))?;
-                    if n == 0 {
-                        break;
+                let stdout_fut = async {
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = stdout
+                            .read(&mut chunk)
+                            .await
+                            .map_err(|e| CredentialError::ExecFailed(None, e.to_string()))?;
+                        if n == 0 {
+                            break;
+                        }
+                        stdout_buf.extend_from_slice(&chunk[..n]);
+                        if stdout_buf.len() > MAX_STDOUT_BYTES {
+                            // Kill immediately rather than draining a
+                            // possibly unbounded stream to EOF first.
+                            // `kill_on_drop` alone wouldn't fire until this
+                            // whole async block is dropped (i.e. not until
+                            // the outer timeout elapses), so an explicit
+                            // kill here is what makes detection fast rather
+                            // than timeout-bounded.
+                            let _ = child.kill().await;
+                            return Err(CredentialError::ExecFailed(
+                                None,
+                                format!(
+                                    "credential helper stdout exceeded {MAX_STDOUT_BYTES} bytes"
+                                ),
+                            ));
+                        }
                     }
-                    stdout_buf.extend_from_slice(&chunk[..n]);
-                    if stdout_buf.len() > MAX_STDOUT_BYTES {
-                        // Kill immediately rather than draining a possibly
-                        // unbounded stream to EOF first. `kill_on_drop`
-                        // alone wouldn't fire until this whole async block
-                        // is dropped (i.e. not until the outer timeout
-                        // elapses), so an explicit kill here is what makes
-                        // detection fast rather than timeout-bounded.
-                        let _ = child.kill().await;
-                        return Err(CredentialError::ExecFailed(
-                            None,
-                            format!("credential helper stdout exceeded {MAX_STDOUT_BYTES} bytes"),
-                        ));
+                    Ok(())
+                };
+
+                // Bounded, not `read_to_end`: this drain runs for as long as
+                // the pipe stays open, independent of whatever `stdout_fut`
+                // decides above, so it must never itself grow unboundedly.
+                // It keeps consuming (and discarding) bytes past the cap
+                // rather than stopping, since stopping early would recreate
+                // the exact full-pipe stall this concurrent drain exists to
+                // avoid.
+                let stderr_fut = async {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match stderr.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if buf.len() < MAX_STDERR_BYTES_BUFFERED {
+                                    let take = (MAX_STDERR_BYTES_BUFFERED - buf.len()).min(n);
+                                    buf.extend_from_slice(&chunk[..take]);
+                                }
+                            }
+                        }
                     }
-                }
+                    buf
+                };
+
+                let (stdout_result, stderr_buf) = tokio::join!(stdout_fut, stderr_fut);
+                stdout_result?;
 
                 let status = child
                     .wait()
@@ -163,8 +217,6 @@ impl CredentialProvider for ExecCommandCredential {
                     // shape-based patterns are the only thing that ever sees
                     // this text, and it is hard-truncated regardless, since a
                     // persisted `CredentialError` derives `Display`/`Debug`.
-                    let mut stderr_buf = Vec::new();
-                    let _ = stderr.read_to_end(&mut stderr_buf).await;
                     let redacted = roundhouse_provider::audit::redact_error_body(
                         &String::from_utf8_lossy(&stderr_buf),
                     );
