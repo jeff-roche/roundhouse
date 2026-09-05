@@ -505,7 +505,7 @@ impl SessionActor {
 
         let unsealed = self.policy.unsealed();
         let ctx = self.sealed_context();
-        let decision = self.policy.decide_sealed(&req.params, unsealed, &ctx);
+        let decision = self.policy.decide_sealed(&req.params, &ctx);
 
         // Task 25 fix-round-2 (security review): recorded AFTER the
         // decision is known, and describing the REAL outcome — fix-round-1

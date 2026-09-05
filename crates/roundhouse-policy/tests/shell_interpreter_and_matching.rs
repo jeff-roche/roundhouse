@@ -25,13 +25,8 @@ fn python_is_forced_ask_even_with_a_broad_allow_rule() {
         Outcome::Allow,
         Predicate::program("python"),
     )]);
-    let decision = decide_shell_command(
-        &policy,
-        false,
-        &ctx(),
-        "python script.py",
-        &SessionEnv::default(),
-    );
+    let decision =
+        decide_shell_command(&policy, &ctx(), "python script.py", &SessionEnv::default());
     assert_eq!(
         decision.outcome,
         Outcome::Ask,
@@ -47,13 +42,8 @@ fn allow_interpreter_flag_on_the_rule_opts_out() {
         "python",
         true,
     )]);
-    let decision = decide_shell_command(
-        &policy,
-        false,
-        &ctx(),
-        "python script.py",
-        &SessionEnv::default(),
-    );
+    let decision =
+        decide_shell_command(&policy, &ctx(), "python script.py", &SessionEnv::default());
     assert_eq!(decision.outcome, Outcome::Allow);
 }
 
@@ -80,13 +70,7 @@ fn explicit_deny_on_an_interpreter_program_still_denies() {
         Outcome::Deny,
         Predicate::program("python"),
     )]);
-    let decision = decide_shell_command(
-        &policy,
-        false,
-        &ctx(),
-        "python evil.py",
-        &SessionEnv::default(),
-    );
+    let decision = decide_shell_command(&policy, &ctx(), "python evil.py", &SessionEnv::default());
     assert_eq!(
         decision.outcome,
         Outcome::Deny,
@@ -109,7 +93,6 @@ fn interpreter_gate_recognizes_path_qualified_and_python3_forms() {
     )]);
     let decision = decide_shell_command(
         &policy,
-        false,
         &ctx(),
         "/usr/bin/python3 -c whatever",
         &SessionEnv::default(),

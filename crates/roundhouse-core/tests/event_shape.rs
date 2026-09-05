@@ -126,6 +126,37 @@ fn note_and_message_are_cross_cutting_payloads() {
 }
 
 #[test]
+fn event_payload_loss_round_trips_through_serde_with_all_fields_intact() {
+    // Nothing constructs `EventPayload::Loss` yet (Phase 7 Task 13b adds the
+    // provider-codec emit sites) — this only pins the shape and the serde
+    // round-trip so the flag day is complete on its own.
+    let payload = EventPayload::Loss {
+        kind: "context_window_exceeded".into(),
+        description: "provider rejected the request: too many input tokens".into(),
+        blocks_affected: 3,
+    };
+
+    let json = serde_json::to_string(&payload).expect("Loss must serialize");
+    let restored: EventPayload = serde_json::from_str(&json).expect("Loss must deserialize");
+
+    match restored {
+        EventPayload::Loss {
+            kind,
+            description,
+            blocks_affected,
+        } => {
+            assert_eq!(kind, "context_window_exceeded");
+            assert_eq!(
+                description,
+                "provider rejected the request: too many input tokens"
+            );
+            assert_eq!(blocks_affected, 3);
+        }
+        other => panic!("expected EventPayload::Loss to round-trip, got {other:?}"),
+    }
+}
+
+#[test]
 fn task_started_carries_an_optional_handle_for_long_running_tasks() {
     use roundhouse_core::{Handle, IsolationAttestation, Tier};
 

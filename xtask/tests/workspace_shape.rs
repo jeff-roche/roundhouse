@@ -73,162 +73,6 @@ fn workspace_lists_all_expected_crates() {
     );
 }
 
-/// The expected internal (`roundhouse-*`) dependency edges for each real
-/// workspace crate, matching `docs/architecture/02-system-architecture.md`
-/// §5.2's crate-dependency table as corrected by the final Phase 2
-/// whole-branch-review cleanup. This is a deliberate, hardcoded mirror of
-/// that table — not derived from it — so a future edit to either the table
-/// or a crate's real `Cargo.toml` dependencies that isn't also reflected
-/// here fails this test loudly, the way doc drift like the one this test
-/// was added to catch should have been caught before it could land.
-///
-/// `xtask` itself and `roundhouse-core` (no internal deps) are omitted —
-/// `roundhouse-core`'s empty edge set is still checked via `expect(&[])`
-/// falling out of `.unwrap_or(&[])` below for any crate not listed here
-/// with a nonempty real dependency set, so leaving it out is fine, but it's
-/// listed explicitly for clarity.
-const EXPECTED_EDGES: &[(&str, &[&str])] = &[
-    ("roundhouse-core", &[]),
-    ("roundhouse-proto", &["roundhouse-core"]),
-    (
-        "roundhouse-store",
-        &["roundhouse-core", "roundhouse-provider"],
-    ),
-    (
-        "roundhouse-policy",
-        &["roundhouse-core", "roundhouse-store"],
-    ),
-    ("roundhouse-sandbox", &["roundhouse-core"]),
-    ("roundhouse-provider", &["roundhouse-core"]),
-    // Deliberate, authorized addition (Phase 6 Task 3): the shared
-    // provider-adapter conformance suite (§9.10) depends on
-    // `roundhouse-provider` for the `Provider`/IR types it exercises and on
-    // `roundhouse-core` for `Usage` (which is not re-exported from
-    // `roundhouse-provider`'s crate root). `roundhouse-provider` only
-    // *dev*-depends back (see its own Cargo.toml comment), so this edge
-    // stays acyclic.
-    (
-        "roundhouse-conformance",
-        &["roundhouse-core", "roundhouse-provider"],
-    ),
-    (
-        "roundhouse-tools",
-        &[
-            "roundhouse-core",
-            "roundhouse-sandbox",
-            "roundhouse-policy",
-            "roundhouse-net",
-        ],
-    ),
-    // `roundhouse-provider` below is a deliberate, authorized addition
-    // (Task 1, Phase 3; plan correction dated 2026-08-28) — `ContentBlock`/
-    // `MediaSource` live in `roundhouse-provider` (src/ir.rs), not
-    // `roundhouse-core`, and the doc table row was updated in the same
-    // commit per this test's keep-both-in-sync rule.
-    (
-        "roundhouse-mcp",
-        &[
-            "roundhouse-core",
-            "roundhouse-policy",
-            "roundhouse-provider",
-        ],
-    ),
-    ("roundhouse-acp", &["roundhouse-core", "roundhouse-proto"]),
-    ("roundhouse-bus", &["roundhouse-core"]),
-    (
-        "roundhouse-engine",
-        &[
-            "roundhouse-core",
-            "roundhouse-store",
-            "roundhouse-policy",
-            "roundhouse-net",
-            "roundhouse-sandbox",
-            "roundhouse-provider",
-            "roundhouse-bus",
-        ],
-    ),
-    ("roundhouse-config", &[]),
-    // `roundhouse-provider` below is a deliberate, authorized addition
-    // (Phase 6 Task 2) — the six concrete `CredentialProvider`
-    // implementations (§9.9) live here and implement
-    // `roundhouse_provider::credential::CredentialProvider` directly;
-    // acyclic because this crate already reaches `roundhouse-provider`
-    // transitively through the `roundhouse-store` edge below.
-    (
-        "roundhouse-secrets",
-        &[
-            "roundhouse-config",
-            "roundhouse-core",
-            "roundhouse-provider",
-            "roundhouse-store",
-        ],
-    ),
-    (
-        "roundhouse-flow",
-        &["roundhouse-core", "roundhouse-engine", "roundhouse-store"],
-    ),
-    // `roundhouse-bus` below is a deliberate, authorized addition (Task 1,
-    // Phase 5, Subsystem A): a `Message` trigger's `Binding` doubles as the
-    // addressable recipient for a bus mailbox, and Task 4's
-    // `bind_message_trigger`/`poll_message_trigger` call the `Bus` trait
-    // directly — the doc table row was updated in the same commit per this
-    // test's keep-both-in-sync rule.
-    (
-        "roundhouse-sched",
-        &[
-            "roundhouse-core",
-            "roundhouse-engine",
-            "roundhouse-store",
-            "roundhouse-bus",
-        ],
-    ),
-    (
-        "roundhouse-daemon",
-        &[
-            "roundhouse-core",
-            "roundhouse-proto",
-            "roundhouse-store",
-            "roundhouse-policy",
-            "roundhouse-sandbox",
-            "roundhouse-provider",
-            "roundhouse-tools",
-            "roundhouse-mcp",
-            "roundhouse-acp",
-            "roundhouse-bus",
-            "roundhouse-engine",
-            "roundhouse-flow",
-            "roundhouse-sched",
-            "roundhouse-config",
-            "roundhouse-tui",
-        ],
-    ),
-    ("roundhouse-tui", &["roundhouse-proto"]),
-    ("roundhouse-cli", &["roundhouse-proto", "roundhouse-tui"]),
-    // Phase 5 Task 31 (Subsystem D2): `roundhouse-core` is a deliberate,
-    // tracked deviation from this table's original `proto`-only row for
-    // `roundhouse-web`, authorised by ruling P9. §11.3's SSE cursor is
-    // `(session_id, seq)` and `SessionId` lives in `roundhouse-core`;
-    // `roundhouse-proto` uses it without re-exporting it. See
-    // `crates/roundhouse-web/Cargo.toml`'s own comment on the edge.
-    // Phase 5 Task 34 (Subsystem D5): `roundhouse-flow` and `roundhouse-store`
-    // join `roundhouse-core` as tracked deviations from the original
-    // `proto`-only row, on the same ruling P9. §8.6's Runs inbox query lives in
-    // `roundhouse-flow` (ruling P86 — it already owns `WorkflowRun`/`Report`
-    // and the `roundhouse-store` edge, so this crate writes no SQL), and
-    // `AppState` carries a `roundhouse_store::StorePool`. See
-    // `crates/roundhouse-web/Cargo.toml`'s own comments on both edges.
-    (
-        "roundhouse-web",
-        &[
-            "roundhouse-core",
-            "roundhouse-flow",
-            "roundhouse-proto",
-            "roundhouse-store",
-        ],
-    ),
-    ("roundhouse-net", &["roundhouse-core", "roundhouse-store"]),
-];
-
 /// Reads `path`'s `[dependencies]` table and returns the sorted names of
 /// every `roundhouse-*` dependency it declares. A straightforward
 /// TOML-parsing check, consistent with `workspace_lists_all_expected_crates`
@@ -257,23 +101,49 @@ fn real_internal_deps(manifest_path: &Path) -> Vec<String> {
 }
 
 #[test]
-fn crate_dependency_edges_match_the_architecture_doc() {
+fn the_architecture_doc_table_itself_not_just_a_hardcoded_mirror_of_it_matches_real_cargo_toml_deps(
+) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .to_path_buf();
+    let doc_path = root.join("docs/architecture/02-system-architecture.md");
+    let doc_text = fs::read_to_string(&doc_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", doc_path.display()));
+    let parsed = xtask::doc_table_parser::parse_dependency_table(&doc_text)
+        .expect("§5.2's table should parse cleanly");
 
-    for (crate_name, expected_edges) in EXPECTED_EDGES {
+    for (crate_name, doc_deps) in &parsed {
         let manifest_path = root.join("crates").join(crate_name).join("Cargo.toml");
-        let mut expected: Vec<String> = expected_edges.iter().map(|s| s.to_string()).collect();
-        expected.sort();
-        let actual = real_internal_deps(&manifest_path);
+        let real_deps = real_internal_deps(&manifest_path);
+        let mut doc_deps_sorted = doc_deps.clone();
+        doc_deps_sorted.sort();
         assert_eq!(
-            actual, expected,
-            "{crate_name}'s real Cargo.toml roundhouse-* dependencies {actual:?} do not \
-             match the expected edges {expected:?} (kept in sync with \
-             docs/architecture/02-system-architecture.md §5.2 — update EXPECTED_EDGES here \
-             AND that table together, never one without the other)"
+            doc_deps_sorted, real_deps,
+            "{crate_name}'s doc-table dependency set {doc_deps_sorted:?} does not match its \
+             real Cargo.toml roundhouse-* dependencies {real_deps:?}"
+        );
+    }
+
+    // Coverage: every workspace member under `crates/` must have a row in
+    // the doc table, so a newly added crate without a table row fails
+    // loudly instead of silently escaping this guard.
+    for member in EXPECTED_MEMBERS {
+        if *member == "xtask" {
+            // `xtask` is a workspace member but is not a `crates/` member
+            // and has no row in §5.2's table — excluded explicitly and by
+            // name (not by a `starts_with("crates/")` filter, which could
+            // also hide a future non-`crates/`, non-`xtask` member that
+            // should have a row and doesn't).
+            continue;
+        }
+        let crate_name = member
+            .strip_prefix("crates/")
+            .unwrap_or_else(|| panic!("unexpected EXPECTED_MEMBERS entry {member}"));
+        assert!(
+            parsed.contains_key(crate_name),
+            "{crate_name} is a workspace member under crates/ but has no row in \
+             docs/architecture/02-system-architecture.md §5.2's table"
         );
     }
 }

@@ -142,6 +142,9 @@ Workspace ──┬── Session ──┬── Task ──┬── Task (chi
 ```
 
 - **Workspace** — a project root and the config/policy/memory scoped to it.
+  (Naming note: §6.2 also uses `Workspace` for one specific config-precedence
+  scope within this — the local, per-machine override layer, distinct from
+  the repo-committed `Project` scope — narrower than this product-noun sense.)
 - **Session** — a supervised agent instance: a provider+model, a system prompt, a
   tool set, a working directory, an isolation tier, and an append-only task log.
   Sessions form a tree (a sub-agent is a *child session*, not a hidden call).

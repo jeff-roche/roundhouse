@@ -425,15 +425,24 @@ impl PolicyEngine {
     }
 
     /// Task 25 fix-round-1 (security review): the single source of truth for
-    /// whether the sealed floor is disabled for this engine. Before this
-    /// accessor existed, `SessionActor` held its own independent `unsealed`
-    /// bool, settable to a different value than the one this `PolicyEngine`
-    /// was actually constructed with — a caller could construct a
-    /// `PolicyEngine::with_unsealed(false)` whose sealed floor still got
-    /// disabled anyway because whatever *called* `decide_sealed` consulted
-    /// its own, unrelated flag instead of this one. Every caller of
-    /// `decide_sealed` outside this impl block must read `unsealed` from
-    /// here, never maintain a parallel copy.
+    /// whether the sealed floor is disabled for this engine. Originally this
+    /// existed so a caller could pass the flag into `decide_sealed` — before
+    /// this accessor existed, `SessionActor` held its own independent
+    /// `unsealed` bool, settable to a different value than the one this
+    /// `PolicyEngine` was actually constructed with, so the sealed floor
+    /// could get disabled even though whoever *called* `decide_sealed`
+    /// consulted its own, unrelated flag instead of this one.
+    ///
+    /// Task 25 fix-round-2 (this unit) closed that hole at the type level:
+    /// `decide_sealed`/`decide_pipeline`/`decide_shell_command` no longer
+    /// accept `unsealed` as a parameter at all, reading `self.unsealed`
+    /// internally instead — a caller can no longer supply a stale or wrong
+    /// value even by mistake. This accessor now exists purely for callers
+    /// that need to *observe* the flag for something other than feeding it
+    /// into a decision, e.g. `SessionActor::admit_task`
+    /// (`roundhouse-engine/src/session_actor.rs`), which reads it to decide
+    /// whether the never-silent unsealed-audit note needs to be recorded at
+    /// all.
     pub fn unsealed(&self) -> bool {
         self.unsealed
     }
@@ -461,10 +470,9 @@ impl PolicyEngine {
     pub fn decide_sealed(
         &self,
         params: &TaskParams,
-        unsealed: bool,
         ctx: &crate::sealed::SealedContext,
     ) -> Decision {
-        if !unsealed {
+        if !self.unsealed {
             for rule in crate::sealed::sealed_rules() {
                 if (rule.matches)(params, ctx) {
                     return Decision {
@@ -536,7 +544,7 @@ impl PolicyEngine {
     /// the interactive default of Ask, because there is no human to answer the
     /// Ask. The sealed floor is still applied first.
     pub fn decide_unattended(&self, params: &TaskParams) -> Decision {
-        let d = self.decide_sealed(params, self.unsealed, &self.sealed_ctx());
+        let d = self.decide_sealed(params, &self.sealed_ctx());
         if d.rule.is_none() && d.outcome == Outcome::Ask {
             Decision {
                 outcome: Outcome::Deny,
@@ -557,7 +565,7 @@ impl PolicyEngine {
 /// through the trait-object call path either.
 impl crate::Policy for PolicyEngine {
     fn decide(&self, input: &PolicyInput) -> PolicyDecision {
-        self.decide_sealed(&input.params, self.unsealed, &self.sealed_ctx())
+        self.decide_sealed(&input.params, &self.sealed_ctx())
             .outcome
             .into()
     }
