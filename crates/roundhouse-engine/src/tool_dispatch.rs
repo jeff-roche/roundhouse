@@ -848,7 +848,12 @@ async fn run_shell_dispatch(
 /// resolves at all (`cancel: None`, or the `SessionActor` — and with it the
 /// `watch::Sender` — has been dropped, which only `None`'s sibling branches
 /// in [`run_shell_dispatch`]'s `select!` can still make progress against).
-async fn wait_for_session_cancel(cancel: &mut Option<watch::Receiver<SessionState>>) {
+/// `pub(crate)` as of fix round D: [`crate::agent_loop`]'s MCP arm needs the
+/// identical "resolve as soon as this session leaves `Created`/`Running`"
+/// future for its own cancellation `select!` (ruling W1-R81 finding I2
+/// level 2), and reimplementing the `changed()`-error-means-pend subtlety a
+/// second time is exactly how the two would drift apart.
+pub(crate) async fn wait_for_session_cancel(cancel: &mut Option<watch::Receiver<SessionState>>) {
     match cancel {
         Some(rx) => loop {
             if !matches!(*rx.borrow(), SessionState::Created | SessionState::Running) {

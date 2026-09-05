@@ -12,13 +12,12 @@ use std::sync::{Arc, Mutex};
 
 use futures::stream;
 use roundhouse_core::{
-    EventPayload, OnDegrade, PolicyDecision, SessionId, SessionSpec, SessionState, TaskId,
-    TaskKind, Tier,
+    EventPayload, OnDegrade, SessionId, SessionSpec, SessionState, TaskId, TaskKind, Tier,
 };
 use roundhouse_engine::agent_loop::{run_agent_loop, AgentLoopConfig, AgentLoopError};
-use roundhouse_engine::mcp_spawner::EngineTaskSpawner;
+use roundhouse_engine::mcp_spawner::{EngineTaskSpawner, SessionMcp};
 use roundhouse_engine::{tool_catalog, SessionActor};
-use roundhouse_mcp::executor::{McpExecutor, TaskSpawner as McpTaskSpawner};
+use roundhouse_mcp::executor::TaskSpawner as McpTaskSpawner;
 use roundhouse_mcp::namespace::ToolNamespace;
 use roundhouse_mcp::transport::McpTransport;
 use roundhouse_mcp::wire::{
@@ -28,7 +27,8 @@ use roundhouse_mcp::wire::{
 use roundhouse_policy::engine::{
     ArgMatcher, CompiledRule, Outcome, PolicyEngine, Predicate, Scope,
 };
-use roundhouse_policy::{FsOp, Policy, PolicyInput, ServerId};
+use roundhouse_policy::sealed::SealedContext;
+use roundhouse_policy::{FsOp, ServerId};
 use roundhouse_provider::{
     BlockDelta, BlockKind, BoxFut, Capabilities, ChatRequest, ChatStream, ContentBlock,
     HttpRequest, HttpResponseStream, HttpTransport, ModelId, Params, Plan, Provider, ProviderError,
@@ -114,11 +114,30 @@ async fn new_actor(
     std::path::PathBuf,
     SessionId,
 ) {
+    let policy = Arc::new(PolicyEngine::from_rules(config_rules));
+    new_actor_with_engine(dir, state_dir, daemon_binary, policy).await
+}
+
+/// `new_actor`, but over a caller-supplied `PolicyEngine` (fix round D).
+/// Every MCP test now shares ONE engine between the `SessionActor` and the
+/// `SessionMcp`, which is both what Task 7's production wiring will do and
+/// the only way to write a test where `admit_task` and `McpExecutor::gate`
+/// are known to be judging against the same rules.
+async fn new_actor_with_engine(
+    dir: &std::path::Path,
+    state_dir: std::path::PathBuf,
+    daemon_binary: std::path::PathBuf,
+    policy: Arc<PolicyEngine>,
+) -> (
+    SessionActor,
+    roundhouse_store::EventWriter,
+    std::path::PathBuf,
+    SessionId,
+) {
     let db_path = dir.join("events.db");
     let store = open(&db_path).await.unwrap();
     let writer = spawn_writer(store).await;
 
-    let policy = Arc::new(PolicyEngine::from_rules(config_rules));
     let isolate: Arc<dyn Isolate> = Arc::new(available_isolate());
     let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
     let handle = isolate.prepare(&spec).await.unwrap();
@@ -1060,6 +1079,21 @@ enum ScriptedMcpResponse {
         input_requests: Vec<InputRequest>,
         request_state: RequestState,
     },
+    /// Never resolves — a wedged or deliberately-stalling MCP server. The
+    /// `AtomicBool` flips when the hanging future is DROPPED, which is the
+    /// only observable difference between "the dispatch was really abandoned"
+    /// and "we stopped waiting but it is still running detached" (fix round
+    /// D, ruling W1-R81 finding I2 levels 2 and 3).
+    Hang(Arc<std::sync::atomic::AtomicBool>),
+}
+
+/// Flips its flag on drop. Held across the `pending()` await inside a
+/// `Hang` response so the flag flips exactly when that future is dropped.
+struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 struct ScriptedMcpTransport {
@@ -1093,7 +1127,11 @@ impl McpTransport for ScriptedMcpTransport {
 
     async fn call_tool(&self, req: ToolCallRequest) -> Result<McpResult, McpError> {
         self.calls.lock().unwrap().push(req);
-        match self.script.lock().unwrap().pop_front() {
+        // Popped into a local BEFORE the match so no `MutexGuard` is held
+        // across the `Hang` arm's await (a `MutexGuard` is not `Send`, and
+        // `McpTransport::call_tool` returns a `Send` future).
+        let next = self.script.lock().unwrap().pop_front();
+        match next {
             None => Err(McpError::Protocol(
                 "scripted transport script exhausted".into(),
             )),
@@ -1113,6 +1151,11 @@ impl McpTransport for ScriptedMcpTransport {
                 content: vec![],
                 is_error: false,
             }),
+            Some(ScriptedMcpResponse::Hang(dropped)) => {
+                let _flag = DropFlag(dropped);
+                std::future::pending::<()>().await;
+                unreachable!("a Hang response never resolves")
+            }
         }
     }
 
@@ -1121,38 +1164,79 @@ impl McpTransport for ScriptedMcpTransport {
     }
 }
 
-/// Test double for `roundhouse_policy::Policy` — always returns the fixed
-/// decision it was built with. Mirrors `roundhouse-mcp`'s own `FixedPolicy`
-/// (unreachable from here — see this section's header comment).
-struct FixedPolicy(PolicyDecision);
-impl Policy for FixedPolicy {
-    fn decide(&self, _input: &PolicyInput) -> PolicyDecision {
-        self.0
-    }
+/// The one MCP server id every fixture in this section uses.
+const FAKE_SERVER: &str = "fake-server";
+
+/// A real `PolicyEngine` with a real `sealed_ctx_provider` installed — the
+/// shape both mints of a `SessionMcp` demand, and the shape
+/// `McpExecutor::gate` actually consults through
+/// `impl crate::Policy for PolicyEngine`.
+///
+/// **Fix round D, ruling W1-R81 finding I4.** Before this round every MCP
+/// test in this file built its executor with `FixedPolicy(Allow)`, an
+/// `Arc<dyn Policy>` test double — so no test anywhere exercised the real
+/// sealed floor on the MCP arm, while the built-in arm had exactly such a
+/// test. `SessionMcp::from_parts` now takes the CONCRETE
+/// `Arc<PolicyEngine>`, which makes that substitution a compile error rather
+/// than a thing a test (or a future production caller) can quietly do. Every
+/// MCP test below therefore drives a real engine end to end: the real
+/// `decide_sealed` floor, the real `sealed:mcp-unresolved-server` rule, and
+/// real `CompiledRule`s.
+fn mcp_engine(
+    state_dir: &std::path::Path,
+    daemon_binary: &std::path::Path,
+    resolved_servers: &[&str],
+    rules: Vec<CompiledRule>,
+) -> Arc<PolicyEngine> {
+    let ctx = SealedContext {
+        state_dir: state_dir.to_path_buf(),
+        daemon_binary: daemon_binary.to_path_buf(),
+        resolved_mcp_servers: resolved_servers.iter().map(|s| s.to_string()).collect(),
+        // Equal, so `sealed_tier_shortfall` does not fire and the MCP rules
+        // under test are what actually decide these tasks.
+        requested_tier: Tier::Sandbox,
+        attested_tier: Tier::Sandbox,
+        home: roundhouse_policy::sealed::home_dir(),
+    };
+    Arc::new(
+        PolicyEngine::from_rules(rules).with_sealed_ctx_provider(Arc::new(move || ctx.clone())),
+    )
 }
 
-/// Builds a real `McpExecutor` wired to a `ScriptedMcpTransport` and a
+/// A config rule allowing exactly one MCP tool on one server. `tool` is the
+/// server's ORIGINAL tool name, never the namespaced one — `Predicate::Mcp`
+/// matches `tool` by exact string equality, which is the whole reason
+/// `dispatch_mcp` must feed `admit_task` the original name.
+fn allow_mcp_tool(server: &str, tool: &str) -> CompiledRule {
+    CompiledRule::test_new(
+        Scope::Builtin,
+        Outcome::Allow,
+        Predicate::mcp(ServerId(server.to_string()), Some(tool.to_string())),
+    )
+}
+
+/// Builds a real `SessionMcp` wired to a `ScriptedMcpTransport` and a
 /// REAL `EngineTaskSpawner` (production code, not a test double — every
 /// event this executor's own internal task-spawner calls produce lands in
 /// the SAME session's real event log `session_events` below can read
-/// back). Returns the executor, the transport (to assert on `call_count`),
-/// and the one tool's namespaced name `run_agent_loop`'s scripted provider
-/// should ask for.
+/// back). Returns the `SessionMcp`, the transport (to assert on
+/// `call_count`), and the one tool's namespaced name `run_agent_loop`'s
+/// scripted provider should ask for.
 async fn build_mcp_executor(
     runner: &'static roundhouse_core::TaskRunner,
     writer: roundhouse_store::EventWriter,
     session_id: SessionId,
-    policy: Arc<dyn Policy>,
+    policy: Arc<PolicyEngine>,
     original_tool_name: &str,
     script: Vec<ScriptedMcpResponse>,
-) -> (Arc<McpExecutor>, Arc<ScriptedMcpTransport>, String) {
+) -> (SessionMcp, Arc<ScriptedMcpTransport>, String) {
     let tool_def = McpToolDef {
         name: original_tool_name.to_string(),
         description: "a scripted test tool".to_string(),
         input_schema: serde_json::json!({}),
     };
     let transport = Arc::new(ScriptedMcpTransport::new(vec![tool_def.clone()], script));
-    let server = ServerId("fake-server".to_string());
+    let server = ServerId(FAKE_SERVER.to_string());
     let connections: Vec<(ServerId, Arc<dyn McpTransport>)> =
         vec![(server.clone(), transport.clone() as Arc<dyn McpTransport>)];
 
@@ -1176,32 +1260,74 @@ async fn build_mcp_executor(
 
     let task_spawner: Arc<dyn McpTaskSpawner> =
         Arc::new(EngineTaskSpawner::new(runner, writer, session_id));
-    let executor = Arc::new(McpExecutor::new(
-        connections,
-        namespace,
-        policy,
-        task_spawner,
-    ));
+    let mcp = SessionMcp::from_parts(connections, namespace, policy, task_spawner)
+        .expect("the test engine has an installed sealed-ctx provider with absolute paths");
 
-    (executor, transport, namespaced_name)
+    (mcp, transport, namespaced_name)
+}
+
+/// Everything one ordinary MCP dispatch test needs, wired the way Task 7's
+/// production path will wire it: ONE `PolicyEngine` shared by the
+/// `SessionActor` and the `SessionMcp` (so `admit_task` and
+/// `McpExecutor::gate` judge against the same rules and the same
+/// `SealedContext`), and the session told which servers actually resolved
+/// via `register_mcp`.
+struct McpFixture {
+    actor: SessionActor,
+    mcp: SessionMcp,
+    transport: Arc<ScriptedMcpTransport>,
+    namespaced_name: String,
+    db_path: std::path::PathBuf,
+    session_id: SessionId,
+}
+
+async fn mcp_fixture(
+    dir: &std::path::Path,
+    rules: Vec<CompiledRule>,
+    original_tool_name: &str,
+    script: Vec<ScriptedMcpResponse>,
+) -> McpFixture {
+    let state_dir = dir.join("state");
+    let daemon_binary = dir.join("daemon-binary");
+    let engine = mcp_engine(&state_dir, &daemon_binary, &[FAKE_SERVER], rules);
+    let (actor, writer, db_path, session_id) =
+        new_actor_with_engine(dir, state_dir, daemon_binary, Arc::clone(&engine)).await;
+    let (mcp, transport, namespaced_name) = build_mcp_executor(
+        &RUNNER,
+        writer,
+        session_id,
+        engine,
+        original_tool_name,
+        script,
+    )
+    .await;
+    // Without this the session's own `SealedContext.resolved_mcp_servers` is
+    // empty and `sealed:mcp-unresolved-server` denies every MCP task at
+    // admission — see `SessionActor::register_mcp`'s doc comment.
+    actor.register_mcp(&mcp);
+    McpFixture {
+        actor,
+        mcp,
+        transport,
+        namespaced_name,
+        db_path,
+        session_id,
+    }
 }
 
 #[tokio::test]
 async fn an_mcp_tool_call_is_dispatched_through_the_real_executor_and_folded_back() {
     let dir = tempfile::tempdir().unwrap();
-    let (actor, writer, db_path, session_id) = new_actor(
-        dir.path(),
-        dir.path().join("state"),
-        dir.path().join("daemon-binary"),
-        vec![],
-    )
-    .await;
-
-    let (mcp, transport, namespaced_name) = build_mcp_executor(
-        &RUNNER,
-        writer,
+    let McpFixture {
+        actor,
+        mcp,
+        transport,
+        namespaced_name,
+        db_path,
         session_id,
-        Arc::new(FixedPolicy(PolicyDecision::Allow)),
+    } = mcp_fixture(
+        dir.path(),
+        vec![allow_mcp_tool(FAKE_SERVER, "search")],
         "search",
         vec![ScriptedMcpResponse::Ok {
             content: vec![McpContentBlock::Text {
@@ -1235,6 +1361,14 @@ async fn an_mcp_tool_call_is_dispatched_through_the_real_executor_and_folded_bac
     .await
     .unwrap();
 
+    // Fix round D, ruling W1-R80's silent-failure mode, made load-bearing
+    // here: the ONLY allow rule in this engine is
+    // `Predicate::Mcp { tool: Some("search") }`, matched by exact string
+    // equality, and BOTH gates the call now passes (`admit_task` and
+    // `McpExecutor::gate`) consult it. If `dispatch_mcp` fed `admit_task`
+    // the NAMESPACED name instead of the original one, no rule would match,
+    // `decide_sealed` would fall through to its no-match `Ask`, admission
+    // would refuse, and this count would be 0.
     assert_eq!(
         transport.call_count(),
         1,
@@ -1272,19 +1406,25 @@ async fn an_mcp_tool_call_is_dispatched_through_the_real_executor_and_folded_bac
 #[tokio::test]
 async fn an_mcp_tool_call_denied_by_policy_is_recorded_and_surfaced_as_an_error() {
     let dir = tempfile::tempdir().unwrap();
-    let (actor, writer, db_path, session_id) = new_actor(
-        dir.path(),
-        dir.path().join("state"),
-        dir.path().join("daemon-binary"),
-        vec![],
-    )
-    .await;
-
-    let (mcp, transport, namespaced_name) = build_mcp_executor(
-        &RUNNER,
-        writer,
+    let McpFixture {
+        actor,
+        mcp,
+        transport,
+        namespaced_name,
+        db_path,
         session_id,
-        Arc::new(FixedPolicy(PolicyDecision::Deny)),
+    } = mcp_fixture(
+        dir.path(),
+        // A REAL deny rule in a REAL `PolicyEngine`, not a `FixedPolicy`
+        // stand-in — `decide` short-circuits on any matching Deny.
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            Outcome::Deny,
+            Predicate::mcp(
+                ServerId(FAKE_SERVER.to_string()),
+                Some("search".to_string()),
+            ),
+        )],
         "search",
         vec![], // never reached — the gate must refuse before the transport
     )
@@ -1317,38 +1457,41 @@ async fn an_mcp_tool_call_denied_by_policy_is_recorded_and_surfaced_as_an_error(
         "a policy-denied call must never reach the transport"
     );
     assert!(
-        blocks
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. })),
-        "a denied MCP call must surface as an error tool result, got {blocks:?}"
+        blocks.iter().any(|b| matches!(
+            b,
+            ContentBlock::ToolResult { is_error: true, content, .. }
+                if content.iter().any(|p| p.text.contains("denied"))
+        )),
+        "a denied MCP call must surface as an error tool result naming the denial, got {blocks:?}"
     );
 
     let reopened = open(&db_path).await.unwrap();
     let events = session_events(&reopened, session_id).await.unwrap();
+    // Discriminating on the category, not just "some TaskFailed exists":
+    // a timeout, a transport error and a panic all produce a `TaskFailed`
+    // too, and only a real policy denial produces this one.
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(&e.payload, EventPayload::TaskFailed { .. })),
-        "a denied MCP dispatch must still record a real, queryable TaskFailed"
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::TaskFailed { error, .. } if error.category == "policy_denied"
+        )),
+        "a denied MCP dispatch must record a real, queryable TaskFailed categorised as a \
+         policy denial, got {:?}",
+        events.iter().map(|e| &e.payload).collect::<Vec<_>>()
     );
 }
 
 #[tokio::test]
 async fn an_unresolvable_namespaced_mcp_tool_name_is_refused_without_dispatch() {
     let dir = tempfile::tempdir().unwrap();
-    let (actor, writer, _db_path, session_id) = new_actor(
+    let McpFixture {
+        actor,
+        mcp,
+        transport,
+        ..
+    } = mcp_fixture(
         dir.path(),
-        dir.path().join("state"),
-        dir.path().join("daemon-binary"),
-        vec![],
-    )
-    .await;
-
-    let (mcp, transport, _namespaced_name) = build_mcp_executor(
-        &RUNNER,
-        writer,
-        session_id,
-        Arc::new(FixedPolicy(PolicyDecision::Allow)),
+        vec![allow_mcp_tool(FAKE_SERVER, "search")],
         "search",
         vec![],
     )
@@ -1437,22 +1580,17 @@ async fn mcp_result_text_is_capped_with_a_visible_marker_when_it_exceeds_the_bou
     // — the excess is discarded with a visible marker, mirroring M2/I1's
     // own "truncation must be visible" precedent.
     let dir = tempfile::tempdir().unwrap();
-    let (actor, writer, _db_path, session_id) = new_actor(
-        dir.path(),
-        dir.path().join("state"),
-        dir.path().join("daemon-binary"),
-        vec![],
-    )
-    .await;
-
     // Comfortably past MAX_MCP_RESULT_TEXT_BYTES (256 KiB) without this
     // test itself being unreasonably slow or memory-heavy.
     let huge_text = "x".repeat(400 * 1024);
-    let (mcp, _transport, namespaced_name) = build_mcp_executor(
-        &RUNNER,
-        writer,
-        session_id,
-        Arc::new(FixedPolicy(PolicyDecision::Allow)),
+    let McpFixture {
+        actor,
+        mcp,
+        namespaced_name,
+        ..
+    } = mcp_fixture(
+        dir.path(),
+        vec![allow_mcp_tool(FAKE_SERVER, "dump")],
         "dump",
         vec![ScriptedMcpResponse::Ok {
             content: vec![McpContentBlock::Text { text: huge_text }],
@@ -1510,25 +1648,20 @@ async fn mcp_image_content_is_rendered_as_a_placeholder_not_inlined_as_base64() 
     // CF-7 item 4's other half: non-text content must not be base64'd
     // straight into the model's context.
     let dir = tempfile::tempdir().unwrap();
-    let (actor, writer, _db_path, session_id) = new_actor(
-        dir.path(),
-        dir.path().join("state"),
-        dir.path().join("daemon-binary"),
-        vec![],
-    )
-    .await;
-
     // A real, valid base64 payload ("not a real png" verbatim), so this
     // exercises the actual decode path in `McpExecutor::decode_content`,
     // not a pre-built ContentBlock. Hand-encoded to avoid pulling in the
     // `base64` crate as a direct dependency of this test binary just for
     // one literal.
     let fake_png_base64 = "bm90IGEgcmVhbCBwbmc=".to_string();
-    let (mcp, _transport, namespaced_name) = build_mcp_executor(
-        &RUNNER,
-        writer,
-        session_id,
-        Arc::new(FixedPolicy(PolicyDecision::Allow)),
+    let McpFixture {
+        actor,
+        mcp,
+        namespaced_name,
+        ..
+    } = mcp_fixture(
+        dir.path(),
+        vec![allow_mcp_tool(FAKE_SERVER, "screenshot")],
         "screenshot",
         vec![ScriptedMcpResponse::Ok {
             content: vec![McpContentBlock::Image {
@@ -1591,19 +1724,16 @@ async fn an_mcp_elicitation_result_suspends_the_task_honestly_without_a_double_w
     // path already durably writes `TaskSuspended` via the injected
     // `EngineTaskSpawner`, so this dispatch must not write a second one.
     let dir = tempfile::tempdir().unwrap();
-    let (actor, writer, db_path, session_id) = new_actor(
-        dir.path(),
-        dir.path().join("state"),
-        dir.path().join("daemon-binary"),
-        vec![],
-    )
-    .await;
-
-    let (mcp, _transport, namespaced_name) = build_mcp_executor(
-        &RUNNER,
-        writer,
+    let McpFixture {
+        actor,
+        mcp,
+        namespaced_name,
+        db_path,
         session_id,
-        Arc::new(FixedPolicy(PolicyDecision::Allow)),
+        ..
+    } = mcp_fixture(
+        dir.path(),
+        vec![allow_mcp_tool(FAKE_SERVER, "delete_repo")],
         "delete_repo",
         vec![ScriptedMcpResponse::InputRequired {
             input_requests: vec![InputRequest {
@@ -1736,5 +1866,649 @@ async fn a_panicked_mcp_dispatch_records_task_failed_instead_of_leaving_the_task
             .iter()
             .any(|e| matches!(&e.payload, EventPayload::TaskFailed { .. })),
         "the task must be recorded as failed, not left dangling at TaskStarted forever"
+    );
+}
+
+// =======================================================================================
+// Fix round D — the four ways the MCP arm was still weaker than the built-in
+// arm (rulings W1-R80 / W1-R81), plus the two smaller ones.
+// =======================================================================================
+
+/// MUST 1 / finding I2 level 1 — the session-lifecycle guard.
+///
+/// `admit_task`'s `SessionState` allowlist is what refuses new work into a
+/// session being torn down. `dispatch_mcp` never called it, so a `Cancelling`
+/// session could still have a fresh MCP call started against a real server.
+/// The built-in arm has had this property since Task 25; this test is the MCP
+/// arm's version of it.
+#[tokio::test]
+async fn a_cancelling_session_refuses_a_new_mcp_dispatch_before_it_reaches_the_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let McpFixture {
+        actor,
+        mcp,
+        transport,
+        namespaced_name,
+        db_path,
+        session_id,
+    } = mcp_fixture(
+        dir.path(),
+        // Explicitly ALLOWED by policy, so nothing but the lifecycle guard
+        // can be what refuses this call — the discriminator that makes this
+        // test about admission rather than about the policy gate.
+        vec![allow_mcp_tool(FAKE_SERVER, "search")],
+        "search",
+        vec![ScriptedMcpResponse::Ok {
+            content: vec![McpContentBlock::Text {
+                text: "should never be reached".to_string(),
+            }],
+            is_error: false,
+        }],
+    )
+    .await;
+
+    actor
+        .cancel(&RUNNER, roundhouse_core::CancelReason::User)
+        .await
+        .unwrap();
+
+    let tools = actor.tool_defs().to_vec();
+    let provider =
+        ScriptedToolCallProvider::new(&namespaced_name, serde_json::json!({ "query": "x" }));
+    let ctx = fake_ctx();
+
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        Some(mcp),
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        transport.call_count(),
+        0,
+        "a Cancelling session must not start a new MCP call against a real server"
+    );
+    let refusal = blocks
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::ToolResult {
+                is_error: true,
+                content,
+                ..
+            } => Some(content.iter().map(|p| p.text.clone()).collect::<String>()),
+            _ => None,
+        })
+        .expect("the refusal must reach the model as an error tool result");
+    assert!(
+        refusal.contains("session is Cancelling"),
+        "the model must be told WHY the call was refused, not just that it failed: {refusal:?}"
+    );
+
+    let reopened = open(&db_path).await.unwrap();
+    let events = session_events(&reopened, session_id).await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::TaskFailed { error, .. } if error.category == "session_not_running"
+        )),
+        "the refused attempt must still be a real, queryable TaskFailed categorised as a \
+         lifecycle refusal, got {:?}",
+        events.iter().map(|e| &e.payload).collect::<Vec<_>>()
+    );
+}
+
+/// MUST 5 / finding I4 — the REAL sealed floor, on the MCP arm, end to end.
+///
+/// Before this round every MCP test built its executor with a permissive
+/// `FixedPolicy(Allow)` `Arc<dyn Policy>` double, so nothing anywhere proved
+/// the MCP gate consults the compiled-in floor at all. `SessionMcp::from_parts`
+/// now takes the concrete `Arc<PolicyEngine>`, which makes that double a
+/// compile error. This test proves the floor really fires here: an explicit
+/// config rule ALLOWS the tool, and the call is denied anyway, because
+/// `sealed:mcp-unresolved-server` matches first and config cannot override the
+/// sealed floor. A `FixedPolicy(Allow)` could not produce this outcome.
+#[tokio::test]
+async fn the_real_sealed_floor_denies_an_mcp_call_to_an_unresolved_server_despite_an_allow_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let daemon_binary = dir.path().join("daemon-binary");
+    // The engine's sealed context reports NO resolved MCP servers — the
+    // honest state for a server that never completed a handshake — while its
+    // config rules explicitly allow the tool.
+    let engine = mcp_engine(
+        &state_dir,
+        &daemon_binary,
+        &[],
+        vec![allow_mcp_tool(FAKE_SERVER, "search")],
+    );
+    let (actor, writer, db_path, session_id) =
+        new_actor_with_engine(dir.path(), state_dir, daemon_binary, Arc::clone(&engine)).await;
+    let (mcp, transport, namespaced_name) =
+        build_mcp_executor(&RUNNER, writer, session_id, engine, "search", vec![]).await;
+    // Deliberately NOT calling `actor.register_mcp(&mcp)`: this session never
+    // learned of a resolved server either.
+
+    let tools = actor.tool_defs().to_vec();
+    let provider =
+        ScriptedToolCallProvider::new(&namespaced_name, serde_json::json!({ "query": "x" }));
+    let ctx = fake_ctx();
+
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        Some(mcp),
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        transport.call_count(),
+        0,
+        "the compiled-in sealed floor must refuse an unresolved server even though a config \
+         rule allows the tool — config cannot override the floor"
+    );
+    let refusal = blocks
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::ToolResult {
+                is_error: true,
+                content,
+                ..
+            } => Some(content.iter().map(|p| p.text.clone()).collect::<String>()),
+            _ => None,
+        })
+        .expect("the denial must reach the model as an error tool result");
+    assert!(
+        refusal.contains("denied by sealed floor"),
+        "the denial must name the sealed floor, not read as a generic failure: {refusal:?}"
+    );
+
+    let reopened = open(&db_path).await.unwrap();
+    let events = session_events(&reopened, session_id).await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::TaskFailed { error, .. } if error.category == "policy_denied"
+        )),
+        "a sealed-floor denial must be a real, queryable TaskFailed"
+    );
+}
+
+/// MUST 2 / finding I1 — an `Ask` must record a terminal, and must say
+/// "approval", not "elicitation".
+///
+/// `gate`'s `Ask` arm records a `TaskDecided(Ask)` and returns
+/// `Suspended { AwaitingApproval }` WITHOUT calling `suspend_task`, unlike
+/// `suspend_for_elicitation`. `dispatch_mcp` used to append nothing for
+/// either, on the (elicitation-only) belief that `execute` had already
+/// written a terminal — leaving `TaskCreated -> TaskStarted ->
+/// TaskDecided(Ask) -> nothing`, a task permanently in flight (S-LOG-1), and
+/// telling the model it needed "an elicitation" when it needed a human.
+///
+/// The two gates are given deliberately different rule sets so that
+/// admission allows and the executor's own gate then Asks — the one
+/// configuration in which `gate`'s `Ask` arm is reachable at all now that
+/// `admit_task` runs first.
+#[tokio::test]
+async fn an_mcp_policy_ask_records_a_terminal_and_is_reported_as_pending_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let daemon_binary = dir.path().join("daemon-binary");
+
+    let actor_engine = mcp_engine(
+        &state_dir,
+        &daemon_binary,
+        &[FAKE_SERVER],
+        vec![allow_mcp_tool(FAKE_SERVER, "search")],
+    );
+    // No rule at all — `PolicyEngine::decide` returns `Ask` when nothing
+    // matches (`engine.rs:536-539`), which is exactly the default path this
+    // finding is about.
+    let executor_engine = mcp_engine(&state_dir, &daemon_binary, &[FAKE_SERVER], vec![]);
+
+    let (actor, writer, db_path, session_id) = new_actor_with_engine(
+        dir.path(),
+        state_dir,
+        daemon_binary,
+        Arc::clone(&actor_engine),
+    )
+    .await;
+    let (mcp, transport, namespaced_name) = build_mcp_executor(
+        &RUNNER,
+        writer,
+        session_id,
+        executor_engine,
+        "search",
+        vec![], // never reached — the gate Asks before the transport
+    )
+    .await;
+    actor.register_mcp(&mcp);
+
+    let tools = actor.tool_defs().to_vec();
+    let provider =
+        ScriptedToolCallProvider::new(&namespaced_name, serde_json::json!({ "query": "x" }));
+    let ctx = fake_ctx();
+
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        Some(mcp),
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        transport.call_count(),
+        0,
+        "an Ask must not reach the transport"
+    );
+
+    let message = blocks
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::ToolResult {
+                is_error: true,
+                content,
+                ..
+            } => Some(content.iter().map(|p| p.text.clone()).collect::<String>()),
+            _ => None,
+        })
+        .expect("a pending-approval call must reach the model as an error tool result");
+    assert!(
+        message.contains("pending approval"),
+        "the model must be told this is awaiting a human approval: {message:?}"
+    );
+    assert!(
+        !message.contains("elicitation"),
+        "a pending approval must NOT be mislabelled as an elicitation: {message:?}"
+    );
+
+    let reopened = open(&db_path).await.unwrap();
+    let events = session_events(&reopened, session_id).await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::TaskDecided {
+                decision: roundhouse_core::PolicyDecision::Ask,
+                ..
+            }
+        )),
+        "the executor's gate must have recorded its Ask decision"
+    );
+    // The S-LOG-1 property this finding is about: the task reaches a terminal
+    // state instead of sitting at TaskDecided(Ask) forever.
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::TaskFailed { error, .. } if error.category == "requires_approval"
+        )),
+        "an Ask must leave a real terminal event, categorised the same way the built-in arm's \
+         `record_denial` categorises its own RequiresApproval, got {:?}",
+        events.iter().map(|e| &e.payload).collect::<Vec<_>>()
+    );
+}
+
+/// MUST 3 level 2 / finding I2 — a mid-dispatch cancellation must actually
+/// reach the MCP call.
+///
+/// `dispatch_builtin` passes `Some(actor.subscribe())` into
+/// `execute_builtin`; `dispatch_mcp` passed no cancellation channel at all,
+/// so a `cancel()` while an MCP call was in flight did nothing and the call
+/// ran on to the full `MCP_CALL_TIMEOUT` (120s). The `timeout` below is the
+/// discriminator: against the pre-fix code this test does not merely assert
+/// something different, it does not finish.
+#[tokio::test]
+async fn a_session_cancelled_mid_mcp_dispatch_abandons_the_call_instead_of_waiting_out_the_timeout()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let McpFixture {
+        actor,
+        mcp,
+        namespaced_name,
+        db_path,
+        session_id,
+        ..
+    } = mcp_fixture(
+        dir.path(),
+        vec![allow_mcp_tool(FAKE_SERVER, "search")],
+        "search",
+        vec![ScriptedMcpResponse::Hang(Arc::clone(&dropped))],
+    )
+    .await;
+
+    let tools = actor.tool_defs().to_vec();
+    let provider =
+        ScriptedToolCallProvider::new(&namespaced_name, serde_json::json!({ "query": "x" }));
+    let ctx = fake_ctx();
+
+    let loop_fut = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        Some(mcp),
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    );
+    let canceller = async {
+        // Long enough for the dispatch to be genuinely in flight inside the
+        // wedged transport, short enough to keep the test fast.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        actor
+            .cancel(&RUNNER, roundhouse_core::CancelReason::User)
+            .await
+            .unwrap();
+    };
+
+    let blocks = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (blocks, ()) = tokio::join!(loop_fut, canceller);
+        blocks
+    })
+    .await
+    .expect(
+        "a cancelled session must abandon its in-flight MCP call promptly — waiting out the \
+         120s MCP_CALL_TIMEOUT instead is the bug this test exists for",
+    )
+    .unwrap();
+
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the in-flight transport call must actually have been dropped, not merely stopped \
+         being awaited"
+    );
+    let message = blocks
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::ToolResult {
+                is_error: true,
+                content,
+                ..
+            } => Some(content.iter().map(|p| p.text.clone()).collect::<String>()),
+            _ => None,
+        })
+        .expect("the abandoned call must reach the model as an error tool result");
+    assert!(
+        message.contains("cancelled"),
+        "the model must be told the call was cancelled: {message:?}"
+    );
+
+    let reopened = open(&db_path).await.unwrap();
+    let events = session_events(&reopened, session_id).await.unwrap();
+    // A cancellation is not a panic — it must not be recorded as one.
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::TaskFailed { error, .. } if error.category == "session_cancelled"
+        )),
+        "an abandoned dispatch must record a terminal categorised as a cancellation, not as a \
+         panic, got {:?}",
+        events.iter().map(|e| &e.payload).collect::<Vec<_>>()
+    );
+}
+
+/// MUST 3 level 3 / finding I2 — dropping the loop must abort the detached
+/// dispatch.
+///
+/// `tokio` does NOT abort a spawned task when its `JoinHandle` is dropped.
+/// Without the `AbortOnDrop` guard, dropping `run_agent_loop`'s future during
+/// session teardown left `execute()` running — still holding the session's
+/// `EngineTaskSpawner` — free to append a `TaskDecided`, a `TaskSuspended`,
+/// or a whole elicitation `TaskCreated` into a closing session's log.
+///
+/// The drop flag is the discriminator: it is set by the transport's own
+/// future being dropped, which can only happen if the spawned task was really
+/// aborted rather than merely abandoned.
+#[tokio::test]
+async fn dropping_the_agent_loop_aborts_an_in_flight_mcp_dispatch_instead_of_detaching_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let McpFixture {
+        actor,
+        mcp,
+        namespaced_name,
+        ..
+    } = mcp_fixture(
+        dir.path(),
+        vec![allow_mcp_tool(FAKE_SERVER, "search")],
+        "search",
+        vec![ScriptedMcpResponse::Hang(Arc::clone(&dropped))],
+    )
+    .await;
+
+    let tools = actor.tool_defs().to_vec();
+    let provider =
+        ScriptedToolCallProvider::new(&namespaced_name, serde_json::json!({ "query": "x" }));
+    let ctx = fake_ctx();
+
+    {
+        let loop_fut = run_agent_loop(
+            &actor,
+            &RUNNER,
+            &provider,
+            &ctx,
+            &tools,
+            Some(mcp),
+            empty_request(),
+            AgentLoopConfig {
+                max_turns: 4,
+                max_tool_calls_per_turn: 10,
+            },
+        );
+        // Drive it far enough that the dispatch is genuinely in flight, then
+        // drop it — the session-teardown shape, where nothing of ours is left
+        // running to observe the drop and act on it.
+        let raced = tokio::time::timeout(std::time::Duration::from_millis(200), loop_fut).await;
+        assert!(
+            raced.is_err(),
+            "the wedged transport must still have been in flight when the loop future was dropped"
+        );
+    }
+
+    // Give the runtime a moment to actually run the abort.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "dropping the agent loop must abort the spawned MCP dispatch — tokio detaches a task \
+         whose JoinHandle is merely dropped, leaving it free to append events into a closing \
+         session"
+    );
+}
+
+/// MUST 4 / finding I3 — the `--unsealed` per-task audit `Note`.
+///
+/// `admit_task` records a `Note` for every task when `PolicyEngine::unsealed()`
+/// and fails admission CLOSED if that append fails — that is what discharges
+/// the "must be recorded per-task, never silent" commitment. `McpExecutor::gate`
+/// records only a `TaskDecided` and STRUCTURALLY cannot record this: it holds
+/// an `Arc<dyn Policy>`, which has no `unsealed()` method. So before this
+/// round, under `round daemon --unsealed`, an MCP call to a server that never
+/// completed a handshake was allowed — `decide_sealed` skips every sealed rule
+/// including `sealed:mcp-unresolved-server` — with NO per-task record that the
+/// floor was off. Routing this arm through `admit_task` is what closes it.
+#[tokio::test]
+async fn an_unsealed_mcp_dispatch_records_the_per_task_audit_note_that_the_floor_was_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let daemon_binary = dir.path().join("daemon-binary");
+    // No resolved servers anywhere and no `register_mcp` call: with the
+    // sealed floor ON this is exactly the `sealed:mcp-unresolved-server`
+    // denial the test above asserts. `--unsealed` skips it — and that fact
+    // is what must not go unrecorded.
+    let engine = Arc::new(
+        PolicyEngine::from_rules(vec![allow_mcp_tool(FAKE_SERVER, "search")])
+            .with_unsealed(true)
+            .with_sealed_ctx_provider({
+                let ctx = SealedContext {
+                    state_dir: state_dir.clone(),
+                    daemon_binary: daemon_binary.clone(),
+                    resolved_mcp_servers: Default::default(),
+                    requested_tier: Tier::Sandbox,
+                    attested_tier: Tier::Sandbox,
+                    home: roundhouse_policy::sealed::home_dir(),
+                };
+                Arc::new(move || ctx.clone())
+            }),
+    );
+    let (actor, writer, db_path, session_id) =
+        new_actor_with_engine(dir.path(), state_dir, daemon_binary, Arc::clone(&engine)).await;
+    let (mcp, transport, namespaced_name) = build_mcp_executor(
+        &RUNNER,
+        writer,
+        session_id,
+        engine,
+        "search",
+        vec![ScriptedMcpResponse::Ok {
+            content: vec![McpContentBlock::Text {
+                text: "reached the server with the floor off".to_string(),
+            }],
+            is_error: false,
+        }],
+    )
+    .await;
+
+    let tools = actor.tool_defs().to_vec();
+    let provider =
+        ScriptedToolCallProvider::new(&namespaced_name, serde_json::json!({ "query": "x" }));
+    let ctx = fake_ctx();
+
+    run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        Some(mcp),
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        transport.call_count(),
+        1,
+        "with --unsealed the floor really is off, so the call to an unresolved server goes \
+         through — which is precisely why it must leave a record"
+    );
+
+    let reopened = open(&db_path).await.unwrap();
+    let events = session_events(&reopened, session_id).await.unwrap();
+    let notes: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::Note { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notes
+            .iter()
+            .any(|t| t.contains("sealed floor DISABLED (--unsealed)") && t.contains("kind=Mcp")),
+        "the MCP task must have its own per-task unsealed audit note naming the task kind, \
+         got {notes:?}"
+    );
+}
+
+/// MUST 6, M1 — `retryable` must be forwarded, not hardcoded `false`.
+///
+/// `ExecutorOutcome::Failed` carries the executor's own judgement, and
+/// `McpExecutor`'s transport-error path sets `retryable: true`
+/// (`executor.rs:717-723`). `dispatch_mcp` matched `Failed { error, .. }` and
+/// passed a literal `false` to `record_task_failed`, while the timeout branch
+/// two dozen lines above it explicitly built `retryable: true` — so the log
+/// contradicted itself within one dispatch.
+///
+/// An empty script makes the scripted transport return
+/// `McpError::Protocol("scripted transport script exhausted")`, which is a
+/// real transport error, so `retryable: true` here is the executor's own
+/// value round-tripped rather than a value this test arranged directly.
+#[tokio::test]
+async fn a_retryable_mcp_transport_failure_is_recorded_as_retryable_not_hardcoded_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let McpFixture {
+        actor,
+        mcp,
+        namespaced_name,
+        db_path,
+        session_id,
+        ..
+    } = mcp_fixture(
+        dir.path(),
+        vec![allow_mcp_tool(FAKE_SERVER, "search")],
+        "search",
+        vec![], // exhausted script -> a real transport error
+    )
+    .await;
+
+    let tools = actor.tool_defs().to_vec();
+    let provider =
+        ScriptedToolCallProvider::new(&namespaced_name, serde_json::json!({ "query": "x" }));
+    let ctx = fake_ctx();
+
+    run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        Some(mcp),
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    let reopened = open(&db_path).await.unwrap();
+    let events = session_events(&reopened, session_id).await.unwrap();
+    let failures: Vec<(&str, bool)> = events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::TaskFailed { error, retryable } => {
+                Some((error.category.as_str(), *retryable))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        failures.contains(&("executor_error", true)),
+        "the executor said this transport failure was retryable; the event log must say so \
+         too, got {failures:?}"
     );
 }

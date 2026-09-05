@@ -49,9 +49,14 @@ use roundhouse_core::{
     Origin, PolicyDecision, SessionId, SuspendReason, TaskId, TaskKind, TaskRunner, Timestamp,
 };
 use roundhouse_mcp::config::McpServerConfig;
-use roundhouse_mcp::executor::{TaskInput as McpTaskInput, TaskSpawner, TerminalOutcome};
+use roundhouse_mcp::executor::{
+    McpExecutor, TaskInput as McpTaskInput, TaskSpawner, TerminalOutcome,
+};
 use roundhouse_mcp::host::{McpHost, McpHostError};
+use roundhouse_mcp::namespace::ToolNamespace;
+use roundhouse_mcp::transport::McpTransport;
 use roundhouse_policy::engine::PolicyEngine;
+use roundhouse_policy::ServerId;
 use roundhouse_provider::ToolDef;
 use roundhouse_store::EventWriter;
 use std::sync::Arc;
@@ -287,10 +292,13 @@ pub enum StartSessionMcpError {
 /// spawn, no discovery to await): sessions configured with zero MCP servers
 /// — the common case — pay effectively nothing to call this.
 ///
-/// Returns the started [`McpHost`] alongside the merged tool list, not just
-/// the list: whatever dispatches a real MCP tool call (Task 5's agent loop)
-/// needs `host.executor` to do so, and whatever tears a session down needs
-/// `host.shutdown()`.
+/// Returns three things, not just the tool list: the started [`McpHost`],
+/// because whatever tears a session down needs `host.shutdown()`; a
+/// [`SessionMcp`], because that is what [`crate::agent_loop::run_agent_loop`]
+/// dispatches through and what [`crate::SessionActor::register_mcp`] takes
+/// (fix round D — see [`SessionMcp`]'s own doc comment for why the loop takes
+/// the newtype rather than a bare `Arc<McpExecutor>`); and the merged tool
+/// list itself.
 ///
 /// # On `policy` (security review fix round 1, ruling W1-R15)
 /// An earlier version of this function took `policy: Arc<dyn Policy>` and
@@ -337,14 +345,114 @@ pub async fn start_session_mcp(
     runner: &'static TaskRunner,
     writer: EventWriter,
     policy: Arc<PolicyEngine>,
-) -> Result<(Arc<McpHost>, Vec<ToolDef>), StartSessionMcpError> {
-    let ctx = policy.sealed_ctx();
-    if !ctx.state_dir.is_absolute() || !ctx.daemon_binary.is_absolute() {
-        return Err(StartSessionMcpError::UnconfiguredSealedContext);
-    }
+) -> Result<(Arc<McpHost>, SessionMcp, Vec<ToolDef>), StartSessionMcpError> {
+    check_sealed_ctx_configured(&policy)?;
     let spawner: Arc<dyn TaskSpawner> =
         Arc::new(EngineTaskSpawner::new(runner, writer, session_id));
     let host = McpHost::start(configs, session_id, policy, spawner).await?;
     let tool_defs = crate::tool_catalog::merged_tool_defs(host.tool_defs())?;
-    Ok((Arc::new(host), tool_defs))
+    let host = Arc::new(host);
+    // The one mint that does not go through `SessionMcp::from_parts`:
+    // `McpHost::start` was just handed the same concrete `Arc<PolicyEngine>`
+    // this function's own signature demands, so the executor it built carries
+    // the real sealed floor by construction — the exact property the newtype
+    // exists to attest to.
+    let mcp = SessionMcp {
+        executor: Arc::clone(&host.executor),
+    };
+    Ok((host, mcp, tool_defs))
+}
+
+/// The [`StartSessionMcpError::UnconfiguredSealedContext`] guard, shared by
+/// both mints of a [`SessionMcp`] so neither can be the loose one. See that
+/// variant's own doc comment (and carry-forward CF-8) for what it does and
+/// does not prove.
+fn check_sealed_ctx_configured(policy: &PolicyEngine) -> Result<(), StartSessionMcpError> {
+    let ctx = policy.sealed_ctx();
+    if !ctx.state_dir.is_absolute() || !ctx.daemon_binary.is_absolute() {
+        return Err(StartSessionMcpError::UnconfiguredSealedContext);
+    }
+    Ok(())
+}
+
+/// An [`McpExecutor`] that is *proven*, by the type system rather than by a
+/// convention one layer up, to have been built against the real
+/// `PolicyEngine` sealed floor.
+///
+/// # Why this type exists (fix round D, ruling W1-R81 finding I4)
+///
+/// `McpExecutor::gate` is the §6.2 policy gate every MCP dispatch passes
+/// through, and it consults an `Arc<dyn Policy>` the executor was
+/// constructed with. `McpExecutor::new` is `pub` and takes exactly that
+/// trait object, and permissive test doubles that implement it really do
+/// exist in this workspace (`AllowAllPolicy` in `roundhouse-mcp`'s
+/// `tests/host_integration.rs` and `tests/integration.rs`). Before this
+/// type, `agent_loop::run_agent_loop` took a bare
+/// `Option<Arc<McpExecutor>>`, so the entire "MCP's gate is not weaker than
+/// the built-in arm's" claim rested on [`start_session_mcp`]'s signature
+/// **one layer up** — a caller that built its own `McpExecutor` and handed
+/// it straight to the loop bypassed the floor with no compiler objection,
+/// and every MCP test in this crate did precisely that.
+///
+/// This is ruling W1-R15's move applied one layer down: both constructors
+/// take the CONCRETE `Arc<PolicyEngine>`, so passing an `AllowAllPolicy` (or
+/// any other `Arc<dyn Policy>`) is a **compile error** rather than a thing a
+/// future caller can quietly do. The field is private and there is no
+/// `From`/`Deref` into one, so the only two ways to obtain a `SessionMcp`
+/// are [`start_session_mcp`] and [`SessionMcp::from_parts`] — and both run
+/// the same [`StartSessionMcpError::UnconfiguredSealedContext`] guard.
+///
+/// **What it does NOT prove** (carry-forward CF-8, unchanged): that the
+/// engine's installed `sealed_ctx_provider` returns a *correct* context.
+/// The guard proves non-default, not correct.
+#[derive(Clone)]
+pub struct SessionMcp {
+    executor: Arc<McpExecutor>,
+}
+
+impl SessionMcp {
+    /// Builds a `SessionMcp` from already-established transports and an
+    /// already-built namespace — the seam an integration test (or any future
+    /// caller that spawns its servers itself rather than through
+    /// [`start_session_mcp`]'s config-driven path) needs.
+    ///
+    /// `policy` is the concrete `Arc<PolicyEngine>`, never `Arc<dyn Policy>`:
+    /// that is the whole point of this type (see its doc comment). The
+    /// `McpExecutor` is constructed HERE from the parts rather than accepted
+    /// pre-built, because accepting a pre-built one would let a caller hand
+    /// over an executor whose policy is something else entirely while still
+    /// passing a real `PolicyEngine` for show.
+    pub fn from_parts(
+        connections: Vec<(ServerId, Arc<dyn McpTransport>)>,
+        namespace: ToolNamespace,
+        policy: Arc<PolicyEngine>,
+        task_spawner: Arc<dyn TaskSpawner>,
+    ) -> Result<Self, StartSessionMcpError> {
+        check_sealed_ctx_configured(&policy)?;
+        Ok(SessionMcp {
+            executor: Arc::new(McpExecutor::new(
+                connections,
+                namespace,
+                policy,
+                task_spawner,
+            )),
+        })
+    }
+
+    /// The underlying executor, for the one caller that dispatches through
+    /// it ([`crate::agent_loop::run_agent_loop`]). Returning `&Arc<_>` rather
+    /// than a clone keeps this a read-only borrow: a caller can dispatch and
+    /// can `Arc::clone` for a spawned task, but cannot mint a `SessionMcp`
+    /// around some *other* executor from it.
+    pub fn executor(&self) -> &Arc<McpExecutor> {
+        &self.executor
+    }
+
+    /// The servers that actually completed spawn + discovery — carry-forward
+    /// CF-9's accessor, forwarded. This is the honest input
+    /// [`crate::SessionActor::register_mcp`] needs for the session's own
+    /// `SealedContext.resolved_mcp_servers`.
+    pub fn resolved_servers(&self) -> Vec<String> {
+        self.executor.resolved_servers()
+    }
 }

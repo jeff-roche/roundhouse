@@ -24,9 +24,9 @@
 //!
 //! **MCP arm: wired as of fix round C2.** Rounds A/B/C1 left it deliberately
 //! unwired: `roundhouse_mcp::executor::McpExecutor`'s real dispatch (`impl
-//! TaskExecutor::execute`, `executor.rs:506`) needs a `TaskInput::Mcp {
+//! TaskExecutor::execute`) needs a `TaskInput::Mcp {
 //! server: ServerId, tool, args }`, and `execute` uses that `server` field
-//! *directly* for its policy gate (`executor.rs:531`) — it is **not**
+//! *directly* for its policy gate — it is **not**
 //! derived from resolving `tool`, and `McpExecutor` exposed no way to
 //! resolve a namespaced tool name to its authoritative `ServerId` (CF-3) or
 //! to tell which servers had actually completed a handshake as opposed to
@@ -35,24 +35,49 @@
 //! [`roundhouse_mcp::executor::McpExecutor::resolve`] and
 //! [`roundhouse_mcp::executor::McpExecutor::resolved_servers`] — and this
 //! module's [`dispatch_mcp`] now builds a real `TaskInput::Mcp` using
-//! `resolve`'s **`server`** half only: `tool` is set to the namespaced name
-//! unchanged, because `execute` re-resolves `tool` itself internally
-//! (`executor.rs:517`) and would reject an already-resolved original name as
-//! unknown. `resolve` exists solely so the caller can learn `server` —
-//! `execute` never re-derives it and uses whatever the caller passed
-//! directly for its policy gate (`executor.rs:531`). This module never
-//! parses a `ServerId` out of the namespaced name itself and never
-//! substitutes a permissive policy (the two things this module always
-//! refused to do to fake "working" MCP dispatch — CF-7 item 2). An MCP call
-//! still fails
-//! closed with a named `ToolResult { is_error: true }` when: no MCP host is
-//! configured for the session; the namespaced name doesn't resolve to any
-//! known server/tool; the dispatch panics (a spawned-task boundary — see
-//! [`dispatch_mcp`]'s doc comment); it exceeds its wall-clock bound; or the
-//! server itself returns an `InputRequired`/elicitation result — the MRTR
-//! retry loop is explicitly OUT OF SCOPE for this round (see
-//! [`dispatch_mcp`]'s `Suspended` arm), so a suspended MCP task is reported
-//! honestly rather than silently hung or faked as failed.
+//! `resolve`'s **`server`** half: `TaskInput::Mcp.tool` is set to the
+//! namespaced name unchanged, because `execute` re-resolves `tool` itself
+//! internally and would reject an already-resolved original name as unknown.
+//! `execute` never re-derives `server` and uses whatever the caller passed
+//! directly for its policy gate. This module never parses a `ServerId` out of
+//! the namespaced name itself and never substitutes a permissive policy (the
+//! two things this module always refused to do to fake "working" MCP
+//! dispatch — CF-7 item 2).
+//!
+//! **Fix round D closed the four ways this arm was still weaker than the
+//! built-in arm** (rulings W1-R80/W1-R81):
+//! - It now passes through the same `SessionActor::admit_task` gate — with
+//!   `resolve`'s **other** half, the ORIGINAL tool name, in its
+//!   `TaskParams::Mcp`, because that is what `McpExecutor::gate` matches on
+//!   and `Predicate::Mcp` compares tool names by exact string equality. That
+//!   restores the session-lifecycle guard, the actor's own live
+//!   `SealedContext`, and the `--unsealed` per-task audit `Note` that `gate`
+//!   — holding an `Arc<dyn Policy>`, which has no `unsealed()` — could never
+//!   have recorded. `SessionActor::register_mcp` is what makes that gate
+//!   meaningful rather than a blanket denial; see its doc comment.
+//! - A mid-dispatch session cancellation now aborts the call instead of
+//!   letting it run to the full wall-clock bound, and the spawned dispatch is
+//!   held in an [`AbortOnDrop`] guard so a torn-down session cannot leave a
+//!   detached `execute()` appending events into a closing log.
+//! - A `PolicyDecision::Ask` — the DEFAULT whenever no rule matches — now
+//!   records a real terminal event instead of leaving the task suspended
+//!   forever at `TaskDecided(Ask)`, and tells the model it is pending
+//!   *approval* rather than mislabelling it an elicitation.
+//! - `run_agent_loop` takes a [`crate::mcp_spawner::SessionMcp`], not a bare
+//!   `Arc<McpExecutor>`, so the sealed floor behind the MCP gate is a
+//!   compile-time property of this boundary rather than a convention one
+//!   layer up.
+//!
+//! An MCP call still fails closed with a named
+//! `ToolResult { is_error: true }` when: no MCP host is configured for the
+//! session; the namespaced name doesn't resolve to any known server/tool;
+//! admission or the executor's own gate refuses it; the dispatch panics (a
+//! spawned-task boundary — see [`dispatch_mcp`]'s doc comment); the session
+//! is cancelled mid-call; it exceeds its wall-clock bound; or the server
+//! returns an `InputRequired`/elicitation result — the MRTR retry loop is
+//! explicitly OUT OF SCOPE for this round (see [`dispatch_mcp`]'s
+//! `Suspended` arms), so a suspended MCP task is reported honestly rather
+//! than silently hung or faked as failed.
 //!
 //! # Unbounded results are now capped for the MCP arm; still uncapped for built-ins
 //! `run_agent_loop` folds every dispatched tool's result into `transcript`
@@ -148,7 +173,7 @@ pub async fn run_agent_loop(
     provider: &dyn Provider,
     ctx: &RequestCtx,
     tools: &[ToolDef],
-    mcp: Option<Arc<roundhouse_mcp::executor::McpExecutor>>,
+    mcp: Option<crate::mcp_spawner::SessionMcp>,
     mut request: ChatRequest,
     config: AgentLoopConfig,
 ) -> Result<Vec<ContentBlock>, AgentLoopError> {
@@ -263,7 +288,7 @@ async fn dispatch_one_tool_call(
     actor: &SessionActor,
     writer: &EventWriter,
     runner: &'static TaskRunner,
-    mcp: Option<&Arc<roundhouse_mcp::executor::McpExecutor>>,
+    mcp: Option<&crate::mcp_spawner::SessionMcp>,
     name: &str,
     input: &serde_json::Value,
     parent: TaskId,
@@ -509,12 +534,25 @@ fn render_mcp_content(content: Vec<(ContentBlock, roundhouse_core::Provenance)>)
 ///
 /// **The spawned-task boundary (CF-7 item 1):** `execute` runs inside
 /// `tokio::spawn`, and this function `.await`s the `JoinHandle` rather than
-/// calling `execute` in-process. `execute`'s only internal writes
-/// (`suspend_for_elicitation`'s `spawn_task`/`suspend_task` calls, reached
-/// only on an `InputRequired` result) go through the SAME `EngineTaskSpawner`
-/// this `McpExecutor` was constructed with (`mcp_spawner.rs`), which PANICS
-/// on a failed `EventWriter` append by design (see that module's own doc
-/// comment) rather than swallowing it. Without the spawned-task boundary,
+/// calling `execute` in-process. `execute`'s internal writes all go through
+/// the SAME `EngineTaskSpawner` this `McpExecutor` was constructed with
+/// (`mcp_spawner.rs`), which PANICS on a failed `EventWriter` append by
+/// design (see that module's own doc comment) rather than swallowing it.
+///
+/// **How load-bearing that boundary is (corrected in fix round D, M2):** an
+/// earlier version of this comment named `suspend_for_elicitation`'s appends
+/// as the *sole* internal panic condition, i.e. something only an
+/// `InputRequired` result could reach. That understated it, and understating
+/// it invites a later reader to "simplify" the boundary away as
+/// elicitation-only. `gate` calls `task_spawner.record_decision` on **every**
+/// dispatch — before the `Allow`/`Ask`/`Deny` match, so
+/// on all three outcomes — and `EngineTaskSpawner::record_decision`
+/// `.expect()`s on a failed append. So the panic
+/// path is reachable from the very first thing `execute` does with the
+/// spawner, on the ordinary allow path, not just from the rare elicitation
+/// one. `suspend_for_elicitation`'s `spawn_task`/`suspend_task` appends
+/// (reached only on an `InputRequired` result) are additional such sites,
+/// not the only ones. Without the spawned-task boundary,
 /// that panic would unwind straight through this function into whatever
 /// called `run_agent_loop` — the session actor itself. `tokio::spawn`
 /// catches it as an `Err(JoinError)` on the handle instead, so ONE
@@ -525,27 +563,31 @@ fn render_mcp_content(content: Vec<(ContentBlock, roundhouse_core::Provenance)>)
 /// before `execute` ever returns) and returns an honest error to the model,
 /// rather than the whole session actor going down.
 ///
-/// **`Suspended` (an `InputRequired`/elicitation result): reports honestly,
-/// records nothing further.** `execute`'s `suspend_for_elicitation` path
-/// already durably wrote `TaskSuspended` for this task (via the injected
-/// `TaskSpawner`, synchronously, before returning) — writing another
-/// terminal event here would be a double-write for the same task. The
-/// MRTR retry loop (resuming a suspended MCP task with
+/// **`Suspended` splits on its reason (fix round D, finding I1).** Only
+/// `AwaitingElicitation` is already durably recorded: `execute`'s
+/// `suspend_for_elicitation` path calls `task_spawner.suspend_task`
+/// synchronously before returning, so writing
+/// another terminal event for it here would be a double-write. `gate`'s
+/// `Ask` arm does **not** — it records a `TaskDecided(Ask)` and returns
+/// `Suspended { AwaitingApproval }` with no `suspend_task` call — so that
+/// reason (and, fail-closed, every other) gets a real `TaskFailed
+/// { category: "requires_approval" }` here, matching `record_denial`'s own
+/// `AdmitError::RequiresApproval` arm on the built-in side. The MRTR retry
+/// loop (resuming a suspended MCP task with
 /// `ResumptionInput::ElicitationAnswers` once a human answers the
 /// elicitation) is explicitly OUT OF SCOPE for this round: nothing in
-/// `run_agent_loop` today re-visits a suspended task, so this arm reports
-/// an honest `is_error: true` result explaining that the tool call requires
-/// input this loop cannot yet supply, rather than silently hanging or
-/// mischaracterizing a genuine suspension as a failure.
+/// `run_agent_loop` today re-visits a suspended task, so both arms report
+/// an honest `is_error: true` result naming what the call is actually
+/// waiting on, rather than silently hanging or mischaracterizing one kind
+/// of suspension as the other.
 ///
 /// # Turns a spawned MCP dispatch's `JoinHandle` result into an `ExecutorOutcome`
 /// Split out from [`dispatch_mcp`] so the CF-7 item 1 boundary — what
-/// happens when the spawned task panicked or was cancelled instead of
+/// happens when the spawned task panicked or was aborted instead of
 /// returning normally — is independently unit-testable without needing to
-/// reproduce the one real internal condition that can trigger it inside
-/// `McpExecutor` (an `EventWriter` append failure inside
-/// `suspend_for_elicitation`, which this crate has no clean way to force
-/// from outside `roundhouse-mcp`). `join_result` is accepted as a plain
+/// reproduce a real internal panic condition inside `McpExecutor` (an
+/// `EventWriter` append failure inside `EngineTaskSpawner`, which this
+/// crate has no clean way to force from outside `roundhouse-mcp`). `join_result` is accepted as a plain
 /// parameter rather than a `JoinHandle` for exactly this reason: a test can
 /// hand it the result of `tokio::spawn(async { panic!(..) }).await` — an
 /// artificially panicking task, unrelated to any real MCP internals — and
@@ -561,6 +603,27 @@ fn render_mcp_content(content: Vec<(ContentBlock, roundhouse_core::Provenance)>)
 /// already-self-contained seam lets `tests/agent_loop_dispatch.rs` (its own,
 /// independent process, with its own `static RUNNER`) test it directly
 /// instead.
+/// Aborts the wrapped spawned task when dropped (fix round D, ruling
+/// W1-R81 finding I2 level 3). `tokio::spawn` detaches: dropping a
+/// `JoinHandle` abandons the handle, **not the task**, which keeps running
+/// to completion. For an MCP dispatch that means a session torn down
+/// mid-call leaves an `execute()` still holding the session's
+/// `EngineTaskSpawner` and still able to append events into a closing
+/// session's log. A one-field guard with a `Drop` impl is the smallest fix
+/// that covers the *drop* case, which no `select!` arm can — by definition
+/// nothing of ours is running to observe it.
+///
+/// Deliberately local rather than `tokio_util::task::AbortOnDropHandle`:
+/// `roundhouse-engine` does not depend on `tokio-util` and this is four
+/// lines.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub async fn resolve_mcp_join_result(
     writer: &EventWriter,
     runner: &TaskRunner,
@@ -575,7 +638,27 @@ pub async fn resolve_mcp_join_result(
             // cancelled) — this task never reached a terminal state on its
             // own, so record one now rather than leaving it dangling at
             // `TaskStarted` forever.
-            let message = format!("MCP tool call dispatch panicked or was cancelled: {join_err}");
+            //
+            // Fix round D: the two causes are now told apart rather than
+            // both being logged as a panic. `is_cancelled()` here means
+            // `dispatch_mcp` aborted the task because the owning session was
+            // cancelled/suspended/closed mid-call (finding I2 level 2), which
+            // is a routine, operator-initiated outcome — recording it under
+            // `mcp_dispatch_panic` would put a false panic in the audit log
+            // every time a user hits cancel.
+            let (message, category) = if join_err.is_cancelled() {
+                (
+                    "MCP tool call dispatch was cancelled: the owning session was \
+                     cancelled/suspended/closed while the call was in flight"
+                        .to_string(),
+                    "session_cancelled",
+                )
+            } else {
+                (
+                    format!("MCP tool call dispatch panicked: {join_err}"),
+                    "mcp_dispatch_panic",
+                )
+            };
             let failed = runner.record_task_failed(
                 session_id,
                 0,
@@ -583,7 +666,7 @@ pub async fn resolve_mcp_join_result(
                 task_id,
                 TaskError {
                     message: message.clone(),
-                    category: "mcp_dispatch_panic".into(),
+                    category: category.into(),
                 },
                 false,
                 1,
@@ -599,14 +682,23 @@ pub async fn resolve_mcp_join_result(
     }
 }
 
-/// The real MCP dispatch arm (fix round C2). Resolves `namespaced_name` via
-/// [`roundhouse_mcp::executor::McpExecutor::resolve`] to learn the
-/// authoritative `server` for `execute`'s policy gate — but passes
-/// `namespaced_name` itself, unchanged, as `TaskInput::Mcp.tool`, because
-/// `execute` re-resolves `tool` internally and rejects an already-resolved
-/// original name as unknown (see this module's top-level doc comment for the
-/// full explanation of that split). Records `TaskCreated`/`TaskStarted`
-/// before dispatch and `TaskCompleted`/`TaskFailed` after, per S-LOG-1.
+/// The real MCP dispatch arm (fix round C2; gated and cancellable as of fix
+/// round D). Resolves `namespaced_name` via
+/// [`roundhouse_mcp::executor::McpExecutor::resolve`] and uses BOTH halves:
+/// the authoritative `server` for `execute`'s policy gate, and the ORIGINAL
+/// tool name for `admit_task`'s `TaskParams::Mcp`. `TaskInput::Mcp.tool`
+/// still carries `namespaced_name` itself, unchanged, because `execute`
+/// re-resolves `tool` internally and rejects an already-resolved original
+/// name as unknown (see this module's top-level doc comment, and the comment
+/// at the `resolve` call below, for the full explanation of that three-way
+/// split).
+///
+/// The event sequence is `dispatch_builtin`'s, exactly: `TaskCreated`, then
+/// `SessionActor::admit_task`, then — only if admission passed —
+/// `TaskStarted`, the dispatch, and a `TaskCompleted`/`TaskFailed`, per
+/// S-LOG-1. A refusal at admission goes through the same [`record_denial`]
+/// helper the built-in arm uses, so a denied MCP call is as queryable as a
+/// denied `write`.
 ///
 /// CF-7 item 1 — the spawned-task boundary: the actual `execute` call runs
 /// inside `tokio::spawn`, wrapped in a `MCP_CALL_TIMEOUT` timeout, so that an
@@ -620,21 +712,30 @@ async fn dispatch_mcp(
     actor: &SessionActor,
     writer: &EventWriter,
     runner: &'static TaskRunner,
-    mcp: &Arc<roundhouse_mcp::executor::McpExecutor>,
+    mcp: &crate::mcp_spawner::SessionMcp,
     namespaced_name: &str,
     input: &serde_json::Value,
     parent: TaskId,
 ) -> Result<Vec<ToolResultPart>, String> {
     // CF-3: the only authoritative source of the ServerId `execute`'s
     // policy gate uses directly — never parsed out of the namespaced name.
-    // Only `server` is needed from this resolution: `execute` takes the
-    // NAMESPACED name as `TaskInput::Mcp.tool` and resolves it to the
-    // original tool name AGAIN, internally, for its own dispatch
-    // (`executor.rs:517`) — this call exists solely to learn the
-    // authoritative `server`, which `execute` uses directly and never
-    // re-derives itself.
-    let server = match mcp.resolve(namespaced_name) {
-        Some((server, _original_tool)) => server.clone(),
+    //
+    // **Both halves of this resolution are load-bearing, for different
+    // consumers (fix round D, ruling W1-R80).** `server` is what `execute`'s
+    // gate uses directly and never re-derives. `original_tool` is a DECOY for
+    // `TaskInput::Mcp.tool` — `execute` re-resolves that field itself
+    // and would reject an already-resolved original
+    // name as unknown — but it is exactly the right input for `admit_task`'s
+    // `TaskParams::Mcp.tool` below, because `execute` resolves the namespaced
+    // name to `original_tool` BEFORE calling `gate`, and
+    // `gate` builds its own `TaskParams::Mcp` with that original name
+    // from that original name. `Predicate::Mcp` matches `tool` by exact
+    // string equality, so feeding `admit_task` the
+    // namespaced name instead would make the two gates silently disagree in
+    // both directions — a rule allowing `search` would match one and not the
+    // other.
+    let (server, original_tool) = match mcp.executor().resolve(namespaced_name) {
+        Some((server, original_tool)) => (server.clone(), original_tool.to_string()),
         None => {
             let message = format!(
                 "unknown MCP tool `{namespaced_name}` — no server registered this namespaced \
@@ -677,6 +778,45 @@ async fn dispatch_mcp(
         .await
         .map_err(|e| format!("failed to record the dispatched MCP tool call: {e}"))?;
 
+    // Fix round D, ruling W1-R80 (finding I2 level 1, plus I3): the SAME
+    // `SessionActor::admit_task` gate the built-in arm goes through. Until
+    // this round the MCP arm skipped it entirely, so it lost three things
+    // `McpExecutor::gate` structurally cannot provide:
+    //
+    //   * the session-lifecycle guard — a session already `Cancelling`/
+    //     `Suspended`/`Closed` could still have a fresh MCP dispatch started;
+    //   * the `--unsealed` per-task audit `Note`, which `admit_task` records
+    //     for every task and **fails admission closed** if it cannot append.
+    //     `gate` holds an `Arc<dyn Policy>`, which has no `unsealed()`
+    //     method, so it could never have recorded one — meaning under
+    //     `round daemon --unsealed` an MCP call to a server that never
+    //     completed a handshake was allowed with no per-task record that the
+    //     floor was off;
+    //   * the actor's OWN live `SealedContext` (its real isolation
+    //     attestation, re-read per call).
+    //
+    // The resulting double-gate (`decide_sealed` runs here and again in
+    // `gate`) is redundant and fail-closed, not harmful: grants are
+    // `CompiledRule`s and `decide` is pure over `self.rules`, so nothing is
+    // double-decremented; `admit_task` emits no `TaskDecided` of its own, so
+    // there is no duplicate event; and the TOCTOU window between the two
+    // drifts only toward Deny.
+    let req = TaskCreateRequest {
+        kind: TaskKind::Mcp,
+        origin: Origin::Model,
+        is_finally_step: false,
+        params: roundhouse_policy::TaskParams::Mcp {
+            server: server.clone(),
+            // The ORIGINAL tool name, matching what `gate` builds — see the
+            // `resolve` call above. NOT `namespaced_name`.
+            tool: original_tool,
+            args: input.clone(),
+        },
+    };
+    if let Err(admit_err) = actor.admit_task(&req).await {
+        return Err(record_denial(writer, runner, actor.session_id(), task_id, admit_err).await);
+    }
+
     let started = runner.record_task_started(
         actor.session_id(),
         0,
@@ -715,14 +855,22 @@ async fn dispatch_mcp(
     let mcp_input = roundhouse_mcp::executor::TaskInput::Mcp {
         server,
         // The NAMESPACED name, not an already-resolved original one —
-        // `execute` resolves `tool` itself (`executor.rs:517`) to find the
+        // `execute` resolves `tool` itself, internally, to find the
         // original tool name it actually dispatches to the transport.
         tool: namespaced_name.to_string(),
         args: input.clone(),
     };
 
-    let mcp_for_task = Arc::clone(mcp);
-    let join_result = tokio::spawn(async move {
+    let mcp_for_task = Arc::clone(mcp.executor());
+    // Fix round D, ruling W1-R81 finding I2 level 3: `tokio` does NOT abort a
+    // spawned task when its `JoinHandle` is dropped. Before this guard, if
+    // `run_agent_loop`'s own future was dropped mid-dispatch (session
+    // teardown), the detached `execute()` kept running — still holding an
+    // `Arc<McpExecutor>` and through it the `EngineTaskSpawner` — and could
+    // append a `TaskDecided`, a `TaskSuspended`, or a whole elicitation
+    // `TaskCreated` into a session that was closing. Dropping this guard
+    // aborts the task instead.
+    let mut dispatch = AbortOnDrop(tokio::spawn(async move {
         match tokio::time::timeout(
             MCP_CALL_TIMEOUT,
             mcp_for_task.execute(&ctx, &mcp_input, None),
@@ -740,8 +888,24 @@ async fn dispatch_mcp(
                 retryable: true,
             },
         }
-    })
-    .await;
+    }));
+
+    // Fix round D, ruling W1-R81 finding I2 level 2: the built-in arm passes
+    // `Some(actor.subscribe())` into `execute_builtin`, so a mid-dispatch
+    // `cancel()` reaches the running call. This arm passed no cancellation
+    // channel at all, so a cancelled session's MCP call ran on to the full
+    // `MCP_CALL_TIMEOUT` regardless. `McpExecutor::execute` takes no
+    // cancellation token of its own, so cancellation is enforced at this
+    // boundary: abort the spawned dispatch and let `resolve_mcp_join_result`
+    // record the resulting `JoinError` as a real terminal event.
+    let mut cancel = Some(actor.subscribe());
+    let join_result = tokio::select! {
+        joined = &mut dispatch.0 => joined,
+        () = crate::tool_dispatch::wait_for_session_cancel(&mut cancel) => {
+            dispatch.0.abort();
+            (&mut dispatch.0).await
+        }
+    };
 
     let outcome =
         resolve_mcp_join_result(writer, runner, actor.session_id(), task_id, join_result).await?;
@@ -768,15 +932,21 @@ async fn dispatch_mcp(
                 Ok(vec![ToolResultPart { text: rendered }])
             }
         }
-        roundhouse_mcp::executor::ExecutorOutcome::Failed { error, .. } => {
+        roundhouse_mcp::executor::ExecutorOutcome::Failed { error, retryable } => {
             let message = error.message.clone();
+            // Fix round D, M1: `retryable` is forwarded, not discarded and
+            // hardcoded `false`. The timeout arm above explicitly constructs
+            // `retryable: true`, and `McpExecutor`'s own transport-error path
+            // does too — dropping the flag here made
+            // the log contradict itself, recording a retryable failure as
+            // non-retryable in the very same dispatch that produced it.
             let failed = runner.record_task_failed(
                 actor.session_id(),
                 0,
                 now_ts(),
                 task_id,
                 error,
-                false,
+                retryable,
                 1,
             );
             writer.append(failed).await.map_err(|e| {
@@ -784,7 +954,29 @@ async fn dispatch_mcp(
             })?;
             Err(message)
         }
-        roundhouse_mcp::executor::ExecutorOutcome::Suspended { .. } => {
+        // Fix round D, ruling W1-R81 finding I1 — an S-LOG-1 violation on
+        // the DEFAULT path. `execute` durably writes a `TaskSuspended` for
+        // exactly ONE of these two reasons, and the pre-fix code appended
+        // nothing for either:
+        //
+        //   * `suspend_for_elicitation` calls `task_spawner.suspend_task`
+        //     before returning — so `AwaitingElicitation`
+        //     really is already recorded, and a second write here would be a
+        //     double-write for the same task;
+        //   * `gate`'s `Ask` arm records only a
+        //     `TaskDecided(Ask)` via `record_decision` and returns
+        //     `Suspended { AwaitingApproval }` **without** calling
+        //     `suspend_task`. That left `TaskCreated -> TaskStarted ->
+        //     TaskDecided(Ask) -> nothing`: a task permanently in flight.
+        //
+        // And `Ask` is not an edge case: `PolicyEngine::decide` returns `Ask`
+        // whenever no rule matches, so every MCP call
+        // without an operator-written allow rule lands here. The model was
+        // additionally told the call needed "an elicitation" when what it
+        // actually needed was a human approval.
+        roundhouse_mcp::executor::ExecutorOutcome::Suspended {
+            reason: roundhouse_core::SuspendReason::AwaitingElicitation { .. },
+        } => {
             // Already durably recorded by `execute` itself — see this
             // function's own doc comment. Nothing more to append here.
             Err(format!(
@@ -792,6 +984,46 @@ async fn dispatch_mcp(
                  dispatch loop cannot yet resume — the task is suspended, not failed, but MRTR \
                  resume is out of this round's scope"
             ))
+        }
+        // Every other suspension reason — `AwaitingApproval` today, and any
+        // future variant — gets a real terminal event. Deliberately a
+        // catch-all rather than a second exact arm: the elicitation case is
+        // the only one this crate can prove is already durably recorded, so
+        // anything else must fail closed toward "record a terminal" rather
+        // than toward "assume someone else did."
+        roundhouse_mcp::executor::ExecutorOutcome::Suspended { reason } => {
+            let message = match &reason {
+                roundhouse_core::SuspendReason::AwaitingApproval { .. } => format!(
+                    "MCP tool `{namespaced_name}` is pending approval: the executor's §6.2 policy \
+                     gate returned Ask, and no approval workflow is wired to this dispatch loop \
+                     yet — the call was not made"
+                ),
+                other => format!(
+                    "MCP tool `{namespaced_name}` suspended for a reason this dispatch loop \
+                     cannot resume ({other:?}) — the call was not made"
+                ),
+            };
+            // `gate` already recorded the `TaskDecided(Ask)`; what was
+            // missing is the terminal. This mirrors `record_denial`'s own
+            // `AdmitError::RequiresApproval` arm on the built-in side —
+            // same `requires_approval` category — so the two arms are no
+            // longer asymmetric on the approval path.
+            let failed = runner.record_task_failed(
+                actor.session_id(),
+                0,
+                now_ts(),
+                task_id,
+                TaskError {
+                    message: message.clone(),
+                    category: "requires_approval".into(),
+                },
+                false,
+                1,
+            );
+            writer.append(failed).await.map_err(|e| {
+                format!("failed to record the suspended MCP tool call's terminal state: {e}")
+            })?;
+            Err(message)
         }
     }
 }
@@ -801,7 +1033,7 @@ async fn dispatch_mcp(
 /// real task in this workspace (S-LOG-1) — **including a denial.** A tool
 /// call the model asked for is minted as a real `TaskCreated` event BEFORE
 /// admission runs, mirroring `McpExecutor::gate`'s own precedent
-/// (`executor.rs:339-378`: mint first, then `record_decision`, then
+/// (`McpExecutor::gate`: mint first, then `record_decision`, then
 /// terminal): a denied call is still a real, queryable attempt in the
 /// session's append-only log, not a silent non-event — a reviewer asking
 /// "why does `write ~/.ssh/authorized_keys` leave no trace?" would be

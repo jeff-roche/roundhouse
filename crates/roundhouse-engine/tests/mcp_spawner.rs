@@ -214,13 +214,20 @@ async fn start_session_mcp_with_no_configured_servers_yields_the_full_builtin_ca
     let session_id = SessionId::new();
     let policy = policy_with_real_sealed_ctx(dir.path());
 
-    let (host, tool_defs) = start_session_mcp(vec![], session_id, &RUNNER, writer, policy)
+    let (host, mcp, tool_defs) = start_session_mcp(vec![], session_id, &RUNNER, writer, policy)
         .await
         .expect("zero configured MCP servers must not fail startup");
 
     assert!(
         host.tool_defs().is_empty(),
         "no MCP servers were configured, so the host discovered nothing"
+    );
+    // Fix round D: `start_session_mcp` is one of the only two mints of a
+    // `SessionMcp`, and the set it reports resolved must be exactly the set
+    // of servers that actually completed a handshake — here, none.
+    assert!(
+        mcp.resolved_servers().is_empty(),
+        "no MCP servers were configured, so none can be reported resolved to the sealed floor"
     );
     // Proves the EngineTaskSpawner -> McpHost::start -> merged_tool_defs
     // composition actually composes, not just type-checks: the five

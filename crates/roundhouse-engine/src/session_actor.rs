@@ -195,10 +195,11 @@ pub struct SessionActor {
     /// one snapshot here, at the same place `state_dir`/`daemon_binary` are
     /// already validated, closes that gap.
     home: Option<PathBuf>,
-    /// Populated by the MCP host (Phase 3) as servers complete their
-    /// handshake; read here, never written from this module in this task's
-    /// scope — Phase 3 is a hard prerequisite for this ever containing
-    /// anything real. `ServerId` (`roundhouse_policy`) has no `Hash`
+    /// The servers that actually completed a handshake. Written ONLY by
+    /// [`SessionActor::register_mcp`] (fix round D — before that it had no
+    /// writer anywhere and so was permanently empty, which would have made
+    /// `sealed_mcp_unresolved` deny every MCP task; see that method's own
+    /// doc comment). `ServerId` (`roundhouse_policy`) has no `Hash`
     /// derive, which is why `SealedContext` itself already stores raw
     /// `String` server names rather than `ServerId`.
     mcp_resolved: Arc<RwLock<HashSet<String>>>,
@@ -368,11 +369,10 @@ impl SessionActor {
             // Task 25 fix-round-1 (security review): a poisoned lock reads
             // as an empty resolved-server set (fail-closed — an empty set
             // makes every `TaskParams::Mcp` sealed-deny, never
-            // spuriously-allow) rather than panicking. `mcp_resolved` is
-            // write-only from Phase 3 code that doesn't exist yet in this
-            // task's scope, but treating a future writer's panic as a
-            // reason to also crash every *reader* of this session would be
-            // a real, avoidable DoS surface once Phase 3 lands.
+            // spuriously-allow) rather than panicking. The one writer is
+            // `SessionActor::register_mcp` (fix round D), but treating a
+            // writer's panic as a reason to also crash every *reader* of
+            // this session would be a real, avoidable DoS surface.
             resolved_mcp_servers: self
                 .mcp_resolved
                 .read()
@@ -381,6 +381,56 @@ impl SessionActor {
             requested_tier: self.effective_tier,
             attested_tier: attestation.tier,
             home: self.home.clone(),
+        }
+    }
+
+    /// Records which MCP servers this session actually resolved, so
+    /// [`Self::sealed_context`] — and therefore `admit_task`'s
+    /// `sealed:mcp-unresolved-server` check — judges MCP tasks against
+    /// reality.
+    ///
+    /// # Why this exists (fix round D)
+    ///
+    /// Ruling W1-R80 directed the MCP dispatch arm through `admit_task`,
+    /// on the stated understanding that the two sealed-context channels
+    /// (this actor's, and `PolicyEngine::sealed_ctx()`) "can genuinely
+    /// disagree ... Deny-ward, so it is safe." They could not merely
+    /// disagree: **nothing anywhere wrote `mcp_resolved`.** It was
+    /// initialised to an empty `HashSet` in [`Self::new`] and read in
+    /// `sealed_context()`, and no code path anywhere assigned to it. An
+    /// empty set makes `sealed_mcp_unresolved` fire on
+    /// *every* `TaskParams::Mcp`, so routing MCP through `admit_task`
+    /// without this method would have denied 100% of MCP calls — fail-closed,
+    /// but a dead arm rather than a gated one.
+    ///
+    /// # Why it takes a [`SessionMcp`] and not a `HashSet<String>`
+    ///
+    /// A plain string-set setter is carry-forward CF-8(b)'s bypass shape
+    /// verbatim: a caller could declare any server resolved — including one
+    /// that never completed a handshake — and silently disarm the sealed
+    /// floor's one MCP rule for this session. Taking the newtype means the
+    /// only declarable set is the one a real, policy-engine-backed executor
+    /// actually holds transports for
+    /// (`McpExecutor::resolved_servers`, built in `McpHost::start` from
+    /// `StartedServer`s only). There is deliberately no way to add a server
+    /// this session does not have a live connection to.
+    ///
+    /// Idempotent and last-write-wins (`*guard = ...`, never a union), so
+    /// re-registering after a teardown genuinely narrows the set rather than
+    /// leaving a stale server resolved forever.
+    pub fn register_mcp(&self, mcp: &crate::mcp_spawner::SessionMcp) {
+        let resolved: HashSet<String> = mcp.resolved_servers().into_iter().collect();
+        match self.mcp_resolved.write() {
+            Ok(mut guard) => *guard = resolved,
+            // Fail closed and loud, mirroring `sealed_context`'s own
+            // poisoned-lock posture: the set stays as it was (empty, unless a
+            // previous registration succeeded), so every `TaskParams::Mcp`
+            // sealed-denies rather than being admitted against a set we could
+            // not update.
+            Err(_) => tracing::error!(
+                "mcp_resolved lock is poisoned; refusing to register resolved MCP servers — \
+                 every MCP task in this session will be denied by the sealed floor"
+            ),
         }
     }
 
