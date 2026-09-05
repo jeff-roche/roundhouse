@@ -12,4 +12,5 @@
 pub mod boot;
 pub mod demo;
 pub mod mcp_config;
+pub mod session_registry;
 pub mod socket_server;
