@@ -118,28 +118,48 @@
 //! config file:** `-c core.hooksPath=/dev/null` (no hook path resolves to
 //! anything runnable), `-c core.fsmonitor=false` (`core.fsmonitor` can also
 //! name an arbitrary executable git runs), `-c core.attributesFile=/dev/null`
-//! (closes the variant where the attacker relies on a *global* attributes
-//! file rather than one committed in the tree — reproduced separately),
-//! and `-c protocol.allow=never` (defense in depth against any implicit
-//! network operation this or a future call shape might trigger). None of
-//! the four change `add`/`remove`'s own observable behavior — verified
-//! directly.
+//! (closes one narrow variant — see exactly what it does and does not cover
+//! below — reproduced separately), and `-c protocol.allow=never` (defense
+//! in depth against any implicit network operation this or a future call
+//! shape might trigger). None of the four change `add`/`remove`'s own
+//! observable behavior — verified directly.
 //!
 //! **What remains open, named rather than left for a reader to
 //! rediscover: `filter.<name>.smudge` (and, by the same mechanism,
-//! `filter.<name>.clean`).** A repository with a tracked `.gitattributes`
-//! declaring `* filter=lfs` — ubiquitous in real-world repositories using
-//! Git LFS — plus one attacker write of
-//! `git config --local filter.lfs.smudge /tmp/evil.sh` to the shared
-//! config causes the **next** `add_worktree` call, with this module's full
-//! current argv, to execute `/tmp/evil.sh` during the checkout `worktree
-//! add` performs by design. Reproduced directly. There is no `filter.*`
-//! wildcard `-c` override, and `-c core.attributesFile=/dev/null` does
-//! **not** close this variant (also verified) — it only blocks a
-//! filter declared through a *global* attributes file, not one committed
-//! in the repository's own tracked tree, which is the realistic case. The
-//! root cause — the shared, write-through `.git/config` a worktree cannot
-//! be given its own copy of — is not something any `-c` flag on this
+//! `filter.<name>.clean`), through *any* of three independent routes —
+//! fix round 3 corrected an earlier version of this section that named only
+//! the first and stated the second imprecisely.**
+//!
+//! 1. **A repository-tracked `.gitattributes`** declaring `* filter=lfs` —
+//!    ubiquitous in real-world repositories using Git LFS.
+//! 2. **`.git/info/attributes`** — a file inside the repository's shared
+//!    common `.git` directory (not inside any one worktree's own checkout),
+//!    governed by **neither** `core.attributesFile` **nor** anything
+//!    tracked in the tree. Reproduced directly, with **no** `.gitattributes`
+//!    file anywhere in the tree at all: `* filter=evil` written there is
+//!    enough on its own.
+//! 3. A `core.attributesFile` entry written into the repository's own
+//!    **shared, local** `.git/config` — the one thing `-c
+//!    core.attributesFile=/dev/null` above actually closes, by overriding
+//!    it for this invocation. (An earlier version of this section called
+//!    this route "a *global* attributes file"; that was imprecise —
+//!    `env_clear()` above means this module's own invocations never had a
+//!    `$HOME`, so `~/.config/git/attributes` was never reachable through
+//!    them in the first place. The real route this `-c` flag blocks is the
+//!    *shared-config* write, identical in shape to every other single-write
+//!    primitive this section describes.)
+//!
+//! One attacker write of `git config --local filter.lfs.smudge
+//! /tmp/evil.sh` (or the `.git/info/attributes` write above, which needs no
+//! companion `filter.*` config write reachable through the tree at all)
+//! causes the **next** `add_worktree` call, with this module's full current
+//! argv, to execute `/tmp/evil.sh` during the checkout `worktree add`
+//! performs by design. Reproduced directly for all three routes, against
+//! both the pre- and post-`core.attributesFile=/dev/null` argv where
+//! applicable — routes 1 and 2 fire under **both**. There is no `filter.*`
+//! wildcard `-c` override. The root cause — the shared, write-through
+//! `.git/config` (and shared common `.git` directory) a worktree cannot be
+//! given its own copy of — is not something any `-c` flag on this
 //! module's own invocations can close; closing it for real needs a
 //! mechanism this module does not have (a per-worktree config, or refusing
 //! to run inner steps with a shell inside a materialized worktree at all).
@@ -205,6 +225,67 @@ pub enum WorktreeError {
         status: std::process::ExitStatus,
         stderr: String,
     },
+}
+
+impl WorktreeError {
+    /// A rendering that withholds every piece of text this module did not
+    /// itself choose — the argv this call passed (which can contain
+    /// `base_ref`), `git`'s own stderr, and the OS-level spawn error text —
+    /// keeping only this crate's own fixed vocabulary: which variant fired,
+    /// `program`/`repo_root` (never secret — this module's own caller-supplied,
+    /// non-workflow-derived values), and, for [`WorktreeError::CommandFailed`],
+    /// the exit status.
+    ///
+    /// # Why this exists (Task 34 fix round 3, ruling W5-36, superseding fix
+    /// round 2's needle-based approach)
+    ///
+    /// `Display`'s ordinary rendering embeds `args`/`stderr`/`source`
+    /// verbatim, and a caller that resolved `base_ref` from a workflow
+    /// expression cannot assume those are safe to persist — `base_ref` may
+    /// be secret-derived. Fix round 2 tried to close that by adding the
+    /// resolved `base_ref` text as an extra needle to scrub out of the
+    /// assembled message; fix round 3's security lens reproduced two ways
+    /// that scrub misses: `git` does not always **echo a copy** of what it
+    /// was given — `@{upstream}`-style branch-mark syntax makes `git` die
+    /// mid-interpretation and report only the prefix before it (so the
+    /// needle, the whole value, never matches the truncated echo), and
+    /// `git`'s own `vreportf` stderr buffer silently truncates values past
+    /// ~4KB (so a long secret's tail survives as a shorter, still-sensitive
+    /// prefix a needle keyed on the *whole* value cannot match either).
+    /// **No exact-match scrub can close a lossy transform** — the fix is to
+    /// never scrub `git`'s free text at all when it might contain
+    /// secret-derived material, and show this instead.
+    pub fn safe_summary(&self) -> String {
+        match self {
+            WorktreeError::NoPath => {
+                // No external free text of any kind — this variant's
+                // ordinary `Display` is already exactly this crate's own
+                // fixed sentence, so there is nothing to withhold.
+                self.to_string()
+            }
+            WorktreeError::Spawn {
+                program, repo_root, ..
+            } => {
+                format!(
+                    "Spawn: failed to spawn `{program}` in {} (the OS's own error text is \
+                     withheld here because it may contain secret-derived material)",
+                    repo_root.display()
+                )
+            }
+            WorktreeError::CommandFailed {
+                program,
+                repo_root,
+                status,
+                ..
+            } => {
+                format!(
+                    "CommandFailed: `{program}` in {} exited with {status} (its stderr and \
+                     argv are withheld here because they may contain secret-derived material)",
+                    repo_root.display()
+                )
+            }
+        }
+    }
 }
 
 /// Runs `git` with `args` inside `repo_root`. Thin wrapper around

@@ -824,3 +824,144 @@ fn a_secret_derived_over_item_never_reaches_the_serialized_outcome() {
          this in independently of the base_ref taint fix"
     );
 }
+
+/// Fix round 3, item 1, probe (a): `git` does not always echo a **copy** of
+/// a rejected ref — `@{upstream}`-style branch-mark syntax makes it die
+/// mid-interpretation and report only the prefix before `@{`. A
+/// needle-based scrub keyed on the *whole* secret-derived value (fix round
+/// 2's fix) matches nothing against that truncated echo, so the secret
+/// still leaked through git's stderr even though the direct
+/// `redacted_base_ref` copy was already correctly `***`. This is the
+/// regression the withhold-don't-scrub fix (this round) closes.
+#[test]
+fn a_secret_derived_base_ref_with_an_at_brace_suffix_never_reaches_the_serialized_outcome() {
+    if !git_available() {
+        eprintln!("skipping: git not available on this host");
+        return;
+    }
+    const SECRET_ELEMENT: &str = "itemvalue-secret1@{upstream}";
+    // What must never leak is the *branch name* git reports back
+    // (`itemvalue-secret1`) — git's own truncation drops the `@{upstream}`
+    // suffix before echoing anything, so that suffix was never the leak
+    // vector this probe is pinning.
+    const LEAKED_PREFIX: &str = "itemvalue-secret1";
+    let repo = TempRepo::new();
+    let provider = Arc::new(ObservingWorktreeProvider::new(repo.path.clone()));
+
+    let yaml = format!(
+        "{WORKFLOW_PREAMBLE}secrets: [T]\nsteps:\n\
+         \x20\x20- id: per_item\n\
+         \x20\x20\x20\x20map:\n\
+         \x20\x20\x20\x20\x20\x20over: \"${{{{ json(secrets.T) }}}}\"\n\
+         \x20\x20\x20\x20\x20\x20as: item\n\
+         \x20\x20\x20\x20\x20\x20max_parallel: 1\n\
+         \x20\x20\x20\x20\x20\x20on_item_error: continue\n\
+         \x20\x20\x20\x20\x20\x20isolation: {{ worktree: {{ base_ref: \"${{{{ item }}}}\" }} }}\n\
+         \x20\x20\x20\x20steps:\n\
+         \x20\x20\x20\x20\x20\x20- id: emit_something\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20emit: {{ ok: true }}\n"
+    );
+    let def = parse_workflow(&yaml).expect("workflow must parse");
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(
+        serde_json::json!({}),
+        "T",
+        &format!("[{SECRET_ELEMENT:?}]"),
+        Some(provider.clone() as Arc<dyn WorktreeProvider>),
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().expect("run must not error");
+
+    let items = outcomes[0].output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]["status"], "failed",
+        "expected git to reject this base_ref as invalid — got {:?}",
+        items[0]
+    );
+    let error = items[0]["error"].as_str().unwrap();
+    assert!(
+        !error.contains(LEAKED_PREFIX),
+        "git's truncated echo of the secret-derived branch name must never appear in the \
+         item's own error message, got: {error:?}"
+    );
+
+    let serialized = serde_json::to_string(&outcomes[0].output).unwrap();
+    assert!(
+        !serialized.contains(LEAKED_PREFIX),
+        "git's truncated echo of the secret-derived branch name must not appear anywhere in \
+         the map step's serialized output, got: {serialized}"
+    );
+}
+
+/// Fix round 3, item 1, probe (b): `git`'s own `vreportf` stderr buffer
+/// silently truncates values past ~4KB (measured on git 2.55.0: 4069 bytes
+/// echo whole, 4070 echo a 4069-byte prefix) — a needle-based scrub keyed
+/// on the whole secret-derived value cannot match a truncated prefix of
+/// it, so a long secret's leading ~4KB survived fix round 2's fix. Uses a
+/// 6000-byte element, comfortably past the measured cutover on any git
+/// build (the withhold-don't-scrub fix depends on no particular threshold —
+/// see this test's assertion, which checks for the *whole* element, not a
+/// build-specific truncation point).
+#[test]
+fn a_secret_derived_base_ref_longer_than_gits_stderr_buffer_never_reaches_the_serialized_outcome() {
+    if !git_available() {
+        eprintln!("skipping: git not available on this host");
+        return;
+    }
+    let secret_element: String = "x".repeat(6000);
+    let repo = TempRepo::new();
+    let provider = Arc::new(ObservingWorktreeProvider::new(repo.path.clone()));
+
+    let yaml = format!(
+        "{WORKFLOW_PREAMBLE}secrets: [T]\nsteps:\n\
+         \x20\x20- id: per_item\n\
+         \x20\x20\x20\x20map:\n\
+         \x20\x20\x20\x20\x20\x20over: \"${{{{ json(secrets.T) }}}}\"\n\
+         \x20\x20\x20\x20\x20\x20as: item\n\
+         \x20\x20\x20\x20\x20\x20max_parallel: 1\n\
+         \x20\x20\x20\x20\x20\x20on_item_error: continue\n\
+         \x20\x20\x20\x20\x20\x20isolation: {{ worktree: {{ base_ref: \"${{{{ item }}}}\" }} }}\n\
+         \x20\x20\x20\x20steps:\n\
+         \x20\x20\x20\x20\x20\x20- id: emit_something\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20emit: {{ ok: true }}\n"
+    );
+    let def = parse_workflow(&yaml).expect("workflow must parse");
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(
+        serde_json::json!({}),
+        "T",
+        &format!("[{secret_element:?}]"),
+        Some(provider.clone() as Arc<dyn WorktreeProvider>),
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().expect("run must not error");
+
+    let items = outcomes[0].output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]["status"], "failed",
+        "expected git to reject this base_ref as invalid — got {:?}",
+        items[0]
+    );
+    let error = items[0]["error"].as_str().unwrap();
+    // Even a partial (truncated) echo of the element must not appear —
+    // check for a long prefix, not just the whole 6000-byte string, since
+    // the whole point of this probe is that git's own truncation would
+    // otherwise let a multi-KB prefix survive a whole-value needle.
+    let probe_prefix = &secret_element[..100];
+    assert!(
+        !error.contains(probe_prefix),
+        "no prefix of the secret-derived element (checked: {} bytes) may appear in the item's \
+         own error message, got an error of {} bytes",
+        probe_prefix.len(),
+        error.len()
+    );
+
+    let serialized = serde_json::to_string(&outcomes[0].output).unwrap();
+    assert!(
+        !serialized.contains(probe_prefix),
+        "no prefix of the secret-derived element may appear anywhere in the map step's \
+         serialized output"
+    );
+}

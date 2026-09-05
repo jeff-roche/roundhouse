@@ -50,9 +50,7 @@
 //!   `roundhouse_sandbox::worktree`.
 
 use crate::caps::ResourceCaps;
-use crate::exec::{
-    evaluate_when_gate, redact_with_needles, Executor, GateDecision, StepOutcome, StepStatus,
-};
+use crate::exec::{evaluate_when_gate, Executor, GateDecision, StepOutcome, StepStatus};
 use crate::expr::{eval_delimited_expression, interpolate, TemplateSource};
 use crate::parse::steps::{parse_step, MapIsolationDef, OnItemError, StepBody, StepDef};
 use crate::worktree::{WorktreeProvider, WorktreeProviderError};
@@ -378,24 +376,6 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::String(_) => "a string",
         Value::Object(_) => "an object",
         Value::Array(_) => "an array",
-    }
-}
-
-/// Scrubs every known secret's raw value out of `message` (Task 34 fix
-/// round 1, item 1) — the same [`redact_with_needles`] needle-based scan
-/// every other dispatch arm's *logged* copy already goes through, applied
-/// here to an `ItemOutcome::Failed` message instead of a sink-bound event.
-/// Needed because a provider/sandbox error's own `Display` can echo
-/// caller-supplied text back verbatim (an exact argv, or a rejected value
-/// quoted in a subprocess's stderr) — text this crate's own evaluator never
-/// touches, so [`crate::expr::Interpolated::redacted_for_logging`] has no
-/// visibility into it and cannot be the only guard.
-fn redact_message(message: String, needles: &[String]) -> String {
-    match redact_with_needles(&Value::String(message), needles) {
-        Value::String(s) => s,
-        other => unreachable!(
-            "redact_with_needles(Value::String(_), _) always returns Value::String, got {other:?}"
-        ),
     }
 }
 
@@ -1178,60 +1158,49 @@ impl<'a> Executor<'a> {
                                 worktree_guard = Some(WorktreeGuard::new(provider, path));
                             }
                             Err(e) => {
-                                // Fix round 1, item 1: the *other* two
-                                // copies of a secret-derived `base_ref`
-                                // this brief found — `WorktreeError::
-                                // CommandFailed`'s `Display` echoes the
-                                // exact argv `git` was called with, and
-                                // git's own stderr quotes a rejected ref
-                                // back — both live inside `{e}`'s text, not
-                                // in `redacted_base_ref` above. Scrubbing
-                                // the whole assembled message through the
-                                // same needle-based redaction every other
-                                // dispatch arm's *logged* copy goes through
-                                // closes both at once, regardless of which
-                                // part of `{e}`'s text the secret landed in
-                                // — for a `base_ref` that is itself a
-                                // registered secret (`${{ secrets.T }}`).
+                                // Fix round 1, item 1 found a secret-derived
+                                // `base_ref` reaching `{e}`'s free text
+                                // (git's stderr, the echoed argv) verbatim.
+                                // Fix round 2 tried closing it by adding
+                                // `unredacted_base_ref` as an extra
+                                // needle-based scrub. Fix round 3, item 1
+                                // (ruling W5-36) retracts that shape:
+                                // `git`'s stderr is not always a **copy** of
+                                // what it was given — `@{upstream}`-style
+                                // syntax makes `git` die mid-interpretation
+                                // and echo only a prefix, and `git`'s own
+                                // stderr buffer silently truncates values
+                                // past ~4KB — so an exact-match needle keyed
+                                // on the whole original value can miss a
+                                // still-sensitive transformed or truncated
+                                // echo entirely, no matter how the needle is
+                                // chosen. No scrub of a *lossy* transform
+                                // can be made reliable.
                                 //
-                                // Fix round 2, item 2: that is not the only
-                                // shape. `over: "${{ json(secrets.T) }}"`
-                                // with `base_ref: "${{ item }}"` makes
-                                // `base_ref` secret-*derived* without its
-                                // value ever being one of
-                                // `self.redaction_needles` (that list holds
-                                // only the raw `RunContext.secrets` values
-                                // themselves, never anything computed from
-                                // them — `redacted_base_ref` above is
-                                // `***` precisely because `Interpolated`'s
-                                // own provenance tracking already caught
-                                // this, but the needle pass has no way to
-                                // know `unredacted_base_ref` is sensitive
-                                // unless told). When `interpolate` marked
-                                // this `base_ref` secret-derived, add its
-                                // exact unredacted value as one more needle
-                                // for this call only — it scrubs precisely
-                                // the text that crossed into argv and came
-                                // back through stderr, without touching any
-                                // other message this run produces. Guarded
-                                // on non-empty so an empty-string element
-                                // can never become a `.replace("", ...)`
-                                // needle (which would corrupt the message
-                                // by inserting the placeholder between
-                                // every byte, the same landmine
-                                // `MIN_REDACTABLE_SECRET_LEN` exists to
-                                // keep the crate-wide needle list away
-                                // from).
-                                let mut needles = self.redaction_needles.clone();
-                                if base_ref_is_secret_derived && !unredacted_base_ref.is_empty() {
-                                    needles.push(unredacted_base_ref.clone());
-                                }
-                                return ItemOutcome::Failed(redact_message(
-                                    format!(
-                                        "map step `{step_id}`: materializing a worktree for \
-                                         base_ref {redacted_base_ref:?}: {e}"
-                                    ),
-                                    &needles,
+                                // **Fix: withhold, don't scrub.** When
+                                // `base_ref` is secret-derived, this message
+                                // uses [`WorktreeProviderError::safe_summary`]
+                                // instead of `e`'s own `Display` — it keeps
+                                // this crate's own vocabulary (which
+                                // variant, the exit status) and drops every
+                                // piece of free text from outside this
+                                // crate's control (argv, stderr, OS error
+                                // text) entirely, rather than trying to
+                                // predict what a lossy external transform
+                                // might do to a scrub. See that method's own
+                                // doc comment for the full reasoning. A
+                                // `base_ref` that is *not* secret-derived
+                                // still gets the full, unwithheld message —
+                                // behaviour here is unchanged for the common
+                                // case.
+                                let detail = if base_ref_is_secret_derived {
+                                    e.safe_summary().to_string()
+                                } else {
+                                    e.to_string()
+                                };
+                                return ItemOutcome::Failed(format!(
+                                    "map step `{step_id}`: materializing a worktree for \
+                                     base_ref {redacted_base_ref:?}: {detail}"
                                 ));
                             }
                         }

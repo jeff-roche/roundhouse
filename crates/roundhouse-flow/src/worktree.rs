@@ -8,7 +8,7 @@
 //! step that leaves `isolation:` unset inherits `Defaults.isolation`
 //! without this trait ever being consulted at all, which is P42's shape
 //! again, for that one case, not yet fixed — see
-//! `crate::exec::map_step::Executor::dispatch_map_step`'s own doc comment,
+//! `crate::exec::Executor::dispatch_map_step`'s own doc comment,
 //! "Task 34", for the full qualification).
 //!
 //! # Why the trait lives here, not in `roundhouse-sandbox` (ruling W5-1)
@@ -17,7 +17,7 @@
 //! primitives and never learns what a workflow, a `map` step, or an
 //! expression context is — see `roundhouse_sandbox::worktree`'s own module
 //! doc comment. This trait is shaped by exactly one caller,
-//! [`crate::exec::map_step::Executor::dispatch_map_step`], and expresses
+//! `crate::exec::Executor::dispatch_map_step`, and expresses
 //! precisely what that caller needs: materialize a worktree for one item,
 //! release it. Putting the trait in `roundhouse-sandbox` and implementing
 //! it here would invert the `flow -> sandbox` dependency edge (`sandbox`
@@ -38,7 +38,7 @@
 //! adapter, nothing upstream of it.
 use std::path::{Path, PathBuf};
 
-/// Exactly what [`crate::exec::map_step::Executor::dispatch_map_step`]
+/// Exactly what `crate::exec::Executor::dispatch_map_step`
 /// needs from a git-worktree backend: materialize one for a fan-out item,
 /// release it afterward. Nothing else — no listing, no locking, no
 /// knowledge of `map` or `${{ }}`.
@@ -69,29 +69,90 @@ pub trait WorktreeProvider: Send + Sync {
     /// computed independently. This trait does not and cannot enforce that
     /// on its own (see `roundhouse_sandbox::worktree`'s own module doc
     /// comment, "What this does not attempt"); the one caller in this crate
-    /// ([`crate::exec::map_step::Executor::dispatch_map_step`]) holds the
+    /// (`crate::exec::Executor::dispatch_map_step`) holds the
     /// path in a guard it never reconstructs from other data — see that
     /// function's own doc comment for how it guarantees this.
     fn release(&self, worktree_path: &Path) -> Result<(), WorktreeProviderError>;
 }
 
-/// A [`WorktreeProvider`] failure. Deliberately a single string-carrying
-/// type, not a re-export of `roundhouse_sandbox::worktree::WorktreeError` —
-/// the trait is meant to be implementable by something other than
-/// [`SandboxWorktreeProvider`] without that implementation needing to name
-/// a `roundhouse-sandbox`-specific type. The message is diagnostic text
-/// only (never a resolved secret — nothing this trait's one implementation
-/// touches is secret-shaped), and callers that log it are expected to
-/// treat it exactly like any other `StepStatus::Failed` message.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct WorktreeProviderError(String);
+/// A [`WorktreeProvider`] failure. Deliberately not a re-export of
+/// `roundhouse_sandbox::worktree::WorktreeError` — the trait is meant to be
+/// implementable by something other than [`SandboxWorktreeProvider`]
+/// without that implementation needing to name a `roundhouse-sandbox`-
+/// specific type.
+///
+/// Carries **two** renderings, not one (Task 34 fix round 3, ruling
+/// W5-36) — see [`Self::safe_summary`]'s own doc comment for why a single
+/// message cannot serve both a caller that knows the failing call involved
+/// no secret-derived input and one that cannot make that assumption.
+#[derive(Debug)]
+pub struct WorktreeProviderError {
+    /// The full message — for a caller that has established the inputs to
+    /// the failing call carry no secret-derived material. May embed
+    /// whatever free text the underlying failure carried (a subprocess's
+    /// stderr, an OS error message, an echoed argv).
+    full: String,
+    /// A message that never embeds any text this crate did not itself
+    /// choose — see [`Self::safe_summary`].
+    safe: String,
+}
 
 impl WorktreeProviderError {
+    /// Constructs an error with no daylight between the two renderings —
+    /// for a failure this implementation knows carries no text from
+    /// outside its own control (nothing derived from a workflow-authored,
+    /// possibly-secret-influenced value).
     pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        let message = message.into();
+        Self {
+            safe: message.clone(),
+            full: message,
+        }
+    }
+
+    /// Constructs an error whose full rendering may embed free text from
+    /// outside this crate's control, alongside a `safe_summary` that never
+    /// does — see [`Self::safe_summary`]'s own doc comment.
+    pub fn with_safe_summary(full: impl Into<String>, safe_summary: impl Into<String>) -> Self {
+        Self {
+            full: full.into(),
+            safe: safe_summary.into(),
+        }
+    }
+
+    /// A rendering safe to persist **even when the input that produced
+    /// this failure might be secret-derived** — never embeds a
+    /// subprocess's stderr, an OS error message, or an echoed argv; only
+    /// this crate's own fixed vocabulary plus non-secret context (a path,
+    /// an exit status).
+    ///
+    /// **Why this exists, not a needle-based scrub of [`Self`]'s
+    /// `Display`:** fix round 2 tried scrubbing the *full* rendering by
+    /// adding the resolved (potentially secret-derived) value as an extra
+    /// redaction needle. Fix round 3's security lens reproduced two ways
+    /// that fails: `git`'s own stderr does not always echo a **copy** of
+    /// what it was given — `@{upstream}`-style syntax makes `git` die
+    /// mid-interpretation and report only a prefix, and `git`'s stderr
+    /// buffer silently truncates values past ~4KB — so an exact-match
+    /// needle keyed on the whole original value can miss a still-sensitive
+    /// transformed or truncated echo entirely. No amount of cleverness in
+    /// the scrub closes a *lossy* transform of the input; the only thing
+    /// that reliably closes it is never showing that free text at all when
+    /// the input might be secret-derived. See
+    /// `roundhouse_sandbox::worktree::WorktreeError::safe_summary`'s own
+    /// doc comment for the sandbox-crate half of this same reasoning.
+    pub fn safe_summary(&self) -> &str {
+        &self.safe
     }
 }
+
+impl std::fmt::Display for WorktreeProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.full)
+    }
+}
+
+impl std::error::Error for WorktreeProviderError {}
 
 /// The one [`WorktreeProvider`] implementation this crate ships: a thin
 /// adapter over `roundhouse_sandbox::worktree`'s free functions, rooted at
@@ -152,20 +213,37 @@ impl WorktreeProvider for SandboxWorktreeProvider {
             .join(uuid::Uuid::new_v4().to_string());
         roundhouse_sandbox::worktree::add_worktree(&self.repo_root, &worktree_path, base_ref)
             .map_err(|e| {
-                WorktreeProviderError::new(format!(
-                    "materializing a worktree at {}: {e}",
-                    worktree_path.display()
-                ))
+                // `e`'s own `Display` can embed `git`'s stderr and this
+                // call's argv, either of which can carry `base_ref`
+                // verbatim — `safe_summary()` never does. See
+                // `WorktreeProviderError::safe_summary`'s own doc comment
+                // for why the caller (not this adapter) decides which
+                // rendering it may persist.
+                WorktreeProviderError::with_safe_summary(
+                    format!(
+                        "materializing a worktree at {}: {e}",
+                        worktree_path.display()
+                    ),
+                    format!(
+                        "materializing a worktree at {}: {}",
+                        worktree_path.display(),
+                        e.safe_summary()
+                    ),
+                )
             })?;
         Ok(worktree_path)
     }
 
     fn release(&self, worktree_path: &Path) -> Result<(), WorktreeProviderError> {
         roundhouse_sandbox::worktree::remove_worktree(&self.repo_root, worktree_path).map_err(|e| {
-            WorktreeProviderError::new(format!(
-                "releasing the worktree at {}: {e}",
-                worktree_path.display()
-            ))
+            WorktreeProviderError::with_safe_summary(
+                format!("releasing the worktree at {}: {e}", worktree_path.display()),
+                format!(
+                    "releasing the worktree at {}: {}",
+                    worktree_path.display(),
+                    e.safe_summary()
+                ),
+            )
         })
     }
 }
