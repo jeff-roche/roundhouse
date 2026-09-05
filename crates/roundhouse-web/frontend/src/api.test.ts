@@ -294,3 +294,113 @@ describe("connectSessionEvents onerror", () => {
     expect(terminal).toBe(false);
   });
 });
+
+describe("connectSessionEvents malformed frames (fix round 1, M5)", () => {
+  // Unlike the onerror-only fake above, this one captures named listeners
+  // so a test can fire `resync_required`/`stream_error` with an arbitrary
+  // (including malformed) body.
+  class FakeEventSource {
+    static readonly CONNECTING = 0;
+    static readonly OPEN = 1;
+    static readonly CLOSED = 2;
+    readyState = FakeEventSource.CONNECTING;
+    onmessage: ((event: MessageEvent) => void) | null = null;
+    onerror: (() => void) | null = null;
+    closed = false;
+    private listeners = new Map<string, Array<(event: MessageEvent) => void>>();
+
+    addEventListener(name: string, callback: (event: MessageEvent) => void): void {
+      const existing = this.listeners.get(name) ?? [];
+      existing.push(callback);
+      this.listeners.set(name, existing);
+    }
+
+    close(): void {
+      this.readyState = FakeEventSource.CLOSED;
+      this.closed = true;
+    }
+
+    emitMessage(rawData: string): void {
+      this.onmessage?.({ data: rawData, lastEventId: "" } as MessageEvent);
+    }
+
+    emitNamed(name: string, rawData: string): void {
+      for (const callback of this.listeners.get(name) ?? []) {
+        callback({ data: rawData } as MessageEvent);
+      }
+    }
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal("EventSource", FakeEventSource);
+  });
+
+  it("drops a malformed onmessage frame and keeps streaming, rather than throwing", () => {
+    const onEvent = vi.fn();
+    const source = connectSessionEvents("sess-1", {
+      onEvent,
+      onResyncRequired: () => {},
+      onStreamError: () => {},
+      onError: () => {},
+    }) as unknown as FakeEventSource;
+
+    expect(() => source.emitMessage("{not valid json")).not.toThrow();
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(source.closed).toBe(false);
+
+    // The stream keeps going: a subsequent well-formed frame still reaches onEvent.
+    source.emitMessage(JSON.stringify({ Ack: { api_version: 0 } }));
+    expect(onEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the terminal onStreamError state on a malformed resync_required body", () => {
+    const onStreamError = vi.fn();
+    const onResyncRequired = vi.fn();
+    const source = connectSessionEvents("sess-1", {
+      onEvent: () => {},
+      onResyncRequired,
+      onStreamError,
+      onError: () => {},
+    }) as unknown as FakeEventSource;
+
+    expect(() => source.emitNamed("resync_required", "{not valid json")).not.toThrow();
+
+    // Terminal either way — the connection is already close()d — but the
+    // malformed body means this can't honestly claim to be a real
+    // resync_required (no resume_from/oldest_retained to report), so it
+    // falls back to the generic terminal handler instead.
+    expect(onResyncRequired).not.toHaveBeenCalled();
+    expect(onStreamError).toHaveBeenCalledOnce();
+    expect(source.closed).toBe(true);
+  });
+
+  it("falls back to the terminal onStreamError state on a malformed stream_error body too", () => {
+    const onStreamError = vi.fn();
+    const source = connectSessionEvents("sess-1", {
+      onEvent: () => {},
+      onResyncRequired: () => {},
+      onStreamError,
+      onError: () => {},
+    }) as unknown as FakeEventSource;
+
+    expect(() => source.emitNamed("stream_error", "{not valid json")).not.toThrow();
+
+    expect(onStreamError).toHaveBeenCalledOnce();
+    expect(source.closed).toBe(true);
+  });
+
+  it("still reports a well-formed resync_required/stream_error normally", () => {
+    const onStreamError = vi.fn();
+    const onResyncRequired = vi.fn();
+    const source = connectSessionEvents("sess-1", {
+      onEvent: () => {},
+      onResyncRequired,
+      onStreamError,
+      onError: () => {},
+    }) as unknown as FakeEventSource;
+
+    source.emitNamed("resync_required", JSON.stringify({ resume_from: 5, oldest_retained: 10 }));
+    expect(onResyncRequired).toHaveBeenCalledWith({ resume_from: 5, oldest_retained: 10 });
+    expect(onStreamError).not.toHaveBeenCalled();
+  });
+});

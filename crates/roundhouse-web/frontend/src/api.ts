@@ -288,17 +288,48 @@ export function connectSessionEvents(
   const source = new EventSource(path);
 
   source.onmessage = (message: MessageEvent<string>) => {
-    handlers.onEvent(JSON.parse(message.data) as ClientEvent, message.lastEventId || null);
+    // Fix round 1 (M5): a malformed body used to throw straight out of this
+    // handler. The stream is not being closed here — unlike the two
+    // listeners below — so there is a next frame to keep listening for;
+    // dropping this one and continuing is strictly better than crashing the
+    // whole connection over one bad frame.
+    let parsed: ClientEvent;
+    try {
+      parsed = JSON.parse(message.data) as ClientEvent;
+    } catch {
+      return;
+    }
+    handlers.onEvent(parsed, message.lastEventId || null);
   };
 
   source.addEventListener("resync_required", (message) => {
     source.close();
-    handlers.onResyncRequired(JSON.parse((message as MessageEvent<string>).data) as ResyncRequired);
+    // Fix round 1 (M5, ruling R13): a malformed body used to throw here,
+    // straight past the whole handler — with `source` already `close()`d,
+    // that left the UI's stream state stuck wherever it last was
+    // (`open`/`connecting`), which looks like a live connection on what is
+    // actually a permanently dead one. That is strictly worse than the
+    // "reload to resume" terminal state this frame exists to produce, so a
+    // parse failure now falls back to that terminal state via
+    // `onStreamError` — `onResyncRequired`'s own fields (`resume_from`,
+    // `oldest_retained`) have no sensible fallback value to invent, while
+    // `onStreamError` only needs a human-readable string.
+    try {
+      handlers.onResyncRequired(JSON.parse((message as MessageEvent<string>).data) as ResyncRequired);
+    } catch {
+      handlers.onStreamError({ error: "received a malformed resync_required frame" });
+    }
   });
 
   source.addEventListener("stream_error", (message) => {
     source.close();
-    handlers.onStreamError(JSON.parse((message as MessageEvent<string>).data) as StreamError);
+    // See the `resync_required` listener above for why this falls back to
+    // the same terminal state on a parse failure rather than throwing.
+    try {
+      handlers.onStreamError(JSON.parse((message as MessageEvent<string>).data) as StreamError);
+    } catch {
+      handlers.onStreamError({ error: "received a malformed stream_error frame" });
+    }
   });
 
   source.onerror = () => {
