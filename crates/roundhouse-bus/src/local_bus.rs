@@ -4,12 +4,12 @@ use crate::handle_registry::HandleRegistry;
 use crate::human_notifications::{HumanNotification, HumanNotificationRegistry};
 use crate::mailbox::{Mailbox, MailboxKind};
 use crate::rate_limit::{decrement_ttl, RateLimiter, RepetitionDamper};
-use crate::teams::{TeamRegistry, TeamState};
+use crate::teams::{Team, TeamRegistry, TeamState};
 use crate::types::{Address, BusError, Envelope, Undeliverable};
 use crate::wait_graph::WaitGraph;
 use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
-use roundhouse_core::{SessionId, WorkspaceId};
+use roundhouse_core::{SessionId, TeamId, WorkspaceId};
 use std::sync::{Arc, Mutex};
 
 /// §7.8: "A routed mpsc registry (LocalBus with DashMap of mailboxes, handles, teams,
@@ -91,6 +91,24 @@ impl LocalBus {
         self.mailboxes.contains_key(&session)
     }
 
+    /// Looks up `team` and refuses (`BusError::UnknownHandle`) unless it belongs to
+    /// `workspace` — checked *before* any draining/roster work below, so a
+    /// cross-workspace caller can't distinguish "wrong workspace" from "no such
+    /// team" by error type, message, or which side effects ran. Mirrors
+    /// `HandleRegistry::resolve_address`'s `Address::Handle` arm, which already
+    /// enforces the ambient workspace the same way; `Team`/`Role` previously took
+    /// `workspace` only to populate this same error's payload, never to gate the
+    /// lookup itself.
+    fn team_in_workspace(&self, workspace: WorkspaceId, team: TeamId) -> Result<Team, BusError> {
+        self.teams
+            .team(team)
+            .filter(|t| t.workspace == workspace)
+            .ok_or_else(|| BusError::UnknownHandle {
+                workspace,
+                name: "<unknown team>".into(),
+            })
+    }
+
     /// §7.2/§7.5: the fan-out expansion Task 2's `HandleRegistry::resolve_address`
     /// explicitly defers to this layer.
     pub async fn resolve_recipients(
@@ -100,10 +118,9 @@ impl LocalBus {
     ) -> Result<Vec<SessionId>, BusError> {
         match addr {
             Address::Team { team } => {
-                if let Some(state) = self.teams.state(*team) {
-                    if state == TeamState::Draining || state == TeamState::Closed {
-                        return Err(BusError::TeamDraining { team: *team });
-                    }
+                let found = self.team_in_workspace(workspace, *team)?;
+                if found.state == TeamState::Draining || found.state == TeamState::Closed {
+                    return Err(BusError::TeamDraining { team: *team });
                 }
                 let roster = self
                     .teams
@@ -126,10 +143,9 @@ impl LocalBus {
                 Ok(recipients)
             }
             Address::Role { team, role } => {
-                if let Some(state) = self.teams.state(*team) {
-                    if state == TeamState::Draining || state == TeamState::Closed {
-                        return Err(BusError::TeamDraining { team: *team });
-                    }
+                let found = self.team_in_workspace(workspace, *team)?;
+                if found.state == TeamState::Draining || found.state == TeamState::Closed {
+                    return Err(BusError::TeamDraining { team: *team });
                 }
                 let roster = self
                     .teams
@@ -908,5 +924,133 @@ mod break_glass_damper_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, crate::types::BusError::Repetitive { .. }));
+    }
+}
+
+#[cfg(test)]
+mod team_workspace_scoping_tests {
+    use super::*;
+    use crate::teams::TeamRegistry;
+    use crate::types::Address;
+    use roundhouse_core::{SessionId, TeamId, WorkspaceId};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn team_address_from_a_different_workspace_is_refused_as_unknown() {
+        let bus = LocalBus::new();
+        let ws_a = WorkspaceId::new();
+        let ws_b = WorkspaceId::new();
+        let lead = SessionId::new();
+        let teams = Arc::new(TeamRegistry::new());
+        let team = teams
+            .create_team(ws_a, "t".into(), "c".into(), lead, "lead".into())
+            .unwrap();
+        let bus = bus.with_teams(teams);
+
+        let err = bus
+            .resolve_recipients(ws_b, &Address::Team { team })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::UnknownHandle { .. }));
+
+        // The same call in the team's real workspace still resolves.
+        assert!(bus
+            .resolve_recipients(ws_a, &Address::Team { team })
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn role_address_from_a_different_workspace_is_refused_as_unknown() {
+        let bus = LocalBus::new();
+        let ws_a = WorkspaceId::new();
+        let ws_b = WorkspaceId::new();
+        let lead = SessionId::new();
+        let teams = Arc::new(TeamRegistry::new());
+        let team = teams
+            .create_team(ws_a, "t".into(), "c".into(), lead, "lead".into())
+            .unwrap();
+        let bus = bus.with_teams(teams);
+
+        let err = bus
+            .resolve_recipients(
+                ws_b,
+                &Address::Role {
+                    team,
+                    role: "lead".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::UnknownHandle { .. }));
+
+        assert!(bus
+            .resolve_recipients(
+                ws_a,
+                &Address::Role {
+                    team,
+                    role: "lead".into(),
+                },
+            )
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn cross_workspace_error_is_indistinguishable_from_a_genuinely_unknown_team() {
+        let bus = LocalBus::new();
+        let ws_a = WorkspaceId::new();
+        let ws_b = WorkspaceId::new();
+        let lead = SessionId::new();
+        let teams = Arc::new(TeamRegistry::new());
+        let real_team = teams
+            .create_team(ws_a, "t".into(), "c".into(), lead, "lead".into())
+            .unwrap();
+        let bus = bus.with_teams(teams);
+
+        let cross_workspace_err = bus
+            .resolve_recipients(ws_b, &Address::Team { team: real_team })
+            .await
+            .unwrap_err();
+        let genuinely_unknown_err = bus
+            .resolve_recipients(
+                ws_b,
+                &Address::Team {
+                    team: TeamId::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            cross_workspace_err,
+            crate::types::BusError::UnknownHandle { .. }
+        ));
+        assert_eq!(
+            format!("{cross_workspace_err}"),
+            format!("{genuinely_unknown_err}")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_draining_team_queried_from_a_different_workspace_is_still_unknown_not_draining() {
+        // A wrong-workspace caller must not learn the team's real state (draining
+        // vs. active) via a different error type either.
+        let bus = LocalBus::new();
+        let ws_a = WorkspaceId::new();
+        let ws_b = WorkspaceId::new();
+        let lead = SessionId::new();
+        let teams = Arc::new(TeamRegistry::new());
+        let team = teams
+            .create_team(ws_a, "t".into(), "c".into(), lead, "lead".into())
+            .unwrap();
+        teams.begin_draining(team).unwrap();
+        let bus = bus.with_teams(teams);
+
+        let err = bus
+            .resolve_recipients(ws_b, &Address::Team { team })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::UnknownHandle { .. }));
     }
 }
