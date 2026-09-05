@@ -284,6 +284,183 @@ fn a_loopback_http_operator_override_is_never_gated() {
     }
 }
 
+/// Fix round 1, F1 (Ruling R23): `docs/architecture/06-provider-abstraction.md`
+/// §9.9 documents `ROUNDHOUSE_<PROVIDER>_BASE_URL` as a first-class operator
+/// override with no scheme restriction -- so an operator pointing at a
+/// non-loopback internal host over plain `http://` (the local-runtime
+/// profile family's documented deployment mode) must have a way to opt back
+/// in now that the HTTPS gate rejects it by default. The sibling env var
+/// `ROUNDHOUSE_<PROVIDER>_ALLOW_INSECURE_BASE_URL` is that lever.
+#[test]
+fn allow_insecure_env_var_opts_a_non_loopback_http_override_back_in() {
+    std::env::set_var(
+        "ROUNDHOUSE_TESTPROV6_BASE_URL",
+        "http://gpu-box.internal:9000/v1",
+    );
+    std::env::set_var("ROUNDHOUSE_TESTPROV6_ALLOW_INSECURE_BASE_URL", "1");
+    let result = roundhouse_provider::credential::resolve_base_url(
+        "testprov6",
+        "https://default.example.com",
+        None,
+        false,
+    );
+    std::env::remove_var("ROUNDHOUSE_TESTPROV6_BASE_URL");
+    std::env::remove_var("ROUNDHOUSE_TESTPROV6_ALLOW_INSECURE_BASE_URL");
+    assert!(
+        result.is_ok(),
+        "the sibling ALLOW_INSECURE_BASE_URL env var must opt a non-loopback \
+         http:// override back in: {result:?}"
+    );
+}
+
+/// Fix round 1, F1: default stays fail-closed -- an absent opt-in env var
+/// must not change the pre-existing rejection behavior.
+#[test]
+fn absent_allow_insecure_env_var_still_rejects_non_loopback_http() {
+    std::env::set_var(
+        "ROUNDHOUSE_TESTPROV7_BASE_URL",
+        "http://gpu-box.internal:9000/v1",
+    );
+    std::env::remove_var("ROUNDHOUSE_TESTPROV7_ALLOW_INSECURE_BASE_URL");
+    let result = roundhouse_provider::credential::resolve_base_url(
+        "testprov7",
+        "https://default.example.com",
+        None,
+        false,
+    );
+    std::env::remove_var("ROUNDHOUSE_TESTPROV7_BASE_URL");
+    assert!(
+        result.is_err(),
+        "an absent ALLOW_INSECURE_BASE_URL env var must not opt in: {result:?}"
+    );
+}
+
+/// Fix round 1, F1: an unparseable/garbage opt-in value must not be treated
+/// as truthy -- default stays fail-closed on anything but the documented
+/// truthy spellings.
+#[test]
+fn garbage_allow_insecure_env_var_values_still_reject() {
+    for garbage in ["maybe", ""] {
+        std::env::set_var(
+            "ROUNDHOUSE_TESTPROV8_BASE_URL",
+            "http://gpu-box.internal:9000/v1",
+        );
+        std::env::set_var("ROUNDHOUSE_TESTPROV8_ALLOW_INSECURE_BASE_URL", garbage);
+        let result = roundhouse_provider::credential::resolve_base_url(
+            "testprov8",
+            "https://default.example.com",
+            None,
+            false,
+        );
+        std::env::remove_var("ROUNDHOUSE_TESTPROV8_BASE_URL");
+        std::env::remove_var("ROUNDHOUSE_TESTPROV8_ALLOW_INSECURE_BASE_URL");
+        assert!(
+            result.is_err(),
+            "a garbage ALLOW_INSECURE_BASE_URL value ({garbage:?}) must not opt in: {result:?}"
+        );
+    }
+}
+
+/// Fix round 1, F1: the opt-in is per-provider -- setting it for one
+/// provider must never leak into another provider's gate.
+#[test]
+fn allow_insecure_env_var_opt_in_does_not_leak_across_providers() {
+    std::env::set_var(
+        "ROUNDHOUSE_TESTPROV9_BASE_URL",
+        "http://gpu-box.internal:9000/v1",
+    );
+    std::env::set_var("ROUNDHOUSE_TESTPROVA_ALLOW_INSECURE_BASE_URL", "1");
+    let result = roundhouse_provider::credential::resolve_base_url(
+        "testprov9",
+        "https://default.example.com",
+        None,
+        false,
+    );
+    std::env::remove_var("ROUNDHOUSE_TESTPROV9_BASE_URL");
+    std::env::remove_var("ROUNDHOUSE_TESTPROVA_ALLOW_INSECURE_BASE_URL");
+    assert!(
+        result.is_err(),
+        "provider A's opt-in env var must not opt provider B's override in: {result:?}"
+    );
+}
+
+/// Fix round 1, F2 (Ruling R24 / security S5): the gate must be an
+/// allowlist (only `https`, or loopback `http`), not a denylist of the
+/// single `http` scheme -- `ws://`, `ftp://`, `gopher://`, `file://`, and
+/// `data:` must all be rejected too when operator-supplied and not opted in.
+#[test]
+fn a_non_http_non_https_scheme_is_rejected_when_operator_supplied() {
+    for scheme_url in [
+        "ws://evil.example.com",
+        "ftp://evil.example.com",
+        "gopher://evil.example.com",
+        "file:///etc/passwd",
+        "data:text/plain,x",
+    ] {
+        let result = roundhouse_provider::credential::resolve_base_url(
+            "testprovb",
+            "https://default.example.com",
+            Some(scheme_url),
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "a non-http/https scheme must be rejected when operator-supplied: \
+             {scheme_url} -> {result:?}"
+        );
+    }
+}
+
+/// Fix round 1, F2: the allowlist inversion must not regress the two paths
+/// that must still succeed -- `https://` unconditionally, and loopback
+/// `http://`.
+#[test]
+fn https_and_loopback_http_still_pass_the_allowlisted_gate() {
+    let https_result = roundhouse_provider::credential::resolve_base_url(
+        "testprovc",
+        "https://default.example.com",
+        Some("https://gateway.example.com/v1"),
+        false,
+    );
+    assert!(https_result.is_ok(), "{https_result:?}");
+
+    let loopback_result = roundhouse_provider::credential::resolve_base_url(
+        "testprovd",
+        "https://default.example.com",
+        Some("http://localhost:9001/v1"),
+        false,
+    );
+    assert!(loopback_result.is_ok(), "{loopback_result:?}");
+}
+
+/// Fix round 1, F6: mirrors
+/// `base_url_parse_failure_never_echoes_the_malformed_override_verbatim` for
+/// the `InsecureBaseUrl` variant -- nothing pinned that its message leaks
+/// none of an operator override's userinfo, path, or query-string secret
+/// material, even though the property holds today.
+#[test]
+fn insecure_base_url_error_never_echoes_userinfo_path_or_query_verbatim() {
+    let err = roundhouse_provider::credential::resolve_base_url(
+        "testprove",
+        "https://default.example.com",
+        Some("http://user:pass@evil.com/secretpath?key=abc123"),
+        false,
+    )
+    .err()
+    .unwrap();
+    let message = err.to_string();
+    for leaked in ["user", "pass", "secretpath", "abc123"] {
+        assert!(
+            !message.contains(leaked),
+            "InsecureBaseUrl message must never carry `{leaked}`: {message}"
+        );
+    }
+    assert!(
+        message.contains("evil.com"),
+        "the host itself is not secret and should stay, for diagnosability: {message}"
+    );
+}
+
 #[test]
 fn provider_src_never_touches_secret_material_directly() {
     // §9.9 / REALITY-CORRECTIONS §6: `roundhouse-provider` defines the

@@ -25,7 +25,35 @@ use super::{host_only::record_base_url_override, CredentialError};
 /// (`localhost`, `127.0.0.1`, `::1`) are exempt from the gate even when
 /// operator-supplied, since redirecting one loopback port to another never
 /// leaves the local machine; a non-loopback operator override still needs
-/// `https://` or `allow_insecure: true`.
+/// `https://` or an opt-in (`allow_insecure: true`, or the sibling env var
+/// below).
+///
+/// **The gate is an allowlist, not a denylist (fix round 1, Ruling R24 /
+/// security S5):** the condition below is "reject unless `https`, or `http`
+/// on a loopback host" — not "reject only `http`". An earlier version
+/// checked `scheme() == "http"` alone, which let every *other* non-TLS
+/// scheme (`ws://`, `ftp://`, `gopher://`, `file://`, `data:`) straight
+/// through a check whose entire job is "this transport is not TLS"; it was
+/// correct only by accident of `reqwest` supporting just `http`/`https` and
+/// the daemon's `https_only(true)`. `is_loopback_host` already returns
+/// `false` for `Host::None`, so `file:`/`data:` (which have no host at all)
+/// are gated by the allowlist for free.
+///
+/// **`ROUNDHOUSE_<PROVIDER>_ALLOW_INSECURE_BASE_URL` (fix round 1, Ruling
+/// R23):** §9.9 documents `ROUNDHOUSE_<PROVIDER>_BASE_URL` as a first-class
+/// operator override with no scheme restriction, and the local-runtime
+/// profile family's real deployment mode is exactly a non-loopback internal
+/// host reached over plain `http://` (e.g. a GPU box on the LAN with no
+/// TLS). Before the HTTPS gate existed that worked; after it, nothing in
+/// production could ever set `allow_insecure: true`, so that documented
+/// mode had no way back in. This env var is the operator-facing opt-in,
+/// read per-provider (same name transformation as the base-URL env var
+/// itself — see [`provider_env_key`]) right next to it, and is equivalent
+/// to passing `allow_insecure: true` for that one provider's resolution
+/// only; it never affects any other provider's gate. Parsing is an explicit
+/// truthy check: `1` or `true` (case-insensitive) is truthy, anything else
+/// — including absent, empty, or any other value — is not. Default stays
+/// fail-closed: an absent or unparseable env var never opts in.
 pub fn resolve_base_url(
     provider_id: &str,
     profile_default: &str,
@@ -35,10 +63,7 @@ pub fn resolve_base_url(
     let (raw, operator_supplied) = match explicit_override {
         Some(explicit) => (explicit.to_string(), true),
         None => {
-            let env_key = format!(
-                "ROUNDHOUSE_{}_BASE_URL",
-                provider_id.to_uppercase().replace('-', "_")
-            );
+            let env_key = provider_env_key(provider_id, "BASE_URL");
             match std::env::var(&env_key) {
                 Ok(from_env) => (from_env, true),
                 Err(_) => (profile_default.to_string(), false),
@@ -58,20 +83,38 @@ pub fn resolve_base_url(
         ))
     })?;
 
-    if operator_supplied
-        && !allow_insecure
-        && parsed.scheme() == "http"
-        && !is_loopback_host(parsed.host())
-    {
+    let allow_insecure_env_key = provider_env_key(provider_id, "ALLOW_INSECURE_BASE_URL");
+    let opted_in_via_env = std::env::var(&allow_insecure_env_key)
+        .is_ok_and(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true"));
+    let effective_allow_insecure = allow_insecure || opted_in_via_env;
+
+    let scheme_is_allowed = parsed.scheme() == "https"
+        || (parsed.scheme() == "http" && is_loopback_host(parsed.host()));
+
+    if operator_supplied && !effective_allow_insecure && !scheme_is_allowed {
         return Err(CredentialError::InsecureBaseUrl(format!(
-            "operator-supplied base URL for provider `{provider_id}` uses insecure http:// \
-             (host `{}`) -- use https://, or opt in with allow_insecure",
+            "operator-supplied base URL for provider `{provider_id}` uses insecure \
+             scheme `{}` (host `{}`) -- use an https base URL, or set \
+             {allow_insecure_env_key}=1 to opt in",
+            parsed.scheme(),
             record_base_url_override(&raw)
         )));
     }
 
     let recorded = record_base_url_override(&raw);
     Ok((parsed, recorded))
+}
+
+/// The `ROUNDHOUSE_<PROVIDER>_<suffix>` env var name for `provider_id`,
+/// using the exact same provider-name-to-env-var transformation the
+/// pre-existing `ROUNDHOUSE_<PROVIDER>_BASE_URL` lookup already used
+/// (uppercase, `-` -> `_`) — factored out here (fix round 1, F1) so the new
+/// `ALLOW_INSECURE_BASE_URL` sibling can't drift from it.
+fn provider_env_key(provider_id: &str, suffix: &str) -> String {
+    format!(
+        "ROUNDHOUSE_{}_{suffix}",
+        provider_id.to_uppercase().replace('-', "_")
+    )
 }
 
 /// `true` for the loopback hosts an operator-supplied `http://` override is
