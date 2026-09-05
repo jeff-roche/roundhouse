@@ -150,6 +150,11 @@ impl Redactor {
                     n,
                 )
             }
+            // `EventPayload::Loss.description` will carry provider error text once
+            // Phase 7 Task 13b fills it in — exactly the free-text shape this method
+            // exists to protect. Nothing constructs `Loss` yet, so no redaction arm is
+            // added here in this commit; Task 13b must route it through `self.redact`
+            // the same way `TaskFailed.error.message` is above, not let it fall through.
             other => (other, 0),
         }
     }

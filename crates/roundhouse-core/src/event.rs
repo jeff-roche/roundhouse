@@ -177,4 +177,17 @@ pub enum EventPayload {
         level: NoteLevel,
         text: String,
     },
+    /// A recorded loss: information that could not be carried forward
+    /// faithfully (e.g. a provider truncating/rejecting context). `kind` is
+    /// a short machine-stable tag, `description` is free text (a provider
+    /// error message may land here), and `blocks_affected` counts how many
+    /// logical blocks the loss touched.
+    ///
+    /// Nothing constructs this variant yet — Phase 7 Task 13b adds the
+    /// provider-codec emit sites.
+    Loss {
+        kind: String,
+        description: String,
+        blocks_affected: u32,
+    },
 }
