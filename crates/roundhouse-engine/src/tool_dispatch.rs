@@ -1072,25 +1072,69 @@ mod tests {
         // root must be refused, not silently admitted with a
         // policy-invisible cwd deciding which binary that name means.
         // `workspace_temp_dir()` creates `cwd` one level directly under
-        // `workspace_root()`, so `../..` from `cwd` lands on
-        // `workspace_root`'s own parent — a real, existing directory
-        // (`cargo test`'s cwd always has one) that is definitely NOT inside
-        // `workspace_root`.
+        // `workspace_root()` (`crates/roundhouse-engine`, since that's this
+        // test binary's own cwd), so `../../../Cargo.toml` from `cwd` lands
+        // on the repo's own top-level `Cargo.toml` — a real, existing,
+        // *regular file* definitely outside `workspace_root`.
+        //
+        // Deliberately NOT a directory (fix round B's own M4 review found
+        // that this test previously used `program: "../.."`, which resolves
+        // to a directory one level above `workspace_root` — since fix round
+        // B also added the M4 is-a-regular-file check, and that check runs
+        // *before* this containment check, the old test stopped exercising
+        // containment at all and silently started exercising M4 instead,
+        // without anyone noticing because the assertion only checked the
+        // error variant, not which of the two reasons produced it).
         let cwd = workspace_temp_dir();
 
         let err = task_params_for(
             TaskKind::Shell,
             &serde_json::json!({
-                "program": "../..",
+                "program": "../../../Cargo.toml",
                 "argv": [],
                 "cwd": cwd.path().to_string_lossy(),
             }),
         )
         .unwrap_err();
-        assert!(
-            matches!(err, ToolDispatchError::ShellProgramRejected(_)),
-            "expected ShellProgramRejected, got {err:?}"
-        );
+        match err {
+            ToolDispatchError::ShellProgramRejected(msg) => assert!(
+                msg.contains("outside the workspace root"),
+                "expected a containment rejection, got: {msg}"
+            ),
+            other => panic!("expected ShellProgramRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_params_for_shell_rejects_a_directory_as_program() {
+        // Fix round B, finding M4 (ruling W1-R69): `program="/"` (the
+        // finding's own example, generalized to any directory) must not
+        // silently pass containment and then fail confusingly at exec time.
+        // Uses an *absolute* directory path so that, pre-fix, it would skip
+        // the containment check entirely (containment only applies to
+        // relative programs) and fall straight through to a successful
+        // `Ok(directory_path)` — a genuine discriminator, unlike `program:
+        // "/"` itself, which has no `file_name()` and would already be
+        // rejected (for an unrelated reason) even without the M4 check.
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = workspace_temp_dir();
+
+        let err = task_params_for(
+            TaskKind::Shell,
+            &serde_json::json!({
+                "program": dir.path().to_string_lossy(),
+                "argv": [],
+                "cwd": cwd.path().to_string_lossy(),
+            }),
+        )
+        .unwrap_err();
+        match err {
+            ToolDispatchError::ShellProgramRejected(msg) => assert!(
+                msg.contains("does not resolve to a regular file"),
+                "expected the M4 not-a-regular-file rejection, got: {msg}"
+            ),
+            other => panic!("expected ShellProgramRejected, got {other:?}"),
+        }
     }
 
     #[test]
