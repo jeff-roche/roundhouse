@@ -1,5 +1,5 @@
-use crate::{FsOp, Method, PolicyInput, ProviderId, ServerId, TaskParams};
-use roundhouse_core::{PolicyDecision, Tier};
+use crate::{FsOp, MemoryOp, Method, PolicyInput, ProviderId, ServerId, TaskParams};
+use roundhouse_core::{MemoryScope, PolicyDecision, SessionId, TeamId, Tier};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -116,6 +116,24 @@ pub enum Predicate {
         provider: Option<ProviderId>,
         model: Option<String>,
         max_tier: Tier,
+    },
+    /// Task 20 (W4): binds a config-authored or synthesized grant to an
+    /// exact `(scope, op)` pair, matching every sibling variant's
+    /// least-privilege contract. Deliberately has no `session` field —
+    /// session is a *who*, not a *what*; `GrantScope::Session` already scopes
+    /// installation and `GrantProvenance` already carries the granting
+    /// session, so binding it here too would make a config-authored rule
+    /// (which has no session at all) impossible to write.
+    ///
+    /// A `Team`-scoped rule of this kind is inert for the read/write
+    /// asymmetry the security model actually relies on: `PolicyEngine::decide`
+    /// short-circuits `MemoryScope::Team` before rule matching is ever
+    /// reached (see `decide`'s `TaskParams::Memory` arm), so this predicate
+    /// can never be used to route around `TeamMembership`. It only ever
+    /// participates in ordinary rule matching for `User`/`Project` scope.
+    Memory {
+        scope: MemoryScope,
+        op: MemoryOp,
     },
 }
 
@@ -348,6 +366,13 @@ impl Predicate {
                     + 1;
                 (provider_ok && model_ok && *tier_request <= *max_tier).then_some((0, bound))
             }
+            (
+                Predicate::Memory {
+                    scope: pscope,
+                    op: pop,
+                },
+                TaskParams::Memory { scope, op, .. },
+            ) => (pscope == scope && pop == op).then_some((0, 2)),
             _ => None,
         }
     }
@@ -401,10 +426,21 @@ impl CompiledRule {
     }
 }
 
+/// Task 20 (W4): dependency-inverted membership check for `MemoryScope::Team`
+/// — `roundhouse-policy` does not depend on `roundhouse-bus`, so this trait
+/// is the seam a thin adapter in `roundhouse-bus` (wrapping its already-real
+/// `can_read_team_memory`/`can_write_team_memory`, G5) implements, wired in
+/// from `roundhouse-daemon` (another lane's crate, later).
+pub trait TeamMembership: Send + Sync {
+    fn can_read(&self, team: TeamId, session: SessionId) -> bool;
+    fn can_write(&self, team: TeamId, session: SessionId) -> bool;
+}
+
 pub struct PolicyEngine {
     rules: Vec<CompiledRule>,
     unsealed: bool,
     sealed_ctx_provider: Arc<dyn Fn() -> crate::sealed::SealedContext + Send + Sync>,
+    team_membership: Option<Arc<dyn TeamMembership>>,
 }
 
 impl PolicyEngine {
@@ -413,6 +449,7 @@ impl PolicyEngine {
             rules,
             unsealed: false,
             sealed_ctx_provider: Arc::new(crate::sealed::default_context),
+            team_membership: None,
         }
     }
 
@@ -463,6 +500,16 @@ impl PolicyEngine {
         (self.sealed_ctx_provider)()
     }
 
+    /// The daemon (or, in tests, a fixture) supplies this at construction.
+    /// Unit tests that never call this get `None` from
+    /// [`from_rules`](Self::from_rules), which `decide`'s `TaskParams::Memory`
+    /// arm treats as fail-closed: an unconfigured `TeamMembership` denies
+    /// every `Team`-scoped op, including `Read`.
+    pub fn with_team_membership(mut self, m: Arc<dyn TeamMembership>) -> Self {
+        self.team_membership = Some(m);
+        self
+    }
+
     /// Sealed rules are matched first and are compiled in, not config. The only
     /// documented escape is `round daemon --unsealed`, which must be recorded on
     /// every task in the session once `TaskSecurity`/attestation lands
@@ -495,6 +542,46 @@ impl PolicyEngine {
             return Decision {
                 outcome: Outcome::Deny,
                 rule: None,
+            };
+        }
+
+        // Task 20 (W4), orchestrator Ruling W4-6: `Team`-scoped memory ops
+        // are decided entirely by `TeamMembership`, never by ordinary rule
+        // matching — a config-authored or synthesized `Predicate::Memory`
+        // rule cannot be used to route around the membership gate.
+        // `User`/`Project` scope falls through unchanged to the rule loop
+        // and the engine's existing default below.
+        if let TaskParams::Memory {
+            scope: MemoryScope::Team { team },
+            op,
+            session,
+        } = params
+        {
+            let Some(membership) = self.team_membership.as_ref() else {
+                // Unverifiable membership is not a reason to allow — fail
+                // closed for every op, including Read.
+                return Decision {
+                    outcome: Outcome::Deny,
+                    rule: Some(RuleId("team-memory:unconfigured".into())),
+                };
+            };
+            let allowed = match op {
+                MemoryOp::Read => membership.can_read(*team, *session),
+                MemoryOp::Write | MemoryOp::Append | MemoryOp::Delete => {
+                    membership.can_write(*team, *session)
+                }
+            };
+            let rule_id = match op {
+                MemoryOp::Read => "team-memory:read",
+                MemoryOp::Write | MemoryOp::Append | MemoryOp::Delete => "team-memory:write",
+            };
+            return Decision {
+                outcome: if allowed {
+                    Outcome::Allow
+                } else {
+                    Outcome::Deny
+                },
+                rule: Some(RuleId(rule_id.into())),
             };
         }
 

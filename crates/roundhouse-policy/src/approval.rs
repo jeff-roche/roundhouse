@@ -239,6 +239,15 @@ pub fn synthesize_grant(
             model: Some(model.clone()),
             max_tier: *tier_request, // never generalized above the tier actually requested
         },
+        // Task 20 (W4): exact scope+op bind, same least-privilege contract as
+        // every other arm. Inert for `Team` scope regardless of what grant is
+        // synthesized here — `PolicyEngine::decide` never consults rules for
+        // `MemoryScope::Team`, only `TeamMembership` (see `Predicate::Memory`'s
+        // doc comment in `engine.rs`).
+        (_, TaskParams::Memory { scope, op, .. }) => Predicate::Memory {
+            scope: scope.clone(),
+            op: *op,
+        },
     };
     let rule = CompiledRule {
         scope: grant_rule_scope(&scope),

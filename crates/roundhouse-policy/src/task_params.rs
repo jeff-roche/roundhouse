@@ -1,4 +1,4 @@
-use roundhouse_core::{TaskId, Tier};
+use roundhouse_core::{MemoryScope, SessionId, TaskId, Tier};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -46,6 +46,18 @@ pub struct ServerId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderId(pub String);
 
+/// The four operations a memory task can perform on a `MemoryScope`. `Read`
+/// is gated separately from `Write`/`Append`/`Delete` in
+/// `PolicyEngine::decide`'s `Team`-scope handling (§15.2's read/write
+/// asymmetry) — see `TeamMembership`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemoryOp {
+    Read,
+    Write,
+    Append,
+    Delete,
+}
+
 /// §6.2 — every task passes through `Policy::decide` matched on these
 /// typed, parsed parameters, never raw strings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +87,19 @@ pub enum TaskParams {
         provider: ProviderId,
         model: String,
         tier_request: Tier,
+    },
+    /// Orchestrator Ruling W4-6: `session` is required here even though the
+    /// plan's field list omits it. `PolicyEngine::decide(&self, params:
+    /// &TaskParams)` has no session in reach, neither `PolicyInput` nor
+    /// `SealedContext` carries one, and none of those may gain one here (their
+    /// callers live in other lanes' crates) — so `TeamMembership::can_read`/
+    /// `can_write` would have no session to check without this field.
+    /// Fabricating a placeholder session id would be a fail-closed violation;
+    /// this variant is brand new, so carrying its own session breaks nothing.
+    Memory {
+        scope: MemoryScope,
+        op: MemoryOp,
+        session: SessionId,
     },
 }
 
