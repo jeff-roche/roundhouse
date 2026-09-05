@@ -166,6 +166,30 @@
 //! round 6**; the remaining rows carry fix-round-5 figures. The shape a figure
 //! was measured against is part of the figure, so every row names one.
 //!
+//! **Task 14 (lane W5) correction to the Integer decode CPU row above, not
+//! re-measured (a full re-measurement of this table is out of scope for a
+//! guard-relocation fix round):** that row's cell still says "**recommended,
+//! not implemented**: nothing in this workspace applies an `RLIMIT_CPU` to
+//! a parse today". That has been false since Task 14's first commits —
+//! `round-yaml-parse-helper` is exactly that remedy — and is doubly false
+//! now that fix round 1 (ruling W5-20) moved `expansion::check_expansion`
+//! into it too. The row's **9,435.7 ms admitted** figure for the
+//! 262,143-byte maximiser is pre-Task-14 history, not current behaviour:
+//! that document's *typed-deserialize* half alone already needed roughly
+//! its own ~9.4 s (the structural-doubling paragraph below), which exceeds
+//! `parse::helper::HELPER_CPU_LIMIT` (2 s) by itself, so this specific
+//! maximiser is now killed as `ParseError::ExceededParseResourceBound`
+//! rather than admitted — confirmed behaviourally, not remeasured for
+//! timing, by `tests/bounded_parse_out_of_process.rs`'s
+//! `an_admitted_but_expensive_alias_document_is_rejected_by_the_out_of_process_bound`
+//! (a smaller but analogous shape, 230,000 zeros / 10,000 aliases). This is
+//! a **narrowing**, not a new gap: a pathological document that used to
+//! finish admitted, slowly, in the daemon's own process now gets rejected
+//! instead. It does not mean the *count* cap
+//! ([`MAX_INTEGER_SCALAR_VISITS`]) fires — it still doesn't, for the
+//! reasons the row gives — only that wall-clock/CPU cost is no longer the
+//! axis nothing bounds.
+//!
 //! **Round 5's version of these rows had a single "non-string scalar" row
 //! covering both floats and integers, and it named
 //! [`MAX_INTEGER_SCALAR_VISITS`] as what bounds the integer half.** That was
@@ -1072,10 +1096,15 @@ pub enum ParseError {
 
     /// The out-of-process helper (Task 14, lane W5) hit its own CPU,
     /// wall-clock, or output-size bound and was killed. Reaching this
-    /// variant means the document passed every in-process guard above but
-    /// still cost more than the real resource bound allows once actually
-    /// deserialized — exactly the residual this task closes (see this
-    /// module's doc comment's axis inventory, integer-decode row).
+    /// variant means the document passed every in-process guard above
+    /// ([`MAX_YAML_BYTES`], [`nesting_depth_bound_violation`]) but still
+    /// cost more than the real resource bound allows once handed to the
+    /// bounded child — exactly the residual this task closes (see this
+    /// module's doc comment's axis inventory, integer-decode row). Since
+    /// Task 14 fix round 1 (ruling W5-20), "handed to the bounded child"
+    /// includes `expansion::check_expansion`'s own metered walk, not only
+    /// the typed deserialize that follows it — the kill can land during
+    /// either.
     #[error(
         "workflow YAML exceeded the out-of-process parsing resource bound and was rejected: {0}"
     )]

@@ -483,9 +483,14 @@ pub const FLOAT_SCALAR_WEIGHT_BYTES: usize = 512;
 /// real narrowing and is stated as one.
 pub const INTEGER_SCALAR_WEIGHT_BYTES: usize = 32;
 
-/// What [`check_expansion`] found. Every variant is a decision
-/// [`super::parse_workflow`] acts on directly; there is no "proceed anyway"
-/// case.
+/// What [`check_expansion`] found. Every variant is a decision the caller
+/// acts on directly; there is no "proceed anyway" case. Before Task 14 fix
+/// round 1 (ruling W5-20) that caller was [`super::parse_workflow`] itself;
+/// since then it is `round-yaml-parse-helper`'s `main()`, which maps each
+/// non-`WithinBudget` variant to a tagged stderr line —
+/// `crate::parse::helper`'s module doc has the wire format —
+/// that `super::parse_workflow` reconstructs the same
+/// [`super::ParseError`] variant from on the way back.
 ///
 /// **Task 14 fix round 1 (ruling W5-20): widened from `pub(super)` to
 /// `#[doc(hidden)] pub`**, so `src/bin/round_yaml_parse_helper.rs` — a

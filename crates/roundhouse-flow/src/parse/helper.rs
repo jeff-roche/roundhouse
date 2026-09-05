@@ -106,12 +106,14 @@ const HELPER_CPU_LIMIT: Duration = Duration::from_secs(2);
 const HELPER_WALL_LIMIT: Duration = Duration::from_secs(5);
 
 /// Ceiling on the helper's re-serialized YAML output. Deliberately well
-/// above [`super::MAX_EXPANDED_WEIGHT`] (the in-process ceiling on
-/// admitted expanded weight, in the same rough units as re-serialized
-/// bytes) rather than tuned tightly to it: this is a backstop against a
-/// compromised or buggy helper emitting unbounded output, not the primary
-/// bound on document size — that's `MAX_YAML_BYTES` plus the expansion
-/// checks, both already applied before this function is ever called.
+/// above [`super::MAX_EXPANDED_WEIGHT`] (the ceiling on admitted expanded
+/// weight, in the same rough units as re-serialized bytes) rather than
+/// tuned tightly to it: this is a backstop against a compromised or buggy
+/// helper emitting unbounded output, not the primary bound on document
+/// size — that's `MAX_YAML_BYTES`, applied before this function is ever
+/// called, plus `expansion::check_expansion` (Task 14 fix round 1, ruling
+/// W5-20), applied by the helper itself before it re-serializes anything,
+/// i.e. inside the same call this ceiling also bounds.
 const HELPER_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Runs `yaml` through `round-yaml-parse-helper` under
@@ -253,4 +255,132 @@ fn helper_binary_path() -> Result<PathBuf, ParseError> {
          parent directory) — is roundhouse built/installed correctly?",
         exe.display()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These pin `map_helper_failure`'s wire-format parsing directly —
+    // nothing in `tests/*.rs` exercises this function on its own, since
+    // every fixture test that reaches `TooManyNumericScalars` accepts
+    // `TooManyNumericScalars | ExpandsTooLarge` and so would not notice a
+    // `"float"` -> `MAX_INTEGER_SCALAR_VISITS` mix-up. `yaml` only matters
+    // for its `.len()` in the `EXPANDS_TOO_LARGE` case, so an empty string
+    // is fine everywhere else.
+
+    #[test]
+    fn expands_too_large_tag_reconstructs_actual_bytes_from_the_caller_and_max_from_the_constant() {
+        let yaml = "0123456789";
+        let err = map_helper_failure(yaml, VERDICT_EXPANDS_TOO_LARGE);
+        match err {
+            ParseError::ExpandsTooLarge { actual_bytes, max } => {
+                assert_eq!(actual_bytes, yaml.len());
+                assert_eq!(max, super::super::MAX_EXPANDED_WEIGHT);
+            }
+            other => panic!("expected ExpandsTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expands_too_large_tag_tolerates_a_trailing_newline() {
+        let text = format!("{VERDICT_EXPANDS_TOO_LARGE}\n");
+        assert!(matches!(
+            map_helper_failure("", &text),
+            ParseError::ExpandsTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn float_kind_maps_to_the_float_ceiling_not_the_integer_one() {
+        let text = format!("{VERDICT_TOO_MANY_NUMERIC_SCALARS_PREFIX}float");
+        match map_helper_failure("", &text) {
+            ParseError::TooManyNumericScalars { kind, max } => {
+                assert_eq!(kind, "float");
+                assert_eq!(max, super::super::MAX_FLOAT_SCALAR_VISITS);
+                assert_ne!(max, super::super::MAX_INTEGER_SCALAR_VISITS);
+            }
+            other => panic!("expected TooManyNumericScalars, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn integer_kind_maps_to_the_integer_ceiling_not_the_float_one() {
+        let text = format!("{VERDICT_TOO_MANY_NUMERIC_SCALARS_PREFIX}integer");
+        match map_helper_failure("", &text) {
+            ParseError::TooManyNumericScalars { kind, max } => {
+                assert_eq!(kind, "integer");
+                assert_eq!(max, super::super::MAX_INTEGER_SCALAR_VISITS);
+                assert_ne!(max, super::super::MAX_FLOAT_SCALAR_VISITS);
+            }
+            other => panic!("expected TooManyNumericScalars, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_numeric_scalar_kind_falls_back_to_a_plain_yaml_error_rather_than_panicking()
+    {
+        let text = format!("{VERDICT_TOO_MANY_NUMERIC_SCALARS_PREFIX}complex");
+        match map_helper_failure("", &text) {
+            ParseError::Yaml(YamlFailure::FromHelper { message, location }) => {
+                assert!(message.contains("complex"));
+                assert_eq!(location, None);
+            }
+            other => panic!("expected a fallback Yaml error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn yaml_error_tag_with_digits_reconstructs_a_location() {
+        let text = format!("{VERDICT_YAML_ERROR_PREFIX}4:7:did not find expected ',' or '}}'");
+        match map_helper_failure("", &text) {
+            ParseError::Yaml(YamlFailure::FromHelper { message, location }) => {
+                assert_eq!(location, Some((4, 7)));
+                assert_eq!(message, "did not find expected ',' or '}'");
+            }
+            other => panic!("expected a Yaml error with a location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn yaml_error_tag_with_dashes_reconstructs_no_location() {
+        let text = format!("{VERDICT_YAML_ERROR_PREFIX}-:-:some message with no position");
+        match map_helper_failure("", &text) {
+            ParseError::Yaml(YamlFailure::FromHelper { message, location }) => {
+                assert_eq!(location, None);
+                assert_eq!(message, "some message with no position");
+            }
+            other => panic!("expected a Yaml error with no location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_colon_inside_the_yaml_error_message_does_not_get_mistaken_for_a_field_separator() {
+        let text =
+            format!("{VERDICT_YAML_ERROR_PREFIX}2:9:mapping values are not allowed here: extra");
+        match map_helper_failure("", &text) {
+            ParseError::Yaml(YamlFailure::FromHelper { message, location }) => {
+                assert_eq!(location, Some((2, 9)));
+                assert_eq!(message, "mapping values are not allowed here: extra");
+            }
+            other => panic!("expected the message to keep its embedded colon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_untagged_text_falls_through_to_a_location_less_yaml_error() {
+        match map_helper_failure(
+            "",
+            "round-yaml-parse-helper: failed to re-serialize expanded YAML: some inner cause",
+        ) {
+            ParseError::Yaml(YamlFailure::FromHelper { message, location }) => {
+                assert_eq!(location, None);
+                assert_eq!(
+                    message,
+                    "round-yaml-parse-helper: failed to re-serialize expanded YAML: some inner cause"
+                );
+            }
+            other => panic!("expected a plain fallback Yaml error, got {other:?}"),
+        }
+    }
 }
