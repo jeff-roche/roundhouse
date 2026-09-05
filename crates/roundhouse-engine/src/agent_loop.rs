@@ -1008,6 +1008,21 @@ async fn dispatch_mcp(
             // `AdmitError::RequiresApproval` arm on the built-in side —
             // same `requires_approval` category — so the two arms are no
             // longer asymmetric on the approval path.
+            //
+            // **The `params_digest` is DISCARDED here, not persisted**
+            // (ruling W1-R88): `SuspendReason::AwaitingApproval` carries a
+            // `rule` and a `params_digest` — §6.2/§6.4's grant-scope
+            // provenance, the blake3 over the canonicalized `TaskParams` that
+            // an approval grant would have to match — and `TaskFailed` has
+            // nowhere to put either. Recording a terminal is the right
+            // fail-closed choice for S-LOG-1 (the alternative is a task in
+            // flight forever), but it FORECLOSES a later approval for this
+            // task rather than parking it: once this event is written, the
+            // model must re-issue the call and a fresh digest is computed.
+            // A future approval-workflow task must NOT assume the digest is
+            // recoverable from the event log — it is not. If resumable
+            // approvals are wanted, this arm needs a real `TaskSuspended`
+            // carrying the reason, plus something that can later resume it.
             let failed = runner.record_task_failed(
                 actor.session_id(),
                 0,

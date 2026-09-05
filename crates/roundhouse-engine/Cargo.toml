@@ -7,6 +7,26 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Ruling W1-R87: gates `mcp_spawner::SessionMcp::from_parts` so daemon code
+# can never reach the caller-trusted mint of a `SessionMcp`. That constructor
+# takes a caller-supplied `Vec<(ServerId, Arc<dyn McpTransport>)>`, and those
+# names flow through `resolved_servers()` -> `SessionActor::register_mcp` ->
+# `SealedContext.resolved_mcp_servers`, where they DISARM the sealed floor's
+# `sealed_mcp_unresolved` rule — CF-8(b)'s bypass shape. Only
+# `start_session_mcp` attests that a server actually completed spawn +
+# discovery, so only it may remain reachable from production. Activated for
+# this crate's own `tests/*.rs` integration-test crates via the self
+# dev-dependency below; `cfg(test)` alone covers only in-lib unit tests.
+#
+# Named `test-util` rather than the `test-support` the ruling's example
+# spelled, to match the identical, security-motivated gates already in
+# `roundhouse-sched` (`store::open_test_db`) and `roundhouse-flow`
+# (`durability::open_test_db`, two in `runs`) — one feature name across the
+# workspace for one purpose. The mechanism is exactly what the ruling
+# specified.
+test-util = []
+
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-store = { path = "../roundhouse-store" }
@@ -39,3 +59,8 @@ async-trait = "0.1"
 tempfile = "3"
 tokio = { version = "1.53", features = ["full"] }
 once_cell = "1"
+# Self dev-dependency, activating the `test-util` feature for this crate's own
+# `tests/*.rs` integration-test crates (ruling W1-R87) — `cfg(test)` alone does
+# not cover them, only this crate's in-lib `#[cfg(test)] mod tests`. Mirrors
+# the identical pattern in `roundhouse-sched`.
+roundhouse-engine = { path = ".", features = ["test-util"] }

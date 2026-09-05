@@ -398,30 +398,63 @@ fn check_sealed_ctx_configured(policy: &PolicyEngine) -> Result<(), StartSession
 /// take the CONCRETE `Arc<PolicyEngine>`, so passing an `AllowAllPolicy` (or
 /// any other `Arc<dyn Policy>`) is a **compile error** rather than a thing a
 /// future caller can quietly do. The field is private and there is no
-/// `From`/`Deref` into one, so the only two ways to obtain a `SessionMcp`
-/// are [`start_session_mcp`] and [`SessionMcp::from_parts`] — and both run
-/// the same [`StartSessionMcpError::UnconfiguredSealedContext`] guard.
+/// `From`/`Deref` into one.
 ///
-/// **What it does NOT prove** (carry-forward CF-8, unchanged): that the
+/// # Exactly what each mint attests (ruling W1-R87)
+///
+/// **In a production build there is one constructor: [`start_session_mcp`].**
+/// It is the only one that attests **spawn + discovery** — its executor's
+/// `connections` come from `McpHost::start`, which builds them solely from
+/// `StartedServer`s, i.e. servers where both `StdioMcpTransport::spawn` and
+/// `discover()` succeeded. That is what makes
+/// [`crate::SessionActor::register_mcp`]'s use of `resolved_servers()` an
+/// honest input to `SealedContext.resolved_mcp_servers`.
+///
+/// [`SessionMcp::from_parts`] is **caller-trusted and test-gated**
+/// (`#[cfg(any(test, feature = "test-util"))]`). It attests the
+/// `PolicyEngine` and nothing else: its `connections` are whatever the caller
+/// passed, so the server *names* in them are caller-invented. Since
+/// `resolved_servers()` is just those keys, an ungated `from_parts` would let
+/// a caller name any server "resolved" and thereby disarm
+/// `sealed_mcp_unresolved` for the session — CF-8(b)'s bypass shape, which is
+/// why production cannot reach it.
+///
+/// **What NEITHER mint proves** (carry-forward CF-8, unchanged): that the
 /// engine's installed `sealed_ctx_provider` returns a *correct* context.
-/// The guard proves non-default, not correct.
+/// `check_sealed_ctx_configured` proves non-default, not correct.
 #[derive(Clone)]
 pub struct SessionMcp {
     executor: Arc<McpExecutor>,
 }
 
 impl SessionMcp {
-    /// Builds a `SessionMcp` from already-established transports and an
-    /// already-built namespace — the seam an integration test (or any future
-    /// caller that spawns its servers itself rather than through
-    /// [`start_session_mcp`]'s config-driven path) needs.
+    /// Builds a `SessionMcp` from caller-supplied transports and an
+    /// already-built namespace — the seam this crate's own integration tests
+    /// need in order to drive the MCP arm against a scripted transport while
+    /// still going through a real `PolicyEngine`.
+    ///
+    /// # Test-gated, and why (ruling W1-R87)
+    ///
+    /// **This constructor attests the `PolicyEngine` and nothing else.**
+    /// `connections` is whatever the caller passed; nothing on this path
+    /// requires a spawn or a `discover()`. `McpExecutor::resolved_servers()`
+    /// is just those connection keys, so a caller-invented server name flows
+    /// through [`SessionMcp::resolved_servers`] into
+    /// [`crate::SessionActor::register_mcp`] and on into
+    /// `SealedContext.resolved_mcp_servers`, where it **disarms
+    /// `sealed_mcp_unresolved`** for that session. That is carry-forward
+    /// CF-8(b)'s bypass shape, so this is gated behind
+    /// `#[cfg(any(test, feature = "test-util"))]` and production code cannot
+    /// reach it — [`start_session_mcp`] is the only mint a daemon build has,
+    /// and it is the only one that attests spawn + discovery.
     ///
     /// `policy` is the concrete `Arc<PolicyEngine>`, never `Arc<dyn Policy>`:
-    /// that is the whole point of this type (see its doc comment). The
+    /// that is the other half of this type's point (see its doc comment). The
     /// `McpExecutor` is constructed HERE from the parts rather than accepted
     /// pre-built, because accepting a pre-built one would let a caller hand
     /// over an executor whose policy is something else entirely while still
     /// passing a real `PolicyEngine` for show.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn from_parts(
         connections: Vec<(ServerId, Arc<dyn McpTransport>)>,
         namespace: ToolNamespace,

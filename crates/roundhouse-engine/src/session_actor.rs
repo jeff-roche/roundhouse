@@ -410,10 +410,28 @@ impl SessionActor {
     /// that never completed a handshake — and silently disarm the sealed
     /// floor's one MCP rule for this session. Taking the newtype means the
     /// only declarable set is the one a real, policy-engine-backed executor
-    /// actually holds transports for
-    /// (`McpExecutor::resolved_servers`, built in `McpHost::start` from
-    /// `StartedServer`s only). There is deliberately no way to add a server
-    /// this session does not have a live connection to.
+    /// actually holds transports for (`McpExecutor::resolved_servers`).
+    ///
+    /// # Precisely how far that goes (corrected per ruling W1-R87)
+    ///
+    /// An earlier version of this comment claimed "there is deliberately no
+    /// way to add a server this session does not have a live connection to."
+    /// That was **true of [`crate::mcp_spawner::start_session_mcp`] and false
+    /// of [`crate::mcp_spawner::SessionMcp::from_parts`]**, which the same
+    /// commit introduced — `from_parts` takes caller-supplied connections, so
+    /// its server names are caller-invented and would have flowed straight
+    /// through here into `SealedContext.resolved_mcp_servers`. A false
+    /// attestation is worse than a missing one, so state it exactly:
+    ///
+    /// - In a **production build** `from_parts` does not exist (it is behind
+    ///   `#[cfg(any(test, feature = "test-util"))]`), so the only reachable
+    ///   mint is `start_session_mcp`, whose executor's connections come from
+    ///   `McpHost::start` and therefore from `StartedServer`s only — servers
+    ///   where both spawn AND `discover()` succeeded. There the guarantee
+    ///   holds as written.
+    /// - In a **test build**, `from_parts` is reachable and this method
+    ///   attests only "some `SessionMcp` said so." Tests are trusted code;
+    ///   the gate exists so daemon code is not.
     ///
     /// Idempotent and last-write-wins (`*guard = ...`, never a union), so
     /// re-registering after a teardown genuinely narrows the set rather than

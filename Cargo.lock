@@ -3670,6 +3670,7 @@ dependencies = [
  "once_cell",
  "roundhouse-bus",
  "roundhouse-core",
+ "roundhouse-engine",
  "roundhouse-mcp",
  "roundhouse-net",
  "roundhouse-policy",

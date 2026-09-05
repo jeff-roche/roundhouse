@@ -2512,3 +2512,132 @@ async fn a_retryable_mcp_transport_failure_is_recorded_as_retryable_not_hardcode
          too, got {failures:?}"
     );
 }
+
+/// Round E, the note carried from W1-R87's review: prove **`McpExecutor::gate`'s**
+/// own sealed floor, independently of `admit_task`'s.
+///
+/// `the_real_sealed_floor_denies_an_mcp_call_to_an_unresolved_server_despite_an_allow_rule`
+/// above leaves both sealed contexts empty, so `admit_task` denies first and
+/// `gate` is never reached — it proves the floor on the *admission* channel
+/// only. This test inverts exactly one variable: the ACTOR's context carries
+/// the server (via `register_mcp`, so admission passes), while the EXECUTOR's
+/// engine is built with no resolved servers at all. The only thing left that
+/// can refuse the call is `gate`'s own `decide_sealed`, and the assertion is
+/// on `gate`'s message text — which is distinguishable from `AdmitError`'s.
+///
+/// Together the two tests show the floor is live on BOTH channels, which is
+/// what the double gate being "fail-closed, not redundant" actually rests on.
+#[tokio::test]
+async fn the_executors_own_sealed_floor_denies_an_unresolved_server_after_admission_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let daemon_binary = dir.path().join("daemon-binary");
+
+    // Admission's channel: server resolved, tool allowed — so `admit_task`
+    // returns Ok and cannot be what refuses this call.
+    let actor_engine = mcp_engine(
+        &state_dir,
+        &daemon_binary,
+        &[FAKE_SERVER],
+        vec![allow_mcp_tool(FAKE_SERVER, "search")],
+    );
+    // The executor's channel: the SAME allow rule, but NO resolved servers,
+    // so only the compiled-in `sealed:mcp-unresolved-server` can fire.
+    let executor_engine = mcp_engine(
+        &state_dir,
+        &daemon_binary,
+        &[],
+        vec![allow_mcp_tool(FAKE_SERVER, "search")],
+    );
+
+    let (actor, writer, db_path, session_id) = new_actor_with_engine(
+        dir.path(),
+        state_dir,
+        daemon_binary,
+        Arc::clone(&actor_engine),
+    )
+    .await;
+    let (mcp, transport, namespaced_name) = build_mcp_executor(
+        &RUNNER,
+        writer,
+        session_id,
+        executor_engine,
+        "search",
+        vec![], // never reached — the gate must refuse before the transport
+    )
+    .await;
+    actor.register_mcp(&mcp);
+
+    let tools = actor.tool_defs().to_vec();
+    let provider =
+        ScriptedToolCallProvider::new(&namespaced_name, serde_json::json!({ "query": "x" }));
+    let ctx = fake_ctx();
+
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        Some(mcp),
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        transport.call_count(),
+        0,
+        "the executor's own sealed floor must refuse before the transport"
+    );
+
+    let refusal = blocks
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::ToolResult {
+                is_error: true,
+                content,
+                ..
+            } => Some(content.iter().map(|p| p.text.clone()).collect::<String>()),
+            _ => None,
+        })
+        .expect("the denial must reach the model as an error tool result");
+    // `McpExecutor::gate`'s own text, NOT `AdmitError::Denied`'s "denied by
+    // sealed floor or configured policy" — this is the discriminator that
+    // says which of the two gates refused, and therefore that admission
+    // really did pass.
+    assert!(
+        refusal.starts_with("denied by policy: mcp tool 'search' on server 'fake-server'"),
+        "the refusal must be the EXECUTOR's gate talking, not admission's: {refusal:?}"
+    );
+    assert!(
+        !refusal.contains("denied by sealed floor or configured policy"),
+        "admission must have PASSED — if this is AdmitError's text the test proves nothing new: \
+         {refusal:?}"
+    );
+
+    let reopened = open(&db_path).await.unwrap();
+    let events = session_events(&reopened, session_id).await.unwrap();
+    // Admission passing means the task really started, unlike the
+    // admission-denied test above where TaskStarted is never reached.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(&e.payload, EventPayload::TaskStarted { .. })),
+        "admission passed, so the task must have reached TaskStarted before the gate refused it"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::TaskDecided {
+                decision: roundhouse_core::PolicyDecision::Deny,
+                ..
+            }
+        )),
+        "the executor's gate must have recorded its own Deny decision"
+    );
+}
