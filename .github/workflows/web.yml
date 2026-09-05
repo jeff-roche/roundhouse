@@ -51,19 +51,31 @@ jobs:
       # S5 (Task 10 slice B security review): a source-side guard, cheaper
       # and far more robust than pattern-matching the built output. Vite
       # auto-loads `.env`/`.env.local` from `frontend/` and inlines any
-      # referenced `VITE_*` value into the bundle at build time — the one
-      # build-time inlining mechanism live in this toolchain, and until now
-      # it was guarded only by nobody having used it yet. Runs before the
-      # build so a violation fails fast rather than after a build that would
-      # already have inlined the leak.
+      # referenced `VITE_*` value into the bundle at build time — one of
+      # Vite's own built-in env-inlining mechanisms, and until now it was
+      # guarded only by nobody having used it yet. Runs before the build so
+      # a violation fails fast rather than after a build that would already
+      # have inlined the leak.
       #
       # Fix round 2 (Important, security): this step's name used to promise
       # "any" build-time env-inlining surface while covering only a subset —
-      # see the `%…%` check below for what changed and why. Left as "any"
-      # here because, after that fix, every mechanism Vite has for inlining
-      # a build-time value into this bundle (`import.meta.env`, `define`,
-      # `.env*`, and HTML `%…%` substitution) is now actually covered.
-      - name: Fail on any build-time env-inlining surface
+      # see the `%…%` check below for what changed and why.
+      #
+      # Fix round 3 (BLOCKING, code review): "any"/"every mechanism" was
+      # still too wide a claim even after that fix. A reviewer built a
+      # counterexample this step cannot reach by construction: an inline
+      # `vite.config.ts` plugin's `transformIndexHtml` hook running
+      # `process.env` through arbitrary JS (e.g. string-replacing a literal
+      # marker with a hostname) ships past every check below — no `%…%`
+      # token, no `define`, no `envPrefix`, no `import.meta.env`, no `.env*`
+      # file. That surface is a plugin executing arbitrary code, not a
+      # greppable pattern, so widening this step's checks is the wrong
+      # instinct; `dist_public_content.rs` (which scans the *built output*
+      # for exactly this shape, backed by the staleness check below) is the
+      # right control for it. This step's own claim is scoped to what it can
+      # actually see: Vite's built-in env-inlining mechanisms only
+      # (`import.meta.env`, `define`, `.env*`, and HTML `%…%` substitution).
+      - name: Fail on Vite's built-in env-inlining surfaces
         run: |
           set -euo pipefail
 
@@ -111,11 +123,16 @@ jobs:
             config_file="vite.config.$config_ext"
             if [ -f "$config_file" ]; then
               found_config=1
-              if grep -E 'define\s*:' "$config_file"; then
+              # Fix round 3 (Minor, code review): the unquoted pattern
+              # doesn't match a quoted key (`"define": {...}`), which is
+              # valid JS/TS object-literal syntax. Non-blocking either way —
+              # the `%…%` check below is prefix-agnostic, so a quoted
+              # `envPrefix` reopens nothing — but two characters closes it.
+              if grep -E '"?define"?\s*:' "$config_file"; then
                 echo "::error::found a 'define' key in $config_file — no per-install value may be inlined into this build"
                 exit 1
               fi
-              if grep -E 'envPrefix\s*:' "$config_file"; then
+              if grep -E '"?envPrefix"?\s*:' "$config_file"; then
                 echo "::error::found an 'envPrefix' key in $config_file — changes which environment variables Vite's HTML %…% substitution and import.meta.env expose; needs deliberate review, not a silent change"
                 exit 1
               fi
@@ -163,10 +180,13 @@ jobs:
           #       in the name, which `[A-Za-z0-9_]` does not match (and
           #       which also defeats the `unset`-based scrub below, since
           #       `grep -oE '^VITE_[A-Za-z0-9_]*'` would extract `VITE_A`,
-          #       the wrong name — plain `unset` cannot remove a hyphenated
-          #       shell variable name at all, only `env -u` can; the source
-          #       check below is the actual control for this, the scrub is
-          #       defense in depth only, and is deliberately left as-is).
+          #       the wrong name — `unset "VITE_A-B"` then silently no-ops
+          #       (bash returns 0 without removing anything; a hyphenated
+          #       name isn't a valid shell identifier for `unset` to act on
+          #       at all), so the real variable stays live after the scrub
+          #       loop runs. The source check below is the actual control
+          #       for this; the scrub is defense in depth only, and is
+          #       deliberately left as-is).
           #   (c) `%BASE_URL%` — one of Vite's own built-in substitutions,
           #       no environment variable or config change required at all.
           #
