@@ -785,16 +785,18 @@ pub fn set_cpu_limit_pre_exec(cmd: &mut std::process::Command, limit: std::time:
 /// caller has to remember to negate.
 ///
 /// Used by [`crate::bounded_parse::run_bounded_subprocess`] (ruling W5-25,
-/// finding 2) to kill a subprocess spawned with `CommandExt::process_group(0)`
-/// (making it the leader of its own new group, `pgid == pid`) **and
-/// everything it forked**, not just the direct child: `Child::kill()` alone
-/// signals only the one process it names, so a single `fork()` inside a
-/// bounded child would otherwise defeat every bound this primitive
-/// enforces — the descendant keeps running (and keeps the stdout pipe's
-/// write end open) after the direct child is killed. Killing the whole
-/// group also closes every descendant's copy of that write end, which is
-/// what lets the concurrent stdout/stderr readers in
-/// `run_bounded_subprocess` observe EOF and its caller's `thread::scope`
+/// finding 2; ruling W5-26 extended the call sites to every exit path, not
+/// only a bound firing) to kill a subprocess spawned with
+/// `CommandExt::process_group(0)` (making it the leader of its own new
+/// group, `pgid == pid`) **and everything it forked**, not just the direct
+/// child: `Child::kill()` alone signals only the one process it names, so a
+/// single `fork()` inside a bounded child would otherwise defeat every
+/// bound this primitive enforces — the descendant keeps running (and keeps
+/// the stdout pipe's write end open) after the direct child is gone,
+/// whether that child was killed by a bound firing or exited cleanly on
+/// its own. Killing the whole group also closes every descendant's copy of
+/// that write end, which is what lets the concurrent stdout/stderr readers
+/// in `run_bounded_subprocess` observe EOF and its caller's `thread::scope`
 /// unblock, rather than hanging forever on a pipe an orphan still holds.
 ///
 /// A safe function despite the `unsafe` FFI call inside, unlike

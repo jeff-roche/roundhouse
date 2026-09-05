@@ -102,11 +102,20 @@
 //!
 //! # Non-Linux behaviour (ruling W5-3)
 //!
-//! `libc` — and therefore [`crate::probe::set_cpu_limit_pre_exec`] — is a
-//! Linux-only dependency of this crate. Off Linux this function still
-//! spawns the child, still enforces `wall_limit` and `max_output_bytes` in
-//! full, and simply carries no `RLIMIT_CPU`: a real, smaller bound, never a
-//! silent no-op.
+//! `libc` — and therefore [`crate::probe::set_cpu_limit_pre_exec`] and the
+//! process-group kill described above — is a Linux-only dependency of this
+//! crate. Off Linux, `CommandExt::process_group(0)` is never set and
+//! `kill_child_and_descendants` falls back to a plain `Child::kill()` on
+//! the direct child only, so **"descendants do not outlive the call" is a
+//! Linux-only guarantee.** `wall_limit` and `max_output_bytes` are still
+//! enforced against the direct child's own output and the wall clock in
+//! full — a real, smaller bound, never a silent no-op for the direct
+//! child — but a child that forks a descendant holding its inherited
+//! stdout/stderr pipe open can still block `run_bounded_subprocess` past
+//! `wall_limit` off Linux, on both the timeout path and the clean-exit
+//! path this file's tests exercise. No caller of this primitive spawns a
+//! forking child off Linux today, so this is a real, named gap rather than
+//! an exercised one, not a claim that it can't happen.
 
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
