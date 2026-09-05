@@ -265,7 +265,19 @@ fn find_opaque_in_io_redirect(r: &ast::IoRedirect, found: &mut Vec<OpaqueNode>) 
 
 fn find_opaque_in_compound_command(cmd: &ast::CompoundCommand, found: &mut Vec<OpaqueNode>) {
     match cmd {
-        ast::CompoundCommand::Arithmetic(_) | ast::CompoundCommand::ArithmeticForClause(_) => {}
+        // Arithmetic expressions (`(( ... ))`) contain no executable
+        // commands. `ArithmeticForClause` (`for ((init;cond;incr))`) is
+        // different — it has its own `body: DoGroupCommand`, exactly like
+        // `ForClause`, and MUST be walked the same way (Task 26, W4): this
+        // was grouped with `Arithmetic` and left a no-op, so an opaque
+        // construct (e.g. a command substitution) hidden inside a C-style
+        // for-loop body was invisible to this hard-deny walk — matching the
+        // exact bug `pipeline.rs`'s own "fix-round-1 Critical 1" already
+        // closed for its own (different) walk.
+        ast::CompoundCommand::Arithmetic(_) => {}
+        ast::CompoundCommand::ArithmeticForClause(c) => {
+            find_opaque_in_compound_list(&c.body.list, found)
+        }
         ast::CompoundCommand::BraceGroup(g) => find_opaque_in_compound_list(&g.list, found),
         ast::CompoundCommand::Subshell(s) => find_opaque_in_compound_list(&s.list, found),
         ast::CompoundCommand::ForClause(c) => {
