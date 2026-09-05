@@ -137,6 +137,18 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// smaller than, the caller-supplied `max_output_bytes` (which bounds
 /// stdout — the actual payload) — stderr here is diagnostic text, not
 /// data, and is never returned to the caller on success.
+///
+/// **This is an internal capture-buffer size, not a bound (ruling W5-28,
+/// item 1).** `max_output_bytes` is a limit the *caller* declares and is
+/// therefore a caller-visible failure when crossed; this constant is a
+/// number this module picked for a diagnostic string. Past it, stderr is
+/// **drained and discarded** by `read_stderr_draining` — read so the child
+/// can never block on an undrained pipe, thrown away so nothing past the
+/// cap is buffered — and crossing it never kills the child and never
+/// affects the verdict. A child that does its job, is chatty on a
+/// diagnostic stream, and exits 0 succeeds. A *runaway* stderr writer is
+/// still bounded, by `wall_limit` and `RLIMIT_CPU`, which is where a
+/// runaway belongs.
 const STDERR_CAPTURE_CAP: usize = 64 * 1024;
 
 /// Why [`run_bounded_subprocess`] did not return the child's stdout.
@@ -172,24 +184,29 @@ pub enum BoundedParseError {
     #[error("helper process was killed by signal {signal} (resource limit exceeded)")]
     ResourceExhausted { signal: i32 },
 
-    /// The child's stdout **or stderr** exceeded its cap and was killed
-    /// before finishing — `max_output_bytes` names whichever limit was
-    /// actually crossed: the caller-supplied stdout cap, or (ruling
-    /// W5-25, finding 5) `STDERR_CAPTURE_CAP` if stderr was the one that
-    /// overflowed. Independent of `wall_limit`/CPU: a child that floods
-    /// output cheaply (e.g. `yes`) must not be allowed to run for the full
-    /// wall-clock allowance just because it isn't CPU-bound.
+    /// The child's **stdout** exceeded the caller-supplied
+    /// `max_output_bytes` cap and it was killed before finishing.
+    /// Independent of `wall_limit`/CPU: a child that floods output cheaply
+    /// (e.g. `yes`) must not be allowed to run for the full wall-clock
+    /// allowance just because it isn't CPU-bound.
+    ///
+    /// **Stdout only (ruling W5-28, item 1).** A stderr flood is never
+    /// reported here: `STDERR_CAPTURE_CAP` is an internal capture-buffer
+    /// size, not a bound the caller declared, so stderr past it is drained
+    /// and discarded rather than turned into a failure — see that
+    /// constant's doc comment.
     #[error("helper process emitted more than {max_output_bytes} output bytes; killed")]
     OutputTooLarge {
-        /// The cap that was actually crossed — not necessarily
-        /// `run_bounded_subprocess`'s caller-supplied stdout cap; see the
-        /// variant doc above.
+        /// The caller-supplied stdout cap that was crossed — the same
+        /// `max_output_bytes` that was passed to
+        /// [`run_bounded_subprocess`].
         max_output_bytes: usize,
     },
 
     /// The child exited on its own, without being killed by either bound
-    /// above, but with a failure status. `stderr` (bounded to
-    /// `STDERR_CAPTURE_CAP`) is included for diagnosis.
+    /// above, but with a failure status. `stderr` (truncated to the first
+    /// `STDERR_CAPTURE_CAP` bytes the child wrote; anything past that was
+    /// drained and discarded) is included for diagnosis.
     #[error("helper process exited with {status}: {stderr}")]
     HelperCrashed { status: String, stderr: String },
 }
@@ -274,7 +291,6 @@ pub fn run_bounded_subprocess(
     let mut stderr = child.stderr.take().expect("stderr was requested as piped");
 
     let output_exceeded = AtomicBool::new(false);
-    let stderr_exceeded = AtomicBool::new(false);
 
     let (outcome, stdout_buf, stderr_buf) = thread::scope(|scope| {
         // Writes stdin (if any) and then drops it, closing the pipe and
@@ -296,17 +312,13 @@ pub fn run_bounded_subprocess(
         // and the wait-loop below, so all three run concurrently.
         let stdout_reader =
             scope.spawn(|| read_capped(&mut stdout, max_output_bytes, &output_exceeded));
-        let stderr_reader =
-            scope.spawn(|| read_capped(&mut stderr, STDERR_CAPTURE_CAP, &stderr_exceeded));
+        // Stderr gets the *draining* reader, not `read_capped`: it keeps
+        // reading to EOF past `STDERR_CAPTURE_CAP` and throws the excess
+        // away, so a chatty child can never block on an undrained pipe and
+        // a chatty child also never fails the call (ruling W5-28, item 1).
+        let stderr_reader = scope.spawn(|| read_stderr_draining(&mut stderr, STDERR_CAPTURE_CAP));
 
-        let outcome = wait_bounded(
-            &mut child,
-            pgid,
-            wall_limit,
-            max_output_bytes,
-            &output_exceeded,
-            &stderr_exceeded,
-        );
+        let outcome = wait_bounded(&mut child, pgid, wall_limit, &output_exceeded);
 
         // Ruling W5-25, finding 8a: `.join()`'s `Err` (the reader thread
         // panicked) used to be silently swallowed by `unwrap_or_default`,
@@ -328,7 +340,7 @@ pub fn run_bounded_subprocess(
         let stderr_join = stderr_reader.join();
         debug_assert!(
             stderr_join.is_ok(),
-            "read_capped's stderr reader thread panicked; see the stdout debug_assert above"
+            "read_stderr_draining's reader thread panicked; see the stdout debug_assert above"
         );
         let stderr_buf = stderr_join.unwrap_or_default();
 
@@ -337,9 +349,7 @@ pub fn run_bounded_subprocess(
 
     match outcome {
         WaitOutcome::TimedOut => Err(BoundedParseError::Timeout { wall_limit }),
-        WaitOutcome::OutputExceeded { limit } => Err(BoundedParseError::OutputTooLarge {
-            max_output_bytes: limit,
-        }),
+        WaitOutcome::OutputExceeded => Err(BoundedParseError::OutputTooLarge { max_output_bytes }),
         WaitOutcome::Exited(status) => {
             // Ruling W5-25, finding 1: `wait_bounded`'s poll loop checks
             // `try_wait()` before `output_exceeded`, so a child that
@@ -365,27 +375,36 @@ pub fn run_bounded_subprocess(
 }
 
 /// What ended the wait loop in [`run_bounded_subprocess`]. `OutputExceeded`
-/// carries which cap fired (`max_output_bytes` for stdout,
-/// `STDERR_CAPTURE_CAP` for stderr — ruling W5-25, finding 5) so the
-/// caller's error message names the byte count that was actually crossed.
+/// carries no cap: stdout's caller-supplied `max_output_bytes` is the only
+/// cap that can produce it (ruling W5-28, item 1 removed stderr from the
+/// verdict entirely), and the one call site already has that value in
+/// scope.
 enum WaitOutcome {
     Exited(ExitStatus),
     TimedOut,
-    OutputExceeded { limit: usize },
+    OutputExceeded,
 }
 
-/// Polls `child` until it exits on its own, `wall_limit` elapses, or either
-/// `output_exceeded` or `stderr_exceeded` is set by its respective
-/// concurrent reader — killing (and reaping, so no zombie is left behind)
-/// the child on any of the latter three paths before returning.
+/// Polls `child` until it exits on its own, `wall_limit` elapses, or
+/// `output_exceeded` is set by the concurrent stdout reader — killing (and
+/// reaping, so no zombie is left behind) the child on either of the latter
+/// two paths before returning.
 ///
-/// **`stderr_exceeded` is consulted here since ruling W5-25, finding 5** —
-/// before, nothing read it: a child that flooded stderr past
-/// `STDERR_CAPTURE_CAP` stopped being drained, blocked on its own `write`
-/// once the pipe filled, and simply sat until `wall_limit` fired instead of
-/// getting the same prompt kill a stdout flood already got. Fail-closed
-/// either way (the wall-clock bound still applied), so this is a
-/// promptness fix, not a bypass fix like finding 1's.
+/// **Stderr takes no part in this loop (ruling W5-28, item 1).** It used to:
+/// ruling W5-25, finding 5 added a `stderr_exceeded` arm that killed the
+/// child the moment it wrote past `STDERR_CAPTURE_CAP`, reported as
+/// `OutputTooLarge`. That fixed a real problem — before it, an over-cap
+/// stderr simply stopped being drained, so the child blocked on its own
+/// `write` once the pipe filled and sat until `wall_limit` — but it fixed
+/// it by promoting an *internal capture-buffer size* to a caller-visible
+/// bound, which also made the verdict racy: the `Exited` arm below never
+/// re-checked `stderr_exceeded`, so a child that flooded stderr and exited 0
+/// promptly returned `Ok` when `try_wait()` won the poll and
+/// `Err(OutputTooLarge)` when the flag won. W5-28 removed the failure mode
+/// rather than making it deterministic: `read_stderr_draining` keeps reading
+/// past the cap and discards the excess, so the child still never blocks on
+/// an undrained pipe, and nothing about stderr can kill the child or decide
+/// the verdict.
 ///
 /// **Ruling W5-26 (fix round 3) — the `Exited` arm now also tears down the
 /// process group, closing what fix round 2's report recorded as residual
@@ -420,21 +439,11 @@ enum WaitOutcome {
 /// without reaping, e.g. via `waitid(..., WNOWAIT)`) has the identical
 /// window — closing it needs a different wait primitive, not a bigger
 /// `killpg` call, and is not attempted here.
-///
-/// **`stderr_exceeded` is consulted here since ruling W5-25, finding 5** —
-/// before, nothing read it: a child that flooded stderr past
-/// `STDERR_CAPTURE_CAP` stopped being drained, blocked on its own `write`
-/// once the pipe filled, and simply sat until `wall_limit` fired instead of
-/// getting the same prompt kill a stdout flood already got. Fail-closed
-/// either way (the wall-clock bound still applied), so this is a
-/// promptness fix, not a bypass fix like finding 1's.
 fn wait_bounded(
     child: &mut Child,
     pgid: i32,
     wall_limit: Duration,
-    max_output_bytes: usize,
     output_exceeded: &AtomicBool,
-    stderr_exceeded: &AtomicBool,
 ) -> WaitOutcome {
     let start = Instant::now();
     loop {
@@ -450,16 +459,7 @@ fn wait_bounded(
         if output_exceeded.load(Ordering::SeqCst) {
             kill_child_and_descendants(child, pgid);
             let _ = child.wait();
-            return WaitOutcome::OutputExceeded {
-                limit: max_output_bytes,
-            };
-        }
-        if stderr_exceeded.load(Ordering::SeqCst) {
-            kill_child_and_descendants(child, pgid);
-            let _ = child.wait();
-            return WaitOutcome::OutputExceeded {
-                limit: STDERR_CAPTURE_CAP,
-            };
+            return WaitOutcome::OutputExceeded;
         }
         if start.elapsed() >= wall_limit {
             kill_child_and_descendants(child, pgid);
@@ -516,12 +516,19 @@ fn kill_child_and_descendants(child: &mut Child, pgid: i32) {
     }
 }
 
-/// Reads `pipe` to EOF, capping the buffered total at `cap` bytes. Sets
-/// `exceeded` and stops reading (without erroring) the moment `cap` is
-/// passed — [`wait_bounded`] is what turns that into an actual kill; this
-/// function's job is only to never buffer past the cap and to never block
-/// forever on a pipe nobody upstream is going to close (a killed child's
-/// pipe closes with an `Ok(0)` or an `Err`, either of which ends the loop).
+/// Reads `pipe` (the child's **stdout**) to EOF, capping the buffered total
+/// at `cap` bytes. Sets `exceeded` and stops reading (without erroring) the
+/// moment `cap` is passed — [`wait_bounded`] is what turns that into an
+/// actual kill; this function's job is only to never buffer past the cap and
+/// to never block forever on a pipe nobody upstream is going to close (a
+/// killed child's pipe closes with an `Ok(0)` or an `Err`, either of which
+/// ends the loop).
+///
+/// Stopping the read is correct *here* precisely because crossing the cap is
+/// a bound violation: [`wait_bounded`] kills the child within one
+/// `POLL_INTERVAL`, so nothing is left blocked on a pipe that will never be
+/// read again. Stderr, which is not a bound and gets no kill, needs the
+/// opposite behaviour and uses [`read_stderr_draining`] instead.
 fn read_capped(pipe: &mut impl Read, cap: usize, exceeded: &AtomicBool) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 64 * 1024];
@@ -534,6 +541,44 @@ fn read_capped(pipe: &mut impl Read, cap: usize, exceeded: &AtomicBool) -> Vec<u
                     exceeded.store(true, Ordering::SeqCst);
                     break;
                 }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
+/// Reads `pipe` (the child's **stderr**) to EOF, buffering only the first
+/// `cap` bytes and **discarding everything past them** (ruling W5-28,
+/// item 1).
+///
+/// The two halves of that are both load-bearing. *Reading* to EOF regardless
+/// of the cap is what keeps a chatty child from blocking on its own `write`
+/// once the stderr pipe fills — the problem ruling W5-25, finding 5
+/// identified. *Discarding* rather than killing is what keeps
+/// `STDERR_CAPTURE_CAP` an internal buffer size instead of a caller-visible
+/// bound: a child that did its job and exited 0 must not fail the call for
+/// having been verbose on a diagnostic stream, and a runaway stderr writer
+/// is caught by `wall_limit`/`RLIMIT_CPU` like any other runaway.
+///
+/// The truncation is exact — the returned buffer is never longer than `cap`
+/// — so a [`BoundedParseError::HelperCrashed`] message is deterministic in
+/// size, and the *first* bytes are the ones kept, which is where a helper's
+/// tagged diagnostic line lives.
+fn read_stderr_draining(pipe: &mut impl Read, cap: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len() < cap {
+                    let keep = n.min(cap - buf.len());
+                    buf.extend_from_slice(&chunk[..keep]);
+                }
+                // Anything past `cap` is deliberately dropped on the floor:
+                // it was read (so the child never blocks) but not retained.
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => break,

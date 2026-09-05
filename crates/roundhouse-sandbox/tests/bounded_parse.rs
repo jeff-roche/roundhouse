@@ -145,20 +145,33 @@ fn a_flooding_child_is_killed_once_output_exceeds_the_cap() {
     );
 }
 
-/// Ruling W5-25, finding 5 — before this fix, `stderr_exceeded` was set by
-/// the stderr reader thread and never consulted anywhere, so a child that
-/// flooded stderr past the (private, 64 KiB) capture cap simply blocked on
-/// its own `write` once the pipe filled and sat until `wall_limit`, rather
-/// than getting the same prompt kill a stdout flood already got. Fail-
-/// closed either way, so this proves promptness, not a bypass: `yes 1>&2`
-/// floods stderr forever while stdout stays empty, so only the newly
-/// consulted flag can be what ends this call before the 10 s wall clock.
+/// Ruling W5-28, item 1 — **this test's expectation was deliberately
+/// revised.** It was added in fix round 2 for ruling W5-25, finding 5, and
+/// asserted that flooding stderr past the (private, 64 KiB) capture cap was
+/// reported to the caller as `OutputTooLarge` naming that cap. W5-28 ruled
+/// that wrong: `max_output_bytes` is a bound the *caller* declares, while
+/// the stderr capture cap is an internal buffer size this module chose, and
+/// promoting the latter to a caller-visible failure both conflated the two
+/// and left the verdict racy (`wait_bounded`'s `Exited` arm never re-checked
+/// the stderr flag, so a prompt-exiting flooder returned `Ok` or
+/// `OutputTooLarge` depending on which side won a 5 ms poll).
+///
+/// The half of finding 5 that was real — the child must never block on an
+/// undrained stderr pipe — is what this now pins. 1 MiB is far past the
+/// capture cap *plus* one 64 KiB reader chunk *plus* a 64 KiB kernel pipe
+/// buffer, so pre-W5-28 (and pre-W5-25) code would have wedged the child on
+/// its own `write` until the 10 s wall clock fired, failing both assertions
+/// below. Post-W5-28 the excess is read and thrown away, the child runs to
+/// completion, exits 0, and the call succeeds with an empty stdout.
 #[test]
-fn a_child_that_floods_stderr_is_also_killed_promptly_not_at_the_wall_clock_ceiling() {
+fn a_stderr_flood_is_drained_and_discarded_rather_than_failing_the_call() {
     let start = Instant::now();
     let result = run_bounded_subprocess(
         Path::new("sh"),
-        &[OsStr::new("-c"), OsStr::new("yes 1>&2")],
+        &[
+            OsStr::new("-c"),
+            OsStr::new("head -c 1048576 /dev/zero >&2"),
+        ],
         &[],
         Duration::from_secs(5),
         Duration::from_secs(10),
@@ -167,15 +180,54 @@ fn a_child_that_floods_stderr_is_also_killed_promptly_not_at_the_wall_clock_ceil
     let elapsed = start.elapsed();
     assert!(
         elapsed < Duration::from_secs(5),
-        "must be killed promptly once the stderr capture cap is hit, not at the \
-         wall-clock ceiling: took {elapsed:?}"
+        "the child must not block on an undrained stderr pipe until the wall-clock \
+         ceiling: took {elapsed:?}"
+    );
+    assert_eq!(
+        result.expect(
+            "a child that floods a diagnostic stream and exits 0 has done its job — \
+             an internal capture-buffer size must not fail the call (ruling W5-28, item 1)"
+        ),
+        Vec::<u8>::new(),
+        "stdout received no bytes, so it must come back empty"
+    );
+}
+
+/// The other half of ruling W5-28, item 1: dropping the stderr *bound* must
+/// not turn into dropping the stderr *cap*. The buffer is still hard-limited
+/// — bytes past the capture cap are read (so the child never blocks) and
+/// then discarded, never accumulated — so the diagnostic string a caller
+/// gets back stays bounded no matter how much the child wrote.
+///
+/// The child writes 1 MiB of NUL bytes to stderr and then exits 3, which is
+/// the only path that surfaces stderr to the caller at all
+/// (`HelperCrashed`). NUL is single-byte in UTF-8, so `from_utf8_lossy`
+/// preserves the byte count exactly and the length assertion below is a
+/// direct read of how much was retained.
+#[test]
+fn stderr_is_still_truncated_to_the_capture_cap_in_the_crash_message() {
+    let result = run_bounded_subprocess(
+        Path::new("sh"),
+        &[
+            OsStr::new("-c"),
+            OsStr::new("head -c 1048576 /dev/zero >&2; exit 3"),
+        ],
+        &[],
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+        4096,
     );
     match result {
-        Err(BoundedParseError::OutputTooLarge { max_output_bytes }) => {
-            assert_ne!(
-                max_output_bytes, 4096,
-                "the reported cap must be the stderr capture cap, not the unrelated \
-                 stdout cap this call passed in — stdout never received any bytes"
+        Err(BoundedParseError::HelperCrashed { stderr, .. }) => {
+            assert!(
+                !stderr.is_empty(),
+                "the first bytes the child wrote must still be captured for diagnosis"
+            );
+            assert!(
+                stderr.len() <= 64 * 1024,
+                "stderr must be truncated to the capture cap, not buffered in full: \
+                 kept {} of the 1 MiB the child wrote",
+                stderr.len()
             );
         }
         other => panic!("unexpected result: {other:?}"),
