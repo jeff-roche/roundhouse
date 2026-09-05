@@ -25,6 +25,16 @@ use roundhouse_policy::{
 use roundhouse_store::{open, spawn_writer, suspended_tasks};
 use std::path::PathBuf;
 
+/// A maximally permissive workspace boundary ("/") for tests in this file
+/// that exercise something other than Task 24's directory-grant boundary
+/// clamp — passing "/" means `synthesize_grant`'s boundary clamp never
+/// narrows anything (every path `starts_with` "/"), preserving this file's
+/// pre-Task-24 assertions unchanged. `grantscope_directory_boundary.rs`
+/// covers the clamp itself with real, meaningful boundaries.
+fn unbounded_workspace() -> &'static std::path::Path {
+    std::path::Path::new("/")
+}
+
 /// `TaskRunner::bootstrap()` panics on a second call per process (S-LOG-1) —
 /// this file has multiple `#[tokio::test]` functions, so a shared
 /// `once_cell::sync::Lazy` static is required, same pattern as
@@ -202,6 +212,7 @@ fn grant_is_generalised_downward_never_broader_than_the_originating_task() {
             path: PathBuf::from("/workspace"),
         },
         provenance,
+        unbounded_workspace(),
     );
 
     // Directory scope must not broaden to the filesystem root or beyond
@@ -229,7 +240,12 @@ fn shell_grant_generalizes_to_the_matched_argv_never_a_wildcard() {
         task_id: TaskId::new(),
         ts: Timestamp::from_unix_nanos(0),
     };
-    let grant = synthesize_grant(&params, GrantScope::Session, provenance);
+    let grant = synthesize_grant(
+        &params,
+        GrantScope::Session,
+        provenance,
+        unbounded_workspace(),
+    );
     // Task 23 (W4): `Grant.rule` is `pub(crate)` now — inspect the
     // synthesized predicate through `Grant::predicate()` instead of reading
     // `.rule.predicate` directly.
@@ -265,6 +281,7 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         },
         GrantScope::Once,
         provenance(),
+        unbounded_workspace(),
     );
     assert!(matches!(http.predicate(), Predicate::Http { .. }));
 
@@ -276,6 +293,7 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         },
         GrantScope::Once,
         provenance(),
+        unbounded_workspace(),
     );
     assert!(matches!(mcp.predicate(), Predicate::Mcp { .. }));
 
@@ -287,6 +305,7 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         },
         GrantScope::Once,
         provenance(),
+        unbounded_workspace(),
     );
     assert!(matches!(git.predicate(), Predicate::Git { .. }));
 
@@ -298,6 +317,7 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         },
         GrantScope::Once,
         provenance(),
+        unbounded_workspace(),
     );
     assert!(matches!(agent.predicate(), Predicate::Agent { .. }));
 }
@@ -334,7 +354,12 @@ fn http_grant_never_widens_past_the_exact_approved_url() {
     // (the only sanctioned way to obtain an installable `CompiledRule`, now
     // that `Grant.rule` is `pub(crate)`) refuses `Once`/`Session`/`ExactArgv`
     // by design.
-    let grant = synthesize_grant(&params, GrantScope::Always, provenance);
+    let grant = synthesize_grant(
+        &params,
+        GrantScope::Always,
+        provenance,
+        unbounded_workspace(),
+    );
     let engine = PolicyEngine::from_rules(vec![grant
         .into_rule_for_installation()
         .expect("Always scope installs cleanly")]);
@@ -388,7 +413,12 @@ fn git_grant_never_widens_past_the_exact_approved_argv() {
     };
     // Task 23 (W4): `Always`, not `Once` — see the comment on the same
     // substitution in `http_grant_never_widens_past_the_exact_approved_url`.
-    let grant = synthesize_grant(&params, GrantScope::Always, provenance);
+    let grant = synthesize_grant(
+        &params,
+        GrantScope::Always,
+        provenance,
+        unbounded_workspace(),
+    );
     let engine = PolicyEngine::from_rules(vec![grant
         .into_rule_for_installation()
         .expect("Always scope installs cleanly")]);
@@ -437,7 +467,12 @@ fn git_grant_for_bare_subcommand_does_not_degenerate_to_matching_any_argv() {
     };
     // Task 23 (W4): `Always`, not `Once` — see the comment on the same
     // substitution in `http_grant_never_widens_past_the_exact_approved_url`.
-    let grant = synthesize_grant(&params, GrantScope::Always, provenance);
+    let grant = synthesize_grant(
+        &params,
+        GrantScope::Always,
+        provenance,
+        unbounded_workspace(),
+    );
     let engine = PolicyEngine::from_rules(vec![grant
         .into_rule_for_installation()
         .expect("Always scope installs cleanly")]);
@@ -482,6 +517,7 @@ fn directory_grant_with_unrelated_or_root_path_does_not_widen_to_filesystem_wide
             path: PathBuf::from("/"),
         },
         provenance,
+        unbounded_workspace(),
     );
     let engine = PolicyEngine::from_rules(vec![grant
         .into_rule_for_installation()
@@ -540,6 +576,7 @@ fn directory_grant_with_a_real_ancestor_path_still_covers_the_directory() {
             path: PathBuf::from("/workspace"),
         },
         provenance,
+        unbounded_workspace(),
     );
     let engine = PolicyEngine::from_rules(vec![grant
         .into_rule_for_installation()
@@ -580,31 +617,47 @@ fn into_rule_for_installation_refuses_unenforced_scopes_and_allows_standing_ones
     };
 
     assert!(
-        synthesize_grant(&params, GrantScope::Once, provenance())
-            .into_rule_for_installation()
-            .is_err(),
+        synthesize_grant(
+            &params,
+            GrantScope::Once,
+            provenance(),
+            unbounded_workspace()
+        )
+        .into_rule_for_installation()
+        .is_err(),
         "Once has no real lifetime enforcement yet and must refuse installation"
     );
     assert!(
-        synthesize_grant(&params, GrantScope::Session, provenance())
-            .into_rule_for_installation()
-            .is_err(),
+        synthesize_grant(
+            &params,
+            GrantScope::Session,
+            provenance(),
+            unbounded_workspace()
+        )
+        .into_rule_for_installation()
+        .is_err(),
         "Session has no real lifetime enforcement yet and must refuse installation"
     );
     assert!(
         synthesize_grant(
             &params,
             GrantScope::ExactArgv { hash: [0u8; 32] },
-            provenance()
+            provenance(),
+            unbounded_workspace()
         )
         .into_rule_for_installation()
         .is_err(),
         "ExactArgv has no real lifetime enforcement yet and must refuse installation"
     );
     assert!(
-        synthesize_grant(&params, GrantScope::Always, provenance())
-            .into_rule_for_installation()
-            .is_ok(),
+        synthesize_grant(
+            &params,
+            GrantScope::Always,
+            provenance(),
+            unbounded_workspace()
+        )
+        .into_rule_for_installation()
+        .is_ok(),
         "Always is meant to be a standing rule and must be installable"
     );
     assert!(
@@ -613,7 +666,8 @@ fn into_rule_for_installation_refuses_unenforced_scopes_and_allows_standing_ones
             GrantScope::Directory {
                 path: PathBuf::from("/workspace")
             },
-            provenance()
+            provenance(),
+            unbounded_workspace()
         )
         .into_rule_for_installation()
         .is_ok(),

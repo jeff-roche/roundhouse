@@ -208,10 +208,20 @@ impl Grant {
 /// (W4) flipped that field's comparison to a floor rather than a ceiling —
 /// see its doc comment in `engine.rs` — so pinning it here means the grant
 /// never generalizes *below* the isolation actually requested).
+/// Task 24 (W4): `workspace_boundary` is the session's real workspace root,
+/// threaded in by the caller — never derived from `params` (which is
+/// entirely caller/task-supplied and must not be trusted to bound itself).
+/// Only consulted for the `GrantScope::Directory` + `TaskParams::Fs` arm; see
+/// `fs_predicate_for_directory_grant`'s doc comment for what it does with it.
+/// Orchestrator Ruling W4-7: this is a plain parameter, not a `SealedContext`
+/// field — `synthesize_grant` has no callers outside this crate, so the
+/// signature change is free, and `SealedContext` is lane W1's actively-edited
+/// file.
 pub fn synthesize_grant(
     params: &TaskParams,
     scope: GrantScope,
     provenance: GrantProvenance,
+    workspace_boundary: &std::path::Path,
 ) -> Grant {
     let predicate = match (&scope, params) {
         (
@@ -221,7 +231,7 @@ pub fn synthesize_grant(
                 path: task_path,
                 canonical,
             },
-        ) => fs_predicate_for_directory_grant(op, task_path, canonical, path),
+        ) => fs_predicate_for_directory_grant(op, task_path, canonical, path, workspace_boundary),
         (
             _,
             TaskParams::Fs {
@@ -340,25 +350,28 @@ pub fn synthesize_grant(
 /// broader — so this never violates the "never broader" contract even when
 /// it silently narrows a caller's mistaken request.
 ///
-/// **Residual gap, not closed here:** this only rejects the literal
-/// filesystem root and genuinely unrelated (non-ancestor) directories. A
-/// caller could still request a shallow-but-non-root ancestor that is
-/// technically a real ancestor of the task's path yet still far broader than
-/// what a human plausibly meant to approve (e.g. `path: "/home"` for a task
-/// that wrote `/home/alice/project/notes.txt` — a genuine ancestor, not the
-/// filesystem root, but still covers every other user's home directory).
-/// Fully closing that requires threading a workspace/session boundary into
-/// `synthesize_grant` (so directory grants can be bounded to "at or below
-/// the session's workspace root," not just "somewhere above the task's own
-/// path") — no such parameter exists on this function today, and adding one
-/// is a real signature/caller-surface change beyond this fix round's scope.
-/// Flagged here loudly, and in the Task 15 fix-round report, rather than
-/// silently left implicit.
+/// **Task 24 (W4) closed the residual gap this comment used to flag:** the
+/// checks above rejected the literal filesystem root and genuinely unrelated
+/// (non-ancestor) directories, but a caller could still request a
+/// shallow-but-non-root ancestor that is technically a real ancestor of the
+/// task's path yet still far broader than what a human plausibly meant to
+/// approve (e.g. `path: "/home"` for a task that wrote
+/// `/home/alice/project/notes.txt` — a genuine ancestor, not the filesystem
+/// root, but still covers every other user's home directory). Now that
+/// `synthesize_grant` threads `workspace_boundary` through, this function
+/// clamps the effective prefix to whichever of `{dir, workspace_boundary}` is
+/// deeper **by real containment**, not depth arithmetic — a path can be
+/// deeper without being inside another, so this uses `starts_with` in both
+/// directions rather than counting path components. See
+/// [`effective_directory_prefix`] for the three-way case analysis (dir at/
+/// below the boundary; dir a shallower ancestor of the boundary; disjoint
+/// trees, which fail closed).
 fn fs_predicate_for_directory_grant(
     op: &FsOp,
     task_path: &std::path::Path,
     canonical: &Result<PathBuf, PathErr>,
     dir: &std::path::Path,
+    workspace_boundary: &std::path::Path,
 ) -> Predicate {
     // `/`'s parent is `None`; every non-root absolute directory has `Some`
     // parent. This is the targeted check that closes the literal
@@ -366,10 +379,18 @@ fn fs_predicate_for_directory_grant(
     // cannot, since `/` is trivially an ancestor of everything.
     let is_filesystem_root = dir.parent().is_none();
     match canonical {
-        Ok(c) if !is_filesystem_root && c.starts_with(dir) => Predicate::FsPrefix {
-            op: clone_op(op),
-            prefix: dir.to_path_buf(),
-        },
+        Ok(c) if !is_filesystem_root && c.starts_with(dir) => {
+            match effective_directory_prefix(dir, workspace_boundary, c) {
+                Some(prefix) => Predicate::FsPrefix {
+                    op: clone_op(op),
+                    prefix,
+                },
+                None => Predicate::FsExact {
+                    op: clone_op(op),
+                    path: c.clone(),
+                },
+            }
+        }
         Ok(c) => Predicate::FsExact {
             op: clone_op(op),
             path: c.clone(),
@@ -378,6 +399,55 @@ fn fs_predicate_for_directory_grant(
             op: clone_op(op),
             path: task_path.to_path_buf(),
         },
+    }
+}
+
+/// Clamps a requested directory-grant ancestor `dir` to never be shallower
+/// than `workspace_boundary`, using real path containment (`starts_with`) in
+/// both directions rather than component-count depth arithmetic — a path can
+/// have more components without being an ancestor/descendant of another at
+/// all (e.g. `/home/alice/other-project` has as many components as
+/// `/home/alice/project/src` but is not "deeper" in any meaningful sense).
+/// Called only after the caller has already verified `dir` is a genuine
+/// ancestor of the task's own canonical path `canonical_task_path` — this
+/// function only decides how far `dir` may be widened relative to the
+/// workspace boundary, not whether it is valid at all.
+///
+/// Three cases, by real containment:
+/// - `dir` is already at or below `workspace_boundary`
+///   (`dir.starts_with(workspace_boundary)`, which is also true when they're
+///   equal): no widening beyond the workspace is possible through this path
+///   anyway, so `dir` is used as-is — this is the common case for a
+///   legitimately-scoped directory grant.
+/// - `dir` is a shallower ancestor of `workspace_boundary`
+///   (`workspace_boundary.starts_with(dir)`): clamp **up** to
+///   `workspace_boundary` itself, never granting the shallower `dir`.
+///   Additionally verified that `canonical_task_path` is actually inside
+///   `workspace_boundary` — the task's own path should always be inside its
+///   own workspace, but this function never trusts a caller-supplied `dir`
+///   (or a mismatched boundary) to imply that on its own; if it somehow
+///   isn't, this fails closed to `None` rather than granting a boundary the
+///   task itself isn't even under.
+/// - Disjoint trees — neither is an ancestor of the other. `dir` cannot be
+///   trusted at all relative to this workspace: fails closed to `None`
+///   (the caller downgrades to `FsExact` on the task's own canonical path),
+///   the same fail-closed choice `fs_predicate_for_directory_grant` already
+///   makes when `dir` isn't even an ancestor of the task's path.
+fn effective_directory_prefix(
+    dir: &std::path::Path,
+    workspace_boundary: &std::path::Path,
+    canonical_task_path: &std::path::Path,
+) -> Option<PathBuf> {
+    if dir.starts_with(workspace_boundary) {
+        Some(dir.to_path_buf())
+    } else if workspace_boundary.starts_with(dir) {
+        if canonical_task_path.starts_with(workspace_boundary) {
+            Some(workspace_boundary.to_path_buf())
+        } else {
+            None
+        }
+    } else {
+        None
     }
 }
 
@@ -531,5 +601,113 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(arr.into_iter().map(canonicalize_json).collect())
         }
         other => other,
+    }
+}
+
+/// Task 24 (W4) direct-unit tests against the private
+/// `fs_predicate_for_directory_grant`/`effective_directory_prefix` — kept
+/// in-module rather than widening the crate's public surface to reach them
+/// (Ruling W4-4: Task 23 in this same bundle exists to *narrow* this crate's
+/// public surface, so widening it elsewhere here would contradict the
+/// bundle's own point). `grantscope_directory_boundary.rs` covers the same
+/// security property through the public `synthesize_grant` +
+/// `PolicyEngine::decide` path.
+#[cfg(test)]
+mod directory_boundary_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn dir_at_or_below_the_boundary_is_used_as_is() {
+        let dir = Path::new("/workspace/sub");
+        let boundary = Path::new("/workspace");
+        let task_path = Path::new("/workspace/sub/notes.txt");
+        assert_eq!(
+            effective_directory_prefix(dir, boundary, task_path),
+            Some(dir.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn dir_equal_to_the_boundary_is_used_as_is() {
+        let dir = Path::new("/workspace");
+        let boundary = Path::new("/workspace");
+        let task_path = Path::new("/workspace/notes.txt");
+        assert_eq!(
+            effective_directory_prefix(dir, boundary, task_path),
+            Some(dir.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn a_shallower_dir_is_clamped_up_to_the_boundary() {
+        let dir = Path::new("/home");
+        let boundary = Path::new("/home/alice/project");
+        let task_path = Path::new("/home/alice/project/src/main.rs");
+        assert_eq!(
+            effective_directory_prefix(dir, boundary, task_path),
+            Some(boundary.to_path_buf()),
+            "a shallow ancestor must clamp up to the workspace boundary, never grant the shallower dir"
+        );
+    }
+
+    #[test]
+    fn a_shallower_dir_fails_closed_when_the_task_path_is_outside_the_boundary() {
+        // The workspace boundary is deeper than `dir`, but the task's own
+        // canonical path isn't even inside that boundary — never trust `dir`
+        // to imply that on its own.
+        let dir = Path::new("/home");
+        let boundary = Path::new("/home/alice/project");
+        let task_path = Path::new("/home/bob/other.txt");
+        assert_eq!(effective_directory_prefix(dir, boundary, task_path), None);
+    }
+
+    #[test]
+    fn disjoint_trees_fail_closed() {
+        let dir = Path::new("/home/alice/project");
+        let boundary = Path::new("/var/other-workspace");
+        let task_path = Path::new("/home/alice/project/notes.txt");
+        assert_eq!(
+            effective_directory_prefix(dir, boundary, task_path),
+            None,
+            "neither tree is an ancestor of the other — must fail closed, not guess"
+        );
+    }
+
+    #[test]
+    fn filesystem_root_request_still_downgrades_to_fs_exact_regardless_of_boundary() {
+        let canonical: Result<PathBuf, PathErr> = Ok(PathBuf::from("/workspace/notes.txt"));
+        let predicate = fs_predicate_for_directory_grant(
+            &FsOp::Write,
+            Path::new("/workspace/notes.txt"),
+            &canonical,
+            Path::new("/"),
+            Path::new("/workspace"),
+        );
+        match predicate {
+            Predicate::FsExact { path, .. } => {
+                assert_eq!(path, PathBuf::from("/workspace/notes.txt"));
+            }
+            other => panic!("expected FsExact downgrade for the filesystem root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shallow_ancestor_beyond_the_boundary_produces_an_fs_prefix_clamped_to_the_boundary() {
+        let canonical: Result<PathBuf, PathErr> =
+            Ok(PathBuf::from("/home/alice/project/src/main.rs"));
+        let predicate = fs_predicate_for_directory_grant(
+            &FsOp::Write,
+            Path::new("/home/alice/project/src/main.rs"),
+            &canonical,
+            Path::new("/home"),
+            Path::new("/home/alice/project"),
+        );
+        match predicate {
+            Predicate::FsPrefix { prefix, .. } => {
+                assert_eq!(prefix, PathBuf::from("/home/alice/project"));
+            }
+            other => panic!("expected FsPrefix clamped to the boundary, got {other:?}"),
+        }
     }
 }
