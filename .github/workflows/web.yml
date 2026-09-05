@@ -190,11 +190,17 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       # Fix round 1 (M1): scrubbed as defense in depth alongside the source
-      # check above. Even if a `%VITE_...%` placeholder somehow reached
-      # `index.html` undetected, Vite can only substitute a `VITE_`-prefixed
-      # environment variable that is actually set when it builds — this job
-      # never intentionally sets one, but nothing enforced that before now.
-      - name: Build (with any VITE_* environment variable scrubbed first)
+      # check above — NOT the control. Fix round 2 demonstrated the control
+      # this scrub cannot provide on its own: `envPrefix` is configurable
+      # (PoC a), the default `VITE_` prefix's charset doesn't stop a
+      # hyphenated name that `unset` can't remove anyway (PoC b), and some
+      # substitutions (`%BASE_URL%`, PoC c) need no environment variable at
+      # all. The `%…%` check above is what actually closes this; this step
+      # only scrubs the one narrow case (a `VITE_`-prefixed, shell-legal
+      # variable name that happens to be set in this job's own environment)
+      # its regex can express, on the belt-and-suspenders theory that one
+      # fewer live variable is one fewer thing that check has to catch.
+      - name: Build (default-prefix VITE_* env scrubbed — defense in depth only; the %…% check above is the control)
         run: |
           set -euo pipefail
           for var_name in $(env | grep -oE '^VITE_[A-Za-z0-9_]*' || true); do
