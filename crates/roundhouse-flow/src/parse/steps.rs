@@ -689,11 +689,17 @@ struct WorktreeIsolationParams {
 ///   parser. That cannot be closed in a parser, which is the third reason
 ///   the argv requirement below is not optional.
 ///
-/// **The owner of the real guarantee is Task 6** — the `map`-step per-item
-/// worktree fan-out, which is what actually creates a worktree from this
-/// value (Task 5 is the step-graph executor core; fix round 4 named it here
-/// and was wrong). **Pass `base_ref` as one discrete argv element after a
-/// `--` separator, never interpolated into a shell string.**
+/// **The owner of the real guarantee is `crate::worktree::WorktreeProvider`
+/// and `roundhouse_sandbox::worktree`** (Task 34, lane W5, rulings
+/// W5-8/W5-22) — the `map`-step per-item worktree fan-out, which is what
+/// actually creates a worktree from this value. **`base_ref` crosses as one
+/// discrete argv element after a `--` separator, never interpolated into a
+/// shell string** — see `roundhouse_sandbox::worktree::add_worktree`'s own
+/// doc comment for where that promise is discharged, and
+/// `Executor::dispatch_map_step`'s own doc comment ("Task 34") for where
+/// this value is resolved (it may still contain an unevaluated `${{ }}`
+/// placeholder at this point — resolving that happens per item, at
+/// dispatch time, not here).
 fn validate_git_ref(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("must not be empty".to_string());
@@ -818,12 +824,16 @@ fn expression_delimiter_positions(value: &str) -> Vec<bool> {
 /// shell metacharacters, because they're not a git concern, they're a
 /// concern only if something later builds a shell command string out of
 /// this value instead of passing it as a discrete argv element. Added as
-/// defense in depth: this parser doesn't know whether the `map`-step
-/// worktree fan-out (Task 6, the task that actually creates a worktree from
-/// this value) invokes git via argv (safe regardless of these characters) or
-/// via a shell string (unsafe if it does), and none of these characters ever
-/// legitimately appears in a real git ref name, so rejecting them costs
-/// nothing either way.
+/// defense in depth, and — as of Task 34 — belt and suspenders rather than
+/// a hedge against the unknown: `roundhouse_sandbox::worktree::add_worktree`
+/// is now the one place this value ever reaches `git`, and it does so via
+/// argv (`std::process::Command`, one `.arg()` per element, after `--`),
+/// never a shell string — so none of these characters could reach a shell
+/// metacharacter position even if this rule were absent. Kept anyway: none
+/// of these characters ever legitimately appears in a real git ref name, so
+/// rejecting them costs nothing, and a parse-time rejection is a much
+/// clearer failure than relying solely on the runtime argv discipline to
+/// save an already-malformed ref.
 ///
 /// **Fix round 5 adds `#`, deliberately against git.** `git check-ref-format
 /// 'refs/heads/a#b'` *succeeds* — `#` is a legal ref character. It is here

@@ -46,10 +46,18 @@
 //!   inside the run whose completion it is. So the durable transfer is closed
 //!   end to end (`insert_workflow_run` draws, [`run_workflow`] refunds)
 //!   without anything recursing.
-//! - **`map`'s worktree fan-out, process spawn and `max_parallel`.** §5.2 gives
-//!   this crate no git and no `tokio`. Ruling P77 §C calls this a
-//!   frozen-contract escalation rather than a scoping choice, and it is why a
-//!   `gate:` or `call:` nested inside a `map` is refused — see
+//! - **A `map` inner step's real process spawn, and `max_parallel`.** §5.2
+//!   gives this crate no `tokio`, so `tool`/`agent` step bodies still only
+//!   emit a `TaskCreated` and defer the real dispatch, inside a `map` exactly
+//!   as at the top level (see [`Executor::dispatch_step`]'s own doc comment
+//!   on those arms). `max_parallel` is accepted and threaded through unread
+//!   — see [`map_step::run_map`]'s own doc comment. (Task 34 closed the
+//!   *other* half this bullet used to name here: `map`'s worktree fan-out is
+//!   real now, via the `flow -> sandbox` edge §5.2's `roundhouse-flow` row
+//!   gained in Task 14 — see [`map_step::Executor::dispatch_map_step`]'s own
+//!   doc comment, "Task 34".) Ruling P77 §C calls the remaining gap a
+//!   frozen-contract escalation rather than a scoping choice, and it is
+//!   still why a `gate:` or `call:` nested inside a `map` is refused — see
 //!   [`Executor::dispatch_step`]'s own arm for both reasons.
 //! - **The crash half of report mandatoriness.** A killed daemon writes
 //!   nothing, so the report for a run that died mid-step is the **recovery

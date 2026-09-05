@@ -32,29 +32,96 @@
 //!   root) — see `dispatch_map_step`'s own doc comment, "History of this
 //!   mechanism", for why each prior design was replaced, not merely
 //!   restyled.
-//! - **`map.isolation`/`base_ref` (the "worktree fan-out" the plan's own
-//!   title names) is out of scope for this diff, structurally, not by
-//!   omission.** `dispatch_map_step` below never reads `StepBody::Map`'s
-//!   `isolation` field and creates no worktree — `roundhouse-flow` has no
-//!   process-spawning or git dependency at all (see its `Cargo.toml`: core,
-//!   engine, store, serde, serde_json, thiserror, sha2, serde_yaml, uuid),
-//!   so it cannot invoke `git worktree add` regardless of what this task
-//!   does. Every other "real dispatch" arm in `crate::exec` (`Tool`/`Agent`/
-//!   `Emit`/`Report`, see their own doc comments) already defers the actual
-//!   process spawn to Task 8's durability layer for the identical reason;
-//!   worktree creation is the same deferral, one layer further out. What
-//!   this diff *does* keep intact is the guarantee `parse/steps.rs:690-694`
-//!   already names this task as the owner of — `base_ref` must reach `git`
-//!   as one discrete argv element after `--`, never interpolated into a
-//!   shell string — by not touching `base_ref` at all: nothing here builds a
-//!   shell string from it, so the guarantee is neither implemented nor
-//!   broken by this diff. See this task's report for the full reasoning.
+//! - **`map.isolation`/`base_ref` — landed by Task 34 (lane W5, rulings
+//!   W5-8/W5-22), closing Phase 5 ruling P42.** Earlier revisions of this
+//!   file left `StepBody::Map`'s `isolation` field completely unread and
+//!   created no worktree, reasoning that `roundhouse-flow` had "no
+//!   process-spawning or git dependency at all." That premise no longer
+//!   holds: Task 14 (this same lane) added the one new `flow -> sandbox`
+//!   Cargo edge this crate is permitted (§5.2's `roundhouse-flow` row), and
+//!   Task 34 is what actually spends it on `map.isolation`. See
+//!   [`Executor::dispatch_map_step`]'s own doc comment, "Task 34:
+//!   `isolation: worktree` materialization", for the real mechanism —
+//!   `crate::worktree::WorktreeProvider` (defined in `crate::worktree`) and
+//!   its `SandboxWorktreeProvider` adapter over
+//!   `roundhouse_sandbox::worktree`.
 
 use crate::caps::ResourceCaps;
 use crate::exec::{evaluate_when_gate, Executor, GateDecision, StepOutcome, StepStatus};
-use crate::expr::{eval_delimited_expression, TemplateSource};
-use crate::parse::steps::{parse_step, OnItemError, StepBody, StepDef};
+use crate::expr::{eval_delimited_expression, interpolate, TemplateSource};
+use crate::parse::steps::{parse_step, MapIsolationDef, OnItemError, StepBody, StepDef};
+use crate::worktree::{WorktreeProvider, WorktreeProviderError};
 use serde_json::Value;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// The `${{ }}` root name a materialized worktree's path is bound under,
+/// alongside `as_name` — never merged into it. See
+/// [`Executor::dispatch_map_step`]'s own doc comment, "Task 34: `isolation:
+/// worktree` materialization", for the binding/snapshot mechanism and why
+/// it deliberately does not reshape `as_name`'s own binding.
+const WORKTREE_ROOT_NAME: &str = "worktree";
+
+/// The default `base_ref` text used when `map.isolation` is bare `worktree`
+/// (no `base_ref:` key at all — `MapIsolationDef::Worktree { base_ref: None }`).
+/// `HEAD` matches the intuitive "isolate me a copy of whatever is checked
+/// out right now" reading of asking for worktree isolation without naming a
+/// starting point.
+const DEFAULT_WORKTREE_BASE_REF: &str = "HEAD";
+
+/// RAII guard around one materialized worktree (Task 34): guarantees
+/// [`WorktreeProvider::release`] runs even if the item's inner steps panic
+/// or return early, because [`Drop::drop`] runs during unwinding as well as
+/// on an ordinary scope exit — see
+/// [`Executor::dispatch_map_step`]'s own doc comment, "Cleanup on both
+/// paths, panic included", for the full reasoning and why the *explicit*
+/// [`Self::release`] call (not `Drop` alone) is what lets a release failure
+/// actually reach the item's own [`ItemOutcome`] on the ordinary path.
+struct WorktreeGuard {
+    provider: Arc<dyn WorktreeProvider>,
+    /// `None` once released — by [`Self::release`], or by [`Drop::drop`] on
+    /// an unwind/early-return path. `Option` (rather than a plain
+    /// `PathBuf`) is what makes both of those paths safe to call
+    /// unconditionally without a double-release: whichever runs first takes
+    /// the path, and the other sees `None` and does nothing.
+    path: Option<PathBuf>,
+}
+
+impl WorktreeGuard {
+    fn new(provider: Arc<dyn WorktreeProvider>, path: PathBuf) -> Self {
+        Self {
+            provider,
+            path: Some(path),
+        }
+    }
+
+    /// Explicit release, run on the ordinary (non-panicking) path so a
+    /// failure can be folded into the item's own outcome. Consumes `self`
+    /// by value: once this returns, the guard's own `Drop` still runs (it
+    /// is a local going out of scope), but sees `path: None` and is a
+    /// no-op, so this is never a double release.
+    fn release(mut self) -> Result<(), WorktreeProviderError> {
+        let path = self
+            .path
+            .take()
+            .expect("release() is the only consumer of `self` and runs at most once");
+        self.provider.release(&path)
+    }
+}
+
+impl Drop for WorktreeGuard {
+    /// The panic/early-return safety net — see [`Self::release`]'s own doc
+    /// comment for why the *ordinary* path goes through that method
+    /// instead. Best-effort: a release failure reached only through
+    /// unwinding has no [`ItemOutcome`] left to attach itself to (the
+    /// closure that would have returned one is itself unwinding), so it is
+    /// swallowed here rather than panicking-while-panicking.
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = self.provider.release(&path);
+        }
+    }
+}
 
 /// Hard, closed-fail cap on a single `map` step's item count (fix round 1,
 /// item 3). See [`Executor::dispatch_map_step`]'s own doc comment,
@@ -725,6 +792,102 @@ impl<'a> Executor<'a> {
     /// change made unilaterally here. Recorded loudly, at the construction
     /// site below and here, so it is not silently rediscovered once
     /// something finally reads `steps.<map_id>.status` for real.
+    ///
+    /// # Task 34: `isolation: worktree` materialization (Phase 5 ruling P42, lane W5 rulings W5-8/W5-22)
+    ///
+    /// `isolation` is `StepBody::Map`'s own field
+    /// ([`crate::parse::steps::MapIsolationDef`]), `Option<MapIsolationDef>`
+    /// — **optionality here is meaningful and is not the same thing as
+    /// `Defaults.isolation`'s default value.** `Defaults.isolation` defaults
+    /// to `IsolationDef::Worktree` (`crate::parse::types::Defaults`) so that
+    /// *some* isolation tier is always declared for a run, but that default
+    /// must never be read as an implicit demand to materialize anything —
+    /// every existing fixture and test in this crate leaves the map-level
+    /// field unset and would gain an unwanted, and likely failing, git
+    /// dependency if it did. Only `isolation: Some(MapIsolationDef::Worktree { .. })`
+    /// — an author writing `map.isolation: worktree` (or the `{ worktree:
+    /// { base_ref } }` form) on *this specific* `map` step — is treated as
+    /// an explicit demand. `None` here (the field absent, or any other
+    /// tier) does nothing at all: no provider lookup, no worktree, no
+    /// binding into the expression context.
+    ///
+    /// **Fail-closed on a missing provider.** When the map-level field
+    /// explicitly asks for `worktree` isolation and this `Executor`'s own
+    /// `worktree_provider` field (threaded from
+    /// [`crate::exec::RunContext::worktree_provider`]) is `None`, the
+    /// *item* fails with a message naming the missing provider — never a
+    /// silent no-op. This is exactly the defect Phase 5 ruling P42 raised:
+    /// a workflow author who writes `isolation: worktree` and gets no
+    /// isolation and no warning. Per-item, not per-`map`-step: `on_item_error`
+    /// governs whether that failure stops the whole fan-out
+    /// (`fail_fast`) or is recorded per-item (`continue`/`collect`), exactly
+    /// like any other item failure.
+    ///
+    /// **`base_ref` is a workflow-file *template*, resolved per item.**
+    /// `parse/steps.rs`'s own doc comment on `validate_git_ref` already
+    /// documents §8.9's fixture using `${{ pr.number }}` inside `base_ref`
+    /// — so the stored string is not necessarily the literal ref text, and
+    /// resolving it happens here, per item, **after** `as_name` is bound
+    /// for that item (below), via [`interpolate`] — the same
+    /// `TemplateSource`/mixed-literal-and-`${{ }}` mechanism
+    /// `StepBody::Agent`'s `prompt` field uses
+    /// (`crate::exec::Executor::dispatch_step`), not
+    /// [`eval_delimited_expression`] (`over`'s mechanism), because
+    /// `base_ref` is ordinary literal text with an *optional* embedded
+    /// expression, not a field required to be wholly one `${{ … }}` block.
+    /// The **unredacted** rendering crosses to
+    /// [`crate::worktree::WorktreeProvider::materialize`] (and from there,
+    /// to `git`, as one discrete argv element after `--` — see that
+    /// method's own doc comment); nothing here ever builds a shell string
+    /// from it. A `base_ref` of `None` (bare `worktree`, no `base_ref:` key)
+    /// resolves to the literal text `"HEAD"` rather than invoking
+    /// `interpolate` at all.
+    ///
+    /// **The materialized path is bound into the expression context,
+    /// alongside `as_name`, not folded into it.** A downstream step inside
+    /// the map body reads it as `${{ worktree.path }}` — a second root,
+    /// [`WORKTREE_ROOT_NAME`], bound and reverted with exactly the same
+    /// [`crate::expr::ExprContext::snapshot_root`]/
+    /// [`crate::expr::ExprContext::restore_root`]/
+    /// [`crate::expr::ExprContext::set_from`] mechanism `as_name` itself
+    /// uses above, for the identical reason (nested-`map` reuse of the same
+    /// root name must revert cleanly — see this function's own "Why binding
+    /// onto the shared context and reverting by name is correct" section).
+    /// Bound via [`crate::expr::Evaluated::derive`] off `item_evaluated` —
+    /// **not** [`crate::expr::ExprContext::set_public`]/`set_secret` called
+    /// directly — for the same reason `as_name`'s own binding is: this
+    /// function's own doc comment above names hand-building an `Evaluated`
+    /// or asserting per-item taint directly as "the re-assertion-by-the-
+    /// back-door defect ruling P37 exists to remove," and that reasoning
+    /// applies here verbatim even though the worktree path's own content
+    /// never contains secret material — deriving from `item_evaluated`
+    /// costs nothing and keeps this call site free of a second taint
+    /// judgment call to get wrong.
+    ///
+    /// **Cleanup on both paths, panic included.** [`WorktreeGuard`] is an
+    /// RAII guard: it is constructed immediately after a successful
+    /// `materialize`, and its `Drop` impl calls
+    /// [`crate::worktree::WorktreeProvider::release`] on exactly the path
+    /// `materialize` returned. Because it is a local inside the per-item
+    /// closure below, Rust drops it at the end of that closure's scope —
+    /// on the item's ordinary `Completed`/`Failed`/`Skipped` return *and*
+    /// during unwinding if anything in the item's inner-step dispatch
+    /// panics — with no explicit cleanup call needed on any of those paths.
+    /// A release failure is folded into that item's `Failed` outcome; it is
+    /// never silently swallowed, and never panics-during-panic (no
+    /// double-drop hazard: [`WorktreeGuard::drop`] extracts the path with
+    /// [`Option::take`], so a second drop — there isn't one here, but the
+    /// guard is written to be safe if a future refactor introduced one — is
+    /// a no-op rather than a double release).
+    ///
+    /// **The path materialized and the path released are always the same
+    /// value** — [`WorktreeGuard`] stores exactly what
+    /// [`crate::worktree::WorktreeProvider::materialize`] returned and
+    /// never accepts one from anywhere else; nothing derived from
+    /// `over`/the item's own value/the workflow document can steer which
+    /// path is released, which is the same guarantee
+    /// `roundhouse_sandbox::worktree`'s own module doc comment states as an
+    /// obligation of its callers.
     pub(crate) fn dispatch_map_step(
         &mut self,
         step_id: &str,
@@ -732,6 +895,7 @@ impl<'a> Executor<'a> {
         as_name: &str,
         max_parallel: u32,
         on_item_error: OnItemError,
+        isolation: Option<&MapIsolationDef>,
         inner_step_yaml: &[serde_yaml::Value],
     ) -> StepOutcome {
         let over_evaluated =
@@ -793,6 +957,15 @@ impl<'a> Executor<'a> {
         // atomicity argument this depends on and the measured cost this
         // replaces under nesting.
         let outer_snapshot = self.ctx.snapshot_root(as_name);
+        // Task 34: only an *explicit* `isolation: worktree` on this map
+        // step snapshots `WORKTREE_ROOT_NAME` at all — see
+        // `Executor::dispatch_map_step`'s own doc comment, "Task 34:
+        // `isolation: worktree` materialization", for why `None` here (the
+        // common case — the field absent, inheriting `Defaults.isolation`)
+        // must leave any outer binding of this name completely undisturbed.
+        let materializes_worktree = matches!(isolation, Some(MapIsolationDef::Worktree { .. }));
+        let outer_worktree_snapshot =
+            materializes_worktree.then(|| self.ctx.snapshot_root(WORKTREE_ROOT_NAME));
         // Fix-round-3-style step-boundary taint: if any item's own inner
         // steps produced secret-derived output, or the collection itself was
         // secret-derived, the map step's *own* aggregate output
@@ -831,6 +1004,62 @@ impl<'a> Executor<'a> {
             |item, _item_caps| {
                 let item_evaluated = over_evaluated.derive(item.clone());
                 self.ctx.set_from(as_name, &item_evaluated);
+
+                // Task 34: materialize this item's worktree, if this map
+                // step explicitly demanded one — see
+                // `Executor::dispatch_map_step`'s own doc comment, "Task
+                // 34: `isolation: worktree` materialization", for the full
+                // reasoning (fail-closed on a missing provider, per-item
+                // `base_ref` interpolation, the binding mechanism, and the
+                // cleanup guarantee `worktree_guard` below provides).
+                let mut worktree_guard: Option<WorktreeGuard> = None;
+                if let Some(MapIsolationDef::Worktree { base_ref }) = isolation {
+                    let provider = match &self.worktree_provider {
+                        Some(provider) => Arc::clone(provider),
+                        None => {
+                            return ItemOutcome::Failed(format!(
+                                "map step `{step_id}` declares `isolation: worktree`, but no \
+                                 WorktreeProvider is configured for this run \
+                                 (RunContext::worktree_provider is None) — refusing to run this \
+                                 item without the isolation it explicitly asked for, rather than \
+                                 silently running it unisolated"
+                            ));
+                        }
+                    };
+                    let resolved_base_ref = match base_ref {
+                        Some(text) => {
+                            match interpolate(TemplateSource::from_workflow_file(text), &self.ctx) {
+                                Ok(interpolated) => interpolated.into_unredacted_for_dispatch(),
+                                Err(e) => {
+                                    return ItemOutcome::Failed(format!(
+                                        "map step `{step_id}`: resolving \
+                                         `isolation.worktree.base_ref`: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                        None => DEFAULT_WORKTREE_BASE_REF.to_string(),
+                    };
+                    match provider.materialize(&resolved_base_ref) {
+                        Ok(path) => {
+                            // Derived from `item_evaluated`, not asserted
+                            // fresh via `set_public`/`set_secret` — see this
+                            // function's own doc comment for why, even
+                            // though the path's own content is never secret
+                            // material.
+                            let workspace_evaluated = item_evaluated
+                                .derive(serde_json::json!({ "path": path.display().to_string() }));
+                            self.ctx.set_from(WORKTREE_ROOT_NAME, &workspace_evaluated);
+                            worktree_guard = Some(WorktreeGuard::new(provider, path));
+                        }
+                        Err(e) => {
+                            return ItemOutcome::Failed(format!(
+                                "map step `{step_id}`: materializing a worktree for base_ref \
+                                 {resolved_base_ref:?}: {e}"
+                            ));
+                        }
+                    }
+                }
 
                 let mut last = ItemOutcome::Completed(Value::Null);
                 for inner in &inner_steps {
@@ -922,11 +1151,38 @@ impl<'a> Executor<'a> {
                         }
                     }
                 }
+
+                // Task 34: release on **every** path out of this item —
+                // the inner loop above may have `break`d on a failure,
+                // fallen through after every inner step ran, or (via
+                // `report:`'s refusal above) never entered the loop body at
+                // all; all three reach here. A release failure only
+                // overwrites `last` when the item would otherwise have
+                // reported success/skip — an item that already failed for
+                // its own reason keeps that reason, which is more
+                // actionable than a release failure piggy-backing on it.
+                // See `WorktreeGuard::release`'s own doc comment for why
+                // this explicit call, not `Drop` alone, is what lets a
+                // release failure reach `last` at all on this (the
+                // non-panicking) path.
+                if let Some(guard) = worktree_guard.take() {
+                    if let Err(e) = guard.release() {
+                        if !matches!(last, ItemOutcome::Failed(_)) {
+                            last = ItemOutcome::Failed(format!(
+                                "map step `{step_id}`: releasing the item's worktree: {e}"
+                            ));
+                        }
+                    }
+                }
+
                 last
             },
         );
 
         self.ctx.restore_root(as_name, outer_snapshot);
+        if let Some(snapshot) = outer_worktree_snapshot {
+            self.ctx.restore_root(WORKTREE_ROOT_NAME, snapshot);
+        }
 
         StepOutcome {
             step_id: step_id.to_string(),

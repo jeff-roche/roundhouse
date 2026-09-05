@@ -237,6 +237,7 @@ fn ctx(run_id: RunId) -> RunContext {
         run_id,
         previous_report: None,
         env_allowlist: EnvAllowlist::deny_all(),
+        worktree_provider: None,
     }
 }
 

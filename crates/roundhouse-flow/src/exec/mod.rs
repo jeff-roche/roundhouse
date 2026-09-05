@@ -276,11 +276,13 @@ use crate::expr::{
 use crate::parse::steps::{parse_step, topological_order, StepBody, StepDef};
 use crate::parse::{ParseError, WorkflowDef};
 use crate::report::Report;
+use crate::worktree::WorktreeProvider;
 use roundhouse_core::{EventPayload, Origin, TaskId, TaskInput, TaskKind, TaskOutput, Usage};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 /// Stands in for `roundhouse-engine`'s real task admission so this crate
 /// stays testable without linking the full engine (this task's Interfaces).
@@ -365,6 +367,30 @@ pub struct RunContext {
     /// denies every name — the correct, fail-closed direction for this
     /// field to default to while that caller-side work is outstanding.
     pub env_allowlist: EnvAllowlist,
+    /// Task 34 (lane W5, rulings W5-8/W5-22 — Phase 5 ruling P42): the
+    /// backend an explicit `map.isolation: worktree` materializes a real
+    /// git worktree through. `None` is the correct default for every
+    /// caller that has no repository to root one in — `Executor::new`
+    /// itself, and every construction site in this crate's own tests — and
+    /// **is not treated as "isolation disabled"**: an author who explicitly
+    /// wrote `map.isolation: worktree` with `None` here gets a hard,
+    /// named-provider-missing error for that item, never a silent no-op
+    /// (see [`map_step::Executor::dispatch_map_step`]'s own doc comment).
+    /// `map.isolation` left unset (inheriting `Defaults.isolation`, which
+    /// defaults to `Worktree`) never reads this field at all — see the same
+    /// doc comment for why that distinction is load-bearing.
+    ///
+    /// `Arc`, not `Box`: `RunContext` is `#[derive(Clone)]`, and
+    /// `Arc<dyn WorktreeProvider>` is `Clone` regardless of whether the
+    /// concrete provider type is, which a boxed trait object is not,
+    /// without adding a second, cloning-specific trait this crate has no
+    /// other use for.
+    ///
+    /// **Lane boundary (Task 34's brief):** this crate only ever *takes*
+    /// this value, exactly like [`Self::env_allowlist`] above — populating
+    /// it with a real `repo_root` from daemon config or session state is
+    /// `roundhouse-daemon`'s job (lane W1's crate), not this one's.
+    pub worktree_provider: Option<Arc<dyn WorktreeProvider>>,
 }
 
 impl fmt::Debug for RunContext {
@@ -400,6 +426,14 @@ impl fmt::Debug for RunContext {
             // `EnvAllowlist` holds only variable *names*, never values —
             // safe to print in full, unlike `secrets` above.
             .field("env_allowlist", &self.env_allowlist)
+            // Presence only, matching `previous_report_present` above — a
+            // provider is a trait object, not printable, and its presence
+            // is the only fact about it a caller's `dbg!`/`tracing::debug!`
+            // could possibly want.
+            .field(
+                "worktree_provider_present",
+                &self.worktree_provider.is_some(),
+            )
             .finish()
     }
 }
@@ -660,6 +694,11 @@ pub struct Executor<'a> {
     /// Where an authored `report:` step's redacted, validated document goes
     /// — see [`ReportEmission`].
     report_emission: ReportEmission,
+    /// Task 34: threaded straight through from [`RunContext::worktree_provider`]
+    /// — see that field's own doc comment. Read only by
+    /// [`map_step::Executor::dispatch_map_step`], on an explicit
+    /// `map.isolation: worktree`.
+    worktree_provider: Option<Arc<dyn WorktreeProvider>>,
 }
 
 /// Whether an authored `report:` step emits its `TaskKind::Report` task at
@@ -760,6 +799,7 @@ impl<'a> Executor<'a> {
             redaction_needles,
             map_budget: None,
             report_emission: ReportEmission::Immediate,
+            worktree_provider: run_ctx.worktree_provider,
         })
     }
 
@@ -1171,12 +1211,15 @@ impl<'a> Executor<'a> {
             // `as:` item variable per item, and recursively runs the inner
             // steps via this same `dispatch_step`. See
             // `map_step::Executor::dispatch_map_step`'s own doc comment for
-            // the full provenance/budget reasoning.
+            // the full provenance/budget reasoning, including Task 34's
+            // addition: an explicit `isolation: worktree` materializes a
+            // real git worktree per item.
             //
             // (`dispatch_step` matches on `&step.body`, so match ergonomics
             // already bind `over`/`r#as`/`max_parallel`/`on_item_error`/
-            // `steps` as references here — `&String`/`u32`/`OnItemError`/
-            // `&Vec<serde_yaml::Value>` — which coerce to `&str`/
+            // `isolation`/`steps` as references here — `&String`/`u32`/
+            // `OnItemError`/`&Option<MapIsolationDef>`/`&Vec<serde_yaml::Value>`
+            // — which coerce to `&str`/`Option<&MapIsolationDef>`/
             // `&[serde_yaml::Value]` at the call site below with no further
             // `&` needed; `max_parallel`/`on_item_error` are `Copy`.)
             StepBody::Map {
@@ -1184,9 +1227,17 @@ impl<'a> Executor<'a> {
                 r#as,
                 max_parallel,
                 on_item_error,
+                isolation,
                 steps,
-                ..
-            } => self.dispatch_map_step(&step.id, over, r#as, *max_parallel, *on_item_error, steps),
+            } => self.dispatch_map_step(
+                &step.id,
+                over,
+                r#as,
+                *max_parallel,
+                *on_item_error,
+                isolation.as_ref(),
+                steps,
+            ),
             // **`gate:` and `call:` are handled by [`run_loop`], not here**
             // (B12c). Both need a `workflow_run` row and a `&mut Connection`
             // — a park is a durable state transition plus a checkpoint, and a
@@ -1208,9 +1259,13 @@ impl<'a> Executor<'a> {
             //    refused for a structural reason, not an omission: a park is a
             //    transition of *the run*, and one run cannot be parked
             //    per-item; a nested `call:` needs the per-item budget pool
-            //    whose ceilings ruling P77 §C defers along with `map`'s
-            //    worktree fan-out. Both belong with whoever gives `map` real
-            //    fan-out.
+            //    whose ceilings ruling P77 §C defers. (Task 34 closed the
+            //    *other* thing this bullet used to lump in here — `map`'s
+            //    worktree fan-out is no longer deferred; see
+            //    `map_step::Executor::dispatch_map_step`'s own doc comment,
+            //    "Task 34".) The per-item budget pool and the nested
+            //    `gate:`/`call:` refusal both still belong with whoever gives
+            //    `map` real fan-out.
             //
             // Fix round 1, item 8: the message used to be
             // `format!("step kind {other:?} handled by a later task")` — a

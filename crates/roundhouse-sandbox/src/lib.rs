@@ -26,6 +26,13 @@
 //! out of process rather than trust an in-process byte cap against a
 //! quadratic-cost parser. This crate takes no dependency on `roundhouse-flow`
 //! or anything YAML-shaped in return — see that module's doc comment.
+//!
+//! Task 34 (lane W5, rulings W5-8/W5-22) added [`worktree`], a third kind
+//! of confinement in the same spirit: a generic, synchronous
+//! `git worktree add`/`remove` primitive, consumed by `roundhouse-flow`'s
+//! `map.isolation: worktree` to give a workflow's per-item fan-out real
+//! filesystem isolation. Like [`bounded_parse`], this module knows nothing
+//! about workflows or `map` steps — see its own module doc comment.
 
 // NOTE: unsafe_code is `deny`, not `forbid`, at the crate level — see
 // Cargo.toml. The only module permitted to use it is `probe` (Phase 2:
@@ -41,6 +48,7 @@ pub mod isolate;
 mod isolate_trait;
 pub mod probe; // the only module permitted unsafe_code — see probe.rs's module-level allow
 mod types;
+pub mod worktree;
 
 pub use isolate_trait::Isolate;
 pub use roundhouse_core::Tier;

@@ -29,15 +29,20 @@
 //! are the ones that actually pin the fixed behavior, because only they
 //! exercise the real caller.
 //!
-//! # `isolation: worktree` in these YAML fixtures is not exercised (fix round 1, "also record")
+//! # `isolation: worktree` in these YAML fixtures is not exercised here (fix round 1, "also record"; updated for Task 34)
 //!
 //! Every workflow YAML below declares `defaults: { isolation: worktree }`
-//! because `parse_workflow` requires *some* isolation default — it is not a
-//! claim that worktree isolation is created or checked anywhere in this
-//! test file. `map_step.rs`'s own module doc comment already states this
-//! plainly (`map.isolation`/`base_ref` are out of scope for this crate); this
-//! note exists so a green run of this file is never mistaken for evidence
-//! that isolation is exercised.
+//! because `parse_workflow` requires *some* isolation default — none of
+//! these fixtures set an explicit **map-level** `isolation:` field, so none
+//! of them materializes a worktree: `Defaults.isolation` is never read as
+//! an implicit demand for one (see
+//! `crate::exec::map_step::Executor::dispatch_map_step`'s own doc comment,
+//! "Task 34"). Worktree materialization itself — real `git worktree add`/
+//! `remove`, the fail-closed missing-provider path, the
+//! `${{ worktree.path }}` binding, and cleanup on both the success and
+//! failure paths — is exercised in `tests/map_step_worktree.rs`, not here.
+//! This note exists so a green run of *this* file is never mistaken for
+//! evidence that isolation materialization is exercised by it.
 
 use roundhouse_core::TaskKind;
 use roundhouse_flow::caps::ResourceCaps;
@@ -96,6 +101,7 @@ fn run_ctx(inputs: serde_json::Value) -> RunContext {
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
         env_allowlist: EnvAllowlist::deny_all(),
+        worktree_provider: None,
     }
 }
 
@@ -109,6 +115,7 @@ fn secret_run_ctx(inputs: serde_json::Value, key: &str, value: &str) -> RunConte
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
         env_allowlist: EnvAllowlist::deny_all(),
+        worktree_provider: None,
     }
 }
 

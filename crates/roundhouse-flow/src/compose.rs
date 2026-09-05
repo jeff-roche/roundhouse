@@ -13,9 +13,12 @@
 //! standing for the call — is **B12c**'s, and landed as
 //! [`crate::exec::run_loop`]'s `call:` arm. It is not
 //! [`crate::exec::Executor::dispatch_step`]'s `StepBody::Call` arm, which
-//! stays a refusal: that function holds no `Connection`, and a `call:` reached
-//! from inside a `map` is refused for the same reason `map`'s worktree fan-out
-//! is deferred.
+//! stays a refusal: that function holds no `Connection`, and a `call:`
+//! reached from inside a `map` is refused because a `call:` needs the
+//! per-item budget pool ruling P77 §C still defers (`map`'s *worktree*
+//! fan-out is a separate, since-Task-34 concern — see
+//! [`crate::exec::map_step::Executor::dispatch_map_step`]'s own doc
+//! comment, "Task 34" — and is not why `call:` is refused here).
 //!
 //! **B12b closed the sourcing half.** [`crate::ledger::admit_call_from_run`]
 //! reads the parent run's `session_depth` (migration 0008) and calls both
@@ -79,11 +82,16 @@
 //!
 //! So [`WorkflowToolRegistration`] is a **parallel shape, not a registration**.
 //! It is constructed by no caller, handed to no registry, and reaches no
-//! model. This is the same structural deferral
-//! [`crate::exec::map_step`] records for `map.isolation`/worktree fan-out —
-//! the capability is absent from the crate's dependency row, not omitted by
-//! choice — but stating it is the point: the plan presented this type as the
-//! deliverable without saying it connects to nothing.
+//! model. This used to be described here as "the same structural deferral
+//! `map.isolation`/worktree fan-out records" — that comparison no longer
+//! holds: Task 34 (lane W5) closed the worktree half via the `flow ->
+//! sandbox` edge Task 14 added to §5.2's `roundhouse-flow` row (see
+//! [`crate::exec::map_step::Executor::dispatch_map_step`]'s own doc
+//! comment, "Task 34"), while `ToolDef` stays unreachable regardless of
+//! that edge — `roundhouse-sandbox` has no idea what a `ToolDef` is either.
+//! Stating the *current* gap is still the point: the plan presented this
+//! type as the deliverable without saying it connects to nothing, and it
+//! still connects to nothing.
 //!
 //! **Owner of the bridge:** whichever crate can name both types. That is
 //! `roundhouse-engine` (which depends on `roundhouse-provider`) or

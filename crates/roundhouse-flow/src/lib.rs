@@ -23,6 +23,7 @@ pub mod parse;
 pub mod report;
 pub mod retry;
 pub mod runs;
+pub mod worktree;
 
 pub fn placeholder_step_kind() -> roundhouse_core::TaskKind {
     roundhouse_core::TaskKind::Flow

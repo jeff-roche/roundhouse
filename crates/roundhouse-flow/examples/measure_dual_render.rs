@@ -105,6 +105,7 @@ fn run_once(yaml: &str) -> (Duration, usize, usize) {
         run_id: RunId::new(),
         previous_report: None,
         env_allowlist: EnvAllowlist::deny_all(),
+        worktree_provider: None,
     };
     let start = Instant::now();
     let mut exec = Executor::new(&def, &mut sink, run_ctx).expect("secrets clear the length floor");

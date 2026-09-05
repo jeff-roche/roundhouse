@@ -43,6 +43,7 @@ fn run_ctx(inputs: serde_json::Value) -> RunContext {
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
         env_allowlist: EnvAllowlist::deny_all(),
+        worktree_provider: None,
     }
 }
 
@@ -558,6 +559,7 @@ steps:
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
         env_allowlist: EnvAllowlist::deny_all(),
+        worktree_provider: None,
     };
     let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     let outcomes = exec.run_to_completion().unwrap();
@@ -598,6 +600,7 @@ fn secret_run_ctx(inputs: serde_json::Value, key: &str, value: &str) -> RunConte
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
         env_allowlist: EnvAllowlist::deny_all(),
+        worktree_provider: None,
     }
 }
 
@@ -856,6 +859,7 @@ fn run_id_bound_into_the_expression_context_is_the_one_from_run_context() {
         run_id,
         previous_report: None,
         env_allowlist: EnvAllowlist::deny_all(),
+        worktree_provider: None,
     };
     let yaml = r#"
 name: run-id-check
@@ -1213,6 +1217,7 @@ fn probe_emit(field: &str, secrets: &[(&str, &str)]) -> (serde_json::Value, serd
         // unset resolves to a clean `Null`", not "denied", which is a
         // different `ExprError` this helper is not testing.
         env_allowlist: EnvAllowlist::from_names(["ROUNDHOUSE_FLOW_DEFINITELY_UNSET_VARIABLE_XYZ"]),
+        worktree_provider: None,
     };
     let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     let outcomes = exec.run_to_completion().unwrap();
@@ -1921,6 +1926,7 @@ steps:
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
         env_allowlist: EnvAllowlist::from_names(["ROUNDHOUSE_EXEC_TEST_ENV_ALLOWED"]),
+        worktree_provider: None,
     };
     let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     let outcomes = exec.run_to_completion().unwrap();
@@ -2053,6 +2059,7 @@ steps:
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
         env_allowlist: EnvAllowlist::deny_all(),
+        worktree_provider: None,
     };
     let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     exec.run_to_completion().unwrap();
@@ -2103,6 +2110,7 @@ steps:
         run_id: roundhouse_flow::exec::RunId::new(),
         previous_report: None,
         env_allowlist: EnvAllowlist::deny_all(),
+        worktree_provider: None,
     };
     let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
     exec.run_to_completion().unwrap();
