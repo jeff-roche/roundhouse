@@ -38,7 +38,15 @@
 //! directory to the materialized path, no enforcer confines any process to
 //! it, and every worktree it creates shares one `.git/config` and one
 //! `hooksPath` with the repository it came from — a worktree is a separate
-//! *directory*, not a separate *repository* or a security boundary. Like
+//! *directory*, not a separate *repository* or a security boundary.
+//! **Fix round 2 confirmed this the hard way:** [`worktree`]'s own `-c`
+//! overrides mitigate the `hooksPath`/`fsmonitor` routes through that
+//! shared config but do not, and cannot, close it as a class — a
+//! repo-tracked `.gitattributes` plus one config write to
+//! `filter.<name>.smudge` still reaches code execution through it, which is
+//! exactly what "not a security boundary" means here, not a residual bug in
+//! the mitigation. See [`worktree`]'s own module doc comment, "Config and
+//! hooks", for the mechanism. Like
 //! [`bounded_parse`], this module knows nothing about workflows or `map`
 //! steps — see its own module doc comment, and see
 //! `roundhouse_flow::exec::map_step::Executor::dispatch_map_step`'s doc

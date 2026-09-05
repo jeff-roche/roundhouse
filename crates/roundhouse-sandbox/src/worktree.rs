@@ -78,41 +78,72 @@
 //! **This says nothing about what `git` reads and executes on its own,
 //! regardless of environment — see "Config and hooks" below, which fix
 //! round 1 added after an earlier version of this paragraph conflated the
-//! two.**
+//! two, and which fix round 2 corrected again after fix round 1's own
+//! "Fix:" heading overclaimed what it actually closed.**
 //!
-//! # Config and hooks: `-c` overrides, not environment, close this (Task 34 fix round 1, item 2)
+//! # Config and hooks: a partial mitigation, not a fix (Task 34 fix rounds 1 and 2)
 //!
-//! A git worktree shares one `.git/config` and one `hooksPath` with the
-//! repository it was created from — worktrees are not independent
-//! repositories. `git worktree add`/`remove` genuinely **run** repo-local
-//! hooks (`post-checkout` on `add`, for one) as the invoking user, with
-//! whatever `PATH` the process has, **regardless of `env_clear()`** — that
-//! bounds what `git` inherits from *this process's environment*, not what
-//! `git` reads from the repository's own on-disk config, which is a
-//! different trust boundary entirely. Reproduced directly against this git
-//! binary: a repo-local `core.hooksPath` pointing at a script touches a
-//! marker file on a plain `env -i PATH="$PATH" git worktree add --detach
-//! -- <path> <ref>`, with no environment variable involved at all.
+//! A git worktree shares one `.git/config`, one `hooksPath`, and the
+//! repository's own tracked `.gitattributes` with the repository it was
+//! created from — worktrees are not independent repositories, and **this
+//! module does not make them one.** This section used to be titled "`-c`
+//! overrides ... close this" and said so under a "Fix:" heading; fix round
+//! 2 corrected that after the security lens reproduced a second route past
+//! it. **Read this alongside this crate's own top-level module doc
+//! comment, which is the accurate framing: a git worktree is a separate
+//! directory, not a security boundary. This section is the specific,
+//! mechanical detail behind that same claim, not a competing one.**
+//!
+//! `git worktree add`/`remove` genuinely **run** repo-local hooks
+//! (`post-checkout` on `add`, for one) as the invoking user, with whatever
+//! `PATH` the process has, **regardless of `env_clear()`** — that bounds
+//! what `git` inherits from *this process's environment*, not what `git`
+//! reads from the repository's own on-disk config, which is a different
+//! trust boundary entirely. Reproduced directly against this git binary: a
+//! repo-local `core.hooksPath` pointing at a script touches a marker file
+//! on a plain `env -i PATH="$PATH" git worktree add --detach -- <path>
+//! <ref>`, with no environment variable involved at all.
 //!
 //! The security consequence is a real, chained one, not merely a stray
 //! hook firing: because a worktree's `.git` is a write-through pointer back
 //! at the *shared* config, anything with a shell inside one worktree (an
-//! `agent`/`tool: shell` inner step, say) can run
-//! `git config --local core.hooksPath /somewhere/attacker-controlled` and
-//! have it apply to **every subsequent `git worktree add`/`remove` call
-//! against that same `repo_root`** — including this module's own calls for
-//! the *next* fan-out item. That is a cross-item escape from the boundary
-//! this feature exists to provide, reaching arbitrary code execution as
-//! whatever user runs the daemon.
+//! `agent`/`tool: shell` inner step, say) can write to that shared config
+//! and have it apply to **every subsequent `git worktree add`/`remove`
+//! call against that same `repo_root`** — including this module's own
+//! calls for the *next* fan-out item. That is a cross-item escape from the
+//! boundary a reader might otherwise assume this feature provides.
 //!
-//! **Fix: three `-c` overrides on every invocation, applied to that one
-//! invocation only — never written to the repository's own config file:**
-//! `-c core.hooksPath=/dev/null` (the direct fix — no hook path resolves to
+//! **Partial mitigation, four `-c` overrides on every invocation, applied
+//! to that one invocation only — never written to the repository's own
+//! config file:** `-c core.hooksPath=/dev/null` (no hook path resolves to
 //! anything runnable), `-c core.fsmonitor=false` (`core.fsmonitor` can also
-//! name an arbitrary executable git runs), and `-c protocol.allow=never`
-//! (defense in depth against any implicit network operation this or a
-//! future call shape might trigger). None of the three change
-//! `add`/`remove`'s own observable behavior — verified directly.
+//! name an arbitrary executable git runs), `-c core.attributesFile=/dev/null`
+//! (closes the variant where the attacker relies on a *global* attributes
+//! file rather than one committed in the tree — reproduced separately),
+//! and `-c protocol.allow=never` (defense in depth against any implicit
+//! network operation this or a future call shape might trigger). None of
+//! the four change `add`/`remove`'s own observable behavior — verified
+//! directly.
+//!
+//! **What remains open, named rather than left for a reader to
+//! rediscover: `filter.<name>.smudge` (and, by the same mechanism,
+//! `filter.<name>.clean`).** A repository with a tracked `.gitattributes`
+//! declaring `* filter=lfs` — ubiquitous in real-world repositories using
+//! Git LFS — plus one attacker write of
+//! `git config --local filter.lfs.smudge /tmp/evil.sh` to the shared
+//! config causes the **next** `add_worktree` call, with this module's full
+//! current argv, to execute `/tmp/evil.sh` during the checkout `worktree
+//! add` performs by design. Reproduced directly. There is no `filter.*`
+//! wildcard `-c` override, and `-c core.attributesFile=/dev/null` does
+//! **not** close this variant (also verified) — it only blocks a
+//! filter declared through a *global* attributes file, not one committed
+//! in the repository's own tracked tree, which is the realistic case. The
+//! root cause — the shared, write-through `.git/config` a worktree cannot
+//! be given its own copy of — is not something any `-c` flag on this
+//! module's own invocations can close; closing it for real needs a
+//! mechanism this module does not have (a per-worktree config, or refusing
+//! to run inner steps with a shell inside a materialized worktree at all).
+//! Recorded here as a known, open route, not chased further this round.
 //!
 //! # What this does not attempt
 //!
@@ -254,14 +285,18 @@ pub fn add_worktree(
     run_git(
         repo_root,
         &[
-            // Fix round 1, item 2: three discrete `-c` overrides, applied
-            // to *this* invocation only (never written to the repo's own
+            // Fix rounds 1 and 2: four discrete `-c` overrides, applied to
+            // *this* invocation only (never written to the repo's own
             // config) — see the module doc comment's "Config and hooks"
-            // section for why these are required, not merely defensive.
+            // section for what these do and do not close (a partial
+            // mitigation, not a fix — `filter.<name>.smudge` is a known,
+            // still-open route through the same shared config).
             OsStr::new("-c"),
             OsStr::new("core.hooksPath=/dev/null"),
             OsStr::new("-c"),
             OsStr::new("core.fsmonitor=false"),
+            OsStr::new("-c"),
+            OsStr::new("core.attributesFile=/dev/null"),
             OsStr::new("-c"),
             OsStr::new("protocol.allow=never"),
             OsStr::new("worktree"),
@@ -295,6 +330,8 @@ pub fn remove_worktree(repo_root: &Path, worktree_path: &Path) -> Result<(), Wor
             OsStr::new("core.hooksPath=/dev/null"),
             OsStr::new("-c"),
             OsStr::new("core.fsmonitor=false"),
+            OsStr::new("-c"),
+            OsStr::new("core.attributesFile=/dev/null"),
             OsStr::new("-c"),
             OsStr::new("protocol.allow=never"),
             OsStr::new("worktree"),

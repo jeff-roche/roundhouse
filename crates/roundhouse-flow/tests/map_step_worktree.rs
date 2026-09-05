@@ -744,3 +744,83 @@ fn isolation_none_explicitly_set_is_still_a_deliverable_no_op() {
         items[0]
     );
 }
+
+/// Fix round 2, item 2 (PROBE D): a secret-*derived* `over:` — as opposed
+/// to `base_ref` reading `secrets.*` directly — still let the per-item
+/// element reach the persisted output in cleartext, because
+/// `self.redaction_needles` only ever contains the *raw* `RunContext.secrets`
+/// values, never anything computed from them (`json(secrets.T)`'s decoded
+/// elements are exactly that). `redacted_base_ref` alone (fix round 1's
+/// fix) is `***` — `Interpolated`'s own provenance tracking already caught
+/// this — but the *other* two copies (the argv echo inside
+/// `WorktreeError::CommandFailed`'s `Display`, and git's own stderr quoting
+/// the rejected ref) live inside `{e}`, which the crate-wide needle list
+/// alone cannot see. Reproduces the brief's PROBE D exactly: `over: "${{
+/// json(secrets.T) }}"`, secret `["itemvalue-secret1"]`, `base_ref: "${{
+/// item }}"`.
+#[test]
+fn a_secret_derived_over_item_never_reaches_the_serialized_outcome() {
+    if !git_available() {
+        eprintln!("skipping: git not available on this host");
+        return;
+    }
+    const SECRET_ELEMENT: &str = "itemvalue-secret1";
+    let repo = TempRepo::new();
+    let provider = Arc::new(ObservingWorktreeProvider::new(repo.path.clone()));
+
+    let yaml = format!(
+        "{WORKFLOW_PREAMBLE}secrets: [T]\nsteps:\n\
+         \x20\x20- id: per_item\n\
+         \x20\x20\x20\x20map:\n\
+         \x20\x20\x20\x20\x20\x20over: \"${{{{ json(secrets.T) }}}}\"\n\
+         \x20\x20\x20\x20\x20\x20as: item\n\
+         \x20\x20\x20\x20\x20\x20max_parallel: 1\n\
+         \x20\x20\x20\x20\x20\x20on_item_error: continue\n\
+         \x20\x20\x20\x20\x20\x20isolation: {{ worktree: {{ base_ref: \"${{{{ item }}}}\" }} }}\n\
+         \x20\x20\x20\x20steps:\n\
+         \x20\x20\x20\x20\x20\x20- id: emit_something\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20emit: {{ ok: true }}\n"
+    );
+    let def = parse_workflow(&yaml).expect("workflow must parse");
+    let mut sink = RecordingSink(Vec::new());
+    // The raw secret value is the JSON-encoded array text itself — never
+    // the decoded element. This is precisely what makes the gap real:
+    // `self.redaction_needles` will contain `["itemvalue-secret1"]` (the
+    // whole blob), not `itemvalue-secret1` (the element that actually
+    // reaches argv).
+    let ctx = secret_run_ctx(
+        serde_json::json!({}),
+        "T",
+        &format!("[{SECRET_ELEMENT:?}]"),
+        Some(provider.clone() as Arc<dyn WorktreeProvider>),
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().expect("run must not error");
+
+    let items = outcomes[0].output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]["status"], "failed",
+        "expected git to reject this base_ref as invalid — got {:?}",
+        items[0]
+    );
+    let error = items[0]["error"].as_str().unwrap();
+    assert!(
+        !error.contains(SECRET_ELEMENT),
+        "the secret-derived over: element must never appear in the item's own error message, \
+         got: {error:?}"
+    );
+
+    let serialized = serde_json::to_string(&outcomes[0].output).unwrap();
+    assert!(
+        !serialized.contains(SECRET_ELEMENT),
+        "the secret-derived over: element must not appear anywhere in the map step's \
+         serialized output, got: {serialized}"
+    );
+
+    assert!(
+        outcomes[0].output_is_secret_derived,
+        "output_is_secret_derived must be true — over_evaluated.secret_derived() already folds \
+         this in independently of the base_ref taint fix"
+    );
+}

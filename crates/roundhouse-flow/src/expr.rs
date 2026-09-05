@@ -377,7 +377,8 @@
 //!
 //! `parse::steps::validate_map_as` rejects `map.as` values that
 //! case-sensitively equal one of `RESERVED_EXPRESSION_ROOTS` (`secrets`,
-//! `steps`, `inputs`, `run`, `vars`, `env`) — it does **not** reject `Steps`
+//! `steps`, `inputs`, `run`, `vars`, `env`, and — since Task 34 fix round 1,
+//! item 3 — `worktree`) — it does **not** reject `Steps`
 //! or `STEPS`. That check is only sound if this evaluator is also
 //! case-sensitive when resolving a root name, because `ExprContext`'s
 //! binding methods and every identifier lookup in this module go through an

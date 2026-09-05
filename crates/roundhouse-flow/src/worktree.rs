@@ -3,7 +3,13 @@
 //! item, plus the one adapter this crate ships that implements it over
 //! `roundhouse-sandbox::worktree` (Task 34, lane W5, rulings W5-1/W5-8/
 //! W5-22 — the answer to Phase 5 ruling P42, "`map.isolation: worktree` is
-//! declared data with no materialization anywhere").
+//! declared data with no materialization anywhere", **for an explicitly
+//! declared `worktree` tier** — fix round 2, item 3, ruling W5-33: a `map`
+//! step that leaves `isolation:` unset inherits `Defaults.isolation`
+//! without this trait ever being consulted at all, which is P42's shape
+//! again, for that one case, not yet fixed — see
+//! `crate::exec::map_step::Executor::dispatch_map_step`'s own doc comment,
+//! "Task 34", for the full qualification).
 //!
 //! # Why the trait lives here, not in `roundhouse-sandbox` (ruling W5-1)
 //!

@@ -33,7 +33,10 @@
 //!   mechanism", for why each prior design was replaced, not merely
 //!   restyled.
 //! - **`map.isolation`/`base_ref` — landed by Task 34 (lane W5, rulings
-//!   W5-8/W5-22), closing Phase 5 ruling P42.** Earlier revisions of this
+//!   W5-8/W5-22), closing Phase 5 ruling P42 for an explicitly declared
+//!   tier — not for a `map` step that leaves `isolation:` unset (fix round
+//!   2, item 3, ruling W5-33; see [`Executor::dispatch_map_step`]'s own doc
+//!   comment, "Task 34", for the qualification in full).** Earlier revisions of this
 //!   file left `StepBody::Map`'s `isolation` field completely unread and
 //!   created no worktree, reasoning that `roundhouse-flow` had "no
 //!   process-spawning or git dependency at all." That premise no longer
@@ -840,9 +843,34 @@ impl<'a> Executor<'a> {
     /// dependency if it did. Only `isolation: Some(MapIsolationDef::Worktree { .. })`
     /// — an author writing `map.isolation: worktree` (or the `{ worktree:
     /// { base_ref } }` form) on *this specific* `map` step — is treated as
-    /// an explicit demand. `None` here (the field absent, or any other
-    /// tier) does nothing at all: no provider lookup, no worktree, no
-    /// binding into the expression context.
+    /// an explicit demand.
+    ///
+    /// **The field being absent and an explicit `isolation: none` are not
+    /// the same claim, even though both take the match arm below that does
+    /// nothing (fix round 2, item 3 — ruling W5-33, correcting an earlier
+    /// version of this paragraph that called both "genuinely
+    /// deliverable").** Explicit `none` is a real, deliverable choice: the
+    /// author asked for nothing, and nothing is exactly what this crate can
+    /// always produce. The field being **absent** inherits
+    /// `Defaults.isolation`, which defaults to `Worktree` — a documented
+    /// safe floor (`crate::parse::types::Defaults`) — and this arm then
+    /// silently does not honour it: no provider lookup, no worktree, no
+    /// binding, no error, no warning. That is the P42 shape, for the
+    /// *default* configuration, wider than the three tiers the arm below
+    /// fails closed. **This is not fixed here.** Ruling W5-33: making the
+    /// absent case materialize would require a wired `WorktreeProvider` for
+    /// every existing workflow before any of them could run at all — the
+    /// daemon does not construct one yet (lane W1's residual, per
+    /// [`crate::exec::RunContext::worktree_provider`]'s own doc comment) —
+    /// so every fixture and every test in this crate would fail closed
+    /// overnight. Ruling W5-8 chose today's behaviour deliberately for
+    /// exactly that reason, and that reasoning still holds; what changed
+    /// this round is only the claim made about it. **Read every "P42 is
+    /// closed" statement in this crate (and in `roundhouse-sandbox`) with
+    /// this qualification attached: P42's silence is closed for an
+    /// explicitly declared `worktree` tier, and for the three
+    /// undeliverable tiers below — it is not closed for a `map` step that
+    /// leaves `isolation:` unset and inherits the default.**
     ///
     /// **Fail-closed on a missing provider.** When the map-level field
     /// explicitly asks for `worktree` isolation and this `Executor`'s own
@@ -1056,11 +1084,16 @@ impl<'a> Executor<'a> {
                 // "Fix round 1, item 1" for the taint-leak fix below.
                 let mut worktree_guard: Option<WorktreeGuard> = None;
                 match isolation {
-                    // Fix round 1, item 6: `None` (the field absent) and an
-                    // explicit `isolation: none` are the only two shapes
-                    // that do nothing here — see the match arm below for
-                    // the other three tiers, which this crate cannot
-                    // deliver and must not silently ignore.
+                    // Fix round 1, item 6 / fix round 2, item 3 (ruling
+                    // W5-33): `None` (the field absent) and an explicit
+                    // `isolation: none` take the same no-op arm, but they
+                    // are not the same claim — see this function's own doc
+                    // comment, "Task 34", for why `None` here is a known,
+                    // tolerated gap (P42's shape for the *inherited*
+                    // default) and not "genuinely deliverable" the way
+                    // explicit `none` is. See the match arm below for the
+                    // other three tiers, which this crate cannot deliver
+                    // and does not tolerate silently.
                     None | Some(MapIsolationDef::None) => {}
                     Some(MapIsolationDef::Worktree { base_ref }) => {
                         let provider = match &self.worktree_provider {
@@ -1088,37 +1121,48 @@ impl<'a> Executor<'a> {
                         // arms (`resolved_prompt`/`resolved_with` vs.
                         // `logged_prompt`/`logged_with`), which this arm
                         // did not follow the first time it was written.
-                        let (unredacted_base_ref, redacted_base_ref) = match base_ref {
-                            Some(text) => {
-                                match interpolate(
-                                    TemplateSource::from_workflow_file(text),
-                                    &self.ctx,
-                                ) {
-                                    Ok(interpolated) => {
-                                        // The part that actually repairs
-                                        // the persisted taint flag — see
-                                        // this function's own doc comment.
-                                        // Folded in unconditionally, before
-                                        // `materialize` is even attempted,
-                                        // so it is set on both the success
-                                        // and the failure path below.
-                                        any_item_secret_derived |= interpolated.is_secret_derived();
-                                        let redacted = interpolated.redacted_for_logging().clone();
-                                        (interpolated.into_unredacted_for_dispatch(), redacted)
-                                    }
-                                    Err(e) => {
-                                        return ItemOutcome::Failed(format!(
-                                            "map step `{step_id}`: resolving \
-                                             `isolation.worktree.base_ref`: {e}"
-                                        ));
+                        let (unredacted_base_ref, redacted_base_ref, base_ref_is_secret_derived) =
+                            match base_ref {
+                                Some(text) => {
+                                    match interpolate(
+                                        TemplateSource::from_workflow_file(text),
+                                        &self.ctx,
+                                    ) {
+                                        Ok(interpolated) => {
+                                            // The part that actually
+                                            // repairs the persisted taint
+                                            // flag — see this function's
+                                            // own doc comment. Folded in
+                                            // unconditionally, before
+                                            // `materialize` is even
+                                            // attempted, so it is set on
+                                            // both the success and the
+                                            // failure path below.
+                                            let is_secret_derived =
+                                                interpolated.is_secret_derived();
+                                            any_item_secret_derived |= is_secret_derived;
+                                            let redacted =
+                                                interpolated.redacted_for_logging().clone();
+                                            (
+                                                interpolated.into_unredacted_for_dispatch(),
+                                                redacted,
+                                                is_secret_derived,
+                                            )
+                                        }
+                                        Err(e) => {
+                                            return ItemOutcome::Failed(format!(
+                                                "map step `{step_id}`: resolving \
+                                                 `isolation.worktree.base_ref`: {e}"
+                                            ));
+                                        }
                                     }
                                 }
-                            }
-                            None => (
-                                DEFAULT_WORKTREE_BASE_REF.to_string(),
-                                DEFAULT_WORKTREE_BASE_REF.to_string(),
-                            ),
-                        };
+                                None => (
+                                    DEFAULT_WORKTREE_BASE_REF.to_string(),
+                                    DEFAULT_WORKTREE_BASE_REF.to_string(),
+                                    false,
+                                ),
+                            };
                         match provider.materialize(&unredacted_base_ref) {
                             Ok(path) => {
                                 // Derived from `item_evaluated`, not
@@ -1146,13 +1190,48 @@ impl<'a> Executor<'a> {
                                 // same needle-based redaction every other
                                 // dispatch arm's *logged* copy goes through
                                 // closes both at once, regardless of which
-                                // part of `{e}`'s text the secret landed in.
+                                // part of `{e}`'s text the secret landed in
+                                // — for a `base_ref` that is itself a
+                                // registered secret (`${{ secrets.T }}`).
+                                //
+                                // Fix round 2, item 2: that is not the only
+                                // shape. `over: "${{ json(secrets.T) }}"`
+                                // with `base_ref: "${{ item }}"` makes
+                                // `base_ref` secret-*derived* without its
+                                // value ever being one of
+                                // `self.redaction_needles` (that list holds
+                                // only the raw `RunContext.secrets` values
+                                // themselves, never anything computed from
+                                // them — `redacted_base_ref` above is
+                                // `***` precisely because `Interpolated`'s
+                                // own provenance tracking already caught
+                                // this, but the needle pass has no way to
+                                // know `unredacted_base_ref` is sensitive
+                                // unless told). When `interpolate` marked
+                                // this `base_ref` secret-derived, add its
+                                // exact unredacted value as one more needle
+                                // for this call only — it scrubs precisely
+                                // the text that crossed into argv and came
+                                // back through stderr, without touching any
+                                // other message this run produces. Guarded
+                                // on non-empty so an empty-string element
+                                // can never become a `.replace("", ...)`
+                                // needle (which would corrupt the message
+                                // by inserting the placeholder between
+                                // every byte, the same landmine
+                                // `MIN_REDACTABLE_SECRET_LEN` exists to
+                                // keep the crate-wide needle list away
+                                // from).
+                                let mut needles = self.redaction_needles.clone();
+                                if base_ref_is_secret_derived && !unredacted_base_ref.is_empty() {
+                                    needles.push(unredacted_base_ref.clone());
+                                }
                                 return ItemOutcome::Failed(redact_message(
                                     format!(
                                         "map step `{step_id}`: materializing a worktree for \
                                          base_ref {redacted_base_ref:?}: {e}"
                                     ),
-                                    &self.redaction_needles,
+                                    &needles,
                                 ));
                             }
                         }
