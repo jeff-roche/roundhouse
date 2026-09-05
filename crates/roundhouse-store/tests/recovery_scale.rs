@@ -6,6 +6,24 @@
 //! pins the rewritten, `tasks`-table-driven, batched version against the real
 //! number.
 //!
+//! **Why best-of-N (issue #12).** The budget is a wall clock, and this test
+//! ran on shared GitHub Actions runners right on the 5s cliff — observed at
+//! 5.06s and 5.82s on commits whose production code was byte-identical to
+//! commits that passed, eight red runs across four branches, and eventually a
+//! red `main`. A budget that fails half the time stops being a guarantee and
+//! starts training people to ignore CI. The fix keeps the 5s number exactly as
+//! S-SESS-4 states it and removes only the dependence on a single sample:
+//! `ATTEMPTS` independent timed runs, asserted against the **fastest**. That is
+//! the right statistic for "this machine can do the work in 5s" — a slow run
+//! can be caused by a noisy neighbour, but a fast run cannot be faked by one.
+//! A real algorithmic regression makes *every* attempt slow, so it still fails.
+//!
+//! Each attempt re-seeds a fresh database rather than reusing one, for two
+//! reasons: `recover_interrupted_tasks` mutates the rows it recovers, so a
+//! second run against the same database would find nothing; and `SessionId`/
+//! `TaskId` are freshly generated per seed, so no attempt reuses another's task
+//! ids against the shared `RUNNER`. Seeding stays outside the timed section.
+//!
 //! Seeding is done via **raw bulk SQL against a plain `rusqlite::Connection`**
 //! in one transaction — not via 100,000+ individual `EventWriter::append()`
 //! calls, which would make the test's own setup the bottleneck rather than
@@ -18,6 +36,10 @@ use roundhouse_store::{open, recover_interrupted_tasks, spawn_writer};
 const SESSIONS: usize = 500;
 const TASKS_PER_SESSION: usize = 200;
 const TOTAL_TASKS: usize = SESSIONS * TASKS_PER_SESSION;
+/// Timed runs per test invocation; the budget is asserted against the fastest.
+/// Three is enough to survive a single noisy-neighbour run without making the
+/// test meaningfully slower (seeding, not recovery, dominates the runtime).
+const ATTEMPTS: usize = 3;
 
 static RUNNER: once_cell::sync::Lazy<roundhouse_core::TaskRunner> =
     once_cell::sync::Lazy::new(roundhouse_core::TaskRunner::bootstrap);
@@ -25,31 +47,53 @@ static RUNNER: once_cell::sync::Lazy<roundhouse_core::TaskRunner> =
 #[tokio::test]
 async fn recovers_500_sessions_times_200_tasks_within_five_seconds() {
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("events.db");
 
-    // `open()` applies migrations; do this once before touching the schema
-    // with a raw connection.
-    drop(open(&db_path).await.unwrap());
+    let mut timings: Vec<std::time::Duration> = Vec::with_capacity(ATTEMPTS);
+    // Carried out of the loop so the post-run row spot-check below runs against
+    // a real recovered database — the last attempt's.
+    let mut last = None;
 
-    seed_non_terminal_tasks(&db_path);
+    for attempt in 1..=ATTEMPTS {
+        let db_path = dir.path().join(format!("events-{attempt}.db"));
 
-    let store = open(&db_path).await.unwrap();
-    let writer = spawn_writer(store).await;
-    let recovery_store = open(&db_path).await.unwrap();
+        // `open()` applies migrations; do this once before touching the schema
+        // with a raw connection.
+        drop(open(&db_path).await.unwrap());
 
-    let started = std::time::Instant::now();
-    let interrupted = recover_interrupted_tasks(&recovery_store, &writer, &RUNNER)
-        .await
-        .unwrap();
-    let elapsed = started.elapsed();
+        seed_non_terminal_tasks(&db_path);
 
-    eprintln!("recover_interrupted_tasks over {TOTAL_TASKS} non-terminal tasks took {elapsed:?}");
+        let store = open(&db_path).await.unwrap();
+        let writer = spawn_writer(store).await;
+        let recovery_store = open(&db_path).await.unwrap();
 
-    assert_eq!(interrupted.len(), TOTAL_TASKS);
+        let started = std::time::Instant::now();
+        let interrupted = recover_interrupted_tasks(&recovery_store, &writer, &RUNNER)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "attempt {attempt}/{ATTEMPTS}: recover_interrupted_tasks over {TOTAL_TASKS} \
+             non-terminal tasks took {elapsed:?}"
+        );
+
+        // Every attempt must recover the full set — this half of the test is
+        // about correctness, not speed, so it is asserted per attempt rather
+        // than best-of.
+        assert_eq!(interrupted.len(), TOTAL_TASKS);
+
+        timings.push(elapsed);
+        last = Some((interrupted, recovery_store));
+    }
+
+    let best = *timings.iter().min().expect("ATTEMPTS is non-zero");
     assert!(
-        elapsed <= std::time::Duration::from_secs(5),
-        "S-SESS-4 budget: 500 sessions x 200 tasks must recover within 5s, took {elapsed:?}"
+        best <= std::time::Duration::from_secs(5),
+        "S-SESS-4 budget: 500 sessions x 200 tasks must recover within 5s; \
+         best of {ATTEMPTS} attempts was {best:?} (all attempts: {timings:?})"
     );
+
+    let (interrupted, recovery_store) = last.expect("ATTEMPTS is non-zero");
 
     // Spot-check a handful of tasks rows now show state = 'Interrupted'.
     let conn = recovery_store.pool.get().await.unwrap();
