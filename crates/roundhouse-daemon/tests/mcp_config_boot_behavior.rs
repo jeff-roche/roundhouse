@@ -14,12 +14,21 @@
 //!
 //! This test proves the fix end to end against the real binary: a real
 //! secret-shaped string, placed in the operator's own user-global MCP
-//! config in a way that reliably produces a `toml::de::Error` embedding it
-//! (verified directly against `mcp_config::load_mcp_servers_from_layers` —
-//! see the sanity assertion below), must never appear on either stream,
-//! and the daemon must still boot successfully (falling back to zero
-//! configured MCP servers) rather than refusing to start over one
-//! malformed table.
+//! config in a way that reliably produces a `toml::de::Error` embedding it,
+//! must never appear on either stream, and the daemon must still boot
+//! successfully (falling back to zero configured MCP servers) rather than
+//! refusing to start over one malformed table.
+//!
+//! **Deliberately does not call `mcp_config::load_mcp_servers_from_layers`
+//! directly** (fix round 3 self-review, after an earlier version of this
+//! file did exactly that in a "sanity" test): that function is `pub`,
+//! kept that way only for `mcp_config.rs`'s OWN tests, and calling it from
+//! this external crate would be exactly the same "raw, caller-labeled
+//! function reachable from outside the crate" back door fix round 2's
+//! MUST 4 closed for `roundhouse-config`'s equivalent function. The
+//! equivalent sanity check (proving the hostile config really does make
+//! `McpConfigError`'s `Display` embed the secret) now lives in
+//! `mcp_config.rs`'s own `#[cfg(test)]` module instead.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -27,42 +36,16 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 const SECRET: &str = "sk-ant-should-never-leak-12345";
 
-/// The exact hostile shape verified (see this file's own sanity test) to
-/// produce a `toml::de::Error` whose `Display` embeds `SECRET` verbatim:
-/// `env` is a `Vec<(String, String)>` in `McpTransportKind::Stdio`, so
-/// giving it a bare string instead of an array is a type mismatch at
-/// exactly the line containing the secret.
+/// The exact hostile shape (see `mcp_config.rs`'s own in-crate sanity test
+/// for the proof) known to produce a `toml::de::Error` whose `Display`
+/// embeds `SECRET` verbatim: `env` is a `Vec<(String, String)>` in
+/// `McpTransportKind::Stdio`, so giving it a bare string instead of an
+/// array is a type mismatch at exactly the line containing the secret.
 fn hostile_mcp_config() -> String {
     format!(
         "[[mcp_server]]\nid = \"fake\"\n[mcp_server.transport]\nkind = \"stdio\"\n\
          command = \"/bin/true\"\nargs = []\nenv = \"{SECRET}\"\n"
     )
-}
-
-/// Sanity check, run against this crate's own library code (no subprocess):
-/// proves `hostile_mcp_config` really does make `McpConfigError`'s `Display`
-/// embed `SECRET` — so the real-binary test below, which asserts the
-/// secret is ABSENT from the daemon's output, is proving the fix actually
-/// intercepts a real leak, not asserting something that was never going to
-/// leak in the first place.
-#[test]
-fn sanity_the_hostile_config_really_does_make_the_raw_error_embed_the_secret() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
-    std::fs::write(&path, hostile_mcp_config()).unwrap();
-    let err = roundhouse_daemon::mcp_config::load_mcp_servers_from_layers(vec![(
-        roundhouse_config::ConfigScope::UserGlobal,
-        path,
-    )])
-    .unwrap_err();
-    assert!(
-        format!("{err}").contains(SECRET),
-        "sanity check failed: the raw McpConfigError's Display should embed the secret"
-    );
-    assert!(
-        !err.kind().contains(SECRET),
-        "McpConfigError::kind() must never contain the secret"
-    );
 }
 
 #[tokio::test]

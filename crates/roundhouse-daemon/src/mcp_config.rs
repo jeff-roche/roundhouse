@@ -163,6 +163,49 @@ pub fn load_mcp_servers_from_layers(
 mod tests {
     use super::*;
 
+    /// Fix round 3, MUST 3: sanity check that a hostile `[[mcp_server]]`
+    /// entry (an `env` given the wrong shape — `McpTransportKind::Stdio::env`
+    /// is a `Vec<(String, String)>`, so a bare string is a type mismatch at
+    /// exactly the line containing whatever secret an operator wrote there)
+    /// really does make `McpConfigError`'s `Display` embed that secret, and
+    /// that `kind()` never does.
+    ///
+    /// Deliberately in-crate, not in the external
+    /// `tests/mcp_config_boot_behavior.rs` (fix round 3 self-review, after
+    /// an earlier version of this fix DID call `load_mcp_servers_from_layers`
+    /// from that external file): that function is `pub` — kept that way for
+    /// THIS module's own tests, which need to inject arbitrary per-scope
+    /// paths (see its own doc comment) — but has no legitimate external
+    /// caller, and calling it from an external test crate would have been
+    /// exactly the same "raw, caller-labeled function reachable from
+    /// outside the crate" back door fix round 2's MUST 4 closed for
+    /// `roundhouse-config`'s equivalent function. The external test covers
+    /// this same scenario through the real binary instead (see that file's
+    /// own doc comment), which never touches this function directly.
+    #[test]
+    fn a_hostile_mcp_config_entry_leaks_its_secret_via_display_but_never_via_kind() {
+        const SECRET: &str = "sk-ant-should-never-leak-12345";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[[mcp_server]]\nid = \"fake\"\n[mcp_server.transport]\nkind = \"stdio\"\n\
+                 command = \"/bin/true\"\nargs = []\nenv = \"{SECRET}\"\n"
+            ),
+        )
+        .unwrap();
+        let err = load_mcp_servers_from_layers(vec![(ConfigScope::UserGlobal, path)]).unwrap_err();
+        assert!(
+            format!("{err}").contains(SECRET),
+            "sanity check failed: the raw McpConfigError's Display should embed the secret"
+        );
+        assert!(
+            !err.kind().contains(SECRET),
+            "McpConfigError::kind() must never contain the secret"
+        );
+    }
+
     #[test]
     fn absent_mcp_server_key_means_no_servers_configured() {
         let dir = tempfile::tempdir().unwrap();

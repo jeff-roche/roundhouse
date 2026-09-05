@@ -385,6 +385,22 @@ fn entry_covers(narrower_entry: &str, wider_entry: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Fix round 3, MUST 2 self-review: serializes the two tests in this
+    /// module that exercise the SAME `tracing::warn!` callsite (the
+    /// rejected-narrower-layer branch) where exactly one of them
+    /// (`the_real_log_call_site_never_emits_the_hostile_files_own_bytes`)
+    /// installs a real subscriber via `tracing::subscriber::with_default`
+    /// and the other does not. `tracing`'s callsite-interest cache is
+    /// process-global, not per-thread — `cargo test`'s default parallel
+    /// test execution can run both on different OS threads at the same
+    /// time, and empirically (reproduced once via a full `cargo test
+    /// --workspace` run, though not reliably in isolation) that races the
+    /// interest cache and can make the tracing-subscriber test observe NO
+    /// captured output at all, even though the log call genuinely ran.
+    /// Acquiring this lock at the top of both tests removes the race by
+    /// construction — they simply never run concurrently with each other.
+    static CALLSITE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn write(dir: &std::path::Path, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, contents).unwrap();
@@ -689,6 +705,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_rejected_project_layer_falls_back_to_the_user_global_result_rather_than_erroring() {
+        let _guard = CALLSITE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let user = write(
             dir.path(),
@@ -819,6 +836,7 @@ mod tests {
     /// escape byte nor any of the hostile file's own text.
     #[test]
     fn the_real_log_call_site_never_emits_the_hostile_files_own_bytes() {
+        let _guard = CALLSITE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let user = write(
             dir.path(),
