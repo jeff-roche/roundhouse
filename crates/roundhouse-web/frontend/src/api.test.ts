@@ -367,6 +367,27 @@ describe("connectSessionEvents malformed frames (fix round 1, M5)", () => {
     expect(onEvent).toHaveBeenCalledTimes(1);
   });
 
+  // Fix round 2 (found alongside the dispatched items, same class):
+  // `JSON.parse("null")` succeeds — it is not a syntax error — so a literal
+  // `null` body used to reach `onEvent` uncast and unchecked, which then
+  // throws downstream wherever the caller accesses a field on it (e.g.
+  // `SessionView`'s `toLogLine`). `42`/`[]`/`{}` don't throw here (property
+  // access on a boxed number or an empty object is just `undefined`), so
+  // `null` is the one value this handler must gate on directly.
+  it("drops a null onmessage frame rather than passing it to onEvent", () => {
+    const onEvent = vi.fn();
+    const source = connectSessionEvents("sess-1", {
+      onEvent,
+      onResyncRequired: () => {},
+      onStreamError: () => {},
+      onError: () => {},
+    }) as unknown as FakeEventSource;
+
+    expect(() => source.emitMessage("null")).not.toThrow();
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(source.closed).toBe(false);
+  });
+
   it("falls back to the terminal onStreamError state on a malformed resync_required body", () => {
     const onStreamError = vi.fn();
     const onResyncRequired = vi.fn();
@@ -423,7 +444,22 @@ describe("connectSessionEvents malformed frames (fix round 1, M5)", () => {
   // a record with a wrong-typed field all parse without throwing. Round 1
   // only checked for a JSON *syntax* error; these pin that a JSON-valid,
   // wrong-shaped body takes the same terminal-fallback path.
-  const jsonValidButWrongShape = ["null", "42", "[]", "{}", JSON.stringify({ resume_from: "not-a-number" })];
+  //
+  // A second review found the original wrong-typed-field case
+  // (`{ resume_from: "not-a-number" }`) is a *missing* field for
+  // `StreamError` (whose only field is `error`), not a wrong-typed one —
+  // so it never actually exercised a wrong-typed `error` on that listener.
+  // `{ error: 42 }` is wrong-typed for `stream_error` and, since it has no
+  // `resume_from`/`oldest_retained` either, still exercises the
+  // missing-field path for `resync_required` — one entry covers both.
+  const jsonValidButWrongShape = [
+    "null",
+    "42",
+    "[]",
+    "{}",
+    JSON.stringify({ resume_from: "not-a-number" }),
+    JSON.stringify({ error: 42 }),
+  ];
 
   it.each(jsonValidButWrongShape)(
     "falls back to onStreamError for a JSON-valid but wrong-shaped resync_required body: %s",

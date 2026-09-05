@@ -324,13 +324,26 @@ export function connectSessionEvents(
     // listeners below — so there is a next frame to keep listening for;
     // dropping this one and continuing is strictly better than crashing the
     // whole connection over one bad frame.
-    let parsed: ClientEvent;
+    let candidate: unknown;
     try {
-      parsed = JSON.parse(message.data) as ClientEvent;
+      candidate = JSON.parse(message.data);
     } catch {
       return;
     }
-    handlers.onEvent(parsed, message.lastEventId || null);
+    // A second round of review found `JSON.parse("null")` succeeds — it is
+    // not a syntax error — so a literal `null` body used to reach
+    // `handlers.onEvent` uncaught by the try above, cast to `ClientEvent`
+    // with no shape check. `null` is the one value that then throws further
+    // downstream (`toLogLine`'s field access on it), turning "drop this one
+    // frame and keep streaming," the whole point of this handler, into an
+    // uncaught exception. `isRecord` is the same minimal shape gate used by
+    // `isResyncRequired`/`isStreamErrorShape` below — this handler doesn't
+    // otherwise validate `ClientEvent`'s specific variants, only that the
+    // frame is an object at all.
+    if (!isRecord(candidate)) {
+      return;
+    }
+    handlers.onEvent(candidate as ClientEvent, message.lastEventId || null);
   };
 
   source.addEventListener("resync_required", (message) => {
