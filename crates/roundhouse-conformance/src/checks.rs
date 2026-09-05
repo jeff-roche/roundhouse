@@ -49,6 +49,12 @@ pub struct FoldedResult {
     pub blocks: Vec<ContentBlock>,
     pub usage: Usage,
     pub loss_events: Vec<String>,
+    /// Whether `StreamEvent::MessageStop` was observed anywhere in the
+    /// folded stream. Task 12 (Ruling R16): `check_truncate_mid_stream`
+    /// needs this to tell a genuine terminal apart from one this crate's
+    /// own fold previously discarded (`StreamEvent::MessageStop => {}` was
+    /// a pure no-op before this field existed).
+    pub saw_message_stop: bool,
 }
 
 impl FoldedResult {
@@ -56,6 +62,7 @@ impl FoldedResult {
         serde_json::to_value(&self.blocks).ok() == serde_json::to_value(&other.blocks).ok()
             && serde_json::to_value(&self.usage).ok() == serde_json::to_value(&other.usage).ok()
             && self.loss_events == other.loss_events
+            && self.saw_message_stop == other.saw_message_stop
     }
 }
 
@@ -79,6 +86,7 @@ pub async fn fold_stream(mut stream: ChatStream) -> FoldedResult {
     let mut blocks = Vec::new();
     let mut usage = Usage::default();
     let mut loss_events = Vec::new();
+    let mut saw_message_stop = false;
 
     while let Some(event) = stream.next().await {
         match event {
@@ -130,7 +138,7 @@ pub async fn fold_stream(mut stream: ChatStream) -> FoldedResult {
                     usage.cache_read_tokens = v;
                 }
             }
-            StreamEvent::MessageStop => {}
+            StreamEvent::MessageStop => saw_message_stop = true,
         }
     }
 
@@ -142,6 +150,7 @@ pub async fn fold_stream(mut stream: ChatStream) -> FoldedResult {
         blocks,
         usage,
         loss_events,
+        saw_message_stop,
     }
 }
 
@@ -264,6 +273,133 @@ pub async fn check_fold_determinism<P: Provider>(
     }
 
     (failures, results.into_iter().next())
+}
+
+/// Task 12 (Cross-Cutting #2), sharpened by Ruling R16: proves a
+/// `ConformanceSubject`'s decoder never lies about truncation, under
+/// EITHER of this codebase's two legitimate encodings (see
+/// `roundhouse_provider::decode_guard`'s module doc): a "strict" codec
+/// returns `Err` when its stream is cut before its own terminal event; an
+/// "absence" codec returns `Ok` but never fabricates
+/// `StreamEvent::MessageStop` it did not actually observe. Both are
+/// correct. The one outcome that is illegitimate under *both* encodings —
+/// and the only one this check fails on — is `Ok(events)` that DOES
+/// contain a `MessageStop` for an input truncated before the wire's real
+/// terminal marker.
+///
+/// **Locating the terminal (Ruling R3)** without any codec-specific
+/// wire-format knowledge (needed since one codec's framing is binary, not
+/// SSE): replaying a byte-for-byte PREFIX of the cassette body through the
+/// subject's own `Provider::stream_chat` and folding the result is exactly
+/// what a truncated connection looks like from the codec's point of view,
+/// for any wire format. "Does this prefix length decode to an `Ok` stream
+/// containing `MessageStop`" is monotonic in prefix length (once the
+/// terminal frame's bytes are fully present, every longer prefix still
+/// contains them), so a binary search over prefix lengths finds the
+/// *minimal* prefix that reaches the terminal — call it `terminal_end` —
+/// without ever having to parse the wire format itself or know what its
+/// terminal marker looks like. Truncating at fractions of `terminal_end`
+/// (rather than of the whole body, which is what the task's original,
+/// rejected design did) guarantees every truncation point this check tests
+/// lands strictly before the terminal, so a codec that correctly sends
+/// bytes AFTER its own terminal (`bedrock_converse`'s post-`messageStop`
+/// metadata frame; `openai_chat`'s trailing `data: [DONE]`) can never be
+/// false-failed by a truncation point that actually retained the terminal
+/// and only dropped trailing bytes.
+///
+/// If the whole cassette never decodes to a `MessageStop` at all, there is
+/// no terminal to truncate before — not this check's job (an ordinary
+/// successful-completion cassette is `check_fold_determinism`'s job), so it
+/// returns no failures.
+pub async fn check_truncate_mid_stream<P: Provider>(
+    provider: &P,
+    request: &ChatRequest,
+    cassette_path: &Path,
+    credentials: Option<std::sync::Arc<dyn roundhouse_provider::credential::CredentialProvider>>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+
+    let full = match CassetteTransport::from_file(cassette_path, ChunkStrategy::WholeBody) {
+        Ok(t) => t,
+        Err(e) => {
+            failures.push(format!(
+                "could not load cassette {} for truncate-mid-stream check: {e}",
+                cassette_path.display()
+            ));
+            return failures;
+        }
+    };
+
+    let n = full.body.len();
+    if !decode_prefix_saw_message_stop(provider, request, &full, n, &credentials).await {
+        // The whole (untruncated) cassette never reaches a MessageStop at
+        // all — nothing to locate a terminal before.
+        return failures;
+    }
+
+    // Binary search for the minimal prefix length that reaches the
+    // terminal: invariant `decode_prefix_saw_message_stop(lo)` is false,
+    // `decode_prefix_saw_message_stop(hi)` is true (established by the `n`
+    // check above), narrowing until they're adjacent.
+    let mut lo = 0usize;
+    let mut hi = n;
+    if decode_prefix_saw_message_stop(provider, request, &full, lo, &credentials).await {
+        hi = lo;
+    } else {
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if decode_prefix_saw_message_stop(provider, request, &full, mid, &credentials).await {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+    }
+    let terminal_end = hi;
+
+    for pct in [25u64, 50, 75] {
+        let cut = (terminal_end as u64 * pct / 100) as usize;
+        if decode_prefix_saw_message_stop(provider, request, &full, cut, &credentials).await {
+            failures.push(format!(
+                "cassette {} decoded a MessageStop after truncating to {cut} of {terminal_end} \
+                 bytes ({pct}% of the located terminal, strictly before it) — a truncated \
+                 stream must never be indistinguishable from a clean completion",
+                cassette_path.display()
+            ));
+        }
+    }
+
+    failures
+}
+
+/// Replays the first `len` bytes of `full`'s body and reports whether the
+/// resulting stream is `Ok` AND contains `StreamEvent::MessageStop`. `Err`,
+/// or an `Ok` stream without `MessageStop`, both report `false` — both are
+/// legitimate non-lying responses to a truncated input, per this check's
+/// own doc comment.
+async fn decode_prefix_saw_message_stop<P: Provider>(
+    provider: &P,
+    request: &ChatRequest,
+    full: &CassetteTransport,
+    len: usize,
+    credentials: &Option<std::sync::Arc<dyn roundhouse_provider::credential::CredentialProvider>>,
+) -> bool {
+    let transport = CassetteTransport {
+        status: full.status,
+        headers: full.headers.clone(),
+        body: full.body[..len].to_vec(),
+        chunk_size: 0,
+    };
+    let ctx = RequestCtx {
+        trace_id: None,
+        transport: std::sync::Arc::new(transport),
+        api_key: "conformance-test-key".into(),
+        credentials: credentials.clone(),
+    };
+    match provider.stream_chat(request, &ctx).await {
+        Ok(stream) => fold_stream(stream).await.saw_message_stop,
+        Err(_) => false,
+    }
 }
 
 /// §9.3's usage invariant: `input_tokens` is the *total* tokens presented

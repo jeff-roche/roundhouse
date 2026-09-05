@@ -225,6 +225,30 @@ async fn bedrock_converse_is_conformant() {
     run::<BedrockConverseSubject>().await.assert_green();
 }
 
+/// Task 12 (Cross-Cutting #2, Ruling R16 / R3): mandatory truncate-mid-
+/// stream check. This codec is both in the "absence" truncation-signaling
+/// group (`decode_guard.rs`'s module doc: `Ok` without a `MessageStop` when
+/// truncated before its real binary `messageStop` frame) AND the specific
+/// codec Ruling R3 named as sending real, correct bytes (a `metadata`/usage
+/// frame) AFTER its own terminal -- proving the check's terminal-locating
+/// binary search (not a flat byte-fraction split) is what keeps this from
+/// false-failing a correct decoder.
+#[tokio::test]
+async fn text_cassette_is_never_indistinguishable_from_a_clean_completion_when_truncated() {
+    let failures = checks::check_truncate_mid_stream(
+        &BedrockConverseSubject::provider(),
+        &fixtures::single_turn_text(),
+        &cassette_path("text.cassette"),
+        BedrockConverseSubject::credentials(),
+    )
+    .await;
+    assert!(
+        failures.is_empty(),
+        "bedrock-converse must never report a clean completion for a stream truncated before \
+         its real terminal: {failures:#?}"
+    );
+}
+
 /// `Result::expect_err` needs `T: Debug`, and `ChatStream` deliberately isn't
 /// -- matches `conformance_openai_responses.rs`'s identical precedent.
 fn expect_err(result: Result<roundhouse_provider::ChatStream, ProviderError>) -> ProviderError {

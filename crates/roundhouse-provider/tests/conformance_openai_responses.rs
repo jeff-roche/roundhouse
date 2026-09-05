@@ -24,7 +24,7 @@
 //! `ProviderError` variant is via this profile's own error-code
 //! classification.
 
-use roundhouse_conformance::{run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
+use roundhouse_conformance::{checks, run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
 use roundhouse_provider::codec::openai_responses::encode::encode;
 use roundhouse_provider::codec::openai_responses::OpenAiResponsesProvider;
 use roundhouse_provider::profile::ProviderProfile;
@@ -225,6 +225,27 @@ impl ConformanceSubject for OpenAiResponsesSubject {
 #[tokio::test]
 async fn openai_responses_is_conformant() {
     run::<OpenAiResponsesSubject>().await.assert_green();
+}
+
+/// Task 12 (Cross-Cutting #2, Ruling R16): mandatory truncate-mid-stream
+/// check -- this codec is in the "absence" truncation-signaling group
+/// (`decode_guard.rs`'s module doc): it returns `Ok` without a `MessageStop`
+/// when truncated before its real `response.completed` terminal, which the
+/// check must accept (only a FABRICATED `MessageStop` fails it).
+#[tokio::test]
+async fn text_cassette_is_never_indistinguishable_from_a_clean_completion_when_truncated() {
+    let failures = checks::check_truncate_mid_stream(
+        &OpenAiResponsesSubject::provider(),
+        &fixtures::single_turn_text(),
+        &cassette_path("text.cassette"),
+        OpenAiResponsesSubject::credentials(),
+    )
+    .await;
+    assert!(
+        failures.is_empty(),
+        "openai-responses must never report a clean completion for a stream truncated before \
+         its real terminal: {failures:#?}"
+    );
 }
 
 fn error_body(code: &str) -> Vec<u8> {
