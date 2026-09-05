@@ -230,14 +230,17 @@ fn shell_grant_generalizes_to_the_matched_argv_never_a_wildcard() {
         ts: Timestamp::from_unix_nanos(0),
     };
     let grant = synthesize_grant(&params, GrantScope::Session, provenance);
-    match grant.rule.predicate {
+    // Task 23 (W4): `Grant.rule` is `pub(crate)` now — inspect the
+    // synthesized predicate through `Grant::predicate()` instead of reading
+    // `.rule.predicate` directly.
+    match grant.predicate() {
         Predicate::Shell {
             program,
             matcher: ArgMatcher::Exact(argv),
             ..
         } => {
             assert_eq!(program, "cargo");
-            assert_eq!(argv, vec!["test".to_string(), "--lib".to_string()]);
+            assert_eq!(argv, &vec!["test".to_string(), "--lib".to_string()]);
         }
         other => panic!(
             "Shell grant must synthesize a Shell predicate bound to the exact observed argv, \
@@ -263,7 +266,7 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         GrantScope::Once,
         provenance(),
     );
-    assert!(matches!(http.rule.predicate, Predicate::Http { .. }));
+    assert!(matches!(http.predicate(), Predicate::Http { .. }));
 
     let mcp = synthesize_grant(
         &TaskParams::Mcp {
@@ -274,7 +277,7 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         GrantScope::Once,
         provenance(),
     );
-    assert!(matches!(mcp.rule.predicate, Predicate::Mcp { .. }));
+    assert!(matches!(mcp.predicate(), Predicate::Mcp { .. }));
 
     let git = synthesize_grant(
         &TaskParams::Git {
@@ -285,7 +288,7 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         GrantScope::Once,
         provenance(),
     );
-    assert!(matches!(git.rule.predicate, Predicate::Git { .. }));
+    assert!(matches!(git.predicate(), Predicate::Git { .. }));
 
     let agent = synthesize_grant(
         &TaskParams::Agent {
@@ -296,7 +299,7 @@ fn http_mcp_git_agent_grants_all_synthesize_without_panicking() {
         GrantScope::Once,
         provenance(),
     );
-    assert!(matches!(agent.rule.predicate, Predicate::Agent { .. }));
+    assert!(matches!(agent.predicate(), Predicate::Agent { .. }));
 }
 
 // ---------------------------------------------------------------------
@@ -325,8 +328,16 @@ fn http_grant_never_widens_past_the_exact_approved_url() {
         task_id: TaskId::new(),
         ts: Timestamp::from_unix_nanos(0),
     };
-    let grant = synthesize_grant(&params, GrantScope::Once, provenance);
-    let engine = PolicyEngine::from_rules(vec![grant.rule.clone()]);
+    // Task 23 (W4): `GrantScope::Always` here, not `Once` — this test is
+    // about `Predicate::Http`'s exact-URL narrowing, not `Once`'s (still
+    // unenforced) one-shot lifetime, and `Grant::into_rule_for_installation`
+    // (the only sanctioned way to obtain an installable `CompiledRule`, now
+    // that `Grant.rule` is `pub(crate)`) refuses `Once`/`Session`/`ExactArgv`
+    // by design.
+    let grant = synthesize_grant(&params, GrantScope::Always, provenance);
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Always scope installs cleanly")]);
 
     // The exact approved call is still Allow.
     assert_eq!(engine.decide(&params).outcome, Outcome::Allow);
@@ -375,8 +386,12 @@ fn git_grant_never_widens_past_the_exact_approved_argv() {
         task_id: TaskId::new(),
         ts: Timestamp::from_unix_nanos(0),
     };
-    let grant = synthesize_grant(&params, GrantScope::Once, provenance);
-    let engine = PolicyEngine::from_rules(vec![grant.rule.clone()]);
+    // Task 23 (W4): `Always`, not `Once` — see the comment on the same
+    // substitution in `http_grant_never_widens_past_the_exact_approved_url`.
+    let grant = synthesize_grant(&params, GrantScope::Always, provenance);
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Always scope installs cleanly")]);
 
     assert_eq!(engine.decide(&params).outcome, Outcome::Allow);
 
@@ -420,8 +435,12 @@ fn git_grant_for_bare_subcommand_does_not_degenerate_to_matching_any_argv() {
         task_id: TaskId::new(),
         ts: Timestamp::from_unix_nanos(0),
     };
-    let grant = synthesize_grant(&params, GrantScope::Once, provenance);
-    let engine = PolicyEngine::from_rules(vec![grant.rule.clone()]);
+    // Task 23 (W4): `Always`, not `Once` — see the comment on the same
+    // substitution in `http_grant_never_widens_past_the_exact_approved_url`.
+    let grant = synthesize_grant(&params, GrantScope::Always, provenance);
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Always scope installs cleanly")]);
 
     assert_eq!(engine.decide(&params).outcome, Outcome::Allow);
 
@@ -464,7 +483,9 @@ fn directory_grant_with_unrelated_or_root_path_does_not_widen_to_filesystem_wide
         },
         provenance,
     );
-    let engine = PolicyEngine::from_rules(vec![grant.rule.clone()]);
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Directory scope installs cleanly")]);
 
     // The originating task's own write is still Allow (never broader than
     // what was actually approved means never *narrower* than the task
@@ -520,7 +541,9 @@ fn directory_grant_with_a_real_ancestor_path_still_covers_the_directory() {
         },
         provenance,
     );
-    let engine = PolicyEngine::from_rules(vec![grant.rule.clone()]);
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Directory scope installs cleanly")]);
 
     let sibling = TaskParams::Fs {
         op: FsOp::Write,

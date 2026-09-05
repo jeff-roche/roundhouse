@@ -70,14 +70,19 @@ pub struct GrantProvenance {
 /// The output of [`synthesize_grant`]: a policy rule generalised from one
 /// approved task, plus the scope and provenance that produced it.
 ///
-/// `rule` is `pub` so tests (and [`Grant::into_rule_for_installation`]
-/// itself) can inspect the synthesized predicate directly, but a caller that
-/// wants to actually **install** this grant into a live `PolicyEngine`
-/// should go through [`Grant::into_rule_for_installation`], not read `rule`
-/// directly — see that method's doc comment and finding 5's fix.
+/// Task 23 (W4): `rule` is `pub(crate)`, not `pub` — it used to be `pub`
+/// specifically so tests (and [`Grant::into_rule_for_installation`] itself)
+/// could inspect the synthesized predicate directly, but that made
+/// `into_rule_for_installation`'s loud `Once`/`Session`-scope error trivially
+/// bypassable by reading `.rule` directly, which this crate's own test suite
+/// did. A caller that wants to actually **install** this grant into a live
+/// `PolicyEngine` must go through [`Grant::into_rule_for_installation`]; a
+/// caller (in-crate or, via [`Grant::predicate`], out-of-crate) that only
+/// needs to inspect what was synthesized — never install it — has that
+/// narrower accessor instead.
 pub struct Grant {
     pub scope: GrantScope,
-    pub rule: CompiledRule,
+    pub(crate) rule: CompiledRule,
     pub provenance: GrantProvenance,
 }
 
@@ -101,8 +106,9 @@ impl Grant {
     /// synthesized from a `Shell`/`Http`/`Mcp`/`Git`/`Agent` task (i.e. the
     /// predicate is not `FsPrefix`/`FsExact`), this always returns `false`;
     /// it is not a general-purpose "does this grant cover this task" check
-    /// for those kinds. Callers working with non-`Fs` `TaskParams` must
-    /// match on `self.rule.predicate` directly instead.
+    /// for those kinds. Callers working with non-`Fs` `TaskParams` must use
+    /// [`Grant::predicate`] and match on it directly instead (Task 23 (W4):
+    /// `self.rule.predicate` is no longer reachable from outside this crate).
     ///
     /// **Security fix round 1, finding 4:** now also checks `op` (previously
     /// only compared the path, so e.g. a grant synthesized for `FsOp::Read`
@@ -117,6 +123,25 @@ impl Grant {
         }
     }
 
+    /// The synthesized predicate this grant's `CompiledRule` was built with —
+    /// read-only inspection, never installation. Task 23 (W4): added
+    /// alongside narrowing `Grant.rule` to `pub(crate)`, specifically for
+    /// callers (this crate's own non-`Fs` tests, chiefly) that need to see
+    /// what [`synthesize_grant`] produced regardless of the grant's
+    /// [`GrantScope`] — `into_rule_for_installation` is *not* a substitute
+    /// here, because it errors for `Once`/`Session`/`ExactArgv` scopes (see
+    /// its own doc comment), and inspecting the synthesized predicate is a
+    /// legitimate thing to want to do even for a scope with no installable
+    /// rule yet. This accessor deliberately hands back only the immutable
+    /// `&Predicate`, never the `CompiledRule` itself (which also carries
+    /// `scope`/`outcome`/`id` and — via [`Grant::into_rule_for_installation`]
+    /// — a path to actual installation) — so it cannot be used to reconstruct
+    /// an installable rule and does not reopen the hole narrowing `rule`
+    /// closes.
+    pub fn predicate(&self) -> &Predicate {
+        &self.rule.predicate
+    }
+
     /// The only sanctioned way to obtain this grant's `CompiledRule` for
     /// installation into a live `PolicyEngine`. **Security fix round 1,
     /// finding 5:** errors loudly, rather than silently handing back a rule
@@ -128,15 +153,17 @@ impl Grant {
     /// that are genuinely meant to become standing rules, so those pass
     /// through unchanged.
     ///
-    /// This exists because `Grant.rule` is `pub` (kept so tests and this
-    /// method itself can inspect the synthesized predicate) — a future
-    /// caller reaching for the obvious thing, `grant.rule`, to install into
-    /// `PolicyEngine::from_rules` would otherwise silently reproduce exactly
-    /// the "one-time approval becomes a permanent rule" bug this synthesis
-    /// module exists to prevent. Real TTL/use-count/session-binding
-    /// *enforcement* inside `PolicyEngine` itself is out of scope for this
-    /// task — this method only makes the current absence of that
-    /// enforcement impossible to silently misuse.
+    /// Task 23 (W4) closed the hole this method's earlier doc comment
+    /// flagged: `Grant.rule` is now `pub(crate)`, not `pub`, so a caller
+    /// outside this crate reaching for the obvious thing, `grant.rule`, to
+    /// install into `PolicyEngine::from_rules` gets a compile error instead
+    /// of silently reproducing the "one-time approval becomes a permanent
+    /// rule" bug this synthesis module exists to prevent — this method is
+    /// now the *only* way to obtain a `CompiledRule` from a `Grant` at all,
+    /// in-crate or out. Real TTL/use-count/session-binding *enforcement*
+    /// inside `PolicyEngine` itself remains out of scope for this task —
+    /// this method only makes the current absence of that enforcement
+    /// impossible to silently misuse.
     pub fn into_rule_for_installation(&self) -> Result<CompiledRule, GrantInstallError> {
         match &self.scope {
             GrantScope::Once => Err(GrantInstallError::UnenforcedLifetime("Once")),

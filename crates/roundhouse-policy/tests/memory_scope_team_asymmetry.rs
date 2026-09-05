@@ -224,15 +224,18 @@ fn synthesize_grant_handles_task_params_memory_without_panicking() {
     };
 
     let grant = synthesize_grant(&params, GrantScope::Once, provenance);
-    match grant.rule.predicate {
+    // Task 23 (W4): `Grant.rule` is `pub(crate)` now — inspect the
+    // synthesized predicate through `Grant::predicate()` instead of reading
+    // `.rule.predicate` directly.
+    match grant.predicate() {
         Predicate::Memory {
             scope,
             op,
             session: bound_session,
         } => {
-            assert_eq!(scope, MemoryScope::Project { workspace });
-            assert_eq!(op, MemoryOp::Write);
-            assert_eq!(bound_session, Some(session));
+            assert_eq!(*scope, MemoryScope::Project { workspace });
+            assert_eq!(*op, MemoryOp::Write);
+            assert_eq!(*bound_session, Some(session));
         }
         other => panic!("expected Predicate::Memory, got {other:?}"),
     }
@@ -257,7 +260,9 @@ fn a_grant_synthesized_for_one_session_does_not_match_a_different_session() {
         ts: Timestamp::from_unix_nanos(0),
     };
     let grant = synthesize_grant(&params_a, GrantScope::Always, provenance);
-    let engine = PolicyEngine::from_rules(vec![grant.rule]);
+    let engine = PolicyEngine::from_rules(vec![grant
+        .into_rule_for_installation()
+        .expect("Always scope installs cleanly")]);
 
     // Session A's exact approved request: Allow.
     let decision_a = engine.decide(&params_a);
