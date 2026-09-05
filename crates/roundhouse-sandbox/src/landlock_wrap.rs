@@ -587,15 +587,19 @@ mod tests {
 
     // Fix round 3, item 3: `same_inode` is the backstop for a bind-mount alias, which
     // Landlock (and the kernel generally) resolves by inode rather than by path.
-    // Directory hard links are refused by the kernel itself (`EPERM`) and creating a
-    // real bind mount needs mount-namespace privileges this test environment does not
-    // reliably have (verified: `unshare --user --map-root-user --mount` bind-mounting
-    // `/` itself fails here even though bind-mounting an ordinary directory like
-    // `/etc` succeeds) — so this exercises the exact comparison `same_inode` performs
-    // using a **file** hard link instead, which the kernel does allow. `dev()`/`ino()`
-    // equality is file-type-agnostic: this is the identical property a directory
-    // bind-mount alias has, tested the one way this environment can produce it
-    // without privilege.
+    // Directory hard links are refused by the kernel itself (`EPERM`), so this
+    // exercises the exact comparison `same_inode` performs using a **file** hard link,
+    // which the kernel does allow — `dev()`/`ino()` equality is file-type-agnostic.
+    //
+    // **Fix round 4, item 2 (Ruling W5-44) corrects what this comment used to claim.**
+    // It said a real bind-mount alias of `/` could not be produced in this environment,
+    // citing `unshare --user --map-root-user --mount` with `mount --bind / <dir>`. That
+    // was wrong by one character: `--bind` fails on `/` (`wrong fs type, bad option,
+    // bad superblock`) but **`--rbind` succeeds**, unprivileged, no bwrap. So this test
+    // is no longer the only reachable evidence — see
+    // `validate_workspace_root_refuses_a_bind_mount_alias_of_the_filesystem_root`
+    // below, which drives the real call site with a real alias. This one stays as the
+    // cheap, namespace-free unit check of the comparison itself.
     #[test]
     fn same_inode_detects_two_distinct_canonical_paths_sharing_one_inode() {
         let base = std::env::temp_dir().join(format!(
@@ -778,6 +782,132 @@ mod tests {
         assert_eq!(
             resolve_grandparent_fallback(&grandparent, WRAPPER_BINARY_NAME),
             Some(std::fs::canonicalize(&wrapper).unwrap())
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Fix round 4, item 2 (Ruling W5-44): the libtest path of the test below. Passed
+    /// to the re-exec'd child as `--exact`, which **exits 0 having run nothing** if it
+    /// matches no test — so the outer half asserts on `1 passed`, not just on the exit
+    /// status. Keep in sync with the function name.
+    const RBIND_ALIAS_TEST_NAME: &str = "landlock_wrap::tests::\
+                                         validate_workspace_root_refuses_a_bind_mount_alias_of_the_filesystem_root";
+
+    /// Set by the outer half on the re-exec'd child, carrying the directory that is a
+    /// bind-mount alias of `/` inside the child's mount namespace.
+    const RBIND_ALIAS_ENV: &str = "ROUNDHOUSE_LANDLOCK_RBIND_ALIAS_DIR";
+
+    /// Fix round 4, item 2 (Ruling W5-44): drives `validate_workspace_root` — the real
+    /// call site — against a real bind-mount alias of `/`.
+    ///
+    /// Why this had to be wired at all: deleting **both** `same_inode(...)` call sites
+    /// from `validate_workspace_root` left the whole suite green, because all three
+    /// `same_inode` tests call the function directly and nothing drove the validator
+    /// with an aliased root. That is structurally the same blind spot as item 1's, in
+    /// the same commit.
+    ///
+    /// The alias makes the two path-based checks above `same_inode` miss by
+    /// construction: `canonicalize` resolves symlinks but never bind mounts, so the
+    /// alias canonicalizes to its own ordinary tempdir path — neither `"/"` nor a
+    /// prefix of any system directory. Only the inode comparison sees it, which is why
+    /// removing the `same_inode` call sites makes this test fail.
+    ///
+    /// The test re-execs its own binary under
+    /// `unshare --user --map-root-user --mount` with `mount --rbind / <dir>` (`--bind`
+    /// fails on `/`; `--rbind` succeeds, unprivileged) and runs only itself there,
+    /// taking the inner branch via `RBIND_ALIAS_ENV`.
+    #[test]
+    fn validate_workspace_root_refuses_a_bind_mount_alias_of_the_filesystem_root() {
+        if let Ok(alias) = std::env::var(RBIND_ALIAS_ENV) {
+            // Inner half: we are inside the mount namespace, `alias` *is* `/`.
+            let alias = PathBuf::from(alias);
+            let canonical = std::fs::canonicalize(&alias).expect("canonicalize the alias");
+            assert_ne!(
+                canonical,
+                Path::new("/"),
+                "the alias must canonicalize to its own path, not to \"/\" — otherwise \
+                 the literal-root check above `same_inode` would be what refuses it and \
+                 this test would prove nothing about the inode backstop"
+            );
+            let err = validate_workspace_root(&alias)
+                .expect_err("a bind-mount alias of \"/\" must be refused");
+            match err {
+                IsolationError::Unsupported(msg) => assert!(
+                    msg.contains("same inode as \"/\""),
+                    "the refusal must come from the inode backstop; message was: {msg}"
+                ),
+                other => panic!("expected Unsupported, got {other:?}"),
+            }
+            return;
+        }
+
+        // Outer half.
+        let base = std::env::temp_dir().join(format!(
+            "roundhouse-landlock-rbind-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let probe_dir = base.join("probe");
+        let alias_dir = base.join("alias");
+        std::fs::create_dir_all(&probe_dir).expect("create probe dir");
+        std::fs::create_dir_all(&alias_dir).expect("create alias dir");
+
+        const RBIND_SCRIPT: &str = r#"mount --rbind / "$1""#;
+        const RBIND_AND_EXEC_SCRIPT: &str =
+            r#"mount --rbind / "$1" && exec "$2" --exact "$3" --nocapture --test-threads=1"#;
+
+        // Capability probe, so an environment without user namespaces skips cleanly
+        // instead of failing — and so that a failure of the real run below is a real
+        // failure rather than an environment gap.
+        let probe = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "sh", "-c"])
+            .arg(RBIND_SCRIPT)
+            .arg("sh")
+            .arg(&probe_dir)
+            .output();
+        match &probe {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                eprintln!(
+                    "skipping {RBIND_ALIAS_TEST_NAME}: `unshare --user --map-root-user --mount` \
+                     with `mount --rbind /` is unavailable here ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                let _ = std::fs::remove_dir_all(&base);
+                return;
+            }
+            Err(err) => {
+                eprintln!("skipping {RBIND_ALIAS_TEST_NAME}: could not run `unshare`: {err}");
+                let _ = std::fs::remove_dir_all(&base);
+                return;
+            }
+        }
+
+        let exe = std::env::current_exe().expect("resolve this test binary");
+        let out = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "sh", "-c"])
+            .arg(RBIND_AND_EXEC_SCRIPT)
+            .arg("sh")
+            .arg(&alias_dir)
+            .arg(&exe)
+            .arg(RBIND_ALIAS_TEST_NAME)
+            .env(RBIND_ALIAS_ENV, &alias_dir)
+            .output()
+            .expect("re-exec this test binary inside a mount namespace");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            out.status.success(),
+            "the re-exec'd inner half failed ({})\n--- child stdout ---\n{stdout}\n--- child \
+             stderr ---\n{stderr}",
+            out.status
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "libtest exits 0 when `--exact` matches no test, so the exit status alone \
+             proves nothing — the inner half must actually have run\n--- child stdout \
+             ---\n{stdout}\n--- child stderr ---\n{stderr}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
