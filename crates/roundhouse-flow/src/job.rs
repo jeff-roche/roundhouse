@@ -18,6 +18,7 @@
 use roundhouse_core::{JobId, Tier};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::convert::TryFrom;
 use thiserror::Error;
 
 /// The session shape a job's run executes under: provider/model selection,
@@ -274,17 +275,90 @@ pub enum AddVersionError {
     NotMonotonic { latest: u32, attempted: u32 },
 }
 
+/// The single implementation of [`AddVersionError::JobIdMismatch`]'s check,
+/// shared by [`Job::add_version`] (for every version after the first) and by
+/// [`TryFrom<JobWire> for Job`](TryFrom) (for the first version, which
+/// [`Job::new`] itself does not check — see that impl's comment). Keeping
+/// this in one place means both call sites enforce byte-identical behavior
+/// and cannot drift.
+fn check_job_id(expected: JobId, version: &JobVersion) -> Result<(), AddVersionError> {
+    if version.job_id() != expected {
+        return Err(AddVersionError::JobIdMismatch {
+            expected,
+            actual: version.job_id(),
+        });
+    }
+    Ok(())
+}
+
 /// A job, identified by `id`, retaining every version it has ever had.
 /// `versions` is private and append-only (via [`Job::add_version`]) and can
 /// never be empty: [`Job::new`] requires a first version, so the
 /// no-versions state this type could otherwise represent simply doesn't
 /// exist, and [`Job::latest`] never needs to panic to account for it.
+///
+/// Deserialized via `#[serde(try_from = "JobWire")]` rather than a plain
+/// derive (Task 29): a derived `Deserialize` would build this struct
+/// directly, bypassing both invariants below for wire/storage-sourced data
+/// even though hand-written code can never violate them. `TryFrom<JobWire>
+/// for Job` closes that gap by re-running the *same* validation — it builds
+/// the `Job` through [`Job::new`] and [`Job::add_version`] rather than
+/// re-implementing their checks, so there is exactly one implementation of
+/// each invariant and the wire path cannot silently drift from the
+/// hand-written path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "JobWire")]
 pub struct Job {
     id: JobId,
     /// Every prior version is retained; nothing here is ever mutated in
     /// place — see the module docs. Always non-empty; see the type docs.
     versions: Vec<JobVersion>,
+}
+
+/// A plain-field mirror of [`Job`]'s wire shape, with no invariants of its
+/// own — its only purpose is to be the `Deserialize` target that
+/// `TryFrom<JobWire> for Job` then validates. Its field names and types
+/// match `Job`'s exactly, so the serialized shape is unaffected (see
+/// `tests/job.rs`'s round-trip regression test, which pins this).
+#[derive(Debug, Deserialize)]
+struct JobWire {
+    id: JobId,
+    versions: Vec<JobVersion>,
+}
+
+/// Why a deserialized [`JobWire`] could not be converted into a valid
+/// [`Job`]: either it had zero versions (unrepresentable via [`Job::new`],
+/// which requires a first version) or one of its versions failed the same
+/// check [`Job::add_version`] applies to hand-written code.
+#[derive(Debug, Error, Clone, PartialEq)]
+pub enum JobFromWireError {
+    #[error("a Job must have at least one version; found zero")]
+    NoVersions,
+    #[error(transparent)]
+    InvalidVersion(#[from] AddVersionError),
+}
+
+impl TryFrom<JobWire> for Job {
+    type Error = JobFromWireError;
+
+    /// Builds the `Job` through its real constructors — [`Job::new`] for
+    /// the first version, then [`Job::add_version`] for every version after
+    /// it, in order — instead of re-implementing their validation. `Job::new`
+    /// itself never checks that its first version's `job_id` matches the
+    /// job's own id (hand-written callers pass both from the same value, so
+    /// hand-written code can never violate it), so that one check is made
+    /// explicit here via the same [`check_job_id`] helper `add_version`
+    /// uses, rather than skipped.
+    fn try_from(wire: JobWire) -> Result<Self, Self::Error> {
+        let mut versions = wire.versions.into_iter();
+        let first = versions.next().ok_or(JobFromWireError::NoVersions)?;
+        check_job_id(wire.id, &first)?;
+        let mut job = Job::new(wire.id, first);
+        for version in versions {
+            job.add_version(version)?;
+        }
+        Ok(job)
+    }
 }
 
 impl Job {
@@ -311,12 +385,7 @@ impl Job {
     /// never rewrite or reorder history) or that belongs to a different
     /// job id.
     pub fn add_version(&mut self, version: JobVersion) -> Result<(), AddVersionError> {
-        if version.job_id() != self.id {
-            return Err(AddVersionError::JobIdMismatch {
-                expected: self.id,
-                actual: version.job_id(),
-            });
-        }
+        check_job_id(self.id, &version)?;
         let latest = self.latest().version();
         if version.version() <= latest {
             return Err(AddVersionError::NotMonotonic {
