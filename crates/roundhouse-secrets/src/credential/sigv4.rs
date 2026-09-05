@@ -186,22 +186,47 @@ fn canonical_uri(path: &str, service: &str) -> String {
 /// `true` for a SigV4 `service` name in the S3 family — every one of which
 /// shares S3's literal-path canonicalization (see [`canonical_uri`]'s doc
 /// comment). Widened (Task 31 item 6, Phase 7 U4) from an exact match on
-/// `"s3"`, which missed two real, currently-shipped-elsewhere AWS service
-/// names: `s3-outposts` (S3 on Outposts) and `s3express` (S3 Express One
-/// Zone). Both would have silently fallen through to the generic
-/// double-encoding branch, producing a signature AWS rejects for any
-/// request whose path contains a character URI-encoding changes (`%`, a
-/// space, or a pre-encoded `%2F` inside one segment).
+/// `"s3"`, which missed two real, currently-shipped AWS service names:
+/// `s3-outposts` (S3 on Outposts) and `s3express` (S3 Express One Zone).
+/// Both fell through to the generic double-encoding branch, producing a
+/// signature AWS rejects for any request whose path contains a character
+/// URI-encoding changes (`%`, a space, or a pre-encoded `%2F` inside one
+/// segment).
 ///
-/// A **prefix** match, not a `contains` match, is the deliberate choice:
-/// AWS reserves an `s3`-prefixed SigV4 service name for exactly this
-/// family — there is no unrelated AWS service whose signing name happens to
-/// start with `s3` — so a prefix check covers `s3-outposts`/`s3express`
-/// without also matching a service name that merely has `s3` somewhere
-/// *inside* it (e.g. a hypothetical `costs3-reports`), which `contains`
-/// would incorrectly pull into S3's canonicalization.
+/// **An explicit, case-insensitive ALLOWLIST — not a prefix match** (fix
+/// round 1, Ruling R35; the first version of this fix used a prefix match
+/// and its justifying comment was WRONG). Checked directly against
+/// botocore's own service models, where `metadata.signatureVersion` is
+/// exactly this single-vs-double-encode flag: `s3` and `s3control` have
+/// signingName `s3` and single-encode (the S3 family), but **`s3tables`**
+/// (signatureVersion `v4`, signingName `s3tables`) and **`s3vectors`**
+/// (signatureVersion `v4`, signingName `s3vectors`) both need
+/// DOUBLE-encoding despite the name. Both are real, currently-shipping AWS
+/// services whose signing name happens to start with `s3` but are NOT part
+/// of this literal-path family — so `starts_with("s3")` silently
+/// misclassified both. An allowlist of the services actually known to need
+/// single-encoding is the only shape that can't be fooled by a future
+/// `s3`-prefixed, non-S3-family service name; a `contains` match would have
+/// the same problem plus a worse false-positive direction (matching a
+/// hypothetical unrelated service that merely has `s3` somewhere *inside*
+/// its name, e.g. `costs3-reports`).
+///
+/// `s3-object-lambda` is included: a real S3-family signing name, covered
+/// for free by the old (wrong) prefix match, kept here deliberately.
+///
+/// **`s3-outposts` is a deliberate, documented choice under genuine
+/// ambiguity**, not an oversight: the same signing name serves both the S3
+/// data-plane path on Outposts (single-encode, like `s3`) and a separate
+/// standalone "Outposts" control-plane API (double-encode) — real AWS SDKs
+/// disambiguate this by which client/endpoint configuration constructed the
+/// request, not by service name alone, information this function does not
+/// have. Listing it here is the data-plane reading, matching this crate's
+/// actual use (signing requests to an S3-shaped endpoint).
 fn is_s3_family_service(service: &str) -> bool {
-    service.len() >= 2 && service.as_bytes()[..2].eq_ignore_ascii_case(b"s3")
+    matches!(
+        service.to_ascii_lowercase().as_str(),
+        "s3" | "s3express" | "s3-outposts" | "s3-object-lambda"
+    )
 }
 
 /// AWS's "CanonicalQueryString": every parameter name/value URI-encoded
@@ -376,6 +401,34 @@ mod tests {
         assert_eq!(canonical_uri(path, "costs3-reports"), generic);
         assert_ne!(
             canonical_uri(path, "costs3-reports"),
+            canonical_uri(path, "s3")
+        );
+    }
+
+    /// Fix round 1 (Ruling R35): `s3tables` and `s3vectors` are real,
+    /// currently-shipping AWS SigV4 service names (botocore's own service
+    /// models: `metadata.signatureVersion = "v4"`, i.e. plain double-encode,
+    /// for both) that happen to START WITH `s3` but are NOT part of the S3
+    /// literal-path family. A plain prefix match misclassifies both into
+    /// S3's branch; the allowlist below must not.
+    #[test]
+    fn s3tables_and_s3vectors_are_not_treated_as_s3_despite_the_s3_prefix() {
+        let path = "/bucket/key%2Fwith-percent and space";
+        let generic = canonical_uri(path, "execute-api");
+        assert_eq!(canonical_uri(path, "s3tables"), generic);
+        assert_eq!(canonical_uri(path, "s3vectors"), generic);
+        assert_ne!(canonical_uri(path, "s3tables"), canonical_uri(path, "s3"));
+        assert_ne!(canonical_uri(path, "s3vectors"), canonical_uri(path, "s3"));
+    }
+
+    /// `s3-object-lambda` is a real S3-family signing name (also covered
+    /// for free by the old prefix match, but never pinned by a test) --
+    /// keep it in the explicit allowlist.
+    #[test]
+    fn s3_object_lambda_gets_s3s_literal_path_treatment() {
+        let path = "/bucket/key%2Fwith-percent and space";
+        assert_eq!(
+            canonical_uri(path, "s3-object-lambda"),
             canonical_uri(path, "s3")
         );
     }
