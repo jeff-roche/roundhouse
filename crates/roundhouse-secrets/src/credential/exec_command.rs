@@ -60,10 +60,15 @@ fn kill_helper_process_group(pgid: u32) {
 /// configured helper); the child process runs with a cleared environment
 /// plus only the caller's explicit allow-list (never the daemon's full
 /// environment, which would otherwise hand every secret in the process's env
-/// to an arbitrary configured helper); it is killed if it outruns
-/// `DEFAULT_TIMEOUT` (or a `with_timeout` override); and its stdout is
-/// rejected outright — not silently truncated-and-used — if it exceeds
-/// `MAX_STDOUT_BYTES` or is empty.
+/// to an arbitrary configured helper); it runs in its own process group
+/// (fix round 1, Ruling R34), and both the stdout-size-cap and whole-call
+/// timeout paths send `SIGKILL` to that ENTIRE group, not just the direct
+/// child — so a grandchild the helper forked (e.g. one still holding the
+/// stdout pipe open after the helper itself exits) is torn down too,
+/// rather than being left running or merely bounded by the timeout; it is
+/// killed if it outruns `DEFAULT_TIMEOUT` (or a `with_timeout` override);
+/// and its stdout is rejected outright — not silently truncated-and-used —
+/// if it exceeds `MAX_STDOUT_BYTES` or is empty.
 pub struct ExecCommandCredential {
     command: String,
     args: Vec<String>,
@@ -132,6 +137,18 @@ impl CredentialProvider for ExecCommandCredential {
                 // before the child exits, tokio kills the direct child on
                 // drop — but see `kill_helper_process_group`'s doc comment
                 // for why that alone doesn't reach a grandchild.
+                //
+                // **Neither error path below calls `child.wait()` after
+                // killing** (cap-exceeded, and the timeout branch's
+                // `start_kill`). That's deliberate, not an oversight: once
+                // a signal has been sent, `child` is simply dropped when
+                // this function returns its `Err`, and tokio's runtime
+                // reaps it via its background "orphan" queue regardless —
+                // the same mechanism `kill_on_drop(true)` itself relies on
+                // for the drop-via-timeout case above. An explicit
+                // `.wait()` here would buy nothing and, worse, would be
+                // exactly the kind of blocking await Ruling R37 (fix round
+                // 2) had to remove from the timeout branch.
                 .kill_on_drop(true);
 
             let mut child = command
@@ -280,7 +297,33 @@ impl CredentialProvider for ExecCommandCredential {
                     if let Some(pgid) = pgid {
                         kill_helper_process_group(pgid);
                     }
-                    let _ = child.kill().await;
+                    // Fix round 2 (Ruling R37): `start_kill`, NOT
+                    // `kill().await`. This branch runs AFTER
+                    // `self.timeout` has already elapsed, with nothing
+                    // left to bound a further wait — and
+                    // `Child::kill().await` is `start_kill()` followed by
+                    // `.wait().await` (tokio 1.53.1's own
+                    // `src/process/mod.rs`), which blocks until the OS
+                    // actually reaps the process. A helper wedged in
+                    // uninterruptible (`D`) state — realistically, a hung
+                    // NFS/FUSE read partway through fetching a token —
+                    // does not die the instant SIGKILL is sent; the kernel
+                    // only delivers it once the blocking syscall returns.
+                    // `kill().await` here would make `apply` (and the
+                    // request using it) wedge for exactly as long as that
+                    // syscall stays blocked, which is precisely what
+                    // `DEFAULT_TIMEOUT` exists to prevent.
+                    // `start_kill` sends the signal and returns
+                    // immediately without waiting for exit, restoring the
+                    // non-blocking semantics this branch had before this
+                    // unit (`kill_on_drop(true)` on the `Command` still
+                    // reaps `child` once it does exit — see the comment on
+                    // `kill_on_drop` above). The group SIGKILL just above
+                    // already does the work that matters for the
+                    // grandchild case; this direct-child signal is
+                    // best-effort belt-and-braces, so a failure here is
+                    // deliberately ignored rather than blocking on it.
+                    let _ = child.start_kill();
                     return Err(CredentialError::ExecFailed(
                         None,
                         format!(
