@@ -54,6 +54,27 @@ use super::{host_only::record_base_url_override, CredentialError};
 /// truthy check: `1` or `true` (case-insensitive) is truthy, anything else
 /// — including absent, empty, or any other value — is not. Default stays
 /// fail-closed: an absent or unparseable env var never opts in.
+///
+/// **This opt-in alone does NOT make the GPU-box scenario work end to end
+/// today (fix round 3, Ruling R39) — say so precisely, don't imply it
+/// does.** Setting the env var clears *this gate*, nothing more. The
+/// daemon's actual transport (`ReqwestTransport::new()`,
+/// `roundhouse-daemon/src/main.rs`) sets `https_only(true)`
+/// (`reqwest_transport.rs`), which rejects a plain `http://` request
+/// independently of anything this function decides — so an insecure base
+/// URL that passes this gate still fails one layer down, at the transport.
+/// `ReqwestTransport::allowing_plaintext_http()` already exists
+/// (`reqwest_transport.rs`) with only test callers today; **when plaintext
+/// HTTP must actually reach a local-runtime provider, the fix is
+/// per-provider transport selection driven by this SAME
+/// `ROUNDHOUSE_<PROVIDER>_ALLOW_INSECURE_BASE_URL` signal — NOT wiring the
+/// daemon to `allowing_plaintext_http()` globally.** A global switch
+/// removes `https_only` for every provider at once, silently widening the
+/// exact control this gate exists to tighten, for every provider whether
+/// or not its operator ever opted in. Recorded here, not only in a
+/// gitignored ledger, because an operator who follows this gate's error
+/// message, sets the env var, and still fails will go looking — and
+/// `allowing_plaintext_http()` is one grep away and already written.
 pub fn resolve_base_url(
     provider_id: &str,
     profile_default: &str,

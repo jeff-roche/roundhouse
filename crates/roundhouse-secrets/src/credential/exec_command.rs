@@ -268,6 +268,37 @@ impl CredentialProvider for ExecCommandCredential {
                     // shape-based patterns are the only thing that ever sees
                     // this text, and it is hard-truncated regardless, since a
                     // persisted `CredentialError` derives `Display`/`Debug`.
+                    //
+                    // **This is the WEAKER of `roundhouse-provider::audit`'s
+                    // two redactors, deliberately, not by oversight (fix
+                    // round 3, Ruling R38 / security M1).** The stronger
+                    // `redact_transport_error_text` is `pub(crate)` inside
+                    // `roundhouse-provider`, and this crate is downstream of
+                    // it (`roundhouse-secrets` -> `roundhouse-provider`), so
+                    // it structurally cannot be called from here without
+                    // making it `pub` — which this unit declines to do: it
+                    // would reverse a recorded visibility decision to widen
+                    // a public API for a call site with zero production
+                    // callers today (`ExecCommandCredential` is only ever
+                    // constructed in tests), and the preferred long-term fix
+                    // (CF12: put only the exit code plus fixed text in
+                    // `ExecFailed`, route redacted stderr to
+                    // `tracing::debug!` instead of a persisted field) would
+                    // make this redactor's strength irrelevant anyway rather
+                    // than needing a stronger one here.
+                    //
+                    // Consequence, executed: `redact_error_body` leaves
+                    // `curl: (7) Failed to connect to
+                    // https://svcacct:PASSWORD@gw.example.com/token`
+                    // COMPLETELY UNCHANGED — the stronger redactor would
+                    // reduce it to a host-only form. So embedded URL
+                    // userinfo in a helper's stderr survives into this
+                    // (truncated, but not host-reduced) error text today.
+                    // **This is gated on zero production callers and MUST
+                    // be closed — by the CF12 fix above, or by finally
+                    // making the stronger redactor reachable across this
+                    // crate boundary — before `ExecCommandCredential` gains
+                    // its first one.**
                     let redacted = roundhouse_provider::audit::redact_error_body(
                         &String::from_utf8_lossy(&stderr_buf),
                     );
