@@ -10,11 +10,23 @@
 //! non-success response could make this process buffer without bound.
 //! [`collect_body_capped`] is the one implementation all seven now call.
 //!
-//! This only ever runs on the error-classification path — the success path
-//! streams and decodes incrementally without ever buffering a whole body
-//! (see e.g. `codec::openai_responses::provider`'s doc comment on its own
-//! now-deleted local `collect_body`). Bounding it here closes the gap without
-//! touching the success-path decoders at all.
+//! This only ever runs on the error-classification path. **The success path
+//! is deliberately out of scope for this cap and remains unbounded** (fix
+//! round 1, Ruling R26 / security S7 — an earlier version of this comment
+//! wrongly claimed the success path "streams and decodes incrementally
+//! without ever buffering a whole body"; it does not).
+//! `reqwest_transport.rs`'s own doc comment (around its
+//! `decode_anthropic_messages_stream` usage) says the opposite: that
+//! consumer drains its stream into a `Vec<StreamEvent>` before returning,
+//! and `sse-stream`'s internal line buffer is unbounded too.
+//! `codec::openai_chat::decode::decode_openai_chat_stream` shows the same
+//! shape — it accumulates a `Vec<StreamEvent>` across SSE frames with no
+//! byte accounting, and `decode_guard::DecodeLoopGuard` bounds only a
+//! `saw_message_stop` flag, not bytes or iterations. A hostile or
+//! compromised HTTP-200 endpoint that streams forever is not stopped by
+//! anything this module adds; bounding the success path is separate,
+//! carry-forward work, not something this cap closes. Bounding the
+//! error-classification path here closes only that one gap.
 //!
 //! **Relationship to `transport::eventstream::MAX_BUFFERED_BYTES` (26 MiB):**
 //! that constant bounds a single AWS eventstream *frame* while it's being
