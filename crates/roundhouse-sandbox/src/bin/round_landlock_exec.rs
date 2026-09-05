@@ -13,18 +13,24 @@
 //! By the time this binary starts, bwrap's namespace, mounts, and `--proc`/
 //! `--dev` setup already exist. It applies a real Landlock ruleset — `ReadFile`
 //! and `Execute` on `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc` (enough
-//! for the dynamic linker and any interpreter/shell to load and run), full
-//! read/write on the workspace root (`ABI::V1`, matching `probe.rs`'s existing
-//! baseline) — via the *safe* `RulesetCreated::restrict_self()` (`probe.rs`'s
-//! module doc comment: this call needs no `unsafe`), then
-//! `CommandExt::exec()`s the real program. `CommandExt::exec` is also safe, so
-//! this binary needs **zero** `unsafe` code and does not widen `probe.rs`'s
-//! carve-out as the crate's one `unsafe_code`-permitted module.
+//! for the dynamic linker and any interpreter/shell to load and run);
+//! `ReadFile`+`WriteFile` on `/dev` and `ReadFile`+`ReadDir` on `/proc` (fix
+//! round 1, item 3 — bounded by bwrap's own curated `--dev`/`--proc` mounts,
+//! never the real host device nodes or process table; without this, ordinary
+//! tooling that touches `/dev/null` or `/proc/self/...` failed outright, e.g.
+//! `git --version` exiting 128); full read/write on the workspace root
+//! (`ABI::V1`, matching `probe.rs`'s existing baseline) — via the *safe*
+//! `RulesetCreated::restrict_self()` (`probe.rs`'s module doc comment: this
+//! call needs no `unsafe`), then `CommandExt::exec()`s the real program.
+//! `CommandExt::exec` is also safe, so this binary needs **zero** `unsafe`
+//! code and does not widen `probe.rs`'s carve-out as the crate's one
+//! `unsafe_code`-permitted module.
 //!
 //! # Fail-closed: never execs the real program without a confirmed ruleset
 //!
-//! If the ruleset cannot be built, or the kernel does not report it as
-//! `FullyEnforced`, this binary exits `2` with a message on stderr and never
+//! If the ruleset cannot be built, or the kernel does not report both
+//! `RulesetStatus::FullyEnforced` and `no_new_privs` as actually enforced (fix
+//! round 1, item 5), this binary exits `2` with a message on stderr and never
 //! reaches `exec()` — a child that appeared sandboxed but silently wasn't
 //! would be exactly the "fail-open hides" pattern this whole mechanism exists
 //! to prevent (the same posture `isolate.rs::seccomp_bpf_for_spawn` already
@@ -100,6 +106,25 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
 /// error — only "doesn't exist" is tolerated.
 const SYSTEM_READ_EXEC_DIRS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
 
+/// Fix round 1 (Ruling W5-40), item 3: `/dev`, granted `ReadFile`+`WriteFile` (never
+/// `Execute` — nothing under it needs to run). Reproduced pre-fix: with `/dev` absent
+/// from every rule, `ReadFile`+`WriteFile` on it are among the accesses `full_access`
+/// (`AccessFs::from_all`) *handles* but no rule *grants* on this path, so the kernel
+/// denies both — every `>/dev/null` redirect failed with `Permission denied`, and
+/// `git --version` exited 128 (`fatal: could not open '/dev/null' for reading and
+/// writing`). Granting access here is bounded, not a blind widening: `bwrap.rs`'s
+/// `--dev /dev` has already replaced the host's real `/dev` with its own minimal,
+/// curated tmpfs before `round-landlock-exec` ever runs, so this rule reaches only
+/// that curated mount, never real host device nodes.
+const DEV_READ_WRITE_DIR: &str = "/dev";
+
+/// Fix round 1 (Ruling W5-40), item 3: `/proc`, granted `ReadFile`+`ReadDir` (never
+/// write or execute). Same rationale as `DEV_READ_WRITE_DIR`: reproduced pre-fix,
+/// `/proc/self/status`, `/proc/version`, and similar reads were all denied. Bounded the
+/// same way — `bwrap.rs`'s `--proc /proc` has already replaced the host's real `/proc`
+/// with its own pidns-isolated procfs, so this reaches only that curated view.
+const PROC_READ_DIR: &str = "/proc";
+
 #[cfg(target_os = "linux")]
 fn apply_landlock_ruleset(workspace: &str) -> Result<(), String> {
     use landlock::{
@@ -112,6 +137,8 @@ fn apply_landlock_ruleset(workspace: &str) -> Result<(), String> {
     // different ABI (Ruling W5-9).
     let abi = ABI::V1;
     let read_exec = AccessFs::ReadFile | AccessFs::Execute;
+    let dev_read_write = AccessFs::ReadFile | AccessFs::WriteFile;
+    let proc_read = AccessFs::ReadFile | AccessFs::ReadDir;
     let full_access = AccessFs::from_all(abi);
 
     let ruleset = Ruleset::default()
@@ -140,6 +167,21 @@ fn apply_landlock_ruleset(workspace: &str) -> Result<(), String> {
             .map_err(|e| format!("add_rule({dir}) failed: {e}"))?;
     }
 
+    // `/dev` and `/proc` always exist under bwrap's own `--dev`/`--proc` mounts by the
+    // time this binary runs (unlike the arm64-conditional entries above) — an open
+    // failure here is a hard error, not tolerated as "this layout has none."
+    let dev_fd = PathFd::new(DEV_READ_WRITE_DIR)
+        .map_err(|e| format!("failed to open {DEV_READ_WRITE_DIR} for the Landlock rule: {e}"))?;
+    created = created
+        .add_rule(PathBeneath::new(dev_fd, dev_read_write))
+        .map_err(|e| format!("add_rule({DEV_READ_WRITE_DIR}) failed: {e}"))?;
+
+    let proc_fd = PathFd::new(PROC_READ_DIR)
+        .map_err(|e| format!("failed to open {PROC_READ_DIR} for the Landlock rule: {e}"))?;
+    created = created
+        .add_rule(PathBeneath::new(proc_fd, proc_read))
+        .map_err(|e| format!("add_rule({PROC_READ_DIR}) failed: {e}"))?;
+
     let workspace_fd = PathFd::new(workspace)
         .map_err(|e| format!("failed to open workspace {workspace} for the Landlock rule: {e}"))?;
     created = created
@@ -149,11 +191,18 @@ fn apply_landlock_ruleset(workspace: &str) -> Result<(), String> {
     let status = created
         .restrict_self()
         .map_err(|e| format!("restrict_self() failed: {e}"))?;
-    if !matches!(status.ruleset, RulesetStatus::FullyEnforced) {
+    // Fix round 1 (Ruling W5-40), item 5: `restrict_self()`'s `RestrictSelfStatus` also
+    // reports whether `no_new_privs` was actually enforced, and this crate treats an
+    // unchecked enforcement claim as the defect class it exists to prevent (the same
+    // posture as the `FullyEnforced` check on `status.ruleset` right below) — checking
+    // only one of the two fields would leave that same class of gap open for the other.
+    // Low risk in practice (the `landlock` crate sets NNP by default and `restrict_self()`
+    // itself errors if it cannot), but the guard was one field short of complete.
+    if !matches!(status.ruleset, RulesetStatus::FullyEnforced) || !status.no_new_privs {
         return Err(format!(
-            "kernel did not fully enforce the requested ruleset (status: {:?}) — refusing to \
-             exec the real program under a partial or absent restriction",
-            status.ruleset
+            "kernel did not fully enforce the requested ruleset (status: {:?}, no_new_privs: \
+             {}) — refusing to exec the real program under a partial or absent restriction",
+            status.ruleset, status.no_new_privs
         ));
     }
     Ok(())

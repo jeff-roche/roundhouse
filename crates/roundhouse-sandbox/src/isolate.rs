@@ -162,6 +162,16 @@ impl BwrapLandlockIsolate {
     /// `Err` rather than silently spawning the real program directly — a `Tier::
     /// Sandbox` attestation reached via Landlock's OR-branch must not silently
     /// degrade to "bwrap namespace isolation only" without the caller finding out.
+    ///
+    /// Fix round 1 (Ruling W5-40), items 1 and 2: also fails closed rather than
+    /// applying a ruleset that would enforce nothing (item 1 —
+    /// `landlock_wrap::validate_workspace_root`, e.g. `workspace_root == "/"`) or that
+    /// a correctly-confined earlier session could have substituted with attacker
+    /// code before this ruleset ever applies (item 2 —
+    /// `landlock_wrap::wrapper_is_inside_workspace`, the ordinary-dev-layout case
+    /// where the wrapper binary sits inside the workspace's own writable bind). Both
+    /// checks run on the canonicalized workspace root, closing the symlink-based
+    /// bypass a purely lexical check would leave open.
     fn wrap_for_landlock_if_available(
         &self,
         cmd: CommandSpec,
@@ -171,10 +181,21 @@ impl BwrapLandlockIsolate {
             self.probe_report.landlock,
             crate::probe::MechanismStatus::Available
         ) {
+            let workspace_root = crate::landlock_wrap::validate_workspace_root(workspace_root)?;
             let wrapper = crate::landlock_wrap::wrapper_binary_path()?;
+            if crate::landlock_wrap::wrapper_is_inside_workspace(&wrapper, &workspace_root) {
+                return Err(IsolationError::Unsupported(format!(
+                    "refusing to apply Landlock: the enforcement binary {} lies inside the \
+                     workspace root {} that this ruleset would grant full read-write access \
+                     to — a correctly confined child could overwrite it before any ruleset \
+                     is ever applied to the next session's spawn",
+                    wrapper.display(),
+                    workspace_root.display()
+                )));
+            }
             Ok(crate::landlock_wrap::wrap_for_landlock(
                 cmd,
-                workspace_root,
+                &workspace_root,
                 &wrapper,
             ))
         } else {
@@ -272,8 +293,9 @@ impl Isolate for BwrapLandlockIsolate {
     /// because Landlock probed `Available` — rather than because Seatbelt or
     /// seccomp did — really is bwrap namespace isolation plus a real,
     /// kernel-confirmed Landlock ruleset restricting the spawned child to
-    /// `ReadFile`+`Execute` on the system directories and read/write on the
-    /// workspace root, applied via `round-landlock-exec` (`landlock_wrap`'s module
+    /// `ReadFile`+`Execute` on the system directories, bwrap's own curated `/dev`
+    /// and `/proc` mounts (fix round 1, item 3), and read/write on the workspace
+    /// root, applied via `round-landlock-exec` (`landlock_wrap`'s module
     /// doc comment has the full mechanism and why it's a pre-exec wrapper binary
     /// rather than `pre_exec` on bwrap itself). See `achieved_tier()`'s doc
     /// comment for the full per-mechanism breakdown.

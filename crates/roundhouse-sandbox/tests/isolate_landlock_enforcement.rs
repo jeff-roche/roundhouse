@@ -44,10 +44,11 @@ fn unique_tmp_dir(prefix: &str) -> PathBuf {
 
 /// A script that (1) tries to read a file outside the workspace and records `cat`'s
 /// real exit code, then (2) does the same for a file inside the workspace — both
-/// redirected into files *inside* the workspace (never `/dev/null`: under the
-/// Landlock ruleset applied below, `/dev` is not in the granted set, and a stray
-/// `/dev/null` write would fail for a reason unrelated to what this test is
-/// checking).
+/// redirected into files *inside* the workspace rather than `/dev/null`. `/dev/null`
+/// writes are themselves granted under this ruleset as of fix round 1, item 3
+/// (`isolate_landlock_fix_round_1.rs` exercises that directly) — kept as plain
+/// workspace files here anyway, to keep this test's own two assertions decoupled from
+/// that separate grant.
 fn probe_script(
     outside_file: &std::path::Path,
     inside_file: &std::path::Path,
