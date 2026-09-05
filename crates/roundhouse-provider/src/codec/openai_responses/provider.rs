@@ -241,7 +241,19 @@ impl Provider for OpenAiResponsesProvider {
                 // outage returning HTML (see `error_500.cassette`) must not
                 // become a decode panic. `classify` already honors this.
                 let headers = to_header_map(&response.headers);
-                let body_bytes = collect_body(response.body).await;
+                let body_bytes = match crate::body_cap::collect_body_capped(
+                    response.body,
+                    crate::body_cap::MAX_RESPONSE_BODY_BYTES,
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        return Err(ProviderError::Transport(redact_transport_error_text(
+                            &e.to_string(),
+                        )))
+                    }
+                };
                 return Err(classify(
                     &self.profile.error_profile(),
                     response.status,
@@ -384,27 +396,6 @@ fn stream_failure_body(failure: &StreamFailure) -> Vec<u8> {
         error_obj["type"] = serde_json::json!(code);
     }
     serde_json::to_vec(&serde_json::json!({ "error": error_obj })).unwrap_or_default()
-}
-
-/// Drains a response body stream into a byte buffer for the error-
-/// classification path only. Not used on the success path (`§9.3`'s
-/// streaming decode reads directly from the stream).
-async fn collect_body(
-    mut body: std::pin::Pin<
-        Box<
-            dyn futures::Stream<Item = Result<bytes::Bytes, crate::transport::TransportError>>
-                + Send,
-        >,
-    >,
-) -> Vec<u8> {
-    use futures::StreamExt;
-    let mut out = Vec::new();
-    while let Some(chunk) = body.next().await {
-        if let Ok(chunk) = chunk {
-            out.extend_from_slice(&chunk);
-        }
-    }
-    out
 }
 
 #[cfg(test)]

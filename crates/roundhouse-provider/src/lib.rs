@@ -20,6 +20,7 @@
 
 mod anthropic_provider;
 pub mod audit;
+pub mod body_cap;
 mod cassette;
 pub mod codec;
 pub mod credential;
