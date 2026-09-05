@@ -9,13 +9,366 @@
  * as a *content-hashed* `assets/*.css` file, which is not this path and
  * would break that assertion.
  *
- * It exists so `assets/dist/` holds more than one content type. With only the
- * HTML shell embedded, `text/html` was the only value any response could
- * carry, and every content-type assertion in `tests/assets.rs` passed against
- * a handler that ignored `rust-embed`'s recorded type and hardcoded
- * `"text/html"`. Serving this file as `text/css` is what makes those
- * assertions capable of failing.
+ * Plain CSS, no framework, no webfont, no remote URL of any kind — this
+ * bundle is served unauthenticated to the whole LAN with no CSP covering
+ * `img-src`/`font-src` beyond `default-src 'self'` (see `index.html`'s CSP
+ * meta tag), so a remote asset reference here would be a beacon to whoever
+ * controls that origin, reachable by anyone who can reach this daemon.
+ *
+ * §11.3's stated use case is "check overnight runs from my phone on my own
+ * network" — this is written mobile-first: a single readable column, large
+ * enough tap targets, and only one breakpoint (widening the layout on a
+ * screen roomy enough to want it) rather than the other way around.
  */
+
+:root {
+  color-scheme: light dark;
+  --fg: #1a1a1a;
+  --bg: #ffffff;
+  --muted: #5f5f5f;
+  --border: #d8d8d8;
+  --surface: #f5f5f5;
+  --accent: #2c5c8f;
+  --needs-you: #8a4b00;
+  --failed: #a3242b;
+  --noop: #6b6b6b;
+  --landed: #256b3a;
+  --findings: #6a4c9c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e8e8e8;
+    --bg: #16181a;
+    --muted: #a0a0a0;
+    --border: #3a3d40;
+    --surface: #202325;
+    --accent: #7fb0e6;
+    --needs-you: #e3a557;
+    --failed: #e5757a;
+    --noop: #9a9a9a;
+    --landed: #7cc491;
+    --findings: #b39ddb;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+
 #app {
   font-family: system-ui, sans-serif;
+  line-height: 1.4;
+}
+
+.app-shell {
+  max-width: 48rem;
+  margin: 0 auto;
+  padding: 0.75rem 1rem 3rem;
+}
+
+.app-header h1 {
+  font-size: 1.25rem;
+  margin: 0.5rem 0;
+}
+
+.app-header nav a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.app-header nav a:hover,
+.app-header nav a:focus-visible {
+  text-decoration: underline;
+}
+
+/* Forms and buttons — sized for a thumb, not a mouse. */
+input[type="text"],
+textarea {
+  width: 100%;
+  font: inherit;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+textarea {
+  min-height: 3.5rem;
+  resize: vertical;
+}
+
+button {
+  font: inherit;
+  padding: 0.5rem 0.9rem;
+  min-height: 2.25rem;
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  background: var(--surface);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled),
+button:focus-visible {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.open-session-form {
+  margin: 0.75rem 0 1.25rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  background: var(--surface);
+}
+
+.open-session-form label {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 0.35rem;
+}
+
+.open-session-form input {
+  margin-bottom: 0.5rem;
+}
+
+.open-session-error {
+  color: var(--failed);
+  font-size: 0.85rem;
+}
+
+.open-session-note {
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin-top: 0.5rem;
+}
+
+/* Runs inbox */
+.runs-loading,
+.runs-empty,
+.runs-unavailable,
+.runs-error {
+  padding: 0.75rem;
+  border-radius: 0.375rem;
+  background: var(--surface);
+}
+
+.runs-unavailable {
+  border-left: 4px solid var(--needs-you);
+}
+
+.runs-error {
+  border-left: 4px solid var(--failed);
+}
+
+.run-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.run,
+.collapsed-noop {
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  padding: 0.6rem 0.75rem;
+}
+
+.bucket-label {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  padding: 0.1rem 0.4rem;
+  border-radius: 0.2rem;
+  margin-right: 0.4rem;
+  color: var(--bg);
+  background: var(--muted);
+}
+
+.run[data-run-id] .bucket-label {
+  background: var(--findings);
+}
+
+.headline {
+  font-weight: 600;
+}
+
+.severity,
+.cost,
+.binding-id {
+  display: block;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.extra-field {
+  font-size: 0.8rem;
+  color: var(--muted);
+  word-break: break-word;
+}
+
+.findings {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0 0;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.finding {
+  font-size: 0.85rem;
+}
+
+.finding-diff-status {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  margin-right: 0.35rem;
+  color: var(--muted);
+}
+
+.finding-diff-status[data-diff-status="new"] {
+  color: var(--failed);
+}
+
+.finding-diff-status[data-diff-status="resolved"] {
+  color: var(--landed);
+}
+
+.collapsed-noop button {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  padding: 0;
+  min-height: 2rem;
+}
+
+.collapsed-noop ul {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+/* Session view */
+.session-view h2 {
+  font-size: 1.05rem;
+  word-break: break-all;
+}
+
+.resume-note {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.stream-terminal,
+.stream-connection-refused,
+.stream-reconnecting,
+.stream-connecting {
+  padding: 0.6rem 0.75rem;
+  border-radius: 0.375rem;
+  background: var(--surface);
+  font-size: 0.9rem;
+}
+
+.stream-terminal,
+.stream-connection-refused {
+  border-left: 4px solid var(--failed);
+}
+
+.transcript {
+  margin: 0.75rem 0;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  background: var(--surface);
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.line-stderr {
+  color: var(--failed);
+}
+
+.line-ack,
+.line-unrecognised {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.interactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: flex-start;
+}
+
+.interactions textarea {
+  flex: 1 1 100%;
+}
+
+.interaction-not-implemented,
+.interaction-error,
+.interaction-sent {
+  flex-basis: 100%;
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.interaction-not-implemented {
+  color: var(--needs-you);
+}
+
+.interaction-error {
+  color: var(--failed);
+}
+
+.interaction-sent {
+  color: var(--landed);
+}
+
+.not-found {
+  padding: 0.75rem;
+  border-radius: 0.375rem;
+  background: var(--surface);
+}
+
+/* Only widen once there is real room — a tablet/desktop viewport, not a
+   phone held sideways. */
+@media (min-width: 40rem) {
+  .app-shell {
+    padding: 1.5rem 2rem 4rem;
+  }
+
+  .interactions button {
+    flex: 0 0 auto;
+  }
 }
