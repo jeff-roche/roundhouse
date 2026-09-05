@@ -218,6 +218,42 @@ fn a_small_output_overshoot_with_a_prompt_exit_is_still_rejected() {
     );
 }
 
+/// Ruling W5-25, finding 2 — process-group kill. `sh` forks a background
+/// `sleep 30`, then execs a foreground `sleep 30` of its own; both share
+/// `sh`'s process group. `wall_limit` (1s) fires long before either sleep
+/// would exit on its own, so this proves `kill_child_and_descendants`
+/// actually reaches the *backgrounded* sibling, not just the process
+/// `Child::kill()` would name: pre-fix, killing only the foreground `sh`
+/// leaves the background `sleep 30` holding the inherited stdout pipe's
+/// write end open, so `read_capped`'s reader thread never sees EOF and
+/// `thread::scope` blocks for the remainder of that sleep — this test's own
+/// 5s ceiling would be blown by roughly the width of the background sleep's
+/// remaining lifetime. Post-fix, `killpg` closes both write ends at once,
+/// the reader hits EOF immediately, and the call returns at the wall-clock
+/// ceiling.
+#[test]
+fn a_backgrounded_sibling_process_is_also_killed_not_left_holding_the_pipe_open() {
+    let start = Instant::now();
+    let result = run_bounded_subprocess(
+        Path::new("sh"),
+        &[OsStr::new("-c"), OsStr::new("sleep 30 & sleep 30")],
+        &[],
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+        4096,
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a backgrounded sibling must not be left holding the stdout pipe open past \
+         the wall-clock ceiling: took {elapsed:?}"
+    );
+    assert!(
+        matches!(result, Err(BoundedParseError::Timeout { .. })),
+        "unexpected result: {result:?}"
+    );
+}
+
 /// A program that doesn't exist must be a clean, typed error — never a
 /// panic, and never silently treated as any of the resource-bound variants.
 #[test]

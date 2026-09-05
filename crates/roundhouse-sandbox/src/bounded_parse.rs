@@ -11,7 +11,7 @@
 //! and memory/address space is a real, uncovered fourth axis, stated
 //! plainly rather than left for a reader to discover.** A security review
 //! found no `RLIMIT_AS`/`RLIMIT_DATA` installed anywhere in this module and
-//! flagged the omission; the project owner ruled against adding one this
+//! flagged the omission; ruling W5-25 decided against adding one this
 //! round (not against ever adding one): `RLIMIT_AS` counts *virtual*
 //! address space and interacts badly with allocator reservations (glibc's
 //! per-thread arenas, jemalloc worse), so there is no obviously-generous
@@ -151,12 +151,20 @@ pub enum BoundedParseError {
     #[error("helper process was killed by signal {signal} (resource limit exceeded)")]
     ResourceExhausted { signal: i32 },
 
-    /// The child's stdout exceeded `max_output_bytes` and was killed
-    /// before finishing. Independent of `wall_limit`/CPU: a child that
-    /// floods output cheaply (e.g. `yes`) must not be allowed to run for
-    /// the full wall-clock allowance just because it isn't CPU-bound.
+    /// The child's stdout **or stderr** exceeded its cap and was killed
+    /// before finishing — `max_output_bytes` names whichever limit was
+    /// actually crossed: the caller-supplied stdout cap, or (ruling
+    /// W5-25, finding 5) `STDERR_CAPTURE_CAP` if stderr was the one that
+    /// overflowed. Independent of `wall_limit`/CPU: a child that floods
+    /// output cheaply (e.g. `yes`) must not be allowed to run for the full
+    /// wall-clock allowance just because it isn't CPU-bound.
     #[error("helper process emitted more than {max_output_bytes} output bytes; killed")]
-    OutputTooLarge { max_output_bytes: usize },
+    OutputTooLarge {
+        /// The cap that was actually crossed — not necessarily
+        /// `run_bounded_subprocess`'s caller-supplied stdout cap; see the
+        /// variant doc above.
+        max_output_bytes: usize,
+    },
 
     /// The child exited on its own, without being killed by either bound
     /// above, but with a failure status. `stderr` (bounded to
@@ -346,6 +354,27 @@ enum WaitOutcome {
 /// getting the same prompt kill a stdout flood already got. Fail-closed
 /// either way (the wall-clock bound still applied), so this is a
 /// promptness fix, not a bypass fix like finding 1's.
+///
+/// **Residual (f), found during this round's self-review, not fixed:** the
+/// `Exited` arm below returns as soon as `try_wait()` reports the *direct*
+/// child gone — it does not call [`kill_child_and_descendants`] first. A
+/// child that forks a descendant, hands it the inherited stdout write end,
+/// and then exits itself (e.g. `sh -c "sleep infinity &"`) leaves that
+/// descendant holding the pipe open with nothing left to kill it: this loop
+/// has already returned, and `run_bounded_subprocess`'s `thread::scope`
+/// blocks forever inside `read_capped`'s `.read()` waiting for an EOF the
+/// orphan never sends — a hang with *no* bound applying at all, not even
+/// `wall_limit`. Distinct from finding 2 (which covers the three paths that
+/// already call `kill_child_and_descendants`: timeout, stdout overflow,
+/// stderr overflow) and from the item-2 residual above (a `setsid` escapee):
+/// this one is reachable through the *ordinary* exit path with no evasion
+/// needed, for any child that legitimately backgrounds work and returns
+/// before that work finishes. Not fixed this round — ruling W5-25 scoped
+/// item 2 to "the kill paths" and adding a `killpg` here changes the
+/// contract for a child that intentionally backgrounds a helper and exits
+/// (killing a legitimate grandchild is different from killing a hung one),
+/// which needs its own ruling rather than a silent addition in a Minor-item
+/// pass.
 fn wait_bounded(
     child: &mut Child,
     wall_limit: Duration,
