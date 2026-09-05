@@ -330,7 +330,6 @@ fn walk_function_body(body: &ast::FunctionBody, out: &mut Vec<ResolvedNode>) {
 /// closed) rather than continuing to evaluate later nodes.
 pub fn decide_pipeline(
     policy: &PolicyEngine,
-    unsealed: bool,
     ctx: &SealedContext,
     cmd: &ParsedShellAst,
 ) -> Decision {
@@ -342,7 +341,7 @@ pub fn decide_pipeline(
             program: node.resolved_program.clone(),
             argv: node.argv.clone(),
         });
-        let d = policy.decide_sealed(&params, unsealed, ctx);
+        let d = policy.decide_sealed(&params, ctx);
         let is_deny = d.outcome == Outcome::Deny;
         worst = combine(worst, d);
         if is_deny {
@@ -361,7 +360,7 @@ pub fn decide_pipeline(
                 path: redir.path.clone(),
                 canonical,
             };
-            let d = policy.decide_sealed(&fs_params, unsealed, ctx);
+            let d = policy.decide_sealed(&fs_params, ctx);
             let is_deny = d.outcome == Outcome::Deny;
             worst = combine(worst, d);
             if is_deny {
@@ -397,7 +396,6 @@ fn combine(acc: Option<Decision>, next: Decision) -> Option<Decision> {
 /// since that classification happens upstream in `classify_shell`.
 pub fn decide_shell_command(
     policy: &PolicyEngine,
-    unsealed: bool,
     ctx: &SealedContext,
     raw: &str,
     env: &SessionEnv,
@@ -407,6 +405,6 @@ pub fn decide_shell_command(
             outcome: Outcome::Deny,
             rule: Some(RuleId(hint.rule.to_string())),
         },
-        ShellClassification::Program(cmd) => decide_pipeline(policy, unsealed, ctx, &cmd),
+        ShellClassification::Program(cmd) => decide_pipeline(policy, ctx, &cmd),
     }
 }

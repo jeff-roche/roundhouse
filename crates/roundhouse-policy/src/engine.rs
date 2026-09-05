@@ -461,10 +461,9 @@ impl PolicyEngine {
     pub fn decide_sealed(
         &self,
         params: &TaskParams,
-        unsealed: bool,
         ctx: &crate::sealed::SealedContext,
     ) -> Decision {
-        if !unsealed {
+        if !self.unsealed {
             for rule in crate::sealed::sealed_rules() {
                 if (rule.matches)(params, ctx) {
                     return Decision {
@@ -536,7 +535,7 @@ impl PolicyEngine {
     /// the interactive default of Ask, because there is no human to answer the
     /// Ask. The sealed floor is still applied first.
     pub fn decide_unattended(&self, params: &TaskParams) -> Decision {
-        let d = self.decide_sealed(params, self.unsealed, &self.sealed_ctx());
+        let d = self.decide_sealed(params, &self.sealed_ctx());
         if d.rule.is_none() && d.outcome == Outcome::Ask {
             Decision {
                 outcome: Outcome::Deny,
@@ -557,7 +556,7 @@ impl PolicyEngine {
 /// through the trait-object call path either.
 impl crate::Policy for PolicyEngine {
     fn decide(&self, input: &PolicyInput) -> PolicyDecision {
-        self.decide_sealed(&input.params, self.unsealed, &self.sealed_ctx())
+        self.decide_sealed(&input.params, &self.sealed_ctx())
             .outcome
             .into()
     }
