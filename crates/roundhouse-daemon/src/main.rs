@@ -4,62 +4,107 @@
 //! workspace (it's one of only two crates — the other is
 //! `roundhouse-cli` — allowed to; nothing else may depend on either).
 //!
-//! Phase 1 runs exactly one scripted demo session (the vertical-slice exit
-//! criterion) and serves its updates to one attached client; the real
-//! supervisor/API-server/lifecycle wiring is Phase 2+ (§13.2). The testable
-//! parts live in `roundhouse_daemon`'s lib target, next to this file.
+//! Phase 1 ran exactly one scripted demo session (the vertical-slice exit
+//! criterion) and served its updates to one attached client — see the
+//! now-retired `run_demo_session`, still kept in `roundhouse_daemon::demo`
+//! as an integration-test fixture (`tests/exit_criterion_demo.rs`) but no
+//! longer called from here. Phase 7, Task 7 replaces that scripted boot
+//! path with the real one: `TaskRunner::bootstrap()` (via `EngineHandles`)
+//! → `boot::run_boot_sequence` → Task 3's real `accept_loop`, serving an
+//! arbitrary number of concurrent `round attach`/`round create`/`round run`
+//! clients against a real `SessionRegistry` whose entries are real
+//! `SessionActor`s (`session_bootstrap::create_real_session`), each backed
+//! by real isolation, a real per-session `PolicyEngine`, this session's
+//! configured MCP servers (if any), real redaction, and a real egress
+//! registration with the daemon's one shared `LoopbackProxy`.
+//!
+//! **What this task does NOT wire (see the task report for the full
+//! rationale):** there is still no `ClientRequest` variant that names "do
+//! something inside an already-created session" — `roundhouse-proto`'s wire
+//! types are a frozen Phase 0 contract, and extending them is out of this
+//! lane's charter (see `socket_server::drive_session`'s own doc comment on
+//! the `Attach`/`CreateSession`-only handshake). So a session created here
+//! is real and reachable, but nothing yet drives a chat turn against it
+//! from a live client — that remains a later task's integration point
+//! (most plausibly `roundhouse-web`'s HTTP layer, Task 9).
 #![forbid(unsafe_code)]
 
+use clap::Parser;
 use roundhouse_bus::local_bus::LocalBus;
-use roundhouse_daemon::boot;
-use roundhouse_daemon::demo::{run_demo_session, DemoConfig, FakeEditProvider, NoopTransport};
-use roundhouse_daemon::socket_server::serve;
+use roundhouse_daemon::mcp_config;
+use roundhouse_daemon::session_bootstrap::DaemonResources;
+use roundhouse_daemon::session_registry::SessionRegistry;
+use roundhouse_daemon::socket_server::{accept_loop, bind_socket};
 use roundhouse_engine::EngineHandles;
-use roundhouse_provider::{AnthropicMessagesProvider, Provider, RequestCtx, ReqwestTransport};
+use roundhouse_net::proxy::LoopbackProxy;
+use roundhouse_provider::{
+    AnthropicMessagesProvider, BoxFut, Capabilities, ChatRequest, ChatStream, HttpRequest,
+    HttpResponseStream, HttpTransport, ModelId, ModelInfo, Plan, Provider, ProviderError,
+    RequestCtx, ReqwestTransport, TokenCount, TransportError,
+};
+use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
+use roundhouse_sandbox::Isolate;
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
-
-/// The demo file's starting contents, rewritten on every run so repeated
-/// `cargo run`s behave identically: `edit_file` fails closed when `find` doesn't
-/// occur exactly once (S-TOOL-3), so a file left containing "new" from a
-/// previous run would make the second run error instead of demoing anything.
-const DEMO_FILE_CONTENTS: &str = "hello old world\n";
 
 /// Owner-only. Everything the daemon writes lives under a directory with this
 /// mode, so no other unprivileged user on the host can pre-plant a symlink at a
 /// path the daemon is about to open with `O_CREAT`.
 const RUNTIME_DIR_MODE: u32 = 0o700;
 
+/// `round-daemon-internal`'s own argument parsing — deliberately tiny.
+/// `round daemon` (`roundhouse-cli`'s subcommand, `commands::daemon::run`)
+/// execs this binary with no arguments today; an operator or test that needs
+/// a non-default socket path invokes this binary directly with `--socket`
+/// (the lane file's own correction: "the daemon binary needs a --socket
+/// flag, not a daemon subcommand of its own" — this is that flag).
+#[derive(Debug, Parser)]
+#[command(
+    name = "round-daemon-internal",
+    about = "The real round daemon process (internal — spawned by `round daemon`, not run directly)",
+    long_about = None
+)]
+struct Args {
+    /// Unix socket path to bind. Falls back to `$ROUND_SOCKET`, then
+    /// `roundhouse_tui::default_socket_path()` — unchanged from before this
+    /// flag existed, so an operator who already relies on `$ROUND_SOCKET`
+    /// sees no behavior change.
+    #[arg(long)]
+    socket: Option<PathBuf>,
+}
+
+/// The one process-wide `TaskRunner`, obtained exactly once via
+/// `EngineHandles::bootstrap` (which panics on a second call — see
+/// `roundhouse_core::TaskRunner::bootstrap`'s own doc comment) and exposed
+/// as `&'static` through this `OnceLock` rather than a bare local binding:
+/// `SessionActor::new` (and everything `session_bootstrap` builds around it)
+/// requires `runner: &'static TaskRunner`, and a local `let handles = ...`
+/// inside `main`'s own stack frame cannot honestly produce that lifetime —
+/// only a `'static` place can.
+static HANDLES: std::sync::OnceLock<EngineHandles> = std::sync::OnceLock::new();
+
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
+    let args = Args::parse();
 
-    // Phase 0 proves the dependency graph compiles; this proves the five
-    // vertical-slice crates run together. This binary runs exactly one scripted
-    // demo session — against `demo::FakeEditProvider` by default, and against
-    // the real `AnthropicMessagesProvider` when `ANTHROPIC_API_KEY` is set (see
-    // the provider selection below, moved up here so it can feed
-    // `EngineHandles::bootstrap`).
-    //
     // Keyed on the *presence* of `ANTHROPIC_API_KEY` rather than on a flag, so
     // the no-key path is the default: with no key set this binary opens zero
-    // outbound connections, matching §12.5's "zero outbound connections before
-    // first session creation" budget, and the exit-criterion demo stays runnable
-    // offline and in CI. Only an operator who has deliberately exported a key
-    // gets a live, billable request.
+    // outbound provider connections, matching §12.5's "zero outbound
+    // connections before first session creation" budget. Only an operator who
+    // has deliberately exported a key gets a live, billable request from any
+    // session created against this daemon.
     //
-    // The key is moved straight into `RequestCtx` and never touched again here:
-    // it is not logged, not echoed into the "demo session complete" line below,
-    // and neither `RequestCtx` nor `HttpRequest` derives `Debug`, so no
-    // formatter downstream can print it either (§9.9).
+    // The key is moved straight into `RequestCtx` and never touched again
+    // here: it is not logged, and neither `RequestCtx` nor `HttpRequest`
+    // derives `Debug`, so no formatter downstream can print it either (§9.9).
     //
     // An empty `ANTHROPIC_API_KEY=` counts as unset: it is what `unset` looks
     // like to a half-written shell profile or a CI job with an unpopulated
-    // secret, and taking the live path with an empty credential would trade the
-    // working demo for a guaranteed 401.
+    // secret, and taking the live path with an empty credential would trade a
+    // working daemon for every session's first request 401-ing.
     let (provider, request_ctx): (Arc<dyn Provider>, RequestCtx) =
         match std::env::var("ANTHROPIC_API_KEY")
             .ok()
@@ -75,27 +120,11 @@ async fn main() -> color_eyre::Result<()> {
                 },
             ),
             None => (
-                Arc::new(FakeEditProvider {
-                    reply_text: "Edited the demo file.".into(),
-                }),
+                Arc::new(NoProviderConfigured) as Arc<dyn Provider>,
                 RequestCtx {
                     trace_id: None,
-                    transport: Arc::new(NoopTransport),
-                    // Phase 7, Task 6 fix round 1 (W1-R24 as resolved by
-                    // W1-R27): this used to be the bare literal `"demo"`,
-                    // a 4-byte placeholder a production security
-                    // threshold (`session_actor::MIN_REDACTABLE_SECRET_LEN`,
-                    // formerly 12) was shaped around solely to exclude —
-                    // registering `"demo"` itself as a redaction pattern
-                    // would have mangled every unrelated occurrence of the
-                    // word "demo" in this session's own log text (e.g.
-                    // "demo session complete"). Fixed at the source
-                    // instead: a placeholder distinctive enough that it
-                    // never collides with this demo's own log text, so the
-                    // length floor no longer needs to be shaped around it.
-                    // Full retirement of this fake-provider path is
-                    // Task 7's.
-                    api_key: "demo-mode-fake-api-key".into(),
+                    transport: Arc::new(NoTransportConfigured),
+                    api_key: "no-anthropic-api-key-configured".into(),
                     credentials: None,
                 },
             ),
@@ -103,35 +132,43 @@ async fn main() -> color_eyre::Result<()> {
 
     // `EngineHandles::bootstrap` is `TaskRunner::bootstrap()`'s real, intended
     // call site (its own doc comment: "called exactly once ... at daemon
-    // startup, and threaded through from there" — it panics on a second call).
-    // A prior version of this comment claimed no concrete `Bus` implementation
-    // existed yet and bypassed `EngineHandles` for that reason; that was stale
-    // even at the time Phase 3 wrote it — `roundhouse_bus::local_bus::LocalBus`
-    // has implemented `Bus` since Phase 4. Nothing in this demo dispatches
-    // through the bus yet, but there is no longer a reason to bypass
-    // `EngineHandles` to avoid inventing one: a real `LocalBus` is free to
-    // construct and this is the daemon's one real startup site.
-    let handles = EngineHandles::bootstrap(Arc::new(LocalBus::new()), vec![provider.clone()]);
+    // startup, and threaded through from there" — it panics on a second
+    // call). Stored in the `'static` `HANDLES` (see that item's own doc
+    // comment) rather than a local binding.
+    let handles = HANDLES.get_or_init(|| {
+        EngineHandles::bootstrap(Arc::new(LocalBus::new()), vec![provider.clone()])
+    });
     let runner = &handles.task_runner;
-    let _layers = roundhouse_config::default_layers(None);
 
-    // Every artifact below (socket, event log, scratch file) goes inside one
-    // private directory rather than straight into the shared temp dir. Writing
-    // predictable names into a world-writable `/tmp` lets any other local user
-    // pre-create one as a symlink; both `tokio::fs::write` and SQLite's
-    // `O_CREAT` open follow symlinks, so the daemon would truncate a file the
-    // attacker chose, as the victim.
+    // Every artifact below (socket, event log, scratch state) goes inside
+    // one private directory rather than straight into the shared temp dir.
+    // Writing predictable names into a world-writable `/tmp` lets any other
+    // local user pre-create one as a symlink; both `tokio::fs::write` and
+    // SQLite's `O_CREAT` open follow symlinks, so the daemon would truncate
+    // a file the attacker chose, as the victim.
     let runtime_dir = roundhouse_tui::default_runtime_dir();
     prepare_runtime_dir(&runtime_dir)?;
 
-    let socket_path = std::env::var_os("ROUND_SOCKET")
-        .map(PathBuf::from)
+    let socket_path = args
+        .socket
+        .or_else(|| std::env::var_os("ROUND_SOCKET").map(PathBuf::from))
         .unwrap_or_else(roundhouse_tui::default_socket_path);
     remove_stale_socket(&socket_path)?;
 
-    let store_path = runtime_dir.join("demo-events.db");
-    let edit_target = runtime_dir.join("demo-target.txt");
-    write_demo_file(&edit_target).await?;
+    // Absolute by construction (`default_runtime_dir`'s own contract) and
+    // asserted as such by `SessionActor::new` — this session-independent
+    // path anchors both `sealed_state_dir_write` and, via
+    // `session_bootstrap::create_real_session`, every session's `SealedContext`.
+    let state_dir = runtime_dir.clone();
+    // The REAL, canonicalized path of this running binary — what
+    // `sealed_daemon_binary_write` protects. `std::env::current_exe()`
+    // itself may return a symlink (e.g. `/proc/self/exe` on some
+    // platforms); canonicalizing resolves to the real underlying file, the
+    // same pattern `commands::daemon::daemon_binary_path` already uses in
+    // `roundhouse-cli`.
+    let daemon_binary = std::fs::canonicalize(std::env::current_exe()?)?;
+
+    let store_path = runtime_dir.join("events.db");
 
     // Boot sequence (S-SESS-4): reclassify any task left in `Created`/`Decided`/
     // `Running` state by a previous daemon process that died mid-run, and
@@ -142,15 +179,14 @@ async fn main() -> color_eyre::Result<()> {
     // through `run_boot_sequence` — this is the actual re-arm site: every
     // persisted `Suspended{AwaitingApproval}` task gets registered live here,
     // so a restarted daemon's registry isn't empty even though the approvals
-    // were always correctly sitting in the database. See `roundhouse_daemon::boot`
-    // for the re-arm loop itself. Runs once, here, between opening the store
-    // and starting the (possibly brand new) demo session — on a fresh
+    // were always correctly sitting in the database. Runs once, here, between
+    // opening the store and starting the accept loop — on a fresh
     // `store_path` this is a cheap no-op scan over an empty `tasks` table.
     let recovery_store = roundhouse_store::open(&store_path).await?;
     let recovery_writer = roundhouse_store::spawn_writer(recovery_store).await;
     let recovery_pool_for_scan = roundhouse_store::open(&store_path).await?;
     let approval_registry = roundhouse_policy::registry::ApprovalRegistry::new();
-    let boot_report = boot::run_boot_sequence(
+    let boot_report = roundhouse_daemon::boot::run_boot_sequence(
         &recovery_pool_for_scan,
         &recovery_writer,
         runner,
@@ -164,77 +200,130 @@ async fn main() -> color_eyre::Result<()> {
             boot_report.suspended.len()
         );
     }
+    // CF-12(a): `recovery_writer` keeps `spawn_writer`'s empty default
+    // redactor — deliberately. `recover_interrupted_tasks` (called above)
+    // only ever appends synthetic `Interrupted` markers keyed by task/session
+    // id (`roundhouse-store/src/recovery.rs`), never user- or
+    // model-controlled text, so there is nothing here for a `Redactor` to
+    // protect. Named explicitly in the task report as one of the three
+    // `EventWriter`s this daemon can append through.
 
-    let (events_tx, events_rx) = tokio::sync::mpsc::channel(16);
-    // Nobody consumes `requests_out` yet: Task 3's real session registry is
-    // what will read `ClientRequest`s off it and act on them. Held here
-    // (rather than dropped) so `serve`'s forwarding send doesn't fail against
-    // a closed channel the moment a client's handshake request arrives.
-    let (requests_tx, _requests_rx) = tokio::sync::mpsc::channel(16);
-    let server = tokio::spawn({
-        let socket_path = socket_path.clone();
-        async move { serve(&socket_path, requests_tx, events_rx).await }
-    });
+    // CF-11: `project_root` is what makes `default_layers`'s Project scope
+    // (and therefore `mcp_config::load_mcp_servers`'s/`load_network_config`'s
+    // own narrow-only project-scope handling) reachable at all — this daemon
+    // has no other source of a filesystem project root: `ClientRequest::
+    // CreateSession`'s `workspace_name` is a plain `String` label, not a
+    // path (see CF-17's own note in the task report). The daemon's own
+    // current working directory is the only real candidate; an operator who
+    // runs `round daemon` from inside their project gets project-scoped
+    // config, one who doesn't gets user-global only.
+    let project_root = std::env::current_dir().ok();
 
-    let cfg = DemoConfig {
-        store_path,
-        edit_target,
-        find: "old".into(),
-        replace: "new".into(),
-        provider,
-        request_ctx,
+    let mcp_configs = mcp_config::load_mcp_servers(project_root.as_deref())?;
+
+    // CF-12(c): `load_network_config` has zero production callers before
+    // this task. Fail-closed decision (stated explicitly, per the task
+    // brief, since nothing in the code constrains this choice): a
+    // `NetworkConfigError` (a malformed `[network]` table in an otherwise
+    // loadable config file) does NOT fail the whole daemon boot — it falls
+    // back to `NetworkConfig::default()` (an empty allowlist, which
+    // `EgressPolicy::matches` treats as deny-all), the same fail-closed
+    // default an absent `[network]` section already gets. A config typo
+    // degrading every session's egress to "denied" is loud (logged) and
+    // safe; refusing to boot the whole daemon over one malformed section
+    // would be a larger, over-restrictive blast radius for a mistake that
+    // doesn't compromise anything by failing closed instead.
+    let network_config = match roundhouse_config::load_network_config(project_root.as_deref()) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "failed to load [network] config; falling back to an empty \
+                 (deny-all) egress allowlist for every session rather than \
+                 failing the whole daemon boot"
+            );
+            roundhouse_config::NetworkConfig::default()
+        }
     };
 
-    // With the fake provider this runs to completion immediately (it never
-    // touches the network); with the real one it takes as long as one Anthropic
-    // turn. Either way the two resulting messages sit buffered in the channel
-    // until a `round` client connects and drains them below.
-    let outcome = run_demo_session(cfg, runner, events_tx)
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+    // A real probe of THIS host's actual isolation mechanisms (landlock,
+    // bwrap, seccomp, seatbelt) — `probe_cached` genuinely exercises each
+    // one via real syscalls (§6.5 rule 1: fail-open is made structurally
+    // impossible by actually exercising each mechanism), not a placeholder.
+    // `BwrapLandlockIsolate::test_with_probe`'s name notwithstanding, it is
+    // not test-gated (`#[cfg(test)]`) — it is a plain, always-`pub`
+    // constructor that takes a caller-supplied `MechanismProbeReport` and
+    // the production bwrap install path baked in
+    // (`test_with_probe_and_bwrap_path`'s own doc comment calls this out
+    // explicitly: "the production install path baked into `test_with_probe`").
+    // `roundhouse-sandbox` is lane W5's crate, not this lane's, so renaming
+    // this naming trap away is out of scope here — noted in the task report.
+    let probe_report = roundhouse_sandbox::probe::probe_cached(&runtime_dir).await;
+    let isolate: Arc<dyn Isolate> = Arc::new(BwrapLandlockIsolate::test_with_probe(probe_report));
 
-    // `println!`, not `tracing::info!`: no subscriber is installed (Phase 2's
-    // real daemon lifecycle owns that decision), so a `tracing` event here would
-    // go nowhere — and this line is the operator's cue to start `round` in a
-    // second terminal.
+    // The daemon-wide egress proxy: bound and serving exactly once, here, at
+    // boot — before any session (and therefore any call to
+    // `session_bootstrap::create_real_session`) exists, per
+    // `create_session_with_egress`'s own doc comment.
+    let proxy = Arc::new(LoopbackProxy::new());
+    let proxy_store = roundhouse_store::open(&store_path).await?;
+    let proxy_writer = roundhouse_store::spawn_writer(proxy_store).await;
+    proxy.clone().serve(runner, proxy_writer.clone()).await?;
+
+    let session_store = roundhouse_store::open(&store_path).await?;
+    let resources = Arc::new(DaemonResources::new(
+        session_store,
+        isolate,
+        proxy,
+        state_dir,
+        daemon_binary,
+        mcp_configs,
+        network_config,
+        runner,
+        provider,
+        request_ctx,
+        proxy_writer,
+    ));
+
+    let registry = Arc::new(SessionRegistry::new());
+
+    // `bind_socket` (bind, then chmod to owner-only) runs here, synchronously,
+    // in this stack frame, before `accept_loop` is ever spawned — restoring
+    // the guarantee that a client dialing immediately after this function
+    // returns will find a real, already-bound socket (`accept_loop`'s own
+    // doc comment, ruling W1-R12).
+    let listener = bind_socket(&socket_path)?;
+
     println!(
-        "demo session complete: session_id={} socket={}",
-        outcome.session_id,
-        socket_path.display()
+        "round daemon listening: socket={} state_dir={}",
+        socket_path.display(),
+        resources.state_dir.display()
     );
 
-    // Blocks on `listener.accept()` until a `round` client attaches, then
-    // serves that one connection until either side ends it: the client
-    // disconnecting, or `events_tx` above closing (it was moved into
-    // `run_demo_session`, which drops it on return — the normal shutdown
-    // order once the scripted session is done sending updates). See
-    // `socket_server::serve_connection`'s doc comment for why "wait for the
-    // client to also disconnect before exiting" was a real deadlock.
-    //
-    // `server` is a `JoinHandle<io::Result<()>>` now, not `JoinHandle<()>`:
-    // `serve`'s `bind`/`set_permissions` can fail, and since `serve` is
-    // spawned rather than called and unwrapped synchronously (unlike Phase
-    // 1's `serve_ndjson`, which propagated a bind failure via `?` before the
-    // demo ever ran), that failure only surfaces here, after the demo has
-    // already completed. Still surfaced as a real error rather than
-    // swallowed, so a socket that failed to bind is not reported as a
-    // successful run.
-    match server.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => return Err(err.into()),
-        Err(join_err) => return Err(color_eyre::eyre::eyre!(join_err.to_string())),
-    }
+    // CF-13(2): `accept_loop`'s `Err` must terminate the daemon with a
+    // non-zero exit — the socket file otherwise still exists and clients get
+    // `ECONNREFUSED`, the identical operator-visible symptom as the old
+    // zombie-daemon bug this lane's earlier rounds fixed, merely fail-closed
+    // instead of fail-open. Spawned (rather than awaited directly) so a panic
+    // inside it is caught by `JoinHandle` rather than taking this whole
+    // `main` task down uncontrolled, but the handle is explicitly awaited and
+    // its `Err` propagated — never `tokio::spawn(accept_loop(..))` with the
+    // handle discarded, the exact pattern this ruling forbids.
+    let accept_handle = tokio::spawn(accept_loop(listener, registry, resources));
+    let result = match accept_handle.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(color_eyre::eyre::eyre!(err)),
+        Err(join_err) => Err(color_eyre::eyre::eyre!(join_err.to_string())),
+    };
 
     // Unlink on the way out: a bound Unix socket outlives the process that
     // created it, and a leftover one makes the next run's `bind` fail with
-    // `EADDRINUSE` (and looks, to a client, like a daemon that never answers).
-    //
-    // Goes through the same guarded helper as startup, so this can never delete
-    // something that isn't a socket — the path could have been replaced while
-    // the daemon ran. Failure is ignored rather than propagated: the run
-    // succeeded, and `remove_stale_socket` at the next startup is self-healing.
+    // `EADDRINUSE` (and looks, to a client, like a daemon that never
+    // answers). Best-effort — the run's own success/failure is what `result`
+    // above already reports; a failure removing the socket must not mask
+    // that.
     let _ = remove_stale_socket(&socket_path);
-    Ok(())
+    result
 }
 
 /// Creates the daemon's runtime directory `0700`, or accepts an existing one
@@ -346,6 +435,68 @@ fn check_owned_by_current_user(_dir: &Path, _meta: &std::fs::Metadata) -> std::i
     Ok(())
 }
 
+/// The `Provider` used when no `ANTHROPIC_API_KEY` is set: every method
+/// returns an error rather than doing anything, since nothing in this task
+/// drives a real chat turn against it yet (see this file's module doc
+/// comment) — a placeholder that costs nothing and opens zero connections,
+/// not a scripted demo. Deliberately NOT `demo::FakeEditProvider`
+/// (`roundhouse_daemon::demo` is kept only as an integration-test fixture,
+/// per that module's own doc comment — reaching into it from the real boot
+/// path would blur exactly the line this task exists to draw).
+struct NoProviderConfigured;
+
+impl Provider for NoProviderConfigured {
+    fn capabilities(&self, _model: &ModelId) -> Capabilities {
+        Capabilities::default()
+    }
+    fn resolve(&self, _req: &ChatRequest) -> Result<Plan, ProviderError> {
+        Err(ProviderError::Unsupported(
+            "no ANTHROPIC_API_KEY configured for this daemon".into(),
+        ))
+    }
+    fn stream_chat<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<ChatStream, ProviderError>> {
+        Box::pin(async {
+            Err(ProviderError::Unsupported(
+                "no ANTHROPIC_API_KEY configured for this daemon".into(),
+            ))
+        })
+    }
+    fn count_tokens<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<TokenCount, ProviderError>> {
+        Box::pin(async { Ok(TokenCount::default()) })
+    }
+    fn list_models<'a>(
+        &'a self,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<Vec<ModelInfo>, ProviderError>> {
+        Box::pin(async { Ok(vec![]) })
+    }
+}
+
+/// Paired with [`NoProviderConfigured`], which never dispatches through the
+/// transport — but `RequestCtx` requires one, so this fills the slot.
+struct NoTransportConfigured;
+
+impl HttpTransport for NoTransportConfigured {
+    fn send<'a>(
+        &'a self,
+        _req: HttpRequest,
+    ) -> futures::future::BoxFuture<'a, Result<HttpResponseStream, TransportError>> {
+        Box::pin(async {
+            Err(TransportError::Io(
+                "no ANTHROPIC_API_KEY configured; this daemon has no live transport".into(),
+            ))
+        })
+    }
+}
+
 /// Removes a leftover socket from a previous run, and *only* a socket.
 ///
 /// An unconditional `remove_file` here would delete whatever happened to sit at
@@ -366,27 +517,4 @@ fn remove_stale_socket(path: &Path) -> std::io::Result<()> {
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
-}
-
-/// Writes the demo's scratch file, refusing to follow a pre-planted symlink.
-///
-/// `remove_file` unlinks a symlink itself rather than its target, and
-/// `create_new` opens with `O_EXCL`, which refuses to follow one. Together they
-/// close the symlink-clobber hole that a plain `fs::write` (`O_CREAT|O_TRUNC`,
-/// which does follow) would leave open — belt-and-braces with the `0700`
-/// directory, which is the primary defense.
-async fn write_demo_file(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
-    }
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await?;
-    file.write_all(DEMO_FILE_CONTENTS.as_bytes()).await?;
-    file.flush().await?;
-    Ok(())
 }

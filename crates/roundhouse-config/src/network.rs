@@ -27,29 +27,41 @@
 //! Unlike `mcp_config.rs`'s fix (structurally drop `Project` scope
 //! entirely, because a merged `LoadedConfig` carries no per-key
 //! provenance), this module implements §6.2's actual narrow-only rule for
-//! real: [`load_network_config`] loads each configured scope through its
-//! **own**, single-layer `ConfigLoader` (never the shared multi-layer
-//! merge), so it always knows exactly which scope contributed which value.
-//! `Builtin`/`UserGlobal` layers may *establish* (or replace) the
-//! allowlist; `Project`/`Workspace` layers may only **intersect** it with
-//! whatever they list, narrowing but never adding a host the wider scope
-//! didn't already allow. Critically, this holds even when the wider scope
-//! never set `allowed_hosts` at all (baseline `[]`, the fail-closed
+//! real: [`load_network_config_from_layers`] loads each configured scope
+//! through its **own**, single-layer `ConfigLoader` (never the shared
+//! multi-layer merge), so it always knows exactly which scope contributed
+//! which value. `Builtin`/`UserGlobal` layers may *establish* (or replace)
+//! the allowlist; `Project`/`Workspace` layers may only **intersect** it
+//! with whatever they list, narrowing but never adding a host the wider
+//! scope didn't already allow. Critically, this holds even when the wider
+//! scope never set `allowed_hosts` at all (baseline `[]`, the fail-closed
 //! default): intersecting `[]` with anything a project layer supplies is
 //! still `[]` — a project config cannot *establish* the allowlist, only
 //! ever shrink one that already exists. See this module's tests for the
 //! load-bearing case (`user_unset_project_widens_is_still_denied`).
 //!
-//! This deliberately takes `layers: Vec<(ConfigScope, PathBuf)>`, not a
-//! pre-merged `&LoadedConfig` (the brief's original sketch) — a merged
-//! `LoadedConfig` has already thrown away per-scope provenance, which is
-//! the one piece of information this narrow-only rule needs. Same shape of
-//! deviation as `mcp_config.rs`'s `load_mcp_servers`, for the same reason.
+//! [`load_network_config_from_layers`] deliberately takes
+//! `layers: Vec<(ConfigScope, PathBuf)>`, not a pre-merged `&LoadedConfig`
+//! (the brief's original sketch) — a merged `LoadedConfig` has already
+//! thrown away per-scope provenance, which is the one piece of information
+//! this narrow-only rule needs. Same shape of deviation as `mcp_config.rs`'s
+//! `load_mcp_servers`, for the same reason.
+//!
+//! **Phase 7, Task 7 (CF-11(b) / Task 4's M2):** that caller-labeled
+//! `layers` parameter is exactly the shape a real production caller could
+//! mislabel — hand-building
+//! `vec![(ConfigScope::UserGlobal, repo_root.join(".roundhouse/config.toml"))]`
+//! would reintroduce the whole widening attack this module exists to
+//! prevent, with no compiler or test objection. [`load_network_config`]
+//! (below) is the fix: it takes a `project_root` and builds `layers` itself
+//! via [`default_layers`], the one trusted source of scope labels, so there
+//! is no label left for a caller to get wrong. Use it, not
+//! [`load_network_config_from_layers`], from any real production call site.
 
-use crate::loader::{ConfigError, ConfigLoader};
+use crate::loader::{default_layers, ConfigError, ConfigLoader};
 use crate::scope::ConfigScope;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Failure loading or parsing the `[network]` config section.
 #[derive(Debug, thiserror::Error)]
@@ -105,11 +117,43 @@ fn hosts_for_layer(
     }
 }
 
-/// Builds a [`NetworkConfig`] honoring §6.2's narrow-only rule for
-/// project-scoped config (see this module's doc comment for the full
-/// rationale and the attack it closes):
+/// Builds `layers` itself via [`default_layers`], so there is no
+/// `ConfigScope` label for a caller to attach — and therefore none to get
+/// wrong (Phase 7, Task 7, CF-11(b) / Task 4's M2).
 ///
-/// - `layers` is typically `roundhouse_config::default_layers(project_root)`.
+/// **Why this replaces a caller-supplied `Vec<(ConfigScope, PathBuf)>`:**
+/// `default_layers` is the one trusted source of scope labels — it always
+/// tags the `$HOME`-derived path `UserGlobal` and the `project_root`-derived
+/// path `Project`. A caller that instead hand-built
+/// `vec![(ConfigScope::UserGlobal, repo_root.join(".roundhouse/config.toml"))]`
+/// (mislabeling a project-controlled path as the wider, trusted scope) would
+/// reintroduce the exact widening attack [`load_network_config_from_layers`]'s
+/// narrow-only intersection logic exists to prevent, with no compiler or
+/// test able to catch the mistake. `roundhouse-daemon`'s `main.rs` is this
+/// crate's first and only production caller, which is why the fix is here
+/// rather than left as a documented caller obligation.
+///
+/// [`load_network_config_from_layers`] remains available, unchanged, for
+/// tests that need to inject arbitrary per-scope paths to exercise the
+/// narrow-only intersection rule directly (its own test module does exactly
+/// that, and so does this crate's `tests/network_policy_config.rs`) — this
+/// wrapper is what a real caller should reach for.
+pub fn load_network_config(
+    project_root: Option<&Path>,
+) -> Result<NetworkConfig, NetworkConfigError> {
+    load_network_config_from_layers(default_layers(project_root))
+}
+
+/// The narrow-only intersection logic itself, taking a caller-labeled list
+/// of layers directly. See [`load_network_config`]'s doc comment for why a
+/// real production caller should use that safe wrapper instead of this
+/// function — this one trusts whatever `ConfigScope` label `layers` already
+/// carries, which is exactly the shape a hostile caller (or a careless
+/// future one) could get wrong.
+///
+/// Honors §6.2's narrow-only rule for project-scoped config (see this
+/// module's doc comment for the full rationale and the attack it closes):
+///
 /// - A `Builtin`/`UserGlobal` layer's `allowed_hosts`, when present,
 ///   **replaces** the running allowlist outright (a wider scope is allowed
 ///   to widen — that's what "wider" means).
@@ -138,7 +182,7 @@ fn hosts_for_layer(
 ///   makes `any` vacuously `false`), so an empty [`NetworkConfig`]
 ///   genuinely denies all egress rather than being read as "unset, allow
 ///   all."
-pub fn load_network_config(
+pub fn load_network_config_from_layers(
     layers: Vec<(ConfigScope, PathBuf)>,
 ) -> Result<NetworkConfig, NetworkConfigError> {
     let mut sorted = layers;
@@ -252,7 +296,7 @@ mod tests {
     fn absent_network_section_means_empty_allowlist_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = write(dir.path(), "config.toml", "");
-        let cfg = load_network_config(vec![(ConfigScope::UserGlobal, path)]).unwrap();
+        let cfg = load_network_config_from_layers(vec![(ConfigScope::UserGlobal, path)]).unwrap();
         assert!(cfg.allowed_hosts.is_empty());
     }
 
@@ -264,7 +308,7 @@ mod tests {
             "config.toml",
             "[network]\nallowed_hosts = [\"api.github.com\", \"crates.io\"]\n",
         );
-        let cfg = load_network_config(vec![(ConfigScope::UserGlobal, path)]).unwrap();
+        let cfg = load_network_config_from_layers(vec![(ConfigScope::UserGlobal, path)]).unwrap();
         assert_eq!(
             cfg.allowed_hosts,
             vec!["api.github.com".to_string(), "crates.io".to_string()]
@@ -284,7 +328,7 @@ mod tests {
             "project.toml",
             "[network]\nallowed_hosts = [\"api.github.com\"]\n",
         );
-        let cfg = load_network_config(vec![
+        let cfg = load_network_config_from_layers(vec![
             (ConfigScope::UserGlobal, user),
             (ConfigScope::Project, project),
         ])
@@ -308,7 +352,7 @@ mod tests {
             "project.toml",
             "[network]\nallowed_hosts = [\"evil.example.com\"]\n",
         );
-        let cfg = load_network_config(vec![
+        let cfg = load_network_config_from_layers(vec![
             (ConfigScope::UserGlobal, user),
             (ConfigScope::Project, project),
         ])
@@ -335,7 +379,7 @@ mod tests {
             "project.toml",
             "[network]\nallowed_hosts = [\"api.github.com\", \"evil.example.com\"]\n",
         );
-        let cfg = load_network_config(vec![
+        let cfg = load_network_config_from_layers(vec![
             (ConfigScope::UserGlobal, user),
             (ConfigScope::Project, project),
         ])
@@ -352,7 +396,7 @@ mod tests {
             "[network]\nallowed_hosts = [\"api.github.com\"]\n",
         );
         let project = write(dir.path(), "project.toml", "[other]\nkey = \"value\"\n");
-        let cfg = load_network_config(vec![
+        let cfg = load_network_config_from_layers(vec![
             (ConfigScope::UserGlobal, user),
             (ConfigScope::Project, project),
         ])
@@ -369,7 +413,7 @@ mod tests {
             "config.toml",
             "[network]\n[network.allowed_hosts]\nnot = \"an array\"\n",
         );
-        let result = load_network_config(vec![(ConfigScope::UserGlobal, path)]);
+        let result = load_network_config_from_layers(vec![(ConfigScope::UserGlobal, path)]);
         assert!(matches!(result, Err(NetworkConfigError::Parse(_))));
     }
 
@@ -396,7 +440,7 @@ mod tests {
             "project.toml",
             "[network]\nallowed_hosts = [\"api.github.com\"]\n",
         );
-        let cfg = load_network_config(vec![
+        let cfg = load_network_config_from_layers(vec![
             (ConfigScope::UserGlobal, user),
             (ConfigScope::Project, project),
         ])
@@ -425,7 +469,7 @@ mod tests {
             "project.toml",
             "[network]\nallowed_hosts = [\"crates.io\"]\n",
         );
-        let cfg = load_network_config(vec![
+        let cfg = load_network_config_from_layers(vec![
             (ConfigScope::UserGlobal, user),
             (ConfigScope::Project, project),
         ])
@@ -448,7 +492,7 @@ mod tests {
             "project.toml",
             "[network]\nallowed_hosts = [\"*.github.com\"]\n",
         );
-        let cfg = load_network_config(vec![
+        let cfg = load_network_config_from_layers(vec![
             (ConfigScope::UserGlobal, user),
             (ConfigScope::Project, project),
         ])
@@ -476,7 +520,7 @@ mod tests {
             "project.toml",
             "[network]\nallowed_hosts = [\"api.github.com\"]\n",
         );
-        let cfg = load_network_config(vec![
+        let cfg = load_network_config_from_layers(vec![
             (ConfigScope::UserGlobal, user),
             (ConfigScope::Project, project),
         ])
@@ -509,7 +553,7 @@ mod tests {
             "[network]\nallowed_hosts = [\"api.github.com\", \"sub.example.com\"]\n",
         );
         let wider_strings = ["API.GitHub.com".to_string(), "*.Example.COM.".to_string()];
-        let cfg = load_network_config(vec![
+        let cfg = load_network_config_from_layers(vec![
             (ConfigScope::UserGlobal, user),
             (ConfigScope::Project, project),
         ])

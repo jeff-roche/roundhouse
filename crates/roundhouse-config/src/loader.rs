@@ -1,6 +1,15 @@
 use crate::scope::ConfigScope;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+/// Ceiling on a single config layer's file size (Phase 7, Task 7, CF-11(a)).
+/// A real config file is a few KiB at most; 1 MiB matches the precedent
+/// this workspace already sets for "generous for any legitimate input,
+/// fixed regardless of what an attacker sends" caps elsewhere
+/// (`roundhouse-daemon::socket_server::MAX_FRAME_BYTES`,
+/// `roundhouse_acp::registry::MAX_RESPONSE_BYTES`).
+const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -14,6 +23,29 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    /// CF-11(a): `path` is not a regular file — most concretely, a symlink.
+    /// A committed `.roundhouse/config.toml` symlink (e.g. to `/dev/zero`)
+    /// in a cloned repository would otherwise be silently followed by
+    /// `read_to_string`, which never reaches EOF against a device file —
+    /// an unbounded-memory hang the moment a real project root is loaded
+    /// (Phase 7 Task 7 is the first production caller to do so). Refusing
+    /// any non-regular-file layer outright, via `symlink_metadata` (which
+    /// does NOT follow the link, unlike the `path.exists()` this replaced),
+    /// closes this before the file is ever opened.
+    #[error(
+        "refusing to load {path}: it is not a regular file (symlinks are rejected outright — a \
+         config layer must never be a symlink to something else, especially in a project a \
+         hostile third party might have authored)"
+    )]
+    NotARegularFile { path: PathBuf },
+    /// CF-11(a): a defense-in-depth cap for a legitimate-looking regular
+    /// file that is nonetheless far larger than any real config file could
+    /// need to be.
+    #[error(
+        "refusing to load {path}: it is {len} bytes, over the {MAX_CONFIG_FILE_BYTES}-byte \
+         config file cap"
+    )]
+    TooLarge { path: PathBuf, len: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -54,8 +86,29 @@ impl ConfigLoader {
         let mut scopes_present = Vec::new();
 
         for (scope, path) in &sorted {
-            if !path.exists() {
-                continue;
+            // `symlink_metadata`, never `path.exists()`/`fs::metadata`: it does
+            // NOT follow a symlink, so a config layer that is itself a symlink
+            // (e.g. a cloned repo's committed `.roundhouse/config.toml -> /dev/zero`)
+            // is caught here, before anything ever opens it — see
+            // `ConfigError::NotARegularFile`'s own doc comment (CF-11(a)).
+            let meta = match std::fs::symlink_metadata(path) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(ConfigError::Io {
+                        path: path.clone(),
+                        source,
+                    })
+                }
+            };
+            if !meta.is_file() {
+                return Err(ConfigError::NotARegularFile { path: path.clone() });
+            }
+            if meta.len() > MAX_CONFIG_FILE_BYTES {
+                return Err(ConfigError::TooLarge {
+                    path: path.clone(),
+                    len: meta.len(),
+                });
             }
             let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
                 path: path.clone(),

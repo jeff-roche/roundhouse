@@ -4,20 +4,22 @@
 //! crate deliberately doesn't depend on `roundhouse-daemon` despite the
 //! table listing that edge).
 //!
-//! Phase 1 implemented the attach path only. Task A8/G6 adds this binary's
+//! Phase 1 implemented the attach path only. Task A8/G6 added this binary's
 //! first argument parsing (`cli::Cli`, ruling P11): `round daemon` and
-//! `round service install`/`round service uninstall`. Running `round` with
-//! no subcommand keeps the Phase 1 behavior below unchanged. Session
-//! selection and other headless runs are later tasks, extending
-//! `cli::Command` rather than replacing it.
+//! `round service install`/`round service uninstall`. Phase 7, Task 7 adds
+//! the session-selection/headless subcommands lane W1's exit criterion
+//! names: `round attach --session ID`, `round create [--workspace NAME]`,
+//! and `round run [--workspace NAME]` (headless, no TUI). Running `round`
+//! with no subcommand keeps the Phase 1 behavior unchanged — equivalent to
+//! `round create` with the default workspace name.
 #![forbid(unsafe_code)]
 
 use clap::Parser;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use roundhouse_cli::cli::{Cli, Command, ServiceAction};
+use roundhouse_cli::cli::{Cli, Command, ServiceAction, DEFAULT_WORKSPACE_NAME};
 use roundhouse_cli::commands::{daemon, service_install};
-use roundhouse_tui::Dashboard;
+use roundhouse_tui::{DaemonClient, Dashboard, SessionId};
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
@@ -26,7 +28,10 @@ async fn main() -> color_eyre::Result<()> {
     match Cli::parse().command {
         Some(Command::Daemon) => run_daemon().await,
         Some(Command::Service { action }) => run_service(action),
-        None => attach().await,
+        Some(Command::Attach { session }) => attach_to_session(session).await,
+        Some(Command::Create { workspace }) => create_and_attach(workspace).await,
+        Some(Command::Run { workspace }) => run_headless(workspace).await,
+        None => create_and_attach(DEFAULT_WORKSPACE_NAME.to_string()).await,
     }
 }
 
@@ -91,54 +96,87 @@ fn print_enable_instructions(os: service_install::OsFamily) {
     }
 }
 
-/// Phase 1's attach path: connect to the daemon's Unix socket and render
-/// every incoming `roundhouse_proto::ClientEvent` through
-/// `roundhouse_tui::Dashboard`. Phase 7 Task 2 retired the hand-rolled
-/// `ServerMessage` this used to render; the wire now carries real
-/// `roundhouse-proto`/`roundhouse-core` types end to end.
-async fn attach() -> color_eyre::Result<()> {
+/// The socket path every subcommand below connects to: `$ROUND_SOCKET` if
+/// set, otherwise the same default the daemon itself binds
+/// (`roundhouse_tui::default_socket_path`) — resolved through
+/// `roundhouse-tui` rather than computed here so the two sides can't drift
+/// onto different paths.
+fn socket_path() -> std::path::PathBuf {
+    std::env::var_os("ROUND_SOCKET")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(roundhouse_tui::default_socket_path)
+}
+
+/// `round create [--workspace NAME]`: mint a new session and attach the TUI
+/// to it. Also what running `round` with no subcommand does (with
+/// `DEFAULT_WORKSPACE_NAME`), preserving the Phase 1 exit-criterion path
+/// unchanged.
+async fn create_and_attach(workspace_name: String) -> color_eyre::Result<()> {
     // Phase 0's placeholder `roundhouse_tui::client_schema()`: not yet consumed
     // for anything beyond proving the wire-schema call site exists.
     let _schema = roundhouse_tui::client_schema();
 
-    // Resolved through `roundhouse-tui` rather than computed here: the daemon
-    // resolves the same default from the same function, which is what keeps the
-    // two sides from drifting onto different paths. It lives in the shared crate
-    // because this crate does not link `roundhouse-daemon` — per the enforced
-    // baseline in `xtask/tests/exit_criterion.rs`, not per §5.2, whose table does
-    // list that edge (see `roundhouse_tui::default_runtime_dir`).
-    let socket_path = std::env::var_os("ROUND_SOCKET")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(roundhouse_tui::default_socket_path);
+    let client = roundhouse_tui::connect_create(&socket_path(), &workspace_name)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+    run_tui(client).await
+}
 
-    // No session-selection UI exists yet (Phase 5): every `round` invocation
-    // asks the daemon to mint a fresh session. Task 3's real session registry
-    // is what will act on this request; today's daemon only forwards it, so
-    // this is a placeholder intent rather than a meaningful workspace name.
-    let mut client = roundhouse_tui::connect(
-        &socket_path,
-        roundhouse_tui::ConnectIntent::CreateSession {
-            workspace_name: "default".into(),
-        },
-    )
-    .await
-    .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+/// `round attach --session ID`: attach the TUI to an already-running
+/// session.
+///
+/// **Read-only once the creating connection has disconnected** (rulings
+/// W1-R37/W1-R52) — see `cli::Command::Attach`'s own doc comment. This
+/// function only ever *receives* the session's event stream; it never sends
+/// anything past the handshake `Attach` request itself, so that limitation
+/// isn't something this function could work around even if it tried to.
+async fn attach_to_session(session: SessionId) -> color_eyre::Result<()> {
+    let client = roundhouse_tui::connect_attach(&socket_path(), session)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+    run_tui(client).await
+}
 
-    // Deliberately no `enable_raw_mode()` here, despite that being the usual
-    // ratatui preamble. Raw mode clears `ISIG`, so Ctrl+C stops generating
-    // SIGINT and instead arrives as an ordinary keystroke — and this loop reads
-    // no keystrokes, because `DaemonClient::recv` wraps a `BufReader::read_line`
-    // that is *not* cancellation-safe, so racing it against a key-event stream
-    // in a `select!` could silently discard a half-buffered NDJSON line. Until
-    // there is a real input path (Phase 5's TUI), leaving the terminal cooked
-    // means Ctrl+C keeps working and no failure mode can strand the user's
-    // terminal in raw mode. The loop also ends on its own when the daemon closes
-    // the socket.
+/// Shared by [`create_and_attach`]/[`attach_to_session`]: build the
+/// `ratatui` terminal and dashboard, then run the real attach-and-render
+/// loop. See [`run_attach_loop`]'s own doc comment for why raw mode is
+/// deliberately never enabled here.
+async fn run_tui(mut client: DaemonClient) -> color_eyre::Result<()> {
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut dashboard = Dashboard::new();
 
     run_attach_loop(&mut client, &mut terminal, &mut dashboard).await
+}
+
+/// `round run [--workspace NAME]`: mint a new session and stream its
+/// events to stdout, one JSON line per event, with no TUI — for scripting
+/// and CI, where there is no terminal to draw a dashboard into.
+///
+/// Prints the minted session id to stdout FIRST, before any event, so a
+/// caller that wants to `round attach --session ID` this same session from
+/// another terminal (a viewer, per the read-only limitation above) can
+/// capture it. Exits cleanly once the daemon closes the connection — the
+/// session's own actor keeps running independently of this connection
+/// (ruling W1-R51), so exiting here does not stop whatever the session is
+/// doing.
+async fn run_headless(workspace_name: String) -> color_eyre::Result<()> {
+    let mut client = roundhouse_tui::connect_create(&socket_path(), &workspace_name)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+    println!("session_id={}", client.session_id());
+
+    while let Some(event) = client
+        .recv()
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?
+    {
+        println!(
+            "{}",
+            serde_json::to_string(&event).map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?
+        );
+    }
+    Ok(())
 }
 
 /// The real attach-and-render loop: every message received drives `Dashboard::apply`,

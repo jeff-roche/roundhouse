@@ -31,6 +31,8 @@
 //! for why that distinction matters and is called out rather than
 //! papered over.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,7 +55,9 @@ const SETTLE: Duration = Duration::from_millis(50);
 
 #[tokio::test]
 async fn drive_session_keeps_draining_requests_while_events_tx_is_stuck_full() {
+    let dir = tempfile::tempdir().unwrap();
     let registry = Arc::new(SessionRegistry::new());
+    let resources = common::real_resources(dir.path()).await;
     let (requests_tx, requests_rx) = tokio::sync::mpsc::channel::<ClientRequest>(1);
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<ClientEvent>(1);
 
@@ -61,6 +65,7 @@ async fn drive_session_keeps_draining_requests_while_events_tx_is_stuck_full() {
         requests_rx,
         events_tx,
         registry.clone(),
+        resources,
         Duration::from_secs(5),
     ));
 
@@ -203,10 +208,13 @@ async fn drive_session_keeps_draining_requests_while_the_session_is_idle() {
     // `requests_rx` even though nothing about `events_tx` is actually full.
     // A correct fix never reserves capacity until it already has a
     // concrete event to send, so this never happens.
+    let dir = tempfile::tempdir().unwrap();
     let registry = Arc::new(SessionRegistry::new());
+    let actor = common::real_actor(dir.path()).await;
     let (session_id, _creator_subscription, _creator_events) =
-        registry.create("idle-test".into()).unwrap();
+        registry.create(actor, None).unwrap();
 
+    let resources = common::real_resources(dir.path()).await;
     let (requests_tx, requests_rx) = tokio::sync::mpsc::channel::<ClientRequest>(1);
     let (events_tx, _events_rx) = tokio::sync::mpsc::channel::<ClientEvent>(8);
 
@@ -214,6 +222,7 @@ async fn drive_session_keeps_draining_requests_while_the_session_is_idle() {
         requests_rx,
         events_tx,
         registry.clone(),
+        resources,
         Duration::from_secs(5),
     ));
 

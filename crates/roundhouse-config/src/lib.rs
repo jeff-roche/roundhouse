@@ -20,6 +20,8 @@ mod scope;
 mod secret_ref;
 
 pub use loader::{default_layers, ConfigError, ConfigLoader, LoadedConfig};
-pub use network::{load_network_config, NetworkConfig, NetworkConfigError};
+pub use network::{
+    load_network_config, load_network_config_from_layers, NetworkConfig, NetworkConfigError,
+};
 pub use scope::ConfigScope;
 pub use secret_ref::SecretRef;

@@ -29,6 +29,10 @@ roundhouse-tools = { path = "../roundhouse-tools" }
 # boot-time wiring needs the engine-side production `TaskSpawner` first.
 # See the KNOWN GAP note in `crates/roundhouse-mcp/src/host.rs`.
 roundhouse-mcp = { path = "../roundhouse-mcp" }
+# Phase 7, Task 7: `session_bootstrap.rs` is this crate's first real call
+# site for `LoopbackProxy`/`EgressPolicy` — real per-session egress
+# registration, replacing `demo.rs`'s network-free stand-in.
+roundhouse-net = { path = "../roundhouse-net" }
 roundhouse-acp = { path = "../roundhouse-acp" }
 roundhouse-bus = { path = "../roundhouse-bus" }
 roundhouse-engine = { path = "../roundhouse-engine" }
@@ -36,6 +40,12 @@ roundhouse-flow = { path = "../roundhouse-flow" }
 roundhouse-sched = { path = "../roundhouse-sched" }
 roundhouse-config = { path = "../roundhouse-config" }
 roundhouse-tui = { path = "../roundhouse-tui" }
+# Phase 7, Task 7: `round-daemon-internal` needs a `--socket PATH` flag (the
+# lane file's own correction: "the daemon binary needs a --socket flag, not
+# a daemon subcommand of its own"). Same exact pin as `roundhouse-cli`'s own
+# manifest (Task A8/G6) — Global Constraints §5.3's pin discipline applies
+# regardless of which crate introduces a net-new dependency.
+clap = { version = "=4.6.6", features = ["derive"] }
 color-eyre = { workspace = true }
 # `fs`/`io-util` on top of the workspace feature set: the demo reads the edited
 # file back and the socket server writes NDJSON lines. Declared here rather than

@@ -38,17 +38,24 @@
 //! contributed to the merge as a whole, not which scope won any given key),
 //! so filtering after the fact cannot distinguish a `[[mcp_server]]` array
 //! contributed by the user layer from one contributed (or silently
-//! replaced) by the project layer. Instead, [`load_mcp_servers`] builds its
-//! OWN `ConfigLoader`, keeping only `ConfigScope::UserGlobal` layers and
-//! dropping every other scope BEFORE any file is ever read — so a
-//! project-scoped `[[mcp_server]]` table is structurally unreachable, not
+//! replaced) by the project layer. Instead, [`load_mcp_servers_from_layers`]
+//! builds its OWN `ConfigLoader`, keeping only `ConfigScope::UserGlobal`
+//! layers and dropping every other scope BEFORE any file is ever read — so
+//! a project-scoped `[[mcp_server]]` table is structurally unreachable, not
 //! merely unused by convention. This must hold even if a caller mistakenly
-//! passes project-scoped layers in (see `load_mcp_servers`'s own doc
-//! comment and its test proving this).
+//! passes project-scoped layers in (see that function's own doc comment
+//! and its test proving this).
+//!
+//! **Phase 7, Task 7 (CF-11(b) / Task 4's M2):** the drop above protects
+//! against a correctly-labeled `Project` layer, but not against a caller
+//! that mislabels a project-controlled path as `UserGlobal` in the first
+//! place — [`load_mcp_servers`] (below) is the fix for that: it takes a
+//! `project_root`, not a caller-labeled `layers` list, and builds the real
+//! layers itself.
 
 use roundhouse_config::{ConfigLoader, ConfigScope};
 use roundhouse_mcp::config::McpServerConfig;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Failure loading or parsing `[[mcp_server]]` config.
 #[derive(Debug, thiserror::Error)]
@@ -59,20 +66,46 @@ pub enum McpConfigError {
     Parse(#[from] toml::de::Error),
 }
 
+/// Builds `layers` itself via [`roundhouse_config::default_layers`], so
+/// there is no `ConfigScope` label for a caller to attach — and therefore
+/// none to get wrong (Phase 7, Task 7, CF-11(b) / Task 4's M2).
+///
+/// **Why this replaces a caller-supplied `Vec<(ConfigScope, PathBuf)>`:**
+/// [`load_mcp_servers_from_layers`] already structurally drops every
+/// non-`UserGlobal` layer (W1-R16), but that guard only helps if the
+/// LABELS attached to `layers` are themselves trustworthy. A caller that
+/// hand-built
+/// `vec![(ConfigScope::UserGlobal, repo_root.join(".roundhouse/config.toml"))]`
+/// — mislabeling a project-controlled path as the wider, trusted scope —
+/// would sail straight through that filter with no compiler or test
+/// objection, reintroducing the exact hostile-repo attack this module
+/// exists to prevent. `roundhouse_config::default_layers` is the one
+/// trusted source of scope labels; this function calls it internally so
+/// there is no label left for a real caller (`roundhouse-daemon`'s
+/// `main.rs`, the first and only production caller) to get wrong.
+pub fn load_mcp_servers(
+    project_root: Option<&Path>,
+) -> Result<Vec<McpServerConfig>, McpConfigError> {
+    load_mcp_servers_from_layers(roundhouse_config::default_layers(project_root))
+}
+
 /// Reads every `[[mcp_server]]` table out of the **user-global** config
 /// layer only, and deserializes it into `McpServerConfig`. An absent
 /// `mcp_server` key means "no MCP servers configured" (`Ok(vec![])`), not
 /// an error — most sessions run with none.
 ///
-/// `layers` is typically `roundhouse_config::default_layers(project_root)`
-/// — but every layer whose `ConfigScope` is not `UserGlobal` is dropped
-/// here before any file is read, regardless of what `layers` actually
-/// contains (ruling W1-R16, see this module's doc comment). This makes it
-/// safe to pass `default_layers(Some(repo_root))`'s full result straight
-/// through: the project-scoped layer it includes can never reach the
-/// `[[mcp_server]]` parse, even if a future caller forgets to filter it out
-/// itself.
-pub fn load_mcp_servers(
+/// Takes a caller-labeled `layers` list directly — see [`load_mcp_servers`]'s
+/// doc comment for why a real production caller should use that safe
+/// wrapper instead. This function still drops every layer whose
+/// `ConfigScope` is not `UserGlobal` before any file is read, regardless of
+/// what `layers` actually contains (ruling W1-R16, see this module's doc
+/// comment) — that half of the defense is unconditional and holds
+/// regardless of which entry point is used; only the "can a caller attach
+/// the wrong label in the first place" half is what [`load_mcp_servers`]
+/// additionally closes. Kept `pub` (rather than `pub(crate)`/test-only) for
+/// this module's own tests, which need to inject arbitrary per-scope paths
+/// to prove the drop is unconditional.
+pub fn load_mcp_servers_from_layers(
     layers: Vec<(ConfigScope, PathBuf)>,
 ) -> Result<Vec<McpServerConfig>, McpConfigError> {
     let mut loader = ConfigLoader::new();
@@ -99,7 +132,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "").unwrap();
-        let servers = load_mcp_servers(vec![(ConfigScope::UserGlobal, path)]).unwrap();
+        let servers = load_mcp_servers_from_layers(vec![(ConfigScope::UserGlobal, path)]).unwrap();
         assert!(servers.is_empty());
     }
 
@@ -121,7 +154,7 @@ env = [["GITHUB_TOKEN_REF", "keyring:github"]]
 "#,
         )
         .unwrap();
-        let servers = load_mcp_servers(vec![(ConfigScope::UserGlobal, path)]).unwrap();
+        let servers = load_mcp_servers_from_layers(vec![(ConfigScope::UserGlobal, path)]).unwrap();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].id.0, "github");
         match &servers[0].transport {
@@ -138,7 +171,7 @@ env = [["GITHUB_TOKEN_REF", "keyring:github"]]
         let path = dir.path().join("config.toml");
         // Missing the required `transport` field entirely.
         std::fs::write(&path, "[[mcp_server]]\nid = \"github\"\n").unwrap();
-        let result = load_mcp_servers(vec![(ConfigScope::UserGlobal, path)]);
+        let result = load_mcp_servers_from_layers(vec![(ConfigScope::UserGlobal, path)]);
         assert!(matches!(result, Err(McpConfigError::Parse(_))));
     }
 
@@ -187,7 +220,7 @@ env = []
         )
         .unwrap();
 
-        let servers = load_mcp_servers(vec![
+        let servers = load_mcp_servers_from_layers(vec![
             (ConfigScope::UserGlobal, user_path),
             (ConfigScope::Project, project_path),
         ])

@@ -12,8 +12,8 @@
 //! arguments instead).
 
 use roundhouse_cli::commands::service_install::{
-    check_exec_path_safe, install_dir, install_to, render_launchd_plist, render_systemd_unit,
-    uninstall_from, OsFamily, ServiceInstallError,
+    check_exec_path_safe, install_dir_unchecked, install_to, render_launchd_plist,
+    render_systemd_unit, uninstall_from, OsFamily, ServiceInstallError,
 };
 use std::path::Path;
 
@@ -171,12 +171,12 @@ fn launchd_plist_substitutes_absolute_log_paths_not_a_literal_tilde() {
 }
 
 #[test]
-fn install_dir_is_the_os_specific_per_user_convention() {
-    let linux = install_dir(OsFamily::Linux);
+fn install_dir_unchecked_is_the_os_specific_per_user_convention() {
+    let linux = install_dir_unchecked(OsFamily::Linux);
     assert!(linux.ends_with("systemd/user"));
     assert!(!linux.starts_with("/etc"));
 
-    let macos = install_dir(OsFamily::MacOs);
+    let macos = install_dir_unchecked(OsFamily::MacOs);
     assert!(macos.ends_with("Library/LaunchAgents"));
     assert!(!macos.starts_with("/Library"));
 }

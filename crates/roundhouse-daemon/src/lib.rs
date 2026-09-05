@@ -10,7 +10,36 @@
 #![forbid(unsafe_code)]
 
 pub mod boot;
+/// Phase 1's scripted, single-session exit-criterion fixture. Phase 7 Task 7
+/// retires it as BOOT behavior (`main.rs` no longer calls
+/// `run_demo_session` — see that file's own module doc) — this module stays
+/// `pub`, unconditionally, only because `tests/exit_criterion_demo.rs` (an
+/// external integration test, which cannot see a `#[cfg(test)]`-gated item
+/// in the library it depends on — `cfg(test)` is local to each compilation
+/// unit) drives it directly to prove the demo wiring itself still works,
+/// same as Task 21 of Phase 1 originally used it. `real_boot_smoke.rs`
+/// separately asserts this module's symbols are absent from `main.rs`'s own
+/// source, i.e. from the real boot path.
 pub mod demo;
 pub mod mcp_config;
+pub mod session_bootstrap;
 pub mod session_registry;
 pub mod socket_server;
+
+/// One `TaskRunner::bootstrap()` shared by every `#[cfg(test)] mod tests`
+/// in this crate's LIBRARY test binary — `session_registry`'s and
+/// `session_bootstrap`'s own test modules both need a `&'static TaskRunner`
+/// to build a real `SessionActor`, and `cargo test -p roundhouse-daemon
+/// --lib` runs every `#[cfg(test)]` module in this crate inside ONE process.
+/// `TaskRunner::bootstrap()` panics on a second call per process (S-LOG-1),
+/// so each module having its own independent `static RUNNER` would panic
+/// the moment both modules' tests ran in the same test binary — this is the
+/// one shared instance both reach for instead.
+#[cfg(test)]
+pub(crate) mod test_support {
+    static RUNNER: std::sync::OnceLock<roundhouse_core::TaskRunner> = std::sync::OnceLock::new();
+
+    pub(crate) fn runner() -> &'static roundhouse_core::TaskRunner {
+        RUNNER.get_or_init(roundhouse_core::TaskRunner::bootstrap)
+    }
+}

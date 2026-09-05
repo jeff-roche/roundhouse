@@ -289,15 +289,34 @@ impl McpHost {
             // Phase 3 review fix (Critical, second bullet): a collision
             // here used to drop the already-spawned transports without any
             // teardown.
+            //
+            // Phase 7, Task 7: collected into an owned `Vec` first, rather
+            // than passing `connections.iter().map(|(_, t)| t)`'s anonymous
+            // closure-typed iterator straight into `shutdown_all`'s generic
+            // `impl IntoIterator` parameter directly — that shape compiles
+            // in isolation but produces a real, reproduced rustc HRTB
+            // inference failure ("implementation of `Send`/`Iterator`/
+            // `FnOnce` is not general enough") the FIRST time this call
+            // site is reachable from inside a `tokio::spawn`'d, `Send +
+            // 'static`-bound future several `async fn` layers deep (exactly
+            // the shape `roundhouse-daemon`'s real accept loop creates,
+            // which nothing before this task ever exercised in production).
+            // A `&[Arc<dyn McpTransport>]` slice (matching the already-working
+            // `shutdown_all(&live)` call above) sidesteps the anonymous
+            // closure-iterator type entirely.
             Err(e) => {
-                shutdown_all(connections.iter().map(|(_, t)| t)).await;
+                let live: Vec<Arc<dyn McpTransport>> =
+                    connections.iter().map(|(_, t)| t.clone()).collect();
+                shutdown_all(&live).await;
                 return Err(e.into());
             }
         };
         let tool_defs = match build_tool_defs(&namespace) {
             Ok(d) => d,
             Err(e) => {
-                shutdown_all(connections.iter().map(|(_, t)| t)).await;
+                let live: Vec<Arc<dyn McpTransport>> =
+                    connections.iter().map(|(_, t)| t.clone()).collect();
+                shutdown_all(&live).await;
                 return Err(e);
             }
         };

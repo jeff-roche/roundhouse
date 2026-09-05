@@ -62,6 +62,20 @@ fn now_ts() -> Timestamp {
     Timestamp::from_unix_nanos(nanos)
 }
 
+/// The tier a session is actually ENTITLED to run at, derived from what the
+/// human's `on_degrade` setting authorized at creation time — see
+/// [`SessionActor`]'s `effective_tier` field for the full rationale (this
+/// free function exists so a caller that needs the same value BEFORE a
+/// `SessionActor` exists — e.g. to build a `PolicyEngine` sealed-context
+/// provider that must agree with the actor it is paired with, Phase 7 Task
+/// 7's CF-9(i) mirroring — does not have to duplicate the two-line match).
+pub fn effective_tier(spec: &SessionSpec) -> Tier {
+    match spec.on_degrade {
+        OnDegrade::Refuse => spec.requested_tier,
+        OnDegrade::AllowDownTo(floor) => floor,
+    }
+}
+
 /// A request to admit a new task for execution, checked against the owning
 /// session's current cancellation state by [`SessionActor::admit_task`].
 #[derive(Debug, Clone)]
@@ -292,10 +306,7 @@ impl SessionActor {
              sealed:daemon-binary-write rule"
         );
         let (state_tx, _rx) = tokio::sync::watch::channel(initial_state);
-        let effective_tier = match session_spec.on_degrade {
-            OnDegrade::Refuse => session_spec.requested_tier,
-            OnDegrade::AllowDownTo(floor) => floor,
-        };
+        let effective_tier = effective_tier(&session_spec);
         // Snapshot HOME once, here, alongside state_dir/daemon_binary's own
         // construction-time validation — never read live at decision time
         // (see the `home` field's doc comment for why that matters).

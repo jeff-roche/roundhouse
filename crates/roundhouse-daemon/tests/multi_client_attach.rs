@@ -9,6 +9,8 @@
 //! the listener is bound synchronously, in this test's own stack frame,
 //! before `accept_loop` is ever spawned.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,9 +23,11 @@ async fn two_clients_can_create_and_then_attach_to_the_same_session() {
     let socket_path = dir.path().join("round.sock");
     let registry = Arc::new(roundhouse_daemon::session_registry::SessionRegistry::new());
     let listener = roundhouse_daemon::socket_server::bind_socket(&socket_path).unwrap();
+    let resources = common::real_resources(dir.path()).await;
     tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
         listener,
         registry.clone(),
+        resources,
     ));
 
     let creator = tokio::time::timeout(
@@ -79,9 +83,11 @@ async fn attaching_to_an_unknown_session_fails_without_hanging() {
     let socket_path = dir.path().join("round.sock");
     let registry = Arc::new(roundhouse_daemon::session_registry::SessionRegistry::new());
     let listener = roundhouse_daemon::socket_server::bind_socket(&socket_path).unwrap();
+    let resources = common::real_resources(dir.path()).await;
     tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
         listener,
         registry.clone(),
+        resources,
     ));
 
     let unknown_session_id = roundhouse_core::SessionId::new();
@@ -113,14 +119,27 @@ async fn attaching_to_an_unknown_session_fails_without_hanging() {
 /// outer `tokio::time::timeout` is what keeps this from hanging CI if reaping
 /// never happens.
 #[tokio::test]
-async fn a_session_with_no_more_subscribers_is_reaped_rather_than_kept_forever() {
+async fn a_session_with_no_more_subscribers_stays_attachable_not_reaped() {
+    // Ruling W1-R51 (Phase 7, Task 7): this test used to prove the OPPOSITE
+    // — that a session's registry entry was reaped once its last subscriber
+    // disconnected. Binding a real `SessionActor` into every entry made
+    // that rule wrong: reaping on subscriber-emptiness would cancel
+    // whatever a session's actor is still doing the instant its one
+    // attached `round` client disconnects, breaking a headless `round run`.
+    // The registry's own module doc comment ("Entry lifetime = actor
+    // lifetime") states the new rule; this test proves it end to end,
+    // through the real accept loop, rather than only at the registry's own
+    // unit-test level (`session_registry.rs`'s
+    // `detaching_the_last_subscriber_does_not_reap_the_session`).
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("round.sock");
     let registry = Arc::new(roundhouse_daemon::session_registry::SessionRegistry::new());
     let listener = roundhouse_daemon::socket_server::bind_socket(&socket_path).unwrap();
+    let resources = common::real_resources(dir.path()).await;
     tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
         listener,
         registry.clone(),
+        resources,
     ));
 
     let creator = tokio::time::timeout(
@@ -133,22 +152,21 @@ async fn a_session_with_no_more_subscribers_is_reaped_rather_than_kept_forever()
     let session_id = creator.session_id();
     drop(creator);
 
-    let reaped = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if roundhouse_tui::connect_attach(&socket_path, session_id)
-                .await
-                .is_err()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+    // Give the daemon's own connection-loop task time to observe the
+    // disconnect and run `SessionRegistry::detach` — a race this test must
+    // not depend on winning by accident.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let attached = tokio::time::timeout(
+        Duration::from_secs(2),
+        roundhouse_tui::connect_attach(&socket_path, session_id),
+    )
     .await;
     assert!(
-        reaped.is_ok(),
-        "the session's registry entry should be reaped once its only \
-         subscriber disconnects, not linger forever"
+        matches!(attached, Ok(Ok(_))),
+        "a session must remain attachable after its last subscriber \
+         disconnects — the actor (and any work it may still be doing) \
+         outlives the connection that created it"
     );
 }
 
@@ -173,9 +191,11 @@ async fn attach_routes_by_session_id_and_never_leaks_another_sessions_events() {
     let socket_path = dir.path().join("round.sock");
     let registry = Arc::new(roundhouse_daemon::session_registry::SessionRegistry::new());
     let listener = roundhouse_daemon::socket_server::bind_socket(&socket_path).unwrap();
+    let resources = common::real_resources(dir.path()).await;
     tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
         listener,
         registry.clone(),
+        resources,
     ));
 
     let session_a = tokio::time::timeout(

@@ -41,6 +41,17 @@ thiserror = { workspace = true }
 # the `ratatui`/`crossterm` versions or the backend types won't be the same type.
 ratatui = { version = "0.30.2", features = ["layout-cache"] }
 crossterm = "0.29"
+# Phase 7, Task 7: `round attach --session ID` parses its argument as a raw
+# UUID before handing it to `roundhouse_tui::SessionId::from_uuid` — an
+# external (non-`roundhouse-*`) dependency, so this does not touch the
+# internal dependency graph `xtask/tests/workspace_shape.rs` checks. Same
+# unpinned-minor-version shape every other crate in this workspace already
+# uses for `uuid` (`roundhouse-core`, `roundhouse-store`, ...).
+uuid = "1"
+# `round run`'s headless output: one `serde_json`-serialized `ClientEvent`
+# line per event. Not a new dependency to the workspace (every other crate
+# already depends on it via the workspace pin), just a new consumer here.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # Same exact-pin discipline as the `clap` addition above.

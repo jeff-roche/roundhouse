@@ -35,6 +35,9 @@ built to avoid.
 The full design lives in [`docs/architecture/`](docs/architecture/), split
 by topic; start at [`docs/architecture/README.md`](docs/architecture/README.md)
 for the reading order and the crate-by-crate implementation phasing.
+Operator-facing notes on real, running-system behavior (as opposed to
+frozen design) live in [`docs/operations/`](docs/operations/) —
+e.g. [what a shell policy `program` rule actually matches](docs/operations/shell-policy-canonicalization.md).
 
 ## License
 

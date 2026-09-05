@@ -339,6 +339,18 @@ pub enum StartSessionMcpError {
 /// as invalid) and returns a named, typed error rather than either
 /// panicking or silently running every dispatch through a floor that can
 /// never resolve any server.
+///
+/// **What this check does NOT prove (carry-forward CF-8):** `check_sealed_ctx_configured`
+/// (below) tests only `state_dir.is_absolute() && daemon_binary.is_absolute()`
+/// — it distinguishes "some real provider is installed" from "the
+/// untouched `default_context()` placeholder," nothing more. An installed
+/// provider that returns an absolute-but-WRONG `state_dir`/`daemon_binary`
+/// (a typo, a path from a different session, a stale snapshot) passes this
+/// guard exactly as readily as a correct one; there is no cross-check
+/// against reality here or anywhere downstream. Read this error variant's
+/// own `Display` message ("refusing to start ... under a policy that
+/// cannot resolve real sealed-floor context") as "resolves *some* context,"
+/// not "resolves the *correct* one."
 pub async fn start_session_mcp(
     configs: Vec<McpServerConfig>,
     session_id: SessionId,

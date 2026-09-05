@@ -10,7 +10,7 @@
 //! real, versioned client↔daemon wire types.
 
 use futures::StreamExt;
-use roundhouse_core::{EventPayload, OnDegrade, SessionSpec, Tier, WorkspaceId};
+use roundhouse_core::EventPayload;
 use roundhouse_proto::{ApiVersion, ClientEvent, ClientRequest};
 use std::io::ErrorKind;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -22,6 +22,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
+use crate::session_bootstrap::{self, DaemonResources};
 use crate::session_registry::SessionRegistry;
 
 /// How many in-flight `ClientRequest`s one connection's driver will buffer
@@ -60,6 +61,20 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// included, so closer to ~267 MiB in practice) — a known, fixed ceiling
 /// rather than something that scales with how many peers happen to connect.
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Maximum length, in bytes, of `ClientRequest::CreateSession`'s
+/// `workspace_name` (CF-14). `drive_session` echoes it straight back inside
+/// `SessionCreated`'s `SessionSpec.name`, so an unbounded `workspace_name`
+/// approaching [`MAX_FRAME_BYTES`] would produce a reply *larger* than that
+/// same cap — which the client's own equal cap
+/// (`roundhouse_tui::client::MAX_FRAME_BYTES`) then rejects. Self-inflicted
+/// and harmless at any realistic length (nobody names a workspace
+/// megabytes-long), but the honest fix is a bound at the point this value is
+/// parsed, not a bigger client-side cap to accommodate an unbounded one.
+/// 4 KiB is generous for a human-chosen name while leaving enormous headroom
+/// under [`MAX_FRAME_BYTES`] even after JSON-escaping and the rest of the
+/// envelope.
+const MAX_WORKSPACE_NAME_BYTES: usize = 4096;
 
 /// Default ceiling on concurrent accepted connections one `accept_loop` will
 /// serve at once (security review Important 3 / ruling W1-R33). Bounds the
@@ -527,10 +542,12 @@ fn current_process_uid() -> std::io::Result<u32> {
 pub async fn accept_loop(
     listener: UnixListener,
     registry: Arc<SessionRegistry>,
+    resources: Arc<DaemonResources>,
 ) -> std::io::Result<()> {
     accept_loop_with(
         listener,
         registry,
+        resources,
         current_process_uid(),
         AcceptLimits::default(),
     )
@@ -608,6 +625,7 @@ pub async fn accept_loop(
 pub async fn accept_loop_with(
     listener: UnixListener,
     registry: Arc<SessionRegistry>,
+    resources: Arc<DaemonResources>,
     expected_uid: std::io::Result<u32>,
     limits: AcceptLimits,
 ) -> std::io::Result<()> {
@@ -684,10 +702,11 @@ pub async fn accept_loop_with(
         };
 
         let registry = registry.clone();
+        let resources = resources.clone();
         let handshake_timeout = limits.handshake_timeout;
         tokio::spawn(async move {
             let _permit = permit;
-            handle_connection(stream, registry, handshake_timeout).await;
+            handle_connection(stream, registry, resources, handshake_timeout).await;
         });
     }
 }
@@ -709,13 +728,20 @@ pub async fn accept_loop_with(
 async fn handle_connection(
     stream: UnixStream,
     registry: Arc<SessionRegistry>,
+    resources: Arc<DaemonResources>,
     handshake_timeout: Duration,
 ) {
     let (requests_tx, requests_rx) = mpsc::channel(REQUEST_CHANNEL_CAPACITY);
     let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     tokio::join!(
         serve_connection(stream, requests_tx, events_rx),
-        drive_session(requests_rx, events_tx, registry, handshake_timeout),
+        drive_session(
+            requests_rx,
+            events_tx,
+            registry,
+            resources,
+            handshake_timeout
+        ),
     );
 }
 
@@ -808,6 +834,7 @@ pub async fn drive_session(
     mut requests_rx: mpsc::Receiver<ClientRequest>,
     events_tx: mpsc::Sender<ClientEvent>,
     registry: Arc<SessionRegistry>,
+    resources: Arc<DaemonResources>,
     handshake_timeout: Duration,
 ) {
     let first_request = match tokio::time::timeout(handshake_timeout, requests_rx.recv()).await {
@@ -826,33 +853,83 @@ pub async fn drive_session(
         }
     };
 
-    let (session_id, subscription, mut session_events) = match first_request {
+    // W1-R37/W1-R52: only the connection that ran `CreateSession` ever gets
+    // its post-handshake requests honored — see the `Some(_request)` arm,
+    // below, for the full rationale and the documented limitation this
+    // implies for `Attach`.
+    let (session_id, subscription, mut session_events, is_creator) = match first_request {
         ClientRequest::CreateSession { workspace_name } => {
+            // CF-14: bound at the protocol boundary, not by making the
+            // client's own frame cap bigger. `SessionCreated`, below, echoes
+            // `workspace_name` straight back — an unbounded value here could
+            // produce a reply larger than [`MAX_FRAME_BYTES`], which the
+            // client's OWN equal cap (`roundhouse_tui::client::MAX_FRAME_BYTES`)
+            // would then reject. Self-inflicted and harmless at any
+            // realistic workspace name length, but the honest fix is a
+            // bound on the input, not a bigger cap on the reply.
+            if workspace_name.len() > MAX_WORKSPACE_NAME_BYTES {
+                tracing::warn!(
+                    len = workspace_name.len(),
+                    max = MAX_WORKSPACE_NAME_BYTES,
+                    "closing connection: CreateSession workspace_name exceeds the maximum length"
+                );
+                return;
+            }
+
+            let real_session = match session_bootstrap::create_real_session(
+                &resources,
+                workspace_name,
+            )
+            .await
+            {
+                Ok(real_session) => real_session,
+                Err(err) => {
+                    // No `ClientRequest`/`ClientEvent` error variant exists to
+                    // report this over the wire with (the same constraint
+                    // ruling W1-R6 already accepted for "unknown session");
+                    // logging and ending the connection is the most honest
+                    // thing left to do. Never includes `err`'s `Display` in
+                    // anything sent to the client — `StartSessionMcpError`/
+                    // `CreateSessionError` are daemon-local operator
+                    // diagnostics, not client-facing payloads.
+                    tracing::error!(error = %err, "failed to construct a real session; refusing CreateSession");
+                    return;
+                }
+            };
+            let spec = real_session.actor.session_spec().clone();
+
             let Some((session_id, subscription, session_events)) =
-                registry.create(workspace_name.clone())
+                registry.create(real_session.actor, real_session.mcp_host)
             else {
                 // At `max_sessions` (security review Important 3 / ruling
-                // W1-R33) — `ClientRequest` has no error-response variant to
-                // report that over the wire with (the same constraint ruling
-                // W1-R6 already accepted for "unknown session"), so ending
-                // the connection is the most honest thing left to do.
+                // W1-R33) — same "no wire error variant" constraint as
+                // above. The isolation handle/MCP host `real_session` just
+                // built are torn down by nothing here (a known, accepted
+                // gap at `DEFAULT_MAX_SESSIONS` — see the task report): this
+                // is the daemon's least-realistic failure path, hit only at
+                // ten thousand concurrently live sessions.
                 return;
             };
             let created = ClientEvent::TaskEvent {
                 session_id,
                 task_id: None,
                 payload: Box::new(EventPayload::SessionCreated {
-                    spec: Box::new(placeholder_session_spec(workspace_name)),
+                    spec: Box::new(spec),
                 }),
             };
             if events_tx.send(created).await.is_err() {
                 // `serve_connection` already gave up on this connection
                 // (e.g. the peer disconnected mid-handshake) — tear the
-                // just-created registration back down rather than leak it.
+                // just-created subscriber registration back down rather
+                // than leak it. The actor itself is NOT torn down (see the
+                // module doc comment, "Entry lifetime = actor lifetime") —
+                // it stays registered, attachable by session id, exactly as
+                // if this connection had detached normally after a
+                // successful handshake.
                 registry.detach(session_id, &subscription);
                 return;
             }
-            (session_id, subscription, session_events)
+            (session_id, subscription, session_events, true)
         }
         // # Attach is authenticated, not authorized (security review
         // Important 5 / ruling W1-R35 — escalated to the operator, not a
@@ -863,12 +940,10 @@ pub async fn drive_session(
         // map lookup: any local peer that learns a `SessionId` (a UUIDv4, so
         // not enumerable, but not secret either — `main.rs` logs it, and the
         // unredacted event stream that follows is not access-controlled
-        // beyond that) can attach to it. That is bounded *today* only
-        // because this function discards every post-handshake request
-        // below as a no-op — see the `Some(_request)` arm's own comment for
-        // why replacing that discard with a real `SessionActor` must not be
-        // done without an attach capability distinct from the routing key,
-        // or an explicit operator decision to accept broadcast-approval.
+        // beyond that) can attach to it. That is bounded by `is_creator`
+        // below: an attached connection's post-handshake requests are
+        // always refused, so an attacker who merely learns a `SessionId`
+        // can watch, never act.
         ClientRequest::Attach { session_id } => match registry.attach(session_id) {
             Some((subscription, session_events)) => {
                 // `roundhouse_tui::connect_attach` waits for this `Ack`
@@ -889,7 +964,7 @@ pub async fn drive_session(
                     registry.detach(session_id, &subscription);
                     return;
                 }
-                (session_id, subscription, session_events)
+                (session_id, subscription, session_events, false)
             }
             // Unknown/no-longer-live session, or already at
             // `max_subscribers_per_session` (security review Important 3 /
@@ -944,23 +1019,66 @@ pub async fn drive_session(
             }
             maybe_request = requests_rx.recv() => {
                 match maybe_request {
-                    // Placeholder: Task 5/7's real `SessionActor` is what
-                    // turns a post-handshake `ClientRequest` (a new task, a
-                    // cancellation, ...) into anything. Draining it here,
-                    // unconditionally, is what keeps `requests_out` from
-                    // ever backing up and wedging `serve_connection`'s read
-                    // side (see this function's doc comment) — and, per the
-                    // `Attach` comment above, it is also what keeps `Attach`
-                    // read-only today. Ruling W1-R37 pre-rules the safe
-                    // default the next implementer inherits: an attached
-                    // connection's post-handshake requests must stay
-                    // refused (it still *receives* the broadcast the frozen
-                    // design mandates) — only the connection that ran
-                    // `CreateSession` gets its requests honored, until W5
-                    // makes "first responder wins among attached responders"
-                    // a deliberate decision rather than something this lane
-                    // concedes by defaulting this open.
-                    Some(_request) => {}
+                    // # Rulings W1-R37/W1-R52 — attached connections are
+                    // READ-ONLY, by design, and this is the discard site
+                    // that enforces it
+                    //
+                    // `ClientRequest` carries exactly two variants today
+                    // (`CreateSession`, `Attach` — both only valid as the
+                    // FIRST line of a connection, matched above); there is
+                    // currently no variant that names "do something inside
+                    // an already-established session" at all, so this arm
+                    // is unreachable in ordinary operation regardless of
+                    // `is_creator`, and both a creator's and an attached
+                    // connection's post-handshake frames are, today,
+                    // identically discarded below. `is_creator` is threaded
+                    // this far anyway (see the `let _ = is_creator;` inside
+                    // this arm) so the binding decision this ruling records
+                    // is visible at the exact discard site a future real
+                    // handler replaces, not left implicit: `docs/architecture/
+                    // 03-security-and-sandboxing.md:174` ("approvals
+                    // broadcast to every attached client, first responder
+                    // wins") governs what an attached client may SEE, not
+                    // what it may SEND — defaulting the latter open the
+                    // moment a real request variant exists would make
+                    // unauthenticated `Attach` an approval-hijack primitive.
+                    // Only the creating connection's future requests may
+                    // ever be honored; an attached connection's must stay
+                    // refused even once a real handler exists.
+                    //
+                    // **Known, deliberate limitation (W1-R52):** once the
+                    // creating connection disconnects, this session has NO
+                    // controller left — `round attach --session ID` from a
+                    // fresh terminal is a VIEWER, never able to send a
+                    // request that will be honored, even though the session
+                    // (per ruling W1-R51) is still very much alive and
+                    // running. That is fail-closed by design, not a bug to
+                    // work around by honoring an attached connection's
+                    // requests "to make attach feel complete" — doing so
+                    // would silently reopen exactly what this ruling closed.
+                    //
+                    // **W1-R38 — this remains a property of the loop's
+                    // shape, not a one-time patch.** The moment a real
+                    // variant exists and handling it needs to `await` a
+                    // `SessionActor` (`registry.actor(session_id)`, already
+                    // available for exactly this), that work must be handed
+                    // to a spawned task or gated behind its own `select!`
+                    // arm reserving capacity — never awaited inside this
+                    // arm's own body — for the identical reason
+                    // `events_tx`/`requests_out` already aren't: doing so
+                    // would stop this arm from polling `session_events.recv()`
+                    // for as long as the await is pending, recreating the
+                    // exact circular wait W1-R31 fixed.
+                    Some(_request) => {
+                        // `is_creator` is read here — rather than left an
+                        // unused tuple element — specifically so the future
+                        // call site (routing to `registry.actor(session_id)`
+                        // only when `is_creator` is `true`) has an obvious
+                        // place to grow into. There is no `ClientRequest`
+                        // variant to route yet, so this is a no-op either
+                        // way today.
+                        let _ = is_creator;
+                    }
                     None => break,
                 }
             }
@@ -968,24 +1086,6 @@ pub async fn drive_session(
     }
 
     registry.detach(session_id, &subscription);
-}
-
-/// A placeholder `SessionSpec` good enough to satisfy the `SessionCreated`
-/// handshake frame (ruling W1-R6) before a real `SessionActor` exists to
-/// supply one.
-///
-/// Task 5/7's real per-session wiring constructs the actual spec (from a
-/// real workspace lookup, tier negotiation, etc.); `SessionRegistry`
-/// explicitly does not construct a `SessionActor` at all yet (see its module
-/// doc comment), so this function's only job is giving `connect_create`
-/// *something* valid to read the minted `session_id` off of.
-fn placeholder_session_spec(workspace_name: String) -> SessionSpec {
-    SessionSpec {
-        workspace: WorkspaceId::new(),
-        name: Some(workspace_name),
-        requested_tier: Tier::Sandbox,
-        on_degrade: OnDegrade::Refuse,
-    }
 }
 
 #[cfg(test)]

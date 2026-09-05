@@ -3592,9 +3592,11 @@ dependencies = [
  "ratatui",
  "roundhouse-proto",
  "roundhouse-tui",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -3635,6 +3637,7 @@ dependencies = [
 name = "roundhouse-daemon"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "color-eyre",
  "futures",
  "roundhouse-acp",
@@ -3644,6 +3647,7 @@ dependencies = [
  "roundhouse-engine",
  "roundhouse-flow",
  "roundhouse-mcp",
+ "roundhouse-net",
  "roundhouse-policy",
  "roundhouse-proto",
  "roundhouse-provider",

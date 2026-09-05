@@ -9,6 +9,8 @@
 //! reviewer's `ulimit -n 200` reproduction is an end-to-end, by-hand
 //! exercise this suite does not automate; see that module's doc comment.
 
+mod common;
+
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,9 +38,11 @@ async fn too_many_concurrent_connections_are_refused_but_the_loop_keeps_running(
         max_connections: 1,
         handshake_timeout: Duration::from_secs(5),
     };
+    let resources = common::real_resources(dir.path()).await;
     tokio::spawn(accept_loop_with(
         listener,
         registry.clone(),
+        resources,
         Ok(own_uid()),
         limits,
     ));
@@ -92,9 +96,11 @@ async fn a_connection_that_never_sends_a_handshake_request_is_closed_after_the_t
         max_connections: 8,
         handshake_timeout: Duration::from_millis(100),
     };
+    let resources = common::real_resources(dir.path()).await;
     tokio::spawn(accept_loop_with(
         listener,
         registry.clone(),
+        resources,
         Ok(own_uid()),
         limits,
     ));
@@ -122,9 +128,11 @@ async fn a_peer_uid_mismatch_is_refused_but_the_loop_keeps_running() {
     let listener = bind_socket(&socket_path).unwrap();
     // Deliberately wrong: this test process's peer_cred will never match.
     let wrong_uid = own_uid().wrapping_add(1);
+    let resources = common::real_resources(dir.path()).await;
     tokio::spawn(accept_loop_with(
         listener,
         registry.clone(),
+        resources,
         Ok(wrong_uid),
         AcceptLimits::default(),
     ));
@@ -152,6 +160,7 @@ async fn an_undeterminable_own_uid_refuses_to_accept_anything() {
     let registry = Arc::new(SessionRegistry::new());
     let listener = bind_socket(&socket_path).unwrap();
     let undeterminable = std::io::Error::new(std::io::ErrorKind::Unsupported, "test: no /proc");
+    let resources = common::real_resources(dir.path()).await;
 
     // Must return an error promptly, before ever calling `accept()` — never
     // silently downgrade to "skip the check" (ruling W1-R34).
@@ -160,6 +169,7 @@ async fn an_undeterminable_own_uid_refuses_to_accept_anything() {
         accept_loop_with(
             listener,
             registry,
+            resources,
             Err(undeterminable),
             AcceptLimits::default(),
         ),
@@ -172,23 +182,29 @@ async fn an_undeterminable_own_uid_refuses_to_accept_anything() {
     );
 }
 
-#[test]
-fn session_registry_refuses_create_once_at_max_sessions() {
+#[tokio::test]
+async fn session_registry_refuses_create_once_at_max_sessions() {
+    let dir = tempfile::tempdir().unwrap();
     let registry = SessionRegistry::with_limits(1, 64);
+    let actor_a = common::real_actor(dir.path()).await;
+    let actor_b = common::real_actor(dir.path()).await;
     assert!(
-        registry.create("a".into()).is_some(),
+        registry.create(actor_a, None).is_some(),
         "the first session, under the cap, must succeed"
     );
     assert!(
-        registry.create("b".into()).is_none(),
+        registry.create(actor_b, None).is_none(),
         "a session past max_sessions must be refused, not silently minted"
     );
 }
 
-#[test]
-fn session_registry_refuses_attach_once_at_max_subscribers_per_session() {
+#[tokio::test]
+async fn session_registry_refuses_attach_once_at_max_subscribers_per_session() {
+    let dir = tempfile::tempdir().unwrap();
     let registry = SessionRegistry::with_limits(64, 1);
-    let (session_id, _creator_subscription, _creator_events) = registry.create("a".into()).unwrap();
+    let actor = common::real_actor(dir.path()).await;
+    let (session_id, _creator_subscription, _creator_events) =
+        registry.create(actor, None).unwrap();
     // The creator itself already counts as the one subscriber this
     // registry allows for this session.
     assert!(
