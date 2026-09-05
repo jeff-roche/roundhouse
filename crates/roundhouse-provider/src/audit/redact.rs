@@ -348,4 +348,41 @@ mod redact_transport_error_text_tests {
         assert!(!redacted.contains("abc123"));
         assert!(redacted.contains("gateway.example.com"));
     }
+
+    /// Fix round 1, F3 (Ruling R27 / security S8): `InsecureBaseUrl`'s own
+    /// remediation advice must survive this function -- the pre-fix wording
+    /// ended `-- use https://, or opt in with allow_insecure`, and
+    /// `EMBEDDED_URL` (`https?://[^\s()'"]+`) matched the bare `https://,`
+    /// literal, replacing it with a host-only string and destroying the
+    /// only actionable instruction in the error before it ever reaches an
+    /// append-only `events` row. The advice must also name the real
+    /// operator-facing opt-in (the `ROUNDHOUSE_<PROVIDER>_ALLOW_INSECURE_
+    /// BASE_URL` env var), not the internal `allow_insecure` parameter name,
+    /// which an operator has no way to set.
+    #[test]
+    fn insecure_base_url_remediation_advice_survives_redaction() {
+        let err = crate::credential::resolve_base_url(
+            "openai-chat",
+            "https://default.example.com",
+            Some("http://gw.example.invalid:8443/v1"),
+            false,
+        )
+        .err()
+        .unwrap();
+        let raw = err.to_string();
+        let redacted = redact_transport_error_text(&raw);
+        assert!(
+            redacted.contains("https"),
+            "the advice to use https must survive redaction: {redacted}"
+        );
+        assert!(
+            redacted.contains("ROUNDHOUSE_OPENAI_CHAT_ALLOW_INSECURE_BASE_URL"),
+            "the advice must name the real operator opt-in env var (surviving \
+             redaction), not the internal `allow_insecure` parameter: {redacted}"
+        );
+        assert!(
+            redacted.contains("gw.example.invalid:8443"),
+            "the host itself is diagnostic, not secret, and must survive: {redacted}"
+        );
+    }
 }
