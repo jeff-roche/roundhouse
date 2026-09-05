@@ -1,6 +1,6 @@
 use roundhouse_flow::expr::{
-    eval, eval_delimited_expression, interpolate, interpolate_json, ExprContext, ExprError,
-    ExpressionSource, JsonTemplateSource, TemplateSource,
+    eval, eval_delimited_expression, interpolate, interpolate_json, EnvAllowlist, ExprContext,
+    ExprError, ExpressionSource, JsonTemplateSource, TemplateSource,
 };
 use serde_json::{json, Value};
 
@@ -988,6 +988,68 @@ fn env_function_returns_null_for_an_allowlisted_but_unset_variable() {
     );
 }
 
+// ---- `EnvAllowlist::credential_shaped_names` (Task 33, ruling W5-17): an
+// advisory, non-filtering hook so a caller building an allowlist can warn
+// about the double bypass a credential-shaped allowlisted name causes
+// (Clean, and not a `secrets` key — invisible to both provenance redaction
+// and the `redact_known_secrets` backstop). ----
+
+#[test]
+fn credential_shaped_names_flags_common_credential_suffixes_case_insensitively_but_not_ordinary_names(
+) {
+    let allow = EnvAllowlist::from_names([
+        "HOME",
+        "PATH",
+        "MY_API_KEY",
+        "database_password",
+        "SESSION_TOKEN",
+        "APP_SECRET",
+        "SERVICE_CREDENTIAL",
+        "KEYBOARD_LAYOUT", // contains "KEY" but does not *end* with "_KEY"
+    ]);
+    let mut flagged = allow.credential_shaped_names();
+    flagged.sort_unstable();
+    assert_eq!(
+        flagged,
+        vec![
+            "APP_SECRET",
+            "MY_API_KEY",
+            "SERVICE_CREDENTIAL",
+            "SESSION_TOKEN",
+            "database_password",
+        ],
+        "HOME/PATH must not be flagged, and a suffix match must be exact \
+         (KEYBOARD_LAYOUT contains KEY but does not end in _KEY)"
+    );
+}
+
+#[test]
+fn credential_shaped_names_never_changes_what_the_allowlist_permits() {
+    // Advisory only: whether a name is credential-shaped must not affect
+    // whether `env()` can actually read it — that decision stays entirely
+    // with whoever called `allow_env`/`from_names`.
+    std::env::set_var(
+        "ROUNDHOUSE_TEST_CREDENTIAL_SHAPED_API_KEY",
+        "still-readable",
+    );
+    let mut c = ctx();
+    c.allow_env(["ROUNDHOUSE_TEST_CREDENTIAL_SHAPED_API_KEY"]);
+    assert_eq!(
+        eval(
+            ExpressionSource::from_workflow_file(
+                "env('ROUNDHOUSE_TEST_CREDENTIAL_SHAPED_API_KEY')"
+            ),
+            &c
+        )
+        .unwrap()
+        .value()
+        .clone(),
+        json!("still-readable"),
+        "credential_shaped_names existing must not turn into a filter — the \
+         name still resolves"
+    );
+}
+
 // ---- `json()` can decode escapes into control characters not literally
 // present in the source text — documented residual, pinned. ----
 
@@ -1105,18 +1167,21 @@ fn root_lookup_is_case_sensitive() {
 // ---- `eval` carries the same P20 trust assertion as `interpolate` /
 // `interpolate_json` (ruling P22, fix round 3, item 1). `eval` is `pub`,
 // takes an expression with no `${{ }}` delimiters at all, and was the
-// shortest path to the P20 abuse before this fix (measured on HEAD with a
-// planted key: `eval("env('ANTHROPIC_API_KEY')", &ctx)` returned the
-// daemon's provider key — see `expr.rs`'s `ExpressionSource` doc comment).
-// This test does not re-plant a real-looking secret name (deliberately: a
-// test that reads `env('ANTHROPIC_API_KEY')` for real would depend on
-// whatever happens to be in *this* process's own environment, which is
-// exactly the residual `expr.rs`'s "`env()` is a second, independent
-// secret-exposure surface" section already documents as unowned). It pins
-// the type-level assertion instead: `eval` only compiles against an
-// `ExpressionSource`, not a bare `&str`, so every caller must go through
-// the same greppable `::from_workflow_file` call `interpolate` /
-// `interpolate_json` require. ----
+// shortest path to the P20 abuse before this fix (measured pre-Task-33 on
+// an unscoped context with a planted key: `eval("env('ANTHROPIC_API_KEY')",
+// &ctx)` returned the daemon's provider key — see `expr.rs`'s
+// `ExpressionSource` doc comment). This test does not re-plant a
+// real-looking secret name (deliberately: a test that reads
+// `env('ANTHROPIC_API_KEY')` for real would depend on whatever happens to
+// be in *this* process's own environment). Since Task 33 (ruling W5-7),
+// `env()` also denies every name by default regardless — this test
+// allowlists its own planted name via `allow_env` specifically so the
+// `env()` call inside it still resolves, keeping this a test of the
+// type-level assertion below, not of the allowlist (which has its own
+// dedicated tests). It pins that type-level assertion: `eval` only
+// compiles against an `ExpressionSource`, not a bare `&str`, so every
+// caller must go through the same greppable `::from_workflow_file` call
+// `interpolate` / `interpolate_json` require. ----
 
 #[test]
 fn eval_requires_an_expression_source_not_a_bare_str() {

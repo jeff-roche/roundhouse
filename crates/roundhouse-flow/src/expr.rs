@@ -840,6 +840,12 @@ enum RootProvenance {
 /// "this collection means deny-all when empty" is a documented type
 /// invariant instead of an incidental fact about whatever collection
 /// happened to be chosen.
+///
+/// See also [`Self::credential_shaped_names`] (Task 33, ruling W5-17): an
+/// *advisory*, non-filtering method a caller building this allowlist should
+/// call and warn on, because an allowlisted `env()` value bypasses this
+/// crate's other leak protections entirely (see that method's own doc
+/// comment for why).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvAllowlist(std::collections::HashSet<String>);
 
@@ -871,6 +877,47 @@ impl EnvAllowlist {
     /// comment for why there is no prefix/glob variant of this.
     fn permits(&self, name: &str) -> bool {
         self.0.contains(name)
+    }
+
+    /// Returns the entries of this allowlist whose *names* look
+    /// credential-bearing — a case-insensitive suffix match on `_KEY`,
+    /// `_TOKEN`, `_SECRET`, `_PASSWORD`, or `_CREDENTIAL` (Task 33, ruling
+    /// W5-17).
+    ///
+    /// **Advisory only.** This never rejects, filters, or otherwise changes
+    /// what [`Self::permits`] allows — allowlisting a credential-shaped
+    /// name remains entirely the operator's call, and there are legitimate
+    /// reasons to do it. What this method exists for: fix round 1's
+    /// security review found that an *allowlisted* `env()` read is doubly
+    /// invisible to this crate's own leak protections — it is Clean, not
+    /// secret-derived (see the taint decision at `Parser::parse_primary`'s
+    /// call site: allowlisting is itself the operator vouching for
+    /// non-secrecy), and it is not a key of `crate::exec::RunContext`'s
+    /// `secrets` map, so `crate::exec::redact_known_secrets`'s backstop
+    /// cannot see it either. An operator who allowlists a genuinely
+    /// credential-shaped name — the canonical case is `ANTHROPIC_API_KEY`
+    /// — therefore reproduces the exact Phase 5 exposure Task 33 exists to
+    /// close, for that one name, with no warning anywhere in this crate.
+    ///
+    /// This is the hook: a caller building an `EnvAllowlist` from operator
+    /// config (`roundhouse-daemon`, lane W1) should call this at
+    /// config-load time and warn on whatever comes back, rather than
+    /// reinventing the same suffix heuristic itself. Living next to
+    /// `EnvAllowlist` keeps it discoverable to whoever writes that config
+    /// loader in a way a line buried in another lane's brief is not.
+    pub fn credential_shaped_names(&self) -> Vec<&str> {
+        const CREDENTIAL_SUFFIXES: &[&str] =
+            &["_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIAL"];
+        self.0
+            .iter()
+            .filter(|name| {
+                let upper = name.to_ascii_uppercase();
+                CREDENTIAL_SUFFIXES
+                    .iter()
+                    .any(|suffix| upper.ends_with(suffix))
+            })
+            .map(String::as_str)
+            .collect()
     }
 }
 
@@ -1456,10 +1503,17 @@ impl fmt::Debug for ExprContext {
 /// just `interpolate`/`interpolate_json`. `eval` is in fact the *shortest*
 /// path to the abuse P20 exists to prevent, because it skips the `${{ }}`
 /// delimiters entirely — `eval` on the bare text `env('ANTHROPIC_API_KEY')`
-/// (no `${{ }}` needed at all) returns the daemon's provider key exactly as
-/// `${{ env('ANTHROPIC_API_KEY') }}` does through `interpolate`. Measured on
-/// HEAD with a planted key: `eval("env('ANTHROPIC_API_KEY')", &ctx)` ->
-/// `"sk-ant-PRETEND-KEY"`.
+/// (no `${{ }}` needed at all) would return the daemon's provider key
+/// exactly as `${{ env('ANTHROPIC_API_KEY') }}` does through `interpolate`,
+/// **if `ANTHROPIC_API_KEY` were allowlisted** — since Task 33 (ruling
+/// W5-7), `env()` denies every name by default, so on a freshly-constructed
+/// [`ExprContext`] this now returns [`ExprError::EnvVarNotAllowed`] instead,
+/// naming the call's source text and never a value. The illustration is
+/// conditional on the caller having opted the name into
+/// [`ExprContext::allow_env`]; the P20/P22 rationale itself rests on
+/// `secrets.*`, not on `env()`, and is unaffected. Measured pre-Task-33 with
+/// a planted key on an unscoped context: `eval("env('ANTHROPIC_API_KEY')",
+/// &ctx)` -> `"sk-ant-PRETEND-KEY"`.
 ///
 /// A distinct type from [`TemplateSource`], not a reuse of it, because the
 /// two wrap different grammars: `TemplateSource` wraps a whole template —
@@ -1945,12 +1999,12 @@ fn truncate_echoed_field(text: &str) -> String {
 /// handed to [`interpolate`] or by being the `Value` handed to
 /// [`interpolate_json`]. The consequence of getting this wrong is not the
 /// silent cross-block merge (that was P19's original, weaker justification,
-/// since corrected) — it is `${{ env('ANTHROPIC_API_KEY') }}` or
-/// `${{ secrets.* }}` appearing in attacker-influenced content and
-/// evaluating for real, emitting the daemon's provider key or the
-/// workflow's own secrets in cleartext. Untrusted data must reach this
-/// module only as a value bound into [`ExprContext`], never as template
-/// text.
+/// since corrected) — it is `${{ env('ANTHROPIC_API_KEY') }}` (if that name
+/// is allowlisted — see Task 33, ruling W5-7) or `${{ secrets.* }}`
+/// appearing in attacker-influenced content and evaluating for real,
+/// emitting the daemon's provider key or the workflow's own secrets in
+/// cleartext. Untrusted data must reach this module only as a value bound
+/// into [`ExprContext`], never as template text.
 ///
 /// Constructible only through [`TemplateSource::from_workflow_file`], so
 /// that assertion is one explicit, greppable call site at the point a
@@ -2245,7 +2299,8 @@ fn value_to_string(v: &Value) -> String {
 /// concatenation whatsoever to reach the same outcome as pasting untrusted
 /// text into a template: every string leaf of that value is evaluated as
 /// `${{ }}` template text, so `{"note": "${{ env('ANTHROPIC_API_KEY') }}"}`
-/// anywhere in the tree evaluates for real.
+/// anywhere in the tree evaluates for real (and, if that name is
+/// allowlisted — Task 33, ruling W5-7 — resolves to the real value).
 pub struct JsonTemplateSource<'a>(&'a Value);
 
 impl<'a> JsonTemplateSource<'a> {

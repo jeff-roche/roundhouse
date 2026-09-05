@@ -1363,16 +1363,26 @@ fn truncate_diagnostic(text: &str, limit: usize) -> Cow<'_, str> {
 ///
 /// **This is not complete redaction, and must not be read as such.**
 /// `${{ env(...) }}` (§8.9's own required function) reads the real process
-/// environment via [`std::env::var`], entirely unscoped from any workflow
-/// `secrets:` declaration and unscoped from this run's own
-/// [`RunContext::secrets`] map — see `crate::expr`'s module doc comment,
-/// "`env()` is a second, independent secret-exposure surface." A value
-/// obtained through `env()` (for example `${{ env('ANTHROPIC_API_KEY') }}`)
-/// is not a key of `secrets`, so this function has no way to recognise it
-/// and will not redact it. This gap is escalated, not closed, by `crate::expr`;
-/// this function closes exactly the narrower gap it documents (a
-/// `secrets.*`-sourced value leaking through this crate's own log call
-/// site) and no more.
+/// environment via [`std::env::var`], but — since Task 33, ruling W5-7 —
+/// only for names the caller's [`crate::expr::EnvAllowlist`] permits; see
+/// `crate::expr`'s module doc comment, "`env()` is scoped by an explicit
+/// allowlist, deny-all by default." An *allowlisted* `env()` read is a
+/// deliberately different gap from the one Task 33 closed: it is
+/// [`crate::expr::ExprError::EnvVarNotAllowed`]-free by design (the caller
+/// opted the name in), its value is Clean rather than secret-derived (an
+/// operator allowlisting a name is vouching for it being non-secret), and
+/// — the part this comment exists to flag — it is **not a key of
+/// [`RunContext::secrets`]**, so this function has no way to recognise it
+/// and will not redact it either. An operator who allowlists a genuinely
+/// credential-shaped name (e.g. `ANTHROPIC_API_KEY`) therefore reproduces
+/// the original unscoped-`env()` exposure for that one name, with neither
+/// provenance-based redaction nor this backstop catching it — see
+/// [`crate::expr::EnvAllowlist::credential_shaped_names`] (ruling W5-17),
+/// the advisory hook that exists precisely so a caller building the
+/// allowlist can warn about this before it happens, rather than this
+/// function trying to catch it after the fact. This function closes
+/// exactly the narrower gap it documents (a `secrets.*`-sourced value
+/// leaking through this crate's own log call site) and no more.
 ///
 /// # What this function does and does not catch — self-contained (fix round 1, item 7)
 ///
