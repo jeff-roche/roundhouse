@@ -18,7 +18,6 @@
 use roundhouse_core::{JobId, Tier};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::convert::TryFrom;
 use thiserror::Error;
 
 /// The session shape a job's run executes under: provider/model selection,

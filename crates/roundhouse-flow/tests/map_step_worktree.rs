@@ -886,6 +886,16 @@ fn a_secret_derived_base_ref_with_an_at_brace_suffix_never_reaches_the_serialize
          item's own error message, got: {error:?}"
     );
 
+    // Final round, item C4: assert the *mechanism*, not only the outcome.
+    // "no leak" also holds if git happened not to echo anything at all, or
+    // if the item failed earlier for an unrelated reason; this pins that
+    // the withhold branch is what produced the message.
+    assert!(
+        error.contains("withheld"),
+        "the secret-derived branch must render `WorktreeError::safe_summary()`, whose \
+         text says what it withheld — got: {error:?}"
+    );
+
     let serialized = serde_json::to_string(&outcomes[0].output).unwrap();
     assert!(
         !serialized.contains(LEAKED_PREFIX),
@@ -956,6 +966,16 @@ fn a_secret_derived_base_ref_longer_than_gits_stderr_buffer_never_reaches_the_se
          own error message, got an error of {} bytes",
         probe_prefix.len(),
         error.len()
+    );
+
+    // Final round, item C4: assert the *mechanism*, not only the outcome.
+    // "no leak" also holds if git happened not to echo anything at all, or
+    // if the item failed earlier for an unrelated reason; this pins that
+    // the withhold branch is what produced the message.
+    assert!(
+        error.contains("withheld"),
+        "the secret-derived branch must render `WorktreeError::safe_summary()`, whose \
+         text says what it withheld — got: {error:?}"
     );
 
     let serialized = serde_json::to_string(&outcomes[0].output).unwrap();

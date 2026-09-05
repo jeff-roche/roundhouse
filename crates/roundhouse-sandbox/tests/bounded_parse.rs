@@ -223,10 +223,16 @@ fn stderr_is_still_truncated_to_the_capture_cap_in_the_crash_message() {
                 !stderr.is_empty(),
                 "the first bytes the child wrote must still be captured for diagnosis"
             );
-            assert!(
-                stderr.len() <= 64 * 1024,
-                "stderr must be truncated to the capture cap, not buffered in full: \
-                 kept {} of the 1 MiB the child wrote",
+            // `assert_eq!`, not `<=` (final round, item C2): the doc
+            // says truncation is *exact*, and `<=` also passes under a
+            // reader that stops early or one that overshoots and is
+            // trimmed elsewhere. Measured at exactly 65536, so pinning
+            // both directions costs nothing.
+            assert_eq!(
+                stderr.len(),
+                64 * 1024,
+                "stderr must be truncated to exactly the capture cap, not buffered in \
+                 full and not cut short: kept {} of the 1 MiB the child wrote",
                 stderr.len()
             );
         }
@@ -427,5 +433,60 @@ fn a_child_cannot_see_the_parents_environment() {
         "the child inherited the parent's environment — `env_clear()` is not being \
          applied, and any secret in the daemon's environment is exposed to every \
          child this primitive spawns"
+    );
+}
+
+/// Final round, item C1: `bounded_parse.rs` documents in **three** places
+/// that "a runaway stderr writer is still bounded, by `wall_limit` and
+/// `RLIMIT_CPU`", and until now nothing pinned it. The test that would have
+/// was replaced during a fix round by a self-terminating `head -c` writer,
+/// which exercises *draining* (the test above) but not *boundedness* — a
+/// child that stops on its own proves nothing about one that never does.
+///
+/// This is the property ruling W5-28 traded the prompt stderr kill away
+/// for: stderr past the capture cap no longer kills the child or decides
+/// the verdict, so the *only* thing left standing between a `yes 1>&2` and
+/// an unbounded run is the pair of general bounds. That claim should not
+/// rest on prose.
+///
+/// **Asserted loosely on the verdict, tightly on the ceiling.** Which bound
+/// fires is a race between `RLIMIT_CPU` and the wall clock, and the shape it
+/// arrives in is not what this test is about: measured, `sh` forks `yes`,
+/// `RLIMIT_CPU` kills the *grandchild*, and `sh` itself exits normally with
+/// 137 — surfacing as `HelperCrashed { status: "exit status: 137" }`, not
+/// `ResourceExhausted`. Pinning that exact variant would pin an
+/// implementation detail of which process the kernel reached first. The
+/// invariant that matters is "the call returns, an order of magnitude below
+/// the runaway", and the `recv_timeout` ceiling is what makes a regression
+/// fail this test instead of hanging CI forever.
+#[test]
+fn a_runaway_stderr_writer_is_still_bounded() {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = run_bounded_subprocess(
+            Path::new("sh"),
+            &[OsStr::new("-c"), OsStr::new("yes 1>&2")],
+            &[],
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            MAX_OUTPUT,
+        );
+        let _ = tx.send((result, started.elapsed()));
+    });
+
+    let (result, elapsed) = rx.recv_timeout(Duration::from_secs(30)).expect(
+        "a child writing to stderr forever must still be ended by the wall clock or \
+         RLIMIT_CPU — a hang here means the only bounds left after ruling W5-28 removed \
+         the stderr kill are not actually holding",
+    );
+    assert!(
+        result.is_err(),
+        "a child killed by a bound must never look like success, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the call must return promptly after its 2s wall limit, not merely eventually; \
+         took {elapsed:?} (result: {result:?})"
     );
 }

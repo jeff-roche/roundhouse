@@ -758,6 +758,72 @@ mod tests {
         );
     }
 
+    /// Final round, item C3: [`WorktreeError::safe_summary`]'s `NoPath` and
+    /// `Spawn` arms had no direct test — they were exercised only
+    /// indirectly, through the flow crate's integration tests, which drive
+    /// the `CommandFailed` arm for real. The match is exhaustive with no
+    /// wildcard, so a new variant cannot silently default to permissive;
+    /// this makes the guarantee local and self-evident as well.
+    ///
+    /// Every field a variant carries that this module did **not** itself
+    /// choose gets the same marker planted in it. `program` and `repo_root`
+    /// are deliberately excluded: they are this module's own hardcoded
+    /// program name and its caller-supplied repository root, never
+    /// workflow-derived, and `safe_summary` shows both on purpose.
+    #[test]
+    fn safe_summary_never_echoes_text_from_outside_this_module_for_any_variant() {
+        use std::os::unix::process::ExitStatusExt;
+
+        const MARKER: &str = "MARKER-SECRET-DERIVED-TEXT";
+        let repo_root = PathBuf::from("/tmp/some-repo");
+        let variants = [
+            WorktreeError::NoPath,
+            WorktreeError::Spawn {
+                program: "git".to_string(),
+                repo_root: repo_root.clone(),
+                args: vec![MARKER.to_string()],
+                source: std::io::Error::other(MARKER),
+            },
+            WorktreeError::TimedOut {
+                program: "git".to_string(),
+                repo_root: repo_root.clone(),
+                wall_limit: Duration::from_secs(1),
+            },
+            WorktreeError::CommandFailed {
+                program: "git".to_string(),
+                repo_root: repo_root.clone(),
+                args: vec![MARKER.to_string()],
+                status: std::process::ExitStatus::from_raw(128 << 8),
+                stderr: format!("fatal: invalid reference: {MARKER}"),
+            },
+        ];
+
+        for error in &variants {
+            let summary = error.safe_summary();
+            assert!(
+                !summary.contains(MARKER),
+                "safe_summary() leaked text from outside this module: {summary}"
+            );
+            assert!(
+                !summary.is_empty(),
+                "every variant must still say something identifiable"
+            );
+        }
+
+        // The marker must genuinely be reachable through the ordinary
+        // rendering, or the loop above would pass without proving anything
+        // (three of these four variants would leak it via `Display`).
+        let leaking = variants
+            .iter()
+            .filter(|e| e.to_string().contains(MARKER))
+            .count();
+        assert_eq!(
+            leaking, 2,
+            "expected `Spawn` and `CommandFailed`'s own Display to embed the marker, so \
+             the assertions above are testing something real"
+        );
+    }
+
     /// Final round, item A2 — the reason this module stopped using
     /// `Command::output()`. Both final whole-branch review lenses found this
     /// independently, and it is ruling W5-26's finding transplanted from
