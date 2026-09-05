@@ -57,6 +57,23 @@ pub struct CredentialCtx<'a> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
+    /// Phase 7 U4, Task 31 item 5 (verified 2026-09-05): reserved for a
+    /// credential-selection layer that resolves a provider's credential by
+    /// trying keyring, env, then profile default, in that order — this is
+    /// the ONLY variant whose message already names that triad. No such
+    /// layer exists yet anywhere reachable from this crate: nothing in
+    /// `roundhouse-provider` or `roundhouse-secrets/src/credential/` ever
+    /// builds a `Box<dyn CredentialProvider>` from configuration (every
+    /// production `RequestCtx.credentials` is `None` today — see e.g.
+    /// `codec::openai_responses::provider`'s comment on that field), and
+    /// `roundhouse-secrets::resolve` resolves a different type (`SecretRef`)
+    /// through a different error type (`SecretError`) with no "profile
+    /// default" source at all. Constructing this variant "at its obvious
+    /// call site" would mean inventing that resolution layer from scratch —
+    /// real, but out of a residual-hardening unit's scope, and its
+    /// config-driven call site is `roundhouse-config`, out of this lane.
+    /// Only constructed today in a test fixture
+    /// (`tests/conformance_cohere_v2.rs`).
     #[error(
         "no credential material found for provider `{0}` (checked keyring, env, profile default)"
     )]
@@ -67,6 +84,24 @@ pub enum CredentialError {
     ExecFailed(Option<i32>, String),
     #[error("sigv4 signing precondition failed: {0}")]
     SigningFailed(String),
+    /// Phase 7 U4, Task 31 item 5 (verified 2026-09-05): the only network
+    /// call among the six `CredentialProvider` impls is
+    /// `roundhouse-secrets`'s `oauth_refresh.rs` (and `azure_entra.rs`,
+    /// which delegates to it), and it deliberately does NOT construct this
+    /// variant via `?` — it maps every `TransportError` to a hand-built,
+    /// host-only `RefreshFailed` message instead, because
+    /// `TransportError::Io(String)` (`transport/mod.rs`) carries a raw
+    /// `reqwest` error `Display`, which can include a URL WITH userinfo
+    /// (`reqwest_transport.rs`'s `TransportError::Io(e.to_string())` call
+    /// sites never redact `e`). Every one of the 7 codec call sites that
+    /// invoke `CredentialProvider::apply` does redact the resulting error's
+    /// `.to_string()` before it becomes a `ProviderError::Transport`, so
+    /// constructing this variant there wouldn't leak in practice — but it
+    /// would remove `oauth_refresh.rs`'s first, already-security-reviewed
+    /// layer of redaction and rely on the second layer alone. That's a
+    /// defense-in-depth regression, not a residual fix, so this unit leaves
+    /// it untouched. Only constructed today in a test fixture
+    /// (`tests/conformance_cohere_v2.rs`).
     #[error("transport error while resolving credential: {0}")]
     Transport(#[from] TransportError),
     #[error("invalid base URL: {0}")]
