@@ -375,7 +375,7 @@ pub struct RunContext {
     /// **is not treated as "isolation disabled"**: an author who explicitly
     /// wrote `map.isolation: worktree` with `None` here gets a hard,
     /// named-provider-missing error for that item, never a silent no-op
-    /// (see [`map_step::Executor::dispatch_map_step`]'s own doc comment).
+    /// (see `Executor::dispatch_map_step`'s own doc comment).
     /// `map.isolation` left unset (inheriting `Defaults.isolation`, which
     /// defaults to `Worktree`) never reads this field at all — see the same
     /// doc comment for why that distinction is load-bearing.

@@ -54,7 +54,7 @@
 //!   — see [`map_step::run_map`]'s own doc comment. (Task 34 closed the
 //!   *other* half this bullet used to name here: `map`'s worktree fan-out is
 //!   real now, via the `flow -> sandbox` edge §5.2's `roundhouse-flow` row
-//!   gained in Task 14 — see [`map_step::Executor::dispatch_map_step`]'s own
+//!   gained in Task 14 — see `Executor::dispatch_map_step`'s own
 //!   doc comment, "Task 34".) Ruling P77 §C calls the remaining gap a
 //!   frozen-contract escalation rather than a scoping choice, and it is
 //!   still why a `gate:` or `call:` nested inside a `map` is refused — see

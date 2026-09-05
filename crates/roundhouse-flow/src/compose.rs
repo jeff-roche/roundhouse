@@ -17,7 +17,7 @@
 //! reached from inside a `map` is refused because a `call:` needs the
 //! per-item budget pool ruling P77 §C still defers (`map`'s *worktree*
 //! fan-out is a separate, since-Task-34 concern — see
-//! [`crate::exec::map_step::Executor::dispatch_map_step`]'s own doc
+//! `crate::exec::Executor::dispatch_map_step`'s own doc
 //! comment, "Task 34" — and is not why `call:` is refused here).
 //!
 //! **B12b closed the sourcing half.** [`crate::ledger::admit_call_from_run`]
@@ -86,7 +86,7 @@
 //! `map.isolation`/worktree fan-out records" — that comparison no longer
 //! holds: Task 34 (lane W5) closed the worktree half via the `flow ->
 //! sandbox` edge Task 14 added to §5.2's `roundhouse-flow` row (see
-//! [`crate::exec::map_step::Executor::dispatch_map_step`]'s own doc
+//! `crate::exec::Executor::dispatch_map_step`'s own doc
 //! comment, "Task 34"), while `ToolDef` stays unreachable regardless of
 //! that edge — `roundhouse-sandbox` has no idea what a `ToolDef` is either.
 //! Stating the *current* gap is still the point: the plan presented this
