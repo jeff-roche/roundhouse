@@ -61,20 +61,24 @@ jobs:
       # "any" build-time env-inlining surface while covering only a subset —
       # see the `%…%` check below for what changed and why.
       #
-      # Fix round 3 (BLOCKING, code review): "any"/"every mechanism" was
-      # still too wide a claim even after that fix. A reviewer built a
-      # counterexample this step cannot reach by construction: an inline
-      # `vite.config.ts` plugin's `transformIndexHtml` hook running
-      # `process.env` through arbitrary JS (e.g. string-replacing a literal
-      # marker with a hostname) ships past every check below — no `%…%`
-      # token, no `define`, no `envPrefix`, no `import.meta.env`, no `.env*`
-      # file. That surface is a plugin executing arbitrary code, not a
-      # greppable pattern, so widening this step's checks is the wrong
-      # instinct; `dist_public_content.rs` (which scans the *built output*
-      # for exactly this shape, backed by the staleness check below) is the
-      # right control for it. This step's own claim is scoped to what it can
-      # actually see: Vite's built-in env-inlining mechanisms only
-      # (`import.meta.env`, `define`, `.env*`, and HTML `%…%` substitution).
+      # Fix round 3 (code review): "any"/"every mechanism" was still too
+      # wide a claim even after that fix. A reviewer built a counterexample
+      # this step cannot reach by construction: an inline `vite.config.ts`
+      # plugin's `transformIndexHtml` hook running `process.env` through
+      # arbitrary JS (e.g. string-replacing a literal marker with a
+      # hostname) ships past every check below — no `%…%` token, no
+      # `define`, no `envPrefix`, no `import.meta.env`, no `.env*` file.
+      # That surface is a plugin executing arbitrary code, not a greppable
+      # pattern, so widening this step's checks is the wrong instinct.
+      # `dist_public_content.rs` is the right control *for this kind of
+      # surface* — it scans the built output itself, backed by the
+      # staleness check below, rather than trying to grep the config that
+      # produced it — though it is not guaranteed to catch a bare hostname
+      # with no scheme/digits/UUID shape specifically; that is a gap in
+      # that file's own guards, not this step's problem to solve. This
+      # step's own claim is scoped to what it can actually see: Vite's
+      # built-in env-inlining mechanisms only (`import.meta.env`, `define`,
+      # `.env*`, and HTML `%…%` substitution).
       - name: Fail on Vite's built-in env-inlining surfaces
         run: |
           set -euo pipefail
