@@ -1102,12 +1102,28 @@ fn a_declared_secrets_raw_value_pasted_literally_into_base_ref_is_still_scrubbed
     let error = items[0]["error"].as_str().unwrap();
     // Part 3 (ruling W5-48) made a declared secret's *presence* in
     // `base_ref` trigger the withhold as well, so this input now exercises
-    // **both** guards rather than the scrub alone. `***` is what still pins
-    // the one this test is about, and it discriminates cleanly:
-    // `safe_summary()` never mentions `base_ref` at all, so the only thing
-    // that can put `***` into the echoed `base_ref` is the pre-format needle
-    // scrub. (Before part 3 this assertion was `!contains("withheld")` —
-    // accurate then, false now.)
+    // **both** guards rather than the scrub alone. (Before part 3 the
+    // assertion below was `!contains("withheld")` — accurate then, false
+    // now.)
+    //
+    // **What each of these two assertions actually pins, measured with
+    // mutants rather than argued (part 5).** `contains("withheld")` bites:
+    // dropping the needle-presence disjunct at the guard fails this test.
+    // `contains("***")` pins that *a* needle scrub ran — but **not which
+    // one**: an earlier version of this comment claimed only the
+    // pre-format scrub could produce it, and that is wrong, because the
+    // post-assembly `redact_message` in the same arm produces `***` too.
+    // Measured: with the pre-format scrub removed, this test still passes.
+    //
+    // That is not a gap to close with a better assertion here — it is
+    // structural. This test's channel is a **literal YAML paste**, and
+    // `"`, `'` and `\` are all in `FORBIDDEN_GIT_REF_CHARS`, so a literal
+    // `base_ref` can never carry a `Debug`-escapable character and the two
+    // scrub positions are indistinguishable for every input this test can
+    // construct. Pre-format specificity is pinned by
+    // `a_backslash_bearing_secret_is_scrubbed_before_debug_formatting_can_escape_it`,
+    // which reaches the escapable characters through the placeholder
+    // channel, and which does fail under that same mutant.
     assert!(
         error.contains("***"),
         "the needle backstop must have replaced the pasted secret with `***`, got: {error:?}"
@@ -1200,9 +1216,11 @@ fn a_backslash_bearing_secret_is_scrubbed_before_debug_formatting_can_escape_it(
         items[0]
     );
     let error = items[0]["error"].as_str().unwrap();
-    // As in the A1 test above: since part 3 this input trips the withhold
-    // too, and `***` is the discriminator for the guard under test here —
-    // `safe_summary()` cannot produce it, only the pre-format scrub can.
+    // As in the A1 test above, this input trips the withhold too since part
+    // 3, so `***` here pins only that *a* needle scrub ran. What makes this
+    // test — and not that one — the pin for the **pre-format** scrub is the
+    // `\\` assertion below: measured with a mutant, removing the pre-format
+    // scrub fails this test and leaves the A1 test passing.
     assert!(
         error.contains("***"),
         "the pre-format needle scrub must have replaced the echoed base_ref, got: {error:?}"

@@ -1290,8 +1290,11 @@ impl<'a> Executor<'a> {
                         // substring, not only as the whole value —
                         // suppresses the provider's own diagnostic text for
                         // that item, so an operator debugging a genuine
-                        // `git` failure sees the variant and exit status
-                        // rather than git's message. That is accepted, for
+                        // `git` failure gets `safe_summary()`'s rendering —
+                        // the variant, the program name, the repository
+                        // root, the generated worktree path and the exit
+                        // status, all crate-generated — instead of `git`'s
+                        // own message and argv. That is accepted, for
                         // three reasons a future reader should weigh before
                         // narrowing it:
                         //
