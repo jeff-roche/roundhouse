@@ -310,6 +310,16 @@ fn has_production_call(source: &str, call: &str) -> bool {
                 syn::visit::visit_item_trait(self, item);
             }
         }
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !cfg_test(&item.attrs) {
+                syn::visit::visit_impl_item_fn(self, item);
+            }
+        }
+        fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+            if !cfg_test(&item.attrs) {
+                syn::visit::visit_trait_item_fn(self, item);
+            }
+        }
         fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
             if node
                 .func
@@ -344,7 +354,8 @@ fn has_production_call(source: &str, call: &str) -> bool {
                     }
                     if list.path.is_ident("any") || list.path.is_ident("all") {
                         return list.parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
-                            .map(|items| items.iter().any(test_meta)).unwrap_or(false);
+                            .map(|items| if list.path.is_ident("any") { items.iter().all(test_meta) } else { items.iter().any(test_meta) })
+                            .unwrap_or(false);
                     }
                     false
                 }
