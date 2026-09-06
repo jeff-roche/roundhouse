@@ -226,8 +226,9 @@ const QUERY_PARAM_PREFIX: &str = "access_token=";
 ///
 /// **Residual: this must move, and the trigger is nearer than it looks.** It is
 /// the only *definition* today, but it is not the only *claim*:
-/// `roundhouse-policy/src/trust.rs:94` already names `~/.local/state/roundhouse`
-/// in prose as the root of the trust store, and `TrustStore::new` takes that
+/// `roundhouse-policy`'s `TrustStore` doc comment already names
+/// `~/.local/state/roundhouse` in prose as the root of the trust store, and
+/// `TrustStore::new` takes that
 /// path from its caller rather than computing it. So the accurate trigger is
 /// **the moment the daemon constructs a `TrustStore`** — at that point one
 /// process needs the trust store and the LAN token rooted at the same
@@ -235,7 +236,8 @@ const QUERY_PARAM_PREFIX: &str = "access_token=";
 /// once wherever the daemon spells it.
 ///
 /// The destination is **`roundhouse-config`**: it already reads the environment
-/// (`loader.rs:108` resolves `$HOME`), and both `roundhouse-web` and
+/// (`loader::default_layers` resolves `$HOME`), and both `roundhouse-web`
+/// and
 /// `roundhouse-policy`'s caller can depend on it. `roundhouse-core` is ruled
 /// out — it is the zero-I/O root, and `std::env` is I/O for its purposes.
 ///
@@ -662,8 +664,9 @@ impl BindConfig {
         }
     }
 
-    /// The address a listener should bind. **Nothing calls this yet** — no crate
-    /// in this workspace binds a listener; see [`crate`]'s module docs.
+    /// The address a listener should bind. `roundhouse-daemon`'s `main.rs`
+    /// calls this now (Task 9, Phase 7), always with the [`Self::loopback`]
+    /// variant — see [`crate`]'s module docs.
     pub fn bind_addr(&self) -> IpAddr {
         match &self.inner {
             Bind::Loopback => IpAddr::V4(Ipv4Addr::LOCALHOST),

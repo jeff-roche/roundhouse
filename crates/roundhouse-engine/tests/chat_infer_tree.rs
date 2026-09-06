@@ -163,9 +163,10 @@ async fn chat_turn_spawns_one_infer_child_task_and_returns_content() {
         policy: RequestPolicy::Error,
     };
 
-    let blocks = run_chat_turn(&writer, &RUNNER, &FakeProvider, &ctx, session_id, request)
-        .await
-        .unwrap();
+    let (chat_task_id, blocks) =
+        run_chat_turn(&writer, &RUNNER, &FakeProvider, &ctx, session_id, request)
+            .await
+            .unwrap();
 
     assert!(matches!(&blocks[0], ContentBlock::Text { text, .. } if text == "Hello"));
 
@@ -210,6 +211,10 @@ async fn chat_turn_spawns_one_infer_child_task_and_returns_content() {
     let chat_task = chat_task.expect("chat task recorded");
     let infer_task = infer_task.expect("infer task recorded");
 
+    assert_eq!(
+        chat_task.id, chat_task_id,
+        "run_chat_turn's returned chat_task_id must match the chat task actually recorded"
+    );
     assert_eq!(
         infer_task.parent,
         Some(chat_task.id),

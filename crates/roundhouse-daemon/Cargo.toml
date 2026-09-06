@@ -29,6 +29,10 @@ roundhouse-tools = { path = "../roundhouse-tools" }
 # boot-time wiring needs the engine-side production `TaskSpawner` first.
 # See the KNOWN GAP note in `crates/roundhouse-mcp/src/host.rs`.
 roundhouse-mcp = { path = "../roundhouse-mcp" }
+# Phase 7, Task 7: `session_bootstrap.rs` is this crate's first real call
+# site for `LoopbackProxy`/`EgressPolicy` — real per-session egress
+# registration, replacing `demo.rs`'s network-free stand-in.
+roundhouse-net = { path = "../roundhouse-net" }
 roundhouse-acp = { path = "../roundhouse-acp" }
 roundhouse-bus = { path = "../roundhouse-bus" }
 roundhouse-engine = { path = "../roundhouse-engine" }
@@ -36,15 +40,88 @@ roundhouse-flow = { path = "../roundhouse-flow" }
 roundhouse-sched = { path = "../roundhouse-sched" }
 roundhouse-config = { path = "../roundhouse-config" }
 roundhouse-tui = { path = "../roundhouse-tui" }
+# Phase 7, Task 9: `main.rs` mounts `roundhouse_web::build_router` behind a
+# loopback HTTP listener, spawned alongside Task 3's Unix-socket accept loop
+# — the wiring `roundhouse-web`'s own module doc named as the crate's whole
+# remaining cost ("nothing links it yet"). `axum` itself stays confined to
+# `roundhouse-web` (`roundhouse_web::serve` takes an already-bound
+# `tokio::net::TcpListener` and the built `axum::Router`), so this daemon
+# gains no direct `axum` dependency of its own.
+roundhouse-web = { path = "../roundhouse-web" }
+# Phase 7, Task 7: `round-daemon-internal` needs a `--socket PATH` flag (the
+# lane file's own correction: "the daemon binary needs a --socket flag, not
+# a daemon subcommand of its own"). Same exact pin as `roundhouse-cli`'s own
+# manifest (Task A8/G6) — Global Constraints §5.3's pin discipline applies
+# regardless of which crate introduces a net-new dependency.
+clap = { version = "=4.6.6", features = ["derive"] }
 color-eyre = { workspace = true }
 # `fs`/`io-util` on top of the workspace feature set: the demo reads the edited
 # file back and the socket server writes NDJSON lines. Declared here rather than
 # relied on via cross-crate feature unification, which is not a guarantee.
 tokio = { workspace = true, features = ["fs", "io-util"] }
+# Fix round 1 (security review Important 1 / ruling W1-R33): `FramedRead` +
+# `LinesCodec::new_with_max_length` cap `socket_server`'s NDJSON read side at
+# a fixed frame length instead of accumulating an unbounded `String`.
+# `tokio-util` is already a workspace dependency (root `Cargo.toml`); this
+# only turns on its `codec` feature (default feature set is empty), so it
+# adds no new dependency.
+tokio-util = { workspace = true, features = ["codec"] }
 futures = "0.3"
 serde_json = { workspace = true }
+# Task 4 (Phase 7): `mcp_config.rs`'s `[[mcp_server]]` TOML table parse
+# deserializes `roundhouse_config::LoadedConfig::get`'s `&toml::Value`
+# directly — the typed parse cannot live in `roundhouse-config` itself
+# without giving that crate a `roundhouse-mcp` edge (not authorized; see
+# LANE-CONTEXT.md), so it lives here, which already depends on both.
+toml = "0.8"
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Ruling W1-R96 (fix round 1): no `tracing` subscriber exists anywhere in
+# this workspace, so every `tracing::warn!`/`error!` this crate (and
+# `roundhouse-engine`, which runs inside this same process) relies on was a
+# discarded no-op — including the CF-12(c) fail-closed `NetworkConfigError`
+# fallback and `wire_redaction_for_session`'s dropped-secret-count warning.
+# Exact pin, matching this lane's own discipline for other net-new
+# additions (`clap`, `uuid`).
+#
+# Fix round 2, MUST 1: bumped from the fix-round-1 pin of `=0.3.19` to
+# `=0.3.23` (the version `Cargo.lock` already resolved to pre-fix-round-1,
+# so this is not a new resolution) — `0.3.19` sits exactly ONE release
+# below `0.3.20`, whose changelog reads "Fixed — Escape ANSI escape
+# sequences in logs (#3368)". Pinning one release below a log-injection fix
+# with no stated reason was itself part of the defect this round closes.
+#
+# **Correction (fix round 5, MUST 2): this bump is NOT a second layer of
+# defense on top of `NetworkConfigError::kind()`/`McpConfigError::kind()`.**
+# Proven directly against 0.3.23: `tracing::warn!(field = %hostile, "msg
+# {hostile}")` escapes the literal MESSAGE BODY text but passes a raw
+# `0x1b` byte straight through in a `field = %value`-style FIELD VALUE,
+# under both `with_ansi(true)` and `with_ansi(false)`. 0.3.20's fix covers
+# message-body interpolation only. This bump is still worth keeping (it is
+# strictly not worse, and does close the message-body case), but the
+# `kind()` discipline — never render a value that can carry attacker- or
+# operator-file-controlled bytes into ANY `tracing` field or message,
+# static strings only — is the ENTIRE defense for field values, not a
+# backstop this library provides. Treat that as a BINDING INVARIANT for
+# every new `tracing` call site in this workspace that touches a config- or
+# file-derived error, not merely a style preference.
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Ruling W1-R99 (fix round 1): this crate's own tests need
+# `roundhouse_engine::mcp_spawner::SessionMcp::from_parts` — gated behind
+# `roundhouse-engine`'s `test-util` feature — to build a real `SessionMcp`
+# without spawning a real MCP subprocess, so `apply_resolved_mcp_servers`
+# (the `register_mcp` call W1-R85 requires) can be tested directly. Adding
+# a feature-enabled entry here, alongside the feature-less `[dependencies]`
+# entry the library code uses, is the same mechanism `roundhouse-engine`
+# already uses on itself (`crates/roundhouse-engine/Cargo.toml`) and is
+# confirmed NOT to unify into normal (non-test) builds under this
+# workspace's `resolver = "2"` (verified directly for that self-dependency
+# case; same resolver, same mechanism, applies identically here).
+roundhouse-engine = { path = "../roundhouse-engine", features = ["test-util"] }
+# `McpTransport` is an `#[async_trait::async_trait]` trait (`roundhouse-mcp`);
+# any external `impl` (this crate's fake test transport) needs the same
+# macro to match its desugared method signatures.
+async-trait = "0.1"

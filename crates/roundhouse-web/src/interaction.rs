@@ -56,6 +56,24 @@
 //! parsed input to. The URL and the request shape are real deliverables and are
 //! worth claiming now; reporting success for a request nothing acted on is not.
 //! See [`post_interaction`] for the whole argument.
+//!
+//! **Still true after Task 9 (Phase 7), for a stronger reason than plumbing.**
+//! A real session actor now exists (`roundhouse_engine::SessionActor`), so the
+//! *sink* half of the argument above is no longer the whole story — but
+//! `roundhouse-daemon`'s `socket_server::drive_session` only ever honors a
+//! post-handshake request from **the connection that created the session**
+//! (rulings W1-R37/W1-R52, the fail-closed answer to an unauthenticated
+//! `Attach` — see that function's own doc comment). An HTTP `POST` carries no
+//! connection identity that could ever be that creating connection: every
+//! request is its own, brand-new TCP connection, gated only by the LAN token
+//! (or nothing, on loopback) and the `Host` check, neither of which identifies
+//! *which* browser tab, let alone which one issued the original
+//! `CreateSession`. So wiring this endpoint to the real actor regardless of
+//! plumbing would have to default the send side open — honoring an attached,
+//! not-the-creator caller's request — which is exactly the approval-hijack
+//! primitive those rulings forbid. `501` stays the honest answer until the web
+//! layer has its own notion of "the connection that created this session," not
+//! merely until the actor exists to receive one.
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::Path;

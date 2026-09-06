@@ -1,13 +1,14 @@
 //! Phase 1's exit criterion, verified end to end: a scripted session opens the
 //! real event log, runs one chat turn through `roundhouse-engine`, edits a real
 //! file through `roundhouse-tools`, and the resulting updates arrive over the
-//! Unix socket in `roundhouse-tui`'s NDJSON wire format.
+//! Unix socket as real `roundhouse-proto` `ClientEvent`s (Phase 7 Task 2
+//! retired the hand-rolled `ServerMessage` this test used to assert on).
 
-use roundhouse_core::TaskRunner;
+use roundhouse_core::{Delta, EventPayload, SessionState, TaskRunner};
 use roundhouse_daemon::demo::{run_demo_session, DemoConfig, FakeEditProvider, NoopTransport};
-use roundhouse_daemon::socket_server::serve_ndjson;
+use roundhouse_daemon::socket_server::serve;
 use roundhouse_provider::RequestCtx;
-use roundhouse_tui::{connect, ServerMessage};
+use roundhouse_tui::{connect, ConnectIntent};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -26,13 +27,28 @@ async fn human_runs_round_starts_a_session_watches_an_edit_and_sees_it_over_the_
         .await
         .unwrap();
 
-    let (tx, rx) = mpsc::channel(16);
-    let server = serve_ndjson(&socket_path, rx).unwrap();
+    let (events_tx, events_rx) = mpsc::channel(16);
+    let (requests_tx, _requests_rx) = mpsc::channel(16);
+    let server = tokio::spawn({
+        let socket_path = socket_path.clone();
+        async move { serve(&socket_path, requests_tx, events_rx).await }
+    });
 
-    // `serve_ndjson` binds synchronously before returning the join handle
-    // (see `socket_server.rs`), so the socket already exists — no sleep needed
-    // before dialing, same as Task 18's own attach test.
-    let mut client = connect(&socket_path).await.unwrap();
+    // Unlike Phase 1's `serve_ndjson` (a plain function that bound
+    // synchronously before returning its `JoinHandle`), `serve` is itself
+    // the async body being spawned above — its `bind` doesn't run until the
+    // runtime actually polls this task, which isn't guaranteed to happen
+    // before `tokio::spawn` returns control here. A short sleep closes that
+    // scheduling gap; see `socket_server::serve`'s doc comment.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let mut client = connect(
+        &socket_path,
+        ConnectIntent::CreateSession {
+            workspace_name: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
 
     let cfg = DemoConfig {
         store_path,
@@ -50,7 +66,7 @@ async fn human_runs_round_starts_a_session_watches_an_edit_and_sees_it_over_the_
         },
     };
 
-    let outcome = run_demo_session(cfg, &runner, tx).await.unwrap();
+    let outcome = run_demo_session(cfg, &runner, events_tx).await.unwrap();
 
     assert!(
         outcome.edited_file.contains("\"new\""),
@@ -59,22 +75,41 @@ async fn human_runs_round_starts_a_session_watches_an_edit_and_sees_it_over_the_
     assert!(!outcome.edited_file.contains("\"old\""));
 
     let first = client.recv().await.unwrap();
-    assert_eq!(
-        first,
-        Some(ServerMessage::TaskDelta {
-            task_id: outcome.session_id.to_string(),
-            text: "Edited main.rs".into()
-        })
-    );
+    match first {
+        Some(roundhouse_proto::ClientEvent::TaskEvent {
+            session_id,
+            payload,
+            ..
+        }) => {
+            assert_eq!(session_id, outcome.session_id);
+            assert!(matches!(
+                *payload,
+                EventPayload::TaskDelta {
+                    delta: Delta::Text { ref text }
+                } if text == "Edited main.rs"
+            ));
+        }
+        other => panic!("expected a TaskDelta TaskEvent, got {other:?}"),
+    }
+
     let second = client.recv().await.unwrap();
-    assert_eq!(
-        second,
-        Some(ServerMessage::SessionSummary {
-            session_id: outcome.session_id.to_string(),
-            running_tasks: 0,
-            blocked: false
-        })
-    );
+    match second {
+        Some(roundhouse_proto::ClientEvent::TaskEvent {
+            session_id,
+            payload,
+            ..
+        }) => {
+            assert_eq!(session_id, outcome.session_id);
+            assert!(matches!(
+                *payload,
+                EventPayload::SessionStateChanged {
+                    state: SessionState::Closed,
+                    reason: None
+                }
+            ));
+        }
+        other => panic!("expected a SessionStateChanged TaskEvent, got {other:?}"),
+    }
 
     server.abort();
 }

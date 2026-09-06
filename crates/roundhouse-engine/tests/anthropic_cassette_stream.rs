@@ -68,7 +68,7 @@ async fn anthropic_thinking_cassette_folds_to_a_thinking_block_with_signature_in
     let provider = AnthropicMessagesProvider::new();
     let session_id = SessionId::new();
 
-    let blocks = run_chat_turn(
+    let (_chat_task_id, blocks) = run_chat_turn(
         &writer,
         &RUNNER,
         &provider,

@@ -5,8 +5,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::stream;
-use roundhouse_core::{SessionId, TaskRunner};
-use roundhouse_engine::{assemble_context, run_chat_turn, AgentError};
+use roundhouse_core::{Delta, EventPayload, SessionId, SessionState, TaskRunner};
+use roundhouse_engine::{
+    assemble_context, live_secret_values, run_chat_turn, wire_redaction_for_session, AgentError,
+};
+use roundhouse_proto::ClientEvent;
 use roundhouse_provider::{
     BlockDelta, BlockKind, Capabilities, ChatRequest, ChatStream, ContentBlock, HttpRequest,
     HttpResponseStream, HttpTransport, Message, MessageRole, ModelId, ModelInfo, Plan, Provider,
@@ -14,7 +17,6 @@ use roundhouse_provider::{
 };
 use roundhouse_store::{open, spawn_writer, StoreError};
 use roundhouse_tools::{edit_file, ToolError};
-use roundhouse_tui::ServerMessage;
 use tokio::sync::mpsc;
 
 /// Stand-in for a real concrete `Provider`. Track B's Tasks 7-10 built only
@@ -154,9 +156,13 @@ pub enum DemoError {
 
 /// The testable core of the Phase 1 exit criterion: open the real event
 /// log, run one chat turn against `cfg.provider`, apply its one scripted
-/// tool call via `roundhouse-tools`, and push a `ServerMessage` per
-/// resulting content block to `updates` so an attached `roundhouse-tui`
-/// client sees it live.
+/// tool call via `roundhouse-tools`, and push a `ClientEvent` wrapping a raw
+/// `EventPayload` per resulting content block to `updates` so an attached
+/// `roundhouse-tui` client sees it live. Phase 7 Task 2 retired the
+/// hand-rolled, daemon-pre-summarized `ServerMessage` this used to build
+/// instead: the daemon now hands the TUI real `roundhouse-proto`/
+/// `roundhouse-core` types and lets `Dashboard::apply` do its own
+/// presentation-level reduction.
 ///
 /// `runner` is threaded in rather than created here because
 /// `TaskRunner::bootstrap()` panics on its second call per process: the sole
@@ -175,10 +181,35 @@ pub enum DemoError {
 pub async fn run_demo_session(
     cfg: DemoConfig,
     runner: &TaskRunner,
-    updates: mpsc::Sender<ServerMessage>,
+    updates: mpsc::Sender<ClientEvent>,
 ) -> Result<DemoOutcome, DemoError> {
     let store = open(&cfg.store_path).await?;
     let writer = spawn_writer(store).await;
+
+    // Phase 7, Task 6: install a real redactor for this session's live
+    // secret values BEFORE anything is appended through `writer` — nothing
+    // has appended through it yet (the very first append below is
+    // `run_chat_turn`'s), so this is the earliest point at which this
+    // session's writer exists at all, and there is no window in which an
+    // event could reference `cfg.request_ctx.api_key` before this call
+    // takes effect. This demo has no configured MCP servers, so
+    // `live_secret_values` is called with an empty slice — `spawn_writer`'s
+    // own default (`Redactor::build(&[])`) previously left this session's
+    // provider API key completely unprotected in the persisted log.
+    //
+    // Fix round 1 (W1-R22 as amended by W1-R28) folded this exact call
+    // into `roundhouse_engine::create_session_with_egress`, so that
+    // production session-creation path can no longer forget it. This
+    // demo path is NOT that path: `run_demo_session` never calls
+    // `create_session_with_egress` or `create_session_isolation` at all
+    // (no isolation handle, no egress proxy — this is Phase 1's hermetic
+    // exit-criterion path, kept as-is for offline/CI use). This manual
+    // call therefore stays — it is the ONLY redaction wiring this path
+    // has, and removing it on the assumption the fold covers it would
+    // silently re-expose this demo's own `api_key`. A future retirement
+    // of this fake-provider path (Task 7) is where this call site goes
+    // away, not before.
+    wire_redaction_for_session(&writer, &live_secret_values(&cfg.request_ctx, &[]));
 
     let session_id = SessionId::new();
     // A real user turn, not an empty `messages` array. `FakeEditProvider`
@@ -207,7 +238,11 @@ pub async fn run_demo_session(
     }];
     let request = assemble_context("claude-sonnet-5", "You are careful.", &[], &user_turn);
 
-    let blocks = run_chat_turn(
+    // fix round B (W1-R53/W1-R64): run_chat_turn now also returns its own
+    // chat_task_id (for callers that link dispatched tool calls to the
+    // turn that issued them) — this demo doesn't dispatch any tools, so it
+    // has no use for it.
+    let (_chat_task_id, blocks) = run_chat_turn(
         &writer,
         runner,
         cfg.provider.as_ref(),
@@ -235,9 +270,12 @@ pub async fn run_demo_session(
         if let ContentBlock::Text { text, .. } = block {
             send_update(
                 &updates,
-                ServerMessage::TaskDelta {
-                    task_id: session_id.to_string(),
-                    text: text.clone(),
+                ClientEvent::TaskEvent {
+                    session_id,
+                    task_id: None,
+                    payload: Box::new(EventPayload::TaskDelta {
+                        delta: Delta::Text { text: text.clone() },
+                    }),
                 },
             )
             .await;
@@ -245,10 +283,13 @@ pub async fn run_demo_session(
     }
     send_update(
         &updates,
-        ServerMessage::SessionSummary {
-            session_id: session_id.to_string(),
-            running_tasks: 0,
-            blocked: false,
+        ClientEvent::TaskEvent {
+            session_id,
+            task_id: None,
+            payload: Box::new(EventPayload::SessionStateChanged {
+                state: SessionState::Closed,
+                reason: None,
+            }),
         },
     )
     .await;
@@ -263,8 +304,8 @@ pub async fn run_demo_session(
 
 /// Best-effort push to the attached client. `send` only fails when the receiver
 /// is gone, which just means nobody is watching — worth a debug line, not an error.
-async fn send_update(updates: &mpsc::Sender<ServerMessage>, message: ServerMessage) {
-    if updates.send(message).await.is_err() {
+async fn send_update(updates: &mpsc::Sender<ClientEvent>, event: ClientEvent) {
+    if updates.send(event).await.is_err() {
         tracing::debug!("no attached client; dropping session update");
     }
 }

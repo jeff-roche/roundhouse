@@ -21,8 +21,19 @@ async fn spawn_sh(shell_command: &str) -> Result<ShellHandle, roundhouse_tools::
         "sh",
         &["-c".to_string(), shell_command.to_string()],
         Path::new("."),
+        &path_env(),
     )
     .await
+}
+
+/// `spawn_cancellable` now `env_clear()`s the child (Fix round A, F1) — bare
+/// names like `sh`/`sleep` below need `PATH` re-added or they fail to
+/// resolve at exec, same as any other caller post-fix.
+fn path_env() -> Vec<(String, String)> {
+    vec![(
+        "PATH".to_string(),
+        std::env::var("PATH").unwrap_or_default(),
+    )]
 }
 
 #[tokio::test]
@@ -76,7 +87,7 @@ async fn sigterm_is_sufficient_for_a_cooperative_process() {
     // below (which is why *that* test tolerates either disposition); this
     // test exists to pin the `Terminated` verdict, so it removes the
     // shell fork from the picture instead of tolerating the flake.
-    let mut handle = spawn_cancellable("sleep", &["30".to_string()], Path::new("."))
+    let mut handle = spawn_cancellable("sleep", &["30".to_string()], Path::new("."), &path_env())
         .await
         .unwrap();
 

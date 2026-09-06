@@ -9,6 +9,15 @@ workspace = true
 
 [dependencies]
 roundhouse-proto = { path = "../roundhouse-proto" }
+# Phase 7 Task 2: `Dashboard::apply(SessionId, EventPayload)` and every match
+# on `ClientEvent::TaskEvent`'s fields name `SessionId`/`EventPayload`/`Delta`
+# directly. `roundhouse-proto` uses those types but re-exports only
+# `{ApiVersion, ClientEvent, ClientRequest, client_event_schema,
+# client_request_schema}`, so there is no path to them through the `proto`
+# edge alone (see `docs/architecture/02-system-architecture.md` §5.2's
+# `roundhouse-tui` row, and its `roundhouse-web` row for the identical
+# reasoning behind that crate's own `core` edge).
+roundhouse-core = { path = "../roundhouse-core" }
 schemars = { workspace = true }
 tokio = { version = "1.53", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

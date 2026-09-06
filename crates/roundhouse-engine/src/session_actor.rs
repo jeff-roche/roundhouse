@@ -38,12 +38,15 @@ use roundhouse_core::{
     CancelReason, NoteLevel, OnDegrade, Origin, SessionId, SessionSpec, SessionState, TaskInput,
     TaskKind, TaskRunner, Tier, Timestamp,
 };
-use roundhouse_net::policy::EgressPolicy;
+use roundhouse_mcp::config::{McpServerConfig, McpTransportKind};
+use roundhouse_net::policy::{EgressPolicy, HostPattern};
 use roundhouse_net::proxy::{LoopbackProxy, ProxyHandle, ProxyNotServingError};
 use roundhouse_policy::engine::{Outcome, PolicyEngine, RuleId};
 use roundhouse_policy::sealed::SealedContext;
 use roundhouse_policy::TaskParams;
+use roundhouse_provider::RequestCtx;
 use roundhouse_sandbox::{Handle, Isolate, IsolationError};
+use roundhouse_store::redact::Redactor;
 use roundhouse_store::{EventWriter, StoreError};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -57,6 +60,20 @@ fn now_ts() -> Timestamp {
         .expect("system clock before UNIX epoch")
         .as_nanos() as i64;
     Timestamp::from_unix_nanos(nanos)
+}
+
+/// The tier a session is actually ENTITLED to run at, derived from what the
+/// human's `on_degrade` setting authorized at creation time — see
+/// [`SessionActor`]'s `effective_tier` field for the full rationale (this
+/// free function exists so a caller that needs the same value BEFORE a
+/// `SessionActor` exists — e.g. to build a `PolicyEngine` sealed-context
+/// provider that must agree with the actor it is paired with, Phase 7 Task
+/// 7's CF-9(i) mirroring — does not have to duplicate the two-line match).
+pub fn effective_tier(spec: &SessionSpec) -> Tier {
+    match spec.on_degrade {
+        OnDegrade::Refuse => spec.requested_tier,
+        OnDegrade::AllowDownTo(floor) => floor,
+    }
 }
 
 /// A request to admit a new task for execution, checked against the owning
@@ -192,10 +209,11 @@ pub struct SessionActor {
     /// one snapshot here, at the same place `state_dir`/`daemon_binary` are
     /// already validated, closes that gap.
     home: Option<PathBuf>,
-    /// Populated by the MCP host (Phase 3) as servers complete their
-    /// handshake; read here, never written from this module in this task's
-    /// scope — Phase 3 is a hard prerequisite for this ever containing
-    /// anything real. `ServerId` (`roundhouse_policy`) has no `Hash`
+    /// The servers that actually completed a handshake. Written ONLY by
+    /// [`SessionActor::register_mcp`] (fix round D — before that it had no
+    /// writer anywhere and so was permanently empty, which would have made
+    /// `sealed_mcp_unresolved` deny every MCP task; see that method's own
+    /// doc comment). `ServerId` (`roundhouse_policy`) has no `Hash`
     /// derive, which is why `SealedContext` itself already stores raw
     /// `String` server names rather than `ServerId`.
     mcp_resolved: Arc<RwLock<HashSet<String>>>,
@@ -233,6 +251,31 @@ pub struct SessionActor {
     /// report anyway — it just doesn't fail open when attestation can't
     /// find the handle.
     effective_tier: Tier,
+    /// Phase 7, Task 4: the merged model-facing tool catalog for this
+    /// session — the built-in executor `ToolDef`s (Task 1's
+    /// `tool_catalog::builtin_tool_defs`) plus whatever this session's
+    /// configured MCP servers discovered, already merged and collision-checked
+    /// by `tool_catalog::merged_tool_defs`. Computed BEFORE this
+    /// `SessionActor` is constructed — see
+    /// [`crate::mcp_spawner::start_session_mcp`], the async, fallible
+    /// free function that calls `McpHost::start` and produces this value —
+    /// and simply stored here so Task 5's agent loop has one place to read
+    /// the tool list an `infer` task's `ChatRequest.tools` should draw
+    /// from, without needing it threaded through by hand at every call
+    /// site.
+    ///
+    /// **The common case is a session with zero configured MCP servers,
+    /// whose catalog is exactly `builtin_tool_defs()`'s five entries** —
+    /// not an empty `Vec`. An empty `Vec` means the model is offered no
+    /// tools at all; it is a legitimate test-only construction (several
+    /// tests build an actor with `vec![]` deliberately), never something
+    /// the daemon's own `create_real_session` produces. Ruling W1-R132:
+    /// this doc comment previously asserted that an empty `Vec` still
+    /// carried the five builtins, which is a contradiction on its face —
+    /// and the daemon's no-MCP branch really was passing `Vec::new()`,
+    /// so the doc was describing the intent while the code did the
+    /// opposite.
+    tool_defs: Vec<roundhouse_provider::ToolDef>,
 }
 
 impl SessionActor {
@@ -260,6 +303,7 @@ impl SessionActor {
         isolate: Arc<dyn Isolate>,
         handle: Handle,
         session_spec: SessionSpec,
+        tool_defs: Vec<roundhouse_provider::ToolDef>,
     ) -> Self {
         assert!(
             state_dir.is_absolute(),
@@ -273,10 +317,7 @@ impl SessionActor {
              sealed:daemon-binary-write rule"
         );
         let (state_tx, _rx) = tokio::sync::watch::channel(initial_state);
-        let effective_tier = match session_spec.on_degrade {
-            OnDegrade::Refuse => session_spec.requested_tier,
-            OnDegrade::AllowDownTo(floor) => floor,
-        };
+        let effective_tier = effective_tier(&session_spec);
         // Snapshot HOME once, here, alongside state_dir/daemon_binary's own
         // construction-time validation — never read live at decision time
         // (see the `home` field's doc comment for why that matters).
@@ -295,7 +336,39 @@ impl SessionActor {
             handle,
             session_spec,
             effective_tier,
+            tool_defs,
         }
+    }
+
+    /// The merged model-facing tool catalog this session was constructed
+    /// with — see the `tool_defs` field's own doc comment for how it's
+    /// computed and by whom.
+    pub fn tool_defs(&self) -> &[roundhouse_provider::ToolDef] {
+        &self.tool_defs
+    }
+
+    /// This session's id. A read-only getter over an already-private field
+    /// (Phase 7, Task 5) — `run_agent_loop` needs it to call
+    /// [`crate::run_chat_turn`] and to mint per-dispatch task events, and
+    /// nothing before this task needed to read it back off a constructed
+    /// `SessionActor` from outside this module.
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// This session's `EventWriter`. A read-only getter over an
+    /// already-private field (fix round A, ruling W1-R60's writer-mismatch
+    /// hazard): before this accessor existed, `run_agent_loop` took its own
+    /// `writer` parameter independently of this actor's own, with nothing
+    /// checking the two were the same instance — a caller could pass one
+    /// whose `set_redactor` was never called, silently un-redacting every
+    /// event the loop appends. `run_agent_loop` now sources its writer from
+    /// here instead of accepting a second, independently-suppliable one, so
+    /// the mismatch is structurally unrepresentable rather than merely
+    /// asserted against. Cheap to clone (`EventWriter` wraps an
+    /// `mpsc::Sender` + `Arc<ArcSwap<Redactor>>`).
+    pub fn writer(&self) -> &EventWriter {
+        &self.writer
     }
 
     /// Builds the live `SealedContext` this session's tasks are judged
@@ -318,11 +391,10 @@ impl SessionActor {
             // Task 25 fix-round-1 (security review): a poisoned lock reads
             // as an empty resolved-server set (fail-closed — an empty set
             // makes every `TaskParams::Mcp` sealed-deny, never
-            // spuriously-allow) rather than panicking. `mcp_resolved` is
-            // write-only from Phase 3 code that doesn't exist yet in this
-            // task's scope, but treating a future writer's panic as a
-            // reason to also crash every *reader* of this session would be
-            // a real, avoidable DoS surface once Phase 3 lands.
+            // spuriously-allow) rather than panicking. The one writer is
+            // `SessionActor::register_mcp` (fix round D), but treating a
+            // writer's panic as a reason to also crash every *reader* of
+            // this session would be a real, avoidable DoS surface.
             resolved_mcp_servers: self
                 .mcp_resolved
                 .read()
@@ -331,6 +403,101 @@ impl SessionActor {
             requested_tier: self.effective_tier,
             attested_tier: attestation.tier,
             home: self.home.clone(),
+        }
+    }
+
+    /// Records which MCP servers this session actually resolved, so
+    /// [`Self::sealed_context`] — and therefore `admit_task`'s
+    /// `sealed:mcp-unresolved-server` check — judges MCP tasks against
+    /// reality.
+    ///
+    /// # Why this exists (fix round D)
+    ///
+    /// Ruling W1-R80 directed the MCP dispatch arm through `admit_task`,
+    /// on the stated understanding that the two sealed-context channels
+    /// (this actor's, and `PolicyEngine::sealed_ctx()`) "can genuinely
+    /// disagree ... Deny-ward, so it is safe." They could not merely
+    /// disagree: **nothing anywhere wrote `mcp_resolved`.** It was
+    /// initialised to an empty `HashSet` in [`Self::new`] and read in
+    /// `sealed_context()`, and no code path anywhere assigned to it. An
+    /// empty set makes `sealed_mcp_unresolved` fire on
+    /// *every* `TaskParams::Mcp`, so routing MCP through `admit_task`
+    /// without this method would have denied 100% of MCP calls — fail-closed,
+    /// but a dead arm rather than a gated one.
+    ///
+    /// # Why it takes a [`SessionMcp`] and not a `HashSet<String>`
+    ///
+    /// A plain string-set setter is carry-forward CF-8(b)'s bypass shape
+    /// verbatim: a caller could declare any server resolved — including one
+    /// that never completed a handshake — and silently disarm the sealed
+    /// floor's one MCP rule for this session. Taking the newtype means the
+    /// only declarable set is the one a real, policy-engine-backed executor
+    /// actually holds transports for (`McpExecutor::resolved_servers`).
+    ///
+    /// # Precisely how far that goes (corrected per ruling W1-R87)
+    ///
+    /// An earlier version of this comment claimed "there is deliberately no
+    /// way to add a server this session does not have a live connection to."
+    /// That was **true of [`crate::mcp_spawner::start_session_mcp`] and false
+    /// of [`crate::mcp_spawner::SessionMcp::from_parts`]**, which the same
+    /// commit introduced — `from_parts` takes caller-supplied connections, so
+    /// its server names are caller-invented and would have flowed straight
+    /// through here into `SealedContext.resolved_mcp_servers`. A false
+    /// attestation is worse than a missing one, so state it exactly:
+    ///
+    /// - In a **production build** `from_parts` does not exist (it is behind
+    ///   `#[cfg(any(test, feature = "test-util"))]`), so the only reachable
+    ///   mint is `start_session_mcp`, whose executor's connections come from
+    ///   `McpHost::start` and therefore from `StartedServer`s only — servers
+    ///   where both spawn AND `discover()` succeeded. There the guarantee
+    ///   holds as written.
+    /// - In a **test build**, `from_parts` is reachable and this method
+    ///   attests only "some `SessionMcp` said so." Tests are trusted code;
+    ///   the gate exists so daemon code is not.
+    ///
+    /// Idempotent and last-write-wins (`*guard = ...`, never a union), so
+    /// re-registering after a teardown genuinely narrows the set rather than
+    /// leaving a stale server resolved forever.
+    pub fn register_mcp(&self, mcp: &crate::mcp_spawner::SessionMcp) {
+        let resolved: HashSet<String> = mcp.resolved_servers().into_iter().collect();
+        match self.mcp_resolved.write() {
+            Ok(mut guard) => *guard = resolved,
+            // Fail closed and loud, mirroring `sealed_context`'s own
+            // poisoned-lock posture: the set stays as it was (empty, unless a
+            // previous registration succeeded), so every `TaskParams::Mcp`
+            // sealed-denies rather than being admitted against a set we could
+            // not update.
+            Err(_) => tracing::error!(
+                "mcp_resolved lock is poisoned; refusing to register resolved MCP servers — \
+                 every MCP task in this session will be denied by the sealed floor"
+            ),
+        }
+    }
+
+    /// Tears down this session's real isolation handle (fix round 2, MUST 2:
+    /// `grep -rn "\.teardown(" crates/*/src/` found exactly one caller
+    /// workspace-wide before this method existed — every path that
+    /// discards a constructed `SessionActor` without ever calling this
+    /// leaks whatever real resource `Isolate::prepare` allocated for it,
+    /// e.g. a real bwrap mount namespace). Best-effort and never panics:
+    /// a caller tearing down a session it is about to discard has no
+    /// further use for a teardown failure beyond logging it — the
+    /// resource is being abandoned either way, and propagating an error
+    /// here would just add a second failure mode to an already-failing or
+    /// already-ending session.
+    ///
+    /// Idempotent from THIS type's perspective (it never mutates any of
+    /// `SessionActor`'s own state), but `Isolate::teardown` itself is not
+    /// guaranteed idempotent — callers should call this at most once per
+    /// actor, exactly like every other real teardown path in this
+    /// workspace.
+    pub async fn teardown(&self) {
+        if let Err(err) = self.isolate.teardown(self.handle.clone()).await {
+            tracing::warn!(
+                session_id = %self.session_id,
+                error = %err,
+                "failed to tear down this session's isolation handle"
+            );
         }
     }
 
@@ -751,6 +918,36 @@ pub async fn create_session_isolation(
 /// (`ProxyNotServingError`), the isolation handle that was just created is
 /// torn down (best-effort) before returning the error, rather than leaked
 /// in the isolate's internal handle map.
+///
+/// **Fix round 1 (W1-R22 as amended by W1-R28):** this now takes `ctx` and
+/// `mcp_configs` and installs the session's real `Redactor` (via
+/// [`live_secret_values`]/[`wire_redaction_for_session`]) as the very
+/// FIRST thing it does — before `create_session_isolation` runs (which can
+/// itself append a Degradation `Note`) and before any `Handle` a caller
+/// could append against is ever returned. Before this fix, neither this
+/// function nor `SessionActor::new` called `wire_redaction_for_session` at
+/// all; the only call site anywhere in the workspace was a manual one in
+/// `roundhouse-daemon/src/demo.rs`, which reproduced the exact bug class
+/// this phase exists to fix (`set_redactor` was orphaned in production
+/// precisely because calling it was somebody's job to remember). Creating
+/// a session and installing real redaction are now one atomic act with
+/// nothing to forget — the same principle `roundhouse-web`'s
+/// `BoundedStore::connection` was built on under Phase 5 ruling P88 §A:
+/// "make the safe act and the only act the same one."
+///
+/// **`SessionActor::new` deliberately does NOT change** (W1-R28) —
+/// threading `ctx` on into the actor is the tempting adjacent move and is
+/// this lane's named internal hazard; only this function is extended.
+///
+/// **A second forget-path this fix leaves open, by design (named for
+/// Task 5/7 to rule on, not fixed here):** [`create_session_isolation`]
+/// remains callable directly, with no redaction wiring of its own — a
+/// caller that reaches for it instead of this function still gets a
+/// session with whatever `Redactor` `writer` already had (`spawn_writer`'s
+/// empty default, absent some other caller having wired one up). Always
+/// prefer this function, never `create_session_isolation` alone, for any
+/// session expected to reach the network (this is also CF-11(e)).
+#[allow(clippy::too_many_arguments)]
 pub async fn create_session_with_egress(
     writer: &EventWriter,
     runner: &TaskRunner,
@@ -759,7 +956,10 @@ pub async fn create_session_with_egress(
     spec: &SessionSpec,
     proxy: &Arc<LoopbackProxy>,
     egress_policy: EgressPolicy,
+    ctx: &RequestCtx,
+    mcp_configs: &[McpServerConfig],
 ) -> Result<(Handle, ProxyHandle), CreateSessionError> {
+    wire_redaction_for_session(writer, &live_secret_values(ctx, mcp_configs));
     let handle = create_session_isolation(writer, runner, session_id, isolate, spec).await?;
     match proxy.register_session(session_id, egress_policy) {
         Ok(proxy_handle) => Ok((handle, proxy_handle)),
@@ -780,4 +980,530 @@ pub enum CreateSessionError {
     Isolation(#[from] IsolationError),
     #[error(transparent)]
     ProxyNotServing(#[from] ProxyNotServingError),
+}
+
+/// Phase 7, Task 6 — closes the gap flagged by this task's own brief:
+/// `roundhouse-store/src/writer.rs` builds every `EventWriter`'s `Redactor`
+/// as `Redactor::build(&[])` at construction time (`spawn_writer`) — an
+/// empty secret list, so redaction runs on every write but redacts
+/// nothing — and `EventWriter::set_redactor` had zero non-test callers
+/// anywhere in the workspace before this function existed.
+///
+/// **Fix-round-1 correction (W1-R24 as resolved by W1-R27):** this used to
+/// be `12`, sized as a de facto *production security threshold* chosen to
+/// accommodate exactly one test fixture — the demo daemon's placeholder
+/// `RequestCtx.api_key`, the literal string `"demo"`
+/// (`roundhouse-daemon/src/main.rs`). That meant a real, short secret (a
+/// 7-byte legacy `DB_PASSWORD`, an 8-char legacy token) was silently never
+/// redacted, with no signal that anything was dropped — a live secret
+/// reaching `Note.text`/`TaskFailed.error.message` verbatim in a log the
+/// `events` table's `UPDATE`/`DELETE` rejection (S-LOG-2) can never
+/// repair. The real fix for the placeholder is at its source (the demo's
+/// `api_key` fixture no longer collides with anything, see `main.rs`),
+/// and MCP env values are now filtered by variable NAME before they ever
+/// reach this function (see [`live_secret_values`]) rather than by
+/// length. What survives here is only a **destructive-pattern guard**: a
+/// 1-3 byte pattern would match at nearly every position in realistic
+/// text and pathologically mangle unrelated log content (the same hazard
+/// `Redactor::build`'s own empty-string filter guards for zero-byte
+/// patterns) — this floor extends that same guard one step further, not a
+/// meaningful line of security defense on its own.
+const MIN_REDACTABLE_SECRET_LEN: usize = 4;
+
+/// Installs a `Redactor` built from `secrets` onto `writer`, hot-swapping
+/// whatever `Redactor` it was constructed with (`spawn_writer`'s
+/// `Redactor::build(&[])` empty default, on every real call site today).
+///
+/// **Caller's responsibility — ordering is the entire point:** this must be
+/// called before any event that could reference one of `secrets` is ever
+/// appended through `writer`. `EventWriter::set_redactor` takes effect only
+/// for writes from that point forward (`ArcSwap::store`, see its own doc
+/// comment) — a write that already landed before this call is `EventWriter`
+/// appended it in already-redacted-or-not form permanently: the `events`
+/// table physically rejects `UPDATE`/`DELETE` (S-LOG-2), so there is no way
+/// to retroactively redact a row once committed. This function's primary
+/// real call site is now [`create_session_with_egress`], which calls it
+/// itself as the very first thing IT does — before `create_session_with_
+/// egress` itself ever appends anything through `writer` (including the
+/// Degradation `Note` `create_session_isolation` may record) — so creating
+/// a session and installing real redaction are one atomic act (W1-R22).
+/// This says nothing about what a caller may already have done with
+/// `writer` before invoking `create_session_with_egress` at all — that
+/// remains the caller's own responsibility, same as always. The
+/// legacy hermetic demo path in `roundhouse-daemon/src/demo.rs`
+/// (`run_demo_session`) calls neither `create_session_with_egress` nor
+/// `create_session_isolation` at all (no isolation, no egress proxy in
+/// that path), so it keeps its own direct call, immediately after
+/// `spawn_writer` and strictly before the first `run_chat_turn`/`append` —
+/// removing it would silently re-expose that path's own `api_key`.
+///
+/// **W1-R25 — replace, not extend.** `EventWriter::set_redactor` is
+/// `ArcSwap::store`: a full replacement of whatever `Redactor` was
+/// installed before, and the `Redactor` this function builds is built
+/// from `secrets` ALONE — nothing already installed is preserved or
+/// merged in. A second call to this function (an MCP server started
+/// mid-session, a credential refresh) with anything less than the
+/// COMPLETE, still-live secret set silently **un-redacts** every secret
+/// that isn't re-passed, from that call forward. `Redactor` exposes no
+/// pattern accessor, so a caller cannot extend the running set — it must
+/// retain the full set itself and pass it, complete, on every call.
+///
+/// Any secret shorter than [`MIN_REDACTABLE_SECRET_LEN`] is dropped before
+/// reaching `Redactor::build` (see that constant's own doc comment for
+/// why this floor is a destructive-pattern guard only, not a security
+/// threshold). A drop is never silent: this logs the **count** of dropped
+/// values, never the values themselves, so an operator can tell a value
+/// was excluded without this function ever becoming a place a secret
+/// could leak through a log line.
+pub fn wire_redaction_for_session(writer: &EventWriter, secrets: &[String]) {
+    let filtered: Vec<String> = secrets
+        .iter()
+        .filter(|s| s.len() >= MIN_REDACTABLE_SECRET_LEN)
+        .cloned()
+        .collect();
+    let dropped = secrets.len() - filtered.len();
+    if dropped > 0 {
+        tracing::warn!(
+            dropped_count = dropped,
+            min_len = MIN_REDACTABLE_SECRET_LEN,
+            "wire_redaction_for_session: dropped {dropped} secret value(s) shorter than the \
+             {MIN_REDACTABLE_SECRET_LEN}-byte destructive-pattern floor (values themselves are \
+             never logged)"
+        );
+    }
+    writer.set_redactor(Redactor::build(&filtered));
+}
+
+/// Variable-NAME suffixes (case-insensitive) that mark an MCP `Stdio`
+/// server's env entry as a declared secret for [`live_secret_values`]'s
+/// purposes. W1-R24 as resolved by **W1-R27**: filtering by name, not by
+/// value length, is what stops an env var like `HOME` (a 13-byte value,
+/// well past the old length floor) from being registered as a "secret"
+/// and turning every path in the session log into `[REDACTED]` (Minor 4)
+/// — while still catching a short, real credential like a 7-byte
+/// `DB_PASSWORD` that a length-only filter would have silently let
+/// through unprotected (Minor 2).
+pub(crate) const SECRET_ENV_NAME_SUFFIXES: [&str; 4] = ["_TOKEN", "_KEY", "_SECRET", "_PASSWORD"];
+
+/// Whether `name` looks like a declared-secret env var by W1-R27's ruled
+/// name suffixes, case-insensitively (`GITHUB_TOKEN`, `github_token`, and
+/// `Github_Token` are all treated the same). `pub(crate)` (fix round B,
+/// ruling W1-R69's allowlist-hardening item): `tool_dispatch.rs`'s shell
+/// env allowlist reuses this exact check as a guardrail against widening
+/// that allowlist with a secret-shaped name by mistake.
+pub(crate) fn is_secret_env_var_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SECRET_ENV_NAME_SUFFIXES
+        .iter()
+        .any(|suffix| upper.ends_with(suffix))
+}
+
+/// Collects every live secret value this session's creation already knows
+/// about, for [`wire_redaction_for_session`]'s `secrets` argument.
+///
+/// Two sources today:
+/// - `ctx.api_key` — Phase 1's original, simplified credential path. It
+///   has no variable name of its own, so no name test applies to it: it
+///   is **unconditionally** a secret and is always included, full stop
+///   (W1-R27). `wire_redaction_for_session`'s own length floor still
+///   applies to it downstream, purely as a destructive-pattern guard —
+///   see that function's doc comment.
+/// - Every MCP `Stdio` server's `env` entries whose variable **NAME**
+///   matches [`SECRET_ENV_NAME_SUFFIXES`] (`McpTransportKind::Stdio.env:
+///   Vec<(String, String)>`), passed literally to the spawned child's
+///   environment via `Command::envs` (`roundhouse-mcp/src/transport/
+///   stdio.rs`), with no secret-ref resolution step in between. Whether a
+///   matched value is a raw secret or a reference string like
+///   `"keyring:github"`, it is exactly what reaches the child process
+///   verbatim, so it belongs in the redaction set regardless — nothing
+///   downstream can distinguish the two shapes. An env var whose name
+///   does NOT match (`HOME`, `AWS_REGION`, a bespoke `AUTH` with no
+///   ruled suffix) is accepted as a known, named limitation of this name
+///   list rather than silently redacting it by accident — see W1-R27.
+///
+/// **Documented seam, not a silent gap:** `ctx.credentials: Option<Arc<dyn
+/// CredentialProvider>>` (Phase 6) is deliberately NOT a source here.
+/// `CredentialProvider`'s only method, `apply(&self, req: &mut HttpRequest,
+/// ctx: &CredentialCtx)`, mutates an outbound `HttpRequest` in place and
+/// returns `Result<(), CredentialError>` — it has no accessor that exposes
+/// the underlying secret material to a caller, by design (`roundhouse-
+/// secrets`' six concrete implementations hold it, never this crate). There
+/// is nothing to extract here today. Whoever gives `CredentialProvider` (or
+/// a sibling trait) a value-exposing method next should feed its result
+/// into this `Vec` alongside `ctx.api_key`.
+///
+/// **Never logs, `Debug`-prints, or echoes any value it collects** —
+/// `RequestCtx` deliberately derives neither `Debug` nor `Serialize`
+/// (§9.9), and this function does not add either.
+pub fn live_secret_values(ctx: &RequestCtx, mcp_configs: &[McpServerConfig]) -> Vec<String> {
+    let mut secrets = vec![ctx.api_key.clone()];
+    for config in mcp_configs {
+        let McpTransportKind::Stdio { env, .. } = &config.transport;
+        secrets.extend(
+            env.iter()
+                .filter(|(name, _)| is_secret_env_var_name(name))
+                .map(|(_, value)| value.clone()),
+        );
+    }
+    secrets
+}
+
+/// Converts a plain, config-sourced allowlist (`roundhouse_config::network::
+/// NetworkConfig.allowed_hosts`) into a real `roundhouse_net::policy::
+/// EgressPolicy` — the conversion `roundhouse-config` cannot perform itself
+/// (it must stay free of every `roundhouse-*` dependency; see that crate's
+/// `network` module doc comment), so it lives here, above config, at the
+/// one crate every real session-creation call site already depends on.
+///
+/// An empty `allowed_hosts` produces an `EgressPolicy` that denies every
+/// host (`EgressPolicy::matches` is `self.allowed_hosts.iter().any(..)`,
+/// vacuously `false` over an empty `Vec` — confirmed by this module's own
+/// test, not just by reading the body) — fail-closed, matching
+/// `load_network_config`'s own documented default.
+///
+/// Each entry becomes an exact-hostname match, **except** a `"*."`-prefixed
+/// entry, which becomes a wildcard-suffix match over the text after the
+/// prefix — with one deliberate guard: an entry whose suffix is empty
+/// **after normalization** is skipped rather than converted.
+/// `HostPattern::wildcard_suffix("")`'s own `match_kind` treats an empty
+/// suffix as matching *every* host unconditionally (`suffix.is_empty()` in
+/// its match arm) — silently turning one config line into "allow all
+/// egress," almost certainly not what a config author who wrote `"*"`
+/// intended (probably a typo for a real suffix, or a mistaken belief that
+/// it means "no restriction" — the actual no-restriction spelling is
+/// simply not configuring `[network]` at all, which this task's default
+/// already happens to deny, not allow). Fail-closed here means skipping
+/// the malformed entry (denying whatever it would have matched) rather
+/// than silently promoting it to allow-everything.
+///
+/// **W1-R23 fix-round-1 correction:** the original guard checked
+/// `Some("")` — emptiness of the RAW text after `strip_prefix("*.")` —
+/// before any normalization, while `roundhouse-net` normalizes (strips
+/// exactly ONE trailing dot, then lowercases) AFTER, inside
+/// `HostPattern::wildcard_suffix` itself. That mismatch let `"*.."`
+/// through: `strip_prefix("*.")` on `"*.."` yields `Some(".")`, non-empty
+/// so not skipped, and `normalize_host(".")` then strips that one
+/// trailing dot down to `""`, landing on the exact allow-all
+/// `WildcardSuffix("")` this guard exists to prevent. The fix trims every
+/// trailing dot off the suffix here, before the emptiness test —
+/// `trim_end_matches('.')`, deliberately over-stripping relative to
+/// `normalize_host`'s own single-dot strip. `roundhouse-net`'s
+/// `normalize_host` strips only one trailing dot today, so a strictly
+/// longer run like `"*..."` (suffix `".."`) does not currently reduce to
+/// an allow-all `WildcardSuffix("")` there either way — but this guard's
+/// entire job is to be the backstop if that ever changes (e.g. someone
+/// makes `normalize_host` itself `trim_end_matches('.')`, the obvious
+/// "more robust" edit, made in a different crate by someone not looking
+/// at this guard). Matching `normalize_host`'s CURRENT single-strip
+/// behavior exactly here would make this guard's safety depend on
+/// `normalize_host` never changing; over-stripping instead means this
+/// guard stays correct — skipping strictly more malformed entries than
+/// strictly necessary today — no matter how many trailing dots
+/// `normalize_host` ever strips. Fail-closed here means skipping the
+/// malformed entry (denying whatever it would have matched), which is
+/// always the safe direction for a guard whose only job is preventing
+/// allow-all. This is the same order-of-operations rule R21/R26 restates
+/// for `roundhouse-config`'s intersection, applied here to this module's
+/// own allow-all foot-gun instead.
+pub fn egress_policy_from_allowed_hosts(allowed_hosts: &[String]) -> EgressPolicy {
+    let mut patterns = Vec::with_capacity(allowed_hosts.len());
+    for host in allowed_hosts {
+        if host == "*" {
+            continue;
+        }
+        match host.strip_prefix("*.") {
+            Some(suffix) if suffix.trim_end_matches('.').is_empty() => continue,
+            Some(suffix) => patterns.push(HostPattern::wildcard_suffix(suffix)),
+            None => patterns.push(HostPattern::exact(host)),
+        }
+    }
+    EgressPolicy {
+        allowed_hosts: patterns,
+    }
+}
+
+#[cfg(test)]
+mod redaction_and_egress_tests {
+    use super::*;
+
+    #[test]
+    fn empty_allowlist_denies_every_host() {
+        let policy = egress_policy_from_allowed_hosts(&[]);
+        assert!(!policy.matches("example.com"));
+        assert!(!policy.matches("api.anthropic.com"));
+    }
+
+    #[test]
+    fn an_exact_host_entry_matches_only_that_host() {
+        let policy = egress_policy_from_allowed_hosts(&["api.anthropic.com".to_string()]);
+        assert!(policy.matches("api.anthropic.com"));
+        assert!(!policy.matches("evil.example.com"));
+        assert!(!policy.matches("anthropic.com"));
+    }
+
+    #[test]
+    fn a_wildcard_suffix_entry_matches_the_suffix_and_subdomains() {
+        let policy = egress_policy_from_allowed_hosts(&["*.example.com".to_string()]);
+        assert!(policy.matches("example.com"));
+        assert!(policy.matches("api.example.com"));
+        assert!(!policy.matches("evilexample.com"));
+    }
+
+    /// The foot-gun `HostPattern::wildcard_suffix("")` would otherwise
+    /// create: a bare `"*"`, `"*."`, `"*.."`, or `"*..."` entry must not
+    /// silently become "allow every host."
+    ///
+    /// `"*.."` is the actual W1-R23 finding: the guard used to check
+    /// emptiness BEFORE normalization while `roundhouse-net` normalizes
+    /// AFTER (`HostPattern::wildcard_suffix` -> `normalize_host` strips a
+    /// trailing dot). `"*.."`.`strip_prefix("*.")` yields `Some(".")` —
+    /// non-empty, so the old guard let it through — and
+    /// `normalize_host(".")` then strips that trailing dot down to `""`,
+    /// landing on `WildcardSuffix("")`, which `policy.rs`'s
+    /// `suffix.is_empty()` arm matches against EVERY host: a plausible
+    /// operator typo (`allowed_hosts = ["*.."]`) silently became
+    /// allow-all egress. Confirmed empirically (security review) by
+    /// extracting `normalize_host` and this guard into a standalone
+    /// binary: `"*"` skipped, `"*."` skipped, `"*.."` -> ALLOW_ALL.
+    ///
+    /// `"*..."` is the case that distinguishes the two candidate fixes.
+    /// `roundhouse-net`'s `normalize_host` strips only ONE trailing dot
+    /// today, so `"*..."` (suffix `".."`) does not currently reduce to
+    /// `WildcardSuffix("")` there either way — a fix that mirrored
+    /// `normalize_host`'s CURRENT single-strip behavior exactly would
+    /// therefore NOT skip `"*..."`, and would only stay correct as long as
+    /// `normalize_host` never changes. This guard deliberately
+    /// over-strips instead (`trim_end_matches('.')`, every trailing dot,
+    /// not just one) so it remains the backstop even if `normalize_host`
+    /// itself is later changed to strip more than one dot (the obvious
+    /// "more robust" edit, made in a different crate, by someone not
+    /// looking at this guard) — see this function's own doc comment.
+    #[test]
+    fn bare_and_multi_dot_wildcard_entries_are_skipped_not_promoted_to_allow_all() {
+        for entry in ["*", "*.", "*..", "*..."] {
+            let policy = egress_policy_from_allowed_hosts(&[entry.to_string()]);
+            assert!(
+                !policy.matches("example.com"),
+                "{entry:?} must not silently become allow-all egress"
+            );
+            assert!(
+                !policy.matches("literally-anything.invalid"),
+                "{entry:?} must not silently become allow-all egress"
+            );
+        }
+    }
+
+    fn stdio_config(id: &str, env: Vec<(&str, &str)>) -> McpServerConfig {
+        McpServerConfig {
+            id: roundhouse_policy::ServerId(id.to_string()),
+            transport: McpTransportKind::Stdio {
+                command: "some-mcp-server".to_string(),
+                args: vec![],
+                env: env
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                pinned_binary_hash: None,
+            },
+        }
+    }
+
+    fn fake_ctx(api_key: &str) -> RequestCtx {
+        RequestCtx {
+            trace_id: None,
+            transport: Arc::new(roundhouse_provider::ReqwestTransport::new()),
+            api_key: api_key.to_string(),
+            credentials: None,
+        }
+    }
+
+    /// W1-R24 as resolved by W1-R27: MCP env values are included only
+    /// when the variable NAME matches `*_TOKEN`/`*_KEY`/`*_SECRET`/
+    /// `*_PASSWORD` — this is what stops an unrelated env var like `HOME`
+    /// from turning every path in the session log into `[REDACTED]`
+    /// (Minor 4). `ctx.api_key` has no variable name and is always
+    /// included, unconditionally.
+    #[test]
+    fn live_secret_values_collects_the_api_key_and_only_name_matched_mcp_env_values() {
+        let ctx = fake_ctx("sk-live-abc123");
+        let configs = vec![
+            stdio_config("github", vec![("GITHUB_TOKEN", "gh-secret-value")]),
+            stdio_config(
+                "other",
+                vec![("HOME", "/home/jeroche"), ("DB_PASSWORD", "shortpw")],
+            ),
+        ];
+        let secrets = live_secret_values(&ctx, &configs);
+        assert!(secrets.contains(&"sk-live-abc123".to_string()));
+        assert!(secrets.contains(&"gh-secret-value".to_string()));
+        assert!(secrets.contains(&"shortpw".to_string()));
+        assert!(
+            !secrets.contains(&"/home/jeroche".to_string()),
+            "an env var whose NAME doesn't look secret-shaped (HOME) must never be treated as \
+             a live secret value — Minor 4's exact complaint"
+        );
+    }
+
+    /// Every name suffix W1-R27 names, plus one deliberately unmatched
+    /// name, in one place.
+    #[test]
+    fn live_secret_values_matches_every_ruled_name_suffix_and_nothing_else() {
+        let ctx = fake_ctx("sk-live-abc123");
+        let configs = vec![stdio_config(
+            "svc",
+            vec![
+                ("API_KEY", "key-val"),
+                ("CLIENT_SECRET", "secret-val"),
+                ("AUTH_TOKEN", "token-val"),
+                ("DB_PASSWORD", "password-val"),
+                ("AWS_REGION", "us-east-1"),
+            ],
+        )];
+        let secrets = live_secret_values(&ctx, &configs);
+        for expected in ["key-val", "secret-val", "token-val", "password-val"] {
+            assert!(
+                secrets.contains(&expected.to_string()),
+                "{expected:?} came from a name-matched env var and must be collected"
+            );
+        }
+        assert!(
+            !secrets.contains(&"us-east-1".to_string()),
+            "AWS_REGION does not match any of the ruled name suffixes"
+        );
+    }
+
+    #[test]
+    fn live_secret_values_with_no_mcp_servers_is_just_the_api_key() {
+        let ctx = fake_ctx("sk-live-abc123");
+        let secrets = live_secret_values(&ctx, &[]);
+        assert_eq!(secrets, vec!["sk-live-abc123".to_string()]);
+    }
+
+    /// W1-R24 as resolved by W1-R27: `MIN_REDACTABLE_SECRET_LEN` survives
+    /// ONLY as a destructive-pattern guard against a pathologically short
+    /// (1-3 byte) value — never again as the production security
+    /// threshold it used to be (the old 12-byte floor was sized only to
+    /// exclude the daemon's own 4-byte `"demo"` placeholder, now fixed at
+    /// its source in `roundhouse-daemon/src/main.rs` instead). This one
+    /// test proves both halves: a pathologically short value is still
+    /// filtered (the guard survives), and a realistic-but-short secret the
+    /// OLD floor silently let through unredacted (Minor 2's own 7-byte
+    /// `DB_PASSWORD` example) is now genuinely protected.
+    #[tokio::test]
+    async fn min_secret_len_is_a_destructive_pattern_guard_not_a_security_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+        let store = roundhouse_store::open(&db_path).await.unwrap();
+        let writer = roundhouse_store::spawn_writer(store).await;
+        let runner = roundhouse_core::TaskRunner::bootstrap();
+
+        // A pathologically short (2-byte) value must still be dropped —
+        // installing it as a redaction pattern would match at nearly
+        // every position and destroy unrelated log content.
+        wire_redaction_for_session(&writer, &["ab".to_string()]);
+        let short_session = SessionId::new();
+        let event = runner.record_note(
+            short_session,
+            0,
+            now_ts(),
+            None,
+            NoteLevel::Info,
+            "ab appears harmlessly in unrelated text".to_string(),
+            1,
+        );
+        writer.append(event).await.unwrap();
+
+        // A realistic 7-byte secret — Minor 2's own example — must now be
+        // redacted. Under the retired 12-byte security-threshold floor
+        // this was silently never protected.
+        let secret = "abcd123";
+        assert_eq!(secret.len(), 7);
+        wire_redaction_for_session(&writer, &[secret.to_string()]);
+        let long_session = SessionId::new();
+        let event = runner.record_note(
+            long_session,
+            0,
+            now_ts(),
+            None,
+            NoteLevel::Info,
+            format!("password is {secret}"),
+            1,
+        );
+        writer.append(event).await.unwrap();
+
+        let read_store = roundhouse_store::open(&db_path).await.unwrap();
+
+        let short_events = roundhouse_store::session_events(&read_store, short_session)
+            .await
+            .unwrap();
+        let roundhouse_core::EventPayload::Note {
+            text: short_text, ..
+        } = &short_events[0].payload
+        else {
+            panic!("expected a Note payload");
+        };
+        assert_eq!(
+            short_text, "ab appears harmlessly in unrelated text",
+            "a 2-byte value must not have been installed as a redaction pattern"
+        );
+
+        let long_events = roundhouse_store::session_events(&read_store, long_session)
+            .await
+            .unwrap();
+        let roundhouse_core::EventPayload::Note {
+            text: long_text, ..
+        } = &long_events[0].payload
+        else {
+            panic!("expected a Note payload");
+        };
+        assert!(
+            !long_text.contains(secret),
+            "a 7-byte secret must now be redacted — Minor 2's exact complaint: got {long_text:?}"
+        );
+        assert!(
+            long_text.contains("[REDACTED]"),
+            "expected the redaction placeholder in place of the secret, got: {long_text:?}"
+        );
+    }
+
+    /// W1-R25: `set_redactor` is `ArcSwap::store` — a full replacement —
+    /// and `wire_redaction_for_session` builds its automaton from its
+    /// `secrets` argument alone, so a SECOND call with anything less than
+    /// the complete, still-live secret set silently un-redacts every
+    /// secret not re-passed. `Redactor` exposes no pattern accessor, so a
+    /// caller cannot extend the running set — it must retain the full set
+    /// itself. Before this fix, `wire_redaction_for_session`'s doc comment
+    /// covered call-ordering thoroughly but never stated this contract at
+    /// all (verified against `e43834d`'s text, which has no such
+    /// sentence). This is a source-level pin, not a behavior test — the
+    /// behavior (`ArcSwap::store`'s full-replace semantics) is unchanged
+    /// by design; only the two acceptable fixes the ruling names are
+    /// "state it explicitly" (chosen here) or "hold the accumulated set in
+    /// the engine" (rejected as YAGNI: no second call site exists in this
+    /// workspace today).
+    #[test]
+    fn wire_redaction_for_session_doc_states_the_replace_not_extend_contract() {
+        let src = include_str!("session_actor.rs");
+        let doc_start = src
+            .find("/// Installs a `Redactor` built from `secrets` onto `writer`")
+            .expect("wire_redaction_for_session's doc comment must still start with this line");
+        let fn_marker = "pub fn wire_redaction_for_session(";
+        let fn_pos = src[doc_start..]
+            .find(fn_marker)
+            .map(|offset| doc_start + offset)
+            .expect("wire_redaction_for_session's definition must follow its doc comment");
+        let doc_comment = &src[doc_start..fn_pos];
+        assert!(
+            doc_comment.contains("replace, not extend")
+                || doc_comment.contains("replace-not-extend"),
+            "wire_redaction_for_session's doc comment must state the replace-not-extend \
+             contract explicitly (W1-R25) — a caller must pass the COMPLETE secret set on \
+             every call, not just what's new"
+        );
+        assert!(
+            doc_comment.contains("COMPLETE") || doc_comment.contains("complete, still-live"),
+            "the doc comment must say to pass the complete accumulated set, not just the \
+             newly-added secrets"
+        );
+    }
 }

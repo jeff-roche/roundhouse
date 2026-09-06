@@ -436,6 +436,20 @@ impl EventWriter {
         self.redactor.store(Arc::new(r));
     }
 
+    /// Runs THIS writer's own live redactor over `text` and returns the
+    /// redacted result plus the match count — the same automaton
+    /// `append`/`append_batch` already consult before persisting, exposed
+    /// so a caller can scan text that is never itself persisted through
+    /// this writer (fix round A, ruling W1-R59: a dispatched tool's result
+    /// is scanned before it's folded into the NEXT provider request, not
+    /// before it's stored — `run_agent_loop`'s own `TaskCompleted` append
+    /// already covers the storage side via the ordinary `redact_event_payload`
+    /// path). Never mutates anything; `redact_event_payload`'s persistence-
+    /// boundary guarantee is unaffected by this method's existence.
+    pub fn redact_outbound(&self, text: &str) -> (String, u32) {
+        self.redactor.load().redact(text)
+    }
+
     /// Append an event to the log. The event's `seq` field is ignored (the writer
     /// assigns a monotonic sequence number per session). Returns the assigned `seq`,
     /// or an error if serialization, database locking, or the writer task fails.

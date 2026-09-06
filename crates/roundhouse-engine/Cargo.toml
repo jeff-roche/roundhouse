@@ -7,6 +7,26 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Ruling W1-R87: gates `mcp_spawner::SessionMcp::from_parts` so daemon code
+# can never reach the caller-trusted mint of a `SessionMcp`. That constructor
+# takes a caller-supplied `Vec<(ServerId, Arc<dyn McpTransport>)>`, and those
+# names flow through `resolved_servers()` -> `SessionActor::register_mcp` ->
+# `SealedContext.resolved_mcp_servers`, where they DISARM the sealed floor's
+# `sealed_mcp_unresolved` rule — CF-8(b)'s bypass shape. Only
+# `start_session_mcp` attests that a server actually completed spawn +
+# discovery, so only it may remain reachable from production. Activated for
+# this crate's own `tests/*.rs` integration-test crates via the self
+# dev-dependency below; `cfg(test)` alone covers only in-lib unit tests.
+#
+# Named `test-util` rather than the `test-support` the ruling's example
+# spelled, to match the identical, security-motivated gates already in
+# `roundhouse-sched` (`store::open_test_db`) and `roundhouse-flow`
+# (`durability::open_test_db`, two in `runs`) — one feature name across the
+# workspace for one purpose. The mechanism is exactly what the ruling
+# specified.
+test-util = []
+
 [dependencies]
 roundhouse-core = { path = "../roundhouse-core" }
 roundhouse-store = { path = "../roundhouse-store" }
@@ -15,16 +35,32 @@ roundhouse-net = { path = "../roundhouse-net" }
 roundhouse-sandbox = { path = "../roundhouse-sandbox" }
 roundhouse-provider = { path = "../roundhouse-provider" }
 roundhouse-bus = { path = "../roundhouse-bus" }
+# Task 4 (Phase 7): `EngineTaskSpawner` (`src/mcp_spawner.rs`) implements
+# `roundhouse_mcp::executor::TaskSpawner`, and session creation calls
+# `roundhouse_mcp::host::McpHost::start` directly — see this crate's row in
+# `docs/architecture/02-system-architecture.md` §5.2, amended in the same
+# commit as this edge (ruling W1-R1).
+roundhouse-mcp = { path = "../roundhouse-mcp" }
+# Task 5 (Phase 7, ruling W1-R1): `src/tool_dispatch.rs` dispatches a
+# model-issued `ToolUse` to `roundhouse_tools`' real read/write/edit/find/shell
+# executors — the agent loop's built-in tool arm — so this crate needs a real
+# dependency on `roundhouse-tools`, not just a same-workspace sibling.
+roundhouse-tools = { path = "../roundhouse-tools" }
+schemars = { workspace = true }
 serde_json = { workspace = true }
 futures = "0.3"
 thiserror = { workspace = true }
 tokio = { version = "1.53", features = ["sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
 tracing = { workspace = true }
+async-trait = "0.1"
 
 [dev-dependencies]
-schemars = { workspace = true }
 tempfile = "3"
 tokio = { version = "1.53", features = ["full"] }
 once_cell = "1"
-async-trait = "0.1"
+# Self dev-dependency, activating the `test-util` feature for this crate's own
+# `tests/*.rs` integration-test crates (ruling W1-R87) — `cfg(test)` alone does
+# not cover them, only this crate's in-lib `#[cfg(test)] mod tests`. Mirrors
+# the identical pattern in `roundhouse-sched`.
+roundhouse-engine = { path = ".", features = ["test-util"] }

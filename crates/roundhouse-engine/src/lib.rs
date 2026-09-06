@@ -17,6 +17,7 @@
 //! `00-overview.md` §3.1.
 #![forbid(unsafe_code)]
 
+pub mod agent_loop;
 pub mod agent_spawn;
 pub mod break_glass;
 
@@ -37,6 +38,7 @@ mod chat;
 pub mod compact;
 mod context;
 mod infer;
+pub mod mcp_spawner;
 pub mod message_render;
 mod session_actor;
 mod working_context;
@@ -48,13 +50,16 @@ pub use compact::{execute_compact, CompactError, CompactInput, CompactOutput, Co
 pub use context::assemble_context;
 pub use infer::fold_stream_to_blocks;
 pub use session_actor::{
-    create_session_isolation, create_session_with_egress, AdmitError, CreateSessionError,
-    FinallySpec, FinallyStepError, SessionActor, TaskCreateRequest,
+    create_session_isolation, create_session_with_egress, effective_tier,
+    egress_policy_from_allowed_hosts, live_secret_values, wire_redaction_for_session, AdmitError,
+    CreateSessionError, FinallySpec, FinallyStepError, SessionActor, TaskCreateRequest,
 };
 pub use working_context::{ContextStateId, TokenBudget, WorkingContext};
 
 pub mod system_prompt;
 pub mod test_support;
+pub mod tool_catalog;
+pub mod tool_dispatch;
 pub mod tools;
 
 use roundhouse_bus::Bus;

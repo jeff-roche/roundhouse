@@ -35,19 +35,17 @@ pub enum AgentError {
 
 /// Runs one chat turn: records a `chat` task, spawns one child `infer` task
 /// that streams from `provider`, folds the stream into final `ContentBlock`s,
-/// and records both tasks completed. Returns the folded content blocks.
+/// and records both tasks completed. Returns this turn's own `chat` task id
+/// alongside the folded content blocks.
 ///
-/// `runner` is the sole authority (`TaskRunner::bootstrap()`, called exactly
-/// once per process by `roundhouse-engine`) that can mint the `Event`s this
-/// function appends — see `roundhouse_core::TaskRunner`'s doc comment.
-///
-/// If `provider.stream_chat` fails, both tasks are recorded `TaskFailed`
-/// (innermost — `infer` — first, then `chat`) before the error is returned,
-/// rather than being left permanently `Running` in the append-only log: a
-/// task stuck in `Running` forever is indistinguishable from one genuinely
-/// still in flight, and `recover_interrupted_tasks` only runs at daemon
-/// restart (and would misattribute it as `CancelReason::DaemonRestart` even
-/// then) — it can't clean up a same-process provider error.
+/// **Fix round B (Phase 7, Task 5, ruling W1-R53/W1-R64):** the returned
+/// `TaskId` lets a caller like `agent_loop::run_agent_loop` link a
+/// model-issued tool call back to the turn that produced it (as the
+/// dispatched task's `parent`) — before this fix, every dispatched tool
+/// call was recorded with `parent: None`, so the session's task log was a
+/// flat list rather than the queryable tree this repo's core bet
+/// (`AGENTS.md`) describes. Additive: every existing caller just needs to
+/// destructure the new tuple.
 pub async fn run_chat_turn(
     writer: &EventWriter,
     runner: &TaskRunner,
@@ -55,7 +53,7 @@ pub async fn run_chat_turn(
     ctx: &RequestCtx,
     session_id: SessionId,
     request: ChatRequest,
-) -> Result<Vec<ContentBlock>, AgentError> {
+) -> Result<(TaskId, Vec<ContentBlock>), AgentError> {
     let chat_task_id = TaskId::new();
     // The `chat` task is the user-facing turn; `Origin::User` reflects that.
     append_created(
@@ -113,7 +111,7 @@ pub async fn run_chat_turn(
     append_completed(writer, runner, session_id, infer_task_id).await?;
     append_completed(writer, runner, session_id, chat_task_id).await?;
 
-    Ok(blocks)
+    Ok((chat_task_id, blocks))
 }
 
 async fn append_created(

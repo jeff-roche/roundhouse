@@ -41,6 +41,35 @@ thiserror = { workspace = true }
 # the `ratatui`/`crossterm` versions or the backend types won't be the same type.
 ratatui = { version = "0.30.2", features = ["layout-cache"] }
 crossterm = "0.29"
+# Phase 7, Task 7: `round attach --session ID` parses its argument as a raw
+# UUID before handing it to `roundhouse_tui::SessionId::from_uuid` — an
+# external (non-`roundhouse-*`) dependency, so this does not touch the
+# internal dependency graph `xtask/tests/workspace_shape.rs` checks. Same
+# unpinned-minor-version shape every other crate in this workspace already
+# uses for `uuid` (`roundhouse-core`, `roundhouse-store`, ...).
+uuid = "1"
+# `round run`'s headless output: one `serde_json`-serialized `ClientEvent`
+# line per event. Not a new dependency to the workspace (every other crate
+# already depends on it via the workspace pin), just a new consumer here.
+serde_json = { workspace = true }
+# Ruling W1-R96 (fix round 1): install a `tracing` subscriber in both
+# binaries, not just the daemon — this crate has no `tracing::*` call sites
+# of its own today, but the review named "both `main`s" explicitly, and a
+# future one (e.g. inside `roundhouse-tui`) would otherwise be silently
+# dropped the same way the daemon's were. Same exact pin as
+# `roundhouse-daemon`'s manifest.
+tracing = { workspace = true }
+# Fix round 2, MUST 1: bumped from `=0.3.19` to `=0.3.23` — see
+# `roundhouse-daemon`'s identical manifest comment for why (0.3.20 fixed an
+# ANSI-escape log-injection issue; 0.3.19 sat exactly one release below it).
+# Correction (fix round 5, MUST 2): that 0.3.20 fix only escapes a
+# `tracing` event's literal MESSAGE BODY text — a raw `0x1b` byte in a
+# `field = %value`-style FIELD VALUE still passes through verbatim under
+# 0.3.23, proven directly, regardless of `with_ansi`. This bump is not a
+# second layer of defense; the `kind()`-only-rendering discipline (see
+# `roundhouse-daemon`'s identical comment) is the entire defense for field
+# values.
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 # Same exact-pin discipline as the `clap` addition above.

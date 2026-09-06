@@ -16,7 +16,8 @@
 //! (currently unwired) integration status.
 
 use roundhouse_core::{
-    Delta, EventPayload, NoteLevel, SessionId, TaskError, TaskId, TaskRunner, Timestamp,
+    Delta, EventPayload, NoteLevel, SessionId, TaskError, TaskId, TaskInput, TaskOutput,
+    TaskRunner, Timestamp,
 };
 
 use crate::pool::StorePool;
@@ -24,6 +25,13 @@ use crate::writer::EventWriter;
 use crate::StoreError;
 
 const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
+
+/// Recursion depth cap for [`Redactor::redact_json_value`] (fix round B, M2
+/// / ruling W1-R69) — see that method's own doc comment for the reproduced
+/// stack overflow (depth 10,000) this closes and why the cap sits well
+/// under `serde_json`'s own default parse recursion limit (128) rather than
+/// relying on it.
+const MAX_JSON_REDACT_DEPTH: usize = 64;
 
 /// An Aho-Corasick automaton over live secret values. `redact`/`redact_event_payload` are
 /// pure (never touch the database themselves) — the persistence-boundary guarantee comes
@@ -95,28 +103,59 @@ impl Redactor {
         (out, count)
     }
 
-    /// Covers exactly four fields today: `TaskDelta{delta: Delta::Text}` (streamed
-    /// model/tool text output), `Note.text`, `TaskFailed.error.message` (an error message
-    /// that quotes back part of the failing input, e.g. a shell command), and (Phase 7
-    /// Task 13b) `Loss.description` (free text that can carry a provider error message
-    /// verbatim). `Loss.kind` is a short machine-stable tag, never free text, and is left
+    /// Covers six fields as of this merge (fix round A, Phase 7 Task 5, plus Phase 7
+    /// Task 13b): `TaskDelta{delta: Delta::Text}` (streamed model/tool text output),
+    /// `Note.text`, `TaskFailed.error.message` (an error message that quotes back part
+    /// of the failing input, e.g. a shell command), `TaskCreated.input` (both
+    /// `TaskInput::Text` and, recursively over every string leaf, `TaskInput::Json` —
+    /// see [`Self::redact_json_value`]), `TaskCompleted.output` (both
+    /// `TaskOutput::Text` and, likewise recursively, `TaskOutput::Json`), and
+    /// `Loss.description` (free text that can carry a provider error message verbatim).
+    /// `Loss.kind` is a short machine-stable tag, never free text, and is left
     /// untouched.
     ///
+    /// **`TaskCreated`/`TaskCompleted` expansion, and why now:** the original version
+    /// of this doc comment listed both as an open gap, "not exploitable ... only
+    /// because current production code doesn't yet emit real text into most of these
+    /// fields." `roundhouse-engine`'s agent-loop dispatch (`agent_loop.rs`'s
+    /// `dispatch_builtin`) is exactly that follow-up: it records a model's raw tool-call
+    /// arguments as `TaskInput::Json` (whole file contents on `write`, for instance) and
+    /// a tool's result as `TaskOutput::Text` (full command stdout/stderr on `shell`) —
+    /// real, model-influenced free text landing in this append-only, unscrubbable log
+    /// for the first time. This closes that gap for those two fields.
+    ///
+    /// **Object KEYS in a `TaskInput`/`TaskOutput::Json` value are NOT redacted, only
+    /// string VALUES (recursively, through arrays and nested objects).** The decision
+    /// is a deliberate, accepted trade-off; **an earlier version of this comment's
+    /// STATED REASON for it was factually wrong, and is corrected here (fix round B, M3
+    /// / ruling W1-R69 — the third time this lane has hit a comment that misstates a
+    /// security property, after W1-R39 and Task 6's M3).** The earlier claim was that
+    /// object keys are "this codebase's own fixed field names … never model-echoed
+    /// content a live secret could appear in." That is false: `dispatch_builtin`
+    /// records the model's ENTIRE raw JSON argument object verbatim
+    /// (`TaskInput::Json(input.clone())`) — nothing validates that it contains only the
+    /// schema's named keys, so a model-authored object with an EXTRA key
+    /// (`{"path": "x", "sk-live-abc123": "irrelevant"}`) would carry that key straight
+    /// into the log, unredacted, verbatim, demonstrated. The decision to still not
+    /// redact keys stands on a narrower, honest basis instead: redacting a key would
+    /// corrupt the JSON's own shape (a key literally matching a secret substring stops
+    /// being a stable, round-trippable field name), and no built-in tool's schema today
+    /// gives the model a way to CHOOSE an arbitrary key that then gets read back by
+    /// name — an extra key is inert cargo, not something anything downstream
+    /// interprets. **That residual narrows to a real gap the moment MCP tool arguments
+    /// (round C) make model-chosen keys routine** (an MCP tool's input schema can name
+    /// an object-valued parameter with caller-chosen keys) — revisit then, not assumed
+    /// safe indefinitely.
+    ///
     /// **Known, tracked gap — NOT a safety property, just an honest inventory of what's
-    /// unprotected today:** every other `EventPayload` field that can carry free text
-    /// passes through completely unredacted (redaction count 0), including
-    /// `TaskCreated.input` (a task's actual prompt/command, when `TaskInput::Text`),
-    /// `TaskCompleted.output` (a task's actual output, same shape), `Delta::Thinking.text`,
-    /// `Delta::ToolArgs.fragment`, `Delta::Stdout`/`Delta::Stderr` (raw byte arrays —
-    /// substring text-matching doesn't apply to them the same way and would need a
-    /// different approach), `TaskFailed.error.category`, `Message{envelope}`,
-    /// `SessionStateChanged.reason`, `TaskSuspended.reason`, and `SessionCreated.spec`. A
-    /// live secret in any of those fields reaches the append-only log unredacted and
-    /// permanently, the moment something actually writes real (non-empty, non-placeholder)
-    /// text into them. Not exploitable in the shipped daemon today only because current
-    /// production code doesn't yet emit real text into most of these fields — expanding
-    /// coverage to close this gap is real follow-up work, not something this method's
-    /// current match arms claim to already handle.
+    /// still unprotected:** `Delta::Thinking.text`, `Delta::ToolArgs.fragment`,
+    /// `Delta::Stdout`/`Delta::Stderr` (raw byte arrays — substring text-matching
+    /// doesn't apply to them the same way and would need a different approach),
+    /// `TaskFailed.error.category`, `Message{envelope}`, `SessionStateChanged.reason`,
+    /// `TaskSuspended.reason`, and `SessionCreated.spec` still pass through completely
+    /// unredacted. A live secret in any of those fields reaches the append-only log
+    /// unredacted and permanently, the moment something actually writes real
+    /// (non-empty, non-placeholder) text into them.
     pub fn redact_event_payload(&self, payload: EventPayload) -> (EventPayload, u32) {
         match payload {
             EventPayload::TaskDelta {
@@ -153,6 +192,35 @@ impl Redactor {
                     n,
                 )
             }
+            EventPayload::TaskCreated {
+                kind,
+                parent,
+                origin,
+                input,
+            } => {
+                let (input, n) = match input {
+                    TaskInput::Text(text) => {
+                        let (redacted, n) = self.redact(&text);
+                        (TaskInput::Text(redacted), n)
+                    }
+                    TaskInput::Json(value) => {
+                        let (redacted, n) = self.redact_json_value(value);
+                        (TaskInput::Json(redacted), n)
+                    }
+                    // No text to scan in a blob reference (it's a content
+                    // hash + size, not inline text).
+                    other @ TaskInput::Blob(_) => (other, 0),
+                };
+                (
+                    EventPayload::TaskCreated {
+                        kind,
+                        parent,
+                        origin,
+                        input,
+                    },
+                    n,
+                )
+            }
             // Phase 7 Task 13b: `description` carries provider error text verbatim (e.g.
             // an upstream response body quoting back part of the request) — the same
             // free-text shape `TaskFailed.error.message` is redacted above. `kind` is a
@@ -172,6 +240,123 @@ impl Redactor {
                     },
                     n,
                 )
+            }
+            EventPayload::TaskCompleted { output, usage } => {
+                let (output, n) = match output {
+                    TaskOutput::Text(text) => {
+                        let (redacted, n) = self.redact(&text);
+                        (TaskOutput::Text(redacted), n)
+                    }
+                    TaskOutput::Json(value) => {
+                        let (redacted, n) = self.redact_json_value(value);
+                        (TaskOutput::Json(redacted), n)
+                    }
+                    other @ TaskOutput::Blob(_) => (other, 0),
+                };
+                (EventPayload::TaskCompleted { output, usage }, n)
+            }
+            other => (other, 0),
+        }
+    }
+
+    /// Recursively redacts every string LEAF in a `serde_json::Value` — object/array
+    /// structure and non-string scalars (numbers, bools, null) pass through unchanged,
+    /// and object KEYS are deliberately never touched (see
+    /// [`Self::redact_event_payload`]'s doc comment for why). Used for
+    /// `TaskInput`/`TaskOutput::Json`, the two JSON-carrying payload shapes this
+    /// module's Aho-Corasick substring automaton needs to reach inside of rather than
+    /// skip over.
+    fn redact_json_value(&self, value: serde_json::Value) -> (serde_json::Value, u32) {
+        self.redact_json_value_at_depth(value, 0)
+    }
+
+    /// `depth`-tracking implementation of [`Self::redact_json_value`] (fix
+    /// round B, M2 / ruling W1-R69): reproduced a real stack overflow at
+    /// recursion depth 10,000 with no explicit bound of our own — today's
+    /// safety rests entirely on `serde_json`'s own default parse recursion
+    /// limit (128, confirmed: 120 parses, 128/200/5000 are rejected before
+    /// this method ever runs), which is an undocumented dependency on a
+    /// third-party default for a check on the hot path of every event
+    /// write. [`MAX_JSON_REDACT_DEPTH`] is deliberately well under that
+    /// limit, so this bound is reached first and on our own terms.
+    ///
+    /// At the cap, this does NOT recurse, serialize, or otherwise walk
+    /// whatever remains below it — an earlier version of this fix tried
+    /// serializing the remaining sub-value to a flat string and redacting
+    /// that, but `serde_json::to_string` is ITSELF unbounded recursion over
+    /// the very structure that's already too deep, so that "fix" merely
+    /// moved the same stack overflow one call frame down (caught by this
+    /// method's own test). Instead, the remaining sub-value is discarded
+    /// outright and replaced with a fixed placeholder string — O(1), no
+    /// further traversal of any kind, so no depth of nesting below the cap
+    /// can affect this method's own stack usage. This means a secret nested
+    /// past the cap is not redacted so much as REMOVED ENTIRELY, never
+    /// round-tripped as structured JSON. Not reachable by any built-in tool
+    /// call today (their JSON shapes are shallow, fixed-schema objects —
+    /// see this module's `TaskCreated`/`TaskCompleted` doc comment), so
+    /// this is a resource bound holding a line, not a live threat this fix
+    /// round found exploited.
+    fn redact_json_value_at_depth(
+        &self,
+        value: serde_json::Value,
+        depth: usize,
+    ) -> (serde_json::Value, u32) {
+        if depth >= MAX_JSON_REDACT_DEPTH {
+            // `value` may still be arbitrarily deep below this point.
+            // `serde_json::Value` has no custom `Drop` (confirmed by
+            // reading its source), so letting it fall out of scope here
+            // and drop normally would hit the SAME stack overflow this
+            // whole cap exists to prevent — verified empirically on an
+            // explicit 2 MiB thread (the size `cargo test` gives each
+            // test): a bare `drop()` of an already-built depth-10,000
+            // `Value`, with NO redaction logic involved at all, survives;
+            // a depth-50,000 one aborts (fix round C1, ruling W1-R75 — a
+            // round B comment here cited depth 10,000 as the overflow
+            // point, which does not reproduce; that number came from a
+            // different, unrelated overflow in how round B's own TEST
+            // fixture was built, not from dropping an already-built
+            // value — see the test's own doc comment for the corrected
+            // mechanism). The exact threshold is unimportant; what matters
+            // is that ordinary recursive `Drop` on a sufficiently deep
+            // value does overflow, at a depth this cap makes unreachable
+            // in the first place. Tear it down iteratively, off the call
+            // stack, instead of letting normal `Drop` recurse into it.
+            drop_iteratively(value);
+            return (
+                serde_json::Value::String(
+                    "[TRUNCATED: exceeded the JSON redaction depth cap]".to_string(),
+                ),
+                0,
+            );
+        }
+        match value {
+            serde_json::Value::String(s) => {
+                let (redacted, n) = self.redact(&s);
+                (serde_json::Value::String(redacted), n)
+            }
+            serde_json::Value::Array(items) => {
+                let mut total = 0u32;
+                let redacted = items
+                    .into_iter()
+                    .map(|v| {
+                        let (v, n) = self.redact_json_value_at_depth(v, depth + 1);
+                        total += n;
+                        v
+                    })
+                    .collect();
+                (serde_json::Value::Array(redacted), total)
+            }
+            serde_json::Value::Object(map) => {
+                let mut total = 0u32;
+                let redacted = map
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let (v, n) = self.redact_json_value_at_depth(v, depth + 1);
+                        total += n;
+                        (k, v)
+                    })
+                    .collect();
+                (serde_json::Value::Object(redacted), total)
             }
             other => (other, 0),
         }
@@ -246,6 +431,31 @@ impl Redactor {
 pub enum SecretLeakDisposition {
     Ask,
     Deny,
+}
+
+/// Tears down a `serde_json::Value` OFF the call stack, one level at a time,
+/// via an explicit heap-allocated work-list — never Rust's default
+/// (recursive) `Drop`. `Redactor::redact_json_value_at_depth` (M2, fix
+/// round B, ruling W1-R69) uses this when it discards a sub-value at the
+/// depth cap: `Value` has no custom `Drop` of its own, so a value that is
+/// still arbitrarily deep below the cap would otherwise overflow the stack
+/// on ordinary drop, defeating the entire point of capping traversal depth
+/// in the first place (verified empirically, not assumed, on an explicit
+/// 2 MiB thread: an already-built depth-10,000 `Value` survives a bare
+/// `drop()`; an already-built depth-50,000 one aborts. See
+/// `redact_json_value_at_depth`'s own doc comment, and the corresponding
+/// test's, for fix round C1's correction of an earlier, wrong number here).
+fn drop_iteratively(value: serde_json::Value) {
+    let mut stack = vec![value];
+    while let Some(v) = stack.pop() {
+        match v {
+            serde_json::Value::Array(items) => stack.extend(items),
+            serde_json::Value::Object(map) => stack.extend(map.into_values()),
+            // Scalars (String/Number/Bool/Null) drop trivially — no
+            // nested `Value`s to worry about.
+            _ => {}
+        }
+    }
 }
 
 /// `Timestamp` (Phase 0, frozen) exposes only `from_unix_nanos`/`as_unix_nanos` — no

@@ -22,7 +22,8 @@
 //!    asset fallback.
 //! 3. **`Last-Event-ID` names the last event the client *received*, so the
 //!    stream resumes at `seq + 1`.** `roundhouse-store` allocates the first
-//!    seq of a session as `COALESCE(MAX(seq), -1) + 1` (`writer.rs:171`) —
+//!    seq of a session as `COALESCE(MAX(seq), -1) + 1` (in
+//!    `roundhouse-store`'s `writer::append_one`) —
 //!    **seq 0 is a real event**, so "0 means no cursor" would be a bug. An
 //!    absent header resumes from 0; a present one resumes strictly after it.
 //! 4. **A malformed or foreign cursor is a `400`, never a silent restart.**
@@ -72,9 +73,15 @@
 //! the same session, and subscribes. **The session id in the URL is a name, not
 //! a capability** — knowing one is sufficient to open its stream, and
 //! [`parse_last_event_id`]'s own note already says the cursor carries no
-//! authority. The task that binds a listener to this endpoint — the same one
-//! residual 1 names — owns authn/authz, and until it exists this crate has no
-//! caller identity to check anything against.
+//! authority. **`roundhouse-daemon`'s `main.rs` is the task that binds a
+//! listener to this endpoint (Task 9, Phase 7), and its decision is: none, on
+//! the loopback bind.** Per §11.3, "loopback-only remains what you get with no
+//! configuration" — the same posture [`crate::lan_auth`] documents for the
+//! whole `/api` surface — so this endpoint is reachable, unauthenticated, by
+//! every local uid, not only the peercred-checked uid the Unix socket admits.
+//! Inert today only because nothing publishes into the hub (residual 1); the
+//! day something does, that gap is live for every local user, not merely the
+//! daemon's own.
 //!
 //! **What the ring changes about that is the blast radius, not the defect.**
 //! Before it, a caller who learned a session UUID received only events
@@ -90,13 +97,28 @@
 //! # Residuals — named here, not solved here
 //!
 //! **1. Nothing publishes into the hub yet.** [`SseHub::publish`] has **no
-//! caller in this workspace**. There is no pub/sub in `roundhouse-store`,
-//! nothing in `roundhouse-daemon` links `roundhouse-web` yet, and no Subsystem
-//! D task specifies the writer. Until one does, a real deployment's stream
-//! would open, stay open, and emit nothing but keep-alive comments. The
-//! endpoint is tested by publishing into the hub directly from
-//! `tests/sse_cursor.rs`, which is exactly the seam a future writer fills —
-//! but that is a test calling it, not the daemon.
+//! caller in this workspace**. `roundhouse-daemon` now links `roundhouse-web`
+//! and binds a real listener (Task 9, Phase 7), so a browser can open this
+//! endpoint against a live daemon — but no writer feeds it: there is no
+//! pub/sub in `roundhouse-store`, and `SessionRegistry::publish`
+//! (`roundhouse-daemon`'s own analogous fan-out for the Unix-socket
+//! transport) has exactly the same defect — zero production callers, only
+//! tests. **The two are one gap, not two**: nothing in this workspace forwards
+//! an appended event to *either* consumer, and closing only this crate's half
+//! would leave a `round attach` client just as silent as a browser tab. Fixing
+//! it needs a new observer seam on `roundhouse-engine`'s side (there is no
+//! existing hook, and neither this crate nor `roundhouse-daemon` can be named
+//! from there — the dependency direction runs the other way), threaded
+//! through every `EventWriter` a session can append through (CF-12(a): the
+//! session writer, `recovery_writer`, and the proxy's own), and it has to
+//! land after whichever redaction step protects a secret from reaching an
+//! append at all, or this hub — which is explicitly not a redaction boundary,
+//! see below — becomes the leak. Task 9's own report has the full analysis;
+//! recorded here as well so a reader of this module sees it without needing
+//! to cross-reference that report. The endpoint is tested by publishing
+//! directly into the hub from `tests/sse_cursor.rs`, which is exactly the
+//! seam a future writer fills — but that is a test calling it, not the
+//! daemon.
 //!
 //! **2. The hub's memory cost is `entries × event size`, and only the ring's
 //! share of it is bounded.** `EventPayload` has unbounded inline variants —
@@ -1093,7 +1115,8 @@ fn cursor_rejected(error: CursorError) -> Response {
 /// rather than delivered late. Ring order and live-queue order cannot disagree
 /// ([`SseHub::publish`] holds one lock across both), so this can only bite a
 /// publisher that allocates seqs out of order — which `roundhouse-store`'s
-/// single monotonic allocator (`COALESCE(MAX(seq), -1) + 1`, `writer.rs:171`)
+/// single monotonic allocator (`COALESCE(MAX(seq), -1) + 1`, in
+/// `roundhouse-store`'s `writer::append_one`)
 /// does not. Recorded because it is a real constraint on the publisher
 /// residual 1 calls for, and it is invisible from the client side.
 ///

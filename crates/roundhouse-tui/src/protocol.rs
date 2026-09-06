@@ -1,4 +1,12 @@
-//! Server message types and protocol errors.
+//! Protocol error type for TUI client operations.
+//!
+//! Used to carry `roundhouse-proto`'s own `ClientRequest`/`ClientEvent` wire
+//! types (see `client.rs`). This module used to also define `ServerMessage`,
+//! a hand-rolled, daemon-pre-summarized wire type; Phase 7 Task 2 retired it
+//! in favor of the real `roundhouse-proto` types, since `ServerMessage`'s two
+//! flattened variants could not represent an MCP tool call, a policy denial,
+//! or a sub-agent spawn event. `TuiError` survives because it still has real
+//! users: `client.rs`'s `send`/`recv`.
 
 /// Error type for TUI client operations.
 #[derive(Debug, thiserror::Error)]
@@ -9,31 +17,4 @@ pub enum TuiError {
     /// JSON decoding error from malformed NDJSON.
     #[error("json decode error: {0}")]
     Json(#[from] serde_json::Error),
-}
-
-/// Messages sent by the daemon to the TUI client over NDJSON.
-///
-/// Each message is a single line of JSON terminated by `\n`.
-/// The `type` field determines which variant is deserialized.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
-#[serde(tag = "type")]
-pub enum ServerMessage {
-    /// A task changed: new delta, completion, or error.
-    #[serde(rename = "task_delta")]
-    TaskDelta {
-        /// Unique identifier for the task.
-        task_id: String,
-        /// Human-readable delta text (e.g. "started", "completed: success").
-        text: String,
-    },
-    /// Session-level summary: counts and status.
-    #[serde(rename = "session_summary")]
-    SessionSummary {
-        /// Unique identifier for the session.
-        session_id: String,
-        /// Number of tasks currently running in this session.
-        running_tasks: u32,
-        /// True if the session is waiting on something external.
-        blocked: bool,
-    },
 }

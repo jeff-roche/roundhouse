@@ -100,9 +100,9 @@
 //! [`require_home`]) is factored out as pure functions taking explicit
 //! `Option<PathBuf>` arguments, so it is unit-tested directly rather than by
 //! mutating process-wide environment variables (which would race Rust's
-//! default parallel test execution). [`install_dir`] is exercised only for
-//! its shape (ends in the right OS-specific suffix) against whatever the
-//! real environment happens to be.
+//! default parallel test execution). [`install_dir_unchecked`] is exercised
+//! only for its shape (ends in the right OS-specific suffix) against
+//! whatever the real environment happens to be.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -228,15 +228,21 @@ fn escape_xml_text(s: &str) -> String {
 /// report's "Deviations from the plan text" for why.
 ///
 /// Best-effort: falls back to `.` if `$HOME` is unset, because this
-/// function's signature (pinned by this task's brief) returns a plain
-/// `PathBuf` with no way to report an error. **Prefer [`resolved_install_dir`]
-/// for anything other than shape-checking/testing** — it hard-errors on an
+/// function's signature (pinned by an earlier task's brief) returns a plain
+/// `PathBuf` with no way to report an error.
+///
+/// **Phase 7, Task 28 — the naming-trap fix.** This function used to be
+/// named `install_dir`, and the actually-safe, hard-erroring function below
+/// was `resolved_install_dir` — an operator or a future caller reaching for
+/// the obviously-named `install_dir` got the LESS safe one, silently. This
+/// function is renamed `install_dir_unchecked` (its best-effort behavior is
+/// otherwise unchanged) so that the plain, obviously-reached-for name
+/// belongs to the safe function instead. **Prefer [`install_dir`] for
+/// anything other than shape-checking/testing** — it hard-errors on an
 /// unset or relative `$HOME` instead of silently degrading to a path
 /// relative to the process's current directory, and is the function
-/// [`install`]/[`uninstall`] actually use. This function's `PathBuf`-only,
-/// best-effort shape exists only because this task's brief pins that exact
-/// signature, not because it's the one new callers should reach for.
-pub fn install_dir(os: OsFamily) -> PathBuf {
+/// [`install`]/[`uninstall`] actually use.
+pub fn install_dir_unchecked(os: OsFamily) -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -245,8 +251,8 @@ pub fn install_dir(os: OsFamily) -> PathBuf {
     build_install_dir(os, &home, xdg_config_home.as_deref())
 }
 
-/// Shared path-assembly logic between the best-effort [`install_dir`] and
-/// the hard-erroring [`resolved_install_dir`] — the two differ only in how
+/// Shared path-assembly logic between the best-effort [`install_dir_unchecked`]
+/// and the hard-erroring [`install_dir`] — the two differ only in how
 /// strictly they resolve `$HOME`/`$XDG_CONFIG_HOME` (see [`require_home`]),
 /// not in the resulting directory shape. Pure and unit-tested directly with
 /// explicit arguments, rather than through the environment.
@@ -269,16 +275,17 @@ fn build_install_dir(os: OsFamily, home: &Path, xdg_config_home: Option<&Path>) 
     }
 }
 
-/// [`install_dir`]'s hard-erroring counterpart: refuses to guess a fallback
-/// when `$HOME` is unset or relative rather than risk writing a
-/// boot-persistent unit under the process's current directory.
-/// [`install`]/[`uninstall`] use this, not [`install_dir`] — and so should
-/// any future caller that needs the *real* install location (a `round
-/// service status`, or a "would install to X" dry run, say). Public since
-/// fix round 2 (code review): this is the safe function to reach for, and
-/// [`install_dir`]'s best-effort fallback existing as the only previously
-/// public option was a trap for exactly that kind of future caller.
-pub fn resolved_install_dir(os: OsFamily) -> Result<PathBuf, ServiceInstallError> {
+/// [`install_dir_unchecked`]'s hard-erroring counterpart, and — since Phase 7,
+/// Task 28's rename — the function the obvious, plain name `install_dir`
+/// actually belongs to: refuses to guess a fallback when `$HOME` is unset or
+/// relative rather than risk writing a boot-persistent unit under the
+/// process's current directory. [`install`]/[`uninstall`] use this, not
+/// [`install_dir_unchecked`] — and so should any future caller that needs
+/// the *real* install location (a `round service status`, or a "would
+/// install to X" dry run, say). This is the safe function to reach for, and
+/// the plain name is deliberately no longer a trap for a caller who reaches
+/// for the obviously-named one.
+pub fn install_dir(os: OsFamily) -> Result<PathBuf, ServiceInstallError> {
     let home = require_home(std::env::var_os("HOME").map(PathBuf::from))?;
     let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     Ok(build_install_dir(os, &home, xdg_config_home.as_deref()))
@@ -296,7 +303,7 @@ fn require_home(home: Option<PathBuf>) -> Result<PathBuf, ServiceInstallError> {
 /// substitution — a rendering nicety, not a decision about where to write a
 /// boot-persistent unit, so falling back to `.` here (rather than erroring)
 /// is acceptable: by the time a real install reaches this function,
-/// [`resolved_install_dir`] has already hard-errored on an unset `$HOME`.
+/// [`install_dir`] has already hard-errored on an unset `$HOME`.
 fn best_effort_home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -627,9 +634,10 @@ pub fn uninstall_from(dir: &Path, os: OsFamily) -> io::Result<()> {
 }
 
 /// `round service install`: writes the rendered unit/plist for this OS into
-/// its real per-user service directory ([`resolved_install_dir`], which
-/// hard-errors on an unset/relative `$HOME` rather than [`install_dir`]'s
-/// best-effort fallback). Enabling/starting the unit (`systemctl --user
+/// its real per-user service directory ([`install_dir`], which
+/// hard-errors on an unset/relative `$HOME` rather than
+/// [`install_dir_unchecked`]'s best-effort fallback). Enabling/starting the
+/// unit (`systemctl --user
 /// enable --now` / `launchctl load`) is left to the caller printing
 /// instructions rather than done here — see the task report's "Deviations
 /// from the plan text" for why: this function must stay callable from an
@@ -640,20 +648,32 @@ pub fn install(
     exec_path: &Path,
     force: bool,
 ) -> Result<PathBuf, ServiceInstallError> {
-    install_to(&resolved_install_dir(os)?, os, exec_path, force)
+    install_to(&install_dir(os)?, os, exec_path, force)
 }
 
 /// `round service uninstall`: removes the unit/plist (and any legacy unit —
 /// see [`uninstall_from`]) for this OS from its real per-user service
 /// directory.
 pub fn uninstall(os: OsFamily) -> Result<(), ServiceInstallError> {
-    uninstall_from(&resolved_install_dir(os)?, os)?;
+    uninstall_from(&install_dir(os)?, os)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 7, Task 28 — the naming-trap fix, proven at the type level: the
+    /// obviously-named function is the SAFE (hard-erroring) one, not the
+    /// best-effort one. Before this task, `install_dir` was the best-effort
+    /// `PathBuf`-returning function and the safe one was named
+    /// `resolved_install_dir` — a future caller reaching for the obvious
+    /// name got the less-safe function silently.
+    #[test]
+    fn install_dir_is_the_safe_function_not_the_best_effort_one() {
+        let _: fn(OsFamily) -> Result<PathBuf, ServiceInstallError> = install_dir;
+        let _: fn(OsFamily) -> PathBuf = install_dir_unchecked;
+    }
 
     #[test]
     fn build_install_dir_uses_xdg_config_home_when_absolute() {

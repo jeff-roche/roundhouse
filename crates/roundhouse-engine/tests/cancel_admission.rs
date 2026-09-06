@@ -105,6 +105,7 @@ async fn spawn_test_actor(
         isolate,
         handle,
         spec,
+        vec![],
     );
 
     (actor, session_id, db_path, dir)

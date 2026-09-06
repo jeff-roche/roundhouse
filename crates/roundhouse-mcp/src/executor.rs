@@ -305,6 +305,51 @@ impl McpExecutor {
             .map(|t| t.namespaced_name.clone())
     }
 
+    /// Fix round C2, carry-forward CF-3: the ONLY authoritative source of
+    /// the `ServerId` a caller must put into `TaskInput::Mcp.server` for a
+    /// given namespaced tool name — `execute`'s own policy gate
+    /// (`Self::gate`, called from `execute`) uses that field directly,
+    /// not anything derived
+    /// from `tool`, so a caller with no way to resolve `tool` correctly has
+    /// no honest way to build a `TaskInput::Mcp` at all (this is exactly
+    /// what round-A/B's `agent_loop.rs` MCP arm was blocked on). A thin,
+    /// read-only passthrough to `ToolNamespace::resolve` — deliberately NOT
+    /// a public `namespace` field, which would also expose
+    /// `NamespacedToolDef`'s untrusted `description`/`input_schema` and the
+    /// full tool list for no caller need beyond this one lookup.
+    ///
+    /// Use ONLY the returned `ServerId` for `TaskInput::Mcp.server` — the
+    /// returned original tool name is a decoy for that purpose. `execute`
+    /// re-resolves `namespaced_name` to an original name itself internally
+    /// and rejects an already-resolved name as unknown, so
+    /// `TaskInput::Mcp.tool` must stay the namespaced name you passed in
+    /// here, unchanged.
+    pub fn resolve(&self, namespaced_name: &str) -> Option<(&ServerId, &str)> {
+        self.namespace.resolve(namespaced_name)
+    }
+
+    /// Fix round C2, carry-forward CF-9: the servers that actually
+    /// completed spawn + discovery, as opposed to merely being *configured*
+    /// — `connections` is built once in [`Self::new`] from
+    /// `McpHost::start`'s `StartedServer` list, which by
+    /// construction contains only servers whose `StdioMcpTransport::spawn`
+    /// AND `discover()` both succeeded (`host.rs`'s `start_server`);
+    /// a server that failed either step never reaches `connections` at all.
+    /// This is the honest input `SealedContext.resolved_mcp_servers` needs
+    /// — using the *configured* id list instead (all this crate exposed
+    /// before this accessor existed) is CF-8(b), the sealed-context-bypass
+    /// shape: a server an operator configured but that never actually
+    /// completed a handshake would be treated as "resolved" regardless.
+    /// Returns owned `String`s, not an iterator borrowing `&self` or a
+    /// `HashSet<ServerId>`: `ServerId` (`roundhouse_policy`) has no `Hash`
+    /// derive (see [`Self::new`]'s own doc comment), and
+    /// `SealedContext.resolved_mcp_servers` is itself a `HashSet<String>`
+    /// for exactly that reason — this returns the same shape the one real
+    /// caller needs, not a shape callers have to convert themselves.
+    pub fn resolved_servers(&self) -> Vec<String> {
+        self.connections.keys().cloned().collect()
+    }
+
     /// Shut down every server connection (Phase 3 review fix: this is the
     /// only production path that reaches `McpTransport::shutdown` — the
     /// executor owns the last `Arc`s, and without a `&self` teardown
@@ -919,6 +964,39 @@ mod tests {
             parent: None,
             taint: Taint::Tainted,
         }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Fix round C2 — CF-3 (`resolve`) and CF-9 (`resolved_servers`) accessors.
+    // -----------------------------------------------------------------------------------
+
+    #[test]
+    fn resolve_returns_the_authoritative_server_and_original_tool_name() {
+        let (executor, _fake, _spawner) = setup(vec![]);
+        // `setup`'s one server ("github") registers "search"; the namespaced
+        // form is whatever `ToolNamespace::build` produced, exercised here
+        // via `namespace_tool_name` (already public) rather than a literal
+        // string, so this test does not duplicate the namespacing scheme.
+        let namespaced = executor.namespace_tool_name("search").unwrap();
+
+        let (server, original) = executor.resolve(&namespaced).unwrap();
+        assert_eq!(server.0, "github");
+        assert_eq!(original, "search");
+    }
+
+    #[test]
+    fn resolve_is_none_for_an_unregistered_namespaced_name() {
+        let (executor, _fake, _spawner) = setup(vec![]);
+        assert!(executor.resolve("nonexistent__tool").is_none());
+    }
+
+    #[test]
+    fn resolved_servers_lists_only_servers_that_completed_handshake() {
+        // CF-9: this must reflect `connections` (built only from servers
+        // that actually spawned+discovered — `setup`'s one "github" server),
+        // never a merely-configured id that never got this far.
+        let (executor, _fake, _spawner) = setup(vec![]);
+        assert_eq!(executor.resolved_servers(), vec!["github".to_string()]);
     }
 
     #[tokio::test]

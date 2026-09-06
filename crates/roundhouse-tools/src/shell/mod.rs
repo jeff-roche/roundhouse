@@ -48,15 +48,31 @@ pub struct ShellOutput {
 /// equivalent as discrete arguments, no argv element can ever be reinterpreted as shell
 /// syntax (`;`, `|`, `$()`, backticks, etc. are all inert, literal characters). There is
 /// no shell in the loop to perform reinterpretation.
+///
+/// **Fix round A (Phase 7, Task 5 finding F1):** the child's environment is now
+/// `env_clear()`'d, with only `PATH` (read from THIS process's own environment, so
+/// bare-name programs like `git` keep resolving) re-added. Before this fix, this
+/// function spawned a bare `Command` that inherited the daemon's FULL environment —
+/// including `ANTHROPIC_API_KEY` when set — into every child, a reproduced leak that
+/// falsified `docs/architecture/03-security-and-sandboxing.md:318`'s "no key enters a
+/// child environment" claim. No signature change: `execve_node` (below) and every
+/// existing caller/test keep working unchanged, since `PATH` is exactly what a bare
+/// program name needs and nothing else was ever load-bearing here.
 pub async fn run_shell(
     program: &str,
     argv: &[String],
     cwd: &Path,
 ) -> Result<ShellOutput, ToolError> {
-    let output = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(argv)
         .current_dir(cwd)
         .kill_on_drop(true)
+        .env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    let output = command
         .output()
         .await
         .map_err(|e| ToolError::Spawn(format!("{program}: {e}")))?;

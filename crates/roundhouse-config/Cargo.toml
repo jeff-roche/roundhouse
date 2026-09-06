@@ -11,3 +11,39 @@ workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }
 toml = "0.8"
+# Fix round 1 (SHOULD item): `load_network_config_from_layers` logs when it
+# treats a rejected narrower config layer as absent rather than discarding
+# the wider scope's own allowlist — an external (non-`roundhouse-*`)
+# dependency, so this does not touch this crate's "no internal
+# `roundhouse-*` dependency" rule (§5.2).
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+# Fix round 3, MUST 2: the ANSI-injection acceptance test needs to assert on
+# the actual rendered log LINE `load_network_config_from_layers` emits, not
+# on `NetworkConfigError::kind()` in isolation (whose `&'static str` return
+# type cannot fail by construction, so asserting on it alone is a test of
+# `kind()`, not a regression test of the log call site itself — reverting
+# `error_kind = err.kind()` back to `error = %err` at the call site passed
+# the old version of this test unchanged). A capturing `tracing_subscriber`
+# `fmt` subscriber, installed only for the duration of one test via
+# `tracing::subscriber::with_default`, is what makes that possible. Same
+# exact pin as `roundhouse-daemon`/`roundhouse-cli`'s own manifests, for the
+# same reason (0.3.20 fixed an ANSI-escape log-injection issue; this crate
+# is testing that exact class of defect, so pinning below the fix here of
+# all places would be a real error, not just inconsistent).
+#
+# Correction (fix round 5, MUST 2): 0.3.20's fix escapes only a `tracing`
+# event's literal MESSAGE BODY text — proven directly that a raw `0x1b`
+# byte in a `field = %value`-style FIELD VALUE (e.g. `error = %err`) still
+# passes through verbatim under 0.3.23, regardless of `with_ansi`. This
+# module's own `the_real_log_call_site_never_emits_the_hostile_files_own_
+# bytes` test renders `error_kind = err.kind()` as a field, not the
+# message body — its passing is entirely because `err.kind()` never
+# carries hostile bytes to begin with (the `kind()` discipline), not
+# because this dependency escapes it. `kind()`-only rendering is a BINDING
+# INVARIANT for every new `tracing` call site touching a config- or
+# file-derived error in this workspace, not a style preference backed by
+# a library-level safety net.
+tracing-subscriber = "=0.3.23"

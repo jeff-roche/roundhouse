@@ -32,6 +32,18 @@ use roundhouse_store::{open, session_events, spawn_writer};
 static RUNNER: once_cell::sync::Lazy<roundhouse_core::TaskRunner> =
     once_cell::sync::Lazy::new(roundhouse_core::TaskRunner::bootstrap);
 
+/// A minimal `RequestCtx` for tests that need one to call
+/// `create_session_with_egress` but aren't themselves testing its
+/// credential contents.
+fn fake_ctx(api_key: &str) -> roundhouse_provider::RequestCtx {
+    roundhouse_provider::RequestCtx {
+        trace_id: None,
+        transport: Arc::new(roundhouse_provider::ReqwestTransport::new()),
+        api_key: api_key.to_string(),
+        credentials: None,
+    }
+}
+
 /// A `BwrapLandlockIsolate` whose probe reports every mechanism `Available`
 /// except Seatbelt (n/a off macOS) — achieves `Tier::Sandbox` deterministically,
 /// hermetically, with no real bwrap/landlock syscalls made.
@@ -74,6 +86,7 @@ async fn admit_task_denies_a_sealed_write_through_the_real_admission_path() {
         isolate,
         handle,
         spec,
+        vec![],
     );
 
     // sealed.rs's own home-dir helper reads $HOME directly (no `dirs` crate
@@ -138,6 +151,7 @@ async fn admit_task_denies_writes_under_the_real_state_dir_and_daemon_binary() {
         isolate,
         handle,
         spec,
+        vec![],
     );
 
     let write_state_dir = TaskCreateRequest {
@@ -256,6 +270,7 @@ async fn session_creation_registers_egress_with_the_real_loopback_proxy() {
     let isolate = available_isolate();
     let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
     let session_id = SessionId::new();
+    let ctx = fake_ctx("sk-not-under-test-here");
 
     let (handle, proxy_handle) = create_session_with_egress(
         &writer,
@@ -267,6 +282,8 @@ async fn session_creation_registers_egress_with_the_real_loopback_proxy() {
         EgressPolicy {
             allowed_hosts: vec![],
         },
+        &ctx,
+        &[],
     )
     .await
     .unwrap();
@@ -283,6 +300,81 @@ async fn session_creation_registers_egress_with_the_real_loopback_proxy() {
         attestation.tier,
         Tier::Sandbox,
         "the isolation handle session creation produced must reflect the achieved tier"
+    );
+}
+
+/// W1-R22 as amended by W1-R28: `create_session_with_egress` must install
+/// real secret redaction ITSELF — before it returns any `Handle` a caller
+/// could append against — rather than leaving that to a manual call
+/// somebody has to remember to make. Before this fix, the only call site
+/// of `wire_redaction_for_session` anywhere in the workspace was a manual
+/// one in `roundhouse-daemon/src/demo.rs`; this test drives session
+/// creation end to end through the real function and proves a live
+/// `RequestCtx.api_key` is genuinely redacted from an event appended
+/// immediately afterward, with nothing else in between remembering to
+/// wire it up.
+#[tokio::test]
+async fn create_session_with_egress_installs_real_redaction_before_any_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("events.db");
+    let store = open(&db_path).await.unwrap();
+    let writer = spawn_writer(store).await;
+
+    let proxy = Arc::new(LoopbackProxy::new());
+    proxy
+        .clone()
+        .serve(&RUNNER, writer.clone())
+        .await
+        .expect("serve() must bind a real loopback listener");
+
+    let isolate = available_isolate();
+    let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
+    let session_id = SessionId::new();
+
+    let secret = "sk-live-super-secret-session-key";
+    let ctx = fake_ctx(secret);
+
+    let (_handle, _proxy_handle) = create_session_with_egress(
+        &writer,
+        &RUNNER,
+        session_id,
+        &isolate,
+        &spec,
+        &proxy,
+        EgressPolicy {
+            allowed_hosts: vec![],
+        },
+        &ctx,
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let event = RUNNER.record_note(
+        session_id,
+        0,
+        roundhouse_core::Timestamp::from_unix_nanos(0),
+        None,
+        NoteLevel::Info,
+        format!("using key {secret} for this request"),
+        1,
+    );
+    writer.append(event).await.unwrap();
+
+    let read_store = open(&db_path).await.unwrap();
+    let events = session_events(&read_store, session_id).await.unwrap();
+    let last = events.last().expect("the note event must be readable back");
+    let EventPayload::Note { text, .. } = &last.payload else {
+        panic!("expected a Note payload, got {:?}", last.payload);
+    };
+    assert!(
+        !text.contains(secret),
+        "create_session_with_egress must install real redaction itself — the live api_key must \
+         never appear verbatim in a persisted event, got: {text:?}"
+    );
+    assert!(
+        text.contains("[REDACTED]"),
+        "expected the redaction placeholder in place of the secret, got: {text:?}"
     );
 }
 
@@ -345,6 +437,7 @@ async fn a_legitimately_downgraded_session_does_not_deny_every_subsequent_task()
         isolate,
         handle,
         spec,
+        vec![],
     );
 
     let ordinary = TaskCreateRequest {
@@ -401,6 +494,7 @@ async fn admitting_a_task_with_the_sealed_floor_disabled_records_a_real_never_si
         isolate,
         handle,
         spec,
+        vec![],
     );
 
     let task = TaskCreateRequest {
@@ -481,6 +575,7 @@ async fn a_dead_or_unrecognized_handle_fails_closed_instead_of_permanently_disab
         isolate,
         dead_handle,
         spec,
+        vec![],
     );
 
     let task = TaskCreateRequest {
@@ -538,6 +633,7 @@ async fn unsealed_audit_note_accurately_reflects_a_denied_outcome_not_admitted()
         isolate,
         handle,
         spec,
+        vec![],
     );
 
     let task = TaskCreateRequest {

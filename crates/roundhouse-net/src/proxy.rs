@@ -223,6 +223,19 @@ impl LoopbackProxy {
         self.sessions.remove(token);
     }
 
+    /// Whether `token` currently names a registered session. Read-only,
+    /// added (lane W1, Phase 7 Task 7 fix round 2) specifically so a test
+    /// can prove a `deregister_session` call actually happened, rather than
+    /// asserting on a `remove` that no-ops harmlessly on a token that was
+    /// never registered in the first place — see
+    /// `roundhouse-daemon`'s `socket_server::session_reaper_tests` for the
+    /// regression this closes (both of that module's tests previously
+    /// passed an unregistered literal token, so deleting the
+    /// `deregister_session` call entirely would still have passed them).
+    pub fn is_registered(&self, token: &str) -> bool {
+        self.sessions.contains_key(token)
+    }
+
     /// Binds an ephemeral loopback port, serves forever in a spawned task,
     /// and returns the bound address. `runner` is the process-wide
     /// `TaskRunner` authority (per S-LOG-1, minted exactly once at daemon
