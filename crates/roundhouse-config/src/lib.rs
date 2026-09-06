@@ -16,6 +16,7 @@
 
 mod loader;
 pub mod network;
+pub mod policy;
 mod scope;
 mod secret_ref;
 
@@ -33,5 +34,9 @@ pub use loader::{default_layers, ConfigError, ConfigLoader, LoadedConfig};
 // its former external test file was folded into `network.rs`'s own
 // `#[cfg(test)]` module and removed.
 pub use network::{load_network_config, NetworkConfig, NetworkConfigError};
+pub use policy::{
+    load_policy_files, load_policy_files_from_layers, PolicyFile, PolicyLayer, PolicyRule,
+    PolicyRuleOutcome,
+};
 pub use scope::ConfigScope;
 pub use secret_ref::SecretRef;

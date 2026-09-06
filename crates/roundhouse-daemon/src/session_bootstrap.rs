@@ -28,7 +28,7 @@
 //!   egress proxy.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use roundhouse_core::{
@@ -44,6 +44,8 @@ use roundhouse_net::policy::EgressPolicy;
 use roundhouse_net::proxy::{LoopbackProxy, ProxyHandle};
 use roundhouse_policy::engine::{CompiledRule, PolicyEngine};
 use roundhouse_policy::sealed::SealedContext;
+use roundhouse_policy::trust::{apply_project_scope_trust, TrustStore};
+use roundhouse_policy::{compile_policy_layers, PolicyConfigError};
 use roundhouse_provider::{Provider, RequestCtx};
 use roundhouse_sandbox::{Handle, Isolate};
 use roundhouse_store::{spawn_writer, EventWriter, StorePool};
@@ -65,6 +67,73 @@ use roundhouse_store::{spawn_writer, EventWriter, StorePool};
 /// [`no_policy_rules`] and therefore still loads **zero** operator rules —
 /// see that function's doc comment.
 pub type PolicyRuleSource = Arc<dyn Fn() -> Vec<CompiledRule> + Send + Sync>;
+
+/// Error returned while building the production [`PolicyRuleSource`].  This is
+/// deliberately a boot-time error: silently replacing a malformed operator
+/// policy with zero rules makes a configuration failure indistinguishable from
+/// the old, intentionally-empty policy and hides an authorization outage.
+#[derive(Debug, thiserror::Error)]
+pub enum PolicyRulesLoadError {
+    #[error("failed to load policy file")]
+    Config(#[source] roundhouse_config::ConfigError),
+    #[error("failed to compile policy file")]
+    Compile(#[source] PolicyConfigError),
+}
+
+/// Loads and validates operator policy files once at daemon boot, then mints a
+/// fresh rule vector for each session.  `CompiledRule` is intentionally not
+/// cloneable: its private construction is the policy authority, so the source
+/// recompiles the already-validated syntax rather than sharing mutable rules.
+///
+/// Project rules pass through [`apply_project_scope_trust`] on every mint.
+/// That gate is owned by `roundhouse-policy`, outside the agent-writable repo,
+/// and can therefore reject a project-layer widening before it reaches
+/// `PolicyEngine`.  User-global rules have no such gate because they are the
+/// operator-controlled wider scope.
+pub fn policy_rules_from_files(
+    project_root: Option<PathBuf>,
+    trust_state_dir: PathBuf,
+) -> Result<PolicyRuleSource, PolicyRulesLoadError> {
+    let layers = roundhouse_config::load_policy_files(project_root.as_deref())
+        .map_err(PolicyRulesLoadError::Config)?;
+
+    // Validate compilation now, before main creates/removes the socket.  The
+    // factory below repeats this deterministic work only because rules cannot
+    // be cloned without reopening their construction authority.
+    effective_policy_rules(&layers, project_root.as_deref(), &trust_state_dir)
+        .map_err(PolicyRulesLoadError::Compile)?;
+
+    Ok(Arc::new(move || {
+        effective_policy_rules(&layers, project_root.as_deref(), &trust_state_dir)
+            .expect("policy files were parsed and compiled during daemon boot")
+    }))
+}
+
+fn effective_policy_rules(
+    layers: &[roundhouse_config::PolicyLayer],
+    project_root: Option<&Path>,
+    trust_state_dir: &Path,
+) -> Result<Vec<CompiledRule>, PolicyConfigError> {
+    let mut effective = Vec::new();
+    let trust_store = TrustStore::new(trust_state_dir.to_path_buf());
+    for layer in layers {
+        let compiled = compile_policy_layers(vec![layer.clone()])?;
+        if layer.scope == roundhouse_config::ConfigScope::Project {
+            // `load_policy_files` labels this path itself; do not accept a
+            // caller-supplied scope label for an agent-controlled path.
+            let root = project_root.expect("a project layer requires a project root");
+            effective.extend(apply_project_scope_trust(
+                root,
+                &layer.contents,
+                compiled,
+                &trust_store,
+            ));
+        } else {
+            effective.extend(compiled);
+        }
+    }
+    Ok(effective)
+}
 
 /// The production [`PolicyRuleSource`]: **no config-derived rules at all**.
 ///
@@ -609,6 +678,31 @@ fn build_sealed_ctx_provider(
 mod tests {
     use super::*;
     use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
+
+    #[test]
+    fn an_untrusted_project_allow_is_filtered_before_a_session_can_receive_it() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let layer = roundhouse_config::PolicyLayer {
+            scope: roundhouse_config::ConfigScope::Project,
+            path: project.path().join(".roundhouse/policy.toml"),
+            contents: "[[rule]]\nid = 'repo-read'\noutcome = 'allow'\nread = '/workspace/a'\n"
+                .to_string(),
+            file: roundhouse_config::PolicyFile {
+                rule: vec![roundhouse_config::PolicyRule {
+                    id: "repo-read".to_string(),
+                    outcome: roundhouse_config::PolicyRuleOutcome::Allow,
+                    read: PathBuf::from("/workspace/a"),
+                }],
+            },
+        };
+        let effective =
+            effective_policy_rules(&[layer], Some(project.path()), state.path()).unwrap();
+        assert!(
+            effective.is_empty(),
+            "a first-use project file must not widen policy with its Allow rule"
+        );
+    }
     use roundhouse_sandbox::probe::{MechanismProbeReport, MechanismStatus};
 
     fn available_isolate() -> Arc<dyn Isolate> {
