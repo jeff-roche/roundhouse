@@ -1,7 +1,7 @@
 //! Real per-session construction (Phase 7, Task 7): turns a `CreateSession`
 //! handshake into a real, event-sourced [`SessionActor`] backed by real
 //! isolation, policy, MCP, redaction, and egress — the machinery Tasks 1-6
-//! built and left unreachable from any real call site. Replaces `demo.rs`'s
+//! built and wired into the daemon's production session-creation call site. Replaces `demo.rs`'s
 //! scripted, single-session stand-in as the daemon's actual session-creation
 //! path.
 //!
