@@ -290,6 +290,26 @@ fn has_production_call(source: &str, call: &str) -> bool {
                 syn::visit::visit_item_mod(self, item);
             }
         }
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if !cfg_test(&item.attrs) {
+                syn::visit::visit_item_impl(self, item);
+            }
+        }
+        fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+            if !cfg_test(&item.attrs) {
+                syn::visit::visit_item_const(self, item);
+            }
+        }
+        fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+            if !cfg_test(&item.attrs) {
+                syn::visit::visit_item_static(self, item);
+            }
+        }
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            if !cfg_test(&item.attrs) {
+                syn::visit::visit_item_trait(self, item);
+            }
+        }
         fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
             if node
                 .func
@@ -315,9 +335,32 @@ fn has_production_call(source: &str, call: &str) -> bool {
         }
     }
     fn cfg_test(attrs: &[syn::Attribute]) -> bool {
+        fn test_meta(meta: &syn::Meta) -> bool {
+            match meta {
+                syn::Meta::Path(path) => path.is_ident("test"),
+                syn::Meta::List(list) => {
+                    if list.path.is_ident("not") {
+                        return false;
+                    }
+                    if list.path.is_ident("any") || list.path.is_ident("all") {
+                        return list.parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+                            .map(|items| items.iter().any(test_meta)).unwrap_or(false);
+                    }
+                    false
+                }
+                syn::Meta::NameValue(_) => false,
+            }
+        }
         attrs.iter().filter(|a| a.path().is_ident("cfg")).any(|a| {
-            let text = a.meta.to_token_stream().to_string();
-            text.contains("test") && !text.contains("not ( test )")
+            if let syn::Meta::List(list) = &a.meta {
+                list.parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .map(|items| items.iter().any(test_meta))
+                .unwrap_or(false)
+            } else {
+                false
+            }
         })
     }
     let mut calls = Calls {

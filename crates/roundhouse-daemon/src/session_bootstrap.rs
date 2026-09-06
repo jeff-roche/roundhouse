@@ -34,6 +34,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 
 use futures::stream::{FuturesUnordered, StreamExt};
+use futures::FutureExt;
 use roundhouse_core::{
     OnDegrade, SessionId, SessionSpec, SessionState, TaskRunner, Tier, WorkspaceId,
 };
@@ -125,9 +126,17 @@ impl BackgroundServices {
             tokio::select! {
                 ready = ready_rx => match ready {
                     Ok(Ok(())) => {
-                        // The service remains in `handles`; its terminal
-                        // result is supervised by `wait_for_failure` after
-                        // boot. No timing grace window is used here.
+                        tokio::task::yield_now().await;
+                        if let Some(completed) = handles.next().now_or_never().flatten() {
+                            cancel.send_replace(true);
+                            for handle in handles.iter() { handle.abort(); }
+                            while handles.next().await.is_some() {}
+                            return match completed {
+                                Ok(Err(error)) => Err(error),
+                                Ok(Ok(())) => Err(BackgroundServiceError("service stopped during startup".to_string())),
+                                Err(error) => Err(BackgroundServiceError(error.to_string())),
+                            };
+                        }
                     }
                     Ok(Err(error)) => {
                         cancel.send_replace(true);
@@ -162,6 +171,7 @@ impl BackgroundServices {
 /// Daemon-owned join/cancellation handle for all started background services.
 /// The daemon calls [`Self::shutdown`] on exit and [`Self::wait_for_failure`]
 /// while serving, making both cancellation and error propagation explicit.
+#[derive(Debug)]
 pub struct RunningBackgroundServices {
     cancel: watch::Sender<bool>,
     handles: FuturesUnordered<tokio::task::JoinHandle<Result<(), BackgroundServiceError>>>,
@@ -906,6 +916,31 @@ mod tests {
             "scheduler failed"
         );
         running.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_immediate_ready_then_error_cannot_escape_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = roundhouse_store::open(&dir.path().join("events.db"))
+            .await
+            .unwrap();
+        let service: BackgroundService = Arc::new(|mut context| {
+            Box::pin(async move {
+                context.signal_ready()?;
+                Err(BackgroundServiceError("immediate failure".to_string()))
+            })
+        });
+        let result = BackgroundServices {
+            workflow: Some(service),
+            scheduler: None,
+            acp: None,
+        }
+        .start(
+            store,
+            Arc::new(crate::session_registry::SessionRegistry::new()),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().0, "immediate failure");
     }
 
     #[test]
