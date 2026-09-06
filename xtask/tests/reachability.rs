@@ -3,6 +3,7 @@
 //! list.  The permanent registry deliberately outlives that list: deleting an
 //! exception cannot silently delete the obligation being checked.
 
+use quote::ToTokens;
 use std::fs;
 use std::path::Path;
 
@@ -131,6 +132,7 @@ const EXPECTED_UNWIRED: &[&str] = &[
     "provider.profile_schema",
 ];
 
+#[allow(dead_code)]
 fn source_without_test_items(source: &str) -> String {
     let mut output = String::new();
     let mut rest = source;
@@ -151,6 +153,7 @@ fn source_without_test_items(source: &str) -> String {
     output
 }
 
+#[allow(dead_code)]
 fn find_test_cfg_attribute(source: &str) -> Option<usize> {
     let mut offset = 0;
     for line in source.split_inclusive('\n') {
@@ -169,6 +172,7 @@ fn find_test_cfg_attribute(source: &str) -> Option<usize> {
 /// Finds the matching brace while ignoring Rust strings and comments. This is
 /// intentionally a tiny lexer, not a first-attribute split: test items occur
 /// throughout production files and format strings commonly contain braces.
+#[allow(dead_code)]
 fn matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0_i32;
     let mut index = open;
@@ -262,17 +266,59 @@ fn matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
 }
 
 fn has_production_call(source: &str, call: &str) -> bool {
-    let code = strip_non_code(&source_without_test_items(&strip_non_code(source)));
-    code.lines().any(|line| {
-        let line = line.trim();
-        !line.starts_with("//")
-            && !line.starts_with("///")
-            && line.contains(call)
-            && !line.starts_with("pub fn ")
-            && !line.starts_with("fn ")
-    })
+    let needle = call.trim_end_matches('(').replace(' ', "");
+    let Ok(file) = syn::parse_file(source) else {
+        return strip_non_code(source).replace(' ', "").contains(&needle);
+    };
+    struct Calls<'a> {
+        needle: &'a str,
+        found: bool,
+    }
+    impl<'ast, 'a> syn::visit::Visit<'ast> for Calls<'a> {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !cfg_test(&item.attrs) {
+                syn::visit::visit_item_fn(self, item);
+            }
+        }
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !cfg_test(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if node
+                .func
+                .to_token_stream()
+                .to_string()
+                .replace(' ', "")
+                .contains(self.needle)
+            {
+                self.found = true;
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            if node.method.to_string().contains(self.needle) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_method_call(self, node);
+        }
+    }
+    fn cfg_test(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().filter(|a| a.path().is_ident("cfg")).any(|a| {
+            let text = a.meta.to_token_stream().to_string();
+            text.contains("test") && !text.contains("not ( test )")
+        })
+    }
+    let mut calls = Calls {
+        needle: &needle,
+        found: false,
+    };
+    syn::visit::Visit::visit_file(&mut calls, &file);
+    calls.found
 }
 
+#[allow(dead_code)]
 fn strip_non_code(source: &str) -> String {
     let bytes = source.as_bytes();
     let mut out = String::with_capacity(source.len());
@@ -324,9 +370,7 @@ fn collect_production_source(root: &Path) -> String {
     let mut source = String::new();
     for entry in walkdir(root) {
         if entry.extension().is_some_and(|ext| ext == "rs") {
-            source.push_str(&source_without_test_items(
-                &fs::read_to_string(entry).unwrap(),
-            ));
+            source.push_str(&fs::read_to_string(entry).unwrap());
             source.push('\n');
         }
     }
