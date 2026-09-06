@@ -266,7 +266,12 @@ fn matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
 }
 
 fn has_production_call(source: &str, call: &str) -> bool {
-    let needle = call.trim_end_matches('(').replace(' ', "");
+    if source.contains("\n// __ROUNDHOUSE_FILE__\n") {
+        return source
+            .split("\n// __ROUNDHOUSE_FILE__\n")
+            .any(|part| has_production_call(part, call));
+    }
+    let needle = call.trim_end_matches('(').replace([' ', '.'], "");
     let Ok(file) = syn::parse_file(source) else {
         return strip_non_code(source).replace(' ', "").contains(&needle);
     };
@@ -290,7 +295,7 @@ fn has_production_call(source: &str, call: &str) -> bool {
                 .func
                 .to_token_stream()
                 .to_string()
-                .replace(' ', "")
+                .replace([' ', '.'], "")
                 .contains(self.needle)
             {
                 self.found = true;
@@ -298,7 +303,12 @@ fn has_production_call(source: &str, call: &str) -> bool {
             syn::visit::visit_expr_call(self, node);
         }
         fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-            if node.method.to_string().contains(self.needle) {
+            if node
+                .method
+                .to_string()
+                .replace('.', "")
+                .contains(self.needle)
+            {
                 self.found = true;
             }
             syn::visit::visit_expr_method_call(self, node);
@@ -371,6 +381,7 @@ fn collect_production_source(root: &Path) -> String {
     for entry in walkdir(root) {
         if entry.extension().is_some_and(|ext| ext == "rs") {
             source.push_str(&fs::read_to_string(entry).unwrap());
+            source.push_str("\n// __ROUNDHOUSE_FILE__\n");
             source.push('\n');
         }
     }

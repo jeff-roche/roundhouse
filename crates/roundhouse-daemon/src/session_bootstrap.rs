@@ -125,24 +125,9 @@ impl BackgroundServices {
             tokio::select! {
                 ready = ready_rx => match ready {
                     Ok(Ok(())) => {
-                        // Give already-started services one scheduling turn
-                        // before declaring boot ready. This closes the race
-                        // where a service fails at the same instant a later
-                        // service signals readiness.
-                        tokio::task::yield_now().await;
-                        if let Ok(Some(completed)) = tokio::time::timeout(
-                            std::time::Duration::from_millis(1),
-                            handles.next(),
-                        ).await {
-                            cancel.send_replace(true);
-                            for handle in handles.iter() { handle.abort(); }
-                            while handles.next().await.is_some() {}
-                            return match completed {
-                                Ok(Err(error)) => Err(error),
-                                Ok(Ok(())) => Err(BackgroundServiceError("service stopped during startup".to_string())),
-                                Err(error) => Err(BackgroundServiceError(error.to_string())),
-                            };
-                        }
+                        // The service remains in `handles`; its terminal
+                        // result is supervised by `wait_for_failure` after
+                        // boot. No timing grace window is used here.
                     }
                     Ok(Err(error)) => {
                         cancel.send_replace(true);
