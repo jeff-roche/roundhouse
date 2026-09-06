@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use roundhouse_core::{
     OnDegrade, SessionId, SessionSpec, SessionState, TaskRunner, Tier, WorkspaceId,
 };
@@ -108,7 +109,7 @@ impl BackgroundServices {
         sessions: Arc<crate::session_registry::SessionRegistry>,
     ) -> Result<RunningBackgroundServices, BackgroundServiceError> {
         let (cancel, _) = watch::channel(false);
-        let mut handles = Vec::new();
+        let handles = FuturesUnordered::new();
         for service in [&self.workflow, &self.scheduler, &self.acp]
             .into_iter()
             .flatten()
@@ -125,7 +126,7 @@ impl BackgroundServices {
                 Ok(Ok(())) => handles.push(handle),
                 Ok(Err(error)) => {
                     cancel.send_replace(true);
-                    for handle in handles {
+                    for handle in handles.iter() {
                         handle.abort();
                     }
                     handle.abort();
@@ -133,7 +134,7 @@ impl BackgroundServices {
                 }
                 Err(_) => {
                     cancel.send_replace(true);
-                    for handle in handles {
+                    for handle in handles.iter() {
                         handle.abort();
                     }
                     handle.abort();
@@ -152,13 +153,13 @@ impl BackgroundServices {
 /// while serving, making both cancellation and error propagation explicit.
 pub struct RunningBackgroundServices {
     cancel: watch::Sender<bool>,
-    handles: Vec<tokio::task::JoinHandle<Result<(), BackgroundServiceError>>>,
+    handles: FuturesUnordered<tokio::task::JoinHandle<Result<(), BackgroundServiceError>>>,
 }
 
 impl RunningBackgroundServices {
     pub async fn wait_for_failure(&mut self) -> Result<(), BackgroundServiceError> {
-        if let Some(handle) = self.handles.first_mut() {
-            match handle.await {
+        if let Some(handle) = self.handles.next().await {
+            match handle {
                 Ok(Ok(())) => {
                     return Err(BackgroundServiceError(
                         "service stopped unexpectedly".to_string(),
@@ -173,14 +174,19 @@ impl RunningBackgroundServices {
 
     pub async fn shutdown(mut self) -> Result<(), BackgroundServiceError> {
         self.cancel.send_replace(true);
-        for handle in &mut self.handles {
-            match handle.await {
+        let mut first_error = None;
+        while let Some(handle) = self.handles.next().await {
+            match handle {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => return Err(error),
-                Err(error) => return Err(BackgroundServiceError(error.to_string())),
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(BackgroundServiceError(error.to_string()));
+                }
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -851,6 +857,48 @@ mod tests {
             .await
             .unwrap();
         started_rx.recv().await.unwrap();
+        running.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_non_workflow_service_failure_is_observed_and_the_remaining_service_is_joined() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = roundhouse_store::open(&dir.path().join("events.db"))
+            .await
+            .unwrap();
+        let workflow: BackgroundService = Arc::new(|mut context| {
+            Box::pin(async move {
+                context.signal_ready()?;
+                while !*context.cancelled.borrow() {
+                    context.cancelled.changed().await.map_err(|_| {
+                        BackgroundServiceError("daemon dropped cancellation channel".to_string())
+                    })?;
+                }
+                Ok(())
+            })
+        });
+        let scheduler: BackgroundService = Arc::new(|mut context| {
+            Box::pin(async move {
+                context.signal_ready()?;
+                Err(BackgroundServiceError("scheduler failed".to_string()))
+            })
+        });
+        let services = BackgroundServices {
+            workflow: Some(workflow),
+            scheduler: Some(scheduler),
+            acp: None,
+        };
+        let mut running = services
+            .start(
+                store,
+                Arc::new(crate::session_registry::SessionRegistry::new()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            running.wait_for_failure().await.unwrap_err().0,
+            "scheduler failed"
+        );
         running.shutdown().await.unwrap();
     }
 

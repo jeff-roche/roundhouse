@@ -41,9 +41,11 @@ use std::time::Duration;
 
 use futures::stream;
 use roundhouse_core::{EventPayload, SessionId, TaskKind};
-use roundhouse_daemon::session_bootstrap::{no_policy_rules, PolicyRuleSource};
-use roundhouse_policy::engine::{CompiledRule, Outcome, Predicate, Scope};
-use roundhouse_policy::FsOp;
+use roundhouse_daemon::session_bootstrap::{
+    no_policy_rules, policy_rules_from_files, PolicyRuleSource,
+};
+use roundhouse_policy::config::compile_policy_layers;
+use roundhouse_policy::trust::{record_explicit_trust, TrustStore};
 use roundhouse_proto::ClientRequest;
 use roundhouse_provider::{
     BlockDelta, BlockKind, BoxFut, Capabilities, ChatRequest, ChatStream, ContentBlock, ModelId,
@@ -552,22 +554,41 @@ async fn the_phase_exit_criterion_a_model_issued_tool_call_actually_runs_and_its
         "read",
         serde_json::json!({ "path": fixture.to_string_lossy() }),
     ));
-    // One ordinary config-shaped rule: reads under the fixture directory are
-    // allowed. `CompiledRule` is not `Clone`, so the source mints a fresh one
-    // per session — which is exactly why `PolicyRuleSource` is a factory.
-    let rules: PolicyRuleSource = {
-        let root = fixture_root.clone();
-        Arc::new(move || {
-            vec![CompiledRule::test_new(
-                Scope::Builtin,
-                Outcome::Allow,
-                Predicate::FsPrefix {
-                    op: FsOp::Read,
-                    prefix: root.clone(),
-                },
-            )]
-        })
-    };
+    // Exercise the production rule-file loader, not an injected literal.
+    // Project Allows require explicit out-of-repository trust; record that
+    // operator decision here before the source mints a session-local rule.
+    let policy_dir = fixture_root.join(".roundhouse");
+    std::fs::create_dir(&policy_dir).unwrap();
+    let policy_path = policy_dir.join("policy.toml");
+    let policy_text = format!(
+        "[[rule]]\nid = 'fixture-read'\noutcome = 'allow'\nread = {:?}\n",
+        fixture
+    );
+    std::fs::write(&policy_path, &policy_text).unwrap();
+    let trust_state = tempfile::tempdir().unwrap();
+    let rules =
+        policy_rules_from_files(Some(fixture_root.clone()), trust_state.path().to_path_buf())
+            .unwrap();
+    let compiled = compile_policy_layers(vec![roundhouse_config::PolicyLayer {
+        scope: roundhouse_config::ConfigScope::Project,
+        path: policy_path,
+        contents: policy_text.clone(),
+        file: roundhouse_config::PolicyFile {
+            rule: vec![roundhouse_config::PolicyRule {
+                id: "fixture-read".to_string(),
+                outcome: roundhouse_config::PolicyRuleOutcome::Allow,
+                read: fixture.clone(),
+            }],
+        },
+    }])
+    .unwrap();
+    record_explicit_trust(
+        &fixture_root,
+        &policy_text,
+        &compiled,
+        &TrustStore::new(trust_state.path().to_path_buf()),
+    )
+    .unwrap();
     let daemon = start_daemon_with_rules(provider.clone(), rules).await;
 
     let mut creator = tokio::time::timeout(

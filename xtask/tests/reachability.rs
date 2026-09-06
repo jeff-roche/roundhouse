@@ -132,15 +132,49 @@ const EXPECTED_UNWIRED: &[&str] = &[
 ];
 
 fn source_without_test_items(source: &str) -> String {
-    // The guard's call spellings are qualified, so a complete test-only file
-    // can be dropped conservatively without confusing a definition for a
-    // production call. Individual production files retain their non-test
-    // content; component integration tests supply stronger runtime evidence.
-    if source.trim_start().starts_with("#[cfg(test)]") {
-        String::new()
-    } else {
-        source.to_string()
+    let mut output = String::new();
+    let mut rest = source;
+    while let Some(offset) = rest.find("#[cfg(test)]") {
+        output.push_str(&rest[..offset]);
+        let after = &rest[offset + "#[cfg(test)]".len()..];
+        let trimmed = after.trim_start();
+        if !trimmed.starts_with("mod ") {
+            // Attribute on a non-module item: retain it rather than guessing
+            // where the item ends. The registry never treats definitions as
+            // calls, and module bodies are where test-only calls live.
+            output.push_str("#[cfg(test)]");
+            rest = after;
+            continue;
+        }
+        let open = trimmed.find('{').expect("a cfg(test) module has a body");
+        let mut depth = 0_i32;
+        let mut end = None;
+        for (index, byte) in trimmed[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + index + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            // Macro input can contain delimiter-like bytes that this compact
+            // scanner cannot classify. Keep the remainder rather than
+            // silently dropping production code; the explicit inline-module
+            // regression above covers the ordinary module shape.
+            output.push_str(trimmed);
+            rest = "";
+            break;
+        };
+        rest = &trimmed[end..];
     }
+    output.push_str(rest);
+    output
 }
 
 fn has_production_call(source: &str, call: &str) -> bool {
@@ -158,7 +192,9 @@ fn collect_production_source(root: &Path) -> String {
     let mut source = String::new();
     for entry in walkdir(root) {
         if entry.extension().is_some_and(|ext| ext == "rs") {
-            source.push_str(&fs::read_to_string(entry).unwrap());
+            source.push_str(&source_without_test_items(
+                &fs::read_to_string(entry).unwrap(),
+            ));
             source.push('\n');
         }
     }
@@ -213,6 +249,14 @@ fn anti_vacuity_a_removed_production_call_fails_the_guard() {
     assert!(!has_production_call(
         "#[cfg(test)]\nfn t() { real::entry(); }",
         feature.call
+    ));
+}
+
+#[test]
+fn anti_vacuity_an_inline_test_module_cannot_satisfy_the_guard() {
+    assert!(!has_production_call(
+        "#[cfg(test)]\nmod tests { fn only_test() { real::entry(); } }",
+        "real::entry("
     ));
 }
 
