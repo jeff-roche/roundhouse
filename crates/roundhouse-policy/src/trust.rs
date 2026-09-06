@@ -56,9 +56,8 @@
 //! `file_order` FIELD, not whatever position a caller's `Vec` happens to iterate rules
 //! in — so `signature_sequence` (below) always sorts by `file_order` before building the
 //! sequence `classify` compares, regardless of the order `parsed_project_rules` arrives
-//! in. Nothing currently in this codebase sets a non-zero `file_order` (the real
-//! `.roundhouse/policy.toml` parser/compiler this module isn't wired into yet doesn't
-//! exist), so today `Vec` order and `file_order` order coincide by construction; this
+//! in. The `.roundhouse/policy.toml` compiler assigns `file_order` per loaded layer, so
+//! today `Vec` order and `file_order` order coincide by construction; this
 //! sort is what keeps that true once a real caller exists that might filter, group, or
 //! recollect rules before calling this module.
 
