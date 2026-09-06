@@ -662,8 +662,9 @@ impl BindConfig {
         }
     }
 
-    /// The address a listener should bind. **Nothing calls this yet** — no crate
-    /// in this workspace binds a listener; see [`crate`]'s module docs.
+    /// The address a listener should bind. `roundhouse-daemon`'s `main.rs`
+    /// calls this now (Task 9, Phase 7), always with the [`Self::loopback`]
+    /// variant — see [`crate`]'s module docs.
     pub fn bind_addr(&self) -> IpAddr {
         match &self.inner {
             Bind::Loopback => IpAddr::V4(Ipv4Addr::LOCALHOST),

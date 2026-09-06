@@ -40,6 +40,14 @@ roundhouse-flow = { path = "../roundhouse-flow" }
 roundhouse-sched = { path = "../roundhouse-sched" }
 roundhouse-config = { path = "../roundhouse-config" }
 roundhouse-tui = { path = "../roundhouse-tui" }
+# Phase 7, Task 9: `main.rs` mounts `roundhouse_web::build_router` behind a
+# loopback HTTP listener, spawned alongside Task 3's Unix-socket accept loop
+# — the wiring `roundhouse-web`'s own module doc named as the crate's whole
+# remaining cost ("nothing links it yet"). `axum` itself stays confined to
+# `roundhouse-web` (`roundhouse_web::serve` takes an already-bound
+# `tokio::net::TcpListener` and the built `axum::Router`), so this daemon
+# gains no direct `axum` dependency of its own.
+roundhouse-web = { path = "../roundhouse-web" }
 # Phase 7, Task 7: `round-daemon-internal` needs a `--socket PATH` flag (the
 # lane file's own correction: "the daemon binary needs a --socket flag, not
 # a daemon subcommand of its own"). Same exact pin as `roundhouse-cli`'s own

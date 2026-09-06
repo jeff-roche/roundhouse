@@ -24,19 +24,31 @@
 //! into that same `api_router`, which is how it is gated and `Host`-checked
 //! without either being decided again. **It answers `501`**: the URL and
 //! request shape are real, and nothing in this workspace can yet deliver an
-//! interaction anywhere; that module's docs carry the whole argument.
-//! **This crate still binds no listener and starts no server**, and nothing
-//! links it yet — so [`lan_auth::BindConfig::bind_addr`] has no caller.
+//! interaction anywhere; that module's docs carry the whole argument. Task 9
+//! did not change this: a web request carries no connection identity that
+//! could ever be "the connection that created the session" (see
+//! `roundhouse-daemon`'s `socket_server::drive_session` module doc, W1-R37/
+//! W1-R52), so an HTTP-driven interaction would have to default the send side
+//! open — the exact approval-hijack primitive those rulings forbid — even
+//! though a real session actor now exists to receive one.
 //!
-//! Wiring it up is a separate, later piece of work, and it is not free: it has
-//! to add the `roundhouse-daemon -> roundhouse-web` Cargo edge, update
-//! `xtask/tests/workspace_shape.rs`'s exact-set assertion on the daemon's
-//! dependencies, and update §5.2's daemon row in
-//! `docs/architecture/02-system-architecture.md` — all three in one commit, or
-//! the workspace-shape test fails. The loopback-vs-LAN binding policy (§11.3)
-//! that used to block it now exists — see [`lan_auth`] — but
-//! `roundhouse-daemon`'s `main.rs` still has no long-running accept loop to
-//! hang a listener off.
+//! **Task 9 (Phase 7) wired this crate into the live daemon.**
+//! `roundhouse-daemon`'s `main.rs` now builds an [`AppState`] (its `store`
+//! field a real `roundhouse_store::StorePool`, via [`BoundedStore::new`]),
+//! calls [`build_router`] with [`lan_auth::BindConfig::loopback`] — the
+//! zero-configuration default; nothing yet exercises
+//! [`lan_auth::BindConfig::lan`] in production, so [`lan_auth::LanToken`]
+//! still has no caller — and hands the result to [`serve`] alongside a
+//! `tokio::net::TcpListener` it binds itself, running that future next to
+//! Task 3's Unix-socket accept loop. [`lan_auth::BindConfig::bind_addr`] and
+//! [`serve`] therefore both have a real caller now. This crate performs no
+//! authentication of its own on that loopback bind (per §11.3, "loopback-only
+//! remains what you get with no configuration") — the posture inherited from
+//! the frozen design, not decided here, and a different one from the Unix
+//! socket's: a peercred-checked `0700` directory admits only this uid, where a
+//! loopback TCP port admits every local uid. See [`sse`]'s residual 1, which
+//! this task closes only its own half of (a listener exists; nothing calls
+//! [`sse::SseHub::publish`] in production yet — see that module for why).
 //!
 //! Per ruling P10 the assets ship in the **daemon** binary: `roundhouse-web`
 //! links into `roundhouse-daemon`, and `round daemon` (in `roundhouse-cli`)
@@ -135,9 +147,10 @@ pub struct AppState {
     /// that this field being `pub` does not put `.pool` within a handler's
     /// reach — see that type for why the difference is the whole bound.
     ///
-    /// **Nothing in this workspace constructs an `AppState` with a store in it
-    /// yet**, because nothing links this crate at all; see this module's docs
-    /// for what wiring the daemon up costs.
+    /// `roundhouse-daemon`'s `main.rs` now constructs one with a real store
+    /// (Task 9, Phase 7) — see this module's docs for exactly what that
+    /// wiring does. Every router in this crate's own test suite still builds
+    /// one with `None`.
     pub store: Option<BoundedStore>,
     /// How many API requests may hold a [`store`](Self::store) connection at
     /// once. See [`ApiPoolPermits`] — the field exists so that a handler cannot
@@ -362,6 +375,23 @@ pub fn build_router(state: AppState, bind: &lan_auth::BindConfig) -> axum::Route
     };
 
     assets::asset_router().nest("/api", api).with_state(state)
+}
+
+/// Serves `router` on `listener` until the listener errors or every clone of
+/// it is dropped.
+///
+/// This is the **only** thing in this crate that names `axum::serve`, and
+/// deliberately: it takes an already-bound `tokio::net::TcpListener` rather
+/// than an address, the same shape `roundhouse-daemon`'s own `bind_socket`/
+/// `accept_loop` split uses for the Unix socket — the caller does the
+/// (synchronous-for-the-socket-case, here `.await`-based) bind in its own
+/// stack frame, so a client dialing immediately after that call returns finds
+/// a real, already-bound listener, and this crate still binds nothing itself.
+/// Keeping `axum::serve` behind this one function is what lets
+/// `roundhouse-daemon`'s `Cargo.toml` gain a `roundhouse-web` edge and no
+/// direct `axum` edge of its own.
+pub async fn serve(listener: tokio::net::TcpListener, router: axum::Router) -> std::io::Result<()> {
+    axum::serve(listener, router).await
 }
 
 /// **The single registration point for every API route in this crate**, nested

@@ -25,8 +25,12 @@
 //! lane's charter (see `socket_server::drive_session`'s own doc comment on
 //! the `Attach`/`CreateSession`-only handshake). So a session created here
 //! is real and reachable, but nothing yet drives a chat turn against it
-//! from a live client — that remains a later task's integration point
-//! (most plausibly `roundhouse-web`'s HTTP layer, Task 9).
+//! from a live client. Phase 7, Task 9 links `roundhouse-web`'s HTTP layer
+//! into this binary (see `roundhouse_web::build_router`, mounted below) but
+//! deliberately does **not** close this gap: `roundhouse_web::interaction`
+//! still answers `501` because an HTTP request carries no connection
+//! identity `drive_session`'s creator-only rule (below) could ever honor —
+//! see that module's own doc comment for the full argument.
 #![forbid(unsafe_code)]
 
 use clap::Parser;
@@ -503,15 +507,46 @@ async fn main() -> color_eyre::Result<()> {
 
     let registry = Arc::new(SessionRegistry::new());
 
+    // Phase 7, Task 9: `roundhouse-web`'s HTTP surface, bound alongside the
+    // Unix socket below rather than instead of it — `round attach`/`round
+    // create` keep using the socket; this is the browser's transport. Bound
+    // *before* `bind_socket`, deliberately: a web-bind failure (the realistic
+    // case is fd exhaustion) must return from `main` with no socket file on
+    // disk yet, rather than leaving one behind for the next boot's
+    // `remove_stale_socket` to clean up — the same "leftover socket looks
+    // like a live-but-unreachable daemon" symptom W1-R109/W1-R111 already
+    // fixed for this function's ordering, not a new one to reintroduce here.
+    // Once the socket exists, both surfaces are up.
+    //
+    // `lan_auth::BindConfig::loopback()` — the zero-configuration default
+    // (`BindConfig`'s own `Default` impl, spelled out here rather than relied
+    // on implicitly) — not `BindConfig::lan`: that constructor needs a
+    // `LanToken` this binary has no flag to provide yet, and defaulting to it
+    // would serve every session's history to the LAN with no gate. Port 0:
+    // this binary has no stable port to publish (Task 10, the frontend, is
+    // what gives an operator a URL to bookmark), and an ephemeral port makes
+    // `round-daemon-internal` safe to run more than once on one host without
+    // a collision.
+    let web_bind = roundhouse_web::lan_auth::BindConfig::loopback();
+    let web_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+    let web_addr = web_listener.local_addr()?;
+    let web_state = roundhouse_web::AppState {
+        store: Some(roundhouse_web::BoundedStore::new(resources.store.clone())),
+        ..Default::default()
+    };
+    let web_router = roundhouse_web::build_router(web_state, &web_bind);
+
     // `bind_socket` (bind, then chmod to owner-only) runs here, synchronously,
     // in this stack frame, before `accept_loop` is ever spawned — restoring
     // the guarantee that a client dialing immediately after this function
     // returns will find a real, already-bound socket (`accept_loop`'s own
-    // doc comment, ruling W1-R12).
+    // doc comment, ruling W1-R12). Ordered after the web bind above for the
+    // reason stated there: the socket's existence is now the signal that
+    // BOTH listeners are ready, not just this one.
     let listener = bind_socket(&socket_path)?;
 
     println!(
-        "round daemon listening: socket={} state_dir={} degrade={degrade_summary}",
+        "round daemon listening: socket={} web=http://{web_addr} state_dir={} degrade={degrade_summary}",
         socket_path.display(),
         resources.state_dir.display()
     );
@@ -524,12 +559,32 @@ async fn main() -> color_eyre::Result<()> {
     // inside it is caught by `JoinHandle` rather than taking this whole
     // `main` task down uncontrolled, but the handle is explicitly awaited and
     // its `Err` propagated — never `tokio::spawn(accept_loop(..))` with the
-    // handle discarded, the exact pattern this ruling forbids.
-    let accept_handle = tokio::spawn(accept_loop(listener, registry, resources));
-    let result = match accept_handle.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(color_eyre::eyre::eyre!(err)),
-        Err(join_err) => Err(color_eyre::eyre::eyre!(join_err.to_string())),
+    // handle discarded, the exact pattern this ruling forbids. The web
+    // listener (Task 9) gets the identical treatment and for the identical
+    // reason: `roundhouse_web::serve`'s `Err` must end the process rather
+    // than leave a daemon that answers the socket but silently dropped its
+    // HTTP surface. Whichever of the two ends first — normally neither does,
+    // since both run forever — aborts the other rather than leaving it
+    // orphaned, and this process exits non-zero unless both ended `Ok`.
+    let mut accept_handle = tokio::spawn(accept_loop(listener, registry, resources));
+    let mut web_handle = tokio::spawn(roundhouse_web::serve(web_listener, web_router));
+    let result = tokio::select! {
+        accept_result = &mut accept_handle => {
+            web_handle.abort();
+            match accept_result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(err)) => Err(color_eyre::eyre::eyre!(err)),
+                Err(join_err) => Err(color_eyre::eyre::eyre!(join_err.to_string())),
+            }
+        }
+        web_result = &mut web_handle => {
+            accept_handle.abort();
+            match web_result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(err)) => Err(color_eyre::eyre::eyre!(err)),
+                Err(join_err) => Err(color_eyre::eyre::eyre!(join_err.to_string())),
+            }
+        }
     };
 
     // Unlink on the way out: a bound Unix socket outlives the process that

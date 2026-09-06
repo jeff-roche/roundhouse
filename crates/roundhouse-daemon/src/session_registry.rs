@@ -363,6 +363,25 @@ impl SessionRegistry {
         }
     }
 
+    /// **Has zero production call sites as of Phase 7 Task 9** — `grep -rn
+    /// "\.publish(" crates/roundhouse-daemon/src/` finds only this file's own
+    /// tests. Nothing in this workspace forwards an appended event to a
+    /// subscriber by this transport, which is why an attached `round attach`
+    /// client receives the handshake `Ack`/`SessionCreated` frame and then
+    /// silence, forever — the `Degradation` `Note` `session_bootstrap.rs`
+    /// records is emitted but invisible to anyone watching. `roundhouse-web`'s
+    /// `sse::SseHub::publish` has the identical defect (that crate's own
+    /// module doc has the twin of this note): the two are one gap, not two,
+    /// and closing only one transport's half would leave the other's
+    /// subscribers just as silent. Fixing it needs a new observer seam on
+    /// `roundhouse-engine`'s side, threaded through every `EventWriter` a
+    /// session can append through (CF-12(a)) — recorded as an open item in
+    /// Task 9's report rather than built there, since neither this crate nor
+    /// `roundhouse-web` can be named from `roundhouse-engine` (the dependency
+    /// direction runs the other way) and the seam has to land after whatever
+    /// redaction step already protects a secret from reaching an append, or
+    /// forwarding becomes the leak.
+    ///
     /// Fans `event` out to every live subscriber of `session_id`, dropping
     /// it for any subscriber whose channel is currently full (see the module
     /// doc comment: backpressure a publisher must never block on) — counted
