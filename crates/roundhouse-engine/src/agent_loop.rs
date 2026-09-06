@@ -388,7 +388,6 @@ async fn dispatch_shell_command(
     {
         return Err("shell control-flow operators are not supported by this tool".to_string());
     }
-
     let env = roundhouse_policy::shell::classify::SessionEnv::default();
     let classification = roundhouse_policy::shell::opaque::classify_shell(command, &env);
     let parsed = match classification {
@@ -397,6 +396,13 @@ async fn dispatch_shell_command(
         }
         roundhouse_policy::shell::opaque::ShellClassification::Program(parsed) => parsed,
     };
+    if command.contains(['(', ')', '!'])
+        || command
+            .split_whitespace()
+            .any(|word| matches!(word, "function" | "coproc" | "time"))
+    {
+        return Err("shell compound syntax is not supported by this tool".to_string());
+    }
     let decision = actor.shell_command_decision(command, &env);
     if decision.outcome == roundhouse_policy::Outcome::Deny {
         return Err("the shell command was denied by policy".to_string());

@@ -12,5 +12,7 @@ Status: accepted 2026-09-06
 - Phase 8 also refuses shell control-flow operators and multiline compound
   commands. Flattening `&&`, `||`, command lists, or loops into independent
   execs would execute branches a shell would skip.
+- Phase 8 refuses grouping, function, coprocess, negation, and timed-command
+  syntax as well. These AST forms are not flattened into independent execs.
 - The classifier receives an empty `SessionEnv`. The daemon environment is not
   model input and must not become an implicit expansion channel.
