@@ -11,21 +11,16 @@
 //! is the phase's literal criterion and it **passes**: the tool actually
 //! runs, and its real output reaches the next provider turn.
 //!
-//! It supplies **one config-derived `Allow` rule** through the
-//! `PolicyRuleSource` seam (ruling W1-R118), because production passes
-//! `no_policy_rules()` and therefore has none. That is not the test working
-//! around the daemon — it is the test supplying the one input a real
-//! deployment would supply from config, and it is worth being precise about
-//! what that does and does not mean:
+//! It loads one project policy-file `Allow` rule through the same production
+//! `PolicyRuleSource` factory used at daemon boot, after recording explicit
+//! out-of-repository trust for that project file.
 //!
 //! - **What it proves:** every layer between a client frame and a real
 //!   filesystem read is correctly wired — handshake, creator-only guard,
 //!   spawned turn, `run_agent_loop`, `admit_task`, the real executor, and
 //!   the fold back into the next provider request.
-//! - **What it does NOT prove:** that a real daemon can do this today. There
-//!   is no rules loader in `roundhouse-config`, so production still loads
-//!   **zero** operator rules and still refuses every model-issued tool call
-//!   at admission. See `session_bootstrap::no_policy_rules`.
+//! - **What it does NOT prove:** broad policy language support; this L0 file
+//!   format intentionally permits only exact read rules.
 //!
 //! Nothing about the sealed floor is bypassed: `decide_sealed` still checks
 //! the compiled-in floor first and can still override the injected rule.
@@ -41,9 +36,11 @@ use std::time::Duration;
 
 use futures::stream;
 use roundhouse_core::{EventPayload, SessionId, TaskKind};
-use roundhouse_daemon::session_bootstrap::{no_policy_rules, PolicyRuleSource};
-use roundhouse_policy::engine::{CompiledRule, Outcome, Predicate, Scope};
-use roundhouse_policy::FsOp;
+use roundhouse_daemon::session_bootstrap::{
+    no_policy_rules, policy_rules_from_files, PolicyRuleSource,
+};
+use roundhouse_policy::config::compile_policy_layers;
+use roundhouse_policy::trust::{record_explicit_trust, TrustStore};
 use roundhouse_proto::ClientRequest;
 use roundhouse_provider::{
     BlockDelta, BlockKind, BoxFut, Capabilities, ChatRequest, ChatStream, ContentBlock, ModelId,
@@ -188,9 +185,8 @@ async fn start_daemon(provider: Arc<dyn Provider>) -> Daemon {
     start_daemon_with_rules(provider, no_policy_rules()).await
 }
 
-/// [`start_daemon`], but with a caller-supplied [`PolicyRuleSource`] — what
-/// the exit-criterion test needs, since production's [`no_policy_rules`]
-/// can never answer `Allow`.
+/// [`start_daemon`], but with a caller-supplied [`PolicyRuleSource`] — useful
+/// for tests that need a deliberately empty or independently prepared source.
 async fn start_daemon_with_rules(
     provider: Arc<dyn Provider>,
     policy_rules: PolicyRuleSource,
@@ -524,17 +520,11 @@ async fn an_oversized_submit_turn_is_dropped_without_wedging_the_connection() {
 /// `PolicyEngine` with its real compiled-in sealed floor, real isolation
 /// probe, real redaction), a real `SessionActor::admit_task`, Task 5's real
 /// `run_agent_loop`, and the real `roundhouse-tools` `read` executor. The
-/// two injected inputs are the scripted provider (so the test decides what
-/// the model asks for) and **one config-derived `Allow` rule**, supplied
-/// through the same `PolicyRuleSource` seam production passes
-/// `no_policy_rules()` to.
+/// only injected input is the scripted provider (so the test decides what
+/// the model asks for); its Allow is loaded through the production policy
+/// source from a real project file.
 ///
-/// **That rule is the honest part of this test, not a cheat.** Production
-/// still loads zero operator rules — there is no rules loader in
-/// `roundhouse-config` — so a real daemon today would still refuse this
-/// call at admission. What this proves is that the *daemon* is wired
-/// correctly end to end, and that the only thing standing between a real
-/// deployment and a working agent is a rules source. Nothing about the
+/// Nothing about the
 /// sealed floor, admission, dispatch, or execution is bypassed: the rule is
 /// an ordinary `Scope::Builtin` `FsPrefix{Read}` allow, exactly what an
 /// operator config would compile to, and `PolicyEngine::decide_sealed`
@@ -552,22 +542,41 @@ async fn the_phase_exit_criterion_a_model_issued_tool_call_actually_runs_and_its
         "read",
         serde_json::json!({ "path": fixture.to_string_lossy() }),
     ));
-    // One ordinary config-shaped rule: reads under the fixture directory are
-    // allowed. `CompiledRule` is not `Clone`, so the source mints a fresh one
-    // per session — which is exactly why `PolicyRuleSource` is a factory.
-    let rules: PolicyRuleSource = {
-        let root = fixture_root.clone();
-        Arc::new(move || {
-            vec![CompiledRule::test_new(
-                Scope::Builtin,
-                Outcome::Allow,
-                Predicate::FsPrefix {
-                    op: FsOp::Read,
-                    prefix: root.clone(),
-                },
-            )]
-        })
-    };
+    // Exercise the production rule-file loader, not an injected literal.
+    // Project Allows require explicit out-of-repository trust; record that
+    // operator decision here before the source mints a session-local rule.
+    let policy_dir = fixture_root.join(".roundhouse");
+    std::fs::create_dir(&policy_dir).unwrap();
+    let policy_path = policy_dir.join("policy.toml");
+    let policy_text = format!(
+        "[[rule]]\nid = 'fixture-read'\noutcome = 'allow'\nread = {:?}\n",
+        fixture
+    );
+    std::fs::write(&policy_path, &policy_text).unwrap();
+    let trust_state = tempfile::tempdir().unwrap();
+    let rules =
+        policy_rules_from_files(Some(fixture_root.clone()), trust_state.path().to_path_buf())
+            .unwrap();
+    let compiled = compile_policy_layers(vec![roundhouse_config::PolicyLayer {
+        scope: roundhouse_config::ConfigScope::Project,
+        path: policy_path,
+        contents: policy_text.clone(),
+        file: roundhouse_config::PolicyFile {
+            rule: vec![roundhouse_config::PolicyRule {
+                id: "fixture-read".to_string(),
+                outcome: roundhouse_config::PolicyRuleOutcome::Allow,
+                read: fixture.clone(),
+            }],
+        },
+    }])
+    .unwrap();
+    record_explicit_trust(
+        &fixture_root,
+        &policy_text,
+        &compiled,
+        &TrustStore::new(trust_state.path().to_path_buf()),
+    )
+    .unwrap();
     let daemon = start_daemon_with_rules(provider.clone(), rules).await;
 
     let mut creator = tokio::time::timeout(

@@ -349,6 +349,29 @@ async fn main() -> color_eyre::Result<()> {
     let runtime_dir = roundhouse_tui::default_runtime_dir();
     prepare_runtime_dir(&runtime_dir)?;
 
+    // Policy trust records deliberately live below the daemon's owner-only
+    // state directory rather than the project.  Parse and compile before
+    // touching the socket: a malformed policy is an operator-visible boot
+    // failure, never an invisible fallback to zero rules.  Creating the
+    // already-validated private runtime directory above is harmless; unlike
+    // `remove_stale_socket`, it cannot disconnect a live daemon.
+    let policy_rules = match roundhouse_daemon::session_bootstrap::policy_rules_from_files(
+        project_root.clone(),
+        runtime_dir.clone(),
+    ) {
+        Ok(source) => source,
+        Err(err) => {
+            tracing::error!(
+                target: "roundhouse_daemon::boot",
+                error_kind = std::any::type_name_of_val(&err),
+                "failed to load policy rules; refusing to boot"
+            );
+            return Err(color_eyre::eyre::eyre!(
+                "failed to load policy rules; refusing to boot (inspect the daemon log for the error kind)"
+            ));
+        }
+    };
+
     let socket_path = args
         .socket
         .or_else(|| std::env::var_os("ROUND_SOCKET").map(PathBuf::from))
@@ -499,15 +522,8 @@ async fn main() -> color_eyre::Result<()> {
         mcp_configs,
         network_config,
         default_on_degrade,
-        // Ruling W1-R118. **Production loads ZERO operator policy rules**,
-        // exactly as before this seam existed: `no_policy_rules` returns an
-        // empty `Vec`, so every session is `PolicyEngine::from_rules(vec![])`
-        // and every task no compiled-in sealed rule denies falls through to
-        // the `Ask` default -> `AdmitError::RequiresApproval`. There is no
-        // rules loader in `roundhouse-config` to pass anything else from;
-        // see `no_policy_rules`'s own doc comment for what that still means
-        // and why it is not solved here.
-        roundhouse_daemon::session_bootstrap::no_policy_rules(),
+        policy_rules,
+        roundhouse_daemon::session_bootstrap::BackgroundServices::default(),
         runner,
         provider,
         request_ctx,
@@ -515,6 +531,11 @@ async fn main() -> color_eyre::Result<()> {
     ));
 
     let registry = Arc::new(SessionRegistry::new());
+    let mut background_services = resources
+        .background_services
+        .start(resources.store.clone(), Arc::clone(&registry))
+        .await
+        .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
 
     // Phase 7, Task 9: `roundhouse-web`'s HTTP surface, bound alongside the
     // Unix socket below rather than instead of it — `round attach`/`round
@@ -578,6 +599,11 @@ async fn main() -> color_eyre::Result<()> {
     let mut accept_handle = tokio::spawn(accept_loop(listener, registry, resources));
     let mut web_handle = tokio::spawn(roundhouse_web::serve(web_listener, web_router));
     let result = tokio::select! {
+        service_result = background_services.wait_for_failure() => {
+            accept_handle.abort();
+            web_handle.abort();
+            Err(color_eyre::eyre::eyre!(service_result.err().map(|err| err.to_string()).unwrap_or_else(|| "background service stopped".to_string())))
+        }
         accept_result = &mut accept_handle => {
             web_handle.abort();
             match accept_result {
@@ -594,6 +620,16 @@ async fn main() -> color_eyre::Result<()> {
                 Err(join_err) => Err(color_eyre::eyre::eyre!(join_err.to_string())),
             }
         }
+    };
+
+    // Explicitly broadcast cancellation and join every background service
+    // before returning.  A service error is already reflected in `result`;
+    // shutdown only supplies an error when the foreground surfaces ended
+    // cleanly and a service then failed while joining.
+    let shutdown_result = background_services.shutdown().await;
+    let result = match (result, shutdown_result) {
+        (Ok(()), Err(error)) => Err(color_eyre::eyre::eyre!(error.to_string())),
+        (result, _) => result,
     };
 
     // Unlink on the way out: a bound Unix socket outlives the process that

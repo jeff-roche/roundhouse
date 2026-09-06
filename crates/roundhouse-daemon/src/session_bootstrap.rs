@@ -1,7 +1,7 @@
 //! Real per-session construction (Phase 7, Task 7): turns a `CreateSession`
 //! handshake into a real, event-sourced [`SessionActor`] backed by real
 //! isolation, policy, MCP, redaction, and egress — the machinery Tasks 1-6
-//! built and left unreachable from any real call site. Replaces `demo.rs`'s
+//! built and wired into the daemon's production session-creation call site. Replaces `demo.rs`'s
 //! scripted, single-session stand-in as the daemon's actual session-creation
 //! path.
 //!
@@ -28,9 +28,13 @@
 //!   egress proxy.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 
+use futures::stream::{FuturesUnordered, StreamExt};
+use futures::FutureExt;
 use roundhouse_core::{
     OnDegrade, SessionId, SessionSpec, SessionState, TaskRunner, Tier, WorkspaceId,
 };
@@ -44,9 +48,178 @@ use roundhouse_net::policy::EgressPolicy;
 use roundhouse_net::proxy::{LoopbackProxy, ProxyHandle};
 use roundhouse_policy::engine::{CompiledRule, PolicyEngine};
 use roundhouse_policy::sealed::SealedContext;
+use roundhouse_policy::trust::{apply_project_scope_trust, TrustStore};
+use roundhouse_policy::{compile_policy_layers, PolicyConfigError};
 use roundhouse_provider::{Provider, RequestCtx};
 use roundhouse_sandbox::{Handle, Isolate};
 use roundhouse_store::{spawn_writer, EventWriter, StorePool};
+use tokio::sync::{oneshot, watch};
+
+/// A background service's terminal failure.  A service must report readiness
+/// before it can be considered part of a live daemon, and its later failure
+/// is returned to the daemon's lifecycle owner rather than being detached.
+#[derive(Debug, thiserror::Error)]
+#[error("background service failed: {0}")]
+pub struct BackgroundServiceError(pub String);
+
+pub type BackgroundServiceFuture =
+    Pin<Box<dyn Future<Output = Result<(), BackgroundServiceError>> + Send>>;
+pub type BackgroundService =
+    Arc<dyn Fn(BackgroundServiceContext) -> BackgroundServiceFuture + Send + Sync>;
+
+/// Inputs a background service receives from the daemon composition root.
+/// `ready` must be completed exactly once before startup succeeds; dropping it
+/// or returning before readiness fails daemon boot.  `cancelled` is observed
+/// by the service during orderly shutdown, and the returned future is joined
+/// by [`RunningBackgroundServices`] so errors are never orphaned.
+pub struct BackgroundServiceContext {
+    pub store: StorePool,
+    pub sessions: Arc<crate::session_registry::SessionRegistry>,
+    pub cancelled: watch::Receiver<bool>,
+    startup_complete: watch::Receiver<bool>,
+    ready: Option<oneshot::Sender<Result<(), BackgroundServiceError>>>,
+}
+
+impl BackgroundServiceContext {
+    pub async fn signal_ready(&mut self) -> Result<(), BackgroundServiceError> {
+        self.ready
+            .take()
+            .ok_or_else(|| BackgroundServiceError("service signaled readiness twice".to_string()))?
+            .send(Ok(()))
+            .map_err(|_| {
+                BackgroundServiceError("daemon stopped waiting for service readiness".to_string())
+            })?;
+        while !*self.startup_complete.borrow() {
+            self.startup_complete.changed().await.map_err(|_| {
+                BackgroundServiceError("daemon stopped startup readiness".to_string())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Three intentionally independent optional slots.  L2, L3, and L4 own
+/// different eventual services and must not agree on a shared trait shape
+/// before those implementations exist.  Production leaves every slot empty
+/// until the owning lane supplies a factory; this is a documented seam, not
+/// evidence that those services are wired.
+#[derive(Default, Clone)]
+pub struct BackgroundServices {
+    pub workflow: Option<BackgroundService>,
+    pub scheduler: Option<BackgroundService>,
+    pub acp: Option<BackgroundService>,
+}
+
+impl BackgroundServices {
+    pub async fn start(
+        &self,
+        store: StorePool,
+        sessions: Arc<crate::session_registry::SessionRegistry>,
+    ) -> Result<RunningBackgroundServices, BackgroundServiceError> {
+        let (cancel, _) = watch::channel(false);
+        let (startup_complete, _) = watch::channel(false);
+        let mut handles = FuturesUnordered::new();
+        for service in [&self.workflow, &self.scheduler, &self.acp]
+            .into_iter()
+            .flatten()
+        {
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let context = BackgroundServiceContext {
+                store: store.clone(),
+                sessions: Arc::clone(&sessions),
+                cancelled: cancel.subscribe(),
+                startup_complete: startup_complete.subscribe(),
+                ready: Some(ready_tx),
+            };
+            handles.push(tokio::spawn(service(context)));
+            tokio::select! {
+                ready = ready_rx => match ready {
+                    Ok(Ok(())) => {
+                        tokio::task::yield_now().await;
+                        if let Some(completed) = handles.next().now_or_never().flatten() {
+                            cancel.send_replace(true);
+                            for handle in handles.iter() { handle.abort(); }
+                            while handles.next().await.is_some() {}
+                            return match completed {
+                                Ok(Err(error)) => Err(error),
+                                Ok(Ok(())) => Err(BackgroundServiceError("service stopped during startup".to_string())),
+                                Err(error) => Err(BackgroundServiceError(error.to_string())),
+                            };
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        cancel.send_replace(true);
+                        for handle in handles.iter() { handle.abort(); }
+                        while handles.next().await.is_some() {}
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        cancel.send_replace(true);
+                        for handle in handles.iter() { handle.abort(); }
+                        while handles.next().await.is_some() {}
+                        return Err(BackgroundServiceError("service exited without signaling readiness".to_string()));
+                    }
+                },
+                completed = handles.next() => {
+                    cancel.send_replace(true);
+                    for handle in handles.iter() { handle.abort(); }
+                    while handles.next().await.is_some() {}
+                    return match completed {
+                        Some(Ok(Err(error))) => Err(error),
+                        Some(Ok(Ok(()))) => Err(BackgroundServiceError("service stopped before readiness".to_string())),
+                        Some(Err(error)) => Err(BackgroundServiceError(error.to_string())),
+                        None => Err(BackgroundServiceError("service stopped before readiness".to_string())),
+                    };
+                }
+            }
+        }
+        startup_complete.send_replace(true);
+        Ok(RunningBackgroundServices { cancel, handles })
+    }
+}
+
+/// Daemon-owned join/cancellation handle for all started background services.
+/// The daemon calls [`Self::shutdown`] on exit and [`Self::wait_for_failure`]
+/// while serving, making both cancellation and error propagation explicit.
+#[derive(Debug)]
+pub struct RunningBackgroundServices {
+    cancel: watch::Sender<bool>,
+    handles: FuturesUnordered<tokio::task::JoinHandle<Result<(), BackgroundServiceError>>>,
+}
+
+impl RunningBackgroundServices {
+    pub async fn wait_for_failure(&mut self) -> Result<(), BackgroundServiceError> {
+        if let Some(handle) = self.handles.next().await {
+            match handle {
+                Ok(Ok(())) => {
+                    return Err(BackgroundServiceError(
+                        "service stopped unexpectedly".to_string(),
+                    ))
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(error) => return Err(BackgroundServiceError(error.to_string())),
+            }
+        }
+        std::future::pending().await
+    }
+
+    pub async fn shutdown(mut self) -> Result<(), BackgroundServiceError> {
+        self.cancel.send_replace(true);
+        let mut first_error = None;
+        while let Some(handle) = self.handles.next().await {
+            match handle {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(BackgroundServiceError(error.to_string()));
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
 
 /// Where a new session's *config-derived* policy rules come from
 /// (Phase 7, Task 8 fix round 1, ruling W1-R118).
@@ -61,12 +234,80 @@ use roundhouse_store::{spawn_writer, EventWriter, StorePool};
 /// **This is a seam, not a configuration surface.** It exists so the rule
 /// set a session is built with is an *input* to session construction
 /// instead of a literal `vec![]` frozen into it, which is what made the
-/// phase's own end-to-end criterion untestable. Production passes
-/// [`no_policy_rules`] and therefore still loads **zero** operator rules —
-/// see that function's doc comment.
+/// phase's own end-to-end criterion untestable. Production builds it with
+/// [`policy_rules_from_files`]; tests can still supply a deliberately empty
+/// source via [`no_policy_rules`].
 pub type PolicyRuleSource = Arc<dyn Fn() -> Vec<CompiledRule> + Send + Sync>;
 
-/// The production [`PolicyRuleSource`]: **no config-derived rules at all**.
+/// Error returned while building the production [`PolicyRuleSource`].  This is
+/// deliberately a boot-time error: silently replacing a malformed operator
+/// policy with zero rules makes a configuration failure indistinguishable from
+/// the old, intentionally-empty policy and hides an authorization outage.
+#[derive(Debug, thiserror::Error)]
+pub enum PolicyRulesLoadError {
+    #[error("failed to load policy file")]
+    Config(#[source] roundhouse_config::ConfigError),
+    #[error("failed to compile policy file")]
+    Compile(#[source] PolicyConfigError),
+}
+
+/// Loads and validates operator policy files once at daemon boot, then mints a
+/// fresh rule vector for each session.  `CompiledRule` is intentionally not
+/// cloneable: its private construction is the policy authority, so the source
+/// recompiles the already-validated syntax rather than sharing mutable rules.
+///
+/// Project rules pass through [`apply_project_scope_trust`] on every mint.
+/// That gate is owned by `roundhouse-policy`, outside the agent-writable repo,
+/// and can therefore reject a project-layer widening before it reaches
+/// `PolicyEngine`.  User-global rules have no such gate because they are the
+/// operator-controlled wider scope.
+pub fn policy_rules_from_files(
+    project_root: Option<PathBuf>,
+    trust_state_dir: PathBuf,
+) -> Result<PolicyRuleSource, PolicyRulesLoadError> {
+    let layers = roundhouse_config::load_policy_files(project_root.as_deref())
+        .map_err(PolicyRulesLoadError::Config)?;
+
+    // Validate compilation now, before main creates/removes the socket.  The
+    // factory below repeats this deterministic work only because rules cannot
+    // be cloned without reopening their construction authority.
+    effective_policy_rules(&layers, project_root.as_deref(), &trust_state_dir)
+        .map_err(PolicyRulesLoadError::Compile)?;
+
+    Ok(Arc::new(move || {
+        effective_policy_rules(&layers, project_root.as_deref(), &trust_state_dir)
+            .expect("policy files were parsed and compiled during daemon boot")
+    }))
+}
+
+fn effective_policy_rules(
+    layers: &[roundhouse_config::PolicyLayer],
+    project_root: Option<&Path>,
+    trust_state_dir: &Path,
+) -> Result<Vec<CompiledRule>, PolicyConfigError> {
+    let mut effective = Vec::new();
+    let trust_store = TrustStore::new(trust_state_dir.to_path_buf());
+    for layer in layers {
+        let compiled = compile_policy_layers(vec![layer.clone()])?;
+        if layer.scope == roundhouse_config::ConfigScope::Project {
+            // `load_policy_files` labels this path itself; do not accept a
+            // caller-supplied scope label for an agent-controlled path.
+            let root = project_root.expect("a project layer requires a project root");
+            effective.extend(apply_project_scope_trust(
+                root,
+                &layer.contents,
+                compiled,
+                &trust_store,
+            ));
+        } else {
+            effective.extend(compiled);
+        }
+    }
+    Ok(effective)
+}
+
+/// A deliberately empty [`PolicyRuleSource`] for tests and explicit
+/// fail-closed fixtures; production uses [`policy_rules_from_files`] at boot.
 ///
 /// Every session built with this gets `PolicyEngine::from_rules(vec![])`,
 /// so `PolicyEngine::decide` falls through to its `Outcome::Ask` default
@@ -75,14 +316,9 @@ pub type PolicyRuleSource = Arc<dyn Fn() -> Vec<CompiledRule> + Send + Sync>;
 /// `AdmitError::RequiresApproval`. Behaviour is byte-identical to the
 /// hardcoded `vec![]` this replaced: fail-closed, and unchanged.
 ///
-/// **The real gap this does NOT close, stated so it cannot read as
-/// solved:** there is no rules *loader* anywhere — `roundhouse-config`
-/// exposes only `LoadedConfig::load` and `load_network_config`, neither of
-/// which produces a `CompiledRule`. So a real daemon still cannot be given
-/// an operator-authored allow rule by any means, and consequently still
-/// cannot *execute* a model-issued tool call: every one is admitted,
-/// denied, and reported to the model as a real error result. Building that
-/// loader is out of this lane's charter and is escalated separately.
+/// This is not the production default and must not be used as a fallback for
+/// malformed policy files: boot rejects those files rather than disguising
+/// them as this intentional empty source.
 pub fn no_policy_rules() -> PolicyRuleSource {
     Arc::new(Vec::new)
 }
@@ -116,8 +352,11 @@ pub struct DaemonResources {
     /// (`AllowDownTo(Tier::None)`) is actively wrong, not merely stricter
     /// than necessary.
     pub default_on_degrade: OnDegrade,
-    /// See [`PolicyRuleSource`]. Production passes [`no_policy_rules`].
+    /// See [`PolicyRuleSource`]. Production uses [`policy_rules_from_files`].
     pub policy_rules: PolicyRuleSource,
+    /// Background-service composition seam. Production is intentionally empty
+    /// until the owning Phase 8 lanes supply their independent factories.
+    pub background_services: BackgroundServices,
     pub runner: &'static TaskRunner,
     pub provider: Arc<dyn Provider>,
     request_ctx: RequestCtx,
@@ -141,6 +380,7 @@ impl DaemonResources {
         network_config: roundhouse_config::NetworkConfig,
         default_on_degrade: OnDegrade,
         policy_rules: PolicyRuleSource,
+        background_services: BackgroundServices,
         runner: &'static TaskRunner,
         provider: Arc<dyn Provider>,
         request_ctx: RequestCtx,
@@ -156,6 +396,7 @@ impl DaemonResources {
             network_config,
             default_on_degrade,
             policy_rules,
+            background_services,
             runner,
             provider,
             request_ctx,
@@ -359,9 +600,8 @@ pub async fn create_real_session(
     let mirrored_mcp_resolved: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
     // Ruling W1-R118: the rule set is an INPUT to session construction, not a
-    // literal frozen into it. `no_policy_rules` — what production passes —
-    // returns an empty `Vec`, so this is byte-identical to the `vec![]` that
-    // was here before, and just as fail-closed. See `PolicyRuleSource`.
+    // literal frozen into it. Tests can pass `no_policy_rules` for an empty,
+    // fail-closed fixture; production supplies the file-derived source.
     let policy = Arc::new(
         PolicyEngine::from_rules((resources.policy_rules)()).with_sealed_ctx_provider(
             build_sealed_ctx_provider(
@@ -609,6 +849,138 @@ fn build_sealed_ctx_provider(
 mod tests {
     use super::*;
     use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
+
+    #[tokio::test]
+    async fn a_supplied_background_service_signals_readiness_and_is_joined_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = roundhouse_store::open(&dir.path().join("events.db"))
+            .await
+            .unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let service: BackgroundService = Arc::new(move |mut context| {
+            let started_tx = started_tx.clone();
+            Box::pin(async move {
+                context.signal_ready().await?;
+                let _ = started_tx.send(());
+                while !*context.cancelled.borrow() {
+                    if context.cancelled.changed().await.is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            })
+        });
+        let services = BackgroundServices {
+            workflow: Some(service),
+            scheduler: None,
+            acp: None,
+        };
+        let running = services
+            .start(
+                store,
+                Arc::new(crate::session_registry::SessionRegistry::new()),
+            )
+            .await
+            .unwrap();
+        started_rx.recv().await.unwrap();
+        running.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_non_workflow_service_failure_is_observed_and_the_remaining_service_is_joined() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = roundhouse_store::open(&dir.path().join("events.db"))
+            .await
+            .unwrap();
+        let workflow: BackgroundService = Arc::new(|mut context| {
+            Box::pin(async move {
+                context.signal_ready().await?;
+                while !*context.cancelled.borrow() {
+                    context.cancelled.changed().await.map_err(|_| {
+                        BackgroundServiceError("daemon dropped cancellation channel".to_string())
+                    })?;
+                }
+                Ok(())
+            })
+        });
+        let scheduler: BackgroundService = Arc::new(|mut context| {
+            Box::pin(async move {
+                context.signal_ready().await?;
+                Err(BackgroundServiceError("scheduler failed".to_string()))
+            })
+        });
+        let services = BackgroundServices {
+            workflow: Some(workflow),
+            scheduler: Some(scheduler),
+            acp: None,
+        };
+        let mut running = services
+            .start(
+                store,
+                Arc::new(crate::session_registry::SessionRegistry::new()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            running.wait_for_failure().await.unwrap_err().0,
+            "scheduler failed"
+        );
+        running.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_ready_service_cannot_fail_until_startup_ownership_is_transferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = roundhouse_store::open(&dir.path().join("events.db"))
+            .await
+            .unwrap();
+        let service: BackgroundService = Arc::new(|mut context| {
+            Box::pin(async move {
+                context.signal_ready().await?;
+                Err(BackgroundServiceError("immediate failure".to_string()))
+            })
+        });
+        let mut running = BackgroundServices {
+            workflow: Some(service),
+            scheduler: None,
+            acp: None,
+        }
+        .start(
+            store,
+            Arc::new(crate::session_registry::SessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            running.wait_for_failure().await.unwrap_err().0,
+            "immediate failure"
+        );
+    }
+
+    #[test]
+    fn an_untrusted_project_allow_is_filtered_before_a_session_can_receive_it() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let layer = roundhouse_config::PolicyLayer {
+            scope: roundhouse_config::ConfigScope::Project,
+            path: project.path().join(".roundhouse/policy.toml"),
+            contents: "[[rule]]\nid = 'repo-read'\noutcome = 'allow'\nread = '/workspace/a'\n"
+                .to_string(),
+            file: roundhouse_config::PolicyFile {
+                rule: vec![roundhouse_config::PolicyRule {
+                    id: "repo-read".to_string(),
+                    outcome: roundhouse_config::PolicyRuleOutcome::Allow,
+                    read: PathBuf::from("/workspace/a"),
+                }],
+            },
+        };
+        let effective =
+            effective_policy_rules(&[layer], Some(project.path()), state.path()).unwrap();
+        assert!(
+            effective.is_empty(),
+            "a first-use project file must not widen policy with its Allow rule"
+        );
+    }
     use roundhouse_sandbox::probe::{MechanismProbeReport, MechanismStatus};
 
     fn available_isolate() -> Arc<dyn Isolate> {
@@ -650,6 +1022,7 @@ mod tests {
             roundhouse_config::NetworkConfig::default(),
             OnDegrade::Refuse,
             no_policy_rules(),
+            BackgroundServices::default(),
             runner(),
             Arc::new(NoopProvider),
             RequestCtx {

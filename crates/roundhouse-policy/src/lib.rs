@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod approval;
+pub mod config;
 pub mod engine;
 pub mod registry;
 pub mod sealed;
@@ -19,6 +20,7 @@ pub mod trust;
 mod policy_trait;
 mod task_params;
 
+pub use config::{compile_policy_layers, PolicyConfigError};
 pub use engine::{
     ArgMatcher, ArgsPattern, CompiledRule, Decision, Outcome, PolicyEngine, Predicate, RuleId,
     Scope, TeamMembership,

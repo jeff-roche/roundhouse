@@ -20,7 +20,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use roundhouse_core::{OnDegrade, SessionId, SessionSpec, SessionState, TaskRunner, Tier};
-use roundhouse_daemon::session_bootstrap::{no_policy_rules, DaemonResources, PolicyRuleSource};
+use roundhouse_daemon::session_bootstrap::{
+    no_policy_rules, BackgroundServices, DaemonResources, PolicyRuleSource,
+};
 use roundhouse_engine::SessionActor;
 use roundhouse_net::proxy::LoopbackProxy;
 use roundhouse_policy::engine::PolicyEngine;
@@ -210,6 +212,7 @@ pub async fn resources_with(
         roundhouse_config::NetworkConfig::default(),
         roundhouse_core::OnDegrade::Refuse,
         policy_rules,
+        BackgroundServices::default(),
         runner(),
         provider,
         RequestCtx {

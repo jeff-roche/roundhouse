@@ -591,36 +591,58 @@ fn method_eq(a: &Method, b: &Method) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
-    pub scope: Scope,
-    pub outcome: Outcome,
-    pub predicate: Predicate,
-    pub file_order: usize,
-    pub id: RuleId,
+    scope: Scope,
+    outcome: Outcome,
+    predicate: Predicate,
+    file_order: usize,
+    id: RuleId,
 }
 
 impl CompiledRule {
-    /// Public (not `pub(crate)`) because `roundhouse-engine`'s tests
-    /// construct `CompiledRule`s directly through this constructor — another
-    /// lane's crate, so this stays `pub`. `#[doc(hidden)]` only hides it from
-    /// generated docs so it doesn't read as a sanctioned way to build a rule
-    /// for production use; it does not restrict who can call it. (B1, review
-    /// round 2: this constructor plus `Predicate: Clone` is why
-    /// `Grant::predicate()` cannot promise that an out-of-crate caller
-    /// cannot reconstruct an installable rule — see that method's doc
-    /// comment in `approval.rs`.)
-    #[doc(hidden)]
-    pub fn test_new(scope: Scope, outcome: Outcome, predicate: Predicate) -> Self {
+    /// Constructs a rule only inside the policy boundary. Configuration
+    /// compilation and approval synthesis are the two sanctioned producers.
+    pub(crate) fn new(
+        scope: Scope,
+        outcome: Outcome,
+        predicate: Predicate,
+        file_order: usize,
+        id: RuleId,
+    ) -> Self {
         Self {
             scope,
             outcome,
             predicate,
-            file_order: 0,
-            id: RuleId("test".into()),
+            file_order,
+            id,
         }
+    }
+
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+    pub fn outcome(&self) -> Outcome {
+        self.outcome
+    }
+    pub fn predicate(&self) -> &Predicate {
+        &self.predicate
+    }
+    pub fn file_order(&self) -> usize {
+        self.file_order
+    }
+    pub fn id(&self) -> &RuleId {
+        &self.id
+    }
+
+    /// Test-only construction helper. This is not available in a production
+    /// dependency build, even if a caller knows its name.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_new(scope: Scope, outcome: Outcome, predicate: Predicate) -> Self {
+        Self::new(scope, outcome, predicate, 0, RuleId("test".into()))
     }
 
     /// Test-only sugar for a `Predicate::Shell` rule with an explicit
     /// `allow_interpreter` flag (bare program name, any argv).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn test_new_with_interpreter_flag(
         scope: Scope,
         outcome: Outcome,
@@ -636,6 +658,11 @@ impl CompiledRule {
                 allow_interpreter,
             },
         )
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_set_file_order(&mut self, file_order: usize) {
+        self.file_order = file_order;
     }
 }
 

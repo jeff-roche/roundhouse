@@ -403,6 +403,62 @@ async fn a_model_issued_tool_use_is_admitted_dispatched_and_its_result_folded_ba
 }
 
 #[tokio::test]
+async fn an_admitted_executor_failure_does_not_disclose_its_host_path_to_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let failing_path = dir.path().join("a-directory-read-as-a-file");
+    std::fs::create_dir(&failing_path).unwrap();
+    let (actor, _writer, _db, _session) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon"),
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            Outcome::Allow,
+            Predicate::FsPrefix {
+                op: FsOp::Read,
+                prefix: dir.path().canonicalize().unwrap(),
+            },
+        )],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "read",
+        serde_json::json!({ "path": failing_path.to_string_lossy() }),
+    );
+    run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &fake_ctx(),
+        actor.tool_defs(),
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 2,
+            max_tool_calls_per_turn: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let rendered = provider.requests()[1]
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { content, .. } => Some(
+                content
+                    .iter()
+                    .map(|part| part.text.as_str())
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(rendered.contains("tool execution failed"));
+    assert!(!rendered.contains(&failing_path.to_string_lossy().to_string()));
+}
+
+#[tokio::test]
 async fn a_sealed_floor_denial_on_a_dispatched_tool_call_surfaces_as_a_tool_result_error_not_a_panic_or_silent_skip(
 ) {
     let dir = tempfile::tempdir().unwrap();

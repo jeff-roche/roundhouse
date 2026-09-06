@@ -7,10 +7,17 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test constructors are absent from ordinary production builds. Integration
+# tests activate this through the self dev-dependency below because `cfg(test)`
+# does not apply to the library compiled for `tests/*.rs`.
+test-util = []
+
 [dependencies]
 brush-parser = "0.4"
 globset = "0.4"
 roundhouse-core = { path = "../roundhouse-core" }
+roundhouse-config = { path = "../roundhouse-config" }
 roundhouse-store = { path = "../roundhouse-store" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,6 +28,7 @@ thiserror = { workspace = true }
 toml = "0.8"
 
 [dev-dependencies]
+roundhouse-policy = { path = ".", features = ["test-util"] }
 tempfile = "3"
 once_cell = "1"
 # Pinned to the same "1" spec as every other trybuild-using crate in this
