@@ -12,11 +12,32 @@ on:
 
 jobs:
   claude:
+    # The repository is public, so anyone can open an issue or comment on a
+    # PR. An `@claude` mention alone is therefore not an authorization
+    # signal: without the association check below, any GitHub user could
+    # trigger this job, which holds `CLAUDE_CODE_OAUTH_TOKEN`. Permissions
+    # here are read-only, so the exposure is quota burn plus a
+    # prompt-injection surface aimed at the token rather than a write path
+    # — but neither is something an unauthenticated stranger should reach.
+    #
+    # The association is checked on the actor who authored THAT event's
+    # content, never OR'd across sources. `github.event.issue.author_association`
+    # is present on `issue_comment` events too, but it describes whoever
+    # opened the issue — so accepting it there would let an outsider
+    # comment `@claude` on a maintainer's issue and pass.
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      (github.event_name == 'issue_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review' &&
+        contains(github.event.review.body, '@claude') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)) ||
+      (github.event_name == 'issues' &&
+        (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association))
     runs-on: ubuntu-latest
     permissions:
       contents: read
