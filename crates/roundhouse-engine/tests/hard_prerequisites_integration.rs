@@ -807,12 +807,36 @@ async fn a_shallow_ancestor_directory_grant_does_not_reach_a_sibling_users_home_
 ///   the `rm -rf` hidden in the loop body actually deletes the victim file,
 ///   because nothing on this path ever parsed the interpreter's payload.
 ///
-/// That second half is by design, not a bug this task found: §6.3 step 6 is
-/// explicit that an interpreter's payload is not analysed, and
-/// `allow_interpreter: true` is a rule author opting out of that protection
-/// knowingly. The finding is narrower and worth stating plainly: **W4's
-/// walker fix is not reachable from model output**, so no adversarial test
-/// routed through the loop can exercise it.
+/// # The second half is the FROZEN DESIGN, quoted, not a bug
+///
+/// `docs/architecture/03-security-and-sandboxing.md` §6.3 step 6, verbatim:
+///
+/// > `InterpreterProgram` nodes (`sh`, `bash`, `python`, `perl`, `awk`,
+/// > `xargs`, `env`, `node`, `make`, `ssh`) are `Ask` regardless of any
+/// > allowlist match, unless a rule names them with
+/// > `allow_interpreter = true`. **We do not analyse the payload.**
+///
+/// So a walker descending into an `sh -c` payload would *contradict* the
+/// frozen contract. This test asserts what the design specifies, and the
+/// assertion must not be inverted to "the rm is denied" without a §13.3
+/// amendment to that clause.
+///
+/// # The real gap, which is structural and larger
+///
+/// §6.3 opens: *"Model-emitted command **strings** are parsed with a real
+/// shell grammar"*, and its steps 1-8 (parse -> expand -> `Opaque`
+/// hard-deny -> per-node Allow -> execve each node) are the design's entire
+/// shell-safety story. But `tool_catalog::ShellParams` is
+/// `{ program, argv, cwd }` — **no field carries a command string**. The
+/// model therefore has no way to emit one, and steps 1-8 have no
+/// model-facing entry point at all.
+///
+/// Both halves of that path exist and both have zero production callers:
+/// `shell::pipeline::decide_shell_command` (steps 1-7, the gate these
+/// walkers serve) and `roundhouse_tools::execve_node` (step 8, the
+/// executor). What is missing is the model-facing tool and the glue between
+/// them. That is a new tool surface with real design choices, not a
+/// fix-round edit — see this task's fix-round-2 report.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_c_style_arithmetic_for_loop_never_reaches_the_ast_walkers_through_the_real_loop_gh_ast_walker(
@@ -907,29 +931,49 @@ async fn a_c_style_arithmetic_for_loop_never_reaches_the_ast_walkers_through_the
 }
 
 // ---------------------------------------------------------------------------
-// Case 5 — gh_isolate_landlock (lane W5's Task 27)
+// Case 5 — gh_isolate_landlock (lane W5's Task 27 — LANDED; still blocked by CF-15)
 // ---------------------------------------------------------------------------
 
-/// **Lane W5's Task 27.** A `shell` tool call the model issued must not be
-/// able to read outside its session's landlock ruleset.
+/// A `shell` tool call the model issued must not be able to read outside its
+/// session's Landlock ruleset.
 ///
-/// This one is `#[ignore]`d because it genuinely fails, and the reason is
-/// **CF-15**: built-in tool execution runs **in-process**, not through the
-/// session's isolate. `Isolate::spawn` has no production call site anywhere
-/// in the workspace — `tool_dispatch::execute_builtin` calls
-/// `roundhouse_tools::run_shell` directly, and `dispatch_builtin` records an
-/// honest `IsolationAttestation { tier: Tier::None, .. }` for exactly that
-/// reason. So the sandbox tier this session attested to (`Tier::Sandbox`)
-/// describes a ruleset no dispatched tool call ever runs under.
+/// # W5's Task 27 has LANDED, and this test still cannot engage — checked, not assumed
+///
+/// Lane W5's fix is merged into this branch and it **works**: Landlock is
+/// genuinely applied to children of `Isolate::spawn`, proven by that lane's
+/// own `roundhouse-sandbox/tests/isolate_landlock_enforcement.rs`, which
+/// reads a genuinely-readable outside file and asserts the read fails only
+/// when the wrapper is engaged.
+///
+/// What blocks this test is **CF-15**, unchanged by that work: built-in tool
+/// execution runs **in-process and never through `Isolate::spawn` at all**.
+/// Re-verified against this post-merge tree rather than carried forward —
+/// every `isolate.spawn(&handle, cmd)` call site in the workspace is inside
+/// `roundhouse-sandbox`'s own `tests/*.rs`, and W5's own
+/// `isolate_landlock_fix_round_1.rs:3` says so in its own words: its fixes
+/// are *"latent today because `Isolate::spawn` has no production caller
+/// yet."* `tool_dispatch::execute_builtin` calls `roundhouse_tools::run_shell`
+/// directly, and `dispatch_builtin` records an honest
+/// `IsolationAttestation { tier: Tier::None, .. }` for exactly that reason.
+/// So the tier this session attested to (`Tier::Sandbox`) describes a ruleset
+/// no dispatched tool call ever runs under.
+///
+/// The ignore reason therefore had to change: `"tracked: W5 Task 27"` is now
+/// **false** — that task landed. What remains is a missing production caller
+/// for `Isolate::spawn`, which belongs to whoever owns the unified
+/// task-execution entry point (`SessionActor`'s own doc comments have flagged
+/// its absence since Phase 1).
 ///
 /// The Allow rule below is load-bearing: without it admission answers `Ask`,
-/// the shell call never runs, the read never happens, and the test would
-/// pass while proving nothing. With it, the call runs in-process and the
-/// out-of-ruleset read succeeds — which is the failure recorded against
-/// this ignore.
+/// the shell call never runs, the read never happens, and the test would pass
+/// while proving nothing. With it, the call runs in-process and the
+/// out-of-ruleset read succeeds — the failure recorded against this ignore.
 #[cfg(unix)]
 #[tokio::test]
-#[ignore = "tracked: W5 Task 27"]
+#[ignore = "blocked: CF-15 — built-in tool execution runs in-process; Isolate::spawn has no \
+            production caller anywhere, so W5 Task 27's landed Landlock enforcement (proven by \
+            roundhouse-sandbox/tests/isolate_landlock_enforcement.rs) never applies to a \
+            dispatched tool call. Needs a production Isolate::spawn caller, not a W5 fix."]
 async fn a_spawned_shell_tool_call_cannot_read_outside_its_landlock_ruleset_gh_isolate_landlock() {
     let work = workspace_contained_dir();
 
