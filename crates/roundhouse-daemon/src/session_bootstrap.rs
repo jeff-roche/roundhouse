@@ -76,18 +76,25 @@ pub struct BackgroundServiceContext {
     pub store: StorePool,
     pub sessions: Arc<crate::session_registry::SessionRegistry>,
     pub cancelled: watch::Receiver<bool>,
+    startup_complete: watch::Receiver<bool>,
     ready: Option<oneshot::Sender<Result<(), BackgroundServiceError>>>,
 }
 
 impl BackgroundServiceContext {
-    pub fn signal_ready(&mut self) -> Result<(), BackgroundServiceError> {
+    pub async fn signal_ready(&mut self) -> Result<(), BackgroundServiceError> {
         self.ready
             .take()
             .ok_or_else(|| BackgroundServiceError("service signaled readiness twice".to_string()))?
             .send(Ok(()))
             .map_err(|_| {
                 BackgroundServiceError("daemon stopped waiting for service readiness".to_string())
-            })
+            })?;
+        while !*self.startup_complete.borrow() {
+            self.startup_complete.changed().await.map_err(|_| {
+                BackgroundServiceError("daemon stopped startup readiness".to_string())
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -110,6 +117,7 @@ impl BackgroundServices {
         sessions: Arc<crate::session_registry::SessionRegistry>,
     ) -> Result<RunningBackgroundServices, BackgroundServiceError> {
         let (cancel, _) = watch::channel(false);
+        let (startup_complete, _) = watch::channel(false);
         let mut handles = FuturesUnordered::new();
         for service in [&self.workflow, &self.scheduler, &self.acp]
             .into_iter()
@@ -120,6 +128,7 @@ impl BackgroundServices {
                 store: store.clone(),
                 sessions: Arc::clone(&sessions),
                 cancelled: cancel.subscribe(),
+                startup_complete: startup_complete.subscribe(),
                 ready: Some(ready_tx),
             };
             handles.push(tokio::spawn(service(context)));
@@ -164,6 +173,7 @@ impl BackgroundServices {
                 }
             }
         }
+        startup_complete.send_replace(true);
         Ok(RunningBackgroundServices { cancel, handles })
     }
 }
@@ -850,7 +860,7 @@ mod tests {
         let service: BackgroundService = Arc::new(move |mut context| {
             let started_tx = started_tx.clone();
             Box::pin(async move {
-                context.signal_ready()?;
+                context.signal_ready().await?;
                 let _ = started_tx.send(());
                 while !*context.cancelled.borrow() {
                     if context.cancelled.changed().await.is_err() {
@@ -884,7 +894,7 @@ mod tests {
             .unwrap();
         let workflow: BackgroundService = Arc::new(|mut context| {
             Box::pin(async move {
-                context.signal_ready()?;
+                context.signal_ready().await?;
                 while !*context.cancelled.borrow() {
                     context.cancelled.changed().await.map_err(|_| {
                         BackgroundServiceError("daemon dropped cancellation channel".to_string())
@@ -895,7 +905,7 @@ mod tests {
         });
         let scheduler: BackgroundService = Arc::new(|mut context| {
             Box::pin(async move {
-                context.signal_ready()?;
+                context.signal_ready().await?;
                 Err(BackgroundServiceError("scheduler failed".to_string()))
             })
         });
@@ -919,18 +929,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_immediate_ready_then_error_cannot_escape_startup() {
+    async fn a_ready_service_cannot_fail_until_startup_ownership_is_transferred() {
         let dir = tempfile::tempdir().unwrap();
         let store = roundhouse_store::open(&dir.path().join("events.db"))
             .await
             .unwrap();
         let service: BackgroundService = Arc::new(|mut context| {
             Box::pin(async move {
-                context.signal_ready()?;
+                context.signal_ready().await?;
                 Err(BackgroundServiceError("immediate failure".to_string()))
             })
         });
-        let result = BackgroundServices {
+        let mut running = BackgroundServices {
             workflow: Some(service),
             scheduler: None,
             acp: None,
@@ -939,8 +949,12 @@ mod tests {
             store,
             Arc::new(crate::session_registry::SessionRegistry::new()),
         )
-        .await;
-        assert_eq!(result.unwrap_err().0, "immediate failure");
+        .await
+        .unwrap();
+        assert_eq!(
+            running.wait_for_failure().await.unwrap_err().0,
+            "immediate failure"
+        );
     }
 
     #[test]

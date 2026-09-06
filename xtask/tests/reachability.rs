@@ -320,6 +320,16 @@ fn has_production_call(source: &str, call: &str) -> bool {
                 syn::visit::visit_trait_item_fn(self, item);
             }
         }
+        fn visit_impl_item_const(&mut self, item: &'ast syn::ImplItemConst) {
+            if !cfg_test(&item.attrs) {
+                syn::visit::visit_impl_item_const(self, item);
+            }
+        }
+        fn visit_trait_item_const(&mut self, item: &'ast syn::TraitItemConst) {
+            if !cfg_test(&item.attrs) {
+                syn::visit::visit_trait_item_const(self, item);
+            }
+        }
         fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
             if node
                 .func
