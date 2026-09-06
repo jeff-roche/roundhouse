@@ -1282,6 +1282,36 @@ impl<'a> Executor<'a> {
                         // treated the same as provenance: it is a property
                         // of the input, so nothing `git` does to the value
                         // afterwards can defeat it.
+                        //
+                        // **What this costs, and why it is not a bug to fix
+                        // (ruling W5-49).** This withholds strictly more
+                        // often than provenance alone would: a declared
+                        // secret appearing anywhere inside `base_ref` — as a
+                        // substring, not only as the whole value —
+                        // suppresses the provider's own diagnostic text for
+                        // that item, so an operator debugging a genuine
+                        // `git` failure sees the variant and exit status
+                        // rather than git's message. That is accepted, for
+                        // three reasons a future reader should weigh before
+                        // narrowing it:
+                        //
+                        // 1. The failure direction is **diagnostics, not
+                        //    secrecy** — the correct way to fail at this
+                        //    boundary, and the same trade ruling W5-36 made
+                        //    when it chose withholding over scrubbing.
+                        // 2. It cannot fire on an ordinary short string.
+                        //    `Executor::new` **refuses to build a run at
+                        //    all** if any declared secret is shorter than
+                        //    `MIN_REDACTABLE_SECRET_LEN` (8 bytes) — see
+                        //    `ExecutorError::SecretTooShortToRedact` — so
+                        //    nothing like `main` or `HEAD` can ever be a
+                        //    needle here.
+                        // 3. Narrowing it means **not** withholding when a
+                        //    declared secret is demonstrably present in the
+                        //    value, i.e. trading secrecy back for
+                        //    diagnostics. That is the wrong direction, and
+                        //    it reintroduces exactly the gap the two
+                        //    transforms above make reachable.
                         let base_ref_carries_secret_material = base_ref_is_secret_derived
                             || self
                                 .redaction_needles
