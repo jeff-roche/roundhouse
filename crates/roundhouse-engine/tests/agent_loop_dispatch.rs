@@ -1101,6 +1101,51 @@ async fn shell_command_refuses_keyword_compounds_without_running_their_body() {
     );
 }
 
+#[tokio::test]
+async fn shell_command_refuses_the_arithmetic_for_loop_before_touching_the_victim() {
+    let (dir, _script) = workspace_contained_script("#!/bin/sh\n", "unused.sh");
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, "must survive").unwrap();
+    let (actor, _writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": format!(
+                "for ((i=0; i<1; i++)); do rm -rf {}; done",
+                victim.display()
+            ),
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })));
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "must survive");
+}
+
 /// Fix round A, ruling W1-R59 ("redact, don't ask"): a dispatched tool's
 /// result must be scanned through the session's own live redactor BEFORE
 /// it is folded into the next turn's `request.messages` — the direct path
