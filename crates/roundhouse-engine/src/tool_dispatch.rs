@@ -219,17 +219,20 @@ impl ToolDispatchError {
             ),
             Self::ShellCwdRejected(_) => (
                 "shell_cwd_rejected",
-                "shell cwd rejected: the requested working directory is not an accessible                  directory inside this session's workspace"
+                "shell cwd rejected: the requested working directory is not an accessible \
+                 directory inside this session's workspace"
                     .to_string(),
             ),
             Self::ShellProgramRejected(_) => (
                 "shell_program_rejected",
-                "shell program rejected: the requested program does not resolve to an                  executable file inside this session's workspace"
+                "shell program rejected: the requested program does not resolve to an \
+                 executable file inside this session's workspace"
                     .to_string(),
             ),
             Self::WorkspaceRootUnavailable(_) => (
                 "workspace_root_unavailable",
-                "shell dispatch is unavailable: this session's workspace containment boundary                  could not be established"
+                "shell dispatch is unavailable: this session's workspace containment boundary \
+                 could not be established"
                     .to_string(),
             ),
             // The remaining variants are not reachable from
@@ -245,12 +248,14 @@ impl ToolDispatchError {
             ),
             Self::UnsupportedParams(_) => (
                 "unsupported_tool_params",
-                "this tool call's parameter shape is not dispatchable through the builtin tool                  catalog"
+                "this tool call's parameter shape is not dispatchable through the builtin tool \
+                 catalog"
                     .to_string(),
             ),
             Self::MissingResolvedCwd => (
                 "missing_resolved_cwd",
-                "internal error: shell dispatch is missing its pre-resolved, already-admitted                  working directory"
+                "internal error: shell dispatch is missing its pre-resolved, already-admitted \
+                 working directory"
                     .to_string(),
             ),
             Self::ShellCancelled(_) => (
@@ -1972,5 +1977,69 @@ mod tests {
              canonicalize to the same string, or an exact-match policy rule can be \
              evaded by choosing which spelling to send"
         );
+    }
+
+    /// Fix round 2: five of [`ToolDispatchError::unadmitted_refusal`]'s
+    /// message literals shipped with their `\` line-continuations dropped,
+    /// leaving an 18-space run mid-sentence in text that is returned
+    /// verbatim to the model AND written into `TaskError.message` in a log
+    /// that physically rejects `UPDATE`/`DELETE` — permanent, on both
+    /// channels.
+    ///
+    /// **Nothing else in the pipeline can catch this class**, which is why
+    /// it is worth a test of its own: `cargo fmt` passes because rustfmt
+    /// does not reformat string CONTENTS, clippy has no lint for it, and
+    /// the containment integration test asserts on `category` plus
+    /// substring presence/absence — the right shape for the security
+    /// property it pins, and structurally blind to whitespace inside the
+    /// sentence.
+    ///
+    /// Constructs every variant rather than only the five reachable from
+    /// [`task_params_for`]: these strings are cheap to get wrong and
+    /// invisible when wrong, so the guard covers the whole rendering.
+    #[test]
+    fn every_unadmitted_refusal_message_is_clean_single_spaced_prose() {
+        let all = [
+            ToolDispatchError::BadArgs {
+                tool: "shell",
+                field: "cwd",
+            },
+            ToolDispatchError::UnsupportedKind {
+                kind: TaskKind::Chat,
+            },
+            ToolDispatchError::UnresolvedPath(roundhouse_policy::PathErr("x".into())),
+            ToolDispatchError::UnsupportedParams("x".into()),
+            ToolDispatchError::WorkspaceRootUnavailable("x".into()),
+            ToolDispatchError::ShellCwdRejected("x".into()),
+            ToolDispatchError::ShellProgramRejected("x".into()),
+            ToolDispatchError::MissingResolvedCwd,
+            ToolDispatchError::ShellCancelled("x".into()),
+            ToolDispatchError::Tool(roundhouse_tools::ToolError::Glob("x".into())),
+        ];
+
+        for err in all {
+            let (category, message) = err.unadmitted_refusal();
+            assert!(
+                !category.is_empty(),
+                "every refusal needs a queryable category, {err:?} has none"
+            );
+            assert!(
+                !message.contains("  "),
+                "a doubled space in a refusal message is a dropped `\\` line-continuation — \
+                 this text is returned to the model and written permanently to the event \
+                 log. Category {category:?}: {message:?}"
+            );
+            assert!(
+                !message.contains('\n') && !message.contains('\t'),
+                "a refusal message must be one line of prose, category {category:?}: \
+                 {message:?}"
+            );
+            assert_eq!(
+                message.trim(),
+                message,
+                "a refusal message must not carry leading or trailing whitespace, category \
+                 {category:?}"
+            );
+        }
     }
 }
