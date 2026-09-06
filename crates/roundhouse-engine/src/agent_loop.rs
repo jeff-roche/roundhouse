@@ -380,6 +380,14 @@ async fn dispatch_shell_command(
     if command.contains('|') {
         return Err("shell pipelines are not supported by this tool".to_string());
     }
+    if command.contains("&&")
+        || command.contains("||")
+        || command.contains(';')
+        || command.contains('&')
+        || command.contains(['\n', '\r'])
+    {
+        return Err("shell control-flow operators are not supported by this tool".to_string());
+    }
 
     let env = roundhouse_policy::shell::classify::SessionEnv::default();
     let classification = roundhouse_policy::shell::opaque::classify_shell(command, &env);

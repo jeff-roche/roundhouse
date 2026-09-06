@@ -9,5 +9,8 @@ Status: accepted 2026-09-06
 - Phase 8 refuses commands containing pipelines or redirections. Pipe file
   descriptors and synthetic write tasks are deferred until a later task;
   silently dropping either would change command meaning.
+- Phase 8 also refuses shell control-flow operators and multiline compound
+  commands. Flattening `&&`, `||`, command lists, or loops into independent
+  execs would execute branches a shell would skip.
 - The classifier receives an empty `SessionEnv`. The daemon environment is not
   model input and must not become an implicit expansion channel.
