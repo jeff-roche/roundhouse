@@ -396,6 +396,9 @@ async fn dispatch_shell_command(
         }
         roundhouse_policy::shell::opaque::ShellClassification::Program(parsed) => parsed,
     };
+    if roundhouse_policy::shell::pipeline::contains_unsupported_control_flow(&parsed.program_ast) {
+        return Err("shell compound syntax is not supported by this tool".to_string());
+    }
     if command.contains(['(', ')', '!'])
         || command
             .split_whitespace()

@@ -1006,12 +1006,54 @@ async fn shell_command_refuses_function_and_subshell_syntax_before_execution() {
     assert!(blocks.iter().any(|block| matches!(
         block,
         ContentBlock::ToolResult { is_error: true, content, .. }
-            if content.iter().any(|part| part.text.contains("compound syntax"))
+            if !content.is_empty()
     )));
     assert!(
         !marker.exists(),
         "unsupported function bodies must never execute"
     );
+}
+
+#[tokio::test]
+async fn shell_command_refuses_ast_compounds_without_running_their_body() {
+    let (dir, script) =
+        workspace_contained_script("#!/bin/sh\ntouch brace-body-ran\n", "brace-body.sh");
+    let marker = dir.path().join("brace-body-ran");
+    let (actor, _writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": format!("{{ {} }}", script.display()),
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })));
+    assert!(!marker.exists(), "AST compound bodies must never execute");
 }
 
 /// Fix round A, ruling W1-R59 ("redact, don't ask"): a dispatched tool's

@@ -78,6 +78,37 @@ pub fn flatten_argv(ast: &ast::Program) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Returns true when `ast` contains syntax whose control flow cannot be
+/// preserved by the direct-exec adapter. Compound commands, function
+/// definitions, extended tests, timed/negated pipelines, and pipelines with
+/// more than one command are all rejected by the model-facing shell tool
+/// rather than flattened into independent executions.
+pub fn contains_unsupported_control_flow(ast: &ast::Program) -> bool {
+    ast.complete_commands.iter().any(|command| {
+        command
+            .0
+            .iter()
+            .any(|item| and_or_has_unsupported_control_flow(&item.0))
+    })
+}
+
+fn and_or_has_unsupported_control_flow(list: &ast::AndOrList) -> bool {
+    if !list.additional.is_empty() {
+        return true;
+    }
+    pipeline_has_unsupported_control_flow(&list.first)
+}
+
+fn pipeline_has_unsupported_control_flow(pipeline: &ast::Pipeline) -> bool {
+    pipeline.timed.is_some()
+        || pipeline.bang
+        || pipeline.seq.len() != 1
+        || pipeline
+            .seq
+            .iter()
+            .any(|command| !matches!(command, ast::Command::Simple(_)))
+}
+
 fn walk_program(program: &ast::Program, out: &mut Vec<ResolvedNode>) {
     for cc in &program.complete_commands {
         walk_compound_list(cc, out);
