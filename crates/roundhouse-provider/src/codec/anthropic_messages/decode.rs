@@ -13,8 +13,66 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 use sse_stream::SseStream;
 
+use crate::audit::redact_transport_error_text;
+use crate::decode_guard::DecodeLoopGuard;
 use crate::stream_event::{BlockDelta, BlockKind, StreamEvent};
 use crate::TransportError;
+
+/// How `provider.rs` should map a [`StreamFailure`] onto a `ProviderError` —
+/// this codec joins the "strict" truncation-signaling group (Ruling R17):
+/// its own decode loop returns `Err` when it never observes `message_stop`,
+/// mirroring `openai_chat`/`cohere_v2`'s identical `StreamFailureKind`
+/// shape (Ruling R1: deliberately NOT unified into one crate-level enum —
+/// see `crate::decode_guard`'s module doc for why).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamFailureKind {
+    /// The stream ended (a clean EOF) without ever observing a
+    /// `message_stop` event — a dropped connection or a graceful proxy
+    /// termination mid-generation, not a completed one.
+    Truncated,
+    /// A mid-stream SSE/transport read error (e.g. a reset connection).
+    /// Ruling R17: this codec's `let Ok(frame) = frame else { continue };`
+    /// used to silently swallow exactly this, making a reset connection
+    /// indistinguishable from a benign skipped keep-alive frame — the last
+    /// codec in this crate still doing that.
+    Transport,
+}
+
+/// A terminal, spec-verified failure signaled mid-stream. Deliberately not
+/// a `ProviderError` — this module has no `ProviderProfile` to classify
+/// through; `provider.rs` maps this into the real `ProviderError` by
+/// `kind`. Mirrors `cohere_v2::decode::StreamFailure`'s shape, `kind` and
+/// `partial_text` included (Ruling R17: going strict without `partial_text`
+/// would discard partial output today's bare `Vec<StreamEvent>` return
+/// preserves).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamFailure {
+    /// How `provider.rs` should map this into a `ProviderError`.
+    pub kind: StreamFailureKind,
+    /// A human-readable description of the failure. Redacted for the
+    /// `Transport` kind, since a mid-stream transport error's text can
+    /// embed the full request URL, query string and all.
+    pub message: String,
+    /// Text decoded before the failure occurred (`BlockDelta::Text`
+    /// fragments, concatenated in first-seen order).
+    pub partial_text: String,
+}
+
+/// Text decoded so far, for `StreamFailure::partial_text`. Mirrors
+/// `cohere_v2::decode`'s identical helper.
+fn partial_text_from_events(events: &[StreamEvent]) -> String {
+    let mut text = String::new();
+    for event in events {
+        if let StreamEvent::BlockDelta {
+            delta: BlockDelta::Text(t),
+            ..
+        } = event
+        {
+            text.push_str(t);
+        }
+    }
+    text
+}
 
 /// Normalizes Anthropic's `input_tokens` usage figure by adding back `cache_read_input_tokens`.
 ///
@@ -48,18 +106,43 @@ pub fn normalize_anthropic_usage(input_tokens: u64, cache_read_input_tokens: u64
 /// also keeps `events[0]` as the first real content event (`BlockStart`) rather than a
 /// usage bookkeeping event that arrives before any content — the natural place for
 /// consumers to look for "did the stream produce anything yet".
+///
+/// Ruling R17 (Phase 7, Task 11): joins the "strict" truncation-signaling
+/// group (`openai_chat`, `cohere_v2`) — returns `Err(StreamFailure)`,
+/// never `Ok`, if the loop ends without ever observing a `message_stop`
+/// event or hits a mid-stream transport/SSE-framing error. Before this fix
+/// it returned a bare `Vec<StreamEvent>` unconditionally, the last codec in
+/// this crate still doing so; see `crate::decode_guard` for the shared,
+/// structural "did we ever see the terminal" guard this and its two strict
+/// siblings now share.
 pub async fn decode_anthropic_messages_stream(
     body: impl Stream<Item = Result<Bytes, TransportError>> + Send + Unpin,
-) -> Vec<StreamEvent> {
+) -> Result<Vec<StreamEvent>, StreamFailure> {
     let mut sse = SseStream::from_bytes_stream(body);
     let mut events = Vec::new();
+    let mut guard = DecodeLoopGuard::new();
     // Buffered from `message_start`; combined with `message_delta`'s `output_tokens` into
     // one `UsageDelta` (see doc comment above).
     let mut initial_input_tokens: Option<u64> = None;
     let mut initial_cache_read_tokens: Option<u64> = None;
 
     while let Some(frame) = sse.next().await {
-        let Ok(frame) = frame else { continue };
+        // Ruling R17: a mid-stream transport/SSE-framing error must not be
+        // swallowed as benign — this used to be `let Ok(frame) = frame else
+        // { continue };`, indistinguishable from a skipped keep-alive
+        // frame. Mirrors `openai_chat`/`cohere_v2::decode`'s identical fix.
+        let frame = match frame {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(StreamFailure {
+                    kind: StreamFailureKind::Transport,
+                    message: redact_transport_error_text(&format!(
+                        "SSE transport error while decoding the anthropic-messages stream: {e}"
+                    )),
+                    partial_text: partial_text_from_events(&events),
+                });
+            }
+        };
         // SSE keep-alive/comment frames carry no `data` field at all — not an error,
         // just skip and wait for the next frame (matches the OpenAI decoder's handling
         // of the same real `sse-stream` API shape).
@@ -172,10 +255,21 @@ pub async fn decode_anthropic_messages_stream(
                     });
                 }
             }
-            "message_stop" => events.push(StreamEvent::MessageStop),
+            "message_stop" => {
+                events.push(StreamEvent::MessageStop);
+                guard.observe(&StreamEvent::MessageStop);
+            }
             _ => {}
         }
     }
 
-    events
+    guard.finish().map_err(|_| StreamFailure {
+        kind: StreamFailureKind::Truncated,
+        message: "anthropic-messages stream ended without ever observing a message_stop event \
+                   -- the generation was truncated"
+            .into(),
+        partial_text: partial_text_from_events(&events),
+    })?;
+
+    Ok(events)
 }

@@ -621,6 +621,67 @@ async fn exec_command_rejects_stdout_over_the_size_cap() {
 }
 
 #[tokio::test]
+async fn exec_command_streams_the_stdout_cap_and_never_buffers_an_unbounded_producer() {
+    // Phase 7 U4, Ruling R14: `yes` never exits and writes far faster than
+    // `MAX_STDOUT_BYTES` (8 KiB) can be consumed. A `.output()`-based
+    // implementation buffers stdout to completion before ever checking its
+    // length, and a process that never exits is only ever caught by the
+    // whole-call timeout below -- so a buffer-then-truncate implementation
+    // would hold megabytes of memory and fail with "timed out", never
+    // "exceeded". A streaming implementation must detect the cap being
+    // crossed as bytes arrive and kill the helper well within the generous
+    // 2s timeout, failing with "exceeded" instead.
+    let cred = ExecCommandCredential::new("/usr/bin/yes".into(), vec![], vec![])
+        .unwrap()
+        .with_timeout(Duration::from_secs(2));
+    let t = NullTransport;
+    let mut req = empty_request();
+    let started = Instant::now();
+    let err = cred.apply(&mut req, &ctx(&t)).await.unwrap_err();
+    assert!(
+        err.to_string().contains("exceeded"),
+        "an unbounded producer must be caught by the streaming cap check, not the \
+         whole-call timeout: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the cap must be detected as bytes arrive rather than by waiting out the \
+         2s timeout: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn exec_command_does_not_deadlock_on_a_helper_that_fills_the_stderr_pipe_before_stdout() {
+    // A helper that writes more than one pipe buffer (~64 KiB on Linux) to
+    // stderr before finishing its stdout write will block on that stderr
+    // write until something drains it. If stdout and stderr aren't drained
+    // concurrently, reading stdout to EOF first (as a naive streaming
+    // rewrite of the old `.output()` call might do) never returns: the
+    // helper is stuck writing stderr, stdout never closes, and this only
+    // ever resolves by hitting the whole-call timeout below and being
+    // reported as "timed out" -- even though the helper would have
+    // succeeded (and produced a real token) if its stderr had been drained
+    // promptly, exactly as `.output()` always did.
+    let cred = ExecCommandCredential::new(
+        "/usr/bin/sh".into(),
+        vec![
+            "-c".into(),
+            "head -c 100000 /dev/zero >&2; printf tok".into(),
+        ],
+        vec![],
+    )
+    .unwrap()
+    .with_timeout(Duration::from_secs(3));
+    let t = NullTransport;
+    let mut req = empty_request();
+    cred.apply(&mut req, &ctx(&t))
+        .await
+        .expect("a helper that eventually writes a valid token to stdout must succeed even if it fills the stderr pipe first");
+    assert_eq!(header(&req, "authorization"), Some("Bearer tok"));
+}
+
+#[tokio::test]
 async fn exec_command_kills_a_hung_helper_after_its_timeout() {
     let cred = ExecCommandCredential::new("/usr/bin/sleep".into(), vec!["5".into()], vec![])
         .unwrap()
@@ -633,6 +694,58 @@ async fn exec_command_kills_a_hung_helper_after_its_timeout() {
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "a hung helper must not wedge the request until its real 5s sleep finishes"
+    );
+}
+
+#[tokio::test]
+async fn exec_command_kills_a_grandchild_holding_the_stdout_pipe_open_via_process_group() {
+    // Phase 7 U4 fix round 1 (Ruling R34): `process_group(0)` alone does
+    // NOT let this code reach a grandchild the helper forked that's still
+    // holding the stdout pipe open after the helper itself exits -- only
+    // killing the whole process group does. This helper's immediate
+    // process (`sh`) backgrounds a `sleep` in a subshell (which, under a
+    // non-interactive `sh -c`'s lack of job control, stays in the SAME
+    // process group as `sh` itself -- the same group `process_group(0)`
+    // put `sh` in) and then exits almost immediately. The backgrounded
+    // `sleep` keeps the write end of the stdout pipe open, so
+    // `stdout.read()` never sees EOF on its own -- only the whole-call
+    // timeout, followed by a real process-GROUP kill, can end this call
+    // and actually reap the leaked grandchild.
+    let cred = ExecCommandCredential::new(
+        "/usr/bin/sh".into(),
+        vec!["-c".into(), "(sleep 876.543 &); printf tok".into()],
+        vec![],
+    )
+    .unwrap()
+    .with_timeout(Duration::from_millis(300));
+    let t = NullTransport;
+    let mut req = empty_request();
+    let err = cred.apply(&mut req, &ctx(&t)).await.unwrap_err();
+    assert!(
+        err.to_string().contains("timed out"),
+        "a grandchild holding the pipe open must force the whole-call \
+         timeout (the helper itself already exited successfully): {err}"
+    );
+
+    // Give the SIGKILL a brief moment to actually remove the process from
+    // the process table, then confirm the grandchild is really gone -- not
+    // merely unreachable from this process, but dead.
+    let mut still_alive = true;
+    for _ in 0..20 {
+        let out = std::process::Command::new("pgrep")
+            .args(["-f", "sleep 876.543"])
+            .output()
+            .expect("pgrep must be runnable in this environment");
+        if !out.status.success() {
+            still_alive = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !still_alive,
+        "the grandchild `sleep 876.543` must be killed via the \
+         process-group kill, not merely orphaned and left running"
     );
 }
 
@@ -688,6 +801,43 @@ async fn sigv4_applies_signature_with_identifier_kept_out_of_secret_wrapper() {
     assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/"));
     assert!(header(&req, "x-amz-date").is_some());
     assert!(header(&req, "x-amz-security-token").is_none());
+}
+
+#[tokio::test]
+async fn sigv4_credential_scope_carries_the_configured_service_not_a_hardcoded_bedrock() {
+    // Phase 7 Task 30 (Ruling R13): the audit's "hardcoded service" finding
+    // has no production instance today -- `SigV4Credential::new` has zero
+    // production callers (every reference is a test fixture), and the
+    // call site the audit blamed (`AnthropicMessagesProfileProvider::
+    // stream_chat`) does not exist anywhere in this codebase. This
+    // regression test pins the real contract directly at the type that
+    // does exist: `SigV4Credential` must thread whatever `service` it was
+    // constructed with into the signed request's credential scope, never
+    // a literal `"bedrock"` -- so a future call site that DOES hardcode
+    // `"bedrock"` (the specific regression the audit was worried about)
+    // fails this test immediately, regardless of where that call site
+    // ends up living.
+    let cred = SigV4Credential::new(
+        "AKIAEXAMPLE",
+        Secret::new("wJalrXUtnFEMI".to_string()),
+        None,
+        "us-east-1",
+        "some-other-aws-service",
+    );
+    let t = NullTransport;
+    let mut req = empty_request();
+    cred.apply(&mut req, &ctx(&t)).await.unwrap();
+    let auth = header(&req, "authorization").expect("SigV4 must set an Authorization header");
+    assert!(
+        auth.contains("/us-east-1/some-other-aws-service/aws4_request"),
+        "credential scope must carry the configured service, not a hardcoded \
+         value: {auth}"
+    );
+    assert!(
+        !auth.contains("/bedrock/"),
+        "a non-bedrock service must never silently become bedrock in the \
+         credential scope: {auth}"
+    );
 }
 
 #[tokio::test]

@@ -1,5 +1,5 @@
-use crate::{FsOp, Method, PolicyInput, ProviderId, ServerId, TaskParams};
-use roundhouse_core::{PolicyDecision, Tier};
+use crate::{FsOp, MemoryOp, Method, PolicyInput, ProviderId, ServerId, TaskParams};
+use roundhouse_core::{MemoryScope, PolicyDecision, SessionId, TeamId, Tier};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -57,10 +57,10 @@ pub struct Decision {
     pub rule: Option<RuleId>,
 }
 
-/// Covers all six `TaskParams` variants (Phase 0, frozen) from the start — the
-/// audit's "only Fs*/Shell predicates ever get defined" bug meant no rule could
-/// ever Allow a git/http/mcp/agent task regardless of config; every variant
-/// gets a matcher here.
+/// Covers all seven `TaskParams` variants — the audit's "only Fs*/Shell
+/// predicates ever get defined" bug meant no rule could ever Allow a
+/// git/http/mcp/agent task regardless of config; every variant gets a
+/// matcher here.
 #[derive(Debug, Clone)]
 pub enum Predicate {
     FsPrefix {
@@ -97,6 +97,18 @@ pub enum Predicate {
     Mcp {
         server: ServerId,
         tool: Option<String>,
+        /// Task 22 (W4): binds the approved call's arguments. `None` means
+        /// unscoped — matches any `args`, the pre-fix behaviour, retained as
+        /// an explicit opt-in for genuinely argument-independent approvals
+        /// (e.g. a read-only discovery tool where the arguments never carry
+        /// anything sensitive). Before this field existed, approving one MCP
+        /// call with specific arguments silently granted every future call
+        /// to that tool regardless of arguments — the real least-privilege
+        /// bug every sibling grant type (`Http`/`Git`/`Shell`) was already
+        /// fixed for. Same idiom as `Predicate::Memory`'s `session` field:
+        /// `matches`'s specificity `bound` is bumped when this is `Some`, so
+        /// a more specific (args-bound) grant outranks a less specific one.
+        args: Option<ArgsPattern>,
     },
     Git {
         subcommand: String,
@@ -115,7 +127,150 @@ pub enum Predicate {
     Agent {
         provider: Option<ProviderId>,
         model: Option<String>,
+        /// **Task 21 (W4): this is now an isolation FLOOR, not a ceiling,
+        /// despite the name.** `Tier` (`roundhouse-core/src/tier.rs`) derives
+        /// `Ord` over ascending isolation (`None < Worktree < Sandbox <
+        /// Container < Remote`). `matches` used to require
+        /// `tier_request <= max_tier`, so a grant approved at, say,
+        /// `max_tier: Remote` also covered `tier_request: None` — approving
+        /// the *most*-isolated request silently permitted the *least*-isolated
+        /// one. The comparison is now `tier_request >= max_tier`: a request is
+        /// covered only if it asks for at least as much isolation as was
+        /// approved.
+        ///
+        /// **This "more isolation is safer" framing holds only on the
+        /// isolation axis. It does not hold on the egress axis.**
+        /// `docs/architecture/03-security-and-sandboxing.md:213` documents
+        /// that `Tier::Remote` sends the `CommandSpec` over the network to a
+        /// remote host — a property `Tier::None` (same process) does not
+        /// have. Concretely, `synthesize_grant` (`approval.rs`) pins
+        /// `max_tier: *tier_request`, so a grant synthesized from an
+        /// approved `Tier::None` spawn now covers **all five tiers**,
+        /// because `None` is the universal floor — pre-flip it covered
+        /// exactly `{None}`. So a human approving one local, unisolated
+        /// sub-agent spawn would — once agent-spawn policy wiring lands —
+        /// silently authorize a spawn at `Tier::Remote` that ships the
+        /// command off-box. This is tracked as defect **(A)** (orchestrator
+        /// Ruling W4-23): the fix component is an `exact: bool` on this
+        /// variant, matching the idiom `Predicate::Http`/`Predicate::Git`
+        /// already carry, where a synthesized grant sets `true` and matching
+        /// becomes `tier_request == max_tier` instead of `>=`. Ruling W4-23
+        /// also defers implementing it here: adding the field breaks every
+        /// `Predicate::Agent` construction site at merge time, and lane W1
+        /// is writing new ones against this branch right now — the same
+        /// reason Ruling W4-5 (above) kept the `max_tier` name instead of
+        /// renaming it. It is also unreachable today: `TaskParams::Agent`
+        /// has no production constructor.
+        ///
+        /// **A second, separate tracked defect — (B), orchestrator Ruling
+        /// W4-24 — has a different fix component and was deferred for the
+        /// same reason.** `max_tier` is excluded from the specificity
+        /// `bound` `matches` computes for this variant (`bound` counts only
+        /// `provider.is_some()` and `model.is_some()`, plus a constant
+        /// offset — see the `Agent` arm of `matches` below). Two same-scope
+        /// `Agent` rules differing *only* in floor therefore produce
+        /// identical `(literal_prefix_len, bound)` and fall through to
+        /// `file_order`, meaning an earlier broad `Allow { max_tier: None }`
+        /// can outrank a later, narrower `Ask { max_tier: Remote }` on a
+        /// `Remote` request — a less specific rule beating a more specific
+        /// one. This cannot be fixed by bumping `bound` for `max_tier`:
+        /// `max_tier: Tier` is not an `Option`, so counting it would apply
+        /// to *every* `Agent` predicate uniformly and change nothing
+        /// relative to other `Agent` rules. (B)'s fix component is instead
+        /// making the floor `Option<Tier>`: `None` would mean unbound and
+        /// score lower than `Some(Remote)` in the specificity comparison.
+        /// `Agent` is the only variant with this gap — `Http`/`Git` also
+        /// omit their `exact` bool from `bound`, but a correlated
+        /// maximal-prefix-length win stands in for it there, and `Agent`'s
+        /// floor has no such correlate.
+        ///
+        /// **(A) and (B) are two different bugs with two related but
+        /// distinct fix components. Fixing one does not fix the other.**
+        /// `exact: bool` alone closes (A) — matching becomes
+        /// `tier_request == max_tier` — but leaves `max_tier` a non-`Option`,
+        /// so (B)'s specificity tie-break gap survives untouched. An
+        /// `Option<Tier>` floor alone closes (B) — an unbound `None` now
+        /// scores lower than a bound `Some(_)` — but matching stays `>=` on
+        /// whatever `Some(_)` value is present, so a grant synthesized at
+        /// `Some(Tier::None)` still covers all five tiers and (A) survives
+        /// unchanged. Closing both requires *both* halves together: the
+        /// floor becomes `Option<Tier>` **and** the `>=` comparison gains an
+        /// exactness component (e.g. an `exact: bool` alongside it) so a
+        /// synthesized grant matches only the tier it was approved for.
+        ///
+        /// The field is **deliberately not renamed** to something
+        /// like `min_tier` (orchestrator Ruling W4-5): another lane is
+        /// concurrently writing new `Predicate::Agent` construction sites
+        /// against this field's name on `main`, and a rename would hand that
+        /// merge a compile break for zero behavioural gain. A post-merge
+        /// rename is expected but out of scope here.
+        ///
+        /// **B3 (review round 2) — this same floor comparison applies to
+        /// `Deny` rules too, and it inverts the meaning an operator is most
+        /// likely to expect from one.** `Predicate::matches` doesn't know or
+        /// care what `Outcome` its rule carries — a matching `Deny` wins
+        /// outright, same as a matching `Allow`. An operator writing "deny
+        /// agent spawns that ask for weak isolation" would naturally author
+        /// `Deny` with `max_tier: Sandbox`, expecting it to deny
+        /// `None`/`Worktree`/`Sandbox`. What it actually denies is
+        /// `tier_request >= Sandbox`, i.e. `Sandbox`/`Container`/`Remote` —
+        /// and lets `None`/`Worktree` (the actually-weak requests) through.
+        /// To deny weak isolation, the operator must instead author the
+        /// floor at `None` (which denies everything, being the universal
+        /// floor) — there is no config shape today that expresses "deny
+        /// anything below X" directly.
+        ///
+        /// This is a documented limit, not something to fix by making the
+        /// comparison direction depend on `outcome` (orchestrator Ruling
+        /// W4-17 rejected that: one field meaning two opposite things
+        /// depending on its own rule's outcome is a worse footgun than the
+        /// one it would close). There is also no live exposure today: the
+        /// only `Predicate::Agent` construction sites in the workspace are
+        /// `synthesize_grant` (always `Allow`-shaped) and this crate's own
+        /// tests, and there is no config→`Predicate` compiler for `Agent` at
+        /// all yet. The real fix, when a rule compiler for `Agent` exists,
+        /// is a shape change — two separate optional bounds (a floor for
+        /// `Allow`, a ceiling for `Deny`, or similar) — not a same-field
+        /// direction flip.
         max_tier: Tier,
+    },
+    /// Task 20 (W4): binds a config-authored or synthesized grant to an
+    /// exact `(scope, op)` pair, matching every sibling variant's
+    /// least-privilege contract.
+    ///
+    /// Fix round 1 (Ruling W4-11): `session` binds the requesting session —
+    /// `None` means "any session" (what a config-authored rule, which has no
+    /// session to name, must use), `Some(s)` requires the request's `session`
+    /// to equal `s` exactly. This is not optional polish: `PolicyEngine` is
+    /// held behind an `Arc` shared across every session actor, so a rule with
+    /// no session binding matches every session's identical request. Before
+    /// this field existed, a durable `Always`-scoped grant synthesized from
+    /// session A's `MemoryScope::User` request also matched session B's
+    /// (including an untrusted sub-agent's) — `synthesize_grant` binds
+    /// `Some(session)` from the params being generalized, the same
+    /// least-privilege contract `Http`/`Git`/`Shell` already follow for their
+    /// own fields.
+    ///
+    /// Correcting an earlier, incorrect claim in this comment: this field is
+    /// *not* redundant with `GrantScope::Session` or `GrantProvenance`.
+    /// `GrantScope::Session` is documented elsewhere in this crate as "not
+    /// enforced yet" and `into_rule_for_installation` refuses to install a
+    /// rule for it at all; `GrantProvenance` is folded into the rule's id
+    /// string for audit purposes only and is never read by `matches`. This
+    /// `session` field is the only thing that actually restricts which
+    /// session a `Predicate::Memory` rule matches.
+    ///
+    /// A `Team`-scoped rule of this kind is still inert for the read/write
+    /// asymmetry the security model actually relies on: `PolicyEngine::decide`
+    /// short-circuits `MemoryScope::Team` before rule matching is ever
+    /// reached (see `decide`'s `TaskParams::Memory` arm), so this predicate
+    /// can never be used to route around `TeamMembership` regardless of how
+    /// `session` is bound. It only ever participates in ordinary rule
+    /// matching for `User`/`Project` scope, where this binding is live.
+    Memory {
+        scope: MemoryScope,
+        op: MemoryOp,
+        session: Option<SessionId>,
     },
 }
 
@@ -137,6 +292,52 @@ pub enum ArgMatcher {
     /// `Glob(vec!["*.rs".into()])` matches `["a.rs"]` and `["a.rs", "extra"]`
     /// but not `["subdir", "a.rs"]`.
     Glob(Vec<String>),
+}
+
+/// How a `Predicate::Mcp`'s `args` binds against `TaskParams::Mcp`'s
+/// `args: serde_json::Value` (Task 22, W4). `Prefix` is an **object-subset
+/// match** — every key/value in the pattern must be present and equal in the
+/// candidate; extra keys in the candidate are allowed. This is deliberately
+/// not JSON-schema matching (no wildcards, no type constraints, no nested
+/// subset matching) — sufficient for "these specific keys must match"
+/// without building a schema engine.
+#[derive(Debug, Clone)]
+pub enum ArgsPattern {
+    /// The candidate `args` must equal this value exactly.
+    Exact(serde_json::Value),
+    /// The candidate `args` must be a JSON object containing every key in
+    /// this map with an equal value. A non-object candidate never matches —
+    /// fail closed, not a vacuous match.
+    ///
+    /// **B4 (review round 2), operator footgun:** this only checks that the
+    /// listed keys are present with the listed values — it does not check
+    /// that the candidate has *no other* keys. `Prefix({"path": "/tmp/x"})`
+    /// is also satisfied by `{"path": "/tmp/x", "recursive": true}`. An
+    /// operator authoring a `Prefix` rule for a tool where an unlisted key
+    /// can widen the operation (a `recursive`/`force`/`overwrite`-style flag,
+    /// for instance) must list every key that matters, or use `Exact`
+    /// instead — `Prefix` alone does not bound the operation to what was
+    /// actually intended. Not reachable from grant synthesis today (grant
+    /// synthesis always emits `Exact` — see `synthesize_grant`'s `Mcp` arm),
+    /// so this is purely a hazard for a human- or config-authored `Prefix`
+    /// rule, not a live bypass.
+    Prefix(serde_json::Map<String, serde_json::Value>),
+}
+
+impl ArgsPattern {
+    fn matches(&self, candidate: &serde_json::Value) -> bool {
+        match self {
+            ArgsPattern::Exact(expected) => candidate == expected,
+            ArgsPattern::Prefix(required) => match candidate {
+                serde_json::Value::Object(obj) => {
+                    required.iter().all(|(k, v)| obj.get(k) == Some(v))
+                }
+                // Fail closed: a Prefix pattern is meaningless against a
+                // non-object candidate, so it must never match one.
+                _ => false,
+            },
+        }
+    }
 }
 
 impl Predicate {
@@ -188,8 +389,16 @@ impl Predicate {
             exact: false,
         }
     }
+    /// Unscoped by arguments (`args: None`) — the convenience constructor
+    /// config-authored rules use, which have no specific approved call to
+    /// bind to. A synthesized grant (`approval::synthesize_grant`) builds
+    /// `Predicate::Mcp` directly instead, defaulting to `ArgsPattern::Exact`.
     pub fn mcp(server: ServerId, tool: Option<String>) -> Self {
-        Predicate::Mcp { server, tool }
+        Predicate::Mcp {
+            server,
+            tool,
+            args: None,
+        }
     }
     pub fn git(subcommand: &str, argv_prefix: &[&str]) -> Self {
         Predicate::Git {
@@ -254,14 +463,21 @@ impl Predicate {
                     .then(|| (url_prefix.len(), if method.is_some() { 2 } else { 1 }))
             }
             (
-                Predicate::Mcp { server, tool },
+                Predicate::Mcp { server, tool, args },
                 TaskParams::Mcp {
-                    server: s, tool: t, ..
+                    server: s,
+                    tool: t,
+                    args: a,
                 },
             ) => {
                 let tool_ok = tool.as_ref().map(|x| x == t).unwrap_or(true);
-                (server == s && tool_ok)
-                    .then(|| (server.0.len(), if tool.is_some() { 2 } else { 1 }))
+                let args_ok = args.as_ref().map(|p| p.matches(a)).unwrap_or(true);
+                let bound = [tool.is_some(), args.is_some()]
+                    .iter()
+                    .filter(|b| **b)
+                    .count()
+                    + 1;
+                (server == s && tool_ok && args_ok).then_some((server.0.len(), bound))
             }
             (
                 Predicate::Git {
@@ -346,7 +562,19 @@ impl Predicate {
                     .filter(|b| **b)
                     .count()
                     + 1;
-                (provider_ok && model_ok && *tier_request <= *max_tier).then_some((0, bound))
+                (provider_ok && model_ok && *tier_request >= *max_tier).then_some((0, bound))
+            }
+            (
+                Predicate::Memory {
+                    scope: pscope,
+                    op: pop,
+                    session: psession,
+                },
+                TaskParams::Memory { scope, op, session },
+            ) => {
+                let session_ok = psession.as_ref().map(|s| s == session).unwrap_or(true);
+                (pscope == scope && pop == op && session_ok)
+                    .then_some((0, if psession.is_some() { 3 } else { 2 }))
             }
             _ => None,
         }
@@ -371,6 +599,16 @@ pub struct CompiledRule {
 }
 
 impl CompiledRule {
+    /// Public (not `pub(crate)`) because `roundhouse-engine`'s tests
+    /// construct `CompiledRule`s directly through this constructor — another
+    /// lane's crate, so this stays `pub`. `#[doc(hidden)]` only hides it from
+    /// generated docs so it doesn't read as a sanctioned way to build a rule
+    /// for production use; it does not restrict who can call it. (B1, review
+    /// round 2: this constructor plus `Predicate: Clone` is why
+    /// `Grant::predicate()` cannot promise that an out-of-crate caller
+    /// cannot reconstruct an installable rule — see that method's doc
+    /// comment in `approval.rs`.)
+    #[doc(hidden)]
     pub fn test_new(scope: Scope, outcome: Outcome, predicate: Predicate) -> Self {
         Self {
             scope,
@@ -401,10 +639,21 @@ impl CompiledRule {
     }
 }
 
+/// Task 20 (W4): dependency-inverted membership check for `MemoryScope::Team`
+/// — `roundhouse-policy` does not depend on `roundhouse-bus`, so this trait
+/// is the seam a thin adapter in `roundhouse-bus` (wrapping its already-real
+/// `can_read_team_memory`/`can_write_team_memory`, G5) implements, wired in
+/// from `roundhouse-daemon` (another lane's crate, later).
+pub trait TeamMembership: Send + Sync {
+    fn can_read(&self, team: TeamId, session: SessionId) -> bool;
+    fn can_write(&self, team: TeamId, session: SessionId) -> bool;
+}
+
 pub struct PolicyEngine {
     rules: Vec<CompiledRule>,
     unsealed: bool,
     sealed_ctx_provider: Arc<dyn Fn() -> crate::sealed::SealedContext + Send + Sync>,
+    team_membership: Option<Arc<dyn TeamMembership>>,
 }
 
 impl PolicyEngine {
@@ -413,6 +662,7 @@ impl PolicyEngine {
             rules,
             unsealed: false,
             sealed_ctx_provider: Arc::new(crate::sealed::default_context),
+            team_membership: None,
         }
     }
 
@@ -463,6 +713,16 @@ impl PolicyEngine {
         (self.sealed_ctx_provider)()
     }
 
+    /// The daemon (or, in tests, a fixture) supplies this at construction.
+    /// Unit tests that never call this get `None` from
+    /// [`from_rules`](Self::from_rules), which `decide`'s `TaskParams::Memory`
+    /// arm treats as fail-closed: an unconfigured `TeamMembership` denies
+    /// every `Team`-scoped op, including `Read`.
+    pub fn with_team_membership(mut self, m: Arc<dyn TeamMembership>) -> Self {
+        self.team_membership = Some(m);
+        self
+    }
+
     /// Sealed rules are matched first and are compiled in, not config. The only
     /// documented escape is `round daemon --unsealed`, which must be recorded on
     /// every task in the session once `TaskSecurity`/attestation lands
@@ -495,6 +755,86 @@ impl PolicyEngine {
             return Decision {
                 outcome: Outcome::Deny,
                 rule: None,
+            };
+        }
+
+        // Task 20 (W4), orchestrator Ruling W4-6: `Team`-scoped memory ops
+        // are decided by `TeamMembership`, not by ordinary rule matching
+        // (except for an operator `Deny`, handled first below) — a
+        // config-authored or synthesized `Predicate::Memory` rule cannot be
+        // used to route around the membership gate for Allow. `User`/
+        // `Project` scope falls through unchanged to the rule loop and the
+        // engine's existing default below.
+        //
+        // **Documented deviation from frozen `docs/architecture/
+        // 12-memory-subsystem.md` §15.2** (fix round 1, Ruling W4-12b):
+        // §15.2 says a team write is "a distinct, explicit grant, evaluated
+        // by the same policy engine as everything else (§6.2)" — i.e. it
+        // expects `Team` scope to go through ordinary rule matching like
+        // every other scope, ending in `Ask` when nothing matches so a
+        // human can approve it. This arm instead decides `Team` almost
+        // entirely by `TeamMembership` and normally never consults rules at
+        // all. Concretely, `roundhouse-bus`'s `can_write_team_memory` (G5)
+        // is hardcoded to always return `false`, so once a real
+        // `TeamMembership` adapter is wired in, every team write Denies
+        // permanently: no `Ask` is ever raised, and no human can approve
+        // one. This deviation runs in the safe direction (fail-closed,
+        // never a silent Allow) and is deliberate, not an oversight — do
+        // not "fix" it by simply letting rules decide `Team` scope again;
+        // that is only safe now because `Predicate::Memory` binds the
+        // requesting `session` (fix round 1, Ruling W4-11) — without that
+        // binding, a single approved grant for one session's team op would
+        // silently cover every other session's identical request, since
+        // `PolicyEngine` is shared behind an `Arc` across session actors.
+        // Reconciling this arm with §15.2 (e.g. giving team writes a real
+        // `Ask` path) is an escalation for the orchestrator/operator, not a
+        // unilateral change to make here.
+        if let TaskParams::Memory {
+            scope: MemoryScope::Team { team },
+            op,
+            session,
+        } = params
+        {
+            // Fix round 1 (Ruling W4-12a): an operator-authored `Deny` must
+            // still win over the membership check, exactly as the
+            // interpreter-suppression logic below excludes `Outcome::Allow`
+            // (not `Deny`) so "an operator-authored `Deny python` has to
+            // still produce Deny." Checked first, before consulting
+            // `TeamMembership` at all.
+            if let Some(rule) = self.rules.iter().find(|r| {
+                r.outcome == Outcome::Deny && r.predicate.matches(params, r.outcome).is_some()
+            }) {
+                return Decision {
+                    outcome: Outcome::Deny,
+                    rule: Some(RuleId(rule.id.0.clone())),
+                };
+            }
+
+            let Some(membership) = self.team_membership.as_ref() else {
+                // Unverifiable membership is not a reason to allow — fail
+                // closed for every op, including Read.
+                return Decision {
+                    outcome: Outcome::Deny,
+                    rule: Some(RuleId("team-memory:unconfigured".into())),
+                };
+            };
+            let allowed = match op {
+                MemoryOp::Read => membership.can_read(*team, *session),
+                MemoryOp::Write | MemoryOp::Append | MemoryOp::Delete => {
+                    membership.can_write(*team, *session)
+                }
+            };
+            let rule_id = match op {
+                MemoryOp::Read => "team-memory:read",
+                MemoryOp::Write | MemoryOp::Append | MemoryOp::Delete => "team-memory:write",
+            };
+            return Decision {
+                outcome: if allowed {
+                    Outcome::Allow
+                } else {
+                    Outcome::Deny
+                },
+                rule: Some(RuleId(rule_id.into())),
             };
         }
 

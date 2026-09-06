@@ -103,10 +103,13 @@ impl Provider for OpenAiResponsesProvider {
             // `Url::set_path` (not `Url::join`, which would drop that query
             // entirely per WHATWG relative-URL resolution) preserves it
             // untouched.
-            let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
-                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
-                )?;
+            let (base_url, _host_only) = resolve_base_url(
+                &self.profile.id,
+                &self.profile.defaults.base_url,
+                None,
+                false,
+            )
+            .map_err(|e| ProviderError::Transport(redact_transport_error_text(&e.to_string())))?;
             let endpoint_url = append_path_segment(&base_url, "responses");
 
             let mut http_req = HttpRequest {
@@ -241,7 +244,19 @@ impl Provider for OpenAiResponsesProvider {
                 // outage returning HTML (see `error_500.cassette`) must not
                 // become a decode panic. `classify` already honors this.
                 let headers = to_header_map(&response.headers);
-                let body_bytes = collect_body(response.body).await;
+                let body_bytes = match crate::body_cap::collect_body_capped(
+                    response.body,
+                    crate::body_cap::MAX_RESPONSE_BODY_BYTES,
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        return Err(ProviderError::Transport(redact_transport_error_text(
+                            &e.to_string(),
+                        )))
+                    }
+                };
                 return Err(classify(
                     &self.profile.error_profile(),
                     response.status,
@@ -254,25 +269,71 @@ impl Provider for OpenAiResponsesProvider {
             // arrive IN-BAND after this 200, so the status check above can
             // never catch them -- `decode_openai_responses_stream` returns
             // `Err(StreamFailure)` for these instead of a `StreamEvent`
-            // (the frozen `StreamEvent` enum has no error variant), and that
-            // failure is classified here through the same `[errors]`-table
-            // path as an HTTP-level error, using the response's real status
-            // (200) since there is no other status to report -- a code that
-            // happens to match one of the profile's declared error codes
-            // (plausible: some providers reuse the same code vocabulary
-            // in-band and out-of-band) still gets the right disposition;
-            // anything else falls through to `classify`'s HTTP-status
-            // default tier.
+            // (the frozen `StreamEvent` enum has no error variant).
+            //
+            // Phase 7 Task 13b: `response.incomplete` is not a genuine
+            // provider-side failure -- it is a lossy-but-real completion
+            // (truncated at max tokens, or cut short by a content filter),
+            // which is exactly what `StreamFailure.loss` names
+            // (`decode.rs`'s doc comment). Route it to
+            // `ProviderError::StreamInterrupted` instead of `classify`,
+            // matching every sibling codec's choice of ERROR VARIANT for this
+            // same shape (`cohere_v2`, `openai_chat`, `anthropic_messages`
+            // all map max-tokens/content-filter to `StreamInterrupted`, never
+            // a bare `BadRequest`) -- though not their `partial` field:
+            // siblings populate it with real partial text reconstructed from
+            // already-decoded events, while `partial: String::new()` below
+            // is a hardcode, since this codec's `StreamFailure` never
+            // plumbed partial text through (pre-existing, not a regression,
+            // and not in this task's scope to fix). `response.failed`/bare
+            // `error` (`loss: None`)
+            // keep the original `classify`-through-the-`[errors]`-table
+            // path, using the response's real status (200) since there is
+            // no other status to report -- a code that happens to match one
+            // of the profile's declared error codes (plausible: some
+            // providers reuse the same code vocabulary in-band and
+            // out-of-band) still gets the right disposition; anything else
+            // falls through to `classify`'s HTTP-status default tier.
+            //
+            // Known gap (see `LossEvent::into_payload`'s doc comment): the
+            // real `LossEvent` this failure carries has no channel out of
+            // `stream_chat` today -- `Provider`/`ChatStream`/`StreamEvent`
+            // are all frozen Phase 0 contracts with no field for it. Logging
+            // it here is strictly better than the pre-13b silence, but it is
+            // not yet a persisted `EventPayload::Loss` -- that needs a real
+            // return channel, which is lane W1's engine-wiring call.
             let headers = to_header_map(&response.headers);
             let events = decode_openai_responses_stream(response.body)
                 .await
-                .map_err(|failure| {
-                    classify(
+                .map_err(|failure| match failure.loss {
+                    Some(loss) => {
+                        tracing::warn!(
+                            kind = loss.kind.tag(),
+                            // Fix round 1, K2 (log-site redaction, matching
+                            // `cohere_v2`/`openai_chat`/`azure_provider`/
+                            // `anthropic_messages`/`anthropic_provider`'s
+                            // identical precedent): never rely on the
+                            // construction site alone to have sanitized this
+                            // -- `description` is decoder-controlled free
+                            // text (`loss_kind_for_incomplete_reason`'s
+                            // `Other` arm accepts any wire value), so redact
+                            // it again here regardless of what
+                            // `decode.rs` already did to it.
+                            description = %redact_transport_error_text(&loss.description),
+                            blocks_affected = loss.blocks_affected,
+                            "openai-responses stream ended lossy (response.incomplete) with no \
+                             EventWriter channel yet to persist this as EventPayload::Loss"
+                        );
+                        ProviderError::StreamInterrupted {
+                            partial: String::new(),
+                        }
+                    }
+                    None => classify(
                         &self.profile.error_profile(),
                         response.status,
                         &stream_failure_body(&failure),
                         &headers,
-                    )
+                    ),
                 })?;
             let stream = ChatStream(Box::pin(futures::stream::iter(events)));
             Ok(stream)
@@ -338,27 +399,6 @@ fn stream_failure_body(failure: &StreamFailure) -> Vec<u8> {
         error_obj["type"] = serde_json::json!(code);
     }
     serde_json::to_vec(&serde_json::json!({ "error": error_obj })).unwrap_or_default()
-}
-
-/// Drains a response body stream into a byte buffer for the error-
-/// classification path only. Not used on the success path (`§9.3`'s
-/// streaming decode reads directly from the stream).
-async fn collect_body(
-    mut body: std::pin::Pin<
-        Box<
-            dyn futures::Stream<Item = Result<bytes::Bytes, crate::transport::TransportError>>
-                + Send,
-        >,
-    >,
-) -> Vec<u8> {
-    use futures::StreamExt;
-    let mut out = Vec::new();
-    while let Some(chunk) = body.next().await {
-        if let Ok(chunk) = chunk {
-            out.extend_from_slice(&chunk);
-        }
-    }
-    out
 }
 
 #[cfg(test)]

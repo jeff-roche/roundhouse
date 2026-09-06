@@ -132,9 +132,59 @@ static GOOGLE_API_KEY: LazyLock<Regex> =
 /// secret. This is bounded to the value's own delimiters instead, so it
 /// stops at the actual end of the value the way the surrounding
 /// `["']?`/`\s*[:=]\s*` context already implies one exists.
+/// Phase 7 Task 16: `key` on its own (no `client_secret`/`api_key`/etc.
+/// prefix) is a genuine, separately-observed label some gateways use. It's
+/// added as its own alternative, anchored with a leading `\b`, rather than
+/// folded into the existing prefixed alternatives — those already sit at a
+/// word start in every real body this pattern has ever matched, so they
+/// don't need the anchor, but a bare `key` does: this pattern is `(?i)` with
+/// no leading anchor at all, so an unanchored `key` alternative would also
+/// fire inside `monkey=`, `pubkey=`, `hostkey=` — words that merely *end* in
+/// `key`, not the label itself. `\b` only matches between a word and a
+/// non-word character (or string start/end), and every character in
+/// `monkey`/`pubkey`/`hostkey` immediately before its trailing `key` is
+/// itself a word character, so `\bkey` correctly does not match there while
+/// still matching a `key` that starts right after a quote, brace, `&`, or
+/// whitespace.
+///
+/// **This over-redacts other `\bkey`-anchored spellings, deliberately (fix
+/// round 1, Ruling R25 / security S6).** `-` is a non-word character, so
+/// `\b` also fires right after it: any `<word>-key` label (`Idempotency-Key:
+/// ...`, `partition key=...`, `x-key=...`) and any bare `"key"` JSON field
+/// (`{"key":"claude-sonnet-4-20250514"}`, `{"key":"projects/.../models/
+/// gemini-2.5-pro"}`) is redacted too, even though none of those values is
+/// actually secret. This is accepted as fail-closed, not fixed: a persisted
+/// `events` row physically rejects `UPDATE`/`DELETE`, so under-redacting a
+/// real secret is permanent in a way over-redacting a model id or an
+/// idempotency key is merely inconvenient. Three narrowings were considered
+/// and rejected — do not re-propose them without addressing why each one
+/// fails:
+///
+/// 1. **A trailing `\bkey\b` is a provable no-op.** The pattern already
+///    requires `["']?\s*[:=]` immediately after the label, so the character
+///    following `key` is always `"`, `'`, whitespace, `:`, or `=` — every
+///    one of those is already non-word, so the trailing boundary the label
+///    would need is always already satisfied. Adding it changes nothing.
+/// 2. **Constraining the value's character class (e.g. excluding `/`)
+///    regresses AWS.** The value class `[A-Za-z0-9/_+.~-]{16,}` is shared by
+///    *every* alternative in this one regex, not just `key`'s — `/` and `+`
+///    are in it precisely because AWS `secret_access_key` values are
+///    base64. Narrowing it to fix `key` breaks the label this pattern was
+///    originally built for.
+/// 3. **Excluding a preceding `-` (so `\bkey` can't fire right after a
+///    hyphen) is fail-*open* on a real secret.** A gateway that names its
+///    header `gateway-key: <secret>` — a real, plausible label shape — would
+///    then never be redacted at all. Fail-open on an unproven-safe label is
+///    strictly worse than fail-closed over-redaction on a proven-safe one.
+///
+/// A narrowing that *would* work — lifting the bare-`key` alternative into
+/// its own regex with its own value class and its own preceding-delimiter
+/// set (one that excludes `-` but keeps `"`/`'`/whitespace/`{`/`&`),
+/// re-emitting the delimiter in the replacement — is a separate task, not a
+/// tweak to this line, since it touches the replacement closure's shape too.
 static LABELED_SECRET_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)(client[_-]?secret|secret[_-]?access[_-]?key|api[_-]?key|access[_-]?token)["']?\s*[:=]\s*["']?[A-Za-z0-9/_+.~-]{16,}[^\s"',&}]*"#,
+        r#"(?i)(client[_-]?secret|secret[_-]?access[_-]?key|api[_-]?key|access[_-]?token|\bkey)["']?\s*[:=]\s*["']?[A-Za-z0-9/_+.~-]{16,}[^\s"',&}]*"#,
     )
     .unwrap()
 });
@@ -297,5 +347,49 @@ mod redact_transport_error_text_tests {
         let redacted = redact_transport_error_text(raw);
         assert!(!redacted.contains("abc123"));
         assert!(redacted.contains("gateway.example.com"));
+    }
+
+    /// Fix round 1, F3 (Ruling R27 / security S8): `InsecureBaseUrl`'s own
+    /// remediation advice must survive this function -- the pre-fix wording
+    /// ended `-- use https://, or opt in with allow_insecure`, and
+    /// `EMBEDDED_URL` (`https?://[^\s()'"]+`) matched the bare `https://,`
+    /// literal, replacing it with a host-only string and destroying the
+    /// only actionable instruction in the error before it ever reaches an
+    /// append-only `events` row. The advice must also name the real
+    /// operator-facing opt-in (the `ROUNDHOUSE_<PROVIDER>_ALLOW_INSECURE_
+    /// BASE_URL` env var), not the internal `allow_insecure` parameter name,
+    /// which an operator has no way to set.
+    #[test]
+    fn insecure_base_url_remediation_advice_survives_redaction() {
+        // N3 (Phase 7 U3 fix round 1 carry-forward, Ruling R31): a developer
+        // or CI environment with this var already set to opt in -- the exact
+        // scenario the var exists for -- would otherwise make `resolve_base_url`
+        // return `Ok(..)` here, and `.err().unwrap()` below would panic.
+        // Match every sibling test in `tests/credential_test.rs`, which already
+        // clears its env vars before asserting on `resolve_base_url`.
+        std::env::remove_var("ROUNDHOUSE_OPENAI_CHAT_ALLOW_INSECURE_BASE_URL");
+        let err = crate::credential::resolve_base_url(
+            "openai-chat",
+            "https://default.example.com",
+            Some("http://gw.example.invalid:8443/v1"),
+            false,
+        )
+        .err()
+        .unwrap();
+        let raw = err.to_string();
+        let redacted = redact_transport_error_text(&raw);
+        assert!(
+            redacted.contains("https"),
+            "the advice to use https must survive redaction: {redacted}"
+        );
+        assert!(
+            redacted.contains("ROUNDHOUSE_OPENAI_CHAT_ALLOW_INSECURE_BASE_URL"),
+            "the advice must name the real operator opt-in env var (surviving \
+             redaction), not the internal `allow_insecure` parameter: {redacted}"
+        );
+        assert!(
+            redacted.contains("gw.example.invalid:8443"),
+            "the host itself is diagnostic, not secret, and must survive: {redacted}"
+        );
     }
 }

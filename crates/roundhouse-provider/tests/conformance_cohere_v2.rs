@@ -20,7 +20,7 @@
 //! `every_sse_cassette_has_a_terminator_test.rs`, which walks this whole
 //! tree) -- REALITY-CORRECTIONS §13b item 6.
 
-use roundhouse_conformance::{run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
+use roundhouse_conformance::{checks, run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
 use roundhouse_provider::codec::cohere_v2::encode::encode;
 use roundhouse_provider::codec::cohere_v2::CohereV2Provider;
 use roundhouse_provider::profile::ProviderProfile;
@@ -607,4 +607,28 @@ async fn a_credential_apply_failure_redacts_an_embedded_gateway_query_string_and
         }
         other => panic!("expected Transport, got {other:?}"),
     }
+}
+
+/// Task 12 (Cross-Cutting #2, Ruling R16): mandatory truncate-mid-stream
+/// check, wired into every codec's own conformance suite so a future
+/// regression is caught structurally rather than re-derived per codec. This
+/// codec is in the "strict" truncation-signaling group (`decode_guard.rs`'s
+/// module doc) -- it must `Err`, never fabricate a `MessageStop`, when
+/// truncated before its real `message-end` terminal -- and the check
+/// (correctly) never distinguishes that from the "absence" group's
+/// legitimate `Ok`-without-`MessageStop` response to the same input.
+#[tokio::test]
+async fn text_cassette_is_never_indistinguishable_from_a_clean_completion_when_truncated() {
+    let failures = checks::check_truncate_mid_stream(
+        &CohereV2Subject::provider(),
+        &fixtures::single_turn_text(),
+        &cassette_path("text.cassette"),
+        CohereV2Subject::credentials(),
+    )
+    .await;
+    assert!(
+        failures.is_empty(),
+        "cohere-v2 must never report a clean completion for a stream truncated before its \
+         real terminal: {failures:#?}"
+    );
 }

@@ -4,12 +4,12 @@ use crate::handle_registry::HandleRegistry;
 use crate::human_notifications::{HumanNotification, HumanNotificationRegistry};
 use crate::mailbox::{Mailbox, MailboxKind};
 use crate::rate_limit::{decrement_ttl, RateLimiter, RepetitionDamper};
-use crate::teams::{TeamRegistry, TeamState};
+use crate::teams::{Team, TeamRegistry, TeamState};
 use crate::types::{Address, BusError, Envelope, Undeliverable};
 use crate::wait_graph::WaitGraph;
 use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
-use roundhouse_core::{SessionId, WorkspaceId};
+use roundhouse_core::{SessionId, TeamId, WorkspaceId};
 use std::sync::{Arc, Mutex};
 
 /// §7.8: "A routed mpsc registry (LocalBus with DashMap of mailboxes, handles, teams,
@@ -61,6 +61,15 @@ impl LocalBus {
         self
     }
 
+    /// Test/tuning seam: swaps in a `RateLimiter` built with different numbers (e.g.
+    /// a small global cap) so a test can exhaust the global bucket without needing
+    /// hundreds of real sends. Not used by any non-test caller today.
+    #[cfg(test)]
+    pub(crate) fn with_rate_limiter(mut self, rate_limiter: RateLimiter) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
     /// Shares one `TeamRegistry` between the `Bus` (for fan-out resolution) and
     /// whatever else holds it (e.g. `agent_spawn`/`team_create`, Tasks 15-16) — those
     /// call sites take `&TeamRegistry` directly, so callers pass the same `Arc` both
@@ -91,6 +100,24 @@ impl LocalBus {
         self.mailboxes.contains_key(&session)
     }
 
+    /// Looks up `team` and refuses (`BusError::UnknownHandle`) unless it belongs to
+    /// `workspace` — checked *before* any draining/roster work below, so a
+    /// cross-workspace caller can't distinguish "wrong workspace" from "no such
+    /// team" by error type, message, or which side effects ran. Mirrors
+    /// `HandleRegistry::resolve_address`'s `Address::Handle` arm, which already
+    /// enforces the ambient workspace the same way; `Team`/`Role` previously took
+    /// `workspace` only to populate this same error's payload, never to gate the
+    /// lookup itself.
+    fn team_in_workspace(&self, workspace: WorkspaceId, team: TeamId) -> Result<Team, BusError> {
+        self.teams
+            .team(team)
+            .filter(|t| t.workspace == workspace)
+            .ok_or_else(|| BusError::UnknownHandle {
+                workspace,
+                name: "<unknown team>".into(),
+            })
+    }
+
     /// §7.2/§7.5: the fan-out expansion Task 2's `HandleRegistry::resolve_address`
     /// explicitly defers to this layer.
     pub async fn resolve_recipients(
@@ -100,10 +127,9 @@ impl LocalBus {
     ) -> Result<Vec<SessionId>, BusError> {
         match addr {
             Address::Team { team } => {
-                if let Some(state) = self.teams.state(*team) {
-                    if state == TeamState::Draining || state == TeamState::Closed {
-                        return Err(BusError::TeamDraining { team: *team });
-                    }
+                let found = self.team_in_workspace(workspace, *team)?;
+                if found.state == TeamState::Draining || found.state == TeamState::Closed {
+                    return Err(BusError::TeamDraining { team: *team });
                 }
                 let roster = self
                     .teams
@@ -126,10 +152,9 @@ impl LocalBus {
                 Ok(recipients)
             }
             Address::Role { team, role } => {
-                if let Some(state) = self.teams.state(*team) {
-                    if state == TeamState::Draining || state == TeamState::Closed {
-                        return Err(BusError::TeamDraining { team: *team });
-                    }
+                let found = self.team_in_workspace(workspace, *team)?;
+                if found.state == TeamState::Draining || found.state == TeamState::Closed {
+                    return Err(BusError::TeamDraining { team: *team });
                 }
                 let roster = self
                     .teams
@@ -165,13 +190,21 @@ impl LocalBus {
     /// needing a separate index.
     ///
     /// §7.7: rate cap, repetition damper, and `ttl_hops` decrement, all checked before
-    /// the message is queued — uniformly, regardless of whether the recipient is an
-    /// ordinary session or a registered human (a spamming session shouldn't get to
-    /// flood a human's notification feed either). Task 10 built and unit-tested all
-    /// three in isolation; this is the first place anything actually calls them, which
-    /// is exactly why `BusError::RateLimited`/`Repetitive`/`TtlExpired` were
-    /// unreachable before this task (see `send_wiring_tests`, which exercises this
-    /// through `send` itself rather than the isolated `rate_limit` functions).
+    /// the message is queued — regardless of whether the recipient is an ordinary
+    /// session or a registered human (a spamming session shouldn't get to flood a
+    /// human's notification feed either), with two deliberate exceptions for
+    /// human-*originated* sends (see the `is_human_originated` check below,
+    /// computed up front so both exceptions can consult it): the repetition damper
+    /// is skipped entirely, so a human breaking glass repeatedly on the same stuck
+    /// session isn't jammed like an agent repetition storm; and the rate cap's
+    /// *global* bucket (but never the per-session bucket) is skipped, so agent load
+    /// against the shared global bucket can't starve a human's break-glass send
+    /// (A1 — see `RateLimiter::try_acquire_session_only`'s doc comment). Task 10
+    /// built and unit-tested all three checks in isolation; this is the first place
+    /// anything actually calls them, which is exactly why
+    /// `BusError::RateLimited`/`Repetitive`/`TtlExpired` were unreachable before
+    /// this task (see `send_wiring_tests`, which exercises this through `send`
+    /// itself rather than the isolated `rate_limit` functions).
     /// After those checks, human recipients (§7.2/Task 6) route to
     /// `human_notifications` instead of a `Mailbox` — checked *before* the mailbox
     /// lookup, since a human session never has one.
@@ -180,9 +213,46 @@ impl LocalBus {
         let msg_id = envelope.id;
 
         let ttl_hops = decrement_ttl(envelope.ttl_hops)?;
-        self.rate_limiter
-            .try_acquire(envelope.from, std::time::Instant::now())?;
-        {
+
+        // Computed before the rate-limiter call (not after, as originally written)
+        // so the global-bucket exemption below can consult it — see A1. The two
+        // conditions are OR'd because `human_sessions` is the non-spoofable signal
+        // but may not be populated on every path, while `Origin::User` is the
+        // disjunct that is, in practice, load-bearing *alone*: `register_human`/
+        // `mark_human` have zero non-test callers repo-wide, so `human_sessions` is
+        // always empty in a real daemon today. The real precedent for trusting
+        // `Origin::User` as a break-glass marker isn't anything pre-existing in
+        // this crate — before this task nothing in `roundhouse-bus` read
+        // `provenance` for any decision at all (`git grep provenance\. <pre-Task-9
+        // rev> -- crates/roundhouse-bus/src/` turns up exactly one hit, a unit-test
+        // assertion in `types.rs`). The actual precedent is
+        // `roundhouse-engine/src/tools/message_wait.rs`, which already treats
+        // `provenance.origin == Origin::User` as authority to bypass its
+        // expected-sender anti-forgery check for quorum replies — the check whose
+        // own comment warns that "a forged reply from some other member must not
+        // satisfy `Quorum::All`." If `origin` ever became model-settable, the
+        // blast radius is exactly *two* privileges: damper-free repetition and
+        // (unchanged) global-rate-cap exemption here, and quorum-reply forgery via
+        // `message_wait`. (Rejected alternative: folding `in_reply_to` into the
+        // damper key — that would let an *agent* evade the damper by varying which
+        // message it replies to, which is the opposite of what the damper is for.)
+        let is_human_originated = self.human_sessions.contains(&envelope.from)
+            || envelope.provenance.origin == roundhouse_core::Origin::User;
+
+        if is_human_originated {
+            self.rate_limiter
+                .try_acquire_session_only(envelope.from, std::time::Instant::now())?;
+        } else {
+            self.rate_limiter
+                .try_acquire(envelope.from, std::time::Instant::now())?;
+        }
+
+        // §7.7's repetition damper exists to kill *agent* repetition storms — a
+        // human breaking glass four times on the same stuck session is not that,
+        // and must not be jammed identically to one (orchestrator Ruling W4-8). The
+        // damper key itself is unchanged (still `(from, to, subject)`); a human send
+        // simply skips the check entirely.
+        if !is_human_originated {
             let mut damper = self
                 .damper
                 .lock()
@@ -801,5 +871,333 @@ mod send_wiring_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, crate::types::BusError::TeamDraining { .. }));
+    }
+}
+
+#[cfg(test)]
+mod break_glass_damper_tests {
+    use super::*;
+    use crate::mailbox::MailboxKind;
+    use crate::types::{Address, Envelope, MessageId, Provenance, Trust};
+    use roundhouse_core::{Origin, SessionId};
+    use uuid::Uuid;
+
+    /// Mirrors `answer_as_peer`'s (roundhouse-engine's break-glass reply path) fixed
+    /// subject, so these tests exercise exactly the shape that jams today: a human
+    /// operator answering the same stuck wait four times in a row.
+    fn break_glass_envelope(from: SessionId, to: SessionId, origin: Origin) -> Envelope {
+        Envelope {
+            id: MessageId(Uuid::new_v4()),
+            from,
+            to,
+            to_requested: Address::Session { id: to },
+            subject: "[human override] answer as peer".into(),
+            body: "x".into(),
+            attachments: vec![],
+            expect_reply: None,
+            in_reply_to: None,
+            ttl_hops: 8,
+            provenance: Provenance {
+                origin,
+                trust: Trust::Trusted,
+                task: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registered_human_session_is_exempt_from_the_damper_even_with_non_user_origin() {
+        // Covers the first half of the OR: `human_sessions` is the non-spoofable
+        // signal, checked independently of provenance in case a path forgets to set
+        // Origin::User.
+        let bus = LocalBus::new();
+        let human = SessionId::new();
+        let to = SessionId::new();
+        bus.register_human(human);
+        bus.register_mailbox(to, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        for _ in 0..4 {
+            bus.send(break_glass_envelope(human, to, Origin::Peer))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_sender_with_origin_user_is_exempt_from_the_damper() {
+        // Covers the second half of the OR: `Provenance.origin == Origin::User` is
+        // trusted in-process even when `human_sessions` was never populated for this
+        // sender on this path.
+        let bus = LocalBus::new();
+        let from = SessionId::new(); // deliberately never registered as human
+        let to = SessionId::new();
+        bus.register_mailbox(to, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        for _ in 0..4 {
+            bus.send(break_glass_envelope(from, to, Origin::User))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_agent_sender_is_still_damped_on_the_fourth_identical_send() {
+        // Control: neither condition holds, so the damper's ordinary behavior for an
+        // agent repetition storm is unchanged.
+        let bus = LocalBus::new();
+        let from = SessionId::new();
+        let to = SessionId::new();
+        bus.register_mailbox(to, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            bus.send(break_glass_envelope(from, to, Origin::Peer))
+                .await
+                .unwrap();
+        }
+        let err = bus
+            .send(break_glass_envelope(from, to, Origin::Peer))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::Repetitive { .. }));
+    }
+}
+
+#[cfg(test)]
+mod break_glass_global_rate_cap_tests {
+    // A1: the global rate-cap bucket must not starve a human-originated send —
+    // agent load pinning the global bucket at zero is exactly the failure mode
+    // break-glass exists to defeat. These tests use `with_rate_limiter` to install
+    // a tiny global cap (rather than sending ~1280 real messages) so the exhausted
+    // state is reachable directly.
+    use super::*;
+    use crate::mailbox::MailboxKind;
+    use crate::rate_limit::RateLimiter;
+    use crate::types::{Address, Envelope, MessageId, Provenance, Trust};
+    use roundhouse_core::{Origin, SessionId};
+    use uuid::Uuid;
+
+    fn envelope(from: SessionId, to: SessionId, subject: &str, origin: Origin) -> Envelope {
+        Envelope {
+            id: MessageId(Uuid::new_v4()),
+            from,
+            to,
+            to_requested: Address::Session { id: to },
+            subject: subject.into(),
+            body: "x".into(),
+            attachments: vec![],
+            expect_reply: None,
+            in_reply_to: None,
+            ttl_hops: 8,
+            provenance: Provenance {
+                origin,
+                trust: Trust::Trusted,
+                task: None,
+            },
+        }
+    }
+
+    /// Per-session numbers left generous (burst 10) so only the global bucket is
+    /// ever the constraint in these tests; global burst pinned to 0 so it starts
+    /// already exhausted and a real-time refill can't flake the test.
+    fn bus_with_exhausted_global_bucket() -> LocalBus {
+        LocalBus::new().with_rate_limiter(RateLimiter::new_with_global(20, 10, 6000, 0))
+    }
+
+    #[tokio::test]
+    async fn a_human_originated_send_succeeds_when_the_global_bucket_is_exhausted() {
+        let bus = bus_with_exhausted_global_bucket();
+        let from = SessionId::new();
+        let to = SessionId::new();
+        bus.register_mailbox(to, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        // Different subjects per send so the repetition damper (a separate check)
+        // can't also be the reason this passes.
+        for i in 0..3 {
+            bus.send(envelope(
+                from,
+                to,
+                &format!("break-glass-{i}"),
+                Origin::User,
+            ))
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_send_is_still_refused_when_the_global_bucket_is_exhausted() {
+        let bus = bus_with_exhausted_global_bucket();
+        let from = SessionId::new();
+        let to = SessionId::new();
+        bus.register_mailbox(to, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        let err = bus
+            .send(envelope(from, to, "ordinary", Origin::Peer))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::RateLimited { .. }));
+    }
+
+    #[tokio::test]
+    async fn the_per_session_bucket_still_applies_to_a_human_sender() {
+        // The global bucket is NOT exhausted here — plenty of room — so this
+        // isolates the per-session bucket, proving A1's exemption is scoped to the
+        // global bucket only and does not hand humans an unmetered channel.
+        let bus = LocalBus::new();
+        let from = SessionId::new();
+        let to = SessionId::new();
+        bus.register_mailbox(to, MailboxKind::Bounded(64))
+            .await
+            .unwrap();
+
+        // §7.7 default per-session: 20/min, burst 10.
+        for i in 0..10 {
+            bus.send(envelope(from, to, &format!("s{i}"), Origin::User))
+                .await
+                .unwrap();
+        }
+        let err = bus
+            .send(envelope(from, to, "s10", Origin::User))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::RateLimited { .. }));
+    }
+}
+
+#[cfg(test)]
+mod team_workspace_scoping_tests {
+    use super::*;
+    use crate::teams::TeamRegistry;
+    use crate::types::Address;
+    use roundhouse_core::{SessionId, TeamId, WorkspaceId};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn team_address_from_a_different_workspace_is_refused_as_unknown() {
+        let bus = LocalBus::new();
+        let ws_a = WorkspaceId::new();
+        let ws_b = WorkspaceId::new();
+        let lead = SessionId::new();
+        let teams = Arc::new(TeamRegistry::new());
+        let team = teams
+            .create_team(ws_a, "t".into(), "c".into(), lead, "lead".into())
+            .unwrap();
+        let bus = bus.with_teams(teams);
+
+        let err = bus
+            .resolve_recipients(ws_b, &Address::Team { team })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::UnknownHandle { .. }));
+
+        // The same call in the team's real workspace still resolves.
+        assert!(bus
+            .resolve_recipients(ws_a, &Address::Team { team })
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn role_address_from_a_different_workspace_is_refused_as_unknown() {
+        let bus = LocalBus::new();
+        let ws_a = WorkspaceId::new();
+        let ws_b = WorkspaceId::new();
+        let lead = SessionId::new();
+        let teams = Arc::new(TeamRegistry::new());
+        let team = teams
+            .create_team(ws_a, "t".into(), "c".into(), lead, "lead".into())
+            .unwrap();
+        let bus = bus.with_teams(teams);
+
+        let err = bus
+            .resolve_recipients(
+                ws_b,
+                &Address::Role {
+                    team,
+                    role: "lead".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::UnknownHandle { .. }));
+
+        assert!(bus
+            .resolve_recipients(
+                ws_a,
+                &Address::Role {
+                    team,
+                    role: "lead".into(),
+                },
+            )
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn cross_workspace_error_is_indistinguishable_from_a_genuinely_unknown_team() {
+        let bus = LocalBus::new();
+        let ws_a = WorkspaceId::new();
+        let ws_b = WorkspaceId::new();
+        let lead = SessionId::new();
+        let teams = Arc::new(TeamRegistry::new());
+        let real_team = teams
+            .create_team(ws_a, "t".into(), "c".into(), lead, "lead".into())
+            .unwrap();
+        let bus = bus.with_teams(teams);
+
+        let cross_workspace_err = bus
+            .resolve_recipients(ws_b, &Address::Team { team: real_team })
+            .await
+            .unwrap_err();
+        let genuinely_unknown_err = bus
+            .resolve_recipients(
+                ws_b,
+                &Address::Team {
+                    team: TeamId::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            cross_workspace_err,
+            crate::types::BusError::UnknownHandle { .. }
+        ));
+        assert_eq!(
+            format!("{cross_workspace_err}"),
+            format!("{genuinely_unknown_err}")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_draining_team_queried_from_a_different_workspace_is_still_unknown_not_draining() {
+        // A wrong-workspace caller must not learn the team's real state (draining
+        // vs. active) via a different error type either.
+        let bus = LocalBus::new();
+        let ws_a = WorkspaceId::new();
+        let ws_b = WorkspaceId::new();
+        let lead = SessionId::new();
+        let teams = Arc::new(TeamRegistry::new());
+        let team = teams
+            .create_team(ws_a, "t".into(), "c".into(), lead, "lead".into())
+            .unwrap();
+        teams.begin_draining(team).unwrap();
+        let bus = bus.with_teams(teams);
+
+        let err = bus
+            .resolve_recipients(ws_b, &Address::Team { team })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::types::BusError::UnknownHandle { .. }));
     }
 }

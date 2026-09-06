@@ -6,7 +6,7 @@
 //! against; every cassette's SSE event shapes are drawn from that fetched
 //! spec's real schemas, not hand-invented to match the decoder.
 
-use roundhouse_conformance::{run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
+use roundhouse_conformance::{checks, run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
 use roundhouse_provider::codec::google_genai::encode::encode;
 use roundhouse_provider::codec::google_genai::{EndpointMode, GoogleGenAiProvider};
 use roundhouse_provider::profile::ProviderProfile;
@@ -155,6 +155,27 @@ impl ConformanceSubject for GoogleGenAiSubject {
 #[tokio::test]
 async fn google_genai_is_conformant() {
     run::<GoogleGenAiSubject>().await.assert_green();
+}
+
+/// Task 12 (Cross-Cutting #2, Ruling R16): mandatory truncate-mid-stream
+/// check -- this codec is in the "absence" truncation-signaling group
+/// (`decode_guard.rs`'s module doc): it returns `Ok` without a `MessageStop`
+/// when truncated before its real `interaction.completed` terminal, which
+/// the check must accept (only a FABRICATED `MessageStop` fails it).
+#[tokio::test]
+async fn text_cassette_is_never_indistinguishable_from_a_clean_completion_when_truncated() {
+    let failures = checks::check_truncate_mid_stream(
+        &GoogleGenAiSubject::provider(),
+        &fixtures::single_turn_text(),
+        &cassette_path("text.cassette"),
+        GoogleGenAiSubject::credentials(),
+    )
+    .await;
+    assert!(
+        failures.is_empty(),
+        "google-genai must never report a clean completion for a stream truncated before its \
+         real terminal: {failures:#?}"
+    );
 }
 
 /// `Result::expect_err` needs `T: Debug`, and `ChatStream` deliberately

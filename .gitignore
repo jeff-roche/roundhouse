@@ -27,3 +27,15 @@ docs/scratch/
 # Same class as the three above: local working state for the agent run, not
 # part of the repository's history.
 .superpowers/
+
+# The SolidJS web frontend (Task 10, Phase 5/7 Subsystem D). `node_modules/`
+# is npm-restorable from `package-lock.json` and `dist/` is unused — Vite is
+# configured (`vite.config.ts`'s `build.outDir`) to build straight into
+# `crates/roundhouse-web/assets/dist/`, which stays TRACKED rather than
+# ignored: `rust-embed` compiles it into the daemon binary at Rust compile
+# time (`crates/roundhouse-web/src/assets.rs`), and CI (`ci.yml`) has no npm
+# step, so the four `cargo` gates need that directory populated from git, not
+# from a build this repository's CI never runs. `.github/workflows/web.yml`
+# is what keeps the committed output honest against `frontend/src`.
+crates/roundhouse-web/frontend/node_modules/
+crates/roundhouse-web/frontend/dist/

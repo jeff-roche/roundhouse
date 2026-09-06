@@ -25,7 +25,7 @@
 //! cassette replay adds evidence for -- `OpenAiChatProvider` never reads
 //! `endpoint_preference` at all (§9.2's design note: the real call site for
 //! `resolve_endpoint_preference` is the agent loop, outside this crate).
-use roundhouse_conformance::{run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
+use roundhouse_conformance::{checks, run, ConformanceCase, ConformanceSubject, SerializeOnlyMask};
 use roundhouse_provider::codec::openai_chat::{encode_openai_chat, OpenAiChatProvider};
 use roundhouse_provider::profile::ProviderProfile;
 use roundhouse_provider::ChatRequest;
@@ -83,4 +83,24 @@ impl ConformanceSubject for OpenAiChatSubject {
 #[tokio::test]
 async fn openai_chat_is_conformant() {
     run::<OpenAiChatSubject>().await.assert_green();
+}
+
+/// Task 12 (Cross-Cutting #2, Ruling R16): mandatory truncate-mid-stream
+/// check -- this codec is in the "strict" truncation-signaling group
+/// (`decode_guard.rs`'s module doc): it must `Err`, never fabricate a
+/// `MessageStop`, when truncated before its real `data: [DONE]` terminal.
+#[tokio::test]
+async fn text_cassette_is_never_indistinguishable_from_a_clean_completion_when_truncated() {
+    let failures = checks::check_truncate_mid_stream(
+        &OpenAiChatSubject::provider(),
+        &fixtures::single_turn_text("gpt-4o"),
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/cassettes/openai/text.cassette"),
+        OpenAiChatSubject::credentials(),
+    )
+    .await;
+    assert!(
+        failures.is_empty(),
+        "openai-chat must never report a clean completion for a stream truncated before its \
+         real terminal: {failures:#?}"
+    );
 }

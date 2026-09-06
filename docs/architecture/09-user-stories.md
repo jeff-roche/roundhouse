@@ -76,6 +76,21 @@ recovery ≤5s at 100k tasks, zero acknowledged-event loss over 100 kill/restart
 binary ≤40MiB stripped · zero outbound connections before first session creation · panic
 in any executor fails only the owning task, never the daemon.
 
+**How these are enforced.** The numbers above are reference-hardware design targets, and
+they are deliberately *not* asserted as wall-clock limits in CI. Shared runners are an
+order of magnitude noisier than the reference machine, so a timing assertion there fails
+on load rather than on regression — and, being calibrated for the slow case, it carries so
+much headroom on real hardware that it stops detecting the regression it exists for. Both
+halves of that were measured on the S-SESS-4 recovery budget: it produced eight red CI
+runs on production code that never changed, and a deliberately reintroduced full-event-log
+scan still passed it on a dev machine.
+
+The enforceable content of a budget is the algorithmic property that makes it achievable,
+which is hardware-independent and belongs in a test — for S-SESS-4, that recovery is
+driven off the `tasks` table and never reads the event log, and that its state filter runs
+in SQLite rather than in Rust (`crates/roundhouse-store/tests/recovery_scale.rs`). Assert
+that; measure the wall clock on reference hardware when a number is actually in question.
+
 ### 12.6 Explicitly out of scope
 
 No hosted/multi-tenant service, no model hosting/fine-tuning, no vector DB/RAG (memory is

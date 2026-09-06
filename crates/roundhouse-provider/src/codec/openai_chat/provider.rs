@@ -90,10 +90,13 @@ impl Provider for OpenAiChatProvider {
 
             let body = encode_openai_chat(req, &self.profile);
 
-            let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
-                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
-                )?;
+            let (base_url, _host_only) = resolve_base_url(
+                &self.profile.id,
+                &self.profile.defaults.base_url,
+                None,
+                false,
+            )
+            .map_err(|e| ProviderError::Transport(redact_transport_error_text(&e.to_string())))?;
             let endpoint_url = build_endpoint_url(&base_url);
 
             let mut http_req = HttpRequest {
@@ -172,7 +175,19 @@ impl Provider for OpenAiChatProvider {
             if !(200..300).contains(&response.status) {
                 // §9.8: never `?` on JSON parsing in the error path.
                 let headers = to_header_map(&response.headers);
-                let body_bytes = collect_body(response.body).await;
+                let body_bytes = match crate::body_cap::collect_body_capped(
+                    response.body,
+                    crate::body_cap::MAX_RESPONSE_BODY_BYTES,
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        return Err(ProviderError::Transport(redact_transport_error_text(
+                            &e.to_string(),
+                        )))
+                    }
+                };
                 return Err(classify(
                     &self.profile.error_profile(),
                     response.status,
@@ -328,24 +343,6 @@ fn to_header_map(raw: &[(String, String)]) -> http::HeaderMap {
         }
     }
     headers
-}
-
-async fn collect_body(
-    mut body: std::pin::Pin<
-        Box<
-            dyn futures::Stream<Item = Result<bytes::Bytes, crate::transport::TransportError>>
-                + Send,
-        >,
-    >,
-) -> Vec<u8> {
-    use futures::StreamExt;
-    let mut out = Vec::new();
-    while let Some(chunk) = body.next().await {
-        if let Ok(chunk) = chunk {
-            out.extend_from_slice(&chunk);
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -527,8 +524,12 @@ mod stream_failure_diagnosability_tests {
 
     /// Fix round 7, K2: a mid-stream in-band failure frame's own message can
     /// embed a full URL whose credential is NOT shape-matched by
-    /// `redact_error_body` (a differently-named query param like `?key=...`
-    /// rather than a labeled `api_key=...`, or userinfo). `decode.rs`'s
+    /// `redact_error_body` (a differently-named query param like `?sig=...`
+    /// rather than a labeled `api_key=...`, or userinfo -- Phase 7 Task 16
+    /// added a bare `key=...` alternative to `LABELED_SECRET_VALUE`, so this
+    /// fixture uses `sig=...` instead to keep exercising a genuinely
+    /// unmatched shape rather than one construction-site redaction now
+    /// itself catches). `decode.rs`'s
     /// `sanitize_untrusted_wire_string` (fix round 7, K1) only ever runs the
     /// shape-based `redact_error_body`, so `failure.message` itself still
     /// carries the credential intact -- this test's first assertion pins
@@ -554,7 +555,7 @@ mod stream_failure_diagnosability_tests {
         }
 
         let body = sse_body(&[
-            r#"{"error":{"message":"upstream rejected https://gwuser:gwpass@gw.example.invalid/v1?key=gw-live-9f2b8c1d4e6a7b3c"}}"#,
+            r#"{"error":{"message":"upstream rejected https://gwuser:gwpass@gw.example.invalid/v1?sig=gw-live-9f2b8c1d4e6a7b3c"}}"#,
         ]);
         let failure = match decode_openai_chat_stream(body).await {
             Ok(_) => panic!("expected a StreamFailure"),

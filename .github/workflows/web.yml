@@ -1,0 +1,252 @@
+name: Web
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# S6 (Task 10 slice B security review): this is the only workflow in the repo
+# that executes third-party npm lifecycle scripts (`npm ci` runs `esbuild`'s
+# and `fsevents`' `hasInstallScript` postinstalls), so an inherited
+# read/write `GITHUB_TOKEN` is a worse default here than elsewhere. Nothing
+# in this job needs write access to anything.
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/roundhouse-web/frontend
+    steps:
+      # S7: pinned by commit SHA, not the mutable `@v4` tag, for the same
+      # reason `actions/setup-node` below and `ci.yml`'s
+      # `dtolnay/rust-toolchain` are pinned by SHA rather than a movable ref.
+      # Verified against GitHub's tags API: this SHA is the concrete patch
+      # release `v4.4.0` (fix round 1: naming the immutable patch tag here,
+      # not the mutable major tag `v4`, so a future re-verification of this
+      # pin against the tags API is unambiguous about which release it is).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # D4 (fix round 1 security review): this job deliberately runs
+          # third-party npm lifecycle scripts (`npm ci` triggers `esbuild`'s
+          # and `fsevents`' `hasInstallScript` postinstalls, per S6 above) —
+          # leaving a GITHUB_TOKEN credential helper configured in
+          # `.git/config` for that to reach is a worse default here than
+          # elsewhere. Nothing in this job ever needs to authenticate back
+          # to GitHub as itself.
+          persist-credentials: false
+      # `@v4` resolves as a mutable tag (`v4` is repointed to new commits as
+      # `actions/setup-node` releases patches), which is not reproducible
+      # across runs and can silently change what gets installed — the same
+      # reason `ci.yml` pins `dtolnay/rust-toolchain` by commit SHA rather
+      # than `@stable`. v7.0.0, pinned 2026-09-04.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - run: npm ci
+      # S5 (Task 10 slice B security review): a source-side guard, cheaper
+      # and far more robust than pattern-matching the built output. Vite
+      # auto-loads `.env`/`.env.local` from `frontend/` and inlines any
+      # referenced `VITE_*` value into the bundle at build time — one of
+      # Vite's own built-in env-inlining mechanisms, and until now it was
+      # guarded only by nobody having used it yet. Runs before the build so
+      # a violation fails fast rather than after a build that would already
+      # have inlined the leak.
+      #
+      # Fix round 2 (Important, security): this step's name used to promise
+      # "any" build-time env-inlining surface while covering only a subset —
+      # see the `%…%` check below for what changed and why.
+      #
+      # Fix round 3 (code review): "any"/"every mechanism" was still too
+      # wide a claim even after that fix. A reviewer built a counterexample
+      # this step cannot reach by construction: an inline `vite.config.ts`
+      # plugin's `transformIndexHtml` hook running `process.env` through
+      # arbitrary JS (e.g. string-replacing a literal marker with a
+      # hostname) ships past every check below — no `%…%` token, no
+      # `define`, no `envPrefix`, no `import.meta.env`, no `.env*` file.
+      # That surface is a plugin executing arbitrary code, not a greppable
+      # pattern, so widening this step's checks is the wrong instinct.
+      # `dist_public_content.rs` is the right control *for this kind of
+      # surface* — it scans the built output itself, backed by the
+      # staleness check below, rather than trying to grep the config that
+      # produced it — though it is not guaranteed to catch a bare hostname
+      # with no scheme/digits/UUID shape specifically; that is a gap in
+      # that file's own guards, not this step's problem to solve. This
+      # step's own claim is scoped to what it can actually see: Vite's
+      # built-in env-inlining mechanisms only (`import.meta.env`, `define`,
+      # `.env*`, and HTML `%…%` substitution).
+      - name: Fail on Vite's built-in env-inlining surfaces
+        run: |
+          set -euo pipefail
+
+          # `import.meta.env` is how a component would read an inlined
+          # value; `grep -rl` over source (never node_modules, which ships
+          # its own uses of this in library internals that are not this
+          # client's problem).
+          #
+          # Precondition first: fix round 1 (whole-branch security review,
+          # M2) found `grep -rl` exits 2 (not 1) when `src/` is missing, and
+          # `if grep ...; then` cannot distinguish that from "ran cleanly,
+          # found no match" (exit 1) — a missing directory would otherwise
+          # silently PASS this guard rather than fail it loudly. A bare
+          # `test -d src` does fail closed here (fix round 2: annotated —
+          # an unannotated `exit 1` reads as "Process completed with exit
+          # code 1" in the Actions UI with no indication of which of this
+          # step's several checks caused it).
+          if [ ! -d src ]; then
+            echo "::error::frontend/src/ is missing — cannot verify there is no 'import.meta.env' reference without it"
+            exit 1
+          fi
+          if grep -rl 'import\.meta\.env' src/; then
+            echo "::error::found 'import.meta.env' in frontend/src/ — nothing in this client should read a build-time-inlined value (see vite.config.ts's module docs)"
+            exit 1
+          fi
+
+          # A `define` key in whichever `vite.config.*` file actually exists
+          # is the other way a per-install value could be baked into the
+          # bundle at build time. Vite loads any of six extensions
+          # (js/mjs/cjs/ts/mts/cts); fix round 1 (M2) found the prior version
+          # named only `vite.config.ts` and — like the `grep -rl` above —
+          # would silently pass if that exact file were ever renamed or
+          # replaced, since `grep`'s exit 2 on a missing file reads the same
+          # as "no match" to a bare `if`.
+          #
+          # `envPrefix` is checked alongside `define` (fix round 2): it is
+          # the other config-file lever that changes what the `%…%` check
+          # below actually catches — Vite's HTML substitution reads whatever
+          # prefix `resolveEnvPrefix` returns, default `VITE_`. Since the
+          # `%…%` check below no longer assumes a prefix at all, an
+          # `envPrefix` override does not reopen that hole by itself; this
+          # is additional insurance flagging the config change itself.
+          found_config=0
+          for config_ext in js mjs cjs ts mts cts; do
+            config_file="vite.config.$config_ext"
+            if [ -f "$config_file" ]; then
+              found_config=1
+              # Fix round 3 (Minor, code review): the unquoted pattern
+              # doesn't match a quoted key (`"define": {...}`), which is
+              # valid JS/TS object-literal syntax. Non-blocking either way —
+              # the `%…%` check below is prefix-agnostic, so a quoted
+              # `envPrefix` reopens nothing — but two characters closes it.
+              if grep -E '"?define"?\s*:' "$config_file"; then
+                echo "::error::found a 'define' key in $config_file — no per-install value may be inlined into this build"
+                exit 1
+              fi
+              if grep -E '"?envPrefix"?\s*:' "$config_file"; then
+                echo "::error::found an 'envPrefix' key in $config_file — changes which environment variables Vite's HTML %…% substitution and import.meta.env expose; needs deliberate review, not a silent change"
+                exit 1
+              fi
+            fi
+          done
+          if [ "$found_config" -eq 0 ]; then
+            echo "::error::no vite.config.{js,mjs,cjs,ts,mts,cts} file found under frontend/ — cannot verify there is no 'define'/'envPrefix' key without one"
+            exit 1
+          fi
+
+          # Any .env* file (excluding node_modules, which ships .env.example
+          # files as ordinary package content, not something Vite will load
+          # from this project root) would be auto-loaded by Vite and could
+          # inline a VITE_* value with no other change needed.
+          #
+          # `-print -quit` rather than piping to `grep -q .`: under
+          # `pipefail`, `grep -q` can exit (and close its end of the pipe)
+          # before `find` finishes walking, which delivers `find` a SIGPIPE
+          # and a non-zero exit that `pipefail` would then report as *this*
+          # check's failure — silently skipping the `if` body on a security
+          # guard is the one failure mode worse than a false alarm here.
+          found_env_file="$(find . -path ./node_modules -prune -o -name '.env*' -print -quit)"
+          if [ -n "$found_env_file" ]; then
+            echo "::error::found a .env* file under frontend/ ($found_env_file) — Vite auto-loads these and inlines any VITE_* value referenced from src/"
+            exit 1
+          fi
+
+          # Fix round 1 (M1, the most important finding) — corrected in fix
+          # round 2 after a second review demonstrated the round-1 pattern
+          # closed one spelling of the bypass, not the class it was meant
+          # to close.
+          #
+          # Vite's own HTML substitution (`htmlEnvHook`) matches
+          # `/%(\S+?)%/g` against `{...config.env}` — ANY non-whitespace
+          # key, not just `VITE_`-prefixed ones, and the prefix that decides
+          # which environment variables land in `config.env` comes from
+          # `resolveEnvPrefix({ envPrefix })`, which is itself configurable
+          # (default `VITE_`, but a project can set it to anything). The
+          # round-1 pattern `%VITE_[A-Za-z0-9_]*%` baked in both constraints
+          # Vite does not honour, and none of them are hypothetical:
+          #
+          #   (a) `envPrefix: "RH_"` in vite.config.ts + `%RH_SECRET_HOST%`
+          #       in index.html — a different prefix entirely.
+          #   (b) `%VITE_A-B%` + `VITE_A-B=nas.internal.example` — a hyphen
+          #       in the name, which `[A-Za-z0-9_]` does not match (and
+          #       which also defeats the `unset`-based scrub below, since
+          #       `grep -oE '^VITE_[A-Za-z0-9_]*'` would extract `VITE_A`,
+          #       the wrong name — `unset "VITE_A-B"` then silently no-ops
+          #       (bash returns 0 without removing anything; a hyphenated
+          #       name isn't a valid shell identifier for `unset` to act on
+          #       at all), so the real variable stays live after the scrub
+          #       loop runs. The source check below is the actual control
+          #       for this; the scrub is defense in depth only, and is
+          #       deliberately left as-is).
+          #   (c) `%BASE_URL%` — one of Vite's own built-in substitutions,
+          #       no environment variable or config change required at all.
+          #
+          # Nothing in this client legitimately uses Vite's HTML env
+          # substitution mechanism (that module doc comment's own words),
+          # so the fix is not "widen the character class" but "stop
+          # assuming a prefix or a charset at all": ANY `%…%`-shaped token
+          # in this file is the defect, mirroring Vite's own matching
+          # pattern rather than a guess at what it might match. Verified
+          # against the current `frontend/index.html` and the shipped
+          # `assets/dist/index.html`: zero hits on either, so this does not
+          # false-positive on the CSP-rationale comment's own prose.
+          if [ ! -f index.html ]; then
+            echo "::error::frontend/index.html is missing — cannot verify there is no %...% placeholder without it"
+            exit 1
+          fi
+          if grep -E '%[^%[:space:]]+%' index.html; then
+            echo "::error::found a %...% placeholder in index.html — Vite's HTML env substitution matches ANY non-whitespace token between percent signs, sourced from a CONFIGURABLE prefix (default VITE_, see vite.config.*'s envPrefix) plus Vite's own built-ins (e.g. %BASE_URL%) — independent of .env files or import.meta.env"
+            exit 1
+          fi
+      - run: npm run typecheck
+      - run: npm test
+      # Fix round 1 (M1): scrubbed as defense in depth alongside the source
+      # check above — NOT the control. Fix round 2 demonstrated the control
+      # this scrub cannot provide on its own: `envPrefix` is configurable
+      # (PoC a), the default `VITE_` prefix's charset doesn't stop a
+      # hyphenated name that `unset` can't remove anyway (PoC b), and some
+      # substitutions (`%BASE_URL%`, PoC c) need no environment variable at
+      # all. The `%…%` check above is what actually closes this; this step
+      # only scrubs the one narrow case (a `VITE_`-prefixed, shell-legal
+      # variable name that happens to be set in this job's own environment)
+      # its regex can express, on the belt-and-suspenders theory that one
+      # fewer live variable is one fewer thing that check has to catch.
+      - name: Build (default-prefix VITE_* env scrubbed — defense in depth only; the %…% check above is the control)
+        run: |
+          set -euo pipefail
+          for var_name in $(env | grep -oE '^VITE_[A-Za-z0-9_]*' || true); do
+            unset "$var_name"
+          done
+          npm run build
+      # `crates/roundhouse-web/assets/dist/` is committed (ruling R1 —
+      # `rust-embed` needs it at Rust compile time, and the `cargo` jobs in
+      # `ci.yml` have no npm step to build it themselves). Nothing else in
+      # this workspace can notice that committed output drifting from
+      # `frontend/src`; this is the one place that can, and — since the Vite
+      # build is deterministic — the one place the criterion-1
+      # (`dist_public_content.rs`) and criterion-2 (`token.test.ts`) guards'
+      # *inputs* are freshly regenerated and checked against what is checked
+      # in, rather than trusted from a previous commit.
+      - name: Fail if the committed build output is stale
+        working-directory: .
+        run: |
+          # `--exit-code` alone only catches a *changed* tracked file — a
+          # chunk Vite starts emitting under a new content hash shows up as
+          # untracked, not modified, and `diff` says nothing about it.
+          # `status --porcelain` catches both directions: a stale hash and a
+          # stale file that should no longer be here at all.
+          git diff --exit-code -- crates/roundhouse-web/assets/dist
+          test -z "$(git status --porcelain -- crates/roundhouse-web/assets/dist)"

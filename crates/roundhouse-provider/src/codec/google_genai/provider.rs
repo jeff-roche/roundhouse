@@ -77,10 +77,13 @@ impl Provider for GoogleGenAiProvider {
         Box::pin(async move {
             let body = encode(req, &self.profile, self.mode)?;
 
-            let (base_url, _host_only) =
-                resolve_base_url(&self.profile.id, &self.profile.defaults.base_url, None).map_err(
-                    |e| ProviderError::Transport(redact_transport_error_text(&e.to_string())),
-                )?;
+            let (base_url, _host_only) = resolve_base_url(
+                &self.profile.id,
+                &self.profile.defaults.base_url,
+                None,
+                false,
+            )
+            .map_err(|e| ProviderError::Transport(redact_transport_error_text(&e.to_string())))?;
             // Task 17: `vertex-gemini`'s request envelope (not its content
             // shape -- `encode_generate_content` needs no changes) genuinely
             // diverges from `EndpointMode::GenerateContent`'s otherwise-
@@ -193,7 +196,19 @@ impl Provider for GoogleGenAiProvider {
             if !(200..300).contains(&response.status) {
                 // §9.8: never `?` on JSON parsing in the error path.
                 let headers = to_header_map(&response.headers);
-                let body_bytes = collect_body(response.body).await;
+                let body_bytes = match crate::body_cap::collect_body_capped(
+                    response.body,
+                    crate::body_cap::MAX_RESPONSE_BODY_BYTES,
+                )
+                .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        return Err(ProviderError::Transport(redact_transport_error_text(
+                            &e.to_string(),
+                        )))
+                    }
+                };
                 let remapped = remap_error_body_for_classify(&body_bytes);
                 return Err(classify(
                     &self.profile.error_profile(),
@@ -414,24 +429,6 @@ fn to_header_map(raw: &[(String, String)]) -> http::HeaderMap {
         }
     }
     headers
-}
-
-async fn collect_body(
-    mut body: std::pin::Pin<
-        Box<
-            dyn futures::Stream<Item = Result<bytes::Bytes, crate::transport::TransportError>>
-                + Send,
-        >,
-    >,
-) -> Vec<u8> {
-    use futures::StreamExt;
-    let mut out = Vec::new();
-    while let Some(chunk) = body.next().await {
-        if let Ok(chunk) = chunk {
-            out.extend_from_slice(&chunk);
-        }
-    }
-    out
 }
 
 #[cfg(test)]

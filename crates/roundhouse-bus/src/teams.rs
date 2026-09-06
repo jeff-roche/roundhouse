@@ -35,6 +35,20 @@ pub struct Membership {
 pub trait TeamStore: Send + Sync {
     fn save_team(&self, team: &Team);
     fn save_membership(&self, membership: &Membership);
+    /// Atomically checks the team's current *live* (non-ended) member count against
+    /// `MAX_TEAM_SIZE` and, only if that would not be exceeded, records
+    /// `membership` — the count, the check, and the insert all happen under one
+    /// critical section, so two concurrent callers can never both observe room and
+    /// both insert (the TOCTOU `join` used to have via a `.get()` read followed by a
+    /// separate `save_membership` call). Returns the same
+    /// `BusError::TeamSizeLimitExceeded` `check_team_size` would.
+    ///
+    /// This is a distinct trait method rather than `join` bypassing the trait for
+    /// the atomic path, so a future non-in-memory `TeamStore` (e.g. one backed by a
+    /// real transactional store) is forced to provide its own atomic
+    /// count-check-insert rather than the trap of only `InMemoryTeamStore` ever
+    /// getting this guarantee.
+    fn save_membership_checked(&self, membership: &Membership) -> Result<(), BusError>;
 }
 
 pub struct InMemoryTeamStore {
@@ -67,6 +81,19 @@ impl TeamStore for InMemoryTeamStore {
             .entry(membership.team)
             .or_default()
             .push(membership.clone());
+    }
+
+    fn save_membership_checked(&self, membership: &Membership) -> Result<(), BusError> {
+        // LOAD-BEARING: `entry(team).or_default()` holds this shard's write guard
+        // for the entire count-check-insert below, making it one atomic critical
+        // section. Do NOT call any other `self.memberships` method (or re-enter this
+        // one) while `slot` is held — DashMap guards are per-shard and re-entrant
+        // access to the same shard deadlocks.
+        let mut slot = self.memberships.entry(membership.team).or_default();
+        let current = slot.iter().filter(|m| !m.ended).count() as u32;
+        check_team_size(current + 1)?;
+        slot.push(membership.clone());
+        Ok(())
     }
 }
 
@@ -143,20 +170,17 @@ impl TeamRegistry {
         if team_state == TeamState::Draining || team_state == TeamState::Closed {
             return Err(BusError::TeamDraining { team });
         }
-        let current = self
-            .store
-            .memberships
-            .get(&team)
-            .map(|m| m.iter().filter(|mem| !mem.ended).count() as u32)
-            .unwrap_or(0);
-        check_team_size(current + 1)?;
-        self.store.save_membership(&Membership {
+        // Count, size-check, and insert happen atomically inside
+        // `save_membership_checked` — see its doc comment. `create_team` (above)
+        // deliberately keeps using plain `save_membership`: the creator is always
+        // exactly the team's 1st member, on a `TeamId` no other caller can have
+        // learned of yet, so there is no concurrent joiner to race against.
+        self.store.save_membership_checked(&Membership {
             team,
             session,
             role: role.unwrap_or_else(|| "worker".to_string()),
             ended: false,
-        });
-        Ok(())
+        })
     }
 
     pub fn roster(&self, team: TeamId) -> Option<Vec<Membership>> {
@@ -178,7 +202,12 @@ impl TeamRegistry {
     /// policy engine as everything else." This registry holds no write-grant state at
     /// all and never will — it always answers `false`, so joining a team can never be
     /// mistaken for a write grant. The real grant (if any) lives entirely in Phase 2's
-    /// policy engine, outside this crate.
+    /// policy engine, outside this crate, via the `TeamMembership` trait
+    /// (`roundhouse-policy`'s `engine.rs`) that this method is the intended adapter
+    /// target for. Consequence, documented on `PolicyEngine::decide`'s `Team`-scope
+    /// arm: because this always returns `false`, once a `TeamMembership` adapter
+    /// wraps this method and is wired in, every team-memory write Denies
+    /// permanently — no `Ask` is ever raised, and no human can ever approve one.
     pub fn can_write_team_memory(&self, _team: TeamId, _session: SessionId) -> bool {
         false
     }
@@ -387,5 +416,57 @@ mod tests {
         assert!(registry.can_read_team_memory(team_id, member));
         assert!(!registry.can_read_team_memory(team_id, stranger));
         assert!(!registry.can_write_team_memory(team_id, member)); // never auto-granted
+    }
+
+    /// Regression test for the count-check-insert TOCTOU: `join` used to read the
+    /// current member count, drop that guard, run `check_team_size`, and only then
+    /// call `save_membership` — a second call to `save_membership` independently —
+    /// letting two concurrent joins both observe `current == 31`, both pass
+    /// `check_team_size(32)`, and both push, landing a roster of 33 against
+    /// `MAX_TEAM_SIZE == 32`. Pre-fills the roster to 31 so every racer contends
+    /// right at the boundary, then races 64 joiners against it, repeated many times
+    /// to make the race likely to be caught if it still exists.
+    #[test]
+    fn concurrent_joins_never_overshoot_the_team_size_cap() {
+        use crate::limits::MAX_TEAM_SIZE;
+        use std::sync::Barrier;
+        use std::thread;
+
+        const ITERATIONS: usize = 200;
+        const RACERS: usize = 64;
+
+        for iteration in 0..ITERATIONS {
+            let registry = TeamRegistry::new();
+            let ws = WorkspaceId::new();
+            let creator = SessionId::new();
+            let team_id = registry
+                .create_team(ws, "t".into(), "c".into(), creator, "lead".into())
+                .unwrap();
+            // 1 creator + 30 more == 31, one short of MAX_TEAM_SIZE (32) — every
+            // racer below is contending exactly at the 31->32 boundary.
+            for _ in 0..30 {
+                registry.join(team_id, SessionId::new(), None).unwrap();
+            }
+
+            let barrier = Barrier::new(RACERS);
+            thread::scope(|scope| {
+                for _ in 0..RACERS {
+                    let registry = &registry;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let sid = SessionId::new();
+                        barrier.wait();
+                        registry.join(team_id, sid, None)
+                    });
+                }
+            });
+
+            let roster = registry.roster(team_id).unwrap();
+            let live = roster.iter().filter(|m| !m.ended).count();
+            assert!(
+                live <= MAX_TEAM_SIZE as usize,
+                "iteration {iteration}: roster overshot the cap — {live} live members against MAX_TEAM_SIZE={MAX_TEAM_SIZE}"
+            );
+        }
     }
 }

@@ -280,6 +280,16 @@ fn walk_compound_command(cmd: &ast::CompoundCommand, out: &mut Vec<ResolvedNode>
         // `rm -rf` inside a C-style for-loop body reach exec with zero
         // policy evaluation at all (an unwalked node never becomes a
         // `ResolvedNode`, so it's simply invisible to `decide_pipeline`).
+        //
+        // B5 (review round 2), not fixed (orchestrator Ruling W4-18): no
+        // commands live here, but the raw arithmetic expression string
+        // itself (including the `for ((...))` header's own
+        // initializer/condition/updater) is never inspected by this or any
+        // sibling walker, so a `$(...)` command substitution embedded in one
+        // is invisible everywhere, not just here. See `opaque.rs`'s
+        // `find_opaque_in_compound_command` for the full writeup — this
+        // becomes real the moment a shell-backed executor lands; tracked,
+        // not fixed, here.
         ast::CompoundCommand::Arithmetic(_) => {}
         ast::CompoundCommand::ArithmeticForClause(c) => walk_do_group(&c.body, out),
         ast::CompoundCommand::BraceGroup(g) => walk_compound_list(&g.list, out),

@@ -57,6 +57,28 @@ pub struct CredentialCtx<'a> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
+    /// Phase 7 U4, Task 31 item 5 (verified 2026-09-05): reserved for a
+    /// credential-selection layer that resolves a provider's credential by
+    /// trying keyring, env, then profile default, in that order — this is
+    /// the ONLY variant whose message already names that triad. No such
+    /// layer exists yet anywhere reachable from this crate: nothing in
+    /// `roundhouse-provider` or `roundhouse-secrets/src/credential/` ever
+    /// builds a `Box<dyn CredentialProvider>` from configuration (every
+    /// production `RequestCtx.credentials` is `None` today — see e.g.
+    /// `codec::openai_responses::provider`'s comment on that field), and
+    /// `roundhouse-secrets::resolve` resolves a different type (`SecretRef`)
+    /// through a different error type (`SecretError`) with no "profile
+    /// default" source at all. Constructing this variant "at its obvious
+    /// call site" would mean inventing that resolution layer from scratch —
+    /// real, but out of a residual-hardening unit's scope, and its
+    /// config-driven call site is `roundhouse-config`, out of this lane.
+    /// Fix round 3 correction (Ruling R39/K1): unlike `Transport` below,
+    /// this variant is constructed **nowhere at all today, not even in a
+    /// test** — `grep -rn "CredentialError::NotFound"` outside this enum's
+    /// own definition returns zero hits. An earlier draft of this comment
+    /// wrongly said "only constructed today in a test fixture" for both
+    /// variants; that claim is true of `Transport` (see below) but false
+    /// of this one.
     #[error(
         "no credential material found for provider `{0}` (checked keyring, env, profile default)"
     )]
@@ -67,10 +89,66 @@ pub enum CredentialError {
     ExecFailed(Option<i32>, String),
     #[error("sigv4 signing precondition failed: {0}")]
     SigningFailed(String),
+    /// Phase 7 U4, Task 31 item 5 (fix round 1, Ruling R33 — corrects this
+    /// comment's originally-stated leak vector, which was wrong): the only
+    /// network call among the six `CredentialProvider` impls is
+    /// `roundhouse-secrets`'s `oauth_refresh.rs` (and `azure_entra.rs`,
+    /// which delegates to it), and it deliberately does NOT construct this
+    /// variant via the naive `?` (`#[from] TransportError`) path — it maps
+    /// every `TransportError` to a hand-built, host-only `RefreshFailed`
+    /// message instead. Unlike `NotFound` above, this variant IS
+    /// implicitly constructible today: `#[from]` means the compiler
+    /// derives a `From<TransportError>` impl, so a bare `?` on any
+    /// `TransportError` inside a `Result<_, CredentialError>` function
+    /// constructs it for free, with no explicit call needed — which is
+    /// exactly why `oauth_refresh.rs`'s avoidance is a deliberate,
+    /// load-bearing choice rather than an incidental one; the easy path
+    /// is one `?` away, not something a future author would have to go
+    /// out of their way to write.
+    ///
+    /// **The vector, verified against the pinned `reqwest = 0.13.4` this
+    /// workspace builds's actual source (fix round 2, Ruling CF15
+    /// sharpened this further — see `oauth_refresh.rs`'s call site for the
+    /// full mechanism):** userinfo is not a `Display`-time redaction —
+    /// `reqwest` moves it into an `Authorization: Basic` header at
+    /// Request-build time, CONDITIONALLY (only when the percent-encoded
+    /// username is valid UTF-8), before either `Display` or `Debug` ever
+    /// sees the URL. What NEITHER format ever strips is the query string:
+    /// `http://host/x?api_key=...` survives verbatim regardless. So a
+    /// `refresh_url` carrying `?client_secret=…` or similar is the real,
+    /// always-live leak shape a raw `TransportError::Io`
+    /// (`transport/mod.rs`) could carry.
+    ///
+    /// **Which path is actually dangerous, precisely** (both are true, they
+    /// don't conflict): a *hand-built* `Transport(TransportError::Io(<the
+    /// same pre-redacted, host-only string `RefreshFailed` already uses>))`
+    /// would cost nothing — `TransportError::Io` is a plain public tuple
+    /// variant, so nothing stops a caller from wrapping an already-safe
+    /// string in it. What's dangerous is the naive `?`/`#[from]` path —
+    /// the one an author would actually reach for — which propagates the
+    /// RAW `TransportError` (query string and all) straight through. Every
+    /// one of the 7 codec call sites that invoke `CredentialProvider::apply`
+    /// does redact the resulting error's `.to_string()` before it becomes a
+    /// `ProviderError::Transport`, so even the naive path wouldn't leak
+    /// past that second layer today — but relying on the second layer alone
+    /// removes `oauth_refresh.rs`'s first, already-security-reviewed layer
+    /// of redaction. That's a defense-in-depth regression, not a residual
+    /// fix, so this unit leaves the naive path un-taken. Only constructed
+    /// today in a test fixture (`tests/conformance_cohere_v2.rs`).
     #[error("transport error while resolving credential: {0}")]
     Transport(#[from] TransportError),
     #[error("invalid base URL: {0}")]
     InvalidBaseUrl(String),
+    /// Phase 7 Task 16, Ruling R9 (scheme allowlist per fix round 1, Ruling
+    /// R24): an operator-supplied (explicit override or
+    /// `ROUNDHOUSE_<PROVIDER>_BASE_URL` env var) base URL used a scheme
+    /// other than `https`, or a non-loopback `http://`, without opting in
+    /// via `allow_insecure` or the sibling
+    /// `ROUNDHOUSE_<PROVIDER>_ALLOW_INSECURE_BASE_URL` env var (fix round 1,
+    /// Ruling R23). See `base_url::resolve_base_url`'s doc comment for the
+    /// full policy.
+    #[error("insecure base URL: {0}")]
+    InsecureBaseUrl(String),
 }
 
 /// Applies this credential to an outbound request IN PLACE. Implementations

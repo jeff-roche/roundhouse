@@ -111,11 +111,20 @@ fn git_rule_can_allow_a_read_only_subcommand() {
 }
 
 #[test]
-fn agent_rule_can_allow_a_spawn_at_or_below_a_tier_ceiling() {
+fn agent_rule_can_allow_a_spawn_at_or_above_a_tier_floor() {
+    // Task 21 (W4) flipped `Predicate::Agent`'s tier comparison from a
+    // (backwards) ceiling to a floor: a grant approved at `max_tier: X`
+    // covers a request only if `tier_request >= X`. This test used to
+    // construct `tier_request: Worktree` against a `max_tier: Sandbox` rule
+    // — i.e. a request for *less* isolation than what was "approved" — which
+    // only passed under the old, backwards `<=` comparison; it was
+    // unknowingly relying on the exact direction the security fix corrects.
+    // Flipped here: the rule's floor (`Sandbox`) is now at or below the
+    // request's tier (`Remote`), which is what "covers" is supposed to mean.
     let params = TaskParams::Agent {
         provider: ProviderId("anthropic".into()),
         model: "claude".into(),
-        tier_request: Tier::Worktree,
+        tier_request: Tier::Remote,
     };
     let policy = PolicyEngine::from_rules(vec![CompiledRule::test_new(
         Scope::Project,
