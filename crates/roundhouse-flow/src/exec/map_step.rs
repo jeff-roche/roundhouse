@@ -1117,6 +1117,17 @@ impl<'a> Executor<'a> {
                 // cleanup guarantee `worktree_guard` below provides), and
                 // "Fix round 1, item 1" for the taint-leak fix below.
                 let mut worktree_guard: Option<WorktreeGuard> = None;
+                // Carried out of the match below so the release arm at the
+                // end of this closure can apply the same withhold rule the
+                // materialize arm does (final round part 2, M1). A release
+                // error from *this* crate's adapter never sees `base_ref`
+                // — `remove_worktree` is handed a generated uuid path and
+                // `--force` — but `WorktreeProvider` is a `pub` trait whose
+                // doc now tells an implementor its release errors are
+                // persisted under the same rule, and a caller that ignored
+                // that on one of the two paths would make the promise a
+                // half-truth.
+                let mut base_ref_was_secret_derived = false;
                 match isolation {
                     // Fix round 1, item 6 / fix round 2, item 3 (ruling
                     // W5-33): `None` (the field absent) and an explicit
@@ -1197,6 +1208,7 @@ impl<'a> Executor<'a> {
                                     false,
                                 ),
                             };
+                        base_ref_was_secret_derived = base_ref_is_secret_derived;
                         match provider.materialize(&unredacted_base_ref) {
                             Ok(path) => {
                                 // Derived from `item_evaluated`, not
@@ -1430,15 +1442,27 @@ impl<'a> Executor<'a> {
                 if let Some(guard) = worktree_guard.take() {
                     if let Err(e) = guard.release() {
                         if !matches!(last, ItemOutcome::Failed(_)) {
-                            // Same declared-secrets backstop as the
-                            // materialize arm above (final round, item A1):
-                            // `{e}` embeds `git`'s own stderr, which this
-                            // crate does not control, and a declared
-                            // secret's raw value can be in scope for this
-                            // run through a channel provenance treats as
-                            // clean. See [`redact_message`]'s doc comment.
+                            // Both guards the materialize arm applies, for
+                            // the same reasons, so the two paths out of one
+                            // item's worktree lifecycle cannot diverge:
+                            // withhold when this item's `base_ref` was
+                            // secret-derived (final round part 2, M1 —
+                            // `safe_summary()` is what the trait promises an
+                            // implementor is used), and the declared-secrets
+                            // needle backstop on top either way (item A1 —
+                            // `{e}` embeds free text this crate does not
+                            // control). See [`redact_message`]'s own doc
+                            // comment for why the two are independent.
+                            let detail = if base_ref_was_secret_derived {
+                                e.safe_summary().to_string()
+                            } else {
+                                e.to_string()
+                            };
                             last = ItemOutcome::Failed(redact_message(
-                                format!("map step `{step_id}`: releasing the item's worktree: {e}"),
+                                format!(
+                                    "map step `{step_id}`: releasing the item's worktree: \
+                                     {detail}"
+                                ),
                                 &self.redaction_needles,
                             ));
                         }

@@ -165,6 +165,43 @@ impl WorktreeProvider for FailingReleaseProvider {
     }
 }
 
+/// A provider whose `release` fails with an error embedding whatever text it
+/// was constructed with, built through [`WorktreeProviderError::new`] — the
+/// constructor the trait's own doc now tells implementors *not* to use for a
+/// message carrying outside free text. Deliberately the careless
+/// implementation, because the point of the test that uses it is that the
+/// declared-secrets needle backstop still catches it.
+struct LeakyReleaseProvider(String);
+impl WorktreeProvider for LeakyReleaseProvider {
+    fn materialize(&self, _base_ref: &str) -> Result<PathBuf, WorktreeProviderError> {
+        Ok(PathBuf::from("/fake/worktree/path"))
+    }
+    fn release(&self, _worktree_path: &Path) -> Result<(), WorktreeProviderError> {
+        Err(WorktreeProviderError::new(format!(
+            "LeakyReleaseProvider failed while cleaning up after {}",
+            self.0
+        )))
+    }
+}
+
+/// A provider whose `release` fails with a two-rendering error built the way
+/// the trait doc tells implementors to — full text embedding whatever it was
+/// constructed with, safe summary saying nothing beyond this crate's own
+/// vocabulary. The counterpart to [`LeakyReleaseProvider`]: it exercises
+/// whether the *caller* actually reads `safe_summary()` on the release path.
+struct WithheldReleaseProvider(String);
+impl WorktreeProvider for WithheldReleaseProvider {
+    fn materialize(&self, _base_ref: &str) -> Result<PathBuf, WorktreeProviderError> {
+        Ok(PathBuf::from("/fake/worktree/path"))
+    }
+    fn release(&self, _worktree_path: &Path) -> Result<(), WorktreeProviderError> {
+        Err(WorktreeProviderError::with_safe_summary(
+            format!("WithheldReleaseProvider failed cleaning up {}", self.0),
+            "release failed (its free text is withheld here)",
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------
 // Test scaffolding shared with `tests/map_step.rs` (each `tests/*.rs` file
 // is its own crate, so this cannot be imported from there).
@@ -1178,5 +1215,137 @@ fn a_backslash_bearing_secret_is_scrubbed_before_debug_formatting_can_escape_it(
         !serialized.contains("secret123"),
         "no rendering of the secret — escaped or raw — may survive anywhere in the map \
          step's serialized output, got: {serialized}"
+    );
+}
+
+/// Final round part 2, M2: A1's "verified by removal" evidence covered the
+/// **materialize** site only, while the fix (and its doc comment) claims
+/// both. This drives the other one.
+///
+/// A release failure whose message embeds a declared secret's raw value —
+/// built via `WorktreeProviderError::new`, i.e. by an implementor who
+/// ignored the obligation the trait doc states — must still be scrubbed on
+/// its way into the item's outcome. No `git` involved: `materialize`
+/// returns a fake path, so this exercises the release arm and nothing else.
+///
+/// This is not a hypothetical shape. `WorktreeProvider` is `pub` and meant
+/// for downstream implementation, `new` reads like the default constructor,
+/// and the needle backstop is what stands behind an implementor who got it
+/// wrong.
+#[test]
+fn a_declared_secret_inside_a_release_failure_is_scrubbed_too() {
+    const SECRET_VALUE: &str = "release-path-topsecret456";
+    let yaml = format!(
+        "{WORKFLOW_PREAMBLE}secrets: [T]\nsteps:\n\
+         \x20\x20- id: per_item\n\
+         \x20\x20\x20\x20map:\n\
+         \x20\x20\x20\x20\x20\x20over: \"${{{{ inputs.items }}}}\"\n\
+         \x20\x20\x20\x20\x20\x20as: item\n\
+         \x20\x20\x20\x20\x20\x20max_parallel: 1\n\
+         \x20\x20\x20\x20\x20\x20on_item_error: continue\n\
+         \x20\x20\x20\x20\x20\x20isolation: worktree\n\
+         \x20\x20\x20\x20steps:\n\
+         \x20\x20\x20\x20\x20\x20- id: emit_something\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20emit: {{ ok: true }}\n"
+    );
+    let def = parse_workflow(&yaml).expect("workflow must parse");
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(
+        serde_json::json!({"items": [1]}),
+        "T",
+        SECRET_VALUE,
+        Some(Arc::new(LeakyReleaseProvider(SECRET_VALUE.to_string())) as Arc<dyn WorktreeProvider>),
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().expect("run must not error");
+
+    let items = outcomes[0].output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]["status"], "failed",
+        "a release failure must surface as the item's own failure — got {:?}",
+        items[0]
+    );
+    let error = items[0]["error"].as_str().unwrap();
+    // Sanity: this really is the release arm, not the materialize one.
+    assert!(
+        error.contains("releasing"),
+        "expected the release-failure message, got: {error:?}"
+    );
+    assert!(
+        error.contains("***"),
+        "the needle backstop must have replaced the secret on the release path too, \
+         got: {error:?}"
+    );
+
+    let serialized = serde_json::to_string(&outcomes[0].output).unwrap();
+    assert!(
+        !serialized.contains(SECRET_VALUE),
+        "a declared secret's raw value must not survive a release failure into the map \
+         step's serialized output, got: {serialized}"
+    );
+}
+
+/// The other half of M1: the release arm must read `safe_summary()` when the
+/// item's `base_ref` was secret-derived, exactly as the materialize arm
+/// does. Before this round it formatted `Display` (i.e. `full`)
+/// unconditionally, so `WorktreeProvider`'s doc promised implementors a
+/// guarantee the only shipped caller applied on one of its two paths.
+///
+/// The needle backstop cannot stand in for the withhold here, and that is
+/// the point: the declared secret is the JSON list `["..."]`, while what
+/// reaches `base_ref` is the *element*. `redaction_needles` holds only raw
+/// `RunContext.secrets` values, never anything computed from them, so the
+/// element is invisible to it — only provenance knows, and only the withhold
+/// acts on what provenance knows.
+#[test]
+fn a_secret_derived_items_release_failure_is_withheld_not_rendered_in_full() {
+    const DERIVED_ELEMENT: &str = "derived-release-leak-marker789";
+    let yaml = format!(
+        "{WORKFLOW_PREAMBLE}secrets: [T]\nsteps:\n\
+         \x20\x20- id: per_item\n\
+         \x20\x20\x20\x20map:\n\
+         \x20\x20\x20\x20\x20\x20over: \"${{{{ json(secrets.T) }}}}\"\n\
+         \x20\x20\x20\x20\x20\x20as: item\n\
+         \x20\x20\x20\x20\x20\x20max_parallel: 1\n\
+         \x20\x20\x20\x20\x20\x20on_item_error: continue\n\
+         \x20\x20\x20\x20\x20\x20isolation: {{ worktree: {{ base_ref: \"${{{{ item }}}}\" }} }}\n\
+         \x20\x20\x20\x20steps:\n\
+         \x20\x20\x20\x20\x20\x20- id: emit_something\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20emit: {{ ok: true }}\n"
+    );
+    let def = parse_workflow(&yaml).expect("workflow must parse");
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(
+        serde_json::json!({}),
+        "T",
+        &format!("[{DERIVED_ELEMENT:?}]"),
+        Some(
+            Arc::new(WithheldReleaseProvider(DERIVED_ELEMENT.to_string()))
+                as Arc<dyn WorktreeProvider>,
+        ),
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().expect("run must not error");
+
+    let items = outcomes[0].output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]["status"], "failed",
+        "a release failure must surface as the item's own failure — got {:?}",
+        items[0]
+    );
+    let error = items[0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("releasing") && error.contains("withheld"),
+        "the release arm must render the provider's safe summary for a secret-derived \
+         base_ref, got: {error:?}"
+    );
+
+    let serialized = serde_json::to_string(&outcomes[0].output).unwrap();
+    assert!(
+        !serialized.contains(DERIVED_ELEMENT),
+        "the secret-derived element must not reach the serialized outcome through a \
+         release failure, got: {serialized}"
     );
 }
