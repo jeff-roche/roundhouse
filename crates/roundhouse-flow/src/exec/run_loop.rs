@@ -51,7 +51,7 @@
 //!   emit a `TaskCreated` and defer the real dispatch, inside a `map` exactly
 //!   as at the top level (see [`Executor::dispatch_step`]'s own doc comment
 //!   on those arms). `max_parallel` is accepted and threaded through unread
-//!   — see [`map_step::run_map`]'s own doc comment. (Task 34 closed the
+//!   — see [`crate::exec::map_step::run_map`]'s own doc comment. (Task 34 closed the
 //!   *other* half this bullet used to name here: `map`'s worktree fan-out is
 //!   real now, via the `flow -> sandbox` edge §5.2's `roundhouse-flow` row
 //!   gained in Task 14 — see `Executor::dispatch_map_step`'s own

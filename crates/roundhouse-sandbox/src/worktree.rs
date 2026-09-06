@@ -268,6 +268,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// worktree add`/`remove` emit a line or two; the cap exists so a
 /// repository-controlled hook that floods a pipe cannot turn the wall-clock
 /// bound into unbounded memory growth in this process.
+///
+/// **What truncation costs today: nothing.** Past this many bytes, output
+/// is still read (so the child never blocks on a full pipe) and then
+/// discarded, so a child that writes more than this gets a shortened
+/// `stderr` in [`WorktreeError::CommandFailed`] and a shortened return
+/// value from `run_program`. That is invisible in this crate's current
+/// shape because `run_git` — the only non-test caller — discards stdout
+/// entirely, and `stderr` here is diagnostic text, never data. **A future
+/// caller that actually consumes `run_program`'s stdout must revisit this
+/// number rather than assume it is generous**, because the truncation is
+/// silent by design: nothing here can fail the call or kill the child, the
+/// same distinction ruling W5-28 drew between a caller-declared bound and
+/// an internal capture-buffer size.
 const OUTPUT_CAP: usize = 64 * 1024;
 
 /// Everything that can go wrong materializing or releasing a git worktree.
