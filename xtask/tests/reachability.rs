@@ -273,7 +273,7 @@ fn has_production_call(source: &str, call: &str) -> bool {
     }
     let needle = call.trim_end_matches('(').replace([' ', '.'], "");
     let Ok(file) = syn::parse_file(source) else {
-        return strip_non_code(source).replace(' ', "").contains(&needle);
+        return false;
     };
     struct Calls<'a> {
         needle: &'a str,
