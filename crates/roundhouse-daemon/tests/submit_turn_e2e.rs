@@ -185,9 +185,8 @@ async fn start_daemon(provider: Arc<dyn Provider>) -> Daemon {
     start_daemon_with_rules(provider, no_policy_rules()).await
 }
 
-/// [`start_daemon`], but with a caller-supplied [`PolicyRuleSource`] — what
-/// the exit-criterion test needs, since production's [`no_policy_rules`]
-/// can never answer `Allow`.
+/// [`start_daemon`], but with a caller-supplied [`PolicyRuleSource`] — useful
+/// for tests that need a deliberately empty or independently prepared source.
 async fn start_daemon_with_rules(
     provider: Arc<dyn Provider>,
     policy_rules: PolicyRuleSource,

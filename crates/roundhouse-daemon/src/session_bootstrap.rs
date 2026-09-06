@@ -121,30 +121,33 @@ impl BackgroundServices {
                 cancelled: cancel.subscribe(),
                 ready: Some(ready_tx),
             };
-            let handle = tokio::spawn(service(context));
-            match ready_rx.await {
-                Ok(Ok(())) => handles.push(handle),
-                Ok(Err(error)) => {
-                    cancel.send_replace(true);
-                    for handle in handles.iter() {
-                        handle.abort();
+            handles.push(tokio::spawn(service(context)));
+            tokio::select! {
+                ready = ready_rx => match ready {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        cancel.send_replace(true);
+                        for handle in handles.iter() { handle.abort(); }
+                        while handles.next().await.is_some() {}
+                        return Err(error);
                     }
-                    handle.abort();
-                    while handles.next().await.is_some() {}
-                    let _ = handle.await;
-                    return Err(error);
-                }
-                Err(_) => {
-                    cancel.send_replace(true);
-                    for handle in handles.iter() {
-                        handle.abort();
+                    Err(_) => {
+                        cancel.send_replace(true);
+                        for handle in handles.iter() { handle.abort(); }
+                        while handles.next().await.is_some() {}
+                        return Err(BackgroundServiceError("service exited without signaling readiness".to_string()));
                     }
-                    handle.abort();
+                },
+                completed = handles.next() => {
+                    cancel.send_replace(true);
+                    for handle in handles.iter() { handle.abort(); }
                     while handles.next().await.is_some() {}
-                    let _ = handle.await;
-                    return Err(BackgroundServiceError(
-                        "service exited without signaling readiness".to_string(),
-                    ));
+                    return match completed {
+                        Some(Ok(Err(error))) => Err(error),
+                        Some(Ok(Ok(()))) => Err(BackgroundServiceError("service stopped before readiness".to_string())),
+                        Some(Err(error)) => Err(BackgroundServiceError(error.to_string())),
+                        None => Err(BackgroundServiceError("service stopped before readiness".to_string())),
+                    };
                 }
             }
         }
@@ -207,9 +210,9 @@ impl RunningBackgroundServices {
 /// **This is a seam, not a configuration surface.** It exists so the rule
 /// set a session is built with is an *input* to session construction
 /// instead of a literal `vec![]` frozen into it, which is what made the
-/// phase's own end-to-end criterion untestable. Production passes
-/// [`no_policy_rules`] and therefore still loads **zero** operator rules —
-/// see that function's doc comment.
+/// phase's own end-to-end criterion untestable. Production builds it with
+/// [`policy_rules_from_files`]; tests can still supply a deliberately empty
+/// source via [`no_policy_rules`].
 pub type PolicyRuleSource = Arc<dyn Fn() -> Vec<CompiledRule> + Send + Sync>;
 
 /// Error returned while building the production [`PolicyRuleSource`].  This is
@@ -325,7 +328,7 @@ pub struct DaemonResources {
     /// (`AllowDownTo(Tier::None)`) is actively wrong, not merely stricter
     /// than necessary.
     pub default_on_degrade: OnDegrade,
-    /// See [`PolicyRuleSource`]. Production passes [`no_policy_rules`].
+    /// See [`PolicyRuleSource`]. Production uses [`policy_rules_from_files`].
     pub policy_rules: PolicyRuleSource,
     /// Background-service composition seam. Production is intentionally empty
     /// until the owning Phase 8 lanes supply their independent factories.
@@ -573,9 +576,8 @@ pub async fn create_real_session(
     let mirrored_mcp_resolved: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
     // Ruling W1-R118: the rule set is an INPUT to session construction, not a
-    // literal frozen into it. `no_policy_rules` — what production passes —
-    // returns an empty `Vec`, so this is byte-identical to the `vec![]` that
-    // was here before, and just as fail-closed. See `PolicyRuleSource`.
+    // literal frozen into it. Tests can pass `no_policy_rules` for an empty,
+    // fail-closed fixture; production supplies the file-derived source.
     let policy = Arc::new(
         PolicyEngine::from_rules((resources.policy_rules)()).with_sealed_ctx_provider(
             build_sealed_ctx_provider(

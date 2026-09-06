@@ -134,9 +134,9 @@ const EXPECTED_UNWIRED: &[&str] = &[
 fn source_without_test_items(source: &str) -> String {
     let mut output = String::new();
     let mut rest = source;
-    while let Some(offset) = rest.find("#[cfg(test)]") {
+    while let Some(offset) = find_test_cfg_attribute(rest) {
         output.push_str(&rest[..offset]);
-        let after = &rest[offset + "#[cfg(test)]".len()..];
+        let after = &rest[offset + rest[offset..].find(']').unwrap() + 1..];
         let trimmed = after.trim_start();
         let open = trimmed.find('{').expect("a cfg(test) item has a body");
         let end = matching_brace(trimmed.as_bytes(), open).unwrap_or_else(|| {
@@ -149,6 +149,21 @@ fn source_without_test_items(source: &str) -> String {
     }
     output.push_str(rest);
     output
+}
+
+fn find_test_cfg_attribute(source: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("#[cfg(") {
+            let end = trimmed.find(']')?;
+            if trimmed[..end].contains("test") {
+                return Some(offset + line.len() - trimmed.len());
+            }
+        }
+        offset += line.len();
+    }
+    None
 }
 
 /// Finds the matching brace while ignoring Rust strings and comments. This is
@@ -248,7 +263,19 @@ fn matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
 
 fn has_production_call(source: &str, call: &str) -> bool {
     source_without_test_items(source).lines().any(|line| {
-        let line = line.trim();
+        let line = line.split("//").next().unwrap_or_default().trim();
+        let mut sanitized = String::new();
+        let mut quoted = false;
+        for byte in line.bytes() {
+            if byte == b'"' {
+                quoted = !quoted;
+                continue;
+            }
+            if !quoted {
+                sanitized.push(byte as char);
+            }
+        }
+        let line = sanitized.trim();
         !line.starts_with("//")
             && !line.starts_with("///")
             && line.contains(call)
