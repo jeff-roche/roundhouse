@@ -523,6 +523,7 @@ async fn main() -> color_eyre::Result<()> {
         network_config,
         default_on_degrade,
         policy_rules,
+        roundhouse_daemon::session_bootstrap::BackgroundServices::default(),
         runner,
         provider,
         request_ctx,
@@ -530,6 +531,11 @@ async fn main() -> color_eyre::Result<()> {
     ));
 
     let registry = Arc::new(SessionRegistry::new());
+    let mut background_services = resources
+        .background_services
+        .start(resources.store.clone(), Arc::clone(&registry))
+        .await
+        .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
 
     // Phase 7, Task 9: `roundhouse-web`'s HTTP surface, bound alongside the
     // Unix socket below rather than instead of it — `round attach`/`round
@@ -593,6 +599,11 @@ async fn main() -> color_eyre::Result<()> {
     let mut accept_handle = tokio::spawn(accept_loop(listener, registry, resources));
     let mut web_handle = tokio::spawn(roundhouse_web::serve(web_listener, web_router));
     let result = tokio::select! {
+        service_result = background_services.wait_for_failure() => {
+            accept_handle.abort();
+            web_handle.abort();
+            Err(color_eyre::eyre::eyre!(service_result.err().map(|err| err.to_string()).unwrap_or_else(|| "background service stopped".to_string())))
+        }
         accept_result = &mut accept_handle => {
             web_handle.abort();
             match accept_result {
@@ -609,6 +620,16 @@ async fn main() -> color_eyre::Result<()> {
                 Err(join_err) => Err(color_eyre::eyre::eyre!(join_err.to_string())),
             }
         }
+    };
+
+    // Explicitly broadcast cancellation and join every background service
+    // before returning.  A service error is already reflected in `result`;
+    // shutdown only supplies an error when the foreground surfaces ended
+    // cleanly and a service then failed while joining.
+    let shutdown_result = background_services.shutdown().await;
+    let result = match (result, shutdown_result) {
+        (Ok(()), Err(error)) => Err(color_eyre::eyre::eyre!(error.to_string())),
+        (result, _) => result,
     };
 
     // Unlink on the way out: a bound Unix socket outlives the process that

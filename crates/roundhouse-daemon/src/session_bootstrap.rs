@@ -28,7 +28,9 @@
 //!   egress proxy.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 
 use roundhouse_core::{
@@ -49,6 +51,138 @@ use roundhouse_policy::{compile_policy_layers, PolicyConfigError};
 use roundhouse_provider::{Provider, RequestCtx};
 use roundhouse_sandbox::{Handle, Isolate};
 use roundhouse_store::{spawn_writer, EventWriter, StorePool};
+use tokio::sync::{oneshot, watch};
+
+/// A background service's terminal failure.  A service must report readiness
+/// before it can be considered part of a live daemon, and its later failure
+/// is returned to the daemon's lifecycle owner rather than being detached.
+#[derive(Debug, thiserror::Error)]
+#[error("background service failed: {0}")]
+pub struct BackgroundServiceError(pub String);
+
+pub type BackgroundServiceFuture =
+    Pin<Box<dyn Future<Output = Result<(), BackgroundServiceError>> + Send>>;
+pub type BackgroundService =
+    Arc<dyn Fn(BackgroundServiceContext) -> BackgroundServiceFuture + Send + Sync>;
+
+/// Inputs a background service receives from the daemon composition root.
+/// `ready` must be completed exactly once before startup succeeds; dropping it
+/// or returning before readiness fails daemon boot.  `cancelled` is observed
+/// by the service during orderly shutdown, and the returned future is joined
+/// by [`RunningBackgroundServices`] so errors are never orphaned.
+pub struct BackgroundServiceContext {
+    pub store: StorePool,
+    pub sessions: Arc<crate::session_registry::SessionRegistry>,
+    pub cancelled: watch::Receiver<bool>,
+    ready: Option<oneshot::Sender<Result<(), BackgroundServiceError>>>,
+}
+
+impl BackgroundServiceContext {
+    pub fn signal_ready(&mut self) -> Result<(), BackgroundServiceError> {
+        self.ready
+            .take()
+            .ok_or_else(|| BackgroundServiceError("service signaled readiness twice".to_string()))?
+            .send(Ok(()))
+            .map_err(|_| {
+                BackgroundServiceError("daemon stopped waiting for service readiness".to_string())
+            })
+    }
+}
+
+/// Three intentionally independent optional slots.  L2, L3, and L4 own
+/// different eventual services and must not agree on a shared trait shape
+/// before those implementations exist.  Production leaves every slot empty
+/// until the owning lane supplies a factory; this is a documented seam, not
+/// evidence that those services are wired.
+#[derive(Default, Clone)]
+pub struct BackgroundServices {
+    pub workflow: Option<BackgroundService>,
+    pub scheduler: Option<BackgroundService>,
+    pub acp: Option<BackgroundService>,
+}
+
+impl BackgroundServices {
+    pub async fn start(
+        &self,
+        store: StorePool,
+        sessions: Arc<crate::session_registry::SessionRegistry>,
+    ) -> Result<RunningBackgroundServices, BackgroundServiceError> {
+        let (cancel, _) = watch::channel(false);
+        let mut handles = Vec::new();
+        for service in [&self.workflow, &self.scheduler, &self.acp]
+            .into_iter()
+            .flatten()
+        {
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let context = BackgroundServiceContext {
+                store: store.clone(),
+                sessions: Arc::clone(&sessions),
+                cancelled: cancel.subscribe(),
+                ready: Some(ready_tx),
+            };
+            let handle = tokio::spawn(service(context));
+            match ready_rx.await {
+                Ok(Ok(())) => handles.push(handle),
+                Ok(Err(error)) => {
+                    cancel.send_replace(true);
+                    for handle in handles {
+                        handle.abort();
+                    }
+                    handle.abort();
+                    return Err(error);
+                }
+                Err(_) => {
+                    cancel.send_replace(true);
+                    for handle in handles {
+                        handle.abort();
+                    }
+                    handle.abort();
+                    return Err(BackgroundServiceError(
+                        "service exited without signaling readiness".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(RunningBackgroundServices { cancel, handles })
+    }
+}
+
+/// Daemon-owned join/cancellation handle for all started background services.
+/// The daemon calls [`Self::shutdown`] on exit and [`Self::wait_for_failure`]
+/// while serving, making both cancellation and error propagation explicit.
+pub struct RunningBackgroundServices {
+    cancel: watch::Sender<bool>,
+    handles: Vec<tokio::task::JoinHandle<Result<(), BackgroundServiceError>>>,
+}
+
+impl RunningBackgroundServices {
+    pub async fn wait_for_failure(&mut self) -> Result<(), BackgroundServiceError> {
+        if let Some(handle) = self.handles.first_mut() {
+            match handle.await {
+                Ok(Ok(())) => {
+                    return Err(BackgroundServiceError(
+                        "service stopped unexpectedly".to_string(),
+                    ))
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(error) => return Err(BackgroundServiceError(error.to_string())),
+            }
+        }
+        std::future::pending().await
+    }
+
+    pub async fn shutdown(mut self) -> Result<(), BackgroundServiceError> {
+        self.cancel.send_replace(true);
+        for handle in &mut self.handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(error) => return Err(BackgroundServiceError(error.to_string())),
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Where a new session's *config-derived* policy rules come from
 /// (Phase 7, Task 8 fix round 1, ruling W1-R118).
@@ -187,6 +321,9 @@ pub struct DaemonResources {
     pub default_on_degrade: OnDegrade,
     /// See [`PolicyRuleSource`]. Production passes [`no_policy_rules`].
     pub policy_rules: PolicyRuleSource,
+    /// Background-service composition seam. Production is intentionally empty
+    /// until the owning Phase 8 lanes supply their independent factories.
+    pub background_services: BackgroundServices,
     pub runner: &'static TaskRunner,
     pub provider: Arc<dyn Provider>,
     request_ctx: RequestCtx,
@@ -210,6 +347,7 @@ impl DaemonResources {
         network_config: roundhouse_config::NetworkConfig,
         default_on_degrade: OnDegrade,
         policy_rules: PolicyRuleSource,
+        background_services: BackgroundServices,
         runner: &'static TaskRunner,
         provider: Arc<dyn Provider>,
         request_ctx: RequestCtx,
@@ -225,6 +363,7 @@ impl DaemonResources {
             network_config,
             default_on_degrade,
             policy_rules,
+            background_services,
             runner,
             provider,
             request_ctx,
@@ -679,6 +818,42 @@ mod tests {
     use super::*;
     use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
 
+    #[tokio::test]
+    async fn a_supplied_background_service_signals_readiness_and_is_joined_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = roundhouse_store::open(&dir.path().join("events.db"))
+            .await
+            .unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let service: BackgroundService = Arc::new(move |mut context| {
+            let started_tx = started_tx.clone();
+            Box::pin(async move {
+                context.signal_ready()?;
+                let _ = started_tx.send(());
+                while !*context.cancelled.borrow() {
+                    if context.cancelled.changed().await.is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            })
+        });
+        let services = BackgroundServices {
+            workflow: Some(service),
+            scheduler: None,
+            acp: None,
+        };
+        let running = services
+            .start(
+                store,
+                Arc::new(crate::session_registry::SessionRegistry::new()),
+            )
+            .await
+            .unwrap();
+        started_rx.recv().await.unwrap();
+        running.shutdown().await.unwrap();
+    }
+
     #[test]
     fn an_untrusted_project_allow_is_filtered_before_a_session_can_receive_it() {
         let state = tempfile::tempdir().unwrap();
@@ -744,6 +919,7 @@ mod tests {
             roundhouse_config::NetworkConfig::default(),
             OnDegrade::Refuse,
             no_policy_rules(),
+            BackgroundServices::default(),
             runner(),
             Arc::new(NoopProvider),
             RequestCtx {
