@@ -2080,8 +2080,9 @@ async fn an_mcp_policy_ask_records_a_terminal_and_is_reported_as_pending_approva
         vec![allow_mcp_tool(FAKE_SERVER, "search")],
     );
     // No rule at all — `PolicyEngine::decide` returns `Ask` when nothing
-    // matches (`engine.rs:536-539`), which is exactly the default path this
-    // finding is about.
+    // matches (its no-match arm builds `Decision { outcome: Outcome::Ask,
+    // rule: None }`), which is exactly the default path this finding is
+    // about.
     let executor_engine = mcp_engine(&state_dir, &daemon_binary, &[FAKE_SERVER], vec![]);
 
     let (actor, writer, db_path, session_id) = new_actor_with_engine(
@@ -2446,8 +2447,10 @@ async fn an_unsealed_mcp_dispatch_records_the_per_task_audit_note_that_the_floor
 /// MUST 6, M1 — `retryable` must be forwarded, not hardcoded `false`.
 ///
 /// `ExecutorOutcome::Failed` carries the executor's own judgement, and
-/// `McpExecutor`'s transport-error path sets `retryable: true`
-/// (`executor.rs:717-723`). `dispatch_mcp` matched `Failed { error, .. }` and
+/// `McpExecutor`'s transport-error path sets `retryable: true` (the
+/// `Err(e) => ExecutorOutcome::Failed { .. }` arm of `McpExecutor::execute`,
+/// categorised `executor_error`). `dispatch_mcp` matched
+/// `Failed { error, .. }` and
 /// passed a literal `false` to `record_task_failed`, while the timeout branch
 /// two dozen lines above it explicitly built `retryable: true` — so the log
 /// contradicted itself within one dispatch.
@@ -2640,4 +2643,176 @@ async fn the_executors_own_sealed_floor_denies_an_unresolved_server_after_admiss
         )),
         "the executor's gate must have recorded its own Deny decision"
     );
+}
+
+/// Runs one scripted `shell` tool call with the given `cwd`, and returns the
+/// model-visible text of the resulting error tool result together with the
+/// session's full event log. Used by the containment-refusal test below,
+/// which needs to compare TWO refusals' model-visible text byte-for-byte.
+async fn refused_shell_call(cwd: &str) -> (String, Vec<roundhouse_store::StoredEvent>) {
+    let dir = tempfile::tempdir().unwrap();
+    let (actor, _writer, db_path, session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+
+    let tools = actor.tool_defs().to_vec();
+    let provider = ScriptedToolCallProvider::new(
+        "shell",
+        serde_json::json!({
+            "program": "./whatever.sh",
+            "argv": [],
+            "cwd": cwd,
+        }),
+    );
+    let ctx = fake_ctx();
+
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+
+    let text = blocks
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::ToolResult {
+                is_error: true,
+                content,
+                ..
+            } => Some(
+                content
+                    .iter()
+                    .map(|p| p.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "a rejected shell cwd must surface as an error tool result, \
+             got {blocks:?}"
+            )
+        });
+
+    let reopened = open(&db_path).await.unwrap();
+    let events = session_events(&reopened, session_id).await.unwrap();
+    (text, events)
+}
+
+/// Ruling W1-R131, both halves.
+///
+/// **The audit half:** a shell/fs containment rejection is raised by
+/// `task_params_for` BEFORE `dispatch_builtin` mints its `task_id`, so
+/// before this fix every such refusal returned to the model with zero
+/// events in the append-only log — the same F10 asymmetry ruling W1-R81
+/// closed for the MCP arm via `record_unadmitted_refusal`, left open on the
+/// built-in arm.
+///
+/// **The disclosure half, which is the sharper one:** the rejection
+/// messages were formatted verbatim into the model-visible
+/// `ToolResultPart` — `"cwd {canonical:?} is outside the workspace root
+/// {root:?}"` disclosed the daemon's own absolute working directory, and
+/// `"cwd {raw_cwd:?} not accessible: {e}"` rendered `std::io::Error`'s text
+/// for an attacker-chosen absolute path, whose ENOENT/EACCES/ENOTDIR
+/// variants are distinguishable — a filesystem existence-and-permission
+/// oracle over the whole host, evaluated before `admit_task` so the
+/// fail-closed policy default never saw it.
+///
+/// The positive control that makes this test non-vacuous: two refusals for
+/// GENUINELY DIFFERENT reasons (a path that does not exist at all, and a
+/// real directory that exists but lies outside the workspace root) must
+/// come back to the model as BYTE-IDENTICAL text. Asserting only "the text
+/// contains no `os error`" would pass vacuously against any rewording.
+#[tokio::test]
+async fn a_shell_containment_refusal_is_audited_and_discloses_nothing_about_the_host() {
+    let daemon_cwd = std::env::current_dir().unwrap();
+
+    // Refusal 1: a path that does not exist — `canonicalize` fails ENOENT.
+    let (nonexistent_text, nonexistent_events) =
+        refused_shell_call("/nonexistent-roundhouse-w1r131/definitely/not/here").await;
+
+    // Refusal 2: a real, existing directory that is simply outside the
+    // workspace root — a DIFFERENT rejection branch entirely.
+    let outside = tempfile::tempdir().unwrap();
+    let outside_path = outside.path().canonicalize().unwrap();
+    assert!(
+        !outside_path.starts_with(&daemon_cwd),
+        "this test needs a real directory outside the daemon's cwd to exercise the \
+         outside-the-root branch; got {outside_path:?} under {daemon_cwd:?}"
+    );
+    let (outside_text, outside_events) = refused_shell_call(&outside_path.to_string_lossy()).await;
+
+    assert_eq!(
+        nonexistent_text, outside_text,
+        "a nonexistent cwd and a real-but-outside-the-root cwd must be indistinguishable to \
+         the model — anything else is a filesystem existence oracle"
+    );
+
+    for text in [&nonexistent_text, &outside_text] {
+        assert!(
+            !text.contains(&*daemon_cwd.to_string_lossy()),
+            "the refusal must never disclose the daemon's own working directory: {text:?}"
+        );
+        assert!(
+            !text.contains(&*outside_path.to_string_lossy()),
+            "the refusal must never echo a canonicalized host path back to the model: {text:?}"
+        );
+        assert!(
+            !text.contains("os error") && !text.to_lowercase().contains("no such file"),
+            "the refusal must never render an io::Error — errno is the oracle: {text:?}"
+        );
+    }
+
+    for (label, events) in [
+        ("nonexistent", &nonexistent_events),
+        ("outside-the-root", &outside_events),
+    ] {
+        let task_id = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    &e.payload,
+                    EventPayload::TaskCreated {
+                        kind: TaskKind::Shell,
+                        ..
+                    }
+                )
+            })
+            .and_then(|e| e.task_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the {label} containment refusal must be recorded as a real, queryable \
+                     TaskCreated, not returned as a silent non-event"
+                )
+            });
+        assert!(
+            events.iter().any(|e| e.task_id == Some(task_id)
+                && matches!(
+                    &e.payload,
+                    EventPayload::TaskFailed { error, .. } if error.category == "shell_cwd_rejected"
+                )),
+            "the {label} containment refusal must be recorded TaskFailed under its own \
+             category, not left dangling at TaskCreated"
+        );
+        assert!(
+            !events.iter().any(|e| e.task_id == Some(task_id)
+                && matches!(&e.payload, EventPayload::TaskStarted { .. })),
+            "a containment refusal is raised before admission — it must never reach TaskStarted"
+        );
+    }
 }

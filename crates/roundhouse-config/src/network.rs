@@ -347,7 +347,7 @@ fn normalize_for_compare(host: &str) -> String {
 /// - If `narrower_entry` is a `"*.suffix"` wildcard, it covers
 ///   `wider_entry` when `wider_entry` (normalized) equals `suffix` or ends
 ///   in `.suffix` — mirroring `roundhouse_net::policy::HostPattern::
-///   wildcard_suffix`'s own match semantics (`policy.rs:110-116`), so a
+///   wildcard_suffix`'s own match semantics, so a
 ///   **project wildcard covering a wider literal retains the wider
 ///   literal** (the case the security lens asked to see stated, not
 ///   inferred).

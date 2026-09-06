@@ -262,8 +262,19 @@ pub struct SessionActor {
     /// and simply stored here so Task 5's agent loop has one place to read
     /// the tool list an `infer` task's `ChatRequest.tools` should draw
     /// from, without needing it threaded through by hand at every call
-    /// site. An empty `Vec` (a session with zero configured MCP servers,
-    /// still carrying the five builtins) is the common case, not an error.
+    /// site.
+    ///
+    /// **The common case is a session with zero configured MCP servers,
+    /// whose catalog is exactly `builtin_tool_defs()`'s five entries** —
+    /// not an empty `Vec`. An empty `Vec` means the model is offered no
+    /// tools at all; it is a legitimate test-only construction (several
+    /// tests build an actor with `vec![]` deliberately), never something
+    /// the daemon's own `create_real_session` produces. Ruling W1-R132:
+    /// this doc comment previously asserted that an empty `Vec` still
+    /// carried the five builtins, which is a contradiction on its face —
+    /// and the daemon's no-MCP branch really was passing `Vec::new()`,
+    /// so the doc was describing the intent while the code did the
+    /// opposite.
     tool_defs: Vec<roundhouse_provider::ToolDef>,
 }
 

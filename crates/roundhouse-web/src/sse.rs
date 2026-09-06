@@ -22,7 +22,8 @@
 //!    asset fallback.
 //! 3. **`Last-Event-ID` names the last event the client *received*, so the
 //!    stream resumes at `seq + 1`.** `roundhouse-store` allocates the first
-//!    seq of a session as `COALESCE(MAX(seq), -1) + 1` (`writer.rs:171`) —
+//!    seq of a session as `COALESCE(MAX(seq), -1) + 1` (in
+//!    `roundhouse-store`'s `writer::append_one`) —
 //!    **seq 0 is a real event**, so "0 means no cursor" would be a bug. An
 //!    absent header resumes from 0; a present one resumes strictly after it.
 //! 4. **A malformed or foreign cursor is a `400`, never a silent restart.**
@@ -1114,7 +1115,8 @@ fn cursor_rejected(error: CursorError) -> Response {
 /// rather than delivered late. Ring order and live-queue order cannot disagree
 /// ([`SseHub::publish`] holds one lock across both), so this can only bite a
 /// publisher that allocates seqs out of order — which `roundhouse-store`'s
-/// single monotonic allocator (`COALESCE(MAX(seq), -1) + 1`, `writer.rs:171`)
+/// single monotonic allocator (`COALESCE(MAX(seq), -1) + 1`, in
+/// `roundhouse-store`'s `writer::append_one`)
 /// does not. Recorded because it is a real constraint on the publisher
 /// residual 1 calls for, and it is invisible from the client side.
 ///

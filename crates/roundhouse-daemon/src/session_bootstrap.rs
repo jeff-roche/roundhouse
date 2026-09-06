@@ -377,7 +377,20 @@ pub async fn create_real_session(
     );
 
     let (mcp_host, mcp, tool_defs) = if resources.mcp_configs.is_empty() {
-        (None, None, Vec::new())
+        // **Ruling W1-R132: `builtin_tool_defs()`, NOT `Vec::new()`.** This
+        // is the default production configuration — no `[[mcp_server]]` —
+        // and it must still offer the model the five built-in tools.
+        // `tool_catalog::merged_tool_defs` (below, via `start_session_mcp`)
+        // is the only other thing that prepends them, and it is reachable
+        // only from the MCP branch, so this branch supplying an empty
+        // catalog meant the common case offered ZERO tools — contradicting
+        // `SessionActor::tool_defs`' own doc comment, which describes this
+        // exact case as "still carrying the five builtins".
+        (
+            None,
+            None,
+            roundhouse_engine::tool_catalog::builtin_tool_defs(),
+        )
     } else {
         match start_session_mcp(
             resources.mcp_configs.clone(),
@@ -725,6 +738,48 @@ mod tests {
 
         assert!(real_session.mcp_host.is_none());
         assert_eq!(real_session.actor.state(), SessionState::Running);
+    }
+
+    /// Ruling W1-R132: the DEFAULT production configuration — no
+    /// `[[mcp_server]]` at all — must still offer the model the five
+    /// built-in tools. Before this fix the no-MCP branch of
+    /// `create_real_session` supplied `Vec::new()`, and
+    /// `tool_catalog::merged_tool_defs` (the only thing that prepends
+    /// `builtin_tool_defs()`) had exactly one caller, inside the MCP
+    /// branch — so the common case offered ZERO tools, contradicting the
+    /// `tool_defs` field's own doc comment in `session_actor.rs`.
+    ///
+    /// **No existing daemon-level test would have caught this**: every
+    /// other one builds its `SessionActor` with `vec![]` directly, so the
+    /// value under test here is only ever produced by `create_real_session`
+    /// itself. That is why this asserts through the real bootstrap function
+    /// rather than through a hand-built actor.
+    #[tokio::test]
+    async fn a_session_with_no_mcp_servers_configured_still_offers_the_five_builtins() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = resources(dir.path()).await;
+        assert!(
+            resources.mcp_configs.is_empty(),
+            "this test pins the NO-MCP branch specifically — it proves nothing if the fixture \
+             configures an MCP server"
+        );
+
+        let real_session = create_real_session(&resources, "test-workspace".into())
+            .await
+            .unwrap();
+
+        let mut offered: Vec<&str> = real_session
+            .actor
+            .tool_defs()
+            .iter()
+            .map(|d| d.name())
+            .collect();
+        offered.sort_unstable();
+        assert_eq!(
+            offered,
+            ["edit", "find", "read", "shell", "write"],
+            "a default (no-MCP) session must offer exactly the five builtin tools"
+        );
     }
 
     /// Fix round 3, MUST 4: a poisoned `proxy_secrets` mutex must not panic

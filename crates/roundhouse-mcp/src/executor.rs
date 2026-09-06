@@ -308,7 +308,8 @@ impl McpExecutor {
     /// Fix round C2, carry-forward CF-3: the ONLY authoritative source of
     /// the `ServerId` a caller must put into `TaskInput::Mcp.server` for a
     /// given namespaced tool name — `execute`'s own policy gate
-    /// (`executor.rs:531`) uses that field directly, not anything derived
+    /// (`Self::gate`, called from `execute`) uses that field directly,
+    /// not anything derived
     /// from `tool`, so a caller with no way to resolve `tool` correctly has
     /// no honest way to build a `TaskInput::Mcp` at all (this is exactly
     /// what round-A/B's `agent_loop.rs` MCP arm was blocked on). A thin,
@@ -330,9 +331,9 @@ impl McpExecutor {
     /// Fix round C2, carry-forward CF-9: the servers that actually
     /// completed spawn + discovery, as opposed to merely being *configured*
     /// — `connections` is built once in [`Self::new`] from
-    /// `McpHost::start`'s `StartedServer` list (`host.rs:280-285`), which by
+    /// `McpHost::start`'s `StartedServer` list, which by
     /// construction contains only servers whose `StdioMcpTransport::spawn`
-    /// AND `discover()` both succeeded (`host.rs:90-183`'s `start_server`);
+    /// AND `discover()` both succeeded (`host.rs`'s `start_server`);
     /// a server that failed either step never reaches `connections` at all.
     /// This is the honest input `SealedContext.resolved_mcp_servers` needs
     /// — using the *configured* id list instead (all this crate exposed

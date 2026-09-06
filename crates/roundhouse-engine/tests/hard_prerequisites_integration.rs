@@ -879,13 +879,26 @@ async fn a_c_style_arithmetic_for_loop_never_reaches_the_ast_walkers_through_the
         "the walker call above must be a pure decision, with no side effect"
     );
 
-    // Half two: the same string, through the real loop. `sh -c <command>`
+    // Half two: the same string, through the real loop. `bash -c <command>`
     // is what a model would have to write to get an interpreter to run it,
     // and the rule below is a deliberate `allow_interpreter` opt-out — the
     // ONLY way admission lets an interpreter through (§6.3 step 6). Without
     // that Allow this test would pass on the default `Ask` and prove
     // nothing, which is the failure mode it is written to avoid.
-    let sh = resolved_program("/bin/sh");
+    //
+    // **`/bin/bash`, not `/bin/sh` — and this is load-bearing.** A C-style
+    // arithmetic `for ((...))` is bash syntax; POSIX `sh` has no such
+    // construct. On a distro where `/bin/sh` is bash (this machine) the
+    // payload runs and the assertion below holds; on one where `/bin/sh` is
+    // dash (GitHub's `ubuntu-latest`) the interpreter rejects the string as
+    // a syntax error, the `rm` never fires, the victim survives, and this
+    // test fails for a reason that has nothing to do with what it pins.
+    // Naming bash is also the more faithful pin, not a weaker one: `bash`
+    // is in §6.3 step 6's own interpreter list, and the C-style form is
+    // exactly the shape W4's walker was taught to descend into. Do NOT
+    // "fix" this by rewriting the payload as POSIX-portable — that would
+    // quietly exercise a different construct while still looking green.
+    let sh = resolved_program("/bin/bash");
     let dir = tempfile::tempdir().unwrap();
     let fx = fixture(
         dir.path(),
@@ -907,7 +920,7 @@ async fn a_c_style_arithmetic_for_loop_never_reaches_the_ast_walkers_through_the
         None,
         "shell",
         serde_json::json!({
-            "program": "/bin/sh",
+            "program": "/bin/bash",
             "argv": ["-c", command],
             "cwd": work.path().to_string_lossy(),
         }),
@@ -922,11 +935,21 @@ async fn a_c_style_arithmetic_for_loop_never_reaches_the_ast_walkers_through_the
          refusal here would make the assertion below vacuous, got {:?}",
         results[0].1
     );
+    // This assertion FIRES when the victim still exists — i.e. when the
+    // `rm` did not run — so its message must describe that, not the
+    // by-design behaviour the passing case pins. (An earlier version said
+    // "the `rm -rf` ... actually ran", the exact inverse of its own
+    // condition; two separate readers took the passing case for a security
+    // finding because of it, and it cost a wrong ruling before it was
+    // caught.) The by-design fact — that nothing on `run_agent_loop`'s path
+    // parses an interpreter payload, so W4's AST-walker fix is unreachable
+    // from model output — is what this test's own doc comment above states,
+    // and it is what a PASS here means.
     assert!(
         !victim.exists(),
-        "the `rm -rf` hidden inside the C-style for-loop body actually ran: nothing on \
-         run_agent_loop's path parses an interpreter payload, so W4's AST-walker fix is \
-         not reachable from model output"
+        "the interpreter never executed the payload — the victim file still exists, so this \
+         case never reached the behaviour it exists to pin (most likely the `program` above \
+         is not a shell that accepts C-style `for ((...))`, which is bash syntax)"
     );
 }
 
@@ -950,7 +973,8 @@ async fn a_c_style_arithmetic_for_loop_never_reaches_the_ast_walkers_through_the
 /// Re-verified against this post-merge tree rather than carried forward —
 /// every `isolate.spawn(&handle, cmd)` call site in the workspace is inside
 /// `roundhouse-sandbox`'s own `tests/*.rs`, and W5's own
-/// `isolate_landlock_fix_round_1.rs:3` says so in its own words: its fixes
+/// `isolate_landlock_fix_round_1.rs` says so in its own module doc comment:
+/// its fixes
 /// are *"latent today because `Isolate::spawn` has no production caller
 /// yet."* `tool_dispatch::execute_builtin` calls `roundhouse_tools::run_shell`
 /// directly, and `dispatch_builtin` records an honest

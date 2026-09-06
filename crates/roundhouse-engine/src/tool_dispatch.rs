@@ -15,8 +15,9 @@
 //! the model that `cwd`/`root` are its own to name.
 //!
 //! **`find`'s `root` is genuinely contained by `roundhouse_tools::find_files`
-//! itself** (component-wise `starts_with` against the canonicalized root —
-//! `find.rs:46-95` — every match must resolve inside it).
+//! itself** (component-wise `starts_with` against the canonicalized root,
+//! in `roundhouse_tools::find_files` — every match must resolve inside
+//! it).
 //!
 //! **The original version of this comment claimed the identical thing was
 //! true of `shell`'s `cwd`, via `SessionActor::admit_task`'s sealed floor.
@@ -65,7 +66,8 @@
 //! `request.messages` (that function's own doc comment names the exact
 //! fold site) — so a built-in call against a very large file or a
 //! chatty command has the identical unbounded-context shape CF-7 item 4
-//! already flags for the MCP arm's `stdio.rs:206`. Pre-existing in
+//! already flags for the MCP arm's `StdioMcpTransport::spawn` stdout
+//! reader. Pre-existing in
 //! `roundhouse-tools` (no size cap on any of these signatures); this task
 //! does not add one — noted here so it is not silently narrowed to "only
 //! an MCP problem."
@@ -165,6 +167,102 @@ pub enum ToolDispatchError {
     /// ambiguous edit match, glob error, etc.).
     #[error("{0}")]
     Tool(#[from] roundhouse_tools::ToolError),
+}
+
+impl ToolDispatchError {
+    /// The two strings a refusal raised by [`task_params_for`] — i.e. one
+    /// raised BEFORE `SessionActor::admit_task` ever runs — contributes to
+    /// the session: the `TaskError.category` recorded in the append-only
+    /// log, and the message the model reads back in its `ToolResultPart`.
+    ///
+    /// **Never `self.to_string()` (ruling W1-R131).** Every variant's
+    /// `Display` above is written for a daemon operator reading a log, and
+    /// several of them interpolate values that must not cross back to the
+    /// model:
+    ///
+    /// - `ShellCwdRejected`/`ShellProgramRejected` embed a canonicalized
+    ///   host path and the daemon's own workspace root — the root is not
+    ///   named anywhere in the system prompt, so returning it discloses the
+    ///   daemon's absolute working directory to whoever controls the
+    ///   provider response (in practice a prompt-injected model, since
+    ///   untrusted tool output is folded into `request.messages` on the
+    ///   next turn).
+    /// - Both also embed `std::io::Error`'s `Display` for an
+    ///   attacker-chosen absolute path. ENOENT, EACCES and ENOTDIR render
+    ///   differently, which turns a rejected `shell` call into a
+    ///   **filesystem existence-and-permission oracle over the whole
+    ///   host** — and, because these checks run before admission, one the
+    ///   fail-closed policy default never gets to see.
+    ///
+    /// So the rule this function exists to enforce, stated for whoever adds
+    /// the next variant: **the returned message must be built only from
+    /// this module's own string literals and `&'static str` fields — never
+    /// from a path, an `io::Error`, or any value derived from the model's
+    /// own `input`.** Collapsing every reason within one variant to a
+    /// single sentence is deliberate: telling the model *which* argument to
+    /// fix (`cwd` vs `program`) is useful and discloses nothing, whereas
+    /// telling it *why* within that argument is the oracle. The detailed
+    /// `Display` is not lost — `dispatch_builtin` logs it via `tracing`,
+    /// and the refusal's `TaskCreated` carries the model's verbatim
+    /// `input`, so an operator can still see exactly what was attempted.
+    pub fn unadmitted_refusal(&self) -> (&'static str, String) {
+        match self {
+            Self::BadArgs { tool, field } => (
+                "bad_tool_arguments",
+                // `tool`/`field` are `&'static str` literals from this
+                // module's own call sites, never model-supplied.
+                format!("the `{tool}` tool call is missing or has an invalid `{field}` argument"),
+            ),
+            Self::UnsupportedKind { kind } => (
+                "unsupported_tool_kind",
+                format!("dispatching TaskKind::{kind:?} through the builtin tool catalog is not supported"),
+            ),
+            Self::ShellCwdRejected(_) => (
+                "shell_cwd_rejected",
+                "shell cwd rejected: the requested working directory is not an accessible                  directory inside this session's workspace"
+                    .to_string(),
+            ),
+            Self::ShellProgramRejected(_) => (
+                "shell_program_rejected",
+                "shell program rejected: the requested program does not resolve to an                  executable file inside this session's workspace"
+                    .to_string(),
+            ),
+            Self::WorkspaceRootUnavailable(_) => (
+                "workspace_root_unavailable",
+                "shell dispatch is unavailable: this session's workspace containment boundary                  could not be established"
+                    .to_string(),
+            ),
+            // The remaining variants are not reachable from
+            // `task_params_for` today (they are raised by
+            // [`execute_builtin`], on the far side of admission). They are
+            // still given a rendering here rather than a catch-all `_` arm,
+            // so that adding a variant — or making one of these reachable
+            // before admission — is a compile error that forces the same
+            // disclosure question to be answered again.
+            Self::UnresolvedPath(_) => (
+                "unresolved_path",
+                "the tool call's path could not be resolved".to_string(),
+            ),
+            Self::UnsupportedParams(_) => (
+                "unsupported_tool_params",
+                "this tool call's parameter shape is not dispatchable through the builtin tool                  catalog"
+                    .to_string(),
+            ),
+            Self::MissingResolvedCwd => (
+                "missing_resolved_cwd",
+                "internal error: shell dispatch is missing its pre-resolved, already-admitted                  working directory"
+                    .to_string(),
+            ),
+            Self::ShellCancelled(_) => (
+                "shell_cancelled",
+                "the shell command was cancelled before it completed".to_string(),
+            ),
+            Self::Tool(_) => (
+                "tool_error",
+                "the tool call failed".to_string(),
+            ),
+        }
+    }
 }
 
 /// Dispatch-relevant values [`task_params_for`] resolves that don't fit
@@ -311,7 +409,7 @@ fn reject_root_of_slash(root: PathBuf) -> Result<PathBuf, ToolDispatchError> {
 /// symlink-followed, already-existing directory — required for
 /// `Command::current_dir` to succeed anyway) and required to be
 /// component-wise inside [`workspace_root`] — the same
-/// canonicalize-then-`starts_with` shape `find_files` (`find.rs:46-95`)
+/// canonicalize-then-`starts_with` shape `roundhouse_tools::find_files`
 /// already uses. **Rejection, not a companion `Fs` admission** (ruling
 /// W1-R58 explicitly prefers this over the alternative of running `cwd`
 /// through its own `TaskParams::Fs` admission): a `cwd` that fails this
@@ -384,7 +482,8 @@ fn resolve_shell_cwd(raw_cwd: &str) -> Result<PathBuf, ToolDispatchError> {
 ///     VERBATIM (never the fully-resolved target above). Canonicalizing the
 ///     directory is what defeats a model-controlled `cwd`; preserving the
 ///     final component is what keeps `is_interpreter`
-///     (`shell/interpreter.rs:30`) and `sealed_program`'s basename
+///     (`roundhouse_policy::shell::interpreter::is_interpreter`) and
+///     `sealed_program`'s basename
 ///     semantics intact — both match on basename, and resolving a symlinked
 ///     final component (`python3` -> `/usr/bin/python3.14`) would silently
 ///     defeat both once an operator followed CF-16 and rewrote a rule to
@@ -408,7 +507,8 @@ fn resolve_shell_cwd(raw_cwd: &str) -> Result<PathBuf, ToolDispatchError> {
 ///   `python3` -> `/usr/bin/python3.14`, `awk` -> `/usr/bin/gawk`, and (b)
 ///   is strictly worse than round A: the two branches now produce
 ///   DIFFERENT canonical strings for the identical binary, so
-///   `Predicate::Shell`'s exact-string match (`engine.rs:292`) lets the
+///   `Predicate::Shell`'s exact-string match (its `cmd.program !=
+///   *program` compare in `roundhouse-policy`'s `engine.rs`) lets the
 ///   model choose which string policy sees by deciding whether to spell
 ///   the program with a `/` — an operator's `Deny /usr/bin/python3` is
 ///   evaded by sending `program: "python3"`). See
@@ -451,8 +551,9 @@ fn resolve_shell_program(
         // **The value actually returned is deliberately NOT `fully_resolved`
         // above (fix round B, finding I2 / ruling W1-R67).** Canonicalizing
         // the FULL path — including the final component — resolves
-        // symlinks, and both `is_interpreter` (`shell/interpreter.rs:30`)
-        // and `sealed_program` (`roundhouse-policy/src/sealed.rs`) match on
+        // symlinks, and both `is_interpreter` (`roundhouse-policy`'s
+        // `shell::interpreter`) and `sealed_program` (`roundhouse-policy`'s
+        // `sealed`) match on
         // BASENAME. Measured: `python3` canonicalizes to
         // `/usr/bin/python3.14` and `awk` to `/usr/bin/gawk` on a real
         // distro — `is_interpreter` on either canonical form is `false`.
@@ -555,7 +656,7 @@ const SHELL_ENV_ALLOWLIST_NAMES: &[&str] = &["PATH"];
 
 /// The explicit, `env_clear()`-safe environment allowlist for a dispatched
 /// shell call — copies the shape
-/// `roundhouse-mcp/src/transport/stdio.rs:119`'s `build_command` already
+/// `roundhouse-mcp`'s `transport::stdio::build_command` already
 /// uses ("explicit allowlist only, never inherits the daemon's own env").
 /// Built from [`SHELL_ENV_ALLOWLIST_NAMES`] — see that const's doc comment
 /// for the exclusion rule this function asserts against on every call.

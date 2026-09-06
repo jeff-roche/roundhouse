@@ -86,3 +86,10 @@ The Cargo workspace exists and builds as of Task 1. Standard commands now apply:
 - If a task's assumed interface conflicts with what a frozen contract
   actually looks like, that's an escalation, not something to silently
   paper over (`docs/architecture/10-implementation-phasing.md` §13.3).
+- **Cite code by symbol, never by `file:line`.** A comment that points at
+  another file with a line number (`engine.rs:292`) is correct the day it is
+  written and wrong the first time anything above that line changes — and a
+  merge from another lane changes plenty. Name the item instead
+  (`Predicate::Shell`'s program comparison in `engine.rs`): a symbol survives
+  a merge, a line number does not. This was the ninth comment-accuracy defect
+  found in one lane's review, all from the same cause.

@@ -83,7 +83,8 @@
 //! `run_agent_loop` folds every dispatched tool's result into `transcript`
 //! and into the next turn's `request.messages`. [`dispatch_mcp`] caps the
 //! rendered text it returns (see [`MAX_MCP_RESULT_TEXT_BYTES`]) — CF-7 item
-//! 4's own concern, since `stdio.rs:206` reads with no cap of its own and
+//! 4's own concern, since `StdioMcpTransport::spawn`'s stdout reader task
+//! reads with no cap of its own and
 //! `TaskInput::Json` has no size cap either, so an untrusted server could
 //! otherwise grow context unboundedly on every subsequent turn. The
 //! built-in arm's own executors (`tool_dispatch`'s own doc comment) still
@@ -344,12 +345,24 @@ async fn dispatch_one_tool_call(
     }
 }
 
-/// Records a refusal that never reached `admit_task` at all (no policy
-/// decision was made — there is nothing to gate here, only a real dispatch
-/// capability that doesn't exist) as a real `TaskCreated` followed
-/// unconditionally by `TaskFailed`, mirroring `dispatch_builtin`'s own
-/// "a refused call is still a real, queryable attempt" posture for the
-/// built-in arm.
+/// Records a refusal that never reached `admit_task` at all as a real
+/// `TaskCreated` followed unconditionally by `TaskFailed`, mirroring
+/// `dispatch_builtin`'s own "a refused call is still a real, queryable
+/// attempt" posture for the built-in arm.
+///
+/// Two callers, both refusing before any policy decision exists — so
+/// neither records a `TaskDecided`, unlike `record_denial`:
+///
+/// 1. the MCP arm of [`dispatch_one_tool_call`], where the refusal is that
+///    a real dispatch capability doesn't exist for this session;
+/// 2. [`dispatch_builtin`]'s containment rejections (ruling W1-R131), where
+///    `task_params_for` refused to build `TaskParams` at all — a `cwd` or
+///    `program` outside the workspace root, or malformed arguments.
+///
+/// `message` must be the caller's already-sanitized, model-safe text — for
+/// case 2 that is `ToolDispatchError::unadmitted_refusal`'s, never the
+/// error's own `Display`, since this string is BOTH written to the event
+/// log and returned to the model.
 ///
 /// **Fix round B, ruling W1-R65:** the primary `TaskCreated` append's
 /// failure is now propagated (`Err`) rather than logged-and-continued —
@@ -423,8 +436,9 @@ const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Bound on how many bytes of rendered MCP tool-result TEXT this arm folds
 /// into the next turn's `request.messages` (fix round C2, CF-7 item 4):
-/// `stdio.rs:206` reads an MCP server's response with an unbounded
-/// `BufReader::lines()` and `TaskInput`/`TaskOutput::Json` has no size cap
+/// `StdioMcpTransport::spawn`'s stdout reader task reads an MCP server's
+/// response with an unbounded `BufReader::lines()` and
+/// `TaskInput`/`TaskOutput::Json` has no size cap
 /// of its own, so an untrusted server could otherwise grow this loop's
 /// context without bound on every subsequent turn — the same shape fix
 /// round B's shell-output cap and M2's JSON-depth cap already closed
@@ -1055,6 +1069,14 @@ async fn dispatch_mcp(
 /// asking about a real gap this ordering closes. Must never run the real
 /// executor ([`crate::tool_dispatch::execute_builtin`]) before `admit_task`
 /// has returned `Ok`.
+///
+/// **One refusal is raised even earlier than that minting, and is recorded
+/// anyway (ruling W1-R131):** `task_params_for` rejects a `shell` `cwd` or
+/// `program` outside the workspace root — and malformed arguments — before
+/// there is a `TaskParams` to admit at all. That arm routes through
+/// [`record_unadmitted_refusal`], which mints its own `TaskCreated`/
+/// `TaskFailed` pair, so the "no silent non-event" guarantee above covers
+/// containment rejections too, not only policy denials.
 async fn dispatch_builtin(
     actor: &SessionActor,
     writer: &EventWriter,
@@ -1063,8 +1085,66 @@ async fn dispatch_builtin(
     input: &serde_json::Value,
     parent: TaskId,
 ) -> Result<Vec<ToolResultPart>, String> {
-    let (params, extras) =
-        crate::tool_dispatch::task_params_for(kind.clone(), input).map_err(|e| e.to_string())?;
+    let (params, extras) = match crate::tool_dispatch::task_params_for(kind.clone(), input) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            // **Ruling W1-R131.** This arm used to be `?` — the error
+            // propagated straight back to the model BEFORE `task_id` was
+            // minted below, so every shell/fs containment rejection
+            // (`ShellCwdRejected`, `ShellProgramRejected`, `BadArgs`)
+            // returned with ZERO events in the append-only log. That is
+            // exactly the F10 audit asymmetry ruling W1-R81 closed for the
+            // MCP arm via `record_unadmitted_refusal`; the built-in arm was
+            // never covered, because that ruling's own text said "MCP and
+            // unknown-tool refusals."
+            //
+            // Unlike the MCP arm, there is no categorization to guess at
+            // here: `kind` IS the real `TaskKind` the model asked for, so
+            // the refusal is recorded under the kind it actually attempted.
+            //
+            // `unadmitted_refusal` — never `err.to_string()` — supplies the
+            // model-visible text, for the disclosure half of the same
+            // ruling: the `Display` of these variants embeds the daemon's
+            // own workspace root and `std::io::Error`'s text for an
+            // attacker-chosen path (a filesystem existence-and-permission
+            // oracle, evaluated before `admit_task` so the fail-closed
+            // policy default never sees it). The same `err.kind()`-not-`err`
+            // discipline ruling W1-R112 forced on config errors, for the
+            // identical reason. The detail is not lost: it goes to the
+            // daemon's own log below, and the refusal's `TaskCreated`
+            // carries the model's verbatim `input`.
+            let (category, message) = err.unadmitted_refusal();
+            // `%err` is a tracing FIELD value, which `tracing-subscriber`'s
+            // 0.3.20 escaping fix does NOT cover (it escapes the message
+            // body only — see this workspace's pin comments). It is safe
+            // here because every `ToolDispatchError` variant that embeds a
+            // model-supplied string does so with `{:?}`, and `Debug` for
+            // `str` escapes control characters (an ANSI `\u{1b}` included);
+            // the only `{}`-interpolated payloads are `std::io::Error`
+            // renderings, which the model does not control. A new variant
+            // that interpolates model input with `{}` would break that.
+            tracing::warn!(
+                error = %err,
+                "refusing a builtin tool call before admission"
+            );
+            let recorded = record_unadmitted_refusal(
+                writer,
+                runner,
+                actor.session_id(),
+                kind,
+                parent,
+                input,
+                category,
+                message,
+            )
+            .await;
+            // Mirrors the MCP arm exactly (ruling W1-R65): whichever string
+            // comes back — the refusal itself (`Ok`) or a description of the
+            // `TaskCreated` append failing (`Err`) — this is always a
+            // refusal, so it always becomes `Err` to the caller.
+            return Err(recorded.unwrap_or_else(|e| e));
+        }
+    };
 
     // S-LOG-1: mint and durably record the real task this dispatch is
     // ATTEMPTING, before admission decides its fate — see this function's
