@@ -42,11 +42,50 @@ use roundhouse_mcp::config::McpServerConfig;
 use roundhouse_mcp::host::McpHost;
 use roundhouse_net::policy::EgressPolicy;
 use roundhouse_net::proxy::{LoopbackProxy, ProxyHandle};
-use roundhouse_policy::engine::PolicyEngine;
+use roundhouse_policy::engine::{CompiledRule, PolicyEngine};
 use roundhouse_policy::sealed::SealedContext;
 use roundhouse_provider::{Provider, RequestCtx};
 use roundhouse_sandbox::{Handle, Isolate};
 use roundhouse_store::{spawn_writer, EventWriter, StorePool};
+
+/// Where a new session's *config-derived* policy rules come from
+/// (Phase 7, Task 8 fix round 1, ruling W1-R118).
+///
+/// A factory rather than a `Vec<CompiledRule>` field because
+/// [`CompiledRule`] is deliberately **not** `Clone` — `roundhouse-policy`'s
+/// own `grant_rule_encapsulation` compile-fail test guards that, so a
+/// synthesized grant cannot be duplicated out of the engine that owns it —
+/// and every session needs its own `PolicyEngine::from_rules` set. Called
+/// exactly once per session, inside [`create_real_session`].
+///
+/// **This is a seam, not a configuration surface.** It exists so the rule
+/// set a session is built with is an *input* to session construction
+/// instead of a literal `vec![]` frozen into it, which is what made the
+/// phase's own end-to-end criterion untestable. Production passes
+/// [`no_policy_rules`] and therefore still loads **zero** operator rules —
+/// see that function's doc comment.
+pub type PolicyRuleSource = Arc<dyn Fn() -> Vec<CompiledRule> + Send + Sync>;
+
+/// The production [`PolicyRuleSource`]: **no config-derived rules at all**.
+///
+/// Every session built with this gets `PolicyEngine::from_rules(vec![])`,
+/// so `PolicyEngine::decide` falls through to its `Outcome::Ask` default
+/// for every task no compiled-in sealed rule already denies, and
+/// `SessionActor::admit_task` turns that into
+/// `AdmitError::RequiresApproval`. Behaviour is byte-identical to the
+/// hardcoded `vec![]` this replaced: fail-closed, and unchanged.
+///
+/// **The real gap this does NOT close, stated so it cannot read as
+/// solved:** there is no rules *loader* anywhere — `roundhouse-config`
+/// exposes only `LoadedConfig::load` and `load_network_config`, neither of
+/// which produces a `CompiledRule`. So a real daemon still cannot be given
+/// an operator-authored allow rule by any means, and consequently still
+/// cannot *execute* a model-issued tool call: every one is admitted,
+/// denied, and reported to the model as a real error result. Building that
+/// loader is out of this lane's charter and is escalated separately.
+pub fn no_policy_rules() -> PolicyRuleSource {
+    Arc::new(Vec::new)
+}
 
 /// Everything a real session is built from, constructed once at daemon boot
 /// (`main.rs`) and shared, by `&`, across every `CreateSession` handshake
@@ -77,6 +116,8 @@ pub struct DaemonResources {
     /// (`AllowDownTo(Tier::None)`) is actively wrong, not merely stricter
     /// than necessary.
     pub default_on_degrade: OnDegrade,
+    /// See [`PolicyRuleSource`]. Production passes [`no_policy_rules`].
+    pub policy_rules: PolicyRuleSource,
     pub runner: &'static TaskRunner,
     pub provider: Arc<dyn Provider>,
     request_ctx: RequestCtx,
@@ -99,6 +140,7 @@ impl DaemonResources {
         mcp_configs: Vec<McpServerConfig>,
         network_config: roundhouse_config::NetworkConfig,
         default_on_degrade: OnDegrade,
+        policy_rules: PolicyRuleSource,
         runner: &'static TaskRunner,
         provider: Arc<dyn Provider>,
         request_ctx: RequestCtx,
@@ -113,6 +155,7 @@ impl DaemonResources {
             mcp_configs,
             network_config,
             default_on_degrade,
+            policy_rules,
             runner,
             provider,
             request_ctx,
@@ -173,6 +216,19 @@ pub enum CreateRealSessionError {
 pub struct RealSession {
     pub actor: Arc<SessionActor>,
     pub mcp_host: Option<Arc<McpHost>>,
+    /// This session's MCP dispatch handle (ruling W1-R119, Task 8 fix round
+    /// 1). **Retained, not dropped.** Before this round `create_real_session`
+    /// built a `SessionMcp`, used it for `apply_resolved_mcp_servers`/
+    /// `SessionActor::register_mcp`, and then let it fall out of scope — so
+    /// the session's MCP tools were offered to the model (they are in
+    /// `actor.tool_defs()`) while every call to one hit
+    /// `run_agent_loop`'s honest "no MCP servers are configured for this
+    /// session" refusal, because nothing could hand the loop a
+    /// `SessionMcp`. `SessionRegistry` now stores it alongside the actor,
+    /// and `socket_server::run_submitted_turn` passes it to the loop.
+    ///
+    /// `None` exactly when this session configured no MCP servers.
+    pub mcp: Option<SessionMcp>,
     pub proxy_handle: ProxyHandle,
 }
 
@@ -302,17 +358,23 @@ pub async fn create_real_session(
     // (in principle) about the narrow window between the two writes.
     let mirrored_mcp_resolved: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
-    let policy = Arc::new(PolicyEngine::from_rules(vec![]).with_sealed_ctx_provider(
-        build_sealed_ctx_provider(
-            resources.state_dir.clone(),
-            resources.daemon_binary.clone(),
-            roundhouse_policy::sealed::home_dir(),
-            resources.isolate.clone(),
-            handle.clone(),
-            effective_tier(&spec),
-            mirrored_mcp_resolved.clone(),
+    // Ruling W1-R118: the rule set is an INPUT to session construction, not a
+    // literal frozen into it. `no_policy_rules` — what production passes —
+    // returns an empty `Vec`, so this is byte-identical to the `vec![]` that
+    // was here before, and just as fail-closed. See `PolicyRuleSource`.
+    let policy = Arc::new(
+        PolicyEngine::from_rules((resources.policy_rules)()).with_sealed_ctx_provider(
+            build_sealed_ctx_provider(
+                resources.state_dir.clone(),
+                resources.daemon_binary.clone(),
+                roundhouse_policy::sealed::home_dir(),
+                resources.isolate.clone(),
+                handle.clone(),
+                effective_tier(&spec),
+                mirrored_mcp_resolved.clone(),
+            ),
         ),
-    ));
+    );
 
     let (mcp_host, mcp, tool_defs) = if resources.mcp_configs.is_empty() {
         (None, None, Vec::new())
@@ -362,6 +424,7 @@ pub async fn create_real_session(
     Ok(RealSession {
         actor,
         mcp_host,
+        mcp,
         proxy_handle,
     })
 }
@@ -573,6 +636,7 @@ mod tests {
             Vec::new(),
             roundhouse_config::NetworkConfig::default(),
             OnDegrade::Refuse,
+            no_policy_rules(),
             runner(),
             Arc::new(NoopProvider),
             RequestCtx {

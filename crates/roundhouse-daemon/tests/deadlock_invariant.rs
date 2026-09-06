@@ -217,7 +217,7 @@ async fn drive_session_keeps_draining_requests_while_the_session_is_idle() {
     let registry = Arc::new(SessionRegistry::new());
     let actor = common::real_actor(dir.path()).await;
     let (session_id, _creator_subscription, _creator_events) =
-        registry.create(actor, None).unwrap();
+        registry.create(actor, None, None).unwrap();
 
     let resources = common::real_resources(dir.path()).await;
     let (requests_tx, requests_rx) = tokio::sync::mpsc::channel::<ClientRequest>(1);

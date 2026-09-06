@@ -5,28 +5,33 @@
 //! faked thing is the provider, which is scripted so the test can decide
 //! what the model "asks for".
 //!
-//! # What is provable here today, and what is not — read before editing
+//! # The exit criterion, and the one input that is injected
 //!
-//! `session_bootstrap.rs`'s `create_real_session` builds every session's
-//! policy as `PolicyEngine::from_rules(vec![])` — an **empty** rule set —
-//! and `PolicyEngine::decide` defaults to `Outcome::Ask` when no rule
-//! matches, which `SessionActor::admit_task` turns into
-//! `AdmitError::RequiresApproval`. There is no rules loader anywhere in
-//! `roundhouse-config`, and no approval path (that is lane W5's
-//! `ApprovalPolicy`). So **no real daemon session can currently execute a
-//! model-issued tool call**: every one of them is admitted, denied, and
-//! reported to the model as a real `ToolResult { is_error: true }`.
+//! [`the_phase_exit_criterion_a_model_issued_tool_call_actually_runs_and_its_output_reaches_the_next_turn`]
+//! is the phase's literal criterion and it **passes**: the tool actually
+//! runs, and its real output reaches the next provider turn.
 //!
-//! That splits this file in two, deliberately:
+//! It supplies **one config-derived `Allow` rule** through the
+//! `PolicyRuleSource` seam (ruling W1-R118), because production passes
+//! `no_policy_rules()` and therefore has none. That is not the test working
+//! around the daemon — it is the test supplying the one input a real
+//! deployment would supply from config, and it is worth being precise about
+//! what that does and does not mean:
 //!
-//! - [`a_creator_submitted_turn_reaches_the_real_agent_loop_and_folds_its_result_into_the_next_provider_turn`]
-//!   and [`an_attached_connections_submit_turn_is_refused_while_the_creators_is_honored`]
-//!   pin what genuinely works end to end today and run in the normal suite.
-//! - [`the_phase_exit_criterion_a_model_issued_tool_call_actually_runs_and_its_output_reaches_the_next_turn`]
-//!   is the phase's literal exit criterion — the tool *running* — and is
-//!   `#[ignore]`d against the block above rather than weakened to assert
-//!   the denial is correct. It fails, today, at exactly its `is_error`
-//!   assertion; see this task's report for that recorded output.
+//! - **What it proves:** every layer between a client frame and a real
+//!   filesystem read is correctly wired — handshake, creator-only guard,
+//!   spawned turn, `run_agent_loop`, `admit_task`, the real executor, and
+//!   the fold back into the next provider request.
+//! - **What it does NOT prove:** that a real daemon can do this today. There
+//!   is no rules loader in `roundhouse-config`, so production still loads
+//!   **zero** operator rules and still refuses every model-issued tool call
+//!   at admission. See `session_bootstrap::no_policy_rules`.
+//!
+//! Nothing about the sealed floor is bypassed: `decide_sealed` still checks
+//! the compiled-in floor first and can still override the injected rule.
+//! [`a_creator_submitted_turn_reaches_the_real_agent_loop_and_folds_its_result_into_the_next_provider_turn`]
+//! deliberately keeps `no_policy_rules()` and so exercises the real
+//! production denial path alongside it.
 
 mod common;
 
@@ -36,6 +41,9 @@ use std::time::Duration;
 
 use futures::stream;
 use roundhouse_core::{EventPayload, SessionId, TaskKind};
+use roundhouse_daemon::session_bootstrap::{no_policy_rules, PolicyRuleSource};
+use roundhouse_policy::engine::{CompiledRule, Outcome, Predicate, Scope};
+use roundhouse_policy::FsOp;
 use roundhouse_proto::ClientRequest;
 use roundhouse_provider::{
     BlockDelta, BlockKind, BoxFut, Capabilities, ChatRequest, ChatStream, ContentBlock, ModelId,
@@ -177,12 +185,23 @@ struct Daemon {
 }
 
 async fn start_daemon(provider: Arc<dyn Provider>) -> Daemon {
+    start_daemon_with_rules(provider, no_policy_rules()).await
+}
+
+/// [`start_daemon`], but with a caller-supplied [`PolicyRuleSource`] — what
+/// the exit-criterion test needs, since production's [`no_policy_rules`]
+/// can never answer `Allow`.
+async fn start_daemon_with_rules(
+    provider: Arc<dyn Provider>,
+    policy_rules: PolicyRuleSource,
+) -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("round.sock");
     let db_path = dir.path().join("events.db");
     let registry = Arc::new(roundhouse_daemon::session_registry::SessionRegistry::new());
     let listener = roundhouse_daemon::socket_server::bind_socket(&socket_path).unwrap();
-    let resources = common::resources_with_provider(dir.path(), provider).await;
+    let resources =
+        common::resources_with_provider_and_rules(dir.path(), provider, policy_rules).await;
     tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
         listener, registry, resources,
     ));
@@ -495,25 +514,37 @@ async fn an_oversized_submit_turn_is_dropped_without_wedging_the_connection() {
     );
 }
 
-/// **The phase's literal exit criterion**: a model-issued tool call in a
-/// live session, *dispatched and actually run*, with its real output folded
-/// back into the next provider turn.
+/// **The phase's literal exit criterion, met end to end** (Task 8 fix round
+/// 1, rulings W1-R118/W1-R120): a model-issued tool call in a live session,
+/// dispatched, **actually run**, with its real output folded back into the
+/// next provider turn.
 ///
-/// `#[ignore]`d, not weakened. Everything this test needs is wired — the
-/// wire variant, the creator-only guard, the spawned turn, Task 5's real
-/// loop — and it still cannot pass, for a reason outside this task's
-/// charter: production sessions get an empty policy rule set, so admission
-/// can only ever answer `Ask`. Un-ignoring it is a three-line change once a
-/// rules source exists.
+/// Every layer here is the production one: a real Unix socket, a real
+/// `accept_loop`, a real `create_real_session` (real store, real
+/// `PolicyEngine` with its real compiled-in sealed floor, real isolation
+/// probe, real redaction), a real `SessionActor::admit_task`, Task 5's real
+/// `run_agent_loop`, and the real `roundhouse-tools` `read` executor. The
+/// two injected inputs are the scripted provider (so the test decides what
+/// the model asks for) and **one config-derived `Allow` rule**, supplied
+/// through the same `PolicyRuleSource` seam production passes
+/// `no_policy_rules()` to.
+///
+/// **That rule is the honest part of this test, not a cheat.** Production
+/// still loads zero operator rules — there is no rules loader in
+/// `roundhouse-config` — so a real daemon today would still refuse this
+/// call at admission. What this proves is that the *daemon* is wired
+/// correctly end to end, and that the only thing standing between a real
+/// deployment and a working agent is a rules source. Nothing about the
+/// sealed floor, admission, dispatch, or execution is bypassed: the rule is
+/// an ordinary `Scope::Builtin` `FsPrefix{Read}` allow, exactly what an
+/// operator config would compile to, and `PolicyEngine::decide_sealed`
+/// still checks the compiled-in floor first and can still override it.
 #[tokio::test]
-#[ignore = "blocked: session_bootstrap.rs's create_real_session builds every session with \
-            PolicyEngine::from_rules(vec![]) and roundhouse-config has no rules loader, so no \
-            Allow rule can reach a real session and admission always answers Ask; needs a \
-            ruling on where a real daemon's policy rules come from, or lane W5's approval path"]
 async fn the_phase_exit_criterion_a_model_issued_tool_call_actually_runs_and_its_output_reaches_the_next_turn(
 ) {
     let fixture_dir = tempfile::tempdir().unwrap();
-    let fixture = fixture_dir.path().join("fixture.txt");
+    let fixture_root = fixture_dir.path().canonicalize().unwrap();
+    let fixture = fixture_root.join("fixture.txt");
     let fixture_contents = "the-contents-the-model-must-see";
     std::fs::write(&fixture, fixture_contents).unwrap();
 
@@ -521,7 +552,23 @@ async fn the_phase_exit_criterion_a_model_issued_tool_call_actually_runs_and_its
         "read",
         serde_json::json!({ "path": fixture.to_string_lossy() }),
     ));
-    let daemon = start_daemon(provider.clone()).await;
+    // One ordinary config-shaped rule: reads under the fixture directory are
+    // allowed. `CompiledRule` is not `Clone`, so the source mints a fresh one
+    // per session — which is exactly why `PolicyRuleSource` is a factory.
+    let rules: PolicyRuleSource = {
+        let root = fixture_root.clone();
+        Arc::new(move || {
+            vec![CompiledRule::test_new(
+                Scope::Builtin,
+                Outcome::Allow,
+                Predicate::FsPrefix {
+                    op: FsOp::Read,
+                    prefix: root.clone(),
+                },
+            )]
+        })
+    };
+    let daemon = start_daemon_with_rules(provider.clone(), rules).await;
 
     let mut creator = tokio::time::timeout(
         Duration::from_secs(5),
@@ -540,6 +587,33 @@ async fn the_phase_exit_criterion_a_model_issued_tool_call_actually_runs_and_its
         .await
         .unwrap();
 
+    // (1) The tool ACTUALLY RAN — a real side effect in the real event log,
+    // per Task 5's own pattern. `TaskCompleted` (not merely `TaskCreated`)
+    // is the assertion that separates "dispatched" from "executed".
+    let events = wait_for_event(&daemon.db_path, session_id, "a completed task", |p| {
+        matches!(p, EventPayload::TaskCompleted { .. })
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::TaskCreated {
+                kind: TaskKind::Read,
+                ..
+            }
+        )),
+        "the completed task must be the model's own Read"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.payload, EventPayload::TaskFailed { .. })),
+        "no task in this session may have failed"
+    );
+
+    // (2) Its result reached the NEXT provider turn — the assertion that
+    // matters, since (1) alone would also hold for a turn whose result was
+    // dispatched and then dropped on the floor.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let second = loop {
         let requests = provider.requests();
@@ -582,23 +656,8 @@ async fn the_phase_exit_criterion_a_model_issued_tool_call_actually_runs_and_its
     );
     assert!(
         text.contains(fixture_contents),
-        "the tool's real output must be what reaches the next provider turn, got {text:?}"
-    );
-
-    // ... and the session's own log must record it as a completed task, not
-    // merely a created one.
-    let events = wait_for_event(&daemon.db_path, session_id, "a completed Read task", |p| {
-        matches!(p, EventPayload::TaskCompleted { .. })
-    })
-    .await;
-    assert!(
-        events.iter().any(|e| matches!(
-            &e.payload,
-            EventPayload::TaskCreated {
-                kind: TaskKind::Read,
-                ..
-            }
-        )),
-        "the completed task must be the model's Read"
+        "the tool's REAL output — the fixture file's actual contents, read off disk by the \
+         real roundhouse-tools executor — must be what reaches the next provider turn, \
+         got {text:?}"
     );
 }

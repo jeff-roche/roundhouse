@@ -20,7 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use roundhouse_core::{OnDegrade, SessionId, SessionSpec, SessionState, TaskRunner, Tier};
-use roundhouse_daemon::session_bootstrap::DaemonResources;
+use roundhouse_daemon::session_bootstrap::{no_policy_rules, DaemonResources, PolicyRuleSource};
 use roundhouse_engine::SessionActor;
 use roundhouse_net::proxy::LoopbackProxy;
 use roundhouse_policy::engine::PolicyEngine;
@@ -151,7 +151,20 @@ pub async fn resources_with_provider(
     dir: &Path,
     provider: Arc<dyn Provider>,
 ) -> Arc<DaemonResources> {
-    resources_with(dir, available_isolate(), provider).await
+    resources_with(dir, available_isolate(), provider, no_policy_rules()).await
+}
+
+/// [`resources_with_provider`], but over a caller-supplied
+/// [`PolicyRuleSource`] as well (Task 8 fix round 1, ruling W1-R118) — for
+/// the end-to-end test that needs a real daemon session whose admission
+/// gate can actually answer `Allow`, which production's
+/// [`no_policy_rules`] never can.
+pub async fn resources_with_provider_and_rules(
+    dir: &Path,
+    provider: Arc<dyn Provider>,
+    policy_rules: PolicyRuleSource,
+) -> Arc<DaemonResources> {
+    resources_with(dir, available_isolate(), provider, policy_rules).await
 }
 
 /// [`real_resources`]'s body, factored out (fix round 2, MUST 2) so a test
@@ -160,7 +173,7 @@ pub async fn resources_with_provider(
 /// can supply its own `Isolate` (e.g. one whose `prepare` always errors)
 /// instead of the always-succeeding [`available_isolate`].
 pub async fn resources_with_isolate(dir: &Path, isolate: Arc<dyn Isolate>) -> Arc<DaemonResources> {
-    resources_with(dir, isolate, Arc::new(NoopProvider)).await
+    resources_with(dir, isolate, Arc::new(NoopProvider), no_policy_rules()).await
 }
 
 /// The shared body of [`real_resources`]/[`resources_with_isolate`]/
@@ -172,6 +185,7 @@ pub async fn resources_with(
     dir: &Path,
     isolate: Arc<dyn Isolate>,
     provider: Arc<dyn Provider>,
+    policy_rules: PolicyRuleSource,
 ) -> Arc<DaemonResources> {
     let store = roundhouse_store::open(&dir.join("events.db"))
         .await
@@ -195,6 +209,7 @@ pub async fn resources_with(
         Vec::new(),
         roundhouse_config::NetworkConfig::default(),
         roundhouse_core::OnDegrade::Refuse,
+        policy_rules,
         runner(),
         provider,
         RequestCtx {

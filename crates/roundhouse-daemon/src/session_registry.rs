@@ -98,6 +98,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use roundhouse_core::SessionId;
+use roundhouse_engine::mcp_spawner::SessionMcp;
 use roundhouse_engine::SessionActor;
 use roundhouse_mcp::host::McpHost;
 use roundhouse_proto::ClientEvent;
@@ -159,6 +160,13 @@ struct SessionEntry {
     /// configured MCP servers, the common case.
     #[allow(dead_code)]
     mcp_host: Option<Arc<McpHost>>,
+    /// This session's MCP dispatch handle (ruling W1-R119), so a
+    /// post-handshake turn can actually dispatch to the MCP servers whose
+    /// tools this session already offers the model. Distinct from
+    /// `mcp_host`, which is the *process* supervisor: `mcp_host` keeps the
+    /// child processes alive, `mcp` is what routes a tool call to them.
+    /// `None` for a session with zero configured MCP servers.
+    mcp: Option<SessionMcp>,
     subscribers: Vec<mpsc::Sender<ClientEvent>>,
 }
 
@@ -233,6 +241,7 @@ impl SessionRegistry {
         &self,
         actor: Arc<SessionActor>,
         mcp_host: Option<Arc<McpHost>>,
+        mcp: Option<SessionMcp>,
     ) -> Option<(SessionId, Subscription, mpsc::Receiver<ClientEvent>)> {
         let session_id = actor.session_id();
         let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
@@ -253,6 +262,7 @@ impl SessionRegistry {
             SessionEntry {
                 actor,
                 mcp_host,
+                mcp,
                 subscribers: vec![tx.clone()],
             },
         );
@@ -269,6 +279,24 @@ impl SessionRegistry {
     pub fn actor(&self, session_id: SessionId) -> Option<Arc<SessionActor>> {
         let sessions = self.sessions.lock().unwrap();
         sessions.get(&session_id).map(|entry| entry.actor.clone())
+    }
+
+    /// A clone of the live [`SessionMcp`] bound to `session_id`, or `None`
+    /// if this registry has no entry for it **or** that session configured
+    /// no MCP servers (ruling W1-R119). `SessionMcp` is `Clone` and holds
+    /// an `Arc<McpExecutor>`, so every clone dispatches through the one
+    /// executor this session's `SessionActor::register_mcp` was told about
+    /// — never a second, independently-policed one.
+    ///
+    /// Paired with [`Self::actor`] by `socket_server::run_submitted_turn`:
+    /// a turn needs both, and reading them together is what lets a
+    /// model-issued MCP tool call actually dispatch instead of hitting
+    /// `run_agent_loop`'s "no MCP servers are configured" refusal.
+    pub fn session_mcp(&self, session_id: SessionId) -> Option<SessionMcp> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions
+            .get(&session_id)
+            .and_then(|entry| entry.mcp.clone())
     }
 
     /// Unconditionally removes `session_id`'s entry, regardless of its
@@ -460,6 +488,114 @@ mod tests {
 
     use crate::test_support::real_actor;
 
+    /// Ruling W1-R119 (Task 8 fix round 1): the registry must actually
+    /// **retain** the `SessionMcp` it is given, and hand it back — that is
+    /// the seam whose absence made `socket_server::run_submitted_turn` pass
+    /// `mcp: None` while the session's MCP tools were still offered to the
+    /// model, so every model-issued MCP call got the honest "no MCP servers
+    /// are configured for this session" refusal.
+    ///
+    /// Uses a real `SessionMcp` (the test-gated `SessionMcp::from_parts`,
+    /// not `start_session_mcp` — `create_real_session`'s MCP path spawns a
+    /// real subprocess, too heavy for a unit test, which is the same reason
+    /// `session_bootstrap`'s own `apply_resolved_mcp_servers` tests exist),
+    /// and asserts on `resolved_servers()` rather than merely `is_some()`:
+    /// a registry that returned some *other* `SessionMcp` would pass an
+    /// `is_some()` check.
+    mod session_mcp_retention {
+        use super::*;
+        use roundhouse_engine::mcp_spawner::{EngineTaskSpawner, SessionMcp};
+        use roundhouse_mcp::executor::TaskSpawner as McpTaskSpawner;
+        use roundhouse_mcp::namespace::ToolNamespace;
+        use roundhouse_mcp::transport::McpTransport;
+        use roundhouse_mcp::wire::{DiscoverResult, McpError, McpResult, ToolCallRequest};
+        use roundhouse_policy::engine::PolicyEngine;
+        use roundhouse_policy::sealed::SealedContext;
+        use roundhouse_policy::ServerId;
+
+        const FAKE_SERVER: &str = "fake-server";
+
+        struct FakeTransport;
+
+        #[async_trait::async_trait]
+        impl McpTransport for FakeTransport {
+            async fn discover(&self) -> Result<DiscoverResult, McpError> {
+                unreachable!("not exercised by this test")
+            }
+            async fn call_tool(&self, _req: ToolCallRequest) -> Result<McpResult, McpError> {
+                unreachable!("not exercised by this test")
+            }
+            async fn shutdown(&self) -> Result<(), McpError> {
+                Ok(())
+            }
+        }
+
+        fn fake_session_mcp(
+            dir: &std::path::Path,
+            writer: roundhouse_store::EventWriter,
+        ) -> SessionMcp {
+            let ctx = SealedContext {
+                state_dir: dir.join("state"),
+                daemon_binary: dir.join("daemon-binary"),
+                resolved_mcp_servers: Default::default(),
+                requested_tier: roundhouse_core::Tier::Sandbox,
+                attested_tier: roundhouse_core::Tier::Sandbox,
+                home: roundhouse_policy::sealed::home_dir(),
+            };
+            let policy = Arc::new(
+                PolicyEngine::from_rules(vec![])
+                    .with_sealed_ctx_provider(Arc::new(move || ctx.clone())),
+            );
+            let connections: Vec<(ServerId, Arc<dyn McpTransport>)> =
+                vec![(ServerId(FAKE_SERVER.to_string()), Arc::new(FakeTransport))];
+            let task_spawner: Arc<dyn McpTaskSpawner> = Arc::new(EngineTaskSpawner::new(
+                crate::test_support::runner(),
+                writer,
+                SessionId::new(),
+            ));
+            SessionMcp::from_parts(
+                connections,
+                ToolNamespace::build(&[]).unwrap(),
+                policy,
+                task_spawner,
+            )
+            .expect("the test PolicyEngine has a real sealed_ctx_provider installed")
+        }
+
+        #[tokio::test]
+        async fn create_retains_the_session_mcp_and_session_mcp_hands_it_back() {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = SessionRegistry::new();
+            let actor = real_actor(dir.path()).await;
+            let mcp = fake_session_mcp(dir.path(), actor.writer().clone());
+
+            let (session_id, _subscription, _events) =
+                registry.create(actor, None, Some(mcp)).unwrap();
+
+            let retained = registry
+                .session_mcp(session_id)
+                .expect("the registry must hand back the SessionMcp it was created with");
+            assert_eq!(
+                retained.resolved_servers(),
+                vec![FAKE_SERVER.to_string()],
+                "the retained SessionMcp must be the one this session was built with, not \
+                 some other instance"
+            );
+        }
+
+        /// The other half: a session created with no MCP servers must report
+        /// `None`, not an empty-but-present handle — otherwise the assertion
+        /// above would hold for a registry that fabricated one.
+        #[tokio::test]
+        async fn a_session_created_without_mcp_reports_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = SessionRegistry::new();
+            let actor = real_actor(dir.path()).await;
+            let (session_id, _subscription, _events) = registry.create(actor, None, None).unwrap();
+            assert!(registry.session_mcp(session_id).is_none());
+        }
+    }
+
     fn note(session_id: SessionId, text: &str) -> ClientEvent {
         ClientEvent::TaskEvent {
             session_id,
@@ -477,7 +613,7 @@ mod tests {
         let registry = SessionRegistry::new();
         let actor = real_actor(dir.path()).await;
         let (session_id, _creator_subscription, mut creator_events) =
-            registry.create(actor, None).unwrap();
+            registry.create(actor, None, None).unwrap();
 
         // Fill the subscriber channel to capacity without ever draining it.
         for i in 0..SUBSCRIBER_CHANNEL_CAPACITY {
@@ -527,7 +663,7 @@ mod tests {
         let registry = SessionRegistry::new();
         let actor = real_actor(dir.path()).await;
         let (session_id, creator_subscription, _creator_events) =
-            registry.create(actor, None).unwrap();
+            registry.create(actor, None, None).unwrap();
 
         registry.detach(session_id, &creator_subscription);
 
@@ -549,7 +685,7 @@ mod tests {
         let registry = SessionRegistry::new();
         let actor = real_actor(dir.path()).await;
         let (session_id, _creator_subscription, creator_events) =
-            registry.create(actor, None).unwrap();
+            registry.create(actor, None, None).unwrap();
 
         // Drop the only receiver so the sender `publish` holds becomes
         // `Closed` rather than merely `Full`.
@@ -572,7 +708,7 @@ mod tests {
         let registry = SessionRegistry::new();
         let actor = real_actor(dir.path()).await;
         let (session_id, _creator_subscription, _creator_events) =
-            registry.create(actor, None).unwrap();
+            registry.create(actor, None, None).unwrap();
 
         registry.remove(session_id);
 

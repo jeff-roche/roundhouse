@@ -1179,10 +1179,15 @@ pub async fn drive_session(
             // regardless of what `registry`/`session_events` do with theirs.
             let actor_for_reaper = real_session.actor.clone();
             let mcp_host_for_reaper = real_session.mcp_host.clone();
+            // Ruling W1-R119: `SessionMcp` is `Clone` over one
+            // `Arc<McpExecutor>`, so the teardown path's copy and the
+            // registry's copy dispatch through the same executor — there is
+            // no second, independently-policed one.
+            let mcp_for_teardown = real_session.mcp.clone();
             let proxy_token_for_reaper = real_session.proxy_handle.token().to_string();
 
             let Some((session_id, subscription, session_events)) =
-                registry.create(real_session.actor, real_session.mcp_host)
+                registry.create(real_session.actor, real_session.mcp_host, real_session.mcp)
             else {
                 // At `max_sessions` (security review Important 3 / ruling
                 // W1-R33) — same "no wire error variant" constraint as
@@ -1201,6 +1206,7 @@ pub async fn drive_session(
                 let discarded = session_bootstrap::RealSession {
                     actor: actor_for_reaper,
                     mcp_host: mcp_host_for_reaper,
+                    mcp: mcp_for_teardown,
                     proxy_handle: real_session.proxy_handle,
                 };
                 session_bootstrap::teardown_real_session(&resources.proxy, discarded).await;
@@ -1478,8 +1484,13 @@ pub async fn drive_session(
                                     turn_in_flight = true;
                                     let resources = resources.clone();
                                     let done = turn_done_tx.clone();
+                                    // Ruling W1-R119: read together with the
+                                    // actor, so a model-issued MCP tool call
+                                    // can actually dispatch. `None` only when
+                                    // this session configured no MCP servers.
+                                    let mcp = registry.session_mcp(session_id);
                                     tokio::spawn(async move {
-                                        run_submitted_turn(actor, resources, text).await;
+                                        run_submitted_turn(actor, mcp, resources, text).await;
                                         // Failure means this connection
                                         // already ended — see
                                         // `turn_done_tx`'s declaration.
@@ -1531,20 +1542,15 @@ pub async fn drive_session(
 /// polling `session_events.recv()`, recreating the exact circular wait
 /// ruling W1-R31 fixed, one layer up.
 ///
+/// `mcp` is this session's real [`SessionMcp`], read from the registry
+/// alongside the actor (ruling W1-R119, fix round 1) — `None` exactly when
+/// this session configured no MCP servers. Before that ruling this was
+/// hardcoded `None` while the session's MCP `ToolDef`s were still offered to
+/// the model, so every MCP tool call a model made hit `run_agent_loop`'s
+/// honest "no MCP servers are configured for this session" refusal.
+///
 /// # Known gaps this function does not close, stated rather than papered over
 ///
-/// - **`mcp: None`.** `run_agent_loop`'s MCP arm needs a
-///   `roundhouse_engine::mcp_spawner::SessionMcp`, and there is nowhere to
-///   get one here: `session_bootstrap::create_real_session` builds a
-///   `SessionMcp`, uses it for `apply_resolved_mcp_servers`, and then
-///   **drops it** — `RealSession` carries only `Arc<McpHost>`, and
-///   `SessionRegistry` stores only that. So a session with MCP servers
-///   configured still offers their `ToolDef`s to the model (they are in
-///   `actor.tool_defs()`), and a model that calls one gets the honest
-///   `"no MCP servers are configured for this session"` refusal rather
-///   than a dispatch. Closing this means threading `SessionMcp` through
-///   `RealSession` and `SessionRegistry`; it is not a change this task's
-///   charter covers.
 /// - **Nothing this turn produces reaches the client over the wire.**
 ///   `SessionRegistry::publish` has no producer (documented in that
 ///   function and in `roundhouse-web`'s own doc comments as of Task 9) —
@@ -1556,6 +1562,7 @@ pub async fn drive_session(
 ///   `TaskFailed` in the append-only log, not a wire frame.
 async fn run_submitted_turn(
     actor: Arc<roundhouse_engine::SessionActor>,
+    mcp: Option<roundhouse_engine::mcp_spawner::SessionMcp>,
     resources: Arc<DaemonResources>,
     text: String,
 ) {
@@ -1582,7 +1589,7 @@ async fn run_submitted_turn(
         resources.provider.as_ref(),
         &ctx,
         &tools,
-        None,
+        mcp,
         request,
         roundhouse_engine::agent_loop::AgentLoopConfig {
             max_turns: SUBMIT_TURN_MAX_TURNS,
@@ -2033,7 +2040,7 @@ mod session_reaper_tests {
         let registry = Arc::new(SessionRegistry::new());
         let actor = real_actor_with_state(dir.path(), roundhouse_core::SessionState::Closed).await;
         let actor_for_reaper = actor.clone();
-        let (session_id, _subscription, _events) = registry.create(actor, None).unwrap();
+        let (session_id, _subscription, _events) = registry.create(actor, None, None).unwrap();
 
         let (proxy, token) = real_proxy_with_registered_token(dir.path()).await;
         assert!(
@@ -2080,7 +2087,7 @@ mod session_reaper_tests {
         let registry = Arc::new(SessionRegistry::new());
         let actor = real_actor_with_state(dir.path(), roundhouse_core::SessionState::Running).await;
         let actor_for_reaper = actor.clone();
-        let (session_id, _subscription, _events) = registry.create(actor, None).unwrap();
+        let (session_id, _subscription, _events) = registry.create(actor, None, None).unwrap();
 
         let (proxy, token) = real_proxy_with_registered_token(dir.path()).await;
         spawn_session_reaper(

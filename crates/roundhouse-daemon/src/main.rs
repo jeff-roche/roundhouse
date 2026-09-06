@@ -499,6 +499,15 @@ async fn main() -> color_eyre::Result<()> {
         mcp_configs,
         network_config,
         default_on_degrade,
+        // Ruling W1-R118. **Production loads ZERO operator policy rules**,
+        // exactly as before this seam existed: `no_policy_rules` returns an
+        // empty `Vec`, so every session is `PolicyEngine::from_rules(vec![])`
+        // and every task no compiled-in sealed rule denies falls through to
+        // the `Ask` default -> `AdmitError::RequiresApproval`. There is no
+        // rules loader in `roundhouse-config` to pass anything else from;
+        // see `no_policy_rules`'s own doc comment for what that still means
+        // and why it is not solved here.
+        roundhouse_daemon::session_bootstrap::no_policy_rules(),
         runner,
         provider,
         request_ctx,

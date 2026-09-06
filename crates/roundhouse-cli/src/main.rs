@@ -31,7 +31,7 @@ async fn main() -> color_eyre::Result<()> {
         Some(Command::Service { action }) => run_service(action),
         Some(Command::Attach { session }) => attach_to_session(session).await,
         Some(Command::Create { workspace }) => create_and_attach(workspace).await,
-        Some(Command::Run { workspace }) => run_headless(workspace).await,
+        Some(Command::Run { workspace, message }) => run_headless(workspace, message).await,
         None => create_and_attach(DEFAULT_WORKSPACE_NAME.to_string()).await,
     }
 }
@@ -176,11 +176,27 @@ async fn run_tui(mut client: DaemonClient) -> color_eyre::Result<()> {
 /// session's own actor keeps running independently of this connection
 /// (ruling W1-R51), so exiting here does not stop whatever the session is
 /// doing.
-async fn run_headless(workspace_name: String) -> color_eyre::Result<()> {
+async fn run_headless(workspace_name: String, message: Option<String>) -> color_eyre::Result<()> {
     let mut client = roundhouse_tui::connect_create(&socket_path(), &workspace_name)
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
-    println!("session_id={}", client.session_id());
+    let session_id = client.session_id();
+    println!("session_id={session_id}");
+
+    // Ruling W1-R119: the first — and today the only — `SubmitTurn` sender
+    // outside this workspace's own tests. Sent on THIS connection, the one
+    // that ran `CreateSession`, because `drive_session` honors the variant
+    // from the creating connection alone (W1-R37); `round attach` is a
+    // viewer and a turn submitted from it would be refused (W1-R52).
+    //
+    // Sent AFTER `session_id` is printed, so a caller capturing that line
+    // has it even if the submission itself fails.
+    if let Some(text) = message {
+        client
+            .send(&roundhouse_proto::ClientRequest::SubmitTurn { session_id, text })
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
+    }
 
     while let Some(event) = client
         .recv()

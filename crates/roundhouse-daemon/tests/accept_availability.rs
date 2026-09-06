@@ -189,11 +189,11 @@ async fn session_registry_refuses_create_once_at_max_sessions() {
     let actor_a = common::real_actor(dir.path()).await;
     let actor_b = common::real_actor(dir.path()).await;
     assert!(
-        registry.create(actor_a, None).is_some(),
+        registry.create(actor_a, None, None).is_some(),
         "the first session, under the cap, must succeed"
     );
     assert!(
-        registry.create(actor_b, None).is_none(),
+        registry.create(actor_b, None, None).is_none(),
         "a session past max_sessions must be refused, not silently minted"
     );
 }
@@ -204,7 +204,7 @@ async fn session_registry_refuses_attach_once_at_max_subscribers_per_session() {
     let registry = SessionRegistry::with_limits(64, 1);
     let actor = common::real_actor(dir.path()).await;
     let (session_id, _creator_subscription, _creator_events) =
-        registry.create(actor, None).unwrap();
+        registry.create(actor, None, None).unwrap();
     // The creator itself already counts as the one subscriber this
     // registry allows for this session.
     assert!(

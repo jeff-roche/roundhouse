@@ -84,6 +84,17 @@ pub enum Command {
         /// The workspace the new session belongs to.
         #[arg(long, default_value = DEFAULT_WORKSPACE_NAME)]
         workspace: String,
+        /// A user turn to submit to the new session as soon as it is
+        /// created, so the agent actually does something rather than
+        /// waiting for input this headless path has no way to supply
+        /// (Phase 7, Task 8 fix round 1, ruling W1-R119).
+        ///
+        /// Sent on the CREATING connection, which is the only one whose
+        /// requests the daemon honors (rulings W1-R37/W1-R52) — `round
+        /// attach` is a viewer and cannot submit a turn. Omit it to keep
+        /// the previous behaviour: create, then stream events only.
+        #[arg(long)]
+        message: Option<String>,
     },
 }
 
@@ -204,7 +215,9 @@ mod tests {
     fn run_defaults_workspace_name() {
         let cli = Cli::parse_from(["round", "run"]);
         match cli.command {
-            Some(Command::Run { workspace }) => assert_eq!(workspace, DEFAULT_WORKSPACE_NAME),
+            Some(Command::Run { workspace, .. }) => {
+                assert_eq!(workspace, DEFAULT_WORKSPACE_NAME)
+            }
             other => panic!("expected Run, got {other:?}"),
         }
     }
@@ -213,7 +226,31 @@ mod tests {
     fn run_accepts_an_explicit_workspace_name() {
         let cli = Cli::parse_from(["round", "run", "--workspace", "ci-job"]);
         match cli.command {
-            Some(Command::Run { workspace }) => assert_eq!(workspace, "ci-job"),
+            Some(Command::Run { workspace, .. }) => assert_eq!(workspace, "ci-job"),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    /// Ruling W1-R119: `--message` is what makes `round run` a real
+    /// `SubmitTurn` sender rather than a create-and-watch path, so both its
+    /// presence and its absence are pinned — the `None` case is the one
+    /// that keeps the previous behaviour intact.
+    #[test]
+    fn run_accepts_a_message_to_submit_as_the_first_turn() {
+        let cli = Cli::parse_from(["round", "run", "--message", "read the README"]);
+        match cli.command {
+            Some(Command::Run { message, .. }) => {
+                assert_eq!(message.as_deref(), Some("read the README"))
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_without_a_message_submits_nothing() {
+        let cli = Cli::parse_from(["round", "run"]);
+        match cli.command {
+            Some(Command::Run { message, .. }) => assert_eq!(message, None),
             other => panic!("expected Run, got {other:?}"),
         }
     }
