@@ -1100,14 +1100,22 @@ fn a_declared_secrets_raw_value_pasted_literally_into_base_ref_is_still_scrubbed
         items[0]
     );
     let error = items[0]["error"].as_str().unwrap();
-    assert!(
-        !error.contains("withheld"),
-        "this must be the non-secret-derived branch (no withhold), or the test pins the \
-         wrong guard — got: {error:?}"
-    );
+    // Part 3 (ruling W5-48) made a declared secret's *presence* in
+    // `base_ref` trigger the withhold as well, so this input now exercises
+    // **both** guards rather than the scrub alone. `***` is what still pins
+    // the one this test is about, and it discriminates cleanly:
+    // `safe_summary()` never mentions `base_ref` at all, so the only thing
+    // that can put `***` into the echoed `base_ref` is the pre-format needle
+    // scrub. (Before part 3 this assertion was `!contains("withheld")` —
+    // accurate then, false now.)
     assert!(
         error.contains("***"),
         "the needle backstop must have replaced the pasted secret with `***`, got: {error:?}"
+    );
+    assert!(
+        error.contains("withheld"),
+        "part 3: a declared secret in base_ref must route the provider's own text through \
+         safe_summary() too, got: {error:?}"
     );
 
     let serialized = serde_json::to_string(&outcomes[0].output).unwrap();
@@ -1192,10 +1200,12 @@ fn a_backslash_bearing_secret_is_scrubbed_before_debug_formatting_can_escape_it(
         items[0]
     );
     let error = items[0]["error"].as_str().unwrap();
+    // As in the A1 test above: since part 3 this input trips the withhold
+    // too, and `***` is the discriminator for the guard under test here —
+    // `safe_summary()` cannot produce it, only the pre-format scrub can.
     assert!(
-        !error.contains("withheld"),
-        "this must be the non-secret-derived branch (no withhold), or the test pins the \
-         wrong guard — got: {error:?}"
+        error.contains("***"),
+        "the pre-format needle scrub must have replaced the echoed base_ref, got: {error:?}"
     );
 
     // The escaped form is what the raw-contains assertion in the A1 test is
@@ -1347,5 +1357,102 @@ fn a_secret_derived_items_release_failure_is_withheld_not_rendered_in_full() {
         !serialized.contains(DERIVED_ELEMENT),
         "the secret-derived element must not reach the serialized outcome through a \
          release failure, got: {serialized}"
+    );
+}
+
+/// Final round part 3 (ruling W5-48) — the needle backstop alone cannot
+/// survive `git`'s **lossy** stderr echoes, so a declared secret's presence
+/// in `base_ref` now triggers the withhold regardless of provenance.
+///
+/// This is the same pair of transforms ruling W5-36 already solved for the
+/// secret-*derived* branch, which the scrub-only branch silently inherited:
+///
+/// - `@{upstream}`-style syntax makes `git` die mid-interpretation and echo
+///   only the **prefix** before it, so a needle keyed on the whole value
+///   never matches — measured, 27 of a 38-byte secret survived cleartext;
+/// - a value past `git`'s own `vreportf` stderr buffer (~4KB — **`git`'s
+///   buffer, not this crate's `OUTPUT_CAP`**; a 3024-byte value scrubs
+///   fully, a 5029-byte one does not) comes back as a shorter, still
+///   sensitive prefix.
+///
+/// No scrub of a lossy transform can be made reliable; that was W5-36's
+/// whole finding. The fix makes a declared secret's *presence* sufficient
+/// to withhold, which does not depend on anything `git` does to the value.
+///
+/// Drives the `@{upstream}` case, the cheap one, through the channel that
+/// makes it reachable: a public input list whose element equals a declared
+/// secret, so provenance marks nothing.
+///
+/// **Asserts the produced form AND the absence of the transformed one.**
+/// `***`-present is necessary but not sufficient here: the pre-fix failing
+/// message contained `***` twice *and* the leaked prefix, because the two
+/// raw copies scrubbed while the lossy echo did not.
+#[test]
+fn a_declared_secret_in_base_ref_is_withheld_even_when_git_echoes_only_a_prefix() {
+    if !git_available() {
+        eprintln!("skipping: git not available on this host");
+        return;
+    }
+    // `@{` makes git die mid-interpretation and echo only what precedes it.
+    const SECRET_VALUE: &str = "not-a-real-ref-topsecret123@{upstream}";
+    const LEAKED_PREFIX: &str = "not-a-real-ref-topsecret123";
+    let repo = TempRepo::new();
+    let provider = Arc::new(ObservingWorktreeProvider::new(repo.path.clone()));
+
+    let yaml = format!(
+        "{WORKFLOW_PREAMBLE}secrets: [T]\nsteps:\n\
+         \x20\x20- id: per_item\n\
+         \x20\x20\x20\x20map:\n\
+         \x20\x20\x20\x20\x20\x20over: \"${{{{ inputs.items }}}}\"\n\
+         \x20\x20\x20\x20\x20\x20as: item\n\
+         \x20\x20\x20\x20\x20\x20max_parallel: 1\n\
+         \x20\x20\x20\x20\x20\x20on_item_error: continue\n\
+         \x20\x20\x20\x20\x20\x20isolation: {{ worktree: {{ base_ref: \"${{{{ item }}}}\" }} }}\n\
+         \x20\x20\x20\x20steps:\n\
+         \x20\x20\x20\x20\x20\x20- id: emit_something\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20emit: {{ ok: true }}\n"
+    );
+    let def = parse_workflow(&yaml).expect("workflow must parse");
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(
+        // Public input: provenance marks nothing, so only the declared
+        // secret's *presence* can trigger the withhold.
+        serde_json::json!({"items": [SECRET_VALUE]}),
+        "T",
+        SECRET_VALUE,
+        Some(provider.clone() as Arc<dyn WorktreeProvider>),
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().expect("run must not error");
+
+    let items = outcomes[0].output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]["status"], "failed",
+        "expected git to reject this base_ref as invalid — got {:?}",
+        items[0]
+    );
+    let error = items[0]["error"].as_str().unwrap();
+
+    // The produced form: a declared secret in `base_ref` must route to
+    // `safe_summary()`, the same way a secret-derived one does.
+    assert!(
+        error.contains("withheld"),
+        "a declared secret's presence in base_ref must trigger the withhold, not merely a \
+         scrub — got: {error:?}"
+    );
+    // The transformed form: this is the assertion `***`-present cannot make
+    // for us, and the one that fails without the fix.
+    assert!(
+        !error.contains(LEAKED_PREFIX),
+        "git's truncated echo of a declared secret must not survive into the item's error \
+         message, got: {error:?}"
+    );
+
+    let serialized = serde_json::to_string(&outcomes[0].output).unwrap();
+    assert!(
+        !serialized.contains(LEAKED_PREFIX),
+        "git's truncated echo must not appear anywhere in the serialized output, got: \
+         {serialized}"
     );
 }

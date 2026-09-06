@@ -380,14 +380,39 @@ fn item_outcome_to_json(o: &ItemOutcome) -> Value {
 ///
 /// It exists because provenance and the needle list see different things.
 /// [`crate::expr::Interpolated`]'s provenance catches a `base_ref` that was
-/// *computed from* `${{ secrets.* }}`; the needle list catches a declared
-/// secret's *raw value* however it arrived. A declared secret's raw value
-/// can reach `base_ref` through a channel provenance treats as clean, and
-/// then the withhold branch does not fire because nothing about that
-/// `base_ref` is secret-*derived*. Without this scrub both layers are off at
-/// once and the raw value lands in the append-only `events` table (via the
-/// echoed `base_ref`, which is the value itself in that case, and via
-/// `git`'s stderr echoing it back).
+/// *computed from* `${{ secrets.* }}`; a declared secret's raw value can
+/// reach `base_ref` through a channel provenance treats as clean, and then
+/// the withhold branch would not fire on provenance alone. Without this
+/// scrub the raw value lands in the append-only `events` table via the
+/// echoed `base_ref`, which is the value itself in that case.
+///
+/// # What this scrub does and does not catch (final round part 3, ruling W5-48)
+///
+/// An earlier version of this comment said the needle list catches a
+/// declared secret's raw value **"however it arrived"**. That was a false
+/// coverage claim, and false in the dangerous direction. A needle is an
+/// exact substring match, so it catches every *verbatim* copy of the value
+/// — the echoed `base_ref` this function's caller scrubs before formatting,
+/// and a subprocess's stderr that quotes the value back unchanged — and it
+/// catches **no lossy transform of one**:
+///
+/// - `@{upstream}`-style syntax makes `git` die mid-interpretation and
+///   report only the prefix before the mark. Measured: 27 bytes of a
+///   38-byte declared secret, cleartext, past a whole-value needle.
+/// - A value longer than `git`'s own `vreportf` stderr buffer (~4KB —
+///   **`git`'s buffer, not this workspace's `OUTPUT_CAP`**; a 3024-byte
+///   value scrubs fully, a 5029-byte one does not) comes back as a shorter,
+///   still-sensitive prefix.
+///
+/// Those are the same two transforms ruling W5-36 answered for the
+/// secret-*derived* branch with withhold-don't-scrub. So the caller no
+/// longer relies on this scrub to cover them: a declared secret's
+/// **presence** in `base_ref` now routes the provider's own text through
+/// `safe_summary()` exactly as provenance does — a property of the input,
+/// which nothing `git` does to the value afterwards can defeat. This
+/// function's remaining job is the verbatim layer: the echoed value itself,
+/// and any declared secret appearing in text that reaches a message through
+/// some other route (a downstream provider's release error, say).
 ///
 /// **The two channels that actually reach here** (final round part 2, item
 /// 2 — an earlier version of this comment named `env('NAME')` as one of
@@ -1127,7 +1152,12 @@ impl<'a> Executor<'a> {
                 // persisted under the same rule, and a caller that ignored
                 // that on one of the two paths would make the promise a
                 // half-truth.
-                let mut base_ref_was_secret_derived = false;
+                //
+                // Named for what it actually holds (part 3, W5-48): secret
+                // *material*, either because provenance marked the value or
+                // because a declared secret's raw value is inside it. See
+                // the assignment below for why the second disjunct exists.
+                let mut base_ref_carried_secret_material = false;
                 match isolation {
                     // Fix round 1, item 6 / fix round 2, item 3 (ruling
                     // W5-33): `None` (the field absent) and an explicit
@@ -1228,7 +1258,36 @@ impl<'a> Executor<'a> {
                                     false,
                                 ),
                             };
-                        base_ref_was_secret_derived = base_ref_is_secret_derived;
+                        // **Provenance is not the only reason to withhold
+                        // (final round part 3, ruling W5-48).** A declared
+                        // secret's raw value can reach `base_ref` through a
+                        // channel provenance treats as clean, and the needle
+                        // scrub alone cannot cover that case: `git` does not
+                        // always echo a *copy* of what it was given.
+                        // `@{upstream}`-style syntax makes it die
+                        // mid-interpretation and report only the prefix
+                        // before the mark (measured: 27 of a 38-byte secret,
+                        // cleartext), and a value past `git`'s own `vreportf`
+                        // stderr buffer — **`git`'s buffer, ~4KB, not this
+                        // workspace's `OUTPUT_CAP`**; a 3024-byte value
+                        // scrubs fully and a 5029-byte one does not — comes
+                        // back as a shorter, still-sensitive prefix. A
+                        // whole-value needle matches neither.
+                        //
+                        // These are the exact two lossy transforms ruling
+                        // W5-36 already answered with withhold-don't-scrub
+                        // for the secret-*derived* branch; the scrub-only
+                        // branch silently inherited the limitation. So a
+                        // declared secret's *presence* in the value is
+                        // treated the same as provenance: it is a property
+                        // of the input, so nothing `git` does to the value
+                        // afterwards can defeat it.
+                        let base_ref_carries_secret_material = base_ref_is_secret_derived
+                            || self
+                                .redaction_needles
+                                .iter()
+                                .any(|needle| unredacted_base_ref.contains(needle.as_str()));
+                        base_ref_carried_secret_material = base_ref_carries_secret_material;
                         match provider.materialize(&unredacted_base_ref) {
                             Ok(path) => {
                                 // Derived from `item_evaluated`, not
@@ -1285,7 +1344,7 @@ impl<'a> Executor<'a> {
                                 // withhold"). Fix round 3 deleted that
                                 // backstop along with the scrub it was
                                 // replacing; the final round restored it.
-                                let detail = if base_ref_is_secret_derived {
+                                let detail = if base_ref_carries_secret_material {
                                     e.safe_summary().to_string()
                                 } else {
                                     e.to_string()
@@ -1473,7 +1532,7 @@ impl<'a> Executor<'a> {
                             // `{e}` embeds free text this crate does not
                             // control). See [`redact_message`]'s own doc
                             // comment for why the two are independent.
-                            let detail = if base_ref_was_secret_derived {
+                            let detail = if base_ref_carried_secret_material {
                                 e.safe_summary().to_string()
                             } else {
                                 e.to_string()
