@@ -377,17 +377,22 @@ async fn dispatch_shell_command(
     {
         return Err("unresolved shell globs are not supported by this tool".to_string());
     }
+    if command.contains('|') {
+        return Err("shell pipelines are not supported by this tool".to_string());
+    }
 
-    let classification = roundhouse_policy::shell::opaque::classify_shell(
-        command,
-        &roundhouse_policy::shell::classify::SessionEnv::default(),
-    );
+    let env = roundhouse_policy::shell::classify::SessionEnv::default();
+    let classification = roundhouse_policy::shell::opaque::classify_shell(command, &env);
     let parsed = match classification {
         roundhouse_policy::shell::opaque::ShellClassification::HardDeny(hint) => {
             return Err(hint.hint)
         }
         roundhouse_policy::shell::opaque::ShellClassification::Program(parsed) => parsed,
     };
+    let decision = actor.shell_command_decision(command, &env);
+    if decision.outcome == roundhouse_policy::Outcome::Deny {
+        return Err("the shell command was denied by policy".to_string());
+    }
     let nodes = roundhouse_policy::shell::pipeline::resolve_nodes(&parsed.program_ast);
     if nodes.is_empty() {
         return Err("the shell command did not contain an executable command".to_string());

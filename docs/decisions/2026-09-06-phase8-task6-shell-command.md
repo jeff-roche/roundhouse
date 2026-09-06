@@ -6,8 +6,8 @@ Status: accepted 2026-09-06
   tool remains the explicit argv/direct-exec surface and is not reinterpreted.
 - A parsed command is admitted one resolved node at a time. The second (or any
   later) node cannot inherit an earlier node's approval.
-- Phase 8 refuses commands containing redirections. Synthetic file-descriptor
-  writes are deferred until a later task; silently dropping them would change
-  command meaning.
+- Phase 8 refuses commands containing pipelines or redirections. Pipe file
+  descriptors and synthetic write tasks are deferred until a later task;
+  silently dropping either would change command meaning.
 - The classifier receives an empty `SessionEnv`. The daemon environment is not
   model input and must not become an implicit expansion channel.

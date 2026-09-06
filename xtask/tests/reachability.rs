@@ -112,8 +112,6 @@ const REQUIRED_FEATURES: &[Feature] = &[
 // L6 removes entries as it receives production-call evidence; the test below
 // rejects a spelling that has no corresponding permanent registry entry.
 const EXPECTED_UNWIRED: &[&str] = &[
-    "policy.shell_pipeline",
-    "tools.isolated_exec",
     "sandbox.isolate_spawn",
     "policy.synthesize_grant",
     "store.outbound_redaction",
