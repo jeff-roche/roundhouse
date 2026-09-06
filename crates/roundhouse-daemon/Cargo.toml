@@ -108,6 +108,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+roundhouse-policy = { path = "../roundhouse-policy", features = ["test-util"] }
 tempfile = "3"
 # Ruling W1-R99 (fix round 1): this crate's own tests need
 # `roundhouse_engine::mcp_spawner::SessionMcp::from_parts` — gated behind

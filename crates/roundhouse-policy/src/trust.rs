@@ -194,10 +194,14 @@ fn tag_for(outcome: Outcome) -> &'static str {
 /// predicate. Not a general rule-equality algebra; good enough to answer "did this exact
 /// (outcome, predicate) pair exist in the last-trusted file, and where."
 fn signature_string(rule: &CompiledRule) -> Option<String> {
-    if rule.scope != Scope::Project {
+    if rule.scope() != Scope::Project {
         return None;
     }
-    Some(format!("{}:{:?}", tag_for(rule.outcome), rule.predicate))
+    Some(format!(
+        "{}:{:?}",
+        tag_for(rule.outcome()),
+        rule.predicate()
+    ))
 }
 
 fn is_allow_signature(sig: &str) -> bool {
@@ -215,13 +219,15 @@ fn is_allow_signature(sig: &str) -> bool {
 /// legitimate narrowing edit — which renumbers every rule after the deleted one — as a
 /// wholesale signature change instead of the safe removal it actually is.
 fn signature_sequence(rules: &[CompiledRule]) -> Vec<String> {
-    let mut project_rules: Vec<&CompiledRule> =
-        rules.iter().filter(|r| r.scope == Scope::Project).collect();
-    project_rules.sort_by_key(|r| r.file_order);
+    let mut project_rules: Vec<&CompiledRule> = rules
+        .iter()
+        .filter(|r| r.scope() == Scope::Project)
+        .collect();
+    project_rules.sort_by_key(|r| r.file_order());
     debug_assert!(
         project_rules
             .windows(2)
-            .all(|w| w[0].file_order <= w[1].file_order),
+            .all(|w| w[0].file_order() <= w[1].file_order()),
         "trust::signature_sequence: rules must come out sorted by file_order — the exact \
          field PolicyEngine::decide's tie-break reads — after the sort_by_key above; a \
          violation here means the sort was changed or bypassed, silently reintroducing the \
@@ -323,7 +329,7 @@ pub fn apply_project_scope_trust(
             // silently reset to a fresh, agent-controllable baseline.
             parsed_project_rules
                 .into_iter()
-                .filter(|r| !(r.scope == Scope::Project && r.outcome == Outcome::Allow))
+                .filter(|r| !(r.scope() == Scope::Project && r.outcome() == Outcome::Allow))
                 .collect()
         }
         Ok(None) => {
@@ -344,7 +350,7 @@ pub fn apply_project_scope_trust(
             );
             parsed_project_rules
                 .into_iter()
-                .filter(|r| !(r.scope == Scope::Project && r.outcome == Outcome::Allow))
+                .filter(|r| !(r.scope() == Scope::Project && r.outcome() == Outcome::Allow))
                 .collect()
         }
         Ok(Some(record)) => {
@@ -369,7 +375,7 @@ pub fn apply_project_scope_trust(
                     // until a human calls `record_explicit_trust`.
                     parsed_project_rules
                         .into_iter()
-                        .filter(|r| !(r.scope == Scope::Project && r.outcome != Outcome::Deny))
+                        .filter(|r| !(r.scope() == Scope::Project && r.outcome() != Outcome::Deny))
                         .collect()
                 }
                 Widening::Additive => {
@@ -386,7 +392,7 @@ pub fn apply_project_scope_trust(
                     parsed_project_rules
                         .into_iter()
                         .filter(|r| {
-                            if r.scope == Scope::Project && r.outcome == Outcome::Allow {
+                            if r.scope() == Scope::Project && r.outcome() == Outcome::Allow {
                                 signature_string(r)
                                     .map(|s| trusted_allow.contains(s.as_str()))
                                     .unwrap_or(false)

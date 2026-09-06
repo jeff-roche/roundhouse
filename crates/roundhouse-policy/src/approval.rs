@@ -116,7 +116,7 @@ impl Grant {
     /// `Predicate::matches` in `engine.rs` has always gated on `op`, this
     /// helper just hadn't matched that).
     pub fn rule_covers_path(&self, op: FsOp, path: &PathBuf) -> bool {
-        match &self.rule.predicate {
+        match self.rule.predicate() {
             Predicate::FsPrefix { op: pop, prefix } => *pop == op && path.starts_with(prefix),
             Predicate::FsExact { op: pop, path: p } => *pop == op && path == p,
             _ => false,
@@ -154,7 +154,7 @@ impl Grant {
     /// enforcement, not a guarantee that a determined out-of-crate caller
     /// cannot reconstruct an installable rule.
     pub fn predicate(&self) -> &Predicate {
-        &self.rule.predicate
+        self.rule.predicate()
     }
 
     /// The only sanctioned way to obtain this grant's `CompiledRule` for
@@ -350,17 +350,17 @@ pub fn synthesize_grant(
             session: Some(*session),
         },
     };
-    let rule = CompiledRule {
-        scope: grant_rule_scope(&scope),
-        outcome: Outcome::Allow,
+    let rule = CompiledRule::new(
+        grant_rule_scope(&scope),
+        Outcome::Allow,
         predicate,
-        file_order: 0,
-        id: RuleId(format!(
+        0,
+        RuleId(format!(
             "grant:{}:{}",
             provenance.session_id.as_uuid(),
             provenance.task_id.as_uuid()
         )),
-    };
+    );
     Grant {
         scope,
         rule,

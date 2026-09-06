@@ -1,0 +1,15 @@
+error[E0451]: fields `scope`, `outcome`, `predicate`, `file_order` and `id` of struct `CompiledRule` are private
+ --> tests/ui/compiled_rule_literal.rs:5:9
+  |
+4 |     let _ = CompiledRule {
+  |             ------------ in this type
+5 |         scope: Scope::UserGlobal,
+  |         ^^^^^ private field
+6 |         outcome: Outcome::Allow,
+  |         ^^^^^^^ private field
+7 |         predicate: Predicate::program("read"),
+  |         ^^^^^^^^^ private field
+8 |         file_order: 0,
+  |         ^^^^^^^^^^ private field
+9 |         id: roundhouse_policy::RuleId("forged".into()),
+  |         ^^ private field

@@ -37,11 +37,11 @@ fn first_use_with_no_trust_record_drops_project_scope_allow_rules() {
     );
 
     assert!(
-        !effective.iter().any(|r| r.outcome == Outcome::Allow),
+        !effective.iter().any(|r| r.outcome() == Outcome::Allow),
         "first use is narrow-by-default: no Allow rule applies until a human trusts this exact file"
     );
     assert!(
-        effective.iter().any(|r| r.outcome == Outcome::Deny),
+        effective.iter().any(|r| r.outcome() == Outcome::Deny),
         "Deny rules are never gated — narrowing is always safe"
     );
 }
@@ -64,8 +64,8 @@ fn widening_the_policy_file_without_a_trust_update_is_refused() {
 
     let allowed_programs: Vec<_> = effective
         .iter()
-        .filter(|r| r.outcome == Outcome::Allow)
-        .filter_map(|r| match &r.predicate {
+        .filter(|r| r.outcome() == Outcome::Allow)
+        .filter_map(|r| match r.predicate() {
             Predicate::Shell { program, .. } => Some(program.clone()),
             _ => None,
         })
@@ -129,7 +129,7 @@ fn explicit_trust_update_unlocks_the_wider_rules() {
     assert_eq!(
         effective
             .iter()
-            .filter(|r| r.outcome == Outcome::Allow)
+            .filter(|r| r.outcome() == Outcome::Allow)
             .count(),
         2,
         "after an explicit trust update, the previously-refused wider rule now applies"
@@ -152,7 +152,7 @@ fn a_second_call_on_an_unchanged_untrusted_file_does_not_self_grant() {
     let store1 = TrustStore::new(state_dir.path().to_path_buf());
     let run1 = apply_project_scope_trust(&repo_root, policy_text, rules(), &store1);
     assert!(
-        !run1.iter().any(|r| r.outcome == Outcome::Allow),
+        !run1.iter().any(|r| r.outcome() == Outcome::Allow),
         "run 1 (first use) must refuse all Allow rules"
     );
 
@@ -160,7 +160,7 @@ fn a_second_call_on_an_unchanged_untrusted_file_does_not_self_grant() {
     let store2 = TrustStore::new(state_dir.path().to_path_buf());
     let run2 = apply_project_scope_trust(&repo_root, policy_text, rules(), &store2);
     assert!(
-        !run2.iter().any(|r| r.outcome == Outcome::Allow),
+        !run2.iter().any(|r| r.outcome() == Outcome::Allow),
         "run 2, same unchanged untrusted file, must STILL refuse all Allow rules — no \
          human trust decision was ever recorded"
     );
@@ -191,7 +191,7 @@ fn a_corrupt_trust_record_is_not_silently_clobbered_and_stays_fail_closed() {
 
     let run1 = apply_project_scope_trust(&repo_root, widened_text, widened_rules.clone(), &store);
     assert!(
-        !run1.iter().any(|r| r.outcome == Outcome::Allow),
+        !run1.iter().any(|r| r.outcome() == Outcome::Allow),
         "a corrupt trust record must fail closed, refusing all Allow rules"
     );
 
@@ -206,7 +206,7 @@ fn a_corrupt_trust_record_is_not_silently_clobbered_and_stays_fail_closed() {
 
     let run2 = apply_project_scope_trust(&repo_root, widened_text, widened_rules, &store);
     assert!(
-        !run2.iter().any(|r| r.outcome == Outcome::Allow),
+        !run2.iter().any(|r| r.outcome() == Outcome::Allow),
         "a second call against the still-corrupt record must also stay fail-closed"
     );
 }
@@ -244,7 +244,7 @@ fn removing_a_trusted_deny_rule_widens_the_real_effective_decision_and_is_fully_
         apply_project_scope_trust(&repo_root, deny_removed_text, deny_removed_rules, &store);
 
     assert!(
-        !effective.iter().any(|r| r.outcome == Outcome::Allow),
+        !effective.iter().any(|r| r.outcome() == Outcome::Allow),
         "a disappearing trusted restriction must drop ALL Project-scope Allow rules, not \
          just refuse newly-added ones — the surviving broad `Allow git` rule could still \
          cover the action the deleted Deny used to block"
@@ -296,13 +296,13 @@ fn rewriting_a_trusted_deny_as_ask_on_the_same_predicate_is_widening_and_is_gate
     let effective = apply_project_scope_trust(&repo_root, rewritten_text, rewritten_rules, &store);
 
     assert!(
-        !effective.iter().any(|r| r.outcome == Outcome::Allow),
+        !effective.iter().any(|r| r.outcome() == Outcome::Allow),
         "loosening a trusted Deny to Ask on the same predicate must be gated exactly like \
          any other widening — an absolute refusal becoming a user-approvable prompt is a \
          real widening"
     );
     assert!(
-        !effective.iter().any(|r| r.outcome == Outcome::Ask),
+        !effective.iter().any(|r| r.outcome() == Outcome::Ask),
         "the widened Ask rule itself must also be dropped, not just Allow rules — a live \
          Ask rule would still MATCH `git push --force`, which is exactly what the next \
          assertion below proves matters"
@@ -385,7 +385,7 @@ fn reordering_two_tied_specificity_rules_flips_the_real_decision_and_is_gated() 
     let effective = apply_project_scope_trust(&repo_root, swapped_text, swapped_rules, &store);
 
     assert!(
-        !effective.iter().any(|r| r.outcome == Outcome::Allow),
+        !effective.iter().any(|r| r.outcome() == Outcome::Allow),
         "a pure reorder of tied-specificity rules must be gated as widening — order alone \
          can flip PolicyEngine::decide's outcome even though the signature SET is identical"
     );
@@ -420,8 +420,8 @@ fn reordering_via_the_file_order_field_alone_is_gated_even_when_vec_position_is_
     let mut ask_rule =
         CompiledRule::test_new(Scope::Project, Outcome::Ask, Predicate::program("git"));
     let mut allow_git = allow_rule("git");
-    ask_rule.file_order = 0;
-    allow_git.file_order = 1;
+    ask_rule.test_set_file_order(0);
+    allow_git.test_set_file_order(1);
     // Vec position: [ask_rule, allow_git] — same as the file_order order, so this
     // baseline is unambiguous either way.
     let baseline_rules = vec![ask_rule.clone(), allow_git.clone()];
@@ -444,8 +444,8 @@ fn reordering_via_the_file_order_field_alone_is_gated_even_when_vec_position_is_
     // `allow_git` now carries the lower `file_order`, so it wins the real tie-break.
     let mut swapped_ask = ask_rule;
     let mut swapped_allow = allow_git;
-    swapped_ask.file_order = 1;
-    swapped_allow.file_order = 0;
+    swapped_ask.test_set_file_order(1);
+    swapped_allow.test_set_file_order(0);
     let attacked_rules = vec![swapped_ask, swapped_allow]; // same Vec order as baseline_rules
 
     assert_eq!(
@@ -462,7 +462,7 @@ fn reordering_via_the_file_order_field_alone_is_gated_even_when_vec_position_is_
     assert!(
         effective
             .iter()
-            .all(|r| r.outcome != Outcome::Allow && r.outcome != Outcome::Ask),
+            .all(|r| r.outcome() != Outcome::Allow && r.outcome() != Outcome::Ask),
         "a file_order-only reorder (identical Vec position) must be caught exactly like a \
          Vec-position reorder — the trust gate must key its ordering on file_order, not on \
          incidental Vec iteration order"
