@@ -1195,6 +1195,26 @@ impl<'a> Executor<'a> {
                                             )
                                         }
                                         Err(e) => {
+                                            // No needle scrub here, unlike
+                                            // the two arms below (final
+                                            // round part 2, recorded rather
+                                            // than changed). Clean by
+                                            // construction, not by
+                                            // oversight: every `ExprError`
+                                            // payload is *source text*
+                                            // captured before evaluation
+                                            // (never a value), and a pasted
+                                            // credential cannot be inside
+                                            // that source text — `"`, `'`
+                                            // and `\` are all in
+                                            // `parse/steps.rs`'s
+                                            // `FORBIDDEN_GIT_REF_CHARS`, so
+                                            // a `base_ref` carrying an
+                                            // expression cannot also carry a
+                                            // quoted literal. If that
+                                            // charset is ever relaxed, this
+                                            // arm needs the same backstop
+                                            // the failure arms below have.
                                             return ItemOutcome::Failed(format!(
                                                 "map step `{step_id}`: resolving \
                                                  `isolation.worktree.base_ref`: {e}"

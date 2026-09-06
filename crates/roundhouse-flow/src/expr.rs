@@ -232,8 +232,12 @@
 //! caller opts specific, exact, case-sensitive names in via
 //! [`ExprContext::allow_env`]. A denied read is [`ExprError::EnvVarNotAllowed`],
 //! naming the call's **source text** (a bounded prefix of what the workflow
-//! author wrote, captured before evaluation — never the resolved name and
-//! never a value); an allowlisted-but-unset
+//! author wrote, captured before evaluation — never a **value**, and never
+//! the result of evaluating a computed argument such as
+//! `env(json(secrets.K).varname)`. For the ubiquitous literal
+//! `env('FOO')` the source text *is* the name, in quoted form; what the
+//! capture guarantees is that nothing is ever *evaluated* into this
+//! error); an allowlisted-but-unset
 //! variable still resolves to `Value::Null`, exactly as before this task —
 //! the two conditions ("not permitted" and "permitted but unset") are
 //! deliberately distinguishable, so a workflow author debugging a blank

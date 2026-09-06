@@ -150,6 +150,17 @@
 //!    it is that the attributes half lives outside both
 //!    `core.attributesFile`'s reach and the tracked tree, so neither the
 //!    `-c` override above nor a tree-level review sees it.
+//!    **Where the companion `filter.*` entry can live** (final round part
+//!    2, M4 — "local config" understated it): git merges `/etc/gitconfig`
+//!    **before** the repository's local config, this module passes no
+//!    `--no-system` equivalent, and `env_clear()` strips any inherited
+//!    `GIT_CONFIG_NOSYSTEM`, so a **system**-level `filter.*` driver
+//!    satisfies the precondition just as a local one does. On a host where
+//!    someone ran `git lfs install --system`, route 2 is a one-write route
+//!    even against a bare repository. Writing `/etc/gitconfig` needs root,
+//!    so system config is a *precondition* here rather than an attack route
+//!    of its own — but this section is the reference for what is open, so
+//!    it must name both levels.
 //! 3. A `core.attributesFile` entry written into the repository's own
 //!    **shared, local** `.git/config` — the one thing `-c
 //!    core.attributesFile=/dev/null` above actually closes, by overriding
@@ -205,10 +216,25 @@
 //! the whole group down on **every** path out of the wait — including the
 //! one where the direct child exited cleanly, which is precisely the
 //! backgrounding shape above and the same conclusion ruling W5-26 reached
-//! for [`crate::bounded_parse::run_bounded_subprocess`]. Descendants do
-//! not outlive a call. Stdout and stderr are read capped-and-discarding so
-//! a hook that floods output cannot turn the deadline into unbounded
-//! memory growth.
+//! for [`crate::bounded_parse::run_bounded_subprocess`]. Descendants **that
+//! stay in the process group** do not outlive a call — the qualification
+//! matters, and the paragraph below says why. Stdout and stderr are read
+//! capped-and-discarding so a hook that floods output cannot turn the
+//! deadline into unbounded memory growth.
+//!
+//! **The wall clock alone bounds nothing here; the guarantee rests on the
+//! group kill** (final round part 2, M3 — stated plainly because an earlier
+//! version of this section read as though the two were independent
+//! backstops, which is the same "two sections cannot both be true" shape
+//! this section exists to have fixed). `wait_with_wall_limit` returning is
+//! not the call returning: `thread::scope` still has to join the readers,
+//! and a descendant out of the kill's reach keeps the pipe open past the
+//! deadline. The reviewer's own removal probe measured exactly that — a 5s
+//! `wall_limit` ran to the test's 10s ceiling once the group kill was
+//! deleted. So a descendant that calls `setsid` (leaving the group) can
+//! still hold the call open; closing that needs a PID namespace or cgroup,
+//! not a bigger kill or a shorter deadline. Whoever wires this into the
+//! daemon (lane W1) should read that as the real boundary.
 //!
 //! **What is deliberately still not bounded here, and why it differs from
 //! `run_bounded_subprocess`:** no `RLIMIT_CPU`. That primitive bounds CPU
@@ -329,6 +355,15 @@ pub enum WorktreeError {
     ///
     /// Carries no text from outside this module, so
     /// [`WorktreeError::safe_summary`] has nothing to withhold from it.
+    ///
+    /// **Known residual for whoever wires this up (lane W1):** a timeout
+    /// mid-checkout `SIGKILL`s `git` while `.git/worktrees/<uuid>/locked`
+    /// is held, leaving a registry entry that survives `git worktree prune`
+    /// and a partial directory under `WORKTREE_SUBDIR`. Strictly better
+    /// than the unbounded hang it replaces, but it is a cleanup a caller
+    /// has to own — this module does not attempt it, and a blind
+    /// `remove_worktree` on that path would need `--force` plus a manual
+    /// `locked` removal to succeed.
     #[error(
         "`{program}` in {} exceeded the {wall_limit:?} wall-clock bound and its process group \
          was killed",
@@ -562,7 +597,10 @@ fn run_program_bounded(
 /// behaviour required) leaves that orphan holding the pipe's write end with
 /// nothing left to close it, and the reader in [`run_program_bounded`]
 /// waits forever for an EOF that never comes. Killing the group is what
-/// closes those inherited descriptors. Descendants do not outlive a call.
+/// closes those inherited descriptors. Descendants **that stay in the
+/// group** do not outlive a call — see the second residual below for the
+/// one that does not, and the module doc comment for why the wall clock
+/// cannot cover it.
 ///
 /// **Accepted residual, the same one `bounded_parse::wait_bounded`
 /// documents:** `try_wait()` reaps the direct child before the group kill
