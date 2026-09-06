@@ -298,6 +298,9 @@ async fn dispatch_one_tool_call(
         Some(ToolTarget::Builtin(kind)) => {
             dispatch_builtin(actor, writer, runner, kind, input, parent).await
         }
+        Some(ToolTarget::ShellCommand) => {
+            dispatch_shell_command(actor, writer, runner, input, parent).await
+        }
         Some(ToolTarget::Mcp { namespaced_name }) => match mcp {
             Some(mcp) => {
                 dispatch_mcp(actor, writer, runner, mcp, &namespaced_name, input, parent).await
@@ -343,6 +346,69 @@ async fn dispatch_one_tool_call(
             ))
         }
     }
+}
+
+/// Classifies a model-provided shell string, rejects unsupported redirections,
+/// and dispatches each resolved node through the ordinary admission/execution
+/// path. Each node gets its own `TaskKind::Shell` task and policy decision.
+async fn dispatch_shell_command(
+    actor: &SessionActor,
+    writer: &EventWriter,
+    runner: &'static TaskRunner,
+    input: &serde_json::Value,
+    parent: TaskId,
+) -> Result<Vec<ToolResultPart>, String> {
+    let command = input
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            "the `shell_command` tool call is missing or has an invalid `command` argument"
+                .to_string()
+        })?;
+    let cwd = input
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            "the `shell_command` tool call is missing or has an invalid `cwd` argument".to_string()
+        })?;
+    if command
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']'))
+    {
+        return Err("unresolved shell globs are not supported by this tool".to_string());
+    }
+
+    let classification = roundhouse_policy::shell::opaque::classify_shell(
+        command,
+        &roundhouse_policy::shell::classify::SessionEnv::default(),
+    );
+    let parsed = match classification {
+        roundhouse_policy::shell::opaque::ShellClassification::HardDeny(hint) => {
+            return Err(hint.hint)
+        }
+        roundhouse_policy::shell::opaque::ShellClassification::Program(parsed) => parsed,
+    };
+    let nodes = roundhouse_policy::shell::pipeline::resolve_nodes(&parsed.program_ast);
+    if nodes.is_empty() {
+        return Err("the shell command did not contain an executable command".to_string());
+    }
+    if nodes.iter().any(|node| !node.redirections.is_empty()) {
+        return Err("shell redirections are not supported by this tool".to_string());
+    }
+
+    let mut output = Vec::new();
+    for node in nodes {
+        let node_input = serde_json::json!({
+            "shell_command": true,
+            "program": node.resolved_program,
+            "argv": node.argv,
+            "cwd": cwd,
+        });
+        output.extend(
+            dispatch_builtin(actor, writer, runner, TaskKind::Shell, &node_input, parent).await?,
+        );
+    }
+    Ok(output)
 }
 
 /// Records a refusal that never reached `admit_task` at all as a real

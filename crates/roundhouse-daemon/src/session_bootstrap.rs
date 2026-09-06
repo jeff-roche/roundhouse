@@ -1128,7 +1128,7 @@ mod tests {
     /// itself. That is why this asserts through the real bootstrap function
     /// rather than through a hand-built actor.
     #[tokio::test]
-    async fn a_session_with_no_mcp_servers_configured_still_offers_the_five_builtins() {
+    async fn a_session_with_no_mcp_servers_configured_still_offers_the_builtin_facing_tools() {
         let dir = tempfile::tempdir().unwrap();
         let resources = resources(dir.path()).await;
         assert!(
@@ -1150,8 +1150,8 @@ mod tests {
         offered.sort_unstable();
         assert_eq!(
             offered,
-            ["edit", "find", "read", "shell", "write"],
-            "a default (no-MCP) session must offer exactly the five builtin tools"
+            ["edit", "find", "read", "shell", "shell_command", "write"],
+            "a default (no-MCP) session must offer exactly the builtin-facing tools"
         );
     }
 

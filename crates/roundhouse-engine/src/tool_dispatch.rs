@@ -708,9 +708,14 @@ pub fn task_params_for(
             ResolvedExtras::default(),
         )),
         TaskKind::Shell => {
-            let raw_program = str_field(input, "shell", "program")?;
-            let argv = argv_field(input, "shell")?;
-            let raw_cwd = str_field(input, "shell", "cwd")?;
+            let tool = if input.get("shell_command").is_some() {
+                "shell_command"
+            } else {
+                "shell"
+            };
+            let raw_program = str_field(input, tool, "program")?;
+            let argv = argv_field(input, tool)?;
+            let raw_cwd = str_field(input, tool, "cwd")?;
             let canonical_cwd = resolve_shell_cwd(&raw_cwd)?;
             let canonical_program = resolve_shell_program(&raw_program, &canonical_cwd)?;
             let program = canonical_program.to_string_lossy().to_string();
@@ -838,6 +843,23 @@ pub async fn execute_builtin(
                 .shell_cwd
                 .as_deref()
                 .ok_or(ToolDispatchError::MissingResolvedCwd)?;
+            if input.get("shell_command").is_some() {
+                let node = roundhouse_policy::shell::pipeline::ResolvedNode {
+                    resolved_program: cmd.program.clone(),
+                    argv: cmd.argv.clone(),
+                    redirections: Vec::new(),
+                };
+                let output = roundhouse_tools::execve_node(&node, cwd)
+                    .await
+                    .map_err(ToolDispatchError::Tool)?;
+                let text = format!(
+                    "exit_code={:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.exit_code,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                return Ok(vec![ToolResultPart { text }]);
+            }
             let env = shell_env_allowlist();
             let output =
                 run_shell_dispatch(&cmd.program, &cmd.argv, cwd, &env, SHELL_TIMEOUT, cancel)
