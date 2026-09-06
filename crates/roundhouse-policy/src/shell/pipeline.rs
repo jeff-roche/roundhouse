@@ -78,35 +78,56 @@ pub fn flatten_argv(ast: &ast::Program) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Returns true when `ast` contains syntax whose control flow cannot be
-/// preserved by the direct-exec adapter. Compound commands, function
-/// definitions, extended tests, timed/negated pipelines, and pipelines with
-/// more than one command are all rejected by the model-facing shell tool
-/// rather than flattened into independent executions.
-pub fn contains_unsupported_control_flow(ast: &ast::Program) -> bool {
-    ast.complete_commands.iter().any(|command| {
-        command
-            .0
-            .iter()
-            .any(|item| and_or_has_unsupported_control_flow(&item.0))
-    })
+/// The syntax class that prevented a parsed program from being safely
+/// flattened into independent direct executions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedShellSyntax {
+    CommandList,
+    Pipeline,
+    Compound,
 }
 
-fn and_or_has_unsupported_control_flow(list: &ast::AndOrList) -> bool {
-    if !list.additional.is_empty() {
-        return true;
+/// Identifies syntax whose control flow cannot be preserved by the
+/// direct-exec adapter. The model-facing shell tool reports these classes
+/// separately rather than flattening them into independent executions.
+pub fn unsupported_shell_syntax(ast: &ast::Program) -> Option<UnsupportedShellSyntax> {
+    if ast.complete_commands.len() != 1 {
+        return Some(UnsupportedShellSyntax::CommandList);
     }
-    pipeline_has_unsupported_control_flow(&list.first)
+    for command in &ast.complete_commands {
+        if command.0.len() != 1 {
+            return Some(UnsupportedShellSyntax::CommandList);
+        }
+        for item in &command.0 {
+            if let Some(syntax) = and_or_unsupported_shell_syntax(&item.0) {
+                return Some(syntax);
+            }
+        }
+    }
+    None
 }
 
-fn pipeline_has_unsupported_control_flow(pipeline: &ast::Pipeline) -> bool {
-    pipeline.timed.is_some()
+fn and_or_unsupported_shell_syntax(list: &ast::AndOrList) -> Option<UnsupportedShellSyntax> {
+    if !list.additional.is_empty() {
+        return Some(UnsupportedShellSyntax::Compound);
+    }
+    pipeline_unsupported_shell_syntax(&list.first)
+}
+
+fn pipeline_unsupported_shell_syntax(pipeline: &ast::Pipeline) -> Option<UnsupportedShellSyntax> {
+    if pipeline.seq.len() > 1 {
+        return Some(UnsupportedShellSyntax::Pipeline);
+    }
+    if pipeline.timed.is_some()
         || pipeline.bang
-        || pipeline.seq.len() != 1
         || pipeline
             .seq
             .iter()
             .any(|command| !matches!(command, ast::Command::Simple(_)))
+    {
+        return Some(UnsupportedShellSyntax::Compound);
+    }
+    None
 }
 
 fn walk_program(program: &ast::Program, out: &mut Vec<ResolvedNode>) {

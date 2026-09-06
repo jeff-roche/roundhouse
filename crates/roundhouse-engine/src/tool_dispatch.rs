@@ -281,18 +281,6 @@ impl ToolDispatchError {
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedExtras {
     pub shell_cwd: Option<PathBuf>,
-    pub shell_mode: ShellExecutionMode,
-}
-
-/// Trusted execution mode selected by the dispatch target, never by a model
-/// input field. The classified string tool intentionally uses the simple
-/// `execve_node` path; the legacy argv tool retains cancellation and output
-/// bounds.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ShellExecutionMode {
-    #[default]
-    Argv,
-    Classified,
 }
 
 fn str_field(
@@ -730,7 +718,6 @@ pub fn task_params_for(
                 TaskParams::Shell(ParsedCommand { program, argv }),
                 ResolvedExtras {
                     shell_cwd: Some(canonical_cwd),
-                    shell_mode: ShellExecutionMode::Argv,
                 },
             ))
         }
@@ -851,23 +838,6 @@ pub async fn execute_builtin(
                 .shell_cwd
                 .as_deref()
                 .ok_or(ToolDispatchError::MissingResolvedCwd)?;
-            if extras.shell_mode == ShellExecutionMode::Classified {
-                let node = roundhouse_policy::shell::pipeline::ResolvedNode {
-                    resolved_program: cmd.program.clone(),
-                    argv: cmd.argv.clone(),
-                    redirections: Vec::new(),
-                };
-                let output = roundhouse_tools::execve_node(&node, cwd)
-                    .await
-                    .map_err(ToolDispatchError::Tool)?;
-                let text = format!(
-                    "exit_code={:?}\nstdout:\n{}\nstderr:\n{}",
-                    output.exit_code,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr),
-                );
-                return Ok(vec![ToolResultPart { text }]);
-            }
             let env = shell_env_allowlist();
             let output =
                 run_shell_dispatch(&cmd.program, &cmd.argv, cwd, &env, SHELL_TIMEOUT, cancel)
@@ -1564,7 +1534,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_extra_model_shell_command_field_cannot_select_classified_execution() {
+    async fn an_extra_model_shell_command_field_cannot_change_shell_execution() {
         let dir = workspace_temp_dir();
         let cwd_str = dir.path().to_string_lossy().to_string();
         let input = serde_json::json!({
@@ -1574,7 +1544,6 @@ mod tests {
             "shell_command": true,
         });
         let (params, extras) = task_params_for(TaskKind::Shell, &input).unwrap();
-        assert_eq!(extras.shell_mode, ShellExecutionMode::Argv);
         let parts = execute_builtin(&params, &extras, &input, None)
             .await
             .unwrap();
