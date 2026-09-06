@@ -994,8 +994,12 @@ fn a_secret_derived_base_ref_longer_than_gits_stderr_buffer_never_reaches_the_se
 /// `${{ secrets.T }}` is secret-*derived*, so `WorktreeError::safe_summary()`
 /// replaces `git`'s free text. This test drives the case where a **declared**
 /// secret's raw value reaches `base_ref` through a channel provenance treats
-/// as clean — here the workflow author pasting it literally into the YAML
-/// (`env('NAME')` is the other, kept deliberately clean by ruling W5-7). Then
+/// as clean — here the workflow author pasting it literally into the YAML.
+/// (The other reachable channel is a placeholder over *public* data, driven
+/// by `a_backslash_bearing_secret_is_scrubbed_before_debug_formatting_can_escape_it`
+/// below. `env('NAME')` is **not** one: `'`, `(` and `)` are in
+/// `FORBIDDEN_GIT_REF_CHARS`, so such a `base_ref` never parses — an earlier
+/// version of this comment said otherwise.) Then
 /// `base_ref_is_secret_derived` is `false`, no withhold happens, and the only
 /// thing standing between the raw value and the append-only `events` table is
 /// the needle scan every sibling dispatch arm applies
@@ -1075,5 +1079,104 @@ fn a_declared_secrets_raw_value_pasted_literally_into_base_ref_is_still_scrubbed
         "a declared secret's raw value must not survive anywhere in the map step's \
          serialized output just because it arrived through a channel provenance treats as \
          clean, got: {serialized}"
+    );
+}
+
+/// Final round part 2, item 1 — the **`Debug`-escaping** hole in the
+/// backstop item A1 restored, found by the security lens and reproduced end
+/// to end.
+///
+/// A1's fix assembled the message first (embedding the value as
+/// `{redacted_base_ref:?}`) and scrubbed the whole thing afterwards.
+/// `Debug for str` escapes `"`, `\` and control characters, so a declared
+/// secret containing any of them stops matching the plain-substring needle
+/// **in that one copy** while the raw copies — the echoed argv and `git`'s
+/// stderr — scrub correctly. Two of three occurrences became `***` and the
+/// escaped one survived into the append-only `events` table in trivially
+/// reversible form.
+///
+/// **The channel matters, and it is not the one the previous test drives.**
+/// A literal paste cannot carry a backslash: `\` is in
+/// `FORBIDDEN_GIT_REF_CHARS`, so `parse/steps.rs::validate_git_ref` rejects
+/// it at parse time. The reachable channel is a **placeholder over public
+/// data** — `base_ref: "${{ item }}"` over a public input list whose
+/// element happens to equal a declared secret's raw value. The template
+/// text passes validation, the resolved value is never re-validated, and
+/// provenance marks nothing because the value came from `inputs`.
+///
+/// **Asserting on the escaped form is the whole point.** The A1 test
+/// asserts `!serialized.contains(SECRET_VALUE)`, which an escaped copy
+/// satisfies by construction — that is exactly how it shipped green over
+/// this defect. This asserts on `\\` (the escape `Debug` emits for one
+/// backslash) and on a distinctive substring that survives escaping.
+#[test]
+fn a_backslash_bearing_secret_is_scrubbed_before_debug_formatting_can_escape_it() {
+    if !git_available() {
+        eprintln!("skipping: git not available on this host");
+        return;
+    }
+    // One backslash, so `Debug` renders it as `\\` — the cheap tell below.
+    const SECRET_VALUE: &str = "not-a-real-ref-top\\secret123";
+    let repo = TempRepo::new();
+    let provider = Arc::new(ObservingWorktreeProvider::new(repo.path.clone()));
+
+    let yaml = format!(
+        "{WORKFLOW_PREAMBLE}secrets: [T]\nsteps:\n\
+         \x20\x20- id: per_item\n\
+         \x20\x20\x20\x20map:\n\
+         \x20\x20\x20\x20\x20\x20over: \"${{{{ inputs.items }}}}\"\n\
+         \x20\x20\x20\x20\x20\x20as: item\n\
+         \x20\x20\x20\x20\x20\x20max_parallel: 1\n\
+         \x20\x20\x20\x20\x20\x20on_item_error: continue\n\
+         \x20\x20\x20\x20\x20\x20isolation: {{ worktree: {{ base_ref: \"${{{{ item }}}}\" }} }}\n\
+         \x20\x20\x20\x20steps:\n\
+         \x20\x20\x20\x20\x20\x20- id: emit_something\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20emit: {{ ok: true }}\n"
+    );
+    let def = parse_workflow(&yaml).expect("workflow must parse");
+    let mut sink = RecordingSink(Vec::new());
+    let ctx = secret_run_ctx(
+        // The value arrives through a **public** input, so nothing about
+        // this `base_ref` is secret-derived and the withhold branch never
+        // runs — the needle backstop is the only guard in play.
+        serde_json::json!({"items": [SECRET_VALUE]}),
+        "T",
+        SECRET_VALUE,
+        Some(provider.clone() as Arc<dyn WorktreeProvider>),
+    );
+    let mut exec = Executor::new(&def, &mut sink, ctx).unwrap();
+    let outcomes = exec.run_to_completion().expect("run must not error");
+
+    let items = outcomes[0].output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]["status"], "failed",
+        "expected git to reject this base_ref as invalid — got {:?}",
+        items[0]
+    );
+    let error = items[0]["error"].as_str().unwrap();
+    assert!(
+        !error.contains("withheld"),
+        "this must be the non-secret-derived branch (no withhold), or the test pins the \
+         wrong guard — got: {error:?}"
+    );
+
+    // The escaped form is what the raw-contains assertion in the A1 test is
+    // structurally blind to. Nothing else in this message contains a
+    // backslash, so this is an unambiguous tell.
+    assert!(
+        !error.contains(r"\\"),
+        "a `Debug`-escaped copy of the secret survived the needle scrub — the message must \
+         be scrubbed BEFORE `{{:?}}` gets to escape it, got: {error:?}"
+    );
+
+    // Escape-agnostic: this substring survives any escaping of the
+    // backslash, so it catches a future escaping scheme this test did not
+    // anticipate as well as `Debug`'s.
+    let serialized = serde_json::to_string(&outcomes[0].output).unwrap();
+    assert!(
+        !serialized.contains("secret123"),
+        "no rendering of the secret — escaped or raw — may survive anywhere in the map \
+         step's serialized output, got: {serialized}"
     );
 }

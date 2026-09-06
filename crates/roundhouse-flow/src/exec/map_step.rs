@@ -382,13 +382,31 @@ fn item_outcome_to_json(o: &ItemOutcome) -> Value {
 /// [`crate::expr::Interpolated`]'s provenance catches a `base_ref` that was
 /// *computed from* `${{ secrets.* }}`; the needle list catches a declared
 /// secret's *raw value* however it arrived. A declared secret's raw value
-/// can reach `base_ref` through a channel provenance treats as clean — the
-/// author pasting it literally into the YAML, or `env('NAME')`, which
-/// ruling W5-7 deliberately keeps clean — and then the withhold branch does
-/// not fire, because nothing about that `base_ref` is secret-*derived*.
-/// Without this scrub both layers are off at once and the raw value lands
-/// in the append-only `events` table (via `redacted_base_ref`, which is the
-/// literal itself in that case, and via `git`'s stderr echoing it back).
+/// can reach `base_ref` through a channel provenance treats as clean, and
+/// then the withhold branch does not fire because nothing about that
+/// `base_ref` is secret-*derived*. Without this scrub both layers are off at
+/// once and the raw value lands in the append-only `events` table (via the
+/// echoed `base_ref`, which is the value itself in that case, and via
+/// `git`'s stderr echoing it back).
+///
+/// **The two channels that actually reach here** (final round part 2, item
+/// 2 — an earlier version of this comment named `env('NAME')` as one of
+/// them, which is wrong: `'`, `(` and `)` are all in
+/// `parse/steps.rs`'s `FORBIDDEN_GIT_REF_CHARS`, so
+/// `"${{ env('NAME') }}"` as a `base_ref` is rejected at parse time and
+/// never reaches this function):
+///
+/// 1. **A literal paste** — the author writing the credential straight into
+///    `base_ref:`. `validate_git_ref` bounds *which* literals get here: its
+///    forbidden set includes `"`, `\`, quotes and shell metacharacters, so
+///    a value carrying any of those is rejected at parse time and a plain
+///    one passes.
+/// 2. **A placeholder over public data** — `base_ref: "${{ item }}"` (or
+///    any other public root) whose *resolved* value happens to equal a
+///    declared secret. The template text is what parse-time validation
+///    sees; the resolved value is never re-validated, so this channel can
+///    carry the characters channel 1 cannot — which is exactly what made
+///    the `Debug`-escaping hole at the call site reachable.
 ///
 /// This function was deleted in Task 34's fix round 3, which replaced
 /// *scrubbing* with *withholding* on the secret-derived branch (ruling
@@ -1240,22 +1258,42 @@ impl<'a> Executor<'a> {
                                 } else {
                                     e.to_string()
                                 };
+                                // **Scrubbed here, as a plain string, before
+                                // the `format!` below embeds it (final round
+                                // part 2, item 1).** The first version of
+                                // this fix assembled the message first and
+                                // scrubbed the whole thing afterwards, which
+                                // the security lens defeated: `Debug for str`
+                                // escapes `"`, `\` and control characters, so
+                                // a declared secret containing any of them no
+                                // longer matches the plain-substring needle
+                                // *in the `{:?}` copy* while the raw copies
+                                // (the argv echo, `git`'s stderr) scrub fine.
+                                // Reproduced end to end — two of three
+                                // occurrences became `***` and the escaped
+                                // one reached the append-only log in
+                                // trivially reversible form. Scrubbing first
+                                // means `{:?}` has only `***` to escape.
+                                let echoed_base_ref =
+                                    redact_message(redacted_base_ref, &self.redaction_needles);
                                 let message = format!(
                                     "map step `{step_id}`: materializing a worktree for \
-                                     base_ref {redacted_base_ref:?}: {detail}"
+                                     base_ref {echoed_base_ref:?}: {detail}"
                                 );
                                 return ItemOutcome::Failed(if base_ref_is_secret_derived {
                                     // Nothing here for a needle to find:
                                     // `safe_summary()` carries no text from
                                     // outside this crate at all, and
-                                    // `redacted_base_ref` is already `***`
+                                    // `redacted_base_ref` was already `***`
                                     // because provenance caught it.
                                     message
                                 } else {
-                                    // The whole assembled message, not just
-                                    // `detail`: `redacted_base_ref` IS the
-                                    // raw literal in the pasted-secret case
-                                    // that makes this branch reachable.
+                                    // Still the whole message, for the
+                                    // `{detail}` half: that is raw `Display`
+                                    // text (`git`'s stderr and the echoed
+                                    // argv), so it scrubs correctly after
+                                    // assembly. Only the `{:?}` half had to
+                                    // move ahead of the `format!`.
                                     redact_message(message, &self.redaction_needles)
                                 });
                             }
