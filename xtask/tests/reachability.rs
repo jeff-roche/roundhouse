@@ -138,43 +138,112 @@ fn source_without_test_items(source: &str) -> String {
         output.push_str(&rest[..offset]);
         let after = &rest[offset + "#[cfg(test)]".len()..];
         let trimmed = after.trim_start();
-        if !trimmed.starts_with("mod ") {
-            // Attribute on a non-module item: retain it rather than guessing
-            // where the item ends. The registry never treats definitions as
-            // calls, and module bodies are where test-only calls live.
-            output.push_str("#[cfg(test)]");
-            rest = after;
-            continue;
-        }
-        let open = trimmed.find('{').expect("a cfg(test) module has a body");
-        let mut depth = 0_i32;
-        let mut end = None;
-        for (index, byte) in trimmed[open..].bytes().enumerate() {
-            match byte {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(open + index + 1);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let Some(end) = end else {
-            // Macro input can contain delimiter-like bytes that this compact
-            // scanner cannot classify. Keep the remainder rather than
-            // silently dropping production code; the explicit inline-module
-            // regression above covers the ordinary module shape.
-            output.push_str(trimmed);
-            rest = "";
-            break;
-        };
+        let open = trimmed.find('{').expect("a cfg(test) item has a body");
+        let end = matching_brace(trimmed.as_bytes(), open).unwrap_or_else(|| {
+            panic!(
+                "a #[cfg(test)] item must have balanced braces: {}",
+                &trimmed[..trimmed.len().min(120)]
+            )
+        });
         rest = &trimmed[end..];
     }
     output.push_str(rest);
     output
+}
+
+/// Finds the matching brace while ignoring Rust strings and comments. This is
+/// intentionally a tiny lexer, not a first-attribute split: test items occur
+/// throughout production files and format strings commonly contain braces.
+fn matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0_i32;
+    let mut index = open;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'r' if matches!(bytes.get(index + 1), Some(b'"' | b'#')) => {
+                let mut hashes = 0;
+                let mut cursor = index + 1;
+                while bytes.get(cursor) == Some(&b'#') {
+                    hashes += 1;
+                    cursor += 1;
+                }
+                if bytes.get(cursor) != Some(&b'"') {
+                    index += 1;
+                    continue;
+                }
+                cursor += 1;
+                while cursor < bytes.len() {
+                    if bytes[cursor] == b'"'
+                        && bytes.get(cursor + 1..cursor + 1 + hashes)
+                            == Some(&vec![b'#'; hashes][..])
+                    {
+                        index = cursor + 1 + hashes;
+                        break;
+                    }
+                    cursor += 1;
+                }
+                if cursor >= bytes.len() {
+                    return None;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index += 2;
+            }
+            b'\'' if bytes[index + 1..bytes.len().min(index + 5)].contains(&b'\'') => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index += 2;
+                        continue;
+                    }
+                    if bytes[index] == quote {
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'"' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index += 2;
+                        continue;
+                    }
+                    if bytes[index] == quote {
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'{' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                index += 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 fn has_production_call(source: &str, call: &str) -> bool {
@@ -256,6 +325,14 @@ fn anti_vacuity_a_removed_production_call_fails_the_guard() {
 fn anti_vacuity_an_inline_test_module_cannot_satisfy_the_guard() {
     assert!(!has_production_call(
         "#[cfg(test)]\nmod tests { fn only_test() { real::entry(); } }",
+        "real::entry("
+    ));
+}
+
+#[test]
+fn anti_vacuity_a_multiline_test_function_cannot_satisfy_the_guard() {
+    assert!(!has_production_call(
+        "#[cfg(test)]\nfn only_test() {\n real::entry();\n}",
         "real::entry("
     ));
 }

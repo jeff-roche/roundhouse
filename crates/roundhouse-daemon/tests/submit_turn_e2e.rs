@@ -11,21 +11,16 @@
 //! is the phase's literal criterion and it **passes**: the tool actually
 //! runs, and its real output reaches the next provider turn.
 //!
-//! It supplies **one config-derived `Allow` rule** through the
-//! `PolicyRuleSource` seam (ruling W1-R118), because production passes
-//! `no_policy_rules()` and therefore has none. That is not the test working
-//! around the daemon — it is the test supplying the one input a real
-//! deployment would supply from config, and it is worth being precise about
-//! what that does and does not mean:
+//! It loads one project policy-file `Allow` rule through the same production
+//! `PolicyRuleSource` factory used at daemon boot, after recording explicit
+//! out-of-repository trust for that project file.
 //!
 //! - **What it proves:** every layer between a client frame and a real
 //!   filesystem read is correctly wired — handshake, creator-only guard,
 //!   spawned turn, `run_agent_loop`, `admit_task`, the real executor, and
 //!   the fold back into the next provider request.
-//! - **What it does NOT prove:** that a real daemon can do this today. There
-//!   is no rules loader in `roundhouse-config`, so production still loads
-//!   **zero** operator rules and still refuses every model-issued tool call
-//!   at admission. See `session_bootstrap::no_policy_rules`.
+//! - **What it does NOT prove:** broad policy language support; this L0 file
+//!   format intentionally permits only exact read rules.
 //!
 //! Nothing about the sealed floor is bypassed: `decide_sealed` still checks
 //! the compiled-in floor first and can still override the injected rule.
@@ -526,17 +521,11 @@ async fn an_oversized_submit_turn_is_dropped_without_wedging_the_connection() {
 /// `PolicyEngine` with its real compiled-in sealed floor, real isolation
 /// probe, real redaction), a real `SessionActor::admit_task`, Task 5's real
 /// `run_agent_loop`, and the real `roundhouse-tools` `read` executor. The
-/// two injected inputs are the scripted provider (so the test decides what
-/// the model asks for) and **one config-derived `Allow` rule**, supplied
-/// through the same `PolicyRuleSource` seam production passes
-/// `no_policy_rules()` to.
+/// only injected input is the scripted provider (so the test decides what
+/// the model asks for); its Allow is loaded through the production policy
+/// source from a real project file.
 ///
-/// **That rule is the honest part of this test, not a cheat.** Production
-/// still loads zero operator rules — there is no rules loader in
-/// `roundhouse-config` — so a real daemon today would still refuse this
-/// call at admission. What this proves is that the *daemon* is wired
-/// correctly end to end, and that the only thing standing between a real
-/// deployment and a working agent is a rules source. Nothing about the
+/// Nothing about the
 /// sealed floor, admission, dispatch, or execution is bypassed: the rule is
 /// an ordinary `Scope::Builtin` `FsPrefix{Read}` allow, exactly what an
 /// operator config would compile to, and `PolicyEngine::decide_sealed`

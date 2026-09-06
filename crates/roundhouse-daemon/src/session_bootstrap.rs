@@ -109,7 +109,7 @@ impl BackgroundServices {
         sessions: Arc<crate::session_registry::SessionRegistry>,
     ) -> Result<RunningBackgroundServices, BackgroundServiceError> {
         let (cancel, _) = watch::channel(false);
-        let handles = FuturesUnordered::new();
+        let mut handles = FuturesUnordered::new();
         for service in [&self.workflow, &self.scheduler, &self.acp]
             .into_iter()
             .flatten()
@@ -130,6 +130,8 @@ impl BackgroundServices {
                         handle.abort();
                     }
                     handle.abort();
+                    while handles.next().await.is_some() {}
+                    let _ = handle.await;
                     return Err(error);
                 }
                 Err(_) => {
@@ -138,6 +140,8 @@ impl BackgroundServices {
                         handle.abort();
                     }
                     handle.abort();
+                    while handles.next().await.is_some() {}
+                    let _ = handle.await;
                     return Err(BackgroundServiceError(
                         "service exited without signaling readiness".to_string(),
                     ));
@@ -275,7 +279,8 @@ fn effective_policy_rules(
     Ok(effective)
 }
 
-/// The production [`PolicyRuleSource`]: **no config-derived rules at all**.
+/// A deliberately empty [`PolicyRuleSource`] for tests and explicit
+/// fail-closed fixtures; production uses [`policy_rules_from_files`] at boot.
 ///
 /// Every session built with this gets `PolicyEngine::from_rules(vec![])`,
 /// so `PolicyEngine::decide` falls through to its `Outcome::Ask` default
@@ -284,14 +289,9 @@ fn effective_policy_rules(
 /// `AdmitError::RequiresApproval`. Behaviour is byte-identical to the
 /// hardcoded `vec![]` this replaced: fail-closed, and unchanged.
 ///
-/// **The real gap this does NOT close, stated so it cannot read as
-/// solved:** there is no rules *loader* anywhere — `roundhouse-config`
-/// exposes only `LoadedConfig::load` and `load_network_config`, neither of
-/// which produces a `CompiledRule`. So a real daemon still cannot be given
-/// an operator-authored allow rule by any means, and consequently still
-/// cannot *execute* a model-issued tool call: every one is admitted,
-/// denied, and reported to the model as a real error result. Building that
-/// loader is out of this lane's charter and is escalated separately.
+/// This is not the production default and must not be used as a fallback for
+/// malformed policy files: boot rejects those files rather than disguising
+/// them as this intentional empty source.
 pub fn no_policy_rules() -> PolicyRuleSource {
     Arc::new(Vec::new)
 }
