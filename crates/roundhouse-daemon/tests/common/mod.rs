@@ -140,12 +140,39 @@ pub async fn real_resources(dir: &Path) -> Arc<DaemonResources> {
     resources_with_isolate(dir, available_isolate()).await
 }
 
+/// [`real_resources`], but over a caller-supplied `Provider` — for Phase 7
+/// Task 8's `SubmitTurn` tests, which need the daemon's own real
+/// `CreateSession` -> `create_real_session` -> `run_agent_loop` path driven
+/// by a *scripted* provider rather than [`NoopProvider`]'s
+/// `unimplemented!()`. Nothing else about the session is faked: the store,
+/// the policy engine, the proxy, the redaction wiring and the `SessionActor`
+/// are all the production ones.
+pub async fn resources_with_provider(
+    dir: &Path,
+    provider: Arc<dyn Provider>,
+) -> Arc<DaemonResources> {
+    resources_with(dir, available_isolate(), provider).await
+}
+
 /// [`real_resources`]'s body, factored out (fix round 2, MUST 2) so a test
 /// that needs `create_real_session` to fail deterministically and cheaply —
 /// proving the per-peer failed-construction limiter actually engages —
 /// can supply its own `Isolate` (e.g. one whose `prepare` always errors)
 /// instead of the always-succeeding [`available_isolate`].
 pub async fn resources_with_isolate(dir: &Path, isolate: Arc<dyn Isolate>) -> Arc<DaemonResources> {
+    resources_with(dir, isolate, Arc::new(NoopProvider)).await
+}
+
+/// The shared body of [`real_resources`]/[`resources_with_isolate`]/
+/// [`resources_with_provider`] — the two axes a test may need to vary
+/// (which `Isolate`, which `Provider`) in one place, so the other twelve
+/// `DaemonResources::new` arguments are constructed identically for all of
+/// them.
+pub async fn resources_with(
+    dir: &Path,
+    isolate: Arc<dyn Isolate>,
+    provider: Arc<dyn Provider>,
+) -> Arc<DaemonResources> {
     let store = roundhouse_store::open(&dir.join("events.db"))
         .await
         .unwrap();
@@ -169,7 +196,7 @@ pub async fn resources_with_isolate(dir: &Path, isolate: Arc<dyn Isolate>) -> Ar
         roundhouse_config::NetworkConfig::default(),
         roundhouse_core::OnDegrade::Refuse,
         runner(),
-        Arc::new(NoopProvider),
+        provider,
         RequestCtx {
             trace_id: None,
             transport: Arc::new(NoopTransport),

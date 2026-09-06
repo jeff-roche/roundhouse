@@ -76,6 +76,48 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// envelope.
 const MAX_WORKSPACE_NAME_BYTES: usize = 4096;
 
+/// Maximum length, in bytes, of [`ClientRequest::SubmitTurn`]'s `text`
+/// (Phase 7, Task 8) — the same "bound it where it is parsed" shape
+/// [`MAX_WORKSPACE_NAME_BYTES`] already uses for the other client-supplied
+/// string this module reads (CF-14). Unlike `workspace_name` this value is
+/// never echoed back, so the bound is not about the reply frame: it is
+/// about how much attacker-chosen text one frame can push into a real
+/// provider request, and into this session's append-only event log, per
+/// turn. 64 KiB is far past any realistic human turn while staying well
+/// under [`MAX_FRAME_BYTES`] after JSON escaping.
+const MAX_SUBMIT_TURN_TEXT_BYTES: usize = 64 * 1024;
+
+/// A hard ceiling on how many provider round-trips one wire-submitted turn
+/// may take, and how many tool calls one of those turns may issue. Mirrors
+/// `roundhouse_engine::agent_loop::AgentLoopConfig`'s own contract: the
+/// loop terminates on "the model stopped asking for tools" OR this ceiling,
+/// never unconditionally, so a malfunctioning or hostile provider cannot
+/// spin a session forever on one client frame.
+const SUBMIT_TURN_MAX_TURNS: u32 = 8;
+
+/// See [`SUBMIT_TURN_MAX_TURNS`].
+const SUBMIT_TURN_MAX_TOOL_CALLS_PER_TURN: u32 = 16;
+
+/// The model one wire-submitted turn is dispatched against.
+///
+/// **Named, not silently inlined, because it is a known gap**: there is no
+/// per-session and no daemon-wide model configuration anywhere in this
+/// workspace (`DaemonResources` carries a `provider` and a `RequestCtx`,
+/// and `create_real_session`'s own doc comment says "`chat_model`/
+/// `request_ctx`'s provider stays daemon-wide (there is no per-session
+/// provider selection yet)"). `demo.rs` hard-codes the identical literal
+/// at its own `assemble_context` call. Whoever adds a real model-selection
+/// surface replaces both.
+const SUBMIT_TURN_MODEL: &str = "claude-sonnet-5";
+
+/// The system prompt one wire-submitted turn is dispatched with. Same gap
+/// as [`SUBMIT_TURN_MODEL`]: there is no configurable system-prompt surface
+/// yet (`roundhouse_engine::system_prompt` builds one from session state
+/// this connection does not have), so this is a deliberate, named
+/// placeholder rather than an invented config field.
+const SUBMIT_TURN_SYSTEM_PROMPT: &str =
+    "You are Roundhouse, a careful coding agent. Use the provided tools when they help.";
+
 /// Default ceiling on concurrent accepted connections one `accept_loop` will
 /// serve at once (security review Important 3 / ruling W1-R33). Bounds the
 /// worst-case fd and per-connection memory (two 64-slot channels, one task)
@@ -1255,8 +1297,37 @@ pub async fn drive_session(
     };
 
     let mut pending_event: Option<ClientEvent> = None;
+    // Phase 7, Task 8 — the W1-R38-compliant shape for the `SubmitTurn`
+    // handler below. At most ONE turn may be in flight per connection: the
+    // handler `tokio::spawn`s the turn and returns immediately, and the
+    // spawned task signals completion on this 1-slot channel, which is
+    // polled as its own `select!` ARM (never awaited in a branch body).
+    //
+    // This is the same "reserve capacity as an arm" shape `events_tx`
+    // already uses, applied to the other direction. It is what keeps
+    // `session_events.recv()` and `requests_rx.recv()` continuously
+    // pollable while a turn — which awaits a real `SessionActor`, a real
+    // provider round-trip, and real tool execution, i.e. exactly the
+    // "can block indefinitely" the invariant names — is running.
+    //
+    // The completion channel can never block the spawned task
+    // indefinitely either: capacity 1, at most one in-flight turn, so its
+    // single `send` always has a slot. If this connection ends first, the
+    // receiver drops and that `send` fails — which the spawned task
+    // ignores, deliberately: the session outlives the connection
+    // (ruling W1-R51), so a turn is never cancelled just because the
+    // client that submitted it went away.
+    let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<()>(1);
+    let mut turn_in_flight = false;
     loop {
         tokio::select! {
+            _ = turn_done_rx.recv(), if turn_in_flight => {
+                // `turn_done_tx` is held by this stack frame for the whole
+                // loop, so `recv()` only ever resolves here because a
+                // spawned turn actually finished — never because every
+                // sender was dropped.
+                turn_in_flight = false;
+            }
             maybe_event = session_events.recv(), if pending_event.is_none() => {
                 match maybe_event {
                     Some(event) => {
@@ -1343,15 +1414,100 @@ pub async fn drive_session(
                     // would stop this arm from polling `session_events.recv()`
                     // for as long as the await is pending, recreating the
                     // exact circular wait W1-R31 fixed.
+                    // Phase 7, Task 8 (ruling W1-R116): the real handler
+                    // that grew into the discard site described above.
+                    // Every refusal below is a `warn!` + a dropped frame
+                    // with the connection kept alive: `ClientRequest`/
+                    // `ClientEvent` still carry no error-response variant
+                    // (the same constraint ruling W1-R6 already accepted
+                    // for "unknown session" and a failed construction), so
+                    // there is nothing honest to send back.
+                    Some(ClientRequest::SubmitTurn { session_id: named, text }) => {
+                        if !is_creator {
+                            // W1-R37, enforced here rather than assumed.
+                            // An `Attach`ed connection is READ-ONLY: it may
+                            // see everything this session broadcasts and
+                            // send nothing that acts on it. Defaulting this
+                            // open would make unauthenticated `Attach` an
+                            // approval-hijack primitive.
+                            tracing::warn!(
+                                %session_id,
+                                "refusing SubmitTurn from an attached (non-creating) connection: \
+                                 attached connections are read-only"
+                            );
+                        } else if named != session_id {
+                            // This connection established exactly one
+                            // session; a frame naming a different one is
+                            // either a confused client or an attempt to
+                            // act on a session this connection never
+                            // created. Refused rather than redirected.
+                            tracing::warn!(
+                                %session_id,
+                                named = %named,
+                                "refusing SubmitTurn naming a session other than the one this \
+                                 connection established"
+                            );
+                        } else if text.len() > MAX_SUBMIT_TURN_TEXT_BYTES {
+                            tracing::warn!(
+                                %session_id,
+                                len = text.len(),
+                                max = MAX_SUBMIT_TURN_TEXT_BYTES,
+                                "refusing SubmitTurn: text exceeds the maximum length"
+                            );
+                        } else if turn_in_flight {
+                            // One turn per connection at a time. Refusing
+                            // (rather than queueing) keeps the spawn
+                            // fan-out one client can force to exactly one
+                            // task, and keeps this arm's own work O(1).
+                            tracing::warn!(
+                                %session_id,
+                                "refusing SubmitTurn: a turn is already in flight on this \
+                                 connection"
+                            );
+                        } else {
+                            match registry.actor(session_id) {
+                                Some(actor) => {
+                                    // **W1-R38.** Nothing is awaited here:
+                                    // the turn — which awaits a real
+                                    // `SessionActor`, a real provider
+                                    // round-trip and real tool execution —
+                                    // is handed to a spawned task, and its
+                                    // completion is observed by this
+                                    // loop's own `turn_done_rx` ARM. See
+                                    // `turn_done_tx`'s declaration.
+                                    turn_in_flight = true;
+                                    let resources = resources.clone();
+                                    let done = turn_done_tx.clone();
+                                    tokio::spawn(async move {
+                                        run_submitted_turn(actor, resources, text).await;
+                                        // Failure means this connection
+                                        // already ended — see
+                                        // `turn_done_tx`'s declaration.
+                                        let _ = done.send(()).await;
+                                    });
+                                }
+                                None => {
+                                    // The session was reaped (its actor
+                                    // reached `Closed`) while this
+                                    // connection was still open.
+                                    tracing::warn!(
+                                        %session_id,
+                                        "refusing SubmitTurn: this session is no longer live"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // `CreateSession`/`Attach` are handshake-only (matched
+                    // above as the connection's FIRST frame); any other
+                    // variant is one this daemon does not implement.
+                    // `ClientRequest` is `#[non_exhaustive]`, so this arm
+                    // is also the required catch-all.
                     Some(_request) => {
-                        // `is_creator` is read here — rather than left an
-                        // unused tuple element — specifically so the future
-                        // call site (routing to `registry.actor(session_id)`
-                        // only when `is_creator` is `true`) has an obvious
-                        // place to grow into. There is no `ClientRequest`
-                        // variant to route yet, so this is a no-op either
-                        // way today.
-                        let _ = is_creator;
+                        tracing::warn!(
+                            %session_id,
+                            "discarding a post-handshake request this daemon does not handle"
+                        );
                     }
                     None => break,
                 }
@@ -1360,6 +1516,96 @@ pub async fn drive_session(
     }
 
     registry.detach(session_id, &subscription);
+}
+
+/// Runs one wire-submitted user turn through the real agent loop
+/// (`roundhouse_engine::agent_loop::run_agent_loop`) against this session's
+/// real `SessionActor` — the same loop, the same `admit_task` gate, the same
+/// executors that `roundhouse-engine`'s own integration tests drive.
+///
+/// **Always called from a spawned task, never inline in `drive_session`'s
+/// `select!` (ruling W1-R38).** Every await in here can block indefinitely:
+/// `run_agent_loop` awaits a provider round-trip, `SessionActor::admit_task`
+/// takes the actor's own locks, and a dispatched `shell` call runs a real
+/// subprocess. Awaiting any of that inside the connection loop would stop it
+/// polling `session_events.recv()`, recreating the exact circular wait
+/// ruling W1-R31 fixed, one layer up.
+///
+/// # Known gaps this function does not close, stated rather than papered over
+///
+/// - **`mcp: None`.** `run_agent_loop`'s MCP arm needs a
+///   `roundhouse_engine::mcp_spawner::SessionMcp`, and there is nowhere to
+///   get one here: `session_bootstrap::create_real_session` builds a
+///   `SessionMcp`, uses it for `apply_resolved_mcp_servers`, and then
+///   **drops it** — `RealSession` carries only `Arc<McpHost>`, and
+///   `SessionRegistry` stores only that. So a session with MCP servers
+///   configured still offers their `ToolDef`s to the model (they are in
+///   `actor.tool_defs()`), and a model that calls one gets the honest
+///   `"no MCP servers are configured for this session"` refusal rather
+///   than a dispatch. Closing this means threading `SessionMcp` through
+///   `RealSession` and `SessionRegistry`; it is not a change this task's
+///   charter covers.
+/// - **Nothing this turn produces reaches the client over the wire.**
+///   `SessionRegistry::publish` has no producer (documented in that
+///   function and in `roundhouse-web`'s own doc comments as of Task 9) —
+///   the turn's events are durably appended to the session's event log by
+///   the loop itself, which is where a caller must read them from today.
+/// - **The turn's outcome is logged, not reported to the client.**
+///   `ClientEvent` has no error variant (ruling W1-R6's constraint), so a
+///   failed turn is an operator-visible `tracing` event and a real
+///   `TaskFailed` in the append-only log, not a wire frame.
+async fn run_submitted_turn(
+    actor: Arc<roundhouse_engine::SessionActor>,
+    resources: Arc<DaemonResources>,
+    text: String,
+) {
+    let session_id = actor.session_id();
+    let ctx = resources.clone_request_ctx();
+    let tools = actor.tool_defs().to_vec();
+    let request = roundhouse_engine::assemble_context(
+        SUBMIT_TURN_MODEL,
+        SUBMIT_TURN_SYSTEM_PROMPT,
+        &tools,
+        &[roundhouse_provider::Message {
+            role: roundhouse_provider::MessageRole::User,
+            content: vec![roundhouse_provider::ContentBlock::Text {
+                text,
+                cache: None,
+                citations: vec![],
+            }],
+        }],
+    );
+
+    let result = roundhouse_engine::agent_loop::run_agent_loop(
+        &actor,
+        resources.runner,
+        resources.provider.as_ref(),
+        &ctx,
+        &tools,
+        None,
+        request,
+        roundhouse_engine::agent_loop::AgentLoopConfig {
+            max_turns: SUBMIT_TURN_MAX_TURNS,
+            max_tool_calls_per_turn: SUBMIT_TURN_MAX_TOOL_CALLS_PER_TURN,
+        },
+    )
+    .await;
+
+    match result {
+        Ok(blocks) => {
+            tracing::info!(
+                %session_id,
+                blocks = blocks.len(),
+                "submitted turn completed"
+            );
+        }
+        // Never includes the error's `Display` in anything sent to a
+        // client — it can carry provider-side detail, and there is no wire
+        // variant to send it on regardless.
+        Err(err) => {
+            tracing::error!(%session_id, error = %err, "submitted turn failed");
+        }
+    }
 }
 
 /// Why [`construct_real_session_bounded`] exists, in one line: real session

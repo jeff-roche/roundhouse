@@ -127,7 +127,7 @@ impl DaemonResources {
     /// by hand for each session that needs its own `RequestCtx` value (every
     /// session shares the same underlying transport/credentials/api key
     /// today; there is no per-session provider configuration yet).
-    fn clone_request_ctx(&self) -> RequestCtx {
+    pub(crate) fn clone_request_ctx(&self) -> RequestCtx {
         RequestCtx {
             trace_id: self.request_ctx.trace_id.clone(),
             transport: self.request_ctx.transport.clone(),
