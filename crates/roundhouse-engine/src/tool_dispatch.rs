@@ -281,6 +281,18 @@ impl ToolDispatchError {
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedExtras {
     pub shell_cwd: Option<PathBuf>,
+    pub shell_mode: ShellExecutionMode,
+}
+
+/// Trusted execution mode selected by the dispatch target, never by a model
+/// input field. The classified string tool intentionally uses the simple
+/// `execve_node` path; the legacy argv tool retains cancellation and output
+/// bounds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShellExecutionMode {
+    #[default]
+    Argv,
+    Classified,
 }
 
 fn str_field(
@@ -708,14 +720,9 @@ pub fn task_params_for(
             ResolvedExtras::default(),
         )),
         TaskKind::Shell => {
-            let tool = if input.get("shell_command").is_some() {
-                "shell_command"
-            } else {
-                "shell"
-            };
-            let raw_program = str_field(input, tool, "program")?;
-            let argv = argv_field(input, tool)?;
-            let raw_cwd = str_field(input, tool, "cwd")?;
+            let raw_program = str_field(input, "shell", "program")?;
+            let argv = argv_field(input, "shell")?;
+            let raw_cwd = str_field(input, "shell", "cwd")?;
             let canonical_cwd = resolve_shell_cwd(&raw_cwd)?;
             let canonical_program = resolve_shell_program(&raw_program, &canonical_cwd)?;
             let program = canonical_program.to_string_lossy().to_string();
@@ -723,6 +730,7 @@ pub fn task_params_for(
                 TaskParams::Shell(ParsedCommand { program, argv }),
                 ResolvedExtras {
                     shell_cwd: Some(canonical_cwd),
+                    shell_mode: ShellExecutionMode::Argv,
                 },
             ))
         }
@@ -843,7 +851,7 @@ pub async fn execute_builtin(
                 .shell_cwd
                 .as_deref()
                 .ok_or(ToolDispatchError::MissingResolvedCwd)?;
-            if input.get("shell_command").is_some() {
+            if extras.shell_mode == ShellExecutionMode::Classified {
                 let node = roundhouse_policy::shell::pipeline::ResolvedNode {
                     resolved_program: cmd.program.clone(),
                     argv: cmd.argv.clone(),
@@ -1553,6 +1561,24 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert!(parts[0].text.contains("hello-from-shell"));
         assert!(parts[0].text.contains("exit_code=Some(0)"));
+    }
+
+    #[tokio::test]
+    async fn an_extra_model_shell_command_field_cannot_select_classified_execution() {
+        let dir = workspace_temp_dir();
+        let cwd_str = dir.path().to_string_lossy().to_string();
+        let input = serde_json::json!({
+            "program": "echo",
+            "argv": ["still-cancellable"],
+            "cwd": cwd_str,
+            "shell_command": true,
+        });
+        let (params, extras) = task_params_for(TaskKind::Shell, &input).unwrap();
+        assert_eq!(extras.shell_mode, ShellExecutionMode::Argv);
+        let parts = execute_builtin(&params, &extras, &input, None)
+            .await
+            .unwrap();
+        assert!(parts[0].text.contains("still-cancellable"));
     }
 
     #[tokio::test]

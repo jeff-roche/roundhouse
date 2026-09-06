@@ -296,7 +296,16 @@ async fn dispatch_one_tool_call(
 ) -> Result<Vec<ToolResultPart>, String> {
     match resolve_tool_target(name) {
         Some(ToolTarget::Builtin(kind)) => {
-            dispatch_builtin(actor, writer, runner, kind, input, parent).await
+            dispatch_builtin(
+                actor,
+                writer,
+                runner,
+                kind,
+                input,
+                parent,
+                crate::tool_dispatch::ShellExecutionMode::Argv,
+            )
+            .await
         }
         Some(ToolTarget::ShellCommand) => {
             dispatch_shell_command(actor, writer, runner, input, parent).await
@@ -421,13 +430,21 @@ async fn dispatch_shell_command(
     let mut output = Vec::new();
     for node in nodes {
         let node_input = serde_json::json!({
-            "shell_command": true,
             "program": node.resolved_program,
             "argv": node.argv,
             "cwd": cwd,
         });
         output.extend(
-            dispatch_builtin(actor, writer, runner, TaskKind::Shell, &node_input, parent).await?,
+            dispatch_builtin(
+                actor,
+                writer,
+                runner,
+                TaskKind::Shell,
+                &node_input,
+                parent,
+                crate::tool_dispatch::ShellExecutionMode::Classified,
+            )
+            .await?,
         );
     }
     Ok(output)
@@ -1172,8 +1189,9 @@ async fn dispatch_builtin(
     kind: TaskKind,
     input: &serde_json::Value,
     parent: TaskId,
+    shell_mode: crate::tool_dispatch::ShellExecutionMode,
 ) -> Result<Vec<ToolResultPart>, String> {
-    let (params, extras) = match crate::tool_dispatch::task_params_for(kind.clone(), input) {
+    let (params, mut extras) = match crate::tool_dispatch::task_params_for(kind.clone(), input) {
         Ok(resolved) => resolved,
         Err(err) => {
             // **Ruling W1-R131.** This arm used to be `?` — the error
@@ -1233,6 +1251,7 @@ async fn dispatch_builtin(
             return Err(recorded.unwrap_or_else(|e| e));
         }
     };
+    extras.shell_mode = shell_mode;
 
     // S-LOG-1: mint and durably record the real task this dispatch is
     // ATTEMPTING, before admission decides its fate — see this function's
