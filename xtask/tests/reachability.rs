@@ -262,26 +262,62 @@ fn matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
 }
 
 fn has_production_call(source: &str, call: &str) -> bool {
-    source_without_test_items(source).lines().any(|line| {
-        let line = line.split("//").next().unwrap_or_default().trim();
-        let mut sanitized = String::new();
-        let mut quoted = false;
-        for byte in line.bytes() {
-            if byte == b'"' {
-                quoted = !quoted;
-                continue;
-            }
-            if !quoted {
-                sanitized.push(byte as char);
-            }
-        }
-        let line = sanitized.trim();
+    let code = strip_non_code(&source_without_test_items(&strip_non_code(source)));
+    code.lines().any(|line| {
+        let line = line.trim();
         !line.starts_with("//")
             && !line.starts_with("///")
             && line.contains(call)
             && !line.starts_with("pub fn ")
             && !line.starts_with("fn ")
     })
+}
+
+fn strip_non_code(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 fn collect_production_source(root: &Path) -> String {
