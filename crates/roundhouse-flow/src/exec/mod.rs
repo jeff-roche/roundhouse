@@ -270,16 +270,19 @@ pub(crate) fn evaluate_when_gate(step: &StepDef, ctx: &ExprContext) -> GateDecis
 }
 
 use crate::expr::{
-    eval_delimited_expression, interpolate, interpolate_json, ExprContext, JsonTemplateSource,
-    TemplateSource,
+    eval_delimited_expression, interpolate, interpolate_json, EnvAllowlist, ExprContext,
+    JsonTemplateSource, TemplateSource,
 };
 use crate::parse::steps::{parse_step, topological_order, StepBody, StepDef};
 use crate::parse::{ParseError, WorkflowDef};
+use crate::report::Report;
+use crate::worktree::WorktreeProvider;
 use roundhouse_core::{EventPayload, Origin, TaskId, TaskInput, TaskKind, TaskOutput, Usage};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 /// Stands in for `roundhouse-engine`'s real task admission so this crate
 /// stays testable without linking the full engine (this task's Interfaces).
@@ -331,6 +334,63 @@ pub struct RunContext {
     pub vars: Value,
     pub secrets: HashMap<String, String>,
     pub run_id: RunId,
+    /// Task 19a (§8.6's `carry_over: { last_report: true }`): the report of
+    /// "the previous run of this binding", already loaded by the caller —
+    /// [`crate::durability::previous_run_for_binding`] finds *which* run
+    /// that is, but loading *its report* is a `roundhouse-store`
+    /// `tasks`/`events` query this crate does not have (see
+    /// [`crate::report`]'s module doc), so it cannot be resolved from
+    /// inside `roundhouse-flow`. `None` for a binding's first-ever run, a
+    /// manually-invoked run with no binding at all, or simply because the
+    /// caller did not look it up (e.g. `defaults.carry_over.last_report` is
+    /// `false` and there was nothing worth fetching). See
+    /// [`run_loop::run_workflow`]'s use of this field for where the seed it
+    /// produces is actually bound.
+    ///
+    /// **Only [`run_loop::run_workflow`] consumes this.**
+    /// [`Executor::run_to_completion`], the in-memory sequencer, does not
+    /// read it at all — a `carry_over: { last_report: true }` workflow run
+    /// through that path sees `carry_over` resolve to `null`
+    /// (`expr.rs`'s bare-identifier-unbound behavior), not the seed. That is
+    /// consistent with the rest of `run_to_completion`'s own doc comment
+    /// (no `workflow_run` row, no checkpoints, no admission — it is a pure
+    /// in-memory sequencer, not a second copy of the run-start path), not an
+    /// oversight of this task.
+    pub previous_report: Option<Report>,
+    /// Which process-environment variable names this run's `env()` calls
+    /// may read (Task 33, ruling W5-7). **This crate only ever takes this
+    /// value — it never populates it.** [`EnvAllowlist::default`] (deny-all)
+    /// is what every construction site in this crate uses today; threading
+    /// an operator-authored list of readable names in from daemon config is
+    /// `roundhouse-daemon`'s job (lane W1's crate), not this one's. Until
+    /// that plumbing exists upstream, every `env()` call in a real run
+    /// denies every name — the correct, fail-closed direction for this
+    /// field to default to while that caller-side work is outstanding.
+    pub env_allowlist: EnvAllowlist,
+    /// Task 34 (lane W5, rulings W5-8/W5-22 — Phase 5 ruling P42): the
+    /// backend an explicit `map.isolation: worktree` materializes a real
+    /// git worktree through. `None` is the correct default for every
+    /// caller that has no repository to root one in — `Executor::new`
+    /// itself, and every construction site in this crate's own tests — and
+    /// **is not treated as "isolation disabled"**: an author who explicitly
+    /// wrote `map.isolation: worktree` with `None` here gets a hard,
+    /// named-provider-missing error for that item, never a silent no-op
+    /// (see `Executor::dispatch_map_step`'s own doc comment).
+    /// `map.isolation` left unset (inheriting `Defaults.isolation`, which
+    /// defaults to `Worktree`) never reads this field at all — see the same
+    /// doc comment for why that distinction is load-bearing.
+    ///
+    /// `Arc`, not `Box`: `RunContext` is `#[derive(Clone)]`, and
+    /// `Arc<dyn WorktreeProvider>` is `Clone` regardless of whether the
+    /// concrete provider type is, which a boxed trait object is not,
+    /// without adding a second, cloning-specific trait this crate has no
+    /// other use for.
+    ///
+    /// **Lane boundary (Task 34's brief):** this crate only ever *takes*
+    /// this value, exactly like [`Self::env_allowlist`] above — populating
+    /// it with a real `repo_root` from daemon config or session state is
+    /// `roundhouse-daemon`'s job (lane W1's crate), not this one's.
+    pub worktree_provider: Option<Arc<dyn WorktreeProvider>>,
 }
 
 impl fmt::Debug for RunContext {
@@ -355,6 +415,25 @@ impl fmt::Debug for RunContext {
             .field("vars", &self.vars)
             .field("secrets", &secret_names)
             .field("run_id", &self.run_id)
+            // Same caution as `secrets`, and for the same reason `carry_over`
+            // is bound through `set_secret` rather than `set_public` in
+            // `run_loop::run_workflow`: a prior run's report can contain
+            // model-authored text derived from that run's own secrets, and
+            // this type's whole `Debug` impl exists to keep a stray
+            // `dbg!`/`tracing::debug!` from printing such material — see the
+            // doc comment above.
+            .field("previous_report_present", &self.previous_report.is_some())
+            // `EnvAllowlist` holds only variable *names*, never values —
+            // safe to print in full, unlike `secrets` above.
+            .field("env_allowlist", &self.env_allowlist)
+            // Presence only, matching `previous_report_present` above — a
+            // provider is a trait object, not printable, and its presence
+            // is the only fact about it a caller's `dbg!`/`tracing::debug!`
+            // could possibly want.
+            .field(
+                "worktree_provider_present",
+                &self.worktree_provider.is_some(),
+            )
             .finish()
     }
 }
@@ -615,6 +694,11 @@ pub struct Executor<'a> {
     /// Where an authored `report:` step's redacted, validated document goes
     /// — see [`ReportEmission`].
     report_emission: ReportEmission,
+    /// Task 34: threaded straight through from [`RunContext::worktree_provider`]
+    /// — see that field's own doc comment. Read only by
+    /// [`map_step::Executor::dispatch_map_step`], on an explicit
+    /// `map.isolation: worktree`.
+    worktree_provider: Option<Arc<dyn WorktreeProvider>>,
 }
 
 /// Whether an authored `report:` step emits its `TaskKind::Report` task at
@@ -701,6 +785,12 @@ impl<'a> Executor<'a> {
             ),
         );
         ctx.set_public("run", serde_json::json!({ "id": run_id.to_string() }));
+        // Task 33, ruling W5-7: thread the caller-supplied allowlist
+        // through unchanged. `ExprContext::new()` above already starts
+        // deny-all, so a `RunContext` built with the field left at its
+        // `EnvAllowlist::default()` (every construction site in this crate
+        // today) denies every `env()` name for this run.
+        ctx.allow_env(run_ctx.env_allowlist);
         Ok(Executor {
             def,
             run_id,
@@ -709,6 +799,7 @@ impl<'a> Executor<'a> {
             redaction_needles,
             map_budget: None,
             report_emission: ReportEmission::Immediate,
+            worktree_provider: run_ctx.worktree_provider,
         })
     }
 
@@ -1120,12 +1211,15 @@ impl<'a> Executor<'a> {
             // `as:` item variable per item, and recursively runs the inner
             // steps via this same `dispatch_step`. See
             // `map_step::Executor::dispatch_map_step`'s own doc comment for
-            // the full provenance/budget reasoning.
+            // the full provenance/budget reasoning, including Task 34's
+            // addition: an explicit `isolation: worktree` materializes a
+            // real git worktree per item.
             //
             // (`dispatch_step` matches on `&step.body`, so match ergonomics
             // already bind `over`/`r#as`/`max_parallel`/`on_item_error`/
-            // `steps` as references here — `&String`/`u32`/`OnItemError`/
-            // `&Vec<serde_yaml::Value>` — which coerce to `&str`/
+            // `isolation`/`steps` as references here — `&String`/`u32`/
+            // `OnItemError`/`&Option<MapIsolationDef>`/`&Vec<serde_yaml::Value>`
+            // — which coerce to `&str`/`Option<&MapIsolationDef>`/
             // `&[serde_yaml::Value]` at the call site below with no further
             // `&` needed; `max_parallel`/`on_item_error` are `Copy`.)
             StepBody::Map {
@@ -1133,9 +1227,17 @@ impl<'a> Executor<'a> {
                 r#as,
                 max_parallel,
                 on_item_error,
+                isolation,
                 steps,
-                ..
-            } => self.dispatch_map_step(&step.id, over, r#as, *max_parallel, *on_item_error, steps),
+            } => self.dispatch_map_step(
+                &step.id,
+                over,
+                r#as,
+                *max_parallel,
+                *on_item_error,
+                isolation.as_ref(),
+                steps,
+            ),
             // **`gate:` and `call:` are handled by [`run_loop`], not here**
             // (B12c). Both need a `workflow_run` row and a `&mut Connection`
             // — a park is a durable state transition plus a checkpoint, and a
@@ -1157,9 +1259,13 @@ impl<'a> Executor<'a> {
             //    refused for a structural reason, not an omission: a park is a
             //    transition of *the run*, and one run cannot be parked
             //    per-item; a nested `call:` needs the per-item budget pool
-            //    whose ceilings ruling P77 §C defers along with `map`'s
-            //    worktree fan-out. Both belong with whoever gives `map` real
-            //    fan-out.
+            //    whose ceilings ruling P77 §C defers. (Task 34 closed the
+            //    *other* thing this bullet used to lump in here — `map`'s
+            //    worktree fan-out is no longer deferred; see
+            //    `map_step::Executor::dispatch_map_step`'s own doc comment,
+            //    "Task 34".) The per-item budget pool and the nested
+            //    `gate:`/`call:` refusal both still belong with whoever gives
+            //    `map` real fan-out.
             //
             // Fix round 1, item 8: the message used to be
             // `format!("step kind {other:?} handled by a later task")` — a
@@ -1312,16 +1418,26 @@ fn truncate_diagnostic(text: &str, limit: usize) -> Cow<'_, str> {
 ///
 /// **This is not complete redaction, and must not be read as such.**
 /// `${{ env(...) }}` (§8.9's own required function) reads the real process
-/// environment via [`std::env::var`], entirely unscoped from any workflow
-/// `secrets:` declaration and unscoped from this run's own
-/// [`RunContext::secrets`] map — see `crate::expr`'s module doc comment,
-/// "`env()` is a second, independent secret-exposure surface." A value
-/// obtained through `env()` (for example `${{ env('ANTHROPIC_API_KEY') }}`)
-/// is not a key of `secrets`, so this function has no way to recognise it
-/// and will not redact it. This gap is escalated, not closed, by `crate::expr`;
-/// this function closes exactly the narrower gap it documents (a
-/// `secrets.*`-sourced value leaking through this crate's own log call
-/// site) and no more.
+/// environment via [`std::env::var`], but — since Task 33, ruling W5-7 —
+/// only for names the caller's [`crate::expr::EnvAllowlist`] permits; see
+/// `crate::expr`'s module doc comment, "`env()` is scoped by an explicit
+/// allowlist, deny-all by default." An *allowlisted* `env()` read is a
+/// deliberately different gap from the one Task 33 closed: it is
+/// [`crate::expr::ExprError::EnvVarNotAllowed`]-free by design (the caller
+/// opted the name in), its value is Clean rather than secret-derived (an
+/// operator allowlisting a name is vouching for it being non-secret), and
+/// — the part this comment exists to flag — it is **not a key of
+/// [`RunContext::secrets`]**, so this function has no way to recognise it
+/// and will not redact it either. An operator who allowlists a genuinely
+/// credential-shaped name (e.g. `ANTHROPIC_API_KEY`) therefore reproduces
+/// the original unscoped-`env()` exposure for that one name, with neither
+/// provenance-based redaction nor this backstop catching it — see
+/// [`crate::expr::EnvAllowlist::credential_shaped_names`] (ruling W5-17),
+/// the advisory hook that exists precisely so a caller building the
+/// allowlist can warn about this before it happens, rather than this
+/// function trying to catch it after the fact. This function closes
+/// exactly the narrower gap it documents (a `secrets.*`-sourced value
+/// leaking through this crate's own log call site) and no more.
 ///
 /// # What this function does and does not catch — self-contained (fix round 1, item 7)
 ///

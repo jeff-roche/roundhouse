@@ -32,29 +32,101 @@
 //!   root) — see `dispatch_map_step`'s own doc comment, "History of this
 //!   mechanism", for why each prior design was replaced, not merely
 //!   restyled.
-//! - **`map.isolation`/`base_ref` (the "worktree fan-out" the plan's own
-//!   title names) is out of scope for this diff, structurally, not by
-//!   omission.** `dispatch_map_step` below never reads `StepBody::Map`'s
-//!   `isolation` field and creates no worktree — `roundhouse-flow` has no
-//!   process-spawning or git dependency at all (see its `Cargo.toml`: core,
-//!   engine, store, serde, serde_json, thiserror, sha2, serde_yaml, uuid),
-//!   so it cannot invoke `git worktree add` regardless of what this task
-//!   does. Every other "real dispatch" arm in `crate::exec` (`Tool`/`Agent`/
-//!   `Emit`/`Report`, see their own doc comments) already defers the actual
-//!   process spawn to Task 8's durability layer for the identical reason;
-//!   worktree creation is the same deferral, one layer further out. What
-//!   this diff *does* keep intact is the guarantee `parse/steps.rs:690-694`
-//!   already names this task as the owner of — `base_ref` must reach `git`
-//!   as one discrete argv element after `--`, never interpolated into a
-//!   shell string — by not touching `base_ref` at all: nothing here builds a
-//!   shell string from it, so the guarantee is neither implemented nor
-//!   broken by this diff. See this task's report for the full reasoning.
+//! - **`map.isolation`/`base_ref` — landed by Task 34 (lane W5, rulings
+//!   W5-8/W5-22), closing Phase 5 ruling P42 for an explicitly declared
+//!   tier — not for a `map` step that leaves `isolation:` unset (fix round
+//!   2, item 3, ruling W5-33; see [`Executor::dispatch_map_step`]'s own doc
+//!   comment, "Task 34", for the qualification in full).** Earlier revisions of this
+//!   file left `StepBody::Map`'s `isolation` field completely unread and
+//!   created no worktree, reasoning that `roundhouse-flow` had "no
+//!   process-spawning or git dependency at all." That premise no longer
+//!   holds: Task 14 (this same lane) added the one new `flow -> sandbox`
+//!   Cargo edge this crate is permitted (§5.2's `roundhouse-flow` row), and
+//!   Task 34 is what actually spends it on `map.isolation`. See
+//!   [`Executor::dispatch_map_step`]'s own doc comment, "Task 34:
+//!   `isolation: worktree` materialization", for the real mechanism —
+//!   `crate::worktree::WorktreeProvider` (defined in `crate::worktree`) and
+//!   its `SandboxWorktreeProvider` adapter over
+//!   `roundhouse_sandbox::worktree`.
 
 use crate::caps::ResourceCaps;
-use crate::exec::{evaluate_when_gate, Executor, GateDecision, StepOutcome, StepStatus};
-use crate::expr::{eval_delimited_expression, TemplateSource};
-use crate::parse::steps::{parse_step, OnItemError, StepBody, StepDef};
+use crate::exec::{
+    evaluate_when_gate, redact_with_needles, Executor, GateDecision, StepOutcome, StepStatus,
+};
+use crate::expr::{eval_delimited_expression, interpolate, TemplateSource};
+use crate::parse::steps::{parse_step, MapIsolationDef, OnItemError, StepBody, StepDef};
+use crate::worktree::{WorktreeProvider, WorktreeProviderError};
 use serde_json::Value;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// The `${{ }}` root name a materialized worktree's path is bound under,
+/// alongside `as_name` — never merged into it. See
+/// [`Executor::dispatch_map_step`]'s own doc comment, "Task 34: `isolation:
+/// worktree` materialization", for the binding/snapshot mechanism and why
+/// it deliberately does not reshape `as_name`'s own binding.
+const WORKTREE_ROOT_NAME: &str = "worktree";
+
+/// The default `base_ref` text used when `map.isolation` is bare `worktree`
+/// (no `base_ref:` key at all — `MapIsolationDef::Worktree { base_ref: None }`).
+/// `HEAD` matches the intuitive "isolate me a copy of whatever is checked
+/// out right now" reading of asking for worktree isolation without naming a
+/// starting point.
+const DEFAULT_WORKTREE_BASE_REF: &str = "HEAD";
+
+/// RAII guard around one materialized worktree (Task 34): guarantees
+/// [`WorktreeProvider::release`] runs even if the item's inner steps panic
+/// or return early, because [`Drop::drop`] runs during unwinding as well as
+/// on an ordinary scope exit — see
+/// [`Executor::dispatch_map_step`]'s own doc comment, "Cleanup on both
+/// paths, panic included", for the full reasoning and why the *explicit*
+/// [`Self::release`] call (not `Drop` alone) is what lets a release failure
+/// actually reach the item's own [`ItemOutcome`] on the ordinary path.
+struct WorktreeGuard {
+    provider: Arc<dyn WorktreeProvider>,
+    /// `None` once released — by [`Self::release`], or by [`Drop::drop`] on
+    /// an unwind/early-return path. `Option` (rather than a plain
+    /// `PathBuf`) is what makes both of those paths safe to call
+    /// unconditionally without a double-release: whichever runs first takes
+    /// the path, and the other sees `None` and does nothing.
+    path: Option<PathBuf>,
+}
+
+impl WorktreeGuard {
+    fn new(provider: Arc<dyn WorktreeProvider>, path: PathBuf) -> Self {
+        Self {
+            provider,
+            path: Some(path),
+        }
+    }
+
+    /// Explicit release, run on the ordinary (non-panicking) path so a
+    /// failure can be folded into the item's own outcome. Consumes `self`
+    /// by value: once this returns, the guard's own `Drop` still runs (it
+    /// is a local going out of scope), but sees `path: None` and is a
+    /// no-op, so this is never a double release.
+    fn release(mut self) -> Result<(), WorktreeProviderError> {
+        let path = self
+            .path
+            .take()
+            .expect("release() is the only consumer of `self` and runs at most once");
+        self.provider.release(&path)
+    }
+}
+
+impl Drop for WorktreeGuard {
+    /// The panic/early-return safety net — see [`Self::release`]'s own doc
+    /// comment for why the *ordinary* path goes through that method
+    /// instead. Best-effort: a release failure reached only through
+    /// unwinding has no [`ItemOutcome`] left to attach itself to (the
+    /// closure that would have returned one is itself unwinding), so it is
+    /// swallowed here rather than panicking-while-panicking.
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = self.provider.release(&path);
+        }
+    }
+}
 
 /// Hard, closed-fail cap on a single `map` step's item count (fix round 1,
 /// item 3). See [`Executor::dispatch_map_step`]'s own doc comment,
@@ -298,6 +370,83 @@ fn item_outcome_to_json(o: &ItemOutcome) -> Value {
 /// `StepOutcome`'s hand-written `Debug` impl for why: a resolved value can
 /// be secret-derived, so an error path must never format the value itself
 /// into a message).
+/// Scrubs every **declared** secret's raw value out of `message` — the same
+/// [`redact_with_needles`] needle scan every other dispatch arm's *logged*
+/// copy already goes through (`exec/mod.rs:958`/`:1007`/`:1065`/`:1122`),
+/// applied here to an `ItemOutcome::Failed` message instead of a sink-bound
+/// event.
+///
+/// # Why this is needed on top of the withhold (final round, item A1)
+///
+/// It exists because provenance and the needle list see different things.
+/// [`crate::expr::Interpolated`]'s provenance catches a `base_ref` that was
+/// *computed from* `${{ secrets.* }}`; a declared secret's raw value can
+/// reach `base_ref` through a channel provenance treats as clean, and then
+/// the withhold branch would not fire on provenance alone. Without this
+/// scrub the raw value lands in the append-only `events` table via the
+/// echoed `base_ref`, which is the value itself in that case.
+///
+/// # What this scrub does and does not catch (final round part 3, ruling W5-48)
+///
+/// An earlier version of this comment said the needle list catches a
+/// declared secret's raw value **"however it arrived"**. That was a false
+/// coverage claim, and false in the dangerous direction. A needle is an
+/// exact substring match, so it catches every *verbatim* copy of the value
+/// — the echoed `base_ref` this function's caller scrubs before formatting,
+/// and a subprocess's stderr that quotes the value back unchanged — and it
+/// catches **no lossy transform of one**:
+///
+/// - `@{upstream}`-style syntax makes `git` die mid-interpretation and
+///   report only the prefix before the mark. Measured: 27 bytes of a
+///   38-byte declared secret, cleartext, past a whole-value needle.
+/// - A value longer than `git`'s own `vreportf` stderr buffer (~4KB —
+///   **`git`'s buffer, not this workspace's `OUTPUT_CAP`**; a 3024-byte
+///   value scrubs fully, a 5029-byte one does not) comes back as a shorter,
+///   still-sensitive prefix.
+///
+/// Those are the same two transforms ruling W5-36 answered for the
+/// secret-*derived* branch with withhold-don't-scrub. So the caller no
+/// longer relies on this scrub to cover them: a declared secret's
+/// **presence** in `base_ref` now routes the provider's own text through
+/// `safe_summary()` exactly as provenance does — a property of the input,
+/// which nothing `git` does to the value afterwards can defeat. This
+/// function's remaining job is the verbatim layer: the echoed value itself,
+/// and any declared secret appearing in text that reaches a message through
+/// some other route (a downstream provider's release error, say).
+///
+/// **The two channels that actually reach here** (final round part 2, item
+/// 2 — an earlier version of this comment named `env('NAME')` as one of
+/// them, which is wrong: `'`, `(` and `)` are all in
+/// `parse/steps.rs`'s `FORBIDDEN_GIT_REF_CHARS`, so
+/// `"${{ env('NAME') }}"` as a `base_ref` is rejected at parse time and
+/// never reaches this function):
+///
+/// 1. **A literal paste** — the author writing the credential straight into
+///    `base_ref:`. `validate_git_ref` bounds *which* literals get here: its
+///    forbidden set includes `"`, `\`, quotes and shell metacharacters, so
+///    a value carrying any of those is rejected at parse time and a plain
+///    one passes.
+/// 2. **A placeholder over public data** — `base_ref: "${{ item }}"` (or
+///    any other public root) whose *resolved* value happens to equal a
+///    declared secret. The template text is what parse-time validation
+///    sees; the resolved value is never re-validated, so this channel can
+///    carry the characters channel 1 cannot — which is exactly what made
+///    the `Debug`-escaping hole at the call site reachable.
+///
+/// This function was deleted in Task 34's fix round 3, which replaced
+/// *scrubbing* with *withholding* on the secret-derived branch (ruling
+/// W5-36) and took the backstop off the non-secret-derived branch with it.
+/// The withhold is the right fix for its own branch and is unchanged; this
+/// restores the independent backstop the other branch always had.
+fn redact_message(message: String, needles: &[String]) -> String {
+    match redact_with_needles(&Value::String(message), needles) {
+        Value::String(s) => s,
+        other => unreachable!(
+            "redact_with_needles(Value::String(_), _) always returns Value::String, got {other:?}"
+        ),
+    }
+}
+
 fn value_type_name(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -306,6 +455,19 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::String(_) => "a string",
         Value::Object(_) => "an object",
         Value::Array(_) => "an array",
+    }
+}
+
+/// Names a `MapIsolationDef` tier for an error message — never its
+/// contents (this enum's own variants carry no attacker/secret-influenced
+/// data besides `Worktree`'s `base_ref`, which this function never touches).
+fn map_isolation_tier_name(def: &MapIsolationDef) -> &'static str {
+    match def {
+        MapIsolationDef::None => "none",
+        MapIsolationDef::Worktree { .. } => "worktree",
+        MapIsolationDef::Sandbox => "sandbox",
+        MapIsolationDef::Container => "container",
+        MapIsolationDef::Remote => "remote",
     }
 }
 
@@ -725,6 +887,135 @@ impl<'a> Executor<'a> {
     /// change made unilaterally here. Recorded loudly, at the construction
     /// site below and here, so it is not silently rediscovered once
     /// something finally reads `steps.<map_id>.status` for real.
+    ///
+    /// # Task 34: `isolation: worktree` materialization (Phase 5 ruling P42, lane W5 rulings W5-8/W5-22)
+    ///
+    /// `isolation` is `StepBody::Map`'s own field
+    /// ([`crate::parse::steps::MapIsolationDef`]), `Option<MapIsolationDef>`
+    /// — **optionality here is meaningful and is not the same thing as
+    /// `Defaults.isolation`'s default value.** `Defaults.isolation` defaults
+    /// to `IsolationDef::Worktree` (`crate::parse::types::Defaults`) so that
+    /// *some* isolation tier is always declared for a run, but that default
+    /// must never be read as an implicit demand to materialize anything —
+    /// every existing fixture and test in this crate leaves the map-level
+    /// field unset and would gain an unwanted, and likely failing, git
+    /// dependency if it did. Only `isolation: Some(MapIsolationDef::Worktree { .. })`
+    /// — an author writing `map.isolation: worktree` (or the `{ worktree:
+    /// { base_ref } }` form) on *this specific* `map` step — is treated as
+    /// an explicit demand.
+    ///
+    /// **The field being absent and an explicit `isolation: none` are not
+    /// the same claim, even though both take the match arm below that does
+    /// nothing (fix round 2, item 3 — ruling W5-33, correcting an earlier
+    /// version of this paragraph that called both "genuinely
+    /// deliverable").** Explicit `none` is a real, deliverable choice: the
+    /// author asked for nothing, and nothing is exactly what this crate can
+    /// always produce. The field being **absent** inherits
+    /// `Defaults.isolation`, which defaults to `Worktree` — a documented
+    /// safe floor (`crate::parse::types::Defaults`) — and this arm then
+    /// silently does not honour it: no provider lookup, no worktree, no
+    /// binding, no error, no warning. That is the P42 shape, for the
+    /// *default* configuration, wider than the three tiers the arm below
+    /// fails closed. **This is not fixed here.** Ruling W5-33: making the
+    /// absent case materialize would require a wired `WorktreeProvider` for
+    /// every existing workflow before any of them could run at all — the
+    /// daemon does not construct one yet (lane W1's residual, per
+    /// [`crate::exec::RunContext::worktree_provider`]'s own doc comment) —
+    /// so every fixture and every test in this crate would fail closed
+    /// overnight. Ruling W5-8 chose today's behaviour deliberately for
+    /// exactly that reason, and that reasoning still holds; what changed
+    /// this round is only the claim made about it. **Read every "P42 is
+    /// closed" statement in this crate (and in `roundhouse-sandbox`) with
+    /// this qualification attached: P42's silence is closed for an
+    /// explicitly declared `worktree` tier, and for the three
+    /// undeliverable tiers below — it is not closed for a `map` step that
+    /// leaves `isolation:` unset and inherits the default.**
+    ///
+    /// **Fail-closed on a missing provider.** When the map-level field
+    /// explicitly asks for `worktree` isolation and this `Executor`'s own
+    /// `worktree_provider` field (threaded from
+    /// [`crate::exec::RunContext::worktree_provider`]) is `None`, the
+    /// *item* fails with a message naming the missing provider — never a
+    /// silent no-op. This is exactly the defect Phase 5 ruling P42 raised:
+    /// a workflow author who writes `isolation: worktree` and gets no
+    /// isolation and no warning. Per-item, not per-`map`-step: `on_item_error`
+    /// governs whether that failure stops the whole fan-out
+    /// (`fail_fast`) or is recorded per-item (`continue`/`collect`), exactly
+    /// like any other item failure.
+    ///
+    /// **`base_ref` is a workflow-file *template*, resolved per item.**
+    /// `parse/steps.rs`'s own doc comment on `validate_git_ref` already
+    /// documents §8.9's fixture using `${{ pr.number }}` inside `base_ref`
+    /// — so the stored string is not necessarily the literal ref text, and
+    /// resolving it happens here, per item, **after** `as_name` is bound
+    /// for that item (below), via [`interpolate`] — the same
+    /// `TemplateSource`/mixed-literal-and-`${{ }}` mechanism
+    /// `StepBody::Agent`'s `prompt` field uses
+    /// (`crate::exec::Executor::dispatch_step`), not
+    /// [`eval_delimited_expression`] (`over`'s mechanism), because
+    /// `base_ref` is ordinary literal text with an *optional* embedded
+    /// expression, not a field required to be wholly one `${{ … }}` block.
+    /// The **unredacted** rendering crosses to
+    /// [`crate::worktree::WorktreeProvider::materialize`] (and from there,
+    /// to `git`, as one discrete argv element after `--` — see that
+    /// method's own doc comment); nothing here ever builds a shell string
+    /// from it. A `base_ref` of `None` (bare `worktree`, no `base_ref:` key)
+    /// resolves to the literal text `"HEAD"` rather than invoking
+    /// `interpolate` at all.
+    ///
+    /// **The materialized path is bound into the expression context,
+    /// alongside `as_name`, not folded into it.** A downstream step inside
+    /// the map body reads it as `${{ worktree.path }}` — a second root,
+    /// [`WORKTREE_ROOT_NAME`], bound and reverted with exactly the same
+    /// [`crate::expr::ExprContext::snapshot_root`]/
+    /// [`crate::expr::ExprContext::restore_root`]/
+    /// [`crate::expr::ExprContext::set_from`] mechanism `as_name` itself
+    /// uses above, for the identical reason (nested-`map` reuse of the same
+    /// root name must revert cleanly — see this function's own "Why binding
+    /// onto the shared context and reverting by name is correct" section).
+    /// Bound via [`crate::expr::Evaluated::derive`] off `item_evaluated` —
+    /// **not** [`crate::expr::ExprContext::set_public`]/`set_secret` called
+    /// directly — for the same reason `as_name`'s own binding is: this
+    /// function's own doc comment above names hand-building an `Evaluated`
+    /// or asserting per-item taint directly as "the re-assertion-by-the-
+    /// back-door defect ruling P37 exists to remove," and that reasoning
+    /// applies here verbatim even though the worktree path's own content
+    /// never contains secret material — deriving from `item_evaluated`
+    /// costs nothing and keeps this call site free of a second taint
+    /// judgment call to get wrong.
+    ///
+    /// **Cleanup on both paths, panic included.** [`WorktreeGuard`] is an
+    /// RAII guard: it is constructed immediately after a successful
+    /// `materialize`, and its `Drop` impl calls
+    /// [`crate::worktree::WorktreeProvider::release`] on exactly the path
+    /// `materialize` returned. Because it is a local inside the per-item
+    /// closure below, Rust drops it at the end of that closure's scope —
+    /// on the item's ordinary `Completed`/`Failed`/`Skipped` return *and*
+    /// during unwinding if anything in the item's inner-step dispatch
+    /// panics — with no explicit cleanup call needed on any of those paths.
+    /// **On the ordinary, non-panicking path**, a release failure is folded
+    /// into that item's `Failed` outcome rather than silently swallowed —
+    /// see the explicit [`WorktreeGuard::release`] call below, run after the
+    /// inner-step loop, whose own doc comment covers this. **Fix round 1,
+    /// item 7, scoping a claim that used to say this unconditionally:** on
+    /// the *panicking* path the guard's `Drop` impl is the only thing that
+    /// ever runs, and it deliberately swallows a release failure there (`let
+    /// _ = self.provider.release(&path);` — see [`WorktreeGuard::drop`]'s
+    /// own doc comment) rather than panicking during an unwind already in
+    /// progress. Never a double-drop hazard either way:
+    /// [`WorktreeGuard::drop`] extracts the path with [`Option::take`], so a
+    /// second drop — there isn't one here, but the guard is written to be
+    /// safe if a future refactor introduced one — is a no-op rather than a
+    /// double release.
+    ///
+    /// **The path materialized and the path released are always the same
+    /// value** — [`WorktreeGuard`] stores exactly what
+    /// [`crate::worktree::WorktreeProvider::materialize`] returned and
+    /// never accepts one from anywhere else; nothing derived from
+    /// `over`/the item's own value/the workflow document can steer which
+    /// path is released, which is the same guarantee
+    /// `roundhouse_sandbox::worktree`'s own module doc comment states as an
+    /// obligation of its callers.
     pub(crate) fn dispatch_map_step(
         &mut self,
         step_id: &str,
@@ -732,6 +1023,7 @@ impl<'a> Executor<'a> {
         as_name: &str,
         max_parallel: u32,
         on_item_error: OnItemError,
+        isolation: Option<&MapIsolationDef>,
         inner_step_yaml: &[serde_yaml::Value],
     ) -> StepOutcome {
         let over_evaluated =
@@ -793,6 +1085,15 @@ impl<'a> Executor<'a> {
         // atomicity argument this depends on and the measured cost this
         // replaces under nesting.
         let outer_snapshot = self.ctx.snapshot_root(as_name);
+        // Task 34: only an *explicit* `isolation: worktree` on this map
+        // step snapshots `WORKTREE_ROOT_NAME` at all — see
+        // `Executor::dispatch_map_step`'s own doc comment, "Task 34:
+        // `isolation: worktree` materialization", for why `None` here (the
+        // common case — the field absent, inheriting `Defaults.isolation`)
+        // must leave any outer binding of this name completely undisturbed.
+        let materializes_worktree = matches!(isolation, Some(MapIsolationDef::Worktree { .. }));
+        let outer_worktree_snapshot =
+            materializes_worktree.then(|| self.ctx.snapshot_root(WORKTREE_ROOT_NAME));
         // Fix-round-3-style step-boundary taint: if any item's own inner
         // steps produced secret-derived output, or the collection itself was
         // secret-derived, the map step's *own* aggregate output
@@ -831,6 +1132,320 @@ impl<'a> Executor<'a> {
             |item, _item_caps| {
                 let item_evaluated = over_evaluated.derive(item.clone());
                 self.ctx.set_from(as_name, &item_evaluated);
+
+                // Task 34: materialize this item's worktree, if this map
+                // step explicitly demanded one — see
+                // `Executor::dispatch_map_step`'s own doc comment, "Task
+                // 34: `isolation: worktree` materialization", for the full
+                // reasoning (fail-closed on a missing provider, per-item
+                // `base_ref` interpolation, the binding mechanism, and the
+                // cleanup guarantee `worktree_guard` below provides), and
+                // "Fix round 1, item 1" for the taint-leak fix below.
+                let mut worktree_guard: Option<WorktreeGuard> = None;
+                // Carried out of the match below so the release arm at the
+                // end of this closure can apply the same withhold rule the
+                // materialize arm does (final round part 2, M1). A release
+                // error from *this* crate's adapter never sees `base_ref`
+                // — `remove_worktree` is handed a generated uuid path and
+                // `--force` — but `WorktreeProvider` is a `pub` trait whose
+                // doc now tells an implementor its release errors are
+                // persisted under the same rule, and a caller that ignored
+                // that on one of the two paths would make the promise a
+                // half-truth.
+                //
+                // Named for what it actually holds (part 3, W5-48): secret
+                // *material*, either because provenance marked the value or
+                // because a declared secret's raw value is inside it. See
+                // the assignment below for why the second disjunct exists.
+                let mut base_ref_carried_secret_material = false;
+                match isolation {
+                    // Fix round 1, item 6 / fix round 2, item 3 (ruling
+                    // W5-33): `None` (the field absent) and an explicit
+                    // `isolation: none` take the same no-op arm, but they
+                    // are not the same claim — see this function's own doc
+                    // comment, "Task 34", for why `None` here is a known,
+                    // tolerated gap (P42's shape for the *inherited*
+                    // default) and not "genuinely deliverable" the way
+                    // explicit `none` is. See the match arm below for the
+                    // other three tiers, which this crate cannot deliver
+                    // and does not tolerate silently.
+                    None | Some(MapIsolationDef::None) => {}
+                    Some(MapIsolationDef::Worktree { base_ref }) => {
+                        let provider = match &self.worktree_provider {
+                            Some(provider) => Arc::clone(provider),
+                            None => {
+                                return ItemOutcome::Failed(format!(
+                                    "map step `{step_id}` declares `isolation: worktree`, but no \
+                                     WorktreeProvider is configured for this run \
+                                     (RunContext::worktree_provider is None) — refusing to run \
+                                     this item without the isolation it explicitly asked for, \
+                                     rather than silently running it unisolated"
+                                ));
+                            }
+                        };
+                        // Fix round 1, item 1 (CRITICAL): `base_ref` may
+                        // contain `${{ secrets.* }}`, and `interpolate`
+                        // computes both renderings from one evaluation
+                        // (ruling P33) precisely so a caller never has to
+                        // evaluate twice to get a safe-to-log copy. The
+                        // *redacted* rendering is what goes into every
+                        // message this arm can return; the *unredacted*
+                        // one is used strictly for the
+                        // `provider.materialize` call itself — mirroring
+                        // `Executor::dispatch_step`'s own `Agent`/`Tool`
+                        // arms (`resolved_prompt`/`resolved_with` vs.
+                        // `logged_prompt`/`logged_with`), which this arm
+                        // did not follow the first time it was written.
+                        let (unredacted_base_ref, redacted_base_ref, base_ref_is_secret_derived) =
+                            match base_ref {
+                                Some(text) => {
+                                    match interpolate(
+                                        TemplateSource::from_workflow_file(text),
+                                        &self.ctx,
+                                    ) {
+                                        Ok(interpolated) => {
+                                            // The part that actually
+                                            // repairs the persisted taint
+                                            // flag — see this function's
+                                            // own doc comment. Folded in
+                                            // unconditionally, before
+                                            // `materialize` is even
+                                            // attempted, so it is set on
+                                            // both the success and the
+                                            // failure path below.
+                                            let is_secret_derived =
+                                                interpolated.is_secret_derived();
+                                            any_item_secret_derived |= is_secret_derived;
+                                            let redacted =
+                                                interpolated.redacted_for_logging().clone();
+                                            (
+                                                interpolated.into_unredacted_for_dispatch(),
+                                                redacted,
+                                                is_secret_derived,
+                                            )
+                                        }
+                                        Err(e) => {
+                                            // No needle scrub here, unlike
+                                            // the two arms below (final
+                                            // round part 2, recorded rather
+                                            // than changed). Clean by
+                                            // construction, not by
+                                            // oversight: every `ExprError`
+                                            // payload is *source text*
+                                            // captured before evaluation
+                                            // (never a value), and a pasted
+                                            // credential cannot be inside
+                                            // that source text — `"`, `'`
+                                            // and `\` are all in
+                                            // `parse/steps.rs`'s
+                                            // `FORBIDDEN_GIT_REF_CHARS`, so
+                                            // a `base_ref` carrying an
+                                            // expression cannot also carry a
+                                            // quoted literal. If that
+                                            // charset is ever relaxed, this
+                                            // arm needs the same backstop
+                                            // the failure arms below have.
+                                            return ItemOutcome::Failed(format!(
+                                                "map step `{step_id}`: resolving \
+                                                 `isolation.worktree.base_ref`: {e}"
+                                            ));
+                                        }
+                                    }
+                                }
+                                None => (
+                                    DEFAULT_WORKTREE_BASE_REF.to_string(),
+                                    DEFAULT_WORKTREE_BASE_REF.to_string(),
+                                    false,
+                                ),
+                            };
+                        // **Provenance is not the only reason to withhold
+                        // (final round part 3, ruling W5-48).** A declared
+                        // secret's raw value can reach `base_ref` through a
+                        // channel provenance treats as clean, and the needle
+                        // scrub alone cannot cover that case: `git` does not
+                        // always echo a *copy* of what it was given.
+                        // `@{upstream}`-style syntax makes it die
+                        // mid-interpretation and report only the prefix
+                        // before the mark (measured: 27 of a 38-byte secret,
+                        // cleartext), and a value past `git`'s own `vreportf`
+                        // stderr buffer — **`git`'s buffer, ~4KB, not this
+                        // workspace's `OUTPUT_CAP`**; a 3024-byte value
+                        // scrubs fully and a 5029-byte one does not — comes
+                        // back as a shorter, still-sensitive prefix. A
+                        // whole-value needle matches neither.
+                        //
+                        // These are the exact two lossy transforms ruling
+                        // W5-36 already answered with withhold-don't-scrub
+                        // for the secret-*derived* branch; the scrub-only
+                        // branch silently inherited the limitation. So a
+                        // declared secret's *presence* in the value is
+                        // treated the same as provenance: it is a property
+                        // of the input, so nothing `git` does to the value
+                        // afterwards can defeat it.
+                        //
+                        // **What this costs, and why it is not a bug to fix
+                        // (ruling W5-49).** This withholds strictly more
+                        // often than provenance alone would: a declared
+                        // secret appearing anywhere inside `base_ref` — as a
+                        // substring, not only as the whole value —
+                        // suppresses the provider's own diagnostic text for
+                        // that item, so an operator debugging a genuine
+                        // `git` failure gets `safe_summary()`'s rendering —
+                        // the variant, the program name, the repository
+                        // root, the generated worktree path and the exit
+                        // status, all crate-generated — instead of `git`'s
+                        // own message and argv. That is accepted, for
+                        // three reasons a future reader should weigh before
+                        // narrowing it:
+                        //
+                        // 1. The failure direction is **diagnostics, not
+                        //    secrecy** — the correct way to fail at this
+                        //    boundary, and the same trade ruling W5-36 made
+                        //    when it chose withholding over scrubbing.
+                        // 2. It cannot fire on an ordinary short string.
+                        //    `Executor::new` **refuses to build a run at
+                        //    all** if any declared secret is shorter than
+                        //    `MIN_REDACTABLE_SECRET_LEN` (8 bytes) — see
+                        //    `ExecutorError::SecretTooShortToRedact` — so
+                        //    nothing like `main` or `HEAD` can ever be a
+                        //    needle here.
+                        // 3. Narrowing it means **not** withholding when a
+                        //    declared secret is demonstrably present in the
+                        //    value, i.e. trading secrecy back for
+                        //    diagnostics. That is the wrong direction, and
+                        //    it reintroduces exactly the gap the two
+                        //    transforms above make reachable.
+                        let base_ref_carries_secret_material = base_ref_is_secret_derived
+                            || self
+                                .redaction_needles
+                                .iter()
+                                .any(|needle| unredacted_base_ref.contains(needle.as_str()));
+                        base_ref_carried_secret_material = base_ref_carries_secret_material;
+                        match provider.materialize(&unredacted_base_ref) {
+                            Ok(path) => {
+                                // Derived from `item_evaluated`, not
+                                // asserted fresh via
+                                // `set_public`/`set_secret` — see this
+                                // function's own doc comment for why, even
+                                // though the path's own content is never
+                                // secret material.
+                                let workspace_evaluated = item_evaluated.derive(
+                                    serde_json::json!({ "path": path.display().to_string() }),
+                                );
+                                self.ctx.set_from(WORKTREE_ROOT_NAME, &workspace_evaluated);
+                                worktree_guard = Some(WorktreeGuard::new(provider, path));
+                            }
+                            Err(e) => {
+                                // Fix round 1, item 1 found a secret-derived
+                                // `base_ref` reaching `{e}`'s free text
+                                // (git's stderr, the echoed argv) verbatim.
+                                // Fix round 2 tried closing it by adding
+                                // `unredacted_base_ref` as an extra
+                                // needle-based scrub. Fix round 3, item 1
+                                // (ruling W5-36) retracts that shape:
+                                // `git`'s stderr is not always a **copy** of
+                                // what it was given — `@{upstream}`-style
+                                // syntax makes `git` die mid-interpretation
+                                // and echo only a prefix, and `git`'s own
+                                // stderr buffer silently truncates values
+                                // past ~4KB — so an exact-match needle keyed
+                                // on the whole original value can miss a
+                                // still-sensitive transformed or truncated
+                                // echo entirely, no matter how the needle is
+                                // chosen. No scrub of a *lossy* transform
+                                // can be made reliable.
+                                //
+                                // **Fix: withhold, don't scrub.** When
+                                // `base_ref` is secret-derived, this message
+                                // uses [`WorktreeProviderError::safe_summary`]
+                                // instead of `e`'s own `Display` — it keeps
+                                // this crate's own vocabulary (which
+                                // variant, the exit status) and drops every
+                                // piece of free text from outside this
+                                // crate's control (argv, stderr, OS error
+                                // text) entirely, rather than trying to
+                                // predict what a lossy external transform
+                                // might do to a scrub. See that method's own
+                                // doc comment for the full reasoning. A
+                                // `base_ref` that is *not* secret-derived
+                                // still gets the full, unwithheld message —
+                                // scrubbed through the declared-secrets
+                                // needle backstop below, which is a
+                                // different guard closing a different hole
+                                // (see [`redact_message`]'s own doc comment,
+                                // "Why this is needed on top of the
+                                // withhold"). Fix round 3 deleted that
+                                // backstop along with the scrub it was
+                                // replacing; the final round restored it.
+                                let detail = if base_ref_carries_secret_material {
+                                    e.safe_summary().to_string()
+                                } else {
+                                    e.to_string()
+                                };
+                                // **Scrubbed here, as a plain string, before
+                                // the `format!` below embeds it (final round
+                                // part 2, item 1).** The first version of
+                                // this fix assembled the message first and
+                                // scrubbed the whole thing afterwards, which
+                                // the security lens defeated: `Debug for str`
+                                // escapes `"`, `\` and control characters, so
+                                // a declared secret containing any of them no
+                                // longer matches the plain-substring needle
+                                // *in the `{:?}` copy* while the raw copies
+                                // (the argv echo, `git`'s stderr) scrub fine.
+                                // Reproduced end to end — two of three
+                                // occurrences became `***` and the escaped
+                                // one reached the append-only log in
+                                // trivially reversible form. Scrubbing first
+                                // means `{:?}` has only `***` to escape.
+                                let echoed_base_ref =
+                                    redact_message(redacted_base_ref, &self.redaction_needles);
+                                let message = format!(
+                                    "map step `{step_id}`: materializing a worktree for \
+                                     base_ref {echoed_base_ref:?}: {detail}"
+                                );
+                                return ItemOutcome::Failed(if base_ref_is_secret_derived {
+                                    // Nothing here for a needle to find:
+                                    // `safe_summary()` carries no text from
+                                    // outside this crate at all, and
+                                    // `redacted_base_ref` was already `***`
+                                    // because provenance caught it.
+                                    message
+                                } else {
+                                    // Still the whole message, for the
+                                    // `{detail}` half: that is raw `Display`
+                                    // text (`git`'s stderr and the echoed
+                                    // argv), so it scrubs correctly after
+                                    // assembly. Only the `{:?}` half had to
+                                    // move ahead of the `format!`.
+                                    redact_message(message, &self.redaction_needles)
+                                });
+                            }
+                        }
+                    }
+                    // Fix round 1, item 6: `sandbox`/`container`/`remote`
+                    // parse successfully (`parse/steps.rs` accepts all five
+                    // tiers) but this crate can only ever materialize
+                    // `worktree` — falling through silently here would be
+                    // exactly Phase 5 ruling P42's shape for three of the
+                    // four non-`none` tiers, in a diff whose own docs now
+                    // claim P42 is closed. Fails the item closed, the same
+                    // way a missing `WorktreeProvider` does, rather than
+                    // running it with no isolation and no warning.
+                    Some(
+                        other @ (MapIsolationDef::Sandbox
+                        | MapIsolationDef::Container
+                        | MapIsolationDef::Remote),
+                    ) => {
+                        return ItemOutcome::Failed(format!(
+                            "map step `{step_id}` declares `isolation: {}`, but this crate can \
+                             only materialize `worktree` isolation today — refusing to run this \
+                             item with no isolation at all rather than silently ignoring the \
+                             tier it explicitly asked for",
+                            map_isolation_tier_name(other)
+                        ));
+                    }
+                }
 
                 let mut last = ItemOutcome::Completed(Value::Null);
                 for inner in &inner_steps {
@@ -922,11 +1537,58 @@ impl<'a> Executor<'a> {
                         }
                     }
                 }
+
+                // Task 34: release on **every** path out of this item —
+                // the inner loop above may have `break`d on a failure,
+                // fallen through after every inner step ran, or (via
+                // `report:`'s refusal above) never entered the loop body at
+                // all; all three reach here. A release failure only
+                // overwrites `last` when the item would otherwise have
+                // reported success/skip — an item that already failed for
+                // its own reason keeps that reason, which is more
+                // actionable than a release failure piggy-backing on it.
+                // See `WorktreeGuard::release`'s own doc comment for why
+                // this explicit call, not `Drop` alone, is what lets a
+                // release failure reach `last` at all on this (the
+                // non-panicking) path.
+                if let Some(guard) = worktree_guard.take() {
+                    if let Err(e) = guard.release() {
+                        if !matches!(last, ItemOutcome::Failed(_)) {
+                            // Both guards the materialize arm applies, for
+                            // the same reasons, so the two paths out of one
+                            // item's worktree lifecycle cannot diverge:
+                            // withhold when this item's `base_ref` was
+                            // secret-derived (final round part 2, M1 —
+                            // `safe_summary()` is what the trait promises an
+                            // implementor is used), and the declared-secrets
+                            // needle backstop on top either way (item A1 —
+                            // `{e}` embeds free text this crate does not
+                            // control). See [`redact_message`]'s own doc
+                            // comment for why the two are independent.
+                            let detail = if base_ref_carried_secret_material {
+                                e.safe_summary().to_string()
+                            } else {
+                                e.to_string()
+                            };
+                            last = ItemOutcome::Failed(redact_message(
+                                format!(
+                                    "map step `{step_id}`: releasing the item's worktree: \
+                                     {detail}"
+                                ),
+                                &self.redaction_needles,
+                            ));
+                        }
+                    }
+                }
+
                 last
             },
         );
 
         self.ctx.restore_root(as_name, outer_snapshot);
+        if let Some(snapshot) = outer_worktree_snapshot {
+            self.ctx.restore_root(WORKTREE_ROOT_NAME, snapshot);
+        }
 
         StepOutcome {
             step_id: step_id.to_string(),

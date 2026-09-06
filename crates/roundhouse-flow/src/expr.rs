@@ -194,7 +194,7 @@
 //! | any function call `f(a, b)` | **secret** iff any argument is, read or not |
 //! | comparison `a == b` (and `!=`, `<`, `<=`, `>`, `>=`) | **secret** iff either side is — the resulting `Bool` is a one-bit oracle on the secret |
 //! | ternary `c ? a : b` | **secret** iff `c` is, or iff the *selected* branch is; the untaken branch's value never appears in the result so its taint is not propagated |
-//! | `env('NAME')` with no secret argument | **clean** — see the section below; `env()` is a separately escalated, unowned surface and its behaviour is deliberately unchanged here |
+//! | `env('NAME')` with no secret argument | **clean** — the *taint* verdict, not a statement about access: since Task 33 (ruling W5-7) `env()` is allowlist-scoped and deny-by-default, so most reads never return a value at all; a permitted read is one an operator vouched for, and its result is deliberately not marked secret. See the section below |
 //!
 //! Two consequences worth stating plainly. First, this is **deliberately
 //! conservative**: a value merely *computed from* a secret (its length, a
@@ -206,31 +206,50 @@
 //! bounded, exact-match backstop for precisely that case: the whole declared
 //! `secrets` values, and nothing derived from them.
 //!
-//! ## `env()` is a second, independent secret-exposure surface — AWAITING AN OWNER
+//! ## `env()` is scoped by an explicit allowlist, deny-all by default (Phase 7 W5 Task 33, ruling W5-7)
 //!
 //! `env()` (§8.9's own required function, `docs/architecture/05-scheduling-and-workflows.md:295-296`)
 //! reads the **calling process's real environment** via [`std::env::var`] —
-//! the daemon's environment, not a workflow-scoped view of it, and not
-//! restricted to whatever a workflow declared under its own `secrets:`
-//! list. Building it exactly this way, with no allowlist invented
-//! unilaterally, is correct against the frozen contract — a security review
-//! independently confirmed both that §8.9 really does freeze `env` in the
-//! function list and that declining to scope it down without a brief to do
-//! so was the right call. **What is not settled is what happens next.**
-//! Concretely: `crates/roundhouse-daemon/src/main.rs:125` reads
-//! `ANTHROPIC_API_KEY` from the daemon's process environment to configure
-//! the real provider; `env()` reads that same environment, unscoped; so
-//! `${{ env('ANTHROPIC_API_KEY') }}` in any workflow file yields the
-//! provider key as cleartext into an `env:`/`with:`/header/`run:` value,
-//! bypassing `roundhouse-secrets` and the redaction discipline at
-//! `crates/roundhouse-secrets/src/resolve.rs:108`, and bypassing the
-//! workflow's own declared `secrets:` list entirely. This residual is
-//! **escalated, not closed**: it needs an owner and a decision (process-env
-//! scrubbing before workflow evaluation, or a daemon-config allowlist of
-//! which variable names `env()` may read) that this task is not the one to
-//! make unilaterally. Stated here so the next reader does not mistake the
-//! absence of a fix for the absence of a decision, and does not have to
-//! rediscover the residual by reading `call_function`'s `"env"` arm cold.
+//! the daemon's environment, not a copy of it. §8.9 freezes `env`'s
+//! *existence* in the function list; it does not freeze it as an
+//! unscoped read, and an earlier version of this comment treated the two as
+//! the same thing. They are not: `${{ env('ANTHROPIC_API_KEY') }}` in any
+//! workflow file used to yield the daemon's real provider key (read from
+//! the same process environment by `crates/roundhouse-daemon/src/main.rs:125`)
+//! as cleartext into an `env:`/`with:`/header/`run:` value, bypassing
+//! `roundhouse-secrets` and the redaction discipline at
+//! `crates/roundhouse-secrets/src/resolve.rs:108` entirely — measured, not
+//! hypothetical (Phase 5's orchestrator ran `env('PROBE_FAKE_KEY')` and it
+//! logged the planted value verbatim).
+//!
+//! Ruling W5-7 chose a caller-supplied name allowlist (option (b)) over
+//! scrubbing the process environment (option (a)): scrubbing would also
+//! break `env('HOME')`-class reads that are load-bearing for ordinary
+//! workflow ergonomics, and it is a process-global side effect this library
+//! has no business performing on its host process. [`EnvAllowlist`] is
+//! **deny-all by default** — an [`ExprContext`] built the ordinary way
+//! (`ExprContext::new`) permits `env()` to read nothing at all — and a
+//! caller opts specific, exact, case-sensitive names in via
+//! [`ExprContext::allow_env`]. A denied read is [`ExprError::EnvVarNotAllowed`],
+//! naming the call's **source text** (a bounded prefix of what the workflow
+//! author wrote, captured before evaluation — never a **value**, and never
+//! the result of evaluating a computed argument such as
+//! `env(json(secrets.K).varname)`. For the ubiquitous literal
+//! `env('FOO')` the source text *is* the name, in quoted form; what the
+//! capture guarantees is that nothing is ever *evaluated* into this
+//! error); an allowlisted-but-unset
+//! variable still resolves to `Value::Null`, exactly as before this task —
+//! the two conditions ("not permitted" and "permitted but unset") are
+//! deliberately distinguishable, so a workflow author debugging a blank
+//! `env()` read can tell which one they hit.
+//!
+//! **`roundhouse-flow` only ever takes the allowlist; it does not populate
+//! one.** Threading daemon config (e.g. an operator-authored list of
+//! readable variable names) into the [`crate::exec::RunContext::env_allowlist`]
+//! this crate accepts is `roundhouse-daemon`'s job, not this crate's — until
+//! that plumbing exists, every `env()` call in a real run denies every
+//! name, which is the correct, fail-closed direction for this crate to
+//! default to while that caller-side work is outstanding.
 //!
 //! ## The trust newtypes assert at the call site, not the parse boundary — a Task 13 design input (ruling P23)
 //!
@@ -364,7 +383,8 @@
 //!
 //! `parse::steps::validate_map_as` rejects `map.as` values that
 //! case-sensitively equal one of `RESERVED_EXPRESSION_ROOTS` (`secrets`,
-//! `steps`, `inputs`, `run`, `vars`, `env`) — it does **not** reject `Steps`
+//! `steps`, `inputs`, `run`, `vars`, `env`, and — since Task 34 fix round 1,
+//! item 3 — `worktree`) — it does **not** reject `Steps`
 //! or `STEPS`. That check is only sound if this evaluator is also
 //! case-sensitive when resolving a root name, because `ExprContext`'s
 //! binding methods and every identifier lookup in this module go through an
@@ -711,6 +731,30 @@ pub enum ExprError {
         position: usize,
         index_expression: String,
     },
+    /// `env(...)`'s argument evaluated to a name not on the caller's
+    /// [`ExprContext::allow_env`] allowlist (Task 33, ruling W5-7). Carries
+    /// the call's own **source text** (bounded by [`MAX_ECHOED_FIELD_LEN`]
+    /// via `truncate_echoed_field`) — e.g. `'HOME'` or `secrets.T` —
+    /// **never the evaluated name and never a value**, following the same
+    /// rule [`ExprError::NonNumericIndex`] already follows and for the
+    /// identical reason: `env(...)`'s argument is any expression
+    /// (`env(secrets.T)` is valid syntax, and so is
+    /// `env(json(secrets.K).varname)`, where the *name itself* is
+    /// secret-derived), so echoing the evaluated key back here would open
+    /// exactly the leak channel this scoping exists to close — and one no
+    /// downstream provenance-based redaction can catch, because this error
+    /// never reaches an `Evaluated`/`ExprContext` binding at all. Pinned by
+    /// `tests/expr.rs::expr_error_never_embeds_a_context_value`.
+    ///
+    /// Distinguished on purpose from the `Ok(Value::Null)` an
+    /// allowlisted-but-unset variable still returns, so a workflow author
+    /// can tell "not permitted" apart from "permitted but not set" instead
+    /// of both looking like a blank result.
+    #[error(
+        "env({0}) is not on this run's allowed environment-variable list; ask the caller to \
+         allow it, or use a different variable"
+    )]
+    EnvVarNotAllowed(String),
 }
 
 /// What kind of problem `json()`'s `serde_json::from_str` hit, **carrying
@@ -783,6 +827,133 @@ enum RootProvenance {
     Paths(Vec<Vec<String>>),
 }
 
+/// The set of process-environment variable names `env()` is permitted to
+/// read (Phase 7 W5 Task 33, ruling W5-7 — see the module doc comment's
+/// `env()` section for the full argument).
+///
+/// **Deny-all is the default and the only sound starting point.** An
+/// `EnvAllowlist` with no names in it — [`Self::deny_all`], and what
+/// [`Default::default`] and [`ExprContext::new`] both produce — denies
+/// every name, including a genuinely-set one; that is what makes `env()`
+/// fail closed until a caller explicitly opts names in via
+/// [`ExprContext::allow_env`].
+///
+/// **Exact-name, case-sensitive matching only.** There is deliberately no
+/// prefix or glob support: a wildcard facility is how an allowlist quietly
+/// becomes an allow-all, which is the exact failure mode this type exists
+/// to prevent.
+///
+/// A newtype over a bare `HashSet<String>` rather than the set itself, so
+/// "this collection means deny-all when empty" is a documented type
+/// invariant instead of an incidental fact about whatever collection
+/// happened to be chosen.
+///
+/// See also [`Self::credential_shaped_names`] (Task 33, ruling W5-17): an
+/// *advisory*, non-filtering method a caller building this allowlist should
+/// call and warn on, because an allowlisted `env()` value bypasses this
+/// crate's other leak protections entirely (see that method's own doc
+/// comment for why).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvAllowlist(std::collections::HashSet<String>);
+
+impl EnvAllowlist {
+    /// The explicit, self-documenting spelling of [`Default::default`] —
+    /// permits nothing. Reach for [`ExprContext::allow_env`] to opt names
+    /// in from here.
+    pub fn deny_all() -> Self {
+        Self(std::collections::HashSet::new())
+    }
+
+    /// Builds an allowlist directly from a set of names — the constructor
+    /// a caller outside this crate's own `${{ }}` wiring reaches for.
+    /// `roundhouse-flow` only ever *takes* an `EnvAllowlist`
+    /// (`crate::exec::RunContext::env_allowlist`); it is `roundhouse-daemon`'s
+    /// job to build one from operator config and hand it in here, and this
+    /// is the entry point for that — [`ExprContext::allow_env`] exists
+    /// alongside it for merging names into an already-built context rather
+    /// than constructing a fresh allowlist from scratch.
+    pub fn from_names<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self(names.into_iter().map(Into::into).collect())
+    }
+
+    /// Exact-name, case-sensitive membership test. See the type's own doc
+    /// comment for why there is no prefix/glob variant of this.
+    fn permits(&self, name: &str) -> bool {
+        self.0.contains(name)
+    }
+
+    /// Returns the entries of this allowlist whose *names* look
+    /// credential-bearing — a case-insensitive suffix match on `_KEY`,
+    /// `_TOKEN`, `_SECRET`, `_PASSWORD`, or `_CREDENTIAL` (Task 33, ruling
+    /// W5-17).
+    ///
+    /// **Advisory only.** This never rejects, filters, or otherwise changes
+    /// what [`Self::permits`] allows — allowlisting a credential-shaped
+    /// name remains entirely the operator's call, and there are legitimate
+    /// reasons to do it. What this method exists for: fix round 1's
+    /// security review found that an *allowlisted* `env()` read is doubly
+    /// invisible to this crate's own leak protections — it is Clean, not
+    /// secret-derived (see the taint decision at `Parser::parse_primary`'s
+    /// call site: allowlisting is itself the operator vouching for
+    /// non-secrecy), and it is not a key of `crate::exec::RunContext`'s
+    /// `secrets` map, so `crate::exec::redact_known_secrets`'s backstop
+    /// cannot see it either. An operator who allowlists a genuinely
+    /// credential-shaped name — the canonical case is `ANTHROPIC_API_KEY`
+    /// — therefore reproduces the exact Phase 5 exposure Task 33 exists to
+    /// close, for that one name, with no warning anywhere in this crate.
+    ///
+    /// This is the hook: a caller building an `EnvAllowlist` from operator
+    /// config (`roundhouse-daemon`, lane W1) should call this at
+    /// config-load time and warn on whatever comes back, rather than
+    /// reinventing the same suffix heuristic itself. Living next to
+    /// `EnvAllowlist` keeps it discoverable to whoever writes that config
+    /// loader in a way a line buried in another lane's brief is not.
+    ///
+    /// # Not exhaustive — the output is advisory, not complete
+    ///
+    /// This matches exactly the five suffixes below, so a bare `KEY`, the
+    /// plurals (`API_KEYS`, `SECRETS`), `CREDENTIALS`, and every name that
+    /// is credential-shaped only in its own vocabulary (`PAT`, `SESSION`,
+    /// `COOKIE`, a bare service name) all pass through unmentioned. An
+    /// empty return is therefore **not** evidence that an allowlist holds
+    /// no credentials.
+    ///
+    /// That is by design rather than an oversight to widen later: ruling
+    /// W5-17 forbids this from rejecting anything, precisely because a
+    /// name heuristic is not a security boundary and treating it as one
+    /// would make the miss above dangerous. It exists to catch the
+    /// canonical mistake (`ANTHROPIC_API_KEY` allowlisted by accident)
+    /// loudly and cheaply; a caller must not read its silence as an
+    /// all-clear.
+    pub fn credential_shaped_names(&self) -> Vec<&str> {
+        const CREDENTIAL_SUFFIXES: &[&str] =
+            &["_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIAL"];
+        self.0
+            .iter()
+            .filter(|name| {
+                let upper = name.to_ascii_uppercase();
+                CREDENTIAL_SUFFIXES
+                    .iter()
+                    .any(|suffix| upper.ends_with(suffix))
+            })
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+impl IntoIterator for EnvAllowlist {
+    type Item = String;
+    type IntoIter = std::collections::hash_set::IntoIter<String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 /// The evaluation context: a flat table of named roots (`inputs`, `steps`,
 /// `secrets`, a `map.as` loop binding, …), each an arbitrary
 /// `serde_json::Value`. Lookups are exact-byte-string, case-sensitive —
@@ -795,12 +966,19 @@ enum RootProvenance {
 /// root marked secret here, never because of what a JSON key it landed under
 /// happens to be called. See the module doc comment's "Provenance-based
 /// redaction" section for the full propagation table.
+///
+/// Also carries the [`EnvAllowlist`] that scopes `env()` (Task 33, ruling
+/// W5-7) — deny-all by default, exactly like every other newly-constructed
+/// field here, so a context nobody has explicitly opted variables into
+/// denies `env()` outright rather than falling open.
 #[derive(Default, Clone)]
 pub struct ExprContext {
     vars: HashMap<String, Value>,
     /// Roots (or parts of roots) whose values are secret material. A root
     /// absent from this map is entirely clean.
     secret_provenance: HashMap<String, RootProvenance>,
+    /// Names `env()` may read. Deny-all until [`Self::allow_env`] is called.
+    env_allowlist: EnvAllowlist,
 }
 
 /// An opaque snapshot of one root's binding — both its [`Value`] and its
@@ -825,7 +1003,26 @@ impl ExprContext {
         Self {
             vars: HashMap::new(),
             secret_provenance: HashMap::new(),
+            env_allowlist: EnvAllowlist::deny_all(),
         }
+    }
+
+    /// Opts process-environment variable names into `env()` reads (Task 33,
+    /// ruling W5-7). [`Self::new`] starts deny-all; this is the only way to
+    /// permit a name, one call at a time or via any `IntoIterator` of
+    /// names (including a whole [`EnvAllowlist`], which is how
+    /// `crate::exec::Executor::new` threads `crate::exec::RunContext`'s
+    /// `env_allowlist` field through). Matching stays exact-name,
+    /// case-sensitive — see [`EnvAllowlist`]'s own doc comment for why
+    /// there is deliberately no prefix/glob form of this.
+    pub fn allow_env<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.env_allowlist
+            .0
+            .extend(names.into_iter().map(Into::into));
     }
 
     /// Binds `name` to a value the evaluator produced, **carrying that value's
@@ -1330,10 +1527,17 @@ impl fmt::Debug for ExprContext {
 /// just `interpolate`/`interpolate_json`. `eval` is in fact the *shortest*
 /// path to the abuse P20 exists to prevent, because it skips the `${{ }}`
 /// delimiters entirely — `eval` on the bare text `env('ANTHROPIC_API_KEY')`
-/// (no `${{ }}` needed at all) returns the daemon's provider key exactly as
-/// `${{ env('ANTHROPIC_API_KEY') }}` does through `interpolate`. Measured on
-/// HEAD with a planted key: `eval("env('ANTHROPIC_API_KEY')", &ctx)` ->
-/// `"sk-ant-PRETEND-KEY"`.
+/// (no `${{ }}` needed at all) would return the daemon's provider key
+/// exactly as `${{ env('ANTHROPIC_API_KEY') }}` does through `interpolate`,
+/// **if `ANTHROPIC_API_KEY` were allowlisted** — since Task 33 (ruling
+/// W5-7), `env()` denies every name by default, so on a freshly-constructed
+/// [`ExprContext`] this now returns [`ExprError::EnvVarNotAllowed`] instead,
+/// naming the call's source text and never a value. The illustration is
+/// conditional on the caller having opted the name into
+/// [`ExprContext::allow_env`]; the P20/P22 rationale itself rests on
+/// `secrets.*`, not on `env()`, and is unaffected. Measured pre-Task-33 with
+/// a planted key on an unscoped context: `eval("env('ANTHROPIC_API_KEY')",
+/// &ctx)` -> `"sk-ant-PRETEND-KEY"`.
 ///
 /// A distinct type from [`TemplateSource`], not a reuse of it, because the
 /// two wrap different grammars: `TemplateSource` wraps a whole template —
@@ -1819,12 +2023,12 @@ fn truncate_echoed_field(text: &str) -> String {
 /// handed to [`interpolate`] or by being the `Value` handed to
 /// [`interpolate_json`]. The consequence of getting this wrong is not the
 /// silent cross-block merge (that was P19's original, weaker justification,
-/// since corrected) — it is `${{ env('ANTHROPIC_API_KEY') }}` or
-/// `${{ secrets.* }}` appearing in attacker-influenced content and
-/// evaluating for real, emitting the daemon's provider key or the
-/// workflow's own secrets in cleartext. Untrusted data must reach this
-/// module only as a value bound into [`ExprContext`], never as template
-/// text.
+/// since corrected) — it is `${{ env('ANTHROPIC_API_KEY') }}` (if that name
+/// is allowlisted — see Task 33, ruling W5-7) or `${{ secrets.* }}`
+/// appearing in attacker-influenced content and evaluating for real,
+/// emitting the daemon's provider key or the workflow's own secrets in
+/// cleartext. Untrusted data must reach this module only as a value bound
+/// into [`ExprContext`], never as template text.
 ///
 /// Constructible only through [`TemplateSource::from_workflow_file`], so
 /// that assertion is one explicit, greppable call site at the point a
@@ -2119,7 +2323,8 @@ fn value_to_string(v: &Value) -> String {
 /// concatenation whatsoever to reach the same outcome as pasting untrusted
 /// text into a template: every string leaf of that value is evaluated as
 /// `${{ }}` template text, so `{"note": "${{ env('ANTHROPIC_API_KEY') }}"}`
-/// anywhere in the tree evaluates for real.
+/// anywhere in the tree evaluates for real (and, if that name is
+/// allowlisted — Task 33, ruling W5-7 — resolves to the real value).
 pub struct JsonTemplateSource<'a>(&'a Value);
 
 impl<'a> JsonTemplateSource<'a> {
@@ -2499,9 +2704,33 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 if self.peek() == Some(b'(') {
                     self.pos += 1;
+                    let args_start = self.pos;
                     let (args, any_arg_secret) = self.parse_args()?;
+                    // `parse_args` already consumed the closing `)` by the
+                    // time it returns, hence the `- 1`. Captured *before*
+                    // `call_function` runs, so this is source text, never a
+                    // value — see `ExprError::EnvVarNotAllowed`'s doc
+                    // comment for why `call_function`'s `"env"` arm needs
+                    // that distinction.
+                    let call_source = String::from_utf8_lossy(&self.s[args_start..self.pos - 1])
+                        .trim()
+                        .to_string();
+                    // Taint decision for `env()` (Task 33, ruling W5-7): an
+                    // allowlisted read is treated as clean, not
+                    // secret-derived, on the theory that allowlisting a
+                    // name *is* an operator vouching for it being
+                    // non-secret — the same trust `set_public` already
+                    // asserts for `inputs`/`vars`/`run` in
+                    // `crate::exec::Executor::new`. This falls out of the
+                    // existing rule below without a special case: taint
+                    // here is a function of `any_arg_secret` only (`env`'s
+                    // sole argument is a string naming the variable, never
+                    // the variable's value), never of which function was
+                    // called, so `env(secrets.T)` still taints via its
+                    // *argument* exactly as before — this does not weaken
+                    // that.
                     Ok((
-                        Cow::Owned(call_function(&ident, args)?),
+                        Cow::Owned(call_function(&ident, args, self.ctx, &call_source)?),
                         provenance_from_flag(any_arg_secret),
                     ))
                 } else {
@@ -2901,7 +3130,16 @@ fn index_array(v: Cow<'_, Value>, i: usize) -> Cow<'_, Value> {
 /// expression rather than returning `'x'`, because the chain errors before
 /// this function is ever called. See [`ExprError::NonNumericIndex`] for the
 /// two payloads that changed and why the loss is deliberate.
-fn call_function<'a>(name: &str, args: Vec<Cow<'a, Value>>) -> Result<Value, ExprError> {
+fn call_function<'a>(
+    name: &str,
+    args: Vec<Cow<'a, Value>>,
+    ctx: &ExprContext,
+    // The call's own source text (whatever sits between its parens),
+    // captured by the caller before evaluation — used only by the `"env"`
+    // arm's [`ExprError::EnvVarNotAllowed`], which must echo source text,
+    // never the evaluated argument. See that variant's doc comment.
+    call_source: &str,
+) -> Result<Value, ExprError> {
     match name {
         "len" => Ok(serde_json::json!(match args.first().map(|v| v.as_ref()) {
             Some(Value::Array(a)) => a.len(),
@@ -2957,11 +3195,21 @@ fn call_function<'a>(name: &str, args: Vec<Cow<'a, Value>>) -> Result<Value, Exp
             serde_json::from_str(s).map_err(|e| ExprError::Json(JsonErrorCategory::from(e)))
         }
         "env" => {
-            // Reads the real process environment — see the module doc
-            // comment's "`env()` is a second, independent secret-exposure
-            // surface" section. Not scoped to a workflow's declared
-            // `secrets:` list.
+            // Scoped by an explicit, caller-supplied allowlist — see the
+            // module doc comment's "`env()` is scoped by an explicit
+            // allowlist" section (Task 33, ruling W5-7). Denied names never
+            // reach `std::env::var` at all. The error below echoes
+            // `call_source` (the call's own source text), never `key`
+            // (the evaluated argument) — `key` can itself be secret-derived
+            // (`env(secrets.T)`, `env(json(secrets.K).varname)`), so it must
+            // never appear in a `Display`ed error. See
+            // `ExprError::EnvVarNotAllowed`'s doc comment.
             let key = args.first().and_then(|v| v.as_ref().as_str()).unwrap_or("");
+            if !ctx.env_allowlist.permits(key) {
+                return Err(ExprError::EnvVarNotAllowed(truncate_echoed_field(
+                    call_source,
+                )));
+            }
             Ok(match std::env::var(key) {
                 Ok(v) => Value::String(v),
                 Err(_) => Value::Null,

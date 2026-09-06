@@ -713,6 +713,111 @@ pub async fn probe_cached(cache_dir: &Path) -> MechanismProbeReport {
 }
 
 // ---------------------------------------------------------------------------------
+// Task 14 (lane W5, ruling W5-3): a second, unrelated reason this module needs to
+// stay the crate's one `unsafe_code`-permitted module. `bounded_parse.rs`'s
+// `run_bounded_subprocess` needs a Linux `RLIMIT_CPU` on the child it spawns, and
+// the only way to install an `rlimit` before a `std::process::Command` execs is
+// `CommandExt::pre_exec` — itself `unsafe`, for the same reason `fork()` above is:
+// its closure runs in the forked child between `fork()` and `exec()`, a window
+// where (per this module's top doc comment) some other thread's inherited,
+// still-locked allocator mutex could wedge the first allocation the closure makes.
+// `set_cpu_limit_pre_exec` keeps the closure itself allocation-free — the `rlimit`
+// struct is built by the caller, before the fork, and the closure's only job is the
+// syscall — so it does not introduce a second copy of that hazard, just reuses the
+// module's existing justification for owning it.
+// ---------------------------------------------------------------------------------
+
+/// Installs a `RLIMIT_CPU` (Linux-only; see [`crate::bounded_parse`]'s module doc
+/// for the non-Linux behaviour) of `limit` CPU-seconds on `cmd`, taking effect the
+/// moment `cmd` execs. Both the soft and hard limit are set to the same value, so
+/// the kernel delivers `SIGXCPU` essentially as soon as the limit is reached; since
+/// [`crate::bounded_parse::run_bounded_subprocess`]'s helper children install no
+/// `SIGXCPU` handler, the default disposition (terminate) applies, and the parent
+/// observes it as a signal-terminated [`std::process::ExitStatus`]
+/// (`BoundedParseError::ResourceExhausted`), not a graceful exit.
+///
+/// Sub-second `Duration`s are truncated to whole seconds, with a floor of 1
+/// (ruling W5-25, finding 6 — an earlier version of this sentence said
+/// "rounded up", which `limit.as_secs().max(1)` does not do: a 1.9 s limit
+/// becomes 1 s, not 2. The behaviour is safe, tighter than what was
+/// documented, never looser — only the sentence was wrong). The floor
+/// exists because `RLIMIT_CPU` has no finer resolution than whole seconds,
+/// and a limit of literal `0` risks reading as "already exceeded" rather
+/// than "one second's grace" on some kernels.
+///
+/// A safe function despite installing an `unsafe` `pre_exec` hook internally: the
+/// `rlimit` value is computed here, before any fork happens, so the closure
+/// `pre_exec` runs later touches no caller-provided state and performs exactly one
+/// syscall.
+#[cfg(target_os = "linux")]
+pub fn set_cpu_limit_pre_exec(cmd: &mut std::process::Command, limit: std::time::Duration) {
+    use std::os::unix::process::CommandExt;
+
+    let seconds = limit.as_secs().max(1);
+    let rlim = libc::rlimit {
+        rlim_cur: seconds,
+        rlim_max: seconds,
+    };
+
+    // SAFETY: this closure runs in the forked child between `fork()` and `exec()`
+    // (the same async-signal-safe-only window `forked_probe::run` documents at the
+    // top of this file) and must not allocate or take a lock. `rlim` is a plain
+    // `Copy` struct built above, outside the closure, so capturing it by value
+    // allocates nothing; `libc::setrlimit` is the closure's only call and is on
+    // POSIX's async-signal-safe function list. `std::io::Error::last_os_error()` on
+    // the failure path reads `errno` and constructs a small enum — no allocation
+    // either (`std::io::Error` on this path is a bare OS error code).
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setrlimit(libc::RLIMIT_CPU, &rlim) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+/// Sends `SIGKILL` to every process in the process group `pgid` (Linux only;
+/// see [`crate::bounded_parse`]'s module doc for the non-Linux behaviour).
+/// `libc::killpg` with a positive `pgid` is exactly this — POSIX `kill(2)`
+/// with a negative pid, wrapped — so this is not a raw `kill()` call the
+/// caller has to remember to negate.
+///
+/// Used by [`crate::bounded_parse::run_bounded_subprocess`] (ruling W5-25,
+/// finding 2; ruling W5-26 extended the call sites to every exit path, not
+/// only a bound firing) to kill a subprocess spawned with
+/// `CommandExt::process_group(0)` (making it the leader of its own new
+/// group, `pgid == pid`) **and everything it forked**, not just the direct
+/// child: `Child::kill()` alone signals only the one process it names, so a
+/// single `fork()` inside a bounded child would otherwise defeat every
+/// bound this primitive enforces — the descendant keeps running (and keeps
+/// the stdout pipe's write end open) after the direct child is gone,
+/// whether that child was killed by a bound firing or exited cleanly on
+/// its own. Killing the whole group also closes every descendant's copy of
+/// that write end, which is what lets the concurrent stdout/stderr readers
+/// in `run_bounded_subprocess` observe EOF and its caller's `thread::scope`
+/// unblock, rather than hanging forever on a pipe an orphan still holds.
+///
+/// A safe function despite the `unsafe` FFI call inside, unlike
+/// [`set_cpu_limit_pre_exec`]: `libc::killpg` is an ordinary syscall
+/// wrapper taking two plain integers, with no pointer or lifetime contract
+/// to uphold, and this runs on the calling thread *after* the child
+/// already exists — not in the fork/exec window `pre_exec` runs in, so
+/// none of that function's async-signal-safety constraints apply here.
+/// Errors (e.g. the group already reaped) are deliberately ignored: this
+/// is a best-effort kill on a shutdown path, not a fallible operation
+/// whose failure the caller can usefully act on.
+#[cfg(target_os = "linux")]
+pub(crate) fn kill_process_group(pgid: i32) {
+    // SAFETY: see the doc comment above — no preconditions beyond passing
+    // plain integers.
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+}
+
+// ---------------------------------------------------------------------------------
 // Internal regression tests for `forked_probe::run` itself (needs crate-internal
 // access to the private `forked_probe` module, so this lives here rather than in
 // `tests/probe.rs`).
