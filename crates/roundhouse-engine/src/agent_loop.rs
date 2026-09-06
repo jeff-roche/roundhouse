@@ -1232,7 +1232,11 @@ async fn dispatch_builtin(
             Ok(parts)
         }
         Err(tool_err) => {
-            let message = tool_err.to_string();
+            // A post-admission executor error can carry an `io::Error`, and
+            // therefore an absolute host path. This message is folded into the
+            // next provider turn, so retain no executor payload on that path.
+            let message = "tool execution failed".to_string();
+            tracing::warn!(error = %tool_err, "admitted builtin execution failed");
             let failed = runner.record_task_failed(
                 actor.session_id(),
                 0,
