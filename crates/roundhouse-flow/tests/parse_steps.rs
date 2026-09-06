@@ -665,7 +665,14 @@ fn m3_a_map_as_with_illegal_characters_is_rejected() {
 
 #[test]
 fn m3_map_as_shadowing_a_reserved_expression_root_is_rejected() {
-    for reserved in ["secrets", "steps", "inputs", "run", "vars", "env"] {
+    // "worktree" added by Task 34 fix round 1, item 3: `map_step.rs`'s
+    // `WORKTREE_ROOT_NAME` is a seventh implicit root Task 34 introduced
+    // without reserving it here, so `as: worktree` used to silently let
+    // the materialized path's binding overwrite the item's own — see
+    // `RESERVED_EXPRESSION_ROOTS`'s own doc comment.
+    for reserved in [
+        "secrets", "steps", "inputs", "run", "vars", "env", "worktree",
+    ] {
         let yaml =
             format!("id: a\nmap: {{ over: x, as: {reserved} }}\nsteps: [{{ id: b, tool: shell }}]");
         let err = try_step(&yaml).unwrap_err();

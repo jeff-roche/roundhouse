@@ -1,6 +1,6 @@
 use roundhouse_flow::expr::{
-    eval, eval_delimited_expression, interpolate, interpolate_json, ExprContext, ExprError,
-    ExpressionSource, JsonTemplateSource, TemplateSource,
+    eval, eval_delimited_expression, interpolate, interpolate_json, EnvAllowlist, ExprContext,
+    ExprError, ExpressionSource, JsonTemplateSource, TemplateSource,
 };
 use serde_json::{json, Value};
 
@@ -118,11 +118,16 @@ fn slice_default_contains_flatten_json_env_are_the_full_function_set() {
         .clone(),
         json!({"a":1})
     );
+    // Task 33, ruling W5-7: `env()` only reads names its caller allowlisted
+    // — `ctx()` denies everything by default, so this one call opts this
+    // one name in.
     std::env::set_var("ROUNDHOUSE_TEST_VAR", "hello");
+    let mut env_ctx = ctx();
+    env_ctx.allow_env(["ROUNDHOUSE_TEST_VAR"]);
     assert_eq!(
         eval(
             ExpressionSource::from_workflow_file("env('ROUNDHOUSE_TEST_VAR')"),
-            &ctx()
+            &env_ctx
         )
         .unwrap()
         .value()
@@ -835,7 +840,12 @@ fn expr_error_never_embeds_a_context_value() {
     let mut c = ExprContext::new();
     c.set_public(
         "secrets",
-        json!({"GH_TOKEN": "super-secret-value-should-not-print"}),
+        json!({
+            "GH_TOKEN": "super-secret-value-should-not-print",
+            // A JSON-encoded secret, so a *derived* read (not just a
+            // direct `.field`) can also be exercised below.
+            "NESTED": "{\"name\":\"super-secret-value-should-not-print\"}"
+        }),
     );
     // Trigger a variety of error paths and confirm none of them echo the
     // secret value back in the error's Display text.
@@ -858,6 +868,24 @@ fn expr_error_never_embeds_a_context_value() {
         )
         .unwrap_err()
         .to_string(),
+        // Task 33, ruling W5-7: `env(...)`'s argument is any expression, so
+        // the *name* `env()` is asked to read can itself be secret-derived.
+        // `c` is deny-all (never had `allow_env` called), so both of these
+        // hit `ExprError::EnvVarNotAllowed` — regression for the leak an
+        // earlier version of this variant had, which echoed the evaluated
+        // argument (the secret itself) rather than the call's source text.
+        eval(
+            ExpressionSource::from_workflow_file("env(secrets.GH_TOKEN)"),
+            &c,
+        )
+        .unwrap_err()
+        .to_string(),
+        eval(
+            ExpressionSource::from_workflow_file("env(json(secrets.NESTED).name)"),
+            &c,
+        )
+        .unwrap_err()
+        .to_string(),
     ];
     for e in errs {
         assert!(
@@ -867,16 +895,71 @@ fn expr_error_never_embeds_a_context_value() {
     }
 }
 
-// ---- `env()` reads the real process environment, not a workflow-scoped
-// view — documented residual, pinned so it is a recorded choice. ----
+// ---- `env()` is scoped by an explicit `EnvAllowlist`, deny-all by default
+// (Task 33, ruling W5-7). Previously this section pinned "reads the real
+// process environment unscoped" as a *documented residual* — that residual
+// is now closed, and these tests pin the replacement contract instead. ----
 
 #[test]
-fn env_function_reads_the_real_process_environment_documented_residual() {
-    std::env::set_var("ROUNDHOUSE_TEST_ENV_RESIDUAL", "process-wide-value");
+fn env_function_denies_an_unallowlisted_variable_and_never_returns_its_value() {
+    // A real value is planted under a distinctive canary name — set for
+    // real, not merely unset — so this test would genuinely fail (by
+    // returning the value) if the scoping did not work. `ctx()` allowlists
+    // nothing, so this name is denied purely by never having been opted in.
+    std::env::set_var(
+        "ROUNDHOUSE_TEST_ENV_CANARY_DENIED",
+        "sk-ant-PRETEND-KEY-CANARY",
+    );
+    let err = eval(
+        ExpressionSource::from_workflow_file("env('ROUNDHOUSE_TEST_ENV_CANARY_DENIED')"),
+        &ctx(),
+    )
+    .unwrap_err();
+    // The variant carries the call's *source text* (single-quoted, as
+    // written), never the evaluated name — see
+    // `ExprError::EnvVarNotAllowed`'s doc comment.
+    assert!(matches!(
+        &err,
+        ExprError::EnvVarNotAllowed(source) if source == "'ROUNDHOUSE_TEST_ENV_CANARY_DENIED'"
+    ));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ROUNDHOUSE_TEST_ENV_CANARY_DENIED"),
+        "the error must name the denied variable: {msg}"
+    );
+    assert!(
+        !msg.contains("sk-ant-PRETEND-KEY-CANARY"),
+        "the error must never carry the real value: {msg}"
+    );
+}
+
+#[test]
+fn env_function_denies_every_name_by_default_on_a_freshly_constructed_context() {
+    // The default itself, independent of `ctx()`'s own setup: an
+    // `ExprContext::new()` with nothing else done to it must still deny
+    // `env()` for a real, set value.
+    std::env::set_var("ROUNDHOUSE_TEST_ENV_DEFAULT_DENY", "should-not-leak");
+    let c = ExprContext::new();
+    let err = eval(
+        ExpressionSource::from_workflow_file("env('ROUNDHOUSE_TEST_ENV_DEFAULT_DENY')"),
+        &c,
+    )
+    .unwrap_err();
+    assert!(matches!(err, ExprError::EnvVarNotAllowed(_)));
+}
+
+#[test]
+fn env_function_resolves_an_allowlisted_variable_to_its_real_value() {
+    // The regression the ruling requires: allowlisting must not just fail
+    // to error — it must still let `env()` return the real value, proving
+    // the fix did not just break `env()` outright.
+    std::env::set_var("ROUNDHOUSE_TEST_ENV_ALLOWED", "process-wide-value");
+    let mut c = ctx();
+    c.allow_env(["ROUNDHOUSE_TEST_ENV_ALLOWED"]);
     assert_eq!(
         eval(
-            ExpressionSource::from_workflow_file("env('ROUNDHOUSE_TEST_ENV_RESIDUAL')"),
-            &ctx()
+            ExpressionSource::from_workflow_file("env('ROUNDHOUSE_TEST_ENV_ALLOWED')"),
+            &c
         )
         .unwrap()
         .value()
@@ -886,17 +969,84 @@ fn env_function_reads_the_real_process_environment_documented_residual() {
 }
 
 #[test]
-fn env_function_returns_null_for_an_unset_variable() {
-    std::env::remove_var("ROUNDHOUSE_TEST_ENV_DEFINITELY_UNSET");
+fn env_function_returns_null_for_an_allowlisted_but_unset_variable() {
+    // Distinguishes "not permitted" (an error, never `Null`, see above)
+    // from "permitted but genuinely unset" (still `Null`, unchanged from
+    // before this task).
+    std::env::remove_var("ROUNDHOUSE_TEST_ENV_ALLOWED_BUT_UNSET");
+    let mut c = ctx();
+    c.allow_env(["ROUNDHOUSE_TEST_ENV_ALLOWED_BUT_UNSET"]);
     assert_eq!(
         eval(
-            ExpressionSource::from_workflow_file("env('ROUNDHOUSE_TEST_ENV_DEFINITELY_UNSET')"),
-            &ctx()
+            ExpressionSource::from_workflow_file("env('ROUNDHOUSE_TEST_ENV_ALLOWED_BUT_UNSET')"),
+            &c
         )
         .unwrap()
         .value()
         .clone(),
         json!(null)
+    );
+}
+
+// ---- `EnvAllowlist::credential_shaped_names` (Task 33, ruling W5-17): an
+// advisory, non-filtering hook so a caller building an allowlist can warn
+// about the double bypass a credential-shaped allowlisted name causes
+// (Clean, and not a `secrets` key — invisible to both provenance redaction
+// and the `redact_known_secrets` backstop). ----
+
+#[test]
+fn credential_shaped_names_flags_common_credential_suffixes_case_insensitively_but_not_ordinary_names(
+) {
+    let allow = EnvAllowlist::from_names([
+        "HOME",
+        "PATH",
+        "MY_API_KEY",
+        "database_password",
+        "SESSION_TOKEN",
+        "APP_SECRET",
+        "SERVICE_CREDENTIAL",
+        "KEYBOARD_LAYOUT", // contains "KEY" but does not *end* with "_KEY"
+    ]);
+    let mut flagged = allow.credential_shaped_names();
+    flagged.sort_unstable();
+    assert_eq!(
+        flagged,
+        vec![
+            "APP_SECRET",
+            "MY_API_KEY",
+            "SERVICE_CREDENTIAL",
+            "SESSION_TOKEN",
+            "database_password",
+        ],
+        "HOME/PATH must not be flagged, and a suffix match must be exact \
+         (KEYBOARD_LAYOUT contains KEY but does not end in _KEY)"
+    );
+}
+
+#[test]
+fn credential_shaped_names_never_changes_what_the_allowlist_permits() {
+    // Advisory only: whether a name is credential-shaped must not affect
+    // whether `env()` can actually read it — that decision stays entirely
+    // with whoever called `allow_env`/`from_names`.
+    std::env::set_var(
+        "ROUNDHOUSE_TEST_CREDENTIAL_SHAPED_API_KEY",
+        "still-readable",
+    );
+    let mut c = ctx();
+    c.allow_env(["ROUNDHOUSE_TEST_CREDENTIAL_SHAPED_API_KEY"]);
+    assert_eq!(
+        eval(
+            ExpressionSource::from_workflow_file(
+                "env('ROUNDHOUSE_TEST_CREDENTIAL_SHAPED_API_KEY')"
+            ),
+            &c
+        )
+        .unwrap()
+        .value()
+        .clone(),
+        json!("still-readable"),
+        "credential_shaped_names existing must not turn into a filter — the \
+         name still resolves"
     );
 }
 
@@ -1017,18 +1167,21 @@ fn root_lookup_is_case_sensitive() {
 // ---- `eval` carries the same P20 trust assertion as `interpolate` /
 // `interpolate_json` (ruling P22, fix round 3, item 1). `eval` is `pub`,
 // takes an expression with no `${{ }}` delimiters at all, and was the
-// shortest path to the P20 abuse before this fix (measured on HEAD with a
-// planted key: `eval("env('ANTHROPIC_API_KEY')", &ctx)` returned the
-// daemon's provider key — see `expr.rs`'s `ExpressionSource` doc comment).
-// This test does not re-plant a real-looking secret name (deliberately: a
-// test that reads `env('ANTHROPIC_API_KEY')` for real would depend on
-// whatever happens to be in *this* process's own environment, which is
-// exactly the residual `expr.rs`'s "`env()` is a second, independent
-// secret-exposure surface" section already documents as unowned). It pins
-// the type-level assertion instead: `eval` only compiles against an
-// `ExpressionSource`, not a bare `&str`, so every caller must go through
-// the same greppable `::from_workflow_file` call `interpolate` /
-// `interpolate_json` require. ----
+// shortest path to the P20 abuse before this fix (measured pre-Task-33 on
+// an unscoped context with a planted key: `eval("env('ANTHROPIC_API_KEY')",
+// &ctx)` returned the daemon's provider key — see `expr.rs`'s
+// `ExpressionSource` doc comment). This test does not re-plant a
+// real-looking secret name (deliberately: a test that reads
+// `env('ANTHROPIC_API_KEY')` for real would depend on whatever happens to
+// be in *this* process's own environment). Since Task 33 (ruling W5-7),
+// `env()` also denies every name by default regardless — this test
+// allowlists its own planted name via `allow_env` specifically so the
+// `env()` call inside it still resolves, keeping this a test of the
+// type-level assertion below, not of the allowlist (which has its own
+// dedicated tests). It pins that type-level assertion: `eval` only
+// compiles against an `ExpressionSource`, not a bare `&str`, so every
+// caller must go through the same greppable `::from_workflow_file` call
+// `interpolate` / `interpolate_json` require. ----
 
 #[test]
 fn eval_requires_an_expression_source_not_a_bare_str() {
@@ -1036,11 +1189,14 @@ fn eval_requires_an_expression_source_not_a_bare_str() {
     // `interpolate_json` — all three public entry points require the
     // caller to assert workflow-file trust before this module will
     // evaluate their text.
+    // Task 33, ruling W5-7: `env()` only resolves an allowlisted name.
     std::env::set_var("ROUNDHOUSE_TEST_EVAL_TRUST_VAR", "trusted-value");
+    let mut c = ctx();
+    c.allow_env(["ROUNDHOUSE_TEST_EVAL_TRUST_VAR"]);
     assert_eq!(
         eval(
             ExpressionSource::from_workflow_file("env('ROUNDHOUSE_TEST_EVAL_TRUST_VAR')"),
-            &ctx()
+            &c
         )
         .unwrap()
         .value()

@@ -563,3 +563,107 @@ fn content_hash_is_invariant_under_key_order_nested_two_levels_below_the_schema_
          insertion order differs"
     );
 }
+
+// --- Task 29: `Job`'s `Deserialize` must re-validate the invariants
+// `Job::new`/`Job::add_version` enforce on hand-written code, not just
+// accept anything shaped like a `Job` (what `#[derive(Deserialize)]` did
+// before this task). `JobId` is a UUID newtype (see `roundhouse-core`'s
+// `newtype_id!`), so these fixtures use real UUID strings rather than the
+// plan's placeholder `"j1"`.
+
+fn version_json(job_id: &str, version: u32) -> serde_json::Value {
+    serde_json::json!({
+        "job_id": job_id,
+        "version": version,
+        "template": {
+            "provider": "anthropic",
+            "model": "claude-sonnet",
+            "cwd": "/repo",
+            "tools": ["read"],
+            "isolation": "Worktree",
+            "permission_policy_ref": "pr-review-default",
+        },
+        "body": { "Prompt": { "template": "hello" } },
+        "input_schema": { "type": "object" },
+    })
+}
+
+#[test]
+fn deserializing_a_job_with_empty_versions_is_rejected_not_silently_accepted() {
+    let job_id = "3b9d6f2e-6f0a-4c1a-9c8b-1e2d3f4a5b6c";
+    let malformed = serde_json::json!({
+        "id": job_id,
+        "versions": [],
+    });
+    let result: Result<Job, _> = serde_json::from_value(malformed);
+    assert!(
+        result.is_err(),
+        "a Job with zero versions must be unrepresentable even from the wire, \
+         exactly as it is unrepresentable via Job::new"
+    );
+}
+
+#[test]
+fn deserializing_a_job_with_non_monotonic_versions_is_rejected() {
+    let job_id = "3b9d6f2e-6f0a-4c1a-9c8b-1e2d3f4a5b6c";
+    let malformed = serde_json::json!({
+        "id": job_id,
+        "versions": [version_json(job_id, 2), version_json(job_id, 1)],
+    });
+    let result: Result<Job, _> = serde_json::from_value(malformed);
+    assert!(
+        result.is_err(),
+        "versions must arrive in strictly increasing order, exactly as \
+         Job::add_version enforces for hand-written code"
+    );
+}
+
+#[test]
+fn deserializing_a_job_with_a_version_owned_by_a_different_job_is_rejected() {
+    let job_id = "3b9d6f2e-6f0a-4c1a-9c8b-1e2d3f4a5b6c";
+    let other_job_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let malformed = serde_json::json!({
+        "id": job_id,
+        "versions": [version_json(other_job_id, 1)],
+    });
+    let result: Result<Job, _> = serde_json::from_value(malformed);
+    assert!(
+        result.is_err(),
+        "a JobVersion whose job_id differs from the Job's own id must be \
+         rejected, exactly as Job::add_version's JobIdMismatch rejects it \
+         for hand-written code"
+    );
+}
+
+#[test]
+fn a_valid_job_round_trips_through_serialize_deserialize() {
+    let job_id = JobId::new();
+    let v1 = JobVersion::new(
+        job_id,
+        1,
+        template(),
+        Body::Prompt {
+            template: "hello".to_string(),
+        },
+        InputSchema(serde_json::json!({"type": "object"})),
+    );
+    let v2 = JobVersion::new(
+        job_id,
+        2,
+        template(),
+        Body::Workflow {
+            workflow_yaml: "name: x\nversion: 2\n".to_string(),
+        },
+        InputSchema(serde_json::json!({"type": "object"})),
+    );
+    let mut job = Job::new(job_id, v1);
+    job.add_version(v2).expect("version 2 follows version 1");
+
+    let wire = serde_json::to_string(&job).expect("Job serializes");
+    let round_tripped: Job = serde_json::from_str(&wire).expect("valid Job deserializes");
+
+    assert_eq!(
+        job, round_tripped,
+        "a valid Job must round-trip through its wire format unchanged"
+    );
+}

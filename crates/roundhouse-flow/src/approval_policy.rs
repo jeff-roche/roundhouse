@@ -368,6 +368,30 @@ pub fn default_for_unattended() -> ApprovalPolicy {
 /// [`resolve_notify_timeout`] plus the caller's own response handling, which
 /// is out of this pure module's scope for the same reason `Notify`'s `sink`
 /// is a string here rather than a live connection.
+///
+/// # This is the dispatch-loop hook (Task 19b)
+///
+/// This function's signature is already exactly the shape a dispatch loop
+/// needs at the point a workflow-run task's permission rule escalates: the
+/// run's own [`ApprovalPolicy`] (decided once, at admission, by
+/// `roundhouse-daemon` — see this module's doc comment) and the id of the
+/// one rule that just escalated, and it hands back an [`ApprovalOutcome`]
+/// directly. There is no wrapper to write and no second entry point to add;
+/// the wiring is this one call, at whatever point the dispatch loop
+/// currently branches on `permissions.rules[*].effect == escalate`. Tested
+/// directly and
+/// exhaustively, including the exact scenario just described, by
+/// `tests/approval_policy.rs` — `scheduled_sessions_default_to_deny_all_which_blocks_not_fails`
+/// for the `DenyAll` default, `preapproved_bundle_only_approves_its_own_declared_rules`
+/// for the `Preapproved` path, and the file's remaining cases for `Interactive`,
+/// blank/near-miss rule ids, and `Notify`.
+///
+/// What this function cannot yet be handed, because nothing in this crate
+/// produces it: a string-shaped id for a parsed
+/// [`PermissionRuleDef`](crate::parse::types::PermissionRuleDef), which
+/// carries no `id` field at all today (only `matcher`/`effect`) — see this
+/// task's report for the residual this leaves for whoever lands the
+/// `permissions.rules` escalate path.
 pub fn evaluate_unattended_approval(policy: &ApprovalPolicy, rule_id: &str) -> ApprovalOutcome {
     match policy {
         // Fail closed rather than hang — see `ApprovalPolicy::Interactive`.

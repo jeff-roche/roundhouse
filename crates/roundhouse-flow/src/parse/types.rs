@@ -23,6 +23,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::report::CarryOver;
+
 /// JSON Schema's primitive type names, as used by
 /// `inputs: { <name>: { type: ... } }`. §8.9: "the `inputs:` schema ...
 /// becomes the JSON tool schema when the workflow is exposed as a
@@ -120,6 +122,12 @@ pub struct Defaults {
     pub isolation: IsolationDef,
     #[serde(default)]
     pub retry: RetryDef,
+    /// §8.6's `carry_over: { last_report: true }` — "continuity is data, not
+    /// scrollback." Absent (the default) means the job declared no
+    /// continuity, exactly equivalent to an explicit `carry_over: {
+    /// last_report: false }`.
+    #[serde(default)]
+    pub carry_over: CarryOver,
 }
 
 impl Default for Defaults {
@@ -127,6 +135,7 @@ impl Default for Defaults {
         Defaults {
             isolation: default_isolation(),
             retry: RetryDef::default(),
+            carry_over: CarryOver::default(),
         }
     }
 }

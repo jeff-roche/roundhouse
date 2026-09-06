@@ -22,9 +22,11 @@ use roundhouse_flow::exec::run_loop::{
     run_workflow, CalledWorkflow, GateAnswer, ReportOrigin, RunLoopError, RunOutcome, WorkflowHost,
 };
 use roundhouse_flow::exec::{RunContext, RunId, TaskSink};
+use roundhouse_flow::expr::EnvAllowlist;
 use roundhouse_flow::ledger::run_ledger;
 use roundhouse_flow::parking::{CheckpointError, CheckpointRef, Checkpointer};
 use roundhouse_flow::parse::parse_workflow;
+use roundhouse_flow::report::{Cost, Outcome, Report, Severity};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -233,6 +235,9 @@ fn ctx(run_id: RunId) -> RunContext {
         vars: serde_json::json!({}),
         secrets: HashMap::new(),
         run_id,
+        previous_report: None,
+        env_allowlist: EnvAllowlist::deny_all(),
+        worktree_provider: None,
     }
 }
 
@@ -285,6 +290,38 @@ fn drive_with(
         resume,
     );
     (conn, run_id, sink, host, result)
+}
+
+/// Like [`drive`], but with a caller-supplied `RunContext::previous_report` —
+/// Task 19a's carry-over seed is only reachable at all when the run context
+/// actually carries one, which `ctx()`/`drive()` never populate.
+fn drive_with_previous_report(
+    body: &str,
+    previous_report: Report,
+) -> (
+    Connection,
+    RunId,
+    RecordingSink,
+    Result<RunOutcome, RunLoopError>,
+) {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(body)).expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.previous_report = Some(previous_report);
+    let result = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    );
+    (conn, run_id, sink, result)
 }
 
 /// Writes a finished `Completed` row for `step_id`, so a re-drive skips it —
@@ -3009,4 +3046,136 @@ fn the_restore_matches_the_report_steps_own_row_and_not_merely_some_completed_ro
     );
     assert_eq!(sink.reports().len(), 1, "across both passes");
     assert_eq!(sink.the_report()["synthesised_by"], "run_loop");
+}
+
+// ---------------------------------------------------------------------------
+// Task 19a: `build_carry_over_seed` wired at the run-start path
+// ---------------------------------------------------------------------------
+
+/// This is an executor-level test, not a re-test of `build_carry_over_seed`
+/// in isolation (`tests/report.rs` already covers that function's own
+/// logic): it fails if `run_loop::run_workflow` stops binding the seed into
+/// the run's `ExprContext`, which is the part a unit test of the pure
+/// function cannot see.
+///
+/// Asserted through a `when:` gate rather than the persisted log, and
+/// deliberately: `carry_over` is bound through `set_secret` (ruling P35 —
+/// the previous report's provenance is unknown at the binding site), so an
+/// `emit:` step's own *logged* rendering of a value read through it is
+/// always `"***"` by design — that would make a log-content assertion prove
+/// nothing about whether the real value is actually reachable. A `when:`
+/// gate's pass/fail is control flow, computed from the real, untainted-for-
+/// evaluation-purposes value; taint only ever affects what gets logged
+/// verbatim, never what a comparison decides. Two gates, only one of which
+/// should pass, so this cannot pass merely because "some step ran" or
+/// because an unbound root's `null` happens to make a lenient comparison
+/// true.
+#[test]
+fn carry_over_seed_from_the_previous_run_is_reachable_from_a_workflow_expression() {
+    let previous = Report {
+        outcome: Outcome::Findings,
+        severity: Severity::Med,
+        headline: "2 flaky tests quarantined".into(),
+        needs_human: false,
+        cost: Cost {
+            usd: 0.1,
+            tokens: 500,
+        },
+        findings: vec![],
+        artifacts: vec![],
+        next_actions: vec![],
+        extra: serde_json::Map::new(),
+    };
+
+    let (conn, run_id, _sink, result) = drive_with_previous_report(
+        "defaults: { carry_over: { last_report: true } }\n\
+         steps:\n\
+         \x20 - id: headline_matches\n\
+         \x20   when: \"${{ carry_over.previous_report.headline == '2 flaky tests quarantined' }}\"\n\
+         \x20   emit: { ok: true }\n\
+         \x20 - id: outcome_matches\n\
+         \x20   when: \"${{ carry_over.previous_report.outcome == 'findings' }}\"\n\
+         \x20   emit: { ok: true }\n\
+         \x20 - id: headline_does_not_match\n\
+         \x20   when: \"${{ carry_over.previous_report.headline == 'a different headline' }}\"\n\
+         \x20   emit: { ok: true }\n",
+        previous,
+    );
+    result.expect("the run drives");
+
+    assert_eq!(
+        step_row(&conn, run_id, "headline_matches").0,
+        StepRunState::Completed,
+        "a workflow expression must be able to read the previous run's real \
+         headline through the `carry_over` root — this fails if the call to \
+         build_carry_over_seed / ExprContext::set_secret at the run-start \
+         path in run_loop::run_workflow is ever removed"
+    );
+    assert_eq!(
+        step_row(&conn, run_id, "outcome_matches").0,
+        StepRunState::Completed,
+        "same for the previous run's outcome"
+    );
+    assert_eq!(
+        step_row(&conn, run_id, "headline_does_not_match").0,
+        StepRunState::Skipped,
+        "proves the comparison reads the actual headline value rather than \
+         e.g. always resolving truthy"
+    );
+}
+
+/// `carry_over.last_report` defaults to `false` (§8.6 says nothing runs
+/// unless a job opts in), so a workflow with no `defaults.carry_over` at all
+/// must not have a `carry_over` root bound. An unbound root resolves to
+/// `null` in this evaluator (`expr.rs`'s bare-identifier lookup), not an
+/// evaluation error, so the observable behavior is: the field read off it is
+/// `null`, never the previous run's real data leaking into a job that never
+/// opted in.
+#[test]
+fn no_carry_over_root_is_bound_when_the_job_does_not_opt_in() {
+    let previous = Report {
+        outcome: Outcome::Nothing,
+        severity: Severity::Low,
+        headline: "should never be seen".into(),
+        needs_human: false,
+        cost: Cost {
+            usd: 0.0,
+            tokens: 0,
+        },
+        findings: vec![],
+        artifacts: vec![],
+        next_actions: vec![],
+        extra: serde_json::Map::new(),
+    };
+
+    // `null` on the right of `==` here is not a literal — this expression
+    // language has no `null` keyword (`expr.rs`'s `parse_primary` only
+    // handles string/number/array literals and identifiers). It is a bare,
+    // never-bound identifier, which resolves to `Value::Null` by the same
+    // unbound-root rule the doc comment above cites for `carry_over` itself
+    // — two applications of one rule, not a coincidence.
+    let (conn, run_id, _sink, result) = drive_with_previous_report(
+        "steps:\n\
+         \x20 - id: unset\n\
+         \x20   when: \"${{ carry_over.previous_report.headline == null }}\"\n\
+         \x20   emit: { ok: true }\n\
+         \x20 - id: leaked\n\
+         \x20   when: \"${{ carry_over.previous_report.headline == 'should never be seen' }}\"\n\
+         \x20   emit: { ok: true }\n",
+        previous,
+    );
+    result.expect("the run drives");
+
+    assert_eq!(
+        step_row(&conn, run_id, "unset").0,
+        StepRunState::Completed,
+        "with no `defaults.carry_over.last_report: true`, the root must \
+         resolve to null, not silently disappear or error"
+    );
+    assert_eq!(
+        step_row(&conn, run_id, "leaked").0,
+        StepRunState::Skipped,
+        "the previous run's real report must never be visible to a job \
+         that did not opt into carry_over"
+    );
 }

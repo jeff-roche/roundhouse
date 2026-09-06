@@ -10,6 +10,32 @@ license.workspace = true
 # behind one module. See src/probe.rs.
 unsafe_code = "deny"
 
+[[bin]]
+# Task 27 (lane W5, ruling W5-9, Route B): the pre-authorised Landlock
+# pre-exec wrapper. `bwrap` has no native Landlock flag (unlike its native
+# `--seccomp FD`), and applying the ruleset via `pre_exec` on the *bwrap*
+# `Command` is a dead end (verified empirically, see `landlock_wrap.rs`'s
+# module doc comment) — Landlock denies every handled access on mounts
+# bwrap itself creates after `restrict_self()`, and bwrap's own setup work
+# (uid/gid mapping, `--proc`/`--dev`/bind setup) needs exactly the broad
+# access a real ruleset must deny. So this binary runs *inside* bwrap,
+# after its namespace already exists, applies the real ruleset via the
+# safe `RulesetCreated::restrict_self()`, and `exec`s the real program —
+# `CommandExt::exec` is safe, so this binary needs zero `unsafe`. Named
+# following the existing `round-` prefix convention (`round`,
+# `round-daemon-internal`, `round-yaml-parse-helper`).
+name = "round-landlock-exec"
+path = "src/bin/round_landlock_exec.rs"
+
+[features]
+# Task 27 (ruling W5-9): gates `landlock_wrap`'s grandparent-of-`current_exe()`
+# fallback for locating the sibling `round-landlock-exec` binary, the same
+# convention `roundhouse-flow`'s `round-yaml-parse-helper` lookup established
+# (ruling W5-4) — needed so a `tests/*.rs` integration-test binary (which lives
+# in `target/debug/deps/`, not `target/debug/`) can still find it. Activated
+# for this crate's own integration tests via the self dev-dependency below.
+test-util = []
+
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "=0.4.7"
 seccompiler = "=0.5.0"
@@ -44,3 +70,8 @@ command-fds = { version = "0.3", features = ["tokio"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+# Self dev-dependency, activating the `test-util` feature for this crate's own
+# `tests/*.rs` integration-test crates — `cfg(test)` alone does not cover them,
+# only this crate's in-lib `#[cfg(test)] mod tests` (same pattern as
+# `roundhouse-flow`'s Cargo.toml, ruling W5-4).
+roundhouse-sandbox = { path = ".", features = ["test-util"] }

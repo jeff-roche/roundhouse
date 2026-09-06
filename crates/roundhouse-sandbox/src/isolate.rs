@@ -83,22 +83,23 @@ impl BwrapLandlockIsolate {
     ///  - Seatbelt: real — `MechanismStatus::Available` for Seatbelt already means
     ///    `sandbox-exec` was actually run and its enforcement actually observed
     ///    (`probe.rs`'s Seatbelt probe).
-    ///  - **Landlock: PROBED-availability only, not yet applied to the real spawned
-    ///    child.** `restrict_self()` today runs only inside `probe.rs`'s throwaway
-    ///    forked probe child, never on the process bwrap actually execs. So a session
-    ///    that reaches `Tier::Sandbox` via this OR's Landlock branch (rather than via
-    ///    Seatbelt, or via the now-real seccomp path) is running under bwrap alone
-    ///    plus whatever real seccomp filter was applied — Landlock contributes
-    ///    nothing real yet, despite the probe reporting it `Available`. Real
-    ///    per-process Landlock enforcement on a bwrap-spawned child needs a pre-exec
-    ///    wrapper mechanism (bwrap has no native Landlock flag, unlike its native
-    ///    `--seccomp FD`) — this is a tracked, hard-prerequisite follow-up, not yet
-    ///    built. The OR-logic itself is intentionally unchanged this round: the
-    ///    regression test `seatbelt_alone_achieves_sandbox_tier_on_a_landlock_less_host`
-    ///    depends on it (audit finding 11), and narrowing it to exclude the
-    ///    not-yet-real Landlock branch would make Linux hosts without a real
-    ///    Landlock-enforcement path unable to reach `Sandbox` tier via seccomp alone,
-    ///    which is not this round's fix.
+    ///  - **Landlock: real, as of Task 27 (lane W5, ruling W5-9).** When
+    ///    `self.probe_report.landlock` is `Available`, `spawn()` rewrites the
+    ///    spawned command so bwrap execs `round-landlock-exec` instead of the real
+    ///    program (`landlock_wrap::wrap_for_landlock`); that binary applies the real
+    ///    ruleset — via the safe `RulesetCreated::restrict_self()` — *after* bwrap's
+    ///    own namespace/mount setup already exists, then `exec()`s the real program.
+    ///    See `landlock_wrap`'s module doc comment for why this pre-exec-wrapper
+    ///    shape was needed (bwrap has no native Landlock flag, unlike its native
+    ///    `--seccomp FD`) and for the empirically-verified reason the more obvious
+    ///    `pre_exec`-on-bwrap approach is a dead end. This is independent of which
+    ///    OR-branch reached `Tier::Sandbox`, the same as seccomp above: it applies
+    ///    whenever the probe says Landlock is `Available`, regardless of whether
+    ///    Seatbelt or seccomp is what actually got a given host to `Sandbox` tier.
+    ///    The OR-logic itself is unchanged: the regression test
+    ///    `seatbelt_alone_achieves_sandbox_tier_on_a_landlock_less_host` still
+    ///    depends on it (audit finding 11), and narrowing it is out of this task's
+    ///    scope.
     fn achieved_tier(&self) -> Tier {
         self.probe_report.to_probe_result().achieved
     }
@@ -147,6 +148,59 @@ impl BwrapLandlockIsolate {
     #[cfg(not(target_os = "linux"))]
     fn seccomp_bpf_for_spawn(&self) -> Result<Option<Vec<u8>>, IsolationError> {
         Ok(None)
+    }
+
+    /// Task 27 (lane W5, ruling W5-9): when `self.probe_report.landlock` is
+    /// `Available` (Linux-only in practice — see `probe::probe_landlock`), rewrites
+    /// `cmd` so bwrap execs `round-landlock-exec` instead of the real program,
+    /// applying a real Landlock ruleset to the process bwrap actually execs. See
+    /// `landlock_wrap`'s module doc comment for the full mechanism and why this
+    /// pre-exec-wrapper shape is needed instead of `pre_exec` on bwrap itself.
+    ///
+    /// Fails closed, mirroring `seccomp_bpf_for_spawn` above: if the probe reported
+    /// Landlock `Available` but the wrapper binary cannot be located, this returns
+    /// `Err` rather than silently spawning the real program directly — a `Tier::
+    /// Sandbox` attestation reached via Landlock's OR-branch must not silently
+    /// degrade to "bwrap namespace isolation only" without the caller finding out.
+    ///
+    /// Fix round 1 (Ruling W5-40), items 1 and 2: also fails closed rather than
+    /// applying a ruleset that would enforce nothing (item 1 —
+    /// `landlock_wrap::validate_workspace_root`, e.g. `workspace_root == "/"`) or that
+    /// a correctly-confined earlier session could have substituted with attacker
+    /// code before this ruleset ever applies (item 2 —
+    /// `landlock_wrap::wrapper_is_inside_workspace`, the ordinary-dev-layout case
+    /// where the wrapper binary sits inside the workspace's own writable bind). Both
+    /// checks run on the canonicalized workspace root, closing the symlink-based
+    /// bypass a purely lexical check would leave open.
+    fn wrap_for_landlock_if_available(
+        &self,
+        cmd: CommandSpec,
+        workspace_root: &std::path::Path,
+    ) -> Result<CommandSpec, IsolationError> {
+        if matches!(
+            self.probe_report.landlock,
+            crate::probe::MechanismStatus::Available
+        ) {
+            let workspace_root = crate::landlock_wrap::validate_workspace_root(workspace_root)?;
+            let wrapper = crate::landlock_wrap::wrapper_binary_path()?;
+            if crate::landlock_wrap::wrapper_is_inside_workspace(&wrapper, &workspace_root) {
+                return Err(IsolationError::Unsupported(format!(
+                    "refusing to apply Landlock: the enforcement binary {} lies inside the \
+                     workspace root {} that this ruleset would grant full read-write access \
+                     to — a correctly confined child could overwrite it before any ruleset \
+                     is ever applied to the next session's spawn",
+                    wrapper.display(),
+                    workspace_root.display()
+                )));
+            }
+            Ok(crate::landlock_wrap::wrap_for_landlock(
+                cmd,
+                &workspace_root,
+                &wrapper,
+            ))
+        } else {
+            Ok(cmd)
+        }
     }
 }
 
@@ -216,6 +270,7 @@ impl Isolate for BwrapLandlockIsolate {
             )
         })?;
         let seccomp_bpf = self.seccomp_bpf_for_spawn()?;
+        let cmd = self.wrap_for_landlock_if_available(cmd, &workspace_root)?;
         let (child, live_handle, namespace_confirmed) =
             crate::bwrap::spawn_under_bwrap(&self.bwrap_path, &workspace_root, cmd, seccomp_bpf)
                 .await?;
@@ -231,16 +286,33 @@ impl Isolate for BwrapLandlockIsolate {
     /// (§6.5 rule 4).
     ///
     /// **Read this before trusting `Attestation.tier == Sandbox` as a complete
-    /// security boundary:** as of fix-round-1, bwrap, seccomp (when the probe reported
-    /// `Available`), and Seatbelt are all genuinely enforced on the real spawned
-    /// child — but **Landlock is not**. `restrict_self()` runs only inside
-    /// `probe.rs`'s throwaway probe child, never on the process bwrap actually execs
-    /// (bwrap has no native Landlock flag, unlike its native `--seccomp FD`). So a
-    /// `Tier::Sandbox` attestation reached via `achieved_tier()`'s OR because Landlock
-    /// probed `Available` — rather than because Seatbelt or seccomp did — is really
-    /// only bwrap namespace isolation, nothing more, despite the tier claiming
-    /// `Sandbox`. See `achieved_tier()`'s doc comment for the full per-mechanism
-    /// breakdown and the tracked follow-up (a pre-exec wrapper) that would close this.
+    /// security boundary:** as of Task 27 (lane W5, ruling W5-9), bwrap, seccomp
+    /// (when the probe reported `Available`), Seatbelt, and Landlock (when the
+    /// probe reported `Available`) are all genuinely enforced on the real spawned
+    /// child. A `Tier::Sandbox` attestation reached via `achieved_tier()`'s OR
+    /// because Landlock probed `Available` — rather than because Seatbelt or
+    /// seccomp did — really is bwrap namespace isolation plus a real,
+    /// kernel-confirmed Landlock ruleset restricting the spawned child to exactly
+    /// four grants (`round_landlock_exec.rs::apply_landlock_ruleset`, out of a
+    /// handled set of `AccessFs::from_all(ABI::V1)` — every other access on every
+    /// other path is denied):
+    ///
+    /// - `ReadFile`+`Execute`+`ReadDir` on the six `SYSTEM_READ_EXEC_DIRS`
+    ///   (`/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc`) — never write;
+    /// - `ReadFile`+`WriteFile`+`ReadDir` on `/dev` — never execute, and reaching
+    ///   only bwrap's own curated `--dev` tmpfs, not host device nodes;
+    /// - `ReadFile`+`ReadDir` on `/proc` — never write or execute, and reaching
+    ///   only bwrap's own pidns-isolated `--proc` mount;
+    /// - full access on the workspace root, which
+    ///   `landlock_wrap::validate_workspace_root` has already refused if it is,
+    ///   contains, or is a bind-mount alias of `/` or of a system directory.
+    ///
+    /// (`/dev` and `/proc` are fix round 1, item 3; the three `ReadDir`s are fix
+    /// round 3, item 1 — this doc was the one the round missed, corrected in fix
+    /// round 4, item 3.) Applied via `round-landlock-exec` — `landlock_wrap`'s
+    /// module doc comment has the full mechanism and why it's a pre-exec wrapper
+    /// binary rather than `pre_exec` on bwrap itself. See `achieved_tier()`'s doc
+    /// comment for the full per-mechanism breakdown.
     fn attest(&self, h: &Handle) -> Attestation {
         // Mutable borrow (not just `get`): fix-round-2 security-review finding —
         // attestation must reflect whether the sandboxed child is *still actually
