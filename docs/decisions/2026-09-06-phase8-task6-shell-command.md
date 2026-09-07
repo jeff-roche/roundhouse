@@ -14,5 +14,7 @@ Status: accepted 2026-09-06
   execs would execute branches a shell would skip.
 - Phase 8 refuses grouping, function, coprocess, negation, and timed-command
   syntax as well. These AST forms are not flattened into independent execs.
+- Unquoted glob metacharacters are refused until bounded, workspace-rooted glob
+  expansion exists. Quoted or escaped wildcard characters remain literal argv.
 - The classifier receives an empty `SessionEnv`. The daemon environment is not
   model input and must not become an implicit expansion channel.

@@ -810,7 +810,7 @@ async fn a_model_issued_shell_command_is_classified_and_executes_each_node() {
     let provider = ScriptedToolCallProvider::new(
         "shell_command",
         serde_json::json!({
-            "command": "./command.sh '|' '&&' '*' time coproc",
+            "command": "./command.sh '|' '&&' '*' time coproc \\* # *.comment-only",
             "cwd": dir.path().to_string_lossy(),
         }),
     );
@@ -996,6 +996,51 @@ async fn shell_command_refuses_opaque_syntax_before_execution() {
         block,
         ContentBlock::ToolResult { is_error: true, content, .. }
             if content.iter().any(|part| part.text.contains("inner command"))
+    )));
+}
+
+#[tokio::test]
+async fn shell_command_refuses_unresolved_globs_but_allows_quoted_literals() {
+    let dir = tempfile::tempdir().unwrap();
+    let (actor, _writer, db_path, session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": "echo *.log",
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })));
+    let store = open(&db_path).await.unwrap();
+    let events = session_events(&store, session_id).await.unwrap();
+    assert!(events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::TaskFailed { error, .. } if error.category == "shell_command_glob"
     )));
 }
 

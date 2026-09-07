@@ -407,6 +407,18 @@ async fn dispatch_shell_command(
         }
         roundhouse_policy::shell::opaque::ShellClassification::Program(parsed) => parsed,
     };
+    if roundhouse_policy::shell::pipeline::contains_unresolved_glob(command) {
+        return refuse_shell_command(
+            writer,
+            runner,
+            actor,
+            input,
+            parent,
+            "shell_command_glob",
+            "unresolved shell globs are not supported by this tool".to_string(),
+        )
+        .await;
+    }
     if let Some(syntax) =
         roundhouse_policy::shell::pipeline::unsupported_shell_syntax(&parsed.program_ast)
     {

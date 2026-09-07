@@ -107,6 +107,59 @@ pub fn unsupported_shell_syntax(ast: &ast::Program) -> Option<UnsupportedShellSy
     None
 }
 
+/// Returns true when raw shell text contains an unquoted glob token. Quoted
+/// and escaped wildcard characters remain literal argv data; expanding
+/// unquoted globs is deferred until the bounded workspace expansion path
+/// exists.
+pub fn contains_unresolved_glob(command: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut comment = false;
+    let mut at_word_start = true;
+    for byte in command.bytes() {
+        if comment {
+            if matches!(byte, b'\n' | b'\r') {
+                comment = false;
+                at_word_start = true;
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            at_word_start = false;
+            continue;
+        }
+        match quote {
+            Some(b'\'') => {
+                if byte == b'\'' {
+                    quote = None;
+                }
+            }
+            Some(b'"') => {
+                if byte == b'"' {
+                    quote = None;
+                } else if byte == b'\\' {
+                    escaped = true;
+                }
+            }
+            None => match byte {
+                b'\\' => {
+                    escaped = true;
+                    at_word_start = false;
+                }
+                b'\'' | b'"' => quote = Some(byte),
+                b'#' if at_word_start => comment = true,
+                b'\n' | b'\r' | b' ' | b'\t' => at_word_start = true,
+                b';' | b'|' | b'&' => at_word_start = true,
+                b'*' | b'?' | b'[' | b']' => return true,
+                _ => at_word_start = false,
+            },
+            Some(_) => unreachable!("glob scanner only tracks shell quote types"),
+        }
+    }
+    false
+}
+
 fn and_or_unsupported_shell_syntax(list: &ast::AndOrList) -> Option<UnsupportedShellSyntax> {
     if !list.additional.is_empty() {
         return Some(UnsupportedShellSyntax::Compound);
@@ -468,5 +521,38 @@ pub fn decide_shell_command(
             rule: Some(RuleId(hint.rule.to_string())),
         },
         ShellClassification::Program(cmd) => decide_pipeline(policy, ctx, &cmd),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_unresolved_glob;
+
+    #[test]
+    fn detects_each_unquoted_glob_metacharacter() {
+        for command in ["echo *", "echo ?", "echo [", "echo ]"] {
+            assert!(
+                contains_unresolved_glob(command),
+                "expected unresolved glob in {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_quoted_and_escaped_glob_metacharacters() {
+        for command in ["echo '*'", "echo \"?\"", r"echo \[", "echo 'prefix*'suffix"] {
+            assert!(
+                !contains_unresolved_glob(command),
+                "unexpected unresolved glob in {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_globs_inside_comments_but_detects_mixed_command_globs() {
+        assert!(!contains_unresolved_glob("echo ok # *.log ? [ ]"));
+        assert!(contains_unresolved_glob(
+            "echo '*.log' actual?.log # ignored*"
+        ));
     }
 }
