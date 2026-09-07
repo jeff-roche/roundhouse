@@ -20,9 +20,11 @@ pub(crate) struct HandleMeta {
     /// `bwrap::spawn_under_bwrap`'s doc comment for the full rationale). `attest()`
     /// keys `net_enforced` off this, not `bwrap_pid.is_some()`.
     pub bwrap_namespace_confirmed: bool,
-    /// Kept alive here (not dropped) so tokio can still reap the process; a bare `pid:
-    /// u32` on the frozen `Child` type has nowhere else for the live handle to live.
-    pub child_handle: Option<tokio::process::Child>,
+    /// Kept alive here so session teardown can cancel and reap every process
+    /// group spawned for the session, including children whose direct bwrap
+    /// process already exited while a descendant remains alive.
+    pub child_handles: Vec<Child>,
+    pub lifecycle: std::sync::Arc<tokio::sync::Mutex<bool>>,
 }
 
 pub struct BwrapLandlockIsolate {
@@ -241,7 +243,8 @@ impl Isolate for BwrapLandlockIsolate {
                 tier,
                 bwrap_pid: None,
                 bwrap_namespace_confirmed: false,
-                child_handle: None,
+                child_handles: Vec::new(),
+                lifecycle: std::sync::Arc::new(tokio::sync::Mutex::new(false)),
             },
         );
         Ok(Handle { id })
@@ -258,9 +261,15 @@ impl Isolate for BwrapLandlockIsolate {
     /// and refuses up front if it's absent, rather than silently proceeding with
     /// something meaningless.
     async fn spawn(&self, h: &Handle, cmd: CommandSpec) -> Result<Child, IsolationError> {
-        if !self.handles.contains_key(&h.id) {
+        let lifecycle = self
+            .handles
+            .get(&h.id)
+            .map(|meta| meta.lifecycle.clone())
+            .ok_or_else(|| IsolationError::Unsupported(format!("unknown handle {}", h.id)))?;
+        let closing = lifecycle.lock().await;
+        if *closing {
             return Err(IsolationError::Unsupported(format!(
-                "unknown handle {}",
+                "isolation handle {} is being torn down",
                 h.id
             )));
         }
@@ -269,15 +278,27 @@ impl Isolate for BwrapLandlockIsolate {
                 "spawn requires a real working directory to sandbox into".into(),
             )
         })?;
+        if cmd.program.contains('/') && !std::path::Path::new(&cmd.program).is_file() {
+            return Err(IsolationError::Unsupported(format!(
+                "program does not exist: {}",
+                cmd.program
+            )));
+        }
         let seccomp_bpf = self.seccomp_bpf_for_spawn()?;
         let cmd = self.wrap_for_landlock_if_available(cmd, &workspace_root)?;
-        let (child, live_handle, namespace_confirmed) =
+        let (child, namespace_confirmed) =
             crate::bwrap::spawn_under_bwrap(&self.bwrap_path, &workspace_root, cmd, seccomp_bpf)
                 .await?;
         if let Some(mut meta) = self.handles.get_mut(&h.id) {
-            meta.bwrap_pid = Some(child.pid);
+            meta.bwrap_pid = Some(child.pid());
             meta.bwrap_namespace_confirmed = namespace_confirmed;
-            meta.child_handle = Some(live_handle); // keeps tokio able to reap the process
+            meta.child_handles.push(child.clone());
+        } else {
+            let _ = child.cancel().await;
+            return Err(IsolationError::Unsupported(format!(
+                "isolation handle {} was torn down while its child was starting",
+                h.id
+            )));
         }
         Ok(child)
     }
@@ -327,10 +348,7 @@ impl Isolate for BwrapLandlockIsolate {
         let mut meta = self.handles.get_mut(&h.id);
         let (tier, bwrap_pid, bwrap_namespace_confirmed, still_running) =
             if let Some(m) = meta.as_mut() {
-                let still_running = match m.child_handle.as_mut() {
-                    Some(child) => matches!(child.try_wait(), Ok(None)),
-                    None => false, // never spawned (prepare()-only handle) — nothing to be running
-                };
+                let still_running = m.child_handles.last().is_some_and(Child::is_running);
                 (
                     m.tier,
                     m.bwrap_pid,
@@ -398,16 +416,32 @@ impl Isolate for BwrapLandlockIsolate {
     /// 800ms later). Now actually kills the live child, if there is one, before
     /// dropping the bookkeeping.
     async fn teardown(&self, h: Handle) -> Result<(), IsolationError> {
-        if let Some((_, mut meta)) = self.handles.remove(&h.id) {
-            if let Some(mut child) = meta.child_handle.take() {
-                // Best-effort: `start_kill()` errors only if the process has already
-                // exited (nothing left to kill, not a real failure) — ignored
-                // deliberately. `wait()` afterward reaps it so tokio doesn't leave a
-                // zombie behind.
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+        let lifecycle = self.handles.get(&h.id).map(|meta| meta.lifecycle.clone());
+        let Some(lifecycle) = lifecycle else {
+            return Ok(());
+        };
+        let mut closing = lifecycle.lock().await;
+        *closing = true;
+        let children = self
+            .handles
+            .get(&h.id)
+            .map(|meta| meta.child_handles.clone())
+            .unwrap_or_default();
+        let mut first_error = None;
+        for child in children {
+            if let Err(err) = child.cancel().await {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
             }
         }
+        if let Some(err) = first_error {
+            return Err(IsolationError::Unsupported(format!(
+                "failed to confirm isolated child teardown: {err}"
+            )));
+        }
+        self.handles.remove(&h.id);
+        *closing = false;
         Ok(())
     }
 }

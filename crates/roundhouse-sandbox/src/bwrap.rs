@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child as TokioChild, Command};
+use tokio::process::Command;
 
 /// The child-side fd bwrap is told (`--info-fd <INFO_FD>`) to write its readiness
 /// JSON to, right after namespace/mount setup completes and right before it execs
@@ -24,11 +24,8 @@ const INFO_FD: i32 = 100;
 /// net against a wedged bwrap process, not the expected common-case latency.
 const INFO_FD_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Returns the frozen `Child{pid}` shape (what `Isolate::spawn`'s signature
-/// requires), the live `tokio::process::Child` (which the caller must keep alive
-/// somewhere — `BwrapLandlockIsolate` stores it in `HandleMeta` — so tokio can still
-/// reap the process; dropping it immediately would orphan/zombie the child), and a
-/// `bool` that is `true` only if bwrap itself confirmed, via `--info-fd`, that its
+/// Returns the live sandbox child and a `bool` that is `true` only if bwrap itself
+/// confirmed, via `--info-fd`, that its
 /// namespace/mount setup actually completed for this specific process (fix-round-2;
 /// see the long comment on the info-fd wiring below for why this is the field
 /// `isolate.rs::attest()` must key `net_enforced` off of, not `bwrap_pid.is_some()`).
@@ -52,7 +49,13 @@ pub async fn spawn_under_bwrap(
     workspace_root: &PathBuf,
     cmd: CommandSpec,
     seccomp_bpf: Option<Vec<u8>>,
-) -> Result<(Child, TokioChild, bool), IsolationError> {
+) -> Result<(Child, bool), IsolationError> {
+    if !workspace_root.is_dir() {
+        return Err(IsolationError::Unsupported(format!(
+            "workspace root is not an accessible directory: {}",
+            workspace_root.display()
+        )));
+    }
     let mut command = Command::new(bwrap_path);
     command
         .arg("--ro-bind")
@@ -159,7 +162,21 @@ pub async fn spawn_under_bwrap(
         let _ = std::fs::remove_file(&tmp_path);
         command.arg("--seccomp").arg("0");
         command.stdin(Stdio::from(file));
+    } else {
+        command.stdin(Stdio::null());
     }
+
+    command
+        .env_clear()
+        .envs(cmd.env.iter().cloned())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // The bwrap process is the process-group leader. Killing the returned child
+    // therefore reaches the command it launched as well, instead of leaving a
+    // backgrounded descendant behind after task cancellation.
+    #[cfg(unix)]
+    command.process_group(0);
 
     command.arg("--").arg(&cmd.program).args(&cmd.argv);
     if let Some(cwd) = &cmd.cwd {
@@ -168,9 +185,13 @@ pub async fn spawn_under_bwrap(
     let mut child = command
         .spawn()
         .map_err(|e| IsolationError::Unsupported(format!("failed to spawn under bwrap: {e}")))?;
-    let pid = child.id().ok_or_else(|| {
-        IsolationError::Unsupported("bwrap child exited before its pid was observable".into())
-    })?;
+    let Some(pid) = child.id() else {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(IsolationError::Unsupported(
+            "bwrap child exited before its pid was observable".into(),
+        ));
+    };
 
     // `command-fds`' `fd_mappings` docs: the parent (us) keeps its own copy of the
     // info-fd write end open, via the closure captured inside `command`, until
@@ -198,11 +219,16 @@ pub async fn spawn_under_bwrap(
         // No confirmation ever arrived: either bwrap died before completing its own
         // namespace/mount setup (the common case — e.g. "Creating new namespace
         // failed: Operation not permitted" when unprivileged user namespaces are
-        // disabled, or the same bad-bind-path failure the poll below also catches,
-        // just caught here deterministically instead of by racing a timing window),
+        // disabled, or a bad bind path,
+        // caught here deterministically instead of by racing a timing window),
         // or it's hung. Either way, don't let the caller believe a sandboxed process
         // is genuinely running when its namespace setup was never confirmed.
         let _ = child.start_kill(); // best-effort: nothing to clean up if it already died
+        if let Err(err) = child.wait().await {
+            return Err(IsolationError::Unsupported(format!(
+                "bwrap setup failed and could not be reaped: {err}"
+            )));
+        }
         return Err(IsolationError::Unsupported(
             "bwrap's --info-fd never confirmed namespace/mount setup completed for this \
              process — treating this as a setup failure rather than trusting an unconfirmed \
@@ -211,84 +237,15 @@ pub async fn spawn_under_bwrap(
         ));
     }
 
-    // Fix-round-1 finding 2 (second half): previously `spawn()` only checked whether
-    // the OS could fork/exec the `bwrap` binary at all — never bwrap's own exit
-    // status — so a bwrap process that died on its own setup failure (e.g. the
-    // "Can't find source path" case that motivated this whole fix) still produced
-    // `Ok(Child{pid})`, leaving the caller believing a sandboxed task was running
-    // when it never was.
+    // The info-fd check above deterministically rules out failures before
+    // namespace/mount setup completes. Once it has fired, the returned child
+    // owns the real command's exit status, including legitimate fast non-zero
+    // exits; treating every early non-zero status as a bwrap setup failure would
+    // turn a denied command such as `cat` into a spawn error. Absolute program
+    // paths are preflighted by `BwrapLandlockIsolate::spawn` before this point.
     //
-    // Fix-round-2 (Task 24) note: the info-fd check above already deterministically
-    // rules out early (pre-setup-completion) failures like a bad bind path or a
-    // namespace-creation failure — by the time execution reaches here,
-    // `info_confirmed` was `true`, so namespace/mount setup genuinely completed.
-    // This poll's remaining, still-needed job is catching LATE failures: bwrap's own
-    // exec of the real target command failing (e.g. a nonexistent program), which
-    // happens strictly after the info-fd write and so info-fd confirmation can't see
-    // it. Kept as the same timing-window poll as before for that narrower purpose.
-    //
-    // Fix-round-2 (Task 17) correction: fix-round-1 shipped a single `tokio::task::yield_now()`
-    // (one scheduler tick, ~10us) followed by one `try_wait()`, documented as
-    // "catching every near-instant setup failure" — that claim did not hold up under
-    // measurement. Instrumented timing showed bwrap actually takes ~1.5ms to die on
-    // a bad `--bind` path — two orders of magnitude longer than one `yield_now()`
-    // tick — so the guard caught the deliberately-reproduced failure in 0 of 50 runs,
-    // not "most" of them. This is now a short bounded poll instead: check
-    // immediately (free in the success case if bwrap is somehow already gone), then
-    // back off over a few short sleeps totaling ~15ms — comfortably above the
-    // measured ~1.5ms failure latency with margin, while still bounding the added
-    // latency on every successful spawn (the overwhelmingly common case) to at most
-    // ~15ms. Measured over multiple runs (fix-round-2): 10/10 for a bad bind path via
-    // `spawn_under_bwrap` directly, and 10/10 for a nonexistent exec target through
-    // the real `Isolate::spawn` API — see `tests/isolate_fix_round_2.rs`. This is
-    // still not a mathematical guarantee — a setup failure slower than ~15ms would
-    // still return `Ok` — but it is a real, measured margin over the actual observed
-    // failure latency, not merely an assertion of one.
-    //
-    // Only a *non-zero* exit within the window counts as a setup failure — bwrap's
-    // own top-level process exit code mirrors the real command's when it isn't
-    // reparented under `--as-pid-1`, so a real command that itself finishes within
-    // this same short window (a fast `echo`, a short script, `true`) exits bwrap with
-    // status 0 and must NOT be misreported as a setup failure (fix-round-2 caught this
-    // exact regression: the first version of this fix treated *any* exit within the
-    // window as failure, breaking two passing real-exec tests that happened to finish
-    // fast). Residual, accepted ambiguity: a real command that itself legitimately
-    // fails with a non-zero exit within this same short window is indistinguishable
-    // from a bwrap setup failure by exit code alone (bwrap's stderr, which would
-    // disambiguate the two, isn't captured here) — but `Isolate::spawn`'s frozen
-    // `Child{pid}` return type has no channel to report "ran and exited non-zero"
-    // separately from this error today regardless, so collapsing the two cases here
-    // is not a regression relative to what this contract can already represent.
-    const EXIT_CHECK_DELAYS_MS: &[u64] = &[0, 1, 2, 4, 8];
-    let mut setup_failure_status = None;
-    for delay_ms in EXIT_CHECK_DELAYS_MS {
-        if *delay_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
-        }
-        match child.try_wait() {
-            Ok(Some(status)) if !status.success() => {
-                setup_failure_status = Some(status);
-                break;
-            }
-            Ok(Some(_)) => break, // exited, but successfully — a fast real command, not a setup failure
-            Ok(None) => {}        // still running past its own setup — keep polling
-            Err(e) => {
-                return Err(IsolationError::Unsupported(format!(
-                    "failed to check bwrap's post-spawn status: {e}"
-                )));
-            }
-        }
-    }
-    if let Some(status) = setup_failure_status {
-        return Err(IsolationError::Unsupported(format!(
-            "bwrap exited immediately during setup with a non-zero status ({status}) instead \
-             of running the sandboxed command — this is a setup failure (e.g. an unbindable \
-             path), not a fast-exiting real workload"
-        )));
-    }
-
     // `info_confirmed` is always `true` here — the early-return above already
     // handled the `false` case — so this is a real, not aspirational, confirmation
     // that bwrap's namespace/mount setup completed for this specific process.
-    Ok((Child { pid }, child, info_confirmed))
+    Ok((Child::from_process_internal(pid, child), info_confirmed))
 }

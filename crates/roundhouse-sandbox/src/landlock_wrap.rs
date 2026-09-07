@@ -421,6 +421,7 @@ pub(crate) fn wrap_for_landlock(
         program: wrapper.display().to_string(),
         argv,
         cwd: cmd.cwd,
+        env: cmd.env,
     }
 }
 
@@ -434,6 +435,7 @@ mod tests {
             program: "echo".into(),
             argv: vec!["hello".into(), "world".into()],
             cwd: Some("/workspace".into()),
+            env: vec![],
         };
         let wrapped = wrap_for_landlock(
             cmd,

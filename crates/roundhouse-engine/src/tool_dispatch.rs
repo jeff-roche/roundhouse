@@ -47,15 +47,10 @@
 //! containment would need policy visibility into shell arguments, out of
 //! this task's scope.
 //!
-//! Real process-level sandboxing of the dispatched executor call itself
-//! (running it through the session's `Isolate::spawn` rather than
-//! in-process) remains out of this task's scope (see `agent_loop.rs`'s
-//! module doc comment) — this module wires the real admission gate in front
-//! of the real executors, which is the concrete gap Task 5 exists to close;
-//! routing execution through the sandbox tier too is further,
-//! not-yet-numbered integration work, same as `SessionActor`'s own
-//! pre-existing doc comments already flag for the "no unified
-//! task-execution entry point" gap.
+//! Model-facing shell execution runs through the session's `Isolate::spawn`
+//! after admission. Filesystem helpers remain in-process because they do not
+//! create child processes; their path canonicalization and policy checks stay
+//! in this dispatch bridge.
 //!
 //! # Unbounded results (carry-forward CF-7 item 4)
 //! None of the four `Fs` executors or `run_shell` cap how much data they
@@ -72,9 +67,11 @@
 //! does not add one — noted here so it is not silently narrowed to "only
 //! an MCP problem."
 
+use crate::session_actor::TaskIsolator;
 use roundhouse_core::{SessionState, TaskKind};
 use roundhouse_policy::{FsOp, ParsedCommand, TaskParams};
 use roundhouse_provider::ToolResultPart;
+use roundhouse_sandbox::{Child, CommandSpec, IsolationError};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -91,6 +88,7 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Grace period between SIGTERM and SIGKILL escalation when a dispatched
 /// shell call is cancelled (timeout or session cancellation) — passed
 /// straight through to `roundhouse_tools::cancel_running_shell`.
+#[cfg(test)]
 const SHELL_CANCEL_GRACE: Duration = Duration::from_secs(5);
 
 /// Errors building `TaskParams`/`TaskInput` from a model's tool-call
@@ -167,6 +165,9 @@ pub enum ToolDispatchError {
     /// ambiguous edit match, glob error, etc.).
     #[error("{0}")]
     Tool(#[from] roundhouse_tools::ToolError),
+    /// The session sandbox could not start or control the admitted child.
+    #[error("isolated tool execution failed: {0}")]
+    Isolation(String),
 }
 
 impl ToolDispatchError {
@@ -265,6 +266,10 @@ impl ToolDispatchError {
             Self::Tool(_) => (
                 "tool_error",
                 "the tool call failed".to_string(),
+            ),
+            Self::Isolation(_) => (
+                "isolation_error",
+                "the tool could not be started in its required isolation boundary".to_string(),
             ),
         }
     }
@@ -762,6 +767,8 @@ pub async fn execute_builtin(
     extras: &ResolvedExtras,
     input: &serde_json::Value,
     cancel: Option<watch::Receiver<SessionState>>,
+    pre_spawned: Option<Child>,
+    isolator: &dyn TaskIsolator,
 ) -> Result<Vec<ToolResultPart>, ToolDispatchError> {
     match params {
         TaskParams::Fs {
@@ -839,9 +846,17 @@ pub async fn execute_builtin(
                 .as_deref()
                 .ok_or(ToolDispatchError::MissingResolvedCwd)?;
             let env = shell_env_allowlist();
-            let output =
-                run_shell_dispatch(&cmd.program, &cmd.argv, cwd, &env, SHELL_TIMEOUT, cancel)
-                    .await?;
+            let output = run_isolated_shell_dispatch(
+                isolator,
+                &cmd.program,
+                &cmd.argv,
+                cwd,
+                &env,
+                SHELL_TIMEOUT,
+                cancel,
+                pre_spawned,
+            )
+            .await?;
             let text = format!(
                 "exit_code={:?}\nstdout:\n{}\nstderr:\n{}",
                 output.exit_code,
@@ -851,6 +866,75 @@ pub async fn execute_builtin(
             Ok(vec![ToolResultPart { text }])
         }
         other => Err(ToolDispatchError::UnsupportedParams(format!("{other:?}"))),
+    }
+}
+
+pub(crate) fn isolated_shell_command(cmd: &ParsedCommand, cwd: &Path) -> CommandSpec {
+    CommandSpec {
+        program: cmd.program.clone(),
+        argv: cmd.argv.clone(),
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        env: shell_env_allowlist(),
+    }
+}
+
+/// Runs an admitted shell command through the session-owned isolation handle.
+/// The command and cwd have already been canonicalized before admission; this
+/// function deliberately receives no raw model input so execution cannot drift
+/// from what policy judged.
+async fn run_isolated_shell_dispatch(
+    isolator: &dyn TaskIsolator,
+    program: &str,
+    argv: &[String],
+    cwd: &Path,
+    env: &[(String, String)],
+    timeout: Duration,
+    cancel: Option<watch::Receiver<SessionState>>,
+    pre_spawned: Option<Child>,
+) -> Result<roundhouse_tools::ShellOutput, ToolDispatchError> {
+    let child = match pre_spawned {
+        Some(child) => child,
+        None => isolator
+            .spawn_isolated(CommandSpec {
+                program: program.to_string(),
+                argv: argv.to_vec(),
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                env: env.to_vec(),
+            })
+            .await
+            .map_err(|err: IsolationError| ToolDispatchError::Isolation(err.to_string()))?,
+    };
+    let (stdout, stderr) = child.take_stdio().await;
+    let completion = async {
+        let (status, stdout, stderr) = tokio::join!(
+            child.wait(),
+            drain_to_end(stdout, MAX_SHELL_OUTPUT_BYTES),
+            drain_to_end(stderr, MAX_SHELL_OUTPUT_BYTES),
+        );
+        let status = status.map_err(|err| ToolDispatchError::Isolation(err.to_string()))?;
+        Ok::<_, ToolDispatchError>(roundhouse_tools::ShellOutput {
+            stdout,
+            stderr,
+            exit_code: status.code(),
+        })
+    };
+
+    let mut cancel = cancel;
+    let cancel_reason = tokio::select! {
+        result = completion => return result,
+        () = tokio::time::sleep(timeout) => {
+            format!("exceeded its {timeout:?} wall-clock bound")
+        }
+        () = wait_for_session_cancel(&mut cancel) => {
+            "the owning session was cancelled/suspended/closed".to_string()
+        }
+    };
+
+    match child.cancel().await {
+        Ok(_) => Err(ToolDispatchError::ShellCancelled(cancel_reason)),
+        Err(err) => Err(ToolDispatchError::Isolation(format!(
+            "cancellation could not be confirmed: {err}"
+        ))),
     }
 }
 
@@ -897,6 +981,7 @@ const MAX_SHELL_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 /// A producer that never closes its own end is therefore bounded ONLY by
 /// `timeout`/cancellation in the outer race, exactly like `wait()` always
 /// was — the cap is a memory bound, not a time bound.
+#[cfg(test)]
 async fn run_shell_dispatch(
     program: &str,
     argv: &[String],
@@ -1055,6 +1140,43 @@ async fn drain_to_end<R: tokio::io::AsyncRead + Unpin>(io: Option<R>, cap: u64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roundhouse_sandbox::{Attestation, Child, CommandSpec};
+
+    struct TestIsolator;
+
+    #[async_trait::async_trait]
+    impl TaskIsolator for TestIsolator {
+        async fn spawn_isolated(&self, command: CommandSpec) -> Result<Child, IsolationError> {
+            let mut process = tokio::process::Command::new(&command.program);
+            process
+                .args(&command.argv)
+                .current_dir(command.cwd.as_deref().unwrap_or("."))
+                .env_clear()
+                .envs(command.env)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let child = process
+                .spawn()
+                .map_err(|err| IsolationError::Unsupported(err.to_string()))?;
+            let pid = child
+                .id()
+                .ok_or_else(|| IsolationError::Unsupported("test child has no pid".into()))?;
+            Ok(Child::from_process(pid, child))
+        }
+
+        fn isolation_attestation(&self) -> Attestation {
+            Attestation {
+                tier: roundhouse_core::Tier::None,
+                digest: "test".into(),
+                net_enforced: false,
+            }
+        }
+    }
+
+    fn test_isolator() -> TestIsolator {
+        TestIsolator
+    }
 
     fn round_trip_path(dir: &Path, name: &str) -> (PathBuf, String) {
         let path = dir.join(name);
@@ -1442,7 +1564,7 @@ mod tests {
 
         let input = serde_json::json!({ "path": path_str });
         let (params, extras) = task_params_for(TaskKind::Read, &input).unwrap();
-        let parts = execute_builtin(&params, &extras, &input, None)
+        let parts = execute_builtin(&params, &extras, &input, None, None, &test_isolator())
             .await
             .unwrap();
         assert_eq!(parts.len(), 1);
@@ -1456,7 +1578,7 @@ mod tests {
 
         let input = serde_json::json!({ "path": path_str, "contents": "hi there" });
         let (params, extras) = task_params_for(TaskKind::Write, &input).unwrap();
-        execute_builtin(&params, &extras, &input, None)
+        execute_builtin(&params, &extras, &input, None, None, &test_isolator())
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi there");
@@ -1470,7 +1592,7 @@ mod tests {
 
         let input = serde_json::json!({ "path": path_str, "find": "world", "replace": "there" });
         let (params, extras) = task_params_for(TaskKind::Edit, &input).unwrap();
-        execute_builtin(&params, &extras, &input, None)
+        execute_builtin(&params, &extras, &input, None, None, &test_isolator())
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello there");
@@ -1484,7 +1606,7 @@ mod tests {
 
         let input = serde_json::json!({ "path": path_str, "find": "a", "replace": "b" });
         let (params, extras) = task_params_for(TaskKind::Edit, &input).unwrap();
-        let err = execute_builtin(&params, &extras, &input, None)
+        let err = execute_builtin(&params, &extras, &input, None, None, &test_isolator())
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1507,7 +1629,7 @@ mod tests {
 
         let input = serde_json::json!({ "root": root_str, "pattern": "*.rs" });
         let (params, extras) = task_params_for(TaskKind::Find, &input).unwrap();
-        let parts = execute_builtin(&params, &extras, &input, None)
+        let parts = execute_builtin(&params, &extras, &input, None, None, &test_isolator())
             .await
             .unwrap();
         assert_eq!(parts.len(), 1);
@@ -1525,7 +1647,7 @@ mod tests {
             "cwd": cwd_str,
         });
         let (params, extras) = task_params_for(TaskKind::Shell, &input).unwrap();
-        let parts = execute_builtin(&params, &extras, &input, None)
+        let parts = execute_builtin(&params, &extras, &input, None, None, &test_isolator())
             .await
             .unwrap();
         assert_eq!(parts.len(), 1);
@@ -1544,7 +1666,7 @@ mod tests {
             "shell_command": true,
         });
         let (params, extras) = task_params_for(TaskKind::Shell, &input).unwrap();
-        let parts = execute_builtin(&params, &extras, &input, None)
+        let parts = execute_builtin(&params, &extras, &input, None, None, &test_isolator())
             .await
             .unwrap();
         assert!(parts[0].text.contains("still-cancellable"));
@@ -1773,9 +1895,16 @@ mod tests {
         // admitted — execution must ignore it entirely for path purposes.
         let mismatched_input = serde_json::json!({ "path": decoy_path_str });
 
-        let parts = execute_builtin(&params, &extras, &mismatched_input, None)
-            .await
-            .unwrap();
+        let parts = execute_builtin(
+            &params,
+            &extras,
+            &mismatched_input,
+            None,
+            None,
+            &test_isolator(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             parts[0].text, "admitted contents",
             "execute_builtin must read the admitted canonical path, never a path re-parsed from \
@@ -1803,7 +1932,7 @@ mod tests {
             "cwd": "/definitely/does/not/exist",
         });
 
-        let parts = execute_builtin(&params, &extras, &decoy_input, None)
+        let parts = execute_builtin(&params, &extras, &decoy_input, None, None, &test_isolator())
             .await
             .unwrap();
         assert!(
@@ -1825,6 +1954,8 @@ mod tests {
             &ResolvedExtras::default(),
             &serde_json::json!({}),
             None,
+            None,
+            &test_isolator(),
         )
         .await
         .unwrap_err();

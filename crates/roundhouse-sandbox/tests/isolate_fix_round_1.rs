@@ -85,6 +85,7 @@ async fn spawn_without_a_cwd_is_refused_rather_than_using_a_meaningless_path() {
         program: "true".into(),
         argv: vec![],
         cwd: None,
+        env: vec![],
     };
     let result = isolate.spawn(&handle, cmd).await;
     assert!(
@@ -110,6 +111,7 @@ async fn spawn_uses_cmd_cwd_as_the_real_bind_path_and_actually_runs_the_command(
         program: "sh".into(),
         argv: vec!["-c".into(), "echo real-bind-worked > out.txt".into()],
         cwd: Some(workspace.to_string_lossy().into_owned()),
+        env: vec![],
     };
 
     isolate
@@ -159,6 +161,7 @@ async fn teardown_kills_the_live_spawned_process() {
         program: "sleep".into(),
         argv: vec!["30".into()],
         cwd: Some(workspace.to_string_lossy().into_owned()),
+        env: vec![],
     };
     let child = isolate
         .spawn(&handle, cmd)
@@ -262,6 +265,7 @@ async fn spawn_applies_a_real_seccomp_filter_that_denies_ptrace_when_probed_avai
         program: "python3".into(),
         argv: vec!["-c".into(), script.into()],
         cwd: Some(workspace.to_string_lossy().into_owned()),
+        env: vec![],
     };
 
     isolate

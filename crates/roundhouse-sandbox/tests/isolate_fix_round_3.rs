@@ -75,6 +75,7 @@ async fn attest_reports_net_enforced_true_for_a_genuinely_confirmed_still_runnin
         program: "sleep".into(),
         argv: vec!["5".into()],
         cwd: Some(workspace.to_string_lossy().into_owned()),
+        env: vec![],
     };
     let child = isolate
         .spawn(&handle, cmd)
@@ -122,6 +123,7 @@ async fn attest_reports_net_enforced_false_once_the_sandboxed_child_has_already_
         program: "true".into(),
         argv: vec![],
         cwd: Some(workspace.to_string_lossy().into_owned()),
+        env: vec![],
     };
     let child = isolate
         .spawn(&handle, cmd)

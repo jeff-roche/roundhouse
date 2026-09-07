@@ -88,14 +88,17 @@ fn empty_request() -> ChatRequest {
 /// hermetically, with no real bwrap/landlock syscalls made. Matches
 /// `admission_integration.rs`'s identical helper.
 fn available_isolate() -> BwrapLandlockIsolate {
-    BwrapLandlockIsolate::test_with_probe(MechanismProbeReport {
-        landlock: MechanismStatus::Available,
-        bwrap: MechanismStatus::Available,
-        seccomp: MechanismStatus::Available,
-        seatbelt: MechanismStatus::Unavailable {
-            reason: "n/a".into(),
+    BwrapLandlockIsolate::test_with_probe_and_bwrap_path(
+        MechanismProbeReport {
+            landlock: MechanismStatus::Available,
+            bwrap: MechanismStatus::Available,
+            seccomp: MechanismStatus::Available,
+            seatbelt: MechanismStatus::Unavailable {
+                reason: "n/a".into(),
+            },
         },
-    })
+        "bwrap".into(),
+    )
 }
 
 /// Builds a real `SessionActor` over a fresh on-disk store. `config_rules`
