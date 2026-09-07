@@ -234,12 +234,12 @@ async fn start_session_mcp_with_no_configured_servers_yields_the_full_builtin_ca
     // builtins came out the other end of a real (if server-less) McpHost
     // startup + Task 1 merge, not a bypass.
     let names: HashSet<&str> = tool_defs.iter().map(|d| d.name()).collect();
-    for builtin in ["read", "write", "edit", "find", "shell"] {
+    for builtin in ["read", "write", "edit", "find", "shell", "shell_command"] {
         assert!(names.contains(builtin), "missing builtin tool {builtin}");
     }
     assert_eq!(
         tool_defs.len(),
-        5,
+        6,
         "no MCP tools to merge in, so just the builtins"
     );
 }

@@ -298,6 +298,9 @@ async fn dispatch_one_tool_call(
         Some(ToolTarget::Builtin(kind)) => {
             dispatch_builtin(actor, writer, runner, kind, input, parent).await
         }
+        Some(ToolTarget::ShellCommand) => {
+            dispatch_shell_command(actor, writer, runner, input, parent).await
+        }
         Some(ToolTarget::Mcp { namespaced_name }) => match mcp {
             Some(mcp) => {
                 dispatch_mcp(actor, writer, runner, mcp, &namespaced_name, input, parent).await
@@ -345,12 +348,178 @@ async fn dispatch_one_tool_call(
     }
 }
 
+/// Classifies a model-provided shell string, rejects unsupported redirections,
+/// and dispatches each resolved node through the ordinary admission/execution
+/// path. Each node gets its own `TaskKind::Shell` task and policy decision.
+async fn dispatch_shell_command(
+    actor: &SessionActor,
+    writer: &EventWriter,
+    runner: &'static TaskRunner,
+    input: &serde_json::Value,
+    parent: TaskId,
+) -> Result<Vec<ToolResultPart>, String> {
+    let command = match input.get("command").and_then(serde_json::Value::as_str) {
+        Some(command) => command,
+        None => {
+            return refuse_shell_command(
+                writer,
+                runner,
+                actor,
+                input,
+                parent,
+                "bad_args",
+                "the `shell_command` tool call is missing or has an invalid `command` argument"
+                    .to_string(),
+            )
+            .await;
+        }
+    };
+    let cwd = match input.get("cwd").and_then(serde_json::Value::as_str) {
+        Some(cwd) => cwd,
+        None => {
+            return refuse_shell_command(
+                writer,
+                runner,
+                actor,
+                input,
+                parent,
+                "bad_args",
+                "the `shell_command` tool call is missing or has an invalid `cwd` argument"
+                    .to_string(),
+            )
+            .await;
+        }
+    };
+    let env = roundhouse_policy::shell::classify::SessionEnv::default();
+    let classification = roundhouse_policy::shell::opaque::classify_shell(command, &env);
+    let parsed = match classification {
+        roundhouse_policy::shell::opaque::ShellClassification::HardDeny(hint) => {
+            return refuse_shell_command(
+                writer,
+                runner,
+                actor,
+                input,
+                parent,
+                "shell_command_opaque",
+                hint.hint,
+            )
+            .await
+        }
+        roundhouse_policy::shell::opaque::ShellClassification::Program(parsed) => parsed,
+    };
+    if roundhouse_policy::shell::pipeline::contains_unresolved_glob(command) {
+        return refuse_shell_command(
+            writer,
+            runner,
+            actor,
+            input,
+            parent,
+            "shell_command_glob",
+            "unresolved shell globs are not supported by this tool".to_string(),
+        )
+        .await;
+    }
+    if let Some(syntax) =
+        roundhouse_policy::shell::pipeline::unsupported_shell_syntax(&parsed.program_ast)
+    {
+        let (category, message) = match syntax {
+            roundhouse_policy::shell::pipeline::UnsupportedShellSyntax::CommandList => (
+                "shell_command_command_list",
+                "shell command lists are not supported by this tool".to_string(),
+            ),
+            roundhouse_policy::shell::pipeline::UnsupportedShellSyntax::Pipeline => (
+                "shell_command_pipeline",
+                "shell pipelines are not supported by this tool".to_string(),
+            ),
+            roundhouse_policy::shell::pipeline::UnsupportedShellSyntax::Compound => (
+                "shell_command_control_flow",
+                "shell compound syntax is not supported by this tool".to_string(),
+            ),
+        };
+        return refuse_shell_command(writer, runner, actor, input, parent, category, message).await;
+    }
+    let decision = actor.shell_command_decision(command, &env);
+    if decision.outcome == roundhouse_policy::Outcome::Deny {
+        return refuse_shell_command(
+            writer,
+            runner,
+            actor,
+            input,
+            parent,
+            "policy_denied",
+            "the shell command was denied by policy".to_string(),
+        )
+        .await;
+    }
+    let nodes = roundhouse_policy::shell::pipeline::resolve_nodes(&parsed.program_ast);
+    if nodes.is_empty() {
+        return refuse_shell_command(
+            writer,
+            runner,
+            actor,
+            input,
+            parent,
+            "shell_command_empty",
+            "the shell command did not contain an executable command".to_string(),
+        )
+        .await;
+    }
+    if nodes.iter().any(|node| !node.redirections.is_empty()) {
+        return refuse_shell_command(
+            writer,
+            runner,
+            actor,
+            input,
+            parent,
+            "shell_command_redirection",
+            "shell redirections are not supported by this tool".to_string(),
+        )
+        .await;
+    }
+
+    let mut output = Vec::new();
+    for node in nodes {
+        let node_input = serde_json::json!({
+            "program": node.resolved_program,
+            "argv": node.argv,
+            "cwd": cwd,
+        });
+        output.extend(
+            dispatch_builtin(actor, writer, runner, TaskKind::Shell, &node_input, parent).await?,
+        );
+    }
+    Ok(output)
+}
+
+async fn refuse_shell_command(
+    writer: &EventWriter,
+    runner: &'static TaskRunner,
+    actor: &SessionActor,
+    input: &serde_json::Value,
+    parent: TaskId,
+    category: &'static str,
+    message: String,
+) -> Result<Vec<ToolResultPart>, String> {
+    let recorded = record_unadmitted_refusal(
+        writer,
+        runner,
+        actor.session_id(),
+        TaskKind::Shell,
+        parent,
+        input,
+        category,
+        message,
+    )
+    .await;
+    Err(recorded.unwrap_or_else(|error| error))
+}
+
 /// Records a refusal that never reached `admit_task` at all as a real
 /// `TaskCreated` followed unconditionally by `TaskFailed`, mirroring
 /// `dispatch_builtin`'s own "a refused call is still a real, queryable
 /// attempt" posture for the built-in arm.
 ///
-/// Two callers, both refusing before any policy decision exists — so
+/// Three callers, all refusing before any policy decision exists — so
 /// neither records a `TaskDecided`, unlike `record_denial`:
 ///
 /// 1. the MCP arm of [`dispatch_one_tool_call`], where the refusal is that
@@ -358,6 +527,8 @@ async fn dispatch_one_tool_call(
 /// 2. [`dispatch_builtin`]'s containment rejections (ruling W1-R131), where
 ///    `task_params_for` refused to build `TaskParams` at all — a `cwd` or
 ///    `program` outside the workspace root, or malformed arguments.
+/// 3. [`refuse_shell_command`], where parsing or the model-facing shell
+///    decision rejects the command before any node reaches admission.
 ///
 /// `message` must be the caller's already-sanitized, model-safe text — for
 /// case 2 that is `ToolDispatchError::unadmitted_refusal`'s, never the
@@ -370,9 +541,9 @@ async fn dispatch_one_tool_call(
 /// a real, queryable attempt" guarantee hold, so silently proceeding past a
 /// failure to record that attempt would defeat the fix's own point (and was
 /// inconsistent with `dispatch_builtin`'s sibling append at
-/// `dispatch_builtin`, which already propagates via `?`). The secondary
-/// `TaskFailed` append stays best-effort, matching `record_denial`'s
-/// existing pattern.
+/// `dispatch_builtin`, which already propagates via `?`). The `TaskFailed`
+/// append is also propagated, so a refusal never reports
+/// success after only its `TaskCreated` event was persisted.
 async fn record_unadmitted_refusal(
     writer: &EventWriter,
     runner: &TaskRunner,
@@ -412,9 +583,10 @@ async fn record_unadmitted_refusal(
         false,
         1,
     );
-    if let Err(e) = writer.append(failed).await {
-        tracing::warn!(error = %e, "failed to record TaskFailed for an unadmitted refusal");
-    }
+    writer
+        .append(failed)
+        .await
+        .map_err(|e| format!("failed to record TaskFailed for an unadmitted refusal: {e}"))?;
 
     Ok(message)
 }
@@ -1145,7 +1317,6 @@ async fn dispatch_builtin(
             return Err(recorded.unwrap_or_else(|e| e));
         }
     };
-
     // S-LOG-1: mint and durably record the real task this dispatch is
     // ATTEMPTING, before admission decides its fate — see this function's
     // own doc comment for why a denied call must still be queryable.

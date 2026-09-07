@@ -787,6 +787,628 @@ async fn a_model_issued_shell_tool_use_with_no_matching_policy_rule_is_denied_th
     );
 }
 
+#[tokio::test]
+async fn a_model_issued_shell_command_is_classified_and_executes_each_node() {
+    let (dir, script) =
+        workspace_contained_script("#!/bin/sh\necho shell-command-ran\n", "command.sh");
+    let canonical_script = script.canonicalize().unwrap();
+    let (actor, _writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            Outcome::Allow,
+            Predicate::Shell {
+                program: canonical_script.to_string_lossy().to_string(),
+                matcher: ArgMatcher::ArgvPrefix(vec![]),
+                allow_interpreter: false,
+            },
+        )],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": "./command.sh '|' '&&' '*' time coproc \\* # *.comment-only",
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks.iter().any(|block| matches!(
+        block,
+        ContentBlock::ToolResult { is_error: false, content, .. }
+            if content.iter().any(|part| part.text.contains("shell-command-ran"))
+    )));
+}
+
+#[tokio::test]
+async fn shell_command_cancellation_reaches_the_model_facing_dispatch() {
+    let (dir, script) = workspace_contained_script("#!/bin/sh\nsleep 900\n", "slow.sh");
+    let canonical_script = script.canonicalize().unwrap();
+    let (actor, _writer, db_path, session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            Outcome::Allow,
+            Predicate::Shell {
+                program: canonical_script.to_string_lossy().to_string(),
+                matcher: ArgMatcher::ArgvPrefix(vec![]),
+                allow_interpreter: false,
+            },
+        )],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": "./slow.sh",
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let run = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    );
+    tokio::pin!(run);
+    tokio::select! {
+        result = &mut run => panic!("shell command completed before cancellation: {result:?}"),
+        _ = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            actor
+                .cancel(&RUNNER, roundhouse_core::CancelReason::User)
+                .await
+                .unwrap();
+        } => {}
+    }
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut run)
+        .await
+        .expect("model-facing shell dispatch did not observe cancellation")
+        .unwrap();
+    assert!(result
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })));
+    let store = open(&db_path).await.unwrap();
+    let events = session_events(&store, session_id).await.unwrap();
+    assert!(events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::TaskFailed { error, .. } if error.category == "tool_error"
+    )));
+}
+
+#[tokio::test]
+async fn shell_command_output_is_bounded_through_the_model_facing_dispatch() {
+    let (dir, script) =
+        workspace_contained_script("#!/bin/sh\nhead -c 11000000 /dev/zero\n", "loud.sh");
+    let canonical_script = script.canonicalize().unwrap();
+    let (actor, _writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            Outcome::Allow,
+            Predicate::Shell {
+                program: canonical_script.to_string_lossy().to_string(),
+                matcher: ArgMatcher::ArgvPrefix(vec![]),
+                allow_interpreter: false,
+            },
+        )],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": "./loud.sh",
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks.iter().any(|block| matches!(
+        block,
+        ContentBlock::ToolResult { is_error: false, content, .. }
+            if content.iter().any(|part| part.text.contains(
+                "[output truncated at 10485760 bytes]"
+            ))
+    )));
+}
+
+#[tokio::test]
+async fn shell_command_refuses_opaque_syntax_before_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let (actor, _writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": "echo $(id)",
+            "cwd": std::env::current_dir().unwrap().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks.iter().any(|block| matches!(
+        block,
+        ContentBlock::ToolResult { is_error: true, content, .. }
+            if content.iter().any(|part| part.text.contains("inner command"))
+    )));
+}
+
+#[tokio::test]
+async fn shell_command_refuses_unresolved_globs_but_allows_quoted_literals() {
+    let dir = tempfile::tempdir().unwrap();
+    let (actor, _writer, db_path, session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": "echo *.log",
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })));
+    let store = open(&db_path).await.unwrap();
+    let events = session_events(&store, session_id).await.unwrap();
+    assert!(events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::TaskFailed { error, .. } if error.category == "shell_command_glob"
+    )));
+}
+
+#[tokio::test]
+async fn shell_command_refuses_pipelines_before_any_node_executes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (actor, _writer, db_path, session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": "printf x | wc -c",
+            "cwd": std::env::current_dir().unwrap().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })));
+    let store = open(&db_path).await.unwrap();
+    let events = session_events(&store, session_id).await.unwrap();
+    assert!(events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::TaskFailed { error, .. } if error.category == "shell_command_pipeline"
+    )));
+}
+
+#[tokio::test]
+async fn shell_command_refuses_a_conjunction_before_its_rhs_can_run() {
+    let (dir, script) =
+        workspace_contained_script("#!/bin/sh\ntouch side-effect-ran\n", "side-effect.sh");
+    let side_effect = dir.path().join("side-effect-ran");
+    let (actor, _writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": format!("false && {}", script.display()),
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })));
+    assert!(
+        !side_effect.exists(),
+        "a refused conjunction must not flatten and execute its skipped RHS"
+    );
+}
+
+#[tokio::test]
+async fn shell_command_refuses_command_lists_before_any_command_runs() {
+    let (dir, script) =
+        workspace_contained_script("#!/bin/sh\ntouch command-list-ran\n", "command-list.sh");
+    let marker = dir.path().join("command-list-ran");
+    let (actor, _writer, db_path, session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": format!("true; {}", script.display()),
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })));
+    assert!(
+        !marker.exists(),
+        "command lists must never be flattened into execs"
+    );
+    let store = open(&db_path).await.unwrap();
+    let events = session_events(&store, session_id).await.unwrap();
+    assert!(events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::TaskFailed { error, .. }
+            if error.category == "shell_command_command_list"
+    )));
+}
+
+#[tokio::test]
+async fn shell_command_refuses_multiline_commands_before_execution() {
+    let (dir, script) = workspace_contained_script(
+        "#!/bin/sh\ntouch multiline-command-ran\n",
+        "multiline-command.sh",
+    );
+    let marker = dir.path().join("multiline-command-ran");
+    let (actor, _writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": format!("true\n{}", script.display()),
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })));
+    assert!(!marker.exists(), "multiline commands must not be flattened");
+}
+
+#[tokio::test]
+async fn shell_command_refuses_function_and_subshell_syntax_before_execution() {
+    let (dir, script) =
+        workspace_contained_script("#!/bin/sh\ntouch function-body-ran\n", "function-body.sh");
+    let marker = dir.path().join("function-body-ran");
+    let (actor, _writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": format!("f() ({})", script.display()),
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks.iter().any(|block| matches!(
+        block,
+        ContentBlock::ToolResult { is_error: true, content, .. }
+            if !content.is_empty()
+    )));
+    assert!(
+        !marker.exists(),
+        "unsupported function bodies must never execute"
+    );
+}
+
+#[tokio::test]
+async fn shell_command_refuses_ast_compounds_without_running_their_body() {
+    let (dir, script) =
+        workspace_contained_script("#!/bin/sh\ntouch brace-body-ran\n", "brace-body.sh");
+    let marker = dir.path().join("brace-body-ran");
+    let (actor, _writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": format!("{{ {} }}", script.display()),
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })));
+    assert!(!marker.exists(), "AST compound bodies must never execute");
+}
+
+#[tokio::test]
+async fn shell_command_refuses_keyword_compounds_without_running_their_body() {
+    let (dir, script) =
+        workspace_contained_script("#!/bin/sh\ntouch keyword-body-ran\n", "keyword-body.sh");
+    let marker = dir.path().join("keyword-body-ran");
+    let (actor, _writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": format!("if true; then {}; fi", script.display()),
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })));
+    assert!(
+        !marker.exists(),
+        "keyword compound bodies must never execute"
+    );
+}
+
+#[tokio::test]
+async fn shell_command_refuses_the_arithmetic_for_loop_before_touching_the_victim() {
+    let (dir, _script) = workspace_contained_script("#!/bin/sh\n", "unused.sh");
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, "must survive").unwrap();
+    let (actor, _writer, _db_path, _session_id) = new_actor(
+        dir.path(),
+        dir.path().join("state"),
+        dir.path().join("daemon-binary"),
+        vec![],
+    )
+    .await;
+    let provider = ScriptedToolCallProvider::new(
+        "shell_command",
+        serde_json::json!({
+            "command": format!(
+                "for ((i=0; i<1; i++)); do rm -rf {}; done",
+                victim.display()
+            ),
+            "cwd": dir.path().to_string_lossy(),
+        }),
+    );
+    let tools = actor.tool_defs().to_vec();
+    let ctx = fake_ctx();
+    let blocks = run_agent_loop(
+        &actor,
+        &RUNNER,
+        &provider,
+        &ctx,
+        &tools,
+        None,
+        empty_request(),
+        AgentLoopConfig {
+            max_turns: 4,
+            max_tool_calls_per_turn: 10,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. })));
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "must survive");
+}
+
 /// Fix round A, ruling W1-R59 ("redact, don't ask"): a dispatched tool's
 /// result must be scanned through the session's own live redactor BEFORE
 /// it is folded into the next turn's `request.messages` — the direct path

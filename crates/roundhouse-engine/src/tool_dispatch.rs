@@ -1534,6 +1534,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_extra_model_shell_command_field_cannot_change_shell_execution() {
+        let dir = workspace_temp_dir();
+        let cwd_str = dir.path().to_string_lossy().to_string();
+        let input = serde_json::json!({
+            "program": "echo",
+            "argv": ["still-cancellable"],
+            "cwd": cwd_str,
+            "shell_command": true,
+        });
+        let (params, extras) = task_params_for(TaskKind::Shell, &input).unwrap();
+        let parts = execute_builtin(&params, &extras, &input, None)
+            .await
+            .unwrap();
+        assert!(parts[0].text.contains("still-cancellable"));
+    }
+
+    #[tokio::test]
     async fn execute_builtin_shell_times_out_a_runaway_process_and_confirms_cancellation() {
         // fix round A, finding F6: a process that never exits on its own
         // must be bounded, not left running forever. Uses a real, short

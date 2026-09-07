@@ -1,5 +1,5 @@
 //! The canonical, model-facing tool catalog: `ToolDef`s for the five
-//! built-in executors plus MCP-discovered tools, and the name-based
+//! direct built-in executors, the classified shell-string executor, plus MCP-discovered tools, and the name-based
 //! registry that maps a `ContentBlock::ToolUse { name, .. }` the model
 //! sends back to a dispatch target.
 //!
@@ -15,9 +15,8 @@
 use roundhouse_core::TaskKind;
 use roundhouse_provider::{tool_def_from_schema, ToolDef};
 
-/// Where a resolved tool name dispatches to: one of the five built-in
-/// executors (carrying the `TaskKind` that names it), or an MCP-discovered
-/// tool.
+/// Where a resolved tool name dispatches to: one of the five direct built-in
+/// executors, the classified shell-string executor, or an MCP-discovered tool.
 ///
 /// `Mcp`'s field is deliberately a single opaque `namespaced_name`, not a
 /// split `{server, tool}` pair (orchestrator ruling W1-R10). Splitting on
@@ -40,6 +39,7 @@ use roundhouse_provider::{tool_def_from_schema, ToolDef};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolTarget {
     Builtin(TaskKind),
+    ShellCommand,
     Mcp { namespaced_name: String },
 }
 
@@ -73,6 +73,7 @@ pub fn resolve_tool_target(name: &str) -> Option<ToolTarget> {
         "edit" => Some(ToolTarget::Builtin(TaskKind::Edit)),
         "find" => Some(ToolTarget::Builtin(TaskKind::Find)),
         "shell" => Some(ToolTarget::Builtin(TaskKind::Shell)),
+        "shell_command" => Some(ToolTarget::ShellCommand),
         other if other.contains("__") => Some(ToolTarget::Mcp {
             namespaced_name: other.to_string(),
         }),
@@ -145,6 +146,15 @@ struct ShellParams {
     cwd: String,
 }
 
+#[derive(schemars::JsonSchema)]
+#[allow(dead_code)]
+struct ShellCommandParams {
+    /// Shell command syntax to classify and execute node by node.
+    command: String,
+    /// Working directory for every resolved node.
+    cwd: String,
+}
+
 /// Builds one `ToolDef` per built-in executor (`read`/`write`/`edit`/`find`/
 /// `shell`), via `tool_def_from_schema` so each one's JSON Schema is
 /// `schemars`-generated from a typed params struct above — never
@@ -172,6 +182,10 @@ pub fn builtin_tool_defs() -> Vec<ToolDef> {
         tool_def_from_schema::<ShellParams>(
             "shell",
             "Run a program (via direct exec, never a shell interpreter) and capture its output.",
+        ),
+        tool_def_from_schema::<ShellCommandParams>(
+            "shell_command",
+            "Run a classified shell command; opaque constructs and redirections are refused.",
         ),
     ]
 }

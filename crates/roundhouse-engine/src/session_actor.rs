@@ -41,7 +41,7 @@ use roundhouse_core::{
 use roundhouse_mcp::config::{McpServerConfig, McpTransportKind};
 use roundhouse_net::policy::{EgressPolicy, HostPattern};
 use roundhouse_net::proxy::{LoopbackProxy, ProxyHandle, ProxyNotServingError};
-use roundhouse_policy::engine::{Outcome, PolicyEngine, RuleId};
+use roundhouse_policy::engine::{Decision, Outcome, PolicyEngine, RuleId};
 use roundhouse_policy::sealed::SealedContext;
 use roundhouse_policy::TaskParams;
 use roundhouse_provider::RequestCtx;
@@ -404,6 +404,23 @@ impl SessionActor {
             attested_tier: attestation.tier,
             home: self.home.clone(),
         }
+    }
+
+    /// Runs the composed §6.3 classifier/policy pipeline against this
+    /// session's current sealed context. The string-taking tool uses this
+    /// before its per-node admission calls; those calls remain necessary
+    /// because each node is independently canonicalized before execution.
+    pub fn shell_command_decision(
+        &self,
+        raw: &str,
+        env: &roundhouse_policy::shell::classify::SessionEnv,
+    ) -> Decision {
+        roundhouse_policy::shell::pipeline::decide_shell_command(
+            &self.policy,
+            &self.sealed_context(),
+            raw,
+            env,
+        )
     }
 
     /// Records which MCP servers this session actually resolved, so

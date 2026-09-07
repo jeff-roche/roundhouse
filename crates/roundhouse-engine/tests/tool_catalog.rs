@@ -30,7 +30,7 @@ fn mcp_tool_def(name: &str, description: &str) -> ToolDef {
 fn every_builtin_executor_has_exactly_one_tool_def_with_a_resolvable_target() {
     let defs = builtin_tool_defs();
     let names: Vec<&str> = defs.iter().map(|d| d.name()).collect();
-    for expected in ["read", "write", "edit", "find", "shell"] {
+    for expected in ["read", "write", "edit", "find", "shell", "shell_command"] {
         assert!(
             names.contains(&expected),
             "missing ToolDef for builtin `{expected}`"
@@ -39,13 +39,24 @@ fn every_builtin_executor_has_exactly_one_tool_def_with_a_resolvable_target() {
     for def in &defs {
         assert!(matches!(
             resolve_tool_target(def.name()),
-            Some(ToolTarget::Builtin(_))
+            Some(ToolTarget::Builtin(_)) | Some(ToolTarget::ShellCommand)
         ));
     }
     assert!(matches!(
         resolve_tool_target("edit"),
         Some(ToolTarget::Builtin(TaskKind::Edit))
     ));
+}
+
+#[test]
+fn shell_command_is_a_distinct_model_facing_target() {
+    assert!(matches!(
+        resolve_tool_target("shell_command"),
+        Some(ToolTarget::ShellCommand)
+    ));
+    assert!(builtin_tool_defs()
+        .iter()
+        .any(|definition| definition.name() == "shell_command"));
 }
 
 #[test]
@@ -116,6 +127,7 @@ fn merging_tool_defs_succeeds_when_names_are_disjoint() {
         "edit",
         "find",
         "shell",
+        "shell_command",
         "github__create_issue",
     ] {
         assert!(
@@ -123,5 +135,5 @@ fn merging_tool_defs_succeeds_when_names_are_disjoint() {
             "missing `{expected}` in merged catalog"
         );
     }
-    assert_eq!(merged.len(), 6);
+    assert_eq!(merged.len(), 7);
 }
