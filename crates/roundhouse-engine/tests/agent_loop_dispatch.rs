@@ -35,9 +35,9 @@ use roundhouse_provider::{
     ProviderExt, ReasoningRequest, RequestCtx, RequestPolicy, ResponseFormat, StreamEvent,
     TokenCount, ToolChoice, TransportError,
 };
-use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
-use roundhouse_sandbox::probe::{MechanismProbeReport, MechanismStatus};
-use roundhouse_sandbox::Isolate;
+use roundhouse_sandbox::{
+    Attestation, Child, CommandSpec, Handle, Isolate, IsolationError, ProbeResult,
+};
 use roundhouse_store::{open, session_events, spawn_writer};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -83,22 +83,63 @@ fn empty_request() -> ChatRequest {
     }
 }
 
-/// A `BwrapLandlockIsolate` whose probe reports every mechanism `Available`
-/// except Seatbelt (n/a off macOS) — achieves `Tier::Sandbox` deterministically,
-/// hermetically, with no real bwrap/landlock syscalls made. Matches
-/// `admission_integration.rs`'s identical helper.
-fn available_isolate() -> BwrapLandlockIsolate {
-    BwrapLandlockIsolate::test_with_probe_and_bwrap_path(
-        MechanismProbeReport {
-            landlock: MechanismStatus::Available,
-            bwrap: MechanismStatus::Available,
-            seccomp: MechanismStatus::Available,
-            seatbelt: MechanismStatus::Unavailable {
-                reason: "n/a".into(),
-            },
-        },
-        "bwrap".into(),
-    )
+/// A deterministic child-spawning isolate for dispatcher tests. The dedicated
+/// hard-prerequisite suite owns real bwrap/Landlock coverage; keeping this
+/// fixture host-independent prevents ordinary engine tests from failing on CI
+/// hosts that do not install bwrap.
+struct TestIsolate;
+
+#[async_trait::async_trait]
+impl Isolate for TestIsolate {
+    fn declared(&self) -> Tier {
+        Tier::Sandbox
+    }
+
+    async fn probe(&self) -> ProbeResult {
+        ProbeResult {
+            achieved: Tier::Sandbox,
+            degradations: vec![],
+        }
+    }
+
+    async fn prepare(&self, _spec: &SessionSpec) -> Result<Handle, IsolationError> {
+        Ok(Handle {
+            id: "test-isolate".into(),
+        })
+    }
+
+    async fn spawn(&self, _handle: &Handle, command: CommandSpec) -> Result<Child, IsolationError> {
+        let mut process = tokio::process::Command::new(&command.program);
+        process
+            .args(&command.argv)
+            .current_dir(command.cwd.as_deref().unwrap_or("."))
+            .env_clear()
+            .envs(command.env)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        process.process_group(0);
+        let child = process
+            .spawn()
+            .map_err(|err| IsolationError::Unsupported(err.to_string()))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| IsolationError::Unsupported("test child has no pid".into()))?;
+        Ok(Child::from_process(pid, child))
+    }
+
+    fn attest(&self, _handle: &Handle) -> Attestation {
+        Attestation {
+            tier: Tier::Sandbox,
+            digest: "test-isolate".into(),
+            net_enforced: false,
+        }
+    }
+
+    async fn teardown(&self, _handle: Handle) -> Result<(), IsolationError> {
+        Ok(())
+    }
 }
 
 /// Builds a real `SessionActor` over a fresh on-disk store. `config_rules`
@@ -141,7 +182,7 @@ async fn new_actor_with_engine(
     let store = open(&db_path).await.unwrap();
     let writer = spawn_writer(store).await;
 
-    let isolate: Arc<dyn Isolate> = Arc::new(available_isolate());
+    let isolate: Arc<dyn Isolate> = Arc::new(TestIsolate);
     let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
     let handle = isolate.prepare(&spec).await.unwrap();
     let session_id = SessionId::new();
