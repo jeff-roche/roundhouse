@@ -78,7 +78,7 @@ use roundhouse_provider::{
 };
 use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
 use roundhouse_sandbox::probe::{MechanismProbeReport, MechanismStatus};
-use roundhouse_sandbox::Isolate;
+use roundhouse_sandbox::{Attestation, Child, CommandSpec, Isolate, IsolationError, ProbeResult};
 use roundhouse_store::{open, session_events, spawn_writer, StoredEvent};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -147,6 +147,68 @@ fn available_isolate() -> BwrapLandlockIsolate {
     )
 }
 
+struct TestIsolate;
+
+#[async_trait::async_trait]
+impl Isolate for TestIsolate {
+    fn declared(&self) -> Tier {
+        Tier::Sandbox
+    }
+
+    async fn probe(&self) -> ProbeResult {
+        ProbeResult {
+            achieved: Tier::Sandbox,
+            degradations: vec![],
+        }
+    }
+
+    async fn prepare(
+        &self,
+        _spec: &SessionSpec,
+    ) -> Result<roundhouse_sandbox::Handle, IsolationError> {
+        Ok(roundhouse_sandbox::Handle {
+            id: "test-isolate".into(),
+        })
+    }
+
+    async fn spawn(
+        &self,
+        _handle: &roundhouse_sandbox::Handle,
+        command: CommandSpec,
+    ) -> Result<Child, IsolationError> {
+        let mut process = tokio::process::Command::new(&command.program);
+        process
+            .args(&command.argv)
+            .current_dir(command.cwd.as_deref().unwrap_or("."))
+            .env_clear()
+            .envs(command.env)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        process.process_group(0);
+        let child = process
+            .spawn()
+            .map_err(|err| IsolationError::Unsupported(err.to_string()))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| IsolationError::Unsupported("test child has no pid".into()))?;
+        Ok(Child::from_process(pid, child))
+    }
+
+    fn attest(&self, _handle: &roundhouse_sandbox::Handle) -> Attestation {
+        Attestation {
+            tier: Tier::Sandbox,
+            digest: "test-isolate".into(),
+            net_enforced: false,
+        }
+    }
+
+    async fn teardown(&self, _handle: roundhouse_sandbox::Handle) -> Result<(), IsolationError> {
+        Ok(())
+    }
+}
+
 struct Fixture {
     actor: SessionActor,
     writer: roundhouse_store::EventWriter,
@@ -159,11 +221,19 @@ async fn fixture_with_engine(
     state_dir: std::path::PathBuf,
     policy: Arc<PolicyEngine>,
 ) -> Fixture {
+    fixture_with_isolate(dir, state_dir, policy, Arc::new(TestIsolate)).await
+}
+
+async fn fixture_with_isolate(
+    dir: &std::path::Path,
+    state_dir: std::path::PathBuf,
+    policy: Arc<PolicyEngine>,
+    isolate: Arc<dyn Isolate>,
+) -> Fixture {
     let db_path = dir.join("events.db");
     let store = open(&db_path).await.unwrap();
     let writer = spawn_writer(store).await;
 
-    let isolate: Arc<dyn Isolate> = Arc::new(available_isolate());
     let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
     let handle = isolate.prepare(&spec).await.unwrap();
     let session_id = SessionId::new();
@@ -997,10 +1067,10 @@ async fn a_spawned_shell_tool_call_cannot_read_outside_its_landlock_ruleset_gh_i
     let canonical_script = script.canonicalize().unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let fx = fixture(
+    let fx = fixture_with_isolate(
         dir.path(),
         dir.path().join("state"),
-        vec![CompiledRule::test_new(
+        Arc::new(PolicyEngine::from_rules(vec![CompiledRule::test_new(
             Scope::Builtin,
             Outcome::Allow,
             Predicate::Shell {
@@ -1008,7 +1078,8 @@ async fn a_spawned_shell_tool_call_cannot_read_outside_its_landlock_ruleset_gh_i
                 matcher: ArgMatcher::ArgvPrefix(vec![]),
                 allow_interpreter: false,
             },
-        )],
+        )])),
+        Arc::new(available_isolate()),
     )
     .await;
 
