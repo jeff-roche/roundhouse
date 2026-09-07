@@ -94,7 +94,7 @@
 //! built-in arm, not introduced by this round; closing it there belongs to
 //! whichever task next touches `tool_dispatch::execute_builtin`.
 
-use crate::session_actor::{SessionActor, TaskCreateRequest};
+use crate::session_actor::{SessionActor, TaskCreateRequest, TaskIsolator};
 use crate::tool_catalog::{resolve_tool_target, ToolTarget};
 use roundhouse_core::{
     IsolationAttestation, Origin, TaskError, TaskId, TaskInput, TaskKind, TaskOutput, TaskRunner,
@@ -1356,31 +1356,128 @@ async fn dispatch_builtin(
         return Err(record_denial(writer, runner, actor.session_id(), task_id, admit_err).await);
     }
 
+    // Start shell children before TaskStarted so its attestation reflects the
+    // live process that will execute the admitted task. The child is handed to
+    // the executor below; it is not spawned a second time.
+    let pre_spawned = if let roundhouse_policy::TaskParams::Shell(cmd) = &params {
+        let cwd = match extras.shell_cwd.as_deref() {
+            Some(cwd) => cwd,
+            None => {
+                let failed = runner.record_task_failed(
+                    actor.session_id(),
+                    0,
+                    now_ts(),
+                    task_id,
+                    TaskError {
+                        message: "tool execution failed".into(),
+                        category: "isolation_error".into(),
+                    },
+                    false,
+                    1,
+                );
+                writer.append(failed).await.map_err(|append_err| {
+                    format!("failed to record the dispatched tool call failing: {append_err}")
+                })?;
+                return Err("tool execution failed".into());
+            }
+        };
+        match actor
+            .spawn_isolated(crate::tool_dispatch::isolated_shell_command(cmd, cwd))
+            .await
+        {
+            Ok(child) => Some(child),
+            Err(err) => {
+                tracing::warn!(error = %err, "admitted builtin isolation spawn failed");
+                let failed = runner.record_task_failed(
+                    actor.session_id(),
+                    0,
+                    now_ts(),
+                    task_id,
+                    TaskError {
+                        message: "tool execution failed".into(),
+                        category: "isolation_error".into(),
+                    },
+                    false,
+                    1,
+                );
+                writer.append(failed).await.map_err(|append_err| {
+                    format!("failed to record the dispatched tool call failing: {append_err}")
+                })?;
+                return Err("tool execution failed".into());
+            }
+        }
+    } else {
+        None
+    };
+
     let started = runner.record_task_started(
         actor.session_id(),
         0, // ignored — EventWriter::append assigns the real per-session seq
         now_ts(),
         task_id,
-        // This dispatch runs the real `roundhouse-tools` executor in-process,
-        // not (yet) through the session's `Isolate::spawn` — see this
-        // module's own doc comment on scope. Mirrors `chat.rs`'s identical
-        // placeholder attestation for the same reason: nothing here claims a
-        // sandbox tier this call didn't actually run under.
-        IsolationAttestation {
-            tier: Tier::None,
-            digest: String::new(),
-            net_enforced: false,
+        // Only shell tasks cross the process isolation boundary. Filesystem
+        // helpers remain in-process and must not inherit the session's shell
+        // attestation in their per-task event.
+        {
+            if pre_spawned.is_some() {
+                let attestation = actor.isolation_attestation();
+                IsolationAttestation {
+                    tier: attestation.tier,
+                    digest: attestation.digest,
+                    net_enforced: attestation.net_enforced,
+                }
+            } else {
+                IsolationAttestation {
+                    tier: Tier::None,
+                    digest: String::new(),
+                    net_enforced: false,
+                }
+            }
         },
         None,
         1,
     );
-    writer
-        .append(started)
-        .await
-        .map_err(|e| format!("failed to record the dispatched tool call starting: {e}"))?;
+    if let Err(err) = writer.append(started).await {
+        if let Some(child) = pre_spawned.as_ref() {
+            if let Err(cleanup_err) = child.cancel().await {
+                tracing::error!(
+                    error = %cleanup_err,
+                    "failed to clean up an isolated child after TaskStarted append failure"
+                );
+            }
+        }
+        let failed = runner.record_task_failed(
+            actor.session_id(),
+            0,
+            now_ts(),
+            task_id,
+            TaskError {
+                message: "tool execution failed".into(),
+                category: "event_error".into(),
+            },
+            false,
+            1,
+        );
+        return match writer.append(failed).await {
+            Ok(_) => Err(format!(
+                "failed to record the dispatched tool call starting: {err}"
+            )),
+            Err(terminal_err) => Err(format!(
+                "failed to record the dispatched tool call starting ({err}) and its terminal \
+                 failure ({terminal_err})"
+            )),
+        };
+    }
 
-    match crate::tool_dispatch::execute_builtin(&params, &extras, input, Some(actor.subscribe()))
-        .await
+    match crate::tool_dispatch::execute_builtin(
+        &params,
+        &extras,
+        input,
+        Some(actor.subscribe()),
+        pre_spawned,
+        actor,
+    )
+    .await
     {
         Ok(parts) => {
             let summary = parts
@@ -1407,6 +1504,14 @@ async fn dispatch_builtin(
             // therefore an absolute host path. This message is folded into the
             // next provider turn, so retain no executor payload on that path.
             let message = "tool execution failed".to_string();
+            let category = if matches!(
+                &tool_err,
+                crate::tool_dispatch::ToolDispatchError::Isolation(_)
+            ) {
+                "isolation_error"
+            } else {
+                "tool_error"
+            };
             tracing::warn!(error = %tool_err, "admitted builtin execution failed");
             let failed = runner.record_task_failed(
                 actor.session_id(),
@@ -1415,7 +1520,7 @@ async fn dispatch_builtin(
                 task_id,
                 TaskError {
                     message: message.clone(),
-                    category: "tool_error".into(),
+                    category: category.into(),
                 },
                 false,
                 1,

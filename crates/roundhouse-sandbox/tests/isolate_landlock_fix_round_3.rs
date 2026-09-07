@@ -104,6 +104,7 @@ async fn landlock_wrapped_spawn_allows_directory_enumeration_while_still_denying
         program: "sh".into(),
         argv: vec!["-c".into(), script],
         cwd: Some(workspace.to_string_lossy().into_owned()),
+        env: vec![],
     };
     isolate
         .spawn(&handle, cmd)

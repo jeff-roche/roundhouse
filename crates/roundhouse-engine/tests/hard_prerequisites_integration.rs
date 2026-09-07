@@ -78,7 +78,7 @@ use roundhouse_provider::{
 };
 use roundhouse_sandbox::isolate::BwrapLandlockIsolate;
 use roundhouse_sandbox::probe::{MechanismProbeReport, MechanismStatus};
-use roundhouse_sandbox::Isolate;
+use roundhouse_sandbox::{Attestation, Child, CommandSpec, Isolate, IsolationError, ProbeResult};
 use roundhouse_store::{open, session_events, spawn_writer, StoredEvent};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -130,17 +130,83 @@ fn empty_request() -> ChatRequest {
 }
 
 /// A `BwrapLandlockIsolate` whose probe reports every mechanism `Available`
-/// except Seatbelt (n/a off macOS) — achieves `Tier::Sandbox`
-/// deterministically and hermetically, with no real bwrap/landlock syscalls.
+/// except Seatbelt (n/a off macOS) — used by the fixture to exercise the
+/// production session wiring. Real-host tests skip before using it when the
+/// required bwrap/Landlock facilities are unavailable.
 fn available_isolate() -> BwrapLandlockIsolate {
-    BwrapLandlockIsolate::test_with_probe(MechanismProbeReport {
-        landlock: MechanismStatus::Available,
-        bwrap: MechanismStatus::Available,
-        seccomp: MechanismStatus::Available,
-        seatbelt: MechanismStatus::Unavailable {
-            reason: "n/a".into(),
+    BwrapLandlockIsolate::test_with_probe_and_bwrap_path(
+        MechanismProbeReport {
+            landlock: MechanismStatus::Available,
+            bwrap: MechanismStatus::Available,
+            seccomp: MechanismStatus::Available,
+            seatbelt: MechanismStatus::Unavailable {
+                reason: "n/a".into(),
+            },
         },
-    })
+        "bwrap".into(),
+    )
+}
+
+struct TestIsolate;
+
+#[async_trait::async_trait]
+impl Isolate for TestIsolate {
+    fn declared(&self) -> Tier {
+        Tier::Sandbox
+    }
+
+    async fn probe(&self) -> ProbeResult {
+        ProbeResult {
+            achieved: Tier::Sandbox,
+            degradations: vec![],
+        }
+    }
+
+    async fn prepare(
+        &self,
+        _spec: &SessionSpec,
+    ) -> Result<roundhouse_sandbox::Handle, IsolationError> {
+        Ok(roundhouse_sandbox::Handle {
+            id: "test-isolate".into(),
+        })
+    }
+
+    async fn spawn(
+        &self,
+        _handle: &roundhouse_sandbox::Handle,
+        command: CommandSpec,
+    ) -> Result<Child, IsolationError> {
+        let mut process = tokio::process::Command::new(&command.program);
+        process
+            .args(&command.argv)
+            .current_dir(command.cwd.as_deref().unwrap_or("."))
+            .env_clear()
+            .envs(command.env)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        process.process_group(0);
+        let child = process
+            .spawn()
+            .map_err(|err| IsolationError::Unsupported(err.to_string()))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| IsolationError::Unsupported("test child has no pid".into()))?;
+        Ok(Child::from_process(pid, child))
+    }
+
+    fn attest(&self, _handle: &roundhouse_sandbox::Handle) -> Attestation {
+        Attestation {
+            tier: Tier::Sandbox,
+            digest: "test-isolate".into(),
+            net_enforced: false,
+        }
+    }
+
+    async fn teardown(&self, _handle: roundhouse_sandbox::Handle) -> Result<(), IsolationError> {
+        Ok(())
+    }
 }
 
 struct Fixture {
@@ -155,11 +221,19 @@ async fn fixture_with_engine(
     state_dir: std::path::PathBuf,
     policy: Arc<PolicyEngine>,
 ) -> Fixture {
+    fixture_with_isolate(dir, state_dir, policy, Arc::new(TestIsolate)).await
+}
+
+async fn fixture_with_isolate(
+    dir: &std::path::Path,
+    state_dir: std::path::PathBuf,
+    policy: Arc<PolicyEngine>,
+    isolate: Arc<dyn Isolate>,
+) -> Fixture {
     let db_path = dir.join("events.db");
     let store = open(&db_path).await.unwrap();
     let writer = spawn_writer(store).await;
 
-    let isolate: Arc<dyn Isolate> = Arc::new(available_isolate());
     let spec = SessionSpec::test_requesting(Tier::Sandbox, OnDegrade::Refuse);
     let handle = isolate.prepare(&spec).await.unwrap();
     let session_id = SessionId::new();
@@ -954,51 +1028,29 @@ async fn a_c_style_arithmetic_for_loop_never_reaches_the_ast_walkers_through_the
 }
 
 // ---------------------------------------------------------------------------
-// Case 5 — gh_isolate_landlock (lane W5's Task 27 — LANDED; still blocked by CF-15)
+// Case 5 — gh_isolate_landlock (Phase 8 Task 7)
 // ---------------------------------------------------------------------------
 
 /// A `shell` tool call the model issued must not be able to read outside its
-/// session's Landlock ruleset.
-///
-/// # W5's Task 27 has LANDED, and this test still cannot engage — checked, not assumed
-///
-/// Lane W5's fix is merged into this branch and it **works**: Landlock is
-/// genuinely applied to children of `Isolate::spawn`, proven by that lane's
-/// own `roundhouse-sandbox/tests/isolate_landlock_enforcement.rs`, which
-/// reads a genuinely-readable outside file and asserts the read fails only
-/// when the wrapper is engaged.
-///
-/// What blocks this test is **CF-15**, unchanged by that work: built-in tool
-/// execution runs **in-process and never through `Isolate::spawn` at all**.
-/// Re-verified against this post-merge tree rather than carried forward —
-/// every `isolate.spawn(&handle, cmd)` call site in the workspace is inside
-/// `roundhouse-sandbox`'s own `tests/*.rs`, and W5's own
-/// `isolate_landlock_fix_round_1.rs` says so in its own module doc comment:
-/// its fixes
-/// are *"latent today because `Isolate::spawn` has no production caller
-/// yet."* `tool_dispatch::execute_builtin` calls `roundhouse_tools::run_shell`
-/// directly, and `dispatch_builtin` records an honest
-/// `IsolationAttestation { tier: Tier::None, .. }` for exactly that reason.
-/// So the tier this session attested to (`Tier::Sandbox`) describes a ruleset
-/// no dispatched tool call ever runs under.
-///
-/// The ignore reason therefore had to change: `"tracked: W5 Task 27"` is now
-/// **false** — that task landed. What remains is a missing production caller
-/// for `Isolate::spawn`, which belongs to whoever owns the unified
-/// task-execution entry point (`SessionActor`'s own doc comments have flagged
-/// its absence since Phase 1).
-///
-/// The Allow rule below is load-bearing: without it admission answers `Ask`,
-/// the shell call never runs, the read never happens, and the test would pass
-/// while proving nothing. With it, the call runs in-process and the
-/// out-of-ruleset read succeeds — the failure recorded against this ignore.
+/// session's Landlock ruleset. The explicit admission assertion keeps a policy
+/// refusal from making the confinement assertion vacuous.
 #[cfg(unix)]
 #[tokio::test]
-#[ignore = "blocked: CF-15 — built-in tool execution runs in-process; Isolate::spawn has no \
-            production caller anywhere, so W5 Task 27's landed Landlock enforcement (proven by \
-            roundhouse-sandbox/tests/isolate_landlock_enforcement.rs) never applies to a \
-            dispatched tool call. Needs a production Isolate::spawn caller, not a W5 fix."]
 async fn a_spawned_shell_tool_call_cannot_read_outside_its_landlock_ruleset_gh_isolate_landlock() {
+    if !std::process::Command::new("bwrap")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+    {
+        eprintln!("skipping: bwrap not available on this host");
+        return;
+    }
+    let report = roundhouse_sandbox::probe::probe_cached(&std::env::temp_dir()).await;
+    if !matches!(report.landlock, MechanismStatus::Available) {
+        eprintln!("skipping: Landlock is not available on this host");
+        return;
+    }
     let work = workspace_contained_dir();
 
     // A file outside anything a session ruleset would grant: created in a
@@ -1015,10 +1067,10 @@ async fn a_spawned_shell_tool_call_cannot_read_outside_its_landlock_ruleset_gh_i
     let canonical_script = script.canonicalize().unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let fx = fixture(
+    let fx = fixture_with_isolate(
         dir.path(),
         dir.path().join("state"),
-        vec![CompiledRule::test_new(
+        Arc::new(PolicyEngine::from_rules(vec![CompiledRule::test_new(
             Scope::Builtin,
             Outcome::Allow,
             Predicate::Shell {
@@ -1026,7 +1078,8 @@ async fn a_spawned_shell_tool_call_cannot_read_outside_its_landlock_ruleset_gh_i
                 matcher: ArgMatcher::ArgvPrefix(vec![]),
                 allow_interpreter: false,
             },
-        )],
+        )])),
+        Arc::new(available_isolate()),
     )
     .await;
 
@@ -1051,8 +1104,19 @@ async fn a_spawned_shell_tool_call_cannot_read_outside_its_landlock_ruleset_gh_i
     );
     assert!(
         !results[0].1.contains("SECRET-OUTSIDE-THE-RULESET"),
-        "a dispatched shell tool call read a file outside its session's landlock ruleset — \
-         it ran in-process rather than through Isolate::spawn (CF-15), got {:?}",
+        "a dispatched shell tool call read a file outside its session's Landlock ruleset, got {:?}",
+        results[0].1
+    );
+    assert!(
+        results[0].1.contains("exit_code=Some(1)"),
+        "the fixture command must have run and observed Landlock's denied read, got {:?}",
+        results[0].1
+    );
+    let denied_output = results[0].1.to_ascii_lowercase();
+    assert!(
+        denied_output.contains("permission denied")
+            || denied_output.contains("operation not permitted"),
+        "the failed read must report a kernel permission denial, got {:?}",
         results[0].1
     );
 }

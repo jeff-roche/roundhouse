@@ -128,6 +128,7 @@ async fn landlock_wrapped_spawn_denies_a_genuinely_readable_outside_file_but_all
             probe_script(&outside_file, &inside_file, &workspace),
         ],
         cwd: Some(workspace.to_string_lossy().into_owned()),
+        env: vec![],
     };
     isolate
         .spawn(&handle, cmd)
@@ -200,6 +201,7 @@ async fn without_landlock_probed_available_the_same_outside_read_succeeds_provin
             probe_script(&outside_file, &inside_file, &workspace),
         ],
         cwd: Some(workspace.to_string_lossy().into_owned()),
+        env: vec![],
     };
     isolate
         .spawn(&handle, cmd)

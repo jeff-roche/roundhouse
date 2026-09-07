@@ -119,6 +119,7 @@ async fn spawn_refuses_a_workspace_root_of_the_filesystem_root() {
         program: "true".into(),
         argv: vec![],
         cwd: Some("/".into()),
+        env: vec![],
     };
     let result = isolate.spawn(&handle, cmd).await;
     // Fix round 3, item 4: match on the specific text `validate_workspace_root`'s own
@@ -177,6 +178,7 @@ async fn spawn_refuses_when_the_workspace_contains_the_wrapper_binary() {
         program: "true".into(),
         argv: vec![],
         cwd: Some(workspace.to_string_lossy().into_owned()),
+        env: vec![],
     };
     let result = isolate.spawn(&handle, cmd).await;
     // Fix round 3, item 4: match on the specific text `wrapper_is_inside_workspace`'s
@@ -238,6 +240,7 @@ async fn landlock_wrapped_spawn_allows_dev_null_and_proc_reads_while_still_denyi
         program: "sh".into(),
         argv: vec!["-c".into(), script],
         cwd: Some(workspace.to_string_lossy().into_owned()),
+        env: vec![],
     };
     isolate
         .spawn(&handle, cmd)

@@ -3,19 +3,10 @@
 //! non-`finally:` tasks once that session has left `Created`/`Running`
 //! (i.e. `Suspended`, `Cancelling`, or `Closed`).
 //!
-//! **Scope note — read before wiring this in anywhere:** `admit_task` (this
-//! module) is real and fully wired to `PolicyEngine::decide_sealed` (Phase 2,
-//! Task 25), but is **still not called from any real dispatch chokepoint**
-//! as of this task. `roundhouse-engine` still has no unified task-execution
-//! entry point — the only real driver is [`crate::run_chat_turn`] in
-//! `chat.rs`, and tool executors are invoked ad hoc from
-//! `roundhouse-daemon`'s demo wiring with no admission gate in front of the
-//! real executors yet. Threading `admit_task` in front of those real call
-//! sites (chat turns, tool calls) remains open, deferred to a further,
-//! not-yet-numbered integration task. Don't assume more integration happened
-//! here than did: Task 25 wired real policy/isolation/egress mechanisms
-//! *into* `admit_task`/session creation; it did not wire `admit_task` *into*
-//! a real dispatch chokepoint.
+//! The model-facing built-in dispatch now calls `admit_task` before execution
+//! and uses this module's session-bound isolation handle for shell children.
+//! Filesystem helpers remain in-process operations; shell execution is the
+//! process-spawning boundary owned by [`TaskIsolator`].
 //!
 //! Phase 2, Task 4 adds [`SessionActor::run_finally_steps`] to this same
 //! file (not a separate `cancel.rs` — this module is `SessionActor`'s home).
@@ -45,7 +36,7 @@ use roundhouse_policy::engine::{Decision, Outcome, PolicyEngine, RuleId};
 use roundhouse_policy::sealed::SealedContext;
 use roundhouse_policy::TaskParams;
 use roundhouse_provider::RequestCtx;
-use roundhouse_sandbox::{Handle, Isolate, IsolationError};
+use roundhouse_sandbox::{Attestation, Child, CommandSpec, Handle, Isolate, IsolationError};
 use roundhouse_store::redact::Redactor;
 use roundhouse_store::{EventWriter, StoreError};
 use std::collections::HashSet;
@@ -74,6 +65,15 @@ pub fn effective_tier(spec: &SessionSpec) -> Tier {
         OnDegrade::Refuse => spec.requested_tier,
         OnDegrade::AllowDownTo(floor) => floor,
     }
+}
+
+/// The session-owned process boundary used by model-facing task executors.
+/// Keeping the isolate and prepared handle behind this trait prevents a caller
+/// from pairing a child with a handle from a different session.
+#[async_trait::async_trait]
+pub trait TaskIsolator: Send + Sync {
+    async fn spawn_isolated(&self, command: CommandSpec) -> Result<Child, IsolationError>;
+    fn isolation_attestation(&self) -> Attestation;
 }
 
 /// A request to admit a new task for execution, checked against the owning
@@ -515,6 +515,13 @@ impl SessionActor {
                 error = %err,
                 "failed to tear down this session's isolation handle"
             );
+            if let Err(retry_err) = self.isolate.teardown(self.handle.clone()).await {
+                tracing::error!(
+                    session_id = %self.session_id,
+                    error = %retry_err,
+                    "retrying session isolation teardown also failed"
+                );
+            }
         }
     }
 
@@ -777,6 +784,17 @@ impl SessionActor {
             execute(step).await.map_err(FinallyStepError::Execute)?;
         }
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskIsolator for SessionActor {
+    async fn spawn_isolated(&self, command: CommandSpec) -> Result<Child, IsolationError> {
+        self.isolate.spawn(&self.handle, command).await
+    }
+
+    fn isolation_attestation(&self) -> Attestation {
+        self.isolate.attest(&self.handle)
     }
 }
 

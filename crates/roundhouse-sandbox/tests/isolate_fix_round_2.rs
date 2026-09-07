@@ -71,6 +71,7 @@ async fn spawn_under_bwrap_catches_a_bad_bind_path_setup_failure_consistently() 
             program: "true".into(),
             argv: vec![],
             cwd: None,
+            env: vec![],
         };
         let result = roundhouse_sandbox::bwrap::spawn_under_bwrap(
             std::path::Path::new("bwrap"),
@@ -117,6 +118,7 @@ async fn isolate_spawn_catches_a_nonexistent_program_exec_failure_consistently()
             program: format!("/nonexistent-roundhouse-fixround2-program-{i}"),
             argv: vec![],
             cwd: Some(workspace.to_string_lossy().into_owned()),
+            env: vec![],
         };
         let result = isolate.spawn(&handle, cmd).await;
         match result {

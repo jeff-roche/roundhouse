@@ -39,7 +39,6 @@ test-util = []
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "=0.4.7"
 seccompiler = "=0.5.0"
-libc = "0.2"
 
 # Task 24: `isolate.rs`'s `attest()` computes `net_enforced` from
 # `roundhouse-core::{NetworkMechanism, net_enforced_for}`'s honesty table (mechanism
@@ -67,6 +66,10 @@ uuid = { version = "1", features = ["v4"] }
 # `tokio::process::Command` (what `spawn_under_bwrap` already uses) instead of
 # `std::process::Command`.
 command-fds = { version = "0.3", features = ["tokio"] }
+nix = { version = "0.31", features = ["signal"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
