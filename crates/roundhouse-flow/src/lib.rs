@@ -17,6 +17,7 @@ pub mod exec;
 pub mod expr;
 pub mod hitl;
 pub mod job;
+pub mod job_store;
 pub mod ledger;
 pub mod parking;
 pub mod parse;

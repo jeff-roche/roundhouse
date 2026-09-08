@@ -481,6 +481,54 @@ CREATE INDEX workflow_run_parked_idx
     WHERE parked_at IS NOT NULL;
 "#;
 
+/// Phase 8, Task 9: durable job registrations and immutable job versions.
+/// A job name identifies one source within a workspace; each edit appends a
+/// version instead of replacing the content a prior run pinned.
+const MIGRATION_0009_JOBS: &str = r#"
+CREATE TABLE jobs (
+    id          TEXT NOT NULL PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    source_path TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE job_versions (
+    job_id             TEXT NOT NULL,
+    version            INTEGER NOT NULL CHECK (version > 0),
+    content_hash       TEXT NOT NULL,
+    template_json      TEXT NOT NULL,
+    body_json          TEXT NOT NULL,
+    input_schema_json  TEXT NOT NULL,
+    PRIMARY KEY (job_id, version),
+    UNIQUE (job_id, content_hash)
+) STRICT;
+
+CREATE INDEX job_versions_hash_idx ON job_versions (content_hash);
+
+CREATE TRIGGER jobs_no_update
+BEFORE UPDATE ON jobs
+BEGIN
+    SELECT RAISE(ABORT, 'jobs table is immutable: UPDATE forbidden');
+END;
+
+CREATE TRIGGER jobs_no_delete
+BEFORE DELETE ON jobs
+BEGIN
+    SELECT RAISE(ABORT, 'jobs table is immutable: DELETE forbidden');
+END;
+
+CREATE TRIGGER job_versions_no_update
+BEFORE UPDATE ON job_versions
+BEGIN
+    SELECT RAISE(ABORT, 'job_versions table is append-only: UPDATE forbidden');
+END;
+
+CREATE TRIGGER job_versions_no_delete
+BEFORE DELETE ON job_versions
+BEGIN
+    SELECT RAISE(ABORT, 'job_versions table is append-only: DELETE forbidden');
+END;
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_0001_INITIAL_SCHEMA),
@@ -491,5 +539,6 @@ pub fn migrations() -> Migrations<'static> {
         M::up(MIGRATION_0006_TRIGGER_EVENT),
         M::up(MIGRATION_0007_WORKFLOW_RUN),
         M::up(MIGRATION_0008_WORKFLOW_RUN_LEDGER),
+        M::up(MIGRATION_0009_JOBS),
     ])
 }

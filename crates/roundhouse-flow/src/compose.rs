@@ -146,11 +146,10 @@
 
 use crate::caps::ResourceCaps;
 use crate::job::JobVersion;
-use crate::parse::types::{InputDef, InputType};
-use crate::parse::{parse_workflow, ParseError};
+use crate::parse::types::InputType;
+use crate::parse::{parse_workflow, ParseError, WorkflowDef};
 use roundhouse_engine::limits;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -829,7 +828,7 @@ pub fn register_as_tool(
     let def = parse_workflow(&yaml)?;
     Ok(WorkflowToolRegistration {
         name: format!("workflow:{}", def.name),
-        input_schema: inputs_to_json_schema(&def.inputs),
+        input_schema: input_schema_for_workflow(&def),
         output_schema: Some(crate::report::core_json_schema()),
     })
 }
@@ -849,7 +848,11 @@ pub fn register_as_tool(
 ///
 /// `required` is omitted entirely when no input is required, rather than
 /// emitted as an empty array.
-fn inputs_to_json_schema(inputs: &HashMap<String, InputDef>) -> Value {
+///
+/// Converts a parsed workflow's `inputs:` declarations to the deterministic
+/// JSON Schema stored with a registered job version.
+pub fn input_schema_for_workflow(def: &WorkflowDef) -> Value {
+    let inputs = &def.inputs;
     let mut names: Vec<&String> = inputs.keys().collect();
     names.sort();
 

@@ -29,6 +29,12 @@ fn migrations_create_events_tasks_and_fts_tables() {
         "trigger_event",
         "workflow_run",
         "workflow_step_run",
+        "jobs",
+        "job_versions",
+        "jobs_no_update",
+        "jobs_no_delete",
+        "job_versions_no_update",
+        "job_versions_no_delete",
     ] {
         assert!(
             table_names.iter().any(|n| n == expected),
