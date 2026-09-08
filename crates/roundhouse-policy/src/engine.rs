@@ -3,7 +3,9 @@ use roundhouse_core::{MemoryScope, PolicyDecision, SessionId, TeamId, Tier};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Scope {
     Builtin,
     UserGlobal,
@@ -12,7 +14,7 @@ pub enum Scope {
     Grant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Outcome {
     Allow,
     Ask,
@@ -48,7 +50,7 @@ impl From<Outcome> for PolicyDecision {
 /// constructs a real `EventPayload` (Tasks 1, 2, 15, 21), the `Option<RuleId>`
 /// written is the frozen `core::RuleId(u64)`; everywhere else (`Decision`,
 /// `CompiledRule`, audit/debug output) it is this string type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuleId(pub String);
 
 #[derive(Debug, Clone)]
@@ -61,7 +63,7 @@ pub struct Decision {
 /// predicates ever get defined" bug meant no rule could ever Allow a
 /// git/http/mcp/agent task regardless of config; every variant gets a
 /// matcher here.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Predicate {
     FsPrefix {
         op: FsOp,
@@ -278,7 +280,7 @@ pub enum Predicate {
 /// resolved argv. `Glob` stores raw patterns (compiled lazily at match time,
 /// not eagerly) — see the `Predicate::matches` `Shell` arm for why an
 /// invalid pattern must not panic.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ArgMatcher {
     Exact(Vec<String>),
     ArgvPrefix(Vec<String>),
@@ -301,7 +303,7 @@ pub enum ArgMatcher {
 /// not JSON-schema matching (no wildcards, no type constraints, no nested
 /// subset matching) — sufficient for "these specific keys must match"
 /// without building a schema engine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ArgsPattern {
     /// The candidate `args` must equal this value exactly.
     Exact(serde_json::Value),
