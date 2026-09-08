@@ -21,7 +21,7 @@ roundhouse-core = { path = "../roundhouse-core" }
 schemars = { workspace = true }
 tokio = { version = "1.53", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { workspace = true }
 thiserror = "2.0.20"
 ratatui = { version = "0.30.2", features = ["layout-cache"] }
 crossterm = "0.29"

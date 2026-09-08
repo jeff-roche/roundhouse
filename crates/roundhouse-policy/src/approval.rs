@@ -60,7 +60,7 @@ pub enum GrantScope {
 /// Who approved a [`Grant`], and when — carried on the synthesized
 /// [`CompiledRule`]'s `id` (as `"grant:<session>:<task>"`) and echoed back on
 /// the `Grant` itself for audit/debug purposes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GrantProvenance {
     pub session_id: SessionId,
     pub task_id: TaskId,
@@ -98,6 +98,115 @@ pub enum GrantInstallError {
          exists for this scope."
     )]
     UnenforcedLifetime(&'static str),
+}
+
+/// A standing grant that Task 23 may persist and reload. Its rule is private
+/// so callers cannot bypass the scope check by replacing it before install.
+#[derive(Debug, Clone)]
+pub struct RememberedGrant {
+    scope: RememberedGrantScope,
+    rule: CompiledRule,
+    provenance: GrantProvenance,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+enum RememberedGrantScope {
+    Directory,
+    Always,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct RememberedGrantWire {
+    scope: RememberedGrantScope,
+    rule: RememberedRule,
+    provenance: GrantProvenance,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct RememberedRule {
+    scope: Scope,
+    outcome: Outcome,
+    predicate: Predicate,
+    id: RuleId,
+}
+
+/// A grant cannot be remembered unless its scope is a real standing scope.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RememberedGrantError {
+    #[error("GrantScope::{0} has no lifetime enforcement and cannot be remembered")]
+    UnenforcedLifetime(&'static str),
+}
+
+impl RememberedGrant {
+    /// Returns the validated, policy-owned rule for engine assembly after a
+    /// persisted record has been loaded by Task 23.
+    pub fn into_rule(self) -> CompiledRule {
+        self.rule
+    }
+
+    /// Preserves the original approval metadata for audit and storage layers.
+    pub fn provenance(&self) -> &GrantProvenance {
+        &self.provenance
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RememberedGrant {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = RememberedGrantWire::deserialize(deserializer)?;
+        let scope_matches = matches!(
+            (wire.scope, wire.rule.scope),
+            (RememberedGrantScope::Directory, Scope::Grant)
+                | (RememberedGrantScope::Always, Scope::Workspace)
+        );
+        if !scope_matches || wire.rule.outcome != Outcome::Allow {
+            return Err(serde::de::Error::custom(
+                "remembered grants require an Allow rule at their durable scope",
+            ));
+        }
+        let expected_id = format!(
+            "grant:{}:{}",
+            wire.provenance.session_id.as_uuid(),
+            wire.provenance.task_id.as_uuid()
+        );
+        if wire.rule.id.0 != expected_id {
+            return Err(serde::de::Error::custom(
+                "remembered grant rule id does not match its provenance",
+            ));
+        }
+        Ok(Self {
+            scope: wire.scope,
+            rule: CompiledRule::new(
+                wire.rule.scope,
+                wire.rule.outcome,
+                wire.rule.predicate,
+                0,
+                wire.rule.id,
+            ),
+            provenance: wire.provenance,
+        })
+    }
+}
+
+impl serde::Serialize for RememberedGrant {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        RememberedGrantWire {
+            scope: self.scope,
+            rule: RememberedRule {
+                scope: self.rule.scope(),
+                outcome: self.rule.outcome(),
+                predicate: self.rule.predicate().clone(),
+                id: self.rule.id().clone(),
+            },
+            provenance: self.provenance.clone(),
+        }
+        .serialize(serializer)
+    }
 }
 
 impl Grant {
@@ -180,12 +289,33 @@ impl Grant {
     /// this method only makes the current absence of that enforcement
     /// impossible to silently misuse.
     pub fn into_rule_for_installation(&self) -> Result<CompiledRule, GrantInstallError> {
-        match &self.scope {
-            GrantScope::Once => Err(GrantInstallError::UnenforcedLifetime("Once")),
-            GrantScope::Session => Err(GrantInstallError::UnenforcedLifetime("Session")),
-            GrantScope::ExactArgv { .. } => Err(GrantInstallError::UnenforcedLifetime("ExactArgv")),
-            GrantScope::Directory { .. } | GrantScope::Always => Ok(self.rule.clone()),
+        match standing_scope(&self.scope) {
+            Ok(_) => Ok(self.rule.clone()),
+            Err(scope) => Err(GrantInstallError::UnenforcedLifetime(scope)),
         }
+    }
+
+    /// Converts a standing grant to the only serializable representation Task
+    /// 23 may persist. One-shot and session-scoped grants are rejected before
+    /// they can be mistaken for standing policy.
+    pub fn into_remembered(self) -> Result<RememberedGrant, RememberedGrantError> {
+        let scope =
+            standing_scope(&self.scope).map_err(RememberedGrantError::UnenforcedLifetime)?;
+        Ok(RememberedGrant {
+            scope,
+            rule: self.rule,
+            provenance: self.provenance,
+        })
+    }
+}
+
+fn standing_scope(scope: &GrantScope) -> Result<RememberedGrantScope, &'static str> {
+    match scope {
+        GrantScope::Once => Err("Once"),
+        GrantScope::Session => Err("Session"),
+        GrantScope::ExactArgv { .. } => Err("ExactArgv"),
+        GrantScope::Directory { .. } => Ok(RememberedGrantScope::Directory),
+        GrantScope::Always => Ok(RememberedGrantScope::Always),
     }
 }
 
