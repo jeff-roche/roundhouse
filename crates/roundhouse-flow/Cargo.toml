@@ -81,3 +81,4 @@ roundhouse-sandbox = { path = "../roundhouse-sandbox" }
 # `tests/*.rs` integration-test crates (L7) — `cfg(test)` alone does not cover
 # them, only this crate's in-lib `#[cfg(test)] mod tests`.
 roundhouse-flow = { path = ".", features = ["test-util"] }
+tempfile = "3"
