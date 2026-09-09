@@ -141,6 +141,92 @@ impl Provider for ScriptedToolCallProvider {
     }
 }
 
+struct SequencedToolCallProvider {
+    inputs: Vec<serde_json::Value>,
+    calls: AtomicU32,
+}
+
+impl SequencedToolCallProvider {
+    fn new(inputs: Vec<serde_json::Value>) -> Self {
+        Self {
+            inputs,
+            calls: AtomicU32::new(0),
+        }
+    }
+}
+
+impl Provider for SequencedToolCallProvider {
+    fn capabilities(&self, _model: &ModelId) -> Capabilities {
+        Capabilities::default()
+    }
+
+    fn resolve(&self, _req: &ChatRequest) -> Result<Plan, ProviderError> {
+        Ok(Plan {
+            endpoint: "fake".into(),
+        })
+    }
+
+    fn stream_chat<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<ChatStream, ProviderError>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let tool_input = if call.is_multiple_of(2) {
+            self.inputs.get((call / 2) as usize).cloned()
+        } else {
+            None
+        };
+        Box::pin(async move {
+            let events = match tool_input {
+                Some(input) => vec![
+                    StreamEvent::BlockStart {
+                        index: 0,
+                        kind: BlockKind::ToolUse {
+                            name: "read".into(),
+                            provider_id: Some(format!("call_{call}")),
+                        },
+                    },
+                    StreamEvent::BlockDelta {
+                        index: 0,
+                        delta: BlockDelta::ToolArgsFragment(input.to_string()),
+                    },
+                    StreamEvent::BlockStop { index: 0 },
+                    StreamEvent::MessageStop,
+                ],
+                None => vec![
+                    StreamEvent::BlockStart {
+                        index: 0,
+                        kind: BlockKind::Text,
+                    },
+                    StreamEvent::BlockDelta {
+                        index: 0,
+                        delta: BlockDelta::Text("done".into()),
+                    },
+                    StreamEvent::BlockStop { index: 0 },
+                    StreamEvent::MessageStop,
+                ],
+            };
+            Ok(ChatStream(Box::pin(stream::iter(events))))
+        })
+    }
+
+    fn count_tokens<'a>(
+        &'a self,
+        _req: &'a ChatRequest,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<TokenCount, ProviderError>> {
+        Box::pin(async { Ok(TokenCount::default()) })
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        _ctx: &'a RequestCtx,
+    ) -> BoxFut<'a, Result<Vec<ModelInfo>, ProviderError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
 /// Polls this session's real, on-disk event log until `pred` matches one of
 /// its events, or the bound elapses.
 ///
@@ -191,6 +277,15 @@ async fn start_daemon_with_rules(
     provider: Arc<dyn Provider>,
     policy_rules: PolicyRuleSource,
 ) -> Daemon {
+    start_daemon_with_rules_at_root(provider, policy_rules, None, None).await
+}
+
+async fn start_daemon_with_rules_at_root(
+    provider: Arc<dyn Provider>,
+    policy_rules: PolicyRuleSource,
+    workspace_name: Option<&str>,
+    workspace_root: Option<&std::path::Path>,
+) -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("round.sock");
     let db_path = dir.path().join("events.db");
@@ -198,6 +293,20 @@ async fn start_daemon_with_rules(
     let listener = roundhouse_daemon::socket_server::bind_socket(&socket_path).unwrap();
     let resources =
         common::resources_with_provider_and_rules(dir.path(), provider, policy_rules).await;
+    if let (Some(name), Some(root)) = (workspace_name, workspace_root) {
+        resources
+            .workspace_registry
+            .as_ref()
+            .unwrap()
+            .register(
+                roundhouse_daemon::workspace_registry::WorkspaceRegistration::new(
+                    name,
+                    root.to_path_buf(),
+                ),
+            )
+            .await
+            .unwrap();
+    }
     tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
         listener, registry, resources,
     ));
@@ -206,6 +315,95 @@ async fn start_daemon_with_rules(
         socket_path,
         db_path,
     }
+}
+
+struct TwoWorkspaceDaemon {
+    _dir: tempfile::TempDir,
+    socket_path: std::path::PathBuf,
+    db_path: std::path::PathBuf,
+    server: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+async fn start_two_workspace_daemon(
+    provider: Arc<dyn Provider>,
+    trust_state_dir: &std::path::Path,
+    alpha_root: &std::path::Path,
+    beta_root: &std::path::Path,
+) -> TwoWorkspaceDaemon {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("round.sock");
+    let db_path = dir.path().join("events.db");
+    let registry = Arc::new(roundhouse_daemon::session_registry::SessionRegistry::new());
+    let listener = roundhouse_daemon::socket_server::bind_socket(&socket_path).unwrap();
+    let mut resources =
+        common::resources_with_provider_and_rules(dir.path(), provider, no_policy_rules()).await;
+    let resources_mut = Arc::get_mut(&mut resources).unwrap();
+    resources_mut.load_workspace_config = true;
+    resources_mut.state_dir = trust_state_dir.to_path_buf();
+    let workspace_registry = resources_mut.workspace_registry.as_ref().unwrap();
+    workspace_registry
+        .register(
+            roundhouse_daemon::workspace_registry::WorkspaceRegistration::new(
+                "alpha",
+                alpha_root.to_path_buf(),
+            ),
+        )
+        .await
+        .unwrap();
+    workspace_registry
+        .register(
+            roundhouse_daemon::workspace_registry::WorkspaceRegistration::new(
+                "beta",
+                beta_root.to_path_buf(),
+            ),
+        )
+        .await
+        .unwrap();
+    let server = tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
+        listener, registry, resources,
+    ));
+    TwoWorkspaceDaemon {
+        _dir: dir,
+        socket_path,
+        db_path,
+        server,
+    }
+}
+
+fn trust_read_policy(
+    root: &std::path::Path,
+    rule_id: &str,
+    file: &std::path::Path,
+    trust_state_dir: &std::path::Path,
+) {
+    let policy_dir = root.join(".roundhouse");
+    std::fs::create_dir(&policy_dir).unwrap();
+    let policy_path = policy_dir.join("policy.toml");
+    let policy_text = format!(
+        "[[rule]]\nid = {:?}\noutcome = 'allow'\nread = {:?}\n",
+        rule_id, file
+    );
+    std::fs::write(&policy_path, &policy_text).unwrap();
+    let compiled = compile_policy_layers(vec![roundhouse_config::PolicyLayer {
+        scope: roundhouse_config::ConfigScope::Project,
+        path: policy_path,
+        contents: policy_text.clone(),
+        file: roundhouse_config::PolicyFile {
+            rule: vec![roundhouse_config::PolicyRule {
+                id: rule_id.into(),
+                outcome: roundhouse_config::PolicyRuleOutcome::Allow,
+                read: file.to_path_buf(),
+            }],
+        },
+    }])
+    .unwrap();
+    record_explicit_trust(
+        root,
+        &policy_text,
+        &compiled,
+        &TrustStore::new(trust_state_dir.to_path_buf()),
+    )
+    .unwrap();
 }
 
 /// The Part B reachability pin: a `SubmitTurn` from the **creating**
@@ -577,11 +775,17 @@ async fn the_phase_exit_criterion_a_model_issued_tool_call_actually_runs_and_its
         &TrustStore::new(trust_state.path().to_path_buf()),
     )
     .unwrap();
-    let daemon = start_daemon_with_rules(provider.clone(), rules).await;
+    let daemon = start_daemon_with_rules_at_root(
+        provider.clone(),
+        rules,
+        Some("fixture"),
+        Some(&fixture_root),
+    )
+    .await;
 
     let mut creator = tokio::time::timeout(
         Duration::from_secs(5),
-        roundhouse_tui::connect_create(&daemon.socket_path, "default"),
+        roundhouse_tui::connect_create(&daemon.socket_path, "fixture"),
     )
     .await
     .expect("connect_create must not hang")
@@ -667,6 +871,176 @@ async fn the_phase_exit_criterion_a_model_issued_tool_call_actually_runs_and_its
         text.contains(fixture_contents),
         "the tool's REAL output — the fixture file's actual contents, read off disk by the \
          real roundhouse-tools executor — must be what reaches the next provider turn, \
-         got {text:?}"
+        got {text:?}"
     );
+}
+
+#[tokio::test]
+async fn two_workspaces_keep_project_policy_and_filesystem_roots_separate_across_restart() {
+    let alpha_dir = tempfile::tempdir().unwrap();
+    let beta_dir = tempfile::tempdir().unwrap();
+    let alpha_root = alpha_dir.path().canonicalize().unwrap();
+    let beta_root = beta_dir.path().canonicalize().unwrap();
+    let alpha_file = alpha_root.join("alpha.txt");
+    let beta_file = beta_root.join("beta.txt");
+    std::fs::write(&alpha_file, "alpha-secret").unwrap();
+    std::fs::write(&beta_file, "beta-secret").unwrap();
+
+    let trust_state = tempfile::tempdir().unwrap();
+    trust_read_policy(&alpha_root, "alpha-read", &alpha_file, trust_state.path());
+    trust_read_policy(&beta_root, "beta-read", &beta_file, trust_state.path());
+
+    let provider = Arc::new(SequencedToolCallProvider::new(vec![
+        serde_json::json!({ "path": alpha_file }),
+        serde_json::json!({ "path": beta_file }),
+        serde_json::json!({ "path": beta_file }),
+        serde_json::json!({ "path": alpha_file }),
+    ]));
+    let daemon =
+        start_two_workspace_daemon(provider, trust_state.path(), &alpha_root, &beta_root).await;
+
+    assert!(!daemon.db_path.starts_with(&alpha_root));
+    assert!(!daemon.db_path.starts_with(&beta_root));
+
+    let mut alpha = tokio::time::timeout(
+        Duration::from_secs(5),
+        roundhouse_tui::connect_create(&daemon.socket_path, "alpha"),
+    )
+    .await
+    .expect("alpha handshake must not hang")
+    .unwrap();
+    let alpha_session = alpha.session_id();
+    let mut beta = tokio::time::timeout(
+        Duration::from_secs(5),
+        roundhouse_tui::connect_create(&daemon.socket_path, "beta"),
+    )
+    .await
+    .expect("beta handshake must not hang")
+    .unwrap();
+    let beta_session = beta.session_id();
+
+    alpha
+        .send(&ClientRequest::SubmitTurn {
+            session_id: alpha_session,
+            text: "read alpha's file".into(),
+        })
+        .await
+        .unwrap();
+    let alpha_own_events = wait_for_event(
+        &daemon.db_path,
+        alpha_session,
+        "alpha's successful read",
+        |payload| matches!(payload, EventPayload::TaskCompleted { .. }),
+    )
+    .await;
+    assert!(alpha_own_events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::TaskCreated {
+            kind: TaskKind::Read,
+            ..
+        }
+    )));
+    assert!(!alpha_own_events
+        .iter()
+        .any(|event| matches!(&event.payload, EventPayload::TaskFailed { .. })));
+
+    beta.send(&ClientRequest::SubmitTurn {
+        session_id: beta_session,
+        text: "read beta's file".into(),
+    })
+    .await
+    .unwrap();
+    let beta_own_events = wait_for_event(
+        &daemon.db_path,
+        beta_session,
+        "beta's successful read",
+        |payload| matches!(payload, EventPayload::TaskCompleted { .. }),
+    )
+    .await;
+    assert!(beta_own_events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::TaskCreated {
+            kind: TaskKind::Read,
+            ..
+        }
+    )));
+    assert!(!beta_own_events
+        .iter()
+        .any(|event| matches!(&event.payload, EventPayload::TaskFailed { .. })));
+
+    alpha
+        .send(&ClientRequest::SubmitTurn {
+            session_id: alpha_session,
+            text: "try to read beta's file".into(),
+        })
+        .await
+        .unwrap();
+    let alpha_cross_events = wait_for_event(
+        &daemon.db_path,
+        alpha_session,
+        "alpha's cross-workspace read refusal",
+        |payload| matches!(payload, EventPayload::TaskFailed { .. }),
+    )
+    .await;
+    let alpha_cross_task = alpha_cross_events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::TaskCreated {
+                kind: TaskKind::Read,
+                ..
+            } => event.task_id,
+            _ => None,
+        })
+        .last()
+        .expect("alpha's cross-workspace read must be recorded");
+    assert!(alpha_cross_events.iter().any(|event| {
+        event.task_id == Some(alpha_cross_task)
+            && matches!(&event.payload, EventPayload::TaskFailed { .. })
+    }));
+    assert!(!alpha_cross_events.iter().any(|event| {
+        event.task_id == Some(alpha_cross_task)
+            && matches!(&event.payload, EventPayload::TaskCompleted { .. })
+    }));
+
+    beta.send(&ClientRequest::SubmitTurn {
+        session_id: beta_session,
+        text: "try to read alpha's file".into(),
+    })
+    .await
+    .unwrap();
+    let beta_cross_events = wait_for_event(
+        &daemon.db_path,
+        beta_session,
+        "beta's cross-workspace read refusal",
+        |payload| matches!(payload, EventPayload::TaskFailed { .. }),
+    )
+    .await;
+    let beta_cross_task = beta_cross_events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::TaskCreated {
+                kind: TaskKind::Read,
+                ..
+            } => event.task_id,
+            _ => None,
+        })
+        .last()
+        .expect("beta's cross-workspace read must be recorded");
+    assert!(beta_cross_events.iter().any(|event| {
+        event.task_id == Some(beta_cross_task)
+            && matches!(&event.payload, EventPayload::TaskFailed { .. })
+    }));
+    assert!(!beta_cross_events.iter().any(|event| {
+        event.task_id == Some(beta_cross_task)
+            && matches!(&event.payload, EventPayload::TaskCompleted { .. })
+    }));
+
+    daemon.server.abort();
+    let _ = daemon.server.await;
+    let store = roundhouse_store::open(&daemon.db_path).await.unwrap();
+    let reopened = roundhouse_daemon::workspace_registry::WorkspaceRegistry::open(store)
+        .await
+        .unwrap();
+    assert_eq!(reopened.resolve("alpha").unwrap().root, alpha_root);
+    assert_eq!(reopened.resolve("beta").unwrap().root, beta_root);
 }

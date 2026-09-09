@@ -40,7 +40,7 @@ use roundhouse_sandbox::{Attestation, Child, CommandSpec, Handle, Isolate, Isola
 use roundhouse_store::redact::Redactor;
 use roundhouse_store::{EventWriter, StoreError};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 /// `Timestamp` has no `now()` — read the wall clock ourselves and convert.
@@ -111,11 +111,9 @@ pub struct TaskCreateRequest {
     /// `Ok(path)` outright) — it cannot and does not perform real
     /// canonicalization itself (this is policy-adjacent code that
     /// deliberately does no I/O). Real, symlink-resolving canonicalization
-    /// before this field is ever populated is a hard prerequisite for
-    /// whoever wires `TaskCreateRequest` construction into a real tool
-    /// executor next; that wiring does not exist anywhere in this codebase
-    /// yet (see this module's own doc comment on `admit_task` still not
-    /// being called from a real dispatch chokepoint).
+    /// before this field is populated is enforced by
+    /// `tool_dispatch::task_params_for_in_workspace`, the production
+    /// constructor for built-in tool requests.
     pub params: TaskParams,
 }
 
@@ -195,6 +193,8 @@ pub struct SessionActor {
     /// Same absolute/non-empty invariant as `state_dir`, for the same
     /// reason (`sealed_daemon_binary_write`'s empty-path guard).
     daemon_binary: PathBuf,
+    workspace_root: PathBuf,
+    workspace_identity: Option<(i64, i64)>,
     /// The process's `HOME` value, snapshotted ONCE here at construction
     /// time (not read live at task-admission time) and threaded verbatim
     /// into every `SealedContext` this session builds. `None` means `HOME`
@@ -305,6 +305,76 @@ impl SessionActor {
         session_spec: SessionSpec,
         tool_defs: Vec<roundhouse_provider::ToolDef>,
     ) -> Self {
+        let workspace_root = std::env::current_dir()
+            .expect("SessionActor::new requires a readable current directory");
+        Self::new_with_workspace_root(
+            session_id,
+            writer,
+            initial_state,
+            runner,
+            policy,
+            state_dir,
+            daemon_binary,
+            workspace_root,
+            isolate,
+            handle,
+            session_spec,
+            tool_defs,
+        )
+    }
+
+    /// Constructs a session with the canonical root resolved by the daemon's
+    /// workspace registry. This root is never inferred from a client request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_workspace_root(
+        session_id: SessionId,
+        writer: EventWriter,
+        initial_state: SessionState,
+        runner: &'static TaskRunner,
+        policy: Arc<PolicyEngine>,
+        state_dir: PathBuf,
+        daemon_binary: PathBuf,
+        workspace_root: PathBuf,
+        isolate: Arc<dyn Isolate>,
+        handle: Handle,
+        session_spec: SessionSpec,
+        tool_defs: Vec<roundhouse_provider::ToolDef>,
+    ) -> Self {
+        Self::new_with_workspace_root_and_identity(
+            session_id,
+            writer,
+            initial_state,
+            runner,
+            policy,
+            state_dir,
+            daemon_binary,
+            workspace_root,
+            None,
+            isolate,
+            handle,
+            session_spec,
+            tool_defs,
+        )
+    }
+
+    /// Constructs a session with a workspace identity that must remain stable
+    /// before each isolated process is spawned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_workspace_root_and_identity(
+        session_id: SessionId,
+        writer: EventWriter,
+        initial_state: SessionState,
+        runner: &'static TaskRunner,
+        policy: Arc<PolicyEngine>,
+        state_dir: PathBuf,
+        daemon_binary: PathBuf,
+        workspace_root: PathBuf,
+        workspace_identity: Option<(i64, i64)>,
+        isolate: Arc<dyn Isolate>,
+        handle: Handle,
+        session_spec: SessionSpec,
+        tool_defs: Vec<roundhouse_provider::ToolDef>,
+    ) -> Self {
         assert!(
             state_dir.is_absolute(),
             "SessionActor::new: state_dir must be a non-empty, absolute path (got {state_dir:?}) \
@@ -315,6 +385,10 @@ impl SessionActor {
             "SessionActor::new: daemon_binary must be a non-empty, absolute path (got \
              {daemon_binary:?}) — an empty/relative path silently disables the real \
              sealed:daemon-binary-write rule"
+        );
+        assert!(
+            workspace_root.is_absolute() && workspace_root != Path::new("/"),
+            "SessionActor::new_with_workspace_root: workspace_root must be a non-root absolute path"
         );
         let (state_tx, _rx) = tokio::sync::watch::channel(initial_state);
         let effective_tier = effective_tier(&session_spec);
@@ -330,6 +404,8 @@ impl SessionActor {
             policy,
             state_dir,
             daemon_binary,
+            workspace_root,
+            workspace_identity,
             home,
             mcp_resolved: Arc::new(RwLock::new(HashSet::new())),
             isolate,
@@ -369,6 +445,11 @@ impl SessionActor {
     /// `mpsc::Sender` + `Arc<ArcSwap<Redactor>>`).
     pub fn writer(&self) -> &EventWriter {
         &self.writer
+    }
+
+    /// The canonical filesystem root for this session's workspace.
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
     }
 
     /// Builds the live `SealedContext` this session's tasks are judged
@@ -790,11 +871,65 @@ impl SessionActor {
 #[async_trait::async_trait]
 impl TaskIsolator for SessionActor {
     async fn spawn_isolated(&self, command: CommandSpec) -> Result<Child, IsolationError> {
-        self.isolate.spawn(&self.handle, command).await
+        if let Some(expected) = self.workspace_identity {
+            if !workspace_identity_is_current(&self.workspace_root, expected) {
+                return Err(IsolationError::Unsupported(
+                    "workspace filesystem identity changed".to_string(),
+                ));
+            }
+        }
+        self.isolate
+            .spawn_in_workspace(
+                &self.handle,
+                &self.workspace_root,
+                self.workspace_identity,
+                command,
+            )
+            .await
     }
 
     fn isolation_attestation(&self) -> Attestation {
         self.isolate.attest(&self.handle)
+    }
+}
+
+fn workspace_identity_is_current(path: &Path, expected: (i64, i64)) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path)
+            .map(|metadata| (metadata.dev() as i64, metadata.ino() as i64) == expected)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, expected);
+        true
+    }
+}
+
+#[cfg(test)]
+mod workspace_identity_tests {
+    use super::workspace_identity_is_current;
+    use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_at_the_same_workspace_path_is_detected() {
+        use std::os::unix::fs::MetadataExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        let replacement = parent.path().join("replacement");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let metadata = fs::metadata(&root).unwrap();
+        let identity = (metadata.dev() as i64, metadata.ino() as i64);
+
+        fs::remove_dir(&root).unwrap();
+        fs::rename(&replacement, &root).unwrap();
+
+        assert!(!workspace_identity_is_current(&root, identity));
     }
 }
 

@@ -141,6 +141,9 @@ pub enum ToolDispatchError {
     /// round A, finding F2 / rulings W1-R56/W1-R57).
     #[error("shell program rejected: {0}")]
     ShellProgramRejected(String),
+    /// A filesystem target resolved outside the session workspace.
+    #[error("filesystem path rejected: {0}")]
+    WorkspacePathRejected(String),
     /// `execute_builtin`'s `TaskParams::Shell` arm was reached without a
     /// pre-resolved `cwd` in `ResolvedExtras` — unreachable through
     /// `task_params_for`'s real output today (it always populates
@@ -235,6 +238,10 @@ impl ToolDispatchError {
                 "shell dispatch is unavailable: this session's workspace containment boundary \
                  could not be established"
                     .to_string(),
+            ),
+            Self::WorkspacePathRejected(_) => (
+                "workspace_path_rejected",
+                "the tool call's filesystem path is outside this session's workspace".to_string(),
             ),
             // The remaining variants are not reachable from
             // `task_params_for` today (they are raised by
@@ -352,8 +359,8 @@ fn resolve_canonical(path: &Path) -> Result<PathBuf, roundhouse_policy::PathErr>
     Ok(canonical_parent.join(file_name))
 }
 
-fn fs_params(op: FsOp, raw_path: &str) -> TaskParams {
-    let path = PathBuf::from(raw_path);
+fn fs_params(op: FsOp, raw_path: &str, workspace_root: &Path) -> TaskParams {
+    let path = resolve_workspace_path(raw_path, workspace_root);
     let canonical = resolve_canonical(&path);
     TaskParams::Fs {
         op,
@@ -362,37 +369,39 @@ fn fs_params(op: FsOp, raw_path: &str) -> TaskParams {
     }
 }
 
-/// The containment boundary a dispatched `shell` call's `cwd` (and, for a
-/// relative `/`-containing `program`, its containment check — never the
-/// value actually stored, see [`resolve_shell_program`]) must stay inside
-/// (ruling W1-R58). Nothing in the workspace today defines a per-session or
-/// per-workspace filesystem root — `SessionSpec.workspace` is an opaque
-/// `WorkspaceId`, not a path — so this dispatch uses the daemon process's
-/// own current working directory as its stand-in: `round daemon` is meant
-/// to be launched from within the project/repo it's operating on (the same
-/// assumption `roundhouse-config`'s project-scope loading already makes),
-/// so this is the most direct real boundary available without inventing
-/// new session-wide state or touching `SessionActor::new`'s signature.
-/// **This is a judgment call, not something W1-R58 ruled on directly —
-/// flagged in the fix-round report for confirmation.** Read fresh on every
-/// call rather than cached: nothing in this daemon ever calls
-/// `std::env::set_current_dir`, so it is effectively invariant for the
-/// process's lifetime, but reading it fresh costs nothing and doesn't rely
-/// on that invariant silently.
-///
-/// **Fails closed at `/` (fix round B, finding I3 / ruling W1-R68).** A
-/// root of `/` makes every `starts_with` check in [`resolve_shell_cwd`]/
-/// [`resolve_shell_program`] vacuously true — measured: `root=/ cwd=/etc`
-/// and `root=/ cwd=/home` both passed containment pre-fix. This is not a
-/// contrived setup: a systemd unit with no `WorkingDirectory=` defaults to
-/// `/`. Nothing in `roundhouse-policy` inspects a working directory at all
-/// (confirmed: `grep -rn "cwd" crates/roundhouse-policy/src/` is zero
-/// hits), so `resolve_shell_cwd` is the ONLY gate `cwd` ever passes through
-/// — unlike `program`, where policy is still the real backstop even when
-/// this boundary is weak. A vacuous boundary here is therefore
-/// indistinguishable from no boundary at all, and must fail closed rather
-/// than silently degrade. **A real per-session workspace root (CF-17)
-/// remains the durable fix** — this is a floor, not a replacement for one.
+fn fs_params_for_scope(
+    op: FsOp,
+    raw_path: &str,
+    workspace_root: &Path,
+    enforce_workspace: bool,
+) -> Result<TaskParams, ToolDispatchError> {
+    let params = fs_params(op, raw_path, workspace_root);
+    if !enforce_workspace {
+        return Ok(params);
+    }
+    let inside = match &params {
+        TaskParams::Fs {
+            canonical: Ok(path),
+            ..
+        } => path.starts_with(workspace_root),
+        TaskParams::Fs {
+            canonical: Err(_), ..
+        } => false,
+        _ => false,
+    };
+    if !inside {
+        return Err(ToolDispatchError::WorkspacePathRejected(
+            "resolved filesystem path is outside the session workspace".to_string(),
+        ));
+    }
+    Ok(params)
+}
+
+/// The legacy public [`task_params_for`] API uses the process current
+/// directory as its compatibility root. Production dispatch always calls
+/// [`task_params_for_in_workspace`] with the canonical root resolved from the
+/// daemon's workspace registry; no client-provided path or daemon cwd is used
+/// for a live session.
 fn workspace_root() -> Result<PathBuf, ToolDispatchError> {
     let root = std::env::current_dir()
         .map_err(|e| ToolDispatchError::WorkspaceRootUnavailable(e.to_string()))?;
@@ -406,9 +415,9 @@ fn workspace_root() -> Result<PathBuf, ToolDispatchError> {
 fn reject_root_of_slash(root: PathBuf) -> Result<PathBuf, ToolDispatchError> {
     if root == Path::new("/") {
         return Err(ToolDispatchError::WorkspaceRootUnavailable(
-            "the daemon's current working directory is '/' — refusing to use it as the shell \
-             containment boundary, since that collapses cwd/program containment to no boundary \
-             at all (fix round B, ruling W1-R68)"
+            "the workspace root is '/' — refusing to use it as the shell containment boundary, \
+             since that collapses cwd/program containment to no boundary at all (fix round B, \
+             ruling W1-R68)"
                 .to_string(),
         ));
     }
@@ -423,14 +432,19 @@ fn reject_root_of_slash(root: PathBuf) -> Result<PathBuf, ToolDispatchError> {
 /// already uses. **Rejection, not a companion `Fs` admission** (ruling
 /// W1-R58 explicitly prefers this over the alternative of running `cwd`
 /// through its own `TaskParams::Fs` admission): a `cwd` that fails this
-/// check never reaches `admit_task` at all — `task_params_for` returns
+/// check never reaches `admit_task` at all — `task_params_for_in_workspace` returns
 /// `Err` before building any `TaskParams::Shell`.
-fn resolve_shell_cwd(raw_cwd: &str) -> Result<PathBuf, ToolDispatchError> {
-    let root = workspace_root()?;
-    let canonical = Path::new(raw_cwd).canonicalize().map_err(|e| {
+fn resolve_shell_cwd(raw_cwd: &str, root: &Path) -> Result<PathBuf, ToolDispatchError> {
+    let candidate = resolve_workspace_path(raw_cwd, root);
+    let canonical = candidate.canonicalize().map_err(|e| {
         ToolDispatchError::ShellCwdRejected(format!("cwd {raw_cwd:?} not accessible: {e}"))
     })?;
-    if !canonical.starts_with(&root) {
+    if canonical.to_str().is_none() {
+        return Err(ToolDispatchError::ShellCwdRejected(
+            "cwd resolves to a non-UTF-8 path".to_string(),
+        ));
+    }
+    if !canonical.starts_with(root) {
         return Err(ToolDispatchError::ShellCwdRejected(format!(
             "cwd {canonical:?} is outside the workspace root {root:?}"
         )));
@@ -526,6 +540,7 @@ fn resolve_shell_cwd(raw_cwd: &str) -> Result<PathBuf, ToolDispatchError> {
 fn resolve_shell_program(
     raw_program: &str,
     canonical_cwd: &Path,
+    root: &Path,
 ) -> Result<PathBuf, ToolDispatchError> {
     if raw_program.contains('/') {
         let was_absolute = Path::new(raw_program).is_absolute();
@@ -549,13 +564,10 @@ fn resolve_shell_program(
                 "program {raw_program:?} does not resolve to a regular file"
             )));
         }
-        if !was_absolute {
-            let root = workspace_root()?;
-            if !fully_resolved.starts_with(&root) {
-                return Err(ToolDispatchError::ShellProgramRejected(format!(
-                    "resolved program {fully_resolved:?} is outside the workspace root {root:?}"
-                )));
-            }
+        if !was_absolute && !fully_resolved.starts_with(root) {
+            return Err(ToolDispatchError::ShellProgramRejected(format!(
+                "resolved program {fully_resolved:?} is outside the workspace root {root:?}"
+            )));
         }
 
         // **The value actually returned is deliberately NOT `fully_resolved`
@@ -607,6 +619,15 @@ fn resolve_shell_program(
     }
 }
 
+fn resolve_workspace_path(raw_path: &str, workspace_root: &Path) -> PathBuf {
+    let path = Path::new(raw_path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    }
+}
+
 /// The bare-name half of [`resolve_shell_program`], split out so tests can
 /// inject a controlled `PATH` value directly rather than mutating the
 /// process-global `PATH` env var — `std::env::set_var` on `PATH` would race
@@ -636,7 +657,13 @@ fn resolve_bare_program_on_path(
                      {raw_program:?}: {e}"
                 ))
             })?;
-            return Ok(canonical_dir.join(raw_program));
+            let resolved = canonical_dir.join(raw_program);
+            if resolved.to_str().is_none() {
+                return Err(ToolDispatchError::ShellProgramRejected(
+                    "program resolves to a non-UTF-8 path".to_string(),
+                ));
+            }
+            return Ok(resolved);
         }
     }
     Err(ToolDispatchError::ShellProgramRejected(format!(
@@ -695,30 +722,79 @@ pub fn task_params_for(
     kind: TaskKind,
     input: &serde_json::Value,
 ) -> Result<(TaskParams, ResolvedExtras), ToolDispatchError> {
+    let root = workspace_root()?;
+    task_params_for_root(kind, input, &root, false)
+}
+
+/// Builds dispatch parameters relative to the session's resolved workspace
+/// root. Relative filesystem and shell paths never consult process cwd.
+pub fn task_params_for_in_workspace(
+    kind: TaskKind,
+    input: &serde_json::Value,
+    workspace_root: &Path,
+) -> Result<(TaskParams, ResolvedExtras), ToolDispatchError> {
+    let workspace_root = reject_root_of_slash(workspace_root.to_path_buf())?;
+    task_params_for_root(kind, input, &workspace_root, true)
+}
+
+fn task_params_for_root(
+    kind: TaskKind,
+    input: &serde_json::Value,
+    workspace_root: &Path,
+    enforce_workspace: bool,
+) -> Result<(TaskParams, ResolvedExtras), ToolDispatchError> {
     match kind {
         TaskKind::Read => Ok((
-            fs_params(FsOp::Read, &str_field(input, "read", "path")?),
+            fs_params_for_scope(
+                FsOp::Read,
+                &str_field(input, "read", "path")?,
+                workspace_root,
+                enforce_workspace,
+            )?,
             ResolvedExtras::default(),
         )),
         TaskKind::Write => Ok((
-            fs_params(FsOp::Write, &str_field(input, "write", "path")?),
+            fs_params_for_scope(
+                FsOp::Write,
+                &str_field(input, "write", "path")?,
+                workspace_root,
+                enforce_workspace,
+            )?,
             ResolvedExtras::default(),
         )),
         TaskKind::Edit => Ok((
-            fs_params(FsOp::Edit, &str_field(input, "edit", "path")?),
+            fs_params_for_scope(
+                FsOp::Edit,
+                &str_field(input, "edit", "path")?,
+                workspace_root,
+                enforce_workspace,
+            )?,
             ResolvedExtras::default(),
         )),
         TaskKind::Find => Ok((
-            fs_params(FsOp::Find, &str_field(input, "find", "root")?),
+            fs_params_for_scope(
+                FsOp::Find,
+                &str_field(input, "find", "root")?,
+                workspace_root,
+                enforce_workspace,
+            )?,
             ResolvedExtras::default(),
         )),
         TaskKind::Shell => {
             let raw_program = str_field(input, "shell", "program")?;
             let argv = argv_field(input, "shell")?;
             let raw_cwd = str_field(input, "shell", "cwd")?;
-            let canonical_cwd = resolve_shell_cwd(&raw_cwd)?;
-            let canonical_program = resolve_shell_program(&raw_program, &canonical_cwd)?;
-            let program = canonical_program.to_string_lossy().to_string();
+            let canonical_cwd = resolve_shell_cwd(&raw_cwd, workspace_root)?;
+            let canonical_program =
+                resolve_shell_program(&raw_program, &canonical_cwd, workspace_root)?;
+            let program = canonical_program
+                .to_str()
+                .ok_or_else(|| {
+                    ToolDispatchError::ShellProgramRejected(
+                        "program resolves to a non-UTF-8 path".to_string(),
+                    )
+                })?
+                .to_string();
             Ok((
                 TaskParams::Shell(ParsedCommand { program, argv }),
                 ResolvedExtras {
@@ -1211,6 +1287,43 @@ mod tests {
             } => assert_eq!(c, path.canonicalize().unwrap()),
             other => panic!("expected TaskParams::Fs{{op: Read, canonical: Ok(_)}}, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn relative_filesystem_paths_resolve_against_the_explicit_workspace_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file = workspace.path().join("README.md");
+        std::fs::write(&file, "workspace file").unwrap();
+
+        let (params, _) = task_params_for_in_workspace(
+            TaskKind::Read,
+            &serde_json::json!({ "path": "README.md" }),
+            workspace.path(),
+        )
+        .unwrap();
+
+        match params {
+            TaskParams::Fs { canonical, .. } => {
+                assert_eq!(canonical.unwrap(), file.canonicalize().unwrap())
+            }
+            other => panic!("expected filesystem params, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unresolvable_filesystem_path_is_rejected_instead_of_counting_as_inside() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("missing").join("secret.txt");
+
+        let error = task_params_for_in_workspace(
+            TaskKind::Read,
+            &serde_json::json!({ "path": path }),
+            workspace.path(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ToolDispatchError::WorkspacePathRejected(_)));
     }
 
     #[test]
@@ -2117,7 +2230,8 @@ mod tests {
         let via_bare_name = resolve_bare_program_on_path("mytool", &path_var).unwrap();
 
         let canonical_cwd = dir.path().canonicalize().unwrap();
-        let via_relative_path = resolve_shell_program("./mytool", &canonical_cwd).unwrap();
+        let via_relative_path =
+            resolve_shell_program("./mytool", &canonical_cwd, &canonical_cwd).unwrap();
 
         assert_eq!(
             via_bare_name, via_relative_path,

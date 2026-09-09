@@ -192,6 +192,20 @@ pub async fn resources_with(
     let store = roundhouse_store::open(&dir.join("events.db"))
         .await
         .unwrap();
+    let workspace_registry = Arc::new(
+        roundhouse_daemon::workspace_registry::WorkspaceRegistry::open(store.clone())
+            .await
+            .unwrap(),
+    );
+    workspace_registry
+        .register(
+            roundhouse_daemon::workspace_registry::WorkspaceRegistration::new(
+                "default",
+                dir.to_path_buf(),
+            ),
+        )
+        .await
+        .unwrap();
     let proxy = Arc::new(LoopbackProxy::new());
     let proxy_store = roundhouse_store::open(&dir.join("events.db"))
         .await
@@ -222,5 +236,7 @@ pub async fn resources_with(
             credentials: None,
         },
         proxy_writer,
+        Some(workspace_registry),
+        false,
     ))
 }

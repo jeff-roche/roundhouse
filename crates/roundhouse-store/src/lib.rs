@@ -25,6 +25,7 @@ mod session_events;
 mod suspended;
 mod tasks_view;
 mod txn;
+mod workspaces;
 mod writer;
 
 // Phase 0 exports
@@ -66,3 +67,6 @@ pub use session_events::session_events;
 // CQRS read-model exports (storage replay / fold)
 pub use replay::StoredEvent;
 pub use roundhouse_core::EventFields;
+
+// Phase 8, Task 26: daemon-owned persisted workspace identity rows.
+pub use workspaces::{insert_workspace, workspace_rows, WorkspaceRow};

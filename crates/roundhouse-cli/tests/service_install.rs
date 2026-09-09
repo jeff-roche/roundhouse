@@ -17,9 +17,17 @@ use roundhouse_cli::commands::service_install::{
 };
 use std::path::Path;
 
+fn test_workspaces() -> Vec<String> {
+    vec![format!(
+        "test={}",
+        std::env::current_dir().unwrap().display()
+    )]
+}
+
 #[test]
 fn systemd_unit_names_the_actual_installed_binary_and_restarts_always() {
-    let unit = render_systemd_unit(Path::new("/home/user/.local/bin/round"));
+    let unit =
+        render_systemd_unit(Path::new("/home/user/.local/bin/round"), &test_workspaces()).unwrap();
     // Fix round 1 (security review, H1): the exec path is now quoted so
     // systemd's `ExecStart=` word-splitting can't be fooled by a space in
     // the path — see `systemd_execstart_names_the_exact_verified_path_*`
@@ -33,10 +41,95 @@ fn systemd_unit_names_the_actual_installed_binary_and_restarts_always() {
 
 #[test]
 fn launchd_plist_names_the_actual_installed_binary_and_keeps_alive() {
-    let plist = render_launchd_plist(Path::new("/usr/local/bin/round"));
+    let plist =
+        render_launchd_plist(Path::new("/usr/local/bin/round"), &test_workspaces()).unwrap();
     assert!(plist.contains("<string>/usr/local/bin/round</string>"));
     assert!(plist.contains("<string>daemon</string>"));
     assert!(plist.contains("<key>KeepAlive</key>"));
+}
+
+#[test]
+fn service_renderers_re_register_workspaces_on_boot() {
+    let workspaces = vec![format!(
+        "alpha={}",
+        std::env::current_dir().unwrap().display()
+    )];
+    let unit = render_systemd_unit(Path::new("/home/user/.local/bin/round"), &workspaces).unwrap();
+    assert!(unit.contains(&format!(" daemon --workspace \"{}\"", workspaces[0])));
+
+    let plist = render_launchd_plist(Path::new("/usr/local/bin/round"), &workspaces).unwrap();
+    assert!(plist.contains("<string>--workspace</string>"));
+    assert!(plist.contains(&format!("<string>{}</string>", workspaces[0])));
+}
+
+#[test]
+fn install_to_requires_a_workspace_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let exec_path = Path::new("/tmp/roundhouse/round");
+    let error = install_to(dir.path(), OsFamily::Linux, exec_path, false, &[]).unwrap_err();
+    assert!(matches!(error, ServiceInstallError::MissingWorkspace));
+}
+
+#[test]
+fn install_to_rejects_control_characters_in_a_workspace_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let exec_path = Path::new("/tmp/roundhouse/round");
+    let workspaces = vec!["bad=/tmp/workspace\nEnvironment=INJECTED=1".to_string()];
+    let error = install_to(dir.path(), OsFamily::Linux, exec_path, false, &workspaces).unwrap_err();
+    assert!(matches!(
+        error,
+        ServiceInstallError::InvalidWorkspaceArgument
+    ));
+}
+
+#[test]
+fn service_renderers_reject_duplicate_workspace_registrations() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let workspaces = vec![
+        format!("alpha={}", first.path().display()),
+        format!("alpha={}", second.path().display()),
+    ];
+
+    let error =
+        render_systemd_unit(Path::new("/home/user/.local/bin/round"), &workspaces).unwrap_err();
+    assert!(matches!(
+        error,
+        ServiceInstallError::InvalidWorkspaceArgument
+    ));
+}
+
+#[test]
+fn service_renderers_reject_a_workspace_containing_a_daemon_path() {
+    let workspace = tempfile::tempdir().unwrap();
+    let exec_path = workspace.path().join("round");
+    let workspaces = vec![format!("workspace={}", workspace.path().display())];
+
+    let error = render_launchd_plist(&exec_path, &workspaces).unwrap_err();
+    assert!(matches!(
+        error,
+        ServiceInstallError::InvalidWorkspaceArgument
+    ));
+}
+
+#[test]
+fn install_to_rejects_a_workspace_containing_a_missing_daemon_path() {
+    let workspace = tempfile::tempdir().unwrap();
+    let exec_path = workspace.path().join("round");
+    let workspaces = vec![format!("workspace={}", workspace.path().display())];
+
+    let error = install_to(
+        tempfile::tempdir().unwrap().path(),
+        OsFamily::Linux,
+        &exec_path,
+        false,
+        &workspaces,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ServiceInstallError::InvalidWorkspaceArgument
+    ));
 }
 
 /// H1 (security review): the path a real systemd would actually execute —
@@ -52,14 +145,15 @@ fn launchd_plist_names_the_actual_installed_binary_and_keeps_alive() {
 #[test]
 fn systemd_execstart_names_the_exact_verified_path_even_with_a_space() {
     let exec_path = Path::new("/tmp/rh build/round");
-    let unit = render_systemd_unit(exec_path);
+    let workspaces = test_workspaces();
+    let unit = render_systemd_unit(exec_path, &workspaces).unwrap();
     let line = unit
         .lines()
         .find(|l| l.starts_with("ExecStart="))
         .expect("unit must have an ExecStart= line");
     let value = line
         .strip_prefix("ExecStart=")
-        .and_then(|v| v.strip_suffix(" daemon"))
+        .and_then(|v| v.strip_suffix(&format!(" daemon --workspace \"{}\"", workspaces[0])))
         .expect("ExecStart= must end with the daemon subcommand");
     let recovered = unescape_systemd_word(value);
     assert_eq!(recovered, exec_path.to_str().unwrap());
@@ -68,12 +162,13 @@ fn systemd_execstart_names_the_exact_verified_path_even_with_a_space() {
 #[test]
 fn systemd_execstart_doubles_percent_signs_so_systemd_does_not_expand_a_specifier() {
     let exec_path = Path::new("/opt/100%cpu/round");
-    let unit = render_systemd_unit(exec_path);
+    let workspaces = test_workspaces();
+    let unit = render_systemd_unit(exec_path, &workspaces).unwrap();
     assert!(unit.contains("ExecStart=\"/opt/100%%cpu/round\" daemon"));
     let line = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
     let value = line
         .strip_prefix("ExecStart=")
-        .and_then(|v| v.strip_suffix(" daemon"))
+        .and_then(|v| v.strip_suffix(&format!(" daemon --workspace \"{}\"", workspaces[0])))
         .unwrap();
     assert_eq!(unescape_systemd_word(value), exec_path.to_str().unwrap());
 }
@@ -105,7 +200,7 @@ fn unescape_systemd_word(quoted: &str) -> String {
 
 #[test]
 fn launchd_plist_escapes_xml_special_characters_in_the_exec_path() {
-    let plist = render_launchd_plist(Path::new("/tmp/a&b<c>/round"));
+    let plist = render_launchd_plist(Path::new("/tmp/a&b<c>/round"), &test_workspaces()).unwrap();
     assert!(plist.contains("<string>/tmp/a&amp;b&lt;c&gt;/round</string>"));
     assert!(!plist.contains("<string>/tmp/a&b<c>/round</string>"));
 }
@@ -120,7 +215,7 @@ fn launchd_plist_escapes_xml_special_characters_in_the_exec_path() {
 #[test]
 fn launchd_plist_program_argument_round_trips_xml_special_characters() {
     let exec_path = Path::new("/tmp/a&b<c>/round");
-    let plist = render_launchd_plist(exec_path);
+    let plist = render_launchd_plist(exec_path, &test_workspaces()).unwrap();
     let recovered = unescape_xml_text(&first_program_argument(&plist));
     assert_eq!(recovered, exec_path.to_str().unwrap());
 }
@@ -128,7 +223,7 @@ fn launchd_plist_program_argument_round_trips_xml_special_characters() {
 #[test]
 fn launchd_plist_program_argument_round_trips_a_path_with_a_space() {
     let exec_path = Path::new("/tmp/rh build/round");
-    let plist = render_launchd_plist(exec_path);
+    let plist = render_launchd_plist(exec_path, &test_workspaces()).unwrap();
     let recovered = unescape_xml_text(&first_program_argument(&plist));
     assert_eq!(recovered, exec_path.to_str().unwrap());
 }
@@ -164,7 +259,8 @@ fn unescape_xml_text(s: &str) -> String {
 /// absolute path there too, not just for the binary.
 #[test]
 fn launchd_plist_substitutes_absolute_log_paths_not_a_literal_tilde() {
-    let plist = render_launchd_plist(Path::new("/usr/local/bin/round"));
+    let plist =
+        render_launchd_plist(Path::new("/usr/local/bin/round"), &test_workspaces()).unwrap();
     assert!(!plist.contains("~/Library/Logs"));
     assert!(plist.contains("Library/Logs/roundhouse/daemon.log"));
     assert!(plist.contains("Library/Logs/roundhouse/daemon.err"));
@@ -186,7 +282,14 @@ fn install_to_writes_the_unit_under_a_tempdir() {
     let dir = tempfile::tempdir().unwrap();
     let exec_path = Path::new("/home/user/.local/bin/round");
 
-    let unit_path = install_to(dir.path(), OsFamily::Linux, exec_path, false).unwrap();
+    let unit_path = install_to(
+        dir.path(),
+        OsFamily::Linux,
+        exec_path,
+        false,
+        &test_workspaces(),
+    )
+    .unwrap();
 
     assert_eq!(unit_path, dir.path().join("roundhouse.service"));
     assert!(dir.path().join("roundhouse.service").is_file());
@@ -204,7 +307,14 @@ fn install_to_writes_the_plist_under_a_tempdir_on_macos() {
     let dir = tempfile::tempdir().unwrap();
     let exec_path = Path::new("/usr/local/bin/round");
 
-    let plist_path = install_to(dir.path(), OsFamily::MacOs, exec_path, false).unwrap();
+    let plist_path = install_to(
+        dir.path(),
+        OsFamily::MacOs,
+        exec_path,
+        false,
+        &test_workspaces(),
+    )
+    .unwrap();
 
     assert_eq!(plist_path, dir.path().join("com.roundhouse.daemon.plist"));
     assert!(plist_path.is_file());
@@ -215,13 +325,27 @@ fn install_to_refuses_to_clobber_an_existing_unit_without_force() {
     let dir = tempfile::tempdir().unwrap();
     let exec_path = Path::new("/home/user/.local/bin/round");
 
-    install_to(dir.path(), OsFamily::Linux, exec_path, false).unwrap();
+    install_to(
+        dir.path(),
+        OsFamily::Linux,
+        exec_path,
+        false,
+        &test_workspaces(),
+    )
+    .unwrap();
 
     // A hand-customised unit the user edited themselves.
     let unit_path = dir.path().join("roundhouse.service");
     std::fs::write(&unit_path, "# hand customised\n").unwrap();
 
-    let err = install_to(dir.path(), OsFamily::Linux, exec_path, false).unwrap_err();
+    let err = install_to(
+        dir.path(),
+        OsFamily::Linux,
+        exec_path,
+        false,
+        &test_workspaces(),
+    )
+    .unwrap_err();
     assert!(matches!(err, ServiceInstallError::AlreadyExists { .. }));
 
     // The hand-customised content must survive the refused install.
@@ -234,10 +358,24 @@ fn install_to_overwrites_with_force() {
     let dir = tempfile::tempdir().unwrap();
     let exec_path = Path::new("/home/user/.local/bin/round");
 
-    install_to(dir.path(), OsFamily::Linux, exec_path, false).unwrap();
+    install_to(
+        dir.path(),
+        OsFamily::Linux,
+        exec_path,
+        false,
+        &test_workspaces(),
+    )
+    .unwrap();
     std::fs::write(dir.path().join("roundhouse.service"), "# stale\n").unwrap();
 
-    install_to(dir.path(), OsFamily::Linux, exec_path, true).unwrap();
+    install_to(
+        dir.path(),
+        OsFamily::Linux,
+        exec_path,
+        true,
+        &test_workspaces(),
+    )
+    .unwrap();
 
     let contents = std::fs::read_to_string(dir.path().join("roundhouse.service")).unwrap();
     assert!(contents.contains("ExecStart=\"/home/user/.local/bin/round\" daemon"));
@@ -250,7 +388,14 @@ fn install_to_writes_files_that_are_not_group_or_world_writable() {
 
     let dir = tempfile::tempdir().unwrap();
     let exec_path = Path::new("/home/user/.local/bin/round");
-    let unit_path = install_to(dir.path(), OsFamily::Linux, exec_path, false).unwrap();
+    let unit_path = install_to(
+        dir.path(),
+        OsFamily::Linux,
+        exec_path,
+        false,
+        &test_workspaces(),
+    )
+    .unwrap();
 
     let mode = std::fs::metadata(&unit_path).unwrap().permissions().mode() & 0o777;
     assert_eq!(
@@ -277,7 +422,14 @@ fn install_to_with_force_repairs_a_permissive_existing_mode() {
     std::fs::write(&unit_path, "# stale, world-writable\n").unwrap();
     std::fs::set_permissions(&unit_path, std::fs::Permissions::from_mode(0o666)).unwrap();
 
-    install_to(dir.path(), OsFamily::Linux, exec_path, true).unwrap();
+    install_to(
+        dir.path(),
+        OsFamily::Linux,
+        exec_path,
+        true,
+        &test_workspaces(),
+    )
+    .unwrap();
 
     let mode = std::fs::metadata(&unit_path).unwrap().permissions().mode() & 0o777;
     assert_eq!(
@@ -300,7 +452,14 @@ fn install_to_refuses_a_pre_existing_group_writable_install_dir() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
     let exec_path = Path::new("/home/user/.local/bin/round");
 
-    let err = install_to(dir.path(), OsFamily::Linux, exec_path, false).unwrap_err();
+    let err = install_to(
+        dir.path(),
+        OsFamily::Linux,
+        exec_path,
+        false,
+        &test_workspaces(),
+    )
+    .unwrap_err();
     assert!(matches!(err, ServiceInstallError::UnsafeInstallDir { .. }));
     assert!(!dir.path().join("roundhouse.service").exists());
 }
@@ -322,7 +481,14 @@ fn install_to_refuses_an_install_dir_with_a_writable_grandparent() {
     std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let exec_path = Path::new("/home/user/.local/bin/round");
 
-    let err = install_to(&cfg_dir, OsFamily::Linux, exec_path, false).unwrap_err();
+    let err = install_to(
+        &cfg_dir,
+        OsFamily::Linux,
+        exec_path,
+        false,
+        &test_workspaces(),
+    )
+    .unwrap_err();
     assert!(matches!(err, ServiceInstallError::UnsafeInstallDir { .. }));
     assert!(!cfg_dir.join("roundhouse.service").exists());
 }
@@ -336,7 +502,14 @@ fn install_to_rejects_an_exec_path_containing_a_newline() {
     let dir = tempfile::tempdir().unwrap();
     let exec_path = Path::new("/home/user/.local/bin/round\nRestart=no");
 
-    let err = install_to(dir.path(), OsFamily::Linux, exec_path, false).unwrap_err();
+    let err = install_to(
+        dir.path(),
+        OsFamily::Linux,
+        exec_path,
+        false,
+        &test_workspaces(),
+    )
+    .unwrap_err();
     assert!(matches!(err, ServiceInstallError::InvalidExecPath { .. }));
     assert!(!dir.path().join("roundhouse.service").exists());
 }
@@ -355,7 +528,14 @@ fn install_to_rejects_a_non_utf8_exec_path() {
     let bytes = b"/home/user/\xffbin/round";
     let exec_path = Path::new(OsStr::from_bytes(bytes));
 
-    let err = install_to(dir.path(), OsFamily::Linux, exec_path, false).unwrap_err();
+    let err = install_to(
+        dir.path(),
+        OsFamily::Linux,
+        exec_path,
+        false,
+        &test_workspaces(),
+    )
+    .unwrap_err();
     assert!(matches!(err, ServiceInstallError::InvalidExecPath { .. }));
 }
 
@@ -363,7 +543,14 @@ fn install_to_rejects_a_non_utf8_exec_path() {
 fn uninstall_from_removes_previously_installed_files_and_tolerates_absence() {
     let dir = tempfile::tempdir().unwrap();
     let exec_path = Path::new("/home/user/.local/bin/round");
-    install_to(dir.path(), OsFamily::Linux, exec_path, false).unwrap();
+    install_to(
+        dir.path(),
+        OsFamily::Linux,
+        exec_path,
+        false,
+        &test_workspaces(),
+    )
+    .unwrap();
 
     uninstall_from(dir.path(), OsFamily::Linux).unwrap();
 
@@ -383,7 +570,14 @@ fn uninstall_from_removes_previously_installed_files_and_tolerates_absence() {
 fn uninstall_from_removes_the_legacy_socket_unit_left_by_an_earlier_version() {
     let dir = tempfile::tempdir().unwrap();
     let exec_path = Path::new("/home/user/.local/bin/round");
-    install_to(dir.path(), OsFamily::Linux, exec_path, false).unwrap();
+    install_to(
+        dir.path(),
+        OsFamily::Linux,
+        exec_path,
+        false,
+        &test_workspaces(),
+    )
+    .unwrap();
     // Simulate a leftover from the previous installer version, which wrote
     // this file directly (current `install_to` no longer does).
     std::fs::write(dir.path().join("roundhouse.socket"), "[Socket]\n").unwrap();

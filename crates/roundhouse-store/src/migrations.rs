@@ -529,6 +529,36 @@ BEGIN
 END;
 "#;
 
+/// Phase 8, Task 26: the daemon-owned identity registry for named workspaces.
+/// `root_path` preserves the path the operator registered so a changed symlink
+/// target is detected on restart; `canonical_root` is the path execution uses.
+/// `root_device`/`root_inode` detect replacement of a directory at the same
+/// canonical path.
+/// Rows are immutable: changing a name or root would silently rebind existing
+/// sessions to a different filesystem identity.
+const MIGRATION_0010_WORKSPACES: &str = r#"
+CREATE TABLE workspaces (
+    workspace_id   TEXT NOT NULL PRIMARY KEY,
+    name           TEXT NOT NULL UNIQUE,
+    root_path      TEXT NOT NULL,
+    canonical_root TEXT NOT NULL UNIQUE,
+    root_device    INTEGER,
+    root_inode     INTEGER
+) STRICT;
+
+CREATE TRIGGER workspaces_no_update
+BEFORE UPDATE ON workspaces
+BEGIN
+    SELECT RAISE(ABORT, 'workspaces table is immutable: UPDATE forbidden');
+END;
+
+CREATE TRIGGER workspaces_no_delete
+BEFORE DELETE ON workspaces
+BEGIN
+    SELECT RAISE(ABORT, 'workspaces table is immutable: DELETE forbidden');
+END;
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_0001_INITIAL_SCHEMA),
@@ -540,5 +570,6 @@ pub fn migrations() -> Migrations<'static> {
         M::up(MIGRATION_0007_WORKFLOW_RUN),
         M::up(MIGRATION_0008_WORKFLOW_RUN_LEDGER),
         M::up(MIGRATION_0009_JOBS),
+        M::up(MIGRATION_0010_WORKSPACES),
     ])
 }

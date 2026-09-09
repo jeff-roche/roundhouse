@@ -230,6 +230,23 @@ async fn fixture_with_isolate(
     policy: Arc<PolicyEngine>,
     isolate: Arc<dyn Isolate>,
 ) -> Fixture {
+    fixture_with_isolate_at_root(
+        dir,
+        state_dir,
+        policy,
+        isolate,
+        std::env::current_dir().unwrap(),
+    )
+    .await
+}
+
+async fn fixture_with_isolate_at_root(
+    dir: &std::path::Path,
+    state_dir: std::path::PathBuf,
+    policy: Arc<PolicyEngine>,
+    isolate: Arc<dyn Isolate>,
+    workspace_root: std::path::PathBuf,
+) -> Fixture {
     let db_path = dir.join("events.db");
     let store = open(&db_path).await.unwrap();
     let writer = spawn_writer(store).await;
@@ -238,7 +255,7 @@ async fn fixture_with_isolate(
     let handle = isolate.prepare(&spec).await.unwrap();
     let session_id = SessionId::new();
 
-    let actor = SessionActor::new(
+    let actor = SessionActor::new_with_workspace_root(
         session_id,
         writer.clone(),
         SessionState::Running,
@@ -246,6 +263,7 @@ async fn fixture_with_isolate(
         policy,
         state_dir,
         dir.join("daemon-binary"),
+        workspace_root,
         isolate,
         handle,
         spec,
@@ -266,6 +284,22 @@ async fn fixture(
     rules: Vec<CompiledRule>,
 ) -> Fixture {
     fixture_with_engine(dir, state_dir, Arc::new(PolicyEngine::from_rules(rules))).await
+}
+
+async fn fixture_at_root(
+    dir: &std::path::Path,
+    state_dir: std::path::PathBuf,
+    workspace_root: std::path::PathBuf,
+    rules: Vec<CompiledRule>,
+) -> Fixture {
+    fixture_with_isolate_at_root(
+        dir,
+        state_dir,
+        Arc::new(PolicyEngine::from_rules(rules)),
+        Arc::new(TestIsolate),
+        workspace_root,
+    )
+    .await
 }
 
 /// The scripted provider every case drives the loop with: first call
@@ -806,7 +840,13 @@ async fn a_shallow_ancestor_directory_grant_does_not_reach_a_sibling_users_home_
 
     // (a) The grant must NOT reach the sibling's home.
     let denied_dir = tempfile::tempdir().unwrap();
-    let denied = fixture(denied_dir.path(), state_dir.clone(), vec![synthesize()]).await;
+    let denied = fixture_at_root(
+        denied_dir.path(),
+        state_dir.clone(),
+        root_path.clone(),
+        vec![synthesize()],
+    )
+    .await;
     let blocks = drive(
         &denied,
         None,
@@ -835,7 +875,13 @@ async fn a_shallow_ancestor_directory_grant_does_not_reach_a_sibling_users_home_
     // this half the test would also pass against a grant that authorizes
     // nothing at all.
     let allowed_dir = tempfile::tempdir().unwrap();
-    let allowed = fixture(allowed_dir.path(), state_dir, vec![synthesize()]).await;
+    let allowed = fixture_at_root(
+        allowed_dir.path(),
+        state_dir,
+        root_path.clone(),
+        vec![synthesize()],
+    )
+    .await;
     let blocks = drive(
         &allowed,
         None,

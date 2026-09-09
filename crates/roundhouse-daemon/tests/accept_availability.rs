@@ -76,7 +76,7 @@ async fn too_many_concurrent_connections_are_refused_but_the_loop_keeps_running(
     tokio::time::sleep(Duration::from_millis(50)).await;
     let third = tokio::time::timeout(
         Duration::from_secs(2),
-        roundhouse_tui::connect_create(&socket_path, "third"),
+        roundhouse_tui::connect_create(&socket_path, "default"),
     )
     .await;
     assert!(

@@ -44,7 +44,12 @@ pub enum Command {
     /// binary — see `commands::daemon` and ruling P10. This is what a
     /// systemd `Type=simple` unit or launchd `LaunchAgent` installed by
     /// `round service install` actually execs.
-    Daemon,
+    Daemon {
+        /// Register a workspace as `NAME=PATH`. May be repeated. The mapping
+        /// is persisted by the daemon and is resolved before session creation.
+        #[arg(long = "workspace", value_name = "NAME=PATH")]
+        workspaces: Vec<String>,
+    },
     /// Manage the OS-level service that keeps the daemon alive: a systemd
     /// user unit on Linux, a launchd `LaunchAgent` on macOS.
     Service {
@@ -117,6 +122,10 @@ pub enum ServiceAction {
         /// Overwrite an existing unit file instead of refusing.
         #[arg(long)]
         force: bool,
+        /// Register a workspace as `NAME=PATH` in the boot-persistent service.
+        /// May be repeated; at least one is required for a fresh daemon.
+        #[arg(long = "workspace", value_name = "NAME=PATH", required = true)]
+        workspaces: Vec<String>,
     },
     /// Remove the previously installed unit/plist for this OS.
     Uninstall,
@@ -135,24 +144,65 @@ mod tests {
     #[test]
     fn daemon_parses() {
         let cli = Cli::parse_from(["round", "daemon"]);
-        assert!(matches!(cli.command, Some(Command::Daemon)));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon { workspaces }) if workspaces.is_empty()
+        ));
+    }
+
+    #[test]
+    fn daemon_accepts_repeatable_workspace_registrations() {
+        let cli = Cli::parse_from([
+            "round",
+            "daemon",
+            "--workspace",
+            "alpha=/tmp/alpha",
+            "--workspace",
+            "beta=/tmp/beta",
+        ]);
+        match cli.command {
+            Some(Command::Daemon { workspaces }) => assert_eq!(
+                workspaces,
+                vec!["alpha=/tmp/alpha".to_string(), "beta=/tmp/beta".to_string()]
+            ),
+            other => panic!("expected Daemon with workspace registrations, got {other:?}"),
+        }
     }
 
     #[test]
     fn service_install_parses_with_and_without_force() {
-        let cli = Cli::parse_from(["round", "service", "install"]);
+        let cli = Cli::parse_from([
+            "round",
+            "service",
+            "install",
+            "--workspace",
+            "alpha=/tmp/alpha",
+        ]);
         match cli.command {
             Some(Command::Service {
-                action: ServiceAction::Install { force },
-            }) => assert!(!force),
+                action: ServiceAction::Install { force, workspaces },
+            }) => {
+                assert!(!force);
+                assert_eq!(workspaces, vec!["alpha=/tmp/alpha"]);
+            }
             other => panic!("expected Service{{Install}}, got {other:?}"),
         }
 
-        let cli = Cli::parse_from(["round", "service", "install", "--force"]);
+        let cli = Cli::parse_from([
+            "round",
+            "service",
+            "install",
+            "--force",
+            "--workspace",
+            "alpha=/tmp/alpha",
+        ]);
         match cli.command {
             Some(Command::Service {
-                action: ServiceAction::Install { force },
-            }) => assert!(force),
+                action: ServiceAction::Install { force, workspaces },
+            }) => {
+                assert!(force);
+                assert_eq!(workspaces, vec!["alpha=/tmp/alpha"]);
+            }
             other => panic!("expected Service{{Install}}, got {other:?}"),
         }
     }

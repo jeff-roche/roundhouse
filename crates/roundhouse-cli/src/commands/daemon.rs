@@ -57,7 +57,7 @@ pub fn daemon_binary_path() -> io::Result<PathBuf> {
 /// missing `round-daemon-internal` (an incomplete install, say) produces a
 /// clear error naming the exact path that was searched, rather than a bare
 /// `ENOENT` with no path in it.
-pub async fn run() -> io::Result<std::process::ExitStatus> {
+pub async fn run(workspaces: &[String]) -> io::Result<std::process::ExitStatus> {
     let path = daemon_binary_path()?;
     if !path.is_file() {
         return Err(io::Error::new(
@@ -69,7 +69,11 @@ pub async fn run() -> io::Result<std::process::ExitStatus> {
             ),
         ));
     }
-    tokio::process::Command::new(&path).status().await
+    let mut command = tokio::process::Command::new(&path);
+    for workspace in workspaces {
+        command.arg("--workspace").arg(workspace);
+    }
+    command.status().await
 }
 
 #[cfg(test)]

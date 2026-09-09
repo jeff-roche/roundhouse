@@ -1,5 +1,6 @@
 use crate::scope::ConfigScope;
-use std::io::ErrorKind;
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -9,7 +10,7 @@ use thiserror::Error;
 /// fixed regardless of what an attacker sends" caps elsewhere
 /// (`roundhouse-daemon::socket_server::MAX_FRAME_BYTES`,
 /// `roundhouse_acp::registry::MAX_RESPONSE_BYTES`).
-const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -110,10 +111,7 @@ impl ConfigLoader {
                     len: meta.len(),
                 });
             }
-            let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-                path: path.clone(),
-                source,
-            })?;
+            let text = read_bounded_file(path)?;
             let value: toml::Value = text.parse().map_err(|source| ConfigError::Parse {
                 path: path.clone(),
                 source,
@@ -127,6 +125,58 @@ impl ConfigLoader {
             scopes_present,
         })
     }
+}
+
+/// Opens and reads a config layer through one file descriptor. The metadata
+/// check above is retained for precise diagnostics, while `O_NOFOLLOW` and a
+/// capped read close the replacement and growth races between that check and
+/// the read.
+pub(crate) fn read_bounded_file(path: &Path) -> Result<String, ConfigError> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    let metadata = file.metadata().map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(ConfigError::NotARegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    if metadata.len() > MAX_CONFIG_FILE_BYTES {
+        return Err(ConfigError::TooLarge {
+            path: path.to_path_buf(),
+            len: metadata.len(),
+        });
+    }
+
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_CONFIG_FILE_BYTES {
+        return Err(ConfigError::TooLarge {
+            path: path.to_path_buf(),
+            len: bytes.len() as u64,
+        });
+    }
+    String::from_utf8(bytes).map_err(|error| ConfigError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(ErrorKind::InvalidData, error),
+    })
 }
 
 fn merge_into(base: &mut toml::Value, overlay: toml::Value) {

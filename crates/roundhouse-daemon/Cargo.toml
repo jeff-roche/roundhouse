@@ -54,6 +54,8 @@ roundhouse-web = { path = "../roundhouse-web" }
 # manifest (Task A8/G6) — Global Constraints §5.3's pin discipline applies
 # regardless of which crate introduces a net-new dependency.
 clap = { version = "=4.6.6", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+nix = { version = "0.31", features = ["fs"] }
 color-eyre = { workspace = true }
 # `fs`/`io-util` on top of the workspace feature set: the demo reads the edited
 # file back and the socket server writes NDJSON lines. Declared here rather than

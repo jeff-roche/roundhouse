@@ -1,5 +1,6 @@
 use crate::types::{Attestation, Child, CommandSpec, Handle, IsolationError, ProbeResult};
 use roundhouse_core::{SessionSpec, Tier};
+use std::path::Path;
 
 /// §6.5 — tiers compose (`IsolationStack` pairs a `WorkspaceLayer` with a
 /// `Vec<Box<dyn Enforcer>>`), but every tier, however composed, presents
@@ -20,6 +21,21 @@ pub trait Isolate: Send + Sync {
     async fn prepare(&self, spec: &SessionSpec) -> Result<Handle, IsolationError>;
 
     async fn spawn(&self, h: &Handle, cmd: CommandSpec) -> Result<Child, IsolationError>;
+
+    /// Spawns a command with an explicit workspace bind root. Implementations
+    /// that do not need a separate root retain the legacy behavior; sandbox
+    /// implementations override this to keep the command cwd distinct from
+    /// the repository boundary.
+    async fn spawn_in_workspace(
+        &self,
+        h: &Handle,
+        workspace_root: &Path,
+        workspace_identity: Option<(i64, i64)>,
+        cmd: CommandSpec,
+    ) -> Result<Child, IsolationError> {
+        let _ = (workspace_root, workspace_identity);
+        self.spawn(h, cmd).await
+    }
 
     /// §6.5 rule 4: written on every task row, not once per session.
     fn attest(&self, h: &Handle) -> Attestation;

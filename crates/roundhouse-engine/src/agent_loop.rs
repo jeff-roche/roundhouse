@@ -1243,7 +1243,7 @@ async fn dispatch_mcp(
 /// has returned `Ok`.
 ///
 /// **One refusal is raised even earlier than that minting, and is recorded
-/// anyway (ruling W1-R131):** `task_params_for` rejects a `shell` `cwd` or
+/// anyway (ruling W1-R131):** `task_params_for_in_workspace` rejects a `shell` `cwd` or
 /// `program` outside the workspace root — and malformed arguments — before
 /// there is a `TaskParams` to admit at all. That arm routes through
 /// [`record_unadmitted_refusal`], which mints its own `TaskCreated`/
@@ -1257,7 +1257,11 @@ async fn dispatch_builtin(
     input: &serde_json::Value,
     parent: TaskId,
 ) -> Result<Vec<ToolResultPart>, String> {
-    let (params, extras) = match crate::tool_dispatch::task_params_for(kind.clone(), input) {
+    let (params, extras) = match crate::tool_dispatch::task_params_for_in_workspace(
+        kind.clone(),
+        input,
+        actor.workspace_root(),
+    ) {
         Ok(resolved) => resolved,
         Err(err) => {
             // **Ruling W1-R131.** This arm used to be `?` — the error

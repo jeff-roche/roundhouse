@@ -162,6 +162,28 @@ async fn new_actor(
     new_actor_with_engine(dir, state_dir, daemon_binary, policy).await
 }
 
+async fn new_actor_at_root(
+    dir: &std::path::Path,
+    state_dir: std::path::PathBuf,
+    daemon_binary: std::path::PathBuf,
+    config_rules: Vec<CompiledRule>,
+) -> (
+    SessionActor,
+    roundhouse_store::EventWriter,
+    std::path::PathBuf,
+    SessionId,
+) {
+    let policy = Arc::new(PolicyEngine::from_rules(config_rules));
+    new_actor_with_engine_at_root(
+        dir,
+        state_dir,
+        daemon_binary,
+        dir.canonicalize().unwrap(),
+        policy,
+    )
+    .await
+}
+
 /// `new_actor`, but over a caller-supplied `PolicyEngine` (fix round D).
 /// Every MCP test now shares ONE engine between the `SessionActor` and the
 /// `SessionMcp`, which is both what Task 7's production wiring will do and
@@ -178,6 +200,28 @@ async fn new_actor_with_engine(
     std::path::PathBuf,
     SessionId,
 ) {
+    new_actor_with_engine_at_root(
+        dir,
+        state_dir,
+        daemon_binary,
+        std::env::current_dir().unwrap(),
+        policy,
+    )
+    .await
+}
+
+async fn new_actor_with_engine_at_root(
+    dir: &std::path::Path,
+    state_dir: std::path::PathBuf,
+    daemon_binary: std::path::PathBuf,
+    workspace_root: std::path::PathBuf,
+    policy: Arc<PolicyEngine>,
+) -> (
+    SessionActor,
+    roundhouse_store::EventWriter,
+    std::path::PathBuf,
+    SessionId,
+) {
     let db_path = dir.join("events.db");
     let store = open(&db_path).await.unwrap();
     let writer = spawn_writer(store).await;
@@ -187,7 +231,7 @@ async fn new_actor_with_engine(
     let handle = isolate.prepare(&spec).await.unwrap();
     let session_id = SessionId::new();
 
-    let actor = SessionActor::new(
+    let actor = SessionActor::new_with_workspace_root(
         session_id,
         writer.clone(),
         SessionState::Running,
@@ -195,6 +239,7 @@ async fn new_actor_with_engine(
         policy,
         state_dir,
         daemon_binary,
+        workspace_root,
         isolate,
         handle,
         spec,
@@ -361,7 +406,7 @@ async fn a_model_issued_tool_use_is_admitted_dispatched_and_its_result_folded_ba
     let fixture = dir.path().join("fixture.txt");
     std::fs::write(&fixture, "hello from the fixture file").unwrap();
 
-    let (actor, _writer, db_path, session_id) = new_actor(
+    let (actor, _writer, db_path, session_id) = new_actor_at_root(
         dir.path(),
         dir.path().join("state"),
         dir.path().join("daemon-binary"),
@@ -451,7 +496,7 @@ async fn an_admitted_executor_failure_does_not_disclose_its_host_path_to_the_mod
     let dir = tempfile::tempdir().unwrap();
     let failing_path = dir.path().join("a-directory-read-as-a-file");
     std::fs::create_dir(&failing_path).unwrap();
-    let (actor, _writer, _db, _session) = new_actor(
+    let (actor, _writer, _db, _session) = new_actor_at_root(
         dir.path(),
         dir.path().join("state"),
         dir.path().join("daemon"),
@@ -1467,7 +1512,7 @@ async fn a_leaked_secret_in_a_tool_result_is_redacted_before_it_reaches_the_next
     let live_secret = "sk-ant-DAEMON-SECRET-abc123";
     std::fs::write(&secret_file, live_secret).unwrap();
 
-    let (actor, writer, _db_path, _session_id) = new_actor(
+    let (actor, writer, _db_path, _session_id) = new_actor_at_root(
         dir.path(),
         dir.path().join("state"),
         dir.path().join("daemon-binary"),

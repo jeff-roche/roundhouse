@@ -2,6 +2,8 @@ use std::path::Path;
 
 use deadpool_sqlite::{Config, Hook, HookError, Pool, Runtime};
 
+use crate::txn::BUSY_TIMEOUT;
+
 /// The migration harness for this crate's SQLite schema. Wraps Phase 0's complete
 /// migrations (events table with append-only triggers, tasks table, FTS5 index, and
 /// blobs table) in a lazy static for use with `deadpool_sqlite`'s connection pool.
@@ -155,7 +157,7 @@ fn connection_hooks() -> Hook {
         // e.g. `recovery.rs`'s scan — go straight through a pooled connection with
         // no such loop, so without this pragma they surface `SQLITE_BUSY` as a
         // hard error on any contention with the writer.
-        conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)
+        conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT.as_millis() as u32)
             .map_err(HookError::Backend)?;
         // Also per-connection, and set here for that reason. As of store
         // migration 0007 this database holds one column
@@ -216,7 +218,7 @@ pub async fn open(path: &Path) -> Result<StorePool, StoreError> {
     conn.interact(|c| {
         c.pragma_update(None, "journal_mode", "WAL")?;
         c.pragma_update(None, "synchronous", "NORMAL")?;
-        c.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+        c.pragma_update(None, "busy_timeout", BUSY_TIMEOUT.as_millis() as u32)?;
         c.pragma_update(None, "secure_delete", true)?;
         MIGRATIONS.to_latest(c)?;
         // Security fix (Task 0.5 follow-up): backfill `tasks` rows for any task_id
@@ -231,9 +233,3 @@ pub async fn open(path: &Path) -> Result<StorePool, StoreError> {
 
     Ok(StorePool { pool })
 }
-
-/// How long a connection blocks retrying internally on `SQLITE_BUSY` before
-/// giving up and returning the error to the caller. A few seconds is enough to
-/// ride out the single writer task's normal append latency without either
-/// masking a genuinely stuck lock or making a contended read hang unreasonably.
-const BUSY_TIMEOUT_MS: u32 = 5_000;

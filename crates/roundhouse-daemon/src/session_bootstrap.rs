@@ -55,6 +55,8 @@ use roundhouse_sandbox::{Handle, Isolate};
 use roundhouse_store::{spawn_writer, EventWriter, StorePool};
 use tokio::sync::{oneshot, watch};
 
+use crate::mcp_config;
+
 /// A background service's terminal failure.  A service must report readiness
 /// before it can be considered part of a live daemon, and its later failure
 /// is returned to the daemon's lifecycle owner rather than being detached.
@@ -335,14 +337,12 @@ pub struct DaemonResources {
     pub state_dir: PathBuf,
     /// Absolute, same reason.
     pub daemon_binary: PathBuf,
-    /// Loaded once at boot via `mcp_config::load_mcp_servers` (CF-11(b)) —
-    /// user-global scope only, structurally (ruling W1-R16). Every session
-    /// currently gets the SAME configured server list; there is no
-    /// per-session MCP config yet.
+    /// Loaded at boot via `mcp_config::load_mcp_servers` (CF-11(b)) for the
+    /// direct-fixture path. Production sessions reload the relevant global
+    /// and workspace layers after resolving their workspace root.
     pub mcp_configs: Vec<McpServerConfig>,
-    /// Loaded once at boot via `roundhouse_config::load_network_config`
-    /// (CF-12(c)) — see `main.rs` for the fail-closed decision on a load
-    /// error.
+    /// Boot-time network configuration used by direct fixtures. Production
+    /// sessions load the network layers against their resolved workspace root.
     pub network_config: roundhouse_config::NetworkConfig,
     /// The `OnDegrade` every real session is created with (ruling W1-R95).
     /// `OnDegrade::Refuse` — §6.5's documented default — unless the
@@ -366,6 +366,12 @@ pub struct DaemonResources {
     /// `wire_redaction_for_session` call.
     proxy_writer: EventWriter,
     proxy_secrets: Mutex<Vec<String>>,
+    /// The persisted name-to-root registry used by the socket handshake.
+    /// Direct library fixtures may leave this unset; production always sets it.
+    pub workspace_registry: Option<Arc<crate::workspace_registry::WorkspaceRegistry>>,
+    /// Production sessions load config against their resolved root. Direct
+    /// fixtures retain their injected config fields when this is false.
+    pub load_workspace_config: bool,
 }
 
 impl DaemonResources {
@@ -385,6 +391,8 @@ impl DaemonResources {
         provider: Arc<dyn Provider>,
         request_ctx: RequestCtx,
         proxy_writer: EventWriter,
+        workspace_registry: Option<Arc<crate::workspace_registry::WorkspaceRegistry>>,
+        load_workspace_config: bool,
     ) -> Self {
         DaemonResources {
             store,
@@ -402,6 +410,8 @@ impl DaemonResources {
             request_ctx,
             proxy_writer,
             proxy_secrets: Mutex::new(Vec::new()),
+            workspace_registry,
+            load_workspace_config,
         }
     }
 
@@ -428,8 +438,31 @@ pub enum CreateRealSessionError {
     Session(#[from] CreateSessionError),
     #[error("starting this session's configured MCP servers failed: {0}")]
     Mcp(#[from] StartSessionMcpError),
+    #[error("loading this workspace's MCP configuration failed: {0}")]
+    McpConfig(#[from] mcp_config::McpConfigError),
+    #[error("loading this workspace's network configuration failed: {0}")]
+    NetworkConfig(#[from] roundhouse_config::NetworkConfigError),
+    #[error("loading this workspace's policy failed: {0}")]
+    Policy(#[from] PolicyRulesLoadError),
     #[error(transparent)]
     ProxySecretsPoisoned(#[from] ProxySecretsPoisonedError),
+}
+
+impl CreateRealSessionError {
+    /// Returns a static diagnostic category without rendering nested config
+    /// parser errors, whose displays may contain operator- or repository-
+    /// supplied text.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Session(_) => "session_error",
+            Self::Mcp(_) => "mcp_error",
+            Self::McpConfig(error) => error.kind(),
+            Self::NetworkConfig(error) => error.kind(),
+            Self::Policy(PolicyRulesLoadError::Config(_)) => "policy_config_error",
+            Self::Policy(PolicyRulesLoadError::Compile(_)) => "policy_compile_error",
+            Self::ProxySecretsPoisoned(_) => "proxy_secrets_poisoned",
+        }
+    }
 }
 
 /// The result of successfully constructing a real session: the actor
@@ -518,10 +551,27 @@ pub async fn teardown_real_session(proxy: &LoopbackProxy, real_session: RealSess
 /// per-session.
 pub async fn create_real_session(
     resources: &DaemonResources,
+    workspace_id: WorkspaceId,
     workspace_name: String,
+    workspace_root: PathBuf,
+    workspace_device: Option<i64>,
+    workspace_inode: Option<i64>,
 ) -> Result<RealSession, CreateRealSessionError> {
     let session_id = SessionId::new();
     let writer = spawn_writer(resources.store.clone()).await;
+    let (mcp_configs, network_config, policy_rules) = if resources.load_workspace_config {
+        let mcp_configs = mcp_config::load_mcp_servers(Some(&workspace_root))?;
+        let network_config = roundhouse_config::load_network_config(Some(&workspace_root))?;
+        let policy_source =
+            policy_rules_from_files(Some(workspace_root.clone()), resources.state_dir.clone())?;
+        (mcp_configs, network_config, policy_source())
+    } else {
+        (
+            resources.mcp_configs.clone(),
+            resources.network_config.clone(),
+            (resources.policy_rules)(),
+        )
+    };
 
     // `ClientRequest::CreateSession` carries no tier/`on_degrade` field (it
     // is `workspace_name` only), so the daemon picks the default policy
@@ -548,13 +598,13 @@ pub async fn create_real_session(
     // `round-daemon-internal --allow-degraded-to <TIER>`, never silently by
     // this function.
     let spec = SessionSpec {
-        workspace: WorkspaceId::new(),
+        workspace: workspace_id,
         name: Some(workspace_name),
         requested_tier: Tier::Sandbox,
         on_degrade: resources.default_on_degrade,
     };
 
-    let egress_policy = egress_policy_for(resources);
+    let egress_policy = egress_policy_for(&network_config);
     let request_ctx = resources.clone_request_ctx();
 
     // Isolation + egress registration + this session's real `Redactor` —
@@ -569,7 +619,7 @@ pub async fn create_real_session(
         &resources.proxy,
         egress_policy,
         &request_ctx,
-        &resources.mcp_configs,
+        &mcp_configs,
     )
     .await?;
 
@@ -585,7 +635,7 @@ pub async fn create_real_session(
     // `start_session_mcp` failure branch below already uses (fix round 2,
     // MUST 2). No `SessionActor` exists yet at this point to call
     // `teardown()` on, so tear down directly.
-    if let Err(err) = register_proxy_secrets(resources, &request_ctx) {
+    if let Err(err) = register_proxy_secrets(resources, &request_ctx, &mcp_configs) {
         let _ = resources.isolate.teardown(handle).await;
         resources.proxy.deregister_session(proxy_handle.token());
         return Err(err.into());
@@ -603,20 +653,18 @@ pub async fn create_real_session(
     // literal frozen into it. Tests can pass `no_policy_rules` for an empty,
     // fail-closed fixture; production supplies the file-derived source.
     let policy = Arc::new(
-        PolicyEngine::from_rules((resources.policy_rules)()).with_sealed_ctx_provider(
-            build_sealed_ctx_provider(
-                resources.state_dir.clone(),
-                resources.daemon_binary.clone(),
-                roundhouse_policy::sealed::home_dir(),
-                resources.isolate.clone(),
-                handle.clone(),
-                effective_tier(&spec),
-                mirrored_mcp_resolved.clone(),
-            ),
-        ),
+        PolicyEngine::from_rules(policy_rules).with_sealed_ctx_provider(build_sealed_ctx_provider(
+            resources.state_dir.clone(),
+            resources.daemon_binary.clone(),
+            roundhouse_policy::sealed::home_dir(),
+            resources.isolate.clone(),
+            handle.clone(),
+            effective_tier(&spec),
+            mirrored_mcp_resolved.clone(),
+        )),
     );
 
-    let (mcp_host, mcp, tool_defs) = if resources.mcp_configs.is_empty() {
+    let (mcp_host, mcp, tool_defs) = if mcp_configs.is_empty() {
         // **Ruling W1-R132: `builtin_tool_defs()`, NOT `Vec::new()`.** This
         // is the default production configuration — no `[[mcp_server]]` —
         // and it must still offer the model the five built-in tools.
@@ -633,7 +681,7 @@ pub async fn create_real_session(
         )
     } else {
         match start_session_mcp(
-            resources.mcp_configs.clone(),
+            mcp_configs.clone(),
             session_id,
             resources.runner,
             writer.clone(),
@@ -656,7 +704,7 @@ pub async fn create_real_session(
         }
     };
 
-    let actor = Arc::new(SessionActor::new(
+    let actor = Arc::new(SessionActor::new_with_workspace_root_and_identity(
         session_id,
         writer,
         SessionState::Running,
@@ -664,6 +712,8 @@ pub async fn create_real_session(
         policy,
         resources.state_dir.clone(),
         resources.daemon_binary.clone(),
+        workspace_root,
+        workspace_device.zip(workspace_inode),
         resources.isolate.clone(),
         handle,
         spec,
@@ -725,8 +775,8 @@ fn apply_resolved_mcp_servers(
 /// Builds this session's `EgressPolicy` from the daemon's loaded
 /// `NetworkConfig` (CF-12(c)) via the same conversion `roundhouse-engine`
 /// already exposes for exactly this purpose.
-fn egress_policy_for(resources: &DaemonResources) -> EgressPolicy {
-    roundhouse_engine::egress_policy_from_allowed_hosts(&resources.network_config.allowed_hosts)
+fn egress_policy_for(network_config: &roundhouse_config::NetworkConfig) -> EgressPolicy {
+    roundhouse_engine::egress_policy_from_allowed_hosts(&network_config.allowed_hosts)
 }
 
 /// CF-12(a): keeps the daemon's shared egress-proxy writer's redaction
@@ -773,8 +823,9 @@ fn egress_policy_for(resources: &DaemonResources) -> EgressPolicy {
 fn register_proxy_secrets(
     resources: &DaemonResources,
     ctx: &RequestCtx,
+    mcp_configs: &[McpServerConfig],
 ) -> Result<(), ProxySecretsPoisonedError> {
-    let this_session_secrets = roundhouse_engine::live_secret_values(ctx, &resources.mcp_configs);
+    let this_session_secrets = roundhouse_engine::live_secret_values(ctx, mcp_configs);
     let mut all_secrets = match resources.proxy_secrets.lock() {
         Ok(guard) => guard,
         Err(_) => {
@@ -1032,6 +1083,8 @@ mod tests {
                 credentials: None,
             },
             proxy_writer,
+            None,
+            false,
         )
     }
 
@@ -1104,13 +1157,22 @@ mod tests {
     async fn create_real_session_builds_an_actor_with_no_mcp_servers_configured() {
         let dir = tempfile::tempdir().unwrap();
         let resources = resources(dir.path()).await;
+        let workspace_id = WorkspaceId::new();
 
-        let real_session = create_real_session(&resources, "test-workspace".into())
-            .await
-            .unwrap();
+        let real_session = create_real_session(
+            &resources,
+            workspace_id,
+            "test-workspace".into(),
+            dir.path().to_path_buf(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(real_session.mcp_host.is_none());
         assert_eq!(real_session.actor.state(), SessionState::Running);
+        assert_eq!(real_session.actor.session_spec().workspace, workspace_id);
     }
 
     /// Ruling W1-R132: the DEFAULT production configuration — no
@@ -1137,9 +1199,16 @@ mod tests {
              configures an MCP server"
         );
 
-        let real_session = create_real_session(&resources, "test-workspace".into())
-            .await
-            .unwrap();
+        let real_session = create_real_session(
+            &resources,
+            WorkspaceId::new(),
+            "test-workspace".into(),
+            dir.path().to_path_buf(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let mut offered: Vec<&str> = real_session
             .actor
@@ -1184,7 +1253,11 @@ mod tests {
         let ctx = resources.clone_request_ctx();
         let mut result = None;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            result = Some(register_proxy_secrets(&resources, &ctx));
+            result = Some(register_proxy_secrets(
+                &resources,
+                &ctx,
+                &resources.mcp_configs,
+            ));
         }));
         assert!(
             outcome.is_ok(),
@@ -1215,7 +1288,16 @@ mod tests {
         }));
         assert!(resources.proxy_secrets.is_poisoned());
 
-        match create_real_session(&resources, "test-workspace".into()).await {
+        match create_real_session(
+            &resources,
+            WorkspaceId::new(),
+            "test-workspace".into(),
+            dir.path().to_path_buf(),
+            None,
+            None,
+        )
+        .await
+        {
             Err(CreateRealSessionError::ProxySecretsPoisoned(_)) => {}
             Err(other) => panic!(
                 "create_real_session must fail with ProxySecretsPoisoned on a poisoned \
@@ -1310,9 +1392,16 @@ mod tests {
                 },
             }];
 
-            let real_session = create_real_session(&resources, "test-workspace".into())
-                .await
-                .expect("a real, working configured MCP server must not fail session creation");
+            let real_session = create_real_session(
+                &resources,
+                WorkspaceId::new(),
+                "test-workspace".into(),
+                dir.path().to_path_buf(),
+                None,
+                None,
+            )
+            .await
+            .expect("a real, working configured MCP server must not fail session creation");
 
             assert!(
                 real_session.mcp_host.is_some(),

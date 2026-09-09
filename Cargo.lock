@@ -3623,6 +3623,7 @@ dependencies = [
 name = "roundhouse-config"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "tempfile",
  "thiserror 2.0.20",
@@ -3663,6 +3664,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "futures",
+ "nix 0.31.3",
  "roundhouse-acp",
  "roundhouse-bus",
  "roundhouse-config",
@@ -3688,6 +3690,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -27,7 +27,7 @@ async fn main() -> color_eyre::Result<()> {
     install_tracing_subscriber();
 
     match Cli::parse().command {
-        Some(Command::Daemon) => run_daemon().await,
+        Some(Command::Daemon { workspaces }) => run_daemon(workspaces).await,
         Some(Command::Service { action }) => run_service(action),
         Some(Command::Attach { session }) => attach_to_session(session).await,
         Some(Command::Create { workspace }) => create_and_attach(workspace).await,
@@ -53,8 +53,8 @@ fn install_tracing_subscriber() {
 
 /// `round daemon`: runs the real daemon binary in the foreground and exits
 /// with its exit code, per `commands::daemon`'s module doc.
-async fn run_daemon() -> color_eyre::Result<()> {
-    let status = daemon::run()
+async fn run_daemon(workspaces: Vec<String>) -> color_eyre::Result<()> {
+    let status = daemon::run(&workspaces)
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
     std::process::exit(status.code().unwrap_or(1));
@@ -65,10 +65,10 @@ async fn run_daemon() -> color_eyre::Result<()> {
 fn run_service(action: ServiceAction) -> color_eyre::Result<()> {
     let os = current_os_family()?;
     match action {
-        ServiceAction::Install { force } => {
+        ServiceAction::Install { force, workspaces } => {
             let exec_path = service_install::resolve_exec_path()
                 .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
-            let installed = service_install::install(os, &exec_path, force)
+            let installed = service_install::install(os, &exec_path, force, &workspaces)
                 .map_err(|e| color_eyre::eyre::eyre!(e.to_string()))?;
             println!("installed {}", installed.display());
             print_enable_instructions(os);
