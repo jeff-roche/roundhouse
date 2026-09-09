@@ -68,10 +68,7 @@ pub fn load_policy_files_from_layers(
         if !metadata.is_file() {
             return Err(ConfigError::NotARegularFile { path });
         }
-        let contents = std::fs::read_to_string(&path).map_err(|source| ConfigError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        let contents = crate::loader::read_bounded_file(&path)?;
         let file = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
             path: path.clone(),
             source,
@@ -110,6 +107,22 @@ mod tests {
         assert!(matches!(
             load_policy_files_from_layers(vec![(ConfigScope::Project, path)]),
             Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn oversized_policy_file_is_rejected_before_reading_contents() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("policy.toml");
+        let contents = format!(
+            "[[rule]]\nid = \"{}\"\noutcome = \"allow\"\nread = \"file\"\n",
+            "a".repeat(1024 * 1024)
+        );
+        std::fs::write(&path, contents).unwrap();
+
+        assert!(matches!(
+            load_policy_files_from_layers(vec![(ConfigScope::Project, path)]),
+            Err(ConfigError::TooLarge { .. })
         ));
     }
 }

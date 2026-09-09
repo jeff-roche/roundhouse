@@ -200,7 +200,7 @@ async fn attach_routes_by_session_id_and_never_leaks_another_sessions_events() {
 
     let session_a = tokio::time::timeout(
         Duration::from_secs(2),
-        roundhouse_tui::connect_create(&socket_path, "session-a"),
+        roundhouse_tui::connect_create(&socket_path, "default"),
     )
     .await
     .expect("connect_create must not hang")
@@ -209,7 +209,7 @@ async fn attach_routes_by_session_id_and_never_leaks_another_sessions_events() {
 
     let session_b = tokio::time::timeout(
         Duration::from_secs(2),
-        roundhouse_tui::connect_create(&socket_path, "session-b"),
+        roundhouse_tui::connect_create(&socket_path, "default"),
     )
     .await
     .expect("connect_create must not hang")

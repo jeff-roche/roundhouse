@@ -104,13 +104,18 @@ async fn wait_for_stdout_line_containing(
 async fn refuse_is_the_production_default_and_actually_refuses_on_a_degraded_host() {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("round.sock");
+    let workspace_root = dir.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_round-daemon-internal"))
         .arg("--socket")
         .arg(&socket_path)
+        .arg("--workspace")
+        .arg(format!("degraded-host-test={}", workspace_root.display()))
         // Deliberately NOT `--allow-degraded-to` — this is the whole point:
         // proving the compiled-in default, not the opt-in escape hatch
         // `real_boot_smoke.rs` already covers.
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path())
         .env("RUST_LOG", "info")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -177,12 +182,17 @@ async fn refuse_is_the_production_default_and_actually_refuses_on_a_degraded_hos
 async fn allow_degraded_to_none_logs_that_sealed_tier_shortfall_is_disarmed() {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("round.sock");
+    let workspace_root = dir.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_round-daemon-internal"))
         .arg("--socket")
         .arg(&socket_path)
+        .arg("--workspace")
+        .arg(format!("boot-test={}", workspace_root.display()))
         .arg("--allow-degraded-to")
         .arg("none")
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path())
         .env("RUST_LOG", "roundhouse_daemon=info")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -221,12 +231,17 @@ async fn allow_degraded_to_none_logs_that_sealed_tier_shortfall_is_disarmed() {
 async fn the_degrade_state_survives_even_rust_log_error_via_the_unconditional_println() {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("round.sock");
+    let workspace_root = dir.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_round-daemon-internal"))
         .arg("--socket")
         .arg(&socket_path)
+        .arg("--workspace")
+        .arg(format!("boot-test={}", workspace_root.display()))
         .arg("--allow-degraded-to")
         .arg("none")
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path())
         // The whole point: the single most restrictive filter an operator
         // could plausibly set, one that silences every `tracing::warn!`
         // this binary emits.

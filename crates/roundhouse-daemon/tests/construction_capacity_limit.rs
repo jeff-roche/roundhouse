@@ -67,7 +67,7 @@ async fn drive_one_create_session(
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<ClientEvent>(1);
     requests_tx
         .send(ClientRequest::CreateSession {
-            workspace_name: "test".into(),
+            workspace_name: "default".into(),
         })
         .await
         .unwrap();

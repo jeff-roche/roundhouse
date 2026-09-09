@@ -123,7 +123,7 @@ async fn an_overlong_request_line_closes_only_that_connection_not_the_accept_loo
     // client must still be able to connect and complete a handshake.
     let session_id = tokio::time::timeout(
         Duration::from_secs(2),
-        roundhouse_tui::connect_create(&socket_path, "still-alive"),
+        roundhouse_tui::connect_create(&socket_path, "default"),
     )
     .await
     .expect("a fresh client must not hang after a hostile peer was dropped")
@@ -143,13 +143,25 @@ async fn a_generously_long_but_legitimate_workspace_name_still_round_trips() {
     let registry = Arc::new(SessionRegistry::new());
     let listener = roundhouse_daemon::socket_server::bind_socket(&socket_path).unwrap();
     let resources = common::real_resources(dir.path()).await;
+    let long_name = "w".repeat(4096);
+    let long_root = dir.path().join("long-workspace");
+    std::fs::create_dir(&long_root).unwrap();
+    resources
+        .workspace_registry
+        .as_ref()
+        .unwrap()
+        .register(
+            roundhouse_daemon::workspace_registry::WorkspaceRegistration::new(
+                &long_name, long_root,
+            ),
+        )
+        .await
+        .unwrap();
     tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
         listener,
         registry.clone(),
         resources,
     ));
-
-    let long_name = "w".repeat(4096);
     let client = tokio::time::timeout(
         Duration::from_secs(2),
         roundhouse_tui::connect_create(&socket_path, &long_name),
@@ -285,7 +297,7 @@ async fn a_request_line_exactly_at_the_cap_is_accepted_by_the_codec() {
     // succeed — proving the connection survived the exactly-at-cap line
     // rather than having been silently closed by the codec.
     let request = serde_json::to_string(&ClientRequest::CreateSession {
-        workspace_name: "still-here".into(),
+        workspace_name: "default".into(),
     })
     .unwrap();
     client.write_all(request.as_bytes()).await.unwrap();
@@ -344,7 +356,7 @@ async fn a_workspace_name_one_byte_over_the_bound_closes_the_connection() {
     // The accept loop itself must have survived.
     let fresh = tokio::time::timeout(
         Duration::from_secs(2),
-        roundhouse_tui::connect_create(&socket_path, "still-alive"),
+        roundhouse_tui::connect_create(&socket_path, "default"),
     )
     .await;
     assert!(
@@ -393,7 +405,7 @@ async fn a_request_line_one_byte_over_the_cap_closes_the_connection() {
     // The accept loop itself must have survived.
     let fresh = tokio::time::timeout(
         Duration::from_secs(2),
-        roundhouse_tui::connect_create(&socket_path, "still-alive"),
+        roundhouse_tui::connect_create(&socket_path, "default"),
     )
     .await;
     assert!(

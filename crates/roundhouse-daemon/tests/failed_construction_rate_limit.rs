@@ -88,7 +88,7 @@ async fn a_peer_looping_create_session_against_a_failing_host_is_cut_off() {
         let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<ClientEvent>(1);
         requests_tx
             .send(ClientRequest::CreateSession {
-                workspace_name: "test".into(),
+                workspace_name: "default".into(),
             })
             .await
             .unwrap();

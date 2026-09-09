@@ -104,6 +104,7 @@
 //! only for its shape (ends in the right OS-specific suffix) against
 //! whatever the real environment happens to be.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -136,6 +137,10 @@ const MACOS_UNIT_FILES: &[&str] = &["com.roundhouse.daemon.plist"];
 /// meant to prevent, now orphaned and unreachable by the tool that created
 /// it.
 const LINUX_LEGACY_UNIT_FILES: &[&str] = &["roundhouse.socket"];
+const PROTECTED_SYSTEM_ROOTS: &[&str] = &[
+    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/run", "/sbin", "/sys", "/tmp",
+    "/usr", "/var", "/home",
+];
 
 /// Renders the systemd *user* unit (§8.7: "ship a systemd user service")
 /// with the actual installed binary path substituted in. The committed
@@ -150,9 +155,33 @@ const LINUX_LEGACY_UNIT_FILES: &[&str] = &["roundhouse.socket"];
 /// lossy conversion here; the real install path never reaches this function
 /// with such a path because both [`resolve_exec_path`] and [`install_to`]
 /// call [`validate_exec_path_for_render`] first and refuse outright.
-pub fn render_systemd_unit(exec_path: &Path) -> String {
+/// Renders the systemd unit with the workspace registrations needed to boot a
+/// fresh daemon after volatile runtime state has been recreated.
+pub fn render_systemd_unit(
+    exec_path: &Path,
+    workspaces: &[String],
+) -> Result<String, ServiceInstallError> {
+    validate_exec_path_for_render(exec_path)?;
+    validate_workspace_arguments(workspaces)?;
+    validate_daemon_protected_workspace_paths(workspaces, exec_path)?;
     let base = include_str!("../../../../packaging/systemd/roundhouse.service");
-    base.replace("%h/.local/bin/round", &quote_systemd_exec_path(exec_path))
+    let workspace_args = workspaces
+        .iter()
+        .map(|workspace| {
+            format!(
+                " --workspace {}",
+                quote_systemd_exec_path(Path::new(workspace))
+            )
+        })
+        .collect::<String>();
+    Ok(base.replace(
+        "%h/.local/bin/round daemon",
+        &format!(
+            "{} daemon{}",
+            quote_systemd_exec_path(exec_path),
+            workspace_args
+        ),
+    ))
 }
 
 /// Renders the launchd `LaunchAgent` plist with the actual installed binary
@@ -160,10 +189,31 @@ pub fn render_systemd_unit(exec_path: &Path) -> String {
 /// the log paths' `~` with an absolute directory under `$HOME`: launchd does
 /// not expand `~` itself, so `StandardOutPath`/`StandardErrorPath` left as
 /// `~/Library/Logs/...` would silently never be written to.
-pub fn render_launchd_plist(exec_path: &Path) -> String {
+/// Renders the launchd plist with the workspace registrations needed to boot a
+/// fresh daemon after volatile runtime state has been recreated.
+pub fn render_launchd_plist(
+    exec_path: &Path,
+    workspaces: &[String],
+) -> Result<String, ServiceInstallError> {
+    validate_exec_path_for_render(exec_path)?;
+    validate_workspace_arguments(workspaces)?;
+    validate_daemon_protected_workspace_paths(workspaces, exec_path)?;
     let base = include_str!("../../../../packaging/launchd/com.roundhouse.daemon.plist");
     let escaped_exec_path = escape_xml_text(&exec_path.to_string_lossy());
     let mut rendered = base.replace("/usr/local/bin/round", &escaped_exec_path);
+    let workspace_arguments = workspaces
+        .iter()
+        .map(|workspace| {
+            format!(
+                "        <string>--workspace</string>\n        <string>{}</string>\n",
+                escape_xml_text(workspace)
+            )
+        })
+        .collect::<String>();
+    rendered = rendered.replace(
+        "        <string>daemon</string>\n",
+        &format!("        <string>daemon</string>\n{workspace_arguments}"),
+    );
 
     let log_dir = best_effort_home_dir()
         .join("Library")
@@ -177,7 +227,7 @@ pub fn render_launchd_plist(exec_path: &Path) -> String {
         "~/Library/Logs/roundhouse/daemon.err",
         &escape_xml_text(&log_dir.join("daemon.err").display().to_string()),
     );
-    rendered
+    Ok(rendered)
 }
 
 /// Doubles every `%` (systemd's specifier-expansion escape character),
@@ -191,7 +241,7 @@ pub fn render_launchd_plist(exec_path: &Path) -> String {
 /// which every real writer of a unit file calls first.
 fn quote_systemd_exec_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
-    let percent_doubled = raw.replace('%', "%%");
+    let percent_doubled = raw.replace('%', "%%").replace('$', "$$");
     let mut quoted = String::with_capacity(percent_doubled.len() + 2);
     quoted.push('"');
     for ch in percent_doubled.chars() {
@@ -346,6 +396,56 @@ pub enum ServiceInstallError {
          install directory"
     )]
     HomeNotSet,
+    #[error("at least one --workspace NAME=PATH is required for a bootable service")]
+    MissingWorkspace,
+    #[error("workspace registrations cannot contain control characters")]
+    InvalidWorkspaceArgument,
+}
+
+fn validate_workspace_arguments(workspaces: &[String]) -> Result<(), ServiceInstallError> {
+    if workspaces.is_empty() {
+        return Err(ServiceInstallError::MissingWorkspace);
+    }
+    let mut names = HashSet::new();
+    let mut roots = HashSet::new();
+    for workspace in workspaces {
+        if workspace.chars().any(char::is_control) {
+            return Err(ServiceInstallError::InvalidWorkspaceArgument);
+        }
+        let Some((name, root)) = workspace.split_once('=') else {
+            return Err(ServiceInstallError::InvalidWorkspaceArgument);
+        };
+        if name.is_empty() || root.is_empty() || !Path::new(root).is_absolute() {
+            return Err(ServiceInstallError::InvalidWorkspaceArgument);
+        }
+        if name.len() > 4096 {
+            return Err(ServiceInstallError::InvalidWorkspaceArgument);
+        }
+        let canonical = Path::new(root)
+            .canonicalize()
+            .map_err(|_| ServiceInstallError::InvalidWorkspaceArgument)?;
+        if !canonical.is_dir() || canonical == Path::new("/") {
+            return Err(ServiceInstallError::InvalidWorkspaceArgument);
+        }
+        if PROTECTED_SYSTEM_ROOTS.iter().any(|raw_root| {
+            let Ok(protected) = Path::new(raw_root).canonicalize() else {
+                return false;
+            };
+            canonical == protected
+                || (*raw_root != "/tmp" && *raw_root != "/home" && canonical.starts_with(protected))
+        }) {
+            return Err(ServiceInstallError::InvalidWorkspaceArgument);
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            if PathBuf::from(home).canonicalize().ok().as_deref() == Some(canonical.as_path()) {
+                return Err(ServiceInstallError::InvalidWorkspaceArgument);
+            }
+        }
+        if !names.insert(name) || !roots.insert(canonical) {
+            return Err(ServiceInstallError::InvalidWorkspaceArgument);
+        }
+    }
+    Ok(())
 }
 
 /// Rejects an exec path unsafe to embed literally in a rendered unit/plist:
@@ -542,12 +642,16 @@ fn write_unit_file(path: &Path, contents: &str, force: bool) -> Result<(), Servi
 /// check [`check_exec_path_safe`] applies to the exec path): a writable
 /// *directory* anywhere in the chain lets another user replace an installed
 /// unit file wholesale regardless of the file's own `0o644` mode.
+/// Writes a service unit that re-registers the supplied workspaces on every
+/// boot, including after volatile runtime state has been recreated.
 pub fn install_to(
     dir: &Path,
     os: OsFamily,
     exec_path: &Path,
     force: bool,
+    workspaces: &[String],
 ) -> Result<PathBuf, ServiceInstallError> {
+    validate_workspace_arguments(workspaces)?;
     validate_exec_path_for_render(exec_path)?;
 
     #[cfg(unix)]
@@ -579,11 +683,11 @@ pub fn install_to(
     let targets: Vec<(PathBuf, String)> = match os {
         OsFamily::Linux => vec![(
             dir.join(LINUX_UNIT_FILES[0]),
-            render_systemd_unit(exec_path),
+            render_systemd_unit(exec_path, workspaces)?,
         )],
         OsFamily::MacOs => vec![(
             dir.join(MACOS_UNIT_FILES[0]),
-            render_launchd_plist(exec_path),
+            render_launchd_plist(exec_path, workspaces)?,
         )],
     };
 
@@ -647,8 +751,141 @@ pub fn install(
     os: OsFamily,
     exec_path: &Path,
     force: bool,
+    workspaces: &[String],
 ) -> Result<PathBuf, ServiceInstallError> {
-    install_to(&install_dir(os)?, os, exec_path, force)
+    let dir = install_dir(os)?;
+    if os == OsFamily::MacOs {
+        ensure_launchd_log_dir(&dir)?;
+    }
+    install_to(&dir, os, exec_path, force, workspaces)
+}
+
+fn validate_daemon_protected_workspace_paths(
+    workspaces: &[String],
+    exec_path: &Path,
+) -> Result<(), ServiceInstallError> {
+    let mut protected = vec![roundhouse_tui::default_runtime_dir()];
+    if let Some(parent) = exec_path.parent() {
+        protected.push(parent.join("round-daemon-internal"));
+    }
+    let protected = protected
+        .into_iter()
+        .map(|path| {
+            path.canonicalize()
+                .unwrap_or_else(|_| normalize_absolute_path(&path))
+        })
+        .collect::<Vec<_>>();
+    for workspace in workspaces {
+        let (_, root) = workspace
+            .split_once('=')
+            .ok_or(ServiceInstallError::InvalidWorkspaceArgument)?;
+        let root = Path::new(root)
+            .canonicalize()
+            .map_err(|_| ServiceInstallError::InvalidWorkspaceArgument)?;
+        if protected
+            .iter()
+            .any(|path| root.starts_with(path) || path.starts_with(&root))
+        {
+            return Err(ServiceInstallError::InvalidWorkspaceArgument);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn ensure_launchd_log_dir(install_dir: &Path) -> io::Result<()> {
+    let log_dir = install_dir
+        .parent()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "install directory has no parent",
+            )
+        })?
+        .join("Logs/roundhouse");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        validate_directory_chain(&log_dir)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&log_dir)?;
+        let metadata = std::fs::symlink_metadata(&log_dir)?;
+        if !metadata.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "launchd log path exists but is not a directory",
+            ));
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "launchd log directory must be owner-only",
+            ));
+        }
+        validate_directory_chain(&log_dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&log_dir)?;
+    }
+    Ok(())
+}
+
+fn validate_directory_chain(path: &Path) -> io::Result<()> {
+    let mut current = Some(path);
+    while let Some(directory) = current {
+        let metadata = match std::fs::symlink_metadata(directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                current = directory.parent();
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() {
+            let kind = if directory == path {
+                io::ErrorKind::AlreadyExists
+            } else {
+                io::ErrorKind::InvalidInput
+            };
+            return Err(io::Error::new(kind, "directory path contains a symlink"));
+        }
+        if !metadata.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path contains a non-directory or symlink ancestor",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = metadata.permissions().mode() & 0o7777;
+            if dir_mode_is_unsafely_writable(mode) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "directory path contains an unsafe writable ancestor",
+                ));
+            }
+        }
+        current = directory.parent();
+    }
+    Ok(())
 }
 
 /// `round service uninstall`: removes the unit/plist (and any legacy unit —
@@ -732,5 +969,33 @@ mod tests {
             require_home(Some(PathBuf::from("/home/u"))).unwrap(),
             PathBuf::from("/home/u")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launchd_log_setup_rejects_an_existing_symlink_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let install_dir = root.path().join("LaunchAgents");
+        std::fs::create_dir(&install_dir).unwrap();
+        let logs = root.path().join("Logs");
+        std::fs::create_dir(&logs).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(target.path(), logs.join("roundhouse")).unwrap();
+
+        let error = ensure_launchd_log_dir(&install_dir).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launchd_log_setup_rejects_a_symlinked_logs_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let install_dir = root.path().join("LaunchAgents");
+        std::fs::create_dir(&install_dir).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(target.path(), root.path().join("Logs")).unwrap();
+
+        let error = ensure_launchd_log_dir(&install_dir).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

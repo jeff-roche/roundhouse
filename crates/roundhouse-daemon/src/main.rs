@@ -40,6 +40,7 @@ use roundhouse_daemon::mcp_config;
 use roundhouse_daemon::session_bootstrap::DaemonResources;
 use roundhouse_daemon::session_registry::SessionRegistry;
 use roundhouse_daemon::socket_server::{accept_loop, bind_socket};
+use roundhouse_daemon::workspace_registry::{WorkspaceRegistration, WorkspaceRegistry};
 use roundhouse_engine::EngineHandles;
 use roundhouse_net::proxy::LoopbackProxy;
 use roundhouse_provider::{
@@ -61,10 +62,10 @@ const RUNTIME_DIR_MODE: u32 = 0o700;
 
 /// `round-daemon-internal`'s own argument parsing — deliberately tiny.
 /// `round daemon` (`roundhouse-cli`'s subcommand, `commands::daemon::run`)
-/// execs this binary with no arguments today; an operator or test that needs
-/// a non-default socket path invokes this binary directly with `--socket`
-/// (the lane file's own correction: "the daemon binary needs a --socket
-/// flag, not a daemon subcommand of its own" — this is that flag).
+/// forwards workspace registrations to this binary; an operator or test that
+/// needs a non-default socket path invokes this binary directly with
+/// `--socket` (the lane file's own correction: "the daemon binary needs a
+/// --socket flag, not a daemon subcommand of its own" — this is that flag).
 #[derive(Debug, Parser)]
 #[command(
     name = "round-daemon-internal",
@@ -78,6 +79,11 @@ struct Args {
     /// sees no behavior change.
     #[arg(long)]
     socket: Option<PathBuf>,
+
+    /// Register a workspace as `NAME=PATH`. May be repeated. Registrations are
+    /// persisted and are resolved before a session is constructed.
+    #[arg(long = "workspace", value_parser = parse_workspace_registration)]
+    workspaces: Vec<WorkspaceRegistration>,
 
     /// Ruling W1-R95: every real session asks for `Tier::Sandbox`, and by
     /// default (`OnDegrade::Refuse`, §6.5's documented default) this daemon
@@ -142,6 +148,20 @@ fn parse_tier(raw: &str) -> Result<Tier, String> {
              container, remote)"
         )),
     }
+}
+
+fn parse_workspace_registration(raw: &str) -> Result<WorkspaceRegistration, String> {
+    let (name, root) = raw
+        .split_once('=')
+        .ok_or_else(|| "expected workspace registration in NAME=PATH form".to_string())?;
+    if name.is_empty() || root.is_empty() {
+        return Err("workspace registration requires both a name and a path".to_string());
+    }
+    let registration = WorkspaceRegistration::new(name, PathBuf::from(root));
+    registration
+        .validate()
+        .map_err(|_| "workspace registration path is not a usable directory".to_string())?;
+    Ok(registration)
 }
 
 /// The one process-wide `TaskRunner`, obtained exactly once via
@@ -210,34 +230,19 @@ async fn main() -> color_eyre::Result<()> {
     });
     let runner = &handles.task_runner;
 
-    // Fix round 5, W1-R111: this whole config-loading block (`project_root`
-    // through `network_config`, below) runs BEFORE `prepare_runtime_dir`/
-    // `remove_stale_socket` — deliberately, and this ordering is itself the
-    // fix, not incidental. `remove_stale_socket` unlinks whatever socket
-    // sits at the target path with no liveness probe at all (see its own
-    // doc comment for the still-open root cause), so a `round daemon`
-    // re-invoked with a typo'd `[[mcp_server]]` config used to unlink a
-    // LIVE daemon's socket via `remove_stale_socket`, THEN refuse to boot
-    // over the bad config — leaving the original, still-running daemon
-    // (holding real isolation handles, an egress-proxy registration, and
-    // any MCP subprocesses) with no control channel at all, un-killable by
-    // anything short of `kill`. Config is now fully validated (this block
-    // can `return Err` before EITHER `prepare_runtime_dir` or
-    // `remove_stale_socket` ever runs) before this process makes any
-    // filesystem mutation of its own — the same ordering `nginx -t`/`sshd`
-    // use validate-before-touch for, which W1-R109 cited as precedent
-    // without also ordering the sequence that precedent actually implies.
+    // The configuration-loading block (`project_root` through
+    // `network_config`, below) runs before `remove_stale_socket`, so a
+    // malformed configuration cannot strand an already-running daemon by
+    // unlinking its control socket and then refusing to start. The startup
+    // lock and early liveness probe above additionally ensure that a second
+    // daemon refuses before database recovery or any other boot side effect.
     //
-    // CF-11: `project_root` is what makes `default_layers`'s Project scope
-    // (and therefore `mcp_config::load_mcp_servers`'s/`load_network_config`'s
-    // own narrow-only project-scope handling) reachable at all — this daemon
-    // has no other source of a filesystem project root: `ClientRequest::
-    // CreateSession`'s `workspace_name` is a plain `String` label, not a
-    // path (see CF-17's own note in the task report). The daemon's own
-    // current working directory is the only real candidate; an operator who
-    // runs `round daemon` from inside their project gets project-scoped
-    // config, one who doesn't gets user-global only.
-    let project_root = std::env::current_dir().ok();
+    // CF-11: startup validates only operator-global configuration. A client
+    // request carries a workspace name, not a path, so project-scoped
+    // configuration is loaded per session after the persisted workspace name
+    // has resolved to its canonical root. The daemon's current directory is
+    // never used as a project root.
+    let project_root: Option<PathBuf> = None;
 
     // Fix round 3, MUST 3, as amended by fix round 4 (ruling W1-R109): this
     // used to propagate `McpConfigError` straight out of `main` via `?`,
@@ -349,6 +354,14 @@ async fn main() -> color_eyre::Result<()> {
     let runtime_dir = roundhouse_tui::default_runtime_dir();
     prepare_runtime_dir(&runtime_dir)?;
 
+    let socket_path = args
+        .socket
+        .or_else(|| std::env::var_os("ROUND_SOCKET").map(PathBuf::from))
+        .unwrap_or_else(roundhouse_tui::default_socket_path);
+    validate_socket_path(&socket_path)?;
+    let _socket_startup_lock = acquire_daemon_startup_lock(&runtime_dir)?;
+    ensure_socket_not_live(&socket_path)?;
+
     // Policy trust records deliberately live below the daemon's owner-only
     // state directory rather than the project.  Parse and compile before
     // touching the socket: a malformed policy is an operator-visible boot
@@ -372,12 +385,6 @@ async fn main() -> color_eyre::Result<()> {
         }
     };
 
-    let socket_path = args
-        .socket
-        .or_else(|| std::env::var_os("ROUND_SOCKET").map(PathBuf::from))
-        .unwrap_or_else(roundhouse_tui::default_socket_path);
-    remove_stale_socket(&socket_path)?;
-
     // Absolute by construction (`default_runtime_dir`'s own contract) and
     // asserted as such by `SessionActor::new` — this session-independent
     // path anchors both `sealed_state_dir_write` and, via
@@ -392,6 +399,22 @@ async fn main() -> color_eyre::Result<()> {
     let daemon_binary = std::fs::canonicalize(std::env::current_exe()?)?;
 
     let store_path = runtime_dir.join("events.db");
+    let session_store = roundhouse_store::open(&store_path).await?;
+    let workspace_registry = Arc::new(
+        WorkspaceRegistry::open_with_protected_paths(
+            session_store.clone(),
+            vec![runtime_dir.clone(), daemon_binary.clone()],
+        )
+        .await?,
+    );
+    for registration in args.workspaces {
+        workspace_registry.register(registration).await?;
+    }
+    if workspace_registry.is_empty()? {
+        return Err(color_eyre::eyre::eyre!(
+            "no workspaces are registered; pass at least one --workspace NAME=PATH"
+        ));
+    }
 
     // Boot sequence (S-SESS-4): reclassify any task left in `Created`/`Decided`/
     // `Running` state by a previous daemon process that died mid-run, and
@@ -455,7 +478,6 @@ async fn main() -> color_eyre::Result<()> {
     let proxy_writer = roundhouse_store::spawn_writer(proxy_store).await;
     proxy.clone().serve(runner, proxy_writer.clone()).await?;
 
-    let session_store = roundhouse_store::open(&store_path).await?;
     // Fix round 2, MUST 3: make an operator's `--allow-degraded-to` choice
     // loud, on every boot, for the process's whole life — proven, before
     // this fix, that starting with the flag printed NOTHING about it on
@@ -528,6 +550,8 @@ async fn main() -> color_eyre::Result<()> {
         provider,
         request_ctx,
         proxy_writer,
+        Some(workspace_registry),
+        true,
     ));
 
     let registry = Arc::new(SessionRegistry::new());
@@ -573,6 +597,7 @@ async fn main() -> color_eyre::Result<()> {
     // doc comment, ruling W1-R12). Ordered after the web bind above for the
     // reason stated there: the socket's existence is now the signal that
     // BOTH listeners are ready, not just this one.
+    remove_stale_socket(&socket_path)?;
     let listener = bind_socket(&socket_path)?;
 
     println!(
@@ -821,26 +846,16 @@ impl HttpTransport for NoTransportConfigured {
 /// path is reported as a symlink (not a socket) and is refused rather than
 /// followed.
 ///
-/// # Named root cause, not yet fixed (fix round 5, W1-R111)
-///
-/// This function has no LIVENESS probe: it unlinks whatever socket sits at
-/// `path` unconditionally, without ever checking whether a daemon is still
-/// alive and actually listening on it. `main`'s call site is now ordered
-/// so this never runs before `[[mcp_server]]`/`[network]` config has
-/// already been validated (a malformed config used to make this unlink a
-/// LIVE daemon's socket and then refuse to boot, stranding the original
-/// daemon with no control channel) — but that ordering fix only closes
-/// ONE trigger. Every fallible operation between this call and
-/// `bind_socket` (any `?` in `main`, e.g. `std::fs::canonicalize`,
-/// `roundhouse_store::open`, `run_boot_sequence`, `LoopbackProxy::serve`)
-/// shares the identical exposure: this process unlinks the socket first,
-/// then can still exit before ever re-binding it. A `connect()` probe here
-/// (refuse to remove a path that a peer actually accepts a connection on)
-/// would close all of them at the root, not just the one this round fixed
-/// — worth a follow-up, out of scope for this fix.
+/// The caller holds [`acquire_socket_startup_lock`] while this function and
+/// the subsequent bind run. The probe is repeated here because this helper
+/// also runs during shutdown and must never unlink a socket that is currently
+/// serving a peer.
 fn remove_stale_socket(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path),
+        Ok(meta) if meta.file_type().is_socket() => {
+            ensure_socket_not_live(path)?;
+            std::fs::remove_file(path)
+        }
         Ok(_) => Err(std::io::Error::new(
             ErrorKind::AlreadyExists,
             format!(
@@ -851,6 +866,84 @@ fn remove_stale_socket(path: &Path) -> std::io::Result<()> {
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+fn ensure_socket_not_live(path: &Path) -> std::io::Result<()> {
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => Err(std::io::Error::new(
+            ErrorKind::AddrInUse,
+            "socket is still served by a live daemon",
+        )),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::ConnectionRefused | ErrorKind::NotFound
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_socket_path(path: &Path) -> std::io::Result<()> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "socket path must be absolute",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "socket path has no parent directory",
+        )
+    })?;
+    let mut current = Some(parent);
+    while let Some(directory) = current {
+        let metadata = std::fs::symlink_metadata(directory)?;
+        if !metadata.file_type().is_dir() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "socket path has a non-directory or symlink ancestor",
+            ));
+        }
+        let mode = metadata.permissions().mode() & 0o7777;
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "socket path is under a group- or world-writable directory without sticky protection",
+            ));
+        }
+        current = directory.parent();
+    }
+    Ok(())
+}
+
+/// Serializes daemon startup for the shared daemon runtime state. The operating system releases
+/// the advisory lock when the process exits, including an unclean crash, so a
+/// stale lock file does not block recovery on the next boot.
+fn acquire_daemon_startup_lock(
+    runtime_dir: &Path,
+) -> std::io::Result<nix::fcntl::Flock<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let lock_path = runtime_dir.join(".daemon.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(lock_path)?;
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(
+        |(_, error)| match error {
+            nix::errno::Errno::EWOULDBLOCK => {
+                std::io::Error::new(ErrorKind::AddrInUse, "another daemon owns this socket")
+            }
+            error => std::io::Error::other(error.to_string()),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -882,5 +975,42 @@ mod tests {
     fn args_default_to_no_degradation_allowed() {
         let args = Args::parse_from(["round-daemon-internal"]);
         assert_eq!(args.allow_degraded_to, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_live_socket_is_not_removed_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("round.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let error = remove_stale_socket(&socket).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::AddrInUse);
+        assert!(socket.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_one_daemon_can_hold_the_socket_startup_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_daemon_startup_lock(dir.path()).unwrap();
+
+        let error = acquire_daemon_startup_lock(dir.path()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::AddrInUse);
+        drop(first);
+        acquire_daemon_startup_lock(dir.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_under_an_unsafe_custom_parent_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let socket = dir.path().join("round.sock");
+
+        let error = validate_socket_path(&socket).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
     }
 }

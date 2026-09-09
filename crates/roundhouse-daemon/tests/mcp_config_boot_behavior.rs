@@ -70,12 +70,17 @@ async fn a_malformed_operator_mcp_config_refuses_to_boot_without_leaking_its_own
     std::fs::write(config_dir.join("config.toml"), hostile_mcp_config()).unwrap();
 
     let socket_path = dir.path().join("round.sock");
+    let workspace_root = dir.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
     let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_round-daemon-internal"))
         .arg("--socket")
         .arg(&socket_path)
+        .arg("--workspace")
+        .arg(format!("daemon-a-session={}", workspace_root.display()))
         .arg("--allow-degraded-to")
         .arg("none")
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path())
         // Crate-scoped, not a blanket `info` — see
         // `on_degrade_boot_behavior.rs`'s fix round 3 doc comment for why a
         // blanket filter can hide a target-naming regression that a real
@@ -148,13 +153,20 @@ async fn a_malformed_operator_mcp_config_refuses_to_boot_without_leaking_its_own
 async fn a_refused_reboot_never_unlinks_a_live_daemons_socket() {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("round.sock");
+    let workspace_root = dir.path().join("workspace");
+    let daemon_b_home = dir.path().join("daemon-b-home");
+    std::fs::create_dir(&workspace_root).unwrap();
+    std::fs::create_dir(&daemon_b_home).unwrap();
 
     let mut daemon_a = tokio::process::Command::new(env!("CARGO_BIN_EXE_round-daemon-internal"))
         .arg("--socket")
         .arg(&socket_path)
+        .arg("--workspace")
+        .arg(format!("daemon-a-session={}", workspace_root.display()))
         .arg("--allow-degraded-to")
         .arg("none")
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -187,16 +199,19 @@ async fn a_refused_reboot_never_unlinks_a_live_daemons_socket() {
     // the SAME socket path — the exact scenario an operator hits editing
     // their MCP config and re-running `round daemon` without realizing one
     // is already up.
-    let config_dir = dir.path().join(".config/roundhouse");
+    let config_dir = daemon_b_home.join(".config/roundhouse");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(config_dir.join("config.toml"), hostile_mcp_config()).unwrap();
 
     let daemon_b = tokio::process::Command::new(env!("CARGO_BIN_EXE_round-daemon-internal"))
         .arg("--socket")
         .arg(&socket_path)
+        .arg("--workspace")
+        .arg(format!("daemon-a-session={}", workspace_root.display()))
         .arg("--allow-degraded-to")
         .arg("none")
-        .env("HOME", dir.path())
+        .env("HOME", daemon_b_home)
+        .env("XDG_RUNTIME_DIR", dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -209,8 +224,9 @@ async fn a_refused_reboot_never_unlinks_a_live_daemons_socket() {
         .expect("waiting on daemon B must not itself fail");
     assert!(
         !output.status.success(),
-        "daemon B must refuse to boot on the malformed [[mcp_server]] config, got: {:?}",
-        output.status
+        "daemon B must refuse to boot on the malformed [[mcp_server]] config, got: {:?}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
     );
 
     // The load-bearing assertions: daemon A's socket must be untouched, and
@@ -222,7 +238,7 @@ async fn a_refused_reboot_never_unlinks_a_live_daemons_socket() {
     );
     let second_client = tokio::time::timeout(
         Duration::from_secs(10),
-        roundhouse_tui::connect_create(&socket_path, "daemon-a-still-alive"),
+        roundhouse_tui::connect_create(&socket_path, "daemon-a-session"),
     )
     .await
     .expect("connect_create against daemon A must not hang after daemon B's refused reboot")

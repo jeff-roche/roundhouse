@@ -76,6 +76,7 @@ async fn spawn_under_bwrap_catches_a_bad_bind_path_setup_failure_consistently() 
         let result = roundhouse_sandbox::bwrap::spawn_under_bwrap(
             std::path::Path::new("bwrap"),
             &bad_path,
+            None,
             cmd,
             None,
         )

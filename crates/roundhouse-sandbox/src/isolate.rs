@@ -204,6 +204,67 @@ impl BwrapLandlockIsolate {
             Ok(cmd)
         }
     }
+
+    async fn spawn_with_workspace_root(
+        &self,
+        h: &Handle,
+        cmd: CommandSpec,
+        workspace_root: PathBuf,
+        workspace_identity: Option<(i64, i64)>,
+    ) -> Result<Child, IsolationError> {
+        let lifecycle = self
+            .handles
+            .get(&h.id)
+            .map(|meta| meta.lifecycle.clone())
+            .ok_or_else(|| IsolationError::Unsupported(format!("unknown handle {}", h.id)))?;
+        let closing = lifecycle.lock().await;
+        if *closing {
+            return Err(IsolationError::Unsupported(format!(
+                "isolation handle {} is being torn down",
+                h.id
+            )));
+        }
+        if matches!(
+            self.probe_report.landlock,
+            crate::probe::MechanismStatus::Available
+        ) && workspace_root == std::path::Path::new("/")
+        {
+            crate::landlock_wrap::validate_workspace_root(&workspace_root)?;
+        }
+        if !workspace_root.is_absolute() || workspace_root == std::path::Path::new("/") {
+            return Err(IsolationError::Unsupported(
+                "spawn requires a non-root absolute workspace directory".into(),
+            ));
+        }
+        if cmd.program.contains('/') && !std::path::Path::new(&cmd.program).is_file() {
+            return Err(IsolationError::Unsupported(format!(
+                "program does not exist: {}",
+                cmd.program
+            )));
+        }
+        let seccomp_bpf = self.seccomp_bpf_for_spawn()?;
+        let cmd = self.wrap_for_landlock_if_available(cmd, &workspace_root)?;
+        let (child, namespace_confirmed) = crate::bwrap::spawn_under_bwrap(
+            &self.bwrap_path,
+            &workspace_root,
+            workspace_identity,
+            cmd,
+            seccomp_bpf,
+        )
+        .await?;
+        if let Some(mut meta) = self.handles.get_mut(&h.id) {
+            meta.bwrap_pid = Some(child.pid());
+            meta.bwrap_namespace_confirmed = namespace_confirmed;
+            meta.child_handles.push(child.clone());
+        } else {
+            let _ = child.cancel().await;
+            return Err(IsolationError::Unsupported(format!(
+                "isolation handle {} was torn down while its child was starting",
+                h.id
+            )));
+        }
+        Ok(child)
+    }
 }
 
 #[async_trait::async_trait]
@@ -261,46 +322,24 @@ impl Isolate for BwrapLandlockIsolate {
     /// and refuses up front if it's absent, rather than silently proceeding with
     /// something meaningless.
     async fn spawn(&self, h: &Handle, cmd: CommandSpec) -> Result<Child, IsolationError> {
-        let lifecycle = self
-            .handles
-            .get(&h.id)
-            .map(|meta| meta.lifecycle.clone())
-            .ok_or_else(|| IsolationError::Unsupported(format!("unknown handle {}", h.id)))?;
-        let closing = lifecycle.lock().await;
-        if *closing {
-            return Err(IsolationError::Unsupported(format!(
-                "isolation handle {} is being torn down",
-                h.id
-            )));
-        }
         let workspace_root = cmd.cwd.clone().map(PathBuf::from).ok_or_else(|| {
             IsolationError::Unsupported(
                 "spawn requires a real working directory to sandbox into".into(),
             )
         })?;
-        if cmd.program.contains('/') && !std::path::Path::new(&cmd.program).is_file() {
-            return Err(IsolationError::Unsupported(format!(
-                "program does not exist: {}",
-                cmd.program
-            )));
-        }
-        let seccomp_bpf = self.seccomp_bpf_for_spawn()?;
-        let cmd = self.wrap_for_landlock_if_available(cmd, &workspace_root)?;
-        let (child, namespace_confirmed) =
-            crate::bwrap::spawn_under_bwrap(&self.bwrap_path, &workspace_root, cmd, seccomp_bpf)
-                .await?;
-        if let Some(mut meta) = self.handles.get_mut(&h.id) {
-            meta.bwrap_pid = Some(child.pid());
-            meta.bwrap_namespace_confirmed = namespace_confirmed;
-            meta.child_handles.push(child.clone());
-        } else {
-            let _ = child.cancel().await;
-            return Err(IsolationError::Unsupported(format!(
-                "isolation handle {} was torn down while its child was starting",
-                h.id
-            )));
-        }
-        Ok(child)
+        self.spawn_with_workspace_root(h, cmd, workspace_root, None)
+            .await
+    }
+
+    async fn spawn_in_workspace(
+        &self,
+        h: &Handle,
+        workspace_root: &std::path::Path,
+        workspace_identity: Option<(i64, i64)>,
+        cmd: CommandSpec,
+    ) -> Result<Child, IsolationError> {
+        self.spawn_with_workspace_root(h, cmd, workspace_root.to_path_buf(), workspace_identity)
+            .await
     }
 
     /// Written on every task row, not once per session — tiers can change mid-session

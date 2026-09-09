@@ -95,9 +95,13 @@ async fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
 async fn round_daemon_serves_a_real_http_get_api_runs_alongside_the_unix_socket() {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("round.sock");
+    let workspace_root = dir.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_round-daemon-internal"))
         .arg("--socket")
         .arg(&socket_path)
+        .arg("--workspace")
+        .arg(format!("web-test={}", workspace_root.display()))
         // Inert for what this test actually exercises: `--allow-degraded-to`
         // only feeds `OnDegrade`, which is consulted at `CreateSession` —
         // this test never sends one, so the flag changes nothing here. Kept
@@ -106,6 +110,7 @@ async fn round_daemon_serves_a_real_http_get_api_runs_alongside_the_unix_socket(
         .arg("--allow-degraded-to")
         .arg("none")
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)

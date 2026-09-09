@@ -16,6 +16,7 @@ use tokio::process::Command;
 /// picked for no reason. Distinct from fd 0, which the seccomp path below already
 /// uses for a different purpose.
 const INFO_FD: i32 = 100;
+const WORKSPACE_FD: i32 = 101;
 
 /// How long to wait for bwrap's `--info-fd` write (or the pipe closing with no data,
 /// on a setup failure) before giving up. §6.5/fix-round-2 rationale: a *successful*
@@ -47,6 +48,7 @@ const INFO_FD_TIMEOUT: Duration = Duration::from_secs(5);
 pub async fn spawn_under_bwrap(
     bwrap_path: &Path,
     workspace_root: &PathBuf,
+    workspace_identity: Option<(i64, i64)>,
     cmd: CommandSpec,
     seccomp_bpf: Option<Vec<u8>>,
 ) -> Result<(Child, bool), IsolationError> {
@@ -55,6 +57,18 @@ pub async fn spawn_under_bwrap(
             "workspace root is not an accessible directory: {}",
             workspace_root.display()
         )));
+    }
+    let workspace_dir = std::fs::File::open(workspace_root).map_err(|e| {
+        IsolationError::Unsupported(format!(
+            "failed to open workspace root for stable binding: {e}"
+        ))
+    })?;
+    if let Some(expected) = workspace_identity {
+        if !workspace_identity_matches_file(&workspace_dir, expected) {
+            return Err(IsolationError::Unsupported(
+                "workspace filesystem identity changed before sandbox binding".into(),
+            ));
+        }
     }
     let mut command = Command::new(bwrap_path);
     command
@@ -73,7 +87,7 @@ pub async fn spawn_under_bwrap(
         .arg("--dev")
         .arg("/dev")
         .arg("--bind")
-        .arg(workspace_root)
+        .arg(format!("/proc/self/fd/{WORKSPACE_FD}"))
         .arg(workspace_root)
         .arg("--unshare-all")
         // Today this fully unshares network (`--unshare-all` includes network) — no
@@ -116,10 +130,16 @@ pub async fn spawn_under_bwrap(
         IsolationError::Unsupported(format!("failed to register info-fd pipe with tokio: {e}"))
     })?;
     command
-        .fd_mappings(vec![FdMapping {
-            parent_fd: info_write.into(),
-            child_fd: INFO_FD,
-        }])
+        .fd_mappings(vec![
+            FdMapping {
+                parent_fd: info_write.into(),
+                child_fd: INFO_FD,
+            },
+            FdMapping {
+                parent_fd: workspace_dir.into(),
+                child_fd: WORKSPACE_FD,
+            },
+        ])
         .map_err(|e| {
             IsolationError::Unsupported(format!("failed to map info-fd into bwrap's fd table: {e}"))
         })?;
@@ -248,4 +268,50 @@ pub async fn spawn_under_bwrap(
     // handled the `false` case — so this is a real, not aspirational, confirmation
     // that bwrap's namespace/mount setup completed for this specific process.
     Ok((Child::from_process_internal(pid, child), info_confirmed))
+}
+
+fn workspace_identity_matches_file(file: &std::fs::File, expected: (i64, i64)) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        (metadata.dev() as i64, metadata.ino() as i64) == expected
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, expected);
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_identity_matches_file;
+    use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn an_open_workspace_handle_keeps_the_original_identity_after_replacement() {
+        use std::os::unix::fs::MetadataExt;
+
+        let parent =
+            std::env::temp_dir().join(format!("roundhouse-bwrap-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&parent).unwrap();
+        let root = parent.join("workspace");
+        let replacement = parent.join("replacement");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let handle = fs::File::open(&root).unwrap();
+        let metadata = handle.metadata().unwrap();
+        let identity = (metadata.dev() as i64, metadata.ino() as i64);
+
+        fs::remove_dir(&root).unwrap();
+        fs::rename(&replacement, &root).unwrap();
+
+        assert!(workspace_identity_matches_file(&handle, identity));
+        drop(handle);
+        fs::remove_dir_all(parent).unwrap();
+    }
 }

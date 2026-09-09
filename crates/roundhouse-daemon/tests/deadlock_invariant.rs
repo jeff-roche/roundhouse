@@ -79,7 +79,7 @@ async fn drive_session_keeps_draining_requests_while_events_tx_is_stuck_full() {
     // to empty, which the next step relies on.
     requests_tx
         .send(ClientRequest::CreateSession {
-            workspace_name: "test".into(),
+            workspace_name: "default".into(),
         })
         .await
         .unwrap();

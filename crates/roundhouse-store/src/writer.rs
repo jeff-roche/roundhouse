@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use roundhouse_core::{Event, EventPayload};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::redact::Redactor;
+use crate::txn::{
+    begin_immediate, is_sqlite_busy, with_bounded_busy_attempt, INITIAL_BACKOFF, MAX_BUSY_RETRIES,
+};
 use crate::{pool::StorePool, StoreError};
 
 pub(crate) enum WriteCmd {
@@ -121,16 +123,6 @@ pub async fn spawn_writer(store: StorePool) -> EventWriter {
 ///
 /// Backoff: 5ms initial, doubles on each retry attempt (5, 10, 20, 40, 80, 160, 320, 640ms).
 /// With 8 max retries, worst-case total wait is ~1.3s before giving up and surfacing the error.
-const MAX_BUSY_RETRIES: u32 = 8;
-const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
-
-fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
-    matches!(
-        err,
-        rusqlite::Error::SqliteFailure(ffi_err, _) if ffi_err.code == rusqlite::ErrorCode::DatabaseBusy
-    )
-}
-
 async fn append_one(
     store: &StorePool,
     event: Event,
@@ -160,72 +152,74 @@ async fn append_one(
 
         let write_result = conn
             .interact(move |c| -> Result<u64, rusqlite::Error> {
-                // BEGIN IMMEDIATE: acquire the write lock immediately rather than deferring it.
-                // This enforces single-writer discipline: a writer holds the lock for its entire
-                // transaction, so no two writers can execute concurrently. Deferred transactions
-                // would allow multiple writers to run in parallel and race to the lock at commit
-                // time, which would be both unfair to clients and incompatible with S-LOG-4/5's
-                // retry guarantees.
-                let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                let next_seq: i64 = tx.query_row(
-                    "SELECT COALESCE(MAX(seq), -1) + 1 FROM events WHERE session_id = ?1",
-                    [&session_id],
-                    |row| row.get(0),
-                )?;
-                tx.execute(
-                    "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![
-                        session_id,
-                        next_seq,
-                        ts_nanos,
-                        task_id,
-                        payload_json,
-                        schema_v
-                    ],
-                )?;
-                // Same transaction as the events insert above (§6.10's pattern): a
-                // `tasks` row is never inconsistent with the event that produced it.
-                // Session-level events (`task_id: None`) have no `tasks` row to touch.
-                if let Some(task_id) = &task_id {
-                    crate::tasks_view::upsert_for_event(
-                        &tx,
-                        task_id,
-                        &session_id,
-                        next_seq,
-                        ts_nanos,
-                        &payload,
+                with_bounded_busy_attempt(c, |c| {
+                    // BEGIN IMMEDIATE: acquire the write lock immediately rather than deferring it.
+                    // This enforces single-writer discipline: a writer holds the lock for its entire
+                    // transaction, so no two writers can execute concurrently. Deferred transactions
+                    // would allow multiple writers to run in parallel and race to the lock at commit
+                    // time, which would be both unfair to clients and incompatible with S-LOG-4/5's
+                    // retry guarantees.
+                    let tx = begin_immediate(c)?;
+                    let next_seq: i64 = tx.query_row(
+                        "SELECT COALESCE(MAX(seq), -1) + 1 FROM events WHERE session_id = ?1",
+                        [&session_id],
+                        |row| row.get(0),
                     )?;
-                    // Task 19 addendum Ruling 5's gotcha: `upsert_for_event` early-returns
-                    // (via `fold_task_state` returning `None`) for exactly the payload
-                    // kinds redactable text lives in (`TaskDelta`/`Note`), so the
-                    // redaction-count accumulation cannot live inside that function's
-                    // existing match arms — it runs here instead, unconditionally
-                    // alongside the `upsert_for_event` call, in the same transaction as
-                    // the events insert.
-                    //
-                    // Fix round 1, item 4: same fail-closed discipline as
-                    // `tasks_view::upsert_for_event`'s own `UPDATE` branch (which already
-                    // turns a zero-row match into a hard error, not a silent no-op, per
-                    // Task 0.5's security fix). A `TaskDelta`/`Note`/`TaskFailed` event
-                    // with a `task_id` that has no corresponding `tasks` row (e.g. arriving
-                    // before that task's `TaskCreated`, or a corrupt/partial history) would
-                    // otherwise silently drop its redaction count — the event still
-                    // commits, correctly redacted, but the audit-visible count for that
-                    // task simply vanishes. That's exactly the class of bug this crate's
-                    // own precedent exists to prevent.
-                    if redactions > 0 {
-                        let rows_affected = tx.execute(
-                            "UPDATE tasks SET redactions = redactions + ?1 WHERE task_id = ?2",
-                            rusqlite::params![redactions, task_id],
+                    tx.execute(
+                        "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            session_id,
+                            next_seq,
+                            ts_nanos,
+                            task_id,
+                            payload_json,
+                            schema_v
+                        ],
+                    )?;
+                    // Same transaction as the events insert above (§6.10's pattern): a
+                    // `tasks` row is never inconsistent with the event that produced it.
+                    // Session-level events (`task_id: None`) have no `tasks` row to touch.
+                    if let Some(task_id) = &task_id {
+                        crate::tasks_view::upsert_for_event(
+                            &tx,
+                            task_id,
+                            &session_id,
+                            next_seq,
+                            ts_nanos,
+                            &payload,
                         )?;
-                        if rows_affected == 0 {
-                            return Err(rusqlite::Error::StatementChangedRows(0));
+                        // Task 19 addendum Ruling 5's gotcha: `upsert_for_event` early-returns
+                        // (via `fold_task_state` returning `None`) for exactly the payload
+                        // kinds redactable text lives in (`TaskDelta`/`Note`), so the
+                        // redaction-count accumulation cannot live inside that function's
+                        // existing match arms — it runs here instead, unconditionally
+                        // alongside the `upsert_for_event` call, in the same transaction as
+                        // the events insert.
+                        //
+                        // Fix round 1, item 4: same fail-closed discipline as
+                        // `tasks_view::upsert_for_event`'s own `UPDATE` branch (which already
+                        // turns a zero-row match into a hard error, not a silent no-op, per
+                        // Task 0.5's security fix). A `TaskDelta`/`Note`/`TaskFailed` event
+                        // with a `task_id` that has no corresponding `tasks` row (e.g. arriving
+                        // before that task's `TaskCreated`, or a corrupt/partial history) would
+                        // otherwise silently drop its redaction count — the event still
+                        // commits, correctly redacted, but the audit-visible count for that
+                        // task simply vanishes. That's exactly the class of bug this crate's
+                        // own precedent exists to prevent.
+                        if redactions > 0 {
+                            let rows_affected = tx.execute(
+                                "UPDATE tasks SET redactions = redactions + ?1 WHERE task_id = ?2",
+                                rusqlite::params![redactions, task_id],
+                            )?;
+                            if rows_affected == 0 {
+                                return Err(rusqlite::Error::StatementChangedRows(0));
+                            }
                         }
                     }
-                }
-                tx.commit()?;
-                Ok(next_seq as u64)
+                    tx.commit()?;
+                    Ok(next_seq as u64)
+                })
             })
             .await
             .map_err(|e| StoreError::Interact(e.to_string()))?;
@@ -331,9 +325,10 @@ async fn append_batch(
 
         let write_result = conn
             .interact(move |c| -> Result<Vec<u64>, rusqlite::Error> {
+                with_bounded_busy_attempt(c, |c| {
                 // Same BEGIN IMMEDIATE discipline as append_one: acquire the
                 // exclusive write lock for the whole transaction up front.
-                let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let tx = begin_immediate(c)?;
                 let mut next_seq_by_session: HashMap<String, i64> = HashMap::new();
                 let mut seqs = Vec::with_capacity(batch.len());
 
@@ -410,6 +405,7 @@ async fn append_batch(
 
                 tx.commit()?;
                 Ok(seqs)
+                })
             })
             .await
             .map_err(|e| StoreError::Interact(e.to_string()))?;

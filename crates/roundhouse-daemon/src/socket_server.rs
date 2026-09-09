@@ -1078,6 +1078,24 @@ pub async fn drive_session(
                 return;
             }
 
+            let workspace = match resources.workspace_registry.as_ref() {
+                Some(registry) => match registry.resolve(&workspace_name) {
+                    Ok(workspace) => workspace,
+                    Err(_) => {
+                        tracing::warn!(
+                            "closing connection: CreateSession named an unknown or invalid workspace"
+                        );
+                        return;
+                    }
+                },
+                None => {
+                    tracing::error!(
+                        "closing connection: workspace registry is not configured; refusing session"
+                    );
+                    return;
+                }
+            };
+
             // Fix round 1 (SHOULD item): a cheap pre-check before the
             // expensive work below (real isolation `prepare`, proxy
             // registration, potentially a real `McpHost::start` subprocess
@@ -1108,7 +1126,11 @@ pub async fn drive_session(
 
             let real_session = match construct_real_session_bounded(
                 &resources,
+                workspace.id,
                 workspace_name,
+                workspace.root,
+                workspace.root_device,
+                workspace.root_inode,
                 &construction_slots,
             )
             .await
@@ -1127,7 +1149,10 @@ pub async fn drive_session(
                     // anything sent to the client — `StartSessionMcpError`/
                     // `CreateSessionError` are daemon-local operator
                     // diagnostics, not client-facing payloads.
-                    tracing::error!(error = %err, "failed to construct a real session; refusing CreateSession");
+                    tracing::error!(
+                        error_kind = err.kind(),
+                        "failed to construct a real session; refusing CreateSession"
+                    );
                     return;
                 }
                 Err(ConstructionOutcome::TimedOut) => {
@@ -1626,7 +1651,7 @@ enum ConstructionOutcome {
     /// its own error paths are responsible for tearing down whatever they
     /// had already built (see that function's own doc comments; fix round
     /// 2, MUST 2 closed the one gap that existed there).
-    Failed(session_bootstrap::CreateRealSessionError),
+    Failed(Box<session_bootstrap::CreateRealSessionError>),
     /// Construction did not report an outcome within
     /// [`SESSION_CONSTRUCTION_TIMEOUT`]. It is still running in the
     /// background and will tear itself down on completion — see this
@@ -1697,7 +1722,11 @@ enum ConstructionOutcome {
 /// so," which is why this is documented rather than asserted away.
 async fn construct_real_session_bounded(
     resources: &Arc<DaemonResources>,
+    workspace_id: roundhouse_core::WorkspaceId,
     workspace_name: String,
+    workspace_root: std::path::PathBuf,
+    workspace_device: Option<i64>,
+    workspace_inode: Option<i64>,
     construction_slots: &Arc<Semaphore>,
 ) -> Result<session_bootstrap::RealSession, ConstructionOutcome> {
     // Fix round 3, SHOULD 2: `try_acquire_owned`, never an awaited
@@ -1716,8 +1745,15 @@ async fn construct_real_session_bounded(
     let construction_resources = resources.clone();
     tokio::spawn(async move {
         let _construction_permit = construction_permit;
-        let outcome =
-            session_bootstrap::create_real_session(&construction_resources, workspace_name).await;
+        let outcome = session_bootstrap::create_real_session(
+            &construction_resources,
+            workspace_id,
+            workspace_name,
+            workspace_root,
+            workspace_device,
+            workspace_inode,
+        )
+        .await;
         match outcome {
             Ok(real_session) => {
                 if let Err(Ok(real_session)) = result_tx.send(Ok(real_session)) {
@@ -1753,7 +1789,7 @@ async fn construct_real_session_bounded(
         recv = &mut result_rx => {
             match recv {
                 Ok(Ok(real_session)) => Ok(real_session),
-                Ok(Err(err)) => Err(ConstructionOutcome::Failed(err)),
+                Ok(Err(err)) => Err(ConstructionOutcome::Failed(Box::new(err))),
                 Err(_recv_error) => Err(ConstructionOutcome::TaskEnded),
             }
         }

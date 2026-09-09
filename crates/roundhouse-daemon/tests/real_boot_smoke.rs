@@ -35,16 +35,20 @@ fn main_rs_no_longer_references_the_demo_boot_path() {
 
 /// The behavioral exit criterion: a real `round-daemon-internal` process,
 /// started via its own `--socket` flag (not a `daemon` subcommand — see
-/// `commands::daemon::run`, which execs this binary with no arguments at
-/// all), accepts a real `CreateSession` handshake over the real accept loop
+/// `commands::daemon::run`, which execs this binary and forwards its daemon
+/// options), accepts a real `CreateSession` handshake over the real accept loop
 /// — no demo script anywhere on the path.
 #[tokio::test]
 async fn round_daemon_boots_the_real_accept_loop_not_the_scripted_demo() {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("round.sock");
+    let workspace_root = dir.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_round-daemon-internal"))
         .arg("--socket")
         .arg(&socket_path)
+        .arg("--workspace")
+        .arg(format!("smoke-test={}", workspace_root.display()))
         // Ruling W1-R95 (fix round 1): the default `OnDegrade::Refuse`
         // means a `CreateSession` on a host that cannot achieve
         // `Tier::Sandbox` refuses outright — genuinely true of this test
@@ -58,6 +62,7 @@ async fn round_daemon_boots_the_real_accept_loop_not_the_scripted_demo() {
         .arg("--allow-degraded-to")
         .arg("none")
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path())
         // Never inherit this test's own stdout/stderr: the daemon runs
         // forever (it's the accept loop), so an inherited pipe stays open —
         // and, more importantly, if this test panics before reaching
@@ -113,4 +118,35 @@ async fn round_daemon_boots_the_real_accept_loop_not_the_scripted_demo() {
     );
 
     let _ = child.kill().await;
+}
+
+#[tokio::test]
+async fn round_daemon_refuses_to_boot_without_a_workspace_and_preserves_the_socket_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("round.sock");
+    std::fs::write(&socket_path, "pre-existing marker").unwrap();
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_round-daemon-internal"))
+        .arg("--socket")
+        .arg(&socket_path)
+        .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .output()
+        .await
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "an empty workspace registry must refuse boot"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no workspaces are registered"),
+        "the refusal must explain how to register a workspace, got {stderr:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&socket_path).unwrap(),
+        "pre-existing marker",
+        "failed workspace validation must not remove an existing socket path"
+    );
 }
