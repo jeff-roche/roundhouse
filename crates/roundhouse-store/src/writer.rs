@@ -76,6 +76,63 @@ pub fn serialize_payload(
     serde_json::to_string(payload)
 }
 
+/// Appends one event using an already-open write transaction.
+///
+/// This is the composable form of the writer's append operation. It assigns
+/// the next per-session sequence, applies persistence-boundary redaction, and
+/// updates the task projection before returning. The caller owns commit or
+/// rollback, which lets event-log facts share an atomic transaction with a
+/// workflow row or blob reference.
+pub fn append_event_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+    event: &Event,
+    redactor: &Redactor,
+) -> Result<u64, StoreError> {
+    let session_id = event.session_id.to_string();
+    let task_id = event.task_id.map(|task_id| task_id.to_string());
+    let (payload, redactions) = redactor.redact_event_payload(event.payload.clone());
+    let payload_json =
+        serialize_payload(&payload).map_err(|error| StoreError::Interact(error.to_string()))?;
+    let next_seq: i64 = txn.query_row(
+        "SELECT COALESCE(MAX(seq), -1) + 1 FROM events WHERE session_id = ?1",
+        [&session_id],
+        |row| row.get(0),
+    )?;
+    txn.execute(
+        "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            session_id,
+            next_seq,
+            event.ts.as_unix_nanos(),
+            task_id,
+            payload_json,
+            event.schema_v,
+        ],
+    )?;
+    if let Some(task_id) = &task_id {
+        crate::tasks_view::upsert_for_event(
+            txn,
+            task_id,
+            &event.session_id.to_string(),
+            next_seq,
+            event.ts.as_unix_nanos(),
+            &payload,
+        )?;
+        if redactions > 0 {
+            let rows_affected = txn.execute(
+                "UPDATE tasks SET redactions = redactions + ?1 WHERE task_id = ?2",
+                rusqlite::params![redactions, task_id],
+            )?;
+            if rows_affected == 0 {
+                return Err(StoreError::Sqlite(rusqlite::Error::StatementChangedRows(0)));
+            }
+        }
+    }
+    u64::try_from(next_seq)
+        .map_err(|_| StoreError::Interact("event sequence exceeded u64 range".to_string()))
+}
+
 /// Spawn a dedicated async task that owns the event-append write transaction
 /// and channel-receives `Append` commands from multiple callers. Returns an
 /// `EventWriter` handle for sending append requests. The writer task runs until

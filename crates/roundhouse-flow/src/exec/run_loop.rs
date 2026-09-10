@@ -124,13 +124,69 @@ pub struct CalledWorkflow {
     pub session_id: SessionId,
 }
 
+/// Why a production workflow host could not resolve or inspect durable state.
+#[derive(Debug, Error)]
+pub enum WorkflowHostError {
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    JobStore(#[from] crate::job_store::JobStoreError),
+    #[error(transparent)]
+    Durability(#[from] crate::durability::DurabilityError),
+    #[error(transparent)]
+    Parse(#[from] ParseError),
+    #[error("workflow child count for session {session_id} exceeds u32::MAX")]
+    ChildCountOverflow { session_id: SessionId },
+    #[error("workflow session tree is not configured")]
+    SessionTreeUnavailable,
+    #[error("workflow child reservation for session {session_id} was refused")]
+    ChildReservationRefused { session_id: SessionId },
+    #[error(transparent)]
+    Store(#[from] roundhouse_store::StoreError),
+    #[error("child admission failed: {primary}; session rollback failed: {rollback}")]
+    ChildAdmissionRollback { primary: String, rollback: String },
+}
+
+/// The engine-owned session-tree operations required when a workflow creates a
+/// child session. The flow crate cannot mint lifecycle events or see agent
+/// children itself, so production callers must provide this authority.
+pub trait SessionTree: Send {
+    /// Atomically holds one direct-child slot and returns the pre-reservation
+    /// committed child count used for depth/fan-out admission.
+    fn reserve_child(
+        &mut self,
+        parent: SessionId,
+        child: SessionId,
+    ) -> Result<u32, WorkflowHostError>;
+
+    /// Releases a slot when durable child admission does not commit.
+    fn release_child(&mut self, parent: SessionId, child: SessionId);
+
+    /// Appends the child SessionCreated lifecycle event into `txn`.
+    fn persist_child_session(
+        &mut self,
+        txn: &rusqlite::Transaction<'_>,
+        child: &WorkflowRun,
+    ) -> Result<(), WorkflowHostError>;
+
+    /// Makes a committed child admission visible to runtime traversal.
+    fn register_child(
+        &mut self,
+        parent: SessionId,
+        child: SessionId,
+        job_id: JobId,
+    ) -> Result<(), WorkflowHostError>;
+
+    fn direct_children(&mut self, parent: SessionId) -> Result<u32, WorkflowHostError>;
+}
+
 /// The two things the run loop needs that this crate cannot do for itself.
 ///
 /// Both are named rather than faked, in the shape [`Checkpointer`] already
 /// established for §8.11's implicit checkpoint — which is the supertrait, so
 /// one host value serves the park too.
 pub trait WorkflowHost: Checkpointer {
-    /// Resolve a `call:` step's workflow name to a job version, creating the
+    /// Resolve a `call:` step's workflow name to a job version and register the
     /// child's Session on the way.
     ///
     /// `None` means the name does not resolve, and the step fails: §8.12's
@@ -139,21 +195,33 @@ pub trait WorkflowHost: Checkpointer {
     /// `events`, `tasks`, `blobs`, `trigger_event`, `workflow_run`,
     /// `workflow_step_run` — a `Job`/`JobVersion` is an in-memory type in
     /// [`crate::job`]).
-    fn resolve_call(&mut self, workflow: &str, parent: SessionId) -> Option<CalledWorkflow>;
+    fn resolve_call(
+        &mut self,
+        conn: &Connection,
+        workflow: &str,
+        parent: SessionId,
+    ) -> Result<Option<CalledWorkflow>, WorkflowHostError>;
 
-    /// §7.7's fan-out numerator: how many direct children `parent` already
-    /// has **in the session tree**.
-    ///
-    /// A parameter and not a `SELECT COUNT(*) FROM workflow_run WHERE
-    /// parent_run_id = ?` for the reason
-    /// [`crate::ledger::admit_call_from_run`] states at length: §7.7's bound is
-    /// *"≤8 direct children per session"*, and a session's direct children
-    /// include its sub-agent spawns, which have no `workflow_run` row at all. A
-    /// parent with 8 sub-agents and no child runs would count 0 and admit 8
-    /// more. The number that is correct lives in
-    /// `roundhouse_engine::agent_spawn`, which this crate's §5.2 row can reach
-    /// and this module deliberately does not reach around.
-    fn direct_children_of(&mut self, parent: SessionId) -> u32;
+    /// Atomically reserves one direct-child slot and returns the committed
+    /// direct-child count observed before the reservation.
+    fn reserve_child_session(
+        &mut self,
+        parent: SessionId,
+        child: &CalledWorkflow,
+    ) -> Result<u32, WorkflowHostError>;
+
+    /// Releases an uncommitted child slot.
+    fn release_child_session(&mut self, parent: SessionId, child: &CalledWorkflow);
+
+    /// Persists the child session lifecycle event and workflow row in one
+    /// transaction, then registers the runtime spawn-tree edge after commit.
+    fn create_child_run(
+        &mut self,
+        conn: &mut Connection,
+        parent: SessionId,
+        child: &WorkflowRun,
+        called: &CalledWorkflow,
+    ) -> Result<(), WorkflowHostError>;
 }
 
 /// Why a run could not be driven. **Not** a step failing — a step failure is
@@ -231,6 +299,8 @@ pub enum RunLoopError {
     /// something about a report.
     #[error(transparent)]
     Executor(#[from] super::ExecutorError),
+    #[error(transparent)]
+    Host(#[from] WorkflowHostError),
 }
 
 /// A human's answer to the gate a run is parked on, supplied to
@@ -1163,6 +1233,20 @@ impl<H: WorkflowHost> Loop<'_, H> {
             self.now,
             self.host,
         )?;
+        executor.sink.emit(
+            TaskId::new(),
+            None,
+            TaskKind::Checkpoint,
+            EventPayload::TaskCreated {
+                kind: TaskKind::Checkpoint,
+                parent: None,
+                origin: Origin::System,
+                input: TaskInput::Json(serde_json::json!({
+                    "run_id": self.run_id,
+                    "checkpoint": parked.checkpoint_ref.0,
+                })),
+            },
+        );
         // §8.11's *"an `AwaitingHuman` task with a JSON-Schema form that TUI
         // and web render from the same schema"* — put in the log, because
         // otherwise **nobody is ever asked**. `parking::park` reads only the
@@ -1257,23 +1341,38 @@ impl<H: WorkflowHost> Loop<'_, H> {
         workflow: &str,
         with: &Value,
     ) -> StepOutcome {
-        let direct_children = self.host.direct_children_of(self.session_id);
+        let called = match self
+            .host
+            .resolve_call(&*self.conn, workflow, self.session_id)
+        {
+            Ok(Some(called)) => called,
+            Ok(None) => {
+                return StepOutcome::failed(
+                    &step.id,
+                    format!("`call:` names workflow {workflow:?}, which does not resolve to a job"),
+                )
+            }
+            Err(e) => return StepOutcome::failed(&step.id, format!("`call:` refused: {e}")),
+        };
+        let direct_children = match self.host.reserve_child_session(self.session_id, &called) {
+            Ok(count) => count,
+            Err(e) => return StepOutcome::failed(&step.id, format!("`call:` refused: {e}")),
+        };
         let child_depth =
             match crate::ledger::admit_call_from_run(self.conn, self.run_id, direct_children) {
                 Ok(depth) => depth,
-                Err(e) => return StepOutcome::failed(&step.id, format!("`call:` refused: {e}")),
+                Err(e) => {
+                    self.host.release_child_session(self.session_id, &called);
+                    return StepOutcome::failed(&step.id, format!("`call:` refused: {e}"));
+                }
             };
-
-        let Some(called) = self.host.resolve_call(workflow, self.session_id) else {
-            return StepOutcome::failed(
-                &step.id,
-                format!("`call:` names workflow {workflow:?}, which does not resolve to a job"),
-            );
-        };
 
         let mut remaining = match remaining_caps(self.conn, self.run_id, self.now) {
             Ok(caps) => caps,
-            Err(e) => return StepOutcome::failed(&step.id, format!("`call:` refused: {e}")),
+            Err(e) => {
+                self.host.release_child_session(self.session_id, &called);
+                return StepOutcome::failed(&step.id, format!("`call:` refused: {e}"));
+            }
         };
         let requested = requested_child_caps(step, &remaining);
         let grant = draw_child_budget(&mut remaining, &requested);
@@ -1283,7 +1382,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
             id: child_run_id,
             job_id: called.job_id,
             job_version: called.job_version,
-            content_hash: called.content_hash,
+            content_hash: called.content_hash.clone(),
             session_id: called.session_id,
             // §8.6's binding/trigger columns answer "the previous run of this
             // binding". A child run is not a firing of a binding; it is a step
@@ -1295,6 +1394,8 @@ impl<H: WorkflowHost> Loop<'_, H> {
             parent_run_id: Some(self.run_id),
             forked_from_run_id: None,
             awaiting_until: None,
+            checkpoint_ref: None,
+            checkpoint_blob_ref: None,
             started_at: self.now,
             ended_at: None,
             // **The depth `admit_call_from_run` returned**, never a number
@@ -1305,12 +1406,6 @@ impl<H: WorkflowHost> Loop<'_, H> {
             session_depth: Some(child_depth),
             caps: Some(grant.caps().clone()),
         };
-        if let Err(e) = crate::durability::insert_workflow_run(self.conn, &child) {
-            // The distinguishable refusal ruling P113 asks for, reaching the
-            // author as a step failure that names what ran out.
-            return StepOutcome::failed(&step.id, format!("`call:` could not be funded: {e}"));
-        }
-
         // §8.12: *"The parent's log gets one `agent`-kind task standing for the
         // call — identical to sub-agent spawning, which is the point."* The
         // `with:` block is interpolated and redacted on the way in, the same
@@ -1323,9 +1418,16 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 redact_with_needles(resolved.redacted_for_logging(), &executor.redaction_needles)
             }
             Err(e) => {
-                return StepOutcome::failed(&step.id, format!("interpolating `call.with`: {e}"))
+                self.host.release_child_session(self.session_id, &called);
+                return StepOutcome::failed(&step.id, format!("interpolating `call.with`: {e}"));
             }
         };
+        if let Err(e) = self
+            .host
+            .create_child_run(self.conn, self.session_id, &child, &called)
+        {
+            return StepOutcome::failed(&step.id, format!("`call:` could not be funded: {e}"));
+        }
         let task_id = TaskId::new();
         executor.sink.emit(
             task_id,
@@ -1744,6 +1846,8 @@ mod tests {
                 parent_run_id: None,
                 forked_from_run_id: None,
                 awaiting_until: None,
+                checkpoint_ref: None,
+                checkpoint_blob_ref: None,
                 started_at: Timestamp::from_unix_nanos(0),
                 ended_at: None,
                 session_depth: Some(0),

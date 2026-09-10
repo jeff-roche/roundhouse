@@ -47,6 +47,22 @@ pub fn read_blob(state_dir: &Path, blob_ref: &BlobRef) -> io::Result<Vec<u8>> {
     fs::read(blob_path(state_dir, &blob_ref.hash))
 }
 
+/// Reads a blob only when its on-disk bytes still match the reference's length
+/// and BLAKE3 digest.
+pub fn read_verified_blob(state_dir: &Path, blob_ref: &BlobRef) -> io::Result<Vec<u8>> {
+    let bytes = read_blob(state_dir, blob_ref)?;
+    if bytes.len() as u64 != blob_ref.len
+        || Blake3Hash::from_hex(blake3::hash(&bytes).to_hex().to_string())
+            != Ok(blob_ref.hash.clone())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "blob content does not match its reference",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// A `record_blob_write` call was rejected before touching the index.
 #[derive(Debug, thiserror::Error)]
 pub enum RecordBlobError {
@@ -95,6 +111,38 @@ pub fn record_blob_write(
         "INSERT INTO blobs (hash, len, mime, created_at, last_referenced_at, ref_count) \
          VALUES (?1, ?2, ?3, ?4, ?4, 1) \
          ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1, last_referenced_at = ?4",
+        params![
+            blob_ref.hash.as_str(),
+            blob_ref.len as i64,
+            blob_ref.mime,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+/// Records a filesystem blob as a zero-reference GC candidate.
+///
+/// Callers use this after preparing a blob but before the transaction that
+/// creates its durable owner. If that owner transaction fails, normal blob GC
+/// can still discover the file instead of leaving an unindexed orphan.
+pub fn record_unreferenced_blob(
+    txn: &Transaction,
+    state_dir: &Path,
+    blob_ref: &BlobRef,
+    now: i64,
+) -> Result<(), RecordBlobError> {
+    let path = blob_path(state_dir, &blob_ref.hash);
+    if fs::metadata(&path).is_err() {
+        return Err(RecordBlobError::MissingFile {
+            hash: blob_ref.hash.clone(),
+            state_dir: state_dir.to_path_buf(),
+        });
+    }
+    txn.execute(
+        "INSERT INTO blobs (hash, len, mime, created_at, last_referenced_at, ref_count) \
+         VALUES (?1, ?2, ?3, ?4, ?4, 0) \
+         ON CONFLICT(hash) DO NOTHING",
         params![
             blob_ref.hash.as_str(),
             blob_ref.len as i64,

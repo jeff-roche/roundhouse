@@ -1,5 +1,5 @@
 use roundhouse_core::{Origin, SessionId, TaskId, TaskInput, TaskKind, Timestamp};
-use roundhouse_store::{open, spawn_writer};
+use roundhouse_store::{begin_immediate, migrations, open, spawn_writer};
 
 static RUNNER: once_cell::sync::Lazy<roundhouse_core::TaskRunner> =
     once_cell::sync::Lazy::new(roundhouse_core::TaskRunner::bootstrap);
@@ -14,6 +14,43 @@ fn now_ts() -> Timestamp {
         .expect("system clock before UNIX epoch")
         .as_nanos() as i64;
     Timestamp::from_unix_nanos(nanos)
+}
+
+#[test]
+fn transaction_scoped_append_rolls_back_with_its_owner_write() {
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrations().to_latest(&mut conn).unwrap();
+    let session_id = SessionId::new();
+    let event = RUNNER.record_session_created(
+        session_id,
+        0,
+        now_ts(),
+        Box::new(roundhouse_core::SessionSpec::test_default()),
+        1,
+    );
+    let redactor = roundhouse_store::redact::Redactor::build(&[]);
+
+    {
+        let txn = begin_immediate(&mut conn).unwrap();
+        roundhouse_store::append_event_in_transaction(&txn, &event, &redactor).unwrap();
+        txn.execute(
+            "INSERT INTO trigger_event
+             (binding_id, idempotency_key, scheduled_for, fired_at, is_catch_up)
+             VALUES ('binding', 'owner', 'now', 'now', 0)",
+            [],
+        )
+        .unwrap();
+        // Dropping the transaction without commit must roll back both writes.
+    }
+
+    let event_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    let owner_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM trigger_event", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(event_count, 0);
+    assert_eq!(owner_count, 0);
 }
 
 #[tokio::test]

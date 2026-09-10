@@ -377,6 +377,8 @@ pub fn retry_from_step(
         parent_run_id: original.run.parent_run_id,
         forked_from_run_id: Some(original_run_id),
         awaiting_until: None,
+        checkpoint_ref: None,
+        checkpoint_blob_ref: None,
         started_at: now,
         ended_at: None,
         // Inherited, not recomputed: §8.13's fork re-runs the *same* workflow

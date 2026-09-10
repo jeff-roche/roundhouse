@@ -994,6 +994,13 @@ pub struct WorkflowRun {
     /// window on every resume. The absolute instant lives here instead;
     /// nothing in this crate serializes an `AwaitingHuman`.
     pub awaiting_until: Option<Timestamp>,
+    /// The opaque restore-point reference recorded when this run parked. It is
+    /// written with the park transition so recovery never depends on the
+    /// caller retaining the in-memory [`crate::parking::ParkResult`].
+    pub checkpoint_ref: Option<String>,
+    /// The content-addressed blob backing `checkpoint_ref`, when the
+    /// checkpointer uses durable blob storage.
+    pub checkpoint_blob_ref: Option<roundhouse_core::BlobRef>,
     pub started_at: Timestamp,
     pub ended_at: Option<Timestamp>,
     /// How deep this run's **Session** sits in the session tree: the same
@@ -1061,9 +1068,21 @@ pub fn insert_workflow_run(
     run: &WorkflowRun,
 ) -> Result<(), DurabilityError> {
     let txn = roundhouse_store::begin_immediate(conn)?;
-    insert_run_row(&txn, run)?;
+    insert_workflow_run_in_transaction(&txn, run)?;
     txn.commit()?;
     Ok(())
+}
+
+/// Inserts a new workflow run into an existing transaction.
+///
+/// This is the composable form of [`insert_workflow_run`]. In particular, a
+/// caller can append the child session's lifecycle event and insert the child
+/// run under one SQLite commit.
+pub fn insert_workflow_run_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+    run: &WorkflowRun,
+) -> Result<(), DurabilityError> {
+    insert_run_row(txn, run)
 }
 
 /// The `INSERT` itself, without a transaction of its own, so that
@@ -1143,9 +1162,9 @@ fn insert_run_row(conn: &Connection, run: &WorkflowRun) -> Result<(), Durability
     conn.execute(
         "INSERT INTO workflow_run
             (id, job_id, job_version, content_hash, session_id, binding_id, trigger_event_id,
-             state, parent_run_id, forked_from_run_id, awaiting_until, started_at, ended_at,
-             session_depth, caps_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             state, parent_run_id, forked_from_run_id, awaiting_until, checkpoint_ref,
+             checkpoint_blob_ref, started_at, ended_at, session_depth, caps_json)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             run.id.to_string(),
             run.job_id.to_string(),
@@ -1158,6 +1177,10 @@ fn insert_run_row(conn: &Connection, run: &WorkflowRun) -> Result<(), Durability
             run.parent_run_id.map(|r| r.to_string()),
             run.forked_from_run_id.map(|r| r.to_string()),
             run.awaiting_until.map(|t| t.as_unix_nanos()),
+            run.checkpoint_ref,
+            run.checkpoint_blob_ref
+                .as_ref()
+                .map(|blob| serde_json::to_string(blob).expect("BlobRef serializes")),
             run.started_at.as_unix_nanos(),
             run.ended_at.map(|t| t.as_unix_nanos()),
             run.session_depth,
@@ -1220,6 +1243,8 @@ enum DeadlineWrite {
     Set {
         awaiting_until: Option<Timestamp>,
         hold_until: Option<Timestamp>,
+        checkpoint_ref: String,
+        checkpoint_blob_ref: Option<roundhouse_core::BlobRef>,
     },
 }
 
@@ -1232,6 +1257,8 @@ struct StoredParkColumns {
     parked_nanos: i64,
     awaiting_until: Option<i64>,
     hold_until: Option<i64>,
+    checkpoint_ref: Option<String>,
+    checkpoint_blob_ref: Option<String>,
 }
 
 /// Moves a run to `to`, enforcing [`transition_is_legal`] and stamping
@@ -1341,22 +1368,27 @@ pub(crate) fn transition_run_from(
 /// with `awaiting_until` because a park writes both or neither, and they are
 /// deliberately **two different quantities**: only the hold is clamped to
 /// [`crate::parking::SYSTEM_WIDE_HOLD_CAP`].
-pub(crate) fn transition_run_to_awaiting_human(
-    conn: &mut Connection,
+/// The transaction-owned form used by [`crate::parking::park`].
+pub(crate) fn transition_run_to_awaiting_human_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
     run_id: RunId,
     expect_session_id: SessionId,
     awaiting_until: Option<Timestamp>,
     hold_until: Option<Timestamp>,
+    checkpoint_ref: String,
+    checkpoint_blob_ref: Option<&roundhouse_core::BlobRef>,
     now: Timestamp,
 ) -> Result<RunState, DurabilityError> {
-    transition(
-        conn,
+    transition_in_transaction(
+        txn,
         run_id,
         RunState::AwaitingHuman,
         now,
         DeadlineWrite::Set {
             awaiting_until,
             hold_until,
+            checkpoint_ref,
+            checkpoint_blob_ref: checkpoint_blob_ref.cloned(),
         },
         Some(expect_session_id),
         None,
@@ -1373,6 +1405,28 @@ fn transition(
     permitted_from: Option<&[RunState]>,
 ) -> Result<RunState, DurabilityError> {
     let txn = roundhouse_store::begin_immediate(conn)?;
+    let from = transition_in_transaction(
+        &txn,
+        run_id,
+        to,
+        now,
+        deadlines,
+        expect_session_id,
+        permitted_from,
+    )?;
+    txn.commit()?;
+    Ok(from)
+}
+
+fn transition_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+    run_id: RunId,
+    to: RunState,
+    now: Timestamp,
+    deadlines: DeadlineWrite,
+    expect_session_id: Option<SessionId>,
+    permitted_from: Option<&[RunState]>,
+) -> Result<RunState, DurabilityError> {
     // B12b: the park columns are read in this same statement, inside this
     // same `BEGIN IMMEDIATE`, so the values the rules below compute from are
     // the values the `UPDATE` writes over. That is also why the three
@@ -1384,7 +1438,8 @@ fn transition(
     // is held.
     let row: Option<(String, String, StoredParkColumns)> = txn
         .query_row(
-            "SELECT state, session_id, parked_at, parked_nanos, awaiting_until, hold_until
+            "SELECT state, session_id, parked_at, parked_nanos, awaiting_until, hold_until,
+                    checkpoint_ref, checkpoint_blob_ref
              FROM workflow_run WHERE id = ?1",
             params![run_id.to_string()],
             |row| {
@@ -1396,6 +1451,8 @@ fn transition(
                         parked_nanos: row.get(3)?,
                         awaiting_until: row.get(4)?,
                         hold_until: row.get(5)?,
+                        checkpoint_ref: row.get(6)?,
+                        checkpoint_blob_ref: row.get(7)?,
                     },
                 ))
             },
@@ -1471,34 +1528,55 @@ fn transition(
         stored.parked_nanos
     };
 
-    let (awaiting_until, hold_until) = match deadlines {
+    let replacing_checkpoint = matches!(&deadlines, DeadlineWrite::Set { .. });
+    let (awaiting_until, hold_until, checkpoint_ref, checkpoint_blob_ref) = match deadlines {
         DeadlineWrite::Set {
             awaiting_until,
             hold_until,
+            checkpoint_ref,
+            checkpoint_blob_ref,
         } => (
             awaiting_until.map(|t| t.as_unix_nanos()),
             hold_until.map(|t| t.as_unix_nanos()),
+            Some(checkpoint_ref),
+            checkpoint_blob_ref
+                .as_ref()
+                .map(|blob| serde_json::to_string(blob).expect("BlobRef serializes")),
         ),
-        DeadlineWrite::Leave if leaving_park => (None, None),
-        DeadlineWrite::Leave => (stored.awaiting_until, stored.hold_until),
+        DeadlineWrite::Leave if leaving_park => (None, None, None, None),
+        DeadlineWrite::Leave => (
+            stored.awaiting_until,
+            stored.hold_until,
+            stored.checkpoint_ref,
+            stored.checkpoint_blob_ref.clone(),
+        ),
     };
+
+    if leaving_park || replacing_checkpoint {
+        if let Some(blob_json) = stored.checkpoint_blob_ref {
+            let blob: roundhouse_core::BlobRef = serde_json::from_str(&blob_json)
+                .map_err(|_| DurabilityError::MalformedStoredOutput)?;
+            roundhouse_store::blobs::decrement_ref_count(txn, &blob.hash)?;
+        }
+    }
 
     txn.execute(
         "UPDATE workflow_run
             SET state = ?1, ended_at = ?2, awaiting_until = ?3, hold_until = ?4,
-                parked_at = ?5, parked_nanos = ?6
-          WHERE id = ?7",
+                checkpoint_ref = ?5, checkpoint_blob_ref = ?6, parked_at = ?7, parked_nanos = ?8
+          WHERE id = ?9",
         params![
             to.as_sql_str(),
             ended_at,
             awaiting_until,
             hold_until,
+            checkpoint_ref,
+            checkpoint_blob_ref,
             parked_at,
             parked_nanos,
             run_id.to_string(),
         ],
     )?;
-    txn.commit()?;
     Ok(from)
 }
 
@@ -1921,8 +1999,8 @@ pub(crate) fn recent_workflow_runs(
 /// are `TEXT`.
 const WORKFLOW_RUN_SELECT: &str =
     "SELECT id, job_id, job_version, content_hash, session_id, binding_id, trigger_event_id,
-            state, parent_run_id, forked_from_run_id, awaiting_until, started_at, ended_at,
-            session_depth, caps_json
+             state, parent_run_id, forked_from_run_id, awaiting_until, checkpoint_ref,
+             checkpoint_blob_ref, started_at, ended_at, session_depth, caps_json
      FROM workflow_run";
 
 /// The raw `workflow_run` columns, in query order. Extracted as a tuple
@@ -1940,6 +2018,8 @@ type WorkflowRunColumns = (
     Option<String>,
     Option<String>,
     Option<i64>,
+    Option<String>,
+    Option<String>,
     i64,
     Option<i64>,
     Option<i64>,
@@ -1963,6 +2043,8 @@ fn workflow_run_columns(row: &rusqlite::Row) -> rusqlite::Result<WorkflowRunColu
         row.get(12)?,
         row.get(13)?,
         row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
     ))
 }
 
@@ -1979,6 +2061,8 @@ fn workflow_run_from_columns(c: WorkflowRunColumns) -> Result<WorkflowRun, Durab
         parent_run_id,
         forked_from_run_id,
         awaiting_until,
+        checkpoint_ref,
+        checkpoint_blob_ref,
         started_at,
         ended_at,
         session_depth,
@@ -2003,6 +2087,12 @@ fn workflow_run_from_columns(c: WorkflowRunColumns) -> Result<WorkflowRun, Durab
             .map(|r| parse_uuid(&r, "workflow_run.forked_from_run_id").map(RunId::from_uuid))
             .transpose()?,
         awaiting_until: awaiting_until.map(Timestamp::from_unix_nanos),
+        checkpoint_ref,
+        checkpoint_blob_ref: checkpoint_blob_ref
+            .map(|text| {
+                serde_json::from_str(&text).map_err(|_| DurabilityError::MalformedStoredOutput)
+            })
+            .transpose()?,
         started_at: Timestamp::from_unix_nanos(started_at),
         ended_at: ended_at.map(Timestamp::from_unix_nanos),
         session_depth: session_depth.map(session_depth_from_sql).transpose()?,

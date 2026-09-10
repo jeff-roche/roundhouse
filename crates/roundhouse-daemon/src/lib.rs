@@ -25,6 +25,7 @@ pub mod mcp_config;
 pub mod session_bootstrap;
 pub mod session_registry;
 pub mod socket_server;
+pub mod workflow_host;
 pub mod workspace_registry;
 
 /// One `TaskRunner::bootstrap()` shared by every `#[cfg(test)] mod tests`
