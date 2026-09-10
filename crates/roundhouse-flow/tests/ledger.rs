@@ -61,6 +61,8 @@ fn a_run(id: RunId, session_depth: Option<u32>, caps: Option<ResourceCaps>) -> W
         parent_run_id: None,
         forked_from_run_id: None,
         awaiting_until: None,
+        checkpoint_ref: None,
+        checkpoint_blob_ref: None,
         started_at: at_secs(0),
         ended_at: None,
         session_depth,

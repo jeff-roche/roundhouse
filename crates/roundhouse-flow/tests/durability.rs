@@ -9,7 +9,9 @@ use roundhouse_flow::durability::{
     DurabilityError, RunState, StepDisposition, StepOutput, StepRunState, WorkflowRun,
     WorkflowStepRun,
 };
-use roundhouse_flow::durability::{insert_workflow_run, TOP_LEVEL_ITEM_INDEX};
+use roundhouse_flow::durability::{
+    insert_workflow_run, insert_workflow_run_in_transaction, TOP_LEVEL_ITEM_INDEX,
+};
 use roundhouse_flow::exec::{Provenance, RunId, StepOutcome, StepStatus};
 use roundhouse_flow::parse::steps::parse_step;
 
@@ -31,6 +33,8 @@ fn a_run(id: RunId, binding_id: Option<BindingId>, started_at: i64) -> WorkflowR
         parent_run_id: None,
         forked_from_run_id: None,
         awaiting_until: None,
+        checkpoint_ref: None,
+        checkpoint_blob_ref: None,
         started_at: Timestamp::from_unix_nanos(started_at),
         ended_at: None,
         // The default fixture records neither ledger fact, which is exactly a
@@ -54,6 +58,28 @@ fn a_step_run(run_id: RunId, step_id: &str, disposition: StepDisposition) -> Wor
         output: None,
         error: None,
     }
+}
+
+#[test]
+fn transaction_scoped_run_insert_can_roll_back_with_other_owner_writes() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    let run = a_run(run_id, None, 1_000);
+    {
+        let txn = roundhouse_store::begin_immediate(&mut conn).unwrap();
+        insert_workflow_run_in_transaction(&txn, &run).unwrap();
+        txn.execute(
+            "INSERT INTO trigger_event
+            (binding_id, idempotency_key, scheduled_for, fired_at, is_catch_up)
+            VALUES ('binding', 'owner', 'now', 'now', 0)",
+            [],
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        recover_run(&conn, run_id),
+        Err(DurabilityError::RunNotFound { .. })
+    ));
 }
 
 #[test]

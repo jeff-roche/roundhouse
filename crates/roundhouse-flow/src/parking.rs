@@ -157,11 +157,11 @@
 //! now genuinely identical, which is what the original analogy claimed
 //! prematurely: **a timer, and nothing else.**
 
-use crate::durability::{transition_run_to_awaiting_human, DurabilityError};
+use crate::durability::DurabilityError;
 use crate::exec::RunId;
 use crate::hitl::AwaitingHuman;
 use roundhouse_core::{SessionId, Timestamp};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -208,6 +208,13 @@ const SYSTEM_WIDE_HOLD_CAP_NANOS: i64 = SYSTEM_WIDE_HOLD_CAP.as_nanos() as i64;
 /// [`Checkpointer`] and this crate never interprets it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointRef(pub String);
+
+/// The prepared restore point and its content-addressed durable copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointArtifact {
+    pub restore_ref: CheckpointRef,
+    pub blob_ref: Option<roundhouse_core::BlobRef>,
+}
 
 /// Why a checkpoint could not be taken.
 ///
@@ -259,8 +266,36 @@ pub trait Checkpointer {
     fn checkpoint(
         &mut self,
         session_id: SessionId,
+        run_id: RunId,
         label: &str,
     ) -> Result<CheckpointRef, CheckpointError>;
+
+    /// Prepares the checkpoint representation used by a durable park.
+    /// Implementors that do not use the blob store retain the legacy restore
+    /// reference and simply omit `blob_ref`.
+    fn checkpoint_artifact(
+        &mut self,
+        session_id: SessionId,
+        run_id: RunId,
+        label: &str,
+    ) -> Result<CheckpointArtifact, CheckpointError> {
+        Ok(CheckpointArtifact {
+            restore_ref: self.checkpoint(session_id, run_id, label)?,
+            blob_ref: None,
+        })
+    }
+
+    /// Commits the prepared artifact's blob index entry in the park
+    /// transaction. The default is the no-op legacy path.
+    fn commit_checkpoint(
+        &mut self,
+        _txn: &Transaction<'_>,
+        _run_id: RunId,
+        _artifact: &CheckpointArtifact,
+        _now: Timestamp,
+    ) -> Result<(), CheckpointError> {
+        Ok(())
+    }
 }
 
 /// What the caller must do with the run's worktree — **a directive, not a
@@ -540,7 +575,7 @@ pub fn park(
     };
 
     let session_id = run_session_id(conn, run_id)?;
-    let checkpoint_ref = checkpointer.checkpoint(session_id, "awaiting_human_park")?;
+    let artifact = checkpointer.checkpoint_artifact(session_id, run_id, "awaiting_human_park")?;
 
     // B12b: the hold instant is written to `workflow_run.hold_until` in the
     // same transaction as the state and the wait's deadline, so
@@ -551,10 +586,22 @@ pub fn park(
         WorkspaceDisposition::HoldUntil(instant) => Some(instant),
         WorkspaceDisposition::Release => None,
     };
-    transition_run_to_awaiting_human(conn, run_id, session_id, awaiting_until, hold_until, now)?;
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    checkpointer.commit_checkpoint(&txn, run_id, &artifact, now)?;
+    crate::durability::transition_run_to_awaiting_human_in_transaction(
+        &txn,
+        run_id,
+        session_id,
+        awaiting_until,
+        hold_until,
+        artifact.restore_ref.0.clone(),
+        artifact.blob_ref.as_ref(),
+        now,
+    )?;
+    txn.commit()?;
 
     Ok(ParkResult {
-        checkpoint_ref,
+        checkpoint_ref: artifact.restore_ref,
         session_id,
         awaiting_until,
         workspace,

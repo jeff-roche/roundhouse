@@ -31,6 +31,8 @@ fn a_run(id: RunId, session_id: SessionId) -> WorkflowRun {
         parent_run_id: None,
         forked_from_run_id: None,
         awaiting_until: None,
+        checkpoint_ref: None,
+        checkpoint_blob_ref: None,
         started_at: Timestamp::from_unix_nanos(1_000 * NANOS_PER_SEC),
         ended_at: None,
         session_depth: None,

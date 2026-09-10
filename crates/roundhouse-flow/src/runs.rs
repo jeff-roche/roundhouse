@@ -365,6 +365,8 @@ pub fn seed_completed_run_with_report(
         parent_run_id: None,
         forked_from_run_id: None,
         awaiting_until: None,
+        checkpoint_ref: None,
+        checkpoint_blob_ref: None,
         started_at: Timestamp::from_unix_nanos(started_at_nanos),
         ended_at: Some(Timestamp::from_unix_nanos(started_at_nanos + 1)),
         // Both `None` for the same reason the doc above gives for the whole

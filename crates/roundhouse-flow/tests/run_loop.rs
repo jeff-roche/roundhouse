@@ -20,8 +20,9 @@ use roundhouse_flow::durability::{
 };
 use roundhouse_flow::exec::run_loop::{
     run_workflow, CalledWorkflow, GateAnswer, ReportOrigin, RunLoopError, RunOutcome, WorkflowHost,
+    WorkflowHostError,
 };
-use roundhouse_flow::exec::{RunContext, RunId, TaskSink};
+use roundhouse_flow::exec::{RunContext, RunId, StepStatus, TaskSink};
 use roundhouse_flow::expr::EnvAllowlist;
 use roundhouse_flow::ledger::run_ledger;
 use roundhouse_flow::parking::{CheckpointError, CheckpointRef, Checkpointer};
@@ -138,6 +139,7 @@ struct FakeHost {
     resolvable: HashMap<String, (JobId, u32, String)>,
     direct_children: u32,
     sessions_created: Vec<SessionId>,
+    reservations: Vec<SessionId>,
 }
 
 impl FakeHost {
@@ -147,6 +149,7 @@ impl FakeHost {
             resolvable: HashMap::new(),
             direct_children: 0,
             sessions_created: Vec::new(),
+            reservations: Vec::new(),
         }
     }
 
@@ -163,6 +166,7 @@ impl Checkpointer for FakeHost {
     fn checkpoint(
         &mut self,
         session_id: SessionId,
+        _run_id: RunId,
         label: &str,
     ) -> Result<CheckpointRef, CheckpointError> {
         self.checkpoints.push((session_id, label.to_string()));
@@ -171,20 +175,61 @@ impl Checkpointer for FakeHost {
 }
 
 impl WorkflowHost for FakeHost {
-    fn resolve_call(&mut self, workflow: &str, _parent: SessionId) -> Option<CalledWorkflow> {
-        let (job_id, job_version, content_hash) = self.resolvable.get(workflow)?.clone();
+    fn resolve_call(
+        &mut self,
+        _conn: &Connection,
+        workflow: &str,
+        _parent: SessionId,
+    ) -> Result<Option<CalledWorkflow>, WorkflowHostError> {
+        let Some((job_id, job_version, content_hash)) = self.resolvable.get(workflow).cloned()
+        else {
+            return Ok(None);
+        };
         let session_id = SessionId::new();
-        self.sessions_created.push(session_id);
-        Some(CalledWorkflow {
+        Ok(Some(CalledWorkflow {
             job_id,
             job_version,
             content_hash,
             session_id,
-        })
+        }))
     }
 
-    fn direct_children_of(&mut self, _parent: SessionId) -> u32 {
-        self.direct_children
+    fn reserve_child_session(
+        &mut self,
+        _parent: SessionId,
+        child: &CalledWorkflow,
+    ) -> Result<u32, WorkflowHostError> {
+        self.reservations.push(child.session_id);
+        Ok(self.direct_children)
+    }
+
+    fn release_child_session(&mut self, _parent: SessionId, child: &CalledWorkflow) {
+        self.reservations
+            .retain(|session_id| *session_id != child.session_id);
+    }
+
+    fn create_child_run(
+        &mut self,
+        conn: &mut Connection,
+        _parent: SessionId,
+        child: &WorkflowRun,
+        called: &CalledWorkflow,
+    ) -> Result<(), WorkflowHostError> {
+        let txn = roundhouse_store::begin_immediate(conn)?;
+        if let Err(error) =
+            roundhouse_flow::durability::insert_workflow_run_in_transaction(&txn, child)
+        {
+            self.release_child_session(_parent, called);
+            return Err(error.into());
+        }
+        if let Err(error) = txn.commit() {
+            self.release_child_session(_parent, called);
+            return Err(error.into());
+        }
+        self.reservations
+            .retain(|session_id| *session_id != child.session_id);
+        self.sessions_created.push(child.session_id);
+        Ok(())
     }
 }
 
@@ -214,6 +259,8 @@ fn a_run(id: RunId, session_id: SessionId) -> WorkflowRun {
         parent_run_id: None,
         forked_from_run_id: None,
         awaiting_until: None,
+        checkpoint_ref: None,
+        checkpoint_blob_ref: None,
         started_at: at(0),
         ended_at: None,
         session_depth: Some(0),
@@ -1139,6 +1186,54 @@ fn a_call_step_creates_a_funded_child_run_and_one_agent_task() {
         format!("{:?}", agent_tasks[0].1).contains("child-flow"),
         "the task names the workflow it stands for"
     );
+}
+
+#[test]
+fn a_failed_child_insert_releases_its_uncommitted_child_reservation() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    conn.execute_batch(
+        "CREATE TRIGGER reject_child_workflow_run
+         BEFORE INSERT ON workflow_run
+         WHEN NEW.parent_run_id IS NOT NULL
+         BEGIN
+             SELECT RAISE(ABORT, 'test child insert failure');
+         END;",
+    )
+    .expect("install child insert failure");
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: sub\n\
+         \x20   call: child-flow\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new().resolving("child-flow");
+
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("child insertion failure is a workflow failure");
+    let RunOutcome::Terminal { steps, .. } = outcome else {
+        panic!("child insertion failure must terminate the parent");
+    };
+    let StepStatus::Failed { message } = &steps[0].status else {
+        panic!("the call step must fail");
+    };
+    assert!(message.contains("could not be funded"));
+    assert_eq!(
+        host.sessions_created.len(),
+        0,
+        "a failed transaction cannot leave a runtime child edge"
+    );
+    assert!(host.reservations.is_empty());
 }
 
 /// **Measured, and it corrects an assumption the brief carries:** a `call:` is

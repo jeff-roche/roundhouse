@@ -21,6 +21,7 @@ pub mod job_store;
 pub mod ledger;
 pub mod parking;
 pub mod parse;
+pub mod production;
 pub mod report;
 pub mod retry;
 pub mod runs;

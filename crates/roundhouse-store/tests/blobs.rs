@@ -1,7 +1,7 @@
 use roundhouse_core::{Blake3Hash, BlobRef};
 use roundhouse_store::blobs::{
-    decrement_ref_count, gc_eligible_blobs, read_blob, record_blob_write, write_blob,
-    write_blob_with_quota, QuotaError, RecordBlobError,
+    decrement_ref_count, gc_eligible_blobs, read_blob, read_verified_blob, record_blob_write,
+    write_blob, write_blob_with_quota, QuotaError, RecordBlobError,
 };
 use roundhouse_store::{begin_immediate, migrations, open_memory_connection};
 
@@ -9,6 +9,20 @@ fn seeded_conn() -> rusqlite::Connection {
     let mut conn = open_memory_connection();
     migrations().to_latest(&mut conn).unwrap();
     conn
+}
+
+#[test]
+fn verified_blob_read_rejects_bytes_changed_after_the_reference_was_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = write_blob(dir.path(), b"original", None).unwrap();
+    let path = dir
+        .path()
+        .join("blobs")
+        .join(&blob.hash.as_str()[..2])
+        .join(blob.hash.as_str());
+    std::fs::write(path, b"tampered").unwrap();
+
+    assert!(read_verified_blob(dir.path(), &blob).is_err());
 }
 
 #[test]

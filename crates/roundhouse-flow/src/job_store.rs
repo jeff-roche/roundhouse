@@ -173,6 +173,32 @@ pub fn resolve_job(
     Ok(Some(job))
 }
 
+/// Resolves the exact immutable version pinned by a workflow run. Unlike
+/// [`resolve_job`], this never follows the latest version and verifies the
+/// stored content hash before returning executable content.
+pub fn resolve_job_version(
+    conn: &Connection,
+    workspace_root: &Path,
+    job_id: JobId,
+    version: u32,
+    expected_hash: &str,
+) -> Result<Option<RegisteredJob>, JobStoreError> {
+    let Some(mut job) = load_job_by_id(conn, job_id)? else {
+        return Ok(None);
+    };
+    job.source_path =
+        canonical_stored_source(&canonical_workspace(workspace_root)?, &job.source_path)?;
+    let Some(pinned) = job.job.pinned(version) else {
+        return Err(JobStoreError::MalformedStoredField {
+            field: "workflow run version",
+        });
+    };
+    if content_hash(pinned) != expected_hash {
+        return Err(JobStoreError::ContentHashMismatch);
+    }
+    Ok(Some(job))
+}
+
 fn canonical_workspace(path: &Path) -> Result<PathBuf, JobStoreError> {
     path.canonicalize()
         .map_err(|_| JobStoreError::WorkspaceUnavailable)
@@ -234,6 +260,47 @@ fn load_job_by_name(conn: &Connection, name: &str) -> Result<Option<RegisteredJo
         .parse::<uuid::Uuid>()
         .map(JobId::from_uuid)
         .map_err(|_| JobStoreError::MalformedStoredField { field: "job id" })?;
+    let job = load_versions(conn, &id, job_id)?;
+    Ok(Some(RegisteredJob {
+        name,
+        source_path: PathBuf::from(source_path),
+        job,
+    }))
+}
+
+fn load_job_by_id(
+    conn: &Connection,
+    job_id: JobId,
+) -> Result<Option<RegisteredJob>, JobStoreError> {
+    let Some((id, name, source_path)) = conn
+        .query_row(
+            "SELECT id, name, source_path FROM jobs WHERE id = ?1",
+            params![job_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let stored_id = id
+        .parse::<uuid::Uuid>()
+        .map(JobId::from_uuid)
+        .map_err(|_| JobStoreError::MalformedStoredField { field: "job id" })?;
+    let job = load_versions(conn, &id, stored_id)?;
+    Ok(Some(RegisteredJob {
+        name,
+        source_path: PathBuf::from(source_path),
+        job,
+    }))
+}
+
+fn load_versions(conn: &Connection, id: &str, job_id: JobId) -> Result<Job, JobStoreError> {
     let mut versions = conn.prepare(
         "SELECT version, content_hash, template_json, body_json, input_schema_json
            FROM job_versions
@@ -260,11 +327,7 @@ fn load_job_by_name(conn: &Connection, name: &str) -> Result<Option<RegisteredJo
         job.add_version(version)?;
     }
 
-    Ok(Some(RegisteredJob {
-        name,
-        source_path: PathBuf::from(source_path),
-        job,
-    }))
+    Ok(job)
 }
 
 #[derive(Debug)]

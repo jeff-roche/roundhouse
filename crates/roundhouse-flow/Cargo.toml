@@ -46,6 +46,7 @@ thiserror = { workspace = true }
 # defect for binding/job addressing and had to replace it) — sha2's SHA-256
 # is a fixed, versioned algorithm we pin here instead.
 sha2 = "0.10"
+blake3 = "1"
 # Promoted from a Task 1 dev-dependency to a real one: Task 2's
 # `parse::parse_workflow` deserializes workflow YAML at runtime (not just in
 # tests), consuming exactly the `workflow_yaml` shape

@@ -70,6 +70,7 @@ tokio = { workspace = true, features = ["fs", "io-util"] }
 tokio-util = { workspace = true, features = ["codec"] }
 futures = "0.3"
 serde_json = { workspace = true }
+rusqlite = { workspace = true }
 # Task 4 (Phase 7): `mcp_config.rs`'s `[[mcp_server]]` TOML table parse
 # deserializes `roundhouse_config::LoadedConfig::get`'s `&toml::Value`
 # directly — the typed parse cannot live in `roundhouse-config` itself
@@ -110,6 +111,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+roundhouse-flow = { path = "../roundhouse-flow", features = ["test-util"] }
 roundhouse-policy = { path = "../roundhouse-policy", features = ["test-util"] }
 tempfile = "3"
 # Ruling W1-R99 (fix round 1): this crate's own tests need

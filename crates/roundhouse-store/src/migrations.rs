@@ -571,5 +571,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(MIGRATION_0008_WORKFLOW_RUN_LEDGER),
         M::up(MIGRATION_0009_JOBS),
         M::up(MIGRATION_0010_WORKSPACES),
+        M::up("ALTER TABLE workflow_run ADD COLUMN checkpoint_ref TEXT;"),
+        M::up("ALTER TABLE workflow_run ADD COLUMN checkpoint_blob_ref TEXT;"),
     ])
 }

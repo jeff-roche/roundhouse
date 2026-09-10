@@ -46,7 +46,7 @@ pub use pool::{open, StoreError, StorePool, MIGRATIONS};
 pub use pool::{InteractError, PooledConnection, SqliteConnection};
 
 // Task 2 exports
-pub use writer::{serialize_payload, spawn_writer, EventWriter};
+pub use writer::{append_event_in_transaction, serialize_payload, spawn_writer, EventWriter};
 
 // Task 3 exports
 pub use fold::{fold_task, Task, TaskState};

@@ -47,6 +47,22 @@ pub fn read_blob(state_dir: &Path, blob_ref: &BlobRef) -> io::Result<Vec<u8>> {
     fs::read(blob_path(state_dir, &blob_ref.hash))
 }
 
+/// Reads a blob only when its on-disk bytes still match the reference's length
+/// and BLAKE3 digest.
+pub fn read_verified_blob(state_dir: &Path, blob_ref: &BlobRef) -> io::Result<Vec<u8>> {
+    let bytes = read_blob(state_dir, blob_ref)?;
+    if bytes.len() as u64 != blob_ref.len
+        || Blake3Hash::from_hex(blake3::hash(&bytes).to_hex().to_string())
+            != Ok(blob_ref.hash.clone())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "blob content does not match its reference",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// A `record_blob_write` call was rejected before touching the index.
 #[derive(Debug, thiserror::Error)]
 pub enum RecordBlobError {
