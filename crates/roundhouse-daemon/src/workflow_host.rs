@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_core::{EventPayload, JobId, SessionId, SessionSpec, TaskRunner};
+use roundhouse_flow::compose::MAX_DIRECT_CHILD_CALLS;
 use roundhouse_flow::durability::WorkflowRun;
 use roundhouse_flow::exec::run_loop::{SessionTree, WorkflowHostError};
 use thiserror::Error;
@@ -43,7 +44,7 @@ impl SessionTree for WorkflowSessionTree {
     ) -> Result<u32, WorkflowHostError> {
         let direct_children = self.tree.direct_children(parent);
         self.tree
-            .reserve_child(parent, child, 8)
+            .reserve_child(parent, child, MAX_DIRECT_CHILD_CALLS)
             .ok_or(WorkflowHostError::ChildReservationRefused { session_id: parent })?;
         Ok(direct_children)
     }

@@ -1233,6 +1233,20 @@ impl<H: WorkflowHost> Loop<'_, H> {
             self.now,
             self.host,
         )?;
+        executor.sink.emit(
+            TaskId::new(),
+            None,
+            TaskKind::Checkpoint,
+            EventPayload::TaskCreated {
+                kind: TaskKind::Checkpoint,
+                parent: None,
+                origin: Origin::System,
+                input: TaskInput::Json(serde_json::json!({
+                    "run_id": self.run_id,
+                    "checkpoint": parked.checkpoint_ref.0,
+                })),
+            },
+        );
         // §8.11's *"an `AwaitingHuman` task with a JSON-Schema form that TUI
         // and web render from the same schema"* — put in the log, because
         // otherwise **nobody is ever asked**. `parking::park` reads only the

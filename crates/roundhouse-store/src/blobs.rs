@@ -121,6 +121,38 @@ pub fn record_blob_write(
     Ok(())
 }
 
+/// Records a filesystem blob as a zero-reference GC candidate.
+///
+/// Callers use this after preparing a blob but before the transaction that
+/// creates its durable owner. If that owner transaction fails, normal blob GC
+/// can still discover the file instead of leaving an unindexed orphan.
+pub fn record_unreferenced_blob(
+    txn: &Transaction,
+    state_dir: &Path,
+    blob_ref: &BlobRef,
+    now: i64,
+) -> Result<(), RecordBlobError> {
+    let path = blob_path(state_dir, &blob_ref.hash);
+    if fs::metadata(&path).is_err() {
+        return Err(RecordBlobError::MissingFile {
+            hash: blob_ref.hash.clone(),
+            state_dir: state_dir.to_path_buf(),
+        });
+    }
+    txn.execute(
+        "INSERT INTO blobs (hash, len, mime, created_at, last_referenced_at, ref_count) \
+         VALUES (?1, ?2, ?3, ?4, ?4, 0) \
+         ON CONFLICT(hash) DO NOTHING",
+        params![
+            blob_ref.hash.as_str(),
+            blob_ref.len as i64,
+            blob_ref.mime,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
 /// Decrements `ref_count` (e.g. when the session/event owning a reference
 /// is closed or GC'd). Never deletes anything here — reaching
 /// `ref_count == 0` only makes a blob GC-*eligible* (see

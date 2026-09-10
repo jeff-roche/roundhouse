@@ -350,16 +350,19 @@ impl FileCheckpointer {
             .workspace_root
             .canonicalize()
             .map_err(|e| checkpoint_error(&e.to_string()))?;
+        let parent = workspace_root
+            .parent()
+            .ok_or_else(|| checkpoint_error("workspace root has no parent directory"))?;
+        let staging = parent.join(format!(".roundhouse-restore-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&staging).map_err(|e| checkpoint_error(&e.to_string()))?;
         for file in &archive.files {
-            let destination = workspace_root.join(&file.relative_path);
+            let destination = staging.join(&file.relative_path);
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent).map_err(|e| checkpoint_error(&e.to_string()))?;
             }
-            let temporary =
-                destination.with_extension(format!("roundhouse-restore-{}", uuid::Uuid::new_v4()));
-            fs::write(&temporary, &file.bytes).map_err(|e| checkpoint_error(&e.to_string()))?;
-            fs::rename(&temporary, &destination).map_err(|e| checkpoint_error(&e.to_string()))?;
+            fs::write(&destination, &file.bytes).map_err(|e| checkpoint_error(&e.to_string()))?;
         }
+        replace_workspace(&workspace_root, &staging)?;
         Ok(())
     }
 }
@@ -385,6 +388,7 @@ impl Checkpointer for FileCheckpointer {
             .workspace_root
             .canonicalize()
             .map_err(|e| checkpoint_error(&e.to_string()))?;
+        ensure_external_state_dir(&workspace_root, &self.state_dir)?;
         let mut files = Vec::new();
         collect_files(&workspace_root, &workspace_root, &mut files)?;
         let manifest = CheckpointManifest {
@@ -413,6 +417,27 @@ impl Checkpointer for FileCheckpointer {
             restore_ref: CheckpointRef(blob_ref.hash.to_string()),
             blob_ref: Some(blob_ref),
         })
+    }
+
+    fn index_prepared_checkpoint(
+        &mut self,
+        conn: &mut Connection,
+        artifact: &CheckpointArtifact,
+        now: Timestamp,
+    ) -> Result<(), CheckpointError> {
+        let Some(blob_ref) = artifact.blob_ref.as_ref() else {
+            return Ok(());
+        };
+        let txn = roundhouse_store::begin_immediate(conn)
+            .map_err(|e| checkpoint_error(&e.to_string()))?;
+        roundhouse_store::blobs::record_unreferenced_blob(
+            &txn,
+            &self.state_dir,
+            blob_ref,
+            now.as_unix_nanos(),
+        )
+        .map_err(|e| checkpoint_error(&e.to_string()))?;
+        txn.commit().map_err(|e| checkpoint_error(&e.to_string()))
     }
 
     fn commit_checkpoint(
@@ -444,6 +469,38 @@ impl Checkpointer for FileCheckpointer {
         )
         .map_err(|e| checkpoint_error(&e.to_string()))
     }
+}
+
+fn ensure_external_state_dir(
+    workspace_root: &Path,
+    state_dir: &Path,
+) -> Result<(), CheckpointError> {
+    let state_dir = state_dir
+        .canonicalize()
+        .unwrap_or_else(|_| state_dir.to_path_buf());
+    if state_dir.starts_with(workspace_root) {
+        return Err(checkpoint_error(
+            "checkpoint state directory must be outside the workspace",
+        ));
+    }
+    Ok(())
+}
+
+fn replace_workspace(workspace_root: &Path, staging: &Path) -> Result<(), CheckpointError> {
+    let backup = workspace_root.with_file_name(format!(
+        ".roundhouse-restore-backup-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::rename(workspace_root, &backup).map_err(|e| checkpoint_error(&e.to_string()))?;
+    if let Err(error) = fs::rename(staging, workspace_root) {
+        fs::rename(&backup, workspace_root).map_err(|rollback| {
+            checkpoint_error(&format!(
+                "restoring the workspace failed: {error}; rollback failed: {rollback}"
+            ))
+        })?;
+        return Err(checkpoint_error(&error.to_string()));
+    }
+    fs::remove_dir_all(backup).map_err(|e| checkpoint_error(&e.to_string()))
 }
 
 fn collect_files(

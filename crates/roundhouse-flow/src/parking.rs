@@ -285,6 +285,17 @@ pub trait Checkpointer {
         })
     }
 
+    /// Records a prepared blob as a zero-reference GC candidate before the
+    /// park transaction attempts to make it reachable.
+    fn index_prepared_checkpoint(
+        &mut self,
+        _conn: &mut Connection,
+        _artifact: &CheckpointArtifact,
+        _now: Timestamp,
+    ) -> Result<(), CheckpointError> {
+        Ok(())
+    }
+
     /// Commits the prepared artifact's blob index entry in the park
     /// transaction. The default is the no-op legacy path.
     fn commit_checkpoint(
@@ -576,6 +587,7 @@ pub fn park(
 
     let session_id = run_session_id(conn, run_id)?;
     let artifact = checkpointer.checkpoint_artifact(session_id, run_id, "awaiting_human_park")?;
+    checkpointer.index_prepared_checkpoint(conn, &artifact, now)?;
 
     // B12b: the hold instant is written to `workflow_run.hold_until` in the
     // same transaction as the state and the wait's deadline, so

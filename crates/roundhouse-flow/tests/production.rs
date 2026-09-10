@@ -35,6 +35,23 @@ impl TaskSink for Sink {
 }
 
 #[derive(Default)]
+struct RecordingSink {
+    emitted: Vec<(roundhouse_core::TaskKind, roundhouse_core::EventPayload)>,
+}
+
+impl TaskSink for RecordingSink {
+    fn emit(
+        &mut self,
+        _task_id: roundhouse_core::TaskId,
+        _parent: Option<roundhouse_core::TaskId>,
+        kind: roundhouse_core::TaskKind,
+        payload: roundhouse_core::EventPayload,
+    ) {
+        self.emitted.push((kind, payload));
+    }
+}
+
+#[derive(Default)]
 struct RecordingSessionTree {
     children: HashMap<SessionId, Vec<SessionId>>,
     registered: Vec<(SessionId, SessionId, JobId)>,
@@ -163,17 +180,27 @@ fn context(run_id: RunId) -> RunContext {
 #[test]
 fn file_checkpointer_prepares_a_content_addressed_checkpoint_artifact() {
     let workspace = tempdir().expect("workspace");
+    let state = tempdir().expect("state");
     fs::write(workspace.path().join("source.txt"), "checkpoint me").expect("source");
-    let mut checkpointer = FileCheckpointer::new(
-        workspace.path(),
-        workspace.path().join(".roundhouse-checkpoints"),
-    );
+    let mut checkpointer = FileCheckpointer::new(workspace.path(), state.path());
 
     let artifact = checkpointer
         .checkpoint_artifact(SessionId::new(), RunId::new(), "test")
         .expect("checkpoint artifact");
     assert!(artifact.blob_ref.is_some());
     assert_eq!(artifact.restore_ref.0.len(), 64);
+}
+
+#[test]
+fn checkpoint_preparation_rejects_state_storage_inside_the_workspace() {
+    let workspace = tempdir().expect("workspace");
+    let state = workspace.path().join(".roundhouse-checkpoints");
+    fs::write(workspace.path().join("source.txt"), "checkpoint me").expect("source");
+    let mut checkpointer = FileCheckpointer::new(workspace.path(), state);
+
+    checkpointer
+        .checkpoint_artifact(SessionId::new(), RunId::new(), "test")
+        .expect_err("checkpoint storage inside the workspace must be rejected");
 }
 
 #[test]
@@ -238,6 +265,77 @@ fn restore_blob_validates_every_file_before_changing_the_workspace() {
     assert_eq!(
         fs::read_to_string(&second).expect("second remains"),
         "workspace second"
+    );
+}
+
+#[test]
+fn restore_blob_replaces_the_workspace_with_the_checkpoint_contents() {
+    let workspace = tempdir().expect("workspace");
+    let state = tempdir().expect("state");
+    let retained = workspace.path().join("retained.txt");
+    fs::write(&retained, "snapshot").expect("snapshot file");
+    let session_id = SessionId::new();
+    let run_id = RunId::new();
+    let mut checkpointer = FileCheckpointer::new(workspace.path(), state.path());
+    let artifact = checkpointer
+        .checkpoint_artifact(session_id, run_id, "test")
+        .expect("checkpoint artifact");
+    fs::write(&retained, "changed").expect("mutate retained file");
+    fs::write(workspace.path().join("stale.txt"), "stale").expect("stale file");
+
+    checkpointer
+        .restore_blob(
+            session_id,
+            run_id,
+            &artifact.blob_ref.expect("blob checkpoint"),
+        )
+        .expect("restore checkpoint");
+
+    assert_eq!(
+        fs::read_to_string(retained).expect("restored file"),
+        "snapshot"
+    );
+    assert!(
+        !workspace.path().join("stale.txt").exists(),
+        "a restore must remove files absent from the checkpoint"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_blob_does_not_follow_a_workspace_symlink_created_after_checkpointing() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempdir().expect("workspace");
+    let state = tempdir().expect("state");
+    let outside = tempdir().expect("outside");
+    let nested = workspace.path().join("nested");
+    fs::create_dir(&nested).expect("nested directory");
+    fs::write(nested.join("file.txt"), "snapshot").expect("snapshot file");
+    let session_id = SessionId::new();
+    let run_id = RunId::new();
+    let mut checkpointer = FileCheckpointer::new(workspace.path(), state.path());
+    let artifact = checkpointer
+        .checkpoint_artifact(session_id, run_id, "test")
+        .expect("checkpoint artifact");
+    fs::remove_dir_all(&nested).expect("remove nested directory");
+    symlink(outside.path(), &nested).expect("replace nested directory with symlink");
+
+    checkpointer
+        .restore_blob(
+            session_id,
+            run_id,
+            &artifact.blob_ref.expect("blob checkpoint"),
+        )
+        .expect("restore checkpoint");
+
+    assert!(
+        !outside.path().join("file.txt").exists(),
+        "checkpoint extraction must not escape through workspace symlinks"
+    );
+    assert_eq!(
+        fs::read_to_string(nested.join("file.txt")).expect("restored nested file"),
+        "snapshot"
     );
 }
 
@@ -411,6 +509,47 @@ fn parked_run_resumes_after_host_restart_from_durable_step_rows() {
         remaining_refs, 0,
         "resuming a run releases its checkpoint blob"
     );
+}
+
+#[test]
+fn parking_emits_a_checkpoint_task_to_the_session_log() {
+    let workspace = tempdir().expect("workspace");
+    let source = workspace.path().join("workflow.yaml");
+    let yaml = gated_workflow();
+    fs::write(&source, &yaml).expect("workflow source");
+    let mut conn = open_test_db();
+    let registered = register_workflow(&mut conn, workspace.path(), &source, template(), &yaml)
+        .expect("register workflow");
+    let run_id = seed_run(&mut conn, registered.job.id(), SessionId::new());
+    let def = parse_workflow(&yaml).expect("parse workflow");
+    let mut host = SqliteWorkflowHost::with_session_tree(
+        workspace.path(),
+        Box::new(RecordingSessionTree::default()),
+    );
+    let mut sink = RecordingSink::default();
+
+    run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        context(run_id),
+        Timestamp::from_unix_nanos(1),
+        None,
+    )
+    .expect("park workflow");
+
+    assert!(sink.emitted.iter().any(|(kind, payload)| {
+        *kind == roundhouse_core::TaskKind::Checkpoint
+            && matches!(
+                payload,
+                roundhouse_core::EventPayload::TaskCreated {
+                    kind: roundhouse_core::TaskKind::Checkpoint,
+                    ..
+                }
+            )
+    }));
 }
 
 #[test]
@@ -662,4 +801,42 @@ fn repark_replaces_the_previous_checkpoint_blob_reference() {
         })
         .expect("blob references");
     assert_eq!(references, 1);
+}
+
+#[test]
+fn failed_park_indexes_the_prepared_blob_for_garbage_collection() {
+    let workspace = tempdir().expect("workspace");
+    let state = tempdir().expect("state");
+    fs::write(workspace.path().join("source.txt"), "checkpoint").expect("source");
+    let session_id = SessionId::new();
+    let mut conn = open_test_db();
+    let run_id = seed_run(&mut conn, JobId::new(), session_id);
+    let awaiting = roundhouse_flow::hitl::AwaitingHuman {
+        task_id: roundhouse_core::TaskId::new(),
+        source: roundhouse_flow::hitl::HumanWaitSource::Elicitation,
+        form_schema: serde_json::json!({"type": "object"}),
+        timeout_after: None,
+        on_timeout: roundhouse_flow::hitl::UncheckedOnTimeout::new(
+            roundhouse_flow::parse::types::OnTimeout::Deny,
+        ),
+    };
+    let mut checkpointer = FileCheckpointer::with_quota(workspace.path(), state.path(), 0);
+
+    park(
+        &mut conn,
+        run_id,
+        &awaiting,
+        false,
+        Timestamp::from_unix_nanos(1),
+        &mut checkpointer,
+    )
+    .expect_err("quota rejection must fail the park");
+
+    assert_eq!(
+        roundhouse_store::blobs::gc_eligible_blobs(&conn, 1, 0)
+            .expect("query eligible blobs")
+            .len(),
+        1,
+        "failed parking must leave the prepared blob indexed with no references"
+    );
 }
