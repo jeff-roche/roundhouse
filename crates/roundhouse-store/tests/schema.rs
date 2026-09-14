@@ -35,6 +35,13 @@ fn migrations_create_events_tasks_and_fts_tables() {
         "jobs_no_delete",
         "job_versions_no_update",
         "job_versions_no_delete",
+        // Phase 8, Task 2 of the trigger-delivery rebuild: durable binding
+        // registration and the delivery outbox (migration 0013). No
+        // triggers accompany these — `trigger_binding` is deliberately
+        // mutable (see that migration's own doc comment).
+        "trigger_binding",
+        "trigger_binding_cursor",
+        "trigger_delivery",
     ] {
         assert!(
             table_names.iter().any(|n| n == expected),

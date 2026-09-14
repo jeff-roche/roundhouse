@@ -8,10 +8,11 @@
 //! `docs/architecture/05-scheduling-and-workflows.md`.
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use roundhouse_core::{Address, BindingId, JobId, SessionId};
+use roundhouse_core::{Address, BindingId, JobId, SessionId, WorkspaceId};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
+use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CatchUp {
@@ -294,4 +295,105 @@ pub struct TriggerEvent {
     pub fired_at: DateTime<Utc>,
     pub is_catch_up: bool,
     pub session_id: Option<SessionId>,
+    /// What `roundhouse_sched::admission::decide_admission` decided for this
+    /// occurrence, once decided. `None` for a row inserted by
+    /// `record_trigger_event` before admission has run, and for every row
+    /// written before store migration 0013 added the backing
+    /// `trigger_event.outcome` column — both are the honest "not yet known"
+    /// case, not a value to default away. See [`TriggerEventOutcome`] for the
+    /// vocabulary and its `CHECK`-matching `as_sql_str`/`from_sql_str`.
+    pub outcome: Option<TriggerEventOutcome>,
+}
+
+/// Errors from this module's fallible discriminant decoding
+/// (`TriggerEventOutcome::from_sql_str`). Mirrors
+/// `roundhouse_flow::durability::DurabilityError::UnrecognizedDiscriminant`'s
+/// shape: the `CHECK` constraint on the backing column is the insert-time
+/// enforcement leg, this is the read-back leg, and a hand-edited or
+/// corrupted row must be refused rather than silently mapped onto a
+/// plausible variant.
+#[derive(Debug, Error)]
+pub enum TriggerError {
+    #[error("column {column} holds {value:?}, which is not a recognised discriminant")]
+    UnrecognizedDiscriminant { column: &'static str, value: String },
+}
+
+/// What `roundhouse_sched::admission::decide_admission` decided for one
+/// `TriggerEvent`, persisted in `trigger_event.outcome` (store migration
+/// 0013). One variant per `AdmissionDecision` variant, lower-cased to
+/// snake_case and stripped of any carried data (`QueueAt`'s position,
+/// `SkippedQueueFull`'s depth) — this records *which kind* of decision was
+/// made, not its parameters, matching the column's own `CHECK` vocabulary
+/// exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriggerEventOutcome {
+    /// `AdmissionDecision::Admit`: nothing else was active, and a run
+    /// started (or is starting) now.
+    Admitted,
+    /// `AdmissionDecision::SkipDueToOverlap`.
+    SkippedDueToOverlap,
+    /// `AdmissionDecision::QueueAt(_)`: queued behind an already-active or
+    /// already-queued run.
+    Queued,
+    /// `AdmissionDecision::CancelledPreviousAndAdmit`.
+    CancelledPreviousAndAdmitted,
+    /// `AdmissionDecision::SkippedQueueFull { .. }`.
+    SkippedQueueFull,
+    /// `AdmissionDecision::SkippedCancellationUnconfirmed`.
+    SkippedCancellationUnconfirmed,
+}
+
+impl TriggerEventOutcome {
+    /// The column name this discriminant is stored under, for
+    /// [`TriggerError::UnrecognizedDiscriminant`]'s `column` field.
+    const COLUMN: &'static str = "trigger_event.outcome";
+
+    pub fn as_sql_str(self) -> &'static str {
+        match self {
+            TriggerEventOutcome::Admitted => "admitted",
+            TriggerEventOutcome::SkippedDueToOverlap => "skipped_due_to_overlap",
+            TriggerEventOutcome::Queued => "queued",
+            TriggerEventOutcome::CancelledPreviousAndAdmitted => "cancelled_previous_and_admitted",
+            TriggerEventOutcome::SkippedQueueFull => "skipped_queue_full",
+            TriggerEventOutcome::SkippedCancellationUnconfirmed => {
+                "skipped_cancellation_unconfirmed"
+            }
+        }
+    }
+
+    /// The read-back leg of migration 0013's `CHECK` constraint. Deliberately
+    /// **not** a lossy `_ => ...` catch-all: an unrecognized value means the
+    /// row does not say what this crate thinks it says.
+    pub fn from_sql_str(s: &str) -> Result<Self, TriggerError> {
+        match s {
+            "admitted" => Ok(TriggerEventOutcome::Admitted),
+            "skipped_due_to_overlap" => Ok(TriggerEventOutcome::SkippedDueToOverlap),
+            "queued" => Ok(TriggerEventOutcome::Queued),
+            "cancelled_previous_and_admitted" => {
+                Ok(TriggerEventOutcome::CancelledPreviousAndAdmitted)
+            }
+            "skipped_queue_full" => Ok(TriggerEventOutcome::SkippedQueueFull),
+            "skipped_cancellation_unconfirmed" => {
+                Ok(TriggerEventOutcome::SkippedCancellationUnconfirmed)
+            }
+            other => Err(TriggerError::UnrecognizedDiscriminant {
+                column: Self::COLUMN,
+                value: other.to_string(),
+            }),
+        }
+    }
+}
+
+/// A [`Binding`] paired with the trusted workspace identity it belongs to.
+///
+/// `Binding` itself stays daemon/workspace-agnostic by design (it is
+/// constructed and manipulated independently of any workspace, e.g. in this
+/// crate's own unit tests); `StoredBinding` is what a durable-store reader
+/// (Task 3's `store.rs`) hands back once a binding has been loaded from
+/// `trigger_binding`, where `workspace_id` is a real, trusted column rather
+/// than something the caller has to supply out of band.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredBinding {
+    pub workspace: WorkspaceId,
+    pub binding: Binding,
 }

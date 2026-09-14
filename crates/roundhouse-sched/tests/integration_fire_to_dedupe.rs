@@ -164,6 +164,7 @@ fn a_fired_binding_that_admits_and_then_repeats_its_idempotency_key_is_not_doubl
         fired_at,
         is_catch_up: false,
         session_id: None,
+        outcome: None,
     };
     assert!(
         record_trigger_event(&mut conn, &ev).unwrap(),
@@ -200,6 +201,7 @@ fn a_fired_binding_that_admits_and_then_repeats_its_idempotency_key_is_not_doubl
         fired_at: fired_at + chrono::Duration::seconds(5),
         is_catch_up: false,
         session_id: None,
+        outcome: None,
     };
     assert!(
         !record_trigger_event(&mut conn, &retry_ev).unwrap(),

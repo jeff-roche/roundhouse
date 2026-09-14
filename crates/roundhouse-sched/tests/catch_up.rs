@@ -89,6 +89,7 @@ fn sample_event(binding_id: BindingId, idempotency_key: &str) -> TriggerEvent {
         fired_at: Utc::now(),
         is_catch_up: false,
         session_id: None,
+        outcome: None,
     }
 }
 
@@ -213,6 +214,7 @@ fn occurrence_key_based_events_dedupe_across_a_simulated_crash_and_retry() {
         fired_at: scheduled_for, // real fired_at would differ; irrelevant to the key
         is_catch_up: false,
         session_id: None,
+        outcome: None,
     };
     assert!(record_trigger_event(&mut conn, &first_ev).unwrap());
 
@@ -225,6 +227,7 @@ fn occurrence_key_based_events_dedupe_across_a_simulated_crash_and_retry() {
         fired_at: Utc::now(),
         is_catch_up: false,
         session_id: None,
+        outcome: None,
     };
     assert!(
         !record_trigger_event(&mut conn, &retry_ev).unwrap(),
@@ -243,6 +246,7 @@ fn an_over_long_idempotency_key_is_rejected() {
         fired_at: Utc::now(),
         is_catch_up: false,
         session_id: None,
+        outcome: None,
     };
 
     let err = record_trigger_event(&mut conn, &ev).unwrap_err();
@@ -259,6 +263,7 @@ fn a_key_at_exactly_the_cap_is_accepted() {
         fired_at: Utc::now(),
         is_catch_up: false,
         session_id: None,
+        outcome: None,
     };
 
     assert!(record_trigger_event(&mut conn, &ev).unwrap());
