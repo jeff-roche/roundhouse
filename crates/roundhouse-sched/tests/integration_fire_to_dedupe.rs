@@ -19,27 +19,20 @@ use roundhouse_core::{BindingId, JobId};
 use roundhouse_sched::admission::{
     decide_admission, AdmissionDecision, CancellationOutcome, RegistryError, RunRegistry,
 };
-use roundhouse_sched::scheduler::{ClockSource, Scheduler, SchedulerEvent};
+use roundhouse_sched::scheduler::{ClockSource, ScheduledOccurrence, Scheduler, SchedulerEvent};
 use roundhouse_sched::store::{occurrence_key, open_test_db, record_trigger_event};
 use roundhouse_sched::trigger::{Binding, TriggerEvent};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::time::Duration;
-use tokio::time::Instant;
 
-/// A fake clock whose monotonic and wall clocks are advanced together (no
-/// drift), so a cron binding's next occurrence fires deterministically
-/// instead of the test waiting on real wall-clock time. Mirrors
-/// `tests/scheduler.rs`'s own `FakeClock`.
+/// A fake wall clock, advanced directly, so a cron binding's next occurrence
+/// fires deterministically instead of the test waiting on real wall-clock
+/// time. Mirrors `tests/scheduler.rs`'s own `FakeClock`.
 struct FakeClock {
-    mono: RefCell<Instant>,
     wall: RefCell<chrono::DateTime<Utc>>,
 }
 
 impl ClockSource for FakeClock {
-    fn monotonic_now(&self) -> Instant {
-        *self.mono.borrow()
-    }
     fn wall_now(&self) -> chrono::DateTime<Utc> {
         *self.wall.borrow()
     }
@@ -126,9 +119,7 @@ fn a_fired_binding_that_admits_and_then_repeats_its_idempotency_key_is_not_doubl
     // agree on what "the same occurrence" means — driving a real `tick()`
     // does.
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let start_mono = Instant::now();
     let clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
 
@@ -138,16 +129,19 @@ fn a_fired_binding_that_admits_and_then_repeats_its_idempotency_key_is_not_doubl
     let overlap = binding.overlap;
     sched.add_binding(binding, &clock).unwrap();
 
-    // Advance both clocks together by the same amount (no drift) past the
-    // next minute boundary, so the cron binding is genuinely due.
-    *clock.mono.borrow_mut() = start_mono + Duration::from_secs(61);
+    // Advance the wall clock past the next minute boundary, so the cron
+    // binding is genuinely due.
     *clock.wall.borrow_mut() = start_wall + chrono::Duration::seconds(61);
 
     let events = sched.tick(&clock);
     let scheduled_for = events
         .iter()
         .find_map(|event| match event {
-            SchedulerEvent::Fire(id, at) if *id == binding_id => Some(*at),
+            SchedulerEvent::Fire(ScheduledOccurrence {
+                binding_id: id,
+                scheduled_for,
+                ..
+            }) if *id == binding_id => Some(*scheduled_for),
             _ => None,
         })
         .expect("a `* * * * *` cron binding due 61s after registration must fire");

@@ -3,112 +3,140 @@ use chrono_tz::Tz;
 use roundhouse_core::JobId;
 use roundhouse_sched::cron::CronError;
 use roundhouse_sched::scheduler::{
-    ClockSource, Scheduler, SchedulerEvent, MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK,
+    ClockSource, ScheduledOccurrence, Scheduler, SchedulerEvent,
+    MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK,
 };
 use roundhouse_sched::trigger::{Binding, CatchUp, DstAmbiguous, DstGap, TriggerSpec};
 use std::cell::RefCell;
 use std::time::Duration;
-use tokio::time::Instant;
 
-/// A fake clock whose monotonic and wall clocks can be independently
-/// advanced, so drift (NTP step, suspend/resume) is reproducible in a unit
-/// test rather than relying on sleeping and hoping.
+/// A fake wall clock whose reading can be set directly, so forward and
+/// backward wall-clock steps are reproduced deterministically rather than by
+/// sleeping and hoping.
 struct FakeClock {
-    mono: RefCell<Instant>,
     wall: RefCell<DateTime<Utc>>,
 }
 
 impl ClockSource for FakeClock {
-    fn monotonic_now(&self) -> Instant {
-        *self.mono.borrow()
-    }
     fn wall_now(&self) -> DateTime<Utc> {
         *self.wall.borrow()
     }
 }
 
-#[test]
-fn wall_clock_step_beyond_2s_triggers_drift_event_and_full_recompute() {
-    let start_mono = Instant::now();
-    let start_wall = Utc::now();
-    let clock = FakeClock {
-        mono: RefCell::new(start_mono),
-        wall: RefCell::new(start_wall),
-    };
-    let mut sched = Scheduler::new();
-    let binding = Binding::new_cron(JobId::new(), "0 2 * * *".to_string(), Tz::UTC);
-    sched.add_binding(binding.clone(), &clock).unwrap();
-
-    // Advance monotonic by 1s, wall by 30s (simulating an NTP step / resume-from-suspend).
-    *clock.mono.borrow_mut() = start_mono + Duration::from_secs(1);
-    *clock.wall.borrow_mut() = start_wall + chrono::Duration::seconds(30);
-
-    let events = sched.tick(&clock);
-    assert!(events
+fn fires_for(
+    events: &[SchedulerEvent],
+    binding_id: roundhouse_core::BindingId,
+) -> Vec<DateTime<Utc>> {
+    events
         .iter()
-        .any(|e| matches!(e, SchedulerEvent::DriftDetected { .. })));
+        .filter_map(|e| match e {
+            SchedulerEvent::Fire(ScheduledOccurrence {
+                binding_id: id,
+                scheduled_for,
+                ..
+            }) if *id == binding_id => Some(*scheduled_for),
+            _ => None,
+        })
+        .collect()
 }
 
+/// Bug fix (Task 1, Phase 8 rebuild): the old scheduler also read a
+/// monotonic clock and treated any disagreement between it and the wall
+/// clock beyond a 2s threshold as "drift," calling `recompute_all`
+/// regardless of whether the wall clock had moved forward or backward.
+/// Since `recompute_all` only computes the *next* occurrence after the new
+/// wall time (it never fires anything itself — see its doc comment), an
+/// ordinary forward jump — even a large one, with no real backlog problem —
+/// silently dropped whatever was actually due. A forward wall-clock jump,
+/// however large, must instead always drain through `drain_due` and
+/// actually fire what's due.
 #[test]
-fn wall_clock_step_backward_beyond_2s_also_triggers_drift_event() {
-    // A naive `(now_wall - last_wall).to_std().unwrap_or_default()` collapses
-    // a negative wall delta to zero and would silently miss this case — a
-    // backward wall-clock correction (e.g. an NTP step that overshoots after
-    // suspend/resume) must be detected exactly as reliably as a forward one.
-    let start_mono = Instant::now();
-    let start_wall = Utc::now();
+fn tick_forward_wall_clock_jump_of_any_size_still_drains_the_backlog_instead_of_discarding_it() {
+    let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
     let mut sched = Scheduler::new();
-    let binding = Binding::new_cron(JobId::new(), "0 2 * * *".to_string(), Tz::UTC);
-    sched.add_binding(binding.clone(), &clock).unwrap();
+    let binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
+    let binding_id = binding.id;
+    sched.add_binding(binding, &clock).unwrap();
 
-    // Monotonic advances normally by 1s; wall clock jumps *backward* by 30s.
-    *clock.mono.borrow_mut() = start_mono + Duration::from_secs(1);
-    *clock.wall.borrow_mut() = start_wall - chrono::Duration::seconds(30);
+    // A forward jump far beyond the old 2s drift threshold — a full hour,
+    // with the binding's one-minute cron due 59 times over. The bug this
+    // guards against: the old drift check would have seen this same jump as
+    // drift and called `recompute_all`, which fires nothing and simply
+    // reschedules from the new wall time — silently dropping every one of
+    // those due occurrences.
+    let target = start_wall + chrono::Duration::hours(1);
+    *clock.wall.borrow_mut() = target;
 
     let events = sched.tick(&clock);
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, SchedulerEvent::DriftDetected { .. })),
-        "backward wall-clock steps must be detected as drift too, not silently dropped: {events:?}"
+        !fires_for(&events, binding_id).is_empty(),
+        "a forward wall-clock jump, however large, must drain and fire what's due, not \
+         silently discard it via recompute_all: {events:?}"
     );
 }
 
+/// A backward wall-clock step — an NTP correction after a suspend/resume
+/// cycle overshoots, or a manual clock change — is the one case that must
+/// still trigger a full `recompute_all`, dropping whatever schedule was
+/// pending in favor of one recomputed from the corrected time. Proven by
+/// re-anchoring: probing at a wall time that is only reachable if the
+/// schedule was actually recomputed from the backward reading (not left
+/// anchored to the pre-step schedule, which `drain_due` alone would do
+/// nothing to change since nothing in it is yet due at an earlier time).
 #[test]
-fn small_wall_clock_slack_under_2s_does_not_trigger_drift() {
-    let start_mono = Instant::now();
-    let start_wall = Utc::now();
+fn tick_backward_wall_clock_step_triggers_recompute_and_drops_the_pending_schedule() {
+    let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 10, 0).unwrap();
     let clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
     let mut sched = Scheduler::new();
-    let binding = Binding::new_cron(JobId::new(), "0 2 * * *".to_string(), Tz::UTC);
-    sched.add_binding(binding, &clock).unwrap();
+    let binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
+    let binding_id = binding.id;
+    sched.add_binding(binding, &clock).unwrap(); // next fire: 00:11:00
 
-    // Monotonic and wall both advance by ~1s (well under the 2s threshold).
-    *clock.mono.borrow_mut() = start_mono + Duration::from_millis(1_000);
-    *clock.wall.borrow_mut() = start_wall + chrono::Duration::milliseconds(1_500);
-
+    // Ordinary forward tick, nothing due yet — establishes `last_wall`.
+    let advanced = start_wall + chrono::Duration::seconds(30);
+    *clock.wall.borrow_mut() = advanced;
     let events = sched.tick(&clock);
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, SchedulerEvent::DriftDetected { .. })),
-        "sub-threshold slack must not be reported as drift: {events:?}"
+        fires_for(&events, binding_id).is_empty(),
+        "nothing is due yet: {events:?}"
+    );
+
+    // A backward step: 00:09:00 is earlier than the 00:10:30 this scheduler
+    // just recorded. Must recompute (next fire becomes 00:10:00), not
+    // silently do nothing.
+    let backward = Utc.with_ymd_and_hms(2026, 1, 1, 0, 9, 0).unwrap();
+    *clock.wall.borrow_mut() = backward;
+    let events2 = sched.tick(&clock);
+    assert!(
+        fires_for(&events2, binding_id).is_empty(),
+        "a backward step must not itself fire anything: {events2:?}"
+    );
+
+    // Probe at 00:10:01 — past the recompute-derived next fire (00:10:00)
+    // but well before the original, pre-step schedule's next fire
+    // (00:11:00). Only reachable if `recompute_all` actually ran and
+    // re-anchored the schedule to the corrected (backward) wall clock.
+    let probe = Utc.with_ymd_and_hms(2026, 1, 1, 0, 10, 1).unwrap();
+    *clock.wall.borrow_mut() = probe;
+    let events3 = sched.tick(&clock);
+    assert_eq!(
+        fires_for(&events3, binding_id),
+        vec![Utc.with_ymd_and_hms(2026, 1, 1, 0, 10, 0).unwrap()],
+        "the schedule must be recomputed from the corrected (backward) wall clock, dropping \
+         whatever was pending before the step, not left anchored to the pre-step schedule: \
+         {events3:?}"
     );
 }
 
 #[test]
 fn due_binding_fires_and_reschedules_its_next_occurrence() {
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let start_mono = Instant::now();
     let clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
     let mut sched = Scheduler::new();
@@ -116,44 +144,23 @@ fn due_binding_fires_and_reschedules_its_next_occurrence() {
     let binding_id = binding.id;
     sched.add_binding(binding, &clock).unwrap();
 
-    // Advance to just past the first fire time (2026-01-01T02:00:00Z), keeping
-    // monotonic and wall in lockstep so no drift event is produced.
+    // Advance to just past the first fire time (2026-01-01T02:00:00Z).
     let target = Utc.with_ymd_and_hms(2026, 1, 1, 2, 0, 1).unwrap();
-    let elapsed = (target - start_wall).to_std().unwrap();
-    *clock.mono.borrow_mut() = start_mono + elapsed;
     *clock.wall.borrow_mut() = target;
 
     let events = sched.tick(&clock);
-    let fires: Vec<DateTime<Utc>> = events
-        .iter()
-        .filter_map(|e| match e {
-            SchedulerEvent::Fire(id, at) if *id == binding_id => Some(*at),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        fires,
+        fires_for(&events, binding_id),
         vec![Utc.with_ymd_and_hms(2026, 1, 1, 2, 0, 0).unwrap()]
     );
 
     // Tick again well past the *next* day's occurrence: the binding must
-    // have rescheduled itself, not gone silent after firing once. Both
-    // clocks are advanced from `start_mono`/`start_wall` by the same total
-    // elapsed amount, so they stay in lockstep and no drift event fires.
+    // have rescheduled itself, not gone silent after firing once.
     let next_target = Utc.with_ymd_and_hms(2026, 1, 2, 2, 0, 1).unwrap();
-    let total_elapsed = (next_target - start_wall).to_std().unwrap();
-    *clock.mono.borrow_mut() = start_mono + total_elapsed;
     *clock.wall.borrow_mut() = next_target;
     let events = sched.tick(&clock);
-    let fires: Vec<DateTime<Utc>> = events
-        .iter()
-        .filter_map(|e| match e {
-            SchedulerEvent::Fire(id, at) if *id == binding_id => Some(*at),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        fires,
+        fires_for(&events, binding_id),
         vec![Utc.with_ymd_and_hms(2026, 1, 2, 2, 0, 0).unwrap()]
     );
 }
@@ -175,9 +182,7 @@ fn dst_ambiguous_both_schedules_and_fires_both_instants() {
     // occurrence *is* the ambiguous one, isolating the double-fire case
     // rather than also picking up 31 days of unrelated prior fires.
     let start_wall = Utc.with_ymd_and_hms(2026, 11, 1, 4, 0, 0).unwrap();
-    let start_mono = Instant::now();
     let clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
 
@@ -196,21 +201,12 @@ fn dst_ambiguous_both_schedules_and_fires_both_instants() {
     let binding_id = binding.id;
     sched.add_binding(binding, &clock).unwrap();
 
-    // Advance past both fold instants, keeping monotonic and wall in
-    // lockstep so no drift event muddies the assertion.
+    // Advance past both fold instants.
     let target = Utc.with_ymd_and_hms(2026, 11, 1, 7, 0, 0).unwrap();
-    let elapsed = (target - start_wall).to_std().unwrap();
-    *clock.mono.borrow_mut() = start_mono + elapsed;
     *clock.wall.borrow_mut() = target;
 
     let events = sched.tick(&clock);
-    let mut fires: Vec<DateTime<Utc>> = events
-        .iter()
-        .filter_map(|e| match e {
-            SchedulerEvent::Fire(id, at) if *id == binding_id => Some(*at),
-            _ => None,
-        })
-        .collect();
+    let mut fires = fires_for(&events, binding_id);
     fires.sort();
     assert_eq!(
         fires,
@@ -230,9 +226,7 @@ fn dst_ambiguous_both_schedules_and_fires_both_instants() {
 fn dst_ambiguous_first_fires_only_the_earlier_instant_on_the_same_fold() {
     let tz = Tz::America__New_York;
     let start_wall = Utc.with_ymd_and_hms(2026, 11, 1, 4, 0, 0).unwrap();
-    let start_mono = Instant::now();
     let clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
 
@@ -242,36 +236,14 @@ fn dst_ambiguous_first_fires_only_the_earlier_instant_on_the_same_fold() {
     sched.add_binding(binding, &clock).unwrap();
 
     let target = Utc.with_ymd_and_hms(2026, 11, 1, 7, 0, 0).unwrap();
-    let elapsed = (target - start_wall).to_std().unwrap();
-    *clock.mono.borrow_mut() = start_mono + elapsed;
     *clock.wall.borrow_mut() = target;
 
     let events = sched.tick(&clock);
-    let fires: Vec<DateTime<Utc>> = events
-        .iter()
-        .filter_map(|e| match e {
-            SchedulerEvent::Fire(id, at) if *id == binding_id => Some(*at),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        fires,
+        fires_for(&events, binding_id),
         vec![Utc.with_ymd_and_hms(2026, 11, 1, 5, 30, 0).unwrap()],
         "DstAmbiguous::First must fire exactly once, at the earlier instant: {events:?}"
     );
-}
-
-fn fires_for(
-    events: &[SchedulerEvent],
-    binding_id: roundhouse_core::BindingId,
-) -> Vec<DateTime<Utc>> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            SchedulerEvent::Fire(id, at) if *id == binding_id => Some(*at),
-            _ => None,
-        })
-        .collect()
 }
 
 /// M5: `Scheduler::tick` previously never consulted `CatchUp` at all — every
@@ -282,9 +254,7 @@ fn fires_for(
 #[test]
 fn catch_up_none_is_actually_applied_by_tick_and_still_advances_the_schedule() {
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let start_mono = Instant::now();
     let clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
     let mut sched = Scheduler::new();
@@ -297,8 +267,6 @@ fn catch_up_none_is_actually_applied_by_tick_and_still_advances_the_schedule() {
 
     // Simulate an outage: 5 missed once-a-minute occurrences (00:01..00:05).
     let target = start_wall + chrono::Duration::minutes(5);
-    let elapsed = (target - start_wall).to_std().unwrap();
-    *clock.mono.borrow_mut() = start_mono + elapsed;
     *clock.wall.borrow_mut() = target;
 
     let events = sched.tick(&clock);
@@ -311,8 +279,6 @@ fn catch_up_none_is_actually_applied_by_tick_and_still_advances_the_schedule() {
     // gotten stuck re-considering it: the very next occurrence (00:06) must
     // now be the one that's due, not 00:01 again.
     let next_target = target + chrono::Duration::minutes(1);
-    let total_elapsed = (next_target - start_wall).to_std().unwrap();
-    *clock.mono.borrow_mut() = start_mono + total_elapsed;
     *clock.wall.borrow_mut() = next_target;
     let events2 = sched.tick(&clock);
     assert_eq!(fires_for(&events2, binding_id), vec![next_target]);
@@ -323,9 +289,7 @@ fn catch_up_none_is_actually_applied_by_tick_and_still_advances_the_schedule() {
 #[test]
 fn catch_up_latest_is_actually_applied_by_tick() {
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let start_mono = Instant::now();
     let clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
     let mut sched = Scheduler::new();
@@ -335,8 +299,6 @@ fn catch_up_latest_is_actually_applied_by_tick() {
     sched.add_binding(binding, &clock).unwrap();
 
     let target = start_wall + chrono::Duration::minutes(5);
-    let elapsed = (target - start_wall).to_std().unwrap();
-    *clock.mono.borrow_mut() = start_mono + elapsed;
     *clock.wall.borrow_mut() = target;
 
     let events = sched.tick(&clock);
@@ -352,9 +314,7 @@ fn catch_up_latest_is_actually_applied_by_tick() {
 #[test]
 fn catch_up_all_is_actually_applied_by_tick() {
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let start_mono = Instant::now();
     let clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
     let mut sched = Scheduler::new();
@@ -366,8 +326,6 @@ fn catch_up_all_is_actually_applied_by_tick() {
     sched.add_binding(binding, &clock).unwrap();
 
     let target = start_wall + chrono::Duration::minutes(5);
-    let elapsed = (target - start_wall).to_std().unwrap();
-    *clock.mono.borrow_mut() = start_mono + elapsed;
     *clock.wall.borrow_mut() = target;
 
     let events = sched.tick(&clock);
@@ -385,9 +343,7 @@ fn catch_up_all_is_actually_applied_by_tick() {
 #[test]
 fn catch_up_all_is_capped_per_tick_and_completes_progressively_across_calls() {
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let start_mono = Instant::now();
     let clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
     let mut sched = Scheduler::new();
@@ -402,8 +358,6 @@ fn catch_up_all_is_capped_per_tick_and_completes_progressively_across_calls() {
     let extra = 51usize;
     let total_missed = cap * 2 + extra;
     let target = start_wall + chrono::Duration::minutes(total_missed as i64);
-    let elapsed = (target - start_wall).to_std().unwrap();
-    *clock.mono.borrow_mut() = start_mono + elapsed;
     *clock.wall.borrow_mut() = target;
 
     let first = sched.tick(&clock);
@@ -434,19 +388,27 @@ fn catch_up_all_is_capped_per_tick_and_completes_progressively_across_calls() {
     );
 }
 
+/// A held-constant clock (whatever `catch_up_after_wake` last set as the
+/// baseline) used to drive further `tick()` calls in the progressive-drain
+/// test below without introducing any *additional* forward movement of its
+/// own — isolating "does the backlog drain" from "does advancing the clock
+/// further also work" (already covered by
+/// `catch_up_all_is_capped_per_tick_and_completes_progressively_across_calls`).
+fn clock_at(wall: DateTime<Utc>) -> FakeClock {
+    FakeClock {
+        wall: RefCell::new(wall),
+    }
+}
+
 /// Task 6 (§8.7): `Scheduler::catch_up_after_wake` must drain a real
 /// suspend-scale backlog through the same capped, progressive machinery as
-/// `tick`'s ordinary catch-up path — not the drift-triggered
-/// `recompute_all` path, which would silently discard it. Modeled as a
-/// genuinely long sleep (a `* * * * *` cron offline for 10 days — 14,400
-/// missed occurrences, two orders of magnitude past the per-call cap), with
-/// the monotonic/wall asymmetry a real suspend produces: the monotonic
-/// clock barely advances while the wall clock jumps by the full sleep
-/// duration.
+/// `tick`'s ordinary catch-up path — not the backward-step-triggered
+/// `recompute_all` path, which would discard it. Modeled as a genuinely
+/// long sleep (a `* * * * *` cron offline for 10 days — 14,400 missed
+/// occurrences, two orders of magnitude past the per-call cap).
 #[test]
 fn catch_up_after_wake_drains_a_long_sleep_progressively_across_calls() {
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let start_mono = Instant::now();
     let mut binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
     if let TriggerSpec::Cron { catch_up, .. } = &mut binding.spec {
         *catch_up = CatchUp::All;
@@ -454,7 +416,6 @@ fn catch_up_after_wake_drains_a_long_sleep_progressively_across_calls() {
     let binding_id = binding.id;
 
     let clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
     let mut sched = Scheduler::new();
@@ -463,11 +424,8 @@ fn catch_up_after_wake_drains_a_long_sleep_progressively_across_calls() {
     let cap = MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK;
     let total_missed = cap * 100 + 7; // a "daemon asleep for ~10 days" scale backlog
     let target_wall = start_wall + chrono::Duration::minutes(total_missed as i64);
-    // The whole point: monotonic barely moves across a real suspend, unlike
-    // an NTP-style correction where both clocks would move in step.
-    let woke_mono = start_mono + Duration::from_millis(5);
 
-    let first = sched.catch_up_after_wake(woke_mono, target_wall);
+    let first = sched.catch_up_after_wake(target_wall);
     assert_eq!(
         fires_for(&first, binding_id).len(),
         cap,
@@ -490,7 +448,7 @@ fn catch_up_after_wake_drains_a_long_sleep_progressively_across_calls() {
             guard_iterations <= 200,
             "catch-up did not converge; backlog is not draining"
         );
-        let events = sched.tick(&clock_at(target_wall, woke_mono));
+        let events = sched.tick(&clock_at(target_wall));
         let fired = fires_for(&events, binding_id).len();
         assert!(
             fired > 0,
@@ -505,33 +463,12 @@ fn catch_up_after_wake_drains_a_long_sleep_progressively_across_calls() {
     assert_eq!(remaining, 0);
 
     // Fully drained: a later tick at the same wall clock must fire nothing
-    // more, and must not report the already-handled sleep gap as fresh
-    // drift (the wake call already reset the drift baseline).
-    let last = sched.tick(&clock_at(target_wall, woke_mono));
+    // more.
+    let last = sched.tick(&clock_at(target_wall));
     assert!(
         fires_for(&last, binding_id).is_empty(),
         "backlog is fully caught up; nothing more should fire: {last:?}"
     );
-    assert!(
-        !last
-            .iter()
-            .any(|e| matches!(e, SchedulerEvent::DriftDetected { .. })),
-        "catch_up_after_wake must reset the drift baseline so the already-handled sleep gap \
-         is not re-reported as drift by a later tick at the same clock reading: {last:?}"
-    );
-}
-
-/// A held-constant clock (both readings equal to whatever
-/// `catch_up_after_wake` last set as the baseline) used to drive further
-/// `tick()` calls in the progressive-drain test above without introducing
-/// any *additional* drift of its own — isolating "does the backlog drain"
-/// from "does advancing the clock further also work" (already covered by
-/// `catch_up_all_is_capped_per_tick_and_completes_progressively_across_calls`).
-fn clock_at(wall: DateTime<Utc>, mono: Instant) -> FakeClock {
-    FakeClock {
-        mono: RefCell::new(mono),
-        wall: RefCell::new(wall),
-    }
 }
 
 /// Fix round 1 (M2): `CatchUp::None` must drop an *entire* multi-batch
@@ -545,7 +482,6 @@ fn clock_at(wall: DateTime<Utc>, mono: Instant) -> FakeClock {
 #[test]
 fn catch_up_after_wake_with_none_policy_drops_an_entire_multi_batch_backlog() {
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let start_mono = Instant::now();
     let mut binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
     if let TriggerSpec::Cron { catch_up, .. } = &mut binding.spec {
         *catch_up = CatchUp::None;
@@ -553,7 +489,6 @@ fn catch_up_after_wake_with_none_policy_drops_an_entire_multi_batch_backlog() {
     let binding_id = binding.id;
 
     let clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
     let mut sched = Scheduler::new();
@@ -562,20 +497,13 @@ fn catch_up_after_wake_with_none_policy_drops_an_entire_multi_batch_backlog() {
     let cap = MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK;
     let total_missed = cap * 3; // exact multiple of the cap: 3 batches, none partial
     let target_wall = start_wall + chrono::Duration::minutes(total_missed as i64);
-    let woke_mono = start_mono + Duration::from_millis(5);
 
-    let mut all_fires = fires_for(
-        &sched.catch_up_after_wake(woke_mono, target_wall),
-        binding_id,
-    );
+    let mut all_fires = fires_for(&sched.catch_up_after_wake(target_wall), binding_id);
     for _ in 0..10 {
         if sched.heap_len() == 0 {
             break;
         }
-        all_fires.extend(fires_for(
-            &sched.tick(&clock_at(target_wall, woke_mono)),
-            binding_id,
-        ));
+        all_fires.extend(fires_for(&sched.tick(&clock_at(target_wall)), binding_id));
     }
     assert!(
         all_fires.is_empty(),
@@ -587,8 +515,7 @@ fn catch_up_after_wake_with_none_policy_drops_an_entire_multi_batch_backlog() {
     // The pass must actually finish (not leave `catch_up_progress` stuck):
     // a later, genuinely ordinary single occurrence must still fire.
     let next_minute = target_wall + chrono::Duration::minutes(1);
-    let next_mono = woke_mono + Duration::from_secs(60);
-    let after = sched.tick(&clock_at(next_minute, next_mono));
+    let after = sched.tick(&clock_at(next_minute));
     assert_eq!(
         fires_for(&after, binding_id),
         vec![next_minute],
@@ -602,16 +529,14 @@ fn catch_up_after_wake_with_none_policy_drops_an_entire_multi_batch_backlog() {
 /// entry that outlives the backlog it was tracking. Sequence: (1) put a
 /// `CatchUp::None` binding genuinely mid-backlog (a capped batch that did
 /// *not* exhaust it, so a `catch_up_progress` entry is left behind); (2) a
-/// backward wall-clock step beyond `DRIFT_THRESHOLD` at wake, which routes
-/// through `recompute_all`; (3) let one *ordinary* single occurrence come
-/// due afterward and assert it fires. Without the `clear()`, the stranded
-/// entry makes `is_catch_up_pass` true for that lone, unrelated occurrence,
-/// and `CatchUp::None` swallows it — a genuinely ordinary firing lost to a
-/// backlog that no longer exists.
+/// backward wall-clock step at wake, which routes through `recompute_all`;
+/// (3) let one *ordinary* single occurrence come due afterward and assert it
+/// fires. Without the `clear()`, the stranded entry makes `is_catch_up_pass`
+/// true for that lone, unrelated occurrence, and `CatchUp::None` swallows
+/// it — a genuinely ordinary firing lost to a backlog that no longer exists.
 #[test]
 fn recompute_all_clears_catch_up_progress_so_a_later_ordinary_occurrence_still_fires() {
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let start_mono = Instant::now();
     let mut binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
     if let TriggerSpec::Cron { catch_up, .. } = &mut binding.spec {
         *catch_up = CatchUp::None;
@@ -619,35 +544,30 @@ fn recompute_all_clears_catch_up_progress_so_a_later_ordinary_occurrence_still_f
     let binding_id = binding.id;
 
     let add_clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
     let mut sched = Scheduler::new();
     sched.add_binding(binding, &add_clock).unwrap();
 
-    // Step 1: a backlog bigger than the cap, advanced in lockstep (no
-    // drift) via plain `tick`, so the first capped batch does *not* exhaust
-    // the backlog and leaves a `catch_up_progress` entry behind.
+    // Step 1: a backlog bigger than the cap, advanced in a single tick, so
+    // the first capped batch does *not* exhaust the backlog and leaves a
+    // `catch_up_progress` entry behind.
     let cap = MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK;
     let backlog_wall = start_wall + chrono::Duration::minutes((cap + 50) as i64);
-    let backlog_mono = start_mono + Duration::from_secs((cap as u64 + 50) * 60);
-    let first = sched.tick(&clock_at(backlog_wall, backlog_mono));
+    let first = sched.tick(&clock_at(backlog_wall));
     assert!(
         fires_for(&first, binding_id).is_empty(),
         "CatchUp::None must fire nothing from the first (non-exhausting) batch: {first:?}"
     );
 
-    // Step 2: a backward wake step beyond `DRIFT_THRESHOLD` relative to
-    // `backlog_wall` — routes through `recompute_all`, which must also
-    // clear the `catch_up_progress` entry `step 1` just left behind.
+    // Step 2: a backward wake step relative to `backlog_wall` — routes
+    // through `recompute_all`, which must also clear the `catch_up_progress`
+    // entry step 1 just left behind.
     let corrected_wall = start_wall + chrono::Duration::minutes(10);
-    let corrected_mono = backlog_mono + Duration::from_millis(5);
-    let woke = sched.catch_up_after_wake(corrected_mono, corrected_wall);
+    let woke = sched.catch_up_after_wake(corrected_wall);
     assert!(
-        woke.iter()
-            .any(|e| matches!(e, SchedulerEvent::DriftDetected { .. })),
-        "the backward step must be reported as drift, confirming recompute_all's path was \
-         actually taken: {woke:?}"
+        woke.is_empty(),
+        "a backward step must not itself fire anything: {woke:?}"
     );
 
     // Step 3: the schedule is now re-anchored to `corrected_wall`
@@ -656,8 +576,7 @@ fn recompute_all_clears_catch_up_progress_so_a_later_ordinary_occurrence_still_f
     // step 1 — it must fire regardless of `CatchUp::None`, which is only
     // fixed by `recompute_all` having cleared the stranded progress entry.
     let ordinary_fire_at = corrected_wall + chrono::Duration::minutes(1);
-    let probe_mono = corrected_mono + Duration::from_secs(60);
-    let after = sched.tick(&clock_at(ordinary_fire_at, probe_mono));
+    let after = sched.tick(&clock_at(ordinary_fire_at));
     assert_eq!(
         fires_for(&after, binding_id),
         vec![ordinary_fire_at],
@@ -684,9 +603,7 @@ fn recompute_all_clears_catch_up_progress_so_a_later_ordinary_occurrence_still_f
 #[test]
 fn interval_binding_backlog_fires_every_missed_occurrence_across_multiple_capped_batches() {
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let start_mono = Instant::now();
     let clock = FakeClock {
-        mono: RefCell::new(start_mono),
         wall: RefCell::new(start_wall),
     };
     let mut sched = Scheduler::new();
@@ -704,8 +621,6 @@ fn interval_binding_backlog_fires_every_missed_occurrence_across_multiple_capped
     let cap = MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK;
     let total_missed = cap * 2 + 3;
     let target = start_wall + chrono::Duration::minutes(total_missed as i64);
-    let elapsed = (target - start_wall).to_std().unwrap();
-    *clock.mono.borrow_mut() = start_mono + elapsed;
     *clock.wall.borrow_mut() = target;
 
     let mut all_fires: Vec<DateTime<Utc>> = Vec::new();
@@ -731,19 +646,15 @@ fn interval_binding_backlog_fires_every_missed_occurrence_across_multiple_capped
     );
 }
 
-/// Fix round 1 (M1): a *backward* wall-clock step reported at wake — the
-/// same "NTP correction after suspend/resume overshoots" scenario `tick`'s
-/// own drift check exists to catch — must fall back to a full
-/// `recompute_all`, not be treated as a catch-up backlog. An `Interval`
-/// binding (no `CatchUp` policy at all) isolates this from M2's concerns:
-/// the only question here is which of `drain_due`/`recompute_all` ran,
-/// observed indirectly through where the schedule ends up anchored.
+/// Fix round 1 (M1): a *backward* wall-clock step reported at wake must fall
+/// back to a full `recompute_all`, not be treated as a catch-up backlog. An
+/// `Interval` binding (no `CatchUp` policy at all) isolates this from M2's
+/// concerns: the only question here is which of `drain_due`/`recompute_all`
+/// ran, observed indirectly through where the schedule ends up anchored.
 #[test]
 fn catch_up_after_wake_falls_back_to_recompute_on_a_backward_wall_clock_step() {
     let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let mono0 = Instant::now();
     let add_clock = FakeClock {
-        mono: RefCell::new(mono0),
         wall: RefCell::new(t0),
     };
     let mut sched = Scheduler::new();
@@ -763,49 +674,27 @@ fn catch_up_after_wake_falls_back_to_recompute_on_a_backward_wall_clock_step() {
     // so this is indistinguishable from a no-op either way — it only
     // advances the baseline `last_wall` this test's backward step below
     // needs to be backward *relative to*.
-    let fired1 = sched.catch_up_after_wake(
-        mono0 + Duration::from_secs(60 * 60),
-        t0 + chrono::Duration::minutes(60),
-    );
+    let fired1 = sched.catch_up_after_wake(t0 + chrono::Duration::minutes(60));
     assert!(fired1.is_empty());
 
     // Second wake: a *backward* step to t0 + 10min (50 minutes earlier than
     // the t0 + 60min this scheduler just recorded — an NTP correction
-    // overshooting after a resume, exactly the scenario `tick`'s own drift
-    // check names). Must re-anchor via `recompute_all`, not silently do
-    // nothing via `drain_due` (which would find the still-t0+200min heap
-    // entry not yet due and leave it untouched).
-    let fired2 = sched.catch_up_after_wake(
-        mono0 + Duration::from_secs(70 * 60),
-        t0 + chrono::Duration::minutes(10),
-    );
+    // overshooting after a resume). Must re-anchor via `recompute_all`, not
+    // silently do nothing via `drain_due` (which would find the still-
+    // t0+200min heap entry not yet due and leave it untouched).
+    let fired2 = sched.catch_up_after_wake(t0 + chrono::Duration::minutes(10));
     assert!(
-        !fired2.iter().any(|e| matches!(e, SchedulerEvent::Fire(..))),
+        fired2.is_empty(),
         "a clock correction must not itself fire a Fire event: {fired2:?}"
-    );
-    // Fix round 2 (optional item): emitted for symmetry with `tick`'s own
-    // drift-triggered `recompute_all`, so a caller watching only the event
-    // stream can still tell "a clock correction happened" apart from
-    // "woke, nothing was due" — previously only a `tracing::warn!` recorded
-    // the difference.
-    assert!(
-        fired2
-            .iter()
-            .any(|e| matches!(e, SchedulerEvent::DriftDetected { .. })),
-        "a backward wake step must report DriftDetected, matching tick's own symmetry: {fired2:?}"
     );
 
     // Probe with plain `tick` at a wall clock chosen to fall strictly
     // between the two possible re-anchor points: t0 + 200min (if the
     // backward step were wrongly treated as a catch-up backlog and the
     // stale heap entry left untouched) and t0 + 210min (t0 + 10min + 200min,
-    // the correct `recompute_all`-from-the-corrected-clock answer). Monotonic
-    // is advanced in lockstep with wall time here so this probe's own drift
-    // check stays silent — it exists only to observe where the schedule
-    // ended up, not to exercise drift detection a second time.
+    // the correct `recompute_all`-from-the-corrected-clock answer).
     let probe_wall = t0 + chrono::Duration::minutes(205);
-    let probe_mono = mono0 + Duration::from_secs(70 * 60) + Duration::from_secs(195 * 60);
-    let probe = sched.tick(&clock_at(probe_wall, probe_mono));
+    let probe = sched.tick(&clock_at(probe_wall));
     assert!(
         fires_for(&probe, binding_id).is_empty(),
         "a backward wake step must re-anchor the schedule to the corrected clock (next fire \
@@ -813,8 +702,7 @@ fn catch_up_after_wake_falls_back_to_recompute_on_a_backward_wall_clock_step() {
     );
 
     let later_wall = t0 + chrono::Duration::minutes(211);
-    let later_mono = probe_mono + Duration::from_secs(6 * 60);
-    let later = sched.tick(&clock_at(later_wall, later_mono));
+    let later = sched.tick(&clock_at(later_wall));
     assert_eq!(
         fires_for(&later, binding_id),
         vec![t0 + chrono::Duration::minutes(210)],
@@ -829,7 +717,6 @@ fn catch_up_after_wake_falls_back_to_recompute_on_a_backward_wall_clock_step() {
 #[test]
 fn adding_a_zero_duration_interval_binding_is_rejected_not_silently_accepted() {
     let clock = FakeClock {
-        mono: RefCell::new(Instant::now()),
         wall: RefCell::new(Utc::now()),
     };
     let mut sched = Scheduler::new();
@@ -855,7 +742,6 @@ fn adding_a_zero_duration_interval_binding_is_rejected_not_silently_accepted() {
 #[test]
 fn adding_an_interval_binding_beyond_chronos_representable_range_is_rejected() {
     let clock = FakeClock {
-        mono: RefCell::new(Instant::now()),
         wall: RefCell::new(Utc::now()),
     };
     let mut sched = Scheduler::new();
@@ -882,7 +768,6 @@ fn adding_an_interval_binding_beyond_chronos_representable_range_is_rejected() {
 #[test]
 fn adding_an_interval_binding_that_would_overflow_datetime_arithmetic_is_rejected() {
     let clock = FakeClock {
-        mono: RefCell::new(Instant::now()),
         wall: RefCell::new(Utc::now()),
     };
     let mut sched = Scheduler::new();
