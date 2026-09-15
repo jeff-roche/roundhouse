@@ -19,6 +19,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_core::{OnDegrade, SessionId, SessionSpec, SessionState, TaskRunner, Tier};
 use roundhouse_daemon::session_bootstrap::{
     no_policy_rules, BackgroundServices, DaemonResources, PolicyRuleSource,
@@ -220,6 +221,7 @@ pub async fn resources_with(
         store,
         isolate,
         proxy,
+        Arc::new(SpawnTree::new()),
         dir.join("state"),
         dir.join("daemon-binary"),
         Vec::new(),

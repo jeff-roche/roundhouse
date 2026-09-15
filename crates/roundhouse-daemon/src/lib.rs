@@ -43,6 +43,7 @@ pub mod workspace_registry;
 pub(crate) mod test_support {
     use std::sync::Arc;
 
+    use roundhouse_bus::spawn_tree::SpawnTree;
     use roundhouse_core::{OnDegrade, SessionId, SessionSpec, SessionState, Tier};
     use roundhouse_engine::SessionActor;
     use roundhouse_policy::engine::PolicyEngine;
@@ -212,6 +213,7 @@ pub(crate) mod test_support {
             store,
             available_isolate(),
             proxy,
+            Arc::new(SpawnTree::new()),
             dir.join("state"),
             dir.join("daemon-binary"),
             Vec::new(),

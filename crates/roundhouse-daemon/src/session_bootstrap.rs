@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
+use roundhouse_bus::spawn_tree::SpawnTree;
 #[cfg(test)]
 use roundhouse_core::WorkspaceId;
 use roundhouse_core::{OnDegrade, SessionId, SessionSpec, SessionState, TaskRunner, Tier};
@@ -347,6 +348,15 @@ pub struct DaemonResources {
     pub store: StorePool,
     pub isolate: Arc<dyn Isolate>,
     pub proxy: Arc<LoopbackProxy>,
+    /// The daemon-wide spawn tree recording sub-agent parent/child edges
+    /// (§7.1 decision 4: "the spawn tree remains the sole authority for
+    /// lifecycle, cancellation, and budget"). Constructed exactly once, in
+    /// `main.rs`, before `DaemonResources::new` is called, and shared from
+    /// here by every consumer — today `DeliveryExecutor`
+    /// (`scheduler_driver.rs`), and, from a later task, the `agent` tool's
+    /// dispatch — so that no second, independent tree is ever minted. This
+    /// is the field's permanent home, not a transient wiring hack.
+    pub spawn_tree: Arc<SpawnTree>,
     /// Absolute — asserted by `SessionActor::new` itself, which panics on a
     /// non-absolute value (see that constructor's doc comment).
     pub state_dir: PathBuf,
@@ -395,6 +405,7 @@ impl DaemonResources {
         store: StorePool,
         isolate: Arc<dyn Isolate>,
         proxy: Arc<LoopbackProxy>,
+        spawn_tree: Arc<SpawnTree>,
         state_dir: PathBuf,
         daemon_binary: PathBuf,
         mcp_configs: Vec<McpServerConfig>,
@@ -413,6 +424,7 @@ impl DaemonResources {
             store,
             isolate,
             proxy,
+            spawn_tree,
             state_dir,
             daemon_binary,
             mcp_configs,
@@ -1067,6 +1079,7 @@ mod tests {
             store,
             available_isolate(),
             proxy,
+            Arc::new(SpawnTree::new()),
             dir.join("state"),
             dir.join("daemon-binary"),
             Vec::new(),

@@ -35,6 +35,7 @@
 
 use clap::Parser;
 use roundhouse_bus::local_bus::LocalBus;
+use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_core::{OnDegrade, Tier};
 use roundhouse_daemon::mcp_config;
 use roundhouse_daemon::session_bootstrap::DaemonResources;
@@ -503,6 +504,13 @@ async fn main() -> color_eyre::Result<()> {
     let proxy_writer = roundhouse_store::spawn_writer(proxy_store).await;
     proxy.clone().serve(runner, proxy_writer.clone()).await?;
 
+    // The daemon-wide sub-agent spawn tree: constructed exactly once, here,
+    // before `DaemonResources::new` — see that field's own doc comment for
+    // why `DaemonResources` is its one permanent, shared home rather than
+    // something each consumer (the scheduler driver's `DeliveryExecutor`
+    // today, the `agent` tool from a later task) mints its own copy of.
+    let spawn_tree = Arc::new(SpawnTree::new());
+
     // Fix round 2, MUST 3: make an operator's `--allow-degraded-to` choice
     // loud, on every boot, for the process's whole life — proven, before
     // this fix, that starting with the flag printed NOTHING about it on
@@ -564,6 +572,7 @@ async fn main() -> color_eyre::Result<()> {
         session_store,
         isolate,
         proxy,
+        spawn_tree,
         state_dir,
         daemon_binary,
         mcp_configs,

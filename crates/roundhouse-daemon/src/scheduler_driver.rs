@@ -943,11 +943,15 @@ pub(crate) struct DeliveryExecutor {
     resources: Arc<DaemonResources>,
     sessions: Arc<SessionRegistry>,
     registry: Arc<InMemoryRunRegistry>,
-    /// The daemon's runtime workflow spawn tree. Created here because this is
-    /// the workspace's first production `SqliteWorkflowHost` and therefore
-    /// the first thing that needs one; if a second owner ever appears it must
-    /// share *this* tree rather than minting a second (the tree is what
-    /// `MAX_DIRECT_CHILD_CALLS` fan-out admission is counted against).
+    /// The daemon's runtime workflow spawn tree — shared, not owned: injected
+    /// by [`Self::new`] from [`DaemonResources::spawn_tree`], the single
+    /// daemon-wide instance (see that field's own doc comment). This was the
+    /// workspace's first production `SqliteWorkflowHost` and therefore the
+    /// first thing that needed one, which is why it used to be minted here;
+    /// now that a second owner (the `agent` tool, a later task) is coming, it
+    /// shares *this* tree rather than either side minting a second (the tree
+    /// is what `MAX_DIRECT_CHILD_CALLS` fan-out admission is counted
+    /// against).
     spawn_tree: Arc<SpawnTree>,
     /// [`MAX_CONCURRENT_DELIVERIES`] permits, one held for each in-flight
     /// delivery's whole life. See that constant for why the bound has to be
@@ -965,6 +969,7 @@ impl DeliveryExecutor {
         resources: Arc<DaemonResources>,
         sessions: Arc<SessionRegistry>,
         registry: Arc<InMemoryRunRegistry>,
+        spawn_tree: Arc<SpawnTree>,
         clock: Arc<dyn ClockSource + Send + Sync>,
     ) -> Self {
         Self {
@@ -972,7 +977,7 @@ impl DeliveryExecutor {
             resources,
             sessions,
             registry,
-            spawn_tree: Arc::new(SpawnTree::new()),
+            spawn_tree,
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
             clock,
         }
@@ -2722,6 +2727,7 @@ pub async fn run(mut ctx: BackgroundServiceContext) -> Result<(), BackgroundServ
         Arc::clone(&ctx.resources),
         Arc::clone(&ctx.sessions),
         Arc::clone(&registry),
+        Arc::clone(&ctx.resources.spawn_tree),
         Arc::new(SystemClock),
     );
 
@@ -3730,6 +3736,7 @@ mod delivery_tests {
                 Arc::clone(&self.resources),
                 Arc::clone(&sessions),
                 Arc::clone(&registry),
+                Arc::clone(&self.resources.spawn_tree),
                 Arc::new(FixedClock(instant())),
             );
             (executor, registry, sessions)
@@ -3754,11 +3761,13 @@ mod delivery_tests {
             let registry = Arc::new(InMemoryRunRegistry::new());
             let sessions = Arc::new(SessionRegistry::new());
             let resources = Arc::new(daemon_resources(self._dir.path(), None).await);
+            let spawn_tree = Arc::clone(&resources.spawn_tree);
             let executor = DeliveryExecutor::new(
                 self.store.clone(),
                 resources,
                 Arc::clone(&sessions),
                 Arc::clone(&registry),
+                spawn_tree,
                 Arc::new(FixedClock(instant())),
             );
             (executor, registry, sessions)
@@ -4005,6 +4014,7 @@ mod delivery_tests {
             Arc::clone(&resources),
             Arc::clone(&sessions),
             Arc::clone(&registry),
+            Arc::clone(&resources.spawn_tree),
             Arc::new(FixedClock(instant())),
         );
 
@@ -4019,6 +4029,39 @@ mod delivery_tests {
             delivery,
             workspace_root,
         }
+    }
+
+    /// Task 1 of the sub-agent spawn-tracking plan: `DaemonResources` is now
+    /// the single, daemon-wide owner of the `SpawnTree`, and
+    /// `DeliveryExecutor::new` takes it as a parameter instead of minting its
+    /// own — because the not-yet-built `agent` tool (a later task) will read
+    /// the very same `Arc<SpawnTree>` off `DaemonResources`, and the two must
+    /// never disagree about a session's recorded children.
+    ///
+    /// Instance identity (`Arc::ptr_eq`) alone would pass for two separately
+    /// empty, structurally-equal trees, so this also proves it behaviorally:
+    /// a child recorded through the `DaemonResources` handle must be visible
+    /// through the `DeliveryExecutor`-constructed handle.
+    #[tokio::test]
+    async fn the_executor_shares_daemon_resources_spawn_tree_rather_than_minting_its_own() {
+        let harness = harness(completing_workflow()).await;
+
+        assert!(
+            Arc::ptr_eq(&harness.resources.spawn_tree, &harness.executor.spawn_tree),
+            "DeliveryExecutor must share DaemonResources' spawn tree rather than construct its \
+             own"
+        );
+
+        let parent = SessionId::new();
+        let child = SessionId::new();
+        harness.resources.spawn_tree.record_child(parent, child);
+        assert_eq!(
+            harness.executor.spawn_tree.direct_children(parent),
+            1,
+            "a child recorded through DaemonResources' handle must be visible through the \
+             DeliveryExecutor's handle — proof of one shared tree, not two structurally-equal \
+             ones"
+        );
     }
 
     #[tokio::test]
