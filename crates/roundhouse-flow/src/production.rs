@@ -64,6 +64,13 @@ impl SessionTree for UnconfiguredSessionTree {
         Err(WorkflowHostError::SessionTreeUnavailable)
     }
 
+    /// A no-op rather than a refusal, matching `release_child` above: both are
+    /// compensation, and a host with no session tree registered no edge to
+    /// drop in the first place. Returning an error would also be unreportable
+    /// — `child_terminated` is infallible by design, so the caller could only
+    /// swallow it.
+    fn child_terminated(&mut self, _parent: SessionId, _child: SessionId) {}
+
     fn direct_children(&mut self, _parent: SessionId) -> Result<u32, WorkflowHostError> {
         Err(WorkflowHostError::SessionTreeUnavailable)
     }
@@ -235,6 +242,10 @@ impl WorkflowHost for SqliteWorkflowHost {
         }
         self.session_tree
             .register_child(parent, called.session_id, called.job_id)
+    }
+
+    fn child_session_terminated(&mut self, parent: SessionId, child: SessionId) {
+        self.session_tree.child_terminated(parent, child);
     }
 }
 

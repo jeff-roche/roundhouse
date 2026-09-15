@@ -95,6 +95,12 @@ impl SessionTree for RecordingSessionTree {
         Ok(())
     }
 
+    fn child_terminated(&mut self, parent: SessionId, child: SessionId) {
+        if let Some(children) = self.children.get_mut(&parent) {
+            children.retain(|candidate| *candidate != child);
+        }
+    }
+
     fn direct_children(&mut self, parent: SessionId) -> Result<u32, WorkflowHostError> {
         self.children.get(&parent).map_or(Ok(0), |children| {
             u32::try_from(children.len())

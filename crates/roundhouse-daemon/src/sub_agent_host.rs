@@ -22,12 +22,12 @@
 //! 1. [`HeadlessSession`] is a live handle to a real isolation mount, a real
 //!    proxy registration and possibly a real MCP subprocess. Dropping it on
 //!    the floor leaks all three. Something must hold it.
-//! 2. Retiring a sub-agent later needs to know which parent's `SpawnTree`
-//!    edge to remove, and `SpawnTree` indexes parent → children only. This is
-//!    the child → parent direction. Wiring that removal on child termination
-//!    is a **separate, later task**; this module deliberately stops at
-//!    [`SubAgentSessions::take`], which hands the whole record (parent, depth
-//!    and the live session) to whoever adds it.
+//! 2. Retiring a sub-agent needs to know which parent's `SpawnTree` edge to
+//!    remove, and `SpawnTree` indexes parent → children only. This is the
+//!    child → parent direction, and it is what
+//!    [`SubAgentSessions::retire_child`] — the one way to end a tracked
+//!    sub-agent — uses to free the parent's fan-out slot as it tears the
+//!    session down.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -75,11 +75,14 @@ impl LiveSubAgent {
     /// sequence (abort the reaper, deregister, tear down isolation, shut down
     /// MCP, deregister the egress token).
     ///
-    /// Deliberately does NOT touch the spawn tree: removing the parent→child
-    /// edge is the later removal-hook task's decision to make, together with
-    /// whatever drives termination, and doing half of it here would leave that
-    /// task with a partly-wired path to reason about.
-    pub async fn retire(self, registry: &SessionRegistry, proxy: &LoopbackProxy) {
+    /// Module-private, and it does not touch the spawn tree, because it is
+    /// only half of ending a sub-agent — [`SubAgentSessions::retire_child`]
+    /// is the whole of it and the only way in from outside. The one other
+    /// caller is `DaemonSubAgentHost::create_child_session`'s compensation
+    /// for a session that was built but never tracked: that child has no
+    /// committed edge to drop (the engine still owns its reservation), so
+    /// teardown really is all of it there.
+    async fn retire(self, registry: &SessionRegistry, proxy: &LoopbackProxy) {
         self.session.teardown(registry, proxy).await;
     }
 }
@@ -124,11 +127,65 @@ impl SubAgentSessions {
             .and_then(|guard| guard.get(&child).map(|record| record.parent))
     }
 
-    /// Removes `child`'s record and hands the caller everything needed to
-    /// retire it and to remove its spawn-tree edge. The entry point the
-    /// removal-on-termination hook is meant to build on.
-    pub fn take(&self, child: SessionId) -> Option<LiveSubAgent> {
+    /// Removes `child`'s record and hands back everything needed to retire it
+    /// and to drop its spawn-tree edge.
+    ///
+    /// **Module-private on purpose.** A caller holding a [`LiveSubAgent`] it
+    /// took out of this map owns a live session *and* a spawn-tree edge, and
+    /// handing that pair out is how one of them gets forgotten;
+    /// [`Self::retire_child`] is the one public way to end a tracked
+    /// sub-agent, and it closes both.
+    fn take(&self, child: SessionId) -> Option<LiveSubAgent> {
         self.live.lock().ok()?.remove(&child)
+    }
+
+    /// Ends one live sub-agent: drops its parent's spawn-tree edge and tears
+    /// the session down. Returns whether there was a live sub-agent to end.
+    ///
+    /// This is the sub-agent half of removal-on-termination, and the whole
+    /// reason it is one method rather than three calls at a call site: a
+    /// child that stops running without its edge being dropped holds one of
+    /// its parent's eight §7.7 fan-out slots for the life of the daemon
+    /// process. Taking the record, freeing the slot and retiring the session
+    /// are one indivisible act, so the only way to do any of them is to do
+    /// all three.
+    ///
+    /// The slot is freed **before** teardown rather than after: teardown
+    /// awaits real isolation/MCP/proxy work, and the parent's ceiling should
+    /// reflect "this child is finished", not "this child's mount has been
+    /// unwound".
+    ///
+    /// Idempotent, because the map is the authority: a second call for the
+    /// same child finds no record, returns `false`, and touches neither the
+    /// tree nor the registry. So a duplicate termination signal cannot free a
+    /// slot one of the child's live *siblings* is still holding, and cannot
+    /// run [`HeadlessSession::teardown`] twice for one session — which that
+    /// method's own doc comment explains is not safe, since
+    /// `Isolate::teardown` is not guaranteed idempotent.
+    ///
+    /// # No production caller yet, and why that is the correct state
+    ///
+    /// Nothing in this workspace drives a session to `SessionState::Closed`
+    /// ([`crate::session_manager::spawn_session_reaper`]'s own doc comment
+    /// says so), and the `agent` tool hands the model a child id rather than
+    /// running the child to completion — so today's callers are this crate's
+    /// tests. That is deliberate rather than an oversight: Phase 8 L5's job
+    /// is to wire this bookkeeping at the seam that owns it, so that whatever
+    /// later drives a sub-agent to completion inherits a correct slot release
+    /// by construction instead of having to remember one.
+    pub async fn retire_child(
+        &self,
+        child: SessionId,
+        tree: &SpawnTree,
+        registry: &SessionRegistry,
+        proxy: &LoopbackProxy,
+    ) -> bool {
+        let Some(record) = self.take(child) else {
+            return false;
+        };
+        tree.remove_child(record.parent, child);
+        record.retire(registry, proxy).await;
+        true
     }
 
     /// How many live sub-agent sessions this daemon is holding.
@@ -598,12 +655,13 @@ mod tests {
             .expect("a spawned child must itself be able to spawn");
         assert_eq!(child_host.depth(), 1);
 
-        resources
-            .sub_agents
-            .take(child)
-            .expect("the live child must still be tracked")
-            .retire(&registry, &resources.proxy)
-            .await;
+        assert!(
+            resources
+                .sub_agents
+                .retire_child(child, &resources.spawn_tree, &registry, &resources.proxy)
+                .await,
+            "the live child must still be tracked"
+        );
         assert!(registry.actor(child).is_none());
     }
 
@@ -641,12 +699,12 @@ mod tests {
         );
 
         for child in resources.spawn_tree.descendants(parent) {
-            resources
-                .sub_agents
-                .take(child)
-                .unwrap()
-                .retire(&registry, &resources.proxy)
-                .await;
+            assert!(
+                resources
+                    .sub_agents
+                    .retire_child(child, &resources.spawn_tree, &registry, &resources.proxy)
+                    .await
+            );
         }
     }
 
@@ -738,9 +796,118 @@ mod tests {
         );
 
         for session in resources.spawn_tree.descendants(parent) {
-            if let Some(record) = resources.sub_agents.take(session) {
-                record.retire(&registry, &resources.proxy).await;
+            resources
+                .sub_agents
+                .retire_child(session, &resources.spawn_tree, &registry, &resources.proxy)
+                .await;
+        }
+    }
+
+    /// **The sub-agent half of removal-on-termination**, against the real
+    /// ceiling: a parent saturated at `MAX_FAN_OUT` gets a slot back when one
+    /// child is retired, can spend it on a new sub-agent, and gets **exactly
+    /// one** back however many times it is told the same child ended.
+    ///
+    /// Every child here is a real, registered session spawned through the
+    /// real `agent` dispatcher, because the thing under test is that the
+    /// count the ceiling is checked against is the count retirement changes —
+    /// a hand-seeded `record_child` would prove that the tree subtracts, which
+    /// `SpawnTree`'s own suite already covers, rather than that the spawn path
+    /// and the retire path agree on which session is whose child.
+    #[tokio::test]
+    async fn a_retired_sub_agent_frees_exactly_one_of_its_parents_fan_out_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = resources_allowing_agent_spawns(dir.path()).await;
+        let registry = Arc::new(SessionRegistry::new());
+        let actor = parent_actor(dir.path()).await;
+        let parent = actor.session_id();
+        wire_sub_agent_host(&actor, &resources, &registry);
+        let host = actor.sub_agent_host().unwrap();
+
+        let spawn = |args: serde_json::Value| {
+            let actor = Arc::clone(&actor);
+            let host = host.clone();
+            async move {
+                dispatch_agent(
+                    &actor,
+                    actor.writer(),
+                    runner(),
+                    Some(&host),
+                    &args,
+                    TaskId::new(),
+                )
+                .await
             }
+        };
+
+        for _ in 0..roundhouse_bus::limits::MAX_FAN_OUT {
+            spawn(agent_args()).await.expect("under the ceiling");
+        }
+        assert_eq!(
+            resources.spawn_tree.direct_children(parent),
+            roundhouse_bus::limits::MAX_FAN_OUT
+        );
+        assert!(
+            spawn(agent_args()).await.is_err(),
+            "a saturated parent must be refused before the fix is even relevant"
+        );
+
+        let retired = resources.spawn_tree.descendants(parent)[0];
+        assert!(
+            resources
+                .sub_agents
+                .retire_child(retired, &resources.spawn_tree, &registry, &resources.proxy)
+                .await,
+            "retiring a live sub-agent reports that it found one"
+        );
+
+        assert_eq!(
+            resources.spawn_tree.direct_children(parent),
+            roundhouse_bus::limits::MAX_FAN_OUT - 1,
+            "the retired child's slot goes back"
+        );
+        assert!(
+            registry.actor(retired).is_none(),
+            "and the session really was torn down, not merely unhooked"
+        );
+        assert_eq!(
+            resources.sub_agents.len(),
+            (roundhouse_bus::limits::MAX_FAN_OUT - 1) as usize
+        );
+
+        spawn(agent_args())
+            .await
+            .expect("the freed slot is usable: a ninth spawn is admitted");
+        assert_eq!(
+            resources.spawn_tree.direct_children(parent),
+            roundhouse_bus::limits::MAX_FAN_OUT
+        );
+
+        // Idempotency: a duplicate termination signal for a child that is
+        // already gone must not free a slot one of its live siblings is
+        // holding.
+        assert!(
+            !resources
+                .sub_agents
+                .retire_child(retired, &resources.spawn_tree, &registry, &resources.proxy)
+                .await,
+            "a second retirement finds nothing to retire"
+        );
+        assert_eq!(
+            resources.spawn_tree.direct_children(parent),
+            roundhouse_bus::limits::MAX_FAN_OUT,
+            "and frees no phantom slot"
+        );
+        assert!(
+            spawn(agent_args()).await.is_err(),
+            "so the parent is still saturated"
+        );
+
+        for session in resources.spawn_tree.descendants(parent) {
+            resources
+                .sub_agents
+                .retire_child(session, &resources.spawn_tree, &registry, &resources.proxy)
+                .await;
         }
     }
 

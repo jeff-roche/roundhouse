@@ -90,6 +90,26 @@ impl SessionTree for WorkflowSessionTree {
         Ok(())
     }
 
+    /// The `call:` half of removal-on-termination: a child run that has
+    /// reached a terminal state gives its parent's fan-out slot back.
+    ///
+    /// Reached from `finish_run`'s own terminal path in `roundhouse-flow`,
+    /// beside `refund_child_run` — the durable grant and the runtime edge are
+    /// both returned where the child ends, rather than the grant alone. This
+    /// is the same `SpawnTree` `reserve_child`/`register_child` above admit
+    /// into, and the same one the `agent` tool's sub-agent children use, so a
+    /// freed slot is freed for both kinds of child.
+    ///
+    /// Discharges the trait's idempotency requirement outright rather than by
+    /// care at the call site: `SpawnTree::remove_child` is documented
+    /// idempotent and pinned by its own
+    /// `direct_children_can_be_counted_and_removed_idempotently`, so a
+    /// duplicate termination signal — this call and, say, a later reaper
+    /// agreeing about the same child — frees one slot, not two.
+    fn child_terminated(&mut self, parent: SessionId, child: SessionId) {
+        self.tree.remove_child(parent, child);
+    }
+
     fn direct_children(&mut self, parent: SessionId) -> Result<u32, WorkflowHostError> {
         Ok(self.tree.direct_children(parent))
     }
@@ -283,6 +303,73 @@ mod tests {
             Some(parent_run)
         );
         assert_eq!(tree.direct_children(parent_session), 1);
+    }
+
+    /// The `call:` half of removal-on-termination, end to end over a real
+    /// [`SpawnTree`]: a saturated parent gets a slot back when one child ends,
+    /// and gets **exactly one** back however many times it is told.
+    ///
+    /// Written against the ceiling rather than against a single child on
+    /// purpose — `direct_children` dropping from 1 to 0 would pass just as
+    /// well with the ceiling check broken, and the ceiling is the thing this
+    /// leak actually cost: before `child_terminated` had a caller, eight
+    /// `call:` children was every `call:` a parent could make for the life of
+    /// the daemon process, whether or not any of them had finished.
+    #[test]
+    fn a_terminated_child_frees_exactly_one_of_its_parents_fan_out_slots() {
+        let parent = SessionId::new();
+        let tree = Arc::new(SpawnTree::new());
+        let mut host = WorkflowSessionTree::new(
+            Arc::clone(&tree),
+            crate::test_support::runner(),
+            SessionSpec::test_default(),
+        );
+
+        let children: Vec<SessionId> = (0..MAX_DIRECT_CHILD_CALLS)
+            .map(|_| {
+                let child = SessionId::new();
+                host.reserve_child(parent, child)
+                    .expect("under the ceiling");
+                host.register_child(parent, child, JobId::new()).unwrap();
+                child
+            })
+            .collect();
+        assert_eq!(tree.direct_children(parent), MAX_DIRECT_CHILD_CALLS);
+        assert!(
+            host.reserve_child(parent, SessionId::new()).is_err(),
+            "a saturated parent must be refused before the fix is even relevant"
+        );
+
+        host.child_terminated(parent, children[0]);
+
+        assert_eq!(
+            tree.direct_children(parent),
+            MAX_DIRECT_CHILD_CALLS - 1,
+            "the ended child's slot goes back"
+        );
+        let replacement = SessionId::new();
+        host.reserve_child(parent, replacement)
+            .expect("and the freed slot is usable: a new `call:` is admitted");
+        host.register_child(parent, replacement, JobId::new())
+            .unwrap();
+        assert_eq!(tree.direct_children(parent), MAX_DIRECT_CHILD_CALLS);
+
+        // Idempotency at the CALL SITE, not just in `SpawnTree`: a duplicate
+        // termination signal for one child must not free a second slot that
+        // one of its live siblings is still holding.
+        host.child_terminated(parent, children[1]);
+        host.child_terminated(parent, children[1]);
+        assert_eq!(
+            tree.direct_children(parent),
+            MAX_DIRECT_CHILD_CALLS - 1,
+            "two removals of ONE child free one slot, not two"
+        );
+        host.reserve_child(parent, SessionId::new())
+            .expect("the one freed slot is available");
+        assert!(
+            host.reserve_child(parent, SessionId::new()).is_err(),
+            "and only that one: the second call handed out no phantom slot"
+        );
     }
 
     #[test]
