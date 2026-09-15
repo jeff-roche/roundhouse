@@ -190,7 +190,44 @@ impl Scheduler {
     }
 
     /// Registers `binding`, computing and scheduling its next occurrence(s)
-    /// (plural for a `DstAmbiguous::Both` fold) from the current wall clock.
+    /// (plural for a `DstAmbiguous::Both` fold) from the point its schedule
+    /// last got to: its own `last_fired_for` when it has one, and the current
+    /// wall clock when it does not.
+    ///
+    /// # Why `last_fired_for` is the baseline, not always the wall clock
+    ///
+    /// A binding arriving here with `last_fired_for: Some(_)` is a *restored*
+    /// binding — one whose fire cursor was persisted (`trigger_binding_cursor`)
+    /// and read back at daemon boot. Seeding it from `clock.wall_now()`, as
+    /// this originally did, silently discards every occurrence between that
+    /// cursor and boot: a daemon down across a binding's scheduled instants
+    /// would schedule forward from boot and never revisit them. The scheduler's
+    /// catch-up machinery covered a late *tick* within one process's life but
+    /// nothing covered a gap *between* processes, and nothing reported the
+    /// loss either.
+    ///
+    /// Seeding from `last_fired_for` instead makes that gap an ordinary
+    /// backlog, which [`drain_due`](Self::drain_due) already handles
+    /// correctly and boundedly on the very first [`tick`](Self::tick) after
+    /// boot: capped at `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK` per
+    /// binding per call, reduced by the binding's own [`CatchUp`] policy
+    /// (`Latest` collapses the whole window to one fire, `None` drops it,
+    /// `All` drains progressively across calls), and deduped downstream on
+    /// `(binding_id, scheduled_for)`. This is deliberately a reuse of that
+    /// existing, reviewed machinery rather than a second catch-up path —
+    /// nothing about a between-process gap makes it different in kind from a
+    /// tick that simply ran late.
+    ///
+    /// A fresh binding (`last_fired_for: None` — everything `Binding::new`
+    /// and `Binding::new_cron` construct) is unaffected: it still seeds from
+    /// `clock.wall_now()`, exactly as before.
+    ///
+    /// `last_wall` is still established from the real `clock`, never from
+    /// `last_fired_for`: it is this scheduler's backward-*step* baseline, a
+    /// statement about the clock rather than about any binding's schedule.
+    /// Anchoring it to a restored cursor in the past would make the first
+    /// genuine `tick` look like a large forward jump rather than an ordinary
+    /// reading.
     pub fn add_binding(
         &mut self,
         mut binding: Binding,
@@ -205,7 +242,8 @@ impl Scheduler {
         if self.last_wall.is_none() {
             self.last_wall = Some(clock.wall_now());
         }
-        let instants = Self::occurrences_after(&binding, clock.wall_now())?;
+        let after = binding.last_fired_for.unwrap_or_else(|| clock.wall_now());
+        let instants = Self::occurrences_after(&binding, after)?;
         Self::push_occurrences(&mut self.heap, &mut binding, &instants);
         self.bindings.insert(binding.id, binding);
         Ok(())

@@ -484,21 +484,25 @@ fn accept_due_occurrences(
 /// channel into this loop that updates both the scheduler and this map
 /// together.
 ///
-/// # The restored cursor does not replay a downtime backlog
+/// # The restored cursor replays the downtime backlog
 ///
-/// `trigger_binding_cursor.last_fired_for` is restored faithfully onto each
-/// `Binding`, but `Scheduler::add_binding` computes a binding's first heap
-/// entry from `clock.wall_now()` — the boot instant — not from
-/// `last_fired_for`. So a daemon that was down across a binding's scheduled
-/// instants schedules forward from boot and never revisits them; the
-/// scheduler's catch-up machinery covers a *late tick* within one process's
-/// life, not a gap between processes. The restored cursor is still load-
-/// bearing (`accept_occurrence`'s own cursor advance never regresses it,
-/// which is what stops a replayed occurrence from rewinding the record), and
-/// `accept_occurrence`'s `(binding_id, scheduled_for)` dedupe means nothing
-/// double-fires if a future task does seed from the cursor instead. Seeding
-/// the heap from `last_fired_for` would need a scheduler API that does not
-/// exist yet, so it is out of scope here and recorded rather than hidden.
+/// `trigger_binding_cursor.last_fired_for` is restored onto each `Binding`
+/// by [`load_enabled_bindings`], and `Scheduler::add_binding` seeds that
+/// binding's first heap entry from it — so occurrences a binding missed
+/// while this daemon was down are still due on the first tick after boot,
+/// rather than being skipped in favour of "next occurrence after now."
+///
+/// That backlog is bounded by machinery this driver does not duplicate:
+/// `drain_due` caps it at `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK`
+/// per binding per tick and applies the binding's own `CatchUp` policy
+/// (`Latest` collapses the window to one fire, `None` drops it, `All` drains
+/// progressively), and `accept_occurrence` dedupes on
+/// `(binding_id, scheduled_for)` so a replayed occurrence cannot produce a
+/// second `trigger_event`. The cursor advance is also monotonic, so a
+/// replayed occurrence can never rewind the record.
+///
+/// A binding with no cursor row (never fired) seeds from the boot instant
+/// instead and has no backlog at all.
 pub async fn run(mut ctx: BackgroundServiceContext) -> Result<(), BackgroundServiceError> {
     let system_clock = SystemClock;
     let stored = load_enabled_bindings(&ctx.store)
@@ -862,6 +866,84 @@ mod tests {
         assert!(
             cursor.is_some(),
             "accepting an occurrence must advance the persisted fire cursor"
+        );
+    }
+
+    /// Fix round 1: the end-to-end proof of what the boot cursor is *for*.
+    /// A binding whose persisted `last_fired_for` predates boot has the
+    /// occurrences it missed while the daemon was down drained on its first
+    /// tick and turned into a real `trigger_delivery` row — the whole point
+    /// of persisting the cursor. Before the `Scheduler::add_binding` fix this
+    /// tick produced nothing at all: the binding was seeded from the boot
+    /// instant and the entire downtime window vanished silently.
+    ///
+    /// Driven through [`FixedClock`] at both boot and tick, so "how long the
+    /// daemon was down" is chosen by the test rather than by the host.
+    #[tokio::test]
+    async fn a_binding_restored_from_its_cursor_delivers_the_occurrences_it_missed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path()).await;
+
+        let stored = interval_binding(Duration::from_secs(60));
+        let boot = DateTime::from_timestamp_nanos(1_700_000_000_000_000_000);
+        // The cursor says this binding last fired ten minutes before boot, so
+        // ten one-minute occurrences were missed while the daemon was down.
+        let cursor = boot - chrono::Duration::minutes(10);
+        seed_binding(
+            &store,
+            &stored,
+            true,
+            Some(cursor.timestamp_nanos_opt().unwrap()),
+        )
+        .await;
+
+        let loaded = load_enabled_bindings(&store).await.unwrap();
+        assert_eq!(
+            loaded[0].binding.last_fired_for,
+            Some(cursor),
+            "the boot load must hand the persisted cursor to the scheduler; this test \
+             proves nothing if it arrives as None"
+        );
+
+        let mut scheduler = Scheduler::new();
+        let mut bindings = HashMap::new();
+        for stored_binding in loaded {
+            scheduler
+                .add_binding(stored_binding.binding.clone(), &FixedClock(boot))
+                .unwrap();
+            bindings.insert(stored_binding.binding.id, stored_binding);
+        }
+
+        // The very first tick after boot, at the boot instant itself — no
+        // time has passed, so anything that fires here is backlog, not a
+        // newly-due occurrence.
+        let events = scheduler.tick(&FixedClock(boot));
+        let due = pair_with_bindings(&bindings, events);
+        assert!(
+            !due.is_empty(),
+            "the occurrences missed during downtime must still be due at boot"
+        );
+        assert!(
+            due.iter().all(|(_, occurrence)| occurrence.is_catch_up
+                && occurrence.scheduled_for > cursor
+                && occurrence.scheduled_for <= boot),
+            "every drained occurrence must come from the missed window and be reported \
+             as a catch-up fire: {due:?}"
+        );
+
+        let registry = InMemoryRunRegistry::new();
+        let conn = store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            accept_due_occurrences(connection, &due, boot, &registry);
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            delivery_count(&store).await,
+            1,
+            "the missed window must reach a real trigger_delivery row (one, because \
+             OverlapPolicy::Skip admits the first occurrence only)"
         );
     }
 

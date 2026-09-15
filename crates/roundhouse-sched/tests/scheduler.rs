@@ -785,3 +785,146 @@ fn adding_an_interval_binding_that_would_overflow_datetime_arithmetic_is_rejecte
     let err = sched.add_binding(binding, &clock).unwrap_err();
     assert!(matches!(err, CronError::IntervalTooLarge(_)));
 }
+
+/// Phase 8, L3, Task 5 fix round 1: a binding restored from a persisted fire
+/// cursor must have the occurrences it missed while the daemon was down
+/// drained on its first tick — not silently skipped in favour of "next
+/// occurrence after now."
+///
+/// Before this fix `add_binding` always seeded `occurrences_after` from
+/// `clock.wall_now()`, so the whole between-process gap vanished without a
+/// trace: the scheduler's catch-up machinery covered a late *tick* within
+/// one process's life, but nothing covered a gap *between* processes. This
+/// asserts the restored binding's missed window actually reaches the caller,
+/// and — for `CatchUp::Latest` — that it arrives collapsed to a single fire
+/// by the existing, already-reviewed `drain_due` reduction rather than as an
+/// unbounded burst.
+#[test]
+fn a_binding_restored_with_a_past_cursor_drains_its_missed_window_on_the_first_tick() {
+    let boot = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let clock = FakeClock {
+        wall: RefCell::new(boot),
+    };
+    let mut sched = Scheduler::new();
+
+    // A once-a-minute cron whose cursor says it last fired thirty minutes
+    // before boot: thirty occurrences were missed while the daemon was down.
+    // Deliberately inside `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK`, so
+    // the whole window is walked in one `drain_due` call and `Latest`'s
+    // reduction actually flushes here rather than deferring to a later tick —
+    // that cross-tick carry is `drain_due`'s own, separately-tested
+    // behaviour, and folding it into this test would only blur what this one
+    // is pinning. The >cap case has its own test below.
+    let mut binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
+    let cursor = boot - chrono::Duration::minutes(30);
+    binding.last_fired_for = Some(cursor);
+    assert!(
+        matches!(
+            &binding.spec,
+            TriggerSpec::Cron {
+                catch_up: CatchUp::Latest,
+                ..
+            }
+        ),
+        "this test pins Latest's reduction specifically; it proves nothing if the \
+         new_cron default changed"
+    );
+    let binding_id = binding.id;
+    sched.add_binding(binding, &clock).unwrap();
+
+    let events = sched.tick(&clock);
+    let fires = fires_for(&events, binding_id);
+
+    assert_eq!(
+        fires.len(),
+        1,
+        "CatchUp::Latest must collapse the whole missed window to exactly one fire, \
+         not fire once per missed occurrence and not drop it: {events:?}"
+    );
+    let fired_for = fires[0];
+    assert!(
+        fired_for > cursor,
+        "the drained occurrence must come from the missed window, strictly after the \
+         restored cursor, got {fired_for}"
+    );
+    assert_eq!(
+        fired_for, boot,
+        "CatchUp::Latest fires the temporally LATEST missed occurrence — here the one \
+         due exactly at boot — not the oldest and not a future one"
+    );
+    assert!(
+        matches!(
+            events.first(),
+            Some(SchedulerEvent::Fire(ScheduledOccurrence {
+                is_catch_up: true,
+                ..
+            }))
+        ),
+        "a drained missed window is a catch-up pass and must be reported as one: {events:?}"
+    );
+}
+
+/// The regression-catching mirror of the test above: the identical binding
+/// **without** a restored cursor must fire nothing on a tick at the same
+/// instant it was added. Without this, the test above would pass just as
+/// well against a scheduler that fired something spurious for every binding.
+#[test]
+fn the_same_binding_without_a_cursor_has_nothing_to_drain_at_boot() {
+    let boot = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let clock = FakeClock {
+        wall: RefCell::new(boot),
+    };
+    let mut sched = Scheduler::new();
+
+    let binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
+    assert_eq!(
+        binding.last_fired_for, None,
+        "Binding::new_cron must construct a fresh, never-fired binding"
+    );
+    let binding_id = binding.id;
+    sched.add_binding(binding, &clock).unwrap();
+
+    assert!(
+        fires_for(&sched.tick(&clock), binding_id).is_empty(),
+        "a never-fired binding seeds from the wall clock and has no backlog at boot — \
+         this path must be byte-for-byte what it was before the cursor fix"
+    );
+}
+
+/// A restored binding's backlog is still bounded: an `Interval` spec has no
+/// `CatchUp` policy to reduce it (`compute_catch_up` returns it unchanged),
+/// so a very old cursor drains progressively under
+/// `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK` rather than flooding one
+/// tick with the whole window.
+#[test]
+fn a_restored_binding_with_a_huge_backlog_is_still_capped_per_tick() {
+    let boot = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let clock = FakeClock {
+        wall: RefCell::new(boot),
+    };
+    let mut sched = Scheduler::new();
+
+    let mut binding = Binding::new(
+        JobId::new(),
+        TriggerSpec::Interval {
+            every: Duration::from_secs(1),
+            align: false,
+            anchor: None,
+        },
+    );
+    // A full day of one-second occurrences: 86_400 missed, far beyond the cap.
+    binding.last_fired_for = Some(boot - chrono::Duration::days(1));
+    let binding_id = binding.id;
+    sched.add_binding(binding, &clock).unwrap();
+
+    let fires = fires_for(&sched.tick(&clock), binding_id);
+    assert!(
+        !fires.is_empty(),
+        "the restored window must actually drain, not be discarded"
+    );
+    assert!(
+        fires.len() <= MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK,
+        "one tick must never emit more than the per-binding catch-up cap, got {}",
+        fires.len()
+    );
+}
