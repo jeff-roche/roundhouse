@@ -911,6 +911,139 @@ mod tests {
         }
     }
 
+    /// **A KNOWN GAP, pinned so that closing it fails this test rather than
+    /// going unnoticed** (see `workflow_host::reconcile_spawn_tree`'s own
+    /// "KNOWN GAP" section for the full statement).
+    ///
+    /// `retire_child` ends a sub-agent child entirely in memory: it drops the
+    /// map entry, removes the `SpawnTree` edge and tears the session down, and
+    /// writes **nothing** durable. Nothing else in this workspace appends
+    /// `SessionClosed` or `SessionStateChanged { state: Closed, .. }` either.
+    /// So the only durable trace a retired sub-agent leaves is the
+    /// `SessionCreated` that spawned it — and boot recovery, reading that,
+    /// hands its parent's fan-out slot straight back to it.
+    ///
+    /// Both halves are asserted, and the second is what makes the first
+    /// falsifiable rather than a shrug: the boot-recovery filter for a closed
+    /// session **works**, over the same real store, the moment the event
+    /// exists. What is missing is a writer, not the filter.
+    ///
+    /// Every session here is real: spawned through the real `agent`
+    /// dispatcher, retired through the real `retire_child`, and recovered by
+    /// the real `reconcile_spawn_tree` over the real store this daemon wrote.
+    #[tokio::test]
+    async fn a_retired_sub_agent_child_reappears_after_a_restart_known_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = resources_allowing_agent_spawns(dir.path()).await;
+        let registry = Arc::new(SessionRegistry::new());
+        let actor = parent_actor(dir.path()).await;
+        let parent = actor.session_id();
+        wire_sub_agent_host(&actor, &resources, &registry);
+        let host = actor.sub_agent_host().unwrap();
+
+        for _ in 0..2 {
+            dispatch_agent(
+                &actor,
+                actor.writer(),
+                runner(),
+                Some(&host),
+                &agent_args(),
+                TaskId::new(),
+            )
+            .await
+            .expect("under the ceiling");
+        }
+        let children = resources.spawn_tree.descendants(parent);
+        assert_eq!(children.len(), 2);
+        let (retired, live) = (children[0], children[1]);
+
+        assert!(
+            resources
+                .sub_agents
+                .retire_child(retired, &resources.spawn_tree, &registry, &resources.proxy)
+                .await,
+            "one child really is retired: in-memory, the slot is already back"
+        );
+        assert_eq!(resources.spawn_tree.direct_children(parent), 1);
+
+        // The restart: a brand-new tree, rebuilt from durable state alone.
+        let after_restart = Arc::new(SpawnTree::new());
+        let tree = Arc::clone(&after_restart);
+        resources
+            .store
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .interact(move |conn| crate::workflow_host::reconcile_spawn_tree(conn, &tree).unwrap())
+            .await
+            .unwrap();
+
+        let mut recovered = after_restart.descendants(parent);
+        recovered.sort_by_key(|session| session.to_string());
+        let mut both = vec![retired, live];
+        both.sort_by_key(|session| session.to_string());
+        assert_eq!(
+            recovered, both,
+            "THE GAP: the retired child is back, indistinguishable from the live one, \
+             because its retirement was never written down anywhere"
+        );
+
+        // Now give the retired child the durable end signal this codebase can
+        // already express but never writes, and restart again.
+        let closed = runner().record_session_closed(
+            retired,
+            0,
+            now_ts(),
+            roundhouse_core::SessionOutcome::Completed,
+            1,
+        );
+        resources
+            .store
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .interact(move |conn| {
+                let txn = roundhouse_store::begin_immediate(conn).unwrap();
+                roundhouse_store::append_event_in_transaction(
+                    &txn,
+                    &closed,
+                    &roundhouse_store::redact::Redactor::build(&[]),
+                )
+                .unwrap();
+                txn.commit().unwrap();
+            })
+            .await
+            .unwrap();
+
+        let after_second_restart = Arc::new(SpawnTree::new());
+        let tree = Arc::clone(&after_second_restart);
+        resources
+            .store
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .interact(move |conn| crate::workflow_host::reconcile_spawn_tree(conn, &tree).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            after_second_restart.descendants(parent),
+            vec![live],
+            "with the end recorded, only the live child comes back — the filter is \
+             there, a writer for it is not"
+        );
+
+        for session in resources.spawn_tree.descendants(parent) {
+            resources
+                .sub_agents
+                .retire_child(session, &resources.spawn_tree, &registry, &resources.proxy)
+                .await;
+        }
+    }
+
     #[tokio::test]
     async fn a_host_registered_on_the_wrong_session_refuses_to_parent_a_child() {
         let dir = tempfile::tempdir().unwrap();

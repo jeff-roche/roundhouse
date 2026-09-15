@@ -588,6 +588,28 @@ async fn main() -> color_eyre::Result<()> {
         true,
     ));
 
+    // The spawn tree's half of boot recovery (Phase 8, L5): the tree above is
+    // a fresh, empty, in-memory structure, but the children a previous daemon
+    // process spawned are durable facts. Restoring them is what keeps a
+    // parent's fan-out ceiling meaning "children this parent has" across a
+    // restart instead of resetting to zero — see
+    // `workflow_host::reconcile_spawn_tree`, including the KNOWN GAP section
+    // for what a restart still cannot tell about a sub-agent child.
+    //
+    // Here, before `background_services.start(...)` below, deliberately: the
+    // scheduler driver those services start admits `call:` children against
+    // this very tree, so it must not see a half-reconstructed one — and
+    // `accept_loop` (further down) is what lets a client spawn anything new.
+    // Nothing is consuming the tree yet at this point in `main`.
+    let restored_edges = roundhouse_daemon::boot::reconcile_spawn_tree_at_boot(
+        &resources.store,
+        &resources.spawn_tree,
+    )
+    .await?;
+    if restored_edges > 0 {
+        println!("boot recovery: {restored_edges} child session(s) restored into the spawn tree");
+    }
+
     let registry = Arc::new(SessionRegistry::new());
     let mut background_services = resources
         .background_services

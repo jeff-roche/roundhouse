@@ -1,9 +1,10 @@
 //! Daemon-owned session-tree adapter for workflow child admission.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use roundhouse_bus::spawn_tree::SpawnTree;
-use roundhouse_core::{EventPayload, JobId, SessionId, SessionSpec, TaskRunner};
+use roundhouse_core::{EventPayload, JobId, SessionId, SessionSpec, SessionState, TaskRunner};
 use roundhouse_flow::compose::MAX_DIRECT_CHILD_CALLS;
 use roundhouse_flow::durability::WorkflowRun;
 use roundhouse_flow::exec::run_loop::{SessionTree, WorkflowHostError};
@@ -122,43 +123,203 @@ pub enum ReconcileSpawnTreeError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("{column} holds {value:?}, which is not a session id")]
+    MalformedSessionId { column: &'static str, value: String },
 }
 
-/// Restores runtime workflow edges after boot from committed child-run rows
-/// whose child session has a durable `SessionCreated` event.
+// The serialized discriminant text of the three session-lifecycle payloads
+// this scan cares about. `EventPayload` is an externally tagged serde enum
+// and `roundhouse_store::serialize_payload` is a plain `to_string`, so a
+// stored payload begins with `{"<VariantName>":`.
+//
+// These drive a SQL prefilter ONLY — every matched row is still deserialized
+// and matched as a real `EventPayload` below, so a prefix that matched too
+// much would cost a wasted parse, never a wrong edge. A prefix that matched
+// too *little* would silently restore nothing, which is why
+// `the_payload_prefixes_match_what_the_store_actually_writes` pins all three
+// against bytes the real writer produced.
+const SESSION_CREATED_PAYLOAD_PREFIX: &str = r#"{"SessionCreated":"#;
+const SESSION_CLOSED_PAYLOAD_PREFIX: &str = r#"{"SessionClosed":"#;
+const SESSION_STATE_CHANGED_PAYLOAD_PREFIX: &str = r#"{"SessionStateChanged":"#;
+
+/// Rebuilds the daemon's runtime spawn tree from durable facts, once, at boot
+/// — and reports how many parent→child edges it restored.
+///
+/// # One pass, both kinds of child
+///
+/// The edge comes from the **child's own `SessionCreated`**: every child
+/// session this daemon spawns records its immediate parent in
+/// `SessionSpec::parent`, whether it was spawned by a workflow `call:`
+/// (`WorkflowSessionTree::persist_child_session`) or by the `agent` tool
+/// (`DaemonSubAgentHost::persist_session_created`). Scanning that one fact
+/// covers both, which the previous shape — a join through
+/// `workflow_run.parent_run_id` — structurally could not: a sub-agent child
+/// has no `workflow_run` row, so every sub-agent edge was lost at every
+/// restart.
+///
+/// The consequence worth naming: a `SessionCreated` written *before*
+/// `SessionSpec::parent` existed deserializes with `parent: None` (see that
+/// field's own doc comment) and so restores no edge. Such a child's slot is
+/// freed by a restart rather than leaked by one, which is the safe direction,
+/// and no pre-existing store in this pre-release system carries edges that
+/// matter.
+///
+/// # Only children that have not ended
+///
+/// A child that has already finished must not come back holding one of its
+/// parent's [`MAX_DIRECT_CHILD_CALLS`] fan-out slots for the life of the
+/// process. Two durable end-signals are honoured, and they are not
+/// symmetrical:
+///
+/// - **Workflow `call:` child** — its `workflow_run` row has ended. Expressed
+///   as `ended_at IS NOT NULL` rather than as a list of terminal state
+///   discriminants: the two are the same fact by an invariant both writers
+///   enforce (`insert_run_row`'s `TerminalStateEndedAtMismatch` guard and
+///   `transition`'s), and `ended_at` needs no copy of a discriminant spelling
+///   that `roundhouse-flow` deliberately keeps in one place.
+/// - **Sub-agent child** — a `SessionClosed`, or a `SessionStateChanged`
+///   carrying [`SessionState::Closed`], on the child's own log.
+///
+/// # KNOWN GAP: nothing writes a sub-agent child's end today
+///
+/// The second bullet is, as of this task, a filter with no production writer
+/// in front of it. **No code in this workspace appends `SessionClosed` or
+/// `SessionStateChanged { state: Closed, .. }` to the log**:
+/// `SubAgentSessions::retire_child` (the one way a tracked sub-agent ends)
+/// removes the map entry and the tree edge and tears the session down entirely
+/// in memory, writing nothing, and `SessionActor::cancel` — the only
+/// production appender of a session-lifecycle state event at all — writes
+/// `Cancelling`, which §8.13 is explicit is *not* terminal. (The retired demo
+/// path and the socket handshake do build such payloads, but as `ClientEvent`
+/// *frames* sent to a client; neither becomes a row.)
+///
+/// So today: **a retired sub-agent child reappears here as an occupied slot
+/// after a restart, and this function cannot tell it from a live one.** That
+/// is a real, current gap, documented rather than papered over (AGENTS.md's
+/// escalation norm). Closing it means appending a durable session-lifecycle
+/// event when a sub-agent is retired — a change to the frozen event contract
+/// and its own task, not something this one invented on the side. The filter
+/// is written now so that the day such a writer lands, boot recovery is
+/// already correct; it is pinned meanwhile by
+/// `a_retired_sub_agent_child_reappears_after_a_restart_known_gap`
+/// (`sub_agent_host`), which will fail loudly when the gap closes.
+///
+/// The workflow half has the mirror-image situation and it is *not* a gap in
+/// this function: `finish_run` really does write a terminal `workflow_run`
+/// state (and `child_terminated` beside it), so the row read here is the same
+/// fact the live hook keys off — there is simply no production driver for a
+/// `call:` child run yet (a later task's work), so no such row exists in a
+/// running daemon today either.
 pub fn reconcile_spawn_tree(
     conn: &rusqlite::Connection,
     tree: &SpawnTree,
-) -> Result<(), ReconcileSpawnTreeError> {
-    let mut statement = conn.prepare(
-        "SELECT parent.session_id, child.session_id, event.payload
-           FROM workflow_run child
-           JOIN workflow_run parent ON parent.id = child.parent_run_id
-           JOIN events event ON event.session_id = child.session_id
-          WHERE child.parent_run_id IS NOT NULL",
-    )?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (parent, child, payload) = row?;
-        let payload: EventPayload = serde_json::from_str(&payload)?;
-        if !matches!(payload, EventPayload::SessionCreated { .. }) {
+) -> Result<usize, ReconcileSpawnTreeError> {
+    let SessionLifecycleFacts { edges, closed } = session_lifecycle_facts(conn)?;
+    let ended_runs = sessions_whose_runs_have_all_ended(conn)?;
+
+    let mut restored = HashSet::new();
+    for (parent, child) in edges {
+        if closed.contains(&child) || ended_runs.contains(&child) {
             continue;
         }
-        let parent = SessionId::from_uuid(
-            uuid::Uuid::parse_str(&parent).map_err(|_| rusqlite::Error::InvalidQuery)?,
-        );
-        let child = SessionId::from_uuid(
-            uuid::Uuid::parse_str(&child).map_err(|_| rusqlite::Error::InvalidQuery)?,
-        );
-        tree.record_child(parent, child);
+        // `record_child` is itself idempotent; the set is what keeps the
+        // reported count honest if a session somehow carries more than one
+        // `SessionCreated`.
+        if restored.insert((parent, child)) {
+            tree.record_child(parent, child);
+        }
     }
-    Ok(())
+    Ok(restored.len())
+}
+
+/// The two facts boot recovery needs out of the event log.
+struct SessionLifecycleFacts {
+    /// `(parent, child)` for every `SessionCreated` whose spec names a parent.
+    edges: Vec<(SessionId, SessionId)>,
+    /// Sessions durably known to have closed.
+    closed: HashSet<SessionId>,
+}
+
+/// Collects both in one pass over the event log.
+///
+/// Collected together, and filtered afterwards rather than during, because a
+/// session's `SessionClosed` is appended after its `SessionCreated` — deciding
+/// a child's fate on sight would depend on the order rows came back in.
+fn session_lifecycle_facts(
+    conn: &rusqlite::Connection,
+) -> Result<SessionLifecycleFacts, ReconcileSpawnTreeError> {
+    let mut statement = conn.prepare(
+        "SELECT session_id, payload
+           FROM events
+          WHERE payload LIKE ?1 OR payload LIKE ?2 OR payload LIKE ?3",
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            format!("{SESSION_CREATED_PAYLOAD_PREFIX}%"),
+            format!("{SESSION_CLOSED_PAYLOAD_PREFIX}%"),
+            format!("{SESSION_STATE_CHANGED_PAYLOAD_PREFIX}%"),
+        ],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+
+    let mut edges = Vec::new();
+    let mut closed = HashSet::new();
+    for row in rows {
+        let (session, payload) = row?;
+        let session = parse_session_id("events.session_id", &session)?;
+        match serde_json::from_str::<EventPayload>(&payload)? {
+            EventPayload::SessionCreated { spec } => {
+                if let Some(parent) = spec.parent {
+                    edges.push((parent, session));
+                }
+            }
+            EventPayload::SessionClosed { .. }
+            | EventPayload::SessionStateChanged {
+                state: SessionState::Closed,
+                ..
+            } => {
+                closed.insert(session);
+            }
+            _ => {}
+        }
+    }
+    Ok(SessionLifecycleFacts { edges, closed })
+}
+
+/// Sessions whose workflow run (or runs) have all ended — the durable
+/// "terminal" signal for a workflow `call:` child, per this module's
+/// [`reconcile_spawn_tree`] doc.
+///
+/// A session with no `workflow_run` row at all is deliberately absent from
+/// this set rather than counted as ended: that is every sub-agent child, and
+/// every one of them is still live as far as durable state can say.
+fn sessions_whose_runs_have_all_ended(
+    conn: &rusqlite::Connection,
+) -> Result<HashSet<SessionId>, ReconcileSpawnTreeError> {
+    let mut statement = conn.prepare(
+        "SELECT session_id
+           FROM workflow_run
+          GROUP BY session_id
+         HAVING SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END) = 0",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut ended = HashSet::new();
+    for row in rows {
+        ended.insert(parse_session_id("workflow_run.session_id", &row?)?);
+    }
+    Ok(ended)
+}
+
+fn parse_session_id(
+    column: &'static str,
+    value: &str,
+) -> Result<SessionId, ReconcileSpawnTreeError> {
+    uuid::Uuid::parse_str(value)
+        .map(SessionId::from_uuid)
+        .map_err(|_| ReconcileSpawnTreeError::MalformedSessionId {
+            column,
+            value: value.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -200,50 +361,315 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reconciliation_restores_only_child_runs_with_a_created_session() {
-        let mut conn = open_test_db();
-        let parent_session = SessionId::new();
-        let parent_run = RunId::new();
-        let created_child = SessionId::new();
-        let missing_lifecycle_child = SessionId::new();
-        let mut parent = child_run(RunId::new(), parent_session);
-        parent.id = parent_run;
-        parent.parent_run_id = None;
-        parent.session_depth = Some(0);
-        parent.caps.as_mut().unwrap().max_cost_usd = 600.0;
-        parent.caps.as_mut().unwrap().max_tokens = 600;
-        parent.caps.as_mut().unwrap().max_tasks = 600;
-        parent.caps.as_mut().unwrap().max_tool_calls = 600;
-        parent.caps.as_mut().unwrap().max_subagents = 600;
-        parent.caps.as_mut().unwrap().max_bytes_written = 600;
-        parent.caps.as_mut().unwrap().max_escalations = 600;
-        insert_workflow_run(&mut conn, &parent).unwrap();
-        insert_workflow_run(&mut conn, &child_run(parent_run, created_child)).unwrap();
-        insert_workflow_run(&mut conn, &child_run(parent_run, missing_lifecycle_child)).unwrap();
+    /// A root (unparented) run whose budget is large enough to fund every
+    /// child the tests below insert under it.
+    fn root_run(session_id: SessionId) -> WorkflowRun {
+        let mut run = child_run(RunId::new(), session_id);
+        run.parent_run_id = None;
+        run.session_depth = Some(0);
+        let caps = run.caps.as_mut().unwrap();
+        caps.max_tokens = 6_000;
+        caps.max_cost_usd = 6_000.0;
+        caps.max_tasks = 6_000;
+        caps.max_tool_calls = 6_000;
+        caps.max_subagents = 6_000;
+        caps.max_bytes_written = 6_000;
+        caps.max_escalations = 6_000;
+        run
+    }
 
-        let event = crate::test_support::runner().record_session_created(
-            created_child,
-            0,
-            Timestamp::from_unix_nanos(1),
-            Box::new(SessionSpec::test_default()),
-            1,
-        );
-        let txn = roundhouse_store::begin_immediate(&mut conn).unwrap();
+    fn append(conn: &mut rusqlite::Connection, event: &roundhouse_core::Event) {
+        let txn = roundhouse_store::begin_immediate(conn).unwrap();
         roundhouse_store::append_event_in_transaction(
             &txn,
-            &event,
+            event,
             &roundhouse_store::redact::Redactor::build(&[]),
         )
         .unwrap();
         txn.commit().unwrap();
+    }
+
+    /// The one durable fact boot recovery reads: a child session's own
+    /// `SessionCreated`, carrying the parent it was spawned under. Written
+    /// through the real store path (`append_event_in_transaction`), so these
+    /// tests read back exactly the bytes production writes — the same call
+    /// `WorkflowSessionTree::persist_child_session` and
+    /// `DaemonSubAgentHost::persist_session_created` make.
+    fn session_created(
+        conn: &mut rusqlite::Connection,
+        session: SessionId,
+        parent: Option<SessionId>,
+    ) {
+        let mut spec = SessionSpec::test_default();
+        spec.parent = parent;
+        let event = crate::test_support::runner().record_session_created(
+            session,
+            0,
+            Timestamp::from_unix_nanos(1),
+            Box::new(spec),
+            1,
+        );
+        append(conn, &event);
+    }
+
+    fn session_closed(conn: &mut rusqlite::Connection, session: SessionId) {
+        let event = crate::test_support::runner().record_session_closed(
+            session,
+            0,
+            Timestamp::from_unix_nanos(2),
+            roundhouse_core::SessionOutcome::Completed,
+            1,
+        );
+        append(conn, &event);
+    }
+
+    fn session_state_changed(
+        conn: &mut rusqlite::Connection,
+        session: SessionId,
+        state: roundhouse_core::SessionState,
+    ) {
+        let event = crate::test_support::runner().record_session_state_changed(
+            session,
+            0,
+            Timestamp::from_unix_nanos(2),
+            state,
+            None,
+            1,
+        );
+        append(conn, &event);
+    }
+
+    /// A terminal child run, as `transition_run` leaves one: a terminal state
+    /// **and** a stamped `ended_at` (the pairing `insert_run_row` refuses to
+    /// break — see its `TerminalStateEndedAtMismatch` guard).
+    fn ended_child_run(
+        parent_run_id: RunId,
+        session_id: SessionId,
+        state: RunState,
+    ) -> WorkflowRun {
+        let mut run = child_run(parent_run_id, session_id);
+        run.state = state;
+        run.ended_at = Some(Timestamp::from_unix_nanos(2));
+        run
+    }
+
+    #[test]
+    fn reconciliation_restores_only_children_whose_session_created_names_a_parent() {
+        let mut conn = open_test_db();
+        let parent_session = SessionId::new();
+        let parent = root_run(parent_session);
+        let parent_run = parent.id;
+        let created_child = SessionId::new();
+        let missing_lifecycle_child = SessionId::new();
+        insert_workflow_run(&mut conn, &parent).unwrap();
+        insert_workflow_run(&mut conn, &child_run(parent_run, created_child)).unwrap();
+        insert_workflow_run(&mut conn, &child_run(parent_run, missing_lifecycle_child)).unwrap();
+
+        session_created(&mut conn, created_child, Some(parent_session));
 
         let tree = Arc::new(SpawnTree::new());
         reconcile_spawn_tree(&conn, &tree).unwrap();
 
-        assert_eq!(tree.direct_children(parent_session), 1);
-        assert_eq!(tree.direct_children(created_child), 0);
-        assert_eq!(tree.direct_children(missing_lifecycle_child), 0);
+        assert_eq!(tree.descendants(parent_session), vec![created_child]);
+        assert_eq!(
+            tree.direct_children(missing_lifecycle_child),
+            0,
+            "a child run whose session never got a SessionCreated is no one's child"
+        );
+    }
+
+    /// The restart simulation this task exists for: **one** pass over the
+    /// durable log restores the live children of **both** kinds, and restores
+    /// neither ended one.
+    ///
+    /// Seeded into the store directly rather than produced by a live driver on
+    /// purpose. Nothing in this workspace drives a `call:` child run to a
+    /// terminal state yet (Task 4's finding — the driver is a later task), so
+    /// a test that waited for one would be untestable today; the rows are the
+    /// contract boot recovery actually reads, and they are seeded through the
+    /// real writers (`insert_workflow_run`, `append_event_in_transaction`).
+    #[test]
+    fn boot_recovery_restores_live_children_of_both_kinds_and_skips_the_ended_ones() {
+        let mut conn = open_test_db();
+        let parent_session = SessionId::new();
+        let parent = root_run(parent_session);
+        let parent_run = parent.id;
+        insert_workflow_run(&mut conn, &parent).unwrap();
+
+        // (a) a live workflow `call:` child.
+        let live_call_child = SessionId::new();
+        insert_workflow_run(&mut conn, &child_run(parent_run, live_call_child)).unwrap();
+        session_created(&mut conn, live_call_child, Some(parent_session));
+
+        // (b) an ended workflow `call:` child, in each of the three terminal
+        // states, since "terminal" here is the whole of `RunState::is_terminal`
+        // and not just `Completed`.
+        let ended_call_children: Vec<SessionId> =
+            [RunState::Completed, RunState::Failed, RunState::Cancelled]
+                .into_iter()
+                .map(|state| {
+                    let child = SessionId::new();
+                    insert_workflow_run(&mut conn, &ended_child_run(parent_run, child, state))
+                        .unwrap();
+                    session_created(&mut conn, child, Some(parent_session));
+                    child
+                })
+                .collect();
+
+        // (c) a live sub-agent child: a `SessionCreated` naming its parent and
+        // no `workflow_run` row at all. The old `workflow_run.parent_run_id`
+        // join could not see this child; the point of the generalized scan is
+        // that one pass now covers it.
+        let sub_agent_child = SessionId::new();
+        session_created(&mut conn, sub_agent_child, Some(parent_session));
+
+        // (d) an ended sub-agent child — ended in the only way this codebase
+        // can durably say so, an explicit `SessionClosed` on its own log.
+        let closed_sub_agent_child = SessionId::new();
+        session_created(&mut conn, closed_sub_agent_child, Some(parent_session));
+        session_closed(&mut conn, closed_sub_agent_child);
+
+        // (e) a root session: its spec names no parent, so it is nobody's
+        // child and must not be fabricated into one.
+        let root_session = SessionId::new();
+        session_created(&mut conn, root_session, None);
+
+        let tree = Arc::new(SpawnTree::new());
+        let restored = reconcile_spawn_tree(&conn, &tree).unwrap();
+
+        let mut recovered = tree.descendants(parent_session);
+        recovered.sort_by_key(|session| session.to_string());
+        let mut expected = vec![live_call_child, sub_agent_child];
+        expected.sort_by_key(|session| session.to_string());
+        assert_eq!(
+            recovered, expected,
+            "exactly the two live children — one of each kind — come back"
+        );
+        assert_eq!(restored, 2, "and the reported count is the edges recorded");
+        for ended in ended_call_children {
+            assert_eq!(
+                tree.direct_children(ended),
+                0,
+                "an ended child occupies nothing itself either"
+            );
+        }
+        assert_eq!(
+            tree.direct_children(root_session),
+            0,
+            "a parentless session gets no phantom edge"
+        );
+    }
+
+    /// `SessionActor::cancel` is the one production writer of a session
+    /// lifecycle state event, and it writes `Cancelling` — which §8.13 is
+    /// explicit is *not* terminal: the session is draining, not gone. Boot
+    /// recovery must keep that child's slot, or a cooperative cancel would
+    /// silently hand its parent a free slot the instant a daemon restarted.
+    #[test]
+    fn a_cancelling_child_is_still_a_child_because_cancel_is_cooperative() {
+        let mut conn = open_test_db();
+        let parent_session = SessionId::new();
+        let cancelling = SessionId::new();
+        let closed = SessionId::new();
+        session_created(&mut conn, cancelling, Some(parent_session));
+        session_state_changed(
+            &mut conn,
+            cancelling,
+            roundhouse_core::SessionState::Cancelling,
+        );
+        session_created(&mut conn, closed, Some(parent_session));
+        session_state_changed(&mut conn, closed, roundhouse_core::SessionState::Closed);
+
+        let tree = Arc::new(SpawnTree::new());
+        reconcile_spawn_tree(&conn, &tree).unwrap();
+
+        assert_eq!(
+            tree.descendants(parent_session),
+            vec![cancelling],
+            "Cancelling keeps the slot; Closed gives it back"
+        );
+    }
+
+    /// A fork (`control::retry_from_step` → `durability::fork_run`) mints a
+    /// **new** session id while **inheriting** the original's `parent_run_id`,
+    /// and writes no `SessionCreated` for that new session — nothing calls
+    /// `register_child` for a fork, so a fork's session was never a tracked
+    /// child in the first place.
+    ///
+    /// Under the old `workflow_run.parent_run_id` join a fork row was a
+    /// candidate edge, excluded only by the second half of that query (no
+    /// lifecycle event). Under the generalized scan it is not even in the
+    /// input, which is the stronger property — pinned here with a **real**
+    /// fork rather than a hand-built imitation of one, so that a future change
+    /// making forks write their own `SessionCreated` fails this test instead of
+    /// quietly minting a phantom child at every boot.
+    #[test]
+    fn a_forked_runs_fresh_session_is_not_a_phantom_child_at_boot() {
+        let mut conn = open_test_db();
+        let parent_session = SessionId::new();
+        let parent = root_run(parent_session);
+        let parent_run = parent.id;
+        insert_workflow_run(&mut conn, &parent).unwrap();
+
+        let original_child = SessionId::new();
+        let original = ended_child_run(parent_run, original_child, RunState::Completed);
+        insert_workflow_run(&mut conn, &original).unwrap();
+        session_created(&mut conn, original_child, Some(parent_session));
+
+        let fork_session = SessionId::new();
+        let fork = roundhouse_flow::control::retry_from_step(
+            &mut conn,
+            original.id,
+            "only-step",
+            &["only-step"],
+            fork_session,
+            Timestamp::from_unix_nanos(3),
+        )
+        .expect("a terminal, parented run can be retried from its first step");
+        assert_eq!(
+            roundhouse_flow::durability::recover_run(&conn, fork.new_run_id)
+                .unwrap()
+                .run
+                .parent_run_id,
+            Some(parent_run),
+            "the fork really did inherit the original's parent — the edge case is live"
+        );
+
+        let tree = Arc::new(SpawnTree::new());
+        reconcile_spawn_tree(&conn, &tree).unwrap();
+
+        assert_eq!(
+            tree.descendants(parent_session),
+            Vec::<SessionId>::new(),
+            "the original ended and the fork was never a tracked child: no edges at all"
+        );
+        assert_eq!(tree.direct_children(parent_session), 0);
+    }
+
+    /// The SQL prefilter below reads the serialized payload's own discriminant
+    /// text. Pinned against what the store actually writes so that a rename or
+    /// a change of serde representation fails here — loudly — instead of
+    /// silently matching zero rows and quietly restoring no edges at boot.
+    #[test]
+    fn the_payload_prefixes_match_what_the_store_actually_writes() {
+        let mut conn = open_test_db();
+        let session = SessionId::new();
+        session_created(&mut conn, session, None);
+        session_state_changed(&mut conn, session, roundhouse_core::SessionState::Closed);
+        session_closed(&mut conn, session);
+
+        let mut statement = conn
+            .prepare("SELECT payload FROM events WHERE session_id = ?1 ORDER BY seq")
+            .unwrap();
+        let payloads: Vec<String> = statement
+            .query_map([session.to_string()], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        assert!(payloads[0].starts_with(SESSION_CREATED_PAYLOAD_PREFIX));
+        assert!(payloads[1].starts_with(SESSION_STATE_CHANGED_PAYLOAD_PREFIX));
+        assert!(payloads[2].starts_with(SESSION_CLOSED_PAYLOAD_PREFIX));
     }
 
     #[test]
