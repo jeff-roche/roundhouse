@@ -1307,7 +1307,9 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 } => gate_condition_was_secret_derived,
             };
 
+            let mut resumed_seqs: (Option<u64>, Option<u64>) = (None, None);
             let mut outcome = if let Some(work) = resumed_work {
+                resumed_seqs = (work.first_task_seq, work.last_task_seq);
                 step_outcome_from_work_done(work)
             } else {
                 match &step.body {
@@ -1364,7 +1366,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
             outcome.gate_condition_was_secret_derived = gate_secret_derived;
 
             let failed = matches!(outcome.status, StepStatus::Failed { .. });
-            self.record(step, outcome)?;
+            self.record_with_seqs(step, outcome, resumed_seqs.0, resumed_seqs.1)?;
             if failed && !step.continue_on_error {
                 end = PhaseEnd::Failed;
                 stopped_at = Some(index + 1);
@@ -1435,6 +1437,20 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// entry a dependent can read, a row a re-drive can read, and an entry in
     /// what the caller gets back.
     fn record(&mut self, step: &StepDef, outcome: StepOutcome) -> Result<(), RunLoopError> {
+        self.record_with_seqs(step, outcome, None, None)
+    }
+
+    /// [`Self::record`], but also threading through the real
+    /// `first_task_seq`/`last_task_seq` a resumed [`WorkDone`] carries —
+    /// see [`Self::checkpoint_with_seqs`] for why this is a second method
+    /// rather than a parameter every caller has to pass `None` for.
+    fn record_with_seqs(
+        &mut self,
+        step: &StepDef,
+        outcome: StepOutcome,
+        first_task_seq: Option<u64>,
+        last_task_seq: Option<u64>,
+    ) -> Result<(), RunLoopError> {
         if outcome.output_is_secret_derived {
             self.secret_derived_steps.push(step.id.clone());
         }
@@ -1454,7 +1470,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
             StepStatus::Failed { message } => (StepRunState::Failed, None, Some(message.clone())),
             StepStatus::Skipped { reason } => (StepRunState::Skipped, None, Some(reason.clone())),
         };
-        self.checkpoint(step, state, output, error)?;
+        self.checkpoint_with_seqs(step, state, output, error, first_task_seq, last_task_seq)?;
         self.outcomes.push(outcome);
         Ok(())
     }
@@ -1465,6 +1481,29 @@ impl<H: WorkflowHost> Loop<'_, H> {
         state: StepRunState,
         output: Option<StepOutput>,
         error: Option<String>,
+    ) -> Result<(), RunLoopError> {
+        self.checkpoint_with_seqs(step, state, output, error, None, None)
+    }
+
+    /// [`Self::checkpoint`], but also writing the real
+    /// `first_task_seq`/`last_task_seq` a resumed [`WorkDone`] carries.
+    ///
+    /// A second method, not a parameter [`Self::checkpoint`]'s own callers
+    /// have to pass `None` for: every dispatch that runs *inside* this
+    /// crate (`emit:`, `report:`, `gate:`, `call:`, and the `Running`
+    /// checkpoint just before a step suspends) genuinely has no task-log
+    /// range of its own — [`TaskSink::emit`] returns no `seq`, and the
+    /// `Running` row is written before any task exists at all. Only a
+    /// resumed [`WorkDone`] — the caller's real, already-appended
+    /// `TaskCreated`/`TaskCompleted` pair — ever has one to write.
+    fn checkpoint_with_seqs(
+        &mut self,
+        step: &StepDef,
+        state: StepRunState,
+        output: Option<StepOutput>,
+        error: Option<String>,
+        first_task_seq: Option<u64>,
+        last_task_seq: Option<u64>,
     ) -> Result<(), RunLoopError> {
         checkpoint_step(
             self.conn,
@@ -1478,13 +1517,11 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 item_index: None,
                 disposition: derive_disposition(step),
                 state,
-                // §8.10's ranges join back to a session's task log, and
-                // `TaskSink::emit` returns no `seq` — the sink is this crate's
-                // stand-in for task admission and the real seq is assigned by
-                // the store. `None` is the honest value; a fabricated range
-                // would point the join at seqs nothing emitted.
-                first_task_seq: None,
-                last_task_seq: None,
+                // §8.10's ranges join back to a session's task log — see
+                // this method's own doc comment for when a real value is
+                // available to write here.
+                first_task_seq,
+                last_task_seq,
                 output,
                 error,
             },

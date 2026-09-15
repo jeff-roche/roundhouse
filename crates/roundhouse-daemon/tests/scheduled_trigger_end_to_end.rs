@@ -51,12 +51,14 @@ use std::time::Duration;
 
 use roundhouse_core::Tier;
 use roundhouse_daemon::scheduler_driver;
-use roundhouse_daemon::session_bootstrap::BackgroundServices;
+use roundhouse_daemon::session_bootstrap::{policy_rules_from_files, BackgroundServices};
 use roundhouse_daemon::session_registry::SessionRegistry;
 use roundhouse_flow::durability::recover_run;
 use roundhouse_flow::exec::RunId;
 use roundhouse_flow::job::SessionTemplate;
 use roundhouse_flow::job_store::register_workflow_file;
+use roundhouse_policy::config::compile_policy_layers;
+use roundhouse_policy::trust::{record_explicit_trust, TrustStore};
 use roundhouse_sched::delivery::DeliveryState;
 use roundhouse_sched::store::list_deliveries_in_states;
 
@@ -273,6 +275,255 @@ async fn a_scheduled_binding_fires_through_the_real_scheduler_and_completes_a_re
     assert_eq!(
         report_task_count, 1,
         "the run's session must record exactly one completed Report-kind task"
+    );
+
+    running
+        .shutdown()
+        .await
+        .expect("the scheduler driver must observe cancellation and return Ok");
+}
+
+/// A workflow whose single step is a real `tool: read` — Phase 8 Task
+/// 25.3's own exit criterion: this step must suspend the run
+/// (`RunOutcome::AwaitingWork`), be dispatched for real by
+/// `DeliveryExecutor::execute_pending`/`dispatch_tool_for_workflow`, and
+/// resume the run to completion, rather than the fixed `{}`/`Completed`
+/// stub every `tool:` step produced before this task's seam existed.
+fn reading_workflow() -> String {
+    "name: scheduled-read\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+     escalate: fail\nsteps:\n  - id: read_it\n    tool: read\n    with: { path: greeting.txt }\n"
+        .to_string()
+}
+
+/// Phase 8 Task 25.3's exit criterion, proven end to end through the real
+/// production composition path (the identical harness
+/// [`a_scheduled_binding_fires_through_the_real_scheduler_and_completes_a_real_workflow_run`]
+/// uses): a scheduled run's `tool: read` step actually reads a real file —
+/// admitted through the real `SessionActor::admit_task` gate, executed
+/// through the real `roundhouse-tools` `read_file`, and recorded as a real
+/// `Read`-kind task — with the run reaching `Completed` afterward, not
+/// suspended forever and not silently faked.
+#[tokio::test]
+async fn a_scheduled_runs_tool_read_step_executes_for_real_and_the_run_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_root = dir.path().canonicalize().unwrap();
+
+    // The real file `tool: read` must actually read — proves this is not
+    // the old stub, which never touched the filesystem at all.
+    let fixture = fixture_root.join("greeting.txt");
+    std::fs::write(&fixture, "hello from a real file").unwrap();
+
+    // `SessionActor::admit_task` runs the real, independent
+    // `roundhouse-policy` admission gate — a *different* system from this
+    // workflow's own `permissions:` block (that one governs `gate:`/hitl
+    // escalation inside `roundhouse-flow`, not tool admission). With no
+    // rule granting it, `no_policy_rules()`'s real fail-closed default
+    // requires human approval for a `read`, exactly like
+    // `submit_turn_e2e.rs`'s own `the_phase_exit_criterion_...` test — so
+    // this test loads one project `Allow` rule the identical way, through
+    // the production `policy_rules_from_files` loader, after recording the
+    // explicit out-of-repository trust a project Allow requires.
+    let policy_dir = fixture_root.join(".roundhouse");
+    std::fs::create_dir(&policy_dir).unwrap();
+    let policy_path = policy_dir.join("policy.toml");
+    let policy_text = format!(
+        "[[rule]]\nid = 'fixture-read'\noutcome = 'allow'\nread = {:?}\n",
+        fixture
+    );
+    std::fs::write(&policy_path, &policy_text).unwrap();
+    let trust_state = tempfile::tempdir().unwrap();
+    let rules =
+        policy_rules_from_files(Some(fixture_root.clone()), trust_state.path().to_path_buf())
+            .unwrap();
+    let compiled = compile_policy_layers(vec![roundhouse_config::PolicyLayer {
+        scope: roundhouse_config::ConfigScope::Project,
+        path: policy_path,
+        contents: policy_text.clone(),
+        file: roundhouse_config::PolicyFile {
+            rule: vec![roundhouse_config::PolicyRule {
+                id: "fixture-read".to_string(),
+                outcome: roundhouse_config::PolicyRuleOutcome::Allow,
+                read: fixture.clone(),
+            }],
+        },
+    }])
+    .unwrap();
+    record_explicit_trust(
+        &fixture_root,
+        &policy_text,
+        &compiled,
+        &TrustStore::new(trust_state.path().to_path_buf()),
+    )
+    .unwrap();
+
+    let resources = common::resources_with(
+        dir.path(),
+        common::available_isolate(),
+        Arc::new(common::NoopProvider),
+        rules,
+    )
+    .await;
+    let sessions = Arc::new(SessionRegistry::new());
+
+    let workspace = resources
+        .workspace_registry
+        .as_ref()
+        .expect("real_resources wires a real WorkspaceRegistry")
+        .resolve("default")
+        .expect("real_resources registers a \"default\" workspace");
+
+    let source = workspace.root.join("workflow.yaml");
+    std::fs::write(&source, reading_workflow()).unwrap();
+    let job_id = {
+        let conn = resources.store.pool.get().await.unwrap();
+        let root = workspace.root.clone();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &source, template())
+                .unwrap()
+                .job
+                .id()
+        })
+        .await
+        .unwrap()
+    };
+
+    let binding_id = uuid::Uuid::new_v4().to_string();
+    seed_enabled_interval_binding(
+        &resources.store,
+        &binding_id,
+        &workspace.id.to_string(),
+        &job_id.to_string(),
+    )
+    .await;
+
+    let services = BackgroundServices {
+        scheduler: Some(scheduler_service()),
+        ..Default::default()
+    };
+    let running = services
+        .start(resources.store.clone(), sessions, Arc::clone(&resources))
+        .await
+        .expect("the scheduler driver must signal readiness so daemon boot proceeds");
+
+    // Generous bound: this run suspends mid-flight (`AwaitingWork`) and
+    // resumes through a second segment before it can complete, on top of
+    // the same real headless-session-construction cost the sibling test
+    // budgets 45s for.
+    let delivered = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let conn = resources.store.pool.get().await.unwrap();
+            let binding_id = binding_id.clone();
+            let found = conn
+                .interact(move |connection| {
+                    let all = list_deliveries_in_states(
+                        connection,
+                        &[
+                            DeliveryState::Delivered,
+                            DeliveryState::Failed,
+                            DeliveryState::Running,
+                            DeliveryState::Reserved,
+                        ],
+                    )
+                    .expect("querying trigger delivery rows must not fail");
+                    all.into_iter()
+                        .find(|delivery| delivery.binding_id.to_string() == binding_id)
+                })
+                .await
+                .unwrap();
+            if let Some(delivery) = found {
+                if delivery.state == DeliveryState::Failed {
+                    let run_id_str = delivery.run_id.clone().unwrap();
+                    let run_id = RunId::from_uuid(uuid::Uuid::parse_str(&run_id_str).unwrap());
+                    let conn2 = resources.store.pool.get().await.unwrap();
+                    let steps = conn2
+                        .interact(move |c| recover_run(c, run_id).unwrap().steps)
+                        .await
+                        .unwrap();
+                    panic!(
+                        "delivery failed: {:?}; steps: {:#?}",
+                        delivery.last_error, steps
+                    );
+                }
+                if delivery.state == DeliveryState::Delivered {
+                    return delivery;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect(
+        "a scheduled run whose only step is `tool: read` must still reach a Delivered \
+         trigger_delivery within the bound — a run stuck AwaitingWork forever would time out \
+         here instead",
+    );
+
+    let run_id_str = delivered
+        .run_id
+        .clone()
+        .expect("a Delivered delivery must carry the run_id it drove");
+    let run_id = RunId::from_uuid(uuid::Uuid::parse_str(&run_id_str).unwrap());
+    let (workflow_run, step) = {
+        let conn = resources.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            let recovered = recover_run(connection, run_id).unwrap();
+            let step = recovered
+                .steps
+                .into_iter()
+                .find(|s| s.step_id == "read_it")
+                .expect("the read_it step must have a durable row");
+            (recovered.run, step)
+        })
+        .await
+        .unwrap()
+    };
+    assert_eq!(
+        workflow_run.state,
+        roundhouse_flow::durability::RunState::Completed,
+        "a run whose only step is a real tool: read must reach Completed, not stay stuck or fail"
+    );
+
+    // The seam's whole point: this step's row must carry a REAL task
+    // identity and log range, not the `None`/`None` the fixed stub always
+    // left — `WorkDone::first_task_seq`/`last_task_seq`'s own doc comment
+    // calls these "the first real values ... have ever carried".
+    assert!(
+        step.first_task_seq.is_some() && step.last_task_seq.is_some(),
+        "a dispatched-for-real tool: read step must carry a real task_seq range, got {step:?}"
+    );
+    let output = step
+        .output
+        .as_ref()
+        .expect("a completed tool: read step must have a durable output")
+        .value_unredacted_for_resume();
+    assert_eq!(
+        output.get("content").and_then(|v| v.as_str()),
+        Some("hello from a real file"),
+        "the step's durable output must be the real file's real content, got {output:?}"
+    );
+
+    // And a real `Read`-kind task, admitted and completed, must exist in
+    // this run's own session — not folded into a chat turn (this run has
+    // none) and not a fixed empty `{}` no executor ever touched.
+    let read_task_count: i64 = {
+        let session_id = workflow_run.session_id;
+        let conn = resources.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE session_id = ?1 AND kind = 'Read' AND \
+                     state = 'Completed'",
+                    rusqlite::params![session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        })
+        .await
+        .unwrap()
+    };
+    assert_eq!(
+        read_task_count, 1,
+        "the run's session must record exactly one completed Read-kind task"
     );
 
     running

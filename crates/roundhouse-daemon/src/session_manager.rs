@@ -371,6 +371,16 @@ impl HeadlessSession {
         self.session_id
     }
 
+    /// The live `SessionActor` behind this handle — Phase 8 Task 25.3 needs
+    /// it to dispatch a workflow run's `tool:`/`agent:` steps for real
+    /// (`roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow`
+    /// takes `&SessionActor`, not a `HeadlessSession`), the same accessor
+    /// shape `roundhouse-engine`'s own `run_agent_loop` gets via its
+    /// `actor: &SessionActor` parameter.
+    pub(crate) fn actor(&self) -> &Arc<SessionActor> {
+        &self.actor
+    }
+
     /// The egress-proxy bearer token this session was registered under.
     /// Test-only, and only so a test can assert [`Self::teardown`] really
     /// deregisters it — nothing in production needs to read it back, because

@@ -1947,6 +1947,132 @@ fn a_re_drive_honours_every_kind_of_finished_row_and_re_runs_the_rest() {
     );
 }
 
+/// §8.10 tier 2's crash-policy wiring (Phase 8 Task 25.3): a step
+/// `recover_run` reclassifies `Indeterminate` (`Running` + `Effectful`, with
+/// no caller-supplied `WorkDone` answering it) must not be silently treated
+/// as never-started. Before this task, `durability::crash_policy` was built
+/// and tested in isolation but had no caller anywhere in this crate — this
+/// proves the run loop actually consults it, and that with no declared
+/// `on_crash:` the default (`Ask`) fails the run closed rather than
+/// re-dispatching a step whose real-world completion is unknown.
+#[test]
+fn an_indeterminate_effectful_step_with_no_on_crash_declared_fails_closed_rather_than_silently_re_running(
+) {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    // Simulates a crash mid-dispatch of an Effectful step: its row survives
+    // as `Running`, and this (fresh) call supplies no matching `WorkDone`.
+    roundhouse_flow::durability::checkpoint_step(
+        &mut conn,
+        &roundhouse_flow::durability::WorkflowStepRun {
+            run_id,
+            step_id: "risky".to_string(),
+            attempt: 1,
+            item_index: None,
+            disposition: roundhouse_flow::durability::StepDisposition::Effectful,
+            state: StepRunState::Running,
+            first_task_seq: None,
+            last_task_seq: None,
+            output: None,
+            error: None,
+        },
+    )
+    .expect("seed a Running Effectful row, simulating a crash mid-dispatch");
+
+    let def = parse_workflow(&workflow(
+        "steps:\n \x20- id: risky\n \x20  tool: shell\n \x20  with: { cmd: [ls] }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("the run re-drives");
+
+    let RunOutcome::Terminal { state, .. } = outcome else {
+        panic!(
+            "a fail-closed crash policy must reach a terminal state, not suspend on the \
+             step it just refused"
+        );
+    };
+    assert_eq!(
+        state,
+        RunState::Failed,
+        "the default on_crash policy for an Effectful step is Ask, which fails the run closed"
+    );
+    let (row_state, error) = step_row(&conn, run_id, "risky");
+    assert_eq!(row_state, StepRunState::Failed);
+    assert!(
+        error.is_some_and(|e| e.contains("on_crash policy is Ask")),
+        "the failure must name the crash policy it refused to silently re-run under"
+    );
+}
+
+/// The declared half of the same wiring: `on_crash: rerun` on an Effectful
+/// step must win over the derived `Ask` default and let the step proceed to
+/// ordinary re-dispatch — proving the loop's crash-policy branch honours an
+/// author's override in both directions, not just the default it derives.
+#[test]
+fn an_indeterminate_effectful_step_with_on_crash_rerun_declared_is_re_dispatched_instead() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    roundhouse_flow::durability::checkpoint_step(
+        &mut conn,
+        &roundhouse_flow::durability::WorkflowStepRun {
+            run_id,
+            step_id: "risky".to_string(),
+            attempt: 1,
+            item_index: None,
+            disposition: roundhouse_flow::durability::StepDisposition::Effectful,
+            state: StepRunState::Running,
+            first_task_seq: None,
+            last_task_seq: None,
+            output: None,
+            error: None,
+        },
+    )
+    .expect("seed a Running Effectful row, simulating a crash mid-dispatch");
+
+    let def = parse_workflow(&workflow(
+        "steps:\n \x20- id: risky\n \x20  tool: shell\n \x20  on_crash: rerun\n \x20  with: { cmd: [ls] }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("the run re-drives");
+
+    let RunOutcome::AwaitingWork { pending } = outcome else {
+        panic!(
+            "an on_crash: rerun override must let the step proceed to ordinary re-dispatch, \
+             which suspends on the same seam every tool: step suspends on, not fail closed"
+        );
+    };
+    assert_eq!(
+        pending.len(),
+        1,
+        "exactly the one step this run has must be re-dispatched"
+    );
+    assert_eq!(pending[0].step_id, "risky");
+}
+
 /// Taint across a step boundary **within one run**: the run loop keeps its own
 /// `secret_derived_steps` fold, so `steps.<id>.output` read by a later step is
 /// tainted even though it was never itself a `secrets.*` lookup (ruling P33's

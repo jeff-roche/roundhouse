@@ -6,7 +6,8 @@
 //! the `ready` `trigger_delivery` row), and then **claims those `ready` rows
 //! and actually runs them**: reserve a `SessionId`/`RunId`, insert the
 //! `workflow_run` row that *is* the reservation, construct a headless
-//! session, drive [`run_workflow_from_storage`], and complete or fail the
+//! session, drive it to completion through
+//! [`DeliveryExecutor::drive_run_to_completion`], and complete or fail the
 //! delivery — releasing the admission-registry slot on either terminal path.
 //!
 //! # The binding invariant every `tracing` call here honours
@@ -49,6 +50,7 @@
 //!   [`DeliveryExecutor::run_claimed_delivery`] for both.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -57,14 +59,17 @@ use roundhouse_core::{
     BindingId, EventPayload, JobId, OnDegrade, SessionId, SessionSpec, TaskId, TaskKind,
     TaskRunner, Tier, Timestamp, WorkspaceId,
 };
+use roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow;
 use roundhouse_flow::caps::ResourceCaps;
 use roundhouse_flow::durability::{insert_workflow_run, RunState, WorkflowRun};
-use roundhouse_flow::exec::run_loop::RunOutcome;
+use roundhouse_flow::exec::run_loop::{
+    PendingKind, PendingWork, Resume, RunOutcome, WorkDone, WorkStatus,
+};
 use roundhouse_flow::exec::{RunContext, RunId, TaskSink};
 use roundhouse_flow::expr::EnvAllowlist;
 use roundhouse_flow::job::content_hash;
 use roundhouse_flow::job_store::resolve_latest_by_job_id;
-use roundhouse_flow::production::{run_workflow_from_storage, SqliteWorkflowHost};
+use roundhouse_flow::production::{run_workflow_from_definition, SqliteWorkflowHost};
 use roundhouse_flow::worktree::SandboxWorktreeProvider;
 use roundhouse_sched::admission::{CancellationOutcome, RegistryError, RunRegistry};
 use roundhouse_sched::delivery::{DeliveryState, TriggerDelivery};
@@ -932,6 +937,22 @@ fn flush_task_events(
     Ok(())
 }
 
+/// A [`WorkDone`] for a `PendingWork` this daemon cannot yet dispatch for
+/// real — no task was ever minted, so every task-identity field is `None`.
+/// See [`DeliveryExecutor::execute_pending`] for why this always answers
+/// rather than dropping the item.
+fn unanswerable_work(step_id: String, message: String) -> WorkDone {
+    WorkDone {
+        step_id,
+        status: WorkStatus::Failed { message },
+        output: serde_json::Value::Null,
+        output_is_secret_derived: false,
+        task_id: None,
+        first_task_seq: None,
+        last_task_seq: None,
+    }
+}
+
 /// Everything one claimed delivery needs to become a real, running workflow.
 ///
 /// Cloned into each spawned per-delivery task, so every field is a handle
@@ -1576,25 +1597,17 @@ impl DeliveryExecutor {
             ))),
         };
 
-        let runner = self.resources.runner;
-        let spawn_tree = Arc::clone(&self.spawn_tree);
-        self.with_connection(move |conn| {
-            let mut sink = BufferedTaskSink::default();
-            let mut host = SqliteWorkflowHost::with_session_tree(
-                workspace_root,
-                Box::new(WorkflowSessionTree::new(spawn_tree, runner, spec)),
-            );
-            let outcome =
-                run_workflow_from_storage(conn, run_id, &mut sink, &mut host, run_ctx, now, None);
-            if let Err(error) = flush_task_events(conn, runner, session_id, now, sink) {
-                tracing::error!(
-                    session_id = %session_id,
-                    error = %error,
-                    "a scheduled run's task events could not be appended to its session log"
-                );
-            }
-            outcome
-        })
+        self.drive_run_to_completion(
+            run_id,
+            session_id,
+            session
+                .as_ref()
+                .expect("just constructed above, on every non-error path"),
+            spec,
+            workspace_root,
+            run_ctx,
+            now,
+        )
         .await
     }
 
@@ -1756,27 +1769,173 @@ impl DeliveryExecutor {
             ))),
         };
 
-        let runner = self.resources.runner;
-        let spawn_tree = Arc::clone(&self.spawn_tree);
-        self.with_connection(move |conn| {
-            let mut sink = BufferedTaskSink::default();
-            let mut host = SqliteWorkflowHost::with_session_tree(
-                workspace_root,
-                Box::new(WorkflowSessionTree::new(spawn_tree, runner, spec)),
-            );
-            let outcome =
-                run_workflow_from_storage(conn, run_id, &mut sink, &mut host, run_ctx, boot, None);
-            if let Err(error) = flush_task_events(conn, runner, session_id, boot, sink) {
-                tracing::error!(
-                    session_id = %session_id,
-                    error = %error,
-                    "a recovered scheduled run's task events could not be appended to its \
-                     session log"
-                );
-            }
-            outcome
-        })
+        self.drive_run_to_completion(
+            run_id,
+            session_id,
+            session
+                .as_ref()
+                .expect("just constructed above, on every non-error path"),
+            spec,
+            workspace_root,
+            run_ctx,
+            boot,
+        )
         .await
+    }
+
+    /// Drives one run from `resume: None` all the way to a
+    /// `Terminal`/`Parked` outcome, executing every `AwaitingWork`
+    /// suspension for real in between (Phase 8 Task 25.2/25.3's segmented
+    /// driving loop). The workflow definition is resolved once, up front —
+    /// `run_workflow_from_storage`'s own `resolve_run_definition` spawns
+    /// `round-yaml-parse-helper` out of process on every call (see
+    /// [`run_workflow_from_definition`]'s own doc comment), reasonable once
+    /// per run, not once per segment.
+    ///
+    /// Each segment's `with_connection` call holds a pooled store
+    /// connection only for its own synchronous slice; the async gap between
+    /// segments, where [`Self::execute_pending`] actually dispatches a
+    /// step's real work, holds none — the property this whole task exists
+    /// to establish (see this module's own doc comment on
+    /// `MAX_CONCURRENT_DELIVERIES`).
+    async fn drive_run_to_completion(
+        &self,
+        run_id: RunId,
+        session_id: SessionId,
+        session: &HeadlessSession,
+        spec: SessionSpec,
+        workspace_root: PathBuf,
+        run_ctx: RunContext,
+        mut now: Timestamp,
+    ) -> Result<Result<RunOutcome, roundhouse_flow::exec::run_loop::RunLoopError>, DeliveryError>
+    {
+        let def = {
+            let workspace_root = workspace_root.clone();
+            match self
+                .with_connection(move |conn| {
+                    SqliteWorkflowHost::new(workspace_root).resolve_run_definition(conn, run_id)
+                })
+                .await?
+            {
+                Ok(def) => Arc::new(def),
+                Err(error) => {
+                    return Ok(Err(roundhouse_flow::exec::run_loop::RunLoopError::from(
+                        error,
+                    )))
+                }
+            }
+        };
+
+        let runner = self.resources.runner;
+        let mut resume: Option<Resume> = None;
+        loop {
+            let def = Arc::clone(&def);
+            let run_ctx = run_ctx.clone();
+            let spec = spec.clone();
+            let workspace_root = workspace_root.clone();
+            let spawn_tree = Arc::clone(&self.spawn_tree);
+            let resume_segment = resume.take();
+            let outcome = self
+                .with_connection(move |conn| {
+                    let mut sink = BufferedTaskSink::default();
+                    let mut host = SqliteWorkflowHost::with_session_tree(
+                        workspace_root,
+                        Box::new(WorkflowSessionTree::new(spawn_tree, runner, spec)),
+                    );
+                    let outcome = run_workflow_from_definition(
+                        conn,
+                        &def,
+                        run_id,
+                        &mut sink,
+                        &mut host,
+                        run_ctx,
+                        now,
+                        resume_segment,
+                    );
+                    if let Err(error) = flush_task_events(conn, runner, session_id, now, sink) {
+                        tracing::error!(
+                            session_id = %session_id,
+                            error = %error,
+                            "a workflow run's task events could not be appended to its session \
+                             log"
+                        );
+                    }
+                    outcome
+                })
+                .await?;
+
+            match outcome {
+                Ok(RunOutcome::AwaitingWork { pending }) => {
+                    resume = Some(Resume::Work(self.execute_pending(session, pending).await));
+                    now = self.now();
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// Executes every [`PendingWork`] a suspended run handed back, for real,
+    /// against `session`'s own `SessionActor` (Phase 8 Task 25.3). Always
+    /// answers every item — a step this daemon cannot yet dispatch for real
+    /// still gets a [`WorkDone`], just a failed one, so the run is never
+    /// left suspended forever waiting on an answer nothing will supply.
+    ///
+    /// **Scope: `tool: read` only.** Every other `tool:` kind, every
+    /// `agent:` step, and every `call:` child are refused with a named,
+    /// recorded failure — wiring them is Phase 8 Tasks 25.4/25.5/25.6.
+    async fn execute_pending(
+        &self,
+        session: &HeadlessSession,
+        pending: Vec<PendingWork>,
+    ) -> Vec<WorkDone> {
+        let mut done = Vec::with_capacity(pending.len());
+        for item in pending {
+            done.push(match item.kind {
+                PendingKind::Tool {
+                    task_kind,
+                    logged_input,
+                    dispatch_input,
+                    ..
+                } => match dispatch_tool_for_workflow(
+                    session.actor(),
+                    task_kind,
+                    logged_input,
+                    dispatch_input,
+                )
+                .await
+                {
+                    Ok(dispatched) => {
+                        let (status, output) = match dispatched.result {
+                            Ok(value) => (WorkStatus::Completed, value),
+                            Err(message) => {
+                                (WorkStatus::Failed { message }, serde_json::Value::Null)
+                            }
+                        };
+                        WorkDone {
+                            step_id: item.step_id,
+                            status,
+                            output,
+                            output_is_secret_derived: false,
+                            task_id: Some(dispatched.task_id),
+                            first_task_seq: Some(dispatched.first_task_seq),
+                            last_task_seq: dispatched.last_task_seq,
+                        }
+                    }
+                    Err(message) => unanswerable_work(item.step_id, message),
+                },
+                PendingKind::Agent { .. } => unanswerable_work(
+                    item.step_id,
+                    "workflow dispatch of `agent:` steps is not wired yet (Phase 8 Task 25.5)"
+                        .into(),
+                ),
+                PendingKind::ChildRun { .. } => unanswerable_work(
+                    item.step_id,
+                    "workflow dispatch of `call:` children is not wired yet (Phase 8 Task 25.6)"
+                        .into(),
+                ),
+            });
+        }
+        done
     }
 }
 
@@ -1798,6 +1957,16 @@ fn conclusion_for(
             state.wire_name()
         )),
         Ok(RunOutcome::Parked(_)) => RunConclusion::Parked,
+        // `DeliveryExecutor::drive_run_to_completion` is this function's
+        // only production caller, and its own loop never returns
+        // `AwaitingWork` — that variant is exactly what makes it loop
+        // again, driven by `DeliveryExecutor::execute_pending`. Reachable
+        // only if a future caller of `conclusion_for` skips that loop.
+        Ok(RunOutcome::AwaitingWork { .. }) => RunConclusion::Failed(
+            "the workflow run suspended on real work but was not driven through \
+             DeliveryExecutor::drive_run_to_completion's loop"
+                .to_string(),
+        ),
         Err(error) => {
             RunConclusion::Failed(format!("the workflow run could not be driven: {error}"))
         }
