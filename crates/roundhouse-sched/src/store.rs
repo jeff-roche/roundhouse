@@ -385,6 +385,43 @@ pub fn fetch_delivery(
     raw.map(decode_delivery_row).transpose()
 }
 
+/// Every currently-`ready` delivery, oldest first, capped at `limit`.
+///
+/// This is the claim loop's discovery query: a delivery is claimable exactly
+/// while it is `ready`, so every other state is excluded by the `WHERE`
+/// clause rather than filtered afterwards. Ordering is FIFO by `created_at`
+/// with `delivery_id` as the tie-break — several occurrences accepted on one
+/// scheduler tick share a `created_at` (it is that tick's single `fired_at`
+/// reading), so `created_at` alone would leave their relative order up to
+/// SQLite rather than fixed.
+///
+/// A plain read, not wrapped in its own `begin_immediate` — the same
+/// judgement [`fetch_delivery`] makes. **Reading a row here is not claiming
+/// it**: the caller must still win [`lease_delivery`]'s
+/// predecessor-constrained `ready -> leased` transition, which is what makes
+/// a concurrent second reader of the same row a safe no-op.
+pub fn list_ready_deliveries(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<TriggerDelivery>, StoreError> {
+    // A `usize` above `i64::MAX` cannot describe a real backlog; clamping is
+    // the only sane reading of it, and it keeps this from being a fallible
+    // conversion the caller has to think about.
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare(&format!(
+        "SELECT {DELIVERY_COLUMNS} FROM trigger_delivery
+         WHERE state = 'ready'
+         ORDER BY created_at ASC, delivery_id ASC
+         LIMIT ?1"
+    ))?;
+    let rows = statement.query_map(params![limit], map_delivery_row)?;
+    let mut deliveries = Vec::new();
+    for raw in rows {
+        deliveries.push(decode_delivery_row(raw?)?);
+    }
+    Ok(deliveries)
+}
+
 fn advance_cursor_in_txn(
     txn: &Transaction<'_>,
     binding_id: BindingId,
@@ -1530,5 +1567,138 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cancelled.state, DeliveryState::CancellationRequested);
+    }
+
+    /// `create_ready_delivery` with a caller-chosen occurrence/fire instant,
+    /// so a test can seed several `ready` rows with distinct `created_at`
+    /// values (the column `list_ready_deliveries` orders by).
+    fn create_ready_delivery_at(
+        conn: &mut Connection,
+        binding_id: BindingId,
+        minute: i64,
+        fired_at_secs: i64,
+    ) -> TriggerDelivery {
+        let binding = StoredBinding {
+            workspace: WorkspaceId::new(),
+            binding: {
+                let mut b =
+                    Binding::new_cron(JobId::new(), "0 0 * * * *".to_string(), chrono_tz::Tz::UTC);
+                b.id = binding_id;
+                // `CancelPrevious` rather than `Skip`: this helper is used to
+                // seed SEVERAL concurrently-`ready` deliveries for one
+                // binding, which `Skip` would suppress after the first.
+                b.overlap = OverlapPolicy::CancelPrevious;
+                b
+            },
+        };
+        let registry = FakeRegistry::with_cancel_outcome(CancellationOutcome::Confirmed);
+        let occurrence = occurrence_at(binding_id, minute);
+        let acceptance = accept_occurrence(
+            conn,
+            &binding,
+            &occurrence,
+            fired_at(fired_at_secs),
+            &registry,
+        )
+        .unwrap();
+        match acceptance {
+            Acceptance::New {
+                delivery: Some(d), ..
+            } => d,
+            other => panic!("expected a new ready delivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ready_deliveries_are_listed_oldest_first() {
+        let mut conn = open_test_db();
+        // Seeded out of chronological order so a listing that merely returned
+        // insertion order would disagree with `created_at` order.
+        let newest = create_ready_delivery_at(&mut conn, BindingId::new(), 3, 300);
+        let oldest = create_ready_delivery_at(&mut conn, BindingId::new(), 1, 100);
+        let middle = create_ready_delivery_at(&mut conn, BindingId::new(), 2, 200);
+
+        let listed = list_ready_deliveries(&conn, 10).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|d| d.delivery_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                oldest.delivery_id.as_str(),
+                middle.delivery_id.as_str(),
+                newest.delivery_id.as_str()
+            ],
+            "ready deliveries must be handed out FIFO by created_at"
+        );
+        assert!(listed.iter().all(|d| d.state == DeliveryState::Ready));
+    }
+
+    #[test]
+    fn listing_ready_deliveries_honours_its_limit() {
+        let mut conn = open_test_db();
+        let first = create_ready_delivery_at(&mut conn, BindingId::new(), 1, 100);
+        create_ready_delivery_at(&mut conn, BindingId::new(), 2, 200);
+        create_ready_delivery_at(&mut conn, BindingId::new(), 3, 300);
+
+        let listed = list_ready_deliveries(&conn, 2).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed[0].delivery_id, first.delivery_id,
+            "the limit must take the OLDEST rows, not an arbitrary two"
+        );
+        assert!(list_ready_deliveries(&conn, 0).unwrap().is_empty());
+    }
+
+    /// The claim loop must never hand back a delivery something else already
+    /// owns — only `ready` rows are claimable.
+    #[test]
+    fn listing_ready_deliveries_excludes_every_non_ready_state() {
+        let mut conn = open_test_db();
+        let still_ready = create_ready_delivery_at(&mut conn, BindingId::new(), 1, 100);
+        let leased = create_ready_delivery_at(&mut conn, BindingId::new(), 2, 200);
+        let running = create_ready_delivery_at(&mut conn, BindingId::new(), 3, 300);
+        let delivered = create_ready_delivery_at(&mut conn, BindingId::new(), 4, 400);
+
+        assert!(lease_delivery(&mut conn, &leased.delivery_id, ts(999), ts(500)).unwrap());
+        assert!(lease_delivery(&mut conn, &running.delivery_id, ts(999), ts(500)).unwrap());
+        assert!(reserve_delivery(
+            &mut conn,
+            &running.delivery_id,
+            "run-1",
+            SessionId::new(),
+            ts(500)
+        )
+        .unwrap());
+        assert!(mark_delivery_running(&mut conn, &running.delivery_id, ts(500)).unwrap());
+        assert!(lease_delivery(&mut conn, &delivered.delivery_id, ts(999), ts(500)).unwrap());
+        assert!(reserve_delivery(
+            &mut conn,
+            &delivered.delivery_id,
+            "run-2",
+            SessionId::new(),
+            ts(500)
+        )
+        .unwrap());
+        assert!(mark_delivery_running(&mut conn, &delivered.delivery_id, ts(500)).unwrap());
+        assert!(complete_delivery(&mut conn, &delivered.delivery_id, ts(600)).unwrap());
+
+        let listed = list_ready_deliveries(&conn, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].delivery_id, still_ready.delivery_id);
+    }
+
+    #[test]
+    fn listing_ready_deliveries_decodes_every_column() {
+        let mut conn = open_test_db();
+        let binding_id = BindingId::new();
+        let seeded = create_ready_delivery_at(&mut conn, binding_id, 1, 100);
+
+        let listed = list_ready_deliveries(&conn, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0], seeded,
+            "the listed row must decode identically to the one accept_occurrence returned"
+        );
+        assert_eq!(listed[0].binding_id, binding_id);
+        assert!(listed[0].trigger_event_id > 0);
     }
 }
