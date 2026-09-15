@@ -138,9 +138,13 @@ Three known failure modes of a literal "everything is a task" model, and the ans
   the one place a session's origin is already durably recorded, so a session's
   parent lives there rather than in a separate table. `None` for a root session
   (socket-attached or scheduler-driven); set by whichever code path creates a
-  child session — workflow `call:` today (`WorkflowSessionTree::persist_child_session`
-  in `roundhouse-daemon`), the sub-agent `agent` tool in a later task of the same
-  plan. A later task recovers the runtime spawn tree from this edge after restart.
+  child session — workflow `call:` (`WorkflowSessionTree::persist_child_session`
+  in `roundhouse-daemon`) and, since #3 of the same plan, the model-facing
+  `agent` tool (`roundhouse_engine::tools::agent_spawn_tool` deciding the spawn,
+  `roundhouse-daemon`'s `DaemonSubAgentHost` creating the child and appending its
+  `SessionCreated`). Both write the same event with the same field, so one
+  recovery pass reads both. A later task recovers the runtime spawn tree from
+  this edge after restart.
 - **Streaming.** Solved by `TaskDelta`. A task's output is not written until it
   completes; consumers fold deltas for a live view.
 - **Non-terminating tasks.** A `shell` task running `npm run dev` never exits. These

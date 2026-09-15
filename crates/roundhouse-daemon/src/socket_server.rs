@@ -1250,6 +1250,12 @@ pub async fn drive_session(
             // host (previously only `SessionRegistry::remove`/
             // `LoopbackProxy::deregister_session` ran here — the bookkeeping
             // was cleared, but the real resources behind it were not).
+            // Phase 8, L5: this session can now spawn sub-agents. A ROOT
+            // session (depth 0) — a socket client is a human, not somebody
+            // else's child. Sub-agent children are wired by
+            // `DaemonSubAgentHost::create_child_session` instead, which is the
+            // only caller that knows a child's real depth.
+            crate::sub_agent_host::wire_sub_agent_host(&actor_for_reaper, &resources, &registry);
             spawn_session_reaper(
                 registry.clone(),
                 session_id,

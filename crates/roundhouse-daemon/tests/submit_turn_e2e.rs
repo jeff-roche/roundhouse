@@ -265,6 +265,11 @@ struct Daemon {
     _dir: tempfile::TempDir,
     socket_path: std::path::PathBuf,
     db_path: std::path::PathBuf,
+    /// The same registry `accept_loop` was handed, so a test can read back
+    /// what the real socket path actually built for a session — the only way
+    /// to assert on per-session wiring (Phase 8, L5: the `SubAgentHost`) from
+    /// outside the daemon.
+    registry: Arc<roundhouse_daemon::session_registry::SessionRegistry>,
 }
 
 async fn start_daemon(provider: Arc<dyn Provider>) -> Daemon {
@@ -308,12 +313,15 @@ async fn start_daemon_with_rules_at_root(
             .unwrap();
     }
     tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
-        listener, registry, resources,
+        listener,
+        Arc::clone(&registry),
+        resources,
     ));
     Daemon {
         _dir: dir,
         socket_path,
         db_path,
+        registry,
     }
 }
 
@@ -1043,4 +1051,60 @@ async fn two_workspaces_keep_project_policy_and_filesystem_roots_separate_across
         .unwrap();
     assert_eq!(reopened.resolve("alpha").unwrap().root, alpha_root);
     assert_eq!(reopened.resolve("beta").unwrap().root, beta_root);
+}
+
+/// Phase 8, L5: a session created over the **real socket** must come out of
+/// `drive_session` able to spawn sub-agents.
+///
+/// The spawn path itself is proven in `roundhouse-engine`'s
+/// `tests/agent_tool_spawn.rs` (the dispatcher) and in this crate's own
+/// `sub_agent_host` tests (the real child session). Neither of those goes
+/// through the socket handshake, so neither would notice the one line in
+/// `drive_session` that hands a real session its `SubAgentHost` going missing
+/// — and without it every `agent` call a model makes is refused
+/// `sub_agent_host_unavailable`, quietly, forever. This is the test that
+/// notices.
+#[tokio::test]
+async fn a_socket_created_session_can_spawn_sub_agents() {
+    let provider = Arc::new(ScriptedToolCallProvider::new(
+        "read",
+        serde_json::json!({ "path": "/etc/hostname" }),
+    ));
+    let daemon = start_daemon(provider).await;
+
+    let creator = tokio::time::timeout(
+        Duration::from_secs(5),
+        roundhouse_tui::connect_create(&daemon.socket_path, "default"),
+    )
+    .await
+    .expect("connect_create must not hang")
+    .unwrap();
+    let session_id = creator.session_id();
+
+    // The registry entry appears from `drive_session`'s own spawned task, so
+    // poll rather than assume it has already run.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let actor = loop {
+        if let Some(actor) = daemon.registry.actor(session_id) {
+            break actor;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the socket-created session to reach the registry"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    let host = actor
+        .sub_agent_host()
+        .expect("a real socket-created session must be able to spawn sub-agents");
+    assert_eq!(
+        host.depth(),
+        0,
+        "a socket client is a human, so its session is a spawn-tree root"
+    );
+    assert!(
+        actor.tool_defs().iter().any(|d| d.name() == "agent"),
+        "and the model must actually be offered the tool"
+    );
 }

@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use roundhouse_bus::spawn_tree::SpawnTree;
+use roundhouse_bus::teams::TeamRegistry;
 #[cfg(test)]
 use roundhouse_core::WorkspaceId;
 use roundhouse_core::{OnDegrade, SessionId, SessionSpec, SessionState, TaskRunner, Tier};
@@ -357,6 +358,21 @@ pub struct DaemonResources {
     /// dispatch — so that no second, independent tree is ever minted. This
     /// is the field's permanent home, not a transient wiring hack.
     pub spawn_tree: Arc<SpawnTree>,
+    /// The daemon-wide team registry (§7.1 decision 4: *"a Team owns
+    /// addressing only"*), read by the `agent` tool for §7.5's auto-join.
+    ///
+    /// Constructed here rather than taken as a `new` parameter (unlike
+    /// [`Self::spawn_tree`], which `main.rs` builds because `DeliveryExecutor`
+    /// needs the same instance before `DaemonResources` exists): nothing
+    /// outside this struct has a reason to hold one, so constructing it here
+    /// makes "exactly one per daemon" structural instead of a convention every
+    /// construction site has to keep.
+    pub teams: Arc<TeamRegistry>,
+    /// Every live sub-agent session this daemon spawned, keyed by child
+    /// session id — see [`crate::sub_agent_host::SubAgentSessions`] for why
+    /// the child→parent direction has to be recorded somewhere. Constructed
+    /// here for the same reason [`Self::teams`] is.
+    pub sub_agents: Arc<crate::sub_agent_host::SubAgentSessions>,
     /// Absolute — asserted by `SessionActor::new` itself, which panics on a
     /// non-absolute value (see that constructor's doc comment).
     pub state_dir: PathBuf,
@@ -425,6 +441,8 @@ impl DaemonResources {
             isolate,
             proxy,
             spawn_tree,
+            teams: Arc::new(TeamRegistry::new()),
+            sub_agents: Arc::new(crate::sub_agent_host::SubAgentSessions::new()),
             state_dir,
             daemon_binary,
             mcp_configs,
@@ -682,13 +700,13 @@ pub async fn create_real_session(
     let (mcp_host, mcp, tool_defs) = if mcp_configs.is_empty() {
         // **Ruling W1-R132: `builtin_tool_defs()`, NOT `Vec::new()`.** This
         // is the default production configuration — no `[[mcp_server]]` —
-        // and it must still offer the model the five built-in tools.
+        // and it must still offer the model the built-in tools.
         // `tool_catalog::merged_tool_defs` (below, via `start_session_mcp`)
         // is the only other thing that prepends them, and it is reachable
         // only from the MCP branch, so this branch supplying an empty
         // catalog meant the common case offered ZERO tools — contradicting
         // `SessionActor::tool_defs`' own doc comment, which describes this
-        // exact case as "still carrying the five builtins".
+        // exact case as "still carrying the builtins".
         (
             None,
             None,
@@ -1248,7 +1266,18 @@ mod tests {
         offered.sort_unstable();
         assert_eq!(
             offered,
-            ["edit", "find", "read", "shell", "shell_command", "write"],
+            // `agent` joined this list in Phase 8, L5 — the sub-agent spawn
+            // tool is offered to every session, and refuses honestly in a
+            // session with no sub-agent host registered.
+            [
+                "agent",
+                "edit",
+                "find",
+                "read",
+                "shell",
+                "shell_command",
+                "write"
+            ],
             "a default (no-MCP) session must offer exactly the builtin-facing tools"
         );
     }

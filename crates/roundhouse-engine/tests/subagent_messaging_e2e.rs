@@ -48,6 +48,13 @@ async fn parent_spawns_child_sends_request_child_replies_parent_wait_resolves() 
         AgentSpawnInput {
             workspace: ws,
             parent,
+            // Phase 8, L5: the caller mints the child's id, so the spawn-tree
+            // slot it reserved, the team join and the durable `SessionCreated`
+            // all name one session. This test has no spawn tree, so any fresh
+            // id will do — but it must be the SAME one `spawn_out.session_id`
+            // reports back, which is exactly what the assertion below relies
+            // on when it registers the child's mailbox.
+            child_id: SessionId::new(),
             parent_depth: 0,
             parent_direct_children: 0,
             team: Some(team),

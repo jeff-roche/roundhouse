@@ -1,5 +1,6 @@
 //! The canonical, model-facing tool catalog: `ToolDef`s for the five
-//! direct built-in executors, the classified shell-string executor, plus MCP-discovered tools, and the name-based
+//! direct built-in executors, the classified shell-string executor, the
+//! sub-agent spawn tool, plus MCP-discovered tools, and the name-based
 //! registry that maps a `ContentBlock::ToolUse { name, .. }` the model
 //! sends back to a dispatch target.
 //!
@@ -16,7 +17,10 @@ use roundhouse_core::TaskKind;
 use roundhouse_provider::{tool_def_from_schema, ToolDef};
 
 /// Where a resolved tool name dispatches to: one of the five direct built-in
-/// executors, the classified shell-string executor, or an MCP-discovered tool.
+/// executors, the sub-agent spawn tool (`Builtin(TaskKind::Agent)`, which
+/// `agent_loop` routes to `tools::agent_spawn_tool` rather than to a
+/// `roundhouse-tools` executor), the classified shell-string executor, or an
+/// MCP-discovered tool.
 ///
 /// `Mcp`'s field is deliberately a single opaque `namespaced_name`, not a
 /// split `{server, tool}` pair (orchestrator ruling W1-R10). Splitting on
@@ -45,14 +49,15 @@ pub enum ToolTarget {
 
 /// Resolves a model-facing tool name to its dispatch target.
 ///
-/// **Invariant that makes this unambiguous:** the five built-in names
-/// (`"read"`, `"write"`, `"edit"`, `"find"`, `"shell"`) are bare literal
-/// tokens with no `__` in them, while every MCP tool name is namespaced as
+/// **Invariant that makes this unambiguous:** every built-in name
+/// (`"read"`, `"write"`, `"edit"`, `"find"`, `"shell"`, `"shell_command"`,
+/// `"agent"`) is a bare literal token with no `__` in it, while every MCP
+/// tool name is namespaced as
 /// `"{server}__{tool}"` by `roundhouse_mcp::namespace::build_namespaced_name`
 /// (`crates/roundhouse-mcp/src/namespace.rs`) before it ever reaches this
 /// registry or a model. A builtin name therefore can never collide with an
 /// MCP name by construction: the builtin set is closed and enumerated
-/// below, so any input matching one of those five literals is a builtin,
+/// below, so any input matching one of those literals is a builtin,
 /// and any other input containing `"__"` is presumptively MCP-shaped.
 /// Anything matching neither shape (bare unknown name, or `"__"` absent)
 /// resolves to `None` — an unresolvable tool name, which the caller must
@@ -73,6 +78,13 @@ pub fn resolve_tool_target(name: &str) -> Option<ToolTarget> {
         "edit" => Some(ToolTarget::Builtin(TaskKind::Edit)),
         "find" => Some(ToolTarget::Builtin(TaskKind::Find)),
         "shell" => Some(ToolTarget::Builtin(TaskKind::Shell)),
+        // The sub-agent spawn tool (Phase 8, L5). Unlike the names above it
+        // does not dispatch to a `roundhouse-tools` executor — see
+        // [`crate::tools::agent_spawn_tool`], whose `dispatch_agent` arm
+        // `agent_loop` routes `TaskKind::Agent` to instead of
+        // `tool_dispatch::task_params_for_in_workspace` (which has no `Agent`
+        // arm and would refuse it as an unsupported kind).
+        "agent" => Some(ToolTarget::Builtin(TaskKind::Agent)),
         "shell_command" => Some(ToolTarget::ShellCommand),
         other if other.contains("__") => Some(ToolTarget::Mcp {
             namespaced_name: other.to_string(),
@@ -155,14 +167,15 @@ struct ShellCommandParams {
     cwd: String,
 }
 
-/// Builds one `ToolDef` per built-in executor (`read`/`write`/`edit`/`find`/
-/// `shell`), via `tool_def_from_schema` so each one's JSON Schema is
-/// `schemars`-generated from a typed params struct above — never
-/// hand-written JSON — matching the exact same S-TOOL-9 discipline the rest
-/// of the codebase's typed tools follow. Each params struct's doc comment
-/// cites the `roundhouse-tools` executor function it mirrors; if that
-/// executor's signature ever changes, this is the other half that must
-/// change with it.
+/// Builds one `ToolDef` per built-in tool: the five `roundhouse-tools`
+/// executors (`read`/`write`/`edit`/`find`/`shell`), the classified
+/// `shell_command` string executor, and the `agent` sub-agent spawn tool.
+/// All go through `tool_def_from_schema`, so each one's JSON Schema is
+/// `schemars`-generated from a typed params struct — never hand-written JSON
+/// — matching the exact same S-TOOL-9 discipline the rest of the codebase's
+/// typed tools follow. Each executor-backed params struct's doc comment cites
+/// the `roundhouse-tools` function it mirrors; if that function's signature
+/// ever changes, this is the other half that must change with it.
 pub fn builtin_tool_defs() -> Vec<ToolDef> {
     vec![
         tool_def_from_schema::<ReadParams>("read", "Read a file's contents by path."),
@@ -187,6 +200,12 @@ pub fn builtin_tool_defs() -> Vec<ToolDef> {
             "shell_command",
             "Run a classified shell command; opaque constructs and redirections are refused.",
         ),
+        // The sub-agent spawn tool. Its params struct lives with its
+        // dispatcher rather than here, because — unlike the six above, which
+        // mirror a `roundhouse-tools` executor signature — its fields mirror
+        // `agent_spawn::AgentSpawnInput`, and keeping the schema next to the
+        // code that parses it is what stops the two drifting.
+        crate::tools::agent_spawn_tool::agent_tool_def(),
     ]
 }
 

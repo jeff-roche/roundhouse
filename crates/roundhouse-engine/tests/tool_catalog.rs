@@ -128,6 +128,8 @@ fn merging_tool_defs_succeeds_when_names_are_disjoint() {
         "find",
         "shell",
         "shell_command",
+        // Phase 8, L5: the sub-agent spawn tool is a builtin too.
+        "agent",
         "github__create_issue",
     ] {
         assert!(
@@ -135,5 +137,5 @@ fn merging_tool_defs_succeeds_when_names_are_disjoint() {
             "missing `{expected}` in merged catalog"
         );
     }
-    assert_eq!(merged.len(), 7);
+    assert_eq!(merged.len(), 8);
 }

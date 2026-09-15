@@ -27,6 +27,7 @@ pub mod session_bootstrap;
 pub mod session_manager;
 pub mod session_registry;
 pub mod socket_server;
+pub mod sub_agent_host;
 pub mod workflow_host;
 pub mod workspace_registry;
 
