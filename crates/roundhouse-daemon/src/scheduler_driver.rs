@@ -83,7 +83,9 @@ use rusqlite::Connection;
 use uuid::Uuid;
 
 use crate::session_bootstrap::{BackgroundServiceContext, BackgroundServiceError, DaemonResources};
-use crate::session_manager::{create_headless_session, HeadlessSession};
+use crate::session_manager::{
+    create_headless_session, CreateHeadlessSessionError, HeadlessSession,
+};
 use crate::session_registry::SessionRegistry;
 use crate::workflow_host::WorkflowSessionTree;
 
@@ -684,33 +686,6 @@ const MAX_READY_DELIVERIES_SCANNED_PER_TICK: usize = 32;
 /// documented floor — a change to how `roundhouse-flow` is handed its
 /// connection, not a constant this driver can tune its way out of.
 const MAX_CONCURRENT_DELIVERIES: usize = 2;
-
-/// Bounds headless session construction for a scheduled delivery.
-///
-/// `create_headless_session`'s own doc explains why *it* takes no timeout:
-/// bounding construction was a socket-path concern, tuned for arbitrarily
-/// many peers racing `CreateSession`, and it declined to preempt a policy for
-/// a caller that did not exist yet. That caller exists now, and it is a
-/// worse case than the socket's in one specific way — it is unattended and
-/// repeating. A wedged MCP server or a hung isolation probe would park a
-/// delivery permit permanently, and at [`MAX_CONCURRENT_DELIVERIES`] such
-/// deliveries the scheduler stops claiming anything at all, silently, with no
-/// human present to notice.
-///
-/// Same duration as `socket_server::SESSION_CONSTRUCTION_TIMEOUT`, reused
-/// rather than re-chosen: it bounds the identical work (real
-/// `Isolate::prepare`, real `McpHost::start`), so a second number here would
-/// be two answers to one question.
-///
-/// **Residual gap, deliberately not solved here:** a construction that
-/// finishes *after* this elapses has no consumer. The future is dropped at
-/// the timeout, so whatever it had built so far is dropped with it rather
-/// than torn down. The socket path handles this by letting construction run
-/// to completion in its own task and self-tearing-down on a lost race;
-/// replicating that needs `create_headless_session` to be restructured around
-/// a detached task, which is that function's own change to make.
-const SESSION_CONSTRUCTION_TIMEOUT: std::time::Duration =
-    crate::socket_server::SESSION_CONSTRUCTION_TIMEOUT;
 
 /// One delivery this driver has taken ownership of: leased, and holding
 /// exactly one **active** admission slot (promoted from a queued one if that
@@ -1442,26 +1417,32 @@ impl DeliveryExecutor {
             requested_tier: Tier::Sandbox,
             on_degrade: OnDegrade::Refuse,
         };
-        // Bounded, unlike the socket path's identical call — see
-        // `SESSION_CONSTRUCTION_TIMEOUT` for why an unattended, repeating
-        // caller cannot afford to park a delivery permit on a wedged MCP
-        // server or a hung isolation probe.
+        // Fix round 3: `create_headless_session` bounds its OWN construction
+        // now (against the identical wedged-MCP-server / hung-isolation-probe
+        // risk an unattended, repeating caller cannot afford to park a
+        // delivery permit on) — see that function's own doc comment for the
+        // detached-task mechanism. This call site used to wrap the whole
+        // future in `tokio::time::timeout`, which drops the losing future
+        // mid-`.await` on elapse and orphaned whatever isolation/MCP/proxy
+        // state it had already built, once per tick, for as long as the
+        // wedge lasted; a plain `.await` is correct here precisely because
+        // the bounding — and the never-cancel-construction guarantee — now
+        // lives one level down, where the resources actually are.
         *session = Some(
-            tokio::time::timeout(
-                SESSION_CONSTRUCTION_TIMEOUT,
-                create_headless_session(
-                    &self.resources,
-                    &self.sessions,
-                    session_id,
-                    spec.clone(),
-                    workspace_root.clone(),
-                    workspace.root_device,
-                    workspace.root_inode,
-                ),
+            create_headless_session(
+                &self.resources,
+                &self.sessions,
+                session_id,
+                spec.clone(),
+                workspace_root.clone(),
+                workspace.root_device,
+                workspace.root_inode,
             )
             .await
-            .map_err(|_elapsed| DeliveryError::SessionTimeout)?
-            .map_err(|error| DeliveryError::Session(error.kind()))?,
+            .map_err(|error| match error {
+                CreateHeadlessSessionError::Timeout => DeliveryError::SessionTimeout,
+                other => DeliveryError::Session(other.kind()),
+            })?,
         );
 
         let running = self

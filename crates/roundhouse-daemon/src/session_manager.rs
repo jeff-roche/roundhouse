@@ -23,16 +23,26 @@
 //! verbatim so both the socket path and this one share the exact same
 //! teardown-on-`Closed` logic.
 //!
-//! **Deliberately not bounded by a construction timeout or semaphore.**
-//! `socket_server::construct_real_session_bounded` races construction
-//! against [`socket_server`]'s own `SESSION_CONSTRUCTION_TIMEOUT` and a
-//! `construction_slots` semaphore — a concurrent-client-load defense specific
-//! to a Unix socket accepting arbitrarily many peers at once. That is a
-//! socket-path concern, not a property of session construction itself; a
-//! headless caller (typically one delivery at a time) may need a different
-//! policy, or none, and inventing one here — before the caller that actually
-//! needs it exists — would be scope creep. See `create_headless_session`'s
-//! own doc comment.
+//! **Bounded by the same construction timeout as the socket path, but
+//! deliberately not by a semaphore (fix round 3).** An earlier version of
+//! this module reasoned that bounding construction at all was a socket-path
+//! concern — a concurrent-client-load defense specific to a Unix socket
+//! accepting arbitrarily many peers at once — and left [`create_headless_session`]
+//! unbounded until a real caller existed. That reasoning held for the
+//! semaphore (`construction_slots`, a defense against many peers racing
+//! `CreateSession` at once — nothing here has that shape; the scheduler's
+//! own `MAX_CONCURRENT_DELIVERIES` already bounds concurrent headless
+//! construction from the one caller that exists), but not for the timeout:
+//! [`create_headless_session`]'s only caller (`scheduler_driver`) originally
+//! wrapped the whole call in `tokio::time::timeout`, which drops the losing
+//! future mid-`.await` on elapse — and this function awaits repeatedly
+//! *after* real resources are already live (isolation `prepare`, egress
+//! registration, potentially a real `McpHost::start` subprocess spawn), so
+//! every timed-out attempt orphaned whatever it had already built, forever,
+//! for as long as the wedged MCP server / hung isolation probe stayed
+//! wedged. [`create_headless_session`] now bounds its own construction the
+//! same way `socket_server::construct_real_session_bounded` does — see its
+//! own doc comment for the full mechanism.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -68,6 +78,21 @@ pub enum CreateHeadlessSessionError {
     /// this error is returned; nothing is leaked.
     #[error("session registry is full; refusing to register this session")]
     RegistryFull,
+    /// Fix round 3: construction (including registration and the reaper
+    /// spawn) did not report an outcome within
+    /// [`crate::socket_server::SESSION_CONSTRUCTION_TIMEOUT`]. Construction
+    /// itself is never cancelled — it keeps running in a detached task and
+    /// self-tears-down on completion instead of being leaked. See
+    /// [`create_headless_session`]'s own doc comment for the full mechanism,
+    /// which mirrors `socket_server::construct_real_session_bounded`.
+    #[error("headless session construction did not finish within the timeout")]
+    Timeout,
+    /// The detached construction task ended (panicked, or was somehow
+    /// dropped) without ever reporting an outcome. The same failure mode
+    /// `socket_server::ConstructionOutcome::TaskEnded` names for the socket
+    /// path.
+    #[error("headless session construction task ended unexpectedly before reporting an outcome")]
+    TaskEnded,
 }
 
 impl CreateHeadlessSessionError {
@@ -80,6 +105,8 @@ impl CreateHeadlessSessionError {
         match self {
             Self::Session(inner) => inner.kind(),
             Self::RegistryFull => "session_registry_full",
+            Self::Timeout => "session_construction_timeout",
+            Self::TaskEnded => "session_construction_task_ended",
         }
     }
 }
@@ -88,7 +115,7 @@ impl CreateHeadlessSessionError {
 /// `socket_server::construct_real_session_bounded` does for the socket path,
 /// and registers it headlessly (zero subscribers, no channel) — for a caller
 /// with no connected client to hand a `Receiver` to (Phase 8, Task 4: a
-/// scheduled trigger delivery, wired by a later task).
+/// scheduled trigger delivery, wired by Phase 8 Task 6).
 ///
 /// Composes three calls that already exist:
 /// [`create_real_session`] → [`SessionRegistry::register_headless`] →
@@ -98,19 +125,147 @@ impl CreateHeadlessSessionError {
 /// has already completed — never leaving a half-constructed session or a
 /// leaked isolation/MCP/proxy handle behind.
 ///
-/// # No construction timeout or semaphore here, deliberately
+/// # Bounded, but never cancelled (fix round 3)
 ///
-/// `socket_server::construct_real_session_bounded` bounds construction
-/// against a wedged MCP server or isolation probe specifically because a
-/// Unix socket can have arbitrarily many peers racing `CreateSession`
-/// concurrently — the timeout/semaphore pair defends against that shared
-/// resource being exhausted by concurrent client load. Nothing about that
-/// applies here yet: this function's only caller composes it directly, with
-/// none of the socket path's concurrency. Bounding headless construction is
-/// a real question for whichever future task actually drives concurrent
-/// headless sessions, not one this task should preempt by copying a policy
-/// that was tuned for a different problem.
+/// The whole composition above runs inside its own detached [`tokio::spawn`],
+/// racing a [`tokio::sync::oneshot`] receiver — never the construction future
+/// itself — against [`crate::socket_server::SESSION_CONSTRUCTION_TIMEOUT`],
+/// exactly the shape `socket_server::construct_real_session_bounded` already
+/// uses and for the identical reason: a `tokio::time::timeout` wrapped
+/// directly around this work would DROP the losing future mid-`.await` on
+/// elapse, and this function awaits repeatedly (isolation `prepare`, egress
+/// registration, potentially a real `McpHost::start` subprocess spawn, plus
+/// registration and the reaper spawn) after real resources are already live
+/// — dropping it there orphans whatever it had already built. An earlier
+/// version of this module reasoned that no caller needed *any* bound yet and
+/// left this uncovered entirely (see this module's own doc comment); the
+/// caller that exists now (`scheduler_driver`) is unattended and repeating,
+/// so it originally applied `tokio::time::timeout` at its own call site —
+/// reproducing exactly the defect `construct_real_session_bounded`'s doc
+/// comment already explains for the socket path, once per scheduler tick for
+/// as long as the wedged MCP server or hung isolation probe stayed wedged.
+/// The fix is the same one `construct_real_session_bounded` already applies:
+/// never cancel construction, only stop *waiting* on it, and let it
+/// self-tear-down on late completion (below).
+///
+/// The `Duration` is reused, not re-chosen — it bounds the identical work in
+/// both callers, so a second number here would be two answers to one
+/// question.
+///
+/// **Deliberately still no semaphore.** `construct_real_session_bounded`
+/// pairs its timeout with a `construction_slots` semaphore because a Unix
+/// socket can have arbitrarily many peers racing `CreateSession` at once;
+/// nothing about that applies here — this function's only caller
+/// (`scheduler_driver`) already bounds how many deliveries (and therefore how
+/// many concurrent calls into this function) can be in flight at all via its
+/// own `MAX_CONCURRENT_DELIVERIES` semaphore, held for a delivery's whole
+/// life. Adding a second, independent cap here would be a second answer to a
+/// question `scheduler_driver` already owns.
+///
+/// # Late success after the caller already gave up
+///
+/// If construction (including registration and the reaper spawn) finishes
+/// only after this function has already returned
+/// [`CreateHeadlessSessionError::Timeout`] to its caller, the detached task
+/// notices its `oneshot::Sender::send` failed (the receiver was dropped or
+/// closed) and tears the whole [`HeadlessSession`] down via
+/// [`HeadlessSession::teardown`] — the exact sequence a caller would have run
+/// itself, just run here instead, so nothing is leaked: not the isolation
+/// handle, not the MCP host, not the proxy registration, and not the reaper
+/// task ([`HeadlessSession::teardown`] aborts it before anything else, per
+/// that method's own doc comment).
+///
+/// # The send/drop race
+///
+/// Mirrors `construct_real_session_bounded`'s own such section verbatim:
+/// racing `result_rx` via `select!` against a bare `sleep` (rather than
+/// putting `result_rx` inside `tokio::time::timeout` directly) keeps
+/// `result_rx` alive, borrowed, past the timeout arm. On elapse this
+/// explicitly `close()`s the receiver first — so a `send` racing exactly that
+/// instant observably fails and the detached task's own self-teardown path
+/// fires normally — and only then drains `try_recv()` for a value that may
+/// have already landed in the channel's slot in the narrow window before
+/// `close()` ran, which `close()` alone would otherwise leave to be silently
+/// dropped, unread, the instant this function returns.
 pub async fn create_headless_session(
+    resources: &Arc<DaemonResources>,
+    registry: &Arc<SessionRegistry>,
+    session_id: SessionId,
+    spec: SessionSpec,
+    workspace_root: PathBuf,
+    workspace_device: Option<i64>,
+    workspace_inode: Option<i64>,
+) -> Result<HeadlessSession, CreateHeadlessSessionError> {
+    let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+    let construction_resources = resources.clone();
+    let construction_registry = registry.clone();
+    tokio::spawn(async move {
+        let outcome = build_headless_session(
+            &construction_resources,
+            &construction_registry,
+            session_id,
+            spec,
+            workspace_root,
+            workspace_device,
+            workspace_inode,
+        )
+        .await;
+        match outcome {
+            Ok(headless) => {
+                if let Err(Ok(headless)) = result_tx.send(Ok(headless)) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        "headless session construction finished after its caller gave up on \
+                         the timeout; tearing down the session it built instead of leaking it"
+                    );
+                    headless
+                        .teardown(&construction_registry, &construction_resources.proxy)
+                        .await;
+                }
+            }
+            Err(err) => {
+                // A construction/registration error either carries no real
+                // resource to tear down (`create_real_session`'s own error
+                // paths already do that) or has already torn its own down
+                // (the `RegistryFull` path, below). Best-effort send — if
+                // nobody's listening either, there is nothing further to do
+                // with the error but drop it.
+                let _ = result_tx.send(Err(err));
+            }
+        }
+    });
+
+    // See this function's own "The send/drop race" doc section: `&mut
+    // result_rx` here (not moving it into `tokio::time::timeout`) is what
+    // makes the post-elapse `close()`/`try_recv()` below possible at all.
+    tokio::select! {
+        recv = &mut result_rx => {
+            match recv {
+                Ok(result) => result,
+                Err(_recv_error) => Err(CreateHeadlessSessionError::TaskEnded),
+            }
+        }
+        _ = tokio::time::sleep(crate::socket_server::SESSION_CONSTRUCTION_TIMEOUT) => {
+            result_rx.close();
+            if let Ok(Ok(headless)) = result_rx.try_recv() {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "headless session construction finished (racing the timeout in the \
+                     narrow send/drop window) after its caller already gave up; tearing \
+                     down the session it built instead of leaking it"
+                );
+                headless.teardown(registry, &resources.proxy).await;
+            }
+            Err(CreateHeadlessSessionError::Timeout)
+        }
+    }
+}
+
+/// The actual construction-and-registration body [`create_headless_session`]
+/// races against a timeout, in its own detached task — never awaited
+/// directly by that function's caller. See [`create_headless_session`]'s own
+/// doc comment for why this split exists.
+async fn build_headless_session(
     resources: &DaemonResources,
     registry: &Arc<SessionRegistry>,
     session_id: SessionId,
@@ -373,9 +528,12 @@ mod tests {
 
     /// The shared `DaemonResources` fixture, with no workspace registry —
     /// this module's tests pass a workspace root directly and never resolve
-    /// one by name or id.
-    async fn resources(dir: &std::path::Path) -> DaemonResources {
-        daemon_resources(dir, None).await
+    /// one by name or id. `Arc`-wrapped because [`create_headless_session`]
+    /// (fix round 3) clones it into its own detached construction task,
+    /// exactly like its only production caller (`scheduler_driver`) already
+    /// holds it.
+    async fn resources(dir: &std::path::Path) -> Arc<DaemonResources> {
+        Arc::new(daemon_resources(dir, None).await)
     }
 
     fn test_spec(workspace: WorkspaceId, resources: &DaemonResources) -> SessionSpec {
@@ -594,6 +752,85 @@ mod tests {
         assert!(
             registry.actor(session_id).is_none(),
             "a registry-full failure must not leave a half-registered session behind"
+        );
+    }
+
+    /// Fix round 3, focused substitute for exercising
+    /// [`create_headless_session`]'s timeout/late-success path end to end:
+    /// forcing the real construction pipeline (`create_real_session`, which
+    /// goes through isolation/MCP/egress with no injectable delay) to run
+    /// slower than [`crate::socket_server::SESSION_CONSTRUCTION_TIMEOUT`]
+    /// deterministically would need machinery beyond what this fix round's
+    /// scope covers — the standing "no real-clock timing tests" constraint
+    /// also rules out just making it slow via a real `sleep`. Per this fix
+    /// round's own brief, a focused unit test of just the "late send after
+    /// the receiver has been dropped or closed" `oneshot` mechanics —
+    /// without a real `SessionActor` — is the acceptable substitute; this is
+    /// that test.
+    ///
+    /// This proves the exact fact [`create_headless_session`]'s detached
+    /// construction task relies on for its self-teardown branch: once the
+    /// caller-side receiver is gone, `Sender::send` reports failure (rather
+    /// than succeeding into a channel nobody will ever read), handing the
+    /// value straight back so the sender can tear it down instead of leaking
+    /// it. No timer, no sleep, no real elapsed time — the receiver is
+    /// dropped by ordinary control flow (`drop(result_rx)`), not by a clock.
+    #[tokio::test]
+    async fn late_oneshot_send_after_the_receiver_is_dropped_reports_failure_with_the_value() {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<u64>();
+
+        // The "caller gave up" moment: drop the receiver, exactly what
+        // happens when `create_headless_session`'s `tokio::select!` picks
+        // its timeout arm and returns, dropping `result_rx` along with the
+        // rest of that stack frame.
+        drop(result_rx);
+
+        // The "construction finished after the caller gave up" moment: the
+        // detached task's own `send` now runs against a gone receiver.
+        let send_result = result_tx.send(42);
+
+        assert_eq!(
+            send_result,
+            Err(42),
+            "sending into a oneshot channel whose receiver has already been dropped must fail \
+             and hand the value straight back — this is exactly what \
+             `create_headless_session`'s `if let Err(Ok(headless)) = result_tx.send(..)` branch \
+             depends on to detect a late success and tear it down instead of leaking it"
+        );
+    }
+
+    /// The companion mechanic to the test above: the send/drop race window
+    /// [`create_headless_session`]'s own doc comment (and
+    /// `construct_real_session_bounded`'s, which this mirrors) describes.
+    /// Proves `close()` alone does not discard a value that had already
+    /// landed in the channel's slot before `close()` ran — `try_recv()`
+    /// afterward still drains it, which is exactly why the timeout arm calls
+    /// `close()` and only then `try_recv()`, in that order, rather than
+    /// dropping the receiver outright (which — as the test above shows —
+    /// would make that same `send` fail and the value would be lost with no
+    /// way back for whichever call, this one or the sender's, reads it
+    /// second).
+    #[tokio::test]
+    async fn oneshot_try_recv_after_close_still_drains_a_value_that_landed_first() {
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel::<u64>();
+
+        // Simulates a `send` landing in the narrow window before `close()`
+        // runs: the value is sent while the receiver is still fully open.
+        result_tx
+            .send(7)
+            .expect("the receiver has not been touched yet");
+
+        // Now the timeout arm's own sequence: close, then drain.
+        result_rx.close();
+        let drained = result_rx.try_recv();
+
+        assert_eq!(
+            drained,
+            Ok(7),
+            "try_recv() after close() must still return a value that had already landed \
+             before close() ran — otherwise the timeout arm would silently drop a `HeadlessSession` \
+             that finished constructing in that narrow window, leaking its isolation handle/MCP \
+             host/proxy registration"
         );
     }
 }
