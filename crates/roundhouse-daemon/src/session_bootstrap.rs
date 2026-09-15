@@ -35,9 +35,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
-use roundhouse_core::{
-    OnDegrade, SessionId, SessionSpec, SessionState, TaskRunner, Tier, WorkspaceId,
-};
+#[cfg(test)]
+use roundhouse_core::WorkspaceId;
+use roundhouse_core::{OnDegrade, SessionId, SessionSpec, SessionState, TaskRunner, Tier};
 use roundhouse_engine::mcp_spawner::{start_session_mcp, SessionMcp, StartSessionMcpError};
 use roundhouse_engine::{
     create_session_with_egress, effective_tier, CreateSessionError, SessionActor,
@@ -549,15 +549,34 @@ pub async fn teardown_real_session(proxy: &LoopbackProxy, real_session: RealSess
 /// `chat_model`/`request_ctx`'s provider stays daemon-wide (there is no
 /// per-session provider selection yet); everything else here is genuinely
 /// per-session.
+///
+/// # The caller supplies `session_id` and `spec` (Phase 8, Task 4)
+///
+/// Both used to be minted internally: this function called `SessionId::new()`
+/// itself and hard-coded `SessionSpec { requested_tier: Tier::Sandbox,
+/// on_degrade: resources.default_on_degrade, .. }`. That made this function
+/// unusable for a caller that needs the id decided *before* construction (a
+/// scheduled trigger delivery that persists a session id up front) or that
+/// needs a different `SessionSpec` policy. The engine constructors this
+/// function calls into (`create_session_with_egress`,
+/// `SessionActor::new_with_workspace_root_and_identity`) already took both as
+/// parameters, so this is a signature hoist, not a redesign — every existing
+/// caller (the socket handshake path) now builds the identical
+/// `SessionId::new()`/`SessionSpec { requested_tier: Tier::Sandbox, .. }`
+/// values at its own call site instead of having them hidden in here. See
+/// `socket_server::construct_real_session_bounded`'s call site for the
+/// ruling W1-R95 rationale (`OnDegrade::Refuse` as the default, not
+/// `AllowDownTo(Tier::None)`) that used to live in this function's body —
+/// it is a property of what the socket path decides to pass in, not of this
+/// function, so it moved with the code that makes the decision.
 pub async fn create_real_session(
     resources: &DaemonResources,
-    workspace_id: WorkspaceId,
-    workspace_name: String,
+    session_id: SessionId,
+    spec: SessionSpec,
     workspace_root: PathBuf,
     workspace_device: Option<i64>,
     workspace_inode: Option<i64>,
 ) -> Result<RealSession, CreateRealSessionError> {
-    let session_id = SessionId::new();
     let writer = spawn_writer(resources.store.clone()).await;
     let (mcp_configs, network_config, policy_rules) = if resources.load_workspace_config {
         let mcp_configs = mcp_config::load_mcp_servers(Some(&workspace_root))?;
@@ -571,37 +590,6 @@ pub async fn create_real_session(
             resources.network_config.clone(),
             (resources.policy_rules)(),
         )
-    };
-
-    // `ClientRequest::CreateSession` carries no tier/`on_degrade` field (it
-    // is `workspace_name` only), so the daemon picks the default policy
-    // itself.
-    //
-    // **Ruling W1-R95 (fix round 1): `OnDegrade::Refuse` is the default, not
-    // `AllowDownTo(Tier::None)`.** An earlier version of this function used
-    // `AllowDownTo(Tier::None)`, reasoned as "safer than refusing to create
-    // any session on a host without bwrap." That reasoning was backwards:
-    // `SealedContext.requested_tier` is populated from `effective_tier`
-    // (`roundhouse_engine::effective_tier`), not `spec.requested_tier`
-    // directly, and `effective_tier` for `AllowDownTo(floor)` IS `floor`.
-    // `Tier::None` is the first variant of a derived-`Ord` enum, so
-    // `attested_tier < requested_tier` (`sealed_tier_shortfall`,
-    // §6.2/§6.5) becomes unsatisfiable for every `Tier` — that setting
-    // PERMANENTLY DISARMS the one sealed rule that detects a live
-    // mid-session isolation downgrade, for every task, in every session,
-    // for the daemon's whole life. `session_actor.rs`'s own doc comment on
-    // `effective_tier` already records a previous round fixing a bug with
-    // this exact symptom as "a genuine fail-open regression." §6.5 also
-    // names `Refuse` as the documented default and requires a downgrade be
-    // an explicit human decision at creation — `resources.default_on_degrade`
-    // (below) is that decision, made once by the operator via
-    // `round-daemon-internal --allow-degraded-to <TIER>`, never silently by
-    // this function.
-    let spec = SessionSpec {
-        workspace: workspace_id,
-        name: Some(workspace_name),
-        requested_tier: Tier::Sandbox,
-        on_degrade: resources.default_on_degrade,
     };
 
     let egress_policy = egress_policy_for(&network_config);
@@ -1088,6 +1076,19 @@ mod tests {
         )
     }
 
+    /// The exact `SessionSpec` construction `create_real_session` used to
+    /// hard-code internally (`requested_tier: Tier::Sandbox`) before Task 4
+    /// hoisted it to the caller — mirrored here so every test call site below
+    /// keeps its previous, byte-for-byte behavior.
+    fn test_spec(workspace: WorkspaceId, resources: &DaemonResources) -> SessionSpec {
+        SessionSpec {
+            workspace,
+            name: Some("test-workspace".to_string()),
+            requested_tier: Tier::Sandbox,
+            on_degrade: resources.default_on_degrade,
+        }
+    }
+
     /// A `Provider`/`HttpTransport` pair good enough to satisfy
     /// `DaemonResources`'s fields — nothing in this module's own tests
     /// dispatches a chat turn, so neither is ever actually called.
@@ -1158,11 +1159,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let resources = resources(dir.path()).await;
         let workspace_id = WorkspaceId::new();
+        let spec = test_spec(workspace_id, &resources);
 
         let real_session = create_real_session(
             &resources,
-            workspace_id,
-            "test-workspace".into(),
+            SessionId::new(),
+            spec,
             dir.path().to_path_buf(),
             None,
             None,
@@ -1199,10 +1201,11 @@ mod tests {
              configures an MCP server"
         );
 
+        let spec = test_spec(WorkspaceId::new(), &resources);
         let real_session = create_real_session(
             &resources,
-            WorkspaceId::new(),
-            "test-workspace".into(),
+            SessionId::new(),
+            spec,
             dir.path().to_path_buf(),
             None,
             None,
@@ -1288,10 +1291,11 @@ mod tests {
         }));
         assert!(resources.proxy_secrets.is_poisoned());
 
+        let spec = test_spec(WorkspaceId::new(), &resources);
         match create_real_session(
             &resources,
-            WorkspaceId::new(),
-            "test-workspace".into(),
+            SessionId::new(),
+            spec,
             dir.path().to_path_buf(),
             None,
             None,
@@ -1392,10 +1396,11 @@ mod tests {
                 },
             }];
 
+            let spec = test_spec(WorkspaceId::new(), &resources);
             let real_session = create_real_session(
                 &resources,
-                WorkspaceId::new(),
-                "test-workspace".into(),
+                SessionId::new(),
+                spec,
                 dir.path().to_path_buf(),
                 None,
                 None,

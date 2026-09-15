@@ -76,6 +76,13 @@
 //! `max_subscribers_per_session` acting as a proxy, since every session
 //! reaped itself the instant its one subscriber left).
 //!
+//! [`register_headless`] (Phase 8, Task 4) is a second entry point onto that
+//! same zero-subscriber state: a headless caller (a scheduled trigger
+//! delivery, with no socket client attached) starts a session there
+//! directly, rather than arriving after `create`'s one subscriber detaches.
+//! It shares `create`'s exact insertion semantics (the `max_sessions` check,
+//! keying on `actor.session_id()`) and mints no channel at all.
+//!
 //! (`attach`ing to a `SessionId` this registry never created still returns
 //! `None`, same as before — see [`attach`]'s doc comment.)
 //!
@@ -267,6 +274,56 @@ impl SessionRegistry {
             },
         );
         Some((session_id, Subscription(tx), rx))
+    }
+
+    /// Registers an already-constructed `actor` as a brand new session, the
+    /// same way [`Self::create`] does, but with **zero subscribers** and no
+    /// channel minted at all — for a headless caller (Phase 8, Task 4: a
+    /// scheduled trigger delivery) that has no connection to hand a
+    /// `Receiver` back to.
+    ///
+    /// Zero-subscriber [`SessionEntry`]s are already a first-class, tested
+    /// state in this module (ruling W1-R51: "entry lifetime = actor
+    /// lifetime", not subscriber-list emptiness — see the module doc
+    /// comment) — every session created via [`Self::create`] reaches this
+    /// exact state the moment its one subscriber detaches, and stays fully
+    /// attachable and functional. This method just starts a session there
+    /// directly, instead of arriving after a detach. Nothing about that
+    /// invariant is weakened by giving callers a direct path to it.
+    ///
+    /// Same `max_sessions` semantics as [`Self::create`]: returns `None`,
+    /// registering nothing, once this registry already holds `max_sessions`
+    /// live entries — see that method's doc comment for the full rationale.
+    /// Returns the new session's id on success; a later `round attach
+    /// --session ID` (or this crate's own [`Self::attach`]) can still mint
+    /// this session's first real subscriber at any time, exactly as if a
+    /// normal `create`d session's one subscriber had detached immediately.
+    pub fn register_headless(
+        &self,
+        actor: Arc<SessionActor>,
+        mcp_host: Option<Arc<McpHost>>,
+        mcp: Option<SessionMcp>,
+    ) -> Option<SessionId> {
+        let session_id = actor.session_id();
+
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions.len() >= self.max_sessions {
+            return None;
+        }
+        // Same non-collision reasoning as `create`'s own `insert` (never
+        // `entry(..).or_default()`): `session_id` comes off a
+        // freshly-minted `SessionActor`, so this can never collide with an
+        // existing entry.
+        sessions.insert(
+            session_id,
+            SessionEntry {
+                actor,
+                mcp_host,
+                mcp,
+                subscribers: Vec::new(),
+            },
+        );
+        Some(session_id)
     }
 
     /// A clone of the live `SessionActor` bound to `session_id`, or `None`
@@ -467,6 +524,23 @@ impl SessionRegistry {
         // see the module doc comment, "Entry lifetime = actor lifetime"
         // (ruling W1-R51). `entry` (an `Entry::Occupied`) is dropped here
         // without a `.remove()` call, same as `detach` above.
+    }
+
+    /// Test-only observability: `session_id`'s current subscriber count, or
+    /// `None` if this registry has no entry for it. `SessionEntry`'s
+    /// `subscribers` field is private by design (every production reader
+    /// goes through `attach`/`detach`/`publish`, never a raw count), but
+    /// [`Self::register_headless`]'s whole distinguishing property from
+    /// [`Self::create`] is that it starts a session with a subscriber count
+    /// of exactly zero — `crate::session_manager`'s own tests need a direct
+    /// way to assert that, not just an indirect one.
+    #[cfg(test)]
+    pub(crate) fn subscriber_count_for_test(&self, session_id: SessionId) -> Option<usize> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .map(|entry| entry.subscribers.len())
     }
 }
 

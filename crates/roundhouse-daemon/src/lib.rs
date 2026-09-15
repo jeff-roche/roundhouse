@@ -23,6 +23,7 @@ pub mod boot;
 pub mod demo;
 pub mod mcp_config;
 pub mod session_bootstrap;
+pub mod session_manager;
 pub mod session_registry;
 pub mod socket_server;
 pub mod workflow_host;
