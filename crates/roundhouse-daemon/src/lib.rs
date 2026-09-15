@@ -195,6 +195,24 @@ pub(crate) mod test_support {
         dir: &std::path::Path,
         workspace_registry: Option<Arc<crate::workspace_registry::WorkspaceRegistry>>,
     ) -> crate::session_bootstrap::DaemonResources {
+        daemon_resources_with_rules(
+            dir,
+            workspace_registry,
+            crate::session_bootstrap::no_policy_rules(),
+        )
+        .await
+    }
+
+    /// [`daemon_resources`], but with a caller-supplied rule source — so a
+    /// test can build sessions whose OWN `PolicyEngine` admits something.
+    /// `no_policy_rules` makes every task `Ask` -> `RequiresApproval`, which
+    /// is the right fail-closed default but leaves any test about what
+    /// happens AFTER admission with nothing to measure.
+    pub(crate) async fn daemon_resources_with_rules(
+        dir: &std::path::Path,
+        workspace_registry: Option<Arc<crate::workspace_registry::WorkspaceRegistry>>,
+        policy_rules: crate::session_bootstrap::PolicyRuleSource,
+    ) -> crate::session_bootstrap::DaemonResources {
         use roundhouse_net::proxy::LoopbackProxy;
 
         let store = roundhouse_store::open(&dir.join("events.db"))
@@ -220,7 +238,7 @@ pub(crate) mod test_support {
             Vec::new(),
             roundhouse_config::NetworkConfig::default(),
             OnDegrade::Refuse,
-            crate::session_bootstrap::no_policy_rules(),
+            policy_rules,
             crate::session_bootstrap::BackgroundServices::default(),
             runner(),
             Arc::new(NoopProvider),

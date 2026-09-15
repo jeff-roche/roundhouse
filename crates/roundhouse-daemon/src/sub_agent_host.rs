@@ -161,17 +161,65 @@ pub struct DaemonSubAgentHost {
     /// daemon joins a session to a team (`TeamRegistry::join` and the
     /// `team_create` tool have no production caller yet), and inventing a team
     /// here would let `agent_spawn`'s membership fence pass on a team the
-    /// parent never joined. When team wiring lands, this is the field it sets.
+    /// parent never joined.
+    ///
+    /// **This field must be wired before `team_create` becomes
+    /// model-reachable.** The moment a model can put its session on a team,
+    /// a host still reporting `None` silently skips `agent_spawn`'s two team
+    /// fences (§7.5's membership check and its role clamp) for every spawn —
+    /// a real authorization gap, not merely a missing feature. Whoever makes
+    /// `team_create` reachable owns setting this.
     team: Option<TeamId>,
     budget: Arc<Mutex<Budget>>,
 }
 
 impl DaemonSubAgentHost {
-    pub fn new(
+    /// A host for a **root** session: depth 0 and the unmetered starting
+    /// budget. Only a session with no parent may start from
+    /// [`UNMETERED_SESSION_BUDGET`] — a spawned child starts from what its
+    /// parent actually transferred, via [`Self::for_child`].
+    pub fn for_root_session(
+        resources: Arc<DaemonResources>,
+        registry: Arc<SessionRegistry>,
+        session: SessionId,
+    ) -> Self {
+        Self::new(
+            resources,
+            registry,
+            session,
+            0,
+            Budget {
+                remaining_tokens: UNMETERED_SESSION_BUDGET,
+            },
+        )
+    }
+
+    /// A host for a **spawned child**: the depth §7.7 admitted it at, and the
+    /// budget `agent_spawn` actually moved into it.
+    ///
+    /// Both values come from the same `ChildSessionRequest` and are threaded
+    /// for the same reason — §7.7's limits have to hold at every level of the
+    /// tree, not just the first. A child seeded with the root default would
+    /// hand its own sub-agents a pool nobody granted it.
+    pub fn for_child(
+        resources: Arc<DaemonResources>,
+        registry: Arc<SessionRegistry>,
+        child: SessionId,
+        depth: u8,
+        budget: Budget,
+    ) -> Self {
+        Self::new(resources, registry, child, depth, budget)
+    }
+
+    /// Private: the two public constructors above exist so that "unmetered is
+    /// for roots only" is structural rather than a rule every call site has
+    /// to remember.
+    fn new(
         resources: Arc<DaemonResources>,
         registry: Arc<SessionRegistry>,
         session: SessionId,
         depth: u8,
+        budget: Budget,
     ) -> Self {
         DaemonSubAgentHost {
             resources,
@@ -179,9 +227,7 @@ impl DaemonSubAgentHost {
             session,
             depth,
             team: None,
-            budget: Arc::new(Mutex::new(Budget {
-                remaining_tokens: UNMETERED_SESSION_BUDGET,
-            })),
+            budget: Arc::new(Mutex::new(budget)),
         }
     }
 }
@@ -230,7 +276,9 @@ impl SubAgentHost for DaemonSubAgentHost {
             &self.resources,
             &self.registry,
             req.child,
-            spec.clone(),
+            // `req.spec` moved into `spec` above, for the durable
+            // `SessionCreated` below; construction needs its own copy.
+            req.spec,
             req.workspace_root,
             req.workspace_identity.map(|(device, _)| device),
             req.workspace_identity.map(|(_, inode)| inode),
@@ -271,16 +319,28 @@ impl SubAgentHost for DaemonSubAgentHost {
             });
         }
 
-        // A sub-agent can spawn sub-agents of its own, at one greater depth —
-        // which is the only thing that makes §7.7's `MAX_DEPTH` mean anything
-        // beyond the first level.
-        if let Some(actor) = self.registry.actor(req.child) {
-            actor.register_sub_agent_host(Arc::new(DaemonSubAgentHost::new(
+        // A sub-agent can spawn sub-agents of its own — at one greater depth,
+        // and out of the budget it was actually given. Those two facts are
+        // what make §7.7's `MAX_DEPTH` and its budget conservation mean
+        // anything beyond the first level.
+        match self.registry.actor(req.child) {
+            Some(actor) => actor.register_sub_agent_host(Arc::new(DaemonSubAgentHost::for_child(
                 Arc::clone(&self.resources),
                 Arc::clone(&self.registry),
                 req.child,
                 req.depth,
-            )));
+                req.child_budget,
+            ))),
+            // `create_headless_session` returned `Ok`, which means it
+            // registered this session — so the only way here is the child
+            // being retired between that return and this line. Never silent:
+            // the spawn still reports success, and the child would be quietly
+            // unable to spawn anything itself.
+            None => tracing::warn!(
+                session_id = %req.child,
+                "a just-created sub-agent session was not in the registry; it will be unable \
+                 to spawn sub-agents of its own"
+            ),
         }
 
         Ok(())
@@ -349,22 +409,33 @@ fn now_ts() -> Timestamp {
     Timestamp::from_unix_nanos(nanos)
 }
 
-/// Gives `actor` the ability to spawn sub-agents.
+/// Gives `actor` — a ROOT session — the ability to spawn sub-agents.
 ///
-/// Called at every place this daemon finishes building a ROOT session — the
-/// socket handshake and the headless (scheduled) path. Sub-agent children get
-/// theirs from [`DaemonSubAgentHost::create_child_session`] instead, which is
-/// the only caller that knows a child's real depth.
+/// **Exactly one production caller today: `socket_server::drive_session`,
+/// after `SessionRegistry::create` succeeds.** That is the only path in this
+/// daemon that drives `run_agent_loop`, so it is the only path where an
+/// `agent` tool call can be issued at all.
+///
+/// The headless/scheduled path (`session_manager::create_headless_session`
+/// via `scheduler_driver`) deliberately does **not** call this: those sessions
+/// run workflows, not agent loops. A scheduled session therefore cannot spawn
+/// sub-agents, and would refuse an `agent` call with a recorded
+/// `sub_agent_host_unavailable` if something ever handed it one. Whichever
+/// task first drives an agent loop from a scheduled session owns adding the
+/// call there.
+///
+/// Sub-agent children never come through here — they get their host from
+/// [`DaemonSubAgentHost::create_child_session`], the only caller that knows a
+/// child's real depth and transferred budget.
 pub fn wire_sub_agent_host(
     actor: &SessionActor,
     resources: &Arc<DaemonResources>,
     registry: &Arc<SessionRegistry>,
 ) {
-    actor.register_sub_agent_host(Arc::new(DaemonSubAgentHost::new(
+    actor.register_sub_agent_host(Arc::new(DaemonSubAgentHost::for_root_session(
         Arc::clone(resources),
         Arc::clone(registry),
         actor.session_id(),
-        0,
     )));
 }
 
@@ -384,13 +455,34 @@ mod tests {
 
     use super::*;
     use crate::session_bootstrap::DaemonResources;
-    use crate::test_support::{available_isolate, daemon_resources, runner};
+    use crate::test_support::{
+        available_isolate, daemon_resources, daemon_resources_with_rules, runner,
+    };
     use roundhouse_core::{EventPayload, OnDegrade, SessionSpec, SessionState, TaskId, Tier};
     use roundhouse_engine::tools::agent_spawn_tool::dispatch_agent;
     use roundhouse_policy::engine::{CompiledRule, Outcome, PolicyEngine, Predicate, Scope};
 
     async fn resources(dir: &std::path::Path) -> Arc<DaemonResources> {
         Arc::new(daemon_resources(dir, None).await)
+    }
+
+    /// The `agent`-allowing rule every session built from these resources gets
+    /// — including SPAWNED CHILDREN, whose own `PolicyEngine` is built by
+    /// `create_real_session` from this same source. Needed by any test that
+    /// has to get past a child's own admission gate to reach what happens
+    /// after it.
+    fn allow_agent_rules() -> crate::session_bootstrap::PolicyRuleSource {
+        Arc::new(|| {
+            vec![CompiledRule::test_new(
+                Scope::Project,
+                Outcome::Allow,
+                Predicate::agent(None, None, Tier::None),
+            )]
+        })
+    }
+
+    async fn resources_allowing_agent_spawns(dir: &std::path::Path) -> Arc<DaemonResources> {
+        Arc::new(daemon_resources_with_rules(dir, None, allow_agent_rules()).await)
     }
 
     /// A real parent `SessionActor` with an operator rule that allows `agent`
@@ -558,6 +650,100 @@ mod tests {
         }
     }
 
+    /// **Budget conservation past depth 1.** A child's own host must start
+    /// from what its parent actually transferred, not from a fresh
+    /// [`UNMETERED_SESSION_BUDGET`].
+    ///
+    /// Asserted behaviourally, not just by reading the field back: the
+    /// grandchild request below asks for more than the child was ever given,
+    /// and must be refused. Seed the child at the root default instead and
+    /// that same request succeeds — a child handing out a pool nobody granted
+    /// it, which is the whole failure this threads `child_budget` to prevent.
+    #[tokio::test]
+    async fn a_child_spawns_out_of_the_budget_it_was_given_not_an_unmetered_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = resources_allowing_agent_spawns(dir.path()).await;
+        let registry = Arc::new(SessionRegistry::new());
+        let actor = parent_actor(dir.path()).await;
+        let parent = actor.session_id();
+        wire_sub_agent_host(&actor, &resources, &registry);
+        let host = actor.sub_agent_host().unwrap();
+
+        // The parent transfers 250 tokens (see `agent_args`).
+        dispatch_agent(
+            &actor,
+            actor.writer(),
+            runner(),
+            Some(&host),
+            &agent_args(),
+            TaskId::new(),
+        )
+        .await
+        .expect("the first spawn must succeed");
+
+        let child = resources.spawn_tree.descendants(parent)[0];
+        let child_actor = registry.actor(child).unwrap();
+        let child_host = child_actor.sub_agent_host().unwrap();
+
+        assert_eq!(
+            child_host.budget().lock().unwrap().remaining_tokens,
+            250,
+            "the child's host must start from the transfer, not the root default"
+        );
+
+        // The grandchild asks for more than the child ever had. `agent_spawn`
+        // must refuse it, and the refusal must leave no edge behind.
+        let grandchild = dispatch_agent(
+            &child_actor,
+            child_actor.writer(),
+            runner(),
+            Some(&child_host),
+            &serde_json::json!({
+                "prompt": "spend what my parent never gave me",
+                "provider": "anthropic",
+                "budget_tokens": 10_000,
+            }),
+            TaskId::new(),
+        )
+        .await;
+        assert!(
+            grandchild.is_err(),
+            "a grandchild may not be granted more than its parent was transferred"
+        );
+        assert_eq!(resources.spawn_tree.direct_children(child), 0);
+        assert_eq!(resources.spawn_tree.reserved_children(child), 0);
+        assert_eq!(resources.sub_agents.len(), 1, "no grandchild was created");
+
+        // ... and a grandchild that fits IS admitted, so the refusal above is
+        // about the amount, not about children being unable to spawn at all.
+        dispatch_agent(
+            &child_actor,
+            child_actor.writer(),
+            runner(),
+            Some(&child_host),
+            &serde_json::json!({
+                "prompt": "spend within my means",
+                "provider": "anthropic",
+                "budget_tokens": 100,
+            }),
+            TaskId::new(),
+        )
+        .await
+        .expect("a grandchild within the child's transferred budget must be admitted");
+        assert_eq!(resources.spawn_tree.direct_children(child), 1);
+        assert_eq!(
+            child_host.budget().lock().unwrap().remaining_tokens,
+            150,
+            "the grandchild's grant is debited from the child, not from thin air"
+        );
+
+        for session in resources.spawn_tree.descendants(parent) {
+            if let Some(record) = resources.sub_agents.take(session) {
+                record.retire(&registry, &resources.proxy).await;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_host_registered_on_the_wrong_session_refuses_to_parent_a_child() {
         let dir = tempfile::tempdir().unwrap();
@@ -568,11 +754,10 @@ mod tests {
         // mis-registration that would otherwise spend a stranger's budget and
         // hang the child off a stranger's spawn tree.
         let stranger = SessionId::new();
-        actor.register_sub_agent_host(Arc::new(DaemonSubAgentHost::new(
+        actor.register_sub_agent_host(Arc::new(DaemonSubAgentHost::for_root_session(
             Arc::clone(&resources),
             Arc::clone(&registry),
             stranger,
-            0,
         )));
         let host = actor.sub_agent_host().unwrap();
 

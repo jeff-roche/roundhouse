@@ -208,7 +208,18 @@ struct FakeHost {
     /// When set, `create_child_session` fails instead of recording — the
     /// step-5 failure edge.
     create_fails: bool,
-    created: Mutex<Vec<(SessionId, SessionId, SessionSpec, u8)>>,
+    created: Mutex<Vec<CreatedChild>>,
+}
+
+/// One `create_child_session` call, as the daemon-side host would have
+/// received it.
+#[derive(Clone)]
+struct CreatedChild {
+    parent: SessionId,
+    child: SessionId,
+    spec: SessionSpec,
+    depth: u8,
+    budget: Budget,
 }
 
 impl FakeHost {
@@ -226,7 +237,7 @@ impl FakeHost {
         }
     }
 
-    fn created(&self) -> Vec<(SessionId, SessionId, SessionSpec, u8)> {
+    fn created(&self) -> Vec<CreatedChild> {
         self.created.lock().unwrap().clone()
     }
 
@@ -262,10 +273,13 @@ impl SubAgentHost for FakeHost {
                 detail: "the fake host was told to fail".to_string(),
             });
         }
-        self.created
-            .lock()
-            .unwrap()
-            .push((req.parent, req.child, req.spec, req.depth));
+        self.created.lock().unwrap().push(CreatedChild {
+            parent: req.parent,
+            child: req.child,
+            spec: req.spec,
+            depth: req.depth,
+            budget: req.child_budget,
+        });
         Ok(())
     }
 }
@@ -462,22 +476,28 @@ async fn a_model_issued_agent_call_creates_a_tracked_child_session() {
     // own spec and the depth §7.7 admitted.
     let created = fx.host.created();
     assert_eq!(created.len(), 1);
-    let (parent, child, spec, depth) = &created[0];
-    assert_eq!(*parent, fx.session_id);
+    let child_request = &created[0];
+    assert_eq!(child_request.parent, fx.session_id);
     assert_eq!(
-        spec.parent,
+        child_request.spec.parent,
         Some(fx.session_id),
         "the child's own SessionSpec must carry the durable parent edge"
     );
-    assert_eq!(*depth, 1, "a root session's child sits at depth 1");
+    assert_eq!(
+        child_request.depth, 1,
+        "a root session's child sits at depth 1"
+    );
     assert!(
-        results[0].1.contains(&child.to_string()),
+        results[0].1.contains(&child_request.child.to_string()),
         "the model must be told which session it spawned, got {:?}",
         results[0].1
     );
 
-    // §7.7: the transfer is a debit, not a copy.
+    // §7.7: the transfer is a debit, not a copy — and the transferred half
+    // reaches the implementor, which is what lets the CHILD's own host start
+    // from what it was actually given rather than from a fresh default.
     assert_eq!(fx.host.remaining_tokens(), 700);
+    assert_eq!(child_request.budget.remaining_tokens, 300);
 
     // The parent's task log carries exactly one `agent` task.
     let kinds = created_task_kinds(&fx).await;
@@ -500,15 +520,18 @@ async fn the_committed_child_is_the_same_session_the_tree_reserved_and_the_spec_
     drive(&fx, agent_args(10)).await;
 
     let created = fx.host.created();
-    let (_, child, spec, _) = &created[0];
+    let child_request = &created[0];
     assert_eq!(
-        spec.name,
-        Some(format!("agent-{}", &child.to_string()[..8])),
+        child_request.spec.name,
+        Some(format!("agent-{}", &child_request.child.to_string()[..8])),
         "the handle, the reserved id and the persisted spec must all name ONE session"
     );
     // `descendants` reads committed edges only, so this also proves the
     // reservation was committed under the same id.
-    assert_eq!(fx.host.tree.descendants(fx.session_id), vec![*child]);
+    assert_eq!(
+        fx.host.tree.descendants(fx.session_id),
+        vec![child_request.child]
+    );
 }
 
 // ---------------------------------------------------------------------------

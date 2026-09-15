@@ -1081,23 +1081,24 @@ async fn a_socket_created_session_can_spawn_sub_agents() {
     .unwrap();
     let session_id = creator.session_id();
 
-    // The registry entry appears from `drive_session`'s own spawned task, so
-    // poll rather than assume it has already run.
+    // Both the registry entry and the host appear from `drive_session`'s own
+    // spawned task, and the host is registered strictly AFTER
+    // `SessionRegistry::create` returns — so polling only for the actor would
+    // race that gap. Poll for the thing under test itself.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let actor = loop {
+    let (actor, host) = loop {
         if let Some(actor) = daemon.registry.actor(session_id) {
-            break actor;
+            if let Some(host) = actor.sub_agent_host() {
+                break (actor, host);
+            }
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for the socket-created session to reach the registry"
+            "timed out waiting for a real socket-created session to become able to spawn \
+             sub-agents"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
-
-    let host = actor
-        .sub_agent_host()
-        .expect("a real socket-created session must be able to spawn sub-agents");
     assert_eq!(
         host.depth(),
         0,

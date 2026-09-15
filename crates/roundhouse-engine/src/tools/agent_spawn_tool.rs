@@ -121,6 +121,15 @@ struct AdmittedProviderScope {
 }
 
 impl SpawnPolicyScope for AdmittedProviderScope {
+    /// **Reads as a tautology on purpose, and is not one.** `agent_spawn` is
+    /// asking "may this session spawn against this provider?"; the answer was
+    /// already decided — by `SessionActor::admit_task` on a real
+    /// `TaskParams::Agent`, one caller up — and this carries that decision
+    /// rather than re-deriving it. The comparison is what keeps it honest: if
+    /// `agent_spawn` were ever handed a provider OTHER than the admitted one,
+    /// this says no rather than waving it through. See the struct's own doc
+    /// comment for why a second, independent policy question would be worse
+    /// than no second question.
     fn authorizes_provider(&self, provider: &str) -> bool {
         provider == self.admitted
     }
@@ -139,6 +148,17 @@ pub struct ChildSessionRequest {
     /// it so a *nested* spawn from this child can report its own real depth
     /// back through [`SubAgentHost::depth`].
     pub depth: u8,
+    /// The budget [`agent_spawn`] actually moved out of the parent and into
+    /// this child (§7.7: *"budget inheritance is a transfer, not a grant"*).
+    ///
+    /// Threaded for exactly the same reason `depth` is, and the omission
+    /// would be exactly as wrong: an implementor that seeded the child's host
+    /// with anything else — an unmetered default, say — would make the
+    /// transfer arithmetic constrain only siblings of one parent, while the
+    /// child handed ITS own sub-agents a pool its parent never gave it.
+    /// Conservation has to hold at every level of the tree, not just the
+    /// first, and this is the value that makes it hold.
+    pub child_budget: Budget,
     /// [`crate::agent_spawn::AgentSpawnOutput::session_spec`] verbatim,
     /// including its `parent: Some(parent)`. Implementors must persist this
     /// spec, never a template of their own.
@@ -540,6 +560,7 @@ async fn spawn_child(
             parent,
             child,
             depth: out.child_spec.depth,
+            child_budget: out.child_budget,
             spec: out.session_spec,
             workspace_root: actor.workspace_root().to_path_buf(),
             workspace_identity: actor.workspace_identity(),
@@ -551,10 +572,22 @@ async fn spawn_child(
         // the team. The child does not exist, so both must be undone or a
         // failed spawn would permanently cost the parent tokens and leave a
         // phantom on the roster.
-        if let Ok(mut budget) = budget_cell.lock() {
-            budget.remaining_tokens = budget
-                .remaining_tokens
-                .saturating_add(out.child_budget.remaining_tokens);
+        match budget_cell.lock() {
+            Ok(mut budget) => {
+                budget.remaining_tokens = budget
+                    .remaining_tokens
+                    .saturating_add(out.child_budget.remaining_tokens);
+            }
+            // The lock was readable moments ago, so this means the spawn
+            // itself poisoned it. Never silent: the parent has been debited
+            // for a child that does not exist, and nothing else will ever
+            // notice or fix that.
+            Err(_) => tracing::warn!(
+                session_id = %parent,
+                "could not refund a failed sub-agent spawn's budget transfer: this session's \
+                 budget lock is poisoned, so the parent stays debited for a child that was \
+                 never created"
+            ),
         }
         if let Some(team) = host.team() {
             let _ = host.teams().mark_member_ended(team, child);
