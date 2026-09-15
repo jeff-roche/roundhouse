@@ -1057,7 +1057,7 @@ impl<'a> Executor<'a> {
                 let Some(task_kind) = task_kind_for_tool(tool) else {
                     return DispatchDecision::Done(StepOutcome::failed(
                         &step.id,
-                        format!("unknown tool: {tool:?}"),
+                        format!("unknown tool: {tool}"),
                     ));
                 };
                 let dispatch_input = resolved_with.into_unredacted_for_dispatch();

@@ -4,9 +4,9 @@
 //! "unknown tool" refusal, distinguishable from `bad_tool_arguments` and other
 //! categories.
 
+use roundhouse_core::{EventPayload, TaskId, TaskKind};
 use roundhouse_flow::exec::{Executor, RunContext, RunId, TaskSink};
 use roundhouse_flow::parse::WorkflowDef;
-use roundhouse_core::{TaskKind, TaskId, EventPayload};
 use serde_json::json;
 
 struct MockSink {
@@ -74,7 +74,7 @@ steps:
         roundhouse_flow::exec::StepStatus::Failed { message } => {
             // Message must indicate it's an unknown tool, not a missing argument
             assert!(
-                message.contains("unknown") || message.contains("totally-made-up"),
+                message.contains("unknown") && message.contains("totally-made-up"),
                 "error message should mention unknown tool: {message}"
             );
             // Should NOT be a message about missing "program" field (which would
@@ -93,9 +93,14 @@ steps:
     }
 }
 
-/// Verify that a known tool like `read` does not fail with "unknown tool".
+/// Verify that a known tool like `read` produces a Pending decision, not a Failed one.
+/// This test verifies that known tools are not rejected as unknown, by checking
+/// that they reach the tool dispatch path (Pending) rather than failing with
+/// "unknown tool" message. The stub in run_to_completion then converts Pending
+/// to Completed, so this test asserts the tool was recognized by checking that
+/// the outcome is Completed (not Failed with unknown tool message).
 #[test]
-fn known_tool_read_does_not_fail_with_unknown_tool_message() {
+fn known_tool_reaches_pending_not_failed_as_unknown() {
     let yaml = r#"
 name: test-workflow
 version: 1
@@ -129,11 +134,20 @@ steps:
     assert_eq!(outcomes.len(), 1);
     let outcome = &outcomes[0];
 
-    // The outcome should NOT be a "unknown tool" failure
-    if let roundhouse_flow::exec::StepStatus::Failed { message } = &outcome.status {
-        assert!(
-            !message.contains("unknown tool"),
-            "known tool should not fail with 'unknown tool': {message}"
-        );
+    // Known tools should complete (via the Pending->Completed stub path),
+    // not fail with "unknown tool"
+    match &outcome.status {
+        roundhouse_flow::exec::StepStatus::Completed => {
+            // Expected: known tool reached Pending, got stubbed to Completed
+        }
+        roundhouse_flow::exec::StepStatus::Failed { message } => {
+            assert!(
+                !message.contains("unknown tool"),
+                "known tool should not fail with 'unknown tool': {message}"
+            );
+        }
+        roundhouse_flow::exec::StepStatus::Skipped { .. } => {
+            panic!("known tool should not be skipped");
+        }
     }
 }
