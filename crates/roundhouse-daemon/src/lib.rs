@@ -22,6 +22,7 @@ pub mod boot;
 /// source, i.e. from the real boot path.
 pub mod demo;
 pub mod mcp_config;
+pub mod scheduler_driver;
 pub mod session_bootstrap;
 pub mod session_manager;
 pub mod session_registry;

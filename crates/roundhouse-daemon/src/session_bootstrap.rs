@@ -77,6 +77,19 @@ pub type BackgroundService =
 pub struct BackgroundServiceContext {
     pub store: StorePool,
     pub sessions: Arc<crate::session_registry::SessionRegistry>,
+    /// Everything a real session is built from — the same value the socket
+    /// handshake path builds sessions through.
+    ///
+    /// **This arrives as a [`BackgroundServices::start`] parameter, and must
+    /// not be captured by a service's own closure instead.**
+    /// [`DaemonResources`] *contains* the [`BackgroundServices`] value whose
+    /// closures these are (its `background_services` field), and that value
+    /// is constructed *before* `DaemonResources::new` is called — so at the
+    /// point a service closure is written there is no `Arc<DaemonResources>`
+    /// in existence for it to capture, and a closure that captured one would
+    /// be self-referential and unconstructible. Every service is therefore
+    /// generic over whatever resources the context hands it at run time.
+    pub resources: Arc<DaemonResources>,
     pub cancelled: watch::Receiver<bool>,
     startup_complete: watch::Receiver<bool>,
     ready: Option<oneshot::Sender<Result<(), BackgroundServiceError>>>,
@@ -117,6 +130,7 @@ impl BackgroundServices {
         &self,
         store: StorePool,
         sessions: Arc<crate::session_registry::SessionRegistry>,
+        resources: Arc<DaemonResources>,
     ) -> Result<RunningBackgroundServices, BackgroundServiceError> {
         let (cancel, _) = watch::channel(false);
         let (startup_complete, _) = watch::channel(false);
@@ -129,6 +143,7 @@ impl BackgroundServices {
             let context = BackgroundServiceContext {
                 store: store.clone(),
                 sessions: Arc::clone(&sessions),
+                resources: Arc::clone(&resources),
                 cancelled: cancel.subscribe(),
                 startup_complete: startup_complete.subscribe(),
                 ready: Some(ready_tx),
@@ -892,9 +907,7 @@ mod tests {
     #[tokio::test]
     async fn a_supplied_background_service_signals_readiness_and_is_joined_on_shutdown() {
         let dir = tempfile::tempdir().unwrap();
-        let store = roundhouse_store::open(&dir.path().join("events.db"))
-            .await
-            .unwrap();
+        let resources = Arc::new(resources(dir.path()).await);
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
         let service: BackgroundService = Arc::new(move |mut context| {
             let started_tx = started_tx.clone();
@@ -916,8 +929,9 @@ mod tests {
         };
         let running = services
             .start(
-                store,
+                resources.store.clone(),
                 Arc::new(crate::session_registry::SessionRegistry::new()),
+                Arc::clone(&resources),
             )
             .await
             .unwrap();
@@ -928,9 +942,7 @@ mod tests {
     #[tokio::test]
     async fn a_non_workflow_service_failure_is_observed_and_the_remaining_service_is_joined() {
         let dir = tempfile::tempdir().unwrap();
-        let store = roundhouse_store::open(&dir.path().join("events.db"))
-            .await
-            .unwrap();
+        let resources = Arc::new(resources(dir.path()).await);
         let workflow: BackgroundService = Arc::new(|mut context| {
             Box::pin(async move {
                 context.signal_ready().await?;
@@ -955,8 +967,9 @@ mod tests {
         };
         let mut running = services
             .start(
-                store,
+                resources.store.clone(),
                 Arc::new(crate::session_registry::SessionRegistry::new()),
+                Arc::clone(&resources),
             )
             .await
             .unwrap();
@@ -970,9 +983,7 @@ mod tests {
     #[tokio::test]
     async fn a_ready_service_cannot_fail_until_startup_ownership_is_transferred() {
         let dir = tempfile::tempdir().unwrap();
-        let store = roundhouse_store::open(&dir.path().join("events.db"))
-            .await
-            .unwrap();
+        let resources = Arc::new(resources(dir.path()).await);
         let service: BackgroundService = Arc::new(|mut context| {
             Box::pin(async move {
                 context.signal_ready().await?;
@@ -985,8 +996,9 @@ mod tests {
             acp: None,
         }
         .start(
-            store,
+            resources.store.clone(),
             Arc::new(crate::session_registry::SessionRegistry::new()),
+            Arc::clone(&resources),
         )
         .await
         .unwrap();

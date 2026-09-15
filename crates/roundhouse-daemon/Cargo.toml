@@ -55,6 +55,13 @@ roundhouse-web = { path = "../roundhouse-web" }
 # regardless of which crate introduces a net-new dependency.
 clap = { version = "=4.6.6", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
+# Phase 8, L3, Task 5 (`scheduler_driver.rs`): `roundhouse_sched::store::
+# accept_occurrence` takes the tick's wall-clock reading as a
+# `chrono::DateTime<Utc>`, and `trigger_binding_cursor.last_fired_for` is
+# decoded back from unix nanos with `DateTime::from_timestamp_nanos`. Same
+# requirement spelling `roundhouse-sched` already uses for the identical
+# crate, so no new version is resolved.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 nix = { version = "0.31", features = ["fs"] }
 color-eyre = { workspace = true }
 # `fs`/`io-util` on top of the workspace feature set: the demo reads the edited
