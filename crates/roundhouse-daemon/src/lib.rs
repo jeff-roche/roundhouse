@@ -44,7 +44,9 @@ pub mod workspace_registry;
 pub(crate) mod test_support {
     use std::sync::Arc;
 
+    use roundhouse_bus::local_bus::LocalBus;
     use roundhouse_bus::spawn_tree::SpawnTree;
+    use roundhouse_bus::teams::TeamRegistry;
     use roundhouse_core::{OnDegrade, SessionId, SessionSpec, SessionState, Tier};
     use roundhouse_engine::SessionActor;
     use roundhouse_policy::engine::PolicyEngine;
@@ -186,7 +188,7 @@ pub(crate) mod test_support {
     /// Shared by `session_manager`'s and `scheduler_driver`'s test modules —
     /// both need the identical "everything a real session is built from"
     /// fixture, and a second copy of it would be one more thing to keep in
-    /// step with `DaemonResources::new`'s sixteen parameters.
+    /// step with `DaemonResources::new`'s many parameters.
     ///
     /// `load_workspace_config` is `false`: these tests supply their own
     /// (empty) MCP/network/policy inputs rather than having session
@@ -228,11 +230,15 @@ pub(crate) mod test_support {
             .serve(runner(), proxy_writer.clone())
             .await
             .unwrap();
+        let teams = Arc::new(TeamRegistry::new());
+        let bus = Arc::new(LocalBus::new().with_teams(Arc::clone(&teams)));
         crate::session_bootstrap::DaemonResources::new(
             store,
             available_isolate(),
             proxy,
             Arc::new(SpawnTree::new()),
+            teams,
+            bus,
             dir.join("state"),
             dir.join("daemon-binary"),
             Vec::new(),

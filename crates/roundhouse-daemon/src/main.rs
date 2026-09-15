@@ -36,6 +36,7 @@
 use clap::Parser;
 use roundhouse_bus::local_bus::LocalBus;
 use roundhouse_bus::spawn_tree::SpawnTree;
+use roundhouse_bus::teams::TeamRegistry;
 use roundhouse_core::{OnDegrade, Tier};
 use roundhouse_daemon::mcp_config;
 use roundhouse_daemon::session_bootstrap::DaemonResources;
@@ -246,14 +247,24 @@ async fn main() -> color_eyre::Result<()> {
             ),
         };
 
+    // The daemon-wide team registry, shared between the `Bus` (fan-out
+    // resolution) and the `agent` tool's team-join dispatch
+    // (`DaemonResources::teams`, below) — constructed exactly once, here,
+    // before EITHER consumer exists, and handed to both by the same `Arc`
+    // (Phase 8, L5, Task 6). Before this, `LocalBus::new()` minted its own,
+    // independent `TeamRegistry`, so the socket handshake's human-mark and
+    // the `agent` tool's team-join judged two disjoint rosters and
+    // `HumanCannotJoinTeam` could never fire against a real daemon — see
+    // `DaemonResources::teams`'s own doc comment for the full history.
+    let teams = Arc::new(TeamRegistry::new());
     // `EngineHandles::bootstrap` is `TaskRunner::bootstrap()`'s real, intended
     // call site (its own doc comment: "called exactly once ... at daemon
     // startup, and threaded through from there" — it panics on a second
     // call). Stored in the `'static` `HANDLES` (see that item's own doc
     // comment) rather than a local binding.
-    let handles = HANDLES.get_or_init(|| {
-        EngineHandles::bootstrap(Arc::new(LocalBus::new()), vec![provider.clone()])
-    });
+    let bus = Arc::new(LocalBus::new().with_teams(Arc::clone(&teams)));
+    let handles =
+        HANDLES.get_or_init(|| EngineHandles::bootstrap(bus.clone(), vec![provider.clone()]));
     let runner = &handles.task_runner;
 
     // The configuration-loading block (`project_root` through
@@ -573,6 +584,8 @@ async fn main() -> color_eyre::Result<()> {
         isolate,
         proxy,
         spawn_tree,
+        teams,
+        bus,
         state_dir,
         daemon_binary,
         mcp_configs,

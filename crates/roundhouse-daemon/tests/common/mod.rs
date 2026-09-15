@@ -19,7 +19,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use roundhouse_bus::local_bus::LocalBus;
 use roundhouse_bus::spawn_tree::SpawnTree;
+use roundhouse_bus::teams::TeamRegistry;
 use roundhouse_core::{OnDegrade, SessionId, SessionSpec, SessionState, TaskRunner, Tier};
 use roundhouse_daemon::session_bootstrap::{
     no_policy_rules, BackgroundServices, DaemonResources, PolicyRuleSource,
@@ -181,7 +183,7 @@ pub async fn resources_with_isolate(dir: &Path, isolate: Arc<dyn Isolate>) -> Ar
 
 /// The shared body of [`real_resources`]/[`resources_with_isolate`]/
 /// [`resources_with_provider`] — the two axes a test may need to vary
-/// (which `Isolate`, which `Provider`) in one place, so the other twelve
+/// (which `Isolate`, which `Provider`) in one place, so the other
 /// `DaemonResources::new` arguments are constructed identically for all of
 /// them.
 pub async fn resources_with(
@@ -217,11 +219,15 @@ pub async fn resources_with(
         .serve(runner(), proxy_writer.clone())
         .await
         .unwrap();
+    let teams = Arc::new(TeamRegistry::new());
+    let bus = Arc::new(LocalBus::new().with_teams(Arc::clone(&teams)));
     Arc::new(DaemonResources::new(
         store,
         isolate,
         proxy,
         Arc::new(SpawnTree::new()),
+        teams,
+        bus,
         dir.join("state"),
         dir.join("daemon-binary"),
         Vec::new(),

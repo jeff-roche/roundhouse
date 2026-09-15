@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
+use roundhouse_bus::local_bus::LocalBus;
 use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_bus::teams::TeamRegistry;
 #[cfg(test)]
@@ -361,13 +362,25 @@ pub struct DaemonResources {
     /// The daemon-wide team registry (§7.1 decision 4: *"a Team owns
     /// addressing only"*), read by the `agent` tool for §7.5's auto-join.
     ///
-    /// Constructed here rather than taken as a `new` parameter (unlike
-    /// [`Self::spawn_tree`], which `main.rs` builds because `DeliveryExecutor`
-    /// needs the same instance before `DaemonResources` exists): nothing
-    /// outside this struct has a reason to hold one, so constructing it here
-    /// makes "exactly one per daemon" structural instead of a convention every
-    /// construction site has to keep.
+    /// **Phase 8, L5, Task 6 correction:** this used to be constructed
+    /// internally (`Arc::new(TeamRegistry::new())`), on the reasoning that
+    /// "nothing outside this struct has a reason to hold one." That stopped
+    /// being true the moment [`Self::bus`] needed the identical instance:
+    /// `main.rs`'s `LocalBus::with_teams` and this field must share one
+    /// `Arc<TeamRegistry>`, or the socket handshake's `mark_human` and the
+    /// `agent` tool's `TeamRegistry::join` would silently judge two disjoint
+    /// rosters — the exact bug this task exists to close (see
+    /// [`crate::socket_server`]'s `CreateSession` handling). So this now
+    /// mirrors [`Self::spawn_tree`] exactly: built once in `main.rs`, passed
+    /// in here, and never minted a second time.
     pub teams: Arc<TeamRegistry>,
+    /// The daemon-wide `LocalBus`/`Bus` instance — the SAME `Arc` handed to
+    /// `EngineHandles::bootstrap` (as `Arc<dyn Bus>`) in `main.rs`, sharing
+    /// [`Self::teams`] via `LocalBus::with_teams`. Held here, concretely (not
+    /// as `Arc<dyn Bus>`), specifically so [`crate::socket_server`] can call
+    /// `LocalBus::register_human` — a `LocalBus`-only method, not part of the
+    /// `Bus` trait object `roundhouse-engine`'s dispatchers hold instead.
+    pub bus: Arc<LocalBus>,
     /// Every live sub-agent session this daemon spawned, keyed by child
     /// session id — see [`crate::sub_agent_host::SubAgentSessions`] for why
     /// the child→parent direction has to be recorded somewhere. Constructed
@@ -422,6 +435,8 @@ impl DaemonResources {
         isolate: Arc<dyn Isolate>,
         proxy: Arc<LoopbackProxy>,
         spawn_tree: Arc<SpawnTree>,
+        teams: Arc<TeamRegistry>,
+        bus: Arc<LocalBus>,
         state_dir: PathBuf,
         daemon_binary: PathBuf,
         mcp_configs: Vec<McpServerConfig>,
@@ -441,7 +456,8 @@ impl DaemonResources {
             isolate,
             proxy,
             spawn_tree,
-            teams: Arc::new(TeamRegistry::new()),
+            teams,
+            bus,
             sub_agents: Arc::new(crate::sub_agent_host::SubAgentSessions::new()),
             state_dir,
             daemon_binary,
@@ -1093,11 +1109,15 @@ mod tests {
             .serve(runner(), proxy_writer.clone())
             .await
             .unwrap();
+        let teams = Arc::new(TeamRegistry::new());
+        let bus = Arc::new(LocalBus::new().with_teams(Arc::clone(&teams)));
         DaemonResources::new(
             store,
             available_isolate(),
             proxy,
             Arc::new(SpawnTree::new()),
+            teams,
+            bus,
             dir.join("state"),
             dir.join("daemon-binary"),
             Vec::new(),

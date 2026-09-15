@@ -270,6 +270,12 @@ struct Daemon {
     /// to assert on per-session wiring (Phase 8, L5: the `SubAgentHost`) from
     /// outside the daemon.
     registry: Arc<roundhouse_daemon::session_registry::SessionRegistry>,
+    /// The same `DaemonResources` `accept_loop` was handed — Phase 8, L5,
+    /// Task 6 tests read `resources.teams`/`resources.bus` back to prove the
+    /// socket handshake's `mark_human`/`register_human` landed on the exact
+    /// instances the `agent`/`team_create` tools would read, rather than a
+    /// second, independent registry a test built for itself.
+    resources: Arc<roundhouse_daemon::session_bootstrap::DaemonResources>,
 }
 
 async fn start_daemon(provider: Arc<dyn Provider>) -> Daemon {
@@ -315,12 +321,13 @@ async fn start_daemon_with_rules_at_root(
     tokio::spawn(roundhouse_daemon::socket_server::accept_loop(
         listener,
         Arc::clone(&registry),
-        resources,
+        Arc::clone(&resources),
     ));
     Daemon {
         _dir: dir,
         socket_path,
         db_path,
+        resources,
         registry,
     }
 }
@@ -1108,4 +1115,165 @@ async fn a_socket_created_session_can_spawn_sub_agents() {
         actor.tool_defs().iter().any(|d| d.name() == "agent"),
         "and the model must actually be offered the tool"
     );
+}
+
+/// Phase 8, L5, Task 6 — the human-join guard, wired for real.
+///
+/// `TeamRegistry::mark_human`/`LocalBus::register_human` had zero production
+/// callers before this task, so `HumanCannotJoinTeam` could never fire
+/// against a real daemon even though `TeamRegistry::join`/`create_team` both
+/// check it. These two tests build a real daemon exactly as `main.rs` does
+/// (`start_daemon`, above — real `DaemonResources`, real `accept_loop`), mark
+/// a session human through the REAL socket handshake (`ClientRequest::
+/// CreateSession` via `roundhouse_tui::connect_create`, which blocks on the
+/// daemon's `SessionCreated` reply — sent only after `drive_session`'s
+/// `mark_human`/`register_human` calls run, so no polling/race is needed
+/// here the way the sub-agent-host test above needs one), and then drive the
+/// exact functions the `agent` tool and `team_create` tool call
+/// (`roundhouse_engine::agent_spawn::agent_spawn`,
+/// `roundhouse_engine::tools::team_create::team_create`) against
+/// `daemon.resources.teams` — the identical `Arc<TeamRegistry>` `main.rs`
+/// shares with the `LocalBus` the socket handshake just marked the session
+/// human on. A standalone `TeamRegistry::new()` in the test would prove
+/// nothing about the wiring; reading `daemon.resources.teams` back is what
+/// proves the two channels share one instance.
+mod human_join_guard {
+    use super::*;
+    use roundhouse_bus::types::BusError;
+    use roundhouse_core::{TeamId, WorkspaceId};
+    use roundhouse_engine::agent_spawn::{
+        agent_spawn, AgentSpawnInput, Budget, SpawnError, SpawnPolicyScope, TaintSet,
+    };
+    use roundhouse_engine::tools::team_create::team_create;
+
+    /// `agent_spawn`'s own provider-authorization fence is not what this test
+    /// is about — always `true` so the only refusal reachable is the
+    /// human-join guard under test.
+    struct AllowAnyProvider;
+    impl SpawnPolicyScope for AllowAnyProvider {
+        fn authorizes_provider(&self, _provider: &str) -> bool {
+            true
+        }
+    }
+
+    /// Connects a real human session over the real socket, exactly as
+    /// `a_socket_created_session_can_spawn_sub_agents` does, and returns the
+    /// live `Daemon` plus that session's id.
+    async fn daemon_with_human_session() -> (Daemon, SessionId) {
+        let provider = Arc::new(ScriptedToolCallProvider::new(
+            "read",
+            serde_json::json!({ "path": "/etc/hostname" }),
+        ));
+        let daemon = start_daemon(provider).await;
+        let creator = tokio::time::timeout(
+            Duration::from_secs(5),
+            roundhouse_tui::connect_create(&daemon.socket_path, "default"),
+        )
+        .await
+        .expect("connect_create must not hang")
+        .unwrap();
+        let human_session = creator.session_id();
+        (daemon, human_session)
+    }
+
+    /// The `join` arm: a non-human parent session already belongs to a real
+    /// team on the daemon's shared registry; `agent_spawn` — the exact
+    /// function `dispatch_agent` (the `agent` tool's real dispatcher) calls —
+    /// is asked to land the socket-created HUMAN session onto that team's
+    /// roster. It must refuse with `HumanCannotJoinTeam`, and the parent's
+    /// budget (debited before the join call, per `agent_spawn`'s own
+    /// doc comment) must be rolled back rather than permanently spent on a
+    /// refused join.
+    #[tokio::test]
+    async fn a_human_attached_session_is_refused_by_agent_spawns_team_join_arm() {
+        let (daemon, human_session) = daemon_with_human_session().await;
+
+        let workspace = WorkspaceId::new();
+        let non_human_parent = SessionId::new();
+        let team: TeamId = daemon
+            .resources
+            .teams
+            .create_team(
+                workspace,
+                "release-team".into(),
+                "ship it".into(),
+                non_human_parent,
+                "lead".into(),
+            )
+            .expect("a non-human creator must be able to create a team");
+
+        let mut parent_budget = Budget {
+            remaining_tokens: 1_000,
+        };
+        let result = agent_spawn(
+            &daemon.resources.teams,
+            &AllowAnyProvider,
+            &mut parent_budget,
+            AgentSpawnInput {
+                workspace,
+                parent: non_human_parent,
+                child_id: human_session,
+                parent_depth: 0,
+                parent_direct_children: 0,
+                team: Some(team),
+                role: None,
+                provider: "anthropic".into(),
+                budget_tokens: 300,
+                parent_taint: TaintSet::default(),
+            },
+        );
+
+        match result {
+            Err(SpawnError::Bus(BusError::HumanCannotJoinTeam { session })) => {
+                assert_eq!(
+                    session, human_session,
+                    "the refusal must name the human session, not some other one"
+                );
+            }
+            other => panic!(
+                "expected HumanCannotJoinTeam for the socket-created human session, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            parent_budget.remaining_tokens, 1_000,
+            "a refused join must roll back the budget transfer agent_spawn already made"
+        );
+        assert!(
+            !daemon
+                .resources
+                .teams
+                .roster(team)
+                .unwrap()
+                .iter()
+                .any(|m| m.session == human_session),
+            "the human session must never land on the roster"
+        );
+    }
+
+    /// The `create_team` arm — the plan explicitly notes only `join` had
+    /// existing unit coverage. Drives `team_create` (the `team_create`
+    /// tool's real dispatch target) with the socket-created human session as
+    /// the creator, against the same shared `daemon.resources.teams`.
+    #[tokio::test]
+    async fn a_human_attached_session_is_refused_by_team_creates_create_team_arm() {
+        let (daemon, human_session) = daemon_with_human_session().await;
+
+        let result = team_create(
+            &daemon.resources.teams,
+            WorkspaceId::new(),
+            "shadow-team".into(),
+            "should never exist".into(),
+            human_session,
+            Some("lead".into()),
+        );
+
+        match result {
+            Err(BusError::HumanCannotJoinTeam { session }) => {
+                assert_eq!(session, human_session);
+            }
+            other => panic!(
+                "expected HumanCannotJoinTeam for the socket-created human session, got {other:?}"
+            ),
+        }
+    }
 }
