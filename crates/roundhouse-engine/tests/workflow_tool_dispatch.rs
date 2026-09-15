@@ -7,7 +7,9 @@
 use roundhouse_core::{OnDegrade, SessionId, SessionState, TaskKind, TaskRunner, Tier};
 use roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow;
 use roundhouse_engine::SessionActor;
-use roundhouse_policy::engine::PolicyEngine;
+use roundhouse_policy::engine::{
+    CompiledRule, Outcome as PolicyOutcome, PolicyEngine, Predicate, Scope,
+};
 use roundhouse_sandbox::{
     Attestation, Child, CommandSpec, Handle, Isolate, IsolationError, ProbeResult,
     Tier as SandboxTier,
@@ -79,12 +81,15 @@ async fn setup_actor(dir: &TempDir) -> (Arc<SessionActor>, std::path::PathBuf) {
 
     let workspace_root = dir.path().canonicalize().unwrap();
 
-    // Empty rules list - this makes PolicyEngine deny everything by default,
-    // but our tests don't care about admission (we're testing the dispatch gate).
-    // The dispatch gate tests only verify that Write/Edit/Find/Shell pass the
-    // unsupported_workflow_tool check; admission happens after that, so tests
-    // will fail on other grounds (missing args, etc.) but not on the gate.
-    let rules = vec![];
+    // A policy rule allowing the "echo" program used in shell tests.
+    // With zero rules, `PolicyEngine::decide` returns `Outcome::Ask` (§6.4),
+    // which causes `admit_task` to fail with `AdmitError::RequiresApproval`.
+    // This rule ensures tests reach `execute_builtin`, not just the gate.
+    let rules = vec![CompiledRule::test_new(
+        Scope::Builtin,
+        PolicyOutcome::Allow,
+        Predicate::program("echo"),
+    )];
 
     let actor = Arc::new(SessionActor::new_with_workspace_root(
         session_id,
