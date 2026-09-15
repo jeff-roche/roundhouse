@@ -15,7 +15,7 @@ use crate::trigger::{
 };
 use chrono::{DateTime, Utc};
 use roundhouse_core::{BindingId, SessionId, Timestamp};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -457,6 +457,46 @@ pub fn list_ready_deliveries(
     Ok(deliveries)
 }
 
+/// Every delivery currently in one of `states`, oldest first — Task 7's
+/// restart-recovery boot pass reads through this, once, over what should be a
+/// small table: unlike [`list_ready_deliveries`] this is not a hot per-tick
+/// claim query, so it takes no `limit`.
+///
+/// Modelled directly on [`list_ready_deliveries`] (same [`DELIVERY_COLUMNS`]/
+/// [`map_delivery_row`]/[`decode_delivery_row`] reuse, the same "plain read,
+/// not its own `begin_immediate`" judgement, and the same
+/// `created_at ASC, delivery_id ASC` tie-break for determinism), generalized
+/// from a single hard-coded `state = 'ready'` to an arbitrary set of states.
+///
+/// `states` is bound through parameter placeholders, never string-
+/// interpolated into the `IN (...)` list — [`DeliveryState::as_sql_str`]
+/// values are trusted constants either way, but this matches this file's
+/// existing parameterization style regardless. An empty `states` slice short-
+/// circuits to an empty result without touching the connection at all (SQL's
+/// own `IN ()` is a syntax error, not an empty match).
+pub fn list_deliveries_in_states(
+    conn: &Connection,
+    states: &[DeliveryState],
+) -> Result<Vec<TriggerDelivery>, StoreError> {
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = states.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT {DELIVERY_COLUMNS} FROM trigger_delivery
+         WHERE state IN ({placeholders})
+         ORDER BY created_at ASC, delivery_id ASC"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let bound = states.iter().map(|s| s.as_sql_str());
+    let rows = statement.query_map(params_from_iter(bound), map_delivery_row)?;
+    let mut deliveries = Vec::new();
+    for raw in rows {
+        deliveries.push(decode_delivery_row(raw?)?);
+    }
+    Ok(deliveries)
+}
+
 fn advance_cursor_in_txn(
     txn: &Transaction<'_>,
     binding_id: BindingId,
@@ -794,7 +834,19 @@ pub fn mark_delivery_running(
 }
 
 /// Completes a `running` delivery: `running` -> `delivered`.
-/// Predecessor-constrained on `state = 'running'`.
+/// Predecessor-constrained on `state IN ('running', 'cancellation_requested')`.
+///
+/// **`cancellation_requested` is in this set for Task 7's benefit, not the
+/// live claim path's.** `roundhouse-daemon`'s live claim-and-run path only
+/// ever calls this from `running`, so nothing about that path changes.
+/// Restart recovery's cancellation-reconciliation mechanism can find a
+/// `cancellation_requested` delivery whose run actually finished `Completed`
+/// before the previous process could act on the cancellation it recorded — a
+/// genuine race, not a bug — and must reconcile the delivery to match what
+/// really happened rather than force it to `cancelled` dishonestly. Without
+/// this widening that reconciliation could never apply: a
+/// `cancellation_requested` row would never satisfy the original
+/// `state = 'running'` constraint.
 pub fn complete_delivery(
     conn: &mut Connection,
     delivery_id: &str,
@@ -803,17 +855,21 @@ pub fn complete_delivery(
     let txn = roundhouse_store::begin_immediate(conn)?;
     let rows = txn.execute(
         "UPDATE trigger_delivery SET state = 'delivered', updated_at = ?1
-         WHERE delivery_id = ?2 AND state = 'running'",
+         WHERE delivery_id = ?2 AND state IN ('running', 'cancellation_requested')",
         params![now.as_unix_nanos(), delivery_id],
     )?;
     txn.commit()?;
     Ok(rows > 0)
 }
 
-/// Fails a `running` or `reserved` delivery: -> `failed`, recording
-/// `last_error` and incrementing `attempts`. Predecessor-constrained on
-/// `state IN ('running', 'reserved')` — a `reserved` delivery can fail
-/// before ever reaching `running` (e.g. the run never actually started).
+/// Fails a `running`, `reserved`, or `cancellation_requested` delivery: ->
+/// `failed`, recording `last_error` and incrementing `attempts`.
+/// Predecessor-constrained on `state IN ('running', 'reserved',
+/// 'cancellation_requested')` — a `reserved` delivery can fail before ever
+/// reaching `running` (e.g. the run never actually started), and (Task 7)
+/// a `cancellation_requested` delivery can fail on its own before a previous
+/// daemon process's cancellation ever landed, exactly the same kind of race
+/// [`complete_delivery`]'s own doc comment names for the `Completed` case.
 pub fn fail_delivery(
     conn: &mut Connection,
     delivery_id: &str,
@@ -824,8 +880,36 @@ pub fn fail_delivery(
     let rows = txn.execute(
         "UPDATE trigger_delivery
          SET state = 'failed', last_error = ?1, attempts = attempts + 1, updated_at = ?2
-         WHERE delivery_id = ?3 AND state IN ('running', 'reserved')",
+         WHERE delivery_id = ?3 AND state IN ('running', 'reserved', 'cancellation_requested')",
         params![error, now.as_unix_nanos(), delivery_id],
+    )?;
+    txn.commit()?;
+    Ok(rows > 0)
+}
+
+/// Finishes a cancellation: `running`, `reserved`, or
+/// `cancellation_requested` -> `cancelled`. Task 7 (restart recovery)'s own
+/// write — nothing before it ever transitions a delivery to `cancelled`.
+///
+/// Predecessor-constrained on `state IN ('running', 'reserved',
+/// 'cancellation_requested')`: mirrors [`fail_delivery`]'s `running`/
+/// `reserved` set (a `CancelPrevious` cancel recorded by
+/// [`request_cancellation`] can land on a delivery that has not yet reached
+/// `running`) plus `cancellation_requested` itself, which is where this
+/// mechanism's own writes originate — a boot-time recovery pass that called
+/// `roundhouse_flow::control::cancel` and re-drove the run to
+/// `RunState::Cancelled` finishes the delivery-level transition here, the
+/// same `updated_at`-stamping shape [`complete_delivery`] uses.
+pub fn cancel_delivery(
+    conn: &mut Connection,
+    delivery_id: &str,
+    now: Timestamp,
+) -> Result<bool, StoreError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    let rows = txn.execute(
+        "UPDATE trigger_delivery SET state = 'cancelled', updated_at = ?1
+         WHERE delivery_id = ?2 AND state IN ('running', 'reserved', 'cancellation_requested')",
+        params![now.as_unix_nanos(), delivery_id],
     )?;
     txn.commit()?;
     Ok(rows > 0)
@@ -1785,5 +1869,238 @@ mod tests {
         );
         assert_eq!(listed[0].binding_id, binding_id);
         assert!(listed[0].trigger_event_id > 0);
+    }
+
+    /// Task 7's boot-time recovery pass reads through this — it must return
+    /// exactly the rows in the requested states, oldest first, and leave
+    /// every other state out regardless of how many states are requested at
+    /// once.
+    #[test]
+    fn listing_deliveries_in_states_returns_only_the_requested_states_oldest_first() {
+        let mut conn = open_test_db();
+        let ready = create_ready_delivery_at(&mut conn, BindingId::new(), 1, 100);
+        let leased = create_ready_delivery_at(&mut conn, BindingId::new(), 2, 200);
+        let reserved = create_ready_delivery_at(&mut conn, BindingId::new(), 3, 300);
+        let running = create_ready_delivery_at(&mut conn, BindingId::new(), 4, 400);
+        let delivered = create_ready_delivery_at(&mut conn, BindingId::new(), 5, 500);
+
+        assert!(lease_delivery(&mut conn, &leased.delivery_id, ts(999), ts(500)).unwrap());
+
+        assert!(lease_delivery(&mut conn, &reserved.delivery_id, ts(999), ts(500)).unwrap());
+        assert!(reserve_delivery(
+            &mut conn,
+            &reserved.delivery_id,
+            "run-reserved",
+            SessionId::new(),
+            ts(500)
+        )
+        .unwrap());
+
+        assert!(lease_delivery(&mut conn, &running.delivery_id, ts(999), ts(500)).unwrap());
+        assert!(reserve_delivery(
+            &mut conn,
+            &running.delivery_id,
+            "run-running",
+            SessionId::new(),
+            ts(500)
+        )
+        .unwrap());
+        assert!(mark_delivery_running(&mut conn, &running.delivery_id, ts(500)).unwrap());
+
+        assert!(lease_delivery(&mut conn, &delivered.delivery_id, ts(999), ts(500)).unwrap());
+        assert!(reserve_delivery(
+            &mut conn,
+            &delivered.delivery_id,
+            "run-delivered",
+            SessionId::new(),
+            ts(500)
+        )
+        .unwrap());
+        assert!(mark_delivery_running(&mut conn, &delivered.delivery_id, ts(500)).unwrap());
+        assert!(complete_delivery(&mut conn, &delivered.delivery_id, ts(600)).unwrap());
+
+        // A single requested state behaves like a filtered `list_ready_deliveries`.
+        let just_ready = list_deliveries_in_states(&conn, &[DeliveryState::Ready]).unwrap();
+        assert_eq!(
+            just_ready
+                .iter()
+                .map(|d| &d.delivery_id)
+                .collect::<Vec<_>>(),
+            vec![&ready.delivery_id]
+        );
+
+        // Several states at once, in `created_at` order regardless of the
+        // order they were requested in.
+        let reserved_and_running =
+            list_deliveries_in_states(&conn, &[DeliveryState::Running, DeliveryState::Reserved])
+                .unwrap();
+        assert_eq!(
+            reserved_and_running
+                .iter()
+                .map(|d| &d.delivery_id)
+                .collect::<Vec<_>>(),
+            vec![&reserved.delivery_id, &running.delivery_id],
+            "must be ordered by created_at regardless of the order states were requested in, \
+             and must exclude ready/leased/delivered"
+        );
+
+        // Terminal states are real answers too, not just the ones this crate
+        // currently drives recovery from.
+        let terminal = list_deliveries_in_states(&conn, &[DeliveryState::Delivered]).unwrap();
+        assert_eq!(
+            terminal.iter().map(|d| &d.delivery_id).collect::<Vec<_>>(),
+            vec![&delivered.delivery_id]
+        );
+
+        // An empty state set is an empty result, not a SQL syntax error.
+        assert!(list_deliveries_in_states(&conn, &[]).unwrap().is_empty());
+    }
+
+    /// `complete_delivery`/`fail_delivery` gained `cancellation_requested` as
+    /// a legal predecessor (Task 7) so restart recovery's cancellation
+    /// reconciliation can record what a run genuinely did — `Completed` or
+    /// `Failed` — despite a cancellation having been requested against its
+    /// delivery. Widening those two must not loosen their *other*
+    /// predecessor constraints: a `ready` row still cannot complete or fail
+    /// directly.
+    #[test]
+    fn complete_and_fail_delivery_now_also_accept_cancellation_requested_as_a_predecessor() {
+        let mut conn = open_test_db();
+
+        let completed_after_cancel = create_ready_delivery(&mut conn, BindingId::new());
+        assert!(request_cancellation(
+            &mut conn,
+            &completed_after_cancel.delivery_id,
+            DeliveryState::Ready,
+            ts(10),
+        )
+        .unwrap());
+        assert_eq!(
+            fetch_delivery(&conn, &completed_after_cancel.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::CancellationRequested
+        );
+        assert!(complete_delivery(&mut conn, &completed_after_cancel.delivery_id, ts(20)).unwrap());
+        assert_eq!(
+            fetch_delivery(&conn, &completed_after_cancel.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::Delivered
+        );
+
+        let failed_after_cancel = create_ready_delivery(&mut conn, BindingId::new());
+        assert!(request_cancellation(
+            &mut conn,
+            &failed_after_cancel.delivery_id,
+            DeliveryState::Ready,
+            ts(10),
+        )
+        .unwrap());
+        assert!(fail_delivery(
+            &mut conn,
+            &failed_after_cancel.delivery_id,
+            "raced with its own cancellation",
+            ts(20),
+        )
+        .unwrap());
+        let after = fetch_delivery(&conn, &failed_after_cancel.delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, DeliveryState::Failed);
+        assert_eq!(
+            after.last_error.as_deref(),
+            Some("raced with its own cancellation")
+        );
+
+        // The unrelated predecessor constraint is unchanged: `ready` still
+        // cannot complete or fail directly.
+        let still_ready = create_ready_delivery(&mut conn, BindingId::new());
+        assert!(!complete_delivery(&mut conn, &still_ready.delivery_id, ts(30)).unwrap());
+        assert!(!fail_delivery(&mut conn, &still_ready.delivery_id, "nope", ts(30)).unwrap());
+    }
+
+    #[test]
+    fn cancel_delivery_transitions_running_reserved_or_cancellation_requested_to_cancelled() {
+        let mut conn = open_test_db();
+
+        // From `cancellation_requested` — Mechanism 3's own shape: the run
+        // this delivery names was actually confirmed `Cancelled`.
+        let from_cancellation_requested = create_ready_delivery(&mut conn, BindingId::new());
+        assert!(request_cancellation(
+            &mut conn,
+            &from_cancellation_requested.delivery_id,
+            DeliveryState::Ready,
+            ts(10),
+        )
+        .unwrap());
+        assert!(
+            cancel_delivery(&mut conn, &from_cancellation_requested.delivery_id, ts(20)).unwrap()
+        );
+        assert_eq!(
+            fetch_delivery(&conn, &from_cancellation_requested.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::Cancelled
+        );
+
+        // From `reserved` — mirrors `fail_delivery`'s own predecessor set.
+        let from_reserved = create_ready_delivery(&mut conn, BindingId::new());
+        lease_delivery(&mut conn, &from_reserved.delivery_id, ts(999), ts(500)).unwrap();
+        reserve_delivery(
+            &mut conn,
+            &from_reserved.delivery_id,
+            "run-reserved",
+            SessionId::new(),
+            ts(500),
+        )
+        .unwrap();
+        assert!(cancel_delivery(&mut conn, &from_reserved.delivery_id, ts(600)).unwrap());
+        assert_eq!(
+            fetch_delivery(&conn, &from_reserved.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::Cancelled
+        );
+
+        // From `running`.
+        let from_running = create_ready_delivery(&mut conn, BindingId::new());
+        lease_delivery(&mut conn, &from_running.delivery_id, ts(999), ts(500)).unwrap();
+        reserve_delivery(
+            &mut conn,
+            &from_running.delivery_id,
+            "run-running",
+            SessionId::new(),
+            ts(500),
+        )
+        .unwrap();
+        mark_delivery_running(&mut conn, &from_running.delivery_id, ts(500)).unwrap();
+        assert!(cancel_delivery(&mut conn, &from_running.delivery_id, ts(700)).unwrap());
+        assert_eq!(
+            fetch_delivery(&conn, &from_running.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::Cancelled
+        );
+
+        // Predecessor mismatch: `ready` cannot be cancelled directly (no
+        // cancellation was ever requested).
+        let still_ready = create_ready_delivery(&mut conn, BindingId::new());
+        assert!(!cancel_delivery(&mut conn, &still_ready.delivery_id, ts(800)).unwrap());
+        assert_eq!(
+            fetch_delivery(&conn, &still_ready.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::Ready
+        );
+
+        // Already terminal: a second `cancel_delivery` call is a no-op.
+        assert!(!cancel_delivery(&mut conn, &from_running.delivery_id, ts(900)).unwrap());
     }
 }
