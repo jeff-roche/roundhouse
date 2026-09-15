@@ -612,15 +612,36 @@ fn accept_due_occurrences(
 
 /// How many `ready` deliveries one heartbeat tick may claim.
 ///
-/// Each claim becomes its own spawned task holding a store connection for the
-/// length of a whole workflow run, so this is really a bound on how fast the
-/// driver may convert a backlog into concurrent long-lived connection
-/// holders. Eight is comfortably below any sane pool size while still being
-/// more than one tick's realistic admissions — the overlap policies are what
-/// bound admissions per binding, and a tick that finds more than eight
-/// leaves the rest `ready` for the next tick a second later, which is the
-/// correct backpressure rather than a loss.
-const MAX_DELIVERY_CLAIMS_PER_TICK: usize = 8;
+/// Equal to [`MAX_CONCURRENT_DELIVERIES`] by construction: listing more
+/// `ready` rows than there are permits to run them with would only read rows
+/// this tick must then decline. Rows beyond the cap stay `ready` and are
+/// re-listed by the next tick a second later — backpressure, not loss.
+const MAX_DELIVERY_CLAIMS_PER_TICK: usize = MAX_CONCURRENT_DELIVERIES;
+
+/// How many deliveries this daemon may have in flight **at once**.
+///
+/// A per-tick claim limit does not bound this on its own: claims are taken
+/// every second and a workflow run can last hours, so N-per-tick with no
+/// concurrency cap reaches N × ticks in flight. The bound therefore lives on
+/// a semaphore whose permit is held for the delivery's whole life, the same
+/// shape `socket_server::construct_real_session_bounded` uses for session
+/// construction.
+///
+/// **Four, because each in-flight delivery holds a pooled store connection
+/// for the entire run.** `run_workflow_from_storage` takes `&mut Connection`
+/// and drives the whole workflow on it, so the connection cannot be returned
+/// mid-run. `deadpool`'s default pool size is a small multiple of the CPU
+/// count — as low as four on a one-core host — and the heartbeat's own
+/// `accept_occurrence`, the event writer, the socket server and the web
+/// server all draw from the same pool. A cap that could consume it would
+/// wedge the daemon, not just the scheduler.
+///
+/// That a long-running workflow pins a pooled connection at all is a real
+/// architectural tension this task inherits rather than creates; resolving it
+/// (a dedicated per-run connection, or a pool sized for run-length holds) is
+/// a change to how `roundhouse-flow` is given its connection, not a constant
+/// this driver can tune its way out of.
+const MAX_CONCURRENT_DELIVERIES: usize = 4;
 
 /// How long a claim's `ready -> leased` lease is stamped for.
 ///
@@ -848,6 +869,10 @@ pub(crate) struct DeliveryExecutor {
     /// share *this* tree rather than minting a second (the tree is what
     /// `MAX_DIRECT_CHILD_CALLS` fan-out admission is counted against).
     spawn_tree: Arc<SpawnTree>,
+    /// [`MAX_CONCURRENT_DELIVERIES`] permits, one held for each in-flight
+    /// delivery's whole life. See that constant for why the bound has to be
+    /// on concurrency rather than on claims per tick.
+    slots: Arc<tokio::sync::Semaphore>,
     /// Injected rather than read from `Utc::now()` inside the executor, so
     /// every timestamp a delivery writes is chosen by the caller — which is
     /// what makes this path testable without a real clock.
@@ -868,6 +893,7 @@ impl DeliveryExecutor {
             sessions,
             registry,
             spawn_tree: Arc::new(SpawnTree::new()),
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
             clock,
         }
     }
@@ -1378,8 +1404,24 @@ async fn dispatch_ready_deliveries(
             );
             continue;
         };
+        // `try_acquire_owned`, never an awaited `acquire`: waiting here would
+        // stall the heartbeat behind a workflow that may run for hours, which
+        // is precisely what this loop must not do. Without a permit the
+        // delivery is simply not claimed — it stays `ready` and the next tick
+        // reconsiders it.
+        let Ok(slot) = Arc::clone(&executor.slots).try_acquire_owned() else {
+            tracing::debug!(
+                "every delivery slot is in use; the remaining ready deliveries stay ready \
+                 until one frees up"
+            );
+            return;
+        };
         let executor = executor.clone();
         tokio::spawn(async move {
+            // Held for the delivery's whole life, released when this task
+            // ends on any path — including a panic, since the guard is
+            // dropped as the task unwinds.
+            let _slot = slot;
             executor.claim_and_run(delivery, stored).await;
         });
     }
@@ -2657,6 +2699,52 @@ mod delivery_tests {
 
         assert_eq!(harness.delivery_row().await.state, DeliveryState::Ready);
         assert_eq!(harness.active(), 1);
+    }
+
+    /// A per-tick claim limit does not bound concurrency on its own — claims
+    /// are taken every second and a run can last hours — so the bound lives
+    /// on a semaphore whose permit is held for the delivery's whole life.
+    /// With every permit taken, a tick must claim nothing and leave the rows
+    /// `ready` rather than queue behind them.
+    #[tokio::test]
+    async fn dispatch_claims_nothing_once_every_delivery_slot_is_in_use() {
+        let harness = harness(completing_workflow()).await;
+        let mut bindings = HashMap::new();
+        bindings.insert(harness.stored.binding.id, harness.stored.clone());
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_DELIVERIES {
+            held.push(
+                Arc::clone(&harness.executor.slots)
+                    .try_acquire_owned()
+                    .expect("a fresh executor must start with every slot free"),
+            );
+        }
+
+        dispatch_ready_deliveries(&harness.executor, &bindings).await;
+
+        assert_eq!(
+            harness.delivery_row().await.state,
+            DeliveryState::Ready,
+            "with no slot free, a ready delivery must be left alone rather than leased and \
+             then queued behind a run that may take hours"
+        );
+        assert_eq!(harness.active(), 1);
+
+        // Freeing a slot lets the very next tick pick the same row up.
+        held.pop();
+        dispatch_ready_deliveries(&harness.executor, &bindings).await;
+        for _ in 0..1000 {
+            if harness.delivery_row().await.state == DeliveryState::Delivered {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            harness.delivery_row().await.state,
+            DeliveryState::Delivered,
+            "a freed slot must let the next tick claim the delivery it had to decline"
+        );
     }
 
     /// The failure this driver must survive rather than propagate: the
