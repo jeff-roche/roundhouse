@@ -44,8 +44,8 @@ pub struct WorkflowToolDispatch {
 /// Dispatches one `tool:` step for real: mints and records its full
 /// `TaskCreated`/`TaskStarted`/`TaskCompleted`|`TaskFailed` lifecycle
 /// (S-LOG-1) under `actor`'s own session, admits it through the real
-/// `SessionActor::admit_task` gate, and — for `TaskKind::Read` only —
-/// executes it through [`crate::tool_dispatch::execute_builtin`].
+/// `SessionActor::admit_task` gate, and — for the five allowlisted kinds
+/// (Read, Write, Edit, Find, Shell) — executes it through [`crate::tool_dispatch::execute_builtin`].
 ///
 /// `logged_input` is what reaches the event log (ruling P33's redacted
 /// half, already computed by `roundhouse-flow`); `dispatch_input` is what
