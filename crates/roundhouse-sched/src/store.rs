@@ -385,6 +385,41 @@ pub fn fetch_delivery(
     raw.map(decode_delivery_row).transpose()
 }
 
+/// The durable [`TriggerEventOutcome`] recorded on one `trigger_event` row.
+///
+/// `None` covers both "no such row" and "the row exists but has no outcome
+/// yet" — the latter is the crash window `accept_occurrence` documents
+/// (recorded the event, then died before deciding admission). The two are not
+/// distinguished because no caller can act differently on them: neither
+/// licenses assuming an admission decision that may never have been made.
+///
+/// **Why a delivery's executor needs this.** `decide_admission` charges an
+/// `Admit` to [`RunRegistry::note_admitted`] but a `QueueAt` to
+/// [`RunRegistry::note_queued`] — and *both* create a `ready`
+/// `trigger_delivery` row. A claimer that assumed every claimable delivery
+/// holds an *active* slot would answer a queued one's completion with
+/// `note_finished`, underflowing `active` while leaving `queued` stuck at its
+/// pre-claim value forever. This is how the claimer tells the two apart so it
+/// can promote a queued delivery ([`RunRegistry::note_promoted`]) before it
+/// finishes one.
+pub fn fetch_trigger_event_outcome(
+    conn: &Connection,
+    trigger_event_id: i64,
+) -> Result<Option<TriggerEventOutcome>, StoreError> {
+    let outcome: Option<Option<String>> = conn
+        .query_row(
+            "SELECT outcome FROM trigger_event WHERE id = ?1",
+            params![trigger_event_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    outcome
+        .flatten()
+        .map(|text| TriggerEventOutcome::from_sql_str(&text))
+        .transpose()
+        .map_err(StoreError::from)
+}
+
 /// Every currently-`ready` delivery, oldest first, capped at `limit`.
 ///
 /// This is the claim loop's discovery query: a delivery is claimable exactly
@@ -1684,6 +1719,56 @@ mod tests {
         let listed = list_ready_deliveries(&conn, 10).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].delivery_id, still_ready.delivery_id);
+    }
+
+    /// The claimer reads this to tell an *admitted* delivery (holding an
+    /// active slot) from a *queued* one (holding a queued slot), so it can
+    /// promote the latter rather than underflowing `active` at completion.
+    #[test]
+    fn a_deliverys_trigger_event_outcome_is_readable_back() {
+        let mut conn = open_test_db();
+        let admitted = create_ready_delivery(&mut conn, BindingId::new());
+        assert_eq!(
+            fetch_trigger_event_outcome(&conn, admitted.trigger_event_id).unwrap(),
+            Some(TriggerEventOutcome::Admitted)
+        );
+
+        // A `Queue` binding whose first occurrence is already running queues
+        // the second — and a queued occurrence still produces a `ready`
+        // delivery, which is exactly the case this lookup exists for.
+        let binding_id = BindingId::new();
+        let mut queue_binding = test_binding(OverlapPolicy::Queue { depth: 4 });
+        queue_binding.binding.id = binding_id;
+        let registry = FakeRegistry::default();
+        accept_occurrence(
+            &mut conn,
+            &queue_binding,
+            &occurrence_at(binding_id, 1),
+            fired_at(60),
+            &registry,
+        )
+        .unwrap();
+        let second = match accept_occurrence(
+            &mut conn,
+            &queue_binding,
+            &occurrence_at(binding_id, 2),
+            fired_at(120),
+            &registry,
+        )
+        .unwrap()
+        {
+            Acceptance::New {
+                delivery: Some(d), ..
+            } => d,
+            other => panic!("expected a queued delivery, got {other:?}"),
+        };
+        assert_eq!(second.state, DeliveryState::Ready);
+        assert_eq!(
+            fetch_trigger_event_outcome(&conn, second.trigger_event_id).unwrap(),
+            Some(TriggerEventOutcome::Queued)
+        );
+
+        assert_eq!(fetch_trigger_event_outcome(&conn, 9_999).unwrap(), None);
     }
 
     #[test]
