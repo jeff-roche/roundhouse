@@ -77,6 +77,23 @@ pub(crate) enum GateDecision {
     Decided(StepOutcome),
 }
 
+/// What [`Executor::dispatch_step`] did with one step: either it is fully
+/// resolved (every variant but `Tool`/`Agent`, and `Tool`/`Agent` themselves
+/// under [`Executor::dispatch_step_or_stub`]), or it needs real work this
+/// crate cannot perform — see [`run_loop::PendingKind`].
+///
+/// `Executor::run_to_completion` and `map_step::Executor::dispatch_map_step`
+/// — the two callers with no `workflow_run` row behind them — never see
+/// `Pending` at all: both go through [`Executor::dispatch_step_or_stub`],
+/// which converts it into the same stub outcome this crate always produced
+/// for `Tool`/`Agent` before this type existed. Only
+/// [`run_loop::Loop::run_phase`] is able to actually suspend a run, so only
+/// it calls [`Executor::dispatch_step`] directly.
+pub(crate) enum DispatchDecision {
+    Done(StepOutcome),
+    Pending(run_loop::PendingKind),
+}
+
 /// Evaluates `step.when` (if present) against `ctx`, with the identical
 /// `Ok(non-true) -> Skipped` / `Err -> Failed (fail-closed)` split for every
 /// caller — see [`GateDecision`]. A step with no `when:` at all always
@@ -900,7 +917,7 @@ impl<'a> Executor<'a> {
                 } => gate_condition_was_secret_derived,
             };
 
-            let mut outcome = self.dispatch_step(step);
+            let mut outcome = self.dispatch_step_or_stub(step);
             outcome.gate_condition_was_secret_derived = gate_condition_was_secret_derived;
             if outcome.output_is_secret_derived {
                 secret_derived_steps.push(step.id.clone());
@@ -911,13 +928,86 @@ impl<'a> Executor<'a> {
         Ok(outcomes)
     }
 
-    /// Dispatches one step. The returned [`StepOutcome`] carries
+    /// Dispatches one step for a caller with no `workflow_run` row behind it
+    /// — [`Self::run_to_completion`] and `map_step::Executor::dispatch_map_step`
+    /// — by converting a [`DispatchDecision::Pending`] into the same stub
+    /// outcome this crate always produced for `Tool`/`Agent` before that
+    /// variant existed: a `TaskCreated` reaches the sink (so today's
+    /// callers see no change at all), and the outcome is a fixed empty,
+    /// `Completed` object. Real dispatch is [`run_loop::Loop::run_phase`]'s
+    /// alone, because only it can suspend and resume a durable run.
+    fn dispatch_step_or_stub(&mut self, step: &StepDef) -> StepOutcome {
+        let kind = match self.dispatch_step(step) {
+            DispatchDecision::Done(outcome) => return outcome,
+            DispatchDecision::Pending(kind) => kind,
+        };
+        let task_id = TaskId::new();
+        match kind {
+            run_loop::PendingKind::Tool {
+                task_kind,
+                logged_input,
+                ..
+            } => {
+                self.sink.emit(
+                    task_id,
+                    None,
+                    task_kind.clone(),
+                    EventPayload::TaskCreated {
+                        kind: task_kind,
+                        parent: None,
+                        origin: Origin::System,
+                        input: TaskInput::Json(logged_input),
+                    },
+                );
+            }
+            run_loop::PendingKind::Agent { logged_prompt, .. } => {
+                self.sink.emit(
+                    task_id,
+                    None,
+                    TaskKind::Agent,
+                    EventPayload::TaskCreated {
+                        kind: TaskKind::Agent,
+                        parent: None,
+                        origin: Origin::System,
+                        input: TaskInput::Json(logged_prompt),
+                    },
+                );
+            }
+            // `dispatch_step` never produces this from an in-memory
+            // sequencer's own `Tool`/`Agent` steps — `ChildRun` is built
+            // exclusively by `run_loop::Loop::dispatch_call`, which this
+            // function's two callers never reach (see `dispatch_step`'s own
+            // `Gate`/`Call` refusal arm).
+            run_loop::PendingKind::ChildRun { .. } => unreachable!(
+                "dispatch_step never returns PendingKind::ChildRun from Tool/Agent bodies"
+            ),
+        }
+        StepOutcome {
+            step_id: step.id.clone(),
+            output: serde_json::json!({}),
+            status: StepStatus::Completed,
+            output_is_secret_derived: false,
+            gate_condition_was_secret_derived: false,
+        }
+    }
+
+    /// Dispatches one step. The returned [`StepOutcome`] (inside
+    /// [`DispatchDecision::Done`]) carries
     /// [`StepOutcome::output_is_secret_derived`], which
     /// [`Self::run_to_completion`] folds into `secret_derived_steps` to carry
     /// taint across the step boundary — and which, since fix round 4 (item D),
     /// also survives out of this crate rather than being consumed here, so
     /// Task 8's durability layer reads the fact instead of re-deriving it.
-    fn dispatch_step(&mut self, step: &StepDef) -> StepOutcome {
+    ///
+    /// # `Tool`/`Agent` return [`DispatchDecision::Pending`], and emit nothing
+    ///
+    /// Both arms interpolate and dual-render (ruling P33) exactly as before,
+    /// but no longer call `self.sink.emit` — the caller that performs the
+    /// real dispatch mints the task through `TaskRunner`, and a sink emit
+    /// here would be a second, orphaned `TaskCreated` for the same unit of
+    /// work. See [`Self::dispatch_step_or_stub`] for the caller that still
+    /// wants today's stub-and-emit behaviour.
+    fn dispatch_step(&mut self, step: &StepDef) -> DispatchDecision {
         // Computed for every dispatch (matching this task's Interfaces
         // list) but not yet attached to anything persisted — see
         // `provenance::Provenance`'s own doc comment for why.
@@ -929,6 +1019,11 @@ impl<'a> Executor<'a> {
         };
         let _ = &provenance;
 
+        // Only `Emit`/`Report` still use this directly — `Tool`/`Agent` mint
+        // their own task id inside `dispatch_step_or_stub`, once the real
+        // caller is known, since a task id minted here and then discarded on
+        // the `Pending` path would be a second, unused identity for the same
+        // eventual task.
         let task_id = TaskId::new();
         match &step.body {
             StepBody::Tool { tool, with } => {
@@ -945,60 +1040,38 @@ impl<'a> Executor<'a> {
                     {
                         Ok(v) => v,
                         Err(e) => {
-                            return StepOutcome::failed(
+                            return DispatchDecision::Done(StepOutcome::failed(
                                 &step.id,
                                 format!("interpolating `with:`: {e}"),
-                            );
+                            ));
                         }
                     };
                 // Ruling P33's dual rendering: `redacted_for_logging()` is the
                 // only half that may reach the sink; the backstop needles are
                 // applied on top of it for a credential the author pasted
                 // literally into the YAML, which no provenance can see.
-                let logged_with = redact_with_needles(
+                let logged_input = redact_with_needles(
                     resolved_with.redacted_for_logging(),
                     &self.redaction_needles,
                 );
-                let kind = task_kind_for_tool(tool);
-                self.sink.emit(
-                    task_id,
-                    None,
-                    kind.clone(),
-                    EventPayload::TaskCreated {
-                        kind,
-                        parent: None,
-                        origin: Origin::System,
-                        input: TaskInput::Json(logged_with),
-                    },
-                );
-                // Real dispatch delegates
-                // `resolved_with.into_unredacted_for_dispatch()` — the real
-                // value, `${{ secrets.* }}` included — to `roundhouse-tools`
-                // via `roundhouse-engine`; this executor's job ends at
-                // emitting the task and folding its eventual `TaskCompleted`
-                // back into `steps.<id>.output` — wired in Task 8's
-                // durability layer, which owns the actual run loop. Until
-                // then the unredacted half is simply dropped here.
-                //
-                // `output` is a fixed empty object, so it is never
-                // secret-derived regardless of what `with:` contained.
-                StepOutcome {
-                    step_id: step.id.clone(),
-                    output: serde_json::json!({}),
-                    status: StepStatus::Completed,
-                    output_is_secret_derived: false,
-                    gate_condition_was_secret_derived: false,
-                }
+                let task_kind = task_kind_for_tool(tool);
+                let dispatch_input = resolved_with.into_unredacted_for_dispatch();
+                DispatchDecision::Pending(run_loop::PendingKind::Tool {
+                    tool: tool.clone(),
+                    task_kind,
+                    logged_input,
+                    dispatch_input,
+                })
             }
             StepBody::Agent { prompt, .. } => {
                 let resolved_prompt =
                     match interpolate(TemplateSource::from_workflow_file(prompt), &self.ctx) {
                         Ok(s) => s,
                         Err(e) => {
-                            return StepOutcome::failed(
+                            return DispatchDecision::Done(StepOutcome::failed(
                                 &step.id,
                                 format!("interpolating `agent.prompt`: {e}"),
-                            );
+                            ));
                         }
                     };
                 // A prompt is prose, so the redacted rendering here keeps the
@@ -1008,27 +1081,11 @@ impl<'a> Executor<'a> {
                     &serde_json::json!({"prompt": resolved_prompt.redacted_for_logging()}),
                     &self.redaction_needles,
                 );
-                self.sink.emit(
-                    task_id,
-                    None,
-                    TaskKind::Agent,
-                    EventPayload::TaskCreated {
-                        kind: TaskKind::Agent,
-                        parent: None,
-                        origin: Origin::System,
-                        input: TaskInput::Json(logged_prompt),
-                    },
-                );
-                // As in the `Tool` arm: real dispatch (Task 8) gets
-                // `resolved_prompt.into_unredacted_for_dispatch()`; `output`
-                // is a fixed empty object and never secret-derived.
-                StepOutcome {
-                    step_id: step.id.clone(),
-                    output: serde_json::json!({}),
-                    status: StepStatus::Completed,
-                    output_is_secret_derived: false,
-                    gate_condition_was_secret_derived: false,
-                }
+                let dispatch_prompt = resolved_prompt.into_unredacted_for_dispatch();
+                DispatchDecision::Pending(run_loop::PendingKind::Agent {
+                    logged_prompt,
+                    dispatch_prompt,
+                })
             }
             StepBody::Emit { emit } => {
                 // Finding 2 fix: previously this arm only built an
@@ -1044,10 +1101,10 @@ impl<'a> Executor<'a> {
                     {
                         Ok(v) => v,
                         Err(e) => {
-                            return StepOutcome::failed(
+                            return DispatchDecision::Done(StepOutcome::failed(
                                 &step.id,
                                 format!("interpolating `emit:`: {e}"),
-                            );
+                            ));
                         }
                     };
                 // Fix round 1, item 1 (CRITICAL): this arm used to pass
@@ -1084,13 +1141,13 @@ impl<'a> Executor<'a> {
                         usage: Usage::default(),
                     },
                 );
-                StepOutcome {
+                DispatchDecision::Done(StepOutcome {
                     step_id: step.id.clone(),
                     output: resolved.into_unredacted_for_dispatch(),
                     status: StepStatus::Completed,
                     output_is_secret_derived,
                     gate_condition_was_secret_derived: false,
-                }
+                })
             }
             StepBody::Report { report } => {
                 // Finding 2 fix (the audit's headline example): the
@@ -1107,10 +1164,10 @@ impl<'a> Executor<'a> {
                 ) {
                     Ok(v) => v,
                     Err(e) => {
-                        return StepOutcome::failed(
+                        return DispatchDecision::Done(StepOutcome::failed(
                             &step.id,
                             format!("interpolating `report:`: {e}"),
-                        );
+                        ));
                     }
                 };
                 // Fix round 1, item 1 (CRITICAL): same defect as `Emit`
@@ -1167,7 +1224,10 @@ impl<'a> Executor<'a> {
                 // arrive as the redaction placeholder — see `Report`'s doc
                 // comment on the visible consequence of that.
                 if let Err(e) = crate::report::validate_report(&logged) {
-                    return StepOutcome::failed(&step.id, format!("invalid `report:`: {e}"));
+                    return DispatchDecision::Done(StepOutcome::failed(
+                        &step.id,
+                        format!("invalid `report:`: {e}"),
+                    ));
                 }
                 let output_is_secret_derived = resolved.is_secret_derived();
                 match &mut self.report_emission {
@@ -1199,13 +1259,13 @@ impl<'a> Executor<'a> {
                         );
                     }
                 }
-                StepOutcome {
+                DispatchDecision::Done(StepOutcome {
                     step_id: step.id.clone(),
                     output: resolved.into_unredacted_for_dispatch(),
                     status: StepStatus::Completed,
                     output_is_secret_derived,
                     gate_condition_was_secret_derived: false,
-                }
+                })
             }
             // Task 14/B6: real `map` dispatch — evaluates `over:`, binds the
             // `as:` item variable per item, and recursively runs the inner
@@ -1229,7 +1289,7 @@ impl<'a> Executor<'a> {
                 on_item_error,
                 isolation,
                 steps,
-            } => self.dispatch_map_step(
+            } => DispatchDecision::Done(self.dispatch_map_step(
                 &step.id,
                 over,
                 r#as,
@@ -1237,7 +1297,7 @@ impl<'a> Executor<'a> {
                 *on_item_error,
                 isolation.as_ref(),
                 steps,
-            ),
+            )),
             // **`gate:` and `call:` are handled by [`run_loop`], not here**
             // (B12c). Both need a `workflow_run` row and a `&mut Connection`
             // — a park is a durable state transition plus a checkpoint, and a
@@ -1275,14 +1335,17 @@ impl<'a> Executor<'a> {
             // but a literal credential typed directly into a `gate`/`call`
             // body (e.g. `gate.form`, `call.with`) would reach the log
             // verbatim. Name only the variant, never its contents.
-            other @ (StepBody::Gate { .. } | StepBody::Call { .. }) => StepOutcome::failed(
-                &step.id,
-                format!(
-                    "step kind `{}` needs a run loop: it is dispatched by \
-                     `run_loop::run_workflow`, never by a bare executor or from inside a `map`",
-                    step_body_kind_name(other)
-                ),
-            ),
+            other @ (StepBody::Gate { .. } | StepBody::Call { .. }) => {
+                DispatchDecision::Done(StepOutcome::failed(
+                    &step.id,
+                    format!(
+                        "step kind `{}` needs a run loop: it is dispatched by \
+                         `run_loop::run_workflow`, never by a bare executor or from inside a \
+                         `map`",
+                        step_body_kind_name(other)
+                    ),
+                ))
+            }
         }
     }
 }

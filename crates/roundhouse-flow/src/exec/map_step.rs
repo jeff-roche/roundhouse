@@ -1504,7 +1504,12 @@ impl<'a> Executor<'a> {
                             // nested map's own inner taint travels on
                             // `output_is_secret_derived`, folded on the next
                             // line, not on this field).
-                            let mut outcome = self.dispatch_step(inner);
+                            // `dispatch_step_or_stub`, not `dispatch_step`: a
+                            // `map` item has no `workflow_run` row of its own
+                            // to suspend (see `Executor::dispatch_step_or_stub`'s
+                            // own doc) — real per-item `tool:`/`agent:`
+                            // concurrency is Phase 8 Task 25.7's scope.
+                            let mut outcome = self.dispatch_step_or_stub(inner);
                             outcome.gate_condition_was_secret_derived =
                                 gate_condition_was_secret_derived;
                             outcome

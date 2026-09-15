@@ -94,8 +94,9 @@ use super::{
 use crate::caps::ResourceCaps;
 use crate::compose::draw_child_budget;
 use crate::durability::{
-    checkpoint_step, derive_disposition, recover_run, transition_run, DurabilityError, RunState,
-    StepOutput, StepRunState, WorkflowRun, WorkflowStepRun,
+    checkpoint_step, crash_policy, derive_disposition, recover_run, transition_run, CrashPolicy,
+    DurabilityError, RunState, StepDisposition, StepOutput, StepRunState, WorkflowRun,
+    WorkflowStepRun,
 };
 use crate::hitl::{AwaitingHuman, HitlError};
 use crate::ledger::{
@@ -369,6 +370,143 @@ pub struct GateAnswer {
     pub output: Value,
 }
 
+/// What to hand [`run_workflow`] on a call that resumes a suspended run — a
+/// run has at most one live suspension at a time, so which case applies is
+/// the caller's to know, not this crate's to infer.
+#[derive(Debug, Clone)]
+pub enum Resume {
+    /// Resolves an [`RunOutcome::Parked`] gate.
+    Gate(GateAnswer),
+    /// Resolves an [`RunOutcome::AwaitingWork`] suspension — one entry per
+    /// [`PendingWork`] the caller was handed. Always length 1 today (nothing
+    /// yet batches pending work); the `Vec` is here so a future caller that
+    /// answers several pending items in one call does not need a second
+    /// contract change — see [`PendingKind::ChildRun`] and Phase 8 Task
+    /// 25.7 (map `max_parallel`) for why that future caller exists.
+    Work(Vec<WorkDone>),
+}
+
+/// One unit of work [`run_workflow`] cannot perform itself: real dispatch is
+/// async and requires a live `Session` and the engine's policy admission,
+/// both of which live outside this crate — see this module's own doc,
+/// "What this module does NOT own".
+///
+/// By the time this is returned, the step's row is already
+/// [`StepRunState::Running`] — so a crash between here and the matching
+/// [`WorkDone`] is [`crate::durability::recover_run`]'s `Indeterminate`
+/// reclassification, by construction, not a rule the caller must remember.
+#[derive(Debug, Clone)]
+pub struct PendingWork {
+    pub run_id: RunId,
+    /// The Session the eventual task must be filed under —
+    /// [`TaskSink::emit`] structurally cannot carry this; see that trait's
+    /// own doc for why.
+    pub session_id: SessionId,
+    pub step_id: String,
+    /// Always `1` today — see `crate::retry`'s own "built, unwired" note.
+    pub attempt: u32,
+    /// Always `None` today: a `map` item's own pending work is Phase 8 Task
+    /// 25.7's scope, not this one's.
+    pub item_index: Option<u32>,
+    pub disposition: StepDisposition,
+    /// The run's real remaining per-step ceiling as of the moment this step
+    /// started, from the same [`crate::ledger::remaining_caps`] read
+    /// `map`'s own per-step budget refresh already takes (§8.9's "at the
+    /// moment the map starts", applied here to a single step's dispatch).
+    /// The caller must bound the real work with it — nothing inside this
+    /// crate can.
+    pub step_timeout: std::time::Duration,
+    pub kind: PendingKind,
+}
+
+/// What kind of work is pending, and everything a caller needs to dispatch
+/// it for real without re-deriving anything this crate already resolved.
+///
+/// Every field here is already interpolated and dual-rendered (ruling P33):
+/// the `logged_*` value is what a caller mints its `TaskCreated` with, the
+/// `dispatch_*` value is the real one — never for logging or persisting.
+#[derive(Debug, Clone)]
+pub enum PendingKind {
+    Tool {
+        tool: String,
+        task_kind: TaskKind,
+        logged_input: Value,
+        dispatch_input: Value,
+    },
+    Agent {
+        logged_prompt: Value,
+        dispatch_prompt: String,
+    },
+    /// A `call:` child run and Session already exist (created by
+    /// [`Loop::dispatch_call`]); the caller drives the child and reports its
+    /// outcome. **Unused until Phase 8 Task 25.6** — the variant exists now
+    /// so [`Resume::Work`]'s shape does not have to change again when that
+    /// task lands.
+    ChildRun {
+        child_run_id: RunId,
+        child_session_id: SessionId,
+    },
+}
+
+/// What a caller did with one [`PendingWork`].
+#[derive(Debug, Clone)]
+pub struct WorkDone {
+    pub step_id: String,
+    pub status: WorkStatus,
+    /// Becomes `steps.<id>.output` — the real value, never redacted here;
+    /// the redaction that matters happens on the way into the log
+    /// ([`Loop::record`]/`steps_context_entry`), not on the way in here.
+    pub output: Value,
+    /// Read, never recomputed — [`StepOutcome::output_is_secret_derived`]'s
+    /// own doc: "a re-derivation that disagrees with this one is a leak."
+    pub output_is_secret_derived: bool,
+    /// The task the caller actually minted, and its log range — the first
+    /// real values `WorkflowStepRun::first_task_seq`/`last_task_seq` have
+    /// ever carried; see [`Loop::checkpoint`]'s own note on why they were
+    /// `None` before this.
+    pub task_id: Option<TaskId>,
+    pub first_task_seq: Option<u64>,
+    pub last_task_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub enum WorkStatus {
+    Completed,
+    /// Ordinary control flow — `continue_on_error` applies exactly as it
+    /// does to any other step failure.
+    Failed {
+        message: String,
+    },
+    /// §8.13 cancel, observed by the caller mid-dispatch. Recorded as a step
+    /// failure (there is no separate `StepStatus::Cancelled`); the run's own
+    /// `Cancelled` state, not this step's status, is what a reader keys off.
+    Cancelled {
+        reason: String,
+    },
+}
+
+/// Converts what a caller did with a [`PendingWork`] into the same
+/// [`StepOutcome`] shape every other dispatch arm produces, so [`Loop::record`]
+/// has one input type regardless of whether a step ran synchronously or was
+/// suspended and resumed.
+fn step_outcome_from_work_done(work: WorkDone) -> StepOutcome {
+    let status = match work.status {
+        WorkStatus::Completed => StepStatus::Completed,
+        WorkStatus::Failed { message } => StepStatus::Failed { message },
+        WorkStatus::Cancelled { reason } => StepStatus::Failed { message: reason },
+    };
+    StepOutcome {
+        step_id: work.step_id,
+        output: work.output,
+        status,
+        output_is_secret_derived: work.output_is_secret_derived,
+        // Overwritten by the caller immediately after, exactly as every
+        // other arm's outcome is — see `Loop::run_phase`'s
+        // `outcome.gate_condition_was_secret_derived = gate_secret_derived;`.
+        gate_condition_was_secret_derived: false,
+    }
+}
+
 /// Where the run's one `TaskKind::Report` task came from.
 ///
 /// The document itself is deliberately **not** carried here: §8.6 requires it
@@ -413,6 +551,13 @@ pub enum RunOutcome {
     /// report and no owner: `crate::report`'s module doc records that
     /// obligation for whoever builds §8.11's reaper.
     Parked(Box<ParkResult>),
+    /// A `tool:`/`agent:` step needs real work this crate cannot perform.
+    /// **Not terminal, so it carries no report** — the run is still
+    /// `Running` (unlike `Parked`, which writes `AwaitingHuman`: the run
+    /// genuinely is running, its caller is simply not inside
+    /// [`run_workflow`] at this instant). Call [`run_workflow`] again with
+    /// [`Resume::Work`] to resume it.
+    AwaitingWork { pending: Vec<PendingWork> },
 }
 
 /// Which of the three step lists is running — the one thing §8.13's admission
@@ -494,8 +639,21 @@ pub fn run_workflow<H: WorkflowHost>(
     host: &mut H,
     run_ctx: super::RunContext,
     now: Timestamp,
-    resume: Option<GateAnswer>,
+    resume: Option<Resume>,
 ) -> Result<RunOutcome, RunLoopError> {
+    // Split the one `resume` parameter into the two internal channels it can
+    // carry — a run has at most one live suspension at a time, so exactly
+    // one of these is ever non-empty on any call.
+    let (gate_answer, work_results): (Option<GateAnswer>, HashMap<String, WorkDone>) = match resume
+    {
+        Some(Resume::Gate(answer)) => (Some(answer), HashMap::new()),
+        Some(Resume::Work(work)) => (
+            None,
+            work.into_iter().map(|w| (w.step_id.clone(), w)).collect(),
+        ),
+        None => (None, HashMap::new()),
+    };
+
     let main = parse_phase(&def.steps)?;
     let catch = parse_phase(&def.catch)?;
     let finally = parse_phase(&def.finally)?;
@@ -523,7 +681,7 @@ pub fn run_workflow<H: WorkflowHost>(
     let session_id = recovered.run.session_id;
     let started_state = recovered.run.state;
 
-    match (started_state, &resume) {
+    match (started_state, &gate_answer) {
         (RunState::Running, _) => {}
         // **`Cancelling` is drivable, and it has to be.** §8.13's cancel is
         // cooperative: an operator marks the row and the loop is what drains
@@ -540,7 +698,7 @@ pub fn run_workflow<H: WorkflowHost>(
     // Checked even when the run was already `Running`, so an answer naming a
     // step that is not a gate is refused on every path rather than only on the
     // resume path — see `release_park`.
-    if let Some(answer) = &resume {
+    if let Some(answer) = &gate_answer {
         ensure_gate_step(&main, answer)?;
     }
 
@@ -595,13 +753,20 @@ pub fn run_workflow<H: WorkflowHost>(
         report_step,
         report_completed_before: false,
         finished_before: finished_step_rows(&recovered.steps),
-        gate_answer: resume,
+        indeterminate_before: indeterminate_step_rows(&recovered.steps),
+        gate_answer,
+        work_results,
     };
     run.seed_context_from_checkpoints(&recovered.steps);
 
     let main_result = run.run_phase(&mut executor, Phase::Main, &main)?;
     if let PhaseEnd::Parked(parked) = main_result {
         return Ok(RunOutcome::Parked(Box::new(parked)));
+    }
+    if let PhaseEnd::AwaitingWork(pending) = main_result {
+        return Ok(RunOutcome::AwaitingWork {
+            pending: vec![*pending],
+        });
     }
     let main_failed = matches!(main_result, PhaseEnd::Failed);
     let cancelled = matches!(main_result, PhaseEnd::Cancelled);
@@ -610,15 +775,28 @@ pub fn run_workflow<H: WorkflowHost>(
         // §8.9's `catch:` runs on failure and only on failure. Its own failures
         // do not re-enter it: the run is failing either way, and a `catch:`
         // that could trigger itself is a loop.
-        if let PhaseEnd::Parked(parked) = run.run_phase(&mut executor, Phase::Catch, &catch)? {
-            return Ok(RunOutcome::Parked(Box::new(parked)));
+        match run.run_phase(&mut executor, Phase::Catch, &catch)? {
+            PhaseEnd::Parked(parked) => return Ok(RunOutcome::Parked(Box::new(parked))),
+            PhaseEnd::AwaitingWork(pending) => {
+                return Ok(RunOutcome::AwaitingWork {
+                    pending: vec![*pending],
+                })
+            }
+            PhaseEnd::Completed | PhaseEnd::Failed | PhaseEnd::Cancelled => {}
         }
     }
 
     // §8.13: `finally:` runs on every path, cancel included. A park inside
     // `finally:` would suspend a run that is already ending, so a gate here is
-    // refused by `dispatch_gate` rather than honoured.
+    // refused by `dispatch_gate` rather than honoured. A `tool:`/`agent:`
+    // step is not refused the same way — it is ordinary work, not a wait on
+    // a human — so `finally:` can suspend on one exactly like `steps:` can.
     let finally_result = run.run_phase(&mut executor, Phase::Finally, &finally)?;
+    if let PhaseEnd::AwaitingWork(pending) = finally_result {
+        return Ok(RunOutcome::AwaitingWork {
+            pending: vec![*pending],
+        });
+    }
     let finally_failed = matches!(finally_result, PhaseEnd::Failed);
 
     // **Ruling P117 §A, leg 1: the durable row is the second observer of a
@@ -697,6 +875,19 @@ fn finished_step_rows(rows: &[WorkflowStepRun]) -> HashMap<String, WorkflowStepR
             row.item_index.is_none()
                 && matches!(row.state, StepRunState::Completed | StepRunState::Skipped)
         })
+        .map(|row| (row.step_id.clone(), row.clone()))
+        .collect()
+}
+
+/// Every step id [`crate::durability::recover_run`] reclassified
+/// `Indeterminate` — an `Effectful` step found `Running` when this run was
+/// loaded. Consulted by [`Loop::run_phase`] only when the resumed step
+/// carries no caller-supplied [`WorkDone`] (a genuine resume — an ordinary
+/// answer for a step this run just suspended on — is trusted outright and
+/// never routed through the crash policy at all).
+fn indeterminate_step_rows(rows: &[WorkflowStepRun]) -> HashMap<String, WorkflowStepRun> {
+    rows.iter()
+        .filter(|row| row.item_index.is_none() && row.state == StepRunState::Indeterminate)
         .map(|row| (row.step_id.clone(), row.clone()))
         .collect()
 }
@@ -835,6 +1026,10 @@ enum PhaseEnd {
     /// A `gate:` parked the run. The whole loop unwinds; nothing after this
     /// step runs, and no report is written, because the run has not ended.
     Parked(ParkResult),
+    /// A `tool:`/`agent:` step needs real work. The whole loop unwinds
+    /// exactly as for `Parked` — nothing after this step runs — but the run
+    /// stays `Running`, not `AwaitingHuman`.
+    AwaitingWork(Box<PendingWork>),
 }
 
 struct Loop<'c, H: WorkflowHost> {
@@ -860,7 +1055,18 @@ struct Loop<'c, H: WorkflowHost> {
     /// [`Loop::seed_context_from_checkpoints`].
     report_completed_before: bool,
     finished_before: HashMap<String, WorkflowStepRun>,
+    /// Every step id whose row is `Indeterminate` — an `Effectful` step found
+    /// `Running` after a crash, per [`crate::durability::recover_run`].
+    /// Consulted once per matching step, on the pass that first re-drives
+    /// it, so §8.10 tier 2's `on_crash` policy is applied instead of the
+    /// step being treated as never-started.
+    indeterminate_before: HashMap<String, WorkflowStepRun>,
     gate_answer: Option<GateAnswer>,
+    /// What a caller reported for a step this run suspended on, keyed by
+    /// step id and drained as each is consumed. Populated from
+    /// [`Resume::Work`]; empty on every other entry, including a crash
+    /// re-drive with no caller-supplied answer at all.
+    work_results: HashMap<String, WorkDone>,
 }
 
 impl<H: WorkflowHost> Loop<'_, H> {
@@ -977,62 +1183,119 @@ impl<H: WorkflowHost> Loop<'_, H> {
 
             self.bind_steps_context(executor);
 
-            // §8.4's *"caps enforced at task admission"*, at the one place
-            // every step passes. This is also where §8.13's cancel is
-            // observed: `admit_spend` refuses a `Cancelling` run, so the
-            // cooperative drain is read off the same chokepoint that enforces
-            // the budget rather than from a second state read that could
-            // disagree with it.
-            match self.admit(phase, step) {
-                Ok(()) => {}
-                Err(LedgerError::NotAdmitting {
-                    state: RunState::Cancelling,
-                    ..
-                }) => {
-                    end = PhaseEnd::Cancelled;
-                    stopped_at = Some(index);
-                    break;
-                }
-                Err(LedgerError::NotAdmitting { state, .. }) => {
-                    return Err(RunLoopError::RunNotDrivable {
-                        run_id: self.run_id,
-                        state,
-                    })
-                }
-                Err(refused) => {
-                    // A budget refusal is a *step* failure, not a run-loop
-                    // error: the run has an outcome (it ran out of what it was
-                    // given), and an outcome is exactly what the report exists
-                    // to carry. `LedgerError`'s `Display` names the field that
-                    // ran out.
-                    let outcome =
-                        StepOutcome::failed(&step.id, format!("admission refused: {refused}"));
-                    self.record(step, outcome)?;
-                    end = PhaseEnd::Failed;
-                    stopped_at = Some(index + 1);
-                    break;
-                }
-            }
+            // A caller-supplied answer for this exact step always wins,
+            // whether this is an ordinary resume (the run never crashed,
+            // the caller simply was not inside `run_workflow` while the
+            // work ran) or a resume after a restart the caller's own
+            // durable state survived. Consuming it here — before admission,
+            // before the crash-policy check below — is what stops a step
+            // this run already knows the answer to being re-admitted or
+            // re-decided.
+            let resumed_work = self.work_results.remove(&step.id);
 
-            // Ruling P108 §C, discharged: the `map` split is taken from the
-            // run's real remaining ceiling, read at the moment the step starts
-            // — §8.9's own words for when it is taken.
-            //
-            // **Sourced, not yet enforced, and this slice's mutation sweep
-            // measured exactly that.** `map_step::run_map` computes
-            // `split_budget(&budget.total_remaining, n)` and hands the result
-            // to a closure that binds it `_item_caps`; nothing reads it. So
-            // mutating this line away survives at zero test failures, and the
-            // honest reading is that the *sourcing* half of P108 §C is done
-            // and the *enforcement* half is per-item admission — which belongs
-            // with `map`'s worktree fan-out, deferred out of B12 entirely by
-            // ruling P77 §C. Kept rather than deleted because the value is now
-            // real and correct, and the consumer arrives with fan-out.
-            executor.map_budget = Some(MapBudget::from_run_ledger(
-                self.conn,
-                self.run_id,
-                self.now,
-            )?);
+            if resumed_work.is_none() {
+                // §8.10 tier 2: a step found `Indeterminate` (`Effectful`,
+                // `Running` when this run was loaded — see
+                // `crate::durability::recover_run`) with no caller-supplied
+                // answer is a step this run does not know completed. This is
+                // what stops it being silently treated as never-started and
+                // re-admitted/re-dispatched regardless of its declared
+                // `on_crash`.
+                if let Some(row) = self.indeterminate_before.remove(&step.id) {
+                    let policy = crash_policy(step);
+                    match policy {
+                        CrashPolicy::Rerun => {}
+                        CrashPolicy::Fail | CrashPolicy::Ask => {
+                            // `Ask` (§8.10's default) belongs in the gate
+                            // queue; this crate has no park-on-ambiguous-crash
+                            // mechanism yet (Phase 8 Task 25.4's scope), so it
+                            // fails closed rather than silently re-running an
+                            // effectful step whose completion is unknown.
+                            // Never re-running such a step without a human
+                            // decision is the safety property that must hold
+                            // either way — failing closed is a narrower
+                            // interim behaviour than parking, not a weaker
+                            // one.
+                            let outcome = StepOutcome::failed(
+                                &step.id,
+                                format!(
+                                    "step was interrupted mid-dispatch (found {:?}) and its \
+                                     on_crash policy is {policy:?}: refusing to silently \
+                                     re-run an effectful step whose completion is unknown",
+                                    row.state
+                                ),
+                            );
+                            self.record(step, outcome)?;
+                            end = PhaseEnd::Failed;
+                            stopped_at = Some(index + 1);
+                            break;
+                        }
+                    }
+                }
+
+                // §8.4's *"caps enforced at task admission"*, at the one
+                // place every step passes. This is also where §8.13's cancel
+                // is observed: `admit_spend` refuses a `Cancelling` run, so
+                // the cooperative drain is read off the same chokepoint that
+                // enforces the budget rather than from a second state read
+                // that could disagree with it.
+                //
+                // Skipped for a step with a `resumed_work` answer above: it
+                // was already charged on the pass that produced the
+                // `PendingWork` this answers, and admitting it a second time
+                // would double-charge the run's ledger.
+                match self.admit(phase, step) {
+                    Ok(()) => {}
+                    Err(LedgerError::NotAdmitting {
+                        state: RunState::Cancelling,
+                        ..
+                    }) => {
+                        end = PhaseEnd::Cancelled;
+                        stopped_at = Some(index);
+                        break;
+                    }
+                    Err(LedgerError::NotAdmitting { state, .. }) => {
+                        return Err(RunLoopError::RunNotDrivable {
+                            run_id: self.run_id,
+                            state,
+                        })
+                    }
+                    Err(refused) => {
+                        // A budget refusal is a *step* failure, not a run-loop
+                        // error: the run has an outcome (it ran out of what it
+                        // was given), and an outcome is exactly what the
+                        // report exists to carry. `LedgerError`'s `Display`
+                        // names the field that ran out.
+                        let outcome =
+                            StepOutcome::failed(&step.id, format!("admission refused: {refused}"));
+                        self.record(step, outcome)?;
+                        end = PhaseEnd::Failed;
+                        stopped_at = Some(index + 1);
+                        break;
+                    }
+                }
+
+                // Ruling P108 §C, discharged: the `map` split is taken from
+                // the run's real remaining ceiling, read at the moment the
+                // step starts — §8.9's own words for when it is taken.
+                //
+                // **Sourced, not yet enforced, and this slice's mutation
+                // sweep measured exactly that.** `map_step::run_map` computes
+                // `split_budget(&budget.total_remaining, n)` and hands the
+                // result to a closure that binds it `_item_caps`; nothing
+                // reads it. So mutating this line away survives at zero test
+                // failures, and the honest reading is that the *sourcing*
+                // half of P108 §C is done and the *enforcement* half is
+                // per-item admission — which belongs with `map`'s worktree
+                // fan-out, deferred out of B12 entirely by ruling P77 §C.
+                // Kept rather than deleted because the value is now real and
+                // correct, and the consumer arrives with fan-out.
+                executor.map_budget = Some(MapBudget::from_run_ledger(
+                    self.conn,
+                    self.run_id,
+                    self.now,
+                )?);
+            }
 
             let gate_secret_derived = match evaluate_when_gate(step, &executor.ctx) {
                 GateDecision::Decided(outcome) => {
@@ -1044,30 +1307,59 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 } => gate_condition_was_secret_derived,
             };
 
-            let mut outcome = match &step.body {
-                StepBody::Gate {
-                    title,
-                    form,
-                    timeout,
-                    on_timeout,
-                    hold_workspace,
-                } => match self.dispatch_gate(
-                    executor,
-                    step,
-                    title,
-                    form,
-                    timeout,
-                    on_timeout,
-                    *hold_workspace,
-                    phase,
-                )? {
-                    GateStep::Answered(outcome) => outcome,
-                    GateStep::Parked(parked) => return Ok(PhaseEnd::Parked(parked)),
-                },
-                StepBody::Call { workflow, with } => {
-                    self.dispatch_call(executor, step, workflow, with)
+            let mut outcome = if let Some(work) = resumed_work {
+                step_outcome_from_work_done(work)
+            } else {
+                match &step.body {
+                    StepBody::Gate {
+                        title,
+                        form,
+                        timeout,
+                        on_timeout,
+                        hold_workspace,
+                    } => match self.dispatch_gate(
+                        executor,
+                        step,
+                        title,
+                        form,
+                        timeout,
+                        on_timeout,
+                        *hold_workspace,
+                        phase,
+                    )? {
+                        GateStep::Answered(outcome) => outcome,
+                        GateStep::Parked(parked) => return Ok(PhaseEnd::Parked(parked)),
+                    },
+                    StepBody::Call { workflow, with } => {
+                        self.dispatch_call(executor, step, workflow, with)
+                    }
+                    _ => match executor.dispatch_step(step) {
+                        super::DispatchDecision::Done(outcome) => outcome,
+                        super::DispatchDecision::Pending(kind) => {
+                            // The row records that the step is waiting, not
+                            // that it finished — the same shape
+                            // `dispatch_gate`'s park uses, and for the same
+                            // reason: a `Running` row is what §8.10 tier 2
+                            // reclassifies `Indeterminate` for an `Effectful`
+                            // step after a crash.
+                            self.checkpoint(step, StepRunState::Running, None, None)?;
+                            return Ok(PhaseEnd::AwaitingWork(Box::new(PendingWork {
+                                run_id: self.run_id,
+                                session_id: self.session_id,
+                                step_id: step.id.clone(),
+                                attempt: 1,
+                                item_index: None,
+                                disposition: derive_disposition(step),
+                                step_timeout: executor
+                                    .map_budget
+                                    .as_ref()
+                                    .map(|b| b.total_remaining.step_timeout)
+                                    .unwrap_or_default(),
+                                kind,
+                            })));
+                        }
+                    },
                 }
-                _ => executor.dispatch_step(step),
             };
             outcome.gate_condition_was_secret_derived = gate_secret_derived;
 

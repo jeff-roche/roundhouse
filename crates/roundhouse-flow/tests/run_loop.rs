@@ -12,15 +12,17 @@
 //! neither a `.take(1)`-shaped truncation nor a `.skip(1)`-shaped one is
 //! invisible to the suite.
 
-use roundhouse_core::{EventPayload, JobId, SessionId, TaskId, TaskKind, TaskOutput, Timestamp};
+use roundhouse_core::{
+    EventPayload, JobId, Origin, SessionId, TaskId, TaskInput, TaskKind, TaskOutput, Timestamp,
+};
 use roundhouse_flow::caps::ResourceCaps;
 use roundhouse_flow::durability::{
     insert_workflow_run, open_test_db, recover_run, transition_run, RunState, StepRunState,
     WorkflowRun,
 };
 use roundhouse_flow::exec::run_loop::{
-    run_workflow, CalledWorkflow, GateAnswer, ReportOrigin, RunLoopError, RunOutcome, WorkflowHost,
-    WorkflowHostError,
+    run_workflow, CalledWorkflow, GateAnswer, ReportOrigin, Resume, RunLoopError, RunOutcome,
+    WorkflowHost, WorkflowHostError,
 };
 use roundhouse_flow::exec::{RunContext, RunId, StepStatus, TaskSink};
 use roundhouse_flow::expr::EnvAllowlist;
@@ -323,7 +325,7 @@ fn drive_with(
     body: &str,
     now: i64,
     mut host: FakeHost,
-    resume: Option<GateAnswer>,
+    resume: Option<Resume>,
 ) -> (
     Connection,
     RunId,
@@ -335,17 +337,103 @@ fn drive_with(
     let (run_id, _) = seed_run(&mut conn);
     let def = parse_workflow(&workflow(body)).expect("fixture parses");
     let mut sink = RecordingSink::default();
-    let result = run_workflow(
+    let result = run_to_terminal(
         &mut conn,
         &def,
         run_id,
         &mut sink,
         &mut host,
         ctx(run_id),
-        at(now),
+        now,
         resume,
     );
     (conn, run_id, sink, host, result)
+}
+
+/// Drives [`run_workflow`] until it stops returning
+/// [`RunOutcome::AwaitingWork`], answering every pending `tool:`/`agent:`
+/// step with exactly the stub this crate always produced for them before
+/// the suspend/resume seam existed (Phase 8 Task 25.1): a `TaskCreated`
+/// reaches `sink` and the step "completes" with a fixed empty object — see
+/// `Executor::dispatch_step_or_stub`'s own doc, which this mirrors on the
+/// caller side of the seam. This is the stand-in for `roundhouse-daemon`'s
+/// real driving loop (Phase 8 Task 25.2/25.3), which is what actually
+/// dispatches these for real; nothing in this crate does.
+fn run_to_terminal(
+    conn: &mut Connection,
+    def: &roundhouse_flow::parse::WorkflowDef,
+    run_id: RunId,
+    sink: &mut RecordingSink,
+    host: &mut FakeHost,
+    run_ctx: RunContext,
+    now: i64,
+    mut resume: Option<Resume>,
+) -> Result<RunOutcome, RunLoopError> {
+    loop {
+        let outcome = run_workflow(
+            conn,
+            def,
+            run_id,
+            sink,
+            host,
+            run_ctx.clone(),
+            at(now),
+            resume.take(),
+        )?;
+        let pending = match outcome {
+            RunOutcome::AwaitingWork { pending } => pending,
+            other => return Ok(other),
+        };
+        let mut done = Vec::with_capacity(pending.len());
+        for p in pending {
+            let task_id = TaskId::new();
+            match p.kind {
+                roundhouse_flow::exec::run_loop::PendingKind::Tool {
+                    task_kind,
+                    logged_input,
+                    ..
+                } => {
+                    sink.emit(
+                        task_id,
+                        None,
+                        task_kind.clone(),
+                        EventPayload::TaskCreated {
+                            kind: task_kind,
+                            parent: None,
+                            origin: Origin::System,
+                            input: TaskInput::Json(logged_input),
+                        },
+                    );
+                }
+                roundhouse_flow::exec::run_loop::PendingKind::Agent { logged_prompt, .. } => {
+                    sink.emit(
+                        task_id,
+                        None,
+                        TaskKind::Agent,
+                        EventPayload::TaskCreated {
+                            kind: TaskKind::Agent,
+                            parent: None,
+                            origin: Origin::System,
+                            input: TaskInput::Json(logged_prompt),
+                        },
+                    );
+                }
+                roundhouse_flow::exec::run_loop::PendingKind::ChildRun { .. } => {
+                    unreachable!("PendingKind::ChildRun is unused until Phase 8 Task 25.6")
+                }
+            }
+            done.push(roundhouse_flow::exec::run_loop::WorkDone {
+                step_id: p.step_id,
+                status: roundhouse_flow::exec::run_loop::WorkStatus::Completed,
+                output: serde_json::json!({}),
+                output_is_secret_derived: false,
+                task_id: Some(task_id),
+                first_task_seq: None,
+                last_task_seq: None,
+            });
+        }
+        resume = Some(Resume::Work(done));
+    }
 }
 
 /// Like [`drive`], but with a caller-supplied `RunContext::previous_report` —
@@ -1014,10 +1102,10 @@ fn a_gate_step_parks_the_run_and_resuming_it_answers_the_gate() {
         &mut host,
         ctx(run_id),
         at(200),
-        Some(GateAnswer {
+        Some(Resume::Gate(GateAnswer {
             step_id: "approve".into(),
             output: serde_json::json!({ "approve": true }),
-        }),
+        })),
     )
     .expect("the answer releases the park");
 
@@ -1083,10 +1171,10 @@ fn a_gate_answer_naming_a_non_gate_step_is_refused() {
         "steps:\n \x20- id: work\n \x20  emit: { a: 1 }\n",
         10,
         FakeHost::new(),
-        Some(GateAnswer {
+        Some(Resume::Gate(GateAnswer {
             step_id: "work".into(),
             output: serde_json::json!({}),
-        }),
+        })),
     );
     assert!(
         matches!(result, Err(RunLoopError::UnknownGateStep { .. })),
@@ -2033,14 +2121,14 @@ fn the_per_step_charge_is_one_tool_call_for_a_tool_step_and_none_for_the_rest() 
     ))
     .unwrap();
     let mut sink = RecordingSink::default();
-    let outcome = run_workflow(
+    let outcome = run_to_terminal(
         &mut conn,
         &def,
         run_id,
         &mut sink,
         &mut host,
         ctx(run_id),
-        at(10),
+        10,
         None,
     )
     .unwrap();
@@ -2232,10 +2320,10 @@ fn a_gate_answer_releases_only_the_gate_it_names() {
         &mut host,
         ctx(run_id),
         at(10),
-        Some(GateAnswer {
+        Some(Resume::Gate(GateAnswer {
             step_id: "second_gate".into(),
             output: serde_json::json!({ "ok": true }),
-        }),
+        })),
     )
     .expect("the run drives");
 
@@ -2767,10 +2855,10 @@ fn one_sink_across_two_passes_sees_exactly_one_report_and_it_is_the_authored_one
         &mut host,
         ctx(run_id),
         at(20),
-        Some(GateAnswer {
+        Some(Resume::Gate(GateAnswer {
             step_id: "approve".into(),
             output: serde_json::json!({ "approve": true }),
-        }),
+        })),
     )
     .expect("pass two drives");
     let RunOutcome::Terminal { report, state, .. } = second else {
@@ -3233,10 +3321,10 @@ fn the_restore_matches_the_report_steps_own_row_and_not_merely_some_completed_ro
         &mut host,
         ctx(run_id),
         at(20),
-        Some(GateAnswer {
+        Some(Resume::Gate(GateAnswer {
             step_id: "approve".into(),
             output: serde_json::json!({ "approve": true }),
-        }),
+        })),
     )
     .expect("pass two drives");
     let RunOutcome::Terminal { report, state, .. } = second else {

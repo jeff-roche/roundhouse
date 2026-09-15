@@ -179,10 +179,33 @@ pub fn run_workflow_from_storage(
     host: &mut SqliteWorkflowHost,
     run_ctx: RunContext,
     now: Timestamp,
-    resume: Option<crate::exec::run_loop::GateAnswer>,
+    resume: Option<crate::exec::run_loop::Resume>,
 ) -> Result<RunOutcome, RunLoopError> {
     let definition = host.resolve_run_definition(conn, run_id)?;
     run_workflow(conn, &definition, run_id, sink, host, run_ctx, now, resume)
+}
+
+/// Drives a run using a caller-resolved workflow definition, rather than
+/// re-resolving it from storage on every call.
+///
+/// The daemon's segmented driving loop (Phase 8 Task 25.2) needs this: it
+/// re-enters [`run_workflow`] once per suspend/resume segment of one run,
+/// and [`run_workflow_from_storage`]'s `host.resolve_run_definition` spawns
+/// `round-yaml-parse-helper` out of process on every call (see
+/// `crate::parse::parse_workflow`'s own module doc) — reasonable once per
+/// run, not once per segment. Callers that only ever drive a run start to
+/// finish in one call keep using [`run_workflow_from_storage`].
+pub fn run_workflow_from_definition(
+    conn: &mut Connection,
+    def: &crate::parse::WorkflowDef,
+    run_id: RunId,
+    sink: &mut dyn TaskSink,
+    host: &mut SqliteWorkflowHost,
+    run_ctx: RunContext,
+    now: Timestamp,
+    resume: Option<crate::exec::run_loop::Resume>,
+) -> Result<RunOutcome, RunLoopError> {
+    run_workflow(conn, def, run_id, sink, host, run_ctx, now, resume)
 }
 
 impl WorkflowHost for SqliteWorkflowHost {

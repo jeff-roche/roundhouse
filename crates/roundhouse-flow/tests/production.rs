@@ -5,7 +5,7 @@ use std::path::Path;
 use roundhouse_core::{JobId, SessionId, Tier, Timestamp};
 use roundhouse_flow::durability::{insert_workflow_run, open_test_db, RunState, WorkflowRun};
 use roundhouse_flow::exec::run_loop::{
-    run_workflow, GateAnswer, RunOutcome, SessionTree, WorkflowHostError,
+    run_workflow, GateAnswer, Resume, RunOutcome, SessionTree, WorkflowHostError,
 };
 use roundhouse_flow::exec::{RunContext, RunId, TaskSink};
 use roundhouse_flow::expr::EnvAllowlist;
@@ -493,10 +493,10 @@ fn parked_run_resumes_after_host_restart_from_durable_step_rows() {
         &mut restarted,
         context(run_id),
         Timestamp::from_unix_nanos(2),
-        Some(GateAnswer {
+        Some(Resume::Gate(GateAnswer {
             step_id: "approve".into(),
             output: serde_json::json!({ "approved": true }),
-        }),
+        })),
     )
     .expect("resume workflow after restart");
     assert!(matches!(resumed, RunOutcome::Terminal { .. }));
