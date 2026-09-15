@@ -65,7 +65,8 @@ impl Isolate for TestIsolate {
 }
 
 /// Sets up a minimal SessionActor for testing dispatch_tool_for_workflow.
-async fn setup_actor(dir: &TempDir) -> Arc<SessionActor> {
+/// Returns (actor, workspace_root_path) so tests can use the real workspace root.
+async fn setup_actor(dir: &TempDir) -> (Arc<SessionActor>, std::path::PathBuf) {
     let db_path = dir.path().join("events.db");
     let store = open(&db_path).await.unwrap();
     let writer = spawn_writer(store).await;
@@ -76,6 +77,8 @@ async fn setup_actor(dir: &TempDir) -> Arc<SessionActor> {
     let handle = isolate.prepare(&session_spec).await.unwrap();
     let session_id = SessionId::new();
 
+    let workspace_root = dir.path().canonicalize().unwrap();
+
     // Empty rules list - this makes PolicyEngine deny everything by default,
     // but our tests don't care about admission (we're testing the dispatch gate).
     // The dispatch gate tests only verify that Write/Edit/Find/Shell pass the
@@ -83,7 +86,7 @@ async fn setup_actor(dir: &TempDir) -> Arc<SessionActor> {
     // will fail on other grounds (missing args, etc.) but not on the gate.
     let rules = vec![];
 
-    Arc::new(SessionActor::new_with_workspace_root(
+    let actor = Arc::new(SessionActor::new_with_workspace_root(
         session_id,
         writer,
         SessionState::Running,
@@ -91,19 +94,21 @@ async fn setup_actor(dir: &TempDir) -> Arc<SessionActor> {
         Arc::new(PolicyEngine::from_rules(rules)),
         dir.path().join("state"),
         dir.path().join("daemon-binary"),
-        dir.path().canonicalize().unwrap(),
+        workspace_root.clone(),
         isolate,
         handle,
         session_spec,
         vec![],
-    ))
+    ));
+
+    (actor, workspace_root)
 }
 
 /// `write` dispatches without hitting unsupported_workflow_tool gate.
 #[tokio::test]
 async fn write_tool_dispatches_through() {
     let dir = TempDir::new().unwrap();
-    let actor = setup_actor(&dir).await;
+    let (actor, _workspace_root) = setup_actor(&dir).await;
 
     let result = dispatch_tool_for_workflow(
         &actor,
@@ -130,7 +135,7 @@ async fn write_tool_dispatches_through() {
 #[tokio::test]
 async fn edit_tool_dispatches_through() {
     let dir = TempDir::new().unwrap();
-    let actor = setup_actor(&dir).await;
+    let (actor, _workspace_root) = setup_actor(&dir).await;
 
     let result = dispatch_tool_for_workflow(
         &actor,
@@ -156,7 +161,7 @@ async fn edit_tool_dispatches_through() {
 #[tokio::test]
 async fn find_tool_dispatches_through() {
     let dir = TempDir::new().unwrap();
-    let actor = setup_actor(&dir).await;
+    let (actor, _workspace_root) = setup_actor(&dir).await;
 
     let result = dispatch_tool_for_workflow(
         &actor,
@@ -179,24 +184,32 @@ async fn find_tool_dispatches_through() {
 }
 
 /// `shell` dispatches through to execute_builtin without hitting unsupported gate.
+/// Uses the actual workspace root for cwd so it passes resolve_shell_cwd's
+/// workspace containment check and proceeds to admit_task and execute_builtin.
 #[tokio::test]
 async fn shell_tool_dispatches_through() {
     let dir = TempDir::new().unwrap();
-    let actor = setup_actor(&dir).await;
+    let (actor, workspace_root) = setup_actor(&dir).await;
+
+    // Use the actual workspace root for cwd so it passes resolve_shell_cwd's
+    // `canonical.starts_with(root)` check
+    let cwd_str = workspace_root.to_string_lossy().to_string();
 
     let result = dispatch_tool_for_workflow(
         &actor,
         TaskKind::Shell,
-        json!({ "program": "echo", "argv": ["hello"], "cwd": "/tmp" }),
-        json!({ "program": "echo", "argv": ["hello"], "cwd": "/tmp" }),
+        json!({ "program": "echo", "argv": ["hello"], "cwd": cwd_str }),
+        json!({ "program": "echo", "argv": ["hello"], "cwd": &cwd_str }),
     )
     .await;
 
     let dispatch = result.expect("dispatch should succeed");
     match dispatch.result {
-        Ok(_) => {} // Success or execution output
+        Ok(_) => {} // Execution succeeded or produced output
         Err(msg) => {
-            // Should not be "not wired yet" — shell is wired now
+            // Shell is wired, so it should not fail with "not wired yet".
+            // It may fail for other reasons (e.g., policy admission), but not
+            // the unsupported_workflow_tool gate.
             assert!(
                 !msg.contains("not wired yet"),
                 "shell should be supported, not unsupported_workflow_tool: {msg}"
@@ -209,7 +222,7 @@ async fn shell_tool_dispatches_through() {
 #[tokio::test]
 async fn unsupported_tools_rejected() {
     let dir = TempDir::new().unwrap();
-    let actor = setup_actor(&dir).await;
+    let (actor, _workspace_root) = setup_actor(&dir).await;
 
     let result = dispatch_tool_for_workflow(&actor, TaskKind::Http, json!({}), json!({})).await;
 
