@@ -61,6 +61,7 @@ pub mod test_support;
 pub mod tool_catalog;
 pub mod tool_dispatch;
 pub mod tools;
+pub mod workflow_dispatch;
 
 use roundhouse_bus::Bus;
 use roundhouse_core::TaskRunner;
