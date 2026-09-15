@@ -124,6 +124,15 @@ pub enum SpawnTreeRecoveryError {
 /// Separate from [`run_boot_sequence`] rather than folded into it: that pass
 /// belongs to the task log and needs an [`EventWriter`] to append its
 /// reclassifications, while this one is read-only and writes only to memory.
+///
+/// **Fails the daemon's startup rather than degrading**, and deliberately so:
+/// `main.rs` propagates this error, so a single lifecycle payload anywhere in
+/// the log that cannot be deserialized (or a `session_id` column that is not a
+/// uuid) refuses the boot. Skipping such a row would mean starting with a
+/// silently under-counted fan-out — a parent admitted past its ceiling because
+/// one of its children's rows was unreadable — which is the failure this whole
+/// pass exists to prevent. A store this daemon cannot fully read is one it
+/// should not start against.
 pub async fn reconcile_spawn_tree_at_boot(
     store: &StorePool,
     tree: &Arc<SpawnTree>,

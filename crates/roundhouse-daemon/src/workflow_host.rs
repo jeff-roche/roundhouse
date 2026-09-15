@@ -194,8 +194,29 @@ const SESSION_STATE_CHANGED_PAYLOAD_PREFIX: &str = r#"{"SessionStateChanged":"#;
 /// *frames* sent to a client; neither becomes a row.)
 ///
 /// So today: **a retired sub-agent child reappears here as an occupied slot
-/// after a restart, and this function cannot tell it from a live one.** That
-/// is a real, current gap, documented rather than papered over (AGENTS.md's
+/// after a restart, and this function cannot tell it from a live one.**
+///
+/// ## What that costs, stated plainly
+///
+/// [`MAX_DIRECT_CHILD_CALLS`] is `roundhouse_bus::limits::MAX_FAN_OUT` — **8**,
+/// and it is the *same* eight slots both kinds of child draw from. Restoration
+/// applies no ceiling of its own (`SpawnTree::record_child`, unlike
+/// `reserve_child`, takes no `max_children`). So a parent session that has ever
+/// spawned eight sub-agents over its lifetime **can never spawn another after a
+/// daemon restart, for the rest of that session's life**: all eight edges come
+/// back on that restart, and on every restart after it, because nothing ever
+/// writes the signal that would drop one. It does not self-heal on a later
+/// boot; only a real terminal writer heals it.
+///
+/// **This is a new failure mode introduced by wiring this function at boot**,
+/// not a pre-existing one. Until then `reconcile_spawn_tree` had no production
+/// caller, so a restart reset every parent's fan-out to zero — wrong in the
+/// permissive direction (a parent could exceed eight live children across a
+/// restart) rather than the locking one. Whoever decides whether to ship with
+/// the sub-agent terminal writer still deferred is deciding between those two
+/// wrongs, and should be deciding it with this paragraph in hand.
+///
+/// This is a real, current gap, documented rather than papered over (AGENTS.md's
 /// escalation norm). Closing it means appending a durable session-lifecycle
 /// event when a sub-agent is retired — a change to the frozen event contract
 /// and its own task, not something this one invented on the side. The filter
@@ -248,6 +269,12 @@ struct SessionLifecycleFacts {
 fn session_lifecycle_facts(
     conn: &rusqlite::Connection,
 ) -> Result<SessionLifecycleFacts, ReconcileSpawnTreeError> {
+    // A full scan of `events`: the table carries no payload-kind column to
+    // index on (see `roundhouse-store`'s migration for its shape), so the
+    // `LIKE` prefilter narrows what is *deserialized*, not what is *read*.
+    // Acceptable for a one-off boot step and named here so it is not
+    // rediscovered as a surprise on a large store; the alternative is a
+    // migration adding an indexed discriminant column, which is its own task.
     let mut statement = conn.prepare(
         "SELECT session_id, payload
            FROM events
@@ -557,6 +584,67 @@ mod tests {
             tree.direct_children(root_session),
             0,
             "a parentless session gets no phantom edge"
+        );
+    }
+
+    /// The two end-signals are a union, not alternatives: whichever arrives is
+    /// enough. A child whose `workflow_run` row is still live but whose session
+    /// log carries a `SessionClosed` has ended — the session is the unit the
+    /// spawn tree counts, and a run cannot outlive the session it runs in.
+    ///
+    /// Not a hypothetical branch: it is exactly the shape a `call:` child takes
+    /// if a future terminal-writer for sessions lands before the child-run
+    /// driver that would end its row (or if the daemon dies between the two).
+    #[test]
+    fn a_closed_session_is_ended_even_when_its_run_row_still_looks_live() {
+        let mut conn = open_test_db();
+        let parent_session = SessionId::new();
+        let parent = root_run(parent_session);
+        let parent_run = parent.id;
+        insert_workflow_run(&mut conn, &parent).unwrap();
+
+        let closed_but_running = SessionId::new();
+        insert_workflow_run(&mut conn, &child_run(parent_run, closed_but_running)).unwrap();
+        session_created(&mut conn, closed_but_running, Some(parent_session));
+        session_closed(&mut conn, closed_but_running);
+
+        let tree = Arc::new(SpawnTree::new());
+        let restored = reconcile_spawn_tree(&conn, &tree).unwrap();
+
+        assert_eq!(restored, 0);
+        assert_eq!(
+            tree.direct_children(parent_session),
+            0,
+            "either signal alone ends the child; they are not required together"
+        );
+    }
+
+    /// Reconciliation must be safe to run more than once against one tree, and
+    /// must not double-count a session that carries more than one
+    /// `SessionCreated` — `SpawnTree::record_child` dedupes the edge itself, so
+    /// the thing at risk is the *reported count*, which a boot line prints and
+    /// a future caller might act on.
+    #[test]
+    fn reconciliation_is_idempotent_over_repeats_and_duplicate_creations() {
+        let mut conn = open_test_db();
+        let parent_session = SessionId::new();
+        let child = SessionId::new();
+        session_created(&mut conn, child, Some(parent_session));
+        session_created(&mut conn, child, Some(parent_session));
+
+        let tree = Arc::new(SpawnTree::new());
+        assert_eq!(
+            reconcile_spawn_tree(&conn, &tree).unwrap(),
+            1,
+            "two SessionCreated rows for one child are one edge, counted once"
+        );
+        assert_eq!(tree.direct_children(parent_session), 1);
+
+        assert_eq!(reconcile_spawn_tree(&conn, &tree).unwrap(), 1);
+        assert_eq!(
+            tree.direct_children(parent_session),
+            1,
+            "a second pass over the same tree consumes no further slot"
         );
     }
 
