@@ -116,7 +116,27 @@ const EXPECTED_UNWIRED: &[&str] = &[
     "policy.synthesize_grant",
     "store.outbound_redaction",
     "secrets.mcp_exposure",
-    "bus.spawn_tree",
+    // `bus.spawn_tree` was here until Phase 8 L5 (issue #34, "sub-agent spawn
+    // tracking") wired the spawn tree into the running daemon: the `agent`
+    // tool's `spawn_child` and `WorkflowSessionTree::register_child` both
+    // commit real edges into `DaemonResources::spawn_tree`, and `main.rs`
+    // rebuilds it at boot through `boot::reconcile_spawn_tree_at_boot` ->
+    // `workflow_host::reconcile_spawn_tree`, whose own `tree.record_child(..)`
+    // is a production call site in a production function.
+    //
+    // **Honest caveat on what this guard actually proves, since the entry is
+    // being retired on its strength:** the `record_child(` spelling was
+    // already satisfiable before any of that, because
+    // `SpawnTree::commit_child_reservation` calls `self.record_child(..)` in
+    // `roundhouse-bus` itself. This guard asks "is this spelling called from
+    // some non-`cfg(test)` code anywhere in `crates/`", which an intra-crate
+    // helper answers regardless of whether a daemon ever reaches the feature.
+    // So the exception was stale rather than newly-obsolete; what changed in
+    // L5 is that the underlying claim — the spawn tree is live in production —
+    // is now true, and it is pinned by real tests
+    // (`roundhouse-daemon`'s `spawn_limits_end_to_end.rs`,
+    // `spawn_tree_boot_recovery.rs`, `sub_agent_host`/`workflow_host`), not by
+    // this spelling check.
     "bus.restart",
     "bus.rate_limit_state",
     "store.blob_quota",
