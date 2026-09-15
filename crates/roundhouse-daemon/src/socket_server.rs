@@ -1250,6 +1250,28 @@ pub async fn drive_session(
             // host (previously only `SessionRegistry::remove`/
             // `LoopbackProxy::deregister_session` ran here — the bookkeeping
             // was cleared, but the real resources behind it were not).
+            // Phase 8, L5: this session can now spawn sub-agents. A ROOT
+            // session (depth 0) — a socket client is a human, not somebody
+            // else's child. Sub-agent children are wired by
+            // `DaemonSubAgentHost::create_child_session` instead, which is the
+            // only caller that knows a child's real depth.
+            crate::sub_agent_host::wire_sub_agent_host(&actor_for_reaper, &resources, &registry);
+            // Phase 8, L5, Task 6: the SAME "a socket client is a human"
+            // fact, recorded on the two registries that actually enforce
+            // §7.2's "the human is never a Team roster member" —
+            // `TeamRegistry::join`/`create_team` (read by the `agent` tool
+            // and `team_create`) and `LocalBus::send`'s human-notification
+            // routing. Both `resources.teams` and `resources.bus` are the
+            // exact `Arc`s `main.rs` built together via
+            // `LocalBus::with_teams`, so this mark is visible to both
+            // consumers rather than to a second, independent registry —
+            // see `DaemonResources::teams`'s own doc comment for why that
+            // used to not be true. Marked here, not before
+            // `SessionRegistry::create` above: this is the point this
+            // session is confirmed live and durably the one a real human
+            // peer is attached to, not merely constructed.
+            resources.teams.mark_human(session_id);
+            resources.bus.register_human(session_id);
             spawn_session_reaper(
                 registry.clone(),
                 session_id,
@@ -1777,6 +1799,7 @@ async fn construct_real_session_bounded(
             name: Some(workspace_name),
             requested_tier: roundhouse_core::Tier::Sandbox,
             on_degrade: construction_resources.default_on_degrade,
+            parent: None,
         };
         let outcome = session_bootstrap::create_real_session(
             &construction_resources,

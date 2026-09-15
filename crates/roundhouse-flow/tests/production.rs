@@ -78,6 +78,7 @@ impl SessionTree for RecordingSessionTree {
     fn persist_child_session(
         &mut self,
         _txn: &rusqlite::Transaction<'_>,
+        _parent: SessionId,
         _child: &WorkflowRun,
     ) -> Result<(), WorkflowHostError> {
         Ok(())
@@ -92,6 +93,12 @@ impl SessionTree for RecordingSessionTree {
         self.children.entry(parent).or_default().push(child);
         self.registered.push((parent, child, job_id));
         Ok(())
+    }
+
+    fn child_terminated(&mut self, parent: SessionId, child: SessionId) {
+        if let Some(children) = self.children.get_mut(&parent) {
+            children.retain(|candidate| *candidate != child);
+        }
     }
 
     fn direct_children(&mut self, parent: SessionId) -> Result<u32, WorkflowHostError> {

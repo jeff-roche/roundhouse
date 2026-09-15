@@ -35,6 +35,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
+use roundhouse_bus::local_bus::LocalBus;
+use roundhouse_bus::spawn_tree::SpawnTree;
+use roundhouse_bus::teams::TeamRegistry;
 #[cfg(test)]
 use roundhouse_core::WorkspaceId;
 use roundhouse_core::{OnDegrade, SessionId, SessionSpec, SessionState, TaskRunner, Tier};
@@ -347,6 +350,44 @@ pub struct DaemonResources {
     pub store: StorePool,
     pub isolate: Arc<dyn Isolate>,
     pub proxy: Arc<LoopbackProxy>,
+    /// The daemon-wide spawn tree recording sub-agent parent/child edges
+    /// (§7.1 decision 4: "the spawn tree remains the sole authority for
+    /// lifecycle, cancellation, and budget"). Constructed exactly once, in
+    /// `main.rs`, before `DaemonResources::new` is called, and shared from
+    /// here by every consumer — `DeliveryExecutor` (`scheduler_driver.rs`)
+    /// and the `agent` tool's dispatch (through
+    /// [`crate::sub_agent_host::DaemonSubAgentHost`], whose `spawn_tree`
+    /// returns this very field) — so that no second, independent tree is ever
+    /// minted. This is the field's permanent home, not a transient wiring
+    /// hack.
+    pub spawn_tree: Arc<SpawnTree>,
+    /// The daemon-wide team registry (§7.1 decision 4: *"a Team owns
+    /// addressing only"*), read by the `agent` tool for §7.5's auto-join.
+    ///
+    /// **Phase 8, L5, Task 6 correction:** this used to be constructed
+    /// internally (`Arc::new(TeamRegistry::new())`), on the reasoning that
+    /// "nothing outside this struct has a reason to hold one." That stopped
+    /// being true the moment [`Self::bus`] needed the identical instance:
+    /// `main.rs`'s `LocalBus::with_teams` and this field must share one
+    /// `Arc<TeamRegistry>`, or the socket handshake's `mark_human` and the
+    /// `agent` tool's `TeamRegistry::join` would silently judge two disjoint
+    /// rosters — the exact bug this task exists to close (see
+    /// [`crate::socket_server`]'s `CreateSession` handling). So this now
+    /// mirrors [`Self::spawn_tree`] exactly: built once in `main.rs`, passed
+    /// in here, and never minted a second time.
+    pub teams: Arc<TeamRegistry>,
+    /// The daemon-wide `LocalBus`/`Bus` instance — the SAME `Arc` handed to
+    /// `EngineHandles::bootstrap` (as `Arc<dyn Bus>`) in `main.rs`, sharing
+    /// [`Self::teams`] via `LocalBus::with_teams`. Held here, concretely (not
+    /// as `Arc<dyn Bus>`), specifically so [`crate::socket_server`] can call
+    /// `LocalBus::register_human` — a `LocalBus`-only method, not part of the
+    /// `Bus` trait object `roundhouse-engine`'s dispatchers hold instead.
+    pub bus: Arc<LocalBus>,
+    /// Every live sub-agent session this daemon spawned, keyed by child
+    /// session id — see [`crate::sub_agent_host::SubAgentSessions`] for why
+    /// the child→parent direction has to be recorded somewhere. Constructed
+    /// here for the same reason [`Self::teams`] is.
+    pub sub_agents: Arc<crate::sub_agent_host::SubAgentSessions>,
     /// Absolute — asserted by `SessionActor::new` itself, which panics on a
     /// non-absolute value (see that constructor's doc comment).
     pub state_dir: PathBuf,
@@ -395,6 +436,9 @@ impl DaemonResources {
         store: StorePool,
         isolate: Arc<dyn Isolate>,
         proxy: Arc<LoopbackProxy>,
+        spawn_tree: Arc<SpawnTree>,
+        teams: Arc<TeamRegistry>,
+        bus: Arc<LocalBus>,
         state_dir: PathBuf,
         daemon_binary: PathBuf,
         mcp_configs: Vec<McpServerConfig>,
@@ -413,6 +457,10 @@ impl DaemonResources {
             store,
             isolate,
             proxy,
+            spawn_tree,
+            teams,
+            bus,
+            sub_agents: Arc::new(crate::sub_agent_host::SubAgentSessions::new()),
             state_dir,
             daemon_binary,
             mcp_configs,
@@ -670,13 +718,13 @@ pub async fn create_real_session(
     let (mcp_host, mcp, tool_defs) = if mcp_configs.is_empty() {
         // **Ruling W1-R132: `builtin_tool_defs()`, NOT `Vec::new()`.** This
         // is the default production configuration — no `[[mcp_server]]` —
-        // and it must still offer the model the five built-in tools.
+        // and it must still offer the model the built-in tools.
         // `tool_catalog::merged_tool_defs` (below, via `start_session_mcp`)
         // is the only other thing that prepends them, and it is reachable
         // only from the MCP branch, so this branch supplying an empty
         // catalog meant the common case offered ZERO tools — contradicting
         // `SessionActor::tool_defs`' own doc comment, which describes this
-        // exact case as "still carrying the five builtins".
+        // exact case as "still carrying the builtins".
         (
             None,
             None,
@@ -1063,10 +1111,15 @@ mod tests {
             .serve(runner(), proxy_writer.clone())
             .await
             .unwrap();
+        let teams = Arc::new(TeamRegistry::new());
+        let bus = Arc::new(LocalBus::new().with_teams(Arc::clone(&teams)));
         DaemonResources::new(
             store,
             available_isolate(),
             proxy,
+            Arc::new(SpawnTree::new()),
+            teams,
+            bus,
             dir.join("state"),
             dir.join("daemon-binary"),
             Vec::new(),
@@ -1098,6 +1151,7 @@ mod tests {
             name: Some("test-workspace".to_string()),
             requested_tier: Tier::Sandbox,
             on_degrade: resources.default_on_degrade,
+            parent: None,
         }
     }
 
@@ -1234,7 +1288,18 @@ mod tests {
         offered.sort_unstable();
         assert_eq!(
             offered,
-            ["edit", "find", "read", "shell", "shell_command", "write"],
+            // `agent` joined this list in Phase 8, L5 — the sub-agent spawn
+            // tool is offered to every session, and refuses honestly in a
+            // session with no sub-agent host registered.
+            [
+                "agent",
+                "edit",
+                "find",
+                "read",
+                "shell",
+                "shell_command",
+                "write"
+            ],
             "a default (no-MCP) session must offer exactly the builtin-facing tools"
         );
     }

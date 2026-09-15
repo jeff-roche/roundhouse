@@ -230,16 +230,25 @@ async fn start_session_mcp_with_no_configured_servers_yields_the_full_builtin_ca
         "no MCP servers were configured, so none can be reported resolved to the sealed floor"
     );
     // Proves the EngineTaskSpawner -> McpHost::start -> merged_tool_defs
-    // composition actually composes, not just type-checks: the five
-    // builtins came out the other end of a real (if server-less) McpHost
-    // startup + Task 1 merge, not a bypass.
+    // composition actually composes, not just type-checks: the builtins
+    // came out the other end of a real (if server-less) McpHost startup +
+    // Task 1 merge, not a bypass.
     let names: HashSet<&str> = tool_defs.iter().map(|d| d.name()).collect();
-    for builtin in ["read", "write", "edit", "find", "shell", "shell_command"] {
+    for builtin in [
+        "read",
+        "write",
+        "edit",
+        "find",
+        "shell",
+        "shell_command",
+        // Phase 8, L5: the sub-agent spawn tool is a builtin too.
+        "agent",
+    ] {
         assert!(names.contains(builtin), "missing builtin tool {builtin}");
     }
     assert_eq!(
         tool_defs.len(),
-        6,
+        7,
         "no MCP tools to merge in, so just the builtins"
     );
 }

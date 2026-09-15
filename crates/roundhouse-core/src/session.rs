@@ -18,6 +18,18 @@ pub struct SessionSpec {
     pub requested_tier: crate::tier::Tier,
     /// §6.5 — what to do if `requested_tier` can't be honored.
     pub on_degrade: OnDegrade,
+    /// Durable spawn-tree edge: the parent session that created this one, if
+    /// any. `None` for a root session (socket-attached or scheduler-driven).
+    /// Set by both code paths that create a child session: workflow `call:`
+    /// (`WorkflowSessionTree::persist_child_session` in `roundhouse-daemon`)
+    /// and the sub-agent `agent` tool
+    /// (`roundhouse_engine::tools::agent_spawn_tool`, whose child is created
+    /// and persisted by `roundhouse-daemon`'s `DaemonSubAgentHost`).
+    /// `#[serde(default)]`
+    /// so `SessionCreated` events serialized before this field existed still
+    /// deserialize, defaulting to `None` rather than failing to parse.
+    #[serde(default)]
+    pub parent: Option<crate::ids::SessionId>,
 }
 
 impl SessionSpec {
@@ -30,6 +42,7 @@ impl SessionSpec {
             name: None,
             requested_tier: crate::tier::Tier::Sandbox,
             on_degrade: OnDegrade::Refuse,
+            parent: None,
         }
     }
 
@@ -43,6 +56,7 @@ impl SessionSpec {
             name: None,
             requested_tier: tier,
             on_degrade,
+            parent: None,
         }
     }
 }

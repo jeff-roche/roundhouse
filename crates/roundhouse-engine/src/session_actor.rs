@@ -265,17 +265,32 @@ pub struct SessionActor {
     /// site.
     ///
     /// **The common case is a session with zero configured MCP servers,
-    /// whose catalog is exactly `builtin_tool_defs()`'s five entries** —
+    /// whose catalog is exactly `builtin_tool_defs()`'s entries** —
     /// not an empty `Vec`. An empty `Vec` means the model is offered no
     /// tools at all; it is a legitimate test-only construction (several
     /// tests build an actor with `vec![]` deliberately), never something
     /// the daemon's own `create_real_session` produces. Ruling W1-R132:
     /// this doc comment previously asserted that an empty `Vec` still
-    /// carried the five builtins, which is a contradiction on its face —
+    /// carried the builtins, which is a contradiction on its face —
     /// and the daemon's no-MCP branch really was passing `Vec::new()`,
     /// so the doc was describing the intent while the code did the
     /// opposite.
     tool_defs: Vec<roundhouse_provider::ToolDef>,
+    /// The daemon-owned half of the `agent` tool (Phase 8, L5), or `None` for
+    /// a session whose creator never registered one — a library fixture, or
+    /// any session built before `roundhouse-daemon` wires it. Written only by
+    /// [`SessionActor::register_sub_agent_host`], for the same reason
+    /// `mcp_resolved` is written only by [`SessionActor::register_mcp`]:
+    /// `roundhouse-engine` cannot construct one (`create_headless_session`,
+    /// `SessionRegistry` and `HeadlessSession` all live in the daemon, which
+    /// nothing may depend on), so it is injected after construction rather
+    /// than threaded through every `SessionActor::new*` signature.
+    ///
+    /// `None` is a real, honest state, not a hole to fail open through:
+    /// `tools::agent_spawn_tool::dispatch_agent` refuses an `agent` call with
+    /// a recorded `sub_agent_host_unavailable` failure, exactly as
+    /// `agent_loop`'s MCP arm refuses an MCP call in a session with no host.
+    sub_agent_host: RwLock<Option<Arc<dyn crate::tools::agent_spawn_tool::SubAgentHost>>>,
 }
 
 impl SessionActor {
@@ -413,6 +428,7 @@ impl SessionActor {
             session_spec,
             effective_tier,
             tool_defs,
+            sub_agent_host: RwLock::new(None),
         }
     }
 
@@ -450,6 +466,47 @@ impl SessionActor {
     /// The canonical filesystem root for this session's workspace.
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// The `(device, inode)` pair this session's workspace root must still
+    /// resolve to, when one was recorded. Read by the `agent` tool so a
+    /// spawned child is created against the SAME workspace identity its
+    /// parent was — a child that re-resolved the root by path alone could
+    /// silently land in a different directory after a swap.
+    pub fn workspace_identity(&self) -> Option<(i64, i64)> {
+        self.workspace_identity
+    }
+
+    /// Supplies the daemon-owned half of the `agent` tool for this session.
+    /// See the `sub_agent_host` field's doc comment for why this is injected
+    /// rather than constructed.
+    ///
+    /// Last-write-wins and idempotent, mirroring [`Self::register_mcp`]. A
+    /// poisoned lock leaves the host unset, which fails every `agent` call in
+    /// this session closed rather than dispatching against a host we could
+    /// not read.
+    pub fn register_sub_agent_host(
+        &self,
+        host: Arc<dyn crate::tools::agent_spawn_tool::SubAgentHost>,
+    ) {
+        match self.sub_agent_host.write() {
+            Ok(mut guard) => *guard = Some(host),
+            Err(_) => tracing::error!(
+                session_id = %self.session_id,
+                "sub_agent_host lock is poisoned; refusing to register a sub-agent host — every \
+                 `agent` tool call in this session will be refused"
+            ),
+        }
+    }
+
+    /// This session's sub-agent host, if one was registered. `None` on a
+    /// poisoned lock, for the fail-closed reason
+    /// [`Self::register_sub_agent_host`] describes.
+    pub fn sub_agent_host(&self) -> Option<Arc<dyn crate::tools::agent_spawn_tool::SubAgentHost>> {
+        self.sub_agent_host
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     /// Builds the live `SealedContext` this session's tasks are judged

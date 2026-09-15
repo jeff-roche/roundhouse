@@ -49,6 +49,7 @@ impl SessionTree for UnconfiguredSessionTree {
     fn persist_child_session(
         &mut self,
         _txn: &rusqlite::Transaction<'_>,
+        _parent: SessionId,
         _child: &crate::durability::WorkflowRun,
     ) -> Result<(), WorkflowHostError> {
         Err(WorkflowHostError::SessionTreeUnavailable)
@@ -62,6 +63,13 @@ impl SessionTree for UnconfiguredSessionTree {
     ) -> Result<(), WorkflowHostError> {
         Err(WorkflowHostError::SessionTreeUnavailable)
     }
+
+    /// A no-op rather than a refusal, matching `release_child` above: both are
+    /// compensation, and a host with no session tree registered no edge to
+    /// drop in the first place. Returning an error would also be unreportable
+    /// — `child_terminated` is infallible by design, so the caller could only
+    /// swallow it.
+    fn child_terminated(&mut self, _parent: SessionId, _child: SessionId) {}
 
     fn direct_children(&mut self, _parent: SessionId) -> Result<u32, WorkflowHostError> {
         Err(WorkflowHostError::SessionTreeUnavailable)
@@ -219,7 +227,7 @@ impl WorkflowHost for SqliteWorkflowHost {
         let txn = roundhouse_store::begin_immediate(conn)?;
         let result = self
             .session_tree
-            .persist_child_session(&txn, child)
+            .persist_child_session(&txn, parent, child)
             .and_then(|()| {
                 crate::durability::insert_workflow_run_in_transaction(&txn, child)
                     .map_err(WorkflowHostError::from)
@@ -234,6 +242,10 @@ impl WorkflowHost for SqliteWorkflowHost {
         }
         self.session_tree
             .register_child(parent, called.session_id, called.job_id)
+    }
+
+    fn child_session_terminated(&mut self, parent: SessionId, child: SessionId) {
+        self.session_tree.child_terminated(parent, child);
     }
 }
 

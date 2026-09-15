@@ -28,6 +28,12 @@ docs/scratch/
 # part of the repository's history.
 .superpowers/
 
+# Per-lane git worktrees (`using-git-worktrees`'s fallback convention). Same
+# hazard class as the three subtrees above — an untracked directory sitting
+# in `git add -A`'s path — except worse here, since each entry is a full
+# working copy of the repo. Missed when those three were added.
+.worktrees/
+
 # The SolidJS web frontend (Task 10, Phase 5/7 Subsystem D). `node_modules/`
 # is npm-restorable from `package-lock.json` and `dist/` is unused — Vite is
 # configured (`vite.config.ts`'s `build.outDir`) to build straight into

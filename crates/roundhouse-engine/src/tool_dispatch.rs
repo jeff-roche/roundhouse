@@ -1,5 +1,8 @@
 //! Maps one resolved built-in [`crate::tool_catalog::ToolTarget::Builtin`]
-//! tool call onto `roundhouse-policy`'s `TaskParams` (what
+//! tool call — the five that name a `roundhouse-tools` executor, never
+//! `TaskKind::Agent`, which `agent_loop` routes to
+//! [`crate::tools::agent_spawn_tool`] instead —
+//! onto `roundhouse-policy`'s `TaskParams` (what
 //! `SessionActor::admit_task` judges) and `roundhouse-tools`' real executor
 //! (what actually performs the action once admitted) — Phase 7 Task 5's
 //! "dispatch bridge," split out of `agent_loop.rs` for its own unit tests per
@@ -103,10 +106,17 @@ pub enum ToolDispatchError {
         field: &'static str,
     },
     /// `kind` isn't one of the five built-in kinds this module dispatches
-    /// (`Read`/`Write`/`Edit`/`Find`/`Shell`) — unreachable through
-    /// `tool_catalog::resolve_tool_target`'s real output today, but this
-    /// module's own match must still be exhaustive rather than assume that
-    /// invariant holds forever.
+    /// (`Read`/`Write`/`Edit`/`Find`/`Shell`).
+    ///
+    /// **`TaskKind::Agent` reaches this only by mistake, and that is now a
+    /// live possibility rather than a hypothetical** (Phase 8, L5):
+    /// `tool_catalog::resolve_tool_target` resolves `"agent"` to
+    /// `ToolTarget::Builtin(TaskKind::Agent)`, and it is `agent_loop`'s own
+    /// match — one arm above the five real executors — that routes it to
+    /// `tools::agent_spawn_tool` instead of here. A regression that deletes
+    /// that arm lands on this variant rather than dispatching a spawn as if
+    /// it were a filesystem call, which is exactly why this stays a named,
+    /// fail-closed error instead of an unreachable assumption.
     #[error("dispatching TaskKind::{kind:?} through the builtin tool catalog is not supported")]
     UnsupportedKind { kind: TaskKind },
     /// [`execute_builtin`] was handed a `TaskParams::Fs` whose `canonical`
@@ -120,8 +130,10 @@ pub enum ToolDispatchError {
     UnresolvedPath(roundhouse_policy::PathErr),
     /// `execute_builtin` was handed a `TaskParams` variant none of the five
     /// built-in kinds produce (`Http`/`Mcp`/`Git`/`Agent`) — unreachable
-    /// through `task_params_for`'s real output today, but the match must
-    /// still be exhaustive rather than assume that invariant holds forever.
+    /// through `task_params_for`'s real output today (a real
+    /// `TaskParams::Agent` is built by `tools::agent_spawn_tool`, which never
+    /// calls into this module), but the match must still be exhaustive rather
+    /// than assume that invariant holds forever.
     #[error(
         "dispatching this TaskParams shape through the builtin tool catalog is not supported: {0}"
     )]

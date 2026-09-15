@@ -140,6 +140,10 @@ struct FakeHost {
     direct_children: u32,
     sessions_created: Vec<SessionId>,
     reservations: Vec<SessionId>,
+    /// Every `(parent session, child session)` the run loop reported as
+    /// terminated — the runtime fan-out slot the daemon's real host gives back
+    /// to `SpawnTree`.
+    terminated: Vec<(SessionId, SessionId)>,
 }
 
 impl FakeHost {
@@ -150,6 +154,7 @@ impl FakeHost {
             direct_children: 0,
             sessions_created: Vec::new(),
             reservations: Vec::new(),
+            terminated: Vec::new(),
         }
     }
 
@@ -230,6 +235,10 @@ impl WorkflowHost for FakeHost {
             .retain(|session_id| *session_id != child.session_id);
         self.sessions_created.push(child.session_id);
         Ok(())
+    }
+
+    fn child_session_terminated(&mut self, parent: SessionId, child: SessionId) {
+        self.terminated.push((parent, child));
     }
 }
 
@@ -2584,6 +2593,108 @@ fn a_child_cancelled_with_nothing_left_to_admit_refunds_rather_than_leaking_its_
         sink.the_report()["run_state"],
         "cancelled",
         "one report, and it says what the row says"
+    );
+}
+
+/// §7.7's fan-out ceiling is a **concurrency** bound, not a lifetime quota:
+/// a `call:` child that has ended must give its parent's slot back, exactly
+/// as it gives its unspent grant back.
+///
+/// The two halves are deliberately asserted together, because they close the
+/// same transfer at the same instant and from the same branch of
+/// `finish_run`: the durable one through `refund_child_run`, the runtime one
+/// through `WorkflowHost::child_session_terminated`. Before this, only the
+/// first existed — `SpawnTree::remove_child` had no caller at all, so eight
+/// `call:` children was every `call:` a parent would ever get out of one
+/// daemon process, however long ago they finished.
+#[test]
+fn a_child_run_reaching_a_terminal_state_gives_its_parents_fan_out_slot_back() {
+    let mut conn = open_test_db();
+    let (parent_id, parent_session) = seed_run(&mut conn);
+
+    let child_id = RunId::new();
+    let child_session = SessionId::new();
+    let mut child = a_run(child_id, child_session);
+    child.parent_run_id = Some(parent_id);
+    child.session_depth = Some(1);
+    child.caps = Some(ResourceCaps {
+        max_tokens: 400,
+        ..a_grant()
+    });
+    insert_workflow_run(&mut conn, &child).expect("the child draws its grant at insert");
+
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: alpha\n\
+         \x20   emit: { a: 1 }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        child_id,
+        &mut sink,
+        &mut host,
+        ctx(child_id),
+        at(10),
+        None,
+    )
+    .expect("the child run completes");
+    let RunOutcome::Terminal { state, .. } = outcome else {
+        panic!("no gate");
+    };
+    assert_eq!(state, RunState::Completed);
+
+    assert_eq!(
+        host.terminated,
+        vec![(parent_session, child_session)],
+        "the ended child's runtime edge is reported against the PARENT's \
+         session, which is the key `SpawnTree` indexes children under — not \
+         the parent run id, and not the child's own session"
+    );
+    assert!(
+        run_ledger(&conn, child_id).unwrap().refunded_at.is_some(),
+        "and the durable half of the same transfer still closes"
+    );
+}
+
+/// The other half of the same branch: a **root** run reports nothing.
+///
+/// A root run has no parent session, so there is no edge to drop — and
+/// reporting one anyway would hand `SpawnTree::remove_child` a fabricated
+/// parent, which at best does nothing and at worst names a real session that
+/// happens to have this run's session as a child by some other route.
+#[test]
+fn a_root_runs_completion_reports_no_child_termination() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: alpha\n\
+         \x20   emit: { a: 1 }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("the root run completes");
+
+    assert!(
+        host.terminated.is_empty(),
+        "a run with no parent has no fan-out slot to release, got {:?}",
+        host.terminated
     );
 }
 

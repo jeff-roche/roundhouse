@@ -58,6 +58,17 @@ pub trait SpawnPolicyScope {
 pub struct AgentSpawnInput {
     pub workspace: WorkspaceId,
     pub parent: SessionId,
+    /// The child's session id, minted by the CALLER rather than here.
+    ///
+    /// The caller must hold a `SpawnTree` slot for this exact id *before*
+    /// calling [`agent_spawn`] — `SpawnTree::reserve_child` is what makes the
+    /// fan-out check atomic against a concurrent sibling spawn, and it can
+    /// only reserve an id that already exists. An `agent_spawn` that minted
+    /// its own id internally (as it did while it had no production caller)
+    /// would hand back a child that is not the one the tree admitted, so the
+    /// reservation, the team join, the durable `SessionCreated` and the
+    /// committed tree edge would all name different sessions.
+    pub child_id: SessionId,
     pub parent_depth: u8,
     pub parent_direct_children: u32,
     pub team: Option<TeamId>,
@@ -176,7 +187,7 @@ pub fn agent_spawn(
         remaining_tokens: input.budget_tokens,
     };
 
-    let session_id = SessionId::new();
+    let session_id = input.child_id;
     // `SessionId` implements `Display` (writes the underlying UUID) — `.to_string()`,
     // never `.0` field access, which doesn't compile from outside `roundhouse-core`
     // (the field is private).
@@ -188,11 +199,20 @@ pub fn agent_spawn(
     // inheriting the parent's (possibly higher) tier automatically — the same "never
     // exceed the parent's grant" half of §6.1's spawn-boundary rule, applied to
     // isolation rather than credentials/budget.
+    // `parent: Some(input.parent)` is the durable spawn-tree edge: the one
+    // place a child session's origin is already recorded durably
+    // (`SessionCreated`'s spec), so boot-time spawn-tree recovery has a fact
+    // to read rather than an in-memory edge that dies with the process. The
+    // caller persists this spec verbatim — it must never substitute a
+    // template spec's own `parent`, the same rule
+    // `WorkflowSessionTree::persist_child_session` follows for `call:`
+    // children.
     let session_spec = SessionSpec {
         workspace: input.workspace,
         name: Some(handle.clone()),
         requested_tier: Tier::Sandbox,
         on_degrade: OnDegrade::Refuse,
+        parent: Some(input.parent),
     };
 
     // §7.5: "agent_spawn auto-joins the child to the parent's team as `worker` unless
@@ -259,6 +279,7 @@ mod tests {
         let input = AgentSpawnInput {
             workspace: ws,
             parent: parent_session,
+            child_id: SessionId::new(),
             parent_depth: 0,
             parent_direct_children: 0,
             team: Some(team),
@@ -289,6 +310,7 @@ mod tests {
         let input = AgentSpawnInput {
             workspace: ws,
             parent: parent_session,
+            child_id: SessionId::new(),
             parent_depth: 0,
             parent_direct_children: 0,
             team: Some(team),
@@ -317,6 +339,7 @@ mod tests {
         let input = AgentSpawnInput {
             workspace: ws,
             parent: parent_session,
+            child_id: SessionId::new(),
             parent_depth: 0,
             parent_direct_children: 0,
             team: Some(team),
@@ -345,6 +368,7 @@ mod tests {
         let input = AgentSpawnInput {
             workspace: ws,
             parent: parent_session,
+            child_id: SessionId::new(),
             parent_depth: 0,
             parent_direct_children: 0,
             team: Some(team),
@@ -375,6 +399,7 @@ mod tests {
         let input = AgentSpawnInput {
             workspace: ws,
             parent: parent_session,
+            child_id: SessionId::new(),
             parent_depth: 0,
             parent_direct_children: 0,
             team: Some(team),
@@ -406,6 +431,7 @@ mod tests {
         let input = AgentSpawnInput {
             workspace: ws,
             parent: parent_session,
+            child_id: SessionId::new(),
             parent_depth: 4, // child would be depth 5 > MAX_DEPTH(4)
             parent_direct_children: 0,
             team: Some(team),
@@ -438,6 +464,7 @@ mod tests {
         let input = AgentSpawnInput {
             workspace: ws,
             parent: parent_session,
+            child_id: SessionId::new(),
             parent_depth: 0,
             parent_direct_children: 8, // would become 9 > MAX_FAN_OUT(8)
             team: Some(team),
@@ -474,6 +501,7 @@ mod tests {
         let input = AgentSpawnInput {
             workspace: ws,
             parent: worker,
+            child_id: SessionId::new(),
             parent_depth: 0,
             parent_direct_children: 0,
             team: Some(team),
@@ -508,6 +536,7 @@ mod tests {
         let input = AgentSpawnInput {
             workspace: ws,
             parent: stranger,
+            child_id: SessionId::new(),
             parent_depth: 0,
             parent_direct_children: 0,
             team: Some(team),

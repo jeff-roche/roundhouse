@@ -22,6 +22,19 @@
 //! dispatched tool call is queryable in the session's event log, not a
 //! bypass around it.
 //!
+//! **Sub-agent arm (`agent`): wired as of Phase 8, L5.** `"agent"` resolves
+//! to `ToolTarget::Builtin(TaskKind::Agent)`, but it names no
+//! `roundhouse-tools` executor, so [`dispatch_one_tool_call`] intercepts that
+//! one kind ahead of the five and hands it to
+//! [`crate::tools::agent_spawn_tool::dispatch_agent`]. That arm runs the same
+//! `SessionActor::admit_task` gate (against a real `TaskParams::Agent`, which
+//! is what finally makes `Predicate::Agent` reachable from model output) and
+//! records the same `TaskCreated`/`TaskStarted`/terminal lifecycle as the
+//! built-in arm. It refuses honestly — a recorded
+//! `sub_agent_host_unavailable` failure, not a panic or a silent skip — in a
+//! session whose creator registered no `SubAgentHost`, exactly as the MCP arm
+//! refuses a session with no MCP host.
+//!
 //! **MCP arm: wired as of fix round C2.** Rounds A/B/C1 left it deliberately
 //! unwired: `roundhouse_mcp::executor::McpExecutor`'s real dispatch (`impl
 //! TaskExecutor::execute`) needs a `TaskInput::Mcp {
@@ -138,7 +151,7 @@ pub enum AgentLoopError {
 
 /// `Timestamp` has no `now()` — read the wall clock ourselves and convert.
 /// Mirrors the identical helper in `chat.rs`/`session_actor.rs`/`mcp_spawner.rs`.
-fn now_ts() -> Timestamp {
+pub(crate) fn now_ts() -> Timestamp {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
@@ -295,6 +308,28 @@ async fn dispatch_one_tool_call(
     parent: TaskId,
 ) -> Result<Vec<ToolResultPart>, String> {
     match resolve_tool_target(name) {
+        // `agent` is a builtin by catalog shape but not by dispatch: it runs
+        // no `roundhouse-tools` executor and builds no `TaskParams` that
+        // `tool_dispatch::task_params_for_in_workspace` knows how to make
+        // (its `Agent` arm is `UnsupportedKind`). It is intercepted here, one
+        // match arm above the five real executors, and dispatched through
+        // `tools::agent_spawn_tool` instead — which runs the same
+        // `admit_task` gate and records the same task lifecycle.
+        Some(ToolTarget::Builtin(TaskKind::Agent)) => {
+            // Bound to a local, not inlined: `sub_agent_host()` returns an
+            // owned `Option<Arc<_>>` and `dispatch_agent` borrows from it
+            // across an `.await`.
+            let host = actor.sub_agent_host();
+            crate::tools::agent_spawn_tool::dispatch_agent(
+                actor,
+                writer,
+                runner,
+                host.as_ref(),
+                input,
+                parent,
+            )
+            .await
+        }
         Some(ToolTarget::Builtin(kind)) => {
             dispatch_builtin(actor, writer, runner, kind, input, parent).await
         }
@@ -544,7 +579,7 @@ async fn refuse_shell_command(
 /// `dispatch_builtin`, which already propagates via `?`). The `TaskFailed`
 /// append is also propagated, so a refusal never reports
 /// success after only its `TaskCreated` event was persisted.
-async fn record_unadmitted_refusal(
+pub(crate) async fn record_unadmitted_refusal(
     writer: &EventWriter,
     runner: &TaskRunner,
     session_id: roundhouse_core::SessionId,
@@ -1552,7 +1587,7 @@ async fn dispatch_builtin(
 /// `rule: None`, the same choice `EngineTaskSpawner::record_decision` already
 /// makes for the identical reason (`PolicyDecision` itself carries no rule
 /// id on any variant).
-async fn record_denial(
+pub(crate) async fn record_denial(
     writer: &EventWriter,
     runner: &TaskRunner,
     session_id: roundhouse_core::SessionId,

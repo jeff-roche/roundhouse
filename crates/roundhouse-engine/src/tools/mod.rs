@@ -4,6 +4,7 @@
 //! executors (Tasks 13); earlier phases' `read`/`write`/`edit`/`find`/`shell` executors
 //! live in `roundhouse-tools`, a separate crate.
 
+pub mod agent_spawn_tool;
 pub mod message_send;
 pub mod message_wait;
 pub mod peers;

@@ -3,9 +3,14 @@
 //! process left mid-flight when it crashed and to surface tasks that are
 //! still waiting on external action across the restart.
 
+use std::sync::Arc;
+
+use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_core::{SuspendReason, TaskId};
 use roundhouse_policy::registry::{ApprovalRegistry, PendingApproval};
 use roundhouse_store::{EventWriter, StoreError, StorePool, SuspendedTask};
+
+use crate::workflow_host::{reconcile_spawn_tree, ReconcileSpawnTreeError};
 
 /// The result of one daemon boot's recovery pass.
 ///
@@ -91,4 +96,67 @@ pub async fn run_boot_sequence(
         interrupted,
         suspended,
     })
+}
+
+/// Why the spawn tree's boot recovery could not run to completion.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnTreeRecoveryError {
+    /// The connection could not be checked out, or the blocking closure could
+    /// not be run on it.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The durable rows were read but could not be turned into edges.
+    #[error(transparent)]
+    Reconcile(#[from] ReconcileSpawnTreeError),
+}
+
+/// The spawn tree's half of boot recovery: rebuilds `tree` — a fresh, empty,
+/// in-memory structure at every process start — from the durable record of the
+/// children a previous daemon process spawned, and reports how many edges came
+/// back.
+///
+/// Runs once, at boot, **before** anything that admits a new child against the
+/// same tree (the scheduler driver's `DeliveryExecutor`, and any session an
+/// accepted client creates), so no consumer ever sees a half-reconstructed
+/// tree. The scan itself, including what a restart still cannot know about a
+/// sub-agent child, is [`reconcile_spawn_tree`].
+///
+/// Separate from [`run_boot_sequence`] rather than folded into it: that pass
+/// belongs to the task log and needs an [`EventWriter`] to append its
+/// reclassifications, while this one is read-only and writes only to memory.
+///
+/// **A single unreadable lifecycle row is skipped, loudly, rather than
+/// refusing the boot.** [`reconcile_spawn_tree`] logs a `tracing::error!` for
+/// each lifecycle event whose payload will not deserialize or whose
+/// `events.session_id` is not a uuid, and one summary `error!` naming how many
+/// it skipped; the scan then completes and this function returns `Ok` with the
+/// edges it *could* rebuild.
+///
+/// This used to propagate instead, on the reasoning that a store the daemon
+/// cannot fully read is one it should not start against. That reasoning does
+/// not survive contact with S-LOG-2: the `events` table physically rejects
+/// `DELETE`, and `main.rs` propagates this error with `?`, so one bad row
+/// anywhere in the log means the daemon **never boots again** and the row can
+/// never be removed. Both outcomes are wrong, but only one is bounded —
+/// skipping under-counts one parent's fan-out by one child against a ceiling
+/// of eight (permissive by one), which is the same bounded-permissive tradeoff
+/// [`reconcile_spawn_tree`]'s own KNOWN GAP section already accepts for a
+/// sub-agent child with no durable terminal signal.
+///
+/// The tolerance is scoped to that one case. A genuinely unrecoverable problem
+/// — the connection cannot be checked out, the blocking closure cannot run,
+/// the query itself fails, a `workflow_run.session_id` is not a uuid — still
+/// returns `Err` and still refuses the boot.
+pub async fn reconcile_spawn_tree_at_boot(
+    store: &StorePool,
+    tree: &Arc<SpawnTree>,
+) -> Result<usize, SpawnTreeRecoveryError> {
+    let tree = Arc::clone(tree);
+    // `StoreError::Pool` for the checkout and `StoreError::Interact` only for
+    // the blocking closure, per that enum's own documented convention.
+    let conn = store.pool.get().await.map_err(StoreError::Pool)?;
+    Ok(conn
+        .interact(move |conn| reconcile_spawn_tree(conn, &tree))
+        .await
+        .map_err(|error| StoreError::Interact(error.to_string()))??)
 }

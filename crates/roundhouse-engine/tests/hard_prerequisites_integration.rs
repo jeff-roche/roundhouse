@@ -11,51 +11,67 @@
 //! was *still* unreachable from model output in production, so a
 //! unit-level call proves nothing about reachability.
 //!
-//! # The headline finding: three of these mechanisms are NOT reachable
+//! # Reachability status: one mechanism is still NOT reachable
 //!
 //! Lane W4's fixes for `Predicate::Agent`, `Predicate::Mcp { args }`,
 //! `GrantScope::Directory` and the three AST walkers are all merged into
-//! this branch, so the brief required their cases enabled and passing. Two
-//! of the four are genuinely reachable through the real loop and pass. The
-//! other two — and Phase 4's `SpawnTree` case — cannot be reached from
-//! model output **at all**, for reasons that have nothing to do with W4's
-//! fixes being wrong:
+//! this branch, so the brief required their cases enabled and passing.
+//! `Predicate::Mcp { args }` (Case 2) and `GrantScope::Directory` (Case 3)
+//! were reachable through the real loop from the start and pass as real
+//! security tests, not pins.
 //!
-//! - **`Predicate::Agent` / `TaskParams::Agent`**: `tool_catalog::
-//!   builtin_tool_defs()` offers five tools (`read`/`write`/`edit`/`find`/
-//!   `shell`) and `resolve_tool_target` resolves exactly those five plus
-//!   anything containing `"__"` (MCP). There is no `agent` tool, and
-//!   `roundhouse-policy`'s own `engine.rs` says of `Predicate::Agent`'s
-//!   `max_tier` that it "is also unreachable today: `TaskParams::Agent`"
-//!   has no construction site outside that crate.
+//! When this file was first written, three of the other mechanisms could
+//! not be reached from model output at all, and each was written as a
+//! **reachability pin**: an enabled test, driven through the real loop,
+//! asserting the gap that actually existed, designed to fail the moment
+//! someone wired the mechanism up.
+//!
+//! **Two of those three pins have since flipped and been replaced by the
+//! real tests they were holding a place for.** Phase 8's sub-agent
+//! spawn-tracking work (issue #34) added a real `agent` builtin
+//! (`roundhouse_engine::tools::agent_spawn_tool`) that a model can call,
+//! so:
+//!
+//! - **`Predicate::Agent` / `TaskParams::Agent` — REACHABLE.**
+//!   `builtin_tool_defs()` now offers an `agent` tool and
+//!   `resolve_tool_target` resolves it to `ToolTarget::Builtin(TaskKind::
+//!   Agent)`; `dispatch_agent` builds a real `TaskParams::Agent` and puts
+//!   it through the same `SessionActor::admit_task` gate every other
+//!   dispatched call goes through. Case 1 below is now W4's Task 21
+//!   isolation-floor test, driven end to end.
+//! - **`SpawnTree::record_child` / the human-join guard — REACHABLE.**
+//!   `dispatch_agent` reserves, admits and commits a real child session
+//!   into the daemon-wide `SpawnTree`, and `agent_spawn` calls
+//!   `TeamRegistry::join` — the function the human-join guard lives inside
+//!   — on the parent's team. Case 6 below drives both through the real
+//!   loop. The daemon-assembly half (one shared `TeamRegistry`, marked
+//!   human at the real socket handshake) is proven in `roundhouse-daemon`'s
+//!   `submit_turn_e2e.rs`, module `human_join_guard`.
 //! - **The three AST walkers** (`shell/pipeline.rs`, `shell/opaque.rs`,
-//!   `shell/classify.rs`): they take a **raw shell string**, and their
-//!   entry points (`decide_shell_command`, `classify_shell`,
-//!   `parse_command`) have no non-test caller anywhere in the workspace.
-//!   The `shell` builtin emits `TaskParams::Shell(ParsedCommand { program,
-//!   argv })` — direct exec, never an interpreter payload policy parses.
-//! - **`SpawnTree::record_child` / the human-join guard**: no production
-//!   caller exists (`roundhouse-bus`'s `local_bus.rs` says so of
-//!   `register_human`/`mark_human` in its own source), and no tool a model
-//!   can call reaches `agent_spawn`.
-//!
-//! Rather than `#[ignore]` those (which would hide them) or write a test
-//! named for a security property it cannot exhibit (this lane's
-//! most-repeated defect), each is written as a **reachability pin**: an
-//! enabled test, driven through the real loop, asserting the gap that
-//! actually exists. Each one flips the moment someone wires the mechanism
-//! up, which is exactly when the real predicate test should be written.
+//!   `shell/classify.rs`) — **still NOT reachable.** They take a **raw
+//!   shell string**, and their entry points (`decide_shell_command`,
+//!   `classify_shell`, `parse_command`) have no non-test caller anywhere in
+//!   the workspace. The `shell` builtin emits `TaskParams::Shell(
+//!   ParsedCommand { program, argv })` — direct exec, never an interpreter
+//!   payload policy parses. Case 4 remains a reachability pin, for the
+//!   reasons its own doc comment states at length.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::stream;
+use roundhouse_bus::spawn_tree::SpawnTree;
+use roundhouse_bus::teams::TeamRegistry;
 use roundhouse_core::{
-    EventPayload, OnDegrade, SessionId, SessionSpec, SessionState, TaskId, TaskKind, Tier,
+    EventPayload, OnDegrade, SessionId, SessionSpec, SessionState, TaskId, TaskKind, TeamId, Tier,
     Timestamp,
 };
 use roundhouse_engine::agent_loop::{run_agent_loop, AgentLoopConfig};
+use roundhouse_engine::agent_spawn::Budget;
 use roundhouse_engine::mcp_spawner::{EngineTaskSpawner, SessionMcp};
+use roundhouse_engine::tools::agent_spawn_tool::{
+    ChildSessionError, ChildSessionRequest, SubAgentHost,
+};
 use roundhouse_engine::{tool_catalog, SessionActor};
 use roundhouse_mcp::executor::TaskSpawner as McpTaskSpawner;
 use roundhouse_mcp::namespace::ToolNamespace;
@@ -409,9 +425,11 @@ async fn drive(
     .expect("the loop itself must not error — a refused tool call is a ToolResult, not an Err")
 }
 
+/// Every event recorded against the fixture's OWN session. A shorthand for
+/// [`events_for`], which the sub-agent cases need because they also have to
+/// read a spawned *child's* log.
 async fn events_of(fx: &Fixture) -> Vec<StoredEvent> {
-    let reopened = open(&fx.db_path).await.unwrap();
-    session_events(&reopened, fx.session_id).await.unwrap()
+    events_for(fx, fx.session_id).await
 }
 
 fn tool_results(blocks: &[ContentBlock]) -> Vec<(bool, String)> {
@@ -467,47 +485,217 @@ fn resolved_program(absolute: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Case 1 — gh_predicate_agent (lane W4's Task 21)
+// Sub-agent spawning — the half `roundhouse-engine` cannot supply for itself
 // ---------------------------------------------------------------------------
 
-/// **Reachability pin, not the predicate test the spec sketched.** W4's
-/// Task 21 fixed `Predicate::Agent`'s backwards tier comparison and its own
-/// `predicate_agent_tier_direction.rs` proves that fix at the
-/// `PolicyEngine::decide` level. It cannot be proven through
-/// `run_agent_loop`, because **a model cannot issue an `agent` tool call at
-/// all**: `resolve_tool_target` knows five builtin names and "anything
-/// containing `__`" (MCP), and `builtin_tool_defs()` offers no `agent`
-/// tool, so `TaskParams::Agent` is never constructed on any path a model's
-/// output can reach.
+/// A [`SubAgentHost`] over a **real** [`SpawnTree`] and a **real**
+/// [`TeamRegistry`], whose `create_child_session` durably appends the child's
+/// own `SessionCreated` through the fixture's real `EventWriter` — the same
+/// store, and the same `TaskRunner`-minted event, the daemon's
+/// `DaemonSubAgentHost::persist_session_created` writes.
 ///
-/// This test pins that gap through the real loop — a model asking for
-/// `agent` at `Tier::None` gets an unknown-tool refusal, and **no `Agent`
-/// task is minted at all**, so no `Predicate::Agent` is ever evaluated. The
-/// two catalog assertions are the tripwire: the day someone adds an `agent`
-/// tool, this test fails and the real tier-direction case gets written.
+/// Only the parts that genuinely live in `roundhouse-daemon` are absent:
+/// `create_headless_session`, `SessionRegistry` and `HeadlessSession` are
+/// unreachable from this crate by design (nothing may depend on
+/// `roundhouse-daemon`), and the registry half is proven there instead, by
+/// `sub_agent_host::tests::an_agent_tool_call_creates_a_real_registered_child_with_a_durable_parent_edge`.
+/// What matters for *this* file's claims is that the child session exists as a
+/// queryable lifecycle event and that the spawn tree carries the edge, and both
+/// of those are real here.
+struct RecordingSubAgentHost {
+    tree: Arc<SpawnTree>,
+    teams: TeamRegistry,
+    budget: Arc<Mutex<Budget>>,
+    depth: u8,
+    team: Option<TeamId>,
+    writer: roundhouse_store::EventWriter,
+    created: Mutex<Vec<SessionId>>,
+}
+
+impl RecordingSubAgentHost {
+    fn new(writer: roundhouse_store::EventWriter) -> Self {
+        RecordingSubAgentHost {
+            tree: Arc::new(SpawnTree::new()),
+            teams: TeamRegistry::new(),
+            budget: Arc::new(Mutex::new(Budget {
+                remaining_tokens: 1_000,
+            })),
+            depth: 0,
+            team: None,
+            writer,
+            created: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn created(&self) -> Vec<SessionId> {
+        self.created.lock().unwrap().clone()
+    }
+}
+
+fn host_now_ts() -> Timestamp {
+    Timestamp::from_unix_nanos(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0),
+    )
+}
+
+#[async_trait::async_trait]
+impl SubAgentHost for RecordingSubAgentHost {
+    fn spawn_tree(&self) -> &Arc<SpawnTree> {
+        &self.tree
+    }
+    fn teams(&self) -> &TeamRegistry {
+        &self.teams
+    }
+    fn budget(&self) -> Arc<Mutex<Budget>> {
+        Arc::clone(&self.budget)
+    }
+    fn depth(&self) -> u8 {
+        self.depth
+    }
+    fn team(&self) -> Option<TeamId> {
+        self.team
+    }
+    async fn create_child_session(
+        &self,
+        req: ChildSessionRequest,
+    ) -> Result<(), ChildSessionError> {
+        let event = RUNNER.record_session_created(
+            req.child,
+            0, // ignored — `EventWriter::append` assigns the real per-session seq
+            host_now_ts(),
+            Box::new(req.spec),
+            1,
+        );
+        self.writer
+            .append(event)
+            .await
+            .map_err(|err| ChildSessionError {
+                category: "session_created_append_failed",
+                detail: err.to_string(),
+            })?;
+        self.created.lock().unwrap().push(req.child);
+        Ok(())
+    }
+}
+
+/// The `agent` tool call a model issues in the cases below. `tier_request` is
+/// deliberately absent: `agent_spawn_tool::CHILD_TIER` pins every spawned
+/// child at `Tier::Sandbox`, so a model cannot choose its child's isolation —
+/// which is precisely what makes Case 1's floor comparison meaningful rather
+/// than model-controlled.
+fn agent_call_args() -> serde_json::Value {
+    serde_json::json!({
+        "prompt": "do some work in a child session",
+        "provider": "anthropic",
+        "model": "claude",
+        "budget_tokens": 300,
+    })
+}
+
+/// Registers `host` on the fixture's real `SessionActor`, exactly as
+/// `roundhouse-daemon`'s `wire_sub_agent_host` does on the real socket path.
+fn with_host(fx: &Fixture, host: Arc<RecordingSubAgentHost>) -> Arc<RecordingSubAgentHost> {
+    fx.actor.register_sub_agent_host(host.clone());
+    host
+}
+
+/// Every event recorded against `session` in the fixture's store — the parent's
+/// own log when `session` is `fx.session_id` (see [`events_of`]), and a spawned
+/// child's log otherwise.
+async fn events_for(fx: &Fixture, session: SessionId) -> Vec<StoredEvent> {
+    let reopened = open(&fx.db_path).await.unwrap();
+    session_events(&reopened, session).await.unwrap()
+}
+
+fn created_task_kinds(events: &[StoredEvent]) -> Vec<TaskKind> {
+    events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::TaskCreated { kind, .. } => Some(kind.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn failure_categories(events: &[StoredEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::TaskFailed { error, .. } => Some(error.category.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Case 1 — gh_predicate_agent (lane W4's Task 21)
+//          (was a reachability pin; REACHABLE since Phase 8's `agent` tool)
+// ---------------------------------------------------------------------------
+
+/// **The real test the old reachability pin was holding a place for.** Its
+/// predecessor
+/// (`an_agent_tool_call_never_reaches_predicate_agent_because_no_agent_tool_exists_gh_predicate_agent`)
+/// asserted that no `agent` tool existed, so `TaskParams::Agent` was never
+/// constructed on any path a model's output could reach; its own failure
+/// message said to replace it with *"the real Tier::Remote-grant /
+/// Tier::None-request denial test W4's Task 21 targets"* the day one did.
+/// Phase 8's `agent` builtin is that day, and this is that test.
+///
+/// W4's Task 21 turned `Predicate::Agent`'s `max_tier` from a ceiling into
+/// an **isolation floor**: `matches` requires `tier_request >= max_tier`,
+/// where `Tier`'s `Ord` ascends with isolation. Before that flip the
+/// comparison was `<=`, so a rule approved at the *most*-isolated tier also
+/// covered the *least*-isolated request. Both halves below are driven
+/// through the real `run_agent_loop` -> `dispatch_agent` ->
+/// `SessionActor::admit_task` path, where the model's `agent` call becomes a
+/// genuine `TaskParams::Agent` that `PolicyEngine::decide` judges:
+///
+/// - (a) a single `Allow` at `max_tier: Tier::Remote` does **not** cover the
+///   `Tier::Sandbox` a spawned child asks for, so the call falls through to
+///   the engine's default `Ask` and the spawn is refused. Under the pre-flip
+///   `<=` this rule would have matched and the spawn would have succeeded,
+///   which is exactly what makes this half non-vacuous.
+/// - (b) the same rule at `max_tier: Tier::Sandbox` **does** cover it and the
+///   spawn runs — without this half the test would also pass against a
+///   `Predicate::Agent` that matched nothing at all.
+///
+/// Both halves assert a real `TaskKind::Agent` task is minted, which is the
+/// reachability claim itself: a refused spawn is still a queryable attempt,
+/// and an `Agent` task existing at all is what proves `Predicate::Agent` was
+/// consulted rather than skipped.
+///
+/// `tier_request` is **not** model-controlled — `agent_spawn_tool`'s
+/// `CHILD_TIER` pins every spawned child at `Tier::Sandbox`. That is what
+/// makes the floor a real security boundary here instead of a field the
+/// caller can dial down.
 #[tokio::test]
-async fn an_agent_tool_call_never_reaches_predicate_agent_because_no_agent_tool_exists_gh_predicate_agent(
+async fn an_agent_spawns_isolation_floor_refuses_a_request_below_the_approved_tier_gh_predicate_agent(
 ) {
     assert!(
-        tool_catalog::resolve_tool_target("agent").is_none(),
-        "if `agent` now resolves to a dispatch target, TaskParams::Agent IS reachable from \
-         model output — replace this reachability pin with the real Tier::Remote-grant / \
-         Tier::None-request denial test W4's Task 21 targets"
+        matches!(
+            tool_catalog::resolve_tool_target("agent"),
+            Some(tool_catalog::ToolTarget::Builtin(TaskKind::Agent))
+        ),
+        "`agent` must resolve to the sub-agent spawn builtin, or TaskParams::Agent is not \
+         reachable from model output and this test proves nothing"
     );
     assert!(
-        !tool_catalog::builtin_tool_defs()
+        tool_catalog::builtin_tool_defs()
             .iter()
             .any(|d| d.name() == "agent"),
-        "the builtin catalog gained an `agent` tool — see the assertion above"
+        "the builtin catalog must offer an `agent` ToolDef, or no model can ever call it"
     );
 
-    let dir = tempfile::tempdir().unwrap();
-    // A rule that WOULD fire if a `TaskParams::Agent` ever reached the
-    // engine: approved at the most-isolated tier. W4's fix is what makes
-    // this not also cover the `Tier::None` request the model asks for below.
-    let fx = fixture(
-        dir.path(),
-        dir.path().join("state"),
+    // (a) Approved at the most-isolated tier. A `Tier::Sandbox` child request
+    //     asks for LESS isolation than was approved, so the rule must not
+    //     cover it.
+    let denied_dir = tempfile::tempdir().unwrap();
+    let denied = fixture(
+        denied_dir.path(),
+        denied_dir.path().join("state"),
         vec![CompiledRule::test_new(
             Scope::Project,
             Outcome::Allow,
@@ -515,44 +703,88 @@ async fn an_agent_tool_call_never_reaches_predicate_agent_because_no_agent_tool_
         )],
     )
     .await;
+    let denied_host = with_host(
+        &denied,
+        Arc::new(RecordingSubAgentHost::new(denied.writer.clone())),
+    );
 
-    let blocks = drive(
-        &fx,
-        None,
-        "agent",
-        serde_json::json!({
-            "provider": "anthropic",
-            "model": "claude",
-            "tier_request": "None",
-        }),
-    )
-    .await;
-
+    let blocks = drive(&denied, None, "agent", agent_call_args()).await;
     let results = tool_results(&blocks);
     assert_eq!(results.len(), 1, "expected exactly one tool result");
-    let (is_error, text) = &results[0];
     assert!(
-        is_error,
-        "an unresolvable tool name must be an error result"
-    );
-    assert!(
-        text.contains("unknown tool `agent`"),
-        "the refusal must name the real reason — an unresolvable tool, not a policy \
-         decision — got {text:?}"
+        results[0].0,
+        "a Remote-approved `agent` rule must not cover a Sandbox request — under the \
+         pre-Task-21 `<=` comparison it would have, got {:?}",
+        results[0].1
     );
 
-    let events = events_of(&fx).await;
-    assert!(
-        !events.iter().any(|e| matches!(
-            &e.payload,
-            EventPayload::TaskCreated {
-                kind: TaskKind::Agent,
-                ..
-            }
-        )),
-        "no Agent task may exist: nothing on the real dispatch path constructs one, so \
-         Predicate::Agent is never consulted"
+    let denied_events = events_for(&denied, denied.session_id).await;
+    assert_eq!(
+        created_task_kinds(&denied_events)
+            .iter()
+            .filter(|k| **k == TaskKind::Agent)
+            .count(),
+        1,
+        "the refusal must be a real, queryable `agent` task: Predicate::Agent was consulted \
+         and said no, which is the whole reachability claim"
     );
+    assert_eq!(
+        failure_categories(&denied_events),
+        vec!["requires_approval".to_string()],
+        "no rule covered the request, so the engine's default `Ask` decided it"
+    );
+    assert!(
+        denied_host.created().is_empty(),
+        "a policy-refused spawn must never reach the child-session step"
+    );
+    assert_eq!(
+        denied_host.tree.direct_children(denied.session_id),
+        0,
+        "and must leave the parent's spawn tree exactly as it found it"
+    );
+    assert_eq!(denied_host.tree.reserved_children(denied.session_id), 0);
+
+    // (b) The same rule at the tier a child actually asks for. Without this
+    //     half, (a) would also pass against a predicate that matched nothing.
+    let allowed_dir = tempfile::tempdir().unwrap();
+    let allowed = fixture(
+        allowed_dir.path(),
+        allowed_dir.path().join("state"),
+        vec![CompiledRule::test_new(
+            Scope::Project,
+            Outcome::Allow,
+            Predicate::agent(None, None, Tier::Sandbox),
+        )],
+    )
+    .await;
+    let allowed_host = with_host(
+        &allowed,
+        Arc::new(RecordingSubAgentHost::new(allowed.writer.clone())),
+    );
+
+    let blocks = drive(&allowed, None, "agent", agent_call_args()).await;
+    let results = tool_results(&blocks);
+    assert_eq!(results.len(), 1);
+    assert!(
+        !results[0].0,
+        "a rule approved at the tier the child actually requests must admit the spawn, \
+         got {:?}",
+        results[0].1
+    );
+
+    let allowed_events = events_for(&allowed, allowed.session_id).await;
+    assert_eq!(
+        created_task_kinds(&allowed_events)
+            .iter()
+            .filter(|k| **k == TaskKind::Agent)
+            .count(),
+        1
+    );
+    assert!(
+        failure_categories(&allowed_events).is_empty(),
+        "an admitted spawn records no TaskFailed"
+    );
+    assert_eq!(allowed_host.created().len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,61 +1401,191 @@ async fn a_spawned_shell_tool_call_cannot_read_outside_its_landlock_ruleset_gh_i
 
 // ---------------------------------------------------------------------------
 // Case 6 — agent_spawn / SpawnTree::record_child / the human-join guard
+//          (was a reachability pin; REACHABLE since Phase 8's `agent` tool)
 // ---------------------------------------------------------------------------
 
-/// **Reachability pin. Stated plainly, since the spec's fallback ("file the
-/// fix as an addition to lane W4's Task 32") no longer has an owning lane:**
-/// Phase 4's deferred `SpawnTree::record_child` and `mark_human`/
-/// `register_human` items are **not** activated by Task 5's wiring. No tool
-/// a model can call reaches `roundhouse_engine::agent_spawn::agent_spawn`,
-/// so no child session is ever minted through the real loop, so neither the
-/// spawn tree nor the human-join guard can fire.
+/// **The real test the old reachability pin was holding a place for.** Its
+/// predecessor
+/// (`agent_spawn_is_not_reachable_through_the_real_loop_so_spawn_tree_and_the_human_join_guard_never_fire`)
+/// asserted that no spawn-shaped tool name resolved, so
+/// `roundhouse_engine::agent_spawn::agent_spawn` had no model-reachable
+/// caller and neither the spawn tree nor the human-join guard could fire.
+/// Phase 8's `agent` builtin made all of that false, and this is the
+/// end-to-end test the pin's own failure message asked for.
 ///
-/// Driven through the real loop rather than asserted by inspection: a model
-/// asking for every spawn-shaped tool name gets an unresolvable-tool
-/// refusal each time, and the session's log ends with **no `Agent` task**.
+/// Driven through the same `drive(...)` harness the pin used — a scripted
+/// `Provider` issues a real `ContentBlock::ToolUse { name: "agent" }`, the
+/// real dispatcher resolves it, the real `SessionActor::admit_task` judges it
+/// and the real `spawn_child` sequence runs — and asserting all three things
+/// the pin said could not happen:
+///
+/// 1. a `TaskKind::Agent` task **is** minted in the parent's log;
+/// 2. a real child session exists — its own `SessionCreated`, carrying
+///    `spec.parent = Some(parent)`, is durably in the store and queryable by
+///    the child's id;
+/// 3. the shared `SpawnTree` carries the new parent -> child edge, committed
+///    rather than merely reserved.
+///
+/// The `SessionRegistry` half of "a real child session" — a live, running
+/// actor — is `roundhouse-daemon`'s to prove, since `create_headless_session`
+/// and `SessionRegistry` live there and nothing may depend on that crate;
+/// `sub_agent_host::tests::an_agent_tool_call_creates_a_real_registered_child_with_a_durable_parent_edge`
+/// covers it over real daemon resources.
 #[tokio::test]
-async fn agent_spawn_is_not_reachable_through_the_real_loop_so_spawn_tree_and_the_human_join_guard_never_fire(
-) {
-    for name in ["agent", "spawn", "agent_spawn", "task"] {
-        assert!(
-            tool_catalog::resolve_tool_target(name).is_none(),
-            "`{name}` now resolves to a dispatch target — sub-agent spawning may have become \
-             reachable from model output; replace this pin with the real SpawnTree::record_child \
-             / human-join-guard test"
-        );
-    }
-
+async fn an_agent_tool_call_mints_a_real_tracked_child_session_through_the_real_loop() {
     let dir = tempfile::tempdir().unwrap();
-    let fx = fixture(dir.path(), dir.path().join("state"), vec![]).await;
-
-    let blocks = drive(
-        &fx,
-        None,
-        "agent_spawn",
-        serde_json::json!({ "prompt": "do some work in a child session" }),
+    let fx = fixture(
+        dir.path(),
+        dir.path().join("state"),
+        vec![CompiledRule::test_new(
+            Scope::Project,
+            Outcome::Allow,
+            Predicate::agent(None, None, Tier::None),
+        )],
     )
     .await;
+    let host = with_host(&fx, Arc::new(RecordingSubAgentHost::new(fx.writer.clone())));
+
+    let blocks = drive(&fx, None, "agent", agent_call_args()).await;
 
     let results = tool_results(&blocks);
     assert_eq!(results.len(), 1);
     assert!(
-        results[0].0 && results[0].1.contains("unknown tool `agent_spawn`"),
-        "a spawn-shaped tool call must be refused as unresolvable, got {:?}",
-        results[0]
+        !results[0].0,
+        "the model-issued spawn must succeed, got {:?}",
+        results[0].1
     );
 
-    let events = events_of(&fx).await;
-    let kinds: Vec<TaskKind> = events
+    // 1. The parent's own log carries exactly one `agent` task.
+    let parent_events = events_for(&fx, fx.session_id).await;
+    let kinds = created_task_kinds(&parent_events);
+    assert_eq!(
+        kinds.iter().filter(|k| **k == TaskKind::Agent).count(),
+        1,
+        "exactly one TaskKind::Agent task must be recorded, saw {kinds:?}"
+    );
+    assert!(failure_categories(&parent_events).is_empty());
+
+    // 3. The spawn tree carries one committed edge and no dangling
+    //    reservation. Read before (2) so the child's id comes from the tree
+    //    itself rather than from the host's own bookkeeping.
+    assert_eq!(host.tree.direct_children(fx.session_id), 1);
+    assert_eq!(host.tree.reserved_children(fx.session_id), 0);
+    let descendants = host.tree.descendants(fx.session_id);
+    assert_eq!(descendants.len(), 1);
+    let child = descendants[0];
+    assert_eq!(
+        host.created(),
+        vec![child],
+        "the session the tree committed must be the session that was created — one spawn, \
+         one id, everywhere"
+    );
+    assert!(
+        results[0].1.contains(&child.to_string()),
+        "the model must be told which session it spawned, got {:?}",
+        results[0].1
+    );
+
+    // 2. A real child session: its own durable `SessionCreated`, on its own
+    //    log, naming its parent. This is the fact boot-time spawn-tree
+    //    recovery reads (`reconcile_spawn_tree`), so asserting it here is
+    //    asserting the child is recoverable, not merely remembered.
+    let child_events = events_for(&fx, child).await;
+    let specs: Vec<SessionSpec> = child_events
         .iter()
         .filter_map(|e| match &e.payload {
-            EventPayload::TaskCreated { kind, .. } => Some(kind.clone()),
+            EventPayload::SessionCreated { spec, .. } => Some((**spec).clone()),
             _ => None,
         })
         .collect();
-    assert!(
-        !kinds.contains(&TaskKind::Agent),
-        "no Agent task may be minted: sub-agent spawning has no model-reachable entry point, \
-         so `SpawnTree::record_child` and the human-join guard cannot have fired. Saw {kinds:?}"
+    assert_eq!(
+        specs.len(),
+        1,
+        "the child must have exactly one SessionCreated of its own"
     );
+    assert_eq!(
+        specs[0].parent,
+        Some(fx.session_id),
+        "the durable parent edge must name the spawning session"
+    );
+    assert_eq!(
+        specs[0].requested_tier,
+        Tier::Sandbox,
+        "a spawned child asks for the most restrictive real tier, never the parent's"
+    );
+
+    // §7.7: the budget transfer is a debit against the parent, not a copy.
+    assert_eq!(host.budget.lock().unwrap().remaining_tokens, 700);
+}
+
+/// **The human-join guard's own call site, reached through the real loop.**
+/// The retired pin's second claim was that the guard *"never fires"* because
+/// nothing a model could call reached `agent_spawn`. The guard itself lives
+/// inside `TeamRegistry::join` (and `TeamRegistry::create_team`), and
+/// `agent_spawn`'s §7.5 auto-join is the call `dispatch_agent` now makes on
+/// every spawn whose parent is on a team.
+///
+/// This test proves that call really is on the real loop's path: a parent
+/// that is a team member spawns through a model-issued `agent` call, and the
+/// child lands on that team's roster as a `worker`. Every membership the
+/// guard could ever reject arrives through this one call — so a passing
+/// assertion here is what makes "the guard is reachable" a fact rather than
+/// an inference.
+///
+/// The rejection half — a session marked human via the real socket handshake
+/// being refused by both the `join` arm and the `create_team` arm, against
+/// the one `TeamRegistry` the real daemon assembles — belongs to
+/// `roundhouse-daemon`, which is where `mark_human`/`register_human` are
+/// wired: see `submit_turn_e2e.rs`'s `human_join_guard` module. It cannot be
+/// written here, because a freshly minted child session is never a human one.
+#[tokio::test]
+async fn a_spawned_childs_team_auto_join_runs_through_the_real_loop_where_the_human_guard_lives() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = fixture(
+        dir.path(),
+        dir.path().join("state"),
+        vec![CompiledRule::test_new(
+            Scope::Project,
+            Outcome::Allow,
+            Predicate::agent(None, None, Tier::None),
+        )],
+    )
+    .await;
+
+    let mut host = RecordingSubAgentHost::new(fx.writer.clone());
+    // The parent creates, and is therefore the first member of, a real team.
+    // `agent_spawn` refuses outright for a parent that is not a current
+    // member, so without this the auto-join below would never be attempted.
+    let team = host
+        .teams
+        .create_team(
+            fx.actor.session_spec().workspace,
+            "reviewers".to_string(),
+            "review the diff".to_string(),
+            fx.session_id,
+            "lead".to_string(),
+        )
+        .expect("a non-human session may create a team");
+    host.team = Some(team);
+    let host = with_host(&fx, Arc::new(host));
+
+    let blocks = drive(&fx, None, "agent", agent_call_args()).await;
+    let results = tool_results(&blocks);
+    assert!(
+        !results[0].0,
+        "the spawn must succeed, got {:?}",
+        results[0].1
+    );
+
+    let child = host.tree.descendants(fx.session_id)[0];
+    let roster = host
+        .teams
+        .roster(team)
+        .expect("the team the parent created must still exist");
+    let child_membership = roster.iter().find(|m| m.session == child).expect(
+        "the spawned child must have gone through TeamRegistry::join — the exact \
+                 call the human-join guard rejects for a human session",
+    );
+    assert_eq!(child_membership.role, "worker", "§7.5's default role");
+    assert!(!child_membership.ended);
 }

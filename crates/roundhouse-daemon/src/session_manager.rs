@@ -542,6 +542,7 @@ mod tests {
             name: Some("headless-test-workspace".to_string()),
             requested_tier: Tier::Sandbox,
             on_degrade: resources.default_on_degrade,
+            parent: None,
         }
     }
 

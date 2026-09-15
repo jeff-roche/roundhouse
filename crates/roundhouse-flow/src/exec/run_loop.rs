@@ -162,10 +162,15 @@ pub trait SessionTree: Send {
     /// Releases a slot when durable child admission does not commit.
     fn release_child(&mut self, parent: SessionId, child: SessionId);
 
-    /// Appends the child SessionCreated lifecycle event into `txn`.
+    /// Appends the child SessionCreated lifecycle event into `txn`. `parent`
+    /// is the actual calling session (durable spawn-tree linkage,
+    /// `SessionSpec::parent`) — implementors must record it on the child's
+    /// spec themselves, never substitute a stored template spec's own
+    /// `parent` field.
     fn persist_child_session(
         &mut self,
         txn: &rusqlite::Transaction<'_>,
+        parent: SessionId,
         child: &WorkflowRun,
     ) -> Result<(), WorkflowHostError>;
 
@@ -176,6 +181,46 @@ pub trait SessionTree: Send {
         child: SessionId,
         job_id: JobId,
     ) -> Result<(), WorkflowHostError>;
+
+    /// Releases the runtime slot a **committed** child holds, because that
+    /// child's run has reached a terminal state.
+    ///
+    /// The counterpart of [`Self::register_child`], not of
+    /// [`Self::release_child`]: `release_child` compensates a reservation that
+    /// never committed, this ends an edge that did. Without it a parent's
+    /// §7.7 fan-out ceiling is a lifetime quota rather than a concurrency one
+    /// — eight `call:` children per parent per daemon process, ever.
+    ///
+    /// Infallible on purpose, exactly as `release_child` is: dropping the
+    /// bookkeeping edge is best-effort, so a run that has already
+    /// transitioned and already refunded its grant is never reported as
+    /// failing *by this call*. That is a claim about this hook only, not
+    /// about the whole of [`finish_run`]'s terminal branch — the
+    /// `recover_run` lookup that finds the parent's session a few lines
+    /// before this call can still fail and propagate, exactly as the
+    /// `refund_child_run` beside it already can.
+    ///
+    /// # Wired and testable, but no production caller yet
+    ///
+    /// Nothing in this workspace drives a workflow `call:` child run to
+    /// completion in production, so [`finish_run`]'s terminal branch — the
+    /// one call site — is reached only from tests today. That is the same
+    /// deliberate state the sub-agent half is in (see
+    /// `SubAgentSessions::retire_child`'s *"No production caller yet, and why
+    /// that is the correct state"* in `roundhouse-daemon`): the bookkeeping is
+    /// wired at the seam that owns it, so whatever eventually drives a `call:`
+    /// child to completion (part of issue #30's scope) inherits a correct slot
+    /// release by construction rather than having to remember one.
+    ///
+    /// Implementors must be idempotent. **Not** because this call site
+    /// duplicates — [`run_workflow`] refuses to drive a run that is already
+    /// terminal, so a crash after the transition cannot produce a second
+    /// call from here — but because the fact it reports is about a *session*,
+    /// and the daemon learns that a session ended by more routes than this
+    /// one (boot-time reconciliation of the tree, and whatever eventually
+    /// reaps a finished child). Removal that is only correct once is removal
+    /// that breaks the first time two of those agree.
+    fn child_terminated(&mut self, parent: SessionId, child: SessionId);
 
     fn direct_children(&mut self, parent: SessionId) -> Result<u32, WorkflowHostError>;
 }
@@ -222,6 +267,12 @@ pub trait WorkflowHost: Checkpointer {
         child: &WorkflowRun,
         called: &CalledWorkflow,
     ) -> Result<(), WorkflowHostError>;
+
+    /// Drops the runtime edge [`Self::create_child_run`] registered, because
+    /// the child run it stands for has ended. Called by [`finish_run`] from
+    /// the child's **own** terminal transition, beside the durable refund —
+    /// see [`SessionTree::child_terminated`], which this exists to reach.
+    fn child_session_terminated(&mut self, parent: SessionId, child: SessionId);
 }
 
 /// Why a run could not be driven. **Not** a step failing — a step failure is
@@ -599,7 +650,15 @@ pub fn run_workflow<H: WorkflowHost>(
 
     let report = run.ensure_report(&mut executor, state)?;
     let steps = std::mem::take(&mut run.outcomes);
-    let landed = finish_run(run.conn, run_id, state, now, &report)?;
+    let landed = finish_run(
+        run.conn,
+        run.host,
+        run_id,
+        run.session_id,
+        state,
+        now,
+        &report,
+    )?;
 
     Ok(RunOutcome::Terminal {
         // The state that **actually landed on the row**, not the one computed
@@ -719,9 +778,11 @@ fn ensure_gate_step(main: &[StepDef], answer: &GateAnswer) -> Result<(), RunLoop
 /// annotation is one edge stale in exactly this race and no other. Closing
 /// that too would need the report emit and the transition in one transaction,
 /// and the sink is not a database handle (see [`TaskSink`]).
-fn finish_run(
+fn finish_run<H: WorkflowHost>(
     conn: &mut Connection,
+    host: &mut H,
     run_id: RunId,
+    session_id: SessionId,
     state: RunState,
     now: Timestamp,
     _report: &ReportPersisted,
@@ -741,8 +802,20 @@ fn finish_run(
     // that has not reached a terminal state — correctly, since returning a live
     // child's grant would let it spend budget its parent had reclaimed.
     let ledger = run_ledger(conn, run_id)?;
-    if ledger.parent_run_id.is_some() {
+    if let Some(parent_run_id) = ledger.parent_run_id {
         refund_child_run(conn, run_id, now)?;
+        // The runtime half of the same "the child has ended" fact, released
+        // from the same branch as the durable half so the two cannot drift.
+        // The parent's SESSION, not its run: the spawn tree §7.7's fan-out
+        // ceiling is counted in is keyed by session, and a run's session is
+        // the only thing the two child kinds (`call:` children and the
+        // `agent` tool's sub-agents) have in common to be counted under.
+        //
+        // The parent row is guaranteed present: `refund_child_run` above
+        // just credited it, and `insert_workflow_run` refuses to commit a
+        // row carrying a `parent_run_id` without drawing from that parent.
+        let parent_session = recover_run(conn, parent_run_id)?.run.session_id;
+        host.child_session_terminated(parent_session, session_id);
     }
     Ok(landed)
 }
@@ -1830,8 +1903,70 @@ mod tests {
     use crate::durability::{insert_workflow_run, open_test_db, recover_run};
     use roundhouse_core::JobId;
 
-    fn seeded_run(conn: &mut Connection) -> RunId {
+    /// A host that does nothing, for the two tests below that drive
+    /// [`finish_run`] directly.
+    ///
+    /// Both seed a **root** run, so neither reaches the one host call
+    /// `finish_run` makes. `terminated` records it anyway rather than
+    /// ignoring it: a root run that reported a child termination would be
+    /// handing `SpawnTree::remove_child` a parent it invented, and this is
+    /// the level at which that is visible.
+    #[derive(Default)]
+    struct NoopHost {
+        terminated: Vec<(SessionId, SessionId)>,
+    }
+
+    impl Checkpointer for NoopHost {
+        fn checkpoint(
+            &mut self,
+            _session_id: SessionId,
+            _run_id: RunId,
+            _label: &str,
+        ) -> Result<crate::parking::CheckpointRef, CheckpointError> {
+            unreachable!("these tests run no steps, so nothing is checkpointed")
+        }
+    }
+
+    impl WorkflowHost for NoopHost {
+        fn resolve_call(
+            &mut self,
+            _conn: &Connection,
+            _workflow: &str,
+            _parent: SessionId,
+        ) -> Result<Option<CalledWorkflow>, WorkflowHostError> {
+            unreachable!("these tests run no `call:` step")
+        }
+
+        fn reserve_child_session(
+            &mut self,
+            _parent: SessionId,
+            _child: &CalledWorkflow,
+        ) -> Result<u32, WorkflowHostError> {
+            unreachable!("these tests run no `call:` step")
+        }
+
+        fn release_child_session(&mut self, _parent: SessionId, _child: &CalledWorkflow) {
+            unreachable!("these tests run no `call:` step")
+        }
+
+        fn create_child_run(
+            &mut self,
+            _conn: &mut Connection,
+            _parent: SessionId,
+            _child: &WorkflowRun,
+            _called: &CalledWorkflow,
+        ) -> Result<(), WorkflowHostError> {
+            unreachable!("these tests run no `call:` step")
+        }
+
+        fn child_session_terminated(&mut self, parent: SessionId, child: SessionId) {
+            self.terminated.push((parent, child));
+        }
+    }
+
+    fn seeded_run(conn: &mut Connection) -> (RunId, SessionId) {
         let run_id = RunId::new();
+        let session_id = SessionId::new();
         insert_workflow_run(
             conn,
             &WorkflowRun {
@@ -1839,7 +1974,7 @@ mod tests {
                 job_id: JobId::new(),
                 job_version: 1,
                 content_hash: "sha256:pinned".into(),
-                session_id: SessionId::new(),
+                session_id,
                 binding_id: None,
                 trigger_event_id: None,
                 state: RunState::Running,
@@ -1855,13 +1990,13 @@ mod tests {
             },
         )
         .expect("seed the run row");
-        run_id
+        (run_id, session_id)
     }
 
     #[test]
     fn a_cancel_that_raced_the_terminal_write_lands_cancelled_not_stranded() {
         let mut conn = open_test_db();
-        let run_id = seeded_run(&mut conn);
+        let (run_id, session_id) = seeded_run(&mut conn);
         // The operator's cancel, arriving after `run_workflow` read the state
         // and before it wrote the terminal one.
         transition_run(
@@ -1872,14 +2007,21 @@ mod tests {
         )
         .expect("Running -> Cancelling");
 
+        let mut host = NoopHost::default();
         let landed = finish_run(
             &mut conn,
+            &mut host,
             run_id,
+            session_id,
             RunState::Completed,
             Timestamp::from_unix_nanos(2),
             &ReportPersisted(ReportOrigin::Synthesised),
         )
         .expect("the run reaches a terminal state rather than being stranded");
+        assert!(
+            host.terminated.is_empty(),
+            "a root run releases no parent's fan-out slot"
+        );
 
         assert_eq!(
             landed,
@@ -1898,13 +2040,16 @@ mod tests {
     #[test]
     fn a_pause_that_raced_the_terminal_write_still_completes_the_run() {
         let mut conn = open_test_db();
-        let run_id = seeded_run(&mut conn);
+        let (run_id, session_id) = seeded_run(&mut conn);
         crate::control::pause(&mut conn, run_id, Timestamp::from_unix_nanos(1))
             .expect("Running -> Paused");
 
+        let mut host = NoopHost::default();
         let landed = finish_run(
             &mut conn,
+            &mut host,
             run_id,
+            session_id,
             RunState::Completed,
             Timestamp::from_unix_nanos(2),
             &ReportPersisted(ReportOrigin::Synthesised),
