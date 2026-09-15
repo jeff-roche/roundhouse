@@ -23,19 +23,28 @@
 //! - **It never transitions a `workflow_run` row itself.** `finish_run` (in
 //!   `roundhouse-flow`'s run loop) is the workspace's only writer of
 //!   `Completed`/`Failed`/`Cancelled`, and it is what discharges ruling
-//!   P112's "exactly one report on every terminal path". A run whose
-//!   `run_workflow_from_storage` call returned `Err` therefore stays
-//!   `Running` on the row even though its *delivery* correctly reaches
-//!   `failed`. Reconciling those is §8.11's reaper, not this driver's to
-//!   invent.
-//! - **It never closes a session it created.** Nothing in this workspace
-//!   drives a `SessionActor` to `SessionState::Closed` yet (see
-//!   `session_manager::spawn_session_reaper`'s own doc comment), so a
-//!   scheduled run's headless session stays registered for the daemon's
-//!   life. With `max_sessions` bounded, a long-lived daemon running many
-//!   deliveries will eventually fill the registry — a real limit, recorded
-//!   rather than papered over, and closable the moment a terminal session
-//!   transition exists.
+//!   P112's "exactly one report on every terminal path"; a driver-side
+//!   transition would mint a terminal run carrying no report.
+//!
+//!   **The precise residual gap:** when `run_workflow_from_storage` returns
+//!   `Err` — an infra-level failure calling into flow, not a workflow whose
+//!   step failed — everything this task owns is still released (the delivery
+//!   reaches `failed` with `last_error`, the admission slot is released, the
+//!   session is retired), but the `workflow_run` row is left **`Running`
+//!   with no driver attached and no `ended_at`**: an orphaned run that looks
+//!   live forever and that nothing currently detects or recovers. Pinned by
+//!   `delivery_tests::an_undrivable_run_still_fails_its_delivery_and_releases_everything`
+//!   so it is a known state rather than a surprise. Detecting and recovering
+//!   such rows is §8.11's reaper, not this driver's to invent.
+//! - **It does not resume a parked run, so it does not retire a parked run's
+//!   session either.** Every *terminal* delivery retires its session through
+//!   [`HeadlessSession::teardown`] (see
+//!   [`DeliveryExecutor::retire_session`] for why that cannot wait for
+//!   `spawn_session_reaper`), so live sessions are bounded by the
+//!   concurrency cap rather than by the daemon's uptime. A run parked on a
+//!   human gate is the exception: its session must stay alive for the resume
+//!   that has no implementation yet, so it is held until the daemon
+//!   restarts.
 //! - **It resolves no secrets and no `env()` names.** See
 //!   [`DeliveryExecutor::run_claimed_delivery`] for both.
 
@@ -74,7 +83,7 @@ use rusqlite::Connection;
 use uuid::Uuid;
 
 use crate::session_bootstrap::{BackgroundServiceContext, BackgroundServiceError, DaemonResources};
-use crate::session_manager::{create_headless_session, CreateHeadlessSessionError};
+use crate::session_manager::{create_headless_session, HeadlessSession};
 use crate::session_registry::SessionRegistry;
 use crate::workflow_host::WorkflowSessionTree;
 
@@ -968,7 +977,14 @@ impl DeliveryExecutor {
         // `note_finished` below would underflow `active` and strand `queued`.
         self.promote_if_queued(&delivery, binding_id).await;
 
-        match self.run_claimed_delivery(&delivery, &stored, now).await {
+        // Held here rather than inside `run_claimed_delivery` so that the
+        // session is retired on **every** exit from that function, including
+        // the `?` early returns after it was already constructed.
+        let mut session = None;
+        match self
+            .run_claimed_delivery(&delivery, &stored, now, &mut session)
+            .await
+        {
             Ok(RunConclusion::Completed) => {
                 let finished = self.now();
                 self.transition(&delivery_id, move |conn, id| {
@@ -976,23 +992,56 @@ impl DeliveryExecutor {
                 })
                 .await;
                 self.release(binding_id);
+                self.retire_session(session).await;
             }
             Ok(RunConclusion::Parked) => {
                 tracing::info!(
                     binding_id = %binding_id,
-                    "a scheduled run parked on a human gate; its delivery stays `running` and \
-                     its admission slot stays held until the run is resumed"
+                    "a scheduled run parked on a human gate; its delivery stays `running`, its \
+                     admission slot stays held, and its session stays alive until the run is \
+                     resumed"
                 );
+                // Deliberately NOT retired: a parked run resumes into this
+                // session. `session` is dropped here, which drops this task's
+                // `Arc<SessionActor>` — the registry still holds the entry,
+                // so the session stays live and attachable.
             }
             Ok(RunConclusion::Failed(reason)) => {
                 self.fail(&delivery_id, binding_id, "workflow_failed", reason)
                     .await;
+                self.retire_session(session).await;
             }
             Err(error) => {
                 self.fail(&delivery_id, binding_id, error.kind(), error.to_string())
                     .await;
+                self.retire_session(session).await;
             }
         }
+    }
+
+    /// Retires a finished delivery's headless session, if one was created.
+    ///
+    /// **This is the whole reason a scheduled run's session does not
+    /// accumulate.** `spawn_session_reaper` only fires on
+    /// `SessionState::Closed`, and nothing in this workspace drives an actor
+    /// there — fine for the socket path (one session per connected client,
+    /// living as long as the daemon), fatal for the scheduler, which mints
+    /// one session per delivery. At one delivery a minute a daemon would
+    /// reach `SessionRegistry`'s `DEFAULT_MAX_SESSIONS` (10,000) in about a
+    /// week and then fail every further delivery with `RegistryFull`, holding
+    /// ten thousand real isolation handles. Retiring the session at the
+    /// delivery's terminal outcome is what bounds it, and the bound is the
+    /// concurrency cap rather than the daemon's uptime.
+    ///
+    /// Called on the completed and failed paths and never on the parked one —
+    /// see [`Self::claim_and_run`].
+    async fn retire_session(&self, session: Option<HeadlessSession>) {
+        let Some(session) = session else {
+            return;
+        };
+        session
+            .teardown(&self.sessions, &self.resources.proxy)
+            .await;
     }
 
     /// `ready -> leased`. `false` means this delivery is not ours — either
@@ -1084,11 +1133,17 @@ impl DeliveryExecutor {
     /// a git repository here — the provider's own contract is that the first
     /// `materialize` surfaces that, and validating it eagerly would fail
     /// every non-`worktree` workflow in a non-git workspace for nothing.
+    ///
+    /// `session` is an out-parameter rather than part of the return value so
+    /// that a session already constructed when a later step fails is still
+    /// handed back to [`Self::claim_and_run`] to retire — a `?` on the
+    /// `mark_delivery_running` below must not strand a live session.
     async fn run_claimed_delivery(
         &self,
         delivery: &TriggerDelivery,
         stored: &StoredBinding,
         now: Timestamp,
+        session: &mut Option<HeadlessSession>,
     ) -> Result<RunConclusion, DeliveryError> {
         let session_id = SessionId::new();
         let run_id = RunId::new();
@@ -1191,17 +1246,19 @@ impl DeliveryExecutor {
             requested_tier: Tier::Sandbox,
             on_degrade: OnDegrade::Refuse,
         };
-        create_headless_session(
-            &self.resources,
-            &self.sessions,
-            session_id,
-            spec.clone(),
-            workspace_root.clone(),
-            workspace.root_device,
-            workspace.root_inode,
-        )
-        .await
-        .map_err(|error| DeliveryError::Session(headless_session_error_kind(&error)))?;
+        *session = Some(
+            create_headless_session(
+                &self.resources,
+                &self.sessions,
+                session_id,
+                spec.clone(),
+                workspace_root.clone(),
+                workspace.root_device,
+                workspace.root_inode,
+            )
+            .await
+            .map_err(|error| DeliveryError::Session(error.kind()))?,
+        );
 
         let running = self
             .transition_checked(&delivery.delivery_id, move |conn, id| {
@@ -1325,15 +1382,6 @@ impl DeliveryExecutor {
                  the daemon restarts"
             );
         }
-    }
-}
-
-/// [`CreateHeadlessSessionError`] as a static category — see
-/// [`DeliveryError`]'s doc comment for why the `Display` is not used.
-fn headless_session_error_kind(error: &CreateHeadlessSessionError) -> &'static str {
-    match error {
-        CreateHeadlessSessionError::Session(inner) => inner.kind(),
-        CreateHeadlessSessionError::RegistryFull => "session_registry_full",
     }
 }
 
@@ -2366,6 +2414,20 @@ mod delivery_tests {
             .to_string()
     }
 
+    /// A workflow that registers fine (its top-level document parses) but
+    /// whose *step graph* is a `needs:` cycle, which only `run_workflow`'s own
+    /// `parse_phase`/`topological_order` rejects. This is how a test reaches
+    /// the `Err(RunLoopError)` return from `run_workflow_from_storage` — an
+    /// infra-level failure calling into flow — as opposed to the ordinary
+    /// `Ok(RunOutcome::Terminal { state: Failed, .. })` a failing *step*
+    /// produces.
+    fn undrivable_workflow() -> String {
+        "name: scheduled\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: a\n    needs: [b]\n    emit: { x: 1 }\n  - id: b\n    \
+         needs: [a]\n    emit: { y: 2 }\n"
+            .to_string()
+    }
+
     /// A workflow that parks on a human gate — a real, valid non-terminal
     /// outcome this driver deliberately does not resolve.
     fn parking_workflow() -> String {
@@ -2588,13 +2650,19 @@ mod delivery_tests {
             "a completed delivery must release the admission slot accept_occurrence charged, \
              or this binding never fires again"
         );
-        assert!(
-            harness.sessions.actor(session_id).is_some(),
-            "the delivery must have created a real, registered headless session"
-        );
+        // The session was real: its `SessionCreated` event and the run's own
+        // task events are both in its durable log. That log is what makes a
+        // scheduled run openable afterwards — it survives the registry entry,
+        // which is live-actor bookkeeping, not the session's record.
         assert!(
             harness.session_event_count(session_id).await > 1,
             "the run's task events must reach the session's log, not just its SessionCreated"
+        );
+        assert!(
+            harness.sessions.actor(session_id).is_none(),
+            "a terminal delivery must RETIRE its session — spawn_session_reaper waits on a \
+             `Closed` nothing produces, so without an explicit teardown a per-delivery \
+             session would live for the daemon's whole life and fill max_sessions"
         );
     }
 
@@ -2620,6 +2688,14 @@ mod delivery_tests {
             0,
             "a FAILED run must release its slot too — a held slot wedges the binding shut \
              exactly like the never-released case"
+        );
+        assert!(
+            harness
+                .sessions
+                .actor(row.session_id.expect("reserve stamps a session id"))
+                .is_none(),
+            "a FAILED run must retire its session too, or a binding that fails every minute \
+             fills max_sessions just as fast as one that succeeds"
         );
     }
 
@@ -2647,6 +2723,14 @@ mod delivery_tests {
             harness.active(),
             1,
             "a parked run is still live, so its admission slot must stay held"
+        );
+        assert!(
+            harness
+                .sessions
+                .actor(row.session_id.expect("reserve stamps a session id"))
+                .is_some(),
+            "a parked run's session must NOT be retired — the resume that answers its gate \
+             runs in this session"
         );
     }
 
@@ -2699,6 +2783,61 @@ mod delivery_tests {
 
         assert_eq!(harness.delivery_row().await.state, DeliveryState::Ready);
         assert_eq!(harness.active(), 1);
+    }
+
+    /// `run_workflow_from_storage` returning `Err` — an infra-level failure
+    /// calling into flow, not a workflow whose step failed — must still
+    /// release everything Task 6 owns: the delivery reaches `failed`, the
+    /// admission slot is released, and the session is retired.
+    ///
+    /// The one thing deliberately left alone is the `workflow_run` row, which
+    /// stays `Running`. `finish_run` is the workspace's only writer of
+    /// terminal run states and the only thing that discharges ruling P112's
+    /// "exactly one report on every terminal path"; a driver-side transition
+    /// would mint a terminal run with no report. That orphan is a known,
+    /// narrower gap — see this module's own doc comment.
+    #[tokio::test]
+    async fn an_undrivable_run_still_fails_its_delivery_and_releases_everything() {
+        let harness = harness(undrivable_workflow()).await;
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let row = harness.delivery_row().await;
+        assert_eq!(
+            row.state,
+            DeliveryState::Failed,
+            "a run the loop refused to drive must still fail its delivery, not strand it"
+        );
+        assert!(row.last_error.as_deref().is_some_and(|e| !e.is_empty()));
+        assert_eq!(
+            harness.active(),
+            0,
+            "the admission slot must be released even when the failure is infra-level"
+        );
+        let session_id = row.session_id.expect("reserve stamps a session id");
+        assert!(
+            harness.sessions.actor(session_id).is_none(),
+            "the session must be retired even when the failure is infra-level"
+        );
+
+        // The narrower gap, pinned so it is a known state rather than a
+        // surprise: only the `workflow_run` row is orphaned.
+        let run_id = RunId::from_uuid(Uuid::parse_str(row.run_id.as_deref().unwrap()).unwrap());
+        let run = {
+            let conn = harness.store.pool.get().await.unwrap();
+            conn.interact(move |connection| recover_run(connection, run_id).unwrap().run)
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            run.state,
+            RunState::Running,
+            "this driver must not fake a terminal transition on the run row — P112's \
+             exactly-one-report invariant belongs to finish_run"
+        );
     }
 
     /// A per-tick claim limit does not bound concurrency on its own — claims

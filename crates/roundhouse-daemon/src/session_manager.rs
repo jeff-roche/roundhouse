@@ -70,6 +70,20 @@ pub enum CreateHeadlessSessionError {
     RegistryFull,
 }
 
+impl CreateHeadlessSessionError {
+    /// A static diagnostic category, safe to render into a `tracing` field —
+    /// the same discipline (and the same delegation to
+    /// [`CreateRealSessionError::kind`]) the socket path already follows,
+    /// because a nested config-parser error's `Display` may carry operator-
+    /// or repository-supplied text.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Session(inner) => inner.kind(),
+            Self::RegistryFull => "session_registry_full",
+        }
+    }
+}
+
 /// Builds one real session end to end, exactly as
 /// `socket_server::construct_real_session_bounded` does for the socket path,
 /// and registers it headlessly (zero subscribers, no channel) — for a caller
@@ -104,7 +118,7 @@ pub async fn create_headless_session(
     workspace_root: PathBuf,
     workspace_device: Option<i64>,
     workspace_inode: Option<i64>,
-) -> Result<SessionId, CreateHeadlessSessionError> {
+) -> Result<HeadlessSession, CreateHeadlessSessionError> {
     let real_session = create_real_session(
         resources,
         session_id,
@@ -126,6 +140,12 @@ pub async fn create_headless_session(
     let mcp_host_for_reaper = real_session.mcp_host.clone();
     let mcp_for_teardown = real_session.mcp.clone();
     let proxy_token_for_reaper = real_session.proxy_handle.token().to_string();
+    // A third set, for the handle this function returns — the caller's
+    // explicit teardown needs exactly what the reaper needs, and neither may
+    // depend on the other still holding its own copy.
+    let actor_for_handle = actor_for_reaper.clone();
+    let mcp_host_for_handle = mcp_host_for_reaper.clone();
+    let proxy_token_for_handle = proxy_token_for_reaper.clone();
 
     let Some(session_id) =
         registry.register_headless(real_session.actor, real_session.mcp_host, real_session.mcp)
@@ -145,7 +165,7 @@ pub async fn create_headless_session(
         return Err(CreateHeadlessSessionError::RegistryFull);
     };
 
-    spawn_session_reaper(
+    let reaper = spawn_session_reaper(
         registry.clone(),
         session_id,
         actor_for_reaper,
@@ -154,7 +174,94 @@ pub async fn create_headless_session(
         proxy_token_for_reaper,
     );
 
-    Ok(session_id)
+    Ok(HeadlessSession {
+        session_id,
+        actor: actor_for_handle,
+        mcp_host: mcp_host_for_handle,
+        proxy_token: proxy_token_for_handle,
+        reaper,
+    })
+}
+
+/// A live headless session, plus everything needed to retire it.
+///
+/// # Why a headless caller has to retire its own session (Phase 8, Task 6)
+///
+/// [`spawn_session_reaper`] tears a session down when its actor reaches
+/// `SessionState::Closed` — and **nothing in this workspace ever drives an
+/// actor there** (see that function's own doc comment). For the socket path
+/// that is merely latent: a session lives as long as the daemon and there is
+/// one per connected client. For a *scheduled* session it is fatal, because
+/// the scheduler mints one per delivery: at one delivery a minute a daemon
+/// reaches `SessionRegistry`'s `DEFAULT_MAX_SESSIONS` (10,000) in about a
+/// week, after which every further delivery fails `RegistryFull` — with ten
+/// thousand real isolation handles still held.
+///
+/// So a headless caller gets this handle and calls [`Self::teardown`] itself
+/// the moment its work reaches a terminal outcome, rather than waiting for an
+/// event that will never arrive. That is a caller obligation, not an
+/// automatic behaviour: a caller whose work is *not* finished — a workflow
+/// run parked on a human gate — must keep the session alive, and only the
+/// caller knows which it is.
+pub struct HeadlessSession {
+    session_id: SessionId,
+    actor: Arc<SessionActor>,
+    mcp_host: Option<Arc<McpHost>>,
+    proxy_token: String,
+    reaper: tokio::task::JoinHandle<()>,
+}
+
+impl HeadlessSession {
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    /// The egress-proxy bearer token this session was registered under.
+    /// Test-only, and only so a test can assert [`Self::teardown`] really
+    /// deregisters it — nothing in production needs to read it back, because
+    /// `teardown` is the one thing that uses it.
+    #[cfg(test)]
+    pub(crate) fn proxy_token_for_test(&self) -> &str {
+        &self.proxy_token
+    }
+
+    /// Retires this session: the exact sequence [`spawn_session_reaper`]
+    /// performs on `Closed`, run explicitly instead of on an event that never
+    /// comes.
+    ///
+    /// # The reaper is aborted first, and that ordering is load-bearing
+    ///
+    /// `SessionActor::teardown`'s own doc says callers "should call this at
+    /// most once per actor" — `Isolate::teardown` is not guaranteed
+    /// idempotent. Aborting the reaper before tearing down makes "exactly one
+    /// teardown" structural rather than relying on the reaper never firing.
+    ///
+    /// **Aborting is also the only thing that retires that task.** Verified
+    /// against the real types rather than assumed: `SessionActor::teardown`
+    /// releases the isolation handle and never touches `state_tx`, so the
+    /// reaper's `state.changed()` neither resolves (no state transition) nor
+    /// errors (the sender lives inside the actor, and the reaper holds its
+    /// own `Arc` of it). Tearing a session down out from under the reaper is
+    /// therefore safe — no panic and no race, because the reaper simply never
+    /// wakes — but it would stay parked for the process's life holding that
+    /// `Arc`, which at one session per delivery is a slow leak of exactly the
+    /// kind this handle exists to stop. `abort()` on a task parked at an
+    /// await point drops it there, releasing the `Arc`.
+    pub async fn teardown(self, registry: &SessionRegistry, proxy: &LoopbackProxy) {
+        self.reaper.abort();
+        registry.remove(self.session_id);
+        self.actor.teardown().await;
+        if let Some(host) = &self.mcp_host {
+            if let Err(err) = host.shutdown().await {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    error = %err,
+                    "failed to shut down this session's MCP host"
+                );
+            }
+        }
+        proxy.deregister_session(&self.proxy_token);
+    }
 }
 
 /// The "do-reap-when-the-actor-ends" half of ruling W1-R51 (fix round 1,
@@ -180,6 +287,13 @@ pub async fn create_headless_session(
 /// wired at every call site that creates a session, so the moment a future
 /// task adds a real terminal transition, this reaper closes the loop with no
 /// further wiring needed.
+///
+/// **Returns the task's `JoinHandle` (Phase 8, Task 6).** A caller that
+/// retires its session explicitly — [`HeadlessSession::teardown`], because a
+/// scheduled run cannot afford to wait for a `Closed` that never arrives —
+/// needs to abort this task rather than leave it parked forever holding an
+/// `Arc<SessionActor>`. The socket path ignores the handle, which is exactly
+/// the previous behaviour.
 pub(crate) fn spawn_session_reaper(
     registry: Arc<SessionRegistry>,
     session_id: SessionId,
@@ -187,7 +301,7 @@ pub(crate) fn spawn_session_reaper(
     mcp_host: Option<Arc<McpHost>>,
     proxy: Arc<LoopbackProxy>,
     proxy_token: String,
-) {
+) -> tokio::task::JoinHandle<()> {
     let mut state = actor.subscribe();
     tokio::spawn(async move {
         loop {
@@ -219,7 +333,7 @@ pub(crate) fn spawn_session_reaper(
                 return;
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]
@@ -281,7 +395,7 @@ mod tests {
         let session_id = SessionId::new();
         let spec = test_spec(WorkspaceId::new(), &resources);
 
-        let registered_id = create_headless_session(
+        let headless = create_headless_session(
             &resources,
             &registry,
             session_id,
@@ -294,7 +408,8 @@ mod tests {
         .expect("headless session construction must succeed against a working fixture");
 
         assert_eq!(
-            registered_id, session_id,
+            headless.session_id(),
+            session_id,
             "the registry must register the session under the SAME id the caller supplied, \
              not mint a new one"
         );
@@ -326,6 +441,54 @@ mod tests {
             registry.attach(session_id).is_some(),
             "a headlessly-registered session must remain attachable, exactly like a \
              normal session whose one subscriber has detached"
+        );
+
+        // Phase 8, Task 6: the caller's own teardown is what actually retires
+        // a headless session — `spawn_session_reaper` waits on a `Closed`
+        // that nothing in this workspace ever produces, so without this a
+        // per-delivery session would live for the daemon's whole life.
+        headless.teardown(&registry, &resources.proxy).await;
+        assert!(
+            registry.actor(session_id).is_none(),
+            "HeadlessSession::teardown must remove the session from the registry"
+        );
+    }
+
+    /// The counterpart to the assertion above: teardown must release the
+    /// session's *real* resources too, not just its registry bookkeeping —
+    /// the exact defect fix round 2's MUST 2 closed for the reaper path, here
+    /// for the explicit one.
+    #[tokio::test]
+    async fn headless_teardown_deregisters_the_sessions_real_proxy_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = resources(dir.path()).await;
+        let registry = Arc::new(SessionRegistry::new());
+        let session_id = SessionId::new();
+        let spec = test_spec(WorkspaceId::new(), &resources);
+
+        let headless = create_headless_session(
+            &resources,
+            &registry,
+            session_id,
+            spec,
+            dir.path().to_path_buf(),
+            None,
+            None,
+        )
+        .await
+        .expect("headless session construction must succeed against a working fixture");
+        let token = headless.proxy_token_for_test().to_string();
+        assert!(
+            resources.proxy.is_registered(&token),
+            "a real session registers a real proxy token; this test proves nothing otherwise"
+        );
+
+        headless.teardown(&registry, &resources.proxy).await;
+
+        assert!(
+            !resources.proxy.is_registered(&token),
+            "teardown must deregister this session's egress-proxy entry, not just drop its \
+             registry row"
         );
     }
 
@@ -419,9 +582,14 @@ mod tests {
         )
         .await;
 
+        // `HeadlessSession` is deliberately not `Debug` (it holds an actor and
+        // a bearer token), so the failure message names the error rather than
+        // rendering the whole `Result`.
+        let error = result.err();
         assert!(
-            matches!(result, Err(CreateHeadlessSessionError::RegistryFull)),
-            "a full registry must fail create_headless_session with RegistryFull, got {result:?}"
+            matches!(error, Some(CreateHeadlessSessionError::RegistryFull)),
+            "a full registry must fail create_headless_session with RegistryFull, got {:?}",
+            error.as_ref().map(CreateHeadlessSessionError::kind)
         );
         assert!(
             registry.actor(session_id).is_none(),
