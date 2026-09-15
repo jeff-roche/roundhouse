@@ -150,7 +150,7 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// task forever with nothing else timing it out. 30 seconds matches
 /// [`DEFAULT_HANDSHAKE_TIMEOUT`]'s own generous-for-a-human,
 /// bounded-for-a-hang reasoning.
-const SESSION_CONSTRUCTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SESSION_CONSTRUCTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Fix round 3, SHOULD 2: a background construction that outlives its
 /// caller's own [`SESSION_CONSTRUCTION_TIMEOUT`] (see

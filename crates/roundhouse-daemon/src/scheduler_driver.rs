@@ -198,25 +198,45 @@ impl ClockSource for FixedClock {
 /// `&dyn RunRegistry` it is handed, so there is no seam for `SharedRegistry`
 /// to interpose its per-binding lock on.
 ///
-/// **Task 6 added a second caller, and the reasoning below is why that is
-/// still safe rather than why the note above went stale.** The race
-/// `SharedRegistry` exists to close is a torn *read-then-write* inside
-/// `decide_admission` — `active_run_count`, then `note_admitted` — which
-/// two concurrent `decide_admission` callers could interleave into two
-/// admissions over one slot. There is still exactly one `decide_admission`
-/// caller: [`run`]'s heartbeat loop, which processes a tick's occurrences
-/// strictly one after another inside a single blocking `interact` call. The
-/// new caller is [`DeliveryExecutor`], and it only ever calls the
-/// *mutations* `note_promoted`/`note_finished`, never the read-then-write
-/// sequence. Each of those is a single `with_counts` critical section, so
-/// interleaving one with `decide_admission` can move a count only in the
-/// conservative direction: a `note_finished` landing between
-/// `active_run_count` and `note_admitted` makes this occurrence skip when it
-/// could have run (a missed fire, recovered on the next tick), never admit
-/// when it should not have. The fail-open direction — two admissions over
-/// one slot — still needs two concurrent `decide_admission` callers, and
-/// there are none. A second `decide_admission` caller is what would
-/// re-open this; a second mutator is not.
+/// **Task 6 added a second caller, and the reasoning below is what makes that
+/// safe — it is a constraint on where that caller may touch this registry,
+/// not an argument that any second caller would be fine.**
+///
+/// The races `SharedRegistry` exists to close are `decide_admission`'s own
+/// multi-step reads: `active_run_count` then `note_admitted` for `Skip`,
+/// and — the sharper one — `active_run_count` then `queued_count` for
+/// `Queue`. Nothing else in this type is atomic across calls.
+///
+/// There is still exactly one `decide_admission` caller: [`run`]'s heartbeat
+/// loop, processing a tick's occurrences one after another inside a single
+/// blocking `interact`. [`DeliveryExecutor`] is the second caller, and it is
+/// split deliberately:
+///
+/// - **`note_promoted` runs in the heartbeat's own tick**, inside
+///   [`DeliveryExecutor::claim`], which [`dispatch_ready_deliveries`] awaits
+///   inline. It therefore never interleaves with `decide_admission` at all —
+///   they are sequential steps of one task. **This is not incidental.**
+///   `note_promoted` moves a count from `queued` to `active` in one critical
+///   section; run concurrently it could land between `Queue`'s two reads, so
+///   the heartbeat would see `active == 0` (read before the increment) and
+///   `queued == 0` (read after the decrement) and admit an occurrence that
+///   should have queued. Fail-open, and the reason the promotion decision
+///   lives in the tick rather than in the spawned execution task where an
+///   earlier version put it.
+/// - **`note_finished` runs in the spawned task**, and is safe there because
+///   of what it is rather than where it runs: it only ever *decrements*
+///   `active`, and touches nothing else. Every `decide_admission` branch is
+///   conservative under a concurrent decrement — it can make an occurrence
+///   skip or queue that could have been admitted (a missed fire, reconsidered
+///   on the next tick), never admit one that should not have been. Checked
+///   branch by branch, including `Queue`'s two-read sequence, where a
+///   decrement landing between the reads yields `QueueAt` for something that
+///   could have been admitted.
+///
+/// So: a second caller of the *multi-step reads* re-opens this and needs the
+/// per-binding locking discipline back. A caller of the monotone decrement
+/// does not. A caller of anything else — `note_promoted` included — belongs
+/// in the tick.
 #[derive(Debug, Default)]
 pub struct InMemoryRunRegistry {
     counts: Mutex<HashMap<BindingId, Counts>>,
@@ -621,11 +641,22 @@ fn accept_due_occurrences(
 
 /// How many `ready` deliveries one heartbeat tick may claim.
 ///
-/// Equal to [`MAX_CONCURRENT_DELIVERIES`] by construction: listing more
-/// `ready` rows than there are permits to run them with would only read rows
-/// this tick must then decline. Rows beyond the cap stay `ready` and are
-/// re-listed by the next tick a second later — backpressure, not loss.
-const MAX_DELIVERY_CLAIMS_PER_TICK: usize = MAX_CONCURRENT_DELIVERIES;
+/// How many `ready` rows one tick reads while looking for work.
+///
+/// **Deliberately larger than [`MAX_CONCURRENT_DELIVERIES`], not equal to
+/// it.** The listing is FIFO by `created_at`, and a listed row is not
+/// necessarily a claimable one: a queued-origin delivery whose predecessor is
+/// still running is skipped on every tick until that predecessor finishes,
+/// and so is a delivery whose binding is not in this driver's boot snapshot.
+/// If the scan stopped at the concurrency cap, two such rows at the head of
+/// the queue would starve every other binding's work behind them — the
+/// head-of-line block that `OverlapPolicy::Queue` gating would otherwise
+/// introduce. Scanning deeper lets the tick step over what it cannot start
+/// and still find what it can.
+///
+/// Rows past this many stay `ready` for the next tick a second later:
+/// backpressure, not loss.
+const MAX_READY_DELIVERIES_SCANNED_PER_TICK: usize = 32;
 
 /// How many deliveries this daemon may have in flight **at once**.
 ///
@@ -636,21 +667,67 @@ const MAX_DELIVERY_CLAIMS_PER_TICK: usize = MAX_CONCURRENT_DELIVERIES;
 /// shape `socket_server::construct_real_session_bounded` uses for session
 /// construction.
 ///
-/// **Four, because each in-flight delivery holds a pooled store connection
-/// for the entire run.** `run_workflow_from_storage` takes `&mut Connection`
-/// and drives the whole workflow on it, so the connection cannot be returned
+/// **Two, because each in-flight delivery holds a pooled store connection for
+/// the entire run.** `run_workflow_from_storage` takes `&mut Connection` and
+/// drives the whole workflow on it, so the connection cannot be returned
 /// mid-run. `deadpool`'s default pool size is a small multiple of the CPU
-/// count — as low as four on a one-core host — and the heartbeat's own
+/// count — as low as **four** on a one-core host — and the heartbeat's own
 /// `accept_occurrence`, the event writer, the socket server and the web
-/// server all draw from the same pool. A cap that could consume it would
-/// wedge the daemon, not just the scheduler.
+/// server all draw from the same pool, none of them with a checkout timeout.
+/// A cap of four would exactly saturate that floor and starve every other
+/// component; two leaves half of it for the rest of the daemon.
 ///
 /// That a long-running workflow pins a pooled connection at all is a real
-/// architectural tension this task inherits rather than creates; resolving it
-/// (a dedicated per-run connection, or a pool sized for run-length holds) is
-/// a change to how `roundhouse-flow` is given its connection, not a constant
-/// this driver can tune its way out of.
-const MAX_CONCURRENT_DELIVERIES: usize = 4;
+/// architectural tension this task inherits rather than creates. The right
+/// fix is to derive this from the pool's actual configured size (or to give a
+/// run its own dedicated connection) rather than to guess against its
+/// documented floor — a change to how `roundhouse-flow` is handed its
+/// connection, not a constant this driver can tune its way out of.
+const MAX_CONCURRENT_DELIVERIES: usize = 2;
+
+/// Bounds headless session construction for a scheduled delivery.
+///
+/// `create_headless_session`'s own doc explains why *it* takes no timeout:
+/// bounding construction was a socket-path concern, tuned for arbitrarily
+/// many peers racing `CreateSession`, and it declined to preempt a policy for
+/// a caller that did not exist yet. That caller exists now, and it is a
+/// worse case than the socket's in one specific way — it is unattended and
+/// repeating. A wedged MCP server or a hung isolation probe would park a
+/// delivery permit permanently, and at [`MAX_CONCURRENT_DELIVERIES`] such
+/// deliveries the scheduler stops claiming anything at all, silently, with no
+/// human present to notice.
+///
+/// Same duration as `socket_server::SESSION_CONSTRUCTION_TIMEOUT`, reused
+/// rather than re-chosen: it bounds the identical work (real
+/// `Isolate::prepare`, real `McpHost::start`), so a second number here would
+/// be two answers to one question.
+///
+/// **Residual gap, deliberately not solved here:** a construction that
+/// finishes *after* this elapses has no consumer. The future is dropped at
+/// the timeout, so whatever it had built so far is dropped with it rather
+/// than torn down. The socket path handles this by letting construction run
+/// to completion in its own task and self-tearing-down on a lost race;
+/// replicating that needs `create_headless_session` to be restructured around
+/// a detached task, which is that function's own change to make.
+const SESSION_CONSTRUCTION_TIMEOUT: std::time::Duration =
+    crate::socket_server::SESSION_CONSTRUCTION_TIMEOUT;
+
+/// One delivery this driver has taken ownership of: leased, and holding
+/// exactly one **active** admission slot (promoted from a queued one if that
+/// is what `accept_occurrence` charged).
+///
+/// A distinct type so that the hand-off from [`DeliveryExecutor::claim`] —
+/// which runs in the heartbeat's tick — to [`DeliveryExecutor::run_claimed`]
+/// — which runs in a spawned task — carries that proof rather than a
+/// convention. A `run_claimed` that could be handed an unclaimed delivery is
+/// exactly the shape that let the `Queue` policy be ignored.
+struct ClaimedDelivery {
+    delivery: TriggerDelivery,
+    stored: StoredBinding,
+    /// The claim instant, reused for every durable timestamp the run writes,
+    /// so one delivery's rows agree about when it started.
+    claimed_at: Timestamp,
+}
 
 /// How long a claim's `ready -> leased` lease is stamped for.
 ///
@@ -698,6 +775,8 @@ enum DeliveryError {
     RunRow(String),
     #[error("this delivery's headless session could not be constructed: {0}")]
     Session(&'static str),
+    #[error("this delivery's headless session did not finish constructing in time")]
+    SessionTimeout,
     /// Won the lease, then lost the `leased -> reserved` transition — the row
     /// moved underneath this claimer (a reclaimed lease, a cancellation
     /// request). Not an error to shout about; the delivery is simply no
@@ -720,6 +799,7 @@ impl DeliveryError {
             Self::JobUnresolvable(_) => "job_unresolvable",
             Self::RunRow(_) => "run_row",
             Self::Session(_) => "session_construction",
+            Self::SessionTimeout => "session_construction_timeout",
             Self::LostClaim => "lost_claim",
         }
     }
@@ -735,7 +815,7 @@ enum RunConclusion {
     Failed(String),
     /// A `gate:` parked the run on a human. **Not terminal**, so the delivery
     /// stays `running` and the registry slot stays held — see
-    /// [`DeliveryExecutor::claim_and_run`].
+    /// [`DeliveryExecutor::run_claimed`].
     Parked,
 }
 
@@ -942,14 +1022,150 @@ impl DeliveryExecutor {
         })
     }
 
-    /// Claims one `ready` delivery and drives it to a terminal delivery
-    /// state.
+    /// Takes ownership of one `ready` delivery, or declines it.
+    ///
+    /// **This runs in the heartbeat's own tick, synchronously with respect to
+    /// `accept_due_occurrences`, and that is the whole point.** Both this and
+    /// `decide_admission` are awaited from [`run`]'s single loop task, one
+    /// after the other, so no registry read-then-write inside
+    /// `decide_admission` can be interleaved with the `note_promoted` below.
+    /// Doing the promotion from the spawned execution task instead — as an
+    /// earlier version did — put the two on different threads and made
+    /// `decide_admission`'s `Queue` branch (which reads `active`, *then*
+    /// reads `queued`) able to observe `active == 0 && queued == 0` across a
+    /// promotion that had just moved a count from one to the other, admitting
+    /// an occurrence that should have queued. Fail-open, and the reason this
+    /// decision lives here rather than there.
+    ///
+    /// # Honouring `OverlapPolicy::Queue`
+    ///
+    /// A `QueueAt` decision creates a `ready` delivery exactly like an
+    /// `Admit` does, so "is there a `ready` row" is *not* the same question
+    /// as "may it run". A queued-origin delivery may only start once its
+    /// binding has no active run — otherwise `Queue { depth }` silently
+    /// degenerates into `Concurrent { max: depth + 1 }`, which is reachable
+    /// today because `Webhook`/`Message` triggers default to
+    /// `Queue { depth: 8 }`. A delivery whose predecessor is still active is
+    /// left `ready` and reconsidered on the next tick.
+    ///
+    /// Order matters: the gate is checked **before** the lease, so a declined
+    /// delivery's row is never touched; the promotion happens **after** the
+    /// lease, so a promotion is never charged for a delivery another claimer
+    /// won.
+    async fn claim(
+        &self,
+        delivery: TriggerDelivery,
+        stored: StoredBinding,
+    ) -> Option<ClaimedDelivery> {
+        let binding_id = stored.binding.id;
+        let queued_origin = self.is_queued_origin(&delivery).await?;
+
+        if queued_origin {
+            match self.registry.active_run_count(binding_id) {
+                Ok(0) => {}
+                Ok(_) => {
+                    tracing::debug!(
+                        binding_id = %binding_id,
+                        "a queued delivery's predecessor is still running; leaving it ready \
+                         until the binding is free"
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        binding_id = %binding_id,
+                        error = %error,
+                        "could not read a binding's active run count; refusing to start its \
+                         queued delivery rather than running it alongside a predecessor"
+                    );
+                    return None;
+                }
+            }
+        }
+
+        let now = self.now();
+        if !self.lease(&delivery.delivery_id, now).await {
+            return None;
+        }
+
+        if queued_origin {
+            // The delivery is ours and holds a *queued* slot; running it is a
+            // promotion. Without this the `note_finished` at its terminal
+            // outcome would underflow `active` and strand `queued`.
+            if let Err(error) = self.registry.note_promoted(binding_id) {
+                // The counters are already inconsistent if this fails
+                // (`queued` was never charged, or is at its floor). The
+                // delivery is leased and will still be driven to a terminal
+                // state; its `note_finished` may then report an underflow,
+                // which is logged there.
+                tracing::error!(
+                    binding_id = %binding_id,
+                    error = %error,
+                    "could not promote a queued delivery into an active admission slot"
+                );
+            }
+        }
+
+        Some(ClaimedDelivery {
+            delivery,
+            stored,
+            claimed_at: now,
+        })
+    }
+
+    /// Whether this delivery was created by a `QueueAt` decision, or `None`
+    /// when that cannot be established.
+    ///
+    /// **`None` declines the claim, deliberately.** An earlier version
+    /// treated an unreadable outcome as "not queued" and called that
+    /// conservative; with the queue gate above it is the opposite — "not
+    /// queued" now means "no gate applied", so guessing would run a possibly
+    /// queued delivery alongside its predecessor. Declining leaves the row
+    /// `ready` for a tick that can read it.
+    ///
+    /// `Ok(None)` — a `trigger_event` row with no recorded outcome — is
+    /// unreachable rather than merely unlikely: `accept_occurrence` writes
+    /// the outcome and inserts the delivery inside one transaction, so a
+    /// delivery row cannot exist without one. It declines too, for the same
+    /// reason.
+    async fn is_queued_origin(&self, delivery: &TriggerDelivery) -> Option<bool> {
+        let trigger_event_id = delivery.trigger_event_id;
+        let outcome = self
+            .with_connection(move |conn| {
+                fetch_trigger_event_outcome(conn, trigger_event_id).map_err(|e| e.to_string())
+            })
+            .await;
+        match outcome {
+            Ok(Ok(Some(outcome))) => Some(outcome == TriggerEventOutcome::Queued),
+            Ok(Ok(None)) => {
+                tracing::error!(
+                    "a ready delivery's trigger event records no admission outcome; refusing \
+                     to claim it rather than guessing which registry slot it holds"
+                );
+                None
+            }
+            Ok(Err(_)) | Err(_) => {
+                tracing::error!(
+                    "could not read a ready delivery's admission outcome; leaving it ready \
+                     for a tick that can"
+                );
+                None
+            }
+        }
+    }
+
+    /// Drives an already-claimed delivery to a terminal delivery state.
+    ///
+    /// Runs in its own spawned task, so it must never touch the admission
+    /// registry other than through [`Self::release`] — see [`Self::claim`]
+    /// for why every other registry mutation belongs in the tick.
     ///
     /// # The release invariant
     ///
     /// `accept_occurrence` charged exactly one registry slot for this
-    /// delivery — an *active* one for `Admit`/`CancelledPreviousAndAdmit`, a
-    /// *queued* one for `QueueAt`. Every path below that reaches
+    /// delivery, and [`Self::claim`] has converted a *queued* one into an
+    /// *active* one if needed, so by the time this runs the delivery holds
+    /// exactly one active slot. Every path below that reaches
     /// `delivered`/`failed` answers that with exactly one
     /// [`RunRegistry::note_finished`], **including the failure path**: a
     /// failed run that kept its slot would wedge its binding shut exactly
@@ -964,18 +1180,14 @@ impl DeliveryExecutor {
     /// in these tasks resumes a parked scheduled run, so such a delivery
     /// holds its slot until the daemon restarts; that is a known limitation
     /// with a named owner (human-in-the-loop resumption), not an oversight.
-    pub(crate) async fn claim_and_run(&self, delivery: TriggerDelivery, stored: StoredBinding) {
-        let now = self.now();
+    async fn run_claimed(&self, claimed: ClaimedDelivery) {
+        let ClaimedDelivery {
+            delivery,
+            stored,
+            claimed_at: now,
+        } = claimed;
         let binding_id = stored.binding.id;
         let delivery_id = delivery.delivery_id.clone();
-
-        if !self.lease(&delivery_id, now).await {
-            return;
-        }
-        // The claim is ours from here. A queued delivery holds a *queued*
-        // slot; running it is a promotion, and without this the
-        // `note_finished` below would underflow `active` and strand `queued`.
-        self.promote_if_queued(&delivery, binding_id).await;
 
         // Held here rather than inside `run_claimed_delivery` so that the
         // session is retired on **every** exit from that function, including
@@ -1019,6 +1231,21 @@ impl DeliveryExecutor {
         }
     }
 
+    /// [`Self::claim`] followed by [`Self::run_claimed`], for a caller that
+    /// wants the whole delivery driven inline.
+    ///
+    /// Production does **not** use this: [`dispatch_ready_deliveries`] claims
+    /// in the tick and spawns only the run, which is what serializes
+    /// promotion against `decide_admission` (see [`Self::claim`]). This is
+    /// the shape this module's own tests drive when the property under test
+    /// is what one delivery does rather than when it is allowed to start.
+    #[cfg(test)]
+    pub(crate) async fn claim_and_run(&self, delivery: TriggerDelivery, stored: StoredBinding) {
+        if let Some(claimed) = self.claim(delivery, stored).await {
+            self.run_claimed(claimed).await;
+        }
+    }
+
     /// Retires a finished delivery's headless session, if one was created.
     ///
     /// **This is the whole reason a scheduled run's session does not
@@ -1034,7 +1261,7 @@ impl DeliveryExecutor {
     /// concurrency cap rather than the daemon's uptime.
     ///
     /// Called on the completed and failed paths and never on the parked one —
-    /// see [`Self::claim_and_run`].
+    /// see [`Self::run_claimed`].
     async fn retire_session(&self, session: Option<HeadlessSession>) {
         let Some(session) = session else {
             return;
@@ -1074,37 +1301,6 @@ impl DeliveryExecutor {
         }
     }
 
-    /// Moves a delivery created by an `OverlapPolicy::Queue` decision from
-    /// its queued slot into an active one, so the `note_finished` at the end
-    /// of [`Self::claim_and_run`] balances the `note_queued`
-    /// `decide_admission` charged for it.
-    ///
-    /// Everything else — an `Admit` or a `CancelledPreviousAndAdmit` — was
-    /// already charged an active slot by `note_admitted` and needs no
-    /// promotion. An outcome that cannot be read back (a crash between
-    /// recording the event and deciding admission) is treated as
-    /// already-active: that is the conservative reading, since the
-    /// alternative promotes a slot nothing queued.
-    async fn promote_if_queued(&self, delivery: &TriggerDelivery, binding_id: BindingId) {
-        let trigger_event_id = delivery.trigger_event_id;
-        let outcome = self
-            .with_connection(move |conn| {
-                fetch_trigger_event_outcome(conn, trigger_event_id).map_err(|e| e.to_string())
-            })
-            .await;
-        let queued = matches!(outcome, Ok(Ok(Some(TriggerEventOutcome::Queued))));
-        if !queued {
-            return;
-        }
-        if let Err(error) = self.registry.note_promoted(binding_id) {
-            tracing::error!(
-                binding_id = %binding_id,
-                error = %error,
-                "could not promote a queued delivery into an active admission slot"
-            );
-        }
-    }
-
     /// Steps (b) through (i): reserve identities, resolve the job, create the
     /// reservation row and the session, and drive the workflow.
     ///
@@ -1136,7 +1332,7 @@ impl DeliveryExecutor {
     ///
     /// `session` is an out-parameter rather than part of the return value so
     /// that a session already constructed when a later step fails is still
-    /// handed back to [`Self::claim_and_run`] to retire — a `?` on the
+    /// handed back to [`Self::run_claimed`] to retire — a `?` on the
     /// `mark_delivery_running` below must not strand a live session.
     async fn run_claimed_delivery(
         &self,
@@ -1246,17 +1442,25 @@ impl DeliveryExecutor {
             requested_tier: Tier::Sandbox,
             on_degrade: OnDegrade::Refuse,
         };
+        // Bounded, unlike the socket path's identical call — see
+        // `SESSION_CONSTRUCTION_TIMEOUT` for why an unattended, repeating
+        // caller cannot afford to park a delivery permit on a wedged MCP
+        // server or a hung isolation probe.
         *session = Some(
-            create_headless_session(
-                &self.resources,
-                &self.sessions,
-                session_id,
-                spec.clone(),
-                workspace_root.clone(),
-                workspace.root_device,
-                workspace.root_inode,
+            tokio::time::timeout(
+                SESSION_CONSTRUCTION_TIMEOUT,
+                create_headless_session(
+                    &self.resources,
+                    &self.sessions,
+                    session_id,
+                    spec.clone(),
+                    workspace_root.clone(),
+                    workspace.root_device,
+                    workspace.root_inode,
+                ),
             )
             .await
+            .map_err(|_elapsed| DeliveryError::SessionTimeout)?
             .map_err(|error| DeliveryError::Session(error.kind()))?,
         );
 
@@ -1409,28 +1613,54 @@ fn conclusion_for(
     }
 }
 
-/// Discovers `ready` deliveries and spawns one task per delivery to claim and
-/// run it.
+/// Discovers `ready` deliveries, **claims them in this tick**, and spawns one
+/// task per claimed delivery to run it.
 ///
-/// Spawned rather than awaited inline for the obvious reason: a workflow run
-/// can take hours, and the heartbeat has to keep ticking (and other
-/// deliveries have to keep starting) while one runs. Each spawned task
-/// contains its own failures — it returns `()` and every error inside it is
-/// logged, so one bad delivery can neither crash the driver nor block
-/// another.
+/// # Claim here, run there — and why the split is not cosmetic
+///
+/// [`DeliveryExecutor::claim`] is awaited inline, so it runs in [`run`]'s
+/// single loop task, strictly between one `accept_due_occurrences` and the
+/// next. That is what makes the admission registry's queue accounting sound:
+/// `decide_admission`'s `Queue` branch reads `active` and then reads
+/// `queued`, and `claim`'s `note_promoted` moves a count from one to the
+/// other. Performed from a spawned task those two could interleave, and the
+/// heartbeat could observe `active == 0 && queued == 0` *across* a promotion
+/// and admit an occurrence that should have queued. Performed here they
+/// cannot, because they are steps of the same sequential task.
+///
+/// Only [`DeliveryExecutor::run_claimed`] is spawned, for the obvious reason:
+/// a workflow run can take hours and the heartbeat has to keep ticking. Each
+/// spawned task contains its own failures — it returns `()` and every error
+/// inside it is logged — so one bad delivery can neither crash the driver nor
+/// block another.
+///
+/// The only registry call left in a spawned task is `note_finished`, which
+/// only ever *decrements* `active` and touches nothing else. Every
+/// `decide_admission` branch is conservative under a concurrent decrement: it
+/// can make an occurrence queue or skip that could have been admitted (a
+/// missed fire, reconsidered next tick), never admit one that should not have
+/// been. That is the property the earlier promotion-from-a-spawned-task
+/// version did *not* have.
+///
+/// # Rows this tick declines, and why none of them block the others
 ///
 /// A delivery whose binding is not in this driver's boot snapshot is left
-/// `ready`: there is no honest `StoredBinding` to run it against, and
-/// leaving the row alone means a daemon restart (which reloads the snapshot)
-/// picks it up rather than losing it. Logged at `debug` because a tick
-/// happens every second and this state persists across all of them.
+/// `ready` (there is no honest `StoredBinding` to run it against, and a
+/// daemon restart reloads the snapshot). A queued-origin delivery whose
+/// binding still has an active run is left `ready` until that run finishes.
+/// Both are skipped rather than stopping the scan, and
+/// [`MAX_READY_DELIVERIES_SCANNED_PER_TICK`] is deliberately larger than the
+/// concurrency cap so the tick can step over them and still reach work it can
+/// start. Running out of *permits*, by contrast, does stop the scan: nothing
+/// further can start regardless of what the remaining rows are.
 async fn dispatch_ready_deliveries(
     executor: &DeliveryExecutor,
     bindings: &HashMap<BindingId, StoredBinding>,
 ) {
     let ready = match executor
         .with_connection(|conn| {
-            list_ready_deliveries(conn, MAX_DELIVERY_CLAIMS_PER_TICK).map_err(|e| e.to_string())
+            list_ready_deliveries(conn, MAX_READY_DELIVERIES_SCANNED_PER_TICK)
+                .map_err(|e| e.to_string())
         })
         .await
     {
@@ -1454,9 +1684,11 @@ async fn dispatch_ready_deliveries(
         };
         // `try_acquire_owned`, never an awaited `acquire`: waiting here would
         // stall the heartbeat behind a workflow that may run for hours, which
-        // is precisely what this loop must not do. Without a permit the
-        // delivery is simply not claimed — it stays `ready` and the next tick
-        // reconsiders it.
+        // is precisely what this loop must not do.
+        //
+        // Taken *before* the claim so a delivery is never leased with nothing
+        // free to run it; released again by the `drop` below if the claim is
+        // declined, which happens within this same loop iteration.
         let Ok(slot) = Arc::clone(&executor.slots).try_acquire_owned() else {
             tracing::debug!(
                 "every delivery slot is in use; the remaining ready deliveries stay ready \
@@ -1464,13 +1696,17 @@ async fn dispatch_ready_deliveries(
             );
             return;
         };
+        let Some(claimed) = executor.claim(delivery, stored).await else {
+            drop(slot);
+            continue;
+        };
         let executor = executor.clone();
         tokio::spawn(async move {
             // Held for the delivery's whole life, released when this task
             // ends on any path — including a panic, since the guard is
             // dropped as the task unwinds.
             let _slot = slot;
-            executor.claim_and_run(delivery, stored).await;
+            executor.run_claimed(claimed).await;
         });
     }
 }
@@ -2463,6 +2699,48 @@ mod delivery_tests {
                 .unwrap()
         }
 
+        /// Accepts a second occurrence of the same binding, through the real
+        /// `accept_occurrence`, and returns the delivery it created.
+        async fn accept_another_occurrence(&self, seconds_later: i64) -> TriggerDelivery {
+            let stored = self.stored.clone();
+            let occurrence = ScheduledOccurrence {
+                binding_id: stored.binding.id,
+                scheduled_for: instant() + chrono::Duration::seconds(seconds_later),
+                is_catch_up: false,
+            };
+            let fired_at = instant() + chrono::Duration::seconds(seconds_later);
+            let registry = Arc::clone(&self.registry);
+            let conn = self.store.pool.get().await.unwrap();
+            let acceptance = conn
+                .interact(move |connection| {
+                    roundhouse_sched::store::accept_occurrence(
+                        connection,
+                        &stored,
+                        &occurrence,
+                        fired_at,
+                        registry.as_ref(),
+                    )
+                    .unwrap()
+                })
+                .await
+                .unwrap();
+            match acceptance {
+                roundhouse_sched::store::Acceptance::New {
+                    delivery: Some(delivery),
+                    ..
+                } => delivery,
+                other => panic!("expected a second delivery, got {other:?}"),
+            }
+        }
+
+        async fn state_of(&self, delivery_id: &str) -> DeliveryState {
+            let id = delivery_id.to_string();
+            let conn = self.store.pool.get().await.unwrap();
+            conn.interact(move |connection| fetch_delivery(connection, &id).unwrap().unwrap().state)
+                .await
+                .unwrap()
+        }
+
         async fn session_event_count(&self, session_id: SessionId) -> i64 {
             let conn = self.store.pool.get().await.unwrap();
             conn.interact(move |connection| {
@@ -2483,6 +2761,10 @@ mod delivery_tests {
     /// delivery (through `accept_occurrence`, so the admission slot is
     /// genuinely charged), and an executor wired to all of it.
     async fn harness(workflow_yaml: String) -> Harness {
+        harness_with_overlap(workflow_yaml, OverlapPolicy::Skip).await
+    }
+
+    async fn harness_with_overlap(workflow_yaml: String, overlap: OverlapPolicy) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let workspace_root = dir.path().join("workspace");
         std::fs::create_dir(&workspace_root).unwrap();
@@ -2528,16 +2810,18 @@ mod delivery_tests {
             .unwrap()
         };
 
+        let mut binding = Binding::new(
+            job_id,
+            TriggerSpec::Interval {
+                every: Duration::from_secs(60),
+                align: false,
+                anchor: None,
+            },
+        );
+        binding.overlap = overlap;
         let stored = StoredBinding {
             workspace: workspace.id,
-            binding: Binding::new(
-                job_id,
-                TriggerSpec::Interval {
-                    every: Duration::from_secs(60),
-                    align: false,
-                    anchor: None,
-                },
-            ),
+            binding,
         };
 
         let registry = Arc::new(InMemoryRunRegistry::new());
@@ -2837,6 +3121,182 @@ mod delivery_tests {
             RunState::Running,
             "this driver must not fake a terminal transition on the run row — P112's \
              exactly-one-report invariant belongs to finish_run"
+        );
+    }
+
+    /// **`OverlapPolicy::Queue` must actually serialize.** A `QueueAt`
+    /// decision creates a `ready` delivery exactly like an `Admit` does, so
+    /// without a gate the queued occurrence is claimed and run immediately,
+    /// alongside the run it was queued behind — `Queue { depth }` silently
+    /// becoming `Concurrent { max: depth + 1 }`. This is reachable today:
+    /// `Webhook`/`Message` triggers default to `Queue { depth: 8 }`.
+    ///
+    /// The assertion that matters is the negative one: the second delivery
+    /// must still be `Ready`, with no run row and no leased state, *while the
+    /// first is running*. "Both eventually complete" would pass even with the
+    /// policy ignored entirely.
+    #[tokio::test]
+    async fn a_queued_delivery_does_not_start_until_its_predecessor_finishes() {
+        let harness =
+            harness_with_overlap(completing_workflow(), OverlapPolicy::Queue { depth: 4 }).await;
+        let first = harness.delivery.clone();
+        let second = harness.accept_another_occurrence(60).await;
+        let binding_id = harness.stored.binding.id;
+
+        assert_eq!(
+            harness.state_of(&second.delivery_id).await,
+            DeliveryState::Ready,
+            "a QueueAt decision still creates a ready delivery — that is exactly why \
+             `is there a ready row` is not the same question as `may it run`"
+        );
+        assert_eq!(
+            harness.active(),
+            1,
+            "the first occurrence was admitted and holds the active slot"
+        );
+        assert_eq!(
+            harness.registry.queued_count(binding_id).unwrap(),
+            1,
+            "the second was queued, not admitted"
+        );
+
+        // Put the predecessor genuinely in flight — claimed through the real
+        // `claim`, not yet run — so this test observes the steady state a
+        // queued delivery actually meets (predecessor running, itself
+        // `ready`) with no dependence on when a spawned task happens to be
+        // scheduled.
+        let in_flight = harness
+            .executor
+            .claim(first.clone(), harness.stored.clone())
+            .await
+            .expect("the admitted predecessor must be claimable");
+        assert_eq!(
+            harness.state_of(&first.delivery_id).await,
+            DeliveryState::Leased
+        );
+
+        // A whole tick's worth of dispatch, with the predecessor still
+        // active: the queued delivery must be declined, and — the part that
+        // makes this a real assertion — declined *synchronously*, before any
+        // task is spawned, so the row is still `Ready` the instant dispatch
+        // returns.
+        let mut bindings = HashMap::new();
+        bindings.insert(binding_id, harness.stored.clone());
+        dispatch_ready_deliveries(&harness.executor, &bindings).await;
+
+        assert_eq!(
+            harness.state_of(&second.delivery_id).await,
+            DeliveryState::Ready,
+            "a queued delivery must NOT be claimed while its binding has an active run — \
+             this is the whole of OverlapPolicy::Queue"
+        );
+        assert_eq!(
+            harness.registry.queued_count(binding_id).unwrap(),
+            1,
+            "a declined claim must not consume the queued slot either"
+        );
+        assert_eq!(harness.active(), 1);
+
+        // Finish the predecessor. Only now is the binding free.
+        harness.executor.run_claimed(in_flight).await;
+        assert_eq!(
+            harness.state_of(&first.delivery_id).await,
+            DeliveryState::Delivered
+        );
+        assert_eq!(harness.active(), 0, "the predecessor released its slot");
+
+        dispatch_ready_deliveries(&harness.executor, &bindings).await;
+        for _ in 0..1000 {
+            if harness.state_of(&second.delivery_id).await == DeliveryState::Delivered {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            harness.state_of(&second.delivery_id).await,
+            DeliveryState::Delivered,
+            "once the predecessor is done the queued delivery must actually run"
+        );
+        assert_eq!(
+            harness.registry.queued_count(binding_id).unwrap(),
+            0,
+            "running the queued delivery must consume its queued slot (note_promoted)"
+        );
+        assert_eq!(
+            harness.active(),
+            0,
+            "and release the active slot it was promoted into (note_finished) — a promotion \
+             that is never released wedges the binding exactly like a missing release"
+        );
+    }
+
+    /// The counterpart: the promotion is charged only once the claim is
+    /// actually won, and only for a queued-origin delivery. An `Admit`-origin
+    /// delivery already holds an active slot and must not be promoted on top
+    /// of it.
+    #[tokio::test]
+    async fn an_admitted_delivery_is_never_promoted_and_needs_no_predecessor_check() {
+        let harness = harness(completing_workflow()).await;
+        let binding_id = harness.stored.binding.id;
+        assert_eq!(harness.registry.queued_count(binding_id).unwrap(), 0);
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        assert_eq!(
+            harness.delivery_row().await.state,
+            DeliveryState::Delivered,
+            "an admitted delivery runs even though its own binding shows an active run — \
+             that active run IS this delivery"
+        );
+        assert_eq!(
+            harness.registry.queued_count(binding_id).unwrap(),
+            0,
+            "promoting an admitted delivery would underflow the queued counter"
+        );
+        assert_eq!(harness.active(), 0);
+    }
+
+    /// Fail-closed on an unreadable admission outcome. With the queue gate in
+    /// place, "assume not queued" is the fail-*open* direction — it would run
+    /// a possibly-queued delivery alongside its predecessor — so an outcome
+    /// that cannot be established declines the claim and leaves the row for a
+    /// tick that can read it.
+    #[tokio::test]
+    async fn a_delivery_whose_admission_outcome_is_unreadable_is_not_claimed() {
+        let harness = harness(completing_workflow()).await;
+
+        // Point the delivery at a `trigger_event` row that does not exist, so
+        // the outcome lookup legitimately comes back empty.
+        let id = harness.delivery.delivery_id.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            connection
+                .execute(
+                    "UPDATE trigger_delivery SET trigger_event_id = 987654 WHERE delivery_id = ?1",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let mut delivery = harness.delivery.clone();
+        delivery.trigger_event_id = 987_654;
+        assert!(
+            harness
+                .executor
+                .claim(delivery, harness.stored.clone())
+                .await
+                .is_none(),
+            "an unestablished admission outcome must decline the claim, not guess"
+        );
+        assert_eq!(
+            harness.delivery_row().await.state,
+            DeliveryState::Ready,
+            "a declined claim must leave the row untouched"
         );
     }
 
