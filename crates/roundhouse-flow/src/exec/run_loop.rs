@@ -383,6 +383,14 @@ pub enum Resume {
     /// answers several pending items in one call does not need a second
     /// contract change — see [`PendingKind::ChildRun`] and Phase 8 Task
     /// 25.7 (map `max_parallel`) for why that future caller exists.
+    ///
+    /// **Only the outstanding items**: a caller never re-sends what earlier
+    /// segments of the same drive already answered, and does not have to —
+    /// [`run_workflow`] inherits those outcomes from the durable rows
+    /// itself, which is what [`failed_step_rows`] exists for. Carrying this
+    /// variant is also how the loop *knows* this entry is a continuation
+    /// rather than a cold start, so constructing one for any other reason
+    /// would be a lie about which drive the run is in.
     Work(Vec<WorkDone>),
 }
 
@@ -641,6 +649,10 @@ pub fn run_workflow<H: WorkflowHost>(
     now: Timestamp,
     resume: Option<Resume>,
 ) -> Result<RunOutcome, RunLoopError> {
+    // **Whether this entry is a later segment of a drive already in
+    // progress**, which is exactly what [`Resume::Work`] means and the one
+    // thing nothing durable records — see [`failed_step_rows`].
+    let resuming_work = matches!(resume, Some(Resume::Work(_)));
     // Split the one `resume` parameter into the two internal channels it can
     // carry — a run has at most one live suspension at a time, so exactly
     // one of these is ever non-empty on any call.
@@ -754,6 +766,11 @@ pub fn run_workflow<H: WorkflowHost>(
         report_completed_before: false,
         finished_before: finished_step_rows(&recovered.steps),
         indeterminate_before: indeterminate_step_rows(&recovered.steps),
+        failed_before: if resuming_work {
+            failed_step_rows(&recovered.steps)
+        } else {
+            HashMap::new()
+        },
         gate_answer,
         work_results,
     };
@@ -869,12 +886,63 @@ fn parse_phase(raw: &[serde_yaml::Value]) -> Result<Vec<StepDef>, ParseError> {
 /// `control::retry_from_step` inherits only `Completed` for the same reason.
 /// `Pending`/`Running` rows are a step the loop started and did not finish, so
 /// they re-run.
+///
+/// **That is a statement about a *cold* entry**, which is the only kind this
+/// set used to see. A `Failed` row belonging to the drive that is still in
+/// progress is [`failed_step_rows`]'s, not this one's — keeping the two
+/// separate is what lets a failure this drive already decided be terminal
+/// without making a dead run's failure inheritable.
 fn finished_step_rows(rows: &[WorkflowStepRun]) -> HashMap<String, WorkflowStepRun> {
     rows.iter()
         .filter(|row| {
             row.item_index.is_none()
                 && matches!(row.state, StepRunState::Completed | StepRunState::Skipped)
         })
+        .map(|row| (row.step_id.clone(), row.clone()))
+        .collect()
+}
+
+/// Every step id whose row says `Failed`, for the one entry kind on which
+/// such a row belongs to **this** drive rather than to a dead one: an entry
+/// carrying [`Resume::Work`].
+///
+/// # Why a `Failed` row needs a second, narrower set at all
+///
+/// [`run_workflow`] is re-entered once per [`RunOutcome::AwaitingWork`]
+/// suspension, which happens many times inside a single uncrashed run — not
+/// only once after a crash. Every re-entry rebuilds [`finished_step_rows`]
+/// and [`indeterminate_step_rows`] from the durable rows, and a `Failed` row
+/// is in neither: not "finished" (§8.10 tier 2 re-decides one), and not
+/// `Indeterminate` (so [`Loop::run_phase`]'s crash-policy branch never sees
+/// it). Nothing therefore stopped a later segment re-deciding a step an
+/// earlier segment of the same drive had already settled — re-admitting it
+/// (double-charging §8.4's caps), re-dispatching it for real, and suspending
+/// on it again, while the completed [`WorkDone`] the caller had just been
+/// handed for the step the run *actually* suspended on went unconsumed
+/// because [`Loop::run_phase`] returns at the first step that dispatches
+/// `Pending`. The cycle repeats until [`Loop::admit`] exhausts the run's
+/// grant, so the run ends `Failed` reporting "admission refused" rather than
+/// what really happened.
+///
+/// # Why [`Resume::Work`] is the right discriminator, and the only one
+///
+/// The two cases a `Failed` row can be in are indistinguishable on the row:
+/// a step failed by an earlier segment of a live drive, and a step failed by
+/// a drive that then died. Nothing durable separates them, because a crash
+/// writes nothing — which is the whole premise of §8.10.
+///
+/// What does separate them is how the caller got here. A [`Resume::Work`]
+/// can only be built from [`PendingWork`] this crate handed out moments
+/// earlier in the same drive, so an entry carrying one is by construction a
+/// continuation, never a cold start; and a driver recovering a run after a
+/// restart necessarily enters with `resume: None` (it has no outstanding
+/// `PendingWork` to answer — see `DeliveryExecutor::drive_run_to_completion`
+/// in `roundhouse-daemon`, whose loop starts every drive that way). So §8.10
+/// tier 2's re-decision survives untouched on exactly the entries it was
+/// written for, and only the segments of a live drive inherit.
+fn failed_step_rows(rows: &[WorkflowStepRun]) -> HashMap<String, WorkflowStepRun> {
+    rows.iter()
+        .filter(|row| row.item_index.is_none() && row.state == StepRunState::Failed)
         .map(|row| (row.step_id.clone(), row.clone()))
         .collect()
 }
@@ -1061,6 +1129,11 @@ struct Loop<'c, H: WorkflowHost> {
     /// it, so §8.10 tier 2's `on_crash` policy is applied instead of the
     /// step being treated as never-started.
     indeterminate_before: HashMap<String, WorkflowStepRun>,
+    /// Every step id whose row says `Failed` **and** whose failure this same
+    /// drive decided, which is why it is empty on every entry that is not a
+    /// [`Resume::Work`] continuation — see [`failed_step_rows`] for the whole
+    /// argument. Drained as each is inherited.
+    failed_before: HashMap<String, WorkflowStepRun>,
     gate_answer: Option<GateAnswer>,
     /// What a caller reported for a step this run suspended on, keyed by
     /// step id and drained as each is consumed. Populated from
@@ -1125,6 +1198,19 @@ impl<H: WorkflowHost> Loop<'_, H> {
                         .map_or(Value::Null, |o| o.value_unredacted_for_resume().clone()),
                 ),
                 StepRunState::Skipped => ("skipped", Value::Null),
+                // A `Failed` row is seeded **only** when this segment is
+                // going to inherit it rather than re-decide it — see
+                // `failed_step_rows`, which is what populates
+                // `failed_before`. Without this a dependent's
+                // `${{ steps.<id>.status }}` would read `null` for a step
+                // whose failure is the reason it is running at all, and a
+                // `catch:`/`finally:` block would have no way to say what
+                // went wrong. A row that is going to be re-decided is left
+                // out, because the re-decision writes the entry itself a
+                // moment later.
+                StepRunState::Failed if self.failed_before.contains_key(&row.step_id) => {
+                    ("failed", Value::Null)
+                }
                 _ => continue,
             };
             if row
@@ -1178,6 +1264,35 @@ impl<H: WorkflowHost> Loop<'_, H> {
 
         for (index, step) in steps.iter().enumerate() {
             if self.finished_before.contains_key(&step.id) {
+                continue;
+            }
+
+            // A step an **earlier segment of this same drive** already
+            // settled `Failed`. Its outcome is decided, so this segment
+            // re-applies the control flow that failure implies rather than
+            // re-deciding the step: no second admission, no second dispatch,
+            // and — the reason it matters — no second suspension, which would
+            // discard the answer this call is carrying for the step the run
+            // actually suspended on.
+            //
+            // A caller-supplied answer for this exact step still wins, for
+            // the reason stated below where one is consumed; a step that just
+            // suspended has a `Running` row rather than a `Failed` one, so
+            // the two sets do not overlap in practice, and the guard is here
+            // so that ordering is a property of the code and not of a
+            // coincidence.
+            //
+            // The row itself is not re-written: it already says exactly this,
+            // and `outcomes` deliberately omits steps a re-drive inherited —
+            // see `RunOutcome::Terminal`'s own `steps` doc.
+            if !self.work_results.contains_key(&step.id)
+                && self.failed_before.remove(&step.id).is_some()
+            {
+                if !step.continue_on_error {
+                    end = PhaseEnd::Failed;
+                    stopped_at = Some(index + 1);
+                    break;
+                }
                 continue;
             }
 

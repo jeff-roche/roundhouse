@@ -359,6 +359,7 @@ fn drive_with(
 /// caller side of the seam. This is the stand-in for `roundhouse-daemon`'s
 /// real driving loop (Phase 8 Task 25.2/25.3), which is what actually
 /// dispatches these for real; nothing in this crate does.
+#[allow(clippy::too_many_arguments)]
 fn run_to_terminal(
     conn: &mut Connection,
     def: &roundhouse_flow::parse::WorkflowDef,
@@ -367,9 +368,52 @@ fn run_to_terminal(
     host: &mut FakeHost,
     run_ctx: RunContext,
     now: i64,
-    mut resume: Option<Resume>,
+    resume: Option<Resume>,
 ) -> Result<RunOutcome, RunLoopError> {
+    run_to_terminal_failing(conn, def, run_id, sink, host, run_ctx, now, resume, &[])
+}
+
+/// The most segments any fixture in this file legitimately needs — one per
+/// `tool:`/`agent:` step, plus one to reach the terminal transition.
+///
+/// A cap rather than an unbounded loop because the failure this guards is a
+/// **livelock**, not a wrong value: a run whose later segment re-decides a
+/// step an earlier segment already settled suspends on it again, forever,
+/// and the only thing that eventually stops it is `Loop::admit` exhausting
+/// the run's grant — at which point the run ends `Failed` with a spurious
+/// "admission refused" rather than with what actually happened. Tripping
+/// this assertion names the defect; letting the loop run to the cap would
+/// hide it behind an unrelated ledger message.
+const MAX_SEGMENTS: usize = 16;
+
+/// [`run_to_terminal`], but answering every pending step named in `failing`
+/// with [`WorkStatus::Failed`] instead of the completing stub.
+///
+/// The real driver fails a `PendingWork` for ordinary reasons — a tool this
+/// daemon cannot dispatch yet, a tool call the policy gate refuses, a tool
+/// that ran and returned an error — so a step that suspends and then comes
+/// back failed is the common case, not an exotic one, and nothing in this
+/// file could produce it before.
+#[allow(clippy::too_many_arguments)]
+fn run_to_terminal_failing(
+    conn: &mut Connection,
+    def: &roundhouse_flow::parse::WorkflowDef,
+    run_id: RunId,
+    sink: &mut RecordingSink,
+    host: &mut FakeHost,
+    run_ctx: RunContext,
+    now: i64,
+    mut resume: Option<Resume>,
+    failing: &[&str],
+) -> Result<RunOutcome, RunLoopError> {
+    let mut segments = 0usize;
     loop {
+        segments += 1;
+        assert!(
+            segments <= MAX_SEGMENTS,
+            "the run has been re-entered {segments} times without reaching a terminal state: \
+             a step settled by an earlier segment is being re-decided by a later one"
+        );
         let outcome = run_workflow(
             conn,
             def,
@@ -422,9 +466,16 @@ fn run_to_terminal(
                     unreachable!("PendingKind::ChildRun is unused until Phase 8 Task 25.6")
                 }
             }
+            let status = if failing.contains(&p.step_id.as_str()) {
+                roundhouse_flow::exec::run_loop::WorkStatus::Failed {
+                    message: format!("the caller could not dispatch {:?}", p.step_id),
+                }
+            } else {
+                roundhouse_flow::exec::run_loop::WorkStatus::Completed
+            };
             done.push(roundhouse_flow::exec::run_loop::WorkDone {
                 step_id: p.step_id,
-                status: roundhouse_flow::exec::run_loop::WorkStatus::Completed,
+                status,
                 output: serde_json::json!({}),
                 output_is_secret_derived: false,
                 task_id: Some(task_id),
@@ -3598,4 +3649,217 @@ fn no_carry_over_root_is_bound_when_the_job_does_not_opt_in() {
         "the previous run's real report must never be visible to a job \
          that did not opt into carry_over"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A step settled by one segment stays settled in the next
+// ---------------------------------------------------------------------------
+
+/// **A `tool:` step that failed in an earlier segment of the same live run
+/// must stay failed.** `run_workflow` is re-entered once per
+/// [`RunOutcome::AwaitingWork`] suspension — many times within a single,
+/// uncrashed run, not just once after a crash — and each re-entry rebuilds
+/// its "already finished" set from the durable step rows. A `Failed` row is
+/// deliberately not in that set (§8.10 tier 2 re-decides one left behind by
+/// a *previous, crashed* run) and is not `Indeterminate` either, so nothing
+/// used to stop a later segment re-admitting and re-dispatching a step this
+/// very drive had already settled — discarding, on the way, the completed
+/// answer it was handed for the step it actually suspended on.
+///
+/// The failing step is **first** in `steps:` here and last-but-one in
+/// [`a_step_that_failed_with_continue_on_error_stays_failed_across_segments`],
+/// per this file's fixture convention.
+#[test]
+fn a_step_that_failed_in_an_earlier_segment_is_not_re_decided_by_a_later_one() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: a\n\
+         \x20   tool: write\n\
+         \x20   with: { path: out.txt, content: hi }\n\
+         \x20 - id: b\n\
+         \x20   tool: read\n\
+         \x20   with: { path: out.txt }\n\
+         finally:\n\
+         \x20 - id: f1\n\
+         \x20   tool: read\n\
+         \x20   with: { path: one }\n\
+         \x20 - id: f2\n\
+         \x20   tool: read\n\
+         \x20   with: { path: two }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_to_terminal_failing(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        10,
+        None,
+        &["a"],
+    )
+    .expect("the run drives");
+
+    let RunOutcome::Terminal { state, .. } = outcome else {
+        panic!("the run must reach a terminal state, got {outcome:?}")
+    };
+    assert_eq!(state, RunState::Failed);
+
+    // The failure that actually happened, recorded once — not the
+    // "admission refused" a re-decided step eventually produces when it has
+    // burned through the run's grant suspending on itself.
+    let (a_state, a_error) = step_row(&conn, run_id, "a");
+    assert_eq!(a_state, StepRunState::Failed);
+    assert!(
+        a_error
+            .as_deref()
+            .is_some_and(|e| e.contains("the caller could not dispatch")),
+        "the step's row must keep the failure the caller reported, got {a_error:?}"
+    );
+
+    assert_eq!(
+        step_row(&conn, run_id, "b").0,
+        StepRunState::Skipped,
+        "stop-on-failure still holds on the segment that inherits the failure"
+    );
+    assert_eq!(step_row(&conn, run_id, "f1").0, StepRunState::Completed);
+    assert_eq!(
+        step_row(&conn, run_id, "f2").0,
+        StepRunState::Completed,
+        "the `finally:` step answered by the previous segment must not have \
+         its answer discarded"
+    );
+
+    // Three admitted steps — `a`, `f1`, `f2` — each charged exactly once.
+    // `b` never ran, so it was never admitted.
+    let spent = run_ledger(&conn, run_id).unwrap().spent;
+    assert_eq!(
+        (spent.tasks, spent.tool_calls),
+        (3, 3),
+        "a step re-decided by a later segment is re-admitted, and double-charges the ledger"
+    );
+}
+
+/// The same defect with `continue_on_error: true`, which needs no
+/// `finally:` block at all: the later suspension is an ordinary `steps:`
+/// step that runs *after* the failed one, in the same phase.
+#[test]
+fn a_step_that_failed_with_continue_on_error_stays_failed_across_segments() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: a\n\
+         \x20   tool: read\n\
+         \x20   with: { path: one }\n\
+         \x20 - id: b\n\
+         \x20   tool: write\n\
+         \x20   continue_on_error: true\n\
+         \x20   with: { path: out.txt, content: hi }\n\
+         \x20 - id: c\n\
+         \x20   tool: read\n\
+         \x20   with: { path: two }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_to_terminal_failing(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        10,
+        None,
+        &["b"],
+    )
+    .expect("the run drives");
+
+    let RunOutcome::Terminal { state, .. } = outcome else {
+        panic!("the run must reach a terminal state, got {outcome:?}")
+    };
+    assert_eq!(
+        state,
+        RunState::Completed,
+        "`continue_on_error` makes b's failure data, not control flow"
+    );
+    assert_eq!(step_row(&conn, run_id, "a").0, StepRunState::Completed);
+    assert_eq!(step_row(&conn, run_id, "b").0, StepRunState::Failed);
+    assert_eq!(
+        step_row(&conn, run_id, "c").0,
+        StepRunState::Completed,
+        "the step answered by the previous segment must not have its answer discarded"
+    );
+    let spent = run_ledger(&conn, run_id).unwrap().spent;
+    assert_eq!((spent.tasks, spent.tool_calls), (3, 3));
+}
+
+/// The other half of the same discriminator, and the property the fix above
+/// must not cost: a `Failed` row found on a **cold** entry — no
+/// [`Resume::Work`] to carry, which is how a driver recovering a run after a
+/// restart necessarily enters — is still re-decided, exactly as §8.10 tier 2
+/// and `finished_step_rows`' own doc comment require.
+#[test]
+fn a_failed_row_from_a_previous_crashed_run_is_still_re_decided_on_a_cold_entry() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    // The state a daemon that died after this step failed leaves behind.
+    roundhouse_flow::durability::checkpoint_step(
+        &mut conn,
+        &roundhouse_flow::durability::WorkflowStepRun {
+            run_id,
+            step_id: "a".to_string(),
+            attempt: 1,
+            item_index: None,
+            disposition: roundhouse_flow::durability::StepDisposition::Pure,
+            state: StepRunState::Failed,
+            first_task_seq: None,
+            last_task_seq: None,
+            output: None,
+            error: Some("the previous process reported this".into()),
+        },
+    )
+    .expect("checkpoint the failed step");
+
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: a\n\
+         \x20   tool: read\n\
+         \x20   with: { path: one }\n\
+         \x20 - id: b\n\
+         \x20   tool: read\n\
+         \x20   with: { path: two }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("the run drives");
+
+    match outcome {
+        RunOutcome::AwaitingWork { pending } => assert_eq!(
+            pending
+                .iter()
+                .map(|p| p.step_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"],
+            "a cold entry must re-dispatch the failed step, not inherit its row"
+        ),
+        other => panic!("the failed step must be re-decided, not inherited: {other:?}"),
+    }
 }

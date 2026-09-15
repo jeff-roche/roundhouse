@@ -1798,6 +1798,20 @@ impl DeliveryExecutor {
     /// step's real work, holds none — the property this whole task exists
     /// to establish (see this module's own doc comment on
     /// `MAX_CONCURRENT_DELIVERIES`).
+    ///
+    /// # Why re-entering is not re-deciding
+    ///
+    /// Every segment answers only the [`PendingWork`] it was just handed,
+    /// which is what `Resume::Work`'s own doc asks for; it does **not** hand
+    /// back what earlier segments already settled. That is safe because
+    /// `run_workflow` inherits a step's already-decided outcome itself:
+    /// `roundhouse_flow`'s `failed_step_rows` is the seam, and its doc
+    /// comment carries the whole argument for why an entry carrying a
+    /// `Resume::Work` — which only this loop can produce — is the one entry
+    /// on which a `Failed` row belongs to the drive still in progress rather
+    /// than to a dead one. Note where the loop starts every drive, including
+    /// the one [`Self::rebuild_and_drive_recovered_run`] makes after a
+    /// restart: `resume: None`, the cold entry that argument depends on.
     async fn drive_run_to_completion(
         &self,
         run_id: RunId,
