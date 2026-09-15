@@ -354,10 +354,12 @@ pub struct DaemonResources {
     /// (§7.1 decision 4: "the spawn tree remains the sole authority for
     /// lifecycle, cancellation, and budget"). Constructed exactly once, in
     /// `main.rs`, before `DaemonResources::new` is called, and shared from
-    /// here by every consumer — today `DeliveryExecutor`
-    /// (`scheduler_driver.rs`), and, from a later task, the `agent` tool's
-    /// dispatch — so that no second, independent tree is ever minted. This
-    /// is the field's permanent home, not a transient wiring hack.
+    /// here by every consumer — `DeliveryExecutor` (`scheduler_driver.rs`)
+    /// and the `agent` tool's dispatch (through
+    /// [`crate::sub_agent_host::DaemonSubAgentHost`], whose `spawn_tree`
+    /// returns this very field) — so that no second, independent tree is ever
+    /// minted. This is the field's permanent home, not a transient wiring
+    /// hack.
     pub spawn_tree: Arc<SpawnTree>,
     /// The daemon-wide team registry (§7.1 decision 4: *"a Team owns
     /// addressing only"*), read by the `agent` tool for §7.5's auto-join.

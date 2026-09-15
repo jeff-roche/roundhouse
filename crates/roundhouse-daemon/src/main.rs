@@ -518,8 +518,8 @@ async fn main() -> color_eyre::Result<()> {
     // The daemon-wide sub-agent spawn tree: constructed exactly once, here,
     // before `DaemonResources::new` — see that field's own doc comment for
     // why `DaemonResources` is its one permanent, shared home rather than
-    // something each consumer (the scheduler driver's `DeliveryExecutor`
-    // today, the `agent` tool from a later task) mints its own copy of.
+    // something each consumer (the scheduler driver's `DeliveryExecutor`, and
+    // the `agent` tool through `DaemonSubAgentHost`) mints its own copy of.
     let spawn_tree = Arc::new(SpawnTree::new());
 
     // Fix round 2, MUST 3: make an operator's `--allow-degraded-to` choice

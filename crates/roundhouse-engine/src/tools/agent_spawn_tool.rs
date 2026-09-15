@@ -300,6 +300,17 @@ impl AgentArgs {
 ///
 /// `parent_task` is the `chat` task of the turn that issued the call, so the
 /// spawn task hangs off it in the session's task tree.
+///
+/// One failure edge is deliberately not compensated: if the child session was
+/// created and committed but appending the parent's `TaskCompleted` then
+/// fails, this returns `Err` to the model while the child session, its
+/// committed spawn-tree edge and its `SubAgentSessions` entry all remain. That
+/// is consistent with how `agent_loop`'s other arms treat a post-side-effect
+/// append failure — its built-in arm `?`-propagates the same
+/// `record_task_completed` append after `execute_builtin` has already written
+/// files or run a command, and does not undo them either. The side effect is
+/// real and durably recorded (the child's own `SessionCreated` committed in
+/// its own transaction); only the parent's terminal task event is missing.
 pub async fn dispatch_agent(
     actor: &SessionActor,
     writer: &EventWriter,

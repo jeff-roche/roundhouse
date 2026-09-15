@@ -143,8 +143,11 @@ Three known failure modes of a literal "everything is a task" model, and the ans
   `agent` tool (`roundhouse_engine::tools::agent_spawn_tool` deciding the spawn,
   `roundhouse-daemon`'s `DaemonSubAgentHost` creating the child and appending its
   `SessionCreated`). Both write the same event with the same field, so one
-  recovery pass reads both. A later task recovers the runtime spawn tree from
-  this edge after restart.
+  recovery pass reads both — `reconcile_spawn_tree` (`roundhouse-daemon`'s
+  `workflow_host`), which the daemon runs once at startup via
+  `boot::reconcile_spawn_tree_at_boot`, rebuilds the runtime spawn tree from
+  these edges after a restart. See that function's own documentation for what
+  a restart still cannot know about a sub-agent child.
 - **Streaming.** Solved by `TaskDelta`. A task's output is not written until it
   completes; consumers fold deltas for a live view.
 - **Non-terminating tasks.** A `shell` task running `npm run dev` never exits. These

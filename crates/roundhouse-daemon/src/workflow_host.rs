@@ -101,6 +101,13 @@ impl SessionTree for WorkflowSessionTree {
     /// into, and the same one the `agent` tool's sub-agent children use, so a
     /// freed slot is freed for both kinds of child.
     ///
+    /// **Wired and testable today, but with no production caller yet:**
+    /// nothing in this workspace drives a workflow `call:` child run to
+    /// completion, so `finish_run`'s terminal branch — and therefore this
+    /// implementation — is reached only from tests. A future run driver (part
+    /// of issue #30's scope) is what will exercise it in a live daemon; see
+    /// the trait method's own doc comment in `roundhouse-flow`.
+    ///
     /// Discharges the trait's idempotency requirement outright rather than by
     /// care at the call site: `SpawnTree::remove_child` is documented
     /// idempotent and pinned by its own
@@ -117,12 +124,18 @@ impl SessionTree for WorkflowSessionTree {
 }
 
 /// Durable facts the daemon could not use to reconstruct its runtime spawn tree.
+///
+/// Deliberately **not** a variant per unreadable event row: a single malformed
+/// lifecycle row is skipped and logged rather than turned into one of these —
+/// see [`reconcile_spawn_tree`]'s *"One bad row is skipped, not fatal"*
+/// section for why. What remains here is the unrecoverable kind: the store
+/// itself cannot be read (`Sqlite`), or a `workflow_run.session_id` — a column
+/// only this daemon's own writers ever fill, and one whose loss would
+/// misclassify an *ended* run as live — is not a uuid.
 #[derive(Debug, Error)]
 pub enum ReconcileSpawnTreeError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
     #[error("{column} holds {value:?}, which is not a session id")]
     MalformedSessionId { column: &'static str, value: String },
 }
@@ -208,6 +221,42 @@ const SESSION_STATE_CHANGED_PAYLOAD_PREFIX: &str = r#"{"SessionStateChanged":"#;
 /// writes the signal that would drop one. It does not self-heal on a later
 /// boot; only a real terminal writer heals it.
 ///
+/// ## The other half of the same gap: resources are never reclaimed either
+///
+/// Fan-out accounting is the consequence a restart makes visible, but it is
+/// not the only one, and the second does not need a restart to bite. Every
+/// [`LiveSubAgent`](crate::sub_agent_host::LiveSubAgent) holds a real
+/// [`HeadlessSession`](crate::session_manager::HeadlessSession): a real
+/// isolation mount, a real proxy registration, and possibly a real MCP
+/// subprocess. `SubAgentSessions::retire_child` is the one thing that gives
+/// any of those back, and it has **no production caller at all** — not merely
+/// none across restarts. Nothing terminates a sub-agent session in a live,
+/// running daemon, so every sub-agent a parent ever spawns keeps its mount,
+/// its proxy registration and its subprocess **for the life of the daemon
+/// process**, whether or not the model ever looks at that child again.
+///
+/// This is bounded rather than an unbounded resource exhaustion:
+/// `SessionRegistry`'s `DEFAULT_MAX_SESSIONS` (10,000) refuses a new session
+/// fail-closed once the daemon is holding that many, and the eight-slot
+/// fan-out ceiling above bounds what any one parent can accumulate. So the
+/// end state is a daemon that stops accepting sessions, not one that exhausts
+/// the host. It is still a distinct operational consequence from the fan-out
+/// one, and closing it takes the same fix: a real terminal signal for a
+/// sub-agent session, which then drives `retire_child`.
+///
+/// ## A restored edge has no `SubAgentSessions` record behind it
+///
+/// One asymmetry worth stating outright, because it survives the obvious fix:
+/// this function restores a sub-agent child's *edge* into the `SpawnTree` (so
+/// fan-out accounting is right), but it does **not** recreate a
+/// `SubAgentSessions` entry for that child — the `HeadlessSession` it would
+/// need died with the previous process. So even once a real terminal-signal
+/// writer exists, `retire_child` can never be called for a restart-recovered
+/// sub-agent: there is no [`LiveSubAgent`](crate::sub_agent_host::LiveSubAgent)
+/// to `take`. Such an edge is only ever cleared by this function's own
+/// `SessionClosed` filter on a *subsequent* restart, never during the live
+/// process that recovered it.
+///
 /// **This is a new failure mode introduced by wiring this function at boot**,
 /// not a pre-existing one. Until then `reconcile_spawn_tree` had no production
 /// caller, so a restart reset every parent's fan-out to zero — wrong in the
@@ -231,11 +280,49 @@ const SESSION_STATE_CHANGED_PAYLOAD_PREFIX: &str = r#"{"SessionStateChanged":"#;
 /// fact the live hook keys off — there is simply no production driver for a
 /// `call:` child run yet (a later task's work), so no such row exists in a
 /// running daemon today either.
+///
+/// # One bad row is skipped, not fatal
+///
+/// A lifecycle row whose payload will not deserialize into an `EventPayload`,
+/// or whose `events.session_id` column is not a uuid, is **skipped with a
+/// loud `tracing::error!`** — named individually, and counted again in one
+/// summary line before this function returns. It does not abort the scan and
+/// it does not fail the boot.
+///
+/// That is a deliberate choice between two bounded-wrong outcomes, and it is
+/// the same tradeoff the KNOWN GAP above already accepts. The `events` table
+/// physically rejects `DELETE` (S-LOG-2), so a row that refuses the boot
+/// refuses **every** boot after it, forever: one unreadable byte sequence
+/// anywhere in the log and the daemon can never start again, with no operator
+/// remedy short of abandoning the store. Skipping costs one under-recovered
+/// edge — a parent whose fan-out is counted one slot too low, permissive by
+/// exactly one child, against a ceiling of eight. An unbounded "never starts
+/// again" failure is worse than a bounded "under-recovered by one row" one.
+///
+/// This tolerance is scoped to a single malformed row and nothing wider: a
+/// store that cannot be read at all (`rusqlite` failing the query or the row
+/// decode) still returns `Err` and still refuses the boot, as does a
+/// `workflow_run.session_id` that is not a uuid.
 pub fn reconcile_spawn_tree(
     conn: &rusqlite::Connection,
     tree: &SpawnTree,
 ) -> Result<usize, ReconcileSpawnTreeError> {
-    let SessionLifecycleFacts { edges, closed } = session_lifecycle_facts(conn)?;
+    let SessionLifecycleFacts {
+        edges,
+        closed,
+        skipped,
+    } = session_lifecycle_facts(conn)?;
+    if skipped > 0 {
+        // Loud on purpose: this is the one place an operator can learn that
+        // the tree they are about to admit children against is knowably
+        // incomplete. `skipped` is a count this code produced, not log input.
+        tracing::error!(
+            skipped_rows = skipped,
+            "spawn-tree boot recovery skipped unreadable session-lifecycle rows; the restored \
+             fan-out may be under-counted by up to that many children. Boot continues by design \
+             — see reconcile_spawn_tree's documentation"
+        );
+    }
     let ended_runs = sessions_whose_runs_have_all_ended(conn)?;
 
     let mut restored = HashSet::new();
@@ -259,6 +346,9 @@ struct SessionLifecycleFacts {
     edges: Vec<(SessionId, SessionId)>,
     /// Sessions durably known to have closed.
     closed: HashSet<SessionId>,
+    /// How many matched rows could not be read at all and were skipped —
+    /// reported by [`reconcile_spawn_tree`] in one summary line.
+    skipped: usize,
 }
 
 /// Collects both in one pass over the event log.
@@ -276,7 +366,7 @@ fn session_lifecycle_facts(
     // rediscovered as a surprise on a large store; the alternative is a
     // migration adding an indexed discriminant column, which is its own task.
     let mut statement = conn.prepare(
-        "SELECT session_id, payload
+        "SELECT session_id, seq, payload
            FROM events
           WHERE payload LIKE ?1 OR payload LIKE ?2 OR payload LIKE ?3",
     )?;
@@ -286,15 +376,52 @@ fn session_lifecycle_facts(
             format!("{SESSION_CLOSED_PAYLOAD_PREFIX}%"),
             format!("{SESSION_STATE_CHANGED_PAYLOAD_PREFIX}%"),
         ],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
     )?;
 
     let mut edges = Vec::new();
     let mut closed = HashSet::new();
+    let mut skipped = 0usize;
     for row in rows {
-        let (session, payload) = row?;
-        let session = parse_session_id("events.session_id", &session)?;
-        match serde_json::from_str::<EventPayload>(&payload)? {
+        // A `rusqlite` error here is the connection or the column decode
+        // failing, not one row's contents being nonsense — that is the
+        // unrecoverable kind, and it still propagates.
+        let (session, seq, payload) = row?;
+        // Neither the raw `session_id` text nor the payload (nor a serde
+        // error's Display, which quotes its input) is ever rendered into a
+        // log: an unreadable row is by definition a row no trusted writer
+        // produced, and this crate's binding invariant is static strings only
+        // in `tracing` fields (see `roundhouse-daemon`'s Cargo.toml, fix round
+        // 5 MUST 2). `seq` is an integer and `SessionId` a parsed uuid, so
+        // both are safe locators.
+        let Ok(session) = parse_session_id("events.session_id", &session) else {
+            skipped += 1;
+            tracing::error!(
+                seq,
+                reason = "session_id is not a uuid",
+                "skipping an unreadable session-lifecycle event row during spawn-tree boot \
+                 recovery; its spawn-tree edge (if any) is not restored"
+            );
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<EventPayload>(&payload) else {
+            skipped += 1;
+            tracing::error!(
+                session_id = %session,
+                seq,
+                reason = "payload is not a deserializable EventPayload",
+                "skipping an unreadable session-lifecycle event row during spawn-tree boot \
+                 recovery; its spawn-tree edge (if any) is not restored"
+            );
+            continue;
+        };
+        match payload {
             EventPayload::SessionCreated { spec } => {
                 if let Some(parent) = spec.parent {
                     edges.push((parent, session));
@@ -310,7 +437,11 @@ fn session_lifecycle_facts(
             _ => {}
         }
     }
-    Ok(SessionLifecycleFacts { edges, closed })
+    Ok(SessionLifecycleFacts {
+        edges,
+        closed,
+        skipped,
+    })
 }
 
 /// Sessions whose workflow run (or runs) have all ended — the durable
@@ -646,6 +777,69 @@ mod tests {
             1,
             "a second pass over the same tree consumes no further slot"
         );
+    }
+
+    /// Inserts a row into `events` that the real writers could never have
+    /// produced. Raw SQL on purpose: `append_event_in_transaction` takes a
+    /// typed `Event`, so there is no way through it to seed the corruption
+    /// this test is about. `INSERT` is the one verb the append-only triggers
+    /// allow, and the rows written here are never updated or deleted.
+    fn insert_unparseable_event(conn: &rusqlite::Connection, session_id: &str, payload: &str) {
+        conn.execute(
+            "INSERT INTO events (session_id, seq, ts, task_id, payload, schema_v) \
+             VALUES (?1, 1, 1, NULL, ?2, 1)",
+            rusqlite::params![session_id, payload],
+        )
+        .unwrap();
+    }
+
+    /// One malformed lifecycle row must cost exactly its own edge, not the
+    /// daemon's ability to start.
+    ///
+    /// `events` physically rejects `DELETE`, so a row that aborts boot aborts
+    /// **every** boot, forever — the daemon could never start again. The ruling
+    /// for this branch is to skip the row loudly and keep going, which is what
+    /// this pins: two genuinely unreadable rows (an undeserializable
+    /// `SessionCreated` payload, and a `session_id` column that is not a uuid)
+    /// sitting beside two good edges, and both good edges still come back with
+    /// no `Err`.
+    #[test]
+    fn a_malformed_lifecycle_row_is_skipped_rather_than_refusing_the_whole_scan() {
+        let mut conn = open_test_db();
+        let parent_session = SessionId::new();
+        let first = SessionId::new();
+        let second = SessionId::new();
+        session_created(&mut conn, first, Some(parent_session));
+        session_created(&mut conn, second, Some(parent_session));
+
+        // (a) matches the `SessionCreated` prefilter, but `spec` is a string
+        // where `SessionSpec` must be an object — serde cannot make an
+        // `EventPayload` of it.
+        insert_unparseable_event(
+            &conn,
+            &SessionId::new().to_string(),
+            r#"{"SessionCreated":{"spec":"not-a-session-spec"}}"#,
+        );
+        // (b) a `session_id` column that is not a uuid. Its payload is
+        // asserted well-formed and prefilter-matching first, so this row can
+        // only be skipped by the id arm — otherwise it would either never be
+        // read at all or be skipped by (a)'s arm, and pass vacuously.
+        let closed_payload = r#"{"SessionClosed":{"outcome":"Completed"}}"#;
+        assert!(closed_payload.starts_with(SESSION_CLOSED_PAYLOAD_PREFIX));
+        assert!(serde_json::from_str::<EventPayload>(closed_payload).is_ok());
+        insert_unparseable_event(&conn, "not-a-uuid", closed_payload);
+
+        let tree = Arc::new(SpawnTree::new());
+        let restored = reconcile_spawn_tree(&conn, &tree)
+            .expect("a malformed row must not fail the whole reconciliation");
+
+        assert_eq!(
+            restored, 2,
+            "both well-formed edges survive two unreadable rows"
+        );
+        let descendants: HashSet<SessionId> =
+            tree.descendants(parent_session).into_iter().collect();
+        assert_eq!(descendants, HashSet::from([first, second]));
     }
 
     /// `SessionActor::cancel` is the one production writer of a session

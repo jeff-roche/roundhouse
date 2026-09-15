@@ -948,10 +948,10 @@ pub(crate) struct DeliveryExecutor {
     /// daemon-wide instance (see that field's own doc comment). This was the
     /// workspace's first production `SqliteWorkflowHost` and therefore the
     /// first thing that needed one, which is why it used to be minted here;
-    /// now that a second owner (the `agent` tool, a later task) is coming, it
-    /// shares *this* tree rather than either side minting a second (the tree
-    /// is what `MAX_DIRECT_CHILD_CALLS` fan-out admission is counted
-    /// against).
+    /// now that a second owner exists (the `agent` tool, through
+    /// `DaemonSubAgentHost`), it shares *this* tree rather than either side
+    /// minting a second (the tree is what `MAX_DIRECT_CHILD_CALLS` fan-out
+    /// admission is counted against).
     spawn_tree: Arc<SpawnTree>,
     /// [`MAX_CONCURRENT_DELIVERIES`] permits, one held for each in-flight
     /// delivery's whole life. See that constant for why the bound has to be
@@ -4036,7 +4036,7 @@ mod delivery_tests {
     /// Task 1 of the sub-agent spawn-tracking plan: `DaemonResources` is now
     /// the single, daemon-wide owner of the `SpawnTree`, and
     /// `DeliveryExecutor::new` takes it as a parameter instead of minting its
-    /// own — because the not-yet-built `agent` tool (a later task) will read
+    /// own — because the `agent` tool (through `DaemonSubAgentHost`) reads
     /// the very same `Arc<SpawnTree>` off `DaemonResources`, and the two must
     /// never disagree about a session's recorded children.
     ///

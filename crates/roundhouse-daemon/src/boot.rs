@@ -125,14 +125,28 @@ pub enum SpawnTreeRecoveryError {
 /// belongs to the task log and needs an [`EventWriter`] to append its
 /// reclassifications, while this one is read-only and writes only to memory.
 ///
-/// **Fails the daemon's startup rather than degrading**, and deliberately so:
-/// `main.rs` propagates this error, so a single lifecycle payload anywhere in
-/// the log that cannot be deserialized (or a `session_id` column that is not a
-/// uuid) refuses the boot. Skipping such a row would mean starting with a
-/// silently under-counted fan-out — a parent admitted past its ceiling because
-/// one of its children's rows was unreadable — which is the failure this whole
-/// pass exists to prevent. A store this daemon cannot fully read is one it
-/// should not start against.
+/// **A single unreadable lifecycle row is skipped, loudly, rather than
+/// refusing the boot.** [`reconcile_spawn_tree`] logs a `tracing::error!` for
+/// each lifecycle event whose payload will not deserialize or whose
+/// `events.session_id` is not a uuid, and one summary `error!` naming how many
+/// it skipped; the scan then completes and this function returns `Ok` with the
+/// edges it *could* rebuild.
+///
+/// This used to propagate instead, on the reasoning that a store the daemon
+/// cannot fully read is one it should not start against. That reasoning does
+/// not survive contact with S-LOG-2: the `events` table physically rejects
+/// `DELETE`, and `main.rs` propagates this error with `?`, so one bad row
+/// anywhere in the log means the daemon **never boots again** and the row can
+/// never be removed. Both outcomes are wrong, but only one is bounded —
+/// skipping under-counts one parent's fan-out by one child against a ceiling
+/// of eight (permissive by one), which is the same bounded-permissive tradeoff
+/// [`reconcile_spawn_tree`]'s own KNOWN GAP section already accepts for a
+/// sub-agent child with no durable terminal signal.
+///
+/// The tolerance is scoped to that one case. A genuinely unrecoverable problem
+/// — the connection cannot be checked out, the blocking closure cannot run,
+/// the query itself fails, a `workflow_run.session_id` is not a uuid — still
+/// returns `Err` and still refuses the boot.
 pub async fn reconcile_spawn_tree_at_boot(
     store: &StorePool,
     tree: &Arc<SpawnTree>,

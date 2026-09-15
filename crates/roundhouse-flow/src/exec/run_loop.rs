@@ -191,9 +191,26 @@ pub trait SessionTree: Send {
     /// §7.7 fan-out ceiling is a lifetime quota rather than a concurrency one
     /// — eight `call:` children per parent per daemon process, ever.
     ///
-    /// Infallible on purpose, exactly as `release_child` is: a run that has
-    /// already transitioned and already refunded its grant must not be
-    /// reported as failing because a bookkeeping edge could not be dropped.
+    /// Infallible on purpose, exactly as `release_child` is: dropping the
+    /// bookkeeping edge is best-effort, so a run that has already
+    /// transitioned and already refunded its grant is never reported as
+    /// failing *by this call*. That is a claim about this hook only, not
+    /// about the whole of [`finish_run`]'s terminal branch — the
+    /// `recover_run` lookup that finds the parent's session a few lines
+    /// before this call can still fail and propagate, exactly as the
+    /// `refund_child_run` beside it already can.
+    ///
+    /// # Wired and testable, but no production caller yet
+    ///
+    /// Nothing in this workspace drives a workflow `call:` child run to
+    /// completion in production, so [`finish_run`]'s terminal branch — the
+    /// one call site — is reached only from tests today. That is the same
+    /// deliberate state the sub-agent half is in (see
+    /// `SubAgentSessions::retire_child`'s *"No production caller yet, and why
+    /// that is the correct state"* in `roundhouse-daemon`): the bookkeeping is
+    /// wired at the seam that owns it, so whatever eventually drives a `call:`
+    /// child to completion (part of issue #30's scope) inherits a correct slot
+    /// release by construction rather than having to remember one.
     ///
     /// Implementors must be idempotent. **Not** because this call site
     /// duplicates — [`run_workflow`] refuses to drive a run that is already

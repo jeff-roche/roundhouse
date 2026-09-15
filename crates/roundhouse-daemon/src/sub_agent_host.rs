@@ -333,8 +333,8 @@ impl SubAgentHost for DaemonSubAgentHost {
             &self.resources,
             &self.registry,
             req.child,
-            // `req.spec` moved into `spec` above, for the durable
-            // `SessionCreated` below; construction needs its own copy.
+            // The original spec moves in here; the `spec` clone taken above
+            // is the copy kept back for the durable `SessionCreated` below.
             req.spec,
             req.workspace_root,
             req.workspace_identity.map(|(device, _)| device),

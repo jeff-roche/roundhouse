@@ -20,8 +20,12 @@ pub struct SessionSpec {
     pub on_degrade: OnDegrade,
     /// Durable spawn-tree edge: the parent session that created this one, if
     /// any. `None` for a root session (socket-attached or scheduler-driven).
-    /// Set by the code path that creates a child session (workflow `call:`
-    /// today; the sub-agent `agent` tool in a later phase). `#[serde(default)]`
+    /// Set by both code paths that create a child session: workflow `call:`
+    /// (`WorkflowSessionTree::persist_child_session` in `roundhouse-daemon`)
+    /// and the sub-agent `agent` tool
+    /// (`roundhouse_engine::tools::agent_spawn_tool`, whose child is created
+    /// and persisted by `roundhouse-daemon`'s `DaemonSubAgentHost`).
+    /// `#[serde(default)]`
     /// so `SessionCreated` events serialized before this field existed still
     /// deserialize, defaulting to `None` rather than failing to parse.
     #[serde(default)]
