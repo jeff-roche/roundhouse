@@ -16,7 +16,11 @@
 //! Lane W4's fixes for `Predicate::Agent`, `Predicate::Mcp { args }`,
 //! `GrantScope::Directory` and the three AST walkers are all merged into
 //! this branch, so the brief required their cases enabled and passing.
-//! When this file was first written, three of the mechanisms below could
+//! `Predicate::Mcp { args }` (Case 2) and `GrantScope::Directory` (Case 3)
+//! were reachable through the real loop from the start and pass as real
+//! security tests, not pins.
+//!
+//! When this file was first written, three of the other mechanisms could
 //! not be reached from model output at all, and each was written as a
 //! **reachability pin**: an enabled test, driven through the real loop,
 //! asserting the gap that actually existed, designed to fail the moment
@@ -421,9 +425,11 @@ async fn drive(
     .expect("the loop itself must not error — a refused tool call is a ToolResult, not an Err")
 }
 
+/// Every event recorded against the fixture's OWN session. A shorthand for
+/// [`events_for`], which the sub-agent cases need because they also have to
+/// read a spawned *child's* log.
 async fn events_of(fx: &Fixture) -> Vec<StoredEvent> {
-    let reopened = open(&fx.db_path).await.unwrap();
-    session_events(&reopened, fx.session_id).await.unwrap()
+    events_for(fx, fx.session_id).await
 }
 
 fn tool_results(blocks: &[ContentBlock]) -> Vec<(bool, String)> {
@@ -597,8 +603,8 @@ fn with_host(fx: &Fixture, host: Arc<RecordingSubAgentHost>) -> Arc<RecordingSub
 }
 
 /// Every event recorded against `session` in the fixture's store — the parent's
-/// own log when `session` is `fx.session_id`, and a spawned child's log
-/// otherwise.
+/// own log when `session` is `fx.session_id` (see [`events_of`]), and a spawned
+/// child's log otherwise.
 async fn events_for(fx: &Fixture, session: SessionId) -> Vec<StoredEvent> {
     let reopened = open(&fx.db_path).await.unwrap();
     session_events(&reopened, session).await.unwrap()

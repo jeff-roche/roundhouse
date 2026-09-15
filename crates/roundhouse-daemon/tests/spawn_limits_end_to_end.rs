@@ -185,15 +185,20 @@ async fn agent_and_call_children_share_one_parents_fan_out_ceiling() {
         tree.register_child(parent, child, JobId::new())
     };
 
-    // Four real sub-agent children ...
-    let half = MAX_FAN_OUT / 2;
-    for _ in 0..half {
+    // Half the ceiling in real sub-agent children ...
+    let sub_agents = MAX_FAN_OUT / 2;
+    // ... and the REST — `MAX_FAN_OUT - sub_agents`, not a second `/ 2` — in
+    // `call:` children, against the same parent session. Splitting it this way
+    // keeps the two groups summing to exactly the ceiling even if `MAX_FAN_OUT`
+    // ever becomes odd, so the saturation assertion below stays true for the
+    // right reason.
+    let calls = MAX_FAN_OUT - sub_agents;
+    for _ in 0..sub_agents {
         spawn_sub_agent(agent_args())
             .await
             .expect("a sub-agent under the shared ceiling");
     }
-    // ... and four `call:` children, against the same parent session.
-    let call_children: Vec<SessionId> = (0..half)
+    let call_children: Vec<SessionId> = (0..calls)
         .map(|_| {
             let child = SessionId::new();
             admit_call_child(&mut workflow_tree, child)
@@ -205,8 +210,8 @@ async fn agent_and_call_children_share_one_parents_fan_out_ceiling() {
     assert_eq!(
         resources.spawn_tree.direct_children(parent),
         MAX_FAN_OUT,
-        "four sub-agents plus four `call:` children saturate ONE parent — they are counted \
-         together, not eight-and-eight"
+        "sub-agent children plus `call:` children saturate ONE parent between them — they are \
+         counted together, not once per kind"
     );
     let sub_agent_children: Vec<SessionId> = resources
         .spawn_tree
@@ -216,8 +221,9 @@ async fn agent_and_call_children_share_one_parents_fan_out_ceiling() {
         .collect();
     assert_eq!(
         sub_agent_children.len() as u32,
-        half,
-        "and exactly half of the committed edges really are tracked sub-agents"
+        sub_agents,
+        "and the committed edges really are a MIX: exactly the sub-agent half is tracked as \
+         such, so the other half came from the `call:` path"
     );
 
     // The ninth is refused whichever path asks for it.
@@ -335,9 +341,18 @@ async fn a_real_chain_of_nested_sub_agents_is_refused_at_the_depth_ceiling() {
         .await
         .unwrap_or_else(|err| panic!("depth {expected_child_depth} is legal, got {err:?}"));
 
-        let child = resources.spawn_tree.descendants(current.session_id())[0];
+        // Stated rather than relied on: each level spawns exactly once, so
+        // `descendants` holds exactly one session and indexing it is
+        // unambiguous. An index panic would report "out of bounds" for what is
+        // really "this level spawned the wrong number of children".
+        let children = resources.spawn_tree.descendants(current.session_id());
+        assert_eq!(
+            children.len(),
+            1,
+            "each level of the chain has exactly one child, so the next `current` is unambiguous"
+        );
         current = registry
-            .actor(child)
+            .actor(children[0])
             .expect("each spawned child is a real, registered session");
         budget /= 2;
     }

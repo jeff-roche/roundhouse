@@ -137,6 +137,26 @@ const EXPECTED_UNWIRED: &[&str] = &[
     // (`roundhouse-daemon`'s `spawn_limits_end_to_end.rs`,
     // `spawn_tree_boot_recovery.rs`, `sub_agent_host`/`workflow_host`), not by
     // this spelling check.
+    //
+    // **And the "non-`cfg(test)`" qualifier above is weaker than it sounds:
+    // integration-test files count as production code here.**
+    // `collect_production_source` walks *every* `.rs` file under `crates/`,
+    // including `crates/*/tests/`, and `cfg_test` only inspects `#[cfg(..)]`
+    // attributes — a `#[test]`/`#[tokio::test]` function in an integration-test
+    // file carries no `#[cfg(test)]` of its own (the whole file is already a
+    // test target), so this guard cannot tell it apart from a production
+    // function. Concretely: `roundhouse-engine`'s
+    // `tests/agent_tool_spawn.rs` has zero `cfg(test)` markers anywhere, and
+    // its `a_saturated_parent_refuses_the_ninth_spawn_without_consuming_a_slot`
+    // calls `tree.record_child(..)` directly — that one call satisfies
+    // `bus.spawn_tree` on its own, whatever the daemon does or does not wire.
+    // The anti-vacuity tests below cover only the `#[cfg(test)] mod tests`
+    // case, so they give no warning about this one.
+    //
+    // Both holes are recorded rather than fixed: sharpening the needles, or
+    // excluding `crates/*/tests/` from the scan, changes what this ledger
+    // asserts about every feature in it, which is a Phase 8 ledger decision
+    // and its own item — not a side effect of retiring one entry.
     "bus.restart",
     "bus.rate_limit_state",
     "store.blob_quota",
