@@ -60,6 +60,12 @@ tracing = { workspace = true }
 # clock reading that is immune to wall-clock adjustments. No async runtime
 # is spun up by this crate, so only the `time` feature is enabled.
 tokio = { workspace = true, features = ["time"] }
+# Task 3 (`store.rs`'s `accept_occurrence`): `trigger_delivery.delivery_id` is
+# a UUID string minted by the writer (`Uuid::new_v4().to_string()`), per
+# `delivery.rs`'s own doc comment on `TriggerDelivery::delivery_id`. Promoted
+# out of `[dev-dependencies]` (where Task 1 first added it, for tests only)
+# because this is now genuinely a runtime dependency, not just a test one.
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
@@ -68,7 +74,6 @@ serde_json = { workspace = true }
 # executor. `LocalBus` is already reachable through the `[dependencies]`
 # entry Task 1 added, so no extra dev-dependency is needed for it.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-uuid = { version = "1", features = ["v4", "serde"] }
 # Self dev-dependency, activating the `test-util` feature for this crate's
 # own `tests/*.rs` integration-test crates (L7) — `cfg(test)` alone does not
 # cover them, only this crate's in-lib `#[cfg(test)] mod tests`.
