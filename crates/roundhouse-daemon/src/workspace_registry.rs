@@ -73,6 +73,8 @@ pub enum WorkspaceRegistryError {
     RootIdentityChanged,
     #[error("unknown workspace name")]
     UnknownWorkspace { name: String },
+    #[error("unknown workspace id")]
+    UnknownWorkspaceId { id: WorkspaceId },
     #[error("persisted workspace id is invalid")]
     InvalidStoredWorkspaceId,
     #[error("workspace registry lock is poisoned")]
@@ -227,6 +229,26 @@ impl WorkspaceRegistry {
             return Err(WorkspaceRegistryError::RootIdentityChanged);
         }
         Ok(workspace)
+    }
+
+    /// Resolves a workspace by its persisted [`WorkspaceId`] rather than by
+    /// name — the lookup a scheduled trigger delivery needs, since a
+    /// `trigger_binding` row stores `workspace_id` and never the
+    /// operator-facing name.
+    ///
+    /// Finds the entry by id and then hands off to [`Self::resolve`], so the
+    /// protected-root and filesystem-identity checks are the *same code*, not
+    /// a second copy that could drift from it.
+    pub fn resolve_by_id(&self, id: WorkspaceId) -> Result<Workspace, WorkspaceRegistryError> {
+        let name = self
+            .entries
+            .read()
+            .map_err(|_| WorkspaceRegistryError::LockPoisoned)?
+            .values()
+            .find(|workspace| workspace.id == id)
+            .map(|workspace| workspace.name.clone())
+            .ok_or(WorkspaceRegistryError::UnknownWorkspaceId { id })?;
+        self.resolve(&name)
     }
 
     pub fn is_empty(&self) -> Result<bool, WorkspaceRegistryError> {

@@ -252,112 +252,16 @@ mod tests {
     //! it with.
 
     use super::*;
-    use crate::session_bootstrap::{no_policy_rules, BackgroundServices};
-    use crate::test_support::{available_isolate, real_actor_with_state, runner};
-    use roundhouse_core::{OnDegrade, Tier, WorkspaceId};
+    use crate::test_support::{daemon_resources, real_actor_with_state, runner};
+    use roundhouse_core::{Tier, WorkspaceId};
     use roundhouse_net::policy::EgressPolicy;
-    use roundhouse_provider::{Provider, RequestCtx};
     use roundhouse_store::spawn_writer;
 
-    struct NoopProvider;
-    impl Provider for NoopProvider {
-        fn capabilities(
-            &self,
-            _model: &roundhouse_provider::ModelId,
-        ) -> roundhouse_provider::Capabilities {
-            roundhouse_provider::Capabilities::default()
-        }
-        fn resolve(
-            &self,
-            _req: &roundhouse_provider::ChatRequest,
-        ) -> Result<roundhouse_provider::Plan, roundhouse_provider::ProviderError> {
-            unimplemented!("not exercised by this module's tests")
-        }
-        fn stream_chat<'a>(
-            &'a self,
-            _req: &'a roundhouse_provider::ChatRequest,
-            _ctx: &'a RequestCtx,
-        ) -> roundhouse_provider::BoxFut<
-            'a,
-            Result<roundhouse_provider::ChatStream, roundhouse_provider::ProviderError>,
-        > {
-            unimplemented!("not exercised by this module's tests")
-        }
-        fn count_tokens<'a>(
-            &'a self,
-            _req: &'a roundhouse_provider::ChatRequest,
-            _ctx: &'a RequestCtx,
-        ) -> roundhouse_provider::BoxFut<
-            'a,
-            Result<roundhouse_provider::TokenCount, roundhouse_provider::ProviderError>,
-        > {
-            unimplemented!("not exercised by this module's tests")
-        }
-        fn list_models<'a>(
-            &'a self,
-            _ctx: &'a RequestCtx,
-        ) -> roundhouse_provider::BoxFut<
-            'a,
-            Result<Vec<roundhouse_provider::ModelInfo>, roundhouse_provider::ProviderError>,
-        > {
-            unimplemented!("not exercised by this module's tests")
-        }
-    }
-
-    struct NoopTransport;
-    impl roundhouse_provider::HttpTransport for NoopTransport {
-        fn send<'a>(
-            &'a self,
-            _req: roundhouse_provider::HttpRequest,
-        ) -> futures::future::BoxFuture<
-            'a,
-            Result<roundhouse_provider::HttpResponseStream, roundhouse_provider::TransportError>,
-        > {
-            Box::pin(async {
-                Err(roundhouse_provider::TransportError::Io(
-                    "NoopTransport never sends".into(),
-                ))
-            })
-        }
-    }
-
+    /// The shared `DaemonResources` fixture, with no workspace registry —
+    /// this module's tests pass a workspace root directly and never resolve
+    /// one by name or id.
     async fn resources(dir: &std::path::Path) -> DaemonResources {
-        let store = roundhouse_store::open(&dir.join("events.db"))
-            .await
-            .unwrap();
-        let proxy = Arc::new(LoopbackProxy::new());
-        let proxy_store = roundhouse_store::open(&dir.join("events.db"))
-            .await
-            .unwrap();
-        let proxy_writer = spawn_writer(proxy_store).await;
-        proxy
-            .clone()
-            .serve(runner(), proxy_writer.clone())
-            .await
-            .unwrap();
-        DaemonResources::new(
-            store,
-            available_isolate(),
-            proxy,
-            dir.join("state"),
-            dir.join("daemon-binary"),
-            Vec::new(),
-            roundhouse_config::NetworkConfig::default(),
-            OnDegrade::Refuse,
-            no_policy_rules(),
-            BackgroundServices::default(),
-            runner(),
-            Arc::new(NoopProvider),
-            RequestCtx {
-                trace_id: None,
-                transport: Arc::new(NoopTransport),
-                api_key: "test-api-key-not-a-secret".into(),
-                credentials: None,
-            },
-            proxy_writer,
-            None,
-            false,
-        )
+        daemon_resources(dir, None).await
     }
 
     fn test_spec(workspace: WorkspaceId, resources: &DaemonResources) -> SessionSpec {
