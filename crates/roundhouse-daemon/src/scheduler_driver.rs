@@ -38,6 +38,31 @@ use crate::session_bootstrap::{BackgroundServiceContext, BackgroundServiceError}
 /// itself without polling the clock in a tight loop.
 const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How far back a restored binding's persisted fire cursor may reach when it
+/// seeds that binding's catch-up baseline at boot.
+///
+/// `Scheduler`'s own `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK` bounds a
+/// backlog *per tick*, not in total, and one of the two heap-scheduled specs
+/// has nothing that collapses it: `TriggerSpec::Interval` has no `CatchUp`
+/// policy, so `drain_due` takes its identity branch and fires every missed
+/// occurrence. A one-second `Interval` whose daemon was down for a week
+/// therefore owes 604,800 occurrences and would replay them at 100 per tick —
+/// roughly 1.7 hours of continuous `trigger_event` writes after boot, nearly
+/// all of which become `SkipDueToOverlap` anyway. That is the default
+/// non-cron path, not an exotic configuration.
+///
+/// Clamping the *baseline* rather than the per-tick count is what bounds it
+/// in total: a binding is never replayed from further back than this,
+/// however stale its persisted cursor actually is. Twenty-four hours matches
+/// the catch-up philosophy `docs/architecture/05-scheduling-and-workflows.md`
+/// already states — one report this morning, not eight.
+///
+/// **This lives here, in the daemon, deliberately.** `Scheduler::add_binding`
+/// is a general-purpose mechanism ("seed from this baseline"); *how far back
+/// to replay* is a policy decision, and belongs to the caller that decides
+/// what baseline to hand it.
+const MAX_CATCH_UP_LOOKBACK: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// Boot-load failures that abort daemon startup.
 ///
 /// Deliberately static `Display` strings with the real cause carried as a
@@ -250,6 +275,12 @@ struct RawBindingRow {
 /// `trigger_binding_cursor.last_fired_for`, as the [`StoredBinding`]s both
 /// the [`Scheduler`] and [`accept_occurrence`] need.
 ///
+/// `now` is the boot instant this load is reckoned against — taken once by
+/// the caller and passed in rather than read here, both so the whole boot
+/// sequence agrees on one reading and so the [`MAX_CATCH_UP_LOOKBACK`] clamp
+/// each restored cursor passes through
+/// ([`clamp_catch_up_baseline`]) is testable without a real clock.
+///
 /// Disabled rows (`enabled = 0`) are excluded by the query, not filtered
 /// afterwards, so a disabled binding never becomes a `Binding` in the first
 /// place.
@@ -264,6 +295,7 @@ struct RawBindingRow {
 /// so it is not silent.
 pub async fn load_enabled_bindings(
     store: &StorePool,
+    now: DateTime<Utc>,
 ) -> Result<Vec<StoredBinding>, SchedulerDriverError> {
     let conn = store.pool.get().await.map_err(|error| {
         tracing::error!(error = %error, "could not check out a store connection");
@@ -305,13 +337,58 @@ pub async fn load_enabled_bindings(
             SchedulerDriverError::BootLoadQuery
         })?;
 
-    Ok(rows.into_iter().filter_map(decode_binding_row).collect())
+    Ok(rows
+        .into_iter()
+        .filter_map(|raw| decode_binding_row(raw, now))
+        .collect())
+}
+
+/// The effective catch-up baseline for a restored cursor: never further back
+/// than [`MAX_CATCH_UP_LOOKBACK`] before `now`.
+///
+/// A cursor already inside the window is returned untouched; only a staler
+/// one is pulled forward. `None` (a binding that has never fired) stays
+/// `None`, so the scheduler falls back to its own wall-clock reading and the
+/// binding has no backlog at all.
+///
+/// This clamps the *replay baseline*, not the persisted record: the
+/// `trigger_binding_cursor` row still holds the true historical value, and
+/// `accept_occurrence` still advances it monotonically. A binding down longer
+/// than the window simply does not replay everything it missed — by design,
+/// and reported at `warn` so the discarded span is visible rather than
+/// inferred.
+fn clamp_catch_up_baseline(
+    last_fired_for: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    binding_id: BindingId,
+) -> Option<DateTime<Utc>> {
+    let cursor = last_fired_for?;
+    // `MAX_CATCH_UP_LOOKBACK` is a fixed 24h constant, so this conversion
+    // cannot fail; `checked_sub_signed` guards the (unreachable) case of
+    // `now` sitting within a day of chrono's representable minimum rather
+    // than panicking on the subtraction.
+    let Some(earliest) = chrono::Duration::from_std(MAX_CATCH_UP_LOOKBACK)
+        .ok()
+        .and_then(|window| now.checked_sub_signed(window))
+    else {
+        return Some(cursor);
+    };
+    if cursor >= earliest {
+        return Some(cursor);
+    }
+    tracing::warn!(
+        binding_id = %binding_id,
+        lookback_hours = MAX_CATCH_UP_LOOKBACK.as_secs() / 3600,
+        "this binding's persisted fire cursor is older than the catch-up lookback window; \
+         replaying only the window and discarding the rest of the missed span"
+    );
+    Some(earliest)
 }
 
 /// Decodes one raw row, returning `None` (with an `error` log) for a row
 /// this daemon cannot make sense of. See [`load_enabled_bindings`] for why a
 /// bad row is skipped rather than fatal.
-fn decode_binding_row(raw: RawBindingRow) -> Option<StoredBinding> {
+fn decode_binding_row(raw: RawBindingRow, now: DateTime<Utc>) -> Option<StoredBinding> {
     let binding_id = match Uuid::parse_str(&raw.binding_id) {
         Ok(id) => BindingId::from_uuid(id),
         Err(_) => {
@@ -384,7 +461,14 @@ fn decode_binding_row(raw: RawBindingRow) -> Option<StoredBinding> {
             job_id,
             spec,
             overlap,
-            last_fired_for: raw.last_fired_for.map(DateTime::from_timestamp_nanos),
+            // The *effective* replay baseline, clamped to the catch-up
+            // lookback window — not necessarily the historical cursor the
+            // row holds. See `clamp_catch_up_baseline`.
+            last_fired_for: clamp_catch_up_baseline(
+                raw.last_fired_for.map(DateTime::from_timestamp_nanos),
+                now,
+                binding_id,
+            ),
             // Always `None`: `Scheduler::add_binding` overwrites this field
             // itself (via its own `push_occurrences`) from the occurrences it
             // computes, so any value restored here would be discarded on the
@@ -492,20 +576,38 @@ fn accept_due_occurrences(
 /// while this daemon was down are still due on the first tick after boot,
 /// rather than being skipped in favour of "next occurrence after now."
 ///
-/// That backlog is bounded by machinery this driver does not duplicate:
-/// `drain_due` caps it at `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK`
-/// per binding per tick and applies the binding's own `CatchUp` policy
-/// (`Latest` collapses the window to one fire, `None` drops it, `All` drains
-/// progressively), and `accept_occurrence` dedupes on
+/// That backlog is bounded in two independent ways, and both matter:
+///
+/// - **Per tick**, by `drain_due`: at most
+///   `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK` (100) occurrences per
+///   binding per tick, further reduced by the binding's own `CatchUp` policy
+///   (`Latest` collapses the window to one fire, `None` drops it, `All`
+///   drains progressively).
+/// - **In total**, by [`MAX_CATCH_UP_LOOKBACK`] (24 hours): the baseline this
+///   driver hands the scheduler is clamped, so a binding down longer than
+///   the window **will not replay everything it missed — by design**.
+///
+/// The per-tick cap alone is not enough. It bounds the rate, not the total,
+/// and `TriggerSpec::Interval` has no `CatchUp` policy to collapse a backlog
+/// (`drain_due` takes its identity branch), so a one-second `Interval` down
+/// for a week would otherwise replay 604,800 occurrences at 100 a tick —
+/// about 1.7 hours of continuous `trigger_event` writes after boot. The
+/// lookback clamp is what makes that finite.
+///
+/// On top of both, `accept_occurrence` dedupes on
 /// `(binding_id, scheduled_for)` so a replayed occurrence cannot produce a
-/// second `trigger_event`. The cursor advance is also monotonic, so a
+/// second `trigger_event`, and the cursor advance is monotonic, so a
 /// replayed occurrence can never rewind the record.
 ///
 /// A binding with no cursor row (never fired) seeds from the boot instant
 /// instead and has no backlog at all.
 pub async fn run(mut ctx: BackgroundServiceContext) -> Result<(), BackgroundServiceError> {
     let system_clock = SystemClock;
-    let stored = load_enabled_bindings(&ctx.store)
+    // One wall-clock reading for the whole boot sequence: the same instant
+    // clamps every restored cursor and seeds every never-fired binding, so
+    // the two cannot disagree about when "boot" was.
+    let boot = system_clock.wall_now();
+    let stored = load_enabled_bindings(&ctx.store, boot)
         .await
         .map_err(|error| BackgroundServiceError(error.to_string()))?;
 
@@ -518,7 +620,7 @@ pub async fn run(mut ctx: BackgroundServiceContext) -> Result<(), BackgroundServ
         // `add_binding`. Skipping it — rather than failing the whole boot —
         // is the same judgement `decode_binding_row` makes for a corrupt
         // row, for the same reason.
-        match scheduler.add_binding(stored_binding.binding.clone(), &system_clock) {
+        match scheduler.add_binding(stored_binding.binding.clone(), &FixedClock(boot)) {
             Ok(()) => {
                 bindings.insert(binding_id, stored_binding);
             }
@@ -610,6 +712,15 @@ mod tests {
     use super::*;
     use roundhouse_store::StorePool;
     use std::time::Duration;
+
+    /// The fixed instant every test in this module treats as "now" — the
+    /// boot reading `run` takes once and threads through the whole boot
+    /// sequence. A constant, not `Utc::now()`: the catch-up lookback clamp is
+    /// defined relative to "now", so a test that read the real clock would be
+    /// asserting against whatever today's date happens to be.
+    fn boot_instant() -> DateTime<Utc> {
+        DateTime::from_timestamp_nanos(1_700_000_000_000_000_000)
+    }
 
     async fn store(dir: &std::path::Path) -> StorePool {
         roundhouse_store::open(&dir.join("events.db"))
@@ -721,7 +832,7 @@ mod tests {
         let never_fired = interval_binding(Duration::from_secs(90));
         seed_binding(&store, &never_fired, true, None).await;
 
-        let loaded = load_enabled_bindings(&store).await.unwrap();
+        let loaded = load_enabled_bindings(&store, boot_instant()).await.unwrap();
 
         let restored = loaded
             .iter()
@@ -760,7 +871,7 @@ mod tests {
         let disabled = interval_binding(Duration::from_secs(60));
         seed_binding(&store, &disabled, false, Some(1_700_000_000_000_000_000)).await;
 
-        let loaded = load_enabled_bindings(&store).await.unwrap();
+        let loaded = load_enabled_bindings(&store, boot_instant()).await.unwrap();
         assert!(
             loaded.is_empty(),
             "a disabled binding must never reach the scheduler, got {loaded:?}"
@@ -790,7 +901,7 @@ mod tests {
         .await
         .unwrap();
 
-        let loaded = load_enabled_bindings(&store).await.unwrap();
+        let loaded = load_enabled_bindings(&store, boot_instant()).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].binding.id, good.binding.id);
     }
@@ -807,9 +918,9 @@ mod tests {
         let stored = interval_binding(Duration::from_secs(1));
         seed_binding(&store, &stored, true, None).await;
 
-        let loaded = load_enabled_bindings(&store).await.unwrap();
+        let loaded = load_enabled_bindings(&store, boot_instant()).await.unwrap();
         let mut scheduler = Scheduler::new();
-        let boot = DateTime::from_timestamp_nanos(1_700_000_000_000_000_000);
+        let boot = boot_instant();
         let mut bindings = HashMap::new();
         for stored_binding in loaded {
             scheduler
@@ -885,7 +996,7 @@ mod tests {
         let store = store(dir.path()).await;
 
         let stored = interval_binding(Duration::from_secs(60));
-        let boot = DateTime::from_timestamp_nanos(1_700_000_000_000_000_000);
+        let boot = boot_instant();
         // The cursor says this binding last fired ten minutes before boot, so
         // ten one-minute occurrences were missed while the daemon was down.
         let cursor = boot - chrono::Duration::minutes(10);
@@ -897,7 +1008,7 @@ mod tests {
         )
         .await;
 
-        let loaded = load_enabled_bindings(&store).await.unwrap();
+        let loaded = load_enabled_bindings(&store, boot_instant()).await.unwrap();
         assert_eq!(
             loaded[0].binding.last_fired_for,
             Some(cursor),
@@ -947,6 +1058,117 @@ mod tests {
         );
     }
 
+    /// Fix round 2 (review Important finding): the per-tick cap bounds the
+    /// *rate* of a replay, not its total. `TriggerSpec::Interval` has no
+    /// `CatchUp` policy to collapse a backlog, so without a lookback clamp a
+    /// one-second interval whose daemon was down for a week would replay
+    /// 604,800 occurrences at 100 a tick — about 1.7 hours of continuous
+    /// `trigger_event` writes after boot.
+    ///
+    /// This pins the clamp at the boot load: a week-old cursor must arrive as
+    /// the 24-hour baseline, not as the true historical value.
+    #[tokio::test]
+    async fn a_cursor_older_than_the_lookback_window_is_clamped_at_the_boot_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path()).await;
+        let boot = boot_instant();
+
+        let stored = interval_binding(Duration::from_secs(1));
+        let a_week_ago = boot - chrono::Duration::days(7);
+        seed_binding(
+            &store,
+            &stored,
+            true,
+            Some(a_week_ago.timestamp_nanos_opt().unwrap()),
+        )
+        .await;
+
+        let loaded = load_enabled_bindings(&store, boot).await.unwrap();
+        assert_eq!(
+            loaded[0].binding.last_fired_for,
+            Some(boot - chrono::Duration::hours(24)),
+            "a cursor older than MAX_CATCH_UP_LOOKBACK must be pulled forward to the \
+             window's edge, not replayed from where it actually sat"
+        );
+    }
+
+    /// The mirror that stops the clamp from being a blunt instrument: a
+    /// cursor already inside the window is handed through untouched. Without
+    /// this, a clamp that simply returned `now - 24h` unconditionally — and
+    /// so discarded every real recent cursor — would pass the test above.
+    #[tokio::test]
+    async fn a_cursor_inside_the_lookback_window_is_left_exactly_as_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path()).await;
+        let boot = boot_instant();
+
+        let stored = interval_binding(Duration::from_secs(60));
+        let recent = boot - chrono::Duration::hours(3);
+        seed_binding(
+            &store,
+            &stored,
+            true,
+            Some(recent.timestamp_nanos_opt().unwrap()),
+        )
+        .await;
+
+        let loaded = load_enabled_bindings(&store, boot).await.unwrap();
+        assert_eq!(
+            loaded[0].binding.last_fired_for,
+            Some(recent),
+            "a cursor inside the window must survive the clamp unchanged"
+        );
+    }
+
+    /// The behavioural half of the clamp, and the one that actually bounds
+    /// the work: a week-stale one-second `Interval` must not walk back into
+    /// the week. Every occurrence its first tick produces has to sit inside
+    /// the 24-hour window, and the tick itself must still respect the
+    /// per-tick cap — the two bounds compose rather than replacing one
+    /// another.
+    #[tokio::test]
+    async fn a_week_stale_binding_replays_only_inside_the_lookback_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path()).await;
+        let boot = boot_instant();
+
+        let stored = interval_binding(Duration::from_secs(1));
+        let a_week_ago = boot - chrono::Duration::days(7);
+        seed_binding(
+            &store,
+            &stored,
+            true,
+            Some(a_week_ago.timestamp_nanos_opt().unwrap()),
+        )
+        .await;
+
+        let loaded = load_enabled_bindings(&store, boot).await.unwrap();
+        let mut scheduler = Scheduler::new();
+        let mut bindings = HashMap::new();
+        for stored_binding in loaded {
+            scheduler
+                .add_binding(stored_binding.binding.clone(), &FixedClock(boot))
+                .unwrap();
+            bindings.insert(stored_binding.binding.id, stored_binding);
+        }
+
+        let due = pair_with_bindings(&bindings, scheduler.tick(&FixedClock(boot)));
+        assert!(!due.is_empty(), "the clamped window must still drain");
+
+        let window_start = boot - chrono::Duration::hours(24);
+        assert!(
+            due.iter()
+                .all(|(_, occurrence)| occurrence.scheduled_for > window_start),
+            "no occurrence may come from before the lookback window — the week-old \
+             backlog must never be walked at all"
+        );
+        assert!(
+            due.len() <= roundhouse_sched::scheduler::MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK,
+            "the per-tick cap still applies on top of the lookback clamp, got {}",
+            due.len()
+        );
+    }
+
     /// A late tick hands the driver a whole catch-up backlog at once, and
     /// the overlap policy — not the driver — is what decides how much of it
     /// becomes a delivery. This also pins the known limit described on
@@ -968,9 +1190,9 @@ mod tests {
         );
         seed_binding(&store, &stored, true, None).await;
 
-        let loaded = load_enabled_bindings(&store).await.unwrap();
+        let loaded = load_enabled_bindings(&store, boot_instant()).await.unwrap();
         let mut scheduler = Scheduler::new();
-        let boot = DateTime::from_timestamp_nanos(1_700_000_000_000_000_000);
+        let boot = boot_instant();
         let mut bindings = HashMap::new();
         for stored_binding in loaded {
             scheduler
@@ -1171,7 +1393,7 @@ mod tests {
         seed_binding(&store, &broken, true, None).await;
 
         // The row itself decodes fine — it is the scheduling that fails.
-        let loaded = load_enabled_bindings(&store).await.unwrap();
+        let loaded = load_enabled_bindings(&store, boot_instant()).await.unwrap();
         assert_eq!(loaded.len(), 1);
 
         let mut scheduler = Scheduler::new();
