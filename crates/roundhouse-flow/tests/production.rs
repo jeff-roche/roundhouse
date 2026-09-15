@@ -78,6 +78,7 @@ impl SessionTree for RecordingSessionTree {
     fn persist_child_session(
         &mut self,
         _txn: &rusqlite::Transaction<'_>,
+        _parent: SessionId,
         _child: &WorkflowRun,
     ) -> Result<(), WorkflowHostError> {
         Ok(())

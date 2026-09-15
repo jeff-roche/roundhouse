@@ -131,6 +131,16 @@ Three known failure modes of a literal "everything is a task" model, and the ans
 
 - **Nesting.** `parent: Option<TaskId>` gives a tree inside a session; `agent` tasks
   point at a child *session*. Depth and fan-out are bounded by policy (§6, §7).
+  **Amendment (Phase 8 L5, "sub-agent spawn tracking" #2):** `SessionSpec` itself
+  carries `parent: Option<SessionId>` (`#[serde(default)]`, so events serialized
+  before this field existed still deserialize, defaulting to `None`). Sub-agent
+  spawn edges could not survive a daemon restart without it — `SessionCreated` is
+  the one place a session's origin is already durably recorded, so a session's
+  parent lives there rather than in a separate table. `None` for a root session
+  (socket-attached or scheduler-driven); set by whichever code path creates a
+  child session — workflow `call:` today (`WorkflowSessionTree::persist_child_session`
+  in `roundhouse-daemon`), the sub-agent `agent` tool in a later task of the same
+  plan. A later task recovers the runtime spawn tree from this edge after restart.
 - **Streaming.** Solved by `TaskDelta`. A task's output is not written until it
   completes; consumers fold deltas for a live view.
 - **Non-terminating tasks.** A `shell` task running `npm run dev` never exits. These

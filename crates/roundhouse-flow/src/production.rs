@@ -49,6 +49,7 @@ impl SessionTree for UnconfiguredSessionTree {
     fn persist_child_session(
         &mut self,
         _txn: &rusqlite::Transaction<'_>,
+        _parent: SessionId,
         _child: &crate::durability::WorkflowRun,
     ) -> Result<(), WorkflowHostError> {
         Err(WorkflowHostError::SessionTreeUnavailable)
@@ -219,7 +220,7 @@ impl WorkflowHost for SqliteWorkflowHost {
         let txn = roundhouse_store::begin_immediate(conn)?;
         let result = self
             .session_tree
-            .persist_child_session(&txn, child)
+            .persist_child_session(&txn, parent, child)
             .and_then(|()| {
                 crate::durability::insert_workflow_run_in_transaction(&txn, child)
                     .map_err(WorkflowHostError::from)

@@ -115,11 +115,44 @@ fn session_spec_carries_requested_tier_and_on_degrade() {
         name: Some("s".into()),
         requested_tier: Tier::Container,
         on_degrade: OnDegrade::AllowDownTo(Tier::Sandbox),
+        parent: None,
     };
     let json = serde_json::to_string(&spec).unwrap();
     let back: SessionSpec = serde_json::from_str(&json).unwrap();
     assert_eq!(back.requested_tier, Tier::Container);
     assert_eq!(back.on_degrade, OnDegrade::AllowDownTo(Tier::Sandbox));
+}
+
+// ── SessionSpec: parent (durable spawn-tree linkage) ─────────────────────
+
+#[test]
+fn session_spec_parent_round_trips_through_json() {
+    let parent_id = roundhouse_core::SessionId::new();
+    let spec = SessionSpec {
+        workspace: roundhouse_core::WorkspaceId::new(),
+        name: Some("child".into()),
+        requested_tier: Tier::Sandbox,
+        on_degrade: OnDegrade::Refuse,
+        parent: Some(parent_id),
+    };
+    let json = serde_json::to_string(&spec).unwrap();
+    let back: SessionSpec = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.parent, Some(parent_id));
+}
+
+#[test]
+fn session_spec_deserializes_legacy_json_missing_parent_field_as_none() {
+    // Simulates a `SessionCreated` event serialized before `SessionSpec` grew
+    // a `parent` field (Phase 8 L5 Task 2) — it must still deserialize,
+    // defaulting the missing field to `None`, rather than failing to parse.
+    let legacy_json = r#"{
+        "workspace": "00000000-0000-0000-0000-000000000001",
+        "name": null,
+        "requested_tier": "Sandbox",
+        "on_degrade": "Refuse"
+    }"#;
+    let spec: SessionSpec = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(spec.parent, None);
 }
 
 #[test]

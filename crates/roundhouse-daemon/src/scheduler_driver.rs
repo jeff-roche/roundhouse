@@ -1521,6 +1521,7 @@ impl DeliveryExecutor {
             // the one this driver takes.
             requested_tier: Tier::Sandbox,
             on_degrade: OnDegrade::Refuse,
+            parent: None,
         };
         // Fix round 3: `create_headless_session` bounds its OWN construction
         // now (against the identical wedged-MCP-server / hung-isolation-probe
@@ -1723,6 +1724,7 @@ impl DeliveryExecutor {
             name: Some(workspace.name.clone()),
             requested_tier: Tier::Sandbox,
             on_degrade: OnDegrade::Refuse,
+            parent: None,
         };
 
         *session = Some(

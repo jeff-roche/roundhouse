@@ -162,10 +162,15 @@ pub trait SessionTree: Send {
     /// Releases a slot when durable child admission does not commit.
     fn release_child(&mut self, parent: SessionId, child: SessionId);
 
-    /// Appends the child SessionCreated lifecycle event into `txn`.
+    /// Appends the child SessionCreated lifecycle event into `txn`. `parent`
+    /// is the actual calling session (durable spawn-tree linkage,
+    /// `SessionSpec::parent`) — implementors must record it on the child's
+    /// spec themselves, never substitute a stored template spec's own
+    /// `parent` field.
     fn persist_child_session(
         &mut self,
         txn: &rusqlite::Transaction<'_>,
+        parent: SessionId,
         child: &WorkflowRun,
     ) -> Result<(), WorkflowHostError>;
 

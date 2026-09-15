@@ -18,6 +18,14 @@ pub struct SessionSpec {
     pub requested_tier: crate::tier::Tier,
     /// §6.5 — what to do if `requested_tier` can't be honored.
     pub on_degrade: OnDegrade,
+    /// Durable spawn-tree edge: the parent session that created this one, if
+    /// any. `None` for a root session (socket-attached or scheduler-driven).
+    /// Set by the code path that creates a child session (workflow `call:`
+    /// today; the sub-agent `agent` tool in a later phase). `#[serde(default)]`
+    /// so `SessionCreated` events serialized before this field existed still
+    /// deserialize, defaulting to `None` rather than failing to parse.
+    #[serde(default)]
+    pub parent: Option<crate::ids::SessionId>,
 }
 
 impl SessionSpec {
@@ -30,6 +38,7 @@ impl SessionSpec {
             name: None,
             requested_tier: crate::tier::Tier::Sandbox,
             on_degrade: OnDegrade::Refuse,
+            parent: None,
         }
     }
 
@@ -43,6 +52,7 @@ impl SessionSpec {
             name: None,
             requested_tier: tier,
             on_degrade,
+            parent: None,
         }
     }
 }

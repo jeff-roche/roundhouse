@@ -188,11 +188,17 @@ pub fn agent_spawn(
     // inheriting the parent's (possibly higher) tier automatically — the same "never
     // exceed the parent's grant" half of §6.1's spawn-boundary rule, applied to
     // isolation rather than credentials/budget.
+    // `parent: None` here is mechanical, not a design choice: this task
+    // (Phase 8 L5 #2) only wires the one durable-parent behavioral change its
+    // brief specifies (`WorkflowSessionTree::persist_child_session`). Wiring
+    // the real sub-agent `agent` tool — including setting `parent:
+    // Some(input.parent)` here — is Task 3 of the same plan.
     let session_spec = SessionSpec {
         workspace: input.workspace,
         name: Some(handle.clone()),
         requested_tier: Tier::Sandbox,
         on_degrade: OnDegrade::Refuse,
+        parent: None,
     };
 
     // §7.5: "agent_spawn auto-joins the child to the parent's team as `worker` unless

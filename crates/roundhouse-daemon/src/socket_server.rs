@@ -1777,6 +1777,7 @@ async fn construct_real_session_bounded(
             name: Some(workspace_name),
             requested_tier: roundhouse_core::Tier::Sandbox,
             on_degrade: construction_resources.default_on_degrade,
+            parent: None,
         };
         let outcome = session_bootstrap::create_real_session(
             &construction_resources,
