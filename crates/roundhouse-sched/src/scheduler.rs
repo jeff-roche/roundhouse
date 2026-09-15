@@ -1,25 +1,28 @@
-//! Monotonic-timer min-heap scheduler with drift detection.
+//! Wall-clock-only min-heap scheduler.
 //!
-//! Phase 5, Subsystem A, Task 3. Consumes `Binding` (Task 1) and
-//! `next_fire_after`/`fire_all_ambiguous`/`is_ambiguous_local` (Task 2); its
-//! `SchedulerEvent`s are consumed by the `trigger_event` persistence/dedupe
-//! task (Task 4) and the overlap-policy admission task (Task 5). See
-//! `docs/architecture/05-scheduling-and-workflows.md`.
+//! Phase 5, Subsystem A, Task 3 (revised by the Phase 8 rebuild — see
+//! `docs/architecture/05-scheduling-and-workflows.md` §8.2 "Clocks"). Consumes
+//! `Binding` (Task 1) and `next_fire_after`/`fire_all_ambiguous`/
+//! `is_ambiguous_local` (Task 2); its `SchedulerEvent`s are consumed by the
+//! `trigger_event` persistence/dedupe task (Task 4) and the overlap-policy
+//! admission task (Task 5).
 //!
-//! **Monotonic vs. wall clock, and why both are read every tick.** A
-//! scheduler that only reads the wall clock cannot tell "the wall clock
-//! jumped" from "time actually passed" — an NTP step, a manual clock change,
-//! or a suspend/resume cycle all move `Utc::now()` without any real time
-//! having elapsed on the machine's monotonic counter. [`ClockSource`]
-//! exposes both readings so [`Scheduler::tick`] can compare how much time
-//! *actually* passed (`tokio::time::Instant`, monotonic, immune to wall-clock
-//! adjustments) against how much the wall clock *reports* passed
-//! (`DateTime<Utc>`). When the two disagree by more than [`DRIFT_THRESHOLD`],
-//! that is drift — not "usually about on time" — and it is measured, not
-//! assumed: a full recompute is forced from the new wall-clock reading
-//! rather than trusting the heap's already-computed fire times, any of which
-//! could now be stale (in the past, or wildly in the future) relative to
-//! wall-clock reality.
+//! **Wall clock only — no monotonic comparison.** An earlier version of this
+//! scheduler also read a monotonic clock and treated any disagreement
+//! between it and the wall clock beyond a small threshold as "drift,"
+//! discarding the entire pending backlog via [`recompute_all`](Scheduler::recompute_all)
+//! regardless of whether the wall clock had moved forward or backward. That
+//! conflated two very different situations: an ordinary forward tick (or an
+//! NTP step that merely nudges the wall clock ahead) with a genuine backward
+//! clock correction. The former has no missed backlog to discard — it should
+//! simply drain like any other tick — so treating it as drift silently
+//! dropped real, legitimately-scheduled backlog for no reason. Only a wall
+//! clock reading that moves *backward* relative to the previous one this
+//! scheduler observed is genuinely ambiguous (every already-heaped fire time
+//! could now be stale, in the past relative to itself); that case alone
+//! forces a full [`recompute_all`](Scheduler::recompute_all). Any forward (or
+//! unchanged) reading, however large the jump, drains through
+//! [`drain_due`](Scheduler::drain_due) exactly as an ordinary tick would.
 use crate::cron::{fire_all_ambiguous, is_ambiguous_local, next_fire_after, CronError};
 use crate::store::{catch_up_policy, compute_catch_up};
 use crate::trigger::{Binding, CatchUp, DstAmbiguous, TriggerSpec};
@@ -27,46 +30,41 @@ use chrono::{DateTime, Utc};
 use roundhouse_core::BindingId;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::Duration;
-use tokio::time::Instant;
 
-/// Test-injectable source of both the monotonic and wall clocks. Production
-/// code uses [`SystemClock`]; tests use a fake whose two readings can be
-/// advanced independently of each other, so drift is reproduced
-/// deterministically rather than by sleeping and hoping.
+/// Test-injectable source of the wall clock. Production code uses
+/// [`SystemClock`]; tests use a fake whose reading can be set directly, so
+/// forward and backward wall-clock steps are reproduced deterministically
+/// rather than by sleeping and hoping.
 pub trait ClockSource {
-    fn monotonic_now(&self) -> Instant;
     fn wall_now(&self) -> DateTime<Utc>;
 }
 
-/// The real clock: `tokio::time::Instant::now()` for the monotonic reading
-/// (unaffected by wall-clock adjustments) and `Utc::now()` for wall time.
+/// The real clock: `Utc::now()` for wall time.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemClock;
 
 impl ClockSource for SystemClock {
-    fn monotonic_now(&self) -> Instant {
-        Instant::now()
-    }
     fn wall_now(&self) -> DateTime<Utc> {
         Utc::now()
     }
 }
 
+/// One scheduled occurrence a [`SchedulerEvent::Fire`] reports. `is_catch_up`
+/// is the same `is_catch_up_pass` boolean [`Scheduler::drain_due`] already
+/// computes internally to decide which `CatchUp` reduction to apply — making
+/// it available here means a caller building a `TriggerEvent` downstream no
+/// longer has to guess catch-up status itself.
 #[derive(Debug, Clone, PartialEq)]
-pub enum SchedulerEvent {
-    Fire(BindingId, DateTime<Utc>),
-    DriftDetected {
-        monotonic_elapsed: Duration,
-        wall_elapsed: Duration,
-    },
+pub struct ScheduledOccurrence {
+    pub binding_id: BindingId,
+    pub scheduled_for: DateTime<Utc>,
+    pub is_catch_up: bool,
 }
 
-/// Beyond this much disagreement between the monotonic and wall-clock
-/// readings since the previous tick, the wall clock is considered to have
-/// stepped (NTP correction, manual change, suspend/resume) rather than
-/// merely to have ticked normally, and every binding is recomputed from
-/// scratch against the new wall-clock reading.
-const DRIFT_THRESHOLD: Duration = Duration::from_secs(2);
+#[derive(Debug, Clone, PartialEq)]
+pub enum SchedulerEvent {
+    Fire(ScheduledOccurrence),
+}
 
 /// M5: hard ceiling on how many missed occurrences a single binding's
 /// catch-up pass considers in one `tick()` call. Without this, a binding
@@ -143,13 +141,13 @@ impl PartialOrd for HeapEntry {
     }
 }
 
-/// The monotonic min-heap scheduler. Holds every registered [`Binding`] plus
-/// a heap of their upcoming fire instants, and on each [`tick`](Self::tick)
-/// pops whatever is now due and detects monotonic-vs-wall-clock drift.
+/// The wall-clock-only min-heap scheduler. Holds every registered
+/// [`Binding`] plus a heap of their upcoming fire instants, and on each
+/// [`tick`](Self::tick) pops whatever is now due, recomputing from scratch
+/// only if the wall clock has stepped backward since the last reading.
 pub struct Scheduler {
     bindings: HashMap<BindingId, Binding>,
     heap: BinaryHeap<HeapEntry>,
-    last_mono: Option<Instant>,
     last_wall: Option<DateTime<Utc>>,
     /// Fix round 1 (M2, security review of Task 6): a binding whose backlog
     /// spans more than one capped `drain_due` batch needs its `CatchUp`
@@ -186,30 +184,66 @@ impl Scheduler {
         Scheduler {
             bindings: HashMap::new(),
             heap: BinaryHeap::new(),
-            last_mono: None,
             last_wall: None,
             catch_up_progress: HashMap::new(),
         }
     }
 
     /// Registers `binding`, computing and scheduling its next occurrence(s)
-    /// (plural for a `DstAmbiguous::Both` fold) from the current wall clock.
+    /// (plural for a `DstAmbiguous::Both` fold) from the point its schedule
+    /// last got to: its own `last_fired_for` when it has one, and the current
+    /// wall clock when it does not.
+    ///
+    /// # Why `last_fired_for` is the baseline, not always the wall clock
+    ///
+    /// A binding arriving here with `last_fired_for: Some(_)` is a *restored*
+    /// binding — one whose fire cursor was persisted (`trigger_binding_cursor`)
+    /// and read back at daemon boot. Seeding it from `clock.wall_now()`, as
+    /// this originally did, silently discards every occurrence between that
+    /// cursor and boot: a daemon down across a binding's scheduled instants
+    /// would schedule forward from boot and never revisit them. The scheduler's
+    /// catch-up machinery covered a late *tick* within one process's life but
+    /// nothing covered a gap *between* processes, and nothing reported the
+    /// loss either.
+    ///
+    /// Seeding from `last_fired_for` instead makes that gap an ordinary
+    /// backlog, which [`drain_due`](Self::drain_due) already handles
+    /// correctly and boundedly on the very first [`tick`](Self::tick) after
+    /// boot: capped at `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK` per
+    /// binding per call, reduced by the binding's own [`CatchUp`] policy
+    /// (`Latest` collapses the whole window to one fire, `None` drops it,
+    /// `All` drains progressively across calls), and deduped downstream on
+    /// `(binding_id, scheduled_for)`. This is deliberately a reuse of that
+    /// existing, reviewed machinery rather than a second catch-up path —
+    /// nothing about a between-process gap makes it different in kind from a
+    /// tick that simply ran late.
+    ///
+    /// A fresh binding (`last_fired_for: None` — everything `Binding::new`
+    /// and `Binding::new_cron` construct) is unaffected: it still seeds from
+    /// `clock.wall_now()`, exactly as before.
+    ///
+    /// `last_wall` is still established from the real `clock`, never from
+    /// `last_fired_for`: it is this scheduler's backward-*step* baseline, a
+    /// statement about the clock rather than about any binding's schedule.
+    /// Anchoring it to a restored cursor in the past would make the first
+    /// genuine `tick` look like a large forward jump rather than an ordinary
+    /// reading.
     pub fn add_binding(
         &mut self,
         mut binding: Binding,
         clock: &dyn ClockSource,
     ) -> Result<(), CronError> {
-        // Establish the drift baseline from the first clock reading this
-        // scheduler ever sees, so that a *single* subsequent `tick` can
-        // already detect drift relative to it. Without this, a scheduler
-        // that has never ticked would have no baseline to compare against
-        // on its very first tick and would silently skip drift detection
-        // for it.
-        if self.last_mono.is_none() {
-            self.last_mono = Some(clock.monotonic_now());
+        // Establish the wall-clock baseline from the first reading this
+        // scheduler ever sees, so that a *single* subsequent `tick` (or
+        // `catch_up_after_wake`) can already detect a backward step relative
+        // to it. Without this, a scheduler that has never ticked would have
+        // no baseline to compare against on its very first call and would
+        // silently skip backward-step detection for it.
+        if self.last_wall.is_none() {
             self.last_wall = Some(clock.wall_now());
         }
-        let instants = Self::occurrences_after(&binding, clock.wall_now())?;
+        let after = binding.last_fired_for.unwrap_or_else(|| clock.wall_now());
+        let instants = Self::occurrences_after(&binding, after)?;
         Self::push_occurrences(&mut self.heap, &mut binding, &instants);
         self.bindings.insert(binding.id, binding);
         Ok(())
@@ -307,9 +341,11 @@ impl Scheduler {
     }
 
     /// Recomputes every binding's next occurrence(s) from `after`, replacing
-    /// the heap outright. Called on drift detection, where every
-    /// already-heaped fire time is potentially stale relative to the new
-    /// wall-clock reading.
+    /// the heap outright. Called only when the wall clock has been observed
+    /// to step *backward* relative to the last reading this scheduler saw —
+    /// at that point every already-heaped fire time is potentially stale
+    /// (computed against a wall clock that has since been corrected
+    /// backward), so nothing in the old heap can be trusted as-is.
     ///
     /// Fix round 2 (Low, security review of Task 6): also clears
     /// `catch_up_progress`. The heap replacement above already abandons
@@ -322,19 +358,19 @@ impl Scheduler {
     /// genuinely ordinary firing under `CatchUp::None`.
     ///
     /// This clear makes `CatchUp::Latest` and `CatchUp::All` deliberately
-    /// diverge for a binding caught mid-backlog when drift hits: under
-    /// `All`, every batch already fired *before* the drift check ran stays
-    /// fired (`drain_due` fires `All`'s batches immediately, unconditionally
-    /// — nothing to undo), so only the not-yet-processed tail of the
-    /// backlog is discarded. Under `Latest`, nothing in the pending
-    /// backlog had fired yet (its whole point is to defer until
+    /// diverge for a binding caught mid-backlog when a backward step hits:
+    /// under `All`, every batch already fired *before* the step was observed
+    /// stays fired (`drain_due` fires `All`'s batches immediately,
+    /// unconditionally — nothing to undo), so only the not-yet-processed
+    /// tail of the backlog is discarded. Under `Latest`, nothing in the
+    /// pending backlog had fired yet (its whole point is to defer until
     /// `backlog_exhausted`), so clearing the carried "latest seen so far"
-    /// here discards the *entire* missed window for that binding — the
-    /// next occurrence it reports is simply whatever's next after `after`,
-    /// with no representation of anything from before the drift at all.
-    /// Both are defensible readings of "recompute discards the backlog";
-    /// this is `Latest`'s, recorded here so a future reader does not
-    /// rediscover the asymmetry as a bug.
+    /// here discards the *entire* missed window for that binding — the next
+    /// occurrence it reports is simply whatever's next after `after`, with
+    /// no representation of anything from before the step at all. Both are
+    /// defensible readings of "recompute discards the backlog"; this is
+    /// `Latest`'s, recorded here so a future reader does not rediscover the
+    /// asymmetry as a bug.
     pub fn recompute_all(&mut self, after: DateTime<Utc>) {
         let mut new_heap = BinaryHeap::new();
         for binding in self.bindings.values_mut() {
@@ -346,148 +382,94 @@ impl Scheduler {
         self.catch_up_progress.clear();
     }
 
-    /// One scheduler tick: measures monotonic-vs-wall-clock drift since the
-    /// previous tick, then pops and fires whatever is now due. Returns the
-    /// events produced, in order (a `DriftDetected` event first, if drift
-    /// was found, since it implies a full recompute happened before any
-    /// firing decisions were made).
-    pub fn tick(&mut self, clock: &dyn ClockSource) -> Vec<SchedulerEvent> {
-        let mut events = Vec::new();
-        let now_mono = clock.monotonic_now();
-        let now_wall = clock.wall_now();
+    /// Shared reconciliation policy for [`tick`](Self::tick) and
+    /// [`catch_up_after_wake`](Self::catch_up_after_wake): a wall-clock
+    /// reading that has stepped *backward* relative to the last one this
+    /// scheduler observed is unambiguous evidence the clock was corrected —
+    /// every already-heaped fire time could now be stale relative to itself,
+    /// so the whole schedule is recomputed from scratch via
+    /// [`recompute_all`](Self::recompute_all) and nothing drains this call.
+    /// Any forward (or unchanged) reading, however large the jump, is not
+    /// drift at all — it is simply time having passed (or an NTP step
+    /// nudging the wall clock ahead) — and drains normally through
+    /// [`drain_due`](Self::drain_due). `last_wall` is updated unconditionally
+    /// either way, establishing the baseline the *next* call compares
+    /// against.
+    fn reconcile(&mut self, now_wall: DateTime<Utc>) -> Vec<SchedulerEvent> {
+        let backward_step = self.last_wall.is_some_and(|last_wall| now_wall < last_wall);
 
-        if let (Some(last_mono), Some(last_wall)) = (self.last_mono, self.last_wall) {
-            // Real drift measurement, not an approximation: compare how much
-            // time the monotonic clock says passed against how much the
-            // wall clock says passed, in signed arithmetic throughout, so a
-            // *backward* wall-clock step (e.g. an NTP correction after a
-            // suspend/resume cycle overshoots) is detected exactly as
-            // reliably as a forward one. A naive unsigned
-            // `(now_wall - last_wall).to_std().unwrap_or_default()` would
-            // silently collapse a negative wall delta to zero and miss
-            // backward steps entirely.
-            let mono_elapsed = now_mono.duration_since(last_mono);
-            let wall_elapsed_signed = now_wall - last_wall;
-            let mono_elapsed_signed = chrono::Duration::from_std(mono_elapsed)
-                .unwrap_or_else(|_| chrono::Duration::zero());
-            let disagreement = (wall_elapsed_signed - mono_elapsed_signed).abs();
+        let events = if backward_step {
+            self.recompute_all(now_wall);
+            Vec::new()
+        } else {
+            self.drain_due(now_wall)
+        };
 
-            if disagreement.to_std().unwrap_or(Duration::ZERO) > DRIFT_THRESHOLD {
-                events.push(SchedulerEvent::DriftDetected {
-                    monotonic_elapsed: mono_elapsed,
-                    wall_elapsed: wall_elapsed_signed.abs().to_std().unwrap_or(Duration::ZERO),
-                });
-                self.recompute_all(now_wall);
-            }
-        }
-        self.last_mono = Some(now_mono);
         self.last_wall = Some(now_wall);
-
-        events.extend(self.drain_due(now_wall));
         events
     }
 
-    /// Task 6 (§8.7): wake-from-suspend handling. Unlike the drift-triggered
-    /// path inside [`tick`](Self::tick) — which calls
-    /// [`recompute_all`](Self::recompute_all) and thereby *discards* every
-    /// occurrence a binding missed, rescheduling only its next future one —
-    /// a real suspend/resume must not silently drop the backlog that
-    /// accumulated while the machine was asleep, nor flood the caller with
-    /// an unbounded burst of catch-up fires. `recompute_all` is correct for
-    /// an ordinary clock step (an NTP correction with no real backlog to
-    /// speak of) but exactly wrong for this case.
-    ///
-    /// This reuses [`drain_due`](Self::drain_due) — the *same*
-    /// per-binding-capped, `CatchUp`-policy-aware machinery `tick` already
-    /// applies to a binding that merely falls behind between ordinary
-    /// ticks — against the heap exactly as it stood before the sleep. Every
-    /// already-heaped fire time remains a valid absolute UTC instant
-    /// regardless of how long the process was suspended, so it is a
-    /// perfectly good seed for `drain_due`'s missed-occurrence walk; nothing
-    /// needs to be recomputed from scratch. A backlog beyond
+    /// One scheduler tick: reconciles against the current wall clock (see
+    /// [`reconcile`](Self::reconcile) for the forward-drains/backward-recomputes
+    /// policy), then returns whatever events that produced.
+    pub fn tick(&mut self, clock: &dyn ClockSource) -> Vec<SchedulerEvent> {
+        let now_wall = clock.wall_now();
+        self.reconcile(now_wall)
+    }
+
+    /// Task 6 (§8.7): wake-from-suspend handling. A real suspend/resume must
+    /// not silently drop the backlog that accumulated while the machine was
+    /// asleep, nor flood the caller with an unbounded burst of catch-up
+    /// fires — so this drives the exact same [`reconcile`](Self::reconcile)
+    /// policy [`tick`](Self::tick) uses: a forward wall-clock reading (the
+    /// overwhelmingly common real case — an actual suspend/resume) drains
+    /// through [`drain_due`](Self::drain_due) — the *same* per-binding-capped,
+    /// `CatchUp`-policy-aware machinery `tick` already applies to a binding
+    /// that merely falls behind between ordinary ticks — against the heap
+    /// exactly as it stood before the sleep. Every already-heaped fire time
+    /// remains a valid absolute UTC instant regardless of how long the
+    /// process was suspended, so it is a perfectly good seed for
+    /// `drain_due`'s missed-occurrence walk; nothing needs to be recomputed
+    /// from scratch. A backlog beyond
     /// `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK` per binding drains
     /// progressively across successive calls (a wake event, then the
     /// daemon's own regular `tick` calls), exactly as it would for any other
     /// capped catch-up pass.
     ///
-    /// `monotonic_now`/`wall_now` are both taken explicitly — not read
-    /// internally via a `ClockSource` — so the caller's choice of which
-    /// clock backs which value is visible at the call site. They reset this
-    /// scheduler's drift baseline exactly as an ordinary `tick` would,
-    /// so the very next `tick` call measures drift from *this* wake instant
-    /// forward and does not re-report the already-handled sleep gap as
-    /// fresh drift.
-    ///
     /// Fix round 1 (M1, security review of Task 6): a *backward* wall-clock
-    /// reading here — the same "NTP correction after suspend/resume
-    /// overshoots" scenario `tick`'s own drift check exists to catch (see
-    /// its doc comment above) — is not a backlog to drain. If `wall_now` is
-    /// earlier than the last wall-clock reading this scheduler saw, every
+    /// reading here — an NTP correction after a suspend/resume cycle
+    /// overshooting — is not a backlog to drain. If `wall_now` is earlier
+    /// than the last wall-clock reading this scheduler saw, every
     /// already-heaped fire time is now further in the future than it was,
-    /// not overdue, so `drain_due` would find nothing to do; worse, this
-    /// call's own baseline reset would then suppress `tick`'s drift
-    /// detection from ever catching the anomaly afterwards, since the next
-    /// `tick` would measure elapsed time from this already-corrupted
-    /// baseline forward. A backward step beyond `DRIFT_THRESHOLD` instead
-    /// falls back to [`recompute_all`](Self::recompute_all) — exactly what
-    /// `tick` does for any drift beyond that threshold — so the schedule is
-    /// re-anchored to the corrected clock rather than left silently
-    /// unreconciled. A forward step (the overwhelmingly common real case —
-    /// an actual suspend/resume) drains as documented above.
+    /// not overdue, so `drain_due` would find nothing to do; worse, updating
+    /// the baseline to this earlier reading without also recomputing would
+    /// leave the schedule anchored to a stale, since-corrected clock. A
+    /// backward step instead falls back to
+    /// [`recompute_all`](Self::recompute_all) — exactly what `tick` does for
+    /// a backward step — so the schedule is re-anchored to the corrected
+    /// clock rather than left silently unreconciled. A forward step drains
+    /// as documented above.
     ///
-    /// Fix round 2 (optional item, security review of Task 6): the backward
-    /// case emits a [`SchedulerEvent::DriftDetected`] just as `tick`'s own
-    /// drift-triggered `recompute_all` does, with the same field semantics
-    /// (elapsed monotonic and absolute wall time since this scheduler's
-    /// previous reading). Without it, a caller watching the event stream
-    /// alone (rather than logs) cannot distinguish "woke, found nothing due"
-    /// from "woke, but the wall clock reading itself was corrected" — only
-    /// the `tracing::warn!` recorded the difference.
+    /// `wall_now` is taken as an explicit parameter — not read internally
+    /// via a `ClockSource` — so the caller's own choice of when to sample
+    /// the clock (typically immediately on waking) is visible at the call
+    /// site. It resets this scheduler's backward-step baseline exactly as an
+    /// ordinary `tick` would, so the very next `tick` call compares against
+    /// *this* wake instant forward rather than re-evaluating the
+    /// already-handled sleep gap.
     #[must_use]
-    pub fn catch_up_after_wake(
-        &mut self,
-        monotonic_now: Instant,
-        wall_now: DateTime<Utc>,
-    ) -> Vec<SchedulerEvent> {
-        let backward_step = self.last_wall.and_then(|last_wall| {
-            (last_wall - wall_now)
-                .to_std()
-                .ok()
-                .filter(|backward| *backward > DRIFT_THRESHOLD)
-        });
-        let previous_mono = self.last_mono;
-
-        self.last_mono = Some(monotonic_now);
-        self.last_wall = Some(wall_now);
-
-        if let Some(wall_elapsed) = backward_step {
-            tracing::warn!(
-                "wake reported a wall clock reading earlier than the last one this scheduler \
-                 saw (beyond the drift threshold); treating as a clock correction, not a \
-                 catch-up backlog, and forcing a full recompute instead of draining"
-            );
-            self.recompute_all(wall_now);
-            let monotonic_elapsed = previous_mono
-                .map(|last_mono| monotonic_now.duration_since(last_mono))
-                .unwrap_or(Duration::ZERO);
-            vec![SchedulerEvent::DriftDetected {
-                monotonic_elapsed,
-                wall_elapsed,
-            }]
-        } else {
-            self.drain_due(wall_now)
-        }
+    pub fn catch_up_after_wake(&mut self, wall_now: DateTime<Utc>) -> Vec<SchedulerEvent> {
+        self.reconcile(wall_now)
     }
 
     /// Pops and fires whatever in the heap is now due (`fire_at <=
     /// now_wall`), applying each binding's `CatchUp` policy to any backlog
     /// found and capping the work done per binding to
-    /// `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK` (M5). Shared by
-    /// [`tick`](Self::tick) (called after its own drift check) and
-    /// [`catch_up_after_wake`](Self::catch_up_after_wake) (called directly,
-    /// with no drift check or heap replacement first) — the two differ only
-    /// in what happens *before* this runs, not in how the actual draining
-    /// and catch-up capping works.
+    /// `MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK` (M5). Reached from
+    /// [`reconcile`](Self::reconcile) — shared by [`tick`](Self::tick) and
+    /// [`catch_up_after_wake`](Self::catch_up_after_wake) — only on a forward
+    /// (or unchanged) wall-clock reading; a backward reading takes
+    /// `recompute_all` instead and never reaches here.
     fn drain_due(&mut self, now_wall: DateTime<Utc>) -> Vec<SchedulerEvent> {
         let mut events = Vec::new();
 
@@ -514,8 +496,13 @@ impl Scheduler {
                 // The earlier instant of a `DstAmbiguous::Both` fold
                 // (Ruling P16): always fires exactly once and never
                 // accumulates catch-up backlog — the later instant is what
-                // advances the schedule.
-                events.push(SchedulerEvent::Fire(entry.binding_id, entry.fire_at));
+                // advances the schedule. Never a catch-up fire in its own
+                // right.
+                events.push(SchedulerEvent::Fire(ScheduledOccurrence {
+                    binding_id: entry.binding_id,
+                    scheduled_for: entry.fire_at,
+                    is_catch_up: false,
+                }));
                 if let Some(binding) = self.bindings.get_mut(&entry.binding_id) {
                     binding.last_fired_for = Some(entry.fire_at);
                 }
@@ -641,7 +628,11 @@ impl Scheduler {
             if is_catch_up_pass {
                 if matches!(catch_up_policy(binding), None | Some(CatchUp::All)) {
                     for fire_at in &missed {
-                        events.push(SchedulerEvent::Fire(entry.binding_id, *fire_at));
+                        events.push(SchedulerEvent::Fire(ScheduledOccurrence {
+                            binding_id: entry.binding_id,
+                            scheduled_for: *fire_at,
+                            is_catch_up: true,
+                        }));
                     }
                 } else {
                     let batch_latest = compute_catch_up(binding, missed.clone()).into_iter().max();
@@ -656,7 +647,11 @@ impl Scheduler {
                     };
                     if backlog_exhausted {
                         if let Some(fire_at) = combined_latest {
-                            events.push(SchedulerEvent::Fire(entry.binding_id, fire_at));
+                            events.push(SchedulerEvent::Fire(ScheduledOccurrence {
+                                binding_id: entry.binding_id,
+                                scheduled_for: fire_at,
+                                is_catch_up: true,
+                            }));
                         }
                         self.catch_up_progress.remove(&entry.binding_id);
                     } else {
@@ -666,7 +661,11 @@ impl Scheduler {
                 }
             } else {
                 for fire_at in &missed {
-                    events.push(SchedulerEvent::Fire(entry.binding_id, *fire_at));
+                    events.push(SchedulerEvent::Fire(ScheduledOccurrence {
+                        binding_id: entry.binding_id,
+                        scheduled_for: *fire_at,
+                        is_catch_up: false,
+                    }));
                 }
             }
             binding.last_fired_for = missed.last().copied();

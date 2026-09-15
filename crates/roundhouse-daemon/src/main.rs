@@ -174,6 +174,31 @@ fn parse_workspace_registration(raw: &str) -> Result<WorkspaceRegistration, Stri
 /// only a `'static` place can.
 static HANDLES: std::sync::OnceLock<EngineHandles> = std::sync::OnceLock::new();
 
+/// The background services this daemon actually runs (Phase 8, L3, Task 5).
+///
+/// The `scheduler` slot is no longer empty: `scheduler_driver::run` loads the
+/// enabled `trigger_binding` rows at boot and drives a one-second heartbeat
+/// that feeds every occurrence the scheduler fires through
+/// `roundhouse_sched::store::accept_occurrence`. `workflow` and `acp` remain
+/// `None` — they belong to lanes that have not supplied a factory yet, and an
+/// empty slot is the documented seam for that, not a bug to fill in here.
+///
+/// Every service is a plain `fn(BackgroundServiceContext) -> future`, captures
+/// nothing, and reads whatever it needs (the store, the session registry, the
+/// daemon's `DaemonResources`) off the context it is handed. It has to be that
+/// way around: `DaemonResources` owns the `BackgroundServices` value this
+/// function returns, so this function runs strictly *before* any
+/// `Arc<DaemonResources>` exists to capture.
+fn background_services() -> roundhouse_daemon::session_bootstrap::BackgroundServices {
+    roundhouse_daemon::session_bootstrap::BackgroundServices {
+        workflow: None,
+        scheduler: Some(Arc::new(|context| {
+            Box::pin(roundhouse_daemon::scheduler_driver::run(context))
+        })),
+        acp: None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
@@ -545,7 +570,7 @@ async fn main() -> color_eyre::Result<()> {
         network_config,
         default_on_degrade,
         policy_rules,
-        roundhouse_daemon::session_bootstrap::BackgroundServices::default(),
+        background_services(),
         runner,
         provider,
         request_ctx,
@@ -557,7 +582,11 @@ async fn main() -> color_eyre::Result<()> {
     let registry = Arc::new(SessionRegistry::new());
     let mut background_services = resources
         .background_services
-        .start(resources.store.clone(), Arc::clone(&registry))
+        .start(
+            resources.store.clone(),
+            Arc::clone(&registry),
+            Arc::clone(&resources),
+        )
         .await
         .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
 

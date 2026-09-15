@@ -3661,6 +3661,7 @@ name = "roundhouse-daemon"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "clap",
  "color-eyre",
  "futures",
@@ -3867,7 +3868,6 @@ dependencies = [
  "cron",
  "roundhouse-bus",
  "roundhouse-core",
- "roundhouse-engine",
  "roundhouse-sched",
  "roundhouse-store",
  "rusqlite",

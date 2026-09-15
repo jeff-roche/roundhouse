@@ -41,7 +41,7 @@ pub trait PowerEvents {
 /// Its absence does not weaken correctness: [`run_power_watch`] treats this
 /// source as an optimization, not a correctness dependency. A missed (or,
 /// today, entirely absent) `PrepareForSleep` signal just means the wake is
-/// instead caught by the scheduler's own monotonic-vs-wall drift check on
+/// instead caught by the scheduler's own backward-wall-clock-step check on
 /// its next ordinary `tick` — slower to react, but not silently wrong — so
 /// `cargo test` never depends on a live logind/D-Bus session, which would
 /// make the suite machine-dependent (absent on other platforms, in
@@ -118,12 +118,11 @@ pub enum PowerWatchEvent {
     /// through) — the drain that produced them already happened and is not
     /// repeatable; an event dropped here is gone.
     ///
-    /// "Every `SchedulerEvent`" is not "every `Fire`": since fix round 2's
-    /// `DriftDetected` symmetry on the backward-wall-clock-step path, this
-    /// `Vec` can also contain a `DriftDetected` entry instead of (never
-    /// alongside) `Fire`s. A consumer that treats `drained.len()` as a
-    /// fire/catch-up count, rather than filtering for
-    /// `SchedulerEvent::Fire` specifically, will be wrong on that path.
+    /// This `Vec` can be empty: a backward wall-clock step observed at wake
+    /// routes `catch_up_after_wake` through a full `recompute_all` (see that
+    /// method's doc comment), which never itself produces a `Fire` — so
+    /// "woke, nothing fired" covers both "nothing was due yet" and "the
+    /// clock was corrected backward and the schedule was re-anchored."
     Woke(Vec<SchedulerEvent>),
 }
 
@@ -155,15 +154,12 @@ pub trait PowerWatchSink {
 /// it does not mean every in-flight call is safe to blindly resend; see
 /// that trait's doc comment before implementing it.
 ///
-/// Both clock readings are taken explicitly at the point of use, not routed
-/// through a single ambiguous "now": `monotonic_now` only resets the
-/// scheduler's drift baseline (so the *next* ordinary `tick` does not
-/// re-report this same sleep gap as fresh drift — see
-/// [`Scheduler::catch_up_after_wake`]'s doc comment), while `wall_now` is
-/// what the catch-up drain actually measures "how much was missed" against.
-/// Conflating the two would either misreport a wake as drift or
-/// (`monotonic_now` is expected to barely advance across a real suspend,
-/// unlike `wall_now`) under-measure how much was actually missed.
+/// `wall_now` is read once, at the point of use, and passed straight through
+/// to [`Scheduler::catch_up_after_wake`]: it is both what the catch-up drain
+/// measures "how much was missed" against and what resets the scheduler's
+/// backward-step baseline, so the *next* ordinary `tick` compares against
+/// this wake instant forward rather than re-evaluating the already-handled
+/// sleep gap.
 pub async fn run_power_watch(
     sched: Arc<Mutex<Scheduler>>,
     clock: Arc<dyn ClockSource + Send + Sync>,
@@ -183,7 +179,6 @@ pub async fn run_power_watch(
                 tracing::info!(
                     "system woke; draining any missed-occurrence backlog and marking in-flight provider calls retryable"
                 );
-                let monotonic_now = clock.monotonic_now();
                 let wall_now = clock.wall_now();
                 let (mut sched_guard, sched_was_poisoned) = lock_or_recover(&sched, "scheduler");
                 if sched_was_poisoned {
@@ -221,7 +216,7 @@ pub async fn run_power_watch(
                     // clean lock and drains normally again.
                     sched.clear_poison();
                 }
-                let drained = sched_guard.catch_up_after_wake(monotonic_now, wall_now);
+                let drained = sched_guard.catch_up_after_wake(wall_now);
                 drop(sched_guard);
                 sink.accept(PowerWatchEvent::Woke(drained));
                 let (mut retryable_guard, retryable_was_poisoned) =

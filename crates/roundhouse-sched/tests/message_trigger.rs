@@ -96,6 +96,7 @@ async fn a_message_send_to_the_bound_handle_fires_the_trigger_end_to_end() {
         fired_at: now,
         is_catch_up: false,
         session_id: None,
+        outcome: None,
     };
     assert!(record_trigger_event(&mut conn, &ev).unwrap());
 }

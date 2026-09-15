@@ -559,6 +559,195 @@ BEGIN
 END;
 "#;
 
+/// Phase 8, Task 2 of the trigger-delivery rebuild: durable binding
+/// registration and the delivery outbox. Before this migration, a `Binding`
+/// (`roundhouse-sched`'s in-memory type) lived only in the scheduler's own
+/// `HashMap` and vanished on daemon restart — every enabled trigger had to be
+/// re-registered from scratch, and there was nowhere durable to persist an
+/// admission decision or a delivery's lifecycle. This migration adds the
+/// three tables that make both durable, plus one column recording what
+/// admission actually decided for a `trigger_event` row.
+///
+/// # `trigger_binding` — the durable registry
+///
+/// `binding_id` TEXT PK (a `BindingId`'s UUID text), `workspace_id` and
+/// `job_id` TEXT NOT NULL (the trusted workspace identity and the job this
+/// binding starts), `spec_json`/`overlap_json` TEXT NOT NULL (the
+/// `TriggerSpec`/`OverlapPolicy` serialized verbatim — no column-per-variant
+/// shredding, matching how `job_versions.template_json`/`body_json` store
+/// their own typed payloads as opaque JSON elsewhere in this file),
+/// `enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))` (SQLite has no native
+/// boolean; `STRICT` still requires an explicit domain, hence the CHECK —
+/// same shape as `workflow_step_run.output_is_secret_derived` in migration
+/// 0007), `created_at INTEGER NOT NULL` (unix nanos, matching
+/// `roundhouse_core::Timestamp::as_unix_nanos()` and every timestamp column
+/// from migration 0007 onward — deliberately **not** `trigger_event`'s older
+/// RFC3339-text convention, which predates that switch).
+///
+/// **This table is mutable, unlike every other identity/registry table in
+/// this file.** `jobs`/`job_versions` (migration 0009) and `workspaces`
+/// (migration 0010) are immutable by design and enforce it with
+/// `BEFORE UPDATE`/`BEFORE DELETE` triggers that `RAISE(ABORT, ...)`. A
+/// `trigger_binding` row is different: enable/disable/delete are real,
+/// planned lifecycle operations on a binding (a later task), so adding those
+/// same triggers here would be a house-convention error dressed up as a
+/// house-convention match — this table intentionally carries no such
+/// triggers.
+///
+/// No `FOREIGN KEY` on `workspace_id`/`job_id`: as migration 0007's own
+/// comment establishes, no connection in this workspace sets `PRAGMA
+/// foreign_keys = ON` (`pool.rs` sets only `journal_mode`/`synchronous`/
+/// `busy_timeout`/`secure_delete`), so declaring one would record an
+/// intention SQLite never enforces. Both are documented references, checked
+/// by the application.
+///
+/// # `trigger_binding_cursor` — the persisted fire-cursor
+///
+/// Deliberately its own table rather than columns on `trigger_binding`, so
+/// that editing a binding's spec/overlap/enabled state never has to touch
+/// cursor state and vice versa. `binding_id` TEXT PK, `last_fired_for
+/// INTEGER` nullable unix-nanos (`NULL` means "never fired" — the honest
+/// reading for a freshly-registered binding, not a sentinel like `0`).
+///
+/// There is deliberately **no** `next_fire_at` column: the plan requires the
+/// scheduler to recompute its own min-heap from `last_fired_for` at boot
+/// rather than trust a stored next-fire instant, which could otherwise go
+/// stale across a binding-spec edit or a timezone/DST rule change between
+/// restarts.
+///
+/// # `trigger_delivery` — the delivery outbox
+///
+/// One row per admitted (or queued, or otherwise decided) occurrence that
+/// became — or may yet become — a run. `delivery_id` TEXT PK (a UUID string
+/// minted by the writer, not an `INTEGER PRIMARY KEY AUTOINCREMENT`, so a
+/// delivery's identity is stable before it is ever inserted).
+/// `trigger_event_id INTEGER NOT NULL` conceptually references
+/// `trigger_event.id` (an `INTEGER PRIMARY KEY AUTOINCREMENT`, migration
+/// 0006) but carries no SQL `FOREIGN KEY`, for the same no-enforcement
+/// reason given above for `trigger_binding`. `binding_id TEXT NOT NULL` is
+/// likewise a documented, unenforced reference to `trigger_binding`.
+///
+/// `state TEXT NOT NULL` carries a `CHECK` enumerating all nine states this
+/// delivery can ever occupy, even though Task 3 (the next task in this
+/// rebuild) only writes a subset of them at first:
+/// `'ready', 'leased', 'reserved', 'running', 'delivered', 'failed',
+/// 'cancellation_requested', 'cancelled', 'skipped'`. This is the same
+/// "shape now, behaviour later" doctrine migration 0007's own comment states
+/// for `workflow_step_run.state`'s `'skipped'` variant: SQLite has no
+/// `ALTER TABLE ... DROP/MODIFY CONSTRAINT`, so a `CHECK` that omitted a
+/// state some later task needs would force that task to rebuild this table
+/// via the 12-step create-copy-drop-rename dance instead of just writing a
+/// new value into an already-declared vocabulary.
+///
+/// `attempts INTEGER NOT NULL DEFAULT 0` — zero is the *exact* value for a
+/// delivery that has not yet been attempted, not a stand-in for "unknown",
+/// so a real default is correct here (matching migration 0008's accumulator
+/// columns, not its nullable-with-no-default ones). Every other nullable
+/// column below carries **no** default, per this codebase's nullability
+/// doctrine (see migration 0008's own "which columns are nullable, and why
+/// that is the fail-closed direction" section): `lease_expires_at INTEGER`
+/// (unix nanos; `NULL` until a claim leases this delivery), `run_id TEXT`
+/// (`NULL` until a run is actually started for this delivery — kept as a raw
+/// string rather than `roundhouse_flow::RunId`, since `roundhouse-sched`
+/// must not depend on `roundhouse-flow`), `session_id TEXT` (`NULL` until a
+/// session exists for it), `last_error TEXT` (`NULL` while nothing has
+/// failed).
+///
+/// `created_at`/`updated_at INTEGER NOT NULL` are both unix nanos, matching
+/// every other timestamp column in this file from migration 0007 onward.
+///
+/// ## Indexes
+///
+/// - `trigger_delivery_run_id_idx`: `UNIQUE INDEX ... (run_id) WHERE run_id
+///   IS NOT NULL`. Serves two purposes at once: it is the lookup a caller
+///   uses to go from a `run_id` back to the delivery that started it, and it
+///   is the enforcement that two deliveries can never claim the same run —
+///   partial because the overwhelming majority of rows have no run yet, and
+///   `NULL <> NULL` in SQLite's uniqueness comparison already lets any number
+///   of not-yet-started deliveries coexist without the `WHERE` clause, but
+///   the partial form keeps the index itself small (matching
+///   `workflow_run_binding_idx`'s and `blobs_gc_eligible_idx`'s existing
+///   partial-index style in this file).
+/// - `trigger_delivery_session_id_idx`: the same shape, for `session_id`, for
+///   the same reason — the lookup from a session back to its delivery, plus
+///   the same one-delivery-per-session enforcement.
+/// - `trigger_delivery_claim_idx`: `(state, lease_expires_at) WHERE state IN
+///   ('ready', 'leased')`. Serves the claim query a delivery worker runs to
+///   find the next deliverable row (and, for an already-`leased` row, to find
+///   one whose lease has expired and can be reclaimed) without scanning
+///   `delivered`/`failed`/`cancelled`/`skipped` history that can never be an
+///   answer to that query — the same "partial index over the rows a
+///   recurring query can actually match" reasoning as
+///   `workflow_run_parked_idx`'s reaper index in migration 0008.
+///
+/// # `trigger_event.outcome`
+///
+/// `ALTER TABLE trigger_event ADD COLUMN outcome TEXT CHECK (outcome IS NULL
+/// OR outcome IN (...))` — a per-column `CHECK` inside `ADD COLUMN`, which is
+/// real `ADD COLUMN` syntax (ruling P104; see migration 0008's own extended
+/// comment on why `ALTER TABLE ... ADD CONSTRAINT` is never used instead).
+/// Nullable with no default: a `trigger_event` row can exist before its
+/// outcome is decided (the row is inserted by `record_trigger_event` at fire
+/// time; admission runs afterward), and every row that existed before this
+/// migration ran never recorded one at all — both are the honest "not yet
+/// known" case, not a value to default away.
+///
+/// The vocabulary mirrors `roundhouse_sched::admission::AdmissionDecision`'s
+/// six variants exactly, lower-cased to snake_case and stripped of their
+/// carried data (`QueueAt(u32)`'s position, `SkippedQueueFull { depth }`'s
+/// depth) since this column records *which kind* of decision was made, not
+/// its parameters: `'admitted'`, `'skipped_due_to_overlap'`, `'queued'`,
+/// `'cancelled_previous_and_admitted'`, `'skipped_queue_full'`,
+/// `'skipped_cancellation_unconfirmed'`. See
+/// `roundhouse_sched::trigger::TriggerEventOutcome` for the paired Rust enum
+/// and its `as_sql_str`/`from_sql_str`.
+const MIGRATION_0013_TRIGGER_BINDINGS_AND_DELIVERIES: &str = r#"
+CREATE TABLE trigger_binding (
+    binding_id   TEXT NOT NULL PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    job_id       TEXT NOT NULL,
+    spec_json    TEXT NOT NULL,
+    overlap_json TEXT NOT NULL,
+    enabled      INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    created_at   INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE trigger_binding_cursor (
+    binding_id     TEXT NOT NULL PRIMARY KEY,
+    last_fired_for INTEGER
+) STRICT;
+
+CREATE TABLE trigger_delivery (
+    delivery_id       TEXT NOT NULL PRIMARY KEY,
+    trigger_event_id  INTEGER NOT NULL,
+    binding_id        TEXT NOT NULL,
+    state             TEXT NOT NULL CHECK (state IN (
+        'ready', 'leased', 'reserved', 'running', 'delivered', 'failed',
+        'cancellation_requested', 'cancelled', 'skipped'
+    )),
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    lease_expires_at  INTEGER,
+    run_id            TEXT,
+    session_id        TEXT,
+    last_error        TEXT,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+) STRICT;
+
+CREATE UNIQUE INDEX trigger_delivery_run_id_idx
+    ON trigger_delivery (run_id) WHERE run_id IS NOT NULL;
+CREATE UNIQUE INDEX trigger_delivery_session_id_idx
+    ON trigger_delivery (session_id) WHERE session_id IS NOT NULL;
+CREATE INDEX trigger_delivery_claim_idx
+    ON trigger_delivery (state, lease_expires_at) WHERE state IN ('ready', 'leased');
+
+ALTER TABLE trigger_event ADD COLUMN outcome TEXT CHECK (outcome IS NULL OR outcome IN (
+    'admitted', 'skipped_due_to_overlap', 'queued',
+    'cancelled_previous_and_admitted', 'skipped_queue_full',
+    'skipped_cancellation_unconfirmed'
+));
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_0001_INITIAL_SCHEMA),
@@ -573,5 +762,6 @@ pub fn migrations() -> Migrations<'static> {
         M::up(MIGRATION_0010_WORKSPACES),
         M::up("ALTER TABLE workflow_run ADD COLUMN checkpoint_ref TEXT;"),
         M::up("ALTER TABLE workflow_run ADD COLUMN checkpoint_blob_ref TEXT;"),
+        M::up(MIGRATION_0013_TRIGGER_BINDINGS_AND_DELIVERIES),
     ])
 }

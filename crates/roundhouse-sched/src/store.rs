@@ -1,13 +1,23 @@
-//! `trigger_event` persistence: catch-up policy application and idempotency
-//! dedupe (Phase 5, Subsystem A, Task 4). See
+//! `trigger_event`/`trigger_delivery` persistence: catch-up policy
+//! application, idempotency dedupe (Phase 5, Subsystem A, Task 4), and —
+//! Phase 8, Task 3 of the trigger-delivery rebuild — the durable
+//! `accept_occurrence` acceptance path plus the `trigger_delivery` outbox's
+//! predecessor-constrained lifecycle transitions. See
 //! `docs/architecture/05-scheduling-and-workflows.md` and Ruling P4 (the
-//! `trigger_event` table itself lives in `roundhouse_store::migrations`, not
-//! a per-crate migration file — this module only reads/writes it).
-use crate::trigger::{Binding, CatchUp, TriggerEvent, TriggerSpec};
+//! `trigger_event`/`trigger_binding`/`trigger_binding_cursor`/
+//! `trigger_delivery` tables themselves live in `roundhouse_store::migrations`,
+//! not a per-crate migration file — this module only reads/writes them).
+use crate::admission::{decide_admission, AdmissionDecision, RegistryError, RunRegistry};
+use crate::delivery::{DeliveryError, DeliveryState, TriggerDelivery};
+use crate::scheduler::ScheduledOccurrence;
+use crate::trigger::{
+    Binding, CatchUp, StoredBinding, TriggerError, TriggerEvent, TriggerEventOutcome, TriggerSpec,
+};
 use chrono::{DateTime, Utc};
-use roundhouse_core::BindingId;
-use rusqlite::{params, Connection};
+use roundhouse_core::{BindingId, SessionId, Timestamp};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -19,6 +29,41 @@ pub enum StoreError {
     /// `trigger_event` table's rows without limit.
     #[error("idempotency key is {len} bytes, exceeds the {max}-byte cap")]
     IdempotencyKeyTooLong { len: usize, max: usize },
+    /// Task 3, `accept_occurrence` step 1: the caller handed in a
+    /// `StoredBinding`/`ScheduledOccurrence` pair that don't name the same
+    /// binding. Checked *before* opening a transaction — see
+    /// [`accept_occurrence`]'s own doc comment for why this can never be a
+    /// database-observable error.
+    #[error(
+        "occurrence names binding {occurrence_binding_id}, but the supplied binding is \
+         {binding_id}; refusing to touch the database"
+    )]
+    BindingIdentityMismatch {
+        binding_id: BindingId,
+        occurrence_binding_id: BindingId,
+    },
+    /// A `TEXT` id column (`binding_id`/`session_id`) held a value that does
+    /// not parse as a UUID. Mirrors
+    /// `roundhouse_flow::durability::DurabilityError::MalformedId`'s shape —
+    /// a hand-edited or corrupted row must be refused, not silently coerced.
+    #[error("column {column} holds a value that is not a valid UUID: {source}")]
+    MalformedId {
+        column: &'static str,
+        #[source]
+        source: uuid::Error,
+    },
+    /// A numeric column held a value outside the Rust-side type's domain
+    /// (e.g. `trigger_delivery.attempts` not fitting in a `u32`). Refused
+    /// rather than silently clamped, matching this column's own read-back
+    /// discipline elsewhere in the codebase.
+    #[error("column {column} holds out-of-range value {value}")]
+    OutOfRange { column: &'static str, value: i64 },
+    #[error(transparent)]
+    Delivery(#[from] DeliveryError),
+    #[error(transparent)]
+    TriggerOutcome(#[from] TriggerError),
+    #[error(transparent)]
+    Admission(#[from] RegistryError),
 }
 
 /// The binding's configured `CatchUp` policy, or `None` for a non-cron
@@ -74,28 +119,27 @@ pub fn occurrence_key(binding_id: BindingId, scheduled_for: DateTime<Utc>) -> St
 /// pathological key can't grow a `trigger_event` row without limit.
 pub const MAX_IDEMPOTENCY_KEY_LEN: usize = 512;
 
-/// Inserts a `TriggerEvent`. Returns `Ok(true)` if this was a new firing,
-/// `Ok(false)` if `(binding_id, idempotency_key)` already existed (a dedupe
-/// hit — the caller must NOT start a run for a deduped event).
+/// The composable core of the `trigger_event` insert — executes the same
+/// `INSERT ... ON CONFLICT DO NOTHING` against an already-open `&Transaction`
+/// instead of owning its own `begin_immediate`/commit, so it can be called
+/// both from [`record_trigger_event`]'s self-contained transaction and from
+/// [`accept_occurrence`]'s larger one (Task 3 brief step 3: "do not call the
+/// existing `record_trigger_event` directly from inside your transaction —
+/// it owns its own `begin_immediate`/commit and can't be composed into a
+/// shared transaction").
 ///
-/// Deviation from the plan text: the plan's code block did a `SELECT`
-/// existence check, then `INSERT`, wrapped in hand-rolled `BEGIN
-/// IMMEDIATE`/`COMMIT`/`ROLLBACK` SQL strings. That races under concurrent
-/// callers (two writers can both pass the `SELECT` before either commits its
-/// `INSERT`) and violates the project's one hand-rolled-transaction
-/// convention. This implementation instead relies on the real
-/// `trigger_event_dedupe` UNIQUE index via `INSERT ... ON CONFLICT DO
-/// NOTHING` — exactly what the task's own Interfaces section specifies —
-/// through `roundhouse_store::begin_immediate` for the `BEGIN IMMEDIATE`
-/// write transaction (Ruling P4).
-pub fn record_trigger_event(conn: &mut Connection, ev: &TriggerEvent) -> Result<bool, StoreError> {
+/// Returns `Some(trigger_event.id)` for a newly inserted row, `None` for a
+/// dedupe hit (`(binding_id, idempotency_key)` already existed).
+fn insert_trigger_event_in_txn(
+    txn: &Transaction<'_>,
+    ev: &TriggerEvent,
+) -> Result<Option<i64>, StoreError> {
     if ev.idempotency_key.len() > MAX_IDEMPOTENCY_KEY_LEN {
         return Err(StoreError::IdempotencyKeyTooLong {
             len: ev.idempotency_key.len(),
             max: MAX_IDEMPOTENCY_KEY_LEN,
         });
     }
-    let txn = roundhouse_store::begin_immediate(conn)?;
     let rows_changed = txn.execute(
         "INSERT INTO trigger_event
             (binding_id, idempotency_key, scheduled_for, fired_at, is_catch_up, session_id)
@@ -110,8 +154,877 @@ pub fn record_trigger_event(conn: &mut Connection, ev: &TriggerEvent) -> Result<
             ev.session_id.map(|s| s.to_string()),
         ],
     )?;
+    if rows_changed > 0 {
+        Ok(Some(txn.last_insert_rowid()))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Inserts a `TriggerEvent`. Returns `Ok(true)` if this was a new firing,
+/// `Ok(false)` if `(binding_id, idempotency_key)` already existed (a dedupe
+/// hit — the caller must NOT start a run for a deduped event).
+///
+/// Deviation from the plan text: the plan's code block did a `SELECT`
+/// existence check, then `INSERT`, wrapped in hand-rolled `BEGIN
+/// IMMEDIATE`/`COMMIT`/`ROLLBACK` SQL strings. That races under concurrent
+/// callers (two writers can both pass the `SELECT` before either commits its
+/// `INSERT`) and violates the project's one hand-rolled-transaction
+/// convention. This implementation instead relies on the real
+/// `trigger_event_dedupe` UNIQUE index via `INSERT ... ON CONFLICT DO
+/// NOTHING` — exactly what the task's own Interfaces section specifies —
+/// through `roundhouse_store::begin_immediate` for the `BEGIN IMMEDIATE`
+/// write transaction (Ruling P4).
+///
+/// Task 3: the actual `INSERT` now lives in [`insert_trigger_event_in_txn`],
+/// so this function is a thin, self-contained-transaction wrapper around it —
+/// kept for existing callers (and for any caller that only needs the dedupe
+/// insert, not the fuller `accept_occurrence` acceptance path).
+pub fn record_trigger_event(conn: &mut Connection, ev: &TriggerEvent) -> Result<bool, StoreError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    let inserted = insert_trigger_event_in_txn(&txn, ev)?;
     txn.commit()?;
-    Ok(rows_changed > 0)
+    Ok(inserted.is_some())
+}
+
+/// What `AdmissionDecision` variant, if any, admits a new `trigger_delivery`
+/// row into existence. `SkipDueToOverlap`/`SkippedQueueFull`/
+/// `SkippedCancellationUnconfirmed` never create one — the occurrence is
+/// durably recorded (the `trigger_event` row, with its `outcome`) but never
+/// becomes a delivery.
+fn decision_creates_delivery(decision: AdmissionDecision) -> bool {
+    matches!(
+        decision,
+        AdmissionDecision::Admit
+            | AdmissionDecision::QueueAt(_)
+            | AdmissionDecision::CancelledPreviousAndAdmit
+    )
+}
+
+/// The durable, `CHECK`-vocabulary-matching sibling of one
+/// `AdmissionDecision`, stripped of any carried data — see
+/// [`TriggerEventOutcome`]'s own doc comment for why (a `CHECK` column can't
+/// hold `QueueAt`'s position or `SkippedQueueFull`'s depth; that data is an
+/// in-memory admission concern, not something this durable row needs to
+/// answer "what kind of decision was this").
+fn outcome_for_decision(decision: AdmissionDecision) -> TriggerEventOutcome {
+    match decision {
+        AdmissionDecision::Admit => TriggerEventOutcome::Admitted,
+        AdmissionDecision::SkipDueToOverlap => TriggerEventOutcome::SkippedDueToOverlap,
+        AdmissionDecision::QueueAt(_) => TriggerEventOutcome::Queued,
+        AdmissionDecision::CancelledPreviousAndAdmit => {
+            TriggerEventOutcome::CancelledPreviousAndAdmitted
+        }
+        AdmissionDecision::SkippedQueueFull { .. } => TriggerEventOutcome::SkippedQueueFull,
+        AdmissionDecision::SkippedCancellationUnconfirmed => {
+            TriggerEventOutcome::SkippedCancellationUnconfirmed
+        }
+    }
+}
+
+/// `DateTime<Utc>` -> `Timestamp` (unix nanos). Mirrors `cron.rs`'s
+/// `deterministic_jitter`'s own `timestamp_nanos_opt().unwrap_or(0)`
+/// fallback — the only way this can fail is a `DateTime` outside
+/// `chrono`'s representable nanosecond range (year ~1677-2262), which no
+/// real scheduled occurrence ever is.
+fn timestamp_from_datetime(dt: DateTime<Utc>) -> Timestamp {
+    Timestamp::from_unix_nanos(dt.timestamp_nanos_opt().unwrap_or(0))
+}
+
+fn parse_binding_id(s: &str, column: &'static str) -> Result<BindingId, StoreError> {
+    Uuid::parse_str(s)
+        .map(BindingId::from_uuid)
+        .map_err(|source| StoreError::MalformedId { column, source })
+}
+
+fn parse_session_id(s: &str, column: &'static str) -> Result<SessionId, StoreError> {
+    Uuid::parse_str(s)
+        .map(SessionId::from_uuid)
+        .map_err(|source| StoreError::MalformedId { column, source })
+}
+
+/// Raw column values for one `trigger_delivery` row, read inside a
+/// `rusqlite` row-mapping closure (which must return `rusqlite::Result`, so
+/// the fallible `BindingId`/`SessionId`/`DeliveryState` decoding happens
+/// afterward, in [`decode_delivery_row`]).
+struct RawDeliveryRow {
+    delivery_id: String,
+    trigger_event_id: i64,
+    binding_id: String,
+    state: String,
+    attempts: i64,
+    lease_expires_at: Option<i64>,
+    run_id: Option<String>,
+    session_id: Option<String>,
+    last_error: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+const DELIVERY_COLUMNS: &str = "delivery_id, trigger_event_id, binding_id, state, attempts, \
+     lease_expires_at, run_id, session_id, last_error, created_at, updated_at";
+
+fn map_delivery_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawDeliveryRow> {
+    Ok(RawDeliveryRow {
+        delivery_id: row.get(0)?,
+        trigger_event_id: row.get(1)?,
+        binding_id: row.get(2)?,
+        state: row.get(3)?,
+        attempts: row.get(4)?,
+        lease_expires_at: row.get(5)?,
+        run_id: row.get(6)?,
+        session_id: row.get(7)?,
+        last_error: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn decode_delivery_row(raw: RawDeliveryRow) -> Result<TriggerDelivery, StoreError> {
+    let attempts = u32::try_from(raw.attempts).map_err(|_| StoreError::OutOfRange {
+        column: "trigger_delivery.attempts",
+        value: raw.attempts,
+    })?;
+    Ok(TriggerDelivery {
+        delivery_id: raw.delivery_id,
+        trigger_event_id: raw.trigger_event_id,
+        binding_id: parse_binding_id(&raw.binding_id, "trigger_delivery.binding_id")?,
+        state: DeliveryState::from_sql_str(&raw.state)?,
+        attempts,
+        lease_expires_at: raw.lease_expires_at.map(Timestamp::from_unix_nanos),
+        run_id: raw.run_id,
+        session_id: raw
+            .session_id
+            .as_deref()
+            .map(|s| parse_session_id(s, "trigger_delivery.session_id"))
+            .transpose()?,
+        last_error: raw.last_error,
+        created_at: Timestamp::from_unix_nanos(raw.created_at),
+        updated_at: Timestamp::from_unix_nanos(raw.updated_at),
+    })
+}
+
+fn insert_delivery_in_txn(txn: &Transaction<'_>, d: &TriggerDelivery) -> Result<(), StoreError> {
+    txn.execute(
+        "INSERT INTO trigger_delivery
+            (delivery_id, trigger_event_id, binding_id, state, attempts,
+             lease_expires_at, run_id, session_id, last_error, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            d.delivery_id,
+            d.trigger_event_id,
+            d.binding_id.to_string(),
+            d.state.as_sql_str(),
+            d.attempts,
+            d.lease_expires_at.map(|t| t.as_unix_nanos()),
+            d.run_id,
+            d.session_id.map(|s| s.to_string()),
+            d.last_error,
+            d.created_at.as_unix_nanos(),
+            d.updated_at.as_unix_nanos(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn select_delivery_by_trigger_event_id_in_txn(
+    txn: &Transaction<'_>,
+    trigger_event_id: i64,
+) -> Result<Option<TriggerDelivery>, StoreError> {
+    let raw = txn
+        .query_row(
+            &format!("SELECT {DELIVERY_COLUMNS} FROM trigger_delivery WHERE trigger_event_id = ?1"),
+            params![trigger_event_id],
+            map_delivery_row,
+        )
+        .optional()?;
+    raw.map(decode_delivery_row).transpose()
+}
+
+/// The previous non-terminal delivery for `binding_id`, most recent by
+/// `created_at` — the one an `AdmissionDecision::CancelledPreviousAndAdmit`
+/// decision needs to request cancellation on. "Non-terminal" excludes
+/// `delivered`, `failed`, `cancelled`, `skipped` — a delivery already in one
+/// of those states has nothing left to cancel.
+fn select_latest_nonterminal_delivery_for_binding_in_txn(
+    txn: &Transaction<'_>,
+    binding_id: BindingId,
+) -> Result<Option<TriggerDelivery>, StoreError> {
+    let raw = txn
+        .query_row(
+            &format!(
+                "SELECT {DELIVERY_COLUMNS} FROM trigger_delivery
+                 WHERE binding_id = ?1
+                   AND state NOT IN ('delivered', 'failed', 'cancelled', 'skipped')
+                 ORDER BY created_at DESC, delivery_id DESC
+                 LIMIT 1"
+            ),
+            params![binding_id.to_string()],
+            map_delivery_row,
+        )
+        .optional()?;
+    raw.map(decode_delivery_row).transpose()
+}
+
+/// Reads one `trigger_delivery` row by its id — a plain read, not wrapped in
+/// its own `begin_immediate` (a single `SELECT` needs no write-transaction
+/// snapshot of its own). Exposed `pub` for callers (and this module's own
+/// tests) that need to inspect a delivery's current state after calling one
+/// of the lifecycle transitions below.
+pub fn fetch_delivery(
+    conn: &Connection,
+    delivery_id: &str,
+) -> Result<Option<TriggerDelivery>, StoreError> {
+    let raw = conn
+        .query_row(
+            &format!("SELECT {DELIVERY_COLUMNS} FROM trigger_delivery WHERE delivery_id = ?1"),
+            params![delivery_id],
+            map_delivery_row,
+        )
+        .optional()?;
+    raw.map(decode_delivery_row).transpose()
+}
+
+/// The durable [`TriggerEventOutcome`] recorded on one `trigger_event` row.
+///
+/// `None` covers both "no such row" and "the row exists but has no outcome
+/// yet" — the latter is the crash window `accept_occurrence` documents
+/// (recorded the event, then died before deciding admission). The two are not
+/// distinguished because no caller can act differently on them: neither
+/// licenses assuming an admission decision that may never have been made.
+///
+/// **Why a delivery's executor needs this.** `decide_admission` charges an
+/// `Admit` to [`RunRegistry::note_admitted`] but a `QueueAt` to
+/// [`RunRegistry::note_queued`] — and *both* create a `ready`
+/// `trigger_delivery` row. A claimer that assumed every claimable delivery
+/// holds an *active* slot would answer a queued one's completion with
+/// `note_finished`, underflowing `active` while leaving `queued` stuck at its
+/// pre-claim value forever. This is how the claimer tells the two apart so it
+/// can promote a queued delivery ([`RunRegistry::note_promoted`]) before it
+/// finishes one.
+pub fn fetch_trigger_event_outcome(
+    conn: &Connection,
+    trigger_event_id: i64,
+) -> Result<Option<TriggerEventOutcome>, StoreError> {
+    let outcome: Option<Option<String>> = conn
+        .query_row(
+            "SELECT outcome FROM trigger_event WHERE id = ?1",
+            params![trigger_event_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    outcome
+        .flatten()
+        .map(|text| TriggerEventOutcome::from_sql_str(&text))
+        .transpose()
+        .map_err(StoreError::from)
+}
+
+/// Every currently-`ready` delivery, oldest first, capped at `limit`.
+///
+/// This is the claim loop's discovery query: a delivery is claimable exactly
+/// while it is `ready`, so every other state is excluded by the `WHERE`
+/// clause rather than filtered afterwards. Ordering is FIFO by `created_at`
+/// with `delivery_id` as the tie-break — several occurrences accepted on one
+/// scheduler tick share a `created_at` (it is that tick's single `fired_at`
+/// reading), so `created_at` alone would leave their relative order up to
+/// SQLite rather than fixed.
+///
+/// A plain read, not wrapped in its own `begin_immediate` — the same
+/// judgement [`fetch_delivery`] makes. **Reading a row here is not claiming
+/// it**: the caller must still win [`lease_delivery`]'s
+/// predecessor-constrained `ready -> leased` transition, which is what makes
+/// a concurrent second reader of the same row a safe no-op.
+pub fn list_ready_deliveries(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<TriggerDelivery>, StoreError> {
+    // A `usize` above `i64::MAX` cannot describe a real backlog; clamping is
+    // the only sane reading of it, and it keeps this from being a fallible
+    // conversion the caller has to think about.
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare(&format!(
+        "SELECT {DELIVERY_COLUMNS} FROM trigger_delivery
+         WHERE state = 'ready'
+         ORDER BY created_at ASC, delivery_id ASC
+         LIMIT ?1"
+    ))?;
+    let rows = statement.query_map(params![limit], map_delivery_row)?;
+    let mut deliveries = Vec::new();
+    for raw in rows {
+        deliveries.push(decode_delivery_row(raw?)?);
+    }
+    Ok(deliveries)
+}
+
+/// Every delivery currently in one of `states`, oldest first — Task 7's
+/// restart-recovery boot pass reads through this, once, over what should be a
+/// small table: unlike [`list_ready_deliveries`] this is not a hot per-tick
+/// claim query, so it takes no `limit`.
+///
+/// Modelled directly on [`list_ready_deliveries`] (same [`DELIVERY_COLUMNS`]/
+/// [`map_delivery_row`]/[`decode_delivery_row`] reuse, the same "plain read,
+/// not its own `begin_immediate`" judgement, and the same
+/// `created_at ASC, delivery_id ASC` tie-break for determinism), generalized
+/// from a single hard-coded `state = 'ready'` to an arbitrary set of states.
+///
+/// `states` is bound through parameter placeholders, never string-
+/// interpolated into the `IN (...)` list — [`DeliveryState::as_sql_str`]
+/// values are trusted constants either way, but this matches this file's
+/// existing parameterization style regardless. An empty `states` slice short-
+/// circuits to an empty result without touching the connection at all (SQL's
+/// own `IN ()` is a syntax error, not an empty match).
+pub fn list_deliveries_in_states(
+    conn: &Connection,
+    states: &[DeliveryState],
+) -> Result<Vec<TriggerDelivery>, StoreError> {
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = states.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT {DELIVERY_COLUMNS} FROM trigger_delivery
+         WHERE state IN ({placeholders})
+         ORDER BY created_at ASC, delivery_id ASC"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let bound = states.iter().map(|s| s.as_sql_str());
+    let rows = statement.query_map(params_from_iter(bound), map_delivery_row)?;
+    let mut deliveries = Vec::new();
+    for raw in rows {
+        deliveries.push(decode_delivery_row(raw?)?);
+    }
+    Ok(deliveries)
+}
+
+fn advance_cursor_in_txn(
+    txn: &Transaction<'_>,
+    binding_id: BindingId,
+    scheduled_for: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    let nanos = timestamp_from_datetime(scheduled_for).as_unix_nanos();
+    // Task 3 step 6: the occurrence happened regardless of admission outcome
+    // (a `Skip`ped occurrence still consumed its scheduled instant), so the
+    // cursor always advances — but only forward. The `WHERE` clause on the
+    // `DO UPDATE` is the guard: an out-of-order/replayed occurrence whose
+    // `scheduled_for` predates what is already stored must never regress it.
+    txn.execute(
+        "INSERT INTO trigger_binding_cursor (binding_id, last_fired_for)
+         VALUES (?1, ?2)
+         ON CONFLICT(binding_id) DO UPDATE SET last_fired_for = excluded.last_fired_for
+         WHERE trigger_binding_cursor.last_fired_for IS NULL
+            OR excluded.last_fired_for > trigger_binding_cursor.last_fired_for",
+        params![binding_id.to_string(), nanos],
+    )?;
+    Ok(())
+}
+
+/// Requests cancellation of `delivery_id`, predecessor-constrained on
+/// `expected` — the state the caller last observed it in. Returns whether
+/// the request actually applied; a lost race (the delivery already moved to
+/// some other state before this ran) is `Ok(false)`, never an error.
+///
+/// **This — and nothing else in this crate — is as far as
+/// `OverlapPolicy::CancelPrevious` goes here.** It records
+/// `cancellation_requested` and stops; it never marks a delivery terminal
+/// (`cancelled`/`failed`). The daemon (a later task) calls
+/// `roundhouse_flow::control::cancel` and, once that confirms, completes the
+/// cancellation by transitioning the delivery the rest of the way.
+fn request_cancellation_in_txn(
+    txn: &Transaction<'_>,
+    delivery_id: &str,
+    expected: DeliveryState,
+    now: Timestamp,
+) -> Result<bool, StoreError> {
+    let rows = txn.execute(
+        "UPDATE trigger_delivery
+         SET state = 'cancellation_requested', updated_at = ?1
+         WHERE delivery_id = ?2 AND state = ?3",
+        params![now.as_unix_nanos(), delivery_id, expected.as_sql_str()],
+    )?;
+    Ok(rows > 0)
+}
+
+/// `pub` wrapper around [`request_cancellation_in_txn`], for a caller outside
+/// `accept_occurrence` that needs to request cancellation of a specific
+/// delivery (e.g. a future manual-cancel API) with its own transaction.
+pub fn request_cancellation(
+    conn: &mut Connection,
+    delivery_id: &str,
+    expected: DeliveryState,
+    now: Timestamp,
+) -> Result<bool, StoreError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    let applied = request_cancellation_in_txn(&txn, delivery_id, expected, now)?;
+    txn.commit()?;
+    Ok(applied)
+}
+
+/// What `accept_occurrence` decided for one already-durable `trigger_event`
+/// row, and (for a `New` acceptance) the `trigger_delivery` row it may have
+/// created.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Acceptance {
+    /// This occurrence's `(binding_id, idempotency_key)` had never been seen
+    /// before: `decide_admission` ran, its outcome was persisted onto the
+    /// `trigger_event` row, and (for `Admit`/`QueueAt`/
+    /// `CancelledPreviousAndAdmit`) a new `trigger_delivery` row was created.
+    New {
+        trigger_event_id: i64,
+        decision: AdmissionDecision,
+        outcome: TriggerEventOutcome,
+        delivery: Option<TriggerDelivery>,
+    },
+    /// This occurrence's `(binding_id, idempotency_key)` already had a
+    /// `trigger_event` row (a re-fire of the same occurrence, e.g. after a
+    /// crash-and-retry). No fresh `AdmissionDecision` was made — the
+    /// existing row's already-decided `outcome` (or `None`, if the process
+    /// crashed between recording the event and deciding admission for it)
+    /// and any existing `trigger_delivery` are returned as-is.
+    Duplicate {
+        trigger_event_id: i64,
+        outcome: Option<TriggerEventOutcome>,
+        delivery: Option<TriggerDelivery>,
+    },
+}
+
+/// Accepts one scheduler-emitted [`ScheduledOccurrence`] of `binding`: durably
+/// records the `trigger_event` (idempotent — a repeat of the same occurrence
+/// is a no-op that returns the original decision, never a fresh one), runs
+/// `decide_admission` against `registry` exactly once per genuinely-new
+/// occurrence, persists that decision's [`TriggerEventOutcome`], creates the
+/// `trigger_delivery` row an admitting decision implies, requests
+/// cancellation of the previous delivery for `OverlapPolicy::CancelPrevious`,
+/// and advances `binding`'s fire-cursor — all inside one
+/// `roundhouse_store::begin_immediate` transaction.
+///
+/// # Why this owns its transaction
+///
+/// Per §5.3 trap #2 (see `roundhouse_store::txn::begin_immediate`'s own doc
+/// comment): a caller-supplied *deferred* transaction that later issues a
+/// write returns `SQLITE_BUSY_SNAPSHOT`, for which SQLite's busy handler is
+/// never invoked — so this function must open its own `BEGIN IMMEDIATE`
+/// rather than accept one from a caller who might have opened it deferred.
+///
+/// # Identity check
+///
+/// `binding.binding.id` and `occurrence.binding_id` naming different
+/// bindings is a caller bug, not a database state to reconcile — checked
+/// before any statement runs (not even inside a transaction), so a
+/// mismatched call can never partially write anything.
+///
+/// # Compensating a mid-transaction failure (Final-review fix round 1,
+/// Important 3)
+///
+/// `decide_admission` mutates `registry` (`note_admitted`/`note_queued`) —
+/// per `admission.rs`'s own documented contract — *before this function
+/// returns*, not transactionally with anything below it. Several more
+/// fallible statements run after that call inside the same DB transaction
+/// (`UPDATE trigger_event`, `insert_delivery_in_txn`,
+/// `request_cancellation_in_txn`, `advance_cursor_in_txn`, `txn.commit()`);
+/// if any of them fails, `txn` rolls back — no `trigger_delivery` row is ever
+/// created — but the in-memory registry charge `decide_admission` already
+/// made is not undone by the rollback, since it lives outside the database
+/// entirely. Left uncompensated, that permanently wedges the affected
+/// binding's counter (e.g. `active_run_count` stuck at 1 under
+/// `OverlapPolicy::Skip`, with no delivery ever able to release it via
+/// `note_finished`) until the next daemon restart re-seeds the registry from
+/// durable state.
+///
+/// This function does **not** change `decide_admission`'s contract (other
+/// trigger types rely on its documented before-it-returns mutation). Instead
+/// every fallible step from immediately after `decide_admission` returns
+/// through `txn.commit()` runs inside one inner closure; if that closure
+/// fails after a decision was made, the matching inverse registry operation
+/// runs before the error is returned — [`RunRegistry::note_finished`] for a
+/// decision that charged `active` ([`AdmissionDecision::Admit`],
+/// [`AdmissionDecision::CancelledPreviousAndAdmit`]),
+/// [`RunRegistry::note_dequeued`] for one that charged `queued`
+/// ([`AdmissionDecision::QueueAt`]), and nothing for a decision that charged
+/// neither ([`AdmissionDecision::SkipDueToOverlap`],
+/// [`AdmissionDecision::SkippedQueueFull`],
+/// [`AdmissionDecision::SkippedCancellationUnconfirmed`]). A compensation
+/// failure itself is logged, not propagated — the original error is what the
+/// caller needs to see, and a registry that cannot be written to is already
+/// failing closed via every other read/write on that path.
+pub fn accept_occurrence(
+    conn: &mut Connection,
+    binding: &StoredBinding,
+    occurrence: &ScheduledOccurrence,
+    fired_at: DateTime<Utc>,
+    registry: &dyn RunRegistry,
+) -> Result<Acceptance, StoreError> {
+    if binding.binding.id != occurrence.binding_id {
+        return Err(StoreError::BindingIdentityMismatch {
+            binding_id: binding.binding.id,
+            occurrence_binding_id: occurrence.binding_id,
+        });
+    }
+
+    let idempotency_key = occurrence_key(occurrence.binding_id, occurrence.scheduled_for);
+    let fired_at_ts = timestamp_from_datetime(fired_at);
+
+    let txn = roundhouse_store::begin_immediate(conn)?;
+
+    let ev = TriggerEvent {
+        binding_id: occurrence.binding_id,
+        idempotency_key: idempotency_key.clone(),
+        scheduled_for: occurrence.scheduled_for,
+        fired_at,
+        is_catch_up: occurrence.is_catch_up,
+        session_id: None,
+        outcome: None,
+    };
+
+    // Set the moment (if any) `decide_admission` charges a registry slot in
+    // this call, so a later failure in the closure below knows what to
+    // compensate. `None` for the whole call until then, and for the
+    // `Duplicate` path forever (that path never calls `decide_admission` at
+    // all).
+    let mut charged: Option<AdmissionDecision> = None;
+
+    let attempt = (|| -> Result<Acceptance, StoreError> {
+        match insert_trigger_event_in_txn(&txn, &ev)? {
+            None => {
+                // Duplicate (Task 3 step 4): re-fetch what is already durable
+                // and fabricate no fresh `AdmissionDecision` — `decide_admission`
+                // is NOT called again, so there is nothing to compensate on
+                // this path.
+                let (trigger_event_id, outcome_str): (i64, Option<String>) = txn.query_row(
+                    "SELECT id, outcome FROM trigger_event
+                     WHERE binding_id = ?1 AND idempotency_key = ?2",
+                    params![occurrence.binding_id.to_string(), idempotency_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let outcome = outcome_str
+                    .map(|s| TriggerEventOutcome::from_sql_str(&s))
+                    .transpose()?;
+                let delivery = select_delivery_by_trigger_event_id_in_txn(&txn, trigger_event_id)?;
+                Ok(Acceptance::Duplicate {
+                    trigger_event_id,
+                    outcome,
+                    delivery,
+                })
+            }
+            Some(trigger_event_id) => {
+                // Genuinely new occurrence (Task 3 step 5): decide admission
+                // exactly once, against the caller's `registry`. From here on,
+                // `charged` is set, and any `?` below that returns `Err` must
+                // be answered by the caller compensating it.
+                let decision =
+                    decide_admission(binding.binding.overlap, registry, occurrence.binding_id)?;
+                charged = Some(decision);
+                let outcome = outcome_for_decision(decision);
+
+                txn.execute(
+                    "UPDATE trigger_event SET outcome = ?1 WHERE id = ?2",
+                    params![outcome.as_sql_str(), trigger_event_id],
+                )?;
+
+                // Looked up *before* inserting the new delivery row below, so
+                // there is no need to filter the new row back out of this
+                // query.
+                let previous_to_cancel = if decision == AdmissionDecision::CancelledPreviousAndAdmit
+                {
+                    select_latest_nonterminal_delivery_for_binding_in_txn(
+                        &txn,
+                        occurrence.binding_id,
+                    )?
+                } else {
+                    None
+                };
+
+                let delivery = if decision_creates_delivery(decision) {
+                    let delivery = TriggerDelivery {
+                        delivery_id: Uuid::new_v4().to_string(),
+                        trigger_event_id,
+                        binding_id: occurrence.binding_id,
+                        state: DeliveryState::Ready,
+                        attempts: 0,
+                        lease_expires_at: None,
+                        run_id: None,
+                        session_id: None,
+                        last_error: None,
+                        created_at: fired_at_ts,
+                        updated_at: fired_at_ts,
+                    };
+                    insert_delivery_in_txn(&txn, &delivery)?;
+                    Some(delivery)
+                } else {
+                    None
+                };
+
+                if let Some(previous) = previous_to_cancel {
+                    // A lost race (the previous delivery moved to some other
+                    // state — e.g. it already finished — between the read
+                    // above and this write) is a no-op, not an error: the
+                    // whole `accept_occurrence` call must not fail over it.
+                    let applied = request_cancellation_in_txn(
+                        &txn,
+                        &previous.delivery_id,
+                        previous.state,
+                        fired_at_ts,
+                    )?;
+                    if !applied {
+                        tracing::debug!(
+                            delivery_id = %previous.delivery_id,
+                            binding_id = %occurrence.binding_id,
+                            "CancelPrevious: previous delivery's state changed before \
+                             cancellation could be requested (lost race) — no-op, not an error"
+                        );
+                    }
+                }
+
+                Ok(Acceptance::New {
+                    trigger_event_id,
+                    decision,
+                    outcome,
+                    delivery,
+                })
+            }
+        }
+    })();
+
+    let acceptance = match attempt {
+        Ok(acceptance) => acceptance,
+        Err(error) => {
+            compensate_registry_charge(charged, registry, occurrence.binding_id);
+            return Err(error);
+        }
+    };
+
+    // Task 3 step 6: the occurrence happened regardless of admission
+    // outcome, so the cursor advances unconditionally — but never backward.
+    // Still inside the compensation window: a failure here or at `commit`
+    // below is exactly as capable of stranding `charged`'s registry slot as
+    // one inside the closure above.
+    if let Err(error) = advance_cursor_in_txn(&txn, occurrence.binding_id, occurrence.scheduled_for)
+    {
+        compensate_registry_charge(charged, registry, occurrence.binding_id);
+        return Err(error);
+    }
+
+    if let Err(error) = txn.commit() {
+        compensate_registry_charge(charged, registry, occurrence.binding_id);
+        return Err(error.into());
+    }
+
+    Ok(acceptance)
+}
+
+/// Undoes the one registry charge [`decide_admission`] may have made during
+/// an [`accept_occurrence`] call that went on to fail — see that function's
+/// own doc comment for the full compensation contract. `charged` is `None`
+/// for the `Duplicate` path and for any failure before `decide_admission`
+/// ran, in which case this is a no-op.
+fn compensate_registry_charge(
+    charged: Option<AdmissionDecision>,
+    registry: &dyn RunRegistry,
+    binding_id: BindingId,
+) {
+    let Some(decision) = charged else {
+        return;
+    };
+    let result = match decision {
+        // Charged an active slot via `note_admitted`; give it back.
+        AdmissionDecision::Admit | AdmissionDecision::CancelledPreviousAndAdmit => {
+            registry.note_finished(binding_id)
+        }
+        // Charged a queued slot via `note_queued`; give it back.
+        AdmissionDecision::QueueAt(_) => registry.note_dequeued(binding_id),
+        // Charged neither — nothing to undo.
+        AdmissionDecision::SkipDueToOverlap
+        | AdmissionDecision::SkippedQueueFull { .. }
+        | AdmissionDecision::SkippedCancellationUnconfirmed => return,
+    };
+    if let Err(error) = result {
+        // The original transaction failure is what the caller returns and
+        // must see; a failed compensation is a second, distinct problem
+        // (this binding's registry counter may now be wrong until the next
+        // restart) logged here rather than folded into that `Err`.
+        tracing::error!(
+            binding_id = %binding_id,
+            error = %error,
+            "could not compensate an admission-registry charge after accept_occurrence failed \
+             partway through its transaction; this binding's active/queued counter may now be \
+             wrong until the next daemon restart re-seeds it from durable state"
+        );
+    }
+}
+
+/// Leases a `ready` delivery: `ready` -> `leased`, stamping
+/// `lease_expires_at`. Predecessor-constrained on `state = 'ready'`, so
+/// leasing an already-`leased` (or otherwise not-`ready`) delivery is a
+/// no-op (`Ok(false)`), not a clobber or an error.
+pub fn lease_delivery(
+    conn: &mut Connection,
+    delivery_id: &str,
+    lease_expires_at: Timestamp,
+    now: Timestamp,
+) -> Result<bool, StoreError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    let rows = txn.execute(
+        "UPDATE trigger_delivery
+         SET state = 'leased', lease_expires_at = ?1, updated_at = ?2
+         WHERE delivery_id = ?3 AND state = 'ready'",
+        params![
+            lease_expires_at.as_unix_nanos(),
+            now.as_unix_nanos(),
+            delivery_id
+        ],
+    )?;
+    txn.commit()?;
+    Ok(rows > 0)
+}
+
+/// Reclaims an expired lease: `leased` -> `ready` when `now` is at-or-past
+/// the delivery's stored `lease_expires_at`. `now` is an explicit parameter,
+/// never a real clock read inside this function — callers (and this
+/// module's own tests) drive it with whatever `Timestamp` they construct, so
+/// lease-expiry behavior is deterministic and sleep-free to test.
+/// Predecessor-constrained on `state = 'leased' AND lease_expires_at <= now`;
+/// a lease that has not yet expired, or a delivery not currently `leased`,
+/// is a no-op.
+pub fn reclaim_expired_lease(
+    conn: &mut Connection,
+    delivery_id: &str,
+    now: Timestamp,
+) -> Result<bool, StoreError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    let rows = txn.execute(
+        "UPDATE trigger_delivery
+         SET state = 'ready', lease_expires_at = NULL, updated_at = ?1
+         WHERE delivery_id = ?2 AND state = 'leased'
+           AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?3",
+        params![now.as_unix_nanos(), delivery_id, now.as_unix_nanos()],
+    )?;
+    txn.commit()?;
+    Ok(rows > 0)
+}
+
+/// Reserves a `leased` delivery for a specific run: `leased` -> `reserved`,
+/// stamping `run_id`/`session_id`. Predecessor-constrained on
+/// `state = 'leased'`.
+pub fn reserve_delivery(
+    conn: &mut Connection,
+    delivery_id: &str,
+    run_id: &str,
+    session_id: SessionId,
+    now: Timestamp,
+) -> Result<bool, StoreError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    let rows = txn.execute(
+        "UPDATE trigger_delivery
+         SET state = 'reserved', run_id = ?1, session_id = ?2, updated_at = ?3
+         WHERE delivery_id = ?4 AND state = 'leased'",
+        params![
+            run_id,
+            session_id.to_string(),
+            now.as_unix_nanos(),
+            delivery_id
+        ],
+    )?;
+    txn.commit()?;
+    Ok(rows > 0)
+}
+
+/// Marks a `reserved` delivery as actively running: `reserved` -> `running`.
+/// Predecessor-constrained on `state = 'reserved'`.
+pub fn mark_delivery_running(
+    conn: &mut Connection,
+    delivery_id: &str,
+    now: Timestamp,
+) -> Result<bool, StoreError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    let rows = txn.execute(
+        "UPDATE trigger_delivery SET state = 'running', updated_at = ?1
+         WHERE delivery_id = ?2 AND state = 'reserved'",
+        params![now.as_unix_nanos(), delivery_id],
+    )?;
+    txn.commit()?;
+    Ok(rows > 0)
+}
+
+/// Completes a `running` delivery: `running` -> `delivered`.
+/// Predecessor-constrained on `state IN ('running', 'cancellation_requested')`.
+///
+/// **`cancellation_requested` is in this set for Task 7's benefit, not the
+/// live claim path's.** `roundhouse-daemon`'s live claim-and-run path only
+/// ever calls this from `running`, so nothing about that path changes.
+/// Restart recovery's cancellation-reconciliation mechanism can find a
+/// `cancellation_requested` delivery whose run actually finished `Completed`
+/// before the previous process could act on the cancellation it recorded — a
+/// genuine race, not a bug — and must reconcile the delivery to match what
+/// really happened rather than force it to `cancelled` dishonestly. Without
+/// this widening that reconciliation could never apply: a
+/// `cancellation_requested` row would never satisfy the original
+/// `state = 'running'` constraint.
+pub fn complete_delivery(
+    conn: &mut Connection,
+    delivery_id: &str,
+    now: Timestamp,
+) -> Result<bool, StoreError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    let rows = txn.execute(
+        "UPDATE trigger_delivery SET state = 'delivered', updated_at = ?1
+         WHERE delivery_id = ?2 AND state IN ('running', 'cancellation_requested')",
+        params![now.as_unix_nanos(), delivery_id],
+    )?;
+    txn.commit()?;
+    Ok(rows > 0)
+}
+
+/// Fails a `running`, `reserved`, or `cancellation_requested` delivery: ->
+/// `failed`, recording `last_error` and incrementing `attempts`.
+/// Predecessor-constrained on `state IN ('running', 'reserved',
+/// 'cancellation_requested')` — a `reserved` delivery can fail before ever
+/// reaching `running` (e.g. the run never actually started), and (Task 7)
+/// a `cancellation_requested` delivery can fail on its own before a previous
+/// daemon process's cancellation ever landed, exactly the same kind of race
+/// [`complete_delivery`]'s own doc comment names for the `Completed` case.
+pub fn fail_delivery(
+    conn: &mut Connection,
+    delivery_id: &str,
+    error: &str,
+    now: Timestamp,
+) -> Result<bool, StoreError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    let rows = txn.execute(
+        "UPDATE trigger_delivery
+         SET state = 'failed', last_error = ?1, attempts = attempts + 1, updated_at = ?2
+         WHERE delivery_id = ?3 AND state IN ('running', 'reserved', 'cancellation_requested')",
+        params![error, now.as_unix_nanos(), delivery_id],
+    )?;
+    txn.commit()?;
+    Ok(rows > 0)
+}
+
+/// Finishes a cancellation: `running`, `reserved`, or
+/// `cancellation_requested` -> `cancelled`. Task 7 (restart recovery)'s own
+/// write — nothing before it ever transitions a delivery to `cancelled`.
+///
+/// Predecessor-constrained on `state IN ('running', 'reserved',
+/// 'cancellation_requested')`: mirrors [`fail_delivery`]'s `running`/
+/// `reserved` set (a `CancelPrevious` cancel recorded by
+/// [`request_cancellation`] can land on a delivery that has not yet reached
+/// `running`) plus `cancellation_requested` itself, which is where this
+/// mechanism's own writes originate — a boot-time recovery pass that called
+/// `roundhouse_flow::control::cancel` and re-drove the run to
+/// `RunState::Cancelled` finishes the delivery-level transition here, the
+/// same `updated_at`-stamping shape [`complete_delivery`] uses.
+pub fn cancel_delivery(
+    conn: &mut Connection,
+    delivery_id: &str,
+    now: Timestamp,
+) -> Result<bool, StoreError> {
+    let txn = roundhouse_store::begin_immediate(conn)?;
+    let rows = txn.execute(
+        "UPDATE trigger_delivery SET state = 'cancelled', updated_at = ?1
+         WHERE delivery_id = ?2 AND state IN ('running', 'reserved', 'cancellation_requested')",
+        params![now.as_unix_nanos(), delivery_id],
+    )?;
+    txn.commit()?;
+    Ok(rows > 0)
 }
 
 /// Test-only helper: an in-memory SQLite connection with the real store
@@ -134,4 +1047,1268 @@ pub fn open_test_db() -> Connection {
         .to_latest(&mut conn)
         .expect("apply store migrations, including trigger_event");
     conn
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admission::CancellationOutcome;
+    use crate::trigger::{OverlapPolicy, StoredBinding};
+    use roundhouse_core::{JobId, WorkspaceId};
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    /// A minimal in-memory `RunRegistry`, deliberately separate from
+    /// `admission.rs`'s own private `FakeRegistry` (that one is not `pub`,
+    /// and this module wants its own, test-controllable
+    /// `cancel_active`/failure behavior per test).
+    #[derive(Default)]
+    struct FakeRegistry {
+        active: StdMutex<HashMap<BindingId, u32>>,
+        queued: StdMutex<HashMap<BindingId, u32>>,
+        cancel_outcome: StdMutex<Option<CancellationOutcome>>,
+    }
+
+    impl FakeRegistry {
+        fn with_cancel_outcome(outcome: CancellationOutcome) -> Self {
+            FakeRegistry {
+                cancel_outcome: StdMutex::new(Some(outcome)),
+                ..Default::default()
+            }
+        }
+    }
+
+    impl RunRegistry for FakeRegistry {
+        fn active_run_count(&self, binding_id: BindingId) -> Result<u32, RegistryError> {
+            Ok(*self.active.lock().unwrap().get(&binding_id).unwrap_or(&0))
+        }
+        fn queued_count(&self, binding_id: BindingId) -> Result<u32, RegistryError> {
+            Ok(*self.queued.lock().unwrap().get(&binding_id).unwrap_or(&0))
+        }
+        fn cancel_active(
+            &self,
+            binding_id: BindingId,
+        ) -> Result<CancellationOutcome, RegistryError> {
+            let outcome = self
+                .cancel_outcome
+                .lock()
+                .unwrap()
+                .unwrap_or(CancellationOutcome::Confirmed);
+            if outcome == CancellationOutcome::Confirmed {
+                self.active.lock().unwrap().insert(binding_id, 0);
+            }
+            Ok(outcome)
+        }
+        fn note_admitted(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+            let mut active = self.active.lock().unwrap();
+            let slot = active.entry(binding_id).or_insert(0);
+            *slot = slot
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
+            Ok(())
+        }
+        fn note_queued(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+            let mut queued = self.queued.lock().unwrap();
+            let slot = queued.entry(binding_id).or_insert(0);
+            *slot = slot
+                .checked_add(1)
+                .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
+            Ok(())
+        }
+        fn note_finished(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+            let mut active = self.active.lock().unwrap();
+            let slot = active.entry(binding_id).or_insert(0);
+            *slot = slot
+                .checked_sub(1)
+                .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
+            Ok(())
+        }
+        fn note_dequeued(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+            let mut queued = self.queued.lock().unwrap();
+            let slot = queued.entry(binding_id).or_insert(0);
+            *slot = slot
+                .checked_sub(1)
+                .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
+            Ok(())
+        }
+        fn note_promoted(&self, binding_id: BindingId) -> Result<(), RegistryError> {
+            {
+                let mut queued = self.queued.lock().unwrap();
+                let slot = queued.entry(binding_id).or_insert(0);
+                *slot = slot
+                    .checked_sub(1)
+                    .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
+            }
+            {
+                let mut active = self.active.lock().unwrap();
+                let slot = active.entry(binding_id).or_insert(0);
+                *slot = slot
+                    .checked_add(1)
+                    .ok_or(RegistryError::CounterOutOfRange { binding_id })?;
+            }
+            Ok(())
+        }
+    }
+
+    fn test_binding(overlap: OverlapPolicy) -> StoredBinding {
+        let mut binding =
+            Binding::new_cron(JobId::new(), "0 0 * * * *".to_string(), chrono_tz::Tz::UTC);
+        binding.overlap = overlap;
+        StoredBinding {
+            workspace: WorkspaceId::new(),
+            binding,
+        }
+    }
+
+    fn occurrence_at(binding_id: BindingId, minute: i64) -> ScheduledOccurrence {
+        ScheduledOccurrence {
+            binding_id,
+            scheduled_for: DateTime::from_timestamp(minute * 60, 0).unwrap(),
+            is_catch_up: false,
+        }
+    }
+
+    fn ts(secs: i64) -> Timestamp {
+        Timestamp::from_unix_nanos(secs * 1_000_000_000)
+    }
+
+    fn fired_at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(secs, 0).unwrap()
+    }
+
+    #[test]
+    fn identity_mismatch_is_rejected_before_any_write() {
+        let mut conn = open_test_db();
+        let binding = test_binding(OverlapPolicy::Skip);
+        let mismatched_occurrence = occurrence_at(BindingId::new(), 1);
+        let registry = FakeRegistry::default();
+
+        let err = accept_occurrence(
+            &mut conn,
+            &binding,
+            &mismatched_occurrence,
+            fired_at(60),
+            &registry,
+        )
+        .unwrap_err();
+        assert!(matches!(err, StoreError::BindingIdentityMismatch { .. }));
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM trigger_event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "a mismatched call must not write anything");
+    }
+
+    #[test]
+    fn admit_creates_a_ready_delivery_and_admitted_outcome() {
+        let mut conn = open_test_db();
+        let binding = test_binding(OverlapPolicy::Skip);
+        let occurrence = occurrence_at(binding.binding.id, 1);
+        let registry = FakeRegistry::default();
+
+        let acceptance =
+            accept_occurrence(&mut conn, &binding, &occurrence, fired_at(60), &registry).unwrap();
+
+        match acceptance {
+            Acceptance::New {
+                decision,
+                outcome,
+                delivery,
+                ..
+            } => {
+                assert_eq!(decision, AdmissionDecision::Admit);
+                assert_eq!(outcome, TriggerEventOutcome::Admitted);
+                let delivery = delivery.expect("Admit must create a delivery");
+                assert_eq!(delivery.state, DeliveryState::Ready);
+                assert_eq!(delivery.attempts, 0);
+                assert!(delivery.lease_expires_at.is_none());
+            }
+            Acceptance::Duplicate { .. } => panic!("expected a new acceptance"),
+        }
+    }
+
+    #[test]
+    fn skip_due_to_overlap_creates_no_delivery() {
+        let mut conn = open_test_db();
+        let binding = test_binding(OverlapPolicy::Skip);
+        let registry = FakeRegistry::default();
+
+        let first = occurrence_at(binding.binding.id, 1);
+        accept_occurrence(&mut conn, &binding, &first, fired_at(60), &registry).unwrap();
+
+        let second = occurrence_at(binding.binding.id, 2);
+        let acceptance =
+            accept_occurrence(&mut conn, &binding, &second, fired_at(120), &registry).unwrap();
+
+        match acceptance {
+            Acceptance::New {
+                decision,
+                outcome,
+                delivery,
+                ..
+            } => {
+                assert_eq!(decision, AdmissionDecision::SkipDueToOverlap);
+                assert_eq!(outcome, TriggerEventOutcome::SkippedDueToOverlap);
+                assert!(delivery.is_none());
+            }
+            Acceptance::Duplicate { .. } => panic!("expected a new acceptance"),
+        }
+    }
+
+    #[test]
+    fn queue_at_creates_a_ready_delivery_and_queued_outcome() {
+        let mut conn = open_test_db();
+        let binding = test_binding(OverlapPolicy::Queue { depth: 4 });
+        let registry = FakeRegistry::default();
+
+        let first = occurrence_at(binding.binding.id, 1);
+        accept_occurrence(&mut conn, &binding, &first, fired_at(60), &registry).unwrap();
+
+        let second = occurrence_at(binding.binding.id, 2);
+        let acceptance =
+            accept_occurrence(&mut conn, &binding, &second, fired_at(120), &registry).unwrap();
+
+        match acceptance {
+            Acceptance::New {
+                decision,
+                outcome,
+                delivery,
+                ..
+            } => {
+                assert_eq!(decision, AdmissionDecision::QueueAt(0));
+                assert_eq!(outcome, TriggerEventOutcome::Queued);
+                let delivery = delivery.expect("QueueAt must create a delivery");
+                assert_eq!(delivery.state, DeliveryState::Ready);
+            }
+            Acceptance::Duplicate { .. } => panic!("expected a new acceptance"),
+        }
+    }
+
+    #[test]
+    fn queue_full_creates_no_delivery() {
+        let mut conn = open_test_db();
+        let binding = test_binding(OverlapPolicy::Queue { depth: 1 });
+        let registry = FakeRegistry::default();
+
+        accept_occurrence(
+            &mut conn,
+            &binding,
+            &occurrence_at(binding.binding.id, 1),
+            fired_at(60),
+            &registry,
+        )
+        .unwrap(); // Admit
+        accept_occurrence(
+            &mut conn,
+            &binding,
+            &occurrence_at(binding.binding.id, 2),
+            fired_at(120),
+            &registry,
+        )
+        .unwrap(); // QueueAt(0), fills depth 1
+
+        let acceptance = accept_occurrence(
+            &mut conn,
+            &binding,
+            &occurrence_at(binding.binding.id, 3),
+            fired_at(180),
+            &registry,
+        )
+        .unwrap();
+
+        match acceptance {
+            Acceptance::New {
+                decision,
+                outcome,
+                delivery,
+                ..
+            } => {
+                assert_eq!(decision, AdmissionDecision::SkippedQueueFull { depth: 1 });
+                assert_eq!(outcome, TriggerEventOutcome::SkippedQueueFull);
+                assert!(delivery.is_none());
+            }
+            Acceptance::Duplicate { .. } => panic!("expected a new acceptance"),
+        }
+    }
+
+    #[test]
+    fn cancel_previous_and_admit_creates_a_new_delivery_and_requests_cancellation_on_the_old_one() {
+        let mut conn = open_test_db();
+        let binding = test_binding(OverlapPolicy::CancelPrevious);
+        let registry = FakeRegistry::with_cancel_outcome(CancellationOutcome::Confirmed);
+
+        let first_acceptance = accept_occurrence(
+            &mut conn,
+            &binding,
+            &occurrence_at(binding.binding.id, 1),
+            fired_at(60),
+            &registry,
+        )
+        .unwrap();
+        let first_delivery = match first_acceptance {
+            Acceptance::New {
+                delivery: Some(d), ..
+            } => d,
+            other => panic!("expected a new delivery, got {other:?}"),
+        };
+
+        let second_acceptance = accept_occurrence(
+            &mut conn,
+            &binding,
+            &occurrence_at(binding.binding.id, 2),
+            fired_at(120),
+            &registry,
+        )
+        .unwrap();
+
+        match second_acceptance {
+            Acceptance::New {
+                decision,
+                outcome,
+                delivery,
+                ..
+            } => {
+                assert_eq!(decision, AdmissionDecision::CancelledPreviousAndAdmit);
+                assert_eq!(outcome, TriggerEventOutcome::CancelledPreviousAndAdmitted);
+                let new_delivery = delivery.expect("must create a new delivery");
+                assert_ne!(new_delivery.delivery_id, first_delivery.delivery_id);
+                assert_eq!(new_delivery.state, DeliveryState::Ready);
+            }
+            Acceptance::Duplicate { .. } => panic!("expected a new acceptance"),
+        }
+
+        // Task 3 constraint: the OLD delivery is now `cancellation_requested`
+        // — never marked terminal (`cancelled`/`failed`) from this crate.
+        let old_delivery = fetch_delivery(&conn, &first_delivery.delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_delivery.state, DeliveryState::CancellationRequested);
+    }
+
+    #[test]
+    fn cancellation_unconfirmed_creates_no_delivery_and_does_not_touch_the_previous_one() {
+        let mut conn = open_test_db();
+        let binding = test_binding(OverlapPolicy::CancelPrevious);
+        let registry = FakeRegistry::with_cancel_outcome(CancellationOutcome::Confirmed);
+
+        let first_acceptance = accept_occurrence(
+            &mut conn,
+            &binding,
+            &occurrence_at(binding.binding.id, 1),
+            fired_at(60),
+            &registry,
+        )
+        .unwrap();
+        let first_delivery = match first_acceptance {
+            Acceptance::New {
+                delivery: Some(d), ..
+            } => d,
+            other => panic!("expected a new delivery, got {other:?}"),
+        };
+
+        // From here on, cancellation can no longer be confirmed.
+        *registry.cancel_outcome.lock().unwrap() = Some(CancellationOutcome::Unconfirmed);
+
+        let second_acceptance = accept_occurrence(
+            &mut conn,
+            &binding,
+            &occurrence_at(binding.binding.id, 2),
+            fired_at(120),
+            &registry,
+        )
+        .unwrap();
+
+        match second_acceptance {
+            Acceptance::New {
+                decision,
+                outcome,
+                delivery,
+                ..
+            } => {
+                assert_eq!(decision, AdmissionDecision::SkippedCancellationUnconfirmed);
+                assert_eq!(outcome, TriggerEventOutcome::SkippedCancellationUnconfirmed);
+                assert!(delivery.is_none());
+            }
+            Acceptance::Duplicate { .. } => panic!("expected a new acceptance"),
+        }
+
+        // The original delivery is untouched — still `ready`, not requested
+        // for cancellation, since nothing was actually confirmed cancelled.
+        let old_delivery = fetch_delivery(&conn, &first_delivery.delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_delivery.state, DeliveryState::Ready);
+    }
+
+    #[test]
+    fn duplicate_acceptance_does_not_reevaluate_admission_or_create_a_second_delivery() {
+        let mut conn = open_test_db();
+        let binding = test_binding(OverlapPolicy::Skip);
+        let registry = FakeRegistry::default();
+        let occurrence = occurrence_at(binding.binding.id, 1);
+
+        let first =
+            accept_occurrence(&mut conn, &binding, &occurrence, fired_at(60), &registry).unwrap();
+        let (first_id, first_outcome, first_delivery) = match first {
+            Acceptance::New {
+                trigger_event_id,
+                outcome,
+                delivery,
+                ..
+            } => (trigger_event_id, outcome, delivery),
+            Acceptance::Duplicate { .. } => panic!("expected a new acceptance the first time"),
+        };
+        assert_eq!(registry.active_run_count(binding.binding.id).unwrap(), 1);
+
+        // Re-fire the exact same occurrence (same binding_id + scheduled_for,
+        // hence same idempotency key), simulating a crash-and-retry.
+        let second =
+            accept_occurrence(&mut conn, &binding, &occurrence, fired_at(999), &registry).unwrap();
+
+        match second {
+            Acceptance::Duplicate {
+                trigger_event_id,
+                outcome,
+                delivery,
+            } => {
+                assert_eq!(trigger_event_id, first_id);
+                assert_eq!(outcome, Some(first_outcome));
+                assert_eq!(delivery, first_delivery);
+            }
+            Acceptance::New { .. } => panic!("a repeat of the same occurrence must be a duplicate"),
+        }
+
+        // If `decide_admission` had been re-run, a `Skip` policy would have
+        // called `note_admitted` a second time, bumping this to 2 (or, for a
+        // policy that reads `active_run_count > 0`, produced a *different*
+        // decision on the "duplicate" than the original — either way,
+        // observable here as a registry mutation that must not have
+        // happened).
+        assert_eq!(registry.active_run_count(binding.binding.id).unwrap(), 1);
+
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM trigger_event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(event_count, 1, "no second trigger_event row");
+        let delivery_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM trigger_delivery", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(delivery_count, 1, "no second trigger_delivery row");
+    }
+
+    /// Final-review fix round 1, Important 3: `decide_admission` charges the
+    /// registry (here, `note_admitted` for an `Admit` decision) *before*
+    /// `accept_occurrence` returns, but several more fallible statements run
+    /// after that inside the same transaction. If any of them fails, the
+    /// transaction rolls back — no `trigger_delivery` row is ever created —
+    /// but without compensation the registry charge stands anyway, wedging
+    /// `active_run_count` at 1 forever under `OverlapPolicy::Skip` (no
+    /// delivery ever exists to release it via `note_finished`).
+    ///
+    /// This forces the failure in `advance_cursor_in_txn` — the step that
+    /// runs *after* the New/Duplicate match, shared by both arms — rather
+    /// than inside the match arm itself, deliberately: that is the step an
+    /// "only handle the arm's own statements" fix would miss, per the
+    /// brief's "not just the obvious path" requirement. Dropping
+    /// `trigger_binding_cursor` before the call is a deterministic way to
+    /// fail exactly there with no real I/O flakiness — every earlier
+    /// statement in the function never touches that table.
+    #[test]
+    fn accept_occurrence_compensates_its_registry_charge_when_the_transaction_fails_after_admission(
+    ) {
+        let mut conn = open_test_db();
+        let binding = test_binding(OverlapPolicy::Skip);
+        let occurrence = occurrence_at(binding.binding.id, 1);
+        let registry = FakeRegistry::default();
+
+        conn.execute("DROP TABLE trigger_binding_cursor", [])
+            .unwrap();
+
+        let err = accept_occurrence(&mut conn, &binding, &occurrence, fired_at(60), &registry)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected the dropped-table write to surface as a Sqlite error, got {err:?}"
+        );
+
+        assert_eq!(
+            registry.active_run_count(binding.binding.id).unwrap(),
+            0,
+            "decide_admission's Admit charge must be compensated back to its \
+             pre-accept_occurrence value when the surrounding transaction rolls back, not left \
+             stuck at 1 forever"
+        );
+        assert_eq!(registry.queued_count(binding.binding.id).unwrap(), 0);
+
+        // The transaction rolled back: no trigger_event or trigger_delivery
+        // row survives despite the registry having briefly been charged.
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM trigger_event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            event_count, 0,
+            "the whole transaction, including the event insert, rolled back"
+        );
+        let delivery_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM trigger_delivery", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(delivery_count, 0);
+    }
+
+    /// The `QueueAt` side of the same compensation contract: a `Queue`
+    /// binding's decision charges a *queued*, not active, slot
+    /// (`note_queued`), so the matching compensation must be
+    /// `note_dequeued`, not `note_finished` — asserted by checking `queued`
+    /// (not `active`) settles back to zero.
+    #[test]
+    fn accept_occurrence_compensates_a_queued_charge_with_note_dequeued() {
+        let mut conn = open_test_db();
+        let binding = test_binding(OverlapPolicy::Queue { depth: 8 });
+        let registry = FakeRegistry::default();
+
+        // Seed one active run so the next occurrence's decision is `QueueAt`,
+        // not `Admit`.
+        let first = occurrence_at(binding.binding.id, 1);
+        accept_occurrence(&mut conn, &binding, &first, fired_at(60), &registry).unwrap();
+        assert_eq!(registry.active_run_count(binding.binding.id).unwrap(), 1);
+
+        conn.execute("DROP TABLE trigger_binding_cursor", [])
+            .unwrap();
+
+        let second = occurrence_at(binding.binding.id, 2);
+        let err =
+            accept_occurrence(&mut conn, &binding, &second, fired_at(120), &registry).unwrap_err();
+        assert!(matches!(err, StoreError::Sqlite(_)));
+
+        // The first occurrence's active charge is untouched (its own
+        // transaction committed successfully); only the second call's
+        // queued charge must be compensated back to zero.
+        assert_eq!(registry.active_run_count(binding.binding.id).unwrap(), 1);
+        assert_eq!(
+            registry.queued_count(binding.binding.id).unwrap(),
+            0,
+            "the QueueAt decision's note_queued charge must be compensated with \
+             note_dequeued, not left stranded"
+        );
+    }
+
+    #[test]
+    fn cursor_advances_forward_but_never_regresses() {
+        let mut conn = open_test_db();
+        let binding = test_binding(OverlapPolicy::Concurrent { max: 10 });
+        let registry = FakeRegistry::default();
+
+        accept_occurrence(
+            &mut conn,
+            &binding,
+            &occurrence_at(binding.binding.id, 10),
+            fired_at(600),
+            &registry,
+        )
+        .unwrap();
+        let cursor_after_first: Option<i64> = conn
+            .query_row(
+                "SELECT last_fired_for FROM trigger_binding_cursor WHERE binding_id = ?1",
+                params![binding.binding.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let expected_first =
+            timestamp_from_datetime(occurrence_at(binding.binding.id, 10).scheduled_for)
+                .as_unix_nanos();
+        assert_eq!(cursor_after_first, Some(expected_first));
+
+        // A genuinely new, but *earlier*, occurrence (distinct idempotency
+        // key, so it is not a duplicate) must not move the cursor backward.
+        accept_occurrence(
+            &mut conn,
+            &binding,
+            &occurrence_at(binding.binding.id, 5),
+            fired_at(300),
+            &registry,
+        )
+        .unwrap();
+        let cursor_after_second: Option<i64> = conn
+            .query_row(
+                "SELECT last_fired_for FROM trigger_binding_cursor WHERE binding_id = ?1",
+                params![binding.binding.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cursor_after_second,
+            Some(expected_first),
+            "cursor must not regress to the earlier occurrence"
+        );
+
+        // A later occurrence still moves it forward.
+        accept_occurrence(
+            &mut conn,
+            &binding,
+            &occurrence_at(binding.binding.id, 20),
+            fired_at(1200),
+            &registry,
+        )
+        .unwrap();
+        let cursor_after_third: Option<i64> = conn
+            .query_row(
+                "SELECT last_fired_for FROM trigger_binding_cursor WHERE binding_id = ?1",
+                params![binding.binding.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let expected_third =
+            timestamp_from_datetime(occurrence_at(binding.binding.id, 20).scheduled_for)
+                .as_unix_nanos();
+        assert_eq!(cursor_after_third, Some(expected_third));
+    }
+
+    fn create_ready_delivery(conn: &mut Connection, binding_id: BindingId) -> TriggerDelivery {
+        let binding = StoredBinding {
+            workspace: WorkspaceId::new(),
+            binding: {
+                let mut b =
+                    Binding::new_cron(JobId::new(), "0 0 * * * *".to_string(), chrono_tz::Tz::UTC);
+                b.id = binding_id;
+                b.overlap = OverlapPolicy::Skip;
+                b
+            },
+        };
+        let registry = FakeRegistry::default();
+        let occurrence = occurrence_at(binding_id, 1);
+        let acceptance =
+            accept_occurrence(conn, &binding, &occurrence, fired_at(60), &registry).unwrap();
+        match acceptance {
+            Acceptance::New {
+                delivery: Some(d), ..
+            } => d,
+            other => panic!("expected a new ready delivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lease_transitions_ready_to_leased_and_is_a_no_op_on_an_already_leased_delivery() {
+        let mut conn = open_test_db();
+        let delivery = create_ready_delivery(&mut conn, BindingId::new());
+
+        let applied =
+            lease_delivery(&mut conn, &delivery.delivery_id, ts(1_100), ts(1_000)).unwrap();
+        assert!(applied);
+        let leased = fetch_delivery(&conn, &delivery.delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(leased.state, DeliveryState::Leased);
+        assert_eq!(leased.lease_expires_at, Some(ts(1_100)));
+
+        // Predecessor mismatch: already `leased`, not `ready`.
+        let second_applied =
+            lease_delivery(&mut conn, &delivery.delivery_id, ts(2_000), ts(1_500)).unwrap();
+        assert!(
+            !second_applied,
+            "leasing an already-leased delivery must be a no-op"
+        );
+        let still_leased = fetch_delivery(&conn, &delivery.delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            still_leased.lease_expires_at,
+            Some(ts(1_100)),
+            "the no-op must not clobber the original lease"
+        );
+    }
+
+    #[test]
+    fn reclaim_expired_lease_only_fires_once_now_is_past_expiry() {
+        let mut conn = open_test_db();
+        let delivery = create_ready_delivery(&mut conn, BindingId::new());
+        lease_delivery(&mut conn, &delivery.delivery_id, ts(1_100), ts(1_000)).unwrap();
+
+        // Not yet expired: no-op, driven entirely by an explicit `now`, never
+        // a real clock/sleep.
+        let too_early = reclaim_expired_lease(&mut conn, &delivery.delivery_id, ts(1_050)).unwrap();
+        assert!(!too_early);
+        let still_leased = fetch_delivery(&conn, &delivery.delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_leased.state, DeliveryState::Leased);
+
+        // Exactly at expiry: reclaimed.
+        let reclaimed = reclaim_expired_lease(&mut conn, &delivery.delivery_id, ts(1_100)).unwrap();
+        assert!(reclaimed);
+        let ready_again = fetch_delivery(&conn, &delivery.delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready_again.state, DeliveryState::Ready);
+        assert!(ready_again.lease_expires_at.is_none());
+    }
+
+    #[test]
+    fn reserve_mark_running_complete_happy_path() {
+        let mut conn = open_test_db();
+        let delivery = create_ready_delivery(&mut conn, BindingId::new());
+        lease_delivery(&mut conn, &delivery.delivery_id, ts(1_100), ts(1_000)).unwrap();
+
+        let session_id = SessionId::new();
+        let reserved = reserve_delivery(
+            &mut conn,
+            &delivery.delivery_id,
+            "run-1",
+            session_id,
+            ts(1_010),
+        )
+        .unwrap();
+        assert!(reserved);
+        let after_reserve = fetch_delivery(&conn, &delivery.delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_reserve.state, DeliveryState::Reserved);
+        assert_eq!(after_reserve.run_id.as_deref(), Some("run-1"));
+        assert_eq!(after_reserve.session_id, Some(session_id));
+
+        // Predecessor mismatch: already `reserved`, not `leased`.
+        let reserve_again = reserve_delivery(
+            &mut conn,
+            &delivery.delivery_id,
+            "run-2",
+            SessionId::new(),
+            ts(1_020),
+        )
+        .unwrap();
+        assert!(!reserve_again);
+
+        let running = mark_delivery_running(&mut conn, &delivery.delivery_id, ts(1_030)).unwrap();
+        assert!(running);
+        assert_eq!(
+            fetch_delivery(&conn, &delivery.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::Running
+        );
+
+        // Predecessor mismatch: `complete_delivery` from `reserved` (already
+        // moved past it) must be a no-op, not applied twice.
+        let complete_from_wrong_state =
+            complete_delivery(&mut conn, &delivery.delivery_id, ts(1_040)).unwrap();
+        assert!(
+            complete_from_wrong_state,
+            "delivery is `running`, so this must apply"
+        );
+
+        let delivered = fetch_delivery(&conn, &delivery.delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.state, DeliveryState::Delivered);
+
+        // A second `complete_delivery` call is now a no-op (already terminal).
+        let complete_again =
+            complete_delivery(&mut conn, &delivery.delivery_id, ts(1_050)).unwrap();
+        assert!(!complete_again);
+    }
+
+    #[test]
+    fn fail_delivery_from_running_or_reserved_sets_error_and_increments_attempts() {
+        let mut conn = open_test_db();
+
+        // Fail from `running`.
+        let d1 = create_ready_delivery(&mut conn, BindingId::new());
+        lease_delivery(&mut conn, &d1.delivery_id, ts(1_100), ts(1_000)).unwrap();
+        reserve_delivery(
+            &mut conn,
+            &d1.delivery_id,
+            "run-1",
+            SessionId::new(),
+            ts(1_010),
+        )
+        .unwrap();
+        mark_delivery_running(&mut conn, &d1.delivery_id, ts(1_020)).unwrap();
+        let failed = fail_delivery(&mut conn, &d1.delivery_id, "boom", ts(1_030)).unwrap();
+        assert!(failed);
+        let after = fetch_delivery(&conn, &d1.delivery_id).unwrap().unwrap();
+        assert_eq!(after.state, DeliveryState::Failed);
+        assert_eq!(after.last_error.as_deref(), Some("boom"));
+        assert_eq!(after.attempts, 1);
+
+        // A delivery already `ready` cannot fail directly (predecessor
+        // mismatch) — a no-op, not an error.
+        let d2 = create_ready_delivery(&mut conn, BindingId::new());
+        let not_applied = fail_delivery(&mut conn, &d2.delivery_id, "boom", ts(1_000)).unwrap();
+        assert!(!not_applied);
+        assert_eq!(
+            fetch_delivery(&conn, &d2.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::Ready
+        );
+
+        // Fail from `reserved` (never reached `running`).
+        let d3 = create_ready_delivery(&mut conn, BindingId::new());
+        lease_delivery(&mut conn, &d3.delivery_id, ts(1_100), ts(1_000)).unwrap();
+        reserve_delivery(
+            &mut conn,
+            &d3.delivery_id,
+            "run-3",
+            SessionId::new(),
+            ts(1_010),
+        )
+        .unwrap();
+        let failed_reserved =
+            fail_delivery(&mut conn, &d3.delivery_id, "never started", ts(1_020)).unwrap();
+        assert!(failed_reserved);
+        let after3 = fetch_delivery(&conn, &d3.delivery_id).unwrap().unwrap();
+        assert_eq!(after3.state, DeliveryState::Failed);
+        assert_eq!(after3.attempts, 1);
+    }
+
+    #[test]
+    fn request_cancellation_lost_race_is_a_no_op_not_an_error() {
+        let mut conn = open_test_db();
+        let delivery = create_ready_delivery(&mut conn, BindingId::new());
+
+        // The delivery is `ready`, but we (wrongly) expect `leased` — a
+        // lost-race style predecessor mismatch.
+        let applied = request_cancellation(
+            &mut conn,
+            &delivery.delivery_id,
+            DeliveryState::Leased,
+            ts(10),
+        )
+        .unwrap();
+        assert!(!applied);
+        let unchanged = fetch_delivery(&conn, &delivery.delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.state, DeliveryState::Ready);
+
+        // Matching the real predecessor succeeds.
+        let applied2 = request_cancellation(
+            &mut conn,
+            &delivery.delivery_id,
+            DeliveryState::Ready,
+            ts(20),
+        )
+        .unwrap();
+        assert!(applied2);
+        let cancelled = fetch_delivery(&conn, &delivery.delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.state, DeliveryState::CancellationRequested);
+    }
+
+    /// `create_ready_delivery` with a caller-chosen occurrence/fire instant,
+    /// so a test can seed several `ready` rows with distinct `created_at`
+    /// values (the column `list_ready_deliveries` orders by).
+    fn create_ready_delivery_at(
+        conn: &mut Connection,
+        binding_id: BindingId,
+        minute: i64,
+        fired_at_secs: i64,
+    ) -> TriggerDelivery {
+        let binding = StoredBinding {
+            workspace: WorkspaceId::new(),
+            binding: {
+                let mut b =
+                    Binding::new_cron(JobId::new(), "0 0 * * * *".to_string(), chrono_tz::Tz::UTC);
+                b.id = binding_id;
+                // `CancelPrevious` rather than `Skip`: this helper is used to
+                // seed SEVERAL concurrently-`ready` deliveries for one
+                // binding, which `Skip` would suppress after the first.
+                b.overlap = OverlapPolicy::CancelPrevious;
+                b
+            },
+        };
+        let registry = FakeRegistry::with_cancel_outcome(CancellationOutcome::Confirmed);
+        let occurrence = occurrence_at(binding_id, minute);
+        let acceptance = accept_occurrence(
+            conn,
+            &binding,
+            &occurrence,
+            fired_at(fired_at_secs),
+            &registry,
+        )
+        .unwrap();
+        match acceptance {
+            Acceptance::New {
+                delivery: Some(d), ..
+            } => d,
+            other => panic!("expected a new ready delivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ready_deliveries_are_listed_oldest_first() {
+        let mut conn = open_test_db();
+        // Seeded out of chronological order so a listing that merely returned
+        // insertion order would disagree with `created_at` order.
+        let newest = create_ready_delivery_at(&mut conn, BindingId::new(), 3, 300);
+        let oldest = create_ready_delivery_at(&mut conn, BindingId::new(), 1, 100);
+        let middle = create_ready_delivery_at(&mut conn, BindingId::new(), 2, 200);
+
+        let listed = list_ready_deliveries(&conn, 10).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|d| d.delivery_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                oldest.delivery_id.as_str(),
+                middle.delivery_id.as_str(),
+                newest.delivery_id.as_str()
+            ],
+            "ready deliveries must be handed out FIFO by created_at"
+        );
+        assert!(listed.iter().all(|d| d.state == DeliveryState::Ready));
+    }
+
+    #[test]
+    fn listing_ready_deliveries_honours_its_limit() {
+        let mut conn = open_test_db();
+        let first = create_ready_delivery_at(&mut conn, BindingId::new(), 1, 100);
+        create_ready_delivery_at(&mut conn, BindingId::new(), 2, 200);
+        create_ready_delivery_at(&mut conn, BindingId::new(), 3, 300);
+
+        let listed = list_ready_deliveries(&conn, 2).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed[0].delivery_id, first.delivery_id,
+            "the limit must take the OLDEST rows, not an arbitrary two"
+        );
+        assert!(list_ready_deliveries(&conn, 0).unwrap().is_empty());
+    }
+
+    /// The claim loop must never hand back a delivery something else already
+    /// owns — only `ready` rows are claimable.
+    #[test]
+    fn listing_ready_deliveries_excludes_every_non_ready_state() {
+        let mut conn = open_test_db();
+        let still_ready = create_ready_delivery_at(&mut conn, BindingId::new(), 1, 100);
+        let leased = create_ready_delivery_at(&mut conn, BindingId::new(), 2, 200);
+        let running = create_ready_delivery_at(&mut conn, BindingId::new(), 3, 300);
+        let delivered = create_ready_delivery_at(&mut conn, BindingId::new(), 4, 400);
+
+        assert!(lease_delivery(&mut conn, &leased.delivery_id, ts(999), ts(500)).unwrap());
+        assert!(lease_delivery(&mut conn, &running.delivery_id, ts(999), ts(500)).unwrap());
+        assert!(reserve_delivery(
+            &mut conn,
+            &running.delivery_id,
+            "run-1",
+            SessionId::new(),
+            ts(500)
+        )
+        .unwrap());
+        assert!(mark_delivery_running(&mut conn, &running.delivery_id, ts(500)).unwrap());
+        assert!(lease_delivery(&mut conn, &delivered.delivery_id, ts(999), ts(500)).unwrap());
+        assert!(reserve_delivery(
+            &mut conn,
+            &delivered.delivery_id,
+            "run-2",
+            SessionId::new(),
+            ts(500)
+        )
+        .unwrap());
+        assert!(mark_delivery_running(&mut conn, &delivered.delivery_id, ts(500)).unwrap());
+        assert!(complete_delivery(&mut conn, &delivered.delivery_id, ts(600)).unwrap());
+
+        let listed = list_ready_deliveries(&conn, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].delivery_id, still_ready.delivery_id);
+    }
+
+    /// The claimer reads this to tell an *admitted* delivery (holding an
+    /// active slot) from a *queued* one (holding a queued slot), so it can
+    /// promote the latter rather than underflowing `active` at completion.
+    #[test]
+    fn a_deliverys_trigger_event_outcome_is_readable_back() {
+        let mut conn = open_test_db();
+        let admitted = create_ready_delivery(&mut conn, BindingId::new());
+        assert_eq!(
+            fetch_trigger_event_outcome(&conn, admitted.trigger_event_id).unwrap(),
+            Some(TriggerEventOutcome::Admitted)
+        );
+
+        // A `Queue` binding whose first occurrence is already running queues
+        // the second — and a queued occurrence still produces a `ready`
+        // delivery, which is exactly the case this lookup exists for.
+        let binding_id = BindingId::new();
+        let mut queue_binding = test_binding(OverlapPolicy::Queue { depth: 4 });
+        queue_binding.binding.id = binding_id;
+        let registry = FakeRegistry::default();
+        accept_occurrence(
+            &mut conn,
+            &queue_binding,
+            &occurrence_at(binding_id, 1),
+            fired_at(60),
+            &registry,
+        )
+        .unwrap();
+        let second = match accept_occurrence(
+            &mut conn,
+            &queue_binding,
+            &occurrence_at(binding_id, 2),
+            fired_at(120),
+            &registry,
+        )
+        .unwrap()
+        {
+            Acceptance::New {
+                delivery: Some(d), ..
+            } => d,
+            other => panic!("expected a queued delivery, got {other:?}"),
+        };
+        assert_eq!(second.state, DeliveryState::Ready);
+        assert_eq!(
+            fetch_trigger_event_outcome(&conn, second.trigger_event_id).unwrap(),
+            Some(TriggerEventOutcome::Queued)
+        );
+
+        assert_eq!(fetch_trigger_event_outcome(&conn, 9_999).unwrap(), None);
+    }
+
+    #[test]
+    fn listing_ready_deliveries_decodes_every_column() {
+        let mut conn = open_test_db();
+        let binding_id = BindingId::new();
+        let seeded = create_ready_delivery_at(&mut conn, binding_id, 1, 100);
+
+        let listed = list_ready_deliveries(&conn, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0], seeded,
+            "the listed row must decode identically to the one accept_occurrence returned"
+        );
+        assert_eq!(listed[0].binding_id, binding_id);
+        assert!(listed[0].trigger_event_id > 0);
+    }
+
+    /// Task 7's boot-time recovery pass reads through this — it must return
+    /// exactly the rows in the requested states, oldest first, and leave
+    /// every other state out regardless of how many states are requested at
+    /// once.
+    #[test]
+    fn listing_deliveries_in_states_returns_only_the_requested_states_oldest_first() {
+        let mut conn = open_test_db();
+        let ready = create_ready_delivery_at(&mut conn, BindingId::new(), 1, 100);
+        let leased = create_ready_delivery_at(&mut conn, BindingId::new(), 2, 200);
+        let reserved = create_ready_delivery_at(&mut conn, BindingId::new(), 3, 300);
+        let running = create_ready_delivery_at(&mut conn, BindingId::new(), 4, 400);
+        let delivered = create_ready_delivery_at(&mut conn, BindingId::new(), 5, 500);
+
+        assert!(lease_delivery(&mut conn, &leased.delivery_id, ts(999), ts(500)).unwrap());
+
+        assert!(lease_delivery(&mut conn, &reserved.delivery_id, ts(999), ts(500)).unwrap());
+        assert!(reserve_delivery(
+            &mut conn,
+            &reserved.delivery_id,
+            "run-reserved",
+            SessionId::new(),
+            ts(500)
+        )
+        .unwrap());
+
+        assert!(lease_delivery(&mut conn, &running.delivery_id, ts(999), ts(500)).unwrap());
+        assert!(reserve_delivery(
+            &mut conn,
+            &running.delivery_id,
+            "run-running",
+            SessionId::new(),
+            ts(500)
+        )
+        .unwrap());
+        assert!(mark_delivery_running(&mut conn, &running.delivery_id, ts(500)).unwrap());
+
+        assert!(lease_delivery(&mut conn, &delivered.delivery_id, ts(999), ts(500)).unwrap());
+        assert!(reserve_delivery(
+            &mut conn,
+            &delivered.delivery_id,
+            "run-delivered",
+            SessionId::new(),
+            ts(500)
+        )
+        .unwrap());
+        assert!(mark_delivery_running(&mut conn, &delivered.delivery_id, ts(500)).unwrap());
+        assert!(complete_delivery(&mut conn, &delivered.delivery_id, ts(600)).unwrap());
+
+        // A single requested state behaves like a filtered `list_ready_deliveries`.
+        let just_ready = list_deliveries_in_states(&conn, &[DeliveryState::Ready]).unwrap();
+        assert_eq!(
+            just_ready
+                .iter()
+                .map(|d| &d.delivery_id)
+                .collect::<Vec<_>>(),
+            vec![&ready.delivery_id]
+        );
+
+        // Several states at once, in `created_at` order regardless of the
+        // order they were requested in.
+        let reserved_and_running =
+            list_deliveries_in_states(&conn, &[DeliveryState::Running, DeliveryState::Reserved])
+                .unwrap();
+        assert_eq!(
+            reserved_and_running
+                .iter()
+                .map(|d| &d.delivery_id)
+                .collect::<Vec<_>>(),
+            vec![&reserved.delivery_id, &running.delivery_id],
+            "must be ordered by created_at regardless of the order states were requested in, \
+             and must exclude ready/leased/delivered"
+        );
+
+        // Terminal states are real answers too, not just the ones this crate
+        // currently drives recovery from.
+        let terminal = list_deliveries_in_states(&conn, &[DeliveryState::Delivered]).unwrap();
+        assert_eq!(
+            terminal.iter().map(|d| &d.delivery_id).collect::<Vec<_>>(),
+            vec![&delivered.delivery_id]
+        );
+
+        // An empty state set is an empty result, not a SQL syntax error.
+        assert!(list_deliveries_in_states(&conn, &[]).unwrap().is_empty());
+    }
+
+    /// `complete_delivery`/`fail_delivery` gained `cancellation_requested` as
+    /// a legal predecessor (Task 7) so restart recovery's cancellation
+    /// reconciliation can record what a run genuinely did — `Completed` or
+    /// `Failed` — despite a cancellation having been requested against its
+    /// delivery. Widening those two must not loosen their *other*
+    /// predecessor constraints: a `ready` row still cannot complete or fail
+    /// directly.
+    #[test]
+    fn complete_and_fail_delivery_now_also_accept_cancellation_requested_as_a_predecessor() {
+        let mut conn = open_test_db();
+
+        let completed_after_cancel = create_ready_delivery(&mut conn, BindingId::new());
+        assert!(request_cancellation(
+            &mut conn,
+            &completed_after_cancel.delivery_id,
+            DeliveryState::Ready,
+            ts(10),
+        )
+        .unwrap());
+        assert_eq!(
+            fetch_delivery(&conn, &completed_after_cancel.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::CancellationRequested
+        );
+        assert!(complete_delivery(&mut conn, &completed_after_cancel.delivery_id, ts(20)).unwrap());
+        assert_eq!(
+            fetch_delivery(&conn, &completed_after_cancel.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::Delivered
+        );
+
+        let failed_after_cancel = create_ready_delivery(&mut conn, BindingId::new());
+        assert!(request_cancellation(
+            &mut conn,
+            &failed_after_cancel.delivery_id,
+            DeliveryState::Ready,
+            ts(10),
+        )
+        .unwrap());
+        assert!(fail_delivery(
+            &mut conn,
+            &failed_after_cancel.delivery_id,
+            "raced with its own cancellation",
+            ts(20),
+        )
+        .unwrap());
+        let after = fetch_delivery(&conn, &failed_after_cancel.delivery_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, DeliveryState::Failed);
+        assert_eq!(
+            after.last_error.as_deref(),
+            Some("raced with its own cancellation")
+        );
+
+        // The unrelated predecessor constraint is unchanged: `ready` still
+        // cannot complete or fail directly.
+        let still_ready = create_ready_delivery(&mut conn, BindingId::new());
+        assert!(!complete_delivery(&mut conn, &still_ready.delivery_id, ts(30)).unwrap());
+        assert!(!fail_delivery(&mut conn, &still_ready.delivery_id, "nope", ts(30)).unwrap());
+    }
+
+    #[test]
+    fn cancel_delivery_transitions_running_reserved_or_cancellation_requested_to_cancelled() {
+        let mut conn = open_test_db();
+
+        // From `cancellation_requested` — Mechanism 3's own shape: the run
+        // this delivery names was actually confirmed `Cancelled`.
+        let from_cancellation_requested = create_ready_delivery(&mut conn, BindingId::new());
+        assert!(request_cancellation(
+            &mut conn,
+            &from_cancellation_requested.delivery_id,
+            DeliveryState::Ready,
+            ts(10),
+        )
+        .unwrap());
+        assert!(
+            cancel_delivery(&mut conn, &from_cancellation_requested.delivery_id, ts(20)).unwrap()
+        );
+        assert_eq!(
+            fetch_delivery(&conn, &from_cancellation_requested.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::Cancelled
+        );
+
+        // From `reserved` — mirrors `fail_delivery`'s own predecessor set.
+        let from_reserved = create_ready_delivery(&mut conn, BindingId::new());
+        lease_delivery(&mut conn, &from_reserved.delivery_id, ts(999), ts(500)).unwrap();
+        reserve_delivery(
+            &mut conn,
+            &from_reserved.delivery_id,
+            "run-reserved",
+            SessionId::new(),
+            ts(500),
+        )
+        .unwrap();
+        assert!(cancel_delivery(&mut conn, &from_reserved.delivery_id, ts(600)).unwrap());
+        assert_eq!(
+            fetch_delivery(&conn, &from_reserved.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::Cancelled
+        );
+
+        // From `running`.
+        let from_running = create_ready_delivery(&mut conn, BindingId::new());
+        lease_delivery(&mut conn, &from_running.delivery_id, ts(999), ts(500)).unwrap();
+        reserve_delivery(
+            &mut conn,
+            &from_running.delivery_id,
+            "run-running",
+            SessionId::new(),
+            ts(500),
+        )
+        .unwrap();
+        mark_delivery_running(&mut conn, &from_running.delivery_id, ts(500)).unwrap();
+        assert!(cancel_delivery(&mut conn, &from_running.delivery_id, ts(700)).unwrap());
+        assert_eq!(
+            fetch_delivery(&conn, &from_running.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::Cancelled
+        );
+
+        // Predecessor mismatch: `ready` cannot be cancelled directly (no
+        // cancellation was ever requested).
+        let still_ready = create_ready_delivery(&mut conn, BindingId::new());
+        assert!(!cancel_delivery(&mut conn, &still_ready.delivery_id, ts(800)).unwrap());
+        assert_eq!(
+            fetch_delivery(&conn, &still_ready.delivery_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryState::Ready
+        );
+
+        // Already terminal: a second `cancel_delivery` call is a no-op.
+        assert!(!cancel_delivery(&mut conn, &from_running.delivery_id, ts(900)).unwrap());
+    }
 }

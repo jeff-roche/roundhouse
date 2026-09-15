@@ -4,11 +4,11 @@ use roundhouse_core::JobId;
 use roundhouse_sched::power::{
     run_power_watch, PowerEvent, PowerEvents, PowerWatchEvent, PowerWatchSink, RetryableMarker,
 };
-use roundhouse_sched::scheduler::{ClockSource, Scheduler, SchedulerEvent, SystemClock};
+use roundhouse_sched::scheduler::{
+    ClockSource, ScheduledOccurrence, Scheduler, SchedulerEvent, SystemClock,
+};
 use roundhouse_sched::trigger::{Binding, CatchUp, TriggerSpec};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::time::Instant;
 
 struct CountingRetryableMarker(Arc<std::sync::atomic::AtomicUsize>);
 impl RetryableMarker for CountingRetryableMarker {
@@ -85,7 +85,7 @@ async fn wake_event_triggers_full_recompute_and_marks_in_flight_calls_retryable(
     done_rx.await.expect("run_power_watch dropped its signal");
     handle.abort();
 
-    // recompute_all's correctness is already covered by Task 3's drift test;
+    // recompute_all's correctness is already covered by Task 3's own tests;
     // this task's own assertion is that Woke actually reaches both seams.
     assert!(sched.lock().unwrap().heap_len() == 0); // no bindings were registered in this test
     assert_eq!(
@@ -200,29 +200,26 @@ async fn poisoned_scheduler_mutex_is_recovered_not_left_permanently_broken() {
 ///
 /// A shared, externally-mutable clock (unlike the fixed-reading `FakeClock`
 /// below, which only ever needs one reading per test) — the test advances
-/// the wall/monotonic readings *between* the two `Woke` events, which
-/// `run_power_watch` observes on its next `clock.monotonic_now()`/
-/// `clock.wall_now()` read. `Mutex` (not `RefCell`) because this is shared
-/// across the test's thread and `run_power_watch`'s spawned task via
-/// `Arc<dyn ClockSource + Send + Sync>`, which requires `Sync`.
-struct MutableClock(Mutex<(Instant, DateTime<Utc>)>);
+/// the wall-clock reading *between* the two `Woke` events, which
+/// `run_power_watch` observes on its next `clock.wall_now()` read. `Mutex`
+/// (not `RefCell`) because this is shared across the test's thread and
+/// `run_power_watch`'s spawned task via `Arc<dyn ClockSource + Send + Sync>`,
+/// which requires `Sync`.
+struct MutableClock(Mutex<DateTime<Utc>>);
 
 impl MutableClock {
-    fn new(mono: Instant, wall: DateTime<Utc>) -> Self {
-        Self(Mutex::new((mono, wall)))
+    fn new(wall: DateTime<Utc>) -> Self {
+        Self(Mutex::new(wall))
     }
 
-    fn set(&self, mono: Instant, wall: DateTime<Utc>) {
-        *self.0.lock().unwrap() = (mono, wall);
+    fn set(&self, wall: DateTime<Utc>) {
+        *self.0.lock().unwrap() = wall;
     }
 }
 
 impl ClockSource for MutableClock {
-    fn monotonic_now(&self) -> Instant {
-        self.0.lock().unwrap().0
-    }
     fn wall_now(&self) -> DateTime<Utc> {
-        self.0.lock().unwrap().1
+        *self.0.lock().unwrap()
     }
 }
 
@@ -272,7 +269,6 @@ impl PowerEvents for TwoWokesWithGate {
 #[tokio::test]
 async fn poison_recovery_is_one_shot_not_permanent() {
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let start_mono = Instant::now();
 
     let mut scheduler = Scheduler::new();
     let mut binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
@@ -280,10 +276,7 @@ async fn poison_recovery_is_one_shot_not_permanent() {
         *catch_up = CatchUp::All;
     }
     let binding_id = binding.id;
-    let add_clock = FakeClock {
-        mono: start_mono,
-        wall: start_wall,
-    };
+    let add_clock = FakeClock { wall: start_wall };
     scheduler.add_binding(binding, &add_clock).unwrap();
     let sched = Arc::new(Mutex::new(scheduler));
 
@@ -303,7 +296,7 @@ async fn poison_recovery_is_one_shot_not_permanent() {
         "the mutex should now report itself as poisoned"
     );
 
-    let clock = Arc::new(MutableClock::new(start_mono, start_wall));
+    let clock = Arc::new(MutableClock::new(start_wall));
     let clock_dyn: Arc<dyn ClockSource + Send + Sync> = clock.clone();
     let retryable: Arc<Mutex<dyn RetryableMarker + Send>> =
         Arc::new(Mutex::new(NoopRetryableMarker));
@@ -342,8 +335,7 @@ async fn poison_recovery_is_one_shot_not_permanent() {
     // wake — a genuine backlog that accumulated *after* the poison was
     // already repaired and cleared.
     let target_wall = start_wall + chrono::Duration::minutes(5);
-    let target_mono = start_mono + Duration::from_secs(5 * 60);
-    clock.set(target_mono, target_wall);
+    clock.set(target_wall);
     proceed_tx
         .send(())
         .expect("the events source must still be waiting on this rendezvous");
@@ -364,7 +356,11 @@ async fn poison_recovery_is_one_shot_not_permanent() {
             let fires: Vec<DateTime<Utc>> = events
                 .iter()
                 .filter_map(|e| match e {
-                    SchedulerEvent::Fire(id, at) if *id == binding_id => Some(*at),
+                    SchedulerEvent::Fire(ScheduledOccurrence {
+                        binding_id: id,
+                        scheduled_for,
+                        ..
+                    }) if *id == binding_id => Some(*scheduled_for),
                     _ => None,
                 })
                 .collect();
@@ -383,24 +379,16 @@ async fn poison_recovery_is_one_shot_not_permanent() {
     }
 }
 
-/// A fixed-reading fake clock: the point of this test is what happens once
-/// the machine has already woken with a fixed (monotonic, wall) reading
-/// pair, not clock mutation over time, so no interior mutability is needed
-/// — a plain `Send + Sync` struct suffices for `run_power_watch`'s
-/// `Arc<dyn ClockSource + Send + Sync>` bound. On a real machine
-/// `CLOCK_MONOTONIC` does not advance across suspend while `CLOCK_REALTIME`
-/// (wall clock) jumps forward by the sleep duration; this fake's two
-/// readings are constructed with exactly that asymmetry rather than in
-/// lockstep, which is what a mere NTP-sized correction would look like.
+/// A fixed-reading fake wall clock: the point of this test is what happens
+/// once the machine has already woken with a fixed reading, not clock
+/// mutation over time, so no interior mutability is needed — a plain
+/// `Send + Sync` struct suffices for `run_power_watch`'s
+/// `Arc<dyn ClockSource + Send + Sync>` bound.
 struct FakeClock {
-    mono: Instant,
     wall: DateTime<Utc>,
 }
 
 impl ClockSource for FakeClock {
-    fn monotonic_now(&self) -> Instant {
-        self.mono
-    }
     fn wall_now(&self) -> DateTime<Utc> {
         self.wall
     }
@@ -460,11 +448,7 @@ impl PowerEvents for SingleWokeThenSignal {
 #[tokio::test]
 async fn long_simulated_sleep_drains_progressively_through_run_power_watch() {
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let start_mono = Instant::now();
-    let pre_sleep_clock = FakeClock {
-        mono: start_mono,
-        wall: start_wall,
-    };
+    let pre_sleep_clock = FakeClock { wall: start_wall };
 
     let mut scheduler = Scheduler::new();
     let binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
@@ -476,14 +460,7 @@ async fn long_simulated_sleep_drains_progressively_through_run_power_watch() {
     // progressive drains, never a single burst.
     let sleep_duration = chrono::Duration::days(10);
     let target_wall = start_wall + sleep_duration;
-    // The whole point of the monotonic/wall distinction (risk item 2): the
-    // monotonic clock barely moves across a real suspend (a handful of
-    // milliseconds of actual wall-clock processing before/after the sleep
-    // call), while the wall clock jumps by the full sleep duration.
-    let post_wake_clock = FakeClock {
-        mono: start_mono + Duration::from_millis(5),
-        wall: target_wall,
-    };
+    let post_wake_clock = FakeClock { wall: target_wall };
 
     let sched = Arc::new(Mutex::new(scheduler));
     let clock: Arc<dyn ClockSource + Send + Sync> = Arc::new(post_wake_clock);
@@ -539,11 +516,7 @@ async fn long_simulated_sleep_drains_progressively_through_run_power_watch() {
 #[test]
 fn latest_policy_backlog_collapses_to_one_fire_once_fully_drained_via_tick() {
     let start_wall = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let start_mono = Instant::now();
-    let pre_sleep_clock = FakeClock {
-        mono: start_mono,
-        wall: start_wall,
-    };
+    let pre_sleep_clock = FakeClock { wall: start_wall };
     let mut scheduler = Scheduler::new();
     let binding = Binding::new_cron(JobId::new(), "* * * * *".to_string(), Tz::UTC);
     let binding_id = binding.id;
@@ -551,19 +524,15 @@ fn latest_policy_backlog_collapses_to_one_fire_once_fully_drained_via_tick() {
 
     let sleep_duration = chrono::Duration::days(10);
     let target_wall = start_wall + sleep_duration;
-    let woke_mono = start_mono + Duration::from_millis(5);
 
     // 10 days at one-a-minute cadence is 14,400 missed occurrences —
     // exactly 144 capped batches of 100 (`MAX_CATCH_UP_OCCURRENCES_PER_BINDING_PER_TICK`),
     // deliberately chosen as an exact multiple to exercise the fix-round-1
     // edge case where the cap and the true end of the backlog coincide on
     // the same batch (see `drain_due`'s `next_after_cursor` lookahead).
-    let mut fired: Vec<SchedulerEvent> = scheduler.catch_up_after_wake(woke_mono, target_wall);
+    let mut fired: Vec<SchedulerEvent> = scheduler.catch_up_after_wake(target_wall);
 
-    let hold_clock = FakeClock {
-        mono: woke_mono,
-        wall: target_wall,
-    };
+    let hold_clock = FakeClock { wall: target_wall };
     // `heap_len()` never reaches 0 for a registered cron binding (a
     // rescheduled future entry always remains); the real completion signal
     // is a `Fire` event finally showing up for our binding, which — under
@@ -571,10 +540,9 @@ fn latest_policy_backlog_collapses_to_one_fire_once_fully_drained_via_tick() {
     // every one.
     for _ in 0..200 {
         fired.extend(scheduler.tick(&hold_clock));
-        if fired
-            .iter()
-            .any(|e| matches!(e, SchedulerEvent::Fire(id, _) if *id == binding_id))
-        {
+        if fired.iter().any(|e| {
+            matches!(e, SchedulerEvent::Fire(ScheduledOccurrence { binding_id: id, .. }) if *id == binding_id)
+        }) {
             break;
         }
     }
@@ -582,7 +550,11 @@ fn latest_policy_backlog_collapses_to_one_fire_once_fully_drained_via_tick() {
     let fires: Vec<_> = fired
         .into_iter()
         .filter_map(|e| match e {
-            SchedulerEvent::Fire(id, at) if id == binding_id => Some(at),
+            SchedulerEvent::Fire(ScheduledOccurrence {
+                binding_id: id,
+                scheduled_for,
+                ..
+            }) if id == binding_id => Some(scheduled_for),
             _ => None,
         })
         .collect();

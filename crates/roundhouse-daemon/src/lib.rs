@@ -22,7 +22,9 @@ pub mod boot;
 /// source, i.e. from the real boot path.
 pub mod demo;
 pub mod mcp_config;
+pub mod scheduler_driver;
 pub mod session_bootstrap;
+pub mod session_manager;
 pub mod session_registry;
 pub mod socket_server;
 pub mod workflow_host;
@@ -105,5 +107,129 @@ pub(crate) mod test_support {
     /// what every session actually starts as.
     pub(crate) async fn real_actor(dir: &std::path::Path) -> Arc<SessionActor> {
         real_actor_with_state(dir, SessionState::Running).await
+    }
+
+    /// A `Provider` that panics if anything actually asks it for a
+    /// completion. Every test using [`daemon_resources`] builds real
+    /// sessions but drives no model turn, so a real provider would only add
+    /// network dependence to a unit test.
+    pub(crate) struct NoopProvider;
+
+    impl roundhouse_provider::Provider for NoopProvider {
+        fn capabilities(
+            &self,
+            _model: &roundhouse_provider::ModelId,
+        ) -> roundhouse_provider::Capabilities {
+            roundhouse_provider::Capabilities::default()
+        }
+        fn resolve(
+            &self,
+            _req: &roundhouse_provider::ChatRequest,
+        ) -> Result<roundhouse_provider::Plan, roundhouse_provider::ProviderError> {
+            unimplemented!("not exercised by this crate's library tests")
+        }
+        fn stream_chat<'a>(
+            &'a self,
+            _req: &'a roundhouse_provider::ChatRequest,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<roundhouse_provider::ChatStream, roundhouse_provider::ProviderError>,
+        > {
+            unimplemented!("not exercised by this crate's library tests")
+        }
+        fn count_tokens<'a>(
+            &'a self,
+            _req: &'a roundhouse_provider::ChatRequest,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<roundhouse_provider::TokenCount, roundhouse_provider::ProviderError>,
+        > {
+            unimplemented!("not exercised by this crate's library tests")
+        }
+        fn list_models<'a>(
+            &'a self,
+            _ctx: &'a roundhouse_provider::RequestCtx,
+        ) -> roundhouse_provider::BoxFut<
+            'a,
+            Result<Vec<roundhouse_provider::ModelInfo>, roundhouse_provider::ProviderError>,
+        > {
+            unimplemented!("not exercised by this crate's library tests")
+        }
+    }
+
+    struct NoopTransport;
+
+    impl roundhouse_provider::HttpTransport for NoopTransport {
+        fn send<'a>(
+            &'a self,
+            _req: roundhouse_provider::HttpRequest,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<roundhouse_provider::HttpResponseStream, roundhouse_provider::TransportError>,
+        > {
+            Box::pin(async {
+                Err(roundhouse_provider::TransportError::Io(
+                    "NoopTransport never sends".into(),
+                ))
+            })
+        }
+    }
+
+    /// A fully real [`DaemonResources`](crate::session_bootstrap::DaemonResources)
+    /// built against `dir`, with a working loopback proxy, an
+    /// always-`Tier::Sandbox` isolate, and no network provider.
+    ///
+    /// Shared by `session_manager`'s and `scheduler_driver`'s test modules —
+    /// both need the identical "everything a real session is built from"
+    /// fixture, and a second copy of it would be one more thing to keep in
+    /// step with `DaemonResources::new`'s sixteen parameters.
+    ///
+    /// `load_workspace_config` is `false`: these tests supply their own
+    /// (empty) MCP/network/policy inputs rather than having session
+    /// construction read files out of the workspace under test.
+    pub(crate) async fn daemon_resources(
+        dir: &std::path::Path,
+        workspace_registry: Option<Arc<crate::workspace_registry::WorkspaceRegistry>>,
+    ) -> crate::session_bootstrap::DaemonResources {
+        use roundhouse_net::proxy::LoopbackProxy;
+
+        let store = roundhouse_store::open(&dir.join("events.db"))
+            .await
+            .unwrap();
+        let proxy = Arc::new(LoopbackProxy::new());
+        let proxy_store = roundhouse_store::open(&dir.join("events.db"))
+            .await
+            .unwrap();
+        let proxy_writer = roundhouse_store::spawn_writer(proxy_store).await;
+        proxy
+            .clone()
+            .serve(runner(), proxy_writer.clone())
+            .await
+            .unwrap();
+        crate::session_bootstrap::DaemonResources::new(
+            store,
+            available_isolate(),
+            proxy,
+            dir.join("state"),
+            dir.join("daemon-binary"),
+            Vec::new(),
+            roundhouse_config::NetworkConfig::default(),
+            OnDegrade::Refuse,
+            crate::session_bootstrap::no_policy_rules(),
+            crate::session_bootstrap::BackgroundServices::default(),
+            runner(),
+            Arc::new(NoopProvider),
+            roundhouse_provider::RequestCtx {
+                trace_id: None,
+                transport: Arc::new(NoopTransport),
+                api_key: "test-api-key-not-a-secret".into(),
+                credentials: None,
+            },
+            proxy_writer,
+            workspace_registry,
+            false,
+        )
     }
 }

@@ -12,6 +12,7 @@
 
 pub mod admission;
 pub mod cron;
+pub mod delivery;
 pub mod message_trigger;
 pub mod power;
 pub mod scheduler;

@@ -3,7 +3,9 @@ use std::fs;
 use roundhouse_core::Tier;
 use roundhouse_flow::durability::open_test_db;
 use roundhouse_flow::job::{AddVersionError, SessionTemplate};
-use roundhouse_flow::job_store::{register_workflow_file, resolve_job, JobStoreError};
+use roundhouse_flow::job_store::{
+    register_workflow_file, resolve_job, resolve_latest_by_job_id, JobStoreError,
+};
 use tempfile::tempdir;
 
 fn template() -> SessionTemplate {
@@ -243,4 +245,88 @@ fn registered_jobs_and_versions_are_immutable_in_sqlite() {
         rusqlite::params![registered.job.id().to_string()],
     );
     assert!(delete.is_err(), "job versions must reject deletes");
+}
+
+/// A trigger binding carries a `JobId`, never a job *name*, so the
+/// scheduler-delivery path needs a by-id counterpart to `resolve_job` — with
+/// the identical workspace verification, not a bare `SELECT`.
+#[test]
+fn latest_version_resolves_by_job_id_with_the_same_workspace_check_as_by_name() {
+    let root = tempdir().expect("workspace tempdir");
+    let source = root.path().join("workflow.yaml");
+    fs::write(&source, workflow(1, "by-id")).expect("write workflow");
+    let mut conn = open_test_db();
+
+    let registered = register_workflow_file(&mut conn, root.path(), &source, template())
+        .expect("register first version");
+    fs::write(&source, workflow(2, "by-id")).expect("update workflow");
+    register_workflow_file(&mut conn, root.path(), &source, template())
+        .expect("register second version");
+
+    let resolved = resolve_latest_by_job_id(&conn, root.path(), registered.job.id())
+        .expect("resolve registered workflow by id")
+        .expect("job exists");
+    assert_eq!(resolved.name, "by-id");
+    assert_eq!(resolved.job.id(), registered.job.id());
+    assert_eq!(
+        resolved.job.latest().version(),
+        2,
+        "resolving by id must follow the latest version, exactly like resolve_job by name"
+    );
+    assert!(
+        resolved.job.pinned(1).is_some(),
+        "prior versions must still be reachable from the resolved job"
+    );
+    assert_eq!(
+        resolved.source_path,
+        source.canonicalize().expect("canonical source"),
+        "the resolved source path must be the canonical one the workspace check produced"
+    );
+}
+
+#[test]
+fn resolving_an_unregistered_job_id_is_none_rather_than_an_error() {
+    let root = tempdir().expect("workspace tempdir");
+    let conn = open_test_db();
+    assert!(
+        resolve_latest_by_job_id(&conn, root.path(), roundhouse_core::JobId::new())
+            .expect("an unknown job id is not an error")
+            .is_none()
+    );
+}
+
+/// The whole reason this is not a bare `SELECT`: a job registered under one
+/// workspace must not hand back executable content when resolved against a
+/// different workspace root — the same guarantee `resolve_job` gives by name.
+#[test]
+fn resolving_by_job_id_refuses_a_source_outside_the_current_workspace() {
+    let root = tempdir().expect("workspace tempdir");
+    let other = tempdir().expect("other workspace tempdir");
+    let source = root.path().join("workflow.yaml");
+    fs::write(&source, workflow(1, "scoped")).expect("write workflow");
+    let mut conn = open_test_db();
+    let registered = register_workflow_file(&mut conn, root.path(), &source, template())
+        .expect("register workflow");
+
+    let error = resolve_latest_by_job_id(&conn, other.path(), registered.job.id())
+        .expect_err("a job whose source is outside this workspace must be refused");
+    assert!(matches!(error, JobStoreError::SourceOutsideWorkspace));
+}
+
+/// A workspace root that does not exist is refused before any row is read —
+/// `resolve_job`'s own `canonical_workspace` behaviour, which the by-id
+/// resolver must not skip.
+#[test]
+fn resolving_by_job_id_refuses_an_unavailable_workspace_root() {
+    let root = tempdir().expect("workspace tempdir");
+    let source = root.path().join("workflow.yaml");
+    fs::write(&source, workflow(1, "gone")).expect("write workflow");
+    let mut conn = open_test_db();
+    let registered = register_workflow_file(&mut conn, root.path(), &source, template())
+        .expect("register workflow");
+
+    let error =
+        resolve_latest_by_job_id(&conn, &root.path().join("no-such-dir"), registered.job.id())
+            .expect_err("an unresolvable workspace root must fail closed");
+    assert!(matches!(error, JobStoreError::WorkspaceUnavailable));
 }

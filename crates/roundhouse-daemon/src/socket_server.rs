@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use crate::session_bootstrap::{self, DaemonResources};
+use crate::session_manager::spawn_session_reaper;
 use crate::session_registry::SessionRegistry;
 
 /// How many in-flight `ClientRequest`s one connection's driver will buffer
@@ -149,7 +150,7 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// task forever with nothing else timing it out. 30 seconds matches
 /// [`DEFAULT_HANDSHAKE_TIMEOUT`]'s own generous-for-a-human,
 /// bounded-for-a-hang reasoning.
-const SESSION_CONSTRUCTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SESSION_CONSTRUCTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Fix round 3, SHOULD 2: a background construction that outlives its
 /// caller's own [`SESSION_CONSTRUCTION_TIMEOUT`] (see
@@ -1745,10 +1746,42 @@ async fn construct_real_session_bounded(
     let construction_resources = resources.clone();
     tokio::spawn(async move {
         let _construction_permit = construction_permit;
+        let session_id = roundhouse_core::SessionId::new();
+        // `ClientRequest::CreateSession` carries no tier/`on_degrade` field
+        // (it is `workspace_name` only), so the daemon picks the default
+        // policy itself.
+        //
+        // **Ruling W1-R95 (fix round 1): `OnDegrade::Refuse` is the default,
+        // not `AllowDownTo(Tier::None)`.** An earlier version of this path
+        // used `AllowDownTo(Tier::None)`, reasoned as "safer than refusing to
+        // create any session on a host without bwrap." That reasoning was
+        // backwards: `SealedContext.requested_tier` is populated from
+        // `effective_tier` (`roundhouse_engine::effective_tier`), not
+        // `spec.requested_tier` directly, and `effective_tier` for
+        // `AllowDownTo(floor)` IS `floor`. `Tier::None` is the first variant
+        // of a derived-`Ord` enum, so `attested_tier < requested_tier`
+        // (`sealed_tier_shortfall`, §6.2/§6.5) becomes unsatisfiable for
+        // every `Tier` — that setting PERMANENTLY DISARMS the one sealed
+        // rule that detects a live mid-session isolation downgrade, for
+        // every task, in every session, for the daemon's whole life.
+        // `session_actor.rs`'s own doc comment on `effective_tier` already
+        // records a previous round fixing a bug with this exact symptom as
+        // "a genuine fail-open regression." §6.5 also names `Refuse` as the
+        // documented default and requires a downgrade be an explicit human
+        // decision at creation — `construction_resources.default_on_degrade`
+        // (below) is that decision, made once by the operator via
+        // `round-daemon-internal --allow-degraded-to <TIER>`, never silently
+        // by this path.
+        let spec = roundhouse_core::SessionSpec {
+            workspace: workspace_id,
+            name: Some(workspace_name),
+            requested_tier: roundhouse_core::Tier::Sandbox,
+            on_degrade: construction_resources.default_on_degrade,
+        };
         let outcome = session_bootstrap::create_real_session(
             &construction_resources,
-            workspace_id,
-            workspace_name,
+            session_id,
+            spec,
             workspace_root,
             workspace_device,
             workspace_inode,
@@ -1815,68 +1848,11 @@ async fn construct_real_session_bounded(
     }
 }
 
-/// The "do-reap-when-the-actor-ends" half of ruling W1-R51 (fix round 1,
-/// ruling W1-R99): watches `session_id`'s own `SessionState` for its
-/// terminal `Closed` value and calls [`SessionRegistry::remove`] the moment
-/// it's observed.
-///
-/// Spawned once per successfully created session, independent of any one
-/// connection's lifetime — it must keep running after the connection that
-/// called `CreateSession` (and `drive_session` itself) has returned, since a
-/// session's actor can outlive every connection that ever touched it (that
-/// is the entire point of `SessionEntry`'s "entry lifetime = actor
-/// lifetime" rule this reaper closes the other half of).
-///
-/// Nothing in this crate currently drives an actor to `SessionState::Closed`
-/// (there is no live work-submission path yet — see `main.rs`'s own module
-/// doc comment), so this loop simply never observes that value today and the
-/// task sits parked on `state.changed()` for the daemon's whole life,
-/// exactly as inert as `remove`'s previous zero-caller state was loud about
-/// being unwired. The difference is that the mechanism is now real and
-/// wired at the one call site that creates a session, so the moment a
-/// future task adds a real terminal transition, this reaper closes the loop
-/// with no further wiring needed.
-fn spawn_session_reaper(
-    registry: Arc<SessionRegistry>,
-    session_id: roundhouse_core::SessionId,
-    actor: Arc<roundhouse_engine::SessionActor>,
-    mcp_host: Option<Arc<roundhouse_mcp::host::McpHost>>,
-    proxy: Arc<roundhouse_net::proxy::LoopbackProxy>,
-    proxy_token: String,
-) {
-    let mut state = actor.subscribe();
-    tokio::spawn(async move {
-        loop {
-            if *state.borrow() == roundhouse_core::SessionState::Closed {
-                registry.remove(session_id);
-                // Fix round 2, MUST 2: before this, only the BOOKKEEPING
-                // was cleared here (the registry entry, the proxy's
-                // session-token map entry) — the REAL resources behind
-                // them (a real bwrap isolation handle, real MCP child
-                // processes) were never torn down on this path at all.
-                actor.teardown().await;
-                if let Some(host) = &mcp_host {
-                    if let Err(err) = host.shutdown().await {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            error = %err,
-                            "failed to shut down this session's MCP host"
-                        );
-                    }
-                }
-                proxy.deregister_session(&proxy_token);
-                return;
-            }
-            if state.changed().await.is_err() {
-                // The actor's own `state_tx` sender has been dropped — the
-                // actor itself is gone. If that happened through some other
-                // path than reaching `Closed`, there is nothing meaningful
-                // left to watch; just stop.
-                return;
-            }
-        }
-    });
-}
+// `spawn_session_reaper` moved to `crate::session_manager` (Phase 8, Task 4)
+// so both the socket path and a headless caller (a scheduled trigger
+// delivery) share one cleanup path — see that module's own doc comment for
+// the full rationale, unchanged by the move. Imported at the top of this
+// file alongside this module's other `crate::` imports.
 
 #[cfg(test)]
 mod classify_accept_error_tests {

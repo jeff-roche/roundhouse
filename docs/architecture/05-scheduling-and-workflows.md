@@ -53,10 +53,24 @@ assumption. The stored config is exactly as explicit and DST-safe as before; onl
 human's manual-lookup burden for the common case (schedule this on my machine, in my
 timezone) is removed.
 
-**Clocks.** Never sleep to a wall-clock deadline. A min-heap of next-fire instants in UTC,
-slept on a **monotonic** timer. Each tick compares monotonic elapsed against wall elapsed;
-divergence beyond ~2s means NTP step, manual clock change, or resume-from-suspend → drop
-the heap, recompute every binding, run catch-up.
+**Clocks.** Never sleep to a wall-clock deadline. A min-heap of next-fire instants in UTC.
+**Wall clock only — no monotonic comparison.** An earlier design also read a monotonic
+timer alongside the wall clock and treated any disagreement between the two beyond ~2s as
+drift, unconditionally dropping the heap and recomputing every binding. That conflated two
+different situations: an ordinary forward tick (or an NTP step that merely nudges the wall
+clock ahead) has no missed backlog to discard, so treating it as drift silently dropped
+real, legitimately-scheduled occurrences for no reason — a live bug, not a hypothetical one.
+Only a wall-clock reading that moves **backward** relative to the previous one the scheduler
+observed is genuinely ambiguous (every already-heaped fire time could now be stale, in the
+past relative to itself); that case alone drops the heap and recomputes every binding's next
+occurrence(s) from the corrected time — discarding each binding's *pending, not-yet-fired*
+backlog in the process, not running catch-up on it. Already-fired occurrences are unaffected
+regardless of this: they are durable `TriggerEvent` rows, not heap state, so a `CatchUp::All`
+binding's batches fired before the step stand; only the not-yet-processed tail of its backlog
+(and, for `CatchUp::Latest`, the entire pending window, since none of it had fired yet) is
+dropped rather than replayed. Any forward (or unchanged) reading, however large the jump,
+drains the heap normally instead — the same missed-occurrence walk an ordinary late tick
+already uses.
 
 **Catch-up.** Bindings store `last_fired_for` (the *scheduled* instant) and `next_fire_at`.
 `CatchUp::Latest` is the right default — you want one report this morning, not eight.
@@ -196,8 +210,13 @@ socket-activated. Clean split: **the OS answers "is the daemon running", the dae
 runs when".** We need catch-up ourselves regardless, so `Persistent=true` buys nothing.
 
 Sleep/wake: subscribe to logind `PrepareForSleep` / `NSWorkspaceDidWake` where available,
-falling back to monotonic-vs-wall divergence. On resume, recompute schedules, run
-catch-up, and **mark all in-flight provider calls retryable — their sockets are dead.**
+falling back to the scheduler's own backward-wall-clock-step check on its next ordinary
+tick (§8.2 "Clocks") — a missed or absent OS signal is slower to react to, not silently
+wrong. On resume, drain any backlog that accumulated during the sleep through the same
+capped, `CatchUp`-policy-aware machinery an ordinary tick uses (a forward wall-clock
+reading, the overwhelmingly common real case); only a genuine backward wall-clock step
+recomputes schedules from scratch. Either way, **mark all in-flight provider calls
+retryable — their sockets are dead.**
 
 ### 8.8 What a workflow is
 

@@ -41,10 +41,7 @@ fn downstream_crates_declare_required_dependency_edges() {
             "roundhouse-flow",
             &["roundhouse-core", "roundhouse-engine", "roundhouse-store"],
         ),
-        (
-            "roundhouse-sched",
-            &["roundhouse-core", "roundhouse-engine", "roundhouse-store"],
-        ),
+        ("roundhouse-sched", &["roundhouse-core", "roundhouse-store"]),
         (
             "roundhouse-daemon",
             &[
