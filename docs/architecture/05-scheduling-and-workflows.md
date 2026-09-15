@@ -62,10 +62,15 @@ clock ahead) has no missed backlog to discard, so treating it as drift silently 
 real, legitimately-scheduled occurrences for no reason — a live bug, not a hypothetical one.
 Only a wall-clock reading that moves **backward** relative to the previous one the scheduler
 observed is genuinely ambiguous (every already-heaped fire time could now be stale, in the
-past relative to itself); that case alone drops the heap, recomputes every binding from the
-corrected time, and runs catch-up. Any forward (or unchanged) reading, however large the
-jump, drains the heap normally instead — the same missed-occurrence walk an ordinary late
-tick already uses.
+past relative to itself); that case alone drops the heap and recomputes every binding's next
+occurrence(s) from the corrected time — discarding each binding's *pending, not-yet-fired*
+backlog in the process, not running catch-up on it. Already-fired occurrences are unaffected
+regardless of this: they are durable `TriggerEvent` rows, not heap state, so a `CatchUp::All`
+binding's batches fired before the step stand; only the not-yet-processed tail of its backlog
+(and, for `CatchUp::Latest`, the entire pending window, since none of it had fired yet) is
+dropped rather than replayed. Any forward (or unchanged) reading, however large the jump,
+drains the heap normally instead — the same missed-occurrence walk an ordinary late tick
+already uses.
 
 **Catch-up.** Bindings store `last_fired_for` (the *scheduled* instant) and `next_fire_at`.
 `CatchUp::Latest` is the right default — you want one report this morning, not eight.

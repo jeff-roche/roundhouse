@@ -642,8 +642,6 @@ fn accept_due_occurrences(
 
 // ───────────────────────── delivery claim and execution ─────────────────────
 
-/// How many `ready` deliveries one heartbeat tick may claim.
-///
 /// How many `ready` rows one tick reads while looking for work.
 ///
 /// **Deliberately larger than [`MAX_CONCURRENT_DELIVERIES`], not equal to
@@ -1420,18 +1418,23 @@ impl DeliveryExecutor {
         // resolve-then-reserve order the brief sketched.** `fail_delivery` is
         // predecessor-constrained on `state IN ('running', 'reserved')`, so a
         // claim that dies while still `leased` cannot record why it failed:
-        // the row sits `leased` with no owner, and nothing calls
-        // `reclaim_expired_lease` yet. Reserving first puts every fallible
-        // step below inside a state `fail_delivery` accepts. Widening
-        // `fail_delivery` to accept `leased` was the alternative and is
-        // *wrong*: a lease that expires is meant to return to `ready` for
-        // another claimer, not to be burned as a permanent failure.
+        // the row sits `leased` with no owner, and there is no *live-tick*
+        // reaper to return it to `ready` — only the boot-time
+        // `reclaim_expired_leases_at_boot` pass (Task 7) calls
+        // `reclaim_expired_lease`, and that only runs once, at daemon startup.
+        // Reserving first puts every fallible step below inside a state
+        // `fail_delivery` accepts. Widening `fail_delivery` to accept `leased`
+        // was the alternative and is *wrong*: a lease that expires is meant
+        // to return to `ready` for another claimer, not to be burned as a
+        // permanent failure.
         //
         // The residual window is lease-success to reserve-success — one store
         // round-trip with no logic in it. A claimer that dies there leaves a
-        // `leased` row that only a lease reaper (`reclaim_expired_lease`,
-        // which has no caller yet) can return to `ready`. That is what the
-        // lease column is *for*; wiring the reaper is a separate task.
+        // `leased` row that only a lease reaper can return to `ready` — today
+        // that means the next daemon restart's boot-time pass, not a live
+        // tick, so the row is stuck `leased` until then. That is what the
+        // lease column is *for*; wiring a live-tick reaper is a separate
+        // task.
         let reserved = self
             .transition_checked(&delivery.delivery_id, {
                 let run_text = run_id.as_uuid().to_string();
@@ -1894,10 +1897,20 @@ async fn dispatch_ready_deliveries(
 
 // ───────────────────────── restart recovery (Task 7) ─────────────────────
 //
-// At boot, after the binding load and executor construction but before
+// At boot, after the binding load, executor construction, and
 // `ctx.signal_ready()`: reclaim expired leases back to `ready`, re-seed the
 // admission registry for every surviving non-terminal delivery, re-drive
 // `reserved`/`running` deliveries, and finish `cancellation_requested` ones.
+//
+// Final-review fix round 1 (Important 1) moved `signal_ready` ahead of this
+// pass: recovery can drive whole recovered workflows to completion and
+// construct sessions, which is unbounded wall-clock time, and nothing
+// downstream of "ready" (the socket bind, the web listener) needs recovery to
+// have *finished* — only that this service is alive and about to reconcile.
+// Every mechanism below therefore also observes a `&watch::Receiver<bool>`
+// so an orderly shutdown requested while recovery is still running can
+// interrupt it between rows rather than being unable to run at all until
+// recovery finishes (see each mechanism's own cancellation check).
 //
 // **Scope, stated once for the whole section**: this is boot-time
 // reconciliation of state a *previous* daemon process left behind, not a
@@ -2077,7 +2090,11 @@ async fn reconcile_already_terminal_run(
 /// path goes through an established transition rather than a new ad hoc SQL
 /// statement duplicating one that exists. A one-shot boot pass over what
 /// should be a small table, so no batching or pagination.
-async fn reclaim_expired_leases_at_boot(executor: &DeliveryExecutor, boot: Timestamp) {
+async fn reclaim_expired_leases_at_boot(
+    executor: &DeliveryExecutor,
+    boot: Timestamp,
+    cancelled: &tokio::sync::watch::Receiver<bool>,
+) {
     let leased = match executor
         .with_connection(|conn| {
             list_deliveries_in_states(conn, &[DeliveryState::Leased]).map_err(|e| e.to_string())
@@ -2097,6 +2114,15 @@ async fn reclaim_expired_leases_at_boot(executor: &DeliveryExecutor, boot: Times
 
     let mut reclaimed = 0usize;
     for delivery in leased {
+        if *cancelled.borrow() {
+            tracing::info!(
+                reclaimed,
+                "boot-time lease reclamation interrupted by shutdown; the remaining leased \
+                 rows are exactly as recoverable on the next boot as if this pass had not \
+                 reached them"
+            );
+            return;
+        }
         let Some(expires) = delivery.lease_expires_at else {
             // `lease_delivery` always stamps a `leased` row's lease — this
             // should be unreachable, and there is nothing to reclaim against
@@ -2140,7 +2166,10 @@ async fn reclaim_expired_leases_at_boot(executor: &DeliveryExecutor, boot: Times
 /// `Ready`/`Leased` branch already handles both identically, which is
 /// exactly what makes listing them together here correct rather than
 /// incidental.
-async fn reseed_ready_deliveries(executor: &DeliveryExecutor) {
+async fn reseed_ready_deliveries(
+    executor: &DeliveryExecutor,
+    cancelled: &tokio::sync::watch::Receiver<bool>,
+) {
     let rows = match executor
         .with_connection(|conn| {
             list_deliveries_in_states(conn, &[DeliveryState::Ready, DeliveryState::Leased])
@@ -2165,6 +2194,13 @@ async fn reseed_ready_deliveries(executor: &DeliveryExecutor) {
          trigger deliveries"
     );
     for delivery in &rows {
+        if *cancelled.borrow() {
+            tracing::info!(
+                "boot-time registry re-seeding interrupted by shutdown; the remaining rows are \
+                 re-seeded on the next boot"
+            );
+            return;
+        }
         reseed_registry_slot(executor, delivery).await;
     }
 }
@@ -2295,6 +2331,7 @@ async fn redrive_reserved_and_running(
     executor: &DeliveryExecutor,
     bindings: &HashMap<BindingId, StoredBinding>,
     boot: Timestamp,
+    cancelled: &tokio::sync::watch::Receiver<bool>,
 ) {
     let rows = match executor
         .with_connection(|conn| {
@@ -2318,6 +2355,13 @@ async fn redrive_reserved_and_running(
         "boot-time recovery is re-driving surviving reserved/running trigger deliveries"
     );
     for delivery in rows {
+        if *cancelled.borrow() {
+            tracing::info!(
+                "boot-time reserved/running redrive interrupted by shutdown; the remaining \
+                 rows are re-driven on the next boot"
+            );
+            return;
+        }
         redrive_reserved_or_running(executor, bindings, delivery, boot).await;
     }
 }
@@ -2488,6 +2532,7 @@ async fn finish_cancellation_requested_deliveries(
     executor: &DeliveryExecutor,
     bindings: &HashMap<BindingId, StoredBinding>,
     boot: Timestamp,
+    cancelled: &tokio::sync::watch::Receiver<bool>,
 ) {
     let rows = match executor
         .with_connection(|conn| {
@@ -2511,14 +2556,23 @@ async fn finish_cancellation_requested_deliveries(
         "boot-time recovery is finishing surviving cancellation-requested trigger deliveries"
     );
     for delivery in rows {
+        if *cancelled.borrow() {
+            tracing::info!(
+                "boot-time cancellation-requested finishing interrupted by shutdown; the \
+                 remaining rows are finished on the next boot"
+            );
+            return;
+        }
         finish_cancellation_requested_delivery(executor, bindings, delivery, boot).await;
     }
 }
 
-/// Task 7's boot-time restart-recovery pass. Runs once, after the boot-time
-/// binding load and [`DeliveryExecutor`]/[`InMemoryRunRegistry`]
-/// construction, and before [`BackgroundServiceContext::signal_ready`] — see
-/// this module's Task 7 brief for the full mechanism-by-mechanism reasoning.
+/// Task 7's boot-time restart-recovery pass (Final-review fix round 1,
+/// Important 1: reordered to run **after**
+/// [`BackgroundServiceContext::signal_ready`], not before it). Runs once,
+/// after the boot-time binding load, [`DeliveryExecutor`]/
+/// [`InMemoryRunRegistry`] construction, and readiness signalling — see this
+/// module's Task 7 brief for the full mechanism-by-mechanism reasoning.
 ///
 /// Order matters:
 ///
@@ -2530,10 +2584,24 @@ async fn finish_cancellation_requested_deliveries(
 /// 3. Re-drive `reserved`/`running` deliveries — each also re-seeds its own
 ///    registry slot as part of its own recovery.
 /// 4. Finish `cancellation_requested` deliveries — ditto.
+///
+/// This internal sequencing is unchanged by the reorder above: every step
+/// still runs to completion before the next starts, and this whole function
+/// still runs to completion before [`run`]'s heartbeat loop begins. What
+/// changed is only what the daemon's socket bind and web listener wait on —
+/// they no longer wait for this function at all.
+///
+/// `cancelled` is peeked (never `.changed()`-awaited) at the top of each
+/// mechanism's own per-row loop iteration, so an orderly shutdown requested
+/// while recovery is still running stops that mechanism's loop between rows
+/// rather than mid-delivery. An unprocessed row is exactly as recoverable on
+/// the next boot as if this pass had never reached it — reading a row does
+/// not touch its persisted state.
 async fn recover_after_restart(
     executor: &DeliveryExecutor,
     bindings: &HashMap<BindingId, StoredBinding>,
     boot: DateTime<Utc>,
+    cancelled: &tokio::sync::watch::Receiver<bool>,
 ) {
     // The same fallback `roundhouse_sched::store`'s own `timestamp_from_datetime`
     // takes: the only way this is `None` is a `DateTime` outside chrono's
@@ -2541,19 +2609,29 @@ async fn recover_after_restart(
     // ever is.
     let boot_ts = Timestamp::from_unix_nanos(boot.timestamp_nanos_opt().unwrap_or(0));
 
-    reclaim_expired_leases_at_boot(executor, boot_ts).await;
-    reseed_ready_deliveries(executor).await;
-    redrive_reserved_and_running(executor, bindings, boot_ts).await;
-    finish_cancellation_requested_deliveries(executor, bindings, boot_ts).await;
+    reclaim_expired_leases_at_boot(executor, boot_ts, cancelled).await;
+    reseed_ready_deliveries(executor, cancelled).await;
+    redrive_reserved_and_running(executor, bindings, boot_ts, cancelled).await;
+    finish_cancellation_requested_deliveries(executor, bindings, boot_ts, cancelled).await;
 }
 
 /// The scheduler background service.
 ///
-/// Boot order is load -> schedule -> signal readiness -> heartbeat, and
-/// [`BackgroundServiceContext::signal_ready`] is called exactly once, after
-/// the load has succeeded: the daemon's startup contract is that a service
-/// returning or failing before readiness aborts boot, so signalling earlier
-/// would report a scheduler that is not yet scheduling anything.
+/// Boot order is load -> schedule -> signal readiness -> restart recovery ->
+/// heartbeat, and [`BackgroundServiceContext::signal_ready`] is called
+/// exactly once, after the load has succeeded and every binding is in the
+/// scheduler's heap, but **before** [`recover_after_restart`] runs (Final-
+/// review fix round 1, Important 1). "Ready" for this service means "bindings
+/// are loaded and this service is about to reconcile and start ticking," not
+/// "every possibly-hours-long recovered workflow has already finished" —
+/// which is the only thing the daemon's socket bind and web listener actually
+/// need to know before they can serve traffic. Recovery itself still runs to
+/// completion, in its own documented step order, before the heartbeat loop
+/// begins; only *when the daemon is observed as ready* moved, not recovery's
+/// internal guarantees. Because recovery can now run after readiness, it
+/// takes a `&watch::Receiver<bool>` and checks it between rows in each of its
+/// four mechanisms, so an orderly shutdown requested mid-recovery can still
+/// interrupt it (see [`recover_after_restart`]).
 ///
 /// # The binding snapshot is taken once, at boot
 ///
@@ -2647,18 +2725,36 @@ pub async fn run(mut ctx: BackgroundServiceContext) -> Result<(), BackgroundServ
         Arc::new(SystemClock),
     );
 
+    // Final-review fix round 1 (Important 1): `signal_ready` is called here,
+    // BEFORE `recover_after_restart`, not after it. Recovery can drive whole
+    // recovered workflows to completion (unbounded wall-clock time) and
+    // construct sessions (up to `SESSION_CONSTRUCTION_TIMEOUT` each); the
+    // daemon's socket bind and web listener both wait on this service's
+    // readiness (`BackgroundServices::start`), so signalling only after
+    // recovery finished made the whole daemon look dead — reachable by
+    // nothing — for as long as a crash-time backlog of in-flight deliveries
+    // took to redrive, with no way for an orderly shutdown to interrupt it
+    // either (recovery watched nothing, so `RunningBackgroundServices::shutdown`
+    // could not run until `start` returned). "Ready" now means "bindings are
+    // loaded and this service is about to reconcile and start ticking," which
+    // is what the socket/web listener actually need to know — not "every
+    // possibly-hours-long recovered workflow has already finished."
+    ctx.signal_ready().await?;
+
     // Task 7: reconcile whatever a *previous* daemon process left behind —
     // reclaim expired leases, re-seed this fresh, empty registry for every
     // surviving non-terminal delivery, re-drive `reserved`/`running`
     // deliveries, and finish `cancellation_requested` ones. Deliberately
     // after the executor is constructed (it needs `executor.resources`/
-    // `executor.sessions`/`executor.registry`) and before
-    // `ctx.signal_ready()` — the daemon's startup contract is that nothing
-    // observes this daemon as ready until its boot sequence, recovery
-    // included, has run.
-    recover_after_restart(&executor, &bindings, boot).await;
-
-    ctx.signal_ready().await?;
+    // `executor.sessions`/`executor.registry`) and — as of the reorder above —
+    // after `ctx.signal_ready()` too. This does not change recovery's own
+    // internal ordering guarantees (lease reclaim before re-seed, re-seed
+    // before re-drive, etc. are still sequential steps inside this call, and
+    // the whole call still runs to completion before the heartbeat loop
+    // begins); it changes only when the daemon is observed as ready. Handed
+    // `ctx.cancelled` so an orderly shutdown requested while recovery is
+    // still running can interrupt it between rows.
+    recover_after_restart(&executor, &bindings, boot, &ctx.cancelled).await;
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     // A tick missed because a previous tick's acceptance work ran long must
@@ -4438,6 +4534,17 @@ mod delivery_tests {
             map
         }
 
+        /// A `watch::Receiver<bool>` permanently reporting "not cancelled",
+        /// for every recovery test below that isn't itself exercising
+        /// mid-recovery interruption (Final-review fix round 1, Important 1
+        /// part B). The paired `Sender` is dropped immediately — every
+        /// caller here only ever peeks `*borrow()`, never awaits `changed()`,
+        /// so a receiver whose sender is gone still reads back its initial
+        /// `false` value correctly.
+        fn never_cancelled() -> tokio::sync::watch::Receiver<bool> {
+            tokio::sync::watch::channel(false).1
+        }
+
         // ── Mechanism 1: reclaim expired leases ──────────────────────────
 
         #[tokio::test]
@@ -4464,7 +4571,13 @@ mod delivery_tests {
             );
 
             let boot = DateTime::from_timestamp_nanos(200); // past the lease's expiry (100)
-            recover_after_restart(&fresh, &bindings_map(&harness.stored), boot).await;
+            recover_after_restart(
+                &fresh,
+                &bindings_map(&harness.stored),
+                boot,
+                &never_cancelled(),
+            )
+            .await;
 
             assert_eq!(
                 harness.state_of(&harness.delivery.delivery_id).await,
@@ -4478,6 +4591,66 @@ mod delivery_tests {
                 1,
                 "the reclaimed-then-ready delivery must re-seed the fresh registry too, or a \
                  restart would silently stop enforcing OverlapPolicy for its binding"
+            );
+        }
+
+        /// Final-review fix round 1, Important 1 part B: recovery must be
+        /// interruptible by an orderly shutdown, since it can now run
+        /// **after** this service is already observed as ready (part A) —
+        /// so a shutdown request can arrive mid-recovery, not just before or
+        /// after it. `cancelled` is peeked at the top of each mechanism's
+        /// own per-row loop; a receiver that already reports `true` before
+        /// `recover_after_restart` is even called must stop Mechanism 1
+        /// before it processes this expired lease at all — proved by the
+        /// lease staying exactly `leased` (not reclaimed to `ready`) and the
+        /// registry staying at zero (never re-seeded, since Mechanism 2 also
+        /// never runs). No wall-clock timing: `cancelled` is a plain
+        /// `watch::Receiver<bool>` set once, synchronously, before the call.
+        #[tokio::test]
+        async fn recovery_already_cancelled_before_it_starts_does_nothing() {
+            let harness = harness(completing_workflow()).await;
+            let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
+
+            let id = harness.delivery.delivery_id.clone();
+            let conn = harness.store.pool.get().await.unwrap();
+            conn.interact(move |connection| {
+                assert!(lease_delivery(
+                    connection,
+                    &id,
+                    Timestamp::from_unix_nanos(100),
+                    Timestamp::from_unix_nanos(0),
+                )
+                .unwrap());
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                harness.state_of(&harness.delivery.delivery_id).await,
+                DeliveryState::Leased
+            );
+
+            let already_cancelled = tokio::sync::watch::channel(true).1;
+            let boot = DateTime::from_timestamp_nanos(200); // past the lease's expiry (100)
+            recover_after_restart(
+                &fresh,
+                &bindings_map(&harness.stored),
+                boot,
+                &already_cancelled,
+            )
+            .await;
+
+            assert_eq!(
+                harness.state_of(&harness.delivery.delivery_id).await,
+                DeliveryState::Leased,
+                "recovery must not reclaim an expired lease once shutdown has been requested"
+            );
+            assert_eq!(
+                fresh_registry
+                    .active_run_count(harness.stored.binding.id)
+                    .unwrap(),
+                0,
+                "recovery must not re-seed the registry once shutdown has been requested — \
+                 Mechanism 2 never got the chance to run"
             );
         }
 
@@ -4501,7 +4674,13 @@ mod delivery_tests {
             .unwrap();
 
             let boot = DateTime::from_timestamp_nanos(500); // before the lease's expiry (1_000)
-            recover_after_restart(&fresh, &bindings_map(&harness.stored), boot).await;
+            recover_after_restart(
+                &fresh,
+                &bindings_map(&harness.stored),
+                boot,
+                &never_cancelled(),
+            )
+            .await;
 
             assert_eq!(
                 harness.state_of(&harness.delivery.delivery_id).await,
@@ -4533,6 +4712,7 @@ mod delivery_tests {
                 &fresh,
                 &bindings_map(&harness.stored),
                 DateTime::from_timestamp_nanos(0),
+                &never_cancelled(),
             )
             .await;
 
@@ -4570,6 +4750,7 @@ mod delivery_tests {
                 &fresh,
                 &bindings_map(&harness.stored),
                 DateTime::from_timestamp_nanos(0),
+                &never_cancelled(),
             )
             .await;
 
@@ -4606,6 +4787,7 @@ mod delivery_tests {
                 &fresh,
                 &bindings_map(&harness.stored),
                 DateTime::from_timestamp_nanos(0),
+                &never_cancelled(),
             )
             .await;
 
@@ -4633,6 +4815,7 @@ mod delivery_tests {
                 &fresh,
                 &bindings_map(&harness.stored),
                 DateTime::from_timestamp_nanos(0),
+                &never_cancelled(),
             )
             .await;
 
@@ -4664,6 +4847,7 @@ mod delivery_tests {
                 &fresh,
                 &bindings_map(&harness.stored),
                 DateTime::from_timestamp_nanos(0),
+                &never_cancelled(),
             )
             .await;
 
@@ -4693,7 +4877,13 @@ mod delivery_tests {
 
             // No bindings at all — the binding is treated as disabled/deleted
             // since this delivery started.
-            recover_after_restart(&fresh, &HashMap::new(), DateTime::from_timestamp_nanos(0)).await;
+            recover_after_restart(
+                &fresh,
+                &HashMap::new(),
+                DateTime::from_timestamp_nanos(0),
+                &never_cancelled(),
+            )
+            .await;
 
             assert_eq!(
                 harness.state_of(&harness.delivery.delivery_id).await,
@@ -4728,6 +4918,7 @@ mod delivery_tests {
                 &fresh,
                 &bindings_map(&harness.stored),
                 DateTime::from_timestamp_nanos(0),
+                &never_cancelled(),
             )
             .await;
 
@@ -4763,6 +4954,7 @@ mod delivery_tests {
                 &fresh,
                 &bindings_map(&harness.stored),
                 DateTime::from_timestamp_nanos(0),
+                &never_cancelled(),
             )
             .await;
 
@@ -4793,6 +4985,7 @@ mod delivery_tests {
                 &fresh,
                 &bindings_map(&harness.stored),
                 DateTime::from_timestamp_nanos(0),
+                &never_cancelled(),
             )
             .await;
 
@@ -4825,6 +5018,7 @@ mod delivery_tests {
                 &fresh,
                 &bindings_map(&harness.stored),
                 DateTime::from_timestamp_nanos(0),
+                &never_cancelled(),
             )
             .await;
 
@@ -4855,6 +5049,7 @@ mod delivery_tests {
                 &fresh,
                 &bindings_map(&harness.stored),
                 DateTime::from_timestamp_nanos(0),
+                &never_cancelled(),
             )
             .await;
 
@@ -4894,6 +5089,7 @@ mod delivery_tests {
                 &fresh,
                 &bindings_map(&harness.stored),
                 DateTime::from_timestamp_nanos(0),
+                &never_cancelled(),
             )
             .await;
 
@@ -4931,7 +5127,13 @@ mod delivery_tests {
                 .await;
             let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
 
-            recover_after_restart(&fresh, &HashMap::new(), DateTime::from_timestamp_nanos(0)).await;
+            recover_after_restart(
+                &fresh,
+                &HashMap::new(),
+                DateTime::from_timestamp_nanos(0),
+                &never_cancelled(),
+            )
+            .await;
 
             assert_eq!(
                 harness.state_of(&harness.delivery.delivery_id).await,

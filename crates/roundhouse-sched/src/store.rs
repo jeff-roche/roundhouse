@@ -612,6 +612,41 @@ pub enum Acceptance {
 /// bindings is a caller bug, not a database state to reconcile — checked
 /// before any statement runs (not even inside a transaction), so a
 /// mismatched call can never partially write anything.
+///
+/// # Compensating a mid-transaction failure (Final-review fix round 1,
+/// Important 3)
+///
+/// `decide_admission` mutates `registry` (`note_admitted`/`note_queued`) —
+/// per `admission.rs`'s own documented contract — *before this function
+/// returns*, not transactionally with anything below it. Several more
+/// fallible statements run after that call inside the same DB transaction
+/// (`UPDATE trigger_event`, `insert_delivery_in_txn`,
+/// `request_cancellation_in_txn`, `advance_cursor_in_txn`, `txn.commit()`);
+/// if any of them fails, `txn` rolls back — no `trigger_delivery` row is ever
+/// created — but the in-memory registry charge `decide_admission` already
+/// made is not undone by the rollback, since it lives outside the database
+/// entirely. Left uncompensated, that permanently wedges the affected
+/// binding's counter (e.g. `active_run_count` stuck at 1 under
+/// `OverlapPolicy::Skip`, with no delivery ever able to release it via
+/// `note_finished`) until the next daemon restart re-seeds the registry from
+/// durable state.
+///
+/// This function does **not** change `decide_admission`'s contract (other
+/// trigger types rely on its documented before-it-returns mutation). Instead
+/// every fallible step from immediately after `decide_admission` returns
+/// through `txn.commit()` runs inside one inner closure; if that closure
+/// fails after a decision was made, the matching inverse registry operation
+/// runs before the error is returned — [`RunRegistry::note_finished`] for a
+/// decision that charged `active` ([`AdmissionDecision::Admit`],
+/// [`AdmissionDecision::CancelledPreviousAndAdmit`]),
+/// [`RunRegistry::note_dequeued`] for one that charged `queued`
+/// ([`AdmissionDecision::QueueAt`]), and nothing for a decision that charged
+/// neither ([`AdmissionDecision::SkipDueToOverlap`],
+/// [`AdmissionDecision::SkippedQueueFull`],
+/// [`AdmissionDecision::SkippedCancellationUnconfirmed`]). A compensation
+/// failure itself is logged, not propagated — the original error is what the
+/// caller needs to see, and a registry that cannot be written to is already
+/// failing closed via every other read/write on that path.
 pub fn accept_occurrence(
     conn: &mut Connection,
     binding: &StoredBinding,
@@ -641,103 +676,180 @@ pub fn accept_occurrence(
         outcome: None,
     };
 
-    let acceptance = match insert_trigger_event_in_txn(&txn, &ev)? {
-        None => {
-            // Duplicate (Task 3 step 4): re-fetch what is already durable and
-            // fabricate no fresh `AdmissionDecision` — `decide_admission` is
-            // NOT called again.
-            let (trigger_event_id, outcome_str): (i64, Option<String>) = txn.query_row(
-                "SELECT id, outcome FROM trigger_event
-                 WHERE binding_id = ?1 AND idempotency_key = ?2",
-                params![occurrence.binding_id.to_string(), idempotency_key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let outcome = outcome_str
-                .map(|s| TriggerEventOutcome::from_sql_str(&s))
-                .transpose()?;
-            let delivery = select_delivery_by_trigger_event_id_in_txn(&txn, trigger_event_id)?;
-            Acceptance::Duplicate {
-                trigger_event_id,
-                outcome,
-                delivery,
+    // Set the moment (if any) `decide_admission` charges a registry slot in
+    // this call, so a later failure in the closure below knows what to
+    // compensate. `None` for the whole call until then, and for the
+    // `Duplicate` path forever (that path never calls `decide_admission` at
+    // all).
+    let mut charged: Option<AdmissionDecision> = None;
+
+    let attempt = (|| -> Result<Acceptance, StoreError> {
+        match insert_trigger_event_in_txn(&txn, &ev)? {
+            None => {
+                // Duplicate (Task 3 step 4): re-fetch what is already durable
+                // and fabricate no fresh `AdmissionDecision` — `decide_admission`
+                // is NOT called again, so there is nothing to compensate on
+                // this path.
+                let (trigger_event_id, outcome_str): (i64, Option<String>) = txn.query_row(
+                    "SELECT id, outcome FROM trigger_event
+                     WHERE binding_id = ?1 AND idempotency_key = ?2",
+                    params![occurrence.binding_id.to_string(), idempotency_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let outcome = outcome_str
+                    .map(|s| TriggerEventOutcome::from_sql_str(&s))
+                    .transpose()?;
+                let delivery = select_delivery_by_trigger_event_id_in_txn(&txn, trigger_event_id)?;
+                Ok(Acceptance::Duplicate {
+                    trigger_event_id,
+                    outcome,
+                    delivery,
+                })
+            }
+            Some(trigger_event_id) => {
+                // Genuinely new occurrence (Task 3 step 5): decide admission
+                // exactly once, against the caller's `registry`. From here on,
+                // `charged` is set, and any `?` below that returns `Err` must
+                // be answered by the caller compensating it.
+                let decision =
+                    decide_admission(binding.binding.overlap, registry, occurrence.binding_id)?;
+                charged = Some(decision);
+                let outcome = outcome_for_decision(decision);
+
+                txn.execute(
+                    "UPDATE trigger_event SET outcome = ?1 WHERE id = ?2",
+                    params![outcome.as_sql_str(), trigger_event_id],
+                )?;
+
+                // Looked up *before* inserting the new delivery row below, so
+                // there is no need to filter the new row back out of this
+                // query.
+                let previous_to_cancel = if decision == AdmissionDecision::CancelledPreviousAndAdmit
+                {
+                    select_latest_nonterminal_delivery_for_binding_in_txn(
+                        &txn,
+                        occurrence.binding_id,
+                    )?
+                } else {
+                    None
+                };
+
+                let delivery = if decision_creates_delivery(decision) {
+                    let delivery = TriggerDelivery {
+                        delivery_id: Uuid::new_v4().to_string(),
+                        trigger_event_id,
+                        binding_id: occurrence.binding_id,
+                        state: DeliveryState::Ready,
+                        attempts: 0,
+                        lease_expires_at: None,
+                        run_id: None,
+                        session_id: None,
+                        last_error: None,
+                        created_at: fired_at_ts,
+                        updated_at: fired_at_ts,
+                    };
+                    insert_delivery_in_txn(&txn, &delivery)?;
+                    Some(delivery)
+                } else {
+                    None
+                };
+
+                if let Some(previous) = previous_to_cancel {
+                    // A lost race (the previous delivery moved to some other
+                    // state — e.g. it already finished — between the read
+                    // above and this write) is a no-op, not an error: the
+                    // whole `accept_occurrence` call must not fail over it.
+                    let applied = request_cancellation_in_txn(
+                        &txn,
+                        &previous.delivery_id,
+                        previous.state,
+                        fired_at_ts,
+                    )?;
+                    if !applied {
+                        tracing::debug!(
+                            delivery_id = %previous.delivery_id,
+                            binding_id = %occurrence.binding_id,
+                            "CancelPrevious: previous delivery's state changed before \
+                             cancellation could be requested (lost race) — no-op, not an error"
+                        );
+                    }
+                }
+
+                Ok(Acceptance::New {
+                    trigger_event_id,
+                    decision,
+                    outcome,
+                    delivery,
+                })
             }
         }
-        Some(trigger_event_id) => {
-            // Genuinely new occurrence (Task 3 step 5): decide admission
-            // exactly once, against the caller's `registry`.
-            let decision =
-                decide_admission(binding.binding.overlap, registry, occurrence.binding_id)?;
-            let outcome = outcome_for_decision(decision);
+    })();
 
-            txn.execute(
-                "UPDATE trigger_event SET outcome = ?1 WHERE id = ?2",
-                params![outcome.as_sql_str(), trigger_event_id],
-            )?;
-
-            // Looked up *before* inserting the new delivery row below, so
-            // there is no need to filter the new row back out of this query.
-            let previous_to_cancel = if decision == AdmissionDecision::CancelledPreviousAndAdmit {
-                select_latest_nonterminal_delivery_for_binding_in_txn(&txn, occurrence.binding_id)?
-            } else {
-                None
-            };
-
-            let delivery = if decision_creates_delivery(decision) {
-                let delivery = TriggerDelivery {
-                    delivery_id: Uuid::new_v4().to_string(),
-                    trigger_event_id,
-                    binding_id: occurrence.binding_id,
-                    state: DeliveryState::Ready,
-                    attempts: 0,
-                    lease_expires_at: None,
-                    run_id: None,
-                    session_id: None,
-                    last_error: None,
-                    created_at: fired_at_ts,
-                    updated_at: fired_at_ts,
-                };
-                insert_delivery_in_txn(&txn, &delivery)?;
-                Some(delivery)
-            } else {
-                None
-            };
-
-            if let Some(previous) = previous_to_cancel {
-                // A lost race (the previous delivery moved to some other
-                // state — e.g. it already finished — between the read above
-                // and this write) is a no-op, not an error: the whole
-                // `accept_occurrence` call must not fail over it.
-                let applied = request_cancellation_in_txn(
-                    &txn,
-                    &previous.delivery_id,
-                    previous.state,
-                    fired_at_ts,
-                )?;
-                if !applied {
-                    tracing::debug!(
-                        delivery_id = %previous.delivery_id,
-                        binding_id = %occurrence.binding_id,
-                        "CancelPrevious: previous delivery's state changed before cancellation \
-                         could be requested (lost race) — no-op, not an error"
-                    );
-                }
-            }
-
-            Acceptance::New {
-                trigger_event_id,
-                decision,
-                outcome,
-                delivery,
-            }
+    let acceptance = match attempt {
+        Ok(acceptance) => acceptance,
+        Err(error) => {
+            compensate_registry_charge(charged, registry, occurrence.binding_id);
+            return Err(error);
         }
     };
 
     // Task 3 step 6: the occurrence happened regardless of admission
     // outcome, so the cursor advances unconditionally — but never backward.
-    advance_cursor_in_txn(&txn, occurrence.binding_id, occurrence.scheduled_for)?;
+    // Still inside the compensation window: a failure here or at `commit`
+    // below is exactly as capable of stranding `charged`'s registry slot as
+    // one inside the closure above.
+    if let Err(error) = advance_cursor_in_txn(&txn, occurrence.binding_id, occurrence.scheduled_for)
+    {
+        compensate_registry_charge(charged, registry, occurrence.binding_id);
+        return Err(error);
+    }
 
-    txn.commit()?;
+    if let Err(error) = txn.commit() {
+        compensate_registry_charge(charged, registry, occurrence.binding_id);
+        return Err(error.into());
+    }
+
     Ok(acceptance)
+}
+
+/// Undoes the one registry charge [`decide_admission`] may have made during
+/// an [`accept_occurrence`] call that went on to fail — see that function's
+/// own doc comment for the full compensation contract. `charged` is `None`
+/// for the `Duplicate` path and for any failure before `decide_admission`
+/// ran, in which case this is a no-op.
+fn compensate_registry_charge(
+    charged: Option<AdmissionDecision>,
+    registry: &dyn RunRegistry,
+    binding_id: BindingId,
+) {
+    let Some(decision) = charged else {
+        return;
+    };
+    let result = match decision {
+        // Charged an active slot via `note_admitted`; give it back.
+        AdmissionDecision::Admit | AdmissionDecision::CancelledPreviousAndAdmit => {
+            registry.note_finished(binding_id)
+        }
+        // Charged a queued slot via `note_queued`; give it back.
+        AdmissionDecision::QueueAt(_) => registry.note_dequeued(binding_id),
+        // Charged neither — nothing to undo.
+        AdmissionDecision::SkipDueToOverlap
+        | AdmissionDecision::SkippedQueueFull { .. }
+        | AdmissionDecision::SkippedCancellationUnconfirmed => return,
+    };
+    if let Err(error) = result {
+        // The original transaction failure is what the caller returns and
+        // must see; a failed compensation is a second, distinct problem
+        // (this binding's registry counter may now be wrong until the next
+        // restart) logged here rather than folded into that `Err`.
+        tracing::error!(
+            binding_id = %binding_id,
+            error = %error,
+            "could not compensate an admission-registry charge after accept_occurrence failed \
+             partway through its transaction; this binding's active/queued counter may now be \
+             wrong until the next daemon restart re-seeds it from durable state"
+        );
+    }
 }
 
 /// Leases a `ready` delivery: `ready` -> `leased`, stamping
@@ -1382,6 +1494,102 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM trigger_delivery", [], |r| r.get(0))
             .unwrap();
         assert_eq!(delivery_count, 1, "no second trigger_delivery row");
+    }
+
+    /// Final-review fix round 1, Important 3: `decide_admission` charges the
+    /// registry (here, `note_admitted` for an `Admit` decision) *before*
+    /// `accept_occurrence` returns, but several more fallible statements run
+    /// after that inside the same transaction. If any of them fails, the
+    /// transaction rolls back — no `trigger_delivery` row is ever created —
+    /// but without compensation the registry charge stands anyway, wedging
+    /// `active_run_count` at 1 forever under `OverlapPolicy::Skip` (no
+    /// delivery ever exists to release it via `note_finished`).
+    ///
+    /// This forces the failure in `advance_cursor_in_txn` — the step that
+    /// runs *after* the New/Duplicate match, shared by both arms — rather
+    /// than inside the match arm itself, deliberately: that is the step an
+    /// "only handle the arm's own statements" fix would miss, per the
+    /// brief's "not just the obvious path" requirement. Dropping
+    /// `trigger_binding_cursor` before the call is a deterministic way to
+    /// fail exactly there with no real I/O flakiness — every earlier
+    /// statement in the function never touches that table.
+    #[test]
+    fn accept_occurrence_compensates_its_registry_charge_when_the_transaction_fails_after_admission(
+    ) {
+        let mut conn = open_test_db();
+        let binding = test_binding(OverlapPolicy::Skip);
+        let occurrence = occurrence_at(binding.binding.id, 1);
+        let registry = FakeRegistry::default();
+
+        conn.execute("DROP TABLE trigger_binding_cursor", [])
+            .unwrap();
+
+        let err = accept_occurrence(&mut conn, &binding, &occurrence, fired_at(60), &registry)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected the dropped-table write to surface as a Sqlite error, got {err:?}"
+        );
+
+        assert_eq!(
+            registry.active_run_count(binding.binding.id).unwrap(),
+            0,
+            "decide_admission's Admit charge must be compensated back to its \
+             pre-accept_occurrence value when the surrounding transaction rolls back, not left \
+             stuck at 1 forever"
+        );
+        assert_eq!(registry.queued_count(binding.binding.id).unwrap(), 0);
+
+        // The transaction rolled back: no trigger_event or trigger_delivery
+        // row survives despite the registry having briefly been charged.
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM trigger_event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            event_count, 0,
+            "the whole transaction, including the event insert, rolled back"
+        );
+        let delivery_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM trigger_delivery", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(delivery_count, 0);
+    }
+
+    /// The `QueueAt` side of the same compensation contract: a `Queue`
+    /// binding's decision charges a *queued*, not active, slot
+    /// (`note_queued`), so the matching compensation must be
+    /// `note_dequeued`, not `note_finished` — asserted by checking `queued`
+    /// (not `active`) settles back to zero.
+    #[test]
+    fn accept_occurrence_compensates_a_queued_charge_with_note_dequeued() {
+        let mut conn = open_test_db();
+        let binding = test_binding(OverlapPolicy::Queue { depth: 8 });
+        let registry = FakeRegistry::default();
+
+        // Seed one active run so the next occurrence's decision is `QueueAt`,
+        // not `Admit`.
+        let first = occurrence_at(binding.binding.id, 1);
+        accept_occurrence(&mut conn, &binding, &first, fired_at(60), &registry).unwrap();
+        assert_eq!(registry.active_run_count(binding.binding.id).unwrap(), 1);
+
+        conn.execute("DROP TABLE trigger_binding_cursor", [])
+            .unwrap();
+
+        let second = occurrence_at(binding.binding.id, 2);
+        let err =
+            accept_occurrence(&mut conn, &binding, &second, fired_at(120), &registry).unwrap_err();
+        assert!(matches!(err, StoreError::Sqlite(_)));
+
+        // The first occurrence's active charge is untouched (its own
+        // transaction committed successfully); only the second call's
+        // queued charge must be compensated back to zero.
+        assert_eq!(registry.active_run_count(binding.binding.id).unwrap(), 1);
+        assert_eq!(
+            registry.queued_count(binding.binding.id).unwrap(),
+            0,
+            "the QueueAt decision's note_queued charge must be compensated with \
+             note_dequeued, not left stranded"
+        );
     }
 
     #[test]

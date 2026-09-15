@@ -55,10 +55,6 @@ thiserror = { workspace = true }
 # Already a workspace dependency used by several other crates; no new edge
 # in the frozen crate dependency table.
 tracing = { workspace = true }
-# Task 3 (scheduler): only `tokio::time::Instant` is used, for a monotonic
-# clock reading that is immune to wall-clock adjustments. No async runtime
-# is spun up by this crate, so only the `time` feature is enabled.
-tokio = { workspace = true, features = ["time"] }
 # Task 3 (`store.rs`'s `accept_occurrence`): `trigger_delivery.delivery_id` is
 # a UUID string minted by the writer (`Uuid::new_v4().to_string()`), per
 # `delivery.rs`'s own doc comment on `TriggerDelivery::delivery_id`. Promoted
