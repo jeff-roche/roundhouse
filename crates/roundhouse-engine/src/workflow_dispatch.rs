@@ -1,17 +1,16 @@
-//! Phase 8 Task 25.3 — dispatches one `tool:` step of a workflow run for
-//! real, through the same admission/execution machinery
+//! Phase 8 Task 25.3/25.4 — dispatches one `tool:` step of a workflow run
+//! for real, through the same admission/execution machinery
 //! [`crate::agent_loop`]'s chat dispatch uses (`SessionActor::admit_task`,
 //! [`crate::tool_dispatch::execute_builtin`]), and folds the result into the
 //! shape `roundhouse-flow`'s suspend/resume seam hands back to a run —
 //! see `roundhouse_flow::exec::run_loop::WorkDone`'s own doc for the
 //! contract this fills.
 //!
-//! **Scope: `TaskKind::Read` only.** Every other built-in
-//! (`write`/`edit`/`find`/`shell`) is refused with a named, recorded
-//! failure. Wiring them is Phase 8 Task 25.4's scope — `shell` in
-//! particular needs the pre-spawn/cancel-watch machinery
-//! `agent_loop::dispatch_builtin` already has for the chat path, which this
-//! function deliberately does not reproduce yet.
+//! **Scope: `TaskKind::Read | Write | Edit | Find | Shell`.** Every other
+//! built-in is refused with a named, recorded failure. `Shell` in particular
+//! gets its real isolation wiring in Task 2 of this phase; for now it
+//! dispatches with the placeholder `IsolationAttestation { tier: Tier::None, .. }`
+//! (see the comment at `task_started` below).
 //!
 //! # Why this is not `dispatch_builtin` with different arguments
 //!
@@ -77,7 +76,13 @@ pub async fn dispatch_tool_for_workflow(
         .await
         .map_err(|e| format!("failed to record a dispatched workflow tool call: {e}"))?;
 
-    if task_kind != TaskKind::Read {
+    // Explicit allowlist over the five kinds this function actually dispatches.
+    // Everything else is refused with `unsupported_workflow_tool`.
+    let is_supported = matches!(
+        task_kind,
+        TaskKind::Read | TaskKind::Write | TaskKind::Edit | TaskKind::Find | TaskKind::Shell
+    );
+    if !is_supported {
         let last_task_seq = record_workflow_task_failed(
             actor,
             task_id,

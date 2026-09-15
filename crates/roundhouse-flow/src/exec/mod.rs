@@ -1054,7 +1054,12 @@ impl<'a> Executor<'a> {
                     resolved_with.redacted_for_logging(),
                     &self.redaction_needles,
                 );
-                let task_kind = task_kind_for_tool(tool);
+                let Some(task_kind) = task_kind_for_tool(tool) else {
+                    return DispatchDecision::Done(StepOutcome::failed(
+                        &step.id,
+                        format!("unknown tool: {tool:?}"),
+                    ));
+                };
                 let dispatch_input = resolved_with.into_unredacted_for_dispatch();
                 DispatchDecision::Pending(run_loop::PendingKind::Tool {
                     tool: tool.clone(),
@@ -1350,16 +1355,29 @@ impl<'a> Executor<'a> {
     }
 }
 
-fn task_kind_for_tool(tool: &str) -> TaskKind {
+/// Maps a workflow `tool:` name to its `TaskKind`, returning `None` for
+/// unrecognized tool names. Ensures an authored typo is diagnosed as an
+/// unknown tool rather than routed into Shell's argument parser — see Task 1
+/// (Phase 8 Task 25.4) for the hazard this closes.
+///
+/// **Design choice**: returning `Option<TaskKind>` rather than a result or
+/// enum variant allows the call site to distinguish "unknown tool name" from
+/// "known tool but bad parameters" at the step-dispatch level (where this
+/// function sits), keeping the diagnosis in the flow executor rather than
+/// deferring it to a later tool dispatcher. A step with `tool: totally-made-up`
+/// fails immediately with "unknown tool" rather than suspending the run and
+/// later failing with "missing program field."
+fn task_kind_for_tool(tool: &str) -> Option<TaskKind> {
     match tool {
-        "shell" => TaskKind::Shell,
-        "http" => TaskKind::Http,
-        "read" => TaskKind::Read,
-        "write" => TaskKind::Write,
-        "edit" => TaskKind::Edit,
-        "find" => TaskKind::Find,
-        "git" => TaskKind::Git,
-        _ => TaskKind::Shell,
+        "shell" => Some(TaskKind::Shell),
+        "http" => Some(TaskKind::Http),
+        "read" => Some(TaskKind::Read),
+        "write" => Some(TaskKind::Write),
+        "edit" => Some(TaskKind::Edit),
+        "find" => Some(TaskKind::Find),
+        "git" => Some(TaskKind::Git),
+        "mcp" => Some(TaskKind::Mcp),
+        _ => None,
     }
 }
 
