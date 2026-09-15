@@ -2448,14 +2448,35 @@ async fn finish_cancellation_requested_delivery(
                 .await;
         }
         Err(error) => {
-            executor
-                .fail(
-                    &delivery.delivery_id,
-                    binding_id,
-                    error.kind(),
-                    error.to_string(),
-                )
-                .await;
+            // Unlike `redrive_reserved_or_running`'s identical-looking `Err`
+            // arm, `control::cancel` above already durably committed
+            // `Cancelling` to this run's `workflow_run` row before this
+            // pre-run infra failure (session construction, workspace
+            // resolution, a store error) happened. Failing the *delivery*
+            // here — as `executor.fail` would, moving it to terminal
+            // `failed` and releasing the registry slot — would strand the
+            // *run*: every mechanism in this module lists deliveries by
+            // delivery state, so a `failed` delivery is never revisited, and
+            // the `Cancelling` row it points at would never be driven to
+            // `Cancelled`. That reproduces the exact "`Cancelling` is not
+            // terminal, a cancelled run nobody drives is stuck forever"
+            // defect this whole task exists to close. So: leave the
+            // delivery exactly as `cancellation_requested` (a no-op — it
+            // already is) and the registry slot held; the next boot's
+            // Mechanism 3 will find this delivery again via its own
+            // `CancellationRequested` listing, peek `recover_run`, see
+            // `Cancelling` still non-terminal, and retry — tolerating
+            // `ControlError::NotCancellable` on the now-redundant
+            // `control::cancel` call above, exactly as the already-Cancelling
+            // case already does.
+            tracing::error!(
+                binding_id = %binding_id,
+                error = %error,
+                "a cancellation-requested delivery's redrive failed after control::cancel had \
+                 already committed Cancelling to its run; leaving the delivery as \
+                 cancellation_requested and its admission slot held so the next boot retries \
+                 rather than stranding the run at non-terminal Cancelling forever"
+            );
             executor.retire_session(session).await;
         }
     }
@@ -3611,6 +3632,35 @@ mod delivery_tests {
             let executor = DeliveryExecutor::new(
                 self.store.clone(),
                 Arc::clone(&self.resources),
+                Arc::clone(&sessions),
+                Arc::clone(&registry),
+                Arc::new(FixedClock(instant())),
+            );
+            (executor, registry, sessions)
+        }
+
+        /// Like [`Self::fresh_executor_after_restart`], but wired to a fresh
+        /// [`DaemonResources`] whose `workspace_registry` is `None` —
+        /// forcing `DeliveryExecutor::rebuild_and_drive_recovered_run` to
+        /// fail with `DeliveryError::NoWorkspaceRegistry` before it builds
+        /// anything, standing in for any pre-run infra failure (session
+        /// construction, workspace resolution, a store error). Used by the
+        /// fix-round-1 regression test pinning that such a failure, reached
+        /// only after `control::cancel` already committed `Cancelling`,
+        /// must not fail the delivery to a terminal state.
+        async fn fresh_executor_after_restart_without_workspace_registry(
+            &self,
+        ) -> (
+            DeliveryExecutor,
+            Arc<InMemoryRunRegistry>,
+            Arc<SessionRegistry>,
+        ) {
+            let registry = Arc::new(InMemoryRunRegistry::new());
+            let sessions = Arc::new(SessionRegistry::new());
+            let resources = Arc::new(daemon_resources(self._dir.path(), None).await);
+            let executor = DeliveryExecutor::new(
+                self.store.clone(),
+                resources,
                 Arc::clone(&sessions),
                 Arc::clone(&registry),
                 Arc::new(FixedClock(instant())),
@@ -4822,6 +4872,53 @@ mod delivery_tests {
                     .active_run_count(harness.stored.binding.id)
                     .unwrap(),
                 0
+            );
+        }
+
+        #[tokio::test]
+        async fn a_cancellation_requested_delivery_whose_redrive_infra_fails_after_cancel_committed_stays_retryable(
+        ) {
+            let harness = harness(completing_workflow()).await;
+            let (run_id, _session_id) = harness
+                .simulate_cancellation_requested_before_crash(RunState::Running)
+                .await;
+            // `control::cancel` will still succeed (the run row is a real,
+            // resolvable `Running` run); only the *redrive* that follows it
+            // fails, because this executor's `DaemonResources` has no
+            // workspace registry at all.
+            let (fresh, fresh_registry, _sessions) = harness
+                .fresh_executor_after_restart_without_workspace_registry()
+                .await;
+
+            recover_after_restart(
+                &fresh,
+                &bindings_map(&harness.stored),
+                DateTime::from_timestamp_nanos(0),
+            )
+            .await;
+
+            assert_eq!(
+                harness.state_of(&harness.delivery.delivery_id).await,
+                DeliveryState::CancellationRequested,
+                "a pre-run infra failure reached only after control::cancel already committed \
+                 Cancelling must not fail the delivery to a terminal state — that would strand \
+                 the run at non-terminal Cancelling forever, since every recovery mechanism \
+                 lists deliveries by delivery state and a terminal delivery is never revisited"
+            );
+            assert_eq!(
+                harness.run_state(run_id).await,
+                RunState::Cancelling,
+                "control::cancel must have actually committed before the redrive's infra \
+                 failure"
+            );
+            assert_eq!(
+                fresh_registry
+                    .active_run_count(harness.stored.binding.id)
+                    .unwrap(),
+                1,
+                "the registry slot must stay held (not released) so the next boot's Mechanism \
+                 3 retries against an already-charged slot, exactly as every other \
+                 leave-it-as-it-is path in this mechanism does"
             );
         }
 
