@@ -173,6 +173,29 @@ pub fn resolve_job(
     Ok(Some(job))
 }
 
+/// Resolves the latest durable version of the job identified by `job_id`, or
+/// returns `None` when no job has that id. The by-id counterpart to
+/// [`resolve_job`], for a caller that holds a [`JobId`] rather than a name —
+/// a `trigger_binding` carries `job_id`, never the job's name, so the
+/// scheduled-delivery path cannot use the by-name resolver at all.
+///
+/// **Applies exactly the same workspace verification [`resolve_job`] does**,
+/// and for the same reason: a modified `jobs.source_path` must not be able to
+/// turn a job into a source outside the current workspace. The only
+/// difference between the two functions is which column the row is found by.
+pub fn resolve_latest_by_job_id(
+    conn: &Connection,
+    workspace_root: &Path,
+    job_id: JobId,
+) -> Result<Option<RegisteredJob>, JobStoreError> {
+    let workspace_root = canonical_workspace(workspace_root)?;
+    let Some(mut job) = load_job_by_id(conn, job_id)? else {
+        return Ok(None);
+    };
+    job.source_path = canonical_stored_source(&workspace_root, &job.source_path)?;
+    Ok(Some(job))
+}
+
 /// Resolves the exact immutable version pinned by a workflow run. Unlike
 /// [`resolve_job`], this never follows the latest version and verifies the
 /// stored content hash before returning executable content.
