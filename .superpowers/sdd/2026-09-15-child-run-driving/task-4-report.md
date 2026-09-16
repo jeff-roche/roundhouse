@@ -145,3 +145,20 @@ GREEN after the Round 2 implementation:
 - `cargo test -p roundhouse-daemon --lib
   scheduler_driver::delivery_tests::an_incomplete_continuation_claim_retries_only_after_boot_reconciliation
   -- --exact`
+
+## Fix Round 3 Finalization Fence
+
+Every ordinary returned error after a continuation claim now releases that
+claim. In particular, `DeliveryExecutor::continue_after_child_terminal`
+fences `complete_child_continuation_claim` with the same release path it uses
+for join and parent-resume errors. A failed completion transition therefore
+does not strand the non-expiring claim until restart.
+
+TDD evidence:
+
+- RED: `a_finalization_error_releases_the_continuation_for_an_in_process_retry`
+  installed a real SQLite trigger rejecting only the `completed` state. The
+  initial continuation returned an error; after removing the trigger, retry
+  failed because the old finalization `?` left the claim unavailable.
+- GREEN: the same test now passes: the finalization error releases its token,
+  and the unchanged live executor reclaims and completes the continuation.

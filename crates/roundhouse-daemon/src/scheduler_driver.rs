@@ -2423,9 +2423,17 @@ impl DeliveryExecutor {
                     return Err(error);
                 }
             };
-            let completed = self
+            let completed = match self
                 .complete_child_continuation_claim(child_run_id, &claim, self.now())
-                .await?;
+                .await
+            {
+                Ok(completed) => completed,
+                Err(error) => {
+                    self.release_child_continuation_claim(child_run_id, &claim)
+                        .await;
+                    return Err(error);
+                }
+            };
             if !completed {
                 return Ok(continued);
             }
@@ -6260,6 +6268,90 @@ mod delivery_tests {
             child_refunds, 1,
             "finish_run retains ownership of one refund"
         );
+    }
+
+    #[tokio::test]
+    async fn a_finalization_error_releases_the_continuation_for_an_in_process_retry() {
+        let harness = harness(parent_calling_child_gate_workflow()).await;
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_parking_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let parent = harness.delivery_row().await;
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(parent.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let parent_session_id = parent
+            .session_id
+            .expect("reserve stamps a parent session id");
+        let conn = harness.store.pool.get().await.unwrap();
+        let (child_run_id, child_session_id) = conn
+            .interact(move |connection| {
+                let (child_run_id, child_session_id): (String, String) = connection
+                    .query_row(
+                        "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                (
+                    RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap()),
+                    SessionId::from_uuid(Uuid::parse_str(&child_session_id).unwrap()),
+                )
+            })
+            .await
+            .unwrap();
+        let (fresh, _registry, _sessions) =
+            harness.restart_executor_with_reconciled_resources().await;
+        answer_child_gate_after_restart(
+            &fresh,
+            &harness,
+            child_run_id,
+            child_session_id,
+            parent_session_id,
+        )
+        .await;
+
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_continuation_completion
+                     BEFORE UPDATE ON workflow_child_call
+                     WHEN NEW.continuation_state = 'completed'
+                     BEGIN SELECT RAISE(ABORT, 'continuation completion refused'); END;",
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(fresh
+            .continue_after_child_terminal(child_run_id)
+            .await
+            .is_err());
+
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            connection
+                .execute_batch("DROP TRIGGER reject_continuation_completion;")
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(fresh
+            .continue_after_child_terminal(child_run_id)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
