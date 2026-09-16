@@ -547,6 +547,13 @@ pub enum PendingKind {
 #[derive(Debug, Clone)]
 pub struct WorkDone {
     pub step_id: String,
+    /// Which map item this answers, mirroring [`PendingWork::item_index`] —
+    /// `None` for a top-level step. Paired with `step_id` as [`Loop::
+    /// work_results`]'s key: a `map`'s items can share the same inner
+    /// `step_id` while several are pending at once, which a bare `step_id`
+    /// key cannot distinguish. Always `None` today, for the same reason
+    /// [`PendingWork::item_index`] is.
+    pub item_index: Option<u32>,
     pub status: WorkStatus,
     /// Becomes `steps.<id>.output` — the real value, never redacted here;
     /// the redaction that matters happens on the way into the log
@@ -754,7 +761,7 @@ pub fn run_workflow<H: WorkflowHost>(
     type ResumeChannels = (
         Option<GateAnswer>,
         Option<CrashRecoveryAnswer>,
-        HashMap<String, WorkDone>,
+        HashMap<(String, Option<u32>), WorkDone>,
     );
     let (gate_answer, crash_answer, work_results): ResumeChannels = match resume {
         Some(Resume::Gate(answer)) => (Some(answer), None, HashMap::new()),
@@ -762,7 +769,9 @@ pub fn run_workflow<H: WorkflowHost>(
         Some(Resume::Work(work)) => (
             None,
             None,
-            work.into_iter().map(|w| (w.step_id.clone(), w)).collect(),
+            work.into_iter()
+                .map(|w| ((w.step_id.clone(), w.item_index), w))
+                .collect(),
         ),
         None => (None, None, HashMap::new()),
     };
@@ -1320,10 +1329,12 @@ struct Loop<'c, H: WorkflowHost> {
     /// parked at all.
     crash_answer: Option<CrashRecoveryAnswer>,
     /// What a caller reported for a step this run suspended on, keyed by
-    /// step id and drained as each is consumed. Populated from
-    /// [`Resume::Work`]; empty on every other entry, including a crash
+    /// `(step_id, item_index)` — a `map`'s items can share the same inner
+    /// `step_id` while several are pending at once, which a bare `step_id`
+    /// key cannot distinguish — and drained as each is consumed. Populated
+    /// from [`Resume::Work`]; empty on every other entry, including a crash
     /// re-drive with no caller-supplied answer at all.
-    work_results: HashMap<String, WorkDone>,
+    work_results: HashMap<(String, Option<u32>), WorkDone>,
 }
 
 impl<H: WorkflowHost> Loop<'_, H> {
@@ -1363,9 +1374,20 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// report at all.
     fn seed_context_from_checkpoints(&mut self, rows: &[WorkflowStepRun]) {
         for row in rows {
-            if row.item_index.is_some() {
-                continue;
-            }
+            // A `map` item's row shares its inner `step_id` with every
+            // other item's row of the same inner step, so it cannot use
+            // the bare-`step_id` key every top-level row uses without
+            // colliding — `"<step_id>#<item_index>"` (Phase 8 Task 25.7
+            // Task 1's key scheme) is what keeps a per-item row addressable
+            // instead of one silently overwriting another, or being
+            // dropped outright the way this fold used to drop every item
+            // row. Task 2 (wave dispatch) is what actually reads a
+            // per-item entry back; this fold only has to stop discarding
+            // it.
+            let context_key = match row.item_index {
+                Some(item_index) => format!("{}#{item_index}", row.step_id),
+                None => row.step_id.clone(),
+            };
             if row.state == StepRunState::Completed
                 && self
                     .report_step
@@ -1402,10 +1424,15 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 .as_ref()
                 .is_some_and(StepOutput::is_secret_derived)
             {
-                self.secret_derived_steps.push(row.step_id.clone());
+                // The taint path `bind_steps_context` marks must match the
+                // key the value is actually stored under, or the taint
+                // marking targets the wrong (or a nonexistent) leaf — see
+                // that method's own doc on why its projection's cardinality
+                // is load-bearing.
+                self.secret_derived_steps.push(context_key.clone());
             }
             self.steps_context.insert(
-                row.step_id.clone(),
+                context_key,
                 serde_json::json!({
                     "output": output,
                     "status": status,
@@ -1469,7 +1496,11 @@ impl<H: WorkflowHost> Loop<'_, H> {
             // The row itself is not re-written: it already says exactly this,
             // and `outcomes` deliberately omits steps a re-drive inherited —
             // see `RunOutcome::Terminal`'s own `steps` doc.
-            if !self.work_results.contains_key(&step.id)
+            // `None`: `run_phase` only ever drives the three top-level
+            // phases (`steps:`/`catch:`/`finally:`) — a `map` inner step's
+            // own per-item entry is Task 2's (Phase 8 Task 25.7 Task 2) to
+            // read, once something dispatches one.
+            if !self.work_results.contains_key(&(step.id.clone(), None))
                 && self.failed_before.remove(&step.id).is_some()
             {
                 if !step.continue_on_error {
@@ -1490,7 +1521,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
             // before the crash-policy check below — is what stops a step
             // this run already knows the answer to being re-admitted or
             // re-decided.
-            let resumed_work = self.work_results.remove(&step.id);
+            let resumed_work = self.work_results.remove(&(step.id.clone(), None));
 
             if resumed_work.is_none() {
                 // §8.10 tier 2: a step found `Indeterminate` (`Effectful`,
@@ -1712,7 +1743,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
                             CallStep::Completed(outcome) => outcome,
                             CallStep::AwaitingWork(kind) => {
                                 return Ok(PhaseEnd::AwaitingWork(Box::new(
-                                    self.pending_work(executor, step, kind),
+                                    self.pending_work(executor, step, kind, None),
                                 )));
                             }
                         }
@@ -1764,7 +1795,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
     ) -> Result<PhaseEnd, RunLoopError> {
         self.checkpoint(step, StepRunState::Running, None, None)?;
         Ok(PhaseEnd::AwaitingWork(Box::new(
-            self.pending_work(executor, step, kind),
+            self.pending_work(executor, step, kind, None),
         )))
     }
 
@@ -1773,13 +1804,14 @@ impl<H: WorkflowHost> Loop<'_, H> {
         executor: &Executor<'_>,
         step: &StepDef,
         kind: PendingKind,
+        item_index: Option<u32>,
     ) -> PendingWork {
         PendingWork {
             run_id: self.run_id,
             session_id: self.session_id,
             step_id: step.id.clone(),
             attempt: 1,
-            item_index: None,
+            item_index,
             disposition: derive_disposition(step),
             step_timeout: executor
                 .map_budget
@@ -1903,7 +1935,19 @@ impl<H: WorkflowHost> Loop<'_, H> {
     ) -> Result<(), RunLoopError> {
         checkpoint_step(
             self.conn,
-            &self.step_run(step, state, output, error, first_task_seq, last_task_seq),
+            // `None`: every `checkpoint_with_seqs` caller drives a
+            // top-level step (`checkpoint`'s own callers, and the resumed
+            // `record_with_seqs` path) — a `map` inner step's own row is
+            // Task 2's to write, once something checkpoints one.
+            &self.step_run(
+                step,
+                state,
+                output,
+                error,
+                first_task_seq,
+                last_task_seq,
+                None,
+            ),
         )?;
         Ok(())
     }
@@ -1916,12 +1960,13 @@ impl<H: WorkflowHost> Loop<'_, H> {
         error: Option<String>,
         first_task_seq: Option<u64>,
         last_task_seq: Option<u64>,
+        item_index: Option<u32>,
     ) -> WorkflowStepRun {
         WorkflowStepRun {
             run_id: self.run_id,
             step_id: step.id.clone(),
             attempt: 1,
-            item_index: None,
+            item_index,
             disposition: derive_disposition(step),
             state,
             first_task_seq,
@@ -2371,7 +2416,10 @@ impl<H: WorkflowHost> Loop<'_, H> {
         );
         let inputs_secret_derived = resolved_with.is_secret_derived();
         let dispatch_input = resolved_with.into_unredacted_for_dispatch();
-        let parent_step = self.step_run(step, StepRunState::Running, None, None, None, None);
+        // `None`: a `call:` step nested inside a `map` is refused
+        // (`Executor::dispatch_step`'s own doc), so `dispatch_call` only
+        // ever runs for a top-level step.
+        let parent_step = self.step_run(step, StepRunState::Running, None, None, None, None, None);
         let task_id = TaskId::new();
         let parent_call = WorkflowChildCall {
             child_run_id,
@@ -2965,5 +3013,265 @@ mod tests {
         let row = recover_run(&conn, run_id).unwrap().run;
         assert_eq!(row.state, RunState::Completed);
         assert!(row.ended_at.is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 8 Task 25.7 Task 1 — `item_index` data-model plumbing.
+    //
+    // Nothing in this crate produces a real (non-`None`) `item_index` yet
+    // (Task 2's wave dispatch does that); these exercise the three
+    // construction/consumption sites directly rather than through
+    // `run_workflow`, exactly as this task's own brief prescribes. `Loop`
+    // and its methods are private to this module, so — like the tests
+    // above — these live here rather than in `tests/run_loop.rs`.
+    // -----------------------------------------------------------------
+
+    /// A `Loop` with nothing run yet, for a test that drives one of its
+    /// methods directly.
+    fn bare_loop<'c>(
+        conn: &'c mut Connection,
+        host: &'c mut NoopHost,
+        run_id: RunId,
+        session_id: SessionId,
+    ) -> Loop<'c, NoopHost> {
+        Loop {
+            conn,
+            host,
+            run_id,
+            session_id,
+            now: Timestamp::from_unix_nanos(0),
+            steps_context: serde_json::Map::new(),
+            secret_derived_steps: Vec::new(),
+            outcomes: Vec::new(),
+            report_step: None,
+            report_completed_before: false,
+            finished_before: HashMap::new(),
+            indeterminate_before: HashMap::new(),
+            failed_before: HashMap::new(),
+            gate_answer: None,
+            crash_answer: None,
+            work_results: HashMap::new(),
+        }
+    }
+
+    /// A synthetic `Completed` checkpoint row, built directly rather than
+    /// through [`checkpoint_step`] — this task's brief names exactly this
+    /// as how to exercise a per-item row without a live `map` dispatch.
+    fn completed_row(
+        run_id: RunId,
+        step_id: &str,
+        item_index: Option<u32>,
+        value: Value,
+    ) -> WorkflowStepRun {
+        let outcome = StepOutcome {
+            step_id: step_id.to_string(),
+            output: value,
+            status: StepStatus::Completed,
+            output_is_secret_derived: false,
+            gate_condition_was_secret_derived: false,
+        };
+        WorkflowStepRun {
+            run_id,
+            step_id: step_id.to_string(),
+            attempt: 1,
+            item_index,
+            disposition: StepDisposition::Pure,
+            state: StepRunState::Completed,
+            first_task_seq: None,
+            last_task_seq: None,
+            output: Some(StepOutput::from_outcome(&outcome)),
+            error: None,
+        }
+    }
+
+    fn fixture_workflow(body: &str) -> String {
+        format!(
+            "name: t\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    escalate: fail\n{body}"
+        )
+    }
+
+    #[test]
+    fn seed_context_from_checkpoints_keys_per_item_rows_by_step_id_and_item_index() {
+        let mut conn = open_test_db();
+        let (run_id, session_id) = seeded_run(&mut conn);
+        let mut host = NoopHost::default();
+        let mut run = bare_loop(&mut conn, &mut host, run_id, session_id);
+
+        // Two items of the same inner `step_id`, mid-flight in the same
+        // `map` — exactly what a bare `step_id` key could not distinguish,
+        // and why this fold used to drop both rather than risk the
+        // collision.
+        let rows = [
+            completed_row(run_id, "build", Some(0), serde_json::json!({"n": 0})),
+            completed_row(run_id, "build", Some(1), serde_json::json!({"n": 1})),
+        ];
+        run.seed_context_from_checkpoints(&rows);
+
+        let item0 = run
+            .steps_context
+            .get("build#0")
+            .expect("item 0's row must seed under its own per-item key, not be dropped");
+        assert_eq!(item0["output"], serde_json::json!({"n": 0}));
+
+        let item1 = run
+            .steps_context
+            .get("build#1")
+            .expect("item 1's row must seed under its own key, not be dropped either");
+        assert_eq!(item1["output"], serde_json::json!({"n": 1}));
+
+        assert!(
+            !run.steps_context.contains_key("build"),
+            "neither row is a top-level step, so the bare id must not appear"
+        );
+    }
+
+    #[test]
+    fn seed_context_from_checkpoints_does_not_collide_an_item_row_with_a_top_level_row_of_the_same_step_id(
+    ) {
+        let mut conn = open_test_db();
+        let (run_id, session_id) = seeded_run(&mut conn);
+        let mut host = NoopHost::default();
+        let mut run = bare_loop(&mut conn, &mut host, run_id, session_id);
+
+        let rows = [
+            completed_row(run_id, "build", None, serde_json::json!("top-level")),
+            completed_row(run_id, "build", Some(2), serde_json::json!("item-2")),
+        ];
+        run.seed_context_from_checkpoints(&rows);
+
+        let top_level = run
+            .steps_context
+            .get("build")
+            .expect("the top-level row keeps the bare `step_id` scheme, unchanged");
+        assert_eq!(top_level["output"], serde_json::json!("top-level"));
+
+        let item = run.steps_context.get("build#2").expect(
+            "the item row seeds under its own key rather than overwriting the top-level one",
+        );
+        assert_eq!(item["output"], serde_json::json!("item-2"));
+    }
+
+    #[test]
+    fn work_results_key_distinguishes_items_sharing_a_step_id() {
+        fn done(step_id: &str, item_index: Option<u32>, n: i64) -> WorkDone {
+            WorkDone {
+                step_id: step_id.to_string(),
+                item_index,
+                status: WorkStatus::Completed,
+                output: serde_json::json!(n),
+                output_is_secret_derived: false,
+                task_id: None,
+                first_task_seq: None,
+                last_task_seq: None,
+            }
+        }
+
+        // The same fold `run_workflow`'s `Resume::Work` arm performs on
+        // entry — exercised directly because nothing yet drives two items
+        // of the same inner `step_id` concurrently through `run_workflow`
+        // itself (Task 2's job).
+        let mut work_results: HashMap<(String, Option<u32>), WorkDone> = HashMap::new();
+        for w in [
+            done("build", Some(0), 0),
+            done("build", Some(1), 1),
+            done("build", None, 99),
+        ] {
+            work_results.insert((w.step_id.clone(), w.item_index), w);
+        }
+
+        assert_eq!(
+            work_results.len(),
+            3,
+            "three distinct (step_id, item_index) pairs must not collapse into fewer \
+             entries — the bug a bare `step_id` key would reintroduce"
+        );
+        assert_eq!(
+            work_results[&("build".to_string(), Some(0))].output,
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            work_results[&("build".to_string(), Some(1))].output,
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            work_results[&("build".to_string(), None)].output,
+            serde_json::json!(99)
+        );
+    }
+
+    #[test]
+    fn step_run_threads_the_callers_item_index_instead_of_hardcoding_none() {
+        let mut conn = open_test_db();
+        let (run_id, session_id) = seeded_run(&mut conn);
+        let mut host = NoopHost::default();
+        let run = bare_loop(&mut conn, &mut host, run_id, session_id);
+
+        let def = crate::parse::parse_workflow(&fixture_workflow(
+            "steps:\n  - id: build\n    tool: shell\n    with: { cmd: [ls] }\n",
+        ))
+        .expect("fixture parses");
+        let step = parse_step(&def.steps[0]).expect("fixture step parses");
+
+        let row = run.step_run(
+            &step,
+            StepRunState::Running,
+            None,
+            None,
+            None,
+            None,
+            Some(4),
+        );
+
+        assert_eq!(
+            row.item_index,
+            Some(4),
+            "step_run must thread the caller's item_index rather than hardcode None"
+        );
+    }
+
+    #[test]
+    fn pending_work_threads_the_callers_item_index_instead_of_hardcoding_none() {
+        let mut conn = open_test_db();
+        let (run_id, session_id) = seeded_run(&mut conn);
+        let mut host = NoopHost::default();
+        let run = bare_loop(&mut conn, &mut host, run_id, session_id);
+
+        let def = crate::parse::parse_workflow(&fixture_workflow(
+            "steps:\n  - id: build\n    tool: shell\n    with: { cmd: [ls] }\n",
+        ))
+        .expect("fixture parses");
+        let step = parse_step(&def.steps[0]).expect("fixture step parses");
+
+        struct NoopSink;
+        impl TaskSink for NoopSink {
+            fn emit(&mut self, _: TaskId, _: Option<TaskId>, _: TaskKind, _: EventPayload) {}
+        }
+        let mut sink = NoopSink;
+        let run_ctx = crate::exec::RunContext {
+            inputs: serde_json::json!({}),
+            inputs_secret_derived: false,
+            vars: serde_json::json!({}),
+            secrets: HashMap::new(),
+            run_id,
+            previous_report: None,
+            env_allowlist: crate::expr::EnvAllowlist::deny_all(),
+            worktree_provider: None,
+        };
+        let executor = Executor::new(&def, &mut sink, run_ctx).expect("executor builds");
+
+        let kind = PendingKind::Tool {
+            tool: "shell".to_string(),
+            task_kind: TaskKind::Shell,
+            logged_input: serde_json::json!({}),
+            dispatch_input: serde_json::json!({}),
+        };
+
+        let pending = run.pending_work(&executor, &step, kind, Some(7));
+
+        assert_eq!(
+            pending.item_index,
+            Some(7),
+            "pending_work must thread the caller's item_index rather than hardcode None"
+        );
     }
 }

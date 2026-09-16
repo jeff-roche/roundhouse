@@ -1059,6 +1059,10 @@ fn flush_task_events(
 fn unanswerable_work(step_id: String, message: String) -> WorkDone {
     WorkDone {
         step_id,
+        // Phase 8 Task 25.7 Task 1: nothing dispatches a real map item yet
+        // (Task 2's job), so every `WorkDone` this daemon builds answers a
+        // top-level step.
+        item_index: None,
         status: WorkStatus::Failed { message },
         output: serde_json::Value::Null,
         output_is_secret_derived: false,
@@ -1104,6 +1108,7 @@ fn failed_work_done_after_recording(
     match append_result {
         Ok(last_task_seq) => WorkDone {
             step_id,
+            item_index: None,
             status: WorkStatus::Failed { message },
             output: serde_json::Value::Null,
             output_is_secret_derived: false,
@@ -1113,6 +1118,7 @@ fn failed_work_done_after_recording(
         },
         Err(append_err) => WorkDone {
             step_id,
+            item_index: None,
             status: WorkStatus::Failed {
                 message: format!(
                     "{message}; additionally failed to record its terminal event: {append_err}"
@@ -1242,6 +1248,7 @@ fn work_done_from_dispatch(
             };
             WorkDone {
                 step_id,
+                item_index: None,
                 status,
                 output,
                 output_is_secret_derived: false,
@@ -2605,6 +2612,7 @@ impl DeliveryExecutor {
                                         {
                                             Ok(last_task_seq) => WorkDone {
                                                 step_id: item.step_id,
+                                                item_index: None,
                                                 status: WorkStatus::Failed { message },
                                                 output: serde_json::Value::Null,
                                                 output_is_secret_derived: false,
@@ -2622,6 +2630,7 @@ impl DeliveryExecutor {
                                             // pass exactly as before this fix.
                                             Err(append_err) => WorkDone {
                                                 step_id: item.step_id,
+                                                item_index: None,
                                                 status: WorkStatus::Failed {
                                                     message: format!(
                                                         "{message}; additionally failed to record \
@@ -2682,6 +2691,7 @@ impl DeliveryExecutor {
                             Ok(dispatched) => match dispatched.result {
                                 AgentSpawnOutcome::Failed(message) => WorkDone {
                                     step_id: item.step_id,
+                                    item_index: None,
                                     status: WorkStatus::Failed { message },
                                     output: serde_json::Value::Null,
                                     output_is_secret_derived: false,
@@ -2948,6 +2958,7 @@ impl DeliveryExecutor {
                     {
                         Ok(last_task_seq) => WorkDone {
                             step_id,
+                            item_index: None,
                             status: WorkStatus::Completed,
                             output,
                             output_is_secret_derived: false,
@@ -2961,6 +2972,7 @@ impl DeliveryExecutor {
                         // failed-terminal-append case in this file.
                         Err(append_err) => WorkDone {
                             step_id,
+                            item_index: None,
                             status: WorkStatus::Failed {
                                 message: format!(
                                     "the agent step's child completed but recording its \
@@ -3236,6 +3248,13 @@ impl DeliveryExecutor {
             call.clone(),
             WorkDone {
                 step_id: call.parent_step_id,
+                // `call:` nested inside a `map` is refused at parse time
+                // (`Executor::dispatch_step`'s own doc), so a joined
+                // child's `WorkflowChildCall::parent_item_index` is always
+                // `None` too — mirrored here rather than read from it,
+                // since this crate's job is answering `PendingWork`, not
+                // re-deriving one of its own fields.
+                item_index: None,
                 status,
                 output,
                 output_is_secret_derived: false,

@@ -496,6 +496,10 @@ fn run_to_terminal_failing(
             };
             done.push(roundhouse_flow::exec::run_loop::WorkDone {
                 step_id: p.step_id,
+                // Mirrors what this `PendingWork` itself carries — always
+                // `None` today, since nothing produces a real map item's
+                // pending work yet (Phase 8 Task 25.7 Task 2).
+                item_index: p.item_index,
                 status,
                 output: serde_json::json!({}),
                 output_is_secret_derived: false,
@@ -1516,6 +1520,7 @@ fn a_resumed_call_uses_the_original_parent_agent_task() {
         Some(Resume::Work(vec![
             roundhouse_flow::exec::run_loop::WorkDone {
                 step_id: "child".into(),
+                item_index: None,
                 status: roundhouse_flow::exec::run_loop::WorkStatus::Completed,
                 output: serde_json::json!({ "result": "child complete" }),
                 output_is_secret_derived: false,

@@ -1585,6 +1585,7 @@ async fn reclassify_if_interrupted_overwrites_an_ordinary_failure_and_names_the_
     // the exact asymmetry this follow-up closes.
     let mut done = WorkDone {
         step_id: "s".to_string(),
+        item_index: None,
         status: WorkStatus::Failed {
             message: "admission was denied because the session is cancelling".to_string(),
         },
@@ -1638,6 +1639,7 @@ async fn reclassify_if_interrupted_never_overwrites_an_already_cancelled_status(
 
     let mut done = WorkDone {
         step_id: "s".to_string(),
+        item_index: None,
         status: WorkStatus::Cancelled {
             reason: "a real ShellSessionCancelled signal already fired".to_string(),
         },
