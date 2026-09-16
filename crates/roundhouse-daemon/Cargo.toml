@@ -127,6 +127,15 @@ async-trait = "0.1"
 [dev-dependencies]
 roundhouse-flow = { path = "../roundhouse-flow", features = ["test-util"] }
 roundhouse-policy = { path = "../roundhouse-policy", features = ["test-util"] }
+# Phase 8 Task 25.4 (Task 2): `scheduled_trigger_end_to_end.rs`'s real
+# `tool: shell` end-to-end test needs `Child::from_process` (gated behind
+# `roundhouse-sandbox`'s `test-util` feature) to build a real, non-sandboxed
+# test isolate whose `spawn` actually runs a process — mirrors
+# `roundhouse-engine`'s own `tests/*.rs` dev-dependency on itself/its own
+# `test-util` features just above and in this file, and the confirmed
+# no-unification-into-normal-builds property those comments already document
+# for this exact resolver.
+roundhouse-sandbox = { path = "../roundhouse-sandbox", features = ["test-util"] }
 tempfile = "3"
 # Ruling W1-R99 (fix round 1): this crate's own tests need
 # `roundhouse_engine::mcp_spawner::SessionMcp::from_parts` — gated behind

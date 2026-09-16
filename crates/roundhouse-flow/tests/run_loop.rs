@@ -21,11 +21,12 @@ use roundhouse_flow::durability::{
     WorkflowRun,
 };
 use roundhouse_flow::exec::run_loop::{
-    run_workflow, CalledWorkflow, GateAnswer, ReportOrigin, Resume, RunLoopError, RunOutcome,
-    WorkflowHost, WorkflowHostError,
+    run_workflow, CalledWorkflow, CrashRecoveryAnswer, GateAnswer, ReportOrigin, Resume,
+    RunLoopError, RunOutcome, WorkflowHost, WorkflowHostError,
 };
 use roundhouse_flow::exec::{RunContext, RunId, StepStatus, TaskSink};
 use roundhouse_flow::expr::EnvAllowlist;
+use roundhouse_flow::hitl::CrashResolution;
 use roundhouse_flow::ledger::run_ledger;
 use roundhouse_flow::parking::{CheckpointError, CheckpointRef, Checkpointer};
 use roundhouse_flow::parse::parse_workflow;
@@ -1998,26 +1999,16 @@ fn a_re_drive_honours_every_kind_of_finished_row_and_re_runs_the_rest() {
     );
 }
 
-/// §8.10 tier 2's crash-policy wiring (Phase 8 Task 25.3): a step
-/// `recover_run` reclassifies `Indeterminate` (`Running` + `Effectful`, with
-/// no caller-supplied `WorkDone` answering it) must not be silently treated
-/// as never-started. Before this task, `durability::crash_policy` was built
-/// and tested in isolation but had no caller anywhere in this crate — this
-/// proves the run loop actually consults it, and that with no declared
-/// `on_crash:` the default (`Ask`) fails the run closed rather than
-/// re-dispatching a step whose real-world completion is unknown.
-#[test]
-fn an_indeterminate_effectful_step_with_no_on_crash_declared_fails_closed_rather_than_silently_re_running(
-) {
-    let mut conn = open_test_db();
-    let (run_id, _) = seed_run(&mut conn);
-    // Simulates a crash mid-dispatch of an Effectful step: its row survives
-    // as `Running`, and this (fresh) call supplies no matching `WorkDone`.
+/// Seeds a `Running` + `Effectful` `workflow_step_run` row for `step_id` —
+/// exactly what a daemon killed mid-dispatch of a `shell`/`write`/`edit`
+/// step leaves behind, and what `recover_run` reclassifies `Indeterminate`
+/// on the next load.
+fn seed_crashed_effectful_step(conn: &mut Connection, run_id: RunId, step_id: &str) {
     roundhouse_flow::durability::checkpoint_step(
-        &mut conn,
+        conn,
         &roundhouse_flow::durability::WorkflowStepRun {
             run_id,
-            step_id: "risky".to_string(),
+            step_id: step_id.to_string(),
             attempt: 1,
             item_index: None,
             disposition: roundhouse_flow::durability::StepDisposition::Effectful,
@@ -2029,6 +2020,49 @@ fn an_indeterminate_effectful_step_with_no_on_crash_declared_fails_closed_rather
         },
     )
     .expect("seed a Running Effectful row, simulating a crash mid-dispatch");
+}
+
+/// The `awaiting_human` payload the run loop put in the log for a park, as
+/// JSON — §8.11's *"a JSON-Schema form that TUI and web render from the same
+/// schema"*, which is the only thing that actually asks the human anything.
+fn the_awaiting_human_form(sink: &RecordingSink) -> Value {
+    let forms: Vec<Value> = sink
+        .emitted
+        .iter()
+        .filter_map(|(_, payload)| match payload {
+            EventPayload::TaskCreated {
+                input: TaskInput::Json(input),
+                ..
+            } => input.get("awaiting_human").cloned(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        forms.len(),
+        1,
+        "exactly one human-wait form must reach the log per park, got {forms:?}"
+    );
+    forms.into_iter().next().expect("checked non-empty above")
+}
+
+/// §8.10 tier 2's crash-policy wiring, completed (Phase 8 Task 25.4 Task 5):
+/// a step `recover_run` reclassifies `Indeterminate` (`Running` +
+/// `Effectful`, with no caller-supplied `WorkDone` answering it) whose
+/// resolved `CrashPolicy` is `Ask` — §8.10's default for **every**
+/// `Effectful` step with no declared `on_crash:` — **parks the run on a
+/// human**, rather than failing the run closed as Task 25.3's interim
+/// behaviour did.
+///
+/// This test's predecessor asserted the fail-closed behaviour and was
+/// renamed rather than kept: leaving it would pin a rule this task
+/// deliberately replaced. Failing closed meant any daemon restart mid-`shell`
+/// / `write` / `edit` permanently failed the run.
+#[test]
+fn an_indeterminate_effectful_step_with_no_on_crash_declared_parks_for_a_human_instead_of_failing_closed(
+) {
+    let mut conn = open_test_db();
+    let (run_id, session_id) = seed_run(&mut conn);
+    seed_crashed_effectful_step(&mut conn, run_id, "risky");
 
     let def = parse_workflow(&workflow(
         "steps:\n \x20- id: risky\n \x20  tool: shell\n \x20  with: { cmd: [ls] }\n",
@@ -2048,21 +2082,421 @@ fn an_indeterminate_effectful_step_with_no_on_crash_declared_fails_closed_rather
     )
     .expect("the run re-drives");
 
-    let RunOutcome::Terminal { state, .. } = outcome else {
-        panic!(
-            "a fail-closed crash policy must reach a terminal state, not suspend on the \
-             step it just refused"
-        );
+    let RunOutcome::Parked(parked) = outcome else {
+        panic!("an `Effectful` step's `Ask` crash policy parks the run, got {outcome:?}");
+    };
+    assert_eq!(parked.session_id, session_id);
+    assert_eq!(
+        host.checkpoints.len(),
+        1,
+        "§8.11's implicit checkpoint runs before any release, exactly as it does for a gate"
+    );
+    // The durable row, not the returned value: the defect this subsystem
+    // keeps producing is an in-memory answer nothing else can see.
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::AwaitingHuman
+    );
+    assert_eq!(
+        parked.awaiting_until,
+        Some(at(10 + 72 * 3600)),
+        "§8.11's *with no explicit gate timeout, fall back to 72h* — and a crash park has no \
+         author at all to declare one"
+    );
+    assert!(
+        sink.reports().is_empty(),
+        "a parked run has not ended, so it has no result to report"
+    );
+    // The step's own row still says `Running`: that is what makes the next
+    // load reclassify it `Indeterminate` again, which is how the answer
+    // finds the step it belongs to.
+    assert_eq!(
+        step_row(&conn, run_id, "risky").0,
+        StepRunState::Indeterminate
+    );
+
+    let form = the_awaiting_human_form(&sink);
+    assert_eq!(
+        form["source"], "crash_recovery",
+        "the park must name its source, or nothing can tell a crash question from a gate"
+    );
+    assert_eq!(
+        form["form_schema"]["properties"]["resolution"]["enum"],
+        serde_json::json!(["rerun", "skip", "fail"])
+    );
+    assert!(
+        form["form_schema"]["title"]
+            .as_str()
+            .is_some_and(|t| t.contains("risky")),
+        "the prompt must say which step is being asked about: {form:?}"
+    );
+    assert_eq!(
+        form["on_timeout"],
+        serde_json::json!({ "unchecked": "fail" }),
+        "a crash park has no author to write `on_timeout:`, so it defaults to the \
+         conservative `fail`"
+    );
+}
+
+/// The first of §8.10's three answers: `rerun` re-dispatches the step, which
+/// is exactly an at-least-once crash re-run — the step is re-admitted and
+/// suspends on the same `AwaitingWork` seam every `tool:` step suspends on,
+/// and the run then reaches a normal terminal state.
+#[test]
+fn answering_a_crash_recovery_park_with_rerun_re_dispatches_the_step() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    seed_crashed_effectful_step(&mut conn, run_id, "risky");
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: risky\n\
+         \x20   tool: shell\n\
+         \x20   with: { cmd: [ls] }\n\
+         \x20 - id: after\n\
+         \x20   needs: [risky]\n\
+         \x20   emit: { saw: \"${{ steps.risky.status }}\" }\n",
+    ))
+    .expect("fixture parses");
+
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let parked = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("the run re-drives");
+    assert!(matches!(parked, RunOutcome::Parked(_)), "got {parked:?}");
+
+    let mut sink = RecordingSink::default();
+    let outcome = run_to_terminal(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        20,
+        Some(Resume::CrashRecovery(CrashRecoveryAnswer {
+            step_id: "risky".into(),
+            resolution: CrashResolution::Rerun,
+        })),
+    )
+    .expect("the answer releases the park");
+
+    let RunOutcome::Terminal { state, steps, .. } = outcome else {
+        panic!("a re-run step drives the run to a terminal state, got {outcome:?}");
+    };
+    assert_eq!(state, RunState::Completed);
+    assert!(
+        steps.iter().any(|s| s.step_id == "risky"),
+        "`rerun` re-dispatches the step rather than inheriting a decision: {steps:?}"
+    );
+    assert_eq!(step_row(&conn, run_id, "risky").0, StepRunState::Completed);
+    assert_eq!(
+        steps
+            .iter()
+            .find(|s| s.step_id == "after")
+            .expect("the dependent ran")
+            .output["saw"],
+        "completed",
+        "the dependent reads the re-run step's real outcome"
+    );
+    assert_eq!(sink.reports().len(), 1);
+}
+
+/// The second answer: `skip` records the step durably skipped — with a
+/// reason naming the human — and the phase carries on.
+#[test]
+fn answering_a_crash_recovery_park_with_skip_records_the_step_skipped_and_continues() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    seed_crashed_effectful_step(&mut conn, run_id, "risky");
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: risky\n\
+         \x20   tool: shell\n\
+         \x20   with: { cmd: [ls] }\n\
+         \x20 - id: after\n\
+         \x20   needs: [risky]\n\
+         \x20   emit: { saw: \"${{ steps.risky.status }}\" }\n",
+    ))
+    .expect("fixture parses");
+
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("the run parks");
+
+    let mut sink = RecordingSink::default();
+    let outcome = run_to_terminal(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        20,
+        Some(Resume::CrashRecovery(CrashRecoveryAnswer {
+            step_id: "risky".into(),
+            resolution: CrashResolution::Skip,
+        })),
+    )
+    .expect("the answer releases the park");
+
+    let RunOutcome::Terminal { state, steps, .. } = outcome else {
+        panic!("a skipped step does not suspend the run, got {outcome:?}");
     };
     assert_eq!(
         state,
-        RunState::Failed,
-        "the default on_crash policy for an Effectful step is Ask, which fails the run closed"
+        RunState::Completed,
+        "`skip` continues the phase rather than ending the run"
+    );
+    let (row_state, reason) = step_row(&conn, run_id, "risky");
+    assert_eq!(row_state, StepRunState::Skipped);
+    assert!(
+        reason.is_some_and(|r| r.contains("skip")),
+        "the row must say a human chose to skip it, not merely that it was skipped"
+    );
+    assert_eq!(
+        steps
+            .iter()
+            .find(|s| s.step_id == "after")
+            .expect("the dependent ran")
+            .output["saw"],
+        "skipped",
+        "a dependent reads the skip back out of the fold, exactly as for a `when:` skip"
+    );
+}
+
+/// The third answer: `fail` fails the step, with a message naming the
+/// human's decision rather than the crash policy — the run did not fail
+/// closed on a rule, a person decided.
+#[test]
+fn answering_a_crash_recovery_park_with_fail_fails_the_step_naming_the_humans_decision() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    seed_crashed_effectful_step(&mut conn, run_id, "risky");
+    let def = parse_workflow(&workflow(
+        "steps:\n \x20- id: risky\n \x20  tool: shell\n \x20  with: { cmd: [ls] }\n",
+    ))
+    .expect("fixture parses");
+
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("the run parks");
+
+    let mut sink = RecordingSink::default();
+    let outcome = run_to_terminal(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        20,
+        Some(Resume::CrashRecovery(CrashRecoveryAnswer {
+            step_id: "risky".into(),
+            resolution: CrashResolution::Fail,
+        })),
+    )
+    .expect("the answer releases the park");
+
+    let RunOutcome::Terminal { state, .. } = outcome else {
+        panic!("a failed step ends the run, got {outcome:?}");
+    };
+    assert_eq!(state, RunState::Failed);
+    let (row_state, error) = step_row(&conn, run_id, "risky");
+    assert_eq!(row_state, StepRunState::Failed);
+    let error = error.expect("a failed step's row carries its message");
+    assert!(
+        error.contains("human") && error.contains("fail"),
+        "the message must name the human's decision, not a policy: {error:?}"
+    );
+    assert_eq!(sink.reports().len(), 1);
+}
+
+/// An answer naming a step this workflow has no crash-recovery park for is
+/// refused rather than silently ignored — the same rule
+/// `a_gate_answer_naming_a_non_gate_step_is_refused` states for the gate
+/// channel, and for a sharper version of the same reason: an answer nothing
+/// consumes would release the park and leave the run driving on with the
+/// question it parked for still unanswered.
+#[test]
+fn a_crash_recovery_answer_naming_a_step_that_cannot_crash_park_is_refused() {
+    let (_, _, _, _, result) = drive_with(
+        // `read` is `Pure`, so it is never reclassified `Indeterminate` and
+        // its crash policy is `Rerun`, never `Ask`.
+        "steps:\n \x20- id: work\n \x20  tool: read\n \x20  with: { path: a }\n",
+        10,
+        FakeHost::new(),
+        Some(Resume::CrashRecovery(CrashRecoveryAnswer {
+            step_id: "work".into(),
+            resolution: CrashResolution::Rerun,
+        })),
+    );
+    assert!(
+        matches!(result, Err(RunLoopError::UnknownCrashRecoveryStep { .. })),
+        "got {result:?}"
+    );
+}
+
+/// §8.13's *cancel must converge*, at this park's own site: a run already
+/// draining a cancel must not acquire a new indefinite wait on a human. The
+/// run loop's leg of the same rule `Loop::dispatch_gate` applies to a
+/// `gate:` in `catch:`/`finally:`.
+#[test]
+fn a_cancelling_run_fails_an_indeterminate_step_closed_rather_than_parking_it() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    seed_crashed_effectful_step(&mut conn, run_id, "risky");
+    roundhouse_flow::control::cancel(&mut conn, run_id, at(5))
+        .expect("marking a Running run Cancelling must succeed");
+
+    let def = parse_workflow(&workflow(
+        "steps:\n \x20- id: risky\n \x20  tool: shell\n \x20  with: { cmd: [ls] }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("a cancelling run still drains to a terminal state");
+
+    let RunOutcome::Terminal { state, .. } = outcome else {
+        panic!("a cancelling run must converge, not park, got {outcome:?}");
+    };
+    assert_eq!(state, RunState::Cancelled);
+    assert!(
+        host.checkpoints.is_empty(),
+        "nothing parked, so §8.11's implicit checkpoint never ran"
     );
     let (row_state, error) = step_row(&conn, run_id, "risky");
     assert_eq!(row_state, StepRunState::Failed);
     assert!(
-        error.is_some_and(|e| e.contains("on_crash policy is Ask")),
+        error.is_some_and(|e| e.contains("must converge")),
+        "the row must say why the step could not park"
+    );
+}
+
+/// The same refusal for the block a park would deadlock: a crash-recovery
+/// park inside `finally:` would suspend a run that is already ending.
+#[test]
+fn an_indeterminate_step_inside_finally_fails_closed_rather_than_parking_a_run_that_is_ending() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    seed_crashed_effectful_step(&mut conn, run_id, "cleanup");
+
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: work\n\
+         \x20   emit: { a: 1 }\n\
+         finally:\n\
+         \x20 - id: cleanup\n\
+         \x20   tool: shell\n\
+         \x20   with: { cmd: [ls] }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("the run drives");
+
+    let RunOutcome::Terminal { state, .. } = outcome else {
+        panic!("`finally:` must not park, got {outcome:?}");
+    };
+    assert_eq!(state, RunState::Failed);
+    assert!(host.checkpoints.is_empty(), "no park, so no checkpoint");
+    let (row_state, error) = step_row(&conn, run_id, "cleanup");
+    assert_eq!(row_state, StepRunState::Failed);
+    assert!(
+        error.is_some_and(|e| e.contains("finally:")),
+        "the row says which block could not park"
+    );
+}
+
+/// The declared half of the same wiring: `on_crash: fail` on an Effectful
+/// step must win over the derived `Ask` default and fail the run closed with
+/// **no** park — a regression pin that this task's park did not swallow the
+/// one policy that asks for the old behaviour.
+#[test]
+fn an_indeterminate_effectful_step_with_on_crash_fail_declared_still_fails_closed_without_parking()
+{
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    seed_crashed_effectful_step(&mut conn, run_id, "risky");
+
+    let def = parse_workflow(&workflow(
+        "steps:\n \x20- id: risky\n \x20  tool: shell\n \x20  on_crash: fail\n \x20  with: { cmd: [ls] }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("the run re-drives");
+
+    let RunOutcome::Terminal { state, .. } = outcome else {
+        panic!("a declared `on_crash: fail` fails closed rather than parking, got {outcome:?}");
+    };
+    assert_eq!(state, RunState::Failed);
+    assert!(
+        host.checkpoints.is_empty(),
+        "an `on_crash: fail` step never parks, so nothing is checkpointed"
+    );
+    let (row_state, error) = step_row(&conn, run_id, "risky");
+    assert_eq!(row_state, StepRunState::Failed);
+    assert!(
+        error.is_some_and(|e| e.contains("on_crash policy is Fail")),
         "the failure must name the crash policy it refused to silently re-run under"
     );
 }

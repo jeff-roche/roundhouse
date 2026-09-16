@@ -60,18 +60,52 @@ pub(crate) mod test_support {
         RUNNER.get_or_init(roundhouse_core::TaskRunner::bootstrap)
     }
 
+    /// The [`MechanismProbeReport`] every test isolate in this module
+    /// reports — Landlock/bwrap/seccomp all `Available`, Seatbelt N/A (this
+    /// is a Linux dev/CI environment). Shared by [`available_isolate`] and
+    /// [`available_isolate_with_real_bwrap`] so the two differ only in
+    /// which `bwrap` binary they actually exec.
+    fn test_probe_report() -> MechanismProbeReport {
+        MechanismProbeReport {
+            landlock: MechanismStatus::Available,
+            bwrap: MechanismStatus::Available,
+            seccomp: MechanismStatus::Available,
+            seatbelt: MechanismStatus::Unavailable {
+                reason: "n/a".into(),
+            },
+        }
+    }
+
     /// A `BwrapLandlockIsolate` that deterministically achieves `Tier::Sandbox`
     /// with no real bwrap/landlock syscalls (`test_with_probe`).
+    ///
+    /// **This isolate cannot actually spawn anything in a dev checkout.**
+    /// `test_with_probe`'s `bwrap_path` is the hardcoded production install
+    /// path (`/usr/libexec/roundhouse/bwrap`), which nothing in this repo
+    /// vendors into a plain `cargo test` checkout — every real spawn attempt
+    /// fails closed with `IsolationError::Unsupported` ("No such file or
+    /// directory"). Fine for every test that only cares about the
+    /// *attestation*/admission machinery around a `Tier::Sandbox` session
+    /// (which is most of them), wrong for one that needs a shell command to
+    /// actually run — see [`available_isolate_with_real_bwrap`] for that
+    /// case. `real_boot_smoke.rs`'s own `--allow-degraded-to none` is the
+    /// same gap, worked around a different way.
     pub(crate) fn available_isolate() -> Arc<dyn Isolate> {
-        Arc::new(BwrapLandlockIsolate::test_with_probe(
-            MechanismProbeReport {
-                landlock: MechanismStatus::Available,
-                bwrap: MechanismStatus::Available,
-                seccomp: MechanismStatus::Available,
-                seatbelt: MechanismStatus::Unavailable {
-                    reason: "n/a".into(),
-                },
-            },
+        Arc::new(BwrapLandlockIsolate::test_with_probe(test_probe_report()))
+    }
+
+    /// [`available_isolate`], but wired to the real system `bwrap` on
+    /// `$PATH` via `BwrapLandlockIsolate::test_with_probe_and_bwrap_path` —
+    /// that constructor's own doc comment names exactly this need ("spawn a
+    /// real process under the real `bwrap` binary on `$PATH` rather than the
+    /// production install path baked into `test_with_probe`"). A test that
+    /// needs a genuinely running, genuinely killable process — Phase 8 Task
+    /// 25.4 Task 4's §8.13 mid-dispatch shell-cancel tests — needs this, not
+    /// [`available_isolate`], in a dev checkout with no vendored bwrap.
+    pub(crate) fn available_isolate_with_real_bwrap() -> Arc<dyn Isolate> {
+        Arc::new(BwrapLandlockIsolate::test_with_probe_and_bwrap_path(
+            test_probe_report(),
+            std::path::PathBuf::from("bwrap"),
         ))
     }
 
@@ -215,6 +249,39 @@ pub(crate) mod test_support {
         workspace_registry: Option<Arc<crate::workspace_registry::WorkspaceRegistry>>,
         policy_rules: crate::session_bootstrap::PolicyRuleSource,
     ) -> crate::session_bootstrap::DaemonResources {
+        daemon_resources_with_rules_and_isolate(
+            dir,
+            workspace_registry,
+            policy_rules,
+            available_isolate(),
+        )
+        .await
+    }
+
+    /// [`daemon_resources_with_rules`], but with a real, genuinely-spawning
+    /// `bwrap` ([`available_isolate_with_real_bwrap`]) instead of the
+    /// production-install-path isolate that cannot spawn anything in a dev
+    /// checkout. See that function's own doc comment for why this exists.
+    pub(crate) async fn daemon_resources_with_real_bwrap(
+        dir: &std::path::Path,
+        workspace_registry: Option<Arc<crate::workspace_registry::WorkspaceRegistry>>,
+        policy_rules: crate::session_bootstrap::PolicyRuleSource,
+    ) -> crate::session_bootstrap::DaemonResources {
+        daemon_resources_with_rules_and_isolate(
+            dir,
+            workspace_registry,
+            policy_rules,
+            available_isolate_with_real_bwrap(),
+        )
+        .await
+    }
+
+    async fn daemon_resources_with_rules_and_isolate(
+        dir: &std::path::Path,
+        workspace_registry: Option<Arc<crate::workspace_registry::WorkspaceRegistry>>,
+        policy_rules: crate::session_bootstrap::PolicyRuleSource,
+        isolate: Arc<dyn Isolate>,
+    ) -> crate::session_bootstrap::DaemonResources {
         use roundhouse_net::proxy::LoopbackProxy;
 
         let store = roundhouse_store::open(&dir.join("events.db"))
@@ -234,7 +301,7 @@ pub(crate) mod test_support {
         let bus = Arc::new(LocalBus::new().with_teams(Arc::clone(&teams)));
         crate::session_bootstrap::DaemonResources::new(
             store,
-            available_isolate(),
+            isolate,
             proxy,
             Arc::new(SpawnTree::new()),
             teams,

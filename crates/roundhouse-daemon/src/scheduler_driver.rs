@@ -56,10 +56,12 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_core::{
-    BindingId, EventPayload, JobId, OnDegrade, SessionId, SessionSpec, TaskId, TaskKind,
-    TaskRunner, Tier, Timestamp, WorkspaceId,
+    BindingId, EventPayload, JobId, OnDegrade, SessionId, SessionSpec, SessionState, TaskId,
+    TaskKind, TaskRunner, Tier, Timestamp, WorkspaceId,
 };
-use roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow;
+use roundhouse_engine::workflow_dispatch::{
+    dispatch_tool_for_workflow, record_workflow_task_failed, DispatchOutcome, WorkflowToolDispatch,
+};
 use roundhouse_flow::caps::ResourceCaps;
 use roundhouse_flow::durability::{insert_workflow_run, RunState, WorkflowRun};
 use roundhouse_flow::exec::run_loop::{
@@ -927,9 +929,18 @@ fn flush_task_events(
 }
 
 /// A [`WorkDone`] for a `PendingWork` this daemon cannot yet dispatch for
-/// real — no task was ever minted, so every task-identity field is `None`.
-/// See [`DeliveryExecutor::execute_pending`] for why this always answers
-/// rather than dropping the item.
+/// real, or dispatched but can prove no task was ever durably minted for —
+/// every task-identity field is `None`. Besides the `agent:`/`call:`
+/// refusals below (never dispatched at all), this is also what
+/// [`DeliveryExecutor::execute_pending`]'s filesystem-kind timeout arm falls
+/// back to when `dispatch_tool_for_workflow`'s `identity_sink` comes back
+/// empty — proof `TaskCreated` itself was never appended before the future
+/// was dropped. When identity *is* known on that arm, `execute_pending`
+/// builds its `WorkDone` directly instead of calling this, so the row can
+/// carry the real `task_id`/`first_task_seq` (see that method's own doc
+/// comment for the full account, including issue #69's original gap this
+/// closes). See [`DeliveryExecutor::execute_pending`] more generally for why
+/// this always answers rather than dropping the item.
 fn unanswerable_work(step_id: String, message: String) -> WorkDone {
     WorkDone {
         step_id,
@@ -973,6 +984,112 @@ impl SegmentGapGate {
 
     fn release(&self, permits: usize) {
         self.releases.add_permits(permits);
+    }
+}
+
+/// Folds a `dispatch_tool_for_workflow` outcome into the [`WorkDone`] shape
+/// [`DeliveryExecutor::execute_pending`] hands back for one `PendingKind::Tool`
+/// item — shared between its `Shell` branch (no outer timeout wrap) and its
+/// filesystem-kinds branch (wrapped in `tokio::time::timeout`), so the two
+/// only differ in how they got a `Result<WorkflowToolDispatch, String>`, not
+/// in how they interpret one.
+///
+/// Phase 8 Task 25.4 Task 4: `DispatchOutcome::Cancelled` becomes
+/// `WorkStatus::Cancelled` here — today reachable only through the `Shell`
+/// branch, whose `ToolDispatchError::ShellSessionCancelled` is the only
+/// `DispatchOutcome::Cancelled` producer inside `dispatch_tool_for_workflow`
+/// itself. The four filesystem kinds never produce it from in here; see
+/// [`DeliveryExecutor::execute_pending`]'s own doc comment for how (and why)
+/// those four are instead reclassified by the caller, after the fact.
+fn work_done_from_dispatch(
+    step_id: String,
+    dispatched: Result<WorkflowToolDispatch, String>,
+) -> WorkDone {
+    match dispatched {
+        Ok(dispatched) => {
+            let (status, output) = match dispatched.result {
+                DispatchOutcome::Completed(value) => (WorkStatus::Completed, value),
+                DispatchOutcome::Failed(message) => {
+                    (WorkStatus::Failed { message }, serde_json::Value::Null)
+                }
+                DispatchOutcome::Cancelled(reason) => {
+                    (WorkStatus::Cancelled { reason }, serde_json::Value::Null)
+                }
+            };
+            WorkDone {
+                step_id,
+                status,
+                output,
+                output_is_secret_derived: false,
+                task_id: Some(dispatched.task_id),
+                first_task_seq: Some(dispatched.first_task_seq),
+                last_task_seq: dispatched.last_task_seq,
+            }
+        }
+        Err(message) => unanswerable_work(step_id, message),
+    }
+}
+
+/// `session`'s actor's exact `SessionState` — unless it is `Created`/
+/// `Running`, in which case `None` (nothing about the run itself indicates a
+/// call dispatched under it should be reported as interrupted). Mirrors
+/// `roundhouse_engine::tool_dispatch::wait_for_session_cancel`'s own
+/// "not `Created`/`Running`" predicate exactly, and deliberately: that is
+/// the live, mid-dispatch signal `Shell` gets for free via
+/// `ToolDispatchError::ShellSessionCancelled`, and this is the same
+/// predicate applied post-hoc — see
+/// [`DeliveryExecutor::execute_pending`]'s own doc comment for both call
+/// sites and why each needs this.
+///
+/// Returning the real state (not a bare bool) is what lets
+/// [`cancel_reclassification_reason`] name what was actually observed —
+/// `Cancelling` and `Closed` are the interesting/expected cases, `Suspended`
+/// is a real but distinct one, and collapsing all three into one generic
+/// "cancelled" reason string was itself a finding (Phase 8 Task 25.4 PR #68
+/// follow-up): the state is knowable here, so the reason it produces should
+/// say which one fired rather than erase the difference.
+///
+/// A fresh [`roundhouse_engine::SessionActor::subscribe`] call returns a
+/// receiver already initialized with the channel's *current* value, so
+/// `.borrow()` on it is an immediate snapshot, not a wait: this is a
+/// **post-hoc check**, not a race.
+fn interrupting_session_state(session: &HeadlessSession) -> Option<SessionState> {
+    match *session.actor().subscribe().borrow() {
+        SessionState::Created | SessionState::Running => None,
+        ref other => Some(other.clone()),
+    }
+}
+
+/// The reason recorded on a `tool:` step reclassified as
+/// `WorkStatus::Cancelled` after its (uninterruptible, or already-returned)
+/// dispatch — see [`DeliveryExecutor::execute_pending`]'s own doc comment
+/// for the honest limit this names. Names the exact `state` observed rather
+/// than a generic "cancelled" — see [`interrupting_session_state`]'s own doc
+/// comment for why collapsing that distinction was itself a finding.
+fn cancel_reclassification_reason(state: &SessionState) -> String {
+    format!(
+        "the owning session was observed in state {state:?} (not `Created`/`Running`) while \
+         this tool call was in flight or about to be dispatched; the call was allowed to run \
+         to completion (or had already completed) before being reported as cancelled"
+    )
+}
+
+/// Applies [`interrupting_session_state`]'s post-hoc reclassification to
+/// `done` in place, if it fires — shared by both `execute_pending` branches
+/// that need it (`Shell` and the four filesystem kinds; see that method's
+/// own doc comment for why each does). A no-op if `session`'s state is
+/// `Created`/`Running`, or if `done` is already `WorkStatus::Cancelled`
+/// (never overwrite a real cancel — `Shell`'s own live signal via
+/// `ToolDispatchError::ShellSessionCancelled` — with this post-hoc one).
+fn reclassify_if_interrupted(done: &mut WorkDone, session: &HeadlessSession) {
+    if matches!(done.status, WorkStatus::Cancelled { .. }) {
+        return;
+    }
+    if let Some(state) = interrupting_session_state(session) {
+        done.status = WorkStatus::Cancelled {
+            reason: cancel_reclassification_reason(&state),
+        };
+        done.output = serde_json::Value::Null;
     }
 }
 
@@ -1218,12 +1335,14 @@ impl DeliveryExecutor {
     ///
     /// The one deliberate exception is [`RunConclusion::Parked`]. A parked
     /// run is *not* terminal — `roundhouse-flow` will drive it to completion
-    /// when a human answers its gate — so completing or failing the delivery
-    /// there would be a lie, and releasing the slot would let the same
-    /// binding start a second run on top of one that is still live. Nothing
-    /// in these tasks resumes a parked scheduled run, so such a delivery
-    /// holds its slot until the daemon restarts; that is a known limitation
-    /// with a named owner (human-in-the-loop resumption), not an oversight.
+    /// when a human answers the wait, whether that is a `gate:` step or
+    /// (Phase 8 Task 25.4) §8.10's `on_crash: ask` crash recovery — so
+    /// completing or failing the delivery there would be a lie, and
+    /// releasing the slot would let the same binding start a second run on
+    /// top of one that is still live. Nothing in these tasks resumes a
+    /// parked scheduled run, so such a delivery holds its slot until the
+    /// daemon restarts; that is a known limitation with a named owner
+    /// (human-in-the-loop resumption), not an oversight.
     async fn run_claimed(&self, claimed: ClaimedDelivery) {
         let ClaimedDelivery {
             delivery,
@@ -1328,7 +1447,8 @@ impl DeliveryExecutor {
             RunConclusion::Parked => {
                 tracing::info!(
                     binding_id = %binding_id,
-                    "a scheduled run parked on a human gate; its delivery stays `running`, its \
+                    "a scheduled run parked on a human wait (a `gate:` step, or §8.10's \
+                     `on_crash: ask` crash recovery); its delivery stays `running`, its \
                      admission slot stays held, and its session stays alive until the run is \
                      resumed"
                 );
@@ -1634,6 +1754,8 @@ impl DeliveryExecutor {
             workspace_root,
             run_ctx,
             now,
+            // A cold start: this delivery's run was just created.
+            None,
         )
         .await
     }
@@ -1806,11 +1928,15 @@ impl DeliveryExecutor {
             workspace_root,
             run_ctx,
             boot,
+            // The cold entry `failed_step_rows`'s argument depends on: a
+            // restart-recovery pass holds no outstanding `PendingWork`, and
+            // no human answer either.
+            None,
         )
         .await
     }
 
-    /// Drives one run from `resume: None` all the way to a
+    /// Drives one run from `initial_resume` all the way to a
     /// `Terminal`/`Parked` outcome, executing every `AwaitingWork`
     /// suspension for real in between (Phase 8 Task 25.2/25.3's segmented
     /// driving loop). The workflow definition is resolved once, up front —
@@ -1836,9 +1962,29 @@ impl DeliveryExecutor {
     /// comment carries the whole argument for why an entry carrying a
     /// `Resume::Work` — which only this loop can produce — is the one entry
     /// on which a `Failed` row belongs to the drive still in progress rather
-    /// than to a dead one. Note where the loop starts every drive, including
-    /// the one [`Self::rebuild_and_drive_recovered_run`] makes after a
-    /// restart: `resume: None`, the cold entry that argument depends on.
+    /// than to a dead one. Note where both production callers start every
+    /// drive, including the one [`Self::rebuild_and_drive_recovered_run`]
+    /// makes after a restart: `initial_resume: None`, the cold entry that
+    /// argument depends on.
+    ///
+    /// # `initial_resume`, and why it is a parameter with no production caller yet
+    ///
+    /// The answer to carry into the **first** segment, for a drive that is
+    /// resuming a parked run rather than starting one: a
+    /// `Resume::Gate`/`Resume::CrashRecovery` releasing an
+    /// `AwaitingHuman` run (`roundhouse_flow`'s `run_workflow` refuses to
+    /// drive such a run without one). Every production caller passes `None`,
+    /// because nothing in this daemon resumes a parked run yet — that is the
+    /// same named-owner gap [`Self::run_claimed`]'s
+    /// `RunConclusion::Parked` arm records. It is a parameter rather than a
+    /// hardcoded `None` for the reason `SessionTree::child_terminated`'s own
+    /// doc gives for its unreached call site: whatever eventually resumes a
+    /// park inherits the segmented driving loop by construction, instead of
+    /// growing a second copy of it — and it is what lets this module's own
+    /// `a_crash_recovery_park_is_answered_and_the_write_step_really_re_dispatches`
+    /// exercise a real park-and-resume cycle through the production loop
+    /// rather than a simulation of one.
+    #[allow(clippy::too_many_arguments)]
     async fn drive_run_to_completion(
         &self,
         run_id: RunId,
@@ -1848,6 +1994,7 @@ impl DeliveryExecutor {
         workspace_root: PathBuf,
         run_ctx: RunContext,
         mut now: Timestamp,
+        initial_resume: Option<Resume>,
     ) -> Result<Result<RunOutcome, roundhouse_flow::exec::run_loop::RunLoopError>, DeliveryError>
     {
         let def = {
@@ -1868,7 +2015,7 @@ impl DeliveryExecutor {
         };
 
         let runner = self.resources.runner;
-        let mut resume: Option<Resume> = None;
+        let mut resume: Option<Resume> = initial_resume;
         loop {
             let def = Arc::clone(&def);
             let run_ctx = run_ctx.clone();
@@ -1925,9 +2072,137 @@ impl DeliveryExecutor {
     /// still gets a [`WorkDone`], just a failed one, so the run is never
     /// left suspended forever waiting on an answer nothing will supply.
     ///
-    /// **Scope: `tool: read` only.** Every other `tool:` kind, every
-    /// `agent:` step, and every `call:` child are refused with a named,
-    /// recorded failure — wiring them is Phase 8 Tasks 25.4/25.5/25.6.
+    /// **Scope: `tool: read|write|edit|find|shell`.** Every `agent:` step
+    /// and every `call:` child are refused with a named, recorded failure —
+    /// wiring them is Phase 8 Tasks 25.5/25.6.
+    ///
+    /// # `step_timeout` enforcement (Phase 8 Task 25.4 Task 3)
+    ///
+    /// Every `Tool` item's own `PendingWork.step_timeout` is passed straight
+    /// through to `dispatch_tool_for_workflow`, which threads it into
+    /// [`roundhouse_engine::tool_dispatch::execute_builtin`]'s `timeout`
+    /// parameter. For `Shell` that parameter is a real, self-contained
+    /// bound: an elapsed timeout is a process-group kill (SIGTERM
+    /// escalating to SIGKILL, confirmed) before `execute_builtin` ever
+    /// returns.
+    ///
+    /// The four filesystem kinds (`Read`/`Write`/`Edit`/`Find`) have no such
+    /// internal mechanism — their futures are simply awaited to completion
+    /// inside `execute_builtin` — so this function additionally wraps
+    /// *their* `dispatch_tool_for_workflow` call in
+    /// `tokio::time::timeout(step_timeout, ..)` as an outer safety net.
+    ///
+    /// **`Shell` deliberately does NOT get that same outer wrap, and this is
+    /// load-bearing, not an oversight.** `dispatch_tool_for_workflow` admits
+    /// the step and appends `TaskCreated`/`TaskStarted` (real store I/O)
+    /// *before* `execute_builtin`'s own `tokio::time::sleep(timeout)` timer
+    /// ever starts — so an outer timeout of the identical duration, started
+    /// at the identical instant this function calls
+    /// `dispatch_tool_for_workflow`, would *always* reach its deadline
+    /// first. `tokio::time::timeout` on the losing side drops the inner
+    /// future outright: the pre-spawned `Child` (and the still-running
+    /// process it wraps) would be dropped out from under
+    /// `run_isolated_shell_dispatch`'s `tokio::select!` before its own
+    /// timeout branch — the one that actually calls `Child::cancel` and
+    /// awaits its confirmation — ever got a chance to run. `roundhouse_sandbox::Child`
+    /// has no `Drop` impl that kills anything, so that is exactly the
+    /// "wrapped only around the outer future... merely drops that future
+    /// and leak[s] the child" failure this task's brief warns against —
+    /// reintroduced by the outer wrap it also asks for, if applied
+    /// unconditionally. So `Shell` is bounded by the inner, real mechanism
+    /// alone; the outer wrap exists only for the four kinds that have
+    /// nothing else.
+    ///
+    /// A `step_timeout` of [`Duration::ZERO`](std::time::Duration::ZERO) is
+    /// refused outright, before any dispatch is attempted (whatever the
+    /// tool kind), with a message naming it as a bug rather than a timeout —
+    /// see `roundhouse_flow::exec::run_loop::PendingWork::step_timeout`'s
+    /// own doc comment for the (today unreachable) `unwrap_or_default()`
+    /// branch that could otherwise produce one. Handing `Duration::ZERO`
+    /// straight to `tokio::time::timeout` (or to `execute_builtin`'s
+    /// `timeout`) would make every dispatch "time out" instantly and
+    /// indistinguishably from a real one, which is a worse failure mode
+    /// than refusing to guess what zero was supposed to mean.
+    ///
+    /// ## The outer timeout arm still reports real task identity (issue #69)
+    ///
+    /// The four filesystem kinds' outer `tokio::time::timeout` wrap has to
+    /// drop `dispatch_tool_for_workflow`'s future outright when it loses the
+    /// race — but that future has usually already appended
+    /// `TaskCreated`/`TaskStarted` for a real `task_id` by then. Answering
+    /// with [`unanswerable_work`] (`task_id: None`) in that case would be a
+    /// lie — the task was minted and is durably logged, just not reported —
+    /// and would leave it `Running` in the `tasks` materialized view until
+    /// the next daemon boot's recovery pass repairs it. Instead, the
+    /// `identity_sink` handed to `dispatch_tool_for_workflow` (see that
+    /// function's own doc comment) reports `(task_id, first_task_seq)` the
+    /// instant `TaskCreated` lands, race-free with respect to the future
+    /// being dropped; on `Err(_elapsed)` this function checks that channel
+    /// and, when it has an answer, itself appends a real terminal
+    /// `TaskFailed` (`record_workflow_task_failed`) and reports true
+    /// identity. Only when the channel comes back empty — proof
+    /// `TaskCreated` itself was never appended — does this fall back to
+    /// [`unanswerable_work`], which is accurate in that case.
+    ///
+    /// # §8.13 cooperative cancel (Phase 8 Task 25.4 Task 4)
+    ///
+    /// `WorkStatus::Cancelled` (`roundhouse_flow::exec::run_loop`) exists so
+    /// a step the run's own cancel interrupted is told apart from one that
+    /// merely failed; this function is its first, and so far only,
+    /// producer.
+    ///
+    /// **`Shell` gets real mid-dispatch cancellation for (mostly) free.**
+    /// `dispatch_tool_for_workflow` already threads
+    /// `Some(session.actor().subscribe())` into `execute_builtin`, which is
+    /// already consumed by `run_isolated_shell_dispatch`'s own
+    /// `tokio::select!` — a cancel observed there is a real
+    /// SIGTERM→SIGKILL-and-confirm, exactly like a timeout, and is reported
+    /// back as `ToolDispatchError::ShellSessionCancelled`
+    /// (`roundhouse_engine::tool_dispatch`), which
+    /// `dispatch_tool_for_workflow` folds into `DispatchOutcome::Cancelled`
+    /// and [`work_done_from_dispatch`] folds into `WorkStatus::Cancelled`.
+    /// This function's own job for `Shell`'s dispatch itself is exactly what
+    /// it was before this task: await the one dispatch future to
+    /// completion, no outer race — adding one here would drop the future
+    /// holding the pre-spawned child before its own kill-and-confirm logic
+    /// could run, the identical hazard the no-outer-timeout-wrap reasoning
+    /// above already covers. What the live signal does **not** cover is a
+    /// cancel landing before `run_isolated_shell_dispatch`'s `select!` ever
+    /// starts (during `admit_task` or the child pre-spawn) — a Phase 8 Task
+    /// 25.4 PR #68 follow-up finding — so `Shell`'s branch below applies the
+    /// same post-hoc [`interrupting_session_state`] check the filesystem
+    /// kinds use, guarded so it never overwrites a real `Cancelled` the live
+    /// signal already produced.
+    ///
+    /// **The four filesystem kinds cannot be interrupted mid-call, and this
+    /// function does not pretend otherwise.** `execute_builtin`'s
+    /// `Read`/`Write`/`Edit`/`Find` arms never consult `cancel` at all —
+    /// `find` in particular runs inside `tokio::task::spawn_blocking`, whose
+    /// `JoinHandle` dropping does not stop the blocking thread, so there is
+    /// no honest way to abort one in flight. The behaviour this function
+    /// implements instead (the brief's own "allowed to finish" alternative,
+    /// deliberately chosen over "not interruptible, reports normally" so
+    /// that a cancel is never silently invisible in a step's own recorded
+    /// outcome): the call runs to completion — through Task 3's existing
+    /// outer `tokio::time::timeout` unchanged, never raced against a
+    /// separate cancel-drop that would orphan an in-flight
+    /// `TaskCreated`/`TaskStarted` pair the same way an outer timeout wrap
+    /// would for `Shell` — and once it returns,
+    /// [`interrupting_session_state`] takes a **post-hoc** snapshot of
+    /// `session.actor()`'s `SessionState` (a fresh `subscribe()` call
+    /// returns the channel's *current* value, so this is a check, not a
+    /// race) and reclassifies a `Completed`/`Failed` outcome as
+    /// `WorkStatus::Cancelled` when the session was already
+    /// cancelled/suspended/closed by the time the call returned — naming
+    /// exactly which of those three in the recorded reason
+    /// ([`cancel_reclassification_reason`]), rather than a single generic
+    /// "cancelled" string that erased the distinction (the other half of
+    /// that same follow-up finding). This does **not** distinguish
+    /// "interrupted before the call started" from "interrupted while it was
+    /// running" — both look identical from outside an uninterruptible call
+    /// — and it makes no `workspace_released`-style claim: whatever the
+    /// call actually did (wrote a file, read one) already happened by the
+    /// time it is relabelled.
     async fn execute_pending(
         &self,
         session: &HeadlessSession,
@@ -1941,33 +2216,152 @@ impl DeliveryExecutor {
                     logged_input,
                     dispatch_input,
                     ..
-                } => match dispatch_tool_for_workflow(
-                    session.actor(),
-                    task_kind,
-                    logged_input,
-                    dispatch_input,
-                )
-                .await
-                {
-                    Ok(dispatched) => {
-                        let (status, output) = match dispatched.result {
-                            Ok(value) => (WorkStatus::Completed, value),
-                            Err(message) => {
-                                (WorkStatus::Failed { message }, serde_json::Value::Null)
+                } => {
+                    let step_timeout = item.step_timeout;
+                    if step_timeout.is_zero() {
+                        unanswerable_work(
+                            item.step_id,
+                            "step_timeout was zero, which should be unreachable — refusing \
+                             rather than treating it as either \"no timeout\" or a legitimate \
+                             instant timeout"
+                                .into(),
+                        )
+                    } else if task_kind == TaskKind::Shell {
+                        // No outer wrap here — see this method's own doc
+                        // comment for why racing an identical-duration
+                        // outer timeout against Shell's inner one would
+                        // orphan the child instead of protecting anything.
+                        let dispatched = dispatch_tool_for_workflow(
+                            session.actor(),
+                            task_kind,
+                            logged_input,
+                            dispatch_input,
+                            step_timeout,
+                            None,
+                        )
+                        .await;
+                        let mut done = work_done_from_dispatch(item.step_id, dispatched);
+                        // Closes the asymmetry named by the Phase 8 Task
+                        // 25.4 PR #68 follow-up: Shell's own live signal
+                        // (`ToolDispatchError::ShellSessionCancelled`) only
+                        // covers a cancel observed *during*
+                        // `run_isolated_shell_dispatch`'s own
+                        // `tokio::select!` — a cancel landing in the
+                        // pre-dispatch window (before that select! starts,
+                        // e.g. during `admit_task` or the child pre-spawn)
+                        // surfaces as an ordinary `Failed`, not `Cancelled`.
+                        // [`reclassify_if_interrupted`]'s same post-hoc
+                        // snapshot, shared with the filesystem branch below,
+                        // closes that gap here too — its own guard against
+                        // double-wrapping an already-`Cancelled` `Shell`
+                        // result is what makes this safe to call
+                        // unconditionally.
+                        reclassify_if_interrupted(&mut done, session);
+                        done
+                    } else {
+                        // Reports `(task_id, first_task_seq)` the instant
+                        // `TaskCreated` is durably appended inside
+                        // `dispatch_tool_for_workflow`, so the `Err(_elapsed)`
+                        // arm below can still learn real task identity even
+                        // though the outer timeout drops that future before
+                        // it ever returns — see `dispatch_tool_for_workflow`'s
+                        // own doc comment on `identity_sink` for why this is
+                        // race-free, and issue #69 for the gap this closes.
+                        let (identity_tx, mut identity_rx) = tokio::sync::oneshot::channel();
+                        match tokio::time::timeout(
+                            step_timeout,
+                            dispatch_tool_for_workflow(
+                                session.actor(),
+                                task_kind,
+                                logged_input,
+                                dispatch_input,
+                                step_timeout,
+                                Some(identity_tx),
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(dispatched) => {
+                                let mut done = work_done_from_dispatch(item.step_id, dispatched);
+                                // [`reclassify_if_interrupted`]'s post-hoc
+                                // reclassification — see this method's own
+                                // doc comment for the full reasoning. A
+                                // `Cancelled` status cannot reach this arm
+                                // (filesystem dispatch has no producer of
+                                // its own), but its internal guard against
+                                // double-wrapping one is what makes sharing
+                                // this helper with the `Shell` branch above
+                                // (which *can* already be `Cancelled` here)
+                                // safe.
+                                reclassify_if_interrupted(&mut done, session);
+                                done
                             }
-                        };
-                        WorkDone {
-                            step_id: item.step_id,
-                            status,
-                            output,
-                            output_is_secret_derived: false,
-                            task_id: Some(dispatched.task_id),
-                            first_task_seq: Some(dispatched.first_task_seq),
-                            last_task_seq: dispatched.last_task_seq,
+                            Err(_elapsed) => {
+                                let message = format!(
+                                    "the tool call exceeded its {step_timeout:?} step_timeout"
+                                );
+                                match identity_rx.try_recv() {
+                                    // `TaskCreated`/`TaskStarted` may already be
+                                    // durably logged for this real task_id — do
+                                    // not answer as if none was ever minted.
+                                    // Append a real terminal `TaskFailed` so the
+                                    // step's row carries true identity and the
+                                    // task doesn't sit `Running` until the next
+                                    // daemon boot's recovery pass repairs it.
+                                    Ok((task_id, first_task_seq)) => {
+                                        match record_workflow_task_failed(
+                                            session.actor(),
+                                            task_id,
+                                            "step_timeout",
+                                            message.clone(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(last_task_seq) => WorkDone {
+                                                step_id: item.step_id,
+                                                status: WorkStatus::Failed { message },
+                                                output: serde_json::Value::Null,
+                                                output_is_secret_derived: false,
+                                                task_id: Some(task_id),
+                                                first_task_seq: Some(first_task_seq),
+                                                last_task_seq: Some(last_task_seq),
+                                            },
+                                            // The terminal append itself failed —
+                                            // still report the real identity we
+                                            // do have rather than claim none was
+                                            // minted; `last_task_seq: None`
+                                            // honestly reflects that no terminal
+                                            // event was confirmed, leaving this
+                                            // task for the next boot's recovery
+                                            // pass exactly as before this fix.
+                                            Err(append_err) => WorkDone {
+                                                step_id: item.step_id,
+                                                status: WorkStatus::Failed {
+                                                    message: format!(
+                                                        "{message}; additionally failed to record \
+                                                         its terminal event: {append_err}"
+                                                    ),
+                                                },
+                                                output: serde_json::Value::Null,
+                                                output_is_secret_derived: false,
+                                                task_id: Some(task_id),
+                                                first_task_seq: Some(first_task_seq),
+                                                last_task_seq: None,
+                                            },
+                                        }
+                                    }
+                                    // The channel closed with nothing ever sent:
+                                    // `dispatch_tool_for_workflow` was dropped
+                                    // before its `TaskCreated` append ever
+                                    // completed, so `unanswerable_work`'s
+                                    // "no task was ever minted" is actually true
+                                    // here.
+                                    Err(_) => unanswerable_work(item.step_id, message),
+                                }
+                            }
                         }
                     }
-                    Err(message) => unanswerable_work(item.step_id, message),
-                },
+                }
                 PendingKind::Agent { .. } => unanswerable_work(
                     item.step_id,
                     "workflow dispatch of `agent:` steps is not wired yet (Phase 8 Task 25.5)"
@@ -3767,1736 +4161,13 @@ mod tests {
 /// [`FixedClock`] the harness injects into [`DeliveryExecutor`], and the one
 /// place a test waits (the parked case's spawned task) is driven by awaiting
 /// the call directly rather than sleeping.
+///
+/// Split out of this file into `scheduler_driver/delivery_tests.rs` (Phase 8
+/// Task 25.4 follow-up) purely to keep the production source file a
+/// manageable size — this stays a `#[cfg(test)]` submodule of
+/// `scheduler_driver`, not an integration test crate, since it reaches
+/// private items (`SegmentGapGate`, `interrupting_session_state`,
+/// `unanswerable_work`, `work_done_from_dispatch`, `DeliveryExecutor`'s
+/// private fields) that an external `tests/` binary cannot see.
 #[cfg(test)]
-mod delivery_tests {
-    use super::*;
-    use crate::session_registry::SessionRegistry;
-    use crate::test_support::daemon_resources;
-    use crate::workspace_registry::{WorkspaceRegistration, WorkspaceRegistry};
-    use roundhouse_core::Tier;
-    use roundhouse_flow::durability::recover_run;
-    use roundhouse_flow::job::SessionTemplate;
-    use roundhouse_flow::job_store::register_workflow_file;
-    use roundhouse_sched::delivery::DeliveryState;
-    use roundhouse_sched::store::fetch_delivery;
-    use roundhouse_store::StorePool;
-    use std::path::PathBuf;
-    use std::time::Duration;
-
-    /// The one instant every delivery test reckons against.
-    fn instant() -> DateTime<Utc> {
-        DateTime::from_timestamp_nanos(1_700_000_000_000_000_000)
-    }
-
-    fn template() -> SessionTemplate {
-        SessionTemplate {
-            provider: "test".into(),
-            model: "test-model".into(),
-            cwd: "/tmp".into(),
-            tools: vec![],
-            isolation: Tier::Sandbox,
-            permission_policy_ref: "default".into(),
-        }
-    }
-
-    /// A workflow whose single step completes with no dispatch of any kind.
-    fn completing_workflow() -> String {
-        "name: scheduled\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
-         escalate: fail\nsteps:\n  - id: result\n    emit: { value: ready }\n"
-            .to_string()
-    }
-
-    fn reading_workflow() -> String {
-        "name: scheduled-read\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
-         escalate: fail\nsteps:\n  - id: read_it\n    tool: read\n    with: { path: greeting.txt }\n"
-            .to_string()
-    }
-
-    /// A workflow whose step fails: `no_such_fn` is not a function the
-    /// expression evaluator knows, so the step (and therefore the run) fails
-    /// — the same fixture `roundhouse-flow`'s own run-loop tests use.
-    fn failing_workflow() -> String {
-        "name: scheduled\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
-         escalate: fail\nsteps:\n  - id: broken\n    emit: \"${{ no_such_fn(1) }}\"\n"
-            .to_string()
-    }
-
-    /// A workflow that registers fine (its top-level document parses) but
-    /// whose *step graph* is a `needs:` cycle, which only `run_workflow`'s own
-    /// `parse_phase`/`topological_order` rejects. This is how a test reaches
-    /// the `Err(RunLoopError)` return from `run_workflow_from_storage` — an
-    /// infra-level failure calling into flow — as opposed to the ordinary
-    /// `Ok(RunOutcome::Terminal { state: Failed, .. })` a failing *step*
-    /// produces.
-    fn undrivable_workflow() -> String {
-        "name: scheduled\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
-         escalate: fail\nsteps:\n  - id: a\n    needs: [b]\n    emit: { x: 1 }\n  - id: b\n    \
-         needs: [a]\n    emit: { y: 2 }\n"
-            .to_string()
-    }
-
-    /// A workflow that parks on a human gate — a real, valid non-terminal
-    /// outcome this driver deliberately does not resolve.
-    fn parking_workflow() -> String {
-        "name: scheduled\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
-         escalate: fail\nsteps:\n  - id: approve\n    gate:\n      title: approve\n      \
-         form: { approved: { type: boolean } }\n      timeout: 1h\n      on_timeout: deny\n"
-            .to_string()
-    }
-
-    struct Harness {
-        _dir: tempfile::TempDir,
-        store: StorePool,
-        resources: Arc<DaemonResources>,
-        sessions: Arc<SessionRegistry>,
-        executor: DeliveryExecutor,
-        registry: Arc<InMemoryRunRegistry>,
-        stored: StoredBinding,
-        delivery: TriggerDelivery,
-        workspace_root: PathBuf,
-    }
-
-    impl Harness {
-        async fn delivery_row(&self) -> TriggerDelivery {
-            let id = self.delivery.delivery_id.clone();
-            let conn = self.store.pool.get().await.unwrap();
-            conn.interact(move |connection| fetch_delivery(connection, &id).unwrap().unwrap())
-                .await
-                .unwrap()
-        }
-
-        fn active(&self) -> u32 {
-            self.registry
-                .active_run_count(self.stored.binding.id)
-                .unwrap()
-        }
-
-        /// Accepts a second occurrence of the same binding, through the real
-        /// `accept_occurrence`, and returns the delivery it created.
-        async fn accept_another_occurrence(&self, seconds_later: i64) -> TriggerDelivery {
-            let stored = self.stored.clone();
-            let occurrence = ScheduledOccurrence {
-                binding_id: stored.binding.id,
-                scheduled_for: instant() + chrono::Duration::seconds(seconds_later),
-                is_catch_up: false,
-            };
-            let fired_at = instant() + chrono::Duration::seconds(seconds_later);
-            let registry = Arc::clone(&self.registry);
-            let conn = self.store.pool.get().await.unwrap();
-            let acceptance = conn
-                .interact(move |connection| {
-                    roundhouse_sched::store::accept_occurrence(
-                        connection,
-                        &stored,
-                        &occurrence,
-                        fired_at,
-                        registry.as_ref(),
-                    )
-                    .unwrap()
-                })
-                .await
-                .unwrap();
-            match acceptance {
-                roundhouse_sched::store::Acceptance::New {
-                    delivery: Some(delivery),
-                    ..
-                } => delivery,
-                other => panic!("expected a second delivery, got {other:?}"),
-            }
-        }
-
-        async fn state_of(&self, delivery_id: &str) -> DeliveryState {
-            let id = delivery_id.to_string();
-            let conn = self.store.pool.get().await.unwrap();
-            conn.interact(move |connection| fetch_delivery(connection, &id).unwrap().unwrap().state)
-                .await
-                .unwrap()
-        }
-
-        async fn session_event_count(&self, session_id: SessionId) -> i64 {
-            let conn = self.store.pool.get().await.unwrap();
-            conn.interact(move |connection| {
-                connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM events WHERE session_id = ?1",
-                        rusqlite::params![session_id.to_string()],
-                        |row| row.get(0),
-                    )
-                    .unwrap()
-            })
-            .await
-            .unwrap()
-        }
-
-        async fn run_state(&self, run_id: RunId) -> RunState {
-            let conn = self.store.pool.get().await.unwrap();
-            conn.interact(move |connection| recover_run(connection, run_id).unwrap().run.state)
-                .await
-                .unwrap()
-        }
-
-        /// A second [`DeliveryExecutor`], sharing this harness's on-disk
-        /// store and [`DaemonResources`] but wired to a **fresh** (empty)
-        /// [`InMemoryRunRegistry`] and a fresh (empty) [`SessionRegistry`] —
-        /// exactly what a restarted daemon process boots with. Task 7's
-        /// recovery tests drive `recover_after_restart` against this, never
-        /// `self.executor` (which still holds the charge `accept_occurrence`
-        /// made against `self.registry` when the harness set the delivery
-        /// up), so a passing assertion proves the *fresh* registry was
-        /// correctly re-seeded rather than merely never zeroed.
-        fn fresh_executor_after_restart(
-            &self,
-        ) -> (
-            DeliveryExecutor,
-            Arc<InMemoryRunRegistry>,
-            Arc<SessionRegistry>,
-        ) {
-            let registry = Arc::new(InMemoryRunRegistry::new());
-            let sessions = Arc::new(SessionRegistry::new());
-            let executor = DeliveryExecutor::new(
-                self.store.clone(),
-                Arc::clone(&self.resources),
-                Arc::clone(&sessions),
-                Arc::clone(&registry),
-                Arc::clone(&self.resources.spawn_tree),
-                Arc::new(FixedClock(instant())),
-            );
-            (executor, registry, sessions)
-        }
-
-        /// Like [`Self::fresh_executor_after_restart`], but wired to a fresh
-        /// [`DaemonResources`] whose `workspace_registry` is `None` —
-        /// forcing `DeliveryExecutor::rebuild_and_drive_recovered_run` to
-        /// fail with `DeliveryError::NoWorkspaceRegistry` before it builds
-        /// anything, standing in for any pre-run infra failure (session
-        /// construction, workspace resolution, a store error). Used by the
-        /// fix-round-1 regression test pinning that such a failure, reached
-        /// only after `control::cancel` already committed `Cancelling`,
-        /// must not fail the delivery to a terminal state.
-        async fn fresh_executor_after_restart_without_workspace_registry(
-            &self,
-        ) -> (
-            DeliveryExecutor,
-            Arc<InMemoryRunRegistry>,
-            Arc<SessionRegistry>,
-        ) {
-            let registry = Arc::new(InMemoryRunRegistry::new());
-            let sessions = Arc::new(SessionRegistry::new());
-            let resources = Arc::new(daemon_resources(self._dir.path(), None).await);
-            let spawn_tree = Arc::clone(&resources.spawn_tree);
-            let executor = DeliveryExecutor::new(
-                self.store.clone(),
-                resources,
-                Arc::clone(&sessions),
-                Arc::clone(&registry),
-                spawn_tree,
-                Arc::new(FixedClock(instant())),
-            );
-            (executor, registry, sessions)
-        }
-
-        /// Simulates a previous daemon process that reserved `self.delivery`,
-        /// created its `workflow_run` row in `state`, and (for every state
-        /// other than a bare reservation) marked the delivery `running` —
-        /// then crashed before ever calling `run_workflow_from_storage`
-        /// itself. Returns the `RunId`/`SessionId` a recovery test asserts
-        /// against.
-        ///
-        /// This is the harness-level counterpart to
-        /// `DeliveryExecutor::run_claimed_delivery`'s own reserve/resolve/
-        /// insert-run-row/mark-running sequence, stopped one step short of
-        /// actually driving the workflow — precisely the crash window
-        /// restart recovery exists to close.
-        async fn simulate_running_before_crash_with_state(
-            &self,
-            run_state: RunState,
-        ) -> (RunId, SessionId) {
-            let run_id = RunId::new();
-            let session_id = SessionId::new();
-            let delivery_id = self.delivery.delivery_id.clone();
-            let job_id = self.stored.binding.job_id;
-            let binding_id = self.stored.binding.id;
-            let trigger_event_id = self.delivery.trigger_event_id;
-            let workspace_root = self.workspace_root.clone();
-            let conn = self.store.pool.get().await.unwrap();
-            conn.interact(move |connection| {
-                assert!(lease_delivery(
-                    connection,
-                    &delivery_id,
-                    Timestamp::from_unix_nanos(i64::MAX),
-                    Timestamp::from_unix_nanos(0),
-                )
-                .unwrap());
-                assert!(reserve_delivery(
-                    connection,
-                    &delivery_id,
-                    &run_id.as_uuid().to_string(),
-                    session_id,
-                    Timestamp::from_unix_nanos(0),
-                )
-                .unwrap());
-                let resolved = resolve_latest_by_job_id(connection, &workspace_root, job_id)
-                    .unwrap()
-                    .expect("the harness always registers the binding's job");
-                let version = resolved.job.latest();
-                let run = WorkflowRun {
-                    id: run_id,
-                    job_id,
-                    job_version: version.version(),
-                    content_hash: content_hash(version),
-                    session_id,
-                    binding_id: Some(binding_id),
-                    trigger_event_id: Some(trigger_event_id),
-                    state: RunState::Running,
-                    parent_run_id: None,
-                    forked_from_run_id: None,
-                    awaiting_until: None,
-                    checkpoint_ref: None,
-                    checkpoint_blob_ref: None,
-                    started_at: Timestamp::from_unix_nanos(0),
-                    ended_at: None,
-                    session_depth: Some(0),
-                    caps: Some(ResourceCaps::default()),
-                };
-                insert_workflow_run(connection, &run).unwrap();
-                assert!(mark_delivery_running(
-                    connection,
-                    &delivery_id,
-                    Timestamp::from_unix_nanos(0)
-                )
-                .unwrap());
-                // The run row was just inserted `Running`; walk it to
-                // `run_state` through `transition_is_legal`'s actual matrix
-                // rather than writing an illegal hop (`Cancelled` needs two:
-                // `Running -> Cancelling -> Cancelled`).
-                let now = Timestamp::from_unix_nanos(0);
-                match run_state {
-                    RunState::Running => {}
-                    RunState::Cancelled => {
-                        roundhouse_flow::durability::transition_run(
-                            connection,
-                            run_id,
-                            RunState::Cancelling,
-                            now,
-                        )
-                        .unwrap();
-                        roundhouse_flow::durability::transition_run(
-                            connection,
-                            run_id,
-                            RunState::Cancelled,
-                            now,
-                        )
-                        .unwrap();
-                    }
-                    other => {
-                        roundhouse_flow::durability::transition_run(connection, run_id, other, now)
-                            .unwrap();
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            (run_id, session_id)
-        }
-
-        /// [`Self::simulate_running_before_crash_with_state`] followed by
-        /// `request_cancellation`, moving the delivery from `running` to
-        /// `cancellation_requested` — the shape a live `CancelPrevious`
-        /// admission decision leaves behind when the daemon then crashes
-        /// before ever calling `control::cancel` against it.
-        async fn simulate_cancellation_requested_before_crash(
-            &self,
-            run_state: RunState,
-        ) -> (RunId, SessionId) {
-            let (run_id, session_id) = self
-                .simulate_running_before_crash_with_state(run_state)
-                .await;
-            let delivery_id = self.delivery.delivery_id.clone();
-            let conn = self.store.pool.get().await.unwrap();
-            let applied = conn
-                .interact(move |connection| {
-                    roundhouse_sched::store::request_cancellation(
-                        connection,
-                        &delivery_id,
-                        DeliveryState::Running,
-                        Timestamp::from_unix_nanos(0),
-                    )
-                })
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(applied, "the simulated delivery must actually be `running`");
-            (run_id, session_id)
-        }
-    }
-
-    /// Builds a real workspace, a real registered job, a real `ready`
-    /// delivery (through `accept_occurrence`, so the admission slot is
-    /// genuinely charged), and an executor wired to all of it.
-    async fn harness(workflow_yaml: String) -> Harness {
-        harness_with_overlap(workflow_yaml, OverlapPolicy::Skip).await
-    }
-
-    async fn harness_with_overlap(workflow_yaml: String, overlap: OverlapPolicy) -> Harness {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace_root = dir.path().join("workspace");
-        std::fs::create_dir(&workspace_root).unwrap();
-        let source = workspace_root.join("workflow.yaml");
-        std::fs::write(&source, workflow_yaml).unwrap();
-
-        let store = roundhouse_store::open(&dir.path().join("events.db"))
-            .await
-            .unwrap();
-        let workspaces = Arc::new(
-            WorkspaceRegistry::open(
-                roundhouse_store::open(&dir.path().join("events.db"))
-                    .await
-                    .unwrap(),
-            )
-            .await
-            .unwrap(),
-        );
-        let workspace = workspaces
-            .register(WorkspaceRegistration::new(
-                "scheduled-workspace",
-                workspace_root.clone(),
-            ))
-            .await
-            .unwrap();
-        // The canonical root the registry resolved, not the raw tempdir path
-        // — `register_workflow_file` canonicalizes both sides and would
-        // otherwise reject the source as outside the workspace on a platform
-        // whose temp directory is a symlink.
-        let workspace_root = workspace.root.clone();
-        let source = workspace_root.join("workflow.yaml");
-
-        let job_id = {
-            let conn = store.pool.get().await.unwrap();
-            let root = workspace_root.clone();
-            conn.interact(move |connection| {
-                register_workflow_file(connection, &root, &source, template())
-                    .unwrap()
-                    .job
-                    .id()
-            })
-            .await
-            .unwrap()
-        };
-
-        let mut binding = Binding::new(
-            job_id,
-            TriggerSpec::Interval {
-                every: Duration::from_secs(60),
-                align: false,
-                anchor: None,
-            },
-        );
-        binding.overlap = overlap;
-        let stored = StoredBinding {
-            workspace: workspace.id,
-            binding,
-        };
-
-        let registry = Arc::new(InMemoryRunRegistry::new());
-        let due = vec![(
-            stored.clone(),
-            ScheduledOccurrence {
-                binding_id: stored.binding.id,
-                scheduled_for: instant(),
-                is_catch_up: false,
-            },
-        )];
-        {
-            let conn = store.pool.get().await.unwrap();
-            let tick_registry = Arc::clone(&registry);
-            conn.interact(move |connection| {
-                accept_due_occurrences(connection, &due, instant(), tick_registry.as_ref());
-            })
-            .await
-            .unwrap();
-        }
-        let delivery = {
-            let conn = store.pool.get().await.unwrap();
-            conn.interact(|connection| list_ready_deliveries(connection, 10).unwrap())
-                .await
-                .unwrap()
-                .pop()
-                .expect("accept_occurrence must have created one ready delivery")
-        };
-        assert_eq!(
-            registry.active_run_count(stored.binding.id).unwrap(),
-            1,
-            "this harness proves nothing about release unless the slot was really charged"
-        );
-
-        let sessions = Arc::new(SessionRegistry::new());
-        let resources = Arc::new(daemon_resources(dir.path(), Some(Arc::clone(&workspaces))).await);
-        let executor = DeliveryExecutor::new(
-            store.clone(),
-            Arc::clone(&resources),
-            Arc::clone(&sessions),
-            Arc::clone(&registry),
-            Arc::clone(&resources.spawn_tree),
-            Arc::new(FixedClock(instant())),
-        );
-
-        Harness {
-            _dir: dir,
-            store,
-            resources,
-            sessions,
-            executor,
-            registry,
-            stored,
-            delivery,
-            workspace_root,
-        }
-    }
-
-    /// Task 1 of the sub-agent spawn-tracking plan: `DaemonResources` is now
-    /// the single, daemon-wide owner of the `SpawnTree`, and
-    /// `DeliveryExecutor::new` takes it as a parameter instead of minting its
-    /// own — because the `agent` tool (through `DaemonSubAgentHost`) reads
-    /// the very same `Arc<SpawnTree>` off `DaemonResources`, and the two must
-    /// never disagree about a session's recorded children.
-    ///
-    /// Instance identity (`Arc::ptr_eq`) alone would pass for two separately
-    /// empty, structurally-equal trees, so this also proves it behaviorally:
-    /// a child recorded through the `DaemonResources` handle must be visible
-    /// through the `DeliveryExecutor`-constructed handle.
-    #[tokio::test]
-    async fn the_executor_shares_daemon_resources_spawn_tree_rather_than_minting_its_own() {
-        let harness = harness(completing_workflow()).await;
-
-        assert!(
-            Arc::ptr_eq(&harness.resources.spawn_tree, &harness.executor.spawn_tree),
-            "DeliveryExecutor must share DaemonResources' spawn tree rather than construct its \
-             own"
-        );
-
-        let parent = SessionId::new();
-        let child = SessionId::new();
-        harness.resources.spawn_tree.record_child(parent, child);
-        assert_eq!(
-            harness.executor.spawn_tree.direct_children(parent),
-            1,
-            "a child recorded through DaemonResources' handle must be visible through the \
-             DeliveryExecutor's handle — proof of one shared tree, not two structurally-equal \
-             ones"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_ready_delivery_runs_its_workflow_and_releases_its_admission_slot() {
-        let harness = harness(completing_workflow()).await;
-
-        harness
-            .executor
-            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
-            .await;
-
-        let row = harness.delivery_row().await;
-        assert_eq!(
-            row.state,
-            DeliveryState::Delivered,
-            "a completed run must complete its delivery; last_error was {:?}",
-            row.last_error
-        );
-        let run_id = RunId::from_uuid(
-            Uuid::parse_str(row.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
-        );
-        let session_id = row.session_id.expect("reserve stamps a session id");
-
-        let run = {
-            let conn = harness.store.pool.get().await.unwrap();
-            conn.interact(move |connection| recover_run(connection, run_id).unwrap().run)
-                .await
-                .unwrap()
-        };
-        assert_eq!(run.session_id, session_id);
-        assert_eq!(
-            run.binding_id,
-            Some(harness.stored.binding.id),
-            "the run must be attributable back to the binding that scheduled it"
-        );
-        assert_eq!(
-            run.trigger_event_id,
-            Some(harness.delivery.trigger_event_id),
-            "the run must be attributable back to the occurrence that fired it"
-        );
-        assert_eq!(
-            run.session_depth,
-            Some(0),
-            "a root run with no recorded depth is inert — admit_call_from_run refuses it"
-        );
-        assert_eq!(
-            run.caps,
-            Some(ResourceCaps::default()),
-            "a run with no recorded caps is inert — LedgerError::CapsNotRecorded refuses it"
-        );
-        assert_eq!(run.state, RunState::Completed);
-
-        assert_eq!(
-            harness.active(),
-            0,
-            "a completed delivery must release the admission slot accept_occurrence charged, \
-             or this binding never fires again"
-        );
-        // The session was real: its `SessionCreated` event and the run's own
-        // task events are both in its durable log. That log is what makes a
-        // scheduled run openable afterwards — it survives the registry entry,
-        // which is live-actor bookkeeping, not the session's record.
-        assert!(
-            harness.session_event_count(session_id).await > 1,
-            "the run's task events must reach the session's log, not just its SessionCreated"
-        );
-        assert!(
-            harness.sessions.actor(session_id).is_none(),
-            "a terminal delivery must RETIRE its session — spawn_session_reaper waits on a \
-             `Closed` nothing produces, so without an explicit teardown a per-delivery \
-             session would live for the daemon's whole life and fill max_sessions"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failing_workflow_fails_its_delivery_and_still_releases_the_slot() {
-        let harness = harness(failing_workflow()).await;
-
-        harness
-            .executor
-            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
-            .await;
-
-        let row = harness.delivery_row().await;
-        assert_eq!(row.state, DeliveryState::Failed);
-        assert!(
-            row.last_error.as_deref().is_some_and(|e| !e.is_empty()),
-            "a failed delivery must say why, got {:?}",
-            row.last_error
-        );
-        assert_eq!(row.attempts, 1, "fail_delivery counts the attempt");
-        assert_eq!(
-            harness.active(),
-            0,
-            "a FAILED run must release its slot too — a held slot wedges the binding shut \
-             exactly like the never-released case"
-        );
-        assert!(
-            harness
-                .sessions
-                .actor(row.session_id.expect("reserve stamps a session id"))
-                .is_none(),
-            "a FAILED run must retire its session too, or a binding that fails every minute \
-             fills max_sessions just as fast as one that succeeds"
-        );
-    }
-
-    /// A parked run is not terminal. Completing or failing its delivery would
-    /// be a lie, and releasing its slot would let the same binding start a
-    /// second run on top of one that is still live.
-    #[tokio::test]
-    async fn a_parked_run_leaves_its_delivery_running_and_holds_its_slot() {
-        let harness = harness(parking_workflow()).await;
-
-        harness
-            .executor
-            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
-            .await;
-
-        let row = harness.delivery_row().await;
-        assert_eq!(
-            row.state,
-            DeliveryState::Running,
-            "a parked run's delivery must stay `running`; last_error was {:?}",
-            row.last_error
-        );
-        assert!(row.last_error.is_none());
-        assert_eq!(
-            harness.active(),
-            1,
-            "a parked run is still live, so its admission slot must stay held"
-        );
-        assert!(
-            harness
-                .sessions
-                .actor(row.session_id.expect("reserve stamps a session id"))
-                .is_some(),
-            "a parked run's session must NOT be retired — the resume that answers its gate \
-             runs in this session"
-        );
-    }
-
-    /// Losing the `ready -> leased` race is an ordinary no-op: this claimer
-    /// never owned the delivery, so it must neither touch the row nor release
-    /// a slot whose real owner will release it.
-    #[tokio::test]
-    async fn a_delivery_someone_else_already_leased_is_skipped_without_release() {
-        let harness = harness(completing_workflow()).await;
-
-        let id = harness.delivery.delivery_id.clone();
-        let conn = harness.store.pool.get().await.unwrap();
-        let leased = conn
-            .interact(move |connection| {
-                roundhouse_sched::store::lease_delivery(
-                    connection,
-                    &id,
-                    Timestamp::from_unix_nanos(i64::MAX),
-                    Timestamp::from_unix_nanos(0),
-                )
-                .unwrap()
-            })
-            .await
-            .unwrap();
-        assert!(leased);
-
-        harness
-            .executor
-            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
-            .await;
-
-        let row = harness.delivery_row().await;
-        assert_eq!(row.state, DeliveryState::Leased);
-        assert!(row.run_id.is_none(), "a lost claim must reserve nothing");
-        assert_eq!(
-            harness.active(),
-            1,
-            "a claimer that never owned the delivery must not release its slot"
-        );
-    }
-
-    /// A delivery whose binding is not in the driver's boot snapshot has no
-    /// honest `StoredBinding` to run against; leaving it `ready` is what lets
-    /// a daemon that *does* know the binding pick it up later.
-    #[tokio::test]
-    async fn a_delivery_for_an_unknown_binding_is_left_ready() {
-        let harness = harness(completing_workflow()).await;
-
-        dispatch_ready_deliveries(&harness.executor, &HashMap::new()).await;
-
-        assert_eq!(harness.delivery_row().await.state, DeliveryState::Ready);
-        assert_eq!(harness.active(), 1);
-    }
-
-    /// `run_workflow_from_storage` returning `Err` — an infra-level failure
-    /// calling into flow, not a workflow whose step failed — must still
-    /// release everything Task 6 owns: the delivery reaches `failed`, the
-    /// admission slot is released, and the session is retired.
-    ///
-    /// The one thing deliberately left alone is the `workflow_run` row, which
-    /// stays `Running`. `finish_run` is the workspace's only writer of
-    /// terminal run states and the only thing that discharges ruling P112's
-    /// "exactly one report on every terminal path"; a driver-side transition
-    /// would mint a terminal run with no report. That orphan is a known,
-    /// narrower gap — see this module's own doc comment.
-    #[tokio::test]
-    async fn an_undrivable_run_still_fails_its_delivery_and_releases_everything() {
-        let harness = harness(undrivable_workflow()).await;
-
-        harness
-            .executor
-            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
-            .await;
-
-        let row = harness.delivery_row().await;
-        assert_eq!(
-            row.state,
-            DeliveryState::Failed,
-            "a run the loop refused to drive must still fail its delivery, not strand it"
-        );
-        assert!(row.last_error.as_deref().is_some_and(|e| !e.is_empty()));
-        assert_eq!(
-            harness.active(),
-            0,
-            "the admission slot must be released even when the failure is infra-level"
-        );
-        let session_id = row.session_id.expect("reserve stamps a session id");
-        assert!(
-            harness.sessions.actor(session_id).is_none(),
-            "the session must be retired even when the failure is infra-level"
-        );
-
-        // The narrower gap, pinned so it is a known state rather than a
-        // surprise: only the `workflow_run` row is orphaned.
-        let run_id = RunId::from_uuid(Uuid::parse_str(row.run_id.as_deref().unwrap()).unwrap());
-        let run = {
-            let conn = harness.store.pool.get().await.unwrap();
-            conn.interact(move |connection| recover_run(connection, run_id).unwrap().run)
-                .await
-                .unwrap()
-        };
-        assert_eq!(
-            run.state,
-            RunState::Running,
-            "this driver must not fake a terminal transition on the run row — P112's \
-             exactly-one-report invariant belongs to finish_run"
-        );
-    }
-
-    /// **`OverlapPolicy::Queue` must actually serialize.** A `QueueAt`
-    /// decision creates a `ready` delivery exactly like an `Admit` does, so
-    /// without a gate the queued occurrence is claimed and run immediately,
-    /// alongside the run it was queued behind — `Queue { depth }` silently
-    /// becoming `Concurrent { max: depth + 1 }`. This is reachable today:
-    /// `Webhook`/`Message` triggers default to `Queue { depth: 8 }`.
-    ///
-    /// The assertion that matters is the negative one: the second delivery
-    /// must still be `Ready`, with no run row and no leased state, *while the
-    /// first is running*. "Both eventually complete" would pass even with the
-    /// policy ignored entirely.
-    #[tokio::test]
-    async fn a_queued_delivery_does_not_start_until_its_predecessor_finishes() {
-        let harness =
-            harness_with_overlap(completing_workflow(), OverlapPolicy::Queue { depth: 4 }).await;
-        let first = harness.delivery.clone();
-        let second = harness.accept_another_occurrence(60).await;
-        let binding_id = harness.stored.binding.id;
-
-        assert_eq!(
-            harness.state_of(&second.delivery_id).await,
-            DeliveryState::Ready,
-            "a QueueAt decision still creates a ready delivery — that is exactly why \
-             `is there a ready row` is not the same question as `may it run`"
-        );
-        assert_eq!(
-            harness.active(),
-            1,
-            "the first occurrence was admitted and holds the active slot"
-        );
-        assert_eq!(
-            harness.registry.queued_count(binding_id).unwrap(),
-            1,
-            "the second was queued, not admitted"
-        );
-
-        // Put the predecessor genuinely in flight — claimed through the real
-        // `claim`, not yet run — so this test observes the steady state a
-        // queued delivery actually meets (predecessor running, itself
-        // `ready`) with no dependence on when a spawned task happens to be
-        // scheduled.
-        let in_flight = harness
-            .executor
-            .claim(first.clone(), harness.stored.clone())
-            .await
-            .expect("the admitted predecessor must be claimable");
-        assert_eq!(
-            harness.state_of(&first.delivery_id).await,
-            DeliveryState::Leased
-        );
-
-        // A whole tick's worth of dispatch, with the predecessor still
-        // active: the queued delivery must be declined, and — the part that
-        // makes this a real assertion — declined *synchronously*, before any
-        // task is spawned, so the row is still `Ready` the instant dispatch
-        // returns.
-        let mut bindings = HashMap::new();
-        bindings.insert(binding_id, harness.stored.clone());
-        dispatch_ready_deliveries(&harness.executor, &bindings).await;
-
-        assert_eq!(
-            harness.state_of(&second.delivery_id).await,
-            DeliveryState::Ready,
-            "a queued delivery must NOT be claimed while its binding has an active run — \
-             this is the whole of OverlapPolicy::Queue"
-        );
-        assert_eq!(
-            harness.registry.queued_count(binding_id).unwrap(),
-            1,
-            "a declined claim must not consume the queued slot either"
-        );
-        assert_eq!(harness.active(), 1);
-
-        // Finish the predecessor. Only now is the binding free.
-        harness.executor.run_claimed(in_flight).await;
-        assert_eq!(
-            harness.state_of(&first.delivery_id).await,
-            DeliveryState::Delivered
-        );
-        assert_eq!(harness.active(), 0, "the predecessor released its slot");
-
-        dispatch_ready_deliveries(&harness.executor, &bindings).await;
-        for _ in 0..1000 {
-            if harness.state_of(&second.delivery_id).await == DeliveryState::Delivered {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            harness.state_of(&second.delivery_id).await,
-            DeliveryState::Delivered,
-            "once the predecessor is done the queued delivery must actually run"
-        );
-        assert_eq!(
-            harness.registry.queued_count(binding_id).unwrap(),
-            0,
-            "running the queued delivery must consume its queued slot (note_promoted)"
-        );
-        assert_eq!(
-            harness.active(),
-            0,
-            "and release the active slot it was promoted into (note_finished) — a promotion \
-             that is never released wedges the binding exactly like a missing release"
-        );
-    }
-
-    /// The counterpart: the promotion is charged only once the claim is
-    /// actually won, and only for a queued-origin delivery. An `Admit`-origin
-    /// delivery already holds an active slot and must not be promoted on top
-    /// of it.
-    #[tokio::test]
-    async fn an_admitted_delivery_is_never_promoted_and_needs_no_predecessor_check() {
-        let harness = harness(completing_workflow()).await;
-        let binding_id = harness.stored.binding.id;
-        assert_eq!(harness.registry.queued_count(binding_id).unwrap(), 0);
-
-        harness
-            .executor
-            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
-            .await;
-
-        assert_eq!(
-            harness.delivery_row().await.state,
-            DeliveryState::Delivered,
-            "an admitted delivery runs even though its own binding shows an active run — \
-             that active run IS this delivery"
-        );
-        assert_eq!(
-            harness.registry.queued_count(binding_id).unwrap(),
-            0,
-            "promoting an admitted delivery would underflow the queued counter"
-        );
-        assert_eq!(harness.active(), 0);
-    }
-
-    /// Fail-closed on an unreadable admission outcome. With the queue gate in
-    /// place, "assume not queued" is the fail-*open* direction — it would run
-    /// a possibly-queued delivery alongside its predecessor — so an outcome
-    /// that cannot be established declines the claim and leaves the row for a
-    /// tick that can read it.
-    #[tokio::test]
-    async fn a_delivery_whose_admission_outcome_is_unreadable_is_not_claimed() {
-        let harness = harness(completing_workflow()).await;
-
-        // Point the delivery at a `trigger_event` row that does not exist, so
-        // the outcome lookup legitimately comes back empty.
-        let id = harness.delivery.delivery_id.clone();
-        let conn = harness.store.pool.get().await.unwrap();
-        conn.interact(move |connection| {
-            connection
-                .execute(
-                    "UPDATE trigger_delivery SET trigger_event_id = 987654 WHERE delivery_id = ?1",
-                    rusqlite::params![id],
-                )
-                .unwrap();
-        })
-        .await
-        .unwrap();
-
-        let mut delivery = harness.delivery.clone();
-        delivery.trigger_event_id = 987_654;
-        assert!(
-            harness
-                .executor
-                .claim(delivery, harness.stored.clone())
-                .await
-                .is_none(),
-            "an unestablished admission outcome must decline the claim, not guess"
-        );
-        assert_eq!(
-            harness.delivery_row().await.state,
-            DeliveryState::Ready,
-            "a declined claim must leave the row untouched"
-        );
-    }
-
-    /// A per-tick claim limit does not bound concurrency on its own — claims
-    /// are taken every second and a run can last hours — so the bound lives
-    /// on a semaphore whose permit is held for the delivery's whole life.
-    /// With every permit taken, a tick must claim nothing and leave the rows
-    /// `ready` rather than queue behind them.
-    #[tokio::test]
-    async fn dispatch_claims_nothing_once_every_delivery_slot_is_in_use() {
-        let harness = harness(completing_workflow()).await;
-        let mut bindings = HashMap::new();
-        bindings.insert(harness.stored.binding.id, harness.stored.clone());
-
-        let mut held = Vec::new();
-        for _ in 0..MAX_CONCURRENT_DELIVERIES {
-            held.push(
-                Arc::clone(&harness.executor.slots)
-                    .try_acquire_owned()
-                    .expect("a fresh executor must start with every slot free"),
-            );
-        }
-
-        dispatch_ready_deliveries(&harness.executor, &bindings).await;
-
-        assert_eq!(
-            harness.delivery_row().await.state,
-            DeliveryState::Ready,
-            "with no slot free, a ready delivery must be left alone rather than leased and \
-             then queued behind a run that may take hours"
-        );
-        assert_eq!(harness.active(), 1);
-
-        // Freeing a slot lets the very next tick pick the same row up.
-        held.pop();
-        dispatch_ready_deliveries(&harness.executor, &bindings).await;
-        for _ in 0..1000 {
-            if harness.delivery_row().await.state == DeliveryState::Delivered {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            harness.delivery_row().await.state,
-            DeliveryState::Delivered,
-            "a freed slot must let the next tick claim the delivery it had to decline"
-        );
-    }
-
-    #[tokio::test]
-    async fn multiple_deliveries_wait_for_async_work_concurrently_without_holding_store_connections(
-    ) {
-        let mut harness =
-            harness_with_overlap(reading_workflow(), OverlapPolicy::Concurrent { max: 3 }).await;
-        std::fs::write(harness.workspace_root.join("greeting.txt"), "hello").unwrap();
-        let second = harness.accept_another_occurrence(60).await;
-        let third = harness.accept_another_occurrence(120).await;
-        let deliveries = [
-            harness.delivery.delivery_id.clone(),
-            second.delivery_id,
-            third.delivery_id,
-        ];
-        let gate = Arc::new(SegmentGapGate::new());
-        harness.executor.segment_gap_gate = Some(Arc::clone(&gate));
-        let initial_permits = harness.executor.slots.available_permits();
-        let mut bindings = HashMap::new();
-        bindings.insert(harness.stored.binding.id, harness.stored.clone());
-
-        dispatch_ready_deliveries(&harness.executor, &bindings).await;
-        for _ in 0..100_000 {
-            if gate.entrants() == 3 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-
-        assert_eq!(
-            gate.entrants(),
-            3,
-            "all three admitted deliveries must overlap in the connection-free async segment gap"
-        );
-        assert_eq!(
-            initial_permits - harness.executor.slots.available_permits(),
-            3,
-            "each overlapping delivery must hold one scheduler permit"
-        );
-        let pool_status = harness.store.pool.status();
-        assert_eq!(
-            pool_status.waiting, 0,
-            "deliveries waiting on async work must not queue for store connections"
-        );
-        assert_eq!(
-            pool_status.available, pool_status.size,
-            "deliveries waiting on async work must return every store connection"
-        );
-
-        gate.release(3);
-        for _ in 0..100_000 {
-            let mut terminal = true;
-            for delivery_id in &deliveries {
-                terminal &= matches!(
-                    harness.state_of(delivery_id).await,
-                    DeliveryState::Delivered | DeliveryState::Failed | DeliveryState::Cancelled
-                );
-            }
-            if terminal {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-
-        for delivery_id in &deliveries {
-            let state = harness.state_of(delivery_id).await;
-            assert!(
-                matches!(
-                    state,
-                    DeliveryState::Delivered | DeliveryState::Failed | DeliveryState::Cancelled
-                ),
-                "released delivery {delivery_id} must reach a terminal state, got {state:?}"
-            );
-        }
-        for _ in 0..100_000 {
-            if harness.executor.slots.available_permits() == initial_permits {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            harness.executor.slots.available_permits(),
-            initial_permits,
-            "terminal deliveries must return all scheduler permits"
-        );
-    }
-
-    /// The failure this driver must survive rather than propagate: the
-    /// binding's job is not registered in the workspace it names.
-    #[tokio::test]
-    async fn an_unresolvable_job_fails_the_delivery_rather_than_the_driver() {
-        let mut harness = harness(completing_workflow()).await;
-        harness.stored.binding.job_id = JobId::new();
-
-        harness
-            .executor
-            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
-            .await;
-
-        let row = harness.delivery_row().await;
-        assert_eq!(
-            row.state,
-            DeliveryState::Failed,
-            "a delivery that can never run must fail rather than sit leased forever"
-        );
-        assert_eq!(harness.active(), 0);
-        assert!(
-            harness.workspace_root.is_dir(),
-            "the workspace must be untouched by a failed resolution"
-        );
-    }
-
-    /// Task 7's boot-time restart-recovery pass, exercised against the same
-    /// [`Harness`] scaffolding — but always through a **fresh**
-    /// [`DeliveryExecutor`]/[`InMemoryRunRegistry`]/[`SessionRegistry`]
-    /// ([`Harness::fresh_executor_after_restart`]), never `harness.executor`,
-    /// which still holds whatever charge the harness's own setup made
-    /// against `harness.registry`. A recovery test that passed against
-    /// `harness.executor` would prove nothing about re-seeding — the slot
-    /// would already be there regardless.
-    ///
-    /// No real-clock timing anywhere: every `boot` is an explicit
-    /// `DateTime::from_timestamp_nanos` constant.
-    mod recovery_tests {
-        use super::*;
-
-        fn bindings_map(stored: &StoredBinding) -> HashMap<BindingId, StoredBinding> {
-            let mut map = HashMap::new();
-            map.insert(stored.binding.id, stored.clone());
-            map
-        }
-
-        /// A `watch::Receiver<bool>` permanently reporting "not cancelled",
-        /// for every recovery test below that isn't itself exercising
-        /// mid-recovery interruption (Final-review fix round 1, Important 1
-        /// part B). The paired `Sender` is dropped immediately — every
-        /// caller here only ever peeks `*borrow()`, never awaits `changed()`,
-        /// so a receiver whose sender is gone still reads back its initial
-        /// `false` value correctly.
-        fn never_cancelled() -> tokio::sync::watch::Receiver<bool> {
-            tokio::sync::watch::channel(false).1
-        }
-
-        // ── Mechanism 1: reclaim expired leases ──────────────────────────
-
-        #[tokio::test]
-        async fn an_expired_lease_is_reclaimed_back_to_ready_and_reseeded() {
-            let harness = harness(completing_workflow()).await;
-            let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
-
-            let id = harness.delivery.delivery_id.clone();
-            let conn = harness.store.pool.get().await.unwrap();
-            conn.interact(move |connection| {
-                assert!(lease_delivery(
-                    connection,
-                    &id,
-                    Timestamp::from_unix_nanos(100),
-                    Timestamp::from_unix_nanos(0),
-                )
-                .unwrap());
-            })
-            .await
-            .unwrap();
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::Leased
-            );
-
-            let boot = DateTime::from_timestamp_nanos(200); // past the lease's expiry (100)
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                boot,
-                &never_cancelled(),
-            )
-            .await;
-
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::Ready,
-                "an expired lease must be reclaimed back to ready at boot"
-            );
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                1,
-                "the reclaimed-then-ready delivery must re-seed the fresh registry too, or a \
-                 restart would silently stop enforcing OverlapPolicy for its binding"
-            );
-        }
-
-        /// Final-review fix round 1, Important 1 part B: recovery must be
-        /// interruptible by an orderly shutdown, since it can now run
-        /// **after** this service is already observed as ready (part A) —
-        /// so a shutdown request can arrive mid-recovery, not just before or
-        /// after it. `cancelled` is peeked at the top of each mechanism's
-        /// own per-row loop; a receiver that already reports `true` before
-        /// `recover_after_restart` is even called must stop Mechanism 1
-        /// before it processes this expired lease at all — proved by the
-        /// lease staying exactly `leased` (not reclaimed to `ready`) and the
-        /// registry staying at zero (never re-seeded, since Mechanism 2 also
-        /// never runs). No wall-clock timing: `cancelled` is a plain
-        /// `watch::Receiver<bool>` set once, synchronously, before the call.
-        #[tokio::test]
-        async fn recovery_already_cancelled_before_it_starts_does_nothing() {
-            let harness = harness(completing_workflow()).await;
-            let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
-
-            let id = harness.delivery.delivery_id.clone();
-            let conn = harness.store.pool.get().await.unwrap();
-            conn.interact(move |connection| {
-                assert!(lease_delivery(
-                    connection,
-                    &id,
-                    Timestamp::from_unix_nanos(100),
-                    Timestamp::from_unix_nanos(0),
-                )
-                .unwrap());
-            })
-            .await
-            .unwrap();
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::Leased
-            );
-
-            let already_cancelled = tokio::sync::watch::channel(true).1;
-            let boot = DateTime::from_timestamp_nanos(200); // past the lease's expiry (100)
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                boot,
-                &already_cancelled,
-            )
-            .await;
-
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::Leased,
-                "recovery must not reclaim an expired lease once shutdown has been requested"
-            );
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                0,
-                "recovery must not re-seed the registry once shutdown has been requested — \
-                 Mechanism 2 never got the chance to run"
-            );
-        }
-
-        #[tokio::test]
-        async fn a_lease_that_has_not_yet_expired_is_left_leased_but_still_reseeded() {
-            let harness = harness(completing_workflow()).await;
-            let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
-
-            let id = harness.delivery.delivery_id.clone();
-            let conn = harness.store.pool.get().await.unwrap();
-            conn.interact(move |connection| {
-                assert!(lease_delivery(
-                    connection,
-                    &id,
-                    Timestamp::from_unix_nanos(1_000),
-                    Timestamp::from_unix_nanos(0),
-                )
-                .unwrap());
-            })
-            .await
-            .unwrap();
-
-            let boot = DateTime::from_timestamp_nanos(500); // before the lease's expiry (1_000)
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                boot,
-                &never_cancelled(),
-            )
-            .await;
-
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::Leased,
-                "a lease that has not yet expired must not be reclaimed"
-            );
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                1,
-                "a still-leased delivery holds an admission slot exactly like a ready one and \
-                 must be re-seeded too, not only the ones Mechanism 1 actually reclaimed"
-            );
-        }
-
-        // ── Re-seeding `ready`/`leased` deliveries by admission outcome ──
-
-        #[tokio::test]
-        async fn a_queued_ready_delivery_reseeds_the_queued_counter_not_the_active_one() {
-            let harness =
-                harness_with_overlap(completing_workflow(), OverlapPolicy::Queue { depth: 4 })
-                    .await;
-            // Second occurrence: `QueueAt`, still `ready`.
-            let _second = harness.accept_another_occurrence(60).await;
-            let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
-
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                DateTime::from_timestamp_nanos(0),
-                &never_cancelled(),
-            )
-            .await;
-
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                1,
-                "the first (Admitted) delivery must reseed the active slot"
-            );
-            assert_eq!(
-                fresh_registry
-                    .queued_count(harness.stored.binding.id)
-                    .unwrap(),
-                1,
-                "the second (QueueAt) delivery must reseed the QUEUED slot, not the active one"
-            );
-        }
-
-        // ── Mechanism 2: re-drive `reserved`/`running` deliveries ────────
-
-        #[tokio::test]
-        async fn a_running_delivery_crashed_mid_run_is_redriven_to_completion() {
-            let harness = harness(completing_workflow()).await;
-            let (run_id, session_id) = harness
-                .simulate_running_before_crash_with_state(RunState::Running)
-                .await;
-            let (fresh, fresh_registry, fresh_sessions) = harness.fresh_executor_after_restart();
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::Running
-            );
-
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                DateTime::from_timestamp_nanos(0),
-                &never_cancelled(),
-            )
-            .await;
-
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::Delivered,
-                "a running delivery whose run never actually started (crash right after \
-                 mark_delivery_running) must be re-driven to completion, not left stranded"
-            );
-            assert_eq!(harness.run_state(run_id).await, RunState::Completed);
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                0,
-                "a completed re-drive must release the admission slot it re-seeded"
-            );
-            assert!(
-                fresh_sessions.actor(session_id).is_none(),
-                "a terminal re-drive must retire the session it rebuilt, exactly like the live \
-                 claim path"
-            );
-        }
-
-        #[tokio::test]
-        async fn a_running_delivery_redriven_to_a_failing_step_fails_the_delivery() {
-            let harness = harness(failing_workflow()).await;
-            let (run_id, _session_id) = harness
-                .simulate_running_before_crash_with_state(RunState::Running)
-                .await;
-            let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
-
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                DateTime::from_timestamp_nanos(0),
-                &never_cancelled(),
-            )
-            .await;
-
-            let row = harness.delivery_row().await;
-            assert_eq!(row.state, DeliveryState::Failed);
-            assert!(row.last_error.as_deref().is_some_and(|e| !e.is_empty()));
-            assert_eq!(harness.run_state(run_id).await, RunState::Failed);
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                0
-            );
-        }
-
-        #[tokio::test]
-        async fn a_running_deliverys_run_already_parked_before_the_restart_is_left_alone() {
-            let harness = harness(completing_workflow()).await;
-            let _ids = harness
-                .simulate_running_before_crash_with_state(RunState::AwaitingHuman)
-                .await;
-            let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
-
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                DateTime::from_timestamp_nanos(0),
-                &never_cancelled(),
-            )
-            .await;
-
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::Running,
-                "a run already parked before the restart must not be driven — no session, no \
-                 GateAnswer, nothing to resume it with"
-            );
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                1,
-                "a parked run is still live: its admission slot must stay held, exactly like \
-                 the live claim path's own RunConclusion::Parked"
-            );
-        }
-
-        #[tokio::test]
-        async fn a_running_deliverys_run_that_already_completed_before_the_restart_is_reconciled() {
-            let harness = harness(completing_workflow()).await;
-            let (run_id, _session_id) = harness
-                .simulate_running_before_crash_with_state(RunState::Completed)
-                .await;
-            let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
-
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                DateTime::from_timestamp_nanos(0),
-                &never_cancelled(),
-            )
-            .await;
-
-            assert_eq!(
-                harness.delivery_row().await.state,
-                DeliveryState::Delivered,
-                "a run that finished before the previous process could record it must be \
-                 reconciled to Delivered, not left `running` forever"
-            );
-            assert_eq!(harness.run_state(run_id).await, RunState::Completed);
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                0
-            );
-        }
-
-        #[tokio::test]
-        async fn a_running_delivery_whose_binding_is_no_longer_enabled_is_reseeded_but_left_alone()
-        {
-            let harness = harness(completing_workflow()).await;
-            let _ids = harness
-                .simulate_running_before_crash_with_state(RunState::Running)
-                .await;
-            let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
-
-            // No bindings at all — the binding is treated as disabled/deleted
-            // since this delivery started.
-            recover_after_restart(
-                &fresh,
-                &HashMap::new(),
-                DateTime::from_timestamp_nanos(0),
-                &never_cancelled(),
-            )
-            .await;
-
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::Running,
-                "a delivery whose binding no longer resolves must be left exactly as it is"
-            );
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                1,
-                "the registry slot must still be re-seeded even when recovery cannot proceed \
-                 past it — the slot is real regardless of whether this driver can act on it"
-            );
-        }
-
-        // ── Mechanism 3: finish `cancellation_requested` deliveries ──────
-
-        #[tokio::test]
-        async fn a_cancellation_requested_running_delivery_is_cancelled_and_finished() {
-            let harness = harness(completing_workflow()).await;
-            let (run_id, session_id) = harness
-                .simulate_cancellation_requested_before_crash(RunState::Running)
-                .await;
-            let (fresh, fresh_registry, fresh_sessions) = harness.fresh_executor_after_restart();
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::CancellationRequested
-            );
-
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                DateTime::from_timestamp_nanos(0),
-                &never_cancelled(),
-            )
-            .await;
-
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::Cancelled,
-                "a cancellation-requested delivery whose run is actually confirmed Cancelled \
-                 must finish the cancellation, not stay cancellation_requested forever"
-            );
-            assert_eq!(harness.run_state(run_id).await, RunState::Cancelled);
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                0,
-                "finishing the cancellation must release the admission slot it re-seeded"
-            );
-            assert!(
-                fresh_sessions.actor(session_id).is_none(),
-                "a finished cancellation must retire its session"
-            );
-        }
-
-        #[tokio::test]
-        async fn a_cancellation_requested_delivery_already_cancelling_tolerates_not_cancellable() {
-            let harness = harness(completing_workflow()).await;
-            let (run_id, _session_id) = harness
-                .simulate_cancellation_requested_before_crash(RunState::Cancelling)
-                .await;
-            let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
-
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                DateTime::from_timestamp_nanos(0),
-                &never_cancelled(),
-            )
-            .await;
-
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::Cancelled,
-                "ControlError::NotCancellable (already Cancelling) must be tolerated, not treated \
-                 as a fatal error that abandons the row"
-            );
-            assert_eq!(harness.run_state(run_id).await, RunState::Cancelled);
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                0
-            );
-        }
-
-        #[tokio::test]
-        async fn a_cancellation_requested_parked_run_is_still_cancelled_not_left_stuck() {
-            let harness = harness(completing_workflow()).await;
-            let (run_id, session_id) = harness
-                .simulate_cancellation_requested_before_crash(RunState::AwaitingHuman)
-                .await;
-            let (fresh, fresh_registry, fresh_sessions) = harness.fresh_executor_after_restart();
-
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                DateTime::from_timestamp_nanos(0),
-                &never_cancelled(),
-            )
-            .await;
-
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::Cancelled,
-                "unlike Mechanism 2, a parked run here must still be cancelled — a park nobody \
-                 will ever un-park is exactly the stuck-forever case this mechanism exists to \
-                 close"
-            );
-            assert_eq!(harness.run_state(run_id).await, RunState::Cancelled);
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                0
-            );
-            assert!(fresh_sessions.actor(session_id).is_none());
-        }
-
-        #[tokio::test]
-        async fn a_cancellation_requested_deliverys_run_that_already_completed_is_reconciled() {
-            let harness = harness(completing_workflow()).await;
-            let (run_id, _session_id) = harness
-                .simulate_cancellation_requested_before_crash(RunState::Completed)
-                .await;
-            let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
-
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                DateTime::from_timestamp_nanos(0),
-                &never_cancelled(),
-            )
-            .await;
-
-            assert_eq!(
-                harness.delivery_row().await.state,
-                DeliveryState::Delivered,
-                "a run that raced its own cancellation and completed first must be reconciled \
-                 to Delivered — forcing it to `cancelled` would be dishonest"
-            );
-            assert_eq!(harness.run_state(run_id).await, RunState::Completed);
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                0
-            );
-        }
-
-        #[tokio::test]
-        async fn a_cancellation_requested_deliverys_run_that_already_failed_is_reconciled() {
-            let harness = harness(completing_workflow()).await;
-            let (run_id, _session_id) = harness
-                .simulate_cancellation_requested_before_crash(RunState::Failed)
-                .await;
-            let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
-
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                DateTime::from_timestamp_nanos(0),
-                &never_cancelled(),
-            )
-            .await;
-
-            let row = harness.delivery_row().await;
-            assert_eq!(
-                row.state,
-                DeliveryState::Failed,
-                "a run that raced its own cancellation and failed first must be reconciled to \
-                 Failed"
-            );
-            assert!(row.last_error.as_deref().is_some_and(|e| !e.is_empty()));
-            assert_eq!(harness.run_state(run_id).await, RunState::Failed);
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                0
-            );
-        }
-
-        #[tokio::test]
-        async fn a_cancellation_requested_delivery_whose_redrive_infra_fails_after_cancel_committed_stays_retryable(
-        ) {
-            let harness = harness(completing_workflow()).await;
-            let (run_id, _session_id) = harness
-                .simulate_cancellation_requested_before_crash(RunState::Running)
-                .await;
-            // `control::cancel` will still succeed (the run row is a real,
-            // resolvable `Running` run); only the *redrive* that follows it
-            // fails, because this executor's `DaemonResources` has no
-            // workspace registry at all.
-            let (fresh, fresh_registry, _sessions) = harness
-                .fresh_executor_after_restart_without_workspace_registry()
-                .await;
-
-            recover_after_restart(
-                &fresh,
-                &bindings_map(&harness.stored),
-                DateTime::from_timestamp_nanos(0),
-                &never_cancelled(),
-            )
-            .await;
-
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::CancellationRequested,
-                "a pre-run infra failure reached only after control::cancel already committed \
-                 Cancelling must not fail the delivery to a terminal state — that would strand \
-                 the run at non-terminal Cancelling forever, since every recovery mechanism \
-                 lists deliveries by delivery state and a terminal delivery is never revisited"
-            );
-            assert_eq!(
-                harness.run_state(run_id).await,
-                RunState::Cancelling,
-                "control::cancel must have actually committed before the redrive's infra \
-                 failure"
-            );
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                1,
-                "the registry slot must stay held (not released) so the next boot's Mechanism \
-                 3 retries against an already-charged slot, exactly as every other \
-                 leave-it-as-it-is path in this mechanism does"
-            );
-        }
-
-        #[tokio::test]
-        async fn a_cancellation_requested_delivery_whose_binding_is_gone_is_reseeded_but_left_alone(
-        ) {
-            let harness = harness(completing_workflow()).await;
-            let _ids = harness
-                .simulate_cancellation_requested_before_crash(RunState::Running)
-                .await;
-            let (fresh, fresh_registry, _sessions) = harness.fresh_executor_after_restart();
-
-            recover_after_restart(
-                &fresh,
-                &HashMap::new(),
-                DateTime::from_timestamp_nanos(0),
-                &never_cancelled(),
-            )
-            .await;
-
-            assert_eq!(
-                harness.state_of(&harness.delivery.delivery_id).await,
-                DeliveryState::CancellationRequested,
-                "a delivery whose binding no longer resolves must be left exactly as it is"
-            );
-            assert_eq!(
-                fresh_registry
-                    .active_run_count(harness.stored.binding.id)
-                    .unwrap(),
-                1,
-                "the registry slot must still be re-seeded even when recovery cannot proceed"
-            );
-        }
-    }
-}
+mod delivery_tests;
