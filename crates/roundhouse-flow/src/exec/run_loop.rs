@@ -520,6 +520,13 @@ pub enum PendingKind {
         /// The step's declared `agent.output_schema`, passed through
         /// verbatim — a JSON Schema literal, not a template.
         output_schema: Option<Value>,
+        /// The run's real remaining `max_tokens` ceiling as of the moment
+        /// this step dispatched, sourced from `executor.map_budget` exactly
+        /// as [`PendingWork::step_timeout`] already is (ruling P108 §C) — a
+        /// workflow `agent:` step has no authored token budget of its own to
+        /// transfer, unlike the model-issued `agent` tool's `budget_tokens`
+        /// argument.
+        budget_tokens: u64,
     },
     /// A `call:` child run and Session already exist (created by
     /// [`Loop::dispatch_call`]); the caller drives the child and reports its

@@ -104,7 +104,12 @@ pub fn agent_tool_def() -> ToolDef {
 /// restrictive real tier, never the parent's (possibly higher) one. This is
 /// also the `tier_request` the parent's `agent` policy predicate judges, so
 /// the two cannot disagree about what was actually asked for.
-const CHILD_TIER: Tier = Tier::Sandbox;
+///
+/// `pub(crate)`: `crate::workflow_dispatch::dispatch_agent_for_workflow`
+/// (Phase 8 Task 25.5) admits its own spawn against the identical tier, so a
+/// workflow-issued `agent:` step's child is judged by the same predicate
+/// shape as a model-issued one.
+pub(crate) const CHILD_TIER: Tier = Tier::Sandbox;
 
 /// A [`SpawnPolicyScope`] backed by a real, already-completed admission.
 ///
@@ -245,11 +250,18 @@ pub trait SubAgentHost: Send + Sync {
 /// yet because this tool does not run the child (see this module's doc
 /// comment). Validating it anyway keeps the published schema honest — an
 /// `agent` call with no prompt is a malformed call, not a prompt-less spawn.
-struct AgentArgs {
-    provider: String,
-    budget_tokens: u64,
-    model: String,
-    role: Option<String>,
+///
+/// `pub(crate)` and every field too: [`spawn_child`]'s reserve→admit→
+/// create→commit core is shared with `crate::workflow_dispatch::
+/// dispatch_agent_for_workflow` (Phase 8 Task 25.5) rather than duplicated —
+/// a workflow `agent:` step has no `provider`/`role` of its own to validate
+/// out of model-supplied JSON, so that caller constructs this directly
+/// instead of going through [`AgentArgs::parse`].
+pub(crate) struct AgentArgs {
+    pub(crate) provider: String,
+    pub(crate) budget_tokens: u64,
+    pub(crate) model: String,
+    pub(crate) role: Option<String>,
 }
 
 impl AgentArgs {
@@ -466,21 +478,28 @@ pub async fn dispatch_agent(
 /// A spawn that did not happen, split into what the operator's log gets
 /// (`detail`, which may carry host paths) and what the model gets
 /// (`model_message`, built only from this module's own literals plus values
-/// the model itself supplied).
-struct SpawnRefusal {
-    category: &'static str,
-    detail: String,
-    model_message: String,
+/// the model itself supplied). `pub(crate)`/fields `pub(crate)`: shared with
+/// `crate::workflow_dispatch::dispatch_agent_for_workflow`, which records its
+/// own parent task's `TaskFailed` from the same two halves.
+pub(crate) struct SpawnRefusal {
+    pub(crate) category: &'static str,
+    pub(crate) detail: String,
+    pub(crate) model_message: String,
 }
 
-struct SpawnedChild {
-    child: SessionId,
-    handle: String,
+pub(crate) struct SpawnedChild {
+    pub(crate) child: SessionId,
+    pub(crate) handle: String,
 }
 
 /// Steps 1-6 of this module's ordering contract, with the reservation
 /// released on every edge that can fail after it is taken.
-async fn spawn_child(
+///
+/// `pub(crate)`: the one reserve→admit→create→commit core shared by
+/// [`dispatch_agent`] (the model-issued `agent` tool) and
+/// `crate::workflow_dispatch::dispatch_agent_for_workflow` (a workflow
+/// `agent:` step) — see this module's doc comment on why one copy, not two.
+pub(crate) async fn spawn_child(
     actor: &SessionActor,
     host: &Arc<dyn SubAgentHost>,
     args: &AgentArgs,

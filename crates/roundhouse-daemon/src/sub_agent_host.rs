@@ -664,6 +664,61 @@ mod tests {
         assert!(registry.actor(child).is_none());
     }
 
+    /// Phase 8 Task 25.5 (#62): the workflow-facing sibling of
+    /// `dispatch_agent` reuses the identical reserve→admit→create→commit
+    /// core (`agent_spawn_tool::spawn_child`) with workflow-shaped inputs —
+    /// no `provider`/`budget_tokens` JSON to parse, since an `agent:` step's
+    /// AST has neither.
+    #[tokio::test]
+    async fn dispatch_agent_for_workflow_creates_a_real_registered_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = resources(dir.path()).await;
+        let registry = Arc::new(SessionRegistry::new());
+        let actor = parent_actor(dir.path()).await;
+        let parent = actor.session_id();
+        wire_sub_agent_host(&actor, &resources, &registry);
+
+        let host = actor
+            .sub_agent_host()
+            .expect("the host was just registered");
+        let result = roundhouse_engine::workflow_dispatch::dispatch_agent_for_workflow(
+            &actor,
+            Some(&host),
+            serde_json::json!({"prompt": "review the diff"}),
+            None,
+            250,
+        )
+        .await
+        .expect("dispatch must not error");
+
+        assert!(
+            matches!(
+                result.result,
+                roundhouse_engine::workflow_dispatch::AgentSpawnOutcome::Spawned { .. }
+            ),
+            "the spawn must succeed, got {:?}",
+            result.result
+        );
+        assert_eq!(
+            resources.spawn_tree.direct_children(parent),
+            1,
+            "exactly one committed spawn-tree edge, no dangling reservation"
+        );
+        assert_eq!(resources.spawn_tree.reserved_children(parent), 0);
+
+        let child = resources.spawn_tree.descendants(parent)[0];
+        let child_actor = registry
+            .actor(child)
+            .expect("the spawned child must be a real, registered session");
+        assert_eq!(child_actor.state(), SessionState::Running);
+        assert_eq!(resources.sub_agents.parent_of(child), Some(parent));
+
+        resources
+            .sub_agents
+            .retire_child(child, &resources.spawn_tree, &registry, &resources.proxy)
+            .await;
+    }
+
     #[tokio::test]
     async fn a_second_spawn_draws_from_what_the_first_one_left() {
         let dir = tempfile::tempdir().unwrap();

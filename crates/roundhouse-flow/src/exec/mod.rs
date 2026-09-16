@@ -1144,12 +1144,27 @@ impl<'a> Executor<'a> {
                 );
                 let dispatch_prompt = resolved_prompt.into_unredacted_for_dispatch();
                 let dispatch_model = resolved_model.map(|m| m.into_unredacted_for_dispatch());
+                // Ruling P108 §C's existing source, one field earlier: the
+                // same `map_budget` value `Loop::pending_work` reads for
+                // `PendingWork::step_timeout`, read here instead because
+                // `budget_tokens` belongs to `PendingKind::Agent` specifically
+                // (a `Tool`/`ChildRun` step has no token budget to transfer).
+                // `unwrap_or_default()` (0) only for `Executor::run_to_completion`'s
+                // in-memory sequencer, which has no run/ledger behind it and
+                // always converts this to `dispatch_step_or_stub`'s fixed
+                // stub outcome regardless of what this field holds.
+                let budget_tokens = self
+                    .map_budget
+                    .as_ref()
+                    .map(|b| b.total_remaining.max_tokens)
+                    .unwrap_or_default();
                 DispatchDecision::Pending(run_loop::PendingKind::Agent {
                     logged_prompt,
                     dispatch_prompt,
                     model: dispatch_model,
                     tools: tools.clone(),
                     output_schema: output_schema.clone(),
+                    budget_tokens,
                 })
             }
             StepBody::Emit { emit } => {
