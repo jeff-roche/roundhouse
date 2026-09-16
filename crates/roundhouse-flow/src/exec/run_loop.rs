@@ -30,8 +30,9 @@
 //!
 //! - **Driving a child run.** The `call:` arm creates the child
 //!   `workflow_run` (drawing its grant, §8.12) and emits the parent's
-//!   `agent`-kind task standing for the call. It does **not** execute the
-//!   child. Two independent reasons, both structural: resolving
+//!   `agent`-kind task standing for the call. The daemon's delivery driver
+//!   recursively executes the child and resumes the parent with its report.
+//!   Two independent reasons keep that I/O out of this crate: resolving
 //!   `call: <name>` to a definition needs a jobs table that does not exist in
 //!   the schema (`control::retry_from_step`'s own doc records the radius), and
 //!   [`TaskSink::emit`] carries no `SessionId`, so this crate cannot write
@@ -212,17 +213,10 @@ pub trait SessionTree: Send {
     /// before this call can still fail and propagate, exactly as the
     /// `refund_child_run` beside it already can.
     ///
-    /// # Wired and testable, but no production caller yet
-    ///
-    /// Nothing in this workspace drives a workflow `call:` child run to
-    /// completion in production, so [`finish_run`]'s terminal branch — the
-    /// one call site — is reached only from tests today. That is the same
-    /// deliberate state the sub-agent half is in (see
-    /// `SubAgentSessions::retire_child`'s *"No production caller yet, and why
-    /// that is the correct state"* in `roundhouse-daemon`): the bookkeeping is
-    /// wired at the seam that owns it, so whatever eventually drives a `call:`
-    /// child to completion (part of issue #30's scope) inherits a correct slot
-    /// release by construction rather than having to remember one.
+    /// The daemon's scheduled-delivery driver recursively drives a `call:`
+    /// child to this terminal branch. Keeping the release beside the durable
+    /// refund means that driver inherits both halves of child completion rather
+    /// than having to remember either independently.
     ///
     /// Implementors must be idempotent. **Not** because this call site
     /// duplicates — [`run_workflow`] refuses to drive a run that is already

@@ -53,7 +53,7 @@ use roundhouse_core::Tier;
 use roundhouse_daemon::scheduler_driver;
 use roundhouse_daemon::session_bootstrap::{policy_rules_from_files, BackgroundServices};
 use roundhouse_daemon::session_registry::SessionRegistry;
-use roundhouse_flow::durability::recover_run;
+use roundhouse_flow::durability::{recover_run, RunState};
 use roundhouse_flow::exec::RunId;
 use roundhouse_flow::job::SessionTemplate;
 use roundhouse_flow::job_store::register_workflow_file;
@@ -295,6 +295,23 @@ fn reading_workflow() -> String {
         .to_string()
 }
 
+/// The registered child in the scheduled parent-to-child fixture. Its input is
+/// supplied by the parent's `call:` step, so the read proves the child's own
+/// run context, session, and real tool dispatch are all wired together.
+fn child_reading_workflow() -> String {
+    "name: scheduled-child-read\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+     escalate: fail\nsteps:\n  - id: read_it\n    tool: read\n    with: { path: \"${{ inputs.path }}\" }\n"
+        .to_string()
+}
+
+/// The registered scheduled parent calls `scheduled-child-read`; it has no
+/// local tool step, so any `Read` task must belong to the child session.
+fn parent_calling_child_read_workflow() -> String {
+    "name: scheduled-parent-call\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+     escalate: fail\nsteps:\n  - id: child\n    call: scheduled-child-read\n    with: { path: greeting.txt }\n"
+        .to_string()
+}
+
 /// Phase 8 Task 25.3's exit criterion, proven end to end through the real
 /// production composition path (the identical harness
 /// [`a_scheduled_binding_fires_through_the_real_scheduler_and_completes_a_real_workflow_run`]
@@ -524,6 +541,285 @@ async fn a_scheduled_runs_tool_read_step_executes_for_real_and_the_run_completes
     assert_eq!(
         read_task_count, 1,
         "the run's session must record exactly one completed Read-kind task"
+    );
+
+    running
+        .shutdown()
+        .await
+        .expect("the scheduler driver must observe cancellation and return Ok");
+}
+
+/// A scheduled parent must drive its registered child through a real read and
+/// join the child's durable report exactly once. This fails if child dispatch,
+/// child-session routing, terminal joining, or child-ledger settlement is
+/// removed from the production delivery driver.
+#[tokio::test]
+async fn parent_call_drives_child_read_to_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_root = dir.path().canonicalize().unwrap();
+    let fixture = fixture_root.join("greeting.txt");
+    std::fs::write(&fixture, "hello from a child workflow").unwrap();
+
+    let policy_dir = fixture_root.join(".roundhouse");
+    std::fs::create_dir(&policy_dir).unwrap();
+    let policy_path = policy_dir.join("policy.toml");
+    let policy_text = format!(
+        "[[rule]]\nid = 'fixture-read'\noutcome = 'allow'\nread = {:?}\n",
+        fixture
+    );
+    std::fs::write(&policy_path, &policy_text).unwrap();
+    let trust_state = tempfile::tempdir().unwrap();
+    let rules =
+        policy_rules_from_files(Some(fixture_root.clone()), trust_state.path().to_path_buf())
+            .unwrap();
+    let compiled = compile_policy_layers(vec![roundhouse_config::PolicyLayer {
+        scope: roundhouse_config::ConfigScope::Project,
+        path: policy_path,
+        contents: policy_text.clone(),
+        file: roundhouse_config::PolicyFile {
+            rule: vec![roundhouse_config::PolicyRule {
+                id: "fixture-read".to_string(),
+                outcome: roundhouse_config::PolicyRuleOutcome::Allow,
+                read: fixture,
+            }],
+        },
+    }])
+    .unwrap();
+    record_explicit_trust(
+        &fixture_root,
+        &policy_text,
+        &compiled,
+        &TrustStore::new(trust_state.path().to_path_buf()),
+    )
+    .unwrap();
+
+    let resources = common::resources_with(
+        dir.path(),
+        common::available_isolate(),
+        Arc::new(common::NoopProvider),
+        rules,
+    )
+    .await;
+    let sessions = Arc::new(SessionRegistry::new());
+    let workspace = resources
+        .workspace_registry
+        .as_ref()
+        .expect("real_resources wires a real WorkspaceRegistry")
+        .resolve("default")
+        .expect("real_resources registers a \"default\" workspace");
+
+    let parent_source = workspace.root.join("parent.yaml");
+    let child_source = workspace.root.join("child.yaml");
+    std::fs::write(&parent_source, parent_calling_child_read_workflow()).unwrap();
+    std::fs::write(&child_source, child_reading_workflow()).unwrap();
+    let parent_job_id = {
+        let conn = resources.store.pool.get().await.unwrap();
+        let root = workspace.root.clone();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &parent_source, template())
+                .unwrap()
+                .job
+                .id()
+        })
+        .await
+        .unwrap()
+    };
+    {
+        let conn = resources.store.pool.get().await.unwrap();
+        let root = workspace.root.clone();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    let binding_id = uuid::Uuid::new_v4().to_string();
+    seed_enabled_interval_binding(
+        &resources.store,
+        &binding_id,
+        &workspace.id.to_string(),
+        &parent_job_id.to_string(),
+    )
+    .await;
+
+    let services = BackgroundServices {
+        scheduler: Some(scheduler_service()),
+        ..Default::default()
+    };
+    let running = services
+        .start(resources.store.clone(), sessions, Arc::clone(&resources))
+        .await
+        .expect("the scheduler driver must signal readiness so daemon boot proceeds");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let conn = resources.store.pool.get().await.unwrap();
+            let binding_id = binding_id.clone();
+            let found = conn
+                .interact(move |connection| {
+                    list_deliveries_in_states(
+                        connection,
+                        &[DeliveryState::Delivered, DeliveryState::Failed],
+                    )
+                    .expect("querying terminal trigger_delivery rows must not fail")
+                    .into_iter()
+                    .find(|delivery| delivery.binding_id.to_string() == binding_id)
+                })
+                .await
+                .unwrap();
+            if let Some(delivery) = found {
+                assert_eq!(
+                    delivery.state,
+                    DeliveryState::Delivered,
+                    "the parent call must drive the child successfully, not fail its delivery: {:?}",
+                    delivery.last_error
+                );
+                return delivery;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the scheduled parent and its child read must reach a Delivered trigger_delivery");
+
+    let parent_run_id = RunId::from_uuid(
+        uuid::Uuid::parse_str(
+            delivered
+                .run_id
+                .as_deref()
+                .expect("a Delivered delivery must name its parent run"),
+        )
+        .unwrap(),
+    );
+    let (
+        parent_run,
+        child_run,
+        child_read_output,
+        parent_call_output,
+        child_report,
+        parent_call_terminals,
+        reads,
+    ) = {
+        let conn = resources.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            let parent = recover_run(connection, parent_run_id).unwrap();
+            let parent_session_id = parent.run.session_id;
+            let (child_run_id, child_session_id): (String, String) = connection
+                .query_row(
+                    "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
+                    [parent_run_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let child_run_id = RunId::from_uuid(uuid::Uuid::parse_str(&child_run_id).unwrap());
+            let child_session_id = roundhouse_core::SessionId::from_uuid(
+                uuid::Uuid::parse_str(&child_session_id).unwrap(),
+            );
+            let child = recover_run(connection, child_run_id).unwrap();
+            let child_read_output = child
+                .steps
+                .iter()
+                .find(|step| step.step_id == "read_it")
+                .and_then(|step| step.output.as_ref())
+                .map(|output| output.value_unredacted_for_resume().clone())
+                .expect("the child read step must retain its real file output");
+            let parent_call_output = parent
+                .steps
+                .iter()
+                .find(|step| step.step_id == "child")
+                .and_then(|step| step.output.as_ref())
+                .map(|output| output.value_unredacted_for_resume().clone())
+                .expect("the completed parent call step must retain the child report");
+            let child_report = serde_json::to_value(
+                roundhouse_flow::runs::load_report(connection, child_session_id, child_run_id)
+                    .unwrap()
+                    .expect("a terminal child must persist its report"),
+            )
+            .unwrap();
+            let parent_call_terminals: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE session_id = ?2 AND task_id = (
+                         SELECT parent_task_id FROM workflow_child_call WHERE child_run_id = ?1
+                     ) AND (payload LIKE '%TaskCompleted%' OR payload LIKE '%TaskFailed%' OR payload LIKE '%TaskCancelled%')",
+                    rusqlite::params![child_run_id.to_string(), parent_session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let reads: (i64, i64) = connection
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM tasks WHERE session_id = ?1 AND kind = 'Read' AND state = 'Completed'),
+                         (SELECT COUNT(*) FROM tasks WHERE session_id = ?2 AND kind = 'Read')",
+                    rusqlite::params![child_session_id.to_string(), parent_session_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            (
+                parent.run,
+                child.run,
+                child_read_output,
+                parent_call_output,
+                child_report,
+                parent_call_terminals,
+                reads,
+            )
+        })
+        .await
+        .unwrap()
+    };
+
+    assert_eq!(
+        parent_run.state,
+        RunState::Completed,
+        "the scheduled parent run terminates"
+    );
+    assert_eq!(
+        child_run.state,
+        RunState::Completed,
+        "the called child run terminates"
+    );
+    assert_eq!(
+        reads.0, 1,
+        "the actual file read is one completed Read task in the child session"
+    );
+    assert_eq!(
+        child_read_output
+            .get("content")
+            .and_then(|value| value.as_str()),
+        Some("hello from a child workflow"),
+        "the child Read task must return the actual workspace file's content"
+    );
+    assert_eq!(
+        reads.1, 0,
+        "the parent session must not receive the child's Read task"
+    );
+    assert_eq!(
+        parent_call_terminals, 1,
+        "the parent call task must have exactly one terminal event"
+    );
+    assert_eq!(
+        parent_call_output, child_report,
+        "the parent call step must receive the child session's durable report"
+    );
+
+    let conn = resources.store.pool.get().await.unwrap();
+    let settled_children: i64 = conn
+        .interact(move |connection| {
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_run WHERE parent_run_id = ?1
+                     AND drawn_at IS NOT NULL AND refunded_at IS NOT NULL",
+                    [parent_run.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        settled_children, 1,
+        "the one child run draws and refunds its grant exactly once"
     );
 
     running

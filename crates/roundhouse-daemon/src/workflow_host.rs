@@ -305,9 +305,8 @@ const SESSION_STATE_CHANGED_PAYLOAD_PREFIX: &str = r#"{"SessionStateChanged":"#;
 /// The workflow half has the mirror-image situation and it is *not* a gap in
 /// this function: `finish_run` really does write a terminal `workflow_run`
 /// state (and `child_terminated` beside it), so the row read here is the same
-/// fact the live hook keys off — there is simply no production driver for a
-/// `call:` child run yet (a later task's work), so no such row exists in a
-/// running daemon today either.
+/// fact the live hook keys off, and the scheduled-delivery driver now produces
+/// such terminal child rows in a running daemon.
 ///
 /// # One bad row is skipped, not fatal
 ///
@@ -668,12 +667,11 @@ mod tests {
     /// durable log restores the live children of **both** kinds, and restores
     /// neither ended one.
     ///
-    /// Seeded into the store directly rather than produced by a live driver on
-    /// purpose. Nothing in this workspace drives a `call:` child run to a
-    /// terminal state yet (Task 4's finding — the driver is a later task), so
-    /// a test that waited for one would be untestable today; the rows are the
-    /// contract boot recovery actually reads, and they are seeded through the
-    /// real writers (`insert_workflow_run`, `append_event_in_transaction`).
+    /// Seeded into the store directly to isolate boot recovery from the
+    /// scheduled-delivery driver's separate parent-to-child execution proof.
+    /// The rows are the contract boot recovery actually reads, and they are
+    /// seeded through the real writers (`insert_workflow_run`,
+    /// `append_event_in_transaction`).
     #[test]
     fn boot_recovery_restores_live_children_of_both_kinds_and_skips_the_ended_ones() {
         let mut conn = open_test_db();

@@ -200,8 +200,8 @@ pub fn run_workflow_from_storage(
 /// Drives a run using a caller-resolved workflow definition, rather than
 /// re-resolving it from storage on every call.
 ///
-/// The daemon's segmented driving loop (Phase 8 Task 25.2) needs this: it
-/// re-enters [`run_workflow`] once per suspend/resume segment of one run,
+/// The daemon's segmented driving loop, including its recursive `call:` child
+/// drives, needs this: it re-enters [`run_workflow`] once per suspend/resume segment of one run,
 /// and [`run_workflow_from_storage`]'s `host.resolve_run_definition` spawns
 /// `round-yaml-parse-helper` out of process on every call (see
 /// `crate::parse::parse_workflow`'s own module doc) — reasonable once per
