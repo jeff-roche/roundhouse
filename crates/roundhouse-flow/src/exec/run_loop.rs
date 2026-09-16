@@ -3040,9 +3040,29 @@ enum ItemAdvance {
     /// of its own (Phase 8 Task 25.7 Task 7, fix round 1).
     ///
     /// **A wave carrying a `ChildRun` carries exactly that one entry**, and
-    /// this is one of the two halves that keeps it so (the other is
-    /// [`Loop::dispatch_map`] ending its item walk the moment it pushes one).
-    /// The reason is a real data-loss hazard in the caller, not tidiness:
+    /// this is how that is kept true: the wave's [`WaveAdmission`] is consulted
+    /// at each of the two seams an item turns into a new `PendingWork`, and an
+    /// item the wave will not take is deferred instead.
+    ///
+    /// **It defers a *dispatch*, never the item's walk** (fix round 2). The
+    /// first version of this fix short-circuited
+    /// [`Loop::dispatch_map`]'s per-item loop with a `break` the moment a
+    /// `ChildRun` closed the wave, which reintroduced the very harm it exists
+    /// to prevent, deterministically and without needing a park at all: an item
+    /// later in walk order was skipped **entirely**, so an answer already
+    /// waiting for it in [`Loop::work_results`] was never consumed or
+    /// checkpointed, its row stayed `Running`, and the next segment
+    /// crash-refused it. Every item must still be walked so it can consume what
+    /// it has and checkpoint it — that is what [`Loop::advance_map_item`] does
+    /// before it ever reaches a dispatch seam, and it is why deferring *there*
+    /// is safe when abandoning the walk is not. The guards either side of this
+    /// one keep the same shape for the same reason: see
+    /// [`Loop::map_item_is_in_flight`], which exists so that neither
+    /// `fail_fast` nor run-budget exhaustion can abandon an item that already
+    /// holds an answer.
+    ///
+    /// The reason for the invariant is a real data-loss hazard in the caller,
+    /// not tidiness:
     /// `roundhouse-daemon`'s `dispatch_wave` folds a whole wave to
     /// `PendingExecution::ChildParked` if **any** item's child parks, throwing
     /// away every other item's already-computed `WorkDone`. That fold was
@@ -3066,8 +3086,9 @@ enum ItemAdvance {
     /// in step with the daemon's.
     ///
     /// Deferring costs nothing and loses nothing: the item has dispatched
-    /// nothing, written nothing and emitted nothing at this point, and every
-    /// segment re-walks every item from index 0 anyway (see
+    /// nothing, written nothing and emitted nothing at this point — everything
+    /// it *had* to record this segment it already recorded on the way here —
+    /// and every segment re-walks every item from index 0 anyway (see
     /// [`Loop::dispatch_map`]'s "Every segment replays every item"). It is the
     /// same "cost nothing to defer" argument [`Self::WantsPark`] already
     /// makes.
@@ -3082,6 +3103,59 @@ enum ItemAdvance {
     /// time this is returned, so a request the wave declines costs nothing
     /// and is simply re-derived on the next segment.
     WantsPark(Box<PendingPark>),
+}
+
+/// What a wave under construction will still accept from the items
+/// [`Loop::dispatch_map`] has yet to walk (Phase 8 Task 25.7 Task 7, fix
+/// round 2).
+///
+/// **Derived from the wave rather than tracked beside it** — see
+/// [`Self::of`] — so it cannot disagree with the `pending` it describes, which
+/// is the failure mode a `bool` updated at each push would have.
+#[derive(Clone, Copy, Debug)]
+enum WaveAdmission {
+    /// Nothing is dispatched yet, so anything may start — a nested `call:`
+    /// included, since it would not be sharing with anyone.
+    Empty,
+    /// Ordinary `tool:`/`agent:` dispatches. More may join; a nested `call:`
+    /// may not, because a `ChildRun` must have its wave to itself.
+    OrdinaryWork,
+    /// A nested `call:` has this wave. **Nothing** further may join it — not
+    /// another child, and not a `tool:`/`agent:` either, because what makes
+    /// sharing unsafe is the caller discarding the whole wave's answers when
+    /// the child parks, and that discard does not care what kind the sibling
+    /// was. See [`ItemAdvance::Deferred`].
+    HeldByAChildRun,
+}
+
+impl WaveAdmission {
+    /// The wave's own answer, read off its entries.
+    ///
+    /// Scans rather than testing `pending.first()`, though a `ChildRun`-holding
+    /// wave has exactly one entry: this function is what *enforces* that
+    /// invariant, so assuming it here would make the check circular.
+    fn of(pending: &[PendingWork]) -> Self {
+        if pending.is_empty() {
+            Self::Empty
+        } else if pending
+            .iter()
+            .any(|work| matches!(work.kind, PendingKind::ChildRun { .. }))
+        {
+            Self::HeldByAChildRun
+        } else {
+            Self::OrdinaryWork
+        }
+    }
+
+    /// Whether a nested `call:` may dispatch into this wave.
+    fn takes_a_child_run(self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    /// Whether a `tool:`/`agent:` inner step may dispatch into this wave.
+    fn takes_ordinary_work(self) -> bool {
+        !matches!(self, Self::HeldByAChildRun)
+    }
 }
 
 /// One `map` item's request to park the run on its own nested `gate:`.
@@ -3226,10 +3300,23 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// keeps the property that contract was written against rather than
     /// letting a sibling's real, completed work be thrown away and then
     /// crash-refused on the next segment. [`ItemAdvance::Deferred`] holds the
-    /// full argument; the two halves are its arm and this loop's `break`.
+    /// full argument; [`WaveAdmission`] is the mechanism, asked at each
+    /// dispatch seam.
     ///
-    /// `tool:`/`agent:` fan-out is untouched and still runs `max_parallel` at
-    /// a time — nothing in that path can park a wave.
+    /// **What it costs, exactly** (corrected in fix round 2, where the earlier
+    /// claim that "`tool:`/`agent:` fan-out is untouched" turned out to
+    /// overclaim):
+    ///
+    /// - A `map` with **no** nested `call:` is genuinely untouched. No wave can
+    ///   ever be held, so [`WaveAdmission`] is never anything but `Empty` or
+    ///   `OrdinaryWork`, nothing is ever deferred, and `max_parallel` entries
+    ///   still go out together.
+    /// - In a fan-out that **does** nest one, the segment where a child takes
+    ///   the wave withholds every other item's dispatch — of any kind, not just
+    ///   another `call:` — until the next segment. Those items are still walked
+    ///   and still settle everything they can; only the one new dispatch waits.
+    ///   So `max_parallel` remains a ceiling that such a segment does not
+    ///   reach, rather than a figure this loop still meets.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_map(
         &mut self,
@@ -3417,7 +3504,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 &item_evaluated,
                 isolation,
                 &per_item_caps,
-                pending.is_empty(),
+                WaveAdmission::of(&pending),
                 &mut any_item_secret_derived,
                 phase,
             ) {
@@ -3428,33 +3515,25 @@ impl<H: WorkflowHost> Loop<'_, H> {
                     stopped |= policy.observe(&outcome);
                     outcomes[index] = Some(outcome);
                 }
-                Ok(ItemAdvance::Pending(work)) => {
-                    // **A wave that carries a `ChildRun` carries nothing
-                    // else** — the second half of the invariant
-                    // [`ItemAdvance::Deferred`] states and gives the reason
-                    // for. That arm stops a `call:` joining a wave that
-                    // already has entries; this stops entries joining a wave
-                    // that already has a `call:`, which cannot be done there
-                    // because by then the child run exists.
-                    //
-                    // Ending the walk rather than merely withholding further
-                    // *dispatches*: an item that would have finished
-                    // synchronously this segment simply finishes on the next
-                    // one, at the cost of re-walking it, and that is cheaper
-                    // than a second flag threaded through every dispatch seam
-                    // for a distinction nothing observes.
-                    let carries_a_child_run = matches!(work.kind, PendingKind::ChildRun { .. });
-                    pending.push(*work);
-                    if carries_a_child_run {
-                        break;
-                    }
-                }
-                // Nothing was dispatched, written or emitted for this item, so
-                // it is left undecided and re-derived on the next segment.
-                // `pending` is non-empty by construction whenever this is
-                // returned (it is the condition that produces it), so the
-                // early `AwaitingWork` return below is always taken and this
-                // item never reaches the trailing `skipped_by_fail_fast` fill.
+                // **Pushed, and the walk goes on.** Whether this entry closes
+                // the wave to everything else is not decided here: the next
+                // item asks [`WaveAdmission::of`] about the wave as it then
+                // stands. An earlier version of this fix `break`ed here when
+                // the entry was a `ChildRun`, which skipped every later item's
+                // *whole* turn — including consuming an answer already waiting
+                // for it — and so re-created, deterministically, the exact
+                // data loss the invariant exists to prevent. See
+                // [`ItemAdvance::Deferred`], and `map_item_is_in_flight` for
+                // the same hazard the two guards above are shaped around.
+                Ok(ItemAdvance::Pending(work)) => pending.push(*work),
+                // Nothing was dispatched, written or emitted for this item —
+                // though everything it could settle this segment, it already
+                // settled — so it is left undecided and re-derived on the next
+                // one. `pending` is non-empty by construction whenever this is
+                // returned (a wave that takes nothing is a wave that already
+                // has something), so the early `AwaitingWork` return below is
+                // always taken and a deferred item never reaches the trailing
+                // `skipped_by_fail_fast` fill.
                 Ok(ItemAdvance::Deferred) => continue,
                 Ok(ItemAdvance::WantsPark(request)) => park_requests.push(*request),
                 Err(e) => {
@@ -3757,15 +3836,17 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// dispatching, returning the same [`ItemAdvance::Pending`] a `tool:` does
     /// — but it is intercepted here for the same reason the gate is: it needs
     /// the `Connection` and the run's ledger row. It is also the one inner
-    /// step that can be **deferred** rather than run: see
-    /// `wave_can_take_a_child_run` and [`ItemAdvance::Deferred`].
+    /// step that can close a wave to everything else: see [`WaveAdmission`]
+    /// and [`ItemAdvance::Deferred`].
     ///
-    /// `wave_can_take_a_child_run` is the caller's "this wave is still empty",
-    /// and it gates exactly one decision — whether a nested `call:` may
-    /// dispatch now. Passed as a `bool` rather than read off a field because
-    /// the wave lives in [`Self::dispatch_map`]'s local state, and asked here
-    /// rather than there because only this function knows which inner step an
-    /// item has actually reached.
+    /// `wave` is what the caller's half-built wave will still accept. It is
+    /// consulted at the **two dispatch seams only** — never earlier — so an
+    /// item the wave cannot take still consumes and checkpoints every answer
+    /// waiting for it first, and defers only the one thing it cannot do.
+    /// Passed in rather than read off a field because the wave lives in
+    /// [`Self::dispatch_map`]'s local state, and asked here rather than there
+    /// because only this function knows which inner step an item has actually
+    /// reached.
     #[allow(clippy::too_many_arguments)]
     fn advance_map_item(
         &mut self,
@@ -3776,7 +3857,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
         item_evaluated: &Evaluated,
         isolation: Option<&MapIsolationDef>,
         per_item_caps: &ResourceCaps,
-        wave_can_take_a_child_run: bool,
+        wave: WaveAdmission,
         any_item_secret_derived: &mut bool,
         phase: Phase,
     ) -> Result<ItemAdvance, RunLoopError> {
@@ -4034,7 +4115,12 @@ impl<H: WorkflowHost> Loop<'_, H> {
                     // for a wave of its own; see [`ItemAdvance::Deferred`] for
                     // the caller-side hazard that makes a `ChildRun` sharing a
                     // wave unsafe, and why deferring costs nothing.
-                    if !wave_can_take_a_child_run {
+                    //
+                    // Last, also, so that the two refusals above still *decide*
+                    // this item on a segment where it cannot dispatch: a
+                    // refusal is progress and a deferral is not, and neither
+                    // depends on the wave.
+                    if !wave.takes_a_child_run() {
                         return Ok(ItemAdvance::Deferred);
                     }
                     match self.dispatch_call(
@@ -4129,6 +4215,19 @@ impl<H: WorkflowHost> Loop<'_, H> {
                                 .expect("the branch condition is `worktree.is_some_and(..)`");
                             last = executor.release_item_isolation(map_step_id, held, refusal);
                             break;
+                        }
+                        // **And except when a nested `call:` already has this
+                        // wave** (fix round 2). What makes sharing a wave with
+                        // a `ChildRun` unsafe is the caller discarding the
+                        // whole wave's answers if that child parks, and the
+                        // discard does not care that this sibling is only a
+                        // `tool:` — its answer is the one kind that is not even
+                        // recoverable afterwards. So this seam is gated by the
+                        // same [`WaveAdmission`] the `call:` arm above asks,
+                        // and in the same position: last, after everything that
+                        // could decide the item outright.
+                        if !wave.takes_ordinary_work() {
+                            return Ok(ItemAdvance::Deferred);
                         }
                         self.checkpoint_map_item_step_waiting(
                             inner,

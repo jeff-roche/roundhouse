@@ -8566,6 +8566,92 @@ fn a_wave_that_carries_a_nested_call_carries_nothing_else() {
     }
 }
 
+/// **Closing the wave must never cost a later item its turn.** An item walked
+/// after the one whose nested `call:` closed the wave still consumes the answer
+/// already waiting for it, checkpoints it, and carries on — it is only the one
+/// *new* dispatch it cannot make that waits for the next segment.
+///
+/// The regression this pins is the first version of that fix, which stopped
+/// `dispatch_map`'s item walk outright once a `ChildRun` closed the wave. That
+/// re-created the exact data loss the invariant exists to prevent, on a worse
+/// path than the original: no park, no crash, fully deterministic, and on the
+/// most ordinary nested-call shape there is.
+///
+/// The fixture is that shape. Two items, `max_parallel: 2`, inner steps
+/// `[build: tool, sub: call]`:
+///
+/// - wave 1 dispatches both items' `build` together, and both answer;
+/// - in the next segment item 0 consumes its answer, reaches `sub`, and takes
+///   the wave with its child. Item 1's `build` answer is **still unconsumed at
+///   that moment** — abandoning the walk there drops it, leaves its row
+///   `Running`, and the segment after that crash-refuses an item whose `build`
+///   really did complete.
+#[test]
+fn closing_a_wave_with_a_nested_call_still_lets_later_items_take_their_answers() {
+    let (conn, run_id, _sink, waves, children, result) = drive_map_calls(
+        // The `tool:` comes **first**, so both items have an answer in flight
+        // before either reaches its `call:` — which is what puts an unconsumed
+        // answer on the far side of the item that closes the wave.
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 2\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, build] }\n\
+         \x20     - id: sub\n\
+         \x20       call: child-flow\n",
+        map_items(2),
+        a_grant(),
+    );
+    let outcome = result.expect("the run drives");
+
+    // The harm first, then the mechanism: what must not happen is an item
+    // failed over work that succeeded, whatever wave shape produced it.
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries.len(), 2);
+    for (index, entry) in entries.iter().enumerate() {
+        assert!(
+            !format!("{entry}").contains("interrupted mid-dispatch"),
+            "item {index} was crash-refused over a step that actually completed — its answer \
+             was dropped by a walk that ended early: {entry:?}"
+        );
+        assert_eq!(
+            entry["status"], "completed",
+            "item {index} completed: {entry:?}"
+        );
+    }
+    for index in 0..2u32 {
+        assert_eq!(
+            item_step_row(&conn, run_id, "build", index).map(|r| r.0),
+            Some(StepRunState::Completed),
+            "item {index}'s `build` answer was consumed and checkpointed, never abandoned \
+             mid-walk and left `Running`"
+        );
+    }
+    assert_eq!(children.len(), 2, "each item's `call:` still ran");
+
+    assert_eq!(
+        waves,
+        vec![
+            vec![
+                ("build".to_string(), Some(0)),
+                ("build".to_string(), Some(1)),
+            ],
+            vec![("sub".to_string(), Some(0))],
+            vec![("sub".to_string(), Some(1))],
+        ],
+        "both `build`s go out together, then one child per wave — and item 1 is still walked \
+         in the segment item 0's child closes, which is the only way its `build` answer is \
+         ever consumed: {waves:?}"
+    );
+}
+
 /// **A sibling's nested `call:` shrinks a later wave's per-item share**, and an
 /// item can be refused against a smaller ceiling than the one its earlier
 /// dispatches were measured against. Pinned deliberately: this is §8.9's model
