@@ -5193,6 +5193,275 @@ fn fail_fast_stops_pulling_new_items_into_later_waves() {
     }
 }
 
+/// **`fail_fast` must not discard work that already ran.** With
+/// `max_parallel: 1` only one item is ever in flight, so the failing item is
+/// always the only one with an answer outstanding. At `max_parallel: 3` all
+/// three items are dispatched together and all three really run — so an
+/// implementation that stops replaying items the moment the first failure is
+/// observed drops two items' answers on the floor and backfills them
+/// `skipped`, producing a `map` output that contradicts its own event log
+/// (three `TaskCreated`, one item reported as having run).
+///
+/// The cutover point is *starting a new item*, which is §8.9's own wording
+/// ("stop dispatching further **items**") — an item already started finishes.
+#[test]
+fn fail_fast_still_records_an_already_dispatched_items_real_outcome() {
+    let (_conn, _run_id, sink, waves, result) = drive_waves(
+        &map_over_tool(3, "fail_fast"),
+        serde_json::json!({ "items": map_items(3) }),
+        &[("build", 0)],
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![3],
+        "all three items are in flight before any of them can fail: {waves:?}"
+    );
+    assert_eq!(shell_tasks(&sink), 3, "all three really dispatched");
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["status"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>(),
+        vec!["failed", "completed", "completed"],
+        "items 1 and 2 ran and succeeded — reporting them `skipped` would throw away real \
+         work and contradict the three tasks in the log: {entries:?}"
+    );
+}
+
+/// The cutover point, named: an item already started runs to **completion**,
+/// not merely to the end of the round trip that was outstanding when the
+/// failure was seen. Three items of two inner steps each, all three in flight
+/// on the first step when item 0 fails — items 1 and 2 go on to dispatch
+/// their *second* inner step, and no fourth item is ever started because
+/// there isn't one to start.
+///
+/// Stated as a test rather than only in prose because the alternative (stop
+/// an in-flight item at its current step and record what it had) is also
+/// defensible, and the two differ in how many tasks reach the log.
+#[test]
+fn fail_fast_lets_an_already_started_item_finish_its_remaining_inner_steps() {
+    let (_conn, _run_id, sink, waves, result) = drive_waves(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 3\n\
+         \x20     on_item_error: fail_fast\n\
+         \x20   steps:\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, build] }\n\
+         \x20     - id: publish\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, publish] }\n",
+        serde_json::json!({ "items": map_items(3) }),
+        &[("build", 0)],
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![3, 2],
+        "three items start together; after item 0 fails the other two advance to their \
+         second inner step, and nothing new is started: {waves:?}"
+    );
+    assert_eq!(shell_tasks(&sink), 5, "3 builds + 2 publishes");
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["status"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>(),
+        vec!["failed", "completed", "completed"]
+    );
+}
+
+/// **§8.13's cooperative cancel has to be observed once per wave, not once
+/// per `map`.** `Loop::admit` is the one in-phase observer of a `Cancelling`
+/// run, and a `map` mid-fan-out deliberately skips admission on every wave
+/// after its first so the ledger is not charged again — so without a second,
+/// zero-charge observation an operator's cancel is invisible to the map, and
+/// a 2,000-item fan-out at `max_parallel: 1` would issue ~2,000 further real
+/// dispatches before the *next* step's admission finally drained the run.
+#[test]
+fn a_cancel_between_waves_stops_a_mid_flight_map_from_dispatching_more() {
+    use roundhouse_flow::exec::run_loop::{WorkDone, WorkStatus};
+
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(&map_over_tool(1, "continue"))).expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": map_items(4) });
+
+    let first = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx.clone(),
+        at(10),
+        None,
+    )
+    .expect("the run drives");
+    let RunOutcome::AwaitingWork { pending } = first else {
+        panic!("the first wave dispatches item 0, got {first:?}");
+    };
+    assert_eq!(pending.len(), 1, "one item per wave at `max_parallel: 1`");
+    let answer = vec![WorkDone {
+        step_id: pending[0].step_id.clone(),
+        item_index: pending[0].item_index,
+        status: WorkStatus::Completed,
+        output: serde_json::json!({}),
+        output_is_secret_derived: false,
+        task_id: Some(TaskId::new()),
+        first_task_seq: None,
+        last_task_seq: None,
+    }];
+
+    // An operator cancels while the wave is out — the one window in which
+    // nothing inside the loop is looking.
+    transition_run(&mut conn, run_id, RunState::Cancelling, at(11)).expect("the cancel lands");
+
+    let second = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(12),
+        Some(Resume::Work(answer)),
+    )
+    .expect("the run drives");
+
+    match second {
+        RunOutcome::Terminal { state, .. } => assert_eq!(
+            state,
+            RunState::Cancelled,
+            "the cancel drains at the map rather than three waves later"
+        ),
+        other => panic!("a cancelled run must not dispatch another wave, got {other:?}"),
+    }
+    assert_eq!(
+        recover_run(&conn, run_id).unwrap().run.state,
+        RunState::Cancelled
+    );
+}
+
+/// **A crashed run must not silently re-run a `map` item's in-flight
+/// `Effectful` inner step.** §8.10 tier 2 gives a top-level step an
+/// `on_crash` policy consulted on its own cold-entry re-decision; before this
+/// fix a `map` item's inner step bypassed that entirely and simply re-ran —
+/// which, now that the dispatch is real, means a `shell` step that may
+/// already have executed once executes again, at-least-once, with nothing
+/// recorded and no operator asked.
+///
+/// Driven the way it really happens: one wave goes out, the daemon dies, the
+/// run is re-driven cold (so the *map step itself* parks on §8.10's `ask`),
+/// the human answers `rerun`, and only then is the item's own interrupted
+/// inner step reached.
+#[test]
+fn a_crashed_maps_in_flight_effectful_inner_step_is_not_silently_re_run() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(&map_over_tool(1, "continue"))).expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": map_items(2) });
+
+    let first = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx.clone(),
+        at(10),
+        None,
+    )
+    .expect("the run drives");
+    assert!(
+        matches!(first, RunOutcome::AwaitingWork { .. }),
+        "item 0's `tool: shell` step is dispatched and the daemon then dies"
+    );
+
+    // The cold re-drive: no `Resume`, exactly as a recovered run is
+    // re-entered. The `map` step's own row is `Indeterminate`, so §8.10's
+    // `ask` parks before anything re-runs.
+    let recovered = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx.clone(),
+        at(20),
+        None,
+    )
+    .expect("the run drives");
+    assert!(
+        matches!(recovered, RunOutcome::Parked(_)),
+        "an interrupted `map` asks before anything re-runs, got {recovered:?}"
+    );
+
+    // The human says "rerun the map" — which re-drives the fan-out, and is
+    // where the item's own interrupted inner step is finally reached. Item 1
+    // was never started, so it still dispatches normally; `run_to_terminal`
+    // answers its wave the way the daemon would.
+    let before_rerun = shell_tasks(&sink);
+    let resumed = run_to_terminal(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        30,
+        Some(Resume::CrashRecovery(CrashRecoveryAnswer {
+            step_id: "fan".to_string(),
+            resolution: CrashResolution::Rerun,
+        })),
+    )
+    .expect("the run drives");
+
+    let RunOutcome::Terminal { steps, .. } = &resumed else {
+        panic!(
+            "item 0's interrupted `shell` step must not be re-dispatched without a policy \
+             that permits it, got {resumed:?}"
+        );
+    };
+    let map = steps.iter().find(|s| s.step_id == "fan").expect("the map");
+    let entries = map.output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries[0]["status"], "failed");
+    let error = entries[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("interrupted mid-dispatch") && error.contains("on_crash"),
+        "the refusal names what is unsupported, the way `isolation: worktree` across a \
+         suspend does: {error:?}"
+    );
+    assert_eq!(
+        entries[1]["status"], "completed",
+        "item 1 was never started before the crash, so it runs normally"
+    );
+    assert_eq!(
+        shell_tasks(&sink) - before_rerun,
+        1,
+        "exactly one further shell task — item 1's. Item 0's interrupted one is refused, \
+         not dispatched a second time"
+    );
+}
+
 /// `collect` keeps dispatching every item and gathers each failure's message
 /// onto the map step's own output — across waves, once each, in item order.
 #[test]

@@ -1778,13 +1778,25 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 // Skipped for a step with a `resumed_work` answer above: it
                 // was already charged on the pass that produced the
                 // `PendingWork` this answers, and admitting it a second time
-                // would double-charge the run's ledger. Skipped for the same
-                // reason for a `map:` an earlier wave of this drive already
-                // admitted — see `resuming_map` above, which is also what
-                // already drained this step's `Indeterminate` row so the
-                // crash-policy branch above found nothing to act on.
+                // would double-charge the run's ledger.
+                //
+                // **A `map:` an earlier wave already admitted is not charged
+                // again either — but it is still *observed*.** This chokepoint
+                // is the only place inside a phase that sees a `Cancelling`
+                // run (`admit_spend` refuses one, and the arm below turns that
+                // into `PhaseEnd::Cancelled`), so skipping it outright for
+                // every wave after the first would make an operator's cancel
+                // invisible to a fan-out in progress: at `max_parallel: 1` a
+                // 2,000-item `map` would issue ~2,000 further real dispatches
+                // before the *next* step's admission finally drained the run.
+                // Before `map` could suspend at all it had exactly one
+                // admission, so the cancel was always seen; a zero-`Spend`
+                // call restores that without charging anything. See
+                // `resuming_map` above, which is also what already drained
+                // this step's `Indeterminate` row so the crash-policy branch
+                // above found nothing to act on.
                 let admission = if resuming_map {
-                    Ok(())
+                    self.observe_admission(phase)
                 } else {
                     self.admit(phase, step)
                 };
@@ -2032,11 +2044,34 @@ impl<H: WorkflowHost> Loop<'_, H> {
             )),
             ..Spend::ZERO
         };
+        self.charge(phase, &requested)
+    }
+
+    /// [`Self::admit`]'s checks **without its charge** — for a step this drive
+    /// has already admitted once and is re-entering, which today is exactly a
+    /// `map:` whose waves are still draining.
+    ///
+    /// A second charge would double-bill §8.4's ledger (a `map` is one step of
+    /// the run however many waves it takes), but skipping the call entirely
+    /// would skip the only place inside a phase that observes §8.13's
+    /// cooperative cancel — see [`Self::run_phase`]'s admission site for the
+    /// measured cost of that. [`Spend::ZERO`] keeps both: `admit_spend`
+    /// refuses a run that is not admitting whatever is being spent, and checks
+    /// both elapsed-time ceilings on every call regardless, so a zero request
+    /// is a pure observation.
+    fn observe_admission(&mut self, phase: Phase) -> Result<(), LedgerError> {
+        self.charge(phase, &Spend::ZERO)
+    }
+
+    /// The one call both [`Self::admit`] and [`Self::observe_admission`] make,
+    /// so §8.13's `finally:` exemption cannot be applied by one and forgotten
+    /// by the other.
+    fn charge(&mut self, phase: Phase, requested: &Spend) -> Result<(), LedgerError> {
         match phase {
             Phase::Finally => {
-                admit_spend_during_finally(self.conn, self.run_id, &requested, self.now)
+                admit_spend_during_finally(self.conn, self.run_id, requested, self.now)
             }
-            Phase::Main | Phase::Catch => admit_spend(self.conn, self.run_id, &requested, self.now),
+            Phase::Main | Phase::Catch => admit_spend(self.conn, self.run_id, requested, self.now),
         }
         .map(|_| ())
     }
@@ -2774,14 +2809,26 @@ impl<H: WorkflowHost> Loop<'_, H> {
         let mut failure: Option<RunLoopError> = None;
 
         for (index, item) in items.iter().enumerate() {
-            // `fail_fast`'s cutover point under waves is **starting a new
-            // item**: nothing cancels work already dispatched, so an item
-            // already in flight finishes its round trip and only
-            // not-yet-started items are withheld. Same for the ceiling —
-            // which bounds items *dispatched*, not items visited, so an item
-            // that resolves entirely synchronously never consumes a slot.
-            if stopped || pending.len() >= wave_ceiling {
+            // The ceiling bounds items *dispatched*, not items visited, so an
+            // item that resolves entirely synchronously never consumes a slot.
+            if pending.len() >= wave_ceiling {
                 break;
+            }
+            let item_index = index as u32;
+            // **`fail_fast`'s cutover point is *starting a new item*, and it
+            // has to be checked per item rather than as a loop `break`.**
+            // §8.9's wording is "stop dispatching further **items**", and
+            // nothing cancels work already dispatched: at `max_parallel: 3`
+            // all three items are in flight before any of them can fail, so a
+            // `break` here would leave two items' already-computed answers
+            // unconsumed in `work_results` and backfill them
+            // `skipped_by_fail_fast` — a `map` output claiming one item ran
+            // beside three `TaskCreated` in the log, with two real outputs
+            // thrown away. An item that has an answer to consume, or durable
+            // rows from an earlier wave, therefore still advances; only an
+            // item this fan-out would be **starting** is withheld.
+            if stopped && !self.map_item_is_in_flight(&inner_steps, item_index) {
+                continue;
             }
             let item_evaluated = over_evaluated.derive(item.clone());
             executor.ctx.set_from(as_name, &item_evaluated);
@@ -2789,13 +2836,16 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 executor,
                 &step.id,
                 &inner_steps,
-                index as u32,
+                item_index,
                 &item_evaluated,
                 isolation,
                 &mut any_item_secret_derived,
             ) {
                 Ok(ItemAdvance::Finished(outcome)) => {
-                    stopped = policy.observe(&outcome);
+                    // `|=`, not `=`: an in-flight item that completes *after*
+                    // an earlier one failed must not un-stop the fan-out and
+                    // let the items behind it start.
+                    stopped |= policy.observe(&outcome);
                     outcomes[index] = Some(outcome);
                 }
                 Ok(ItemAdvance::Pending(work)) => pending.push(*work),
@@ -2822,10 +2872,13 @@ impl<H: WorkflowHost> Loop<'_, H> {
             outcomes: outcomes
                 .into_iter()
                 // The only items still undecided are ones `fail_fast` stopped
-                // the fan-out before starting: a wave ceiling always leaves
-                // `pending` non-empty, which returned above. Recorded rather
-                // than dropped — §8.9's "every item gets an entry" — through
-                // the same constructor `run_map`'s own trailing fill uses.
+                // the fan-out before **starting** — an item that was started
+                // still advanced above, however late its failure was observed
+                // (see the `map_item_is_in_flight` guard). A wave ceiling
+                // always leaves `pending` non-empty, which returned above.
+                // Recorded rather than dropped — §8.9's "every item gets an
+                // entry" — through the same constructor `run_map`'s own
+                // trailing fill uses.
                 .map(|outcome| outcome.unwrap_or_else(ItemErrorPolicy::skipped_by_fail_fast))
                 .collect(),
             collected_errors: policy.into_collected_errors(),
@@ -2835,6 +2888,30 @@ impl<H: WorkflowHost> Loop<'_, H> {
             &result,
             any_item_secret_derived,
         )))
+    }
+
+    /// Whether this fan-out has **already started** the item — either an
+    /// answer for one of its inner steps arrived with this entry, or an
+    /// earlier wave left one of them a durable row.
+    ///
+    /// The one question `fail_fast` turns on under waves. §8.9 stops the
+    /// fan-out from dispatching further *items*, and nothing cancels work
+    /// already dispatched, so an item that is already in flight must still be
+    /// advanced — otherwise its real, already-computed answer is discarded and
+    /// backfilled as `Skipped`, which is both a lie about the item and a
+    /// contradiction of the `TaskCreated` already in the log.
+    ///
+    /// Cheap by construction rather than by care: it is only ever asked once a
+    /// failure has been observed, and `map` inner-step lists are short
+    /// (`MAX_TOP_LEVEL_STEPS`-scale, not item-scale).
+    fn map_item_is_in_flight(&self, inner_steps: &[StepDef], item_index: u32) -> bool {
+        inner_steps.iter().any(|inner| {
+            self.work_results
+                .contains_key(&(inner.id.clone(), Some(item_index)))
+                || self
+                    .item_steps_before
+                    .contains_key(&(inner.id.clone(), item_index))
+        })
     }
 
     /// Advances one `map` item as far as it goes on this segment.
@@ -2880,7 +2957,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 }
                 continue;
             }
-            if let Some(outcome) = self.decided_map_item_step(inner, item_index) {
+            if let Some(outcome) = self.decided_map_item_step(map_step_id, inner, item_index) {
                 if fold_inner_step_outcome(&mut last, outcome, any_item_secret_derived) {
                     break;
                 }
@@ -3056,13 +3133,19 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// re-dispatched on every subsequent wave, forever), while a failure left
     /// behind by a drive that then died is §8.10 tier 2's to re-decide.
     ///
-    /// `Running`/`Indeterminate`/`Pending` are never inherited — with no
-    /// caller-supplied answer, the step runs again, which is §8.10's
-    /// `on_crash: rerun` applied per item. Tier 2's `ask` and `fail` policies
-    /// are top-level only today ([`Loop::crash_recovery_park`] parks *the
-    /// run*, which is not a per-item thing to do); a `map` item's own crash
-    /// policy belongs with the same task that makes a nested `gate:` real.
-    fn decided_map_item_step(&self, step: &StepDef, item_index: u32) -> Option<StepOutcome> {
+    /// A row this load found **started but not finished** — `Running` for a
+    /// `Pure`/`Idempotent` step, the `Indeterminate` [`recover_run`]
+    /// reclassifies an `Effectful` one to — is §8.10 tier 2's question, per
+    /// item, and it is answered by the step's own
+    /// [`crash_policy`]: `Rerun` re-runs it, and `Ask`/`Fail` refuse the item
+    /// closed. See [`map_item_crash_refusal`] for why `Ask` cannot be honoured
+    /// literally here and what that costs.
+    fn decided_map_item_step(
+        &self,
+        map_step_id: &str,
+        step: &StepDef,
+        item_index: u32,
+    ) -> Option<StepOutcome> {
         let row = self.item_steps_before.get(&(step.id.clone(), item_index))?;
         let (status, output) = match row.state {
             StepRunState::Completed => (
@@ -3083,7 +3166,30 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 },
                 Value::Null,
             ),
-            _ => return None,
+            // §8.10 tier 2 re-decides a failure left behind by a drive that
+            // then died, so the step runs again.
+            StepRunState::Failed => return None,
+            StepRunState::Running | StepRunState::Indeterminate | StepRunState::Pending => {
+                match crash_policy(step) {
+                    // The policy asks for exactly this — declared
+                    // `on_crash: rerun`, or derived for a `Pure`/`Idempotent`
+                    // step ([`crate::durability::on_crash_policy`]). Left
+                    // undecided, so the step runs again.
+                    CrashPolicy::Rerun => return None,
+                    policy => (
+                        StepStatus::Failed {
+                            message: map_item_crash_refusal(
+                                map_step_id,
+                                &step.id,
+                                item_index,
+                                row.state,
+                                policy,
+                            ),
+                        },
+                        Value::Null,
+                    ),
+                }
+            }
         };
         Some(StepOutcome {
             step_id: step.id.clone(),
@@ -3113,6 +3219,65 @@ impl<H: WorkflowHost> Loop<'_, H> {
             .and_then(|row| row.output.as_ref())
             .is_some_and(StepOutput::is_secret_derived)
     }
+}
+
+/// **§8.10 tier 2's `ask`/`fail` for one `map` item's interrupted inner step,
+/// failed closed rather than silently re-run** (Phase 8 Task 25.7 Task 2;
+/// Task 6 owns closing the `ask` half).
+///
+/// A top-level step found `Indeterminate` goes through
+/// [`Loop::crash_recovery_park`], which **parks the run** and asks a human
+/// `rerun | skip | fail`. That mechanism has no item dimension anywhere along
+/// it: [`CrashRecoveryAnswer`] names a `step_id` and nothing else,
+/// [`ensure_crash_recovery_step`] looks that id up in the workflow's
+/// top-level `steps:` list — which a `map` inner step is not in — and
+/// [`crate::hitl::AwaitingHuman`]/[`crate::parking::ParkResult`] carry no
+/// index either. So the question genuinely cannot be *asked* per item today;
+/// threading `item_index` down the whole park path is exactly the plumbing
+/// Phase 8 Task 25.7 Task 6 enumerates for a nested `gate:`, and the two want
+/// the same seam.
+///
+/// What must not happen in the meantime is the alternative this replaces:
+/// before this refusal, a `map` item's interrupted inner step simply re-ran.
+/// That was harmless while every inner `tool:`/`agent:` step was
+/// [`Executor::dispatch_step_or_stub`]'s free stub; it stopped being harmless
+/// the moment Task 2 made the dispatch real, because a `shell` step whose
+/// effect may already have landed would land it a second time, at-least-once,
+/// with nothing recorded and nobody asked. Failing the item closed keeps
+/// `on_item_error`'s existing granularity (the rest of the fan-out behaves
+/// exactly as it would for any other item failure) and leaves a row saying
+/// what happened.
+///
+/// `Fail` needs no such apology: the author declared `on_crash: fail`, and
+/// this is what it asks for.
+fn map_item_crash_refusal(
+    map_step_id: &str,
+    inner_step_id: &str,
+    item_index: u32,
+    found: StepRunState,
+    policy: CrashPolicy,
+) -> String {
+    let why = match policy {
+        CrashPolicy::Ask => {
+            "§8.10's `ask` parks the whole run to put that question to a human, and a park is \
+             a transition of the run rather than of one item — no mechanism exists to ask it \
+             per item, so this item is failed closed instead of being silently re-run"
+        }
+        CrashPolicy::Fail => {
+            "which asks for exactly this: never re-run, never ask, fail rather than repeat an \
+             effect that may already have landed"
+        }
+        // Unreachable: the caller returns before building this message for
+        // `Rerun`. Written out rather than left to a `_` arm so that a fourth
+        // policy is a compile error here, not a message that blames the wrong
+        // one.
+        CrashPolicy::Rerun => "which permits a re-run",
+    };
+    format!(
+        "map step `{map_step_id}`, item {item_index}: inner step `{inner_step_id}` was \
+         interrupted mid-dispatch (found {found:?}) and its on_crash policy is {policy:?} — \
+         {why}"
+    )
 }
 
 /// **A materialized worktree cannot span a suspension, and this says so
