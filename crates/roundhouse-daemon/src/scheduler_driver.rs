@@ -1082,6 +1082,10 @@ pub(crate) struct DeliveryExecutor {
     /// every timestamp a delivery writes is chosen by the caller — which is
     /// what makes this path testable without a real clock.
     clock: Arc<dyn ClockSource + Send + Sync>,
+    /// Headless sessions whose scheduled runs are parked. Retaining the handle
+    /// preserves ownership of the actor and its teardown resources until a
+    /// same-process continuation reaches a terminal delivery outcome.
+    parked_sessions: Arc<Mutex<HashMap<SessionId, HeadlessSession>>>,
     #[cfg(test)]
     segment_gap_gate: Option<Arc<SegmentGapGate>>,
     #[cfg(test)]
@@ -1105,6 +1109,7 @@ impl DeliveryExecutor {
             spawn_tree,
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
             clock,
+            parked_sessions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             segment_gap_gate: None,
             #[cfg(test)]
@@ -1118,6 +1123,23 @@ impl DeliveryExecutor {
         // which no real wall clock is — the same fallback
         // `roundhouse_sched::store`'s own `timestamp_from_datetime` takes.
         Timestamp::from_unix_nanos(self.clock.wall_now().timestamp_nanos_opt().unwrap_or(0))
+    }
+
+    fn park_session(&self, session: HeadlessSession) {
+        let session_id = session.session_id();
+        let previous = self
+            .parked_sessions
+            .lock()
+            .unwrap()
+            .insert(session_id, session);
+        debug_assert!(
+            previous.is_none(),
+            "a parked run must retain exactly one headless session handle"
+        );
+    }
+
+    fn take_parked_session(&self, session_id: SessionId) -> Option<HeadlessSession> {
+        self.parked_sessions.lock().unwrap().remove(&session_id)
     }
 
     /// Runs `f` against a pooled connection on the pool's blocking thread.
@@ -1332,14 +1354,15 @@ impl DeliveryExecutor {
             // reconciliation cares which terminal state a run actually
             // reached.
             Ok(outcome) => {
-                self.handle_run_outcome(
-                    &delivery_id,
-                    binding_id,
-                    session,
-                    outcome,
-                    CancelledHandling::AsFailure,
-                )
-                .await;
+                let _ = self
+                    .handle_run_outcome(
+                        &delivery_id,
+                        binding_id,
+                        session,
+                        outcome,
+                        CancelledHandling::AsFailure,
+                    )
+                    .await;
             }
             Err(error) => {
                 self.fail(&delivery_id, binding_id, error.kind(), error.to_string())
@@ -1376,10 +1399,10 @@ impl DeliveryExecutor {
         session: Option<HeadlessSession>,
         outcome: Result<DrivenRun, roundhouse_flow::exec::run_loop::RunLoopError>,
         cancelled_handling: CancelledHandling,
-    ) {
+    ) -> Result<DrivenRun, roundhouse_flow::exec::run_loop::RunLoopError> {
         if matches!(cancelled_handling, CancelledHandling::AsCancellation)
             && matches!(
-                outcome,
+                &outcome,
                 Ok(DrivenRun::Outcome(RunOutcome::Terminal {
                     state: RunState::Cancelled,
                     ..
@@ -1393,10 +1416,10 @@ impl DeliveryExecutor {
             .await;
             self.release(binding_id);
             self.retire_session(session).await;
-            return;
+            return outcome;
         }
 
-        match conclusion_for(outcome) {
+        match conclusion_for(&outcome) {
             RunConclusion::Completed => {
                 let finished = self.now();
                 self.transition(delivery_id, move |conn, id| {
@@ -1413,10 +1436,9 @@ impl DeliveryExecutor {
                      admission slot stays held, and its session stays alive until the run is \
                      resumed"
                 );
-                // Deliberately NOT retired: a parked run resumes into this
-                // session. `session` is dropped here, which drops this task's
-                // `Arc<SessionActor>` — the registry still holds the entry,
-                // so the session stays live and attachable.
+                if let Some(session) = session {
+                    self.park_session(session);
+                }
             }
             RunConclusion::Failed(reason) => {
                 self.fail(delivery_id, binding_id, "workflow_failed", reason)
@@ -1424,6 +1446,7 @@ impl DeliveryExecutor {
                 self.retire_session(session).await;
             }
         }
+        outcome
     }
 
     /// [`Self::claim`] followed by [`Self::run_claimed`], for a caller that
@@ -2160,7 +2183,10 @@ impl DeliveryExecutor {
                         Ok(Ok(DrivenRun::Outcome(RunOutcome::Terminal { state, .. }))) => state,
                         Ok(Ok(
                             DrivenRun::ChildParked | DrivenRun::Outcome(RunOutcome::Parked(_)),
-                        )) => return PendingExecution::ChildParked,
+                        )) => {
+                            self.park_session(child_session);
+                            return PendingExecution::ChildParked;
+                        }
                         Ok(Err(_)) => {
                             return park_child_after_failure(ChildDispatchFailure::RunLoop);
                         }
@@ -2366,9 +2392,9 @@ impl DeliveryExecutor {
         let mut child_run_id = child_run_id;
         let mut continued = false;
         loop {
-            let state = self
+            let (state, child_session_id) = self
                 .with_connection(move |conn| {
-                    recover_run(conn, child_run_id).map(|run| run.run.state)
+                    recover_run(conn, child_run_id).map(|run| (run.run.state, run.run.session_id))
                 })
                 .await?
                 .map_err(|_| DeliveryError::ChildJoin)?;
@@ -2397,6 +2423,11 @@ impl DeliveryExecutor {
                 else {
                     return Err(DeliveryError::ChildJoin);
                 };
+                if let Some(session) = self.take_parked_session(child_session_id) {
+                    session
+                        .teardown(&self.sessions, &self.resources.proxy)
+                        .await;
+                }
                 #[cfg(test)]
                 if let Some(gate) = &self.continuation_gap_gate {
                     gate.enter().await;
@@ -2532,20 +2563,28 @@ impl DeliveryExecutor {
             .resolve_by_id(parent_spec.workspace)
             .map_err(|error| DeliveryError::Workspace(error.to_string()))?;
         let root = workspace.root.clone();
-        let session = create_headless_session(
-            &self.resources,
-            &self.sessions,
-            parent_run.session_id,
-            parent_spec.clone(),
-            root.clone(),
-            workspace.root_device,
-            workspace.root_inode,
-        )
-        .await
-        .map_err(|error| match error {
-            CreateHeadlessSessionError::Timeout => DeliveryError::SessionTimeout,
-            other => DeliveryError::Session(other.kind()),
-        })?;
+        let session = match self.take_parked_session(parent_run.session_id) {
+            Some(session) => session,
+            None => {
+                if self.sessions.actor(parent_run.session_id).is_some() {
+                    return Err(DeliveryError::ChildParentSession);
+                }
+                create_headless_session(
+                    &self.resources,
+                    &self.sessions,
+                    parent_run.session_id,
+                    parent_spec.clone(),
+                    root.clone(),
+                    workspace.root_device,
+                    workspace.root_inode,
+                )
+                .await
+                .map_err(|error| match error {
+                    CreateHeadlessSessionError::Timeout => DeliveryError::SessionTimeout,
+                    other => DeliveryError::Session(other.kind()),
+                })?
+            }
+        };
         let run_ctx = RunContext {
             inputs: serde_json::Value::Null,
             inputs_secret_derived: false,
@@ -2569,6 +2608,33 @@ impl DeliveryExecutor {
             )
             .await?
             .map_err(|_| DeliveryError::ChildParentResume)?;
+        if parent_run.parent_run_id.is_none() {
+            let run_id = parent_run.id.as_uuid().to_string();
+            let delivery = self
+                .with_connection(move |conn| {
+                    list_deliveries_in_states(conn, &[DeliveryState::Running])
+                        .map(|deliveries| {
+                            deliveries
+                                .into_iter()
+                                .find(|delivery| delivery.run_id.as_deref() == Some(&run_id))
+                        })
+                        .map_err(|error| error.to_string())
+                })
+                .await?
+                .map_err(DeliveryError::Transition)?;
+            if let Some(delivery) = delivery {
+                return self
+                    .handle_run_outcome(
+                        &delivery.delivery_id,
+                        delivery.binding_id,
+                        Some(session),
+                        Ok(result),
+                        CancelledHandling::AsFailure,
+                    )
+                    .await
+                    .map_err(|_| DeliveryError::ChildParentResume);
+            }
+        }
         if matches!(result, DrivenRun::Outcome(RunOutcome::Terminal { .. })) {
             session
                 .teardown(&self.sessions, &self.resources.proxy)
@@ -2584,7 +2650,7 @@ impl DeliveryExecutor {
 /// driver error — but it is still a delivery that did not deliver, so it
 /// fails the delivery rather than completing it.
 fn conclusion_for(
-    outcome: Result<DrivenRun, roundhouse_flow::exec::run_loop::RunLoopError>,
+    outcome: &Result<DrivenRun, roundhouse_flow::exec::run_loop::RunLoopError>,
 ) -> RunConclusion {
     match outcome {
         Ok(DrivenRun::Outcome(RunOutcome::Terminal {
@@ -3115,7 +3181,7 @@ async fn redrive_reserved_or_running(
                 .await;
             match outcome {
                 Ok(outcome) => {
-                    executor
+                    let _ = executor
                         .handle_run_outcome(
                             &delivery.delivery_id,
                             binding_id,
@@ -3297,7 +3363,7 @@ async fn finish_cancellation_requested_delivery(
             // `cancellation_requested`, `cancel_delivery`'s own predecessor
             // set) without inventing a new delivery state, for the exotic
             // re-parked case (`finally:` itself contains a gate).
-            executor
+            let _ = executor
                 .handle_run_outcome(
                     &delivery.delivery_id,
                     binding_id,
@@ -4484,6 +4550,13 @@ mod delivery_tests {
         "name: parent-call-gate-then-read\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
          escalate: fail\nsteps:\n  - id: child\n    call: child-gate\n    with: {}\n  - id: after\n    \
          needs: [child]\n    tool: read\n    with: { path: greeting.txt }\n"
+            .to_string()
+    }
+
+    fn parent_calling_child_gate_then_gate_workflow() -> String {
+        "name: parent-call-gate-then-gate\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: child\n    call: child-gate\n    with: {}\n  - id: parent_approve\n    \
+         needs: [child]\n    gate:\n      title: parent approve\n      form: { approved: { type: boolean } }\n      timeout: 1h\n      on_timeout: deny\n"
             .to_string()
     }
 
@@ -6268,6 +6341,159 @@ mod delivery_tests {
             child_refunds, 1,
             "finish_run retains ownership of one refund"
         );
+    }
+
+    #[tokio::test]
+    async fn a_same_process_child_continuation_completes_the_root_delivery_and_releases_admission()
+    {
+        let harness = harness(parent_calling_child_gate_workflow()).await;
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_parking_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let parent = harness.delivery_row().await;
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(parent.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let parent_session_id = parent
+            .session_id
+            .expect("reserve stamps a parent session id");
+        let conn = harness.store.pool.get().await.unwrap();
+        let (child_run_id, child_session_id) = conn
+            .interact(move |connection| {
+                let (child_run_id, child_session_id): (String, String) = connection
+                    .query_row(
+                        "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                (
+                    RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap()),
+                    SessionId::from_uuid(Uuid::parse_str(&child_session_id).unwrap()),
+                )
+            })
+            .await
+            .unwrap();
+
+        answer_child_gate_after_restart(
+            &harness.executor,
+            &harness,
+            child_run_id,
+            child_session_id,
+            parent_session_id,
+        )
+        .await;
+        assert!(harness
+            .executor
+            .continue_after_child_terminal(child_run_id)
+            .await
+            .unwrap());
+
+        assert_eq!(harness.delivery_row().await.state, DeliveryState::Delivered);
+        assert!(
+            harness.sessions.actor(parent_session_id).is_none(),
+            "terminal root continuation must retire its original parent session"
+        );
+        assert!(
+            harness.sessions.actor(child_session_id).is_none(),
+            "terminal child continuation must retire its original child session"
+        );
+        assert_eq!(
+            harness.active(),
+            0,
+            "a terminal root continuation must release the admission slot its parked delivery held"
+        );
+        assert_eq!(
+            harness.accept_another_occurrence(1).await.state,
+            DeliveryState::Ready,
+            "the released binding must admit its next firing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_same_process_child_continuation_reuses_the_live_parent_session_until_it_reparks() {
+        let harness = harness(parent_calling_child_gate_then_gate_workflow()).await;
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_parking_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let parent = harness.delivery_row().await;
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(parent.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let parent_session_id = parent
+            .session_id
+            .expect("reserve stamps a parent session id");
+        let original_parent_actor = harness
+            .sessions
+            .actor(parent_session_id)
+            .expect("the parked parent session remains registered");
+        let conn = harness.store.pool.get().await.unwrap();
+        let (child_run_id, child_session_id) = conn
+            .interact(move |connection| {
+                let (child_run_id, child_session_id): (String, String) = connection
+                    .query_row(
+                        "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                (
+                    RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap()),
+                    SessionId::from_uuid(Uuid::parse_str(&child_session_id).unwrap()),
+                )
+            })
+            .await
+            .unwrap();
+
+        answer_child_gate_after_restart(
+            &harness.executor,
+            &harness,
+            child_run_id,
+            child_session_id,
+            parent_session_id,
+        )
+        .await;
+        assert!(harness
+            .executor
+            .continue_after_child_terminal(child_run_id)
+            .await
+            .unwrap());
+
+        assert_eq!(
+            harness.run_state(parent_run_id).await,
+            RunState::AwaitingHuman
+        );
+        assert_eq!(harness.delivery_row().await.state, DeliveryState::Running);
+        assert_eq!(harness.active(), 1);
+        assert!(Arc::ptr_eq(
+            &original_parent_actor,
+            &harness
+                .sessions
+                .actor(parent_session_id)
+                .expect("the re-parked parent session must remain registered"),
+        ));
     }
 
     #[tokio::test]
