@@ -56,8 +56,8 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use roundhouse_bus::spawn_tree::SpawnTree;
 use roundhouse_core::{
-    BindingId, EventPayload, JobId, OnDegrade, SessionId, SessionSpec, TaskId, TaskKind,
-    TaskRunner, Tier, Timestamp, WorkspaceId,
+    BindingId, CancelReason, EventPayload, JobId, OnDegrade, Origin, SessionId, SessionSpec,
+    TaskError, TaskId, TaskKind, TaskOutput, TaskRunner, Tier, Timestamp, Usage, WorkspaceId,
 };
 use roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow;
 use roundhouse_flow::caps::ResourceCaps;
@@ -751,6 +751,8 @@ enum DeliveryError {
     /// longer ours.
     #[error("this delivery's state changed after it was leased")]
     LostClaim,
+    #[error("a terminal child workflow could not be joined to its parent task")]
+    ChildJoin,
 }
 
 impl DeliveryError {
@@ -769,6 +771,7 @@ impl DeliveryError {
             Self::Session(_) => "session_construction",
             Self::SessionTimeout => "session_construction_timeout",
             Self::LostClaim => "lost_claim",
+            Self::ChildJoin => "child_join",
         }
     }
 }
@@ -2043,6 +2046,7 @@ impl DeliveryExecutor {
                 PendingKind::ChildRun {
                     child_run_id,
                     child_session_id,
+                    parent_task_id,
                     dispatch_input,
                     inputs_secret_derived,
                     ..
@@ -2114,32 +2118,154 @@ impl DeliveryExecutor {
                             return park_child_after_failure(ChildDispatchFailure::Driver);
                         }
                     };
+                    let joined = self
+                        .join_terminal_child(
+                            item.step_id,
+                            session_id,
+                            parent_task_id,
+                            child_session_id,
+                            child_run_id,
+                            state,
+                            self.now(),
+                        )
+                        .await;
                     child_session
                         .teardown(&self.sessions, &self.resources.proxy)
                         .await;
-                    WorkDone {
-                        step_id: item.step_id,
-                        status: match state {
-                            RunState::Completed => WorkStatus::Completed,
-                            other => WorkStatus::Failed {
-                                message: format!(
-                                    "the child workflow run ended in state `{}`",
-                                    other.wire_name()
-                                ),
-                            },
-                        },
-                        // Task 3 owns loading the child's canonical report and
-                        // joining the parent's agent task to it.
-                        output: serde_json::Value::Null,
-                        output_is_secret_derived: false,
-                        task_id: None,
-                        first_task_seq: None,
-                        last_task_seq: None,
+                    match joined {
+                        Ok(joined) => joined,
+                        Err(_) => return park_child_after_failure(ChildDispatchFailure::Driver),
                     }
                 }
             });
         }
         PendingExecution::Done(done)
+    }
+
+    /// Converts one terminal child run into the terminal event for the parent
+    /// `agent` task that created it. The child report is read through flow's
+    /// single report-loading API; this driver never reads report SQL directly.
+    async fn join_terminal_child(
+        &self,
+        step_id: String,
+        parent_session_id: SessionId,
+        parent_task_id: TaskId,
+        child_session_id: SessionId,
+        child_run_id: RunId,
+        state: RunState,
+        now: Timestamp,
+    ) -> Result<WorkDone, DeliveryError> {
+        if !state.is_terminal() {
+            return Err(DeliveryError::ChildJoin);
+        }
+        let report = self
+            .with_connection(move |conn| {
+                roundhouse_flow::runs::load_report(conn, child_session_id, child_run_id)
+            })
+            .await?
+            .map_err(|_| DeliveryError::ChildJoin)?
+            .ok_or(DeliveryError::ChildJoin)?;
+        let report_json = serde_json::to_value(report).map_err(|_| DeliveryError::ChildJoin)?;
+        let output = match state {
+            RunState::Completed => report_json.clone(),
+            RunState::Failed | RunState::Cancelled => serde_json::Value::Null,
+            RunState::Running
+            | RunState::Paused
+            | RunState::Cancelling
+            | RunState::AwaitingHuman => return Err(DeliveryError::ChildJoin),
+        };
+        let runner = self.resources.runner;
+        let (first_task_seq, last_task_seq) = self
+            .with_connection(
+                move |conn| -> Result<(u64, u64), roundhouse_store::StoreError> {
+                    let txn = roundhouse_store::begin_immediate(conn)?;
+                    let first_task_seq: i64 = txn.query_row(
+                        "SELECT created_seq FROM tasks WHERE task_id = ?1 AND session_id = ?2",
+                        rusqlite::params![
+                            parent_task_id.to_string(),
+                            parent_session_id.to_string()
+                        ],
+                        |row| row.get(0),
+                    )?;
+                    let first_task_seq = u64::try_from(first_task_seq).map_err(|_| {
+                        roundhouse_store::StoreError::Interact(
+                            "a task projection held a negative creation sequence".into(),
+                        )
+                    })?;
+                    let event = match state {
+                        RunState::Completed => runner.record_task_completed(
+                            parent_session_id,
+                            0,
+                            now,
+                            parent_task_id,
+                            TaskOutput::Json(report_json),
+                            Usage::default(),
+                            EVENT_SCHEMA_V,
+                        ),
+                        RunState::Failed => runner.record_task_failed(
+                            parent_session_id,
+                            0,
+                            now,
+                            parent_task_id,
+                            TaskError {
+                                message: "the child workflow run ended in state `failed`".into(),
+                                category: "child_workflow_failed".into(),
+                            },
+                            false,
+                            EVENT_SCHEMA_V,
+                        ),
+                        RunState::Cancelled => runner.record_task_cancelled(
+                            parent_session_id,
+                            0,
+                            now,
+                            parent_task_id,
+                            Origin::System,
+                            CancelReason::User,
+                            EVENT_SCHEMA_V,
+                        ),
+                        RunState::Running
+                        | RunState::Paused
+                        | RunState::Cancelling
+                        | RunState::AwaitingHuman => {
+                            return Err(roundhouse_store::StoreError::Interact(
+                                "a nonterminal child entered terminal joining".into(),
+                            ))
+                        }
+                    };
+                    let last_task_seq = roundhouse_store::append_event_in_transaction(
+                        &txn,
+                        &event,
+                        &roundhouse_store::redact::Redactor::build(&[]),
+                    )?;
+                    txn.commit()?;
+                    Ok((first_task_seq, last_task_seq))
+                },
+            )
+            .await?
+            .map_err(|_| DeliveryError::ChildJoin)?;
+
+        let status = match state {
+            RunState::Completed => WorkStatus::Completed,
+            RunState::Failed => WorkStatus::Failed {
+                message: "the child workflow run ended in state `failed`".into(),
+            },
+            RunState::Cancelled => WorkStatus::Cancelled {
+                reason: "the child workflow run was cancelled".into(),
+            },
+            RunState::Running
+            | RunState::Paused
+            | RunState::Cancelling
+            | RunState::AwaitingHuman => return Err(DeliveryError::ChildJoin),
+        };
+        Ok(WorkDone {
+            step_id,
+            status,
+            output,
+            output_is_secret_derived: false,
+            task_id: Some(parent_task_id),
+            first_task_seq: Some(first_task_seq),
+            last_task_seq: Some(last_task_seq),
+        })
     }
 }
 
@@ -3986,6 +4112,26 @@ mod delivery_tests {
             .to_string()
     }
 
+    fn parent_using_child_report_workflow() -> String {
+        "name: parent-child-report\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: child\n    call: child-complete\n    with: {}\n  - id: after\n    \
+         needs: [child]\n    emit: { headline: \"${{ steps.child.output.headline }}\" }\n"
+            .to_string()
+    }
+
+    fn parent_continuing_after_failed_child_workflow() -> String {
+        "name: parent-child-failure\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: child\n    call: child-fails\n    with: {}\n    \
+         continue_on_error: true\n  - id: after\n    needs: [child]\n    emit: { continued: true }\n"
+            .to_string()
+    }
+
+    fn child_failing_workflow() -> String {
+        "name: child-fails\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: broken\n    emit: \"${{ no_such_fn(1) }}\"\n"
+            .to_string()
+    }
+
     fn child_parking_workflow() -> String {
         "name: child-gate\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
          escalate: fail\nsteps:\n  - id: approve\n    gate:\n      title: approve\n      \
@@ -4840,6 +4986,259 @@ mod delivery_tests {
                 .count(),
             1,
             "the real read task must be filed under the child session"
+        );
+    }
+
+    /// A completed child is a call result, not merely a terminal row: the
+    /// parent's next step consumes the report persisted in the child session.
+    #[tokio::test]
+    async fn a_completed_child_report_becomes_the_parent_call_output() {
+        let harness = harness(parent_using_child_report_workflow()).await;
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(
+            &child_source,
+            completing_workflow().replace("scheduled", "child-complete"),
+        )
+        .unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let row = harness.delivery_row().await;
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(row.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let conn = harness.store.pool.get().await.unwrap();
+        let after_output = conn
+            .interact(move |connection| {
+                recover_run(connection, parent_run_id)
+                    .unwrap()
+                    .steps
+                    .into_iter()
+                    .find(|step| step.step_id == "after")
+                    .and_then(|step| step.output)
+                    .map(|output| output.value_unredacted_for_resume().clone())
+            })
+            .await
+            .unwrap()
+            .expect("the next parent step is checkpointed with its child-report-derived output");
+
+        assert_eq!(row.state, DeliveryState::Delivered);
+        assert_eq!(after_output["headline"], "run completed: 1 steps");
+    }
+
+    /// A child run is refunded by its terminal `finish_run` path; joining it
+    /// must not refund a second time, and a nonfatal parent call must continue.
+    #[tokio::test]
+    async fn a_failed_child_fails_the_parent_call_without_a_second_refund() {
+        let harness = harness(parent_continuing_after_failed_child_workflow()).await;
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_failing_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let row = harness.delivery_row().await;
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(row.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let parent_session_id = row.session_id.expect("reserve stamps a session id");
+        let conn = harness.store.pool.get().await.unwrap();
+        let (parent_steps, child_refunded_at, parent_child_task_events) = conn
+            .interact(move |connection| {
+                let parent_steps = recover_run(connection, parent_run_id).unwrap().steps;
+                let child_run_id: String = connection
+                    .query_row(
+                        "SELECT id FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let child_run_id = RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap());
+                let child_refunded_at =
+                    roundhouse_flow::ledger::run_ledger(connection, child_run_id)
+                        .unwrap()
+                        .refunded_at;
+                let parent_child_task_events = connection
+                    .prepare("SELECT payload FROM events WHERE session_id = ?1 ORDER BY seq")
+                    .unwrap()
+                    .query_map([parent_session_id.to_string()], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|payload| {
+                        matches!(
+                            serde_json::from_str::<EventPayload>(payload).unwrap(),
+                            EventPayload::TaskFailed { .. }
+                        )
+                    })
+                    .count();
+                (parent_steps, child_refunded_at, parent_child_task_events)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(row.state, DeliveryState::Delivered);
+        assert_eq!(
+            parent_steps
+                .iter()
+                .find(|step| step.step_id == "child")
+                .expect("the failed child call is checkpointed")
+                .state,
+            roundhouse_flow::durability::StepRunState::Failed
+        );
+        assert_eq!(
+            parent_steps
+                .iter()
+                .find(|step| step.step_id == "after")
+                .expect("continue_on_error allows the next parent step")
+                .state,
+            roundhouse_flow::durability::StepRunState::Completed
+        );
+        assert!(
+            child_refunded_at.is_some(),
+            "the child terminal path refunded its grant"
+        );
+        assert_eq!(
+            parent_child_task_events, 1,
+            "the failed parent call has one terminal task event rather than attempting another refund"
+        );
+    }
+
+    /// The call task was created before child dispatch. Its terminal event must
+    /// use that exact task id and be appended in the parent session.
+    #[tokio::test]
+    async fn a_terminal_child_completes_its_parent_agent_task() {
+        let harness = harness_with_overlap_and_rules(
+            parent_calling_child_workflow(),
+            OverlapPolicy::Skip,
+            allow_read_rules(),
+        )
+        .await;
+        std::fs::write(harness.workspace_root.join("greeting.txt"), "hello child").unwrap();
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_reading_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let row = harness.delivery_row().await;
+        let parent_session_id = row.session_id.expect("reserve stamps a session id");
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(row.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let conn = harness.store.pool.get().await.unwrap();
+        let parent_events = conn
+            .interact(move |connection| {
+                connection
+                    .prepare(
+                        "SELECT task_id, seq, payload FROM events WHERE session_id = ?1 ORDER BY seq",
+                    )
+                    .unwrap()
+                    .query_map([parent_session_id.to_string()], |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap();
+        let agent_task_id = parent_events
+            .iter()
+            .find_map(|(task_id, _, payload)| {
+                matches!(
+                    serde_json::from_str::<EventPayload>(payload).unwrap(),
+                    EventPayload::TaskCreated {
+                        kind: TaskKind::Agent,
+                        ..
+                    }
+                )
+                .then(|| task_id.clone())
+                .flatten()
+            })
+            .expect("the call creates one parent agent task");
+        let terminal_events = parent_events
+            .iter()
+            .filter(|(task_id, _, payload)| {
+                task_id.as_deref() == Some(agent_task_id.as_str())
+                    && matches!(
+                        serde_json::from_str::<EventPayload>(payload).unwrap(),
+                        EventPayload::TaskCompleted { .. }
+                            | EventPayload::TaskFailed { .. }
+                            | EventPayload::TaskCancelled { .. }
+                    )
+            })
+            .count();
+        let task_event_bounds = parent_events
+            .iter()
+            .filter(|(task_id, _, payload)| {
+                task_id.as_deref() == Some(agent_task_id.as_str())
+                    && matches!(
+                        serde_json::from_str::<EventPayload>(payload).unwrap(),
+                        EventPayload::TaskCreated {
+                            kind: TaskKind::Agent,
+                            ..
+                        } | EventPayload::TaskCompleted { .. }
+                    )
+            })
+            .map(|(_, seq, _)| u64::try_from(*seq).expect("event sequences are nonnegative"))
+            .collect::<Vec<_>>();
+        let conn = harness.store.pool.get().await.unwrap();
+        let child_step_bounds = conn
+            .interact(move |connection| {
+                recover_run(connection, parent_run_id)
+                    .unwrap()
+                    .steps
+                    .into_iter()
+                    .find(|step| step.step_id == "child")
+                    .map(|step| (step.first_task_seq, step.last_task_seq))
+            })
+            .await
+            .unwrap()
+            .expect("the parent child step is checkpointed");
+
+        assert_eq!(
+            terminal_events, 1,
+            "the child must complete the original parent agent task exactly once"
+        );
+        assert_eq!(task_event_bounds.len(), 2);
+        assert_eq!(
+            child_step_bounds,
+            (Some(task_event_bounds[0]), Some(task_event_bounds[1])),
+            "the parent step records the original task creation through its terminal child join"
         );
     }
 
