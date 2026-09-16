@@ -1073,6 +1073,14 @@ pub enum ChildCallJoin {
     },
 }
 
+/// A durable lease token held by the one continuation permitted to resume a
+/// parent call. The token is deliberately opaque to callers; only the writer
+/// that acquired it may release or complete the claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildContinuationClaim {
+    token: Uuid,
+}
+
 impl ChildCallJoin {
     fn as_sql_str(self) -> &'static str {
         match self {
@@ -1222,6 +1230,84 @@ pub fn mark_workflow_child_call_joined_in_transaction(
             seq_to_sql(Some(terminal_task_seq))?,
             joined_at.as_unix_nanos(),
             child_run_id.to_string(),
+        ],
+    )? == 1)
+}
+
+/// Atomically elects one continuation for a terminal child call. A previous
+/// claimant may be replaced only after its lease expires, which makes a crash
+/// retryable without allowing concurrent resumption.
+pub fn claim_workflow_child_continuation_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+    child_run_id: RunId,
+    now: Timestamp,
+    lease_expires_at: Timestamp,
+) -> Result<Option<(WorkflowChildCall, ChildContinuationClaim)>, DurabilityError> {
+    let claim = ChildContinuationClaim {
+        token: Uuid::new_v4(),
+    };
+    if txn.execute(
+        "UPDATE workflow_child_call
+            SET continuation_state = 'claimed', continuation_claim_token = ?1,
+                continuation_lease_expires_at = ?2
+          WHERE child_run_id = ?3
+            AND (continuation_state = 'available'
+                 OR (continuation_state = 'claimed' AND continuation_lease_expires_at <= ?4))",
+        params![
+            claim.token.to_string(),
+            lease_expires_at.as_unix_nanos(),
+            child_run_id.to_string(),
+            now.as_unix_nanos(),
+        ],
+    )? == 0
+    {
+        return Ok(None);
+    }
+    let call = workflow_child_call_for_child_run(txn, child_run_id)?.ok_or(
+        DurabilityError::RunNotFound {
+            run_id: child_run_id,
+        },
+    )?;
+    Ok(Some((call, claim)))
+}
+
+/// Releases a lease after an interrupted or failed continuation. A retry may
+/// claim the call immediately; a stale owner cannot release a newer claim.
+pub fn release_workflow_child_continuation_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+    child_run_id: RunId,
+    claim: &ChildContinuationClaim,
+) -> Result<(), DurabilityError> {
+    txn.execute(
+        "UPDATE workflow_child_call
+            SET continuation_state = 'available', continuation_claim_token = NULL,
+                continuation_lease_expires_at = NULL
+          WHERE child_run_id = ?1 AND continuation_state = 'claimed'
+            AND continuation_claim_token = ?2",
+        params![child_run_id.to_string(), claim.token.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Makes a successfully resumed call permanently ineligible for another
+/// continuation. The token comparison prevents a stale lease owner from
+/// completing a newer retry's work.
+pub fn complete_workflow_child_continuation_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+    child_run_id: RunId,
+    claim: &ChildContinuationClaim,
+    now: Timestamp,
+) -> Result<bool, DurabilityError> {
+    Ok(txn.execute(
+        "UPDATE workflow_child_call
+            SET continuation_state = 'completed', continuation_claim_token = NULL,
+                continuation_lease_expires_at = NULL, continuation_completed_at = ?1
+          WHERE child_run_id = ?2 AND continuation_state = 'claimed'
+            AND continuation_claim_token = ?3",
+        params![
+            now.as_unix_nanos(),
+            child_run_id.to_string(),
+            claim.token.to_string(),
         ],
     )? == 1)
 }

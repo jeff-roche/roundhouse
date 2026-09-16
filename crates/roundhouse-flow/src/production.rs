@@ -21,7 +21,7 @@ use crate::job::Body;
 use crate::job_store::{resolve_job, resolve_job_version, RegisteredJob};
 use crate::parking::{CheckpointArtifact, CheckpointError, CheckpointRef, Checkpointer};
 use crate::parse::WorkflowDef;
-use roundhouse_core::{BlobRef, SessionId, Timestamp};
+use roundhouse_core::{BlobRef, SessionId, TaskId, TaskInput, Timestamp};
 
 /// A workflow host backed by registered immutable job versions in SQLite.
 ///
@@ -52,6 +52,17 @@ impl SessionTree for UnconfiguredSessionTree {
         _txn: &rusqlite::Transaction<'_>,
         _parent: SessionId,
         _child: &crate::durability::WorkflowRun,
+    ) -> Result<(), WorkflowHostError> {
+        Err(WorkflowHostError::SessionTreeUnavailable)
+    }
+
+    fn persist_parent_call_task(
+        &mut self,
+        _txn: &rusqlite::Transaction<'_>,
+        _parent: SessionId,
+        _created_at: Timestamp,
+        _task_id: TaskId,
+        _input: TaskInput,
     ) -> Result<(), WorkflowHostError> {
         Err(WorkflowHostError::SessionTreeUnavailable)
     }
@@ -249,6 +260,7 @@ impl WorkflowHost for SqliteWorkflowHost {
         called: &CalledWorkflow,
         parent_step: &WorkflowStepRun,
         parent_call: &WorkflowChildCall,
+        parent_task_input: TaskInput,
     ) -> Result<(), WorkflowHostError> {
         let txn = roundhouse_store::begin_immediate(conn)?;
         let result = self
@@ -261,6 +273,15 @@ impl WorkflowHost for SqliteWorkflowHost {
             .and_then(|()| {
                 crate::durability::checkpoint_step_in_transaction(&txn, parent_step)
                     .map_err(WorkflowHostError::from)
+            })
+            .and_then(|()| {
+                self.session_tree.persist_parent_call_task(
+                    &txn,
+                    parent,
+                    child.started_at,
+                    parent_call.parent_task_id,
+                    parent_task_input,
+                )
             })
             .and_then(|()| {
                 crate::durability::insert_workflow_child_call_in_transaction(&txn, parent_call)

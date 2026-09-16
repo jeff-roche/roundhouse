@@ -175,6 +175,17 @@ pub trait SessionTree: Send {
         child: &WorkflowRun,
     ) -> Result<(), WorkflowHostError>;
 
+    /// Persists the redacted parent task that represents a `call:` in the same
+    /// transaction as its child run and call association.
+    fn persist_parent_call_task(
+        &mut self,
+        txn: &rusqlite::Transaction<'_>,
+        parent: SessionId,
+        created_at: Timestamp,
+        task_id: TaskId,
+        input: TaskInput,
+    ) -> Result<(), WorkflowHostError>;
+
     /// Makes a committed child admission visible to runtime traversal.
     fn register_child(
         &mut self,
@@ -270,6 +281,7 @@ pub trait WorkflowHost: Checkpointer {
         called: &CalledWorkflow,
         parent_step: &WorkflowStepRun,
         parent_call: &WorkflowChildCall,
+        parent_task_input: TaskInput,
     ) -> Result<(), WorkflowHostError>;
 
     /// Drops the runtime edge [`Self::create_child_run`] registered, because
@@ -2011,6 +2023,11 @@ impl<H: WorkflowHost> Loop<'_, H> {
             parent_task_id: task_id,
             join: ChildCallJoin::Pending,
         };
+        let parent_task_input = TaskInput::Json(serde_json::json!({
+            "workflow": workflow,
+            "child_run_id": child_run_id.to_string(),
+            "with": logged_with,
+        }));
         if let Err(e) = self.host.create_child_run(
             self.conn,
             self.session_id,
@@ -2018,13 +2035,14 @@ impl<H: WorkflowHost> Loop<'_, H> {
             &called,
             &parent_step,
             &parent_call,
+            parent_task_input.clone(),
         ) {
             return CallStep::Completed(StepOutcome::failed(
                 &step.id,
                 format!("`call:` could not be funded: {e}"),
             ));
         }
-        executor.sink.emit(
+        executor.sink.emit_already_persisted(
             task_id,
             None,
             TaskKind::Agent,
@@ -2032,11 +2050,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 kind: TaskKind::Agent,
                 parent: None,
                 origin: Origin::System,
-                input: TaskInput::Json(serde_json::json!({
-                    "workflow": workflow,
-                    "child_run_id": child_run_id.to_string(),
-                    "with": logged_with,
-                })),
+                input: parent_task_input,
             },
         );
 
@@ -2478,6 +2492,7 @@ mod tests {
             _called: &CalledWorkflow,
             _parent_step: &WorkflowStepRun,
             _parent_call: &WorkflowChildCall,
+            _parent_task_input: TaskInput,
         ) -> Result<(), WorkflowHostError> {
             unreachable!("these tests run no `call:` step")
         }

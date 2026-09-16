@@ -4,7 +4,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use roundhouse_bus::spawn_tree::SpawnTree;
-use roundhouse_core::{EventPayload, JobId, SessionId, SessionSpec, SessionState, TaskRunner};
+use roundhouse_core::{
+    EventPayload, JobId, Origin, SessionId, SessionSpec, SessionState, TaskId, TaskInput, TaskKind,
+    TaskRunner, Timestamp,
+};
 use roundhouse_flow::compose::MAX_DIRECT_CHILD_CALLS;
 use roundhouse_flow::durability::WorkflowRun;
 use roundhouse_flow::exec::run_loop::{SessionTree, WorkflowHostError};
@@ -71,6 +74,33 @@ impl SessionTree for WorkflowSessionTree {
             0,
             child.started_at,
             Box::new(spec),
+            1,
+        );
+        roundhouse_store::append_event_in_transaction(
+            txn,
+            &event,
+            &roundhouse_store::redact::Redactor::build(&[]),
+        )?;
+        Ok(())
+    }
+
+    fn persist_parent_call_task(
+        &mut self,
+        txn: &rusqlite::Transaction<'_>,
+        parent: SessionId,
+        created_at: Timestamp,
+        task_id: TaskId,
+        input: TaskInput,
+    ) -> Result<(), WorkflowHostError> {
+        let event = self.runner.record_task_created(
+            parent,
+            0,
+            created_at,
+            task_id,
+            TaskKind::Agent,
+            None,
+            Origin::System,
+            input,
             1,
         );
         roundhouse_store::append_event_in_transaction(

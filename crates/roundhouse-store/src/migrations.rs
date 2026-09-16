@@ -777,6 +777,18 @@ CREATE INDEX workflow_child_call_parent_idx
     WHERE join_state = 'pending';
 "#;
 
+/// Phase 8, Task 4 fix round 1: a continuation lease elects exactly one
+/// process to resume a parent after its child becomes terminal. A lease is
+/// intentionally recoverable: after a crash its expiry makes the call
+/// claimable again, while a completed continuation is never re-driven.
+const MIGRATION_0015_WORKFLOW_CHILD_CALL_CONTINUATIONS: &str = r#"
+ALTER TABLE workflow_child_call ADD COLUMN continuation_state TEXT NOT NULL DEFAULT 'available'
+    CHECK (continuation_state IN ('available', 'claimed', 'completed'));
+ALTER TABLE workflow_child_call ADD COLUMN continuation_claim_token TEXT;
+ALTER TABLE workflow_child_call ADD COLUMN continuation_lease_expires_at INTEGER;
+ALTER TABLE workflow_child_call ADD COLUMN continuation_completed_at INTEGER;
+"#;
+
 pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(MIGRATION_0001_INITIAL_SCHEMA),
@@ -793,5 +805,6 @@ pub fn migrations() -> Migrations<'static> {
         M::up("ALTER TABLE workflow_run ADD COLUMN checkpoint_blob_ref TEXT;"),
         M::up(MIGRATION_0013_TRIGGER_BINDINGS_AND_DELIVERIES),
         M::up(MIGRATION_0014_WORKFLOW_CHILD_CALLS),
+        M::up(MIGRATION_0015_WORKFLOW_CHILD_CALL_CONTINUATIONS),
     ])
 }

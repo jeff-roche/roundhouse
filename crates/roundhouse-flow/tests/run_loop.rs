@@ -223,6 +223,7 @@ impl WorkflowHost for FakeHost {
         called: &CalledWorkflow,
         parent_step: &roundhouse_flow::durability::WorkflowStepRun,
         parent_call: &roundhouse_flow::durability::WorkflowChildCall,
+        _parent_task_input: TaskInput,
     ) -> Result<(), WorkflowHostError> {
         let txn = roundhouse_store::begin_immediate(conn)?;
         if let Err(error) =

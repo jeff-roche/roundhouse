@@ -329,6 +329,20 @@ pub trait TaskSink {
         kind: TaskKind,
         payload: EventPayload,
     );
+
+    /// Records an event that the production host committed in the transaction
+    /// which established its durable control-flow state. Test and in-memory
+    /// sinks retain it for observability; the daemon's buffered sink suppresses
+    /// it because it is already in the append-only log.
+    fn emit_already_persisted(
+        &mut self,
+        task_id: TaskId,
+        parent: Option<TaskId>,
+        kind: TaskKind,
+        payload: EventPayload,
+    ) {
+        self.emit(task_id, parent, kind, payload);
+    }
 }
 
 /// Finding 8's fix: everything the `${{ }}` context needs beyond `steps`

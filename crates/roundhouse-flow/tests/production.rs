@@ -84,6 +84,17 @@ impl SessionTree for RecordingSessionTree {
         Ok(())
     }
 
+    fn persist_parent_call_task(
+        &mut self,
+        _txn: &rusqlite::Transaction<'_>,
+        _parent: SessionId,
+        _created_at: Timestamp,
+        _task_id: roundhouse_core::TaskId,
+        _input: roundhouse_core::TaskInput,
+    ) -> Result<(), WorkflowHostError> {
+        Ok(())
+    }
+
     fn register_child(
         &mut self,
         parent: SessionId,

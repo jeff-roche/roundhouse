@@ -62,8 +62,11 @@ use roundhouse_core::{
 use roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow;
 use roundhouse_flow::caps::ResourceCaps;
 use roundhouse_flow::durability::{
-    insert_workflow_run, mark_workflow_child_call_joined_in_transaction, recover_run,
-    workflow_child_call_for_child_run, ChildCallJoin, RunState, WorkflowChildCall, WorkflowRun,
+    claim_workflow_child_continuation_in_transaction,
+    complete_workflow_child_continuation_in_transaction, insert_workflow_run,
+    mark_workflow_child_call_joined_in_transaction, recover_run,
+    release_workflow_child_continuation_in_transaction, workflow_child_call_for_child_run,
+    ChildCallJoin, ChildContinuationClaim, RunState, WorkflowChildCall, WorkflowRun,
 };
 use roundhouse_flow::exec::run_loop::{
     PendingKind, PendingWork, Resume, RunOutcome, WorkDone, WorkStatus,
@@ -714,6 +717,7 @@ const DELIVERY_LEASE: std::time::Duration = std::time::Duration::from_secs(300);
 /// `workflow_host::WorkflowSessionTree::persist_child_session`, the other
 /// daemon-side minter of workflow-related events.
 const EVENT_SCHEMA_V: u16 = 1;
+const CHILD_CONTINUATION_LEASE_NANOS: i64 = 30_000_000_000;
 
 /// Why one delivery could not be carried through to a completed run.
 ///
@@ -906,6 +910,17 @@ impl TaskSink for BufferedTaskSink {
     ) {
         self.emitted.push((task_id, payload));
     }
+
+    fn emit_already_persisted(
+        &mut self,
+        _task_id: TaskId,
+        _parent: Option<TaskId>,
+        _kind: TaskKind,
+        _payload: EventPayload,
+    ) {
+        // `WorkflowSessionTree::persist_parent_call_task` committed this event
+        // with the child-call association, so buffering it would duplicate it.
+    }
 }
 
 /// Appends a [`BufferedTaskSink`]'s events to `session_id`'s log.
@@ -1070,6 +1085,8 @@ pub(crate) struct DeliveryExecutor {
     clock: Arc<dyn ClockSource + Send + Sync>,
     #[cfg(test)]
     segment_gap_gate: Option<Arc<SegmentGapGate>>,
+    #[cfg(test)]
+    continuation_gap_gate: Option<Arc<SegmentGapGate>>,
 }
 
 impl DeliveryExecutor {
@@ -1091,6 +1108,8 @@ impl DeliveryExecutor {
             clock,
             #[cfg(test)]
             segment_gap_gate: None,
+            #[cfg(test)]
+            continuation_gap_gate: None,
         }
     }
 
@@ -1634,6 +1653,27 @@ impl DeliveryExecutor {
             on_degrade: OnDegrade::Refuse,
             parent: None,
         };
+        let session_spec = spec.clone();
+        let runner = self.resources.runner;
+        self.with_connection(move |conn| {
+            let txn = roundhouse_store::begin_immediate(conn)?;
+            let event = runner.record_session_created(
+                session_id,
+                0,
+                now,
+                Box::new(session_spec),
+                EVENT_SCHEMA_V,
+            );
+            roundhouse_store::append_event_in_transaction(
+                &txn,
+                &event,
+                &roundhouse_store::redact::Redactor::build(&[]),
+            )?;
+            txn.commit()?;
+            Ok::<_, roundhouse_store::StoreError>(())
+        })
+        .await?
+        .map_err(|_| DeliveryError::Session("record"))?;
         // Fix round 3: `create_headless_session` bounds its OWN construction
         // now (against the identical wedged-MCP-server / hung-isolation-probe
         // risk an unattended, repeating caller cannot afford to park a
@@ -1698,6 +1738,7 @@ impl DeliveryExecutor {
             workspace_root,
             run_ctx,
             now,
+            None,
         )
         .await
     }
@@ -1871,6 +1912,7 @@ impl DeliveryExecutor {
             workspace_root,
             run_ctx,
             boot,
+            None,
         )
         .await
     }
@@ -1913,6 +1955,7 @@ impl DeliveryExecutor {
         workspace_root: PathBuf,
         run_ctx: RunContext,
         mut now: Timestamp,
+        mut resume: Option<Resume>,
     ) -> Result<Result<DrivenRun, roundhouse_flow::exec::run_loop::RunLoopError>, DeliveryError>
     {
         let def = {
@@ -1933,7 +1976,6 @@ impl DeliveryExecutor {
         };
 
         let runner = self.resources.runner;
-        let mut resume: Option<Resume> = None;
         loop {
             let def = Arc::clone(&def);
             let segment_run_ctx = run_ctx.clone();
@@ -2116,6 +2158,7 @@ impl DeliveryExecutor {
                         workspace_root.to_path_buf(),
                         child_ctx,
                         self.now(),
+                        None,
                     ))
                     .await;
                     let state = match child_outcome {
@@ -2334,29 +2377,122 @@ impl DeliveryExecutor {
                 })
                 .await?
                 .map_err(|_| DeliveryError::ChildJoin)?;
-            let Some((call, done)) = self
-                .join_terminal_child(child_run_id, state, self.now())
-                .await?
-            else {
+            if !state.is_terminal() {
                 return Ok(continued);
-            };
-            let parent_state = self
+            }
+            let now = self.now();
+            let lease_expires_at = Timestamp::from_unix_nanos(
+                now.as_unix_nanos()
+                    .saturating_add(CHILD_CONTINUATION_LEASE_NANOS),
+            );
+            let claimed = self
                 .with_connection(move |conn| {
-                    recover_run(conn, call.parent_run_id).map(|run| run.run.state)
+                    let txn = roundhouse_store::begin_immediate(conn)?;
+                    let claim = claim_workflow_child_continuation_in_transaction(
+                        &txn,
+                        child_run_id,
+                        now,
+                        lease_expires_at,
+                    )
+                    .map_err(|error| roundhouse_store::StoreError::Interact(error.to_string()))?;
+                    txn.commit()?;
+                    Ok::<_, roundhouse_store::StoreError>(claim)
                 })
                 .await?
                 .map_err(|_| DeliveryError::ChildJoin)?;
-            if parent_state.is_terminal() {
-                child_run_id = call.parent_run_id;
-                continue;
+            let Some((_, claim)) = claimed else {
+                return Ok(continued);
+            };
+            let outcome = async {
+                let Some((call, done)) = self.join_terminal_child(child_run_id, state, now).await?
+                else {
+                    return Err(DeliveryError::ChildJoin);
+                };
+                #[cfg(test)]
+                if let Some(gate) = &self.continuation_gap_gate {
+                    gate.enter().await;
+                }
+                let parent_state = self
+                    .with_connection(move |conn| {
+                        recover_run(conn, call.parent_run_id).map(|run| run.run.state)
+                    })
+                    .await?
+                    .map_err(|_| DeliveryError::ChildJoin)?;
+                if parent_state.is_terminal() {
+                    return Ok((call.parent_run_id, None));
+                }
+                let parent_run_id = call.parent_run_id;
+                let driven = self.resume_parent_after_child_call(call, done).await?;
+                Ok((parent_run_id, Some(driven)))
+            }
+            .await;
+            let (parent_run_id, driven) = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.release_child_continuation_claim(child_run_id, &claim)
+                        .await;
+                    return Err(error);
+                }
+            };
+            let completed = self
+                .complete_child_continuation_claim(child_run_id, &claim, self.now())
+                .await?;
+            if !completed {
+                return Ok(continued);
             }
             continued = true;
-            let parent_run_id = call.parent_run_id;
-            match self.resume_parent_after_child_call(call, done).await? {
-                RunOutcome::Terminal { .. } => child_run_id = parent_run_id,
-                RunOutcome::Parked(_) | RunOutcome::AwaitingWork { .. } => return Ok(continued),
+            match driven {
+                None | Some(DrivenRun::Outcome(RunOutcome::Terminal { .. })) => {
+                    child_run_id = parent_run_id;
+                }
+                Some(DrivenRun::ChildParked | DrivenRun::Outcome(RunOutcome::Parked(_))) => {
+                    return Ok(continued);
+                }
+                Some(DrivenRun::Outcome(RunOutcome::AwaitingWork { .. })) => {
+                    return Err(DeliveryError::ChildParentResume);
+                }
             }
         }
+    }
+
+    async fn release_child_continuation_claim(
+        &self,
+        child_run_id: RunId,
+        claim: &ChildContinuationClaim,
+    ) {
+        let claim = claim.clone();
+        let _ = self
+            .with_connection(move |conn| {
+                let txn = roundhouse_store::begin_immediate(conn)?;
+                release_workflow_child_continuation_in_transaction(&txn, child_run_id, &claim)
+                    .map_err(|error| roundhouse_store::StoreError::Interact(error.to_string()))?;
+                txn.commit()?;
+                Ok::<_, roundhouse_store::StoreError>(())
+            })
+            .await;
+    }
+
+    async fn complete_child_continuation_claim(
+        &self,
+        child_run_id: RunId,
+        claim: &ChildContinuationClaim,
+        now: Timestamp,
+    ) -> Result<bool, DeliveryError> {
+        let claim = claim.clone();
+        self.with_connection(move |conn| {
+            let txn = roundhouse_store::begin_immediate(conn)?;
+            let completed = complete_workflow_child_continuation_in_transaction(
+                &txn,
+                child_run_id,
+                &claim,
+                now,
+            )
+            .map_err(|error| roundhouse_store::StoreError::Interact(error.to_string()))?;
+            txn.commit()?;
+            Ok::<_, roundhouse_store::StoreError>(completed)
+        })
+        .await?
+        .map_err(|_| DeliveryError::ChildJoin)
     }
 
     #[allow(
@@ -2367,22 +2503,16 @@ impl DeliveryExecutor {
         &self,
         call: WorkflowChildCall,
         done: WorkDone,
-    ) -> Result<RunOutcome, DeliveryError> {
+    ) -> Result<DrivenRun, DeliveryError> {
         let parent_run = self
             .with_connection(move |conn| recover_run(conn, call.parent_run_id).map(|run| run.run))
-            .await?
-            .map_err(|_| DeliveryError::ChildParentRun)?;
-        let child_session_id = self
-            .with_connection(move |conn| {
-                recover_run(conn, call.child_run_id).map(|run| run.run.session_id)
-            })
             .await?
             .map_err(|_| DeliveryError::ChildParentRun)?;
         let parent_spec = self
             .with_connection(move |conn| {
                 let mut statement = conn
                     .prepare("SELECT payload FROM events WHERE session_id = ?1 ORDER BY seq ASC")?;
-                let payloads = statement.query_map([child_session_id.to_string()], |row| {
+                let payloads = statement.query_map([parent_run.session_id.to_string()], |row| {
                     row.get::<_, String>(0)
                 })?;
                 let spec = payloads
@@ -2405,44 +2535,49 @@ impl DeliveryExecutor {
             .resolve_by_id(parent_spec.workspace)
             .map_err(|error| DeliveryError::Workspace(error.to_string()))?;
         let root = workspace.root.clone();
-        let runner = self.resources.runner;
-        let tree = Arc::clone(&self.spawn_tree);
-        let now = self.now();
-        self.with_connection(move |conn| {
-            let mut sink = BufferedTaskSink::default();
-            let mut host = SqliteWorkflowHost::with_session_tree(
-                root.clone(),
-                Box::new(WorkflowSessionTree::new(tree, runner, parent_spec.clone())),
-            );
-            let run_ctx = RunContext {
-                inputs: serde_json::Value::Null,
-                inputs_secret_derived: false,
-                vars: serde_json::Value::Null,
-                secrets: HashMap::new(),
-                run_id: parent_run.id,
-                previous_report: None,
-                env_allowlist: EnvAllowlist::deny_all(),
-                worktree_provider: Some(Arc::new(SandboxWorktreeProvider::new(root))),
-            };
-            let outcome = run_workflow_from_definition(
-                conn,
-                &host.resolve_run_definition(conn, parent_run.id)?,
+        let session = create_headless_session(
+            &self.resources,
+            &self.sessions,
+            parent_run.session_id,
+            parent_spec.clone(),
+            root.clone(),
+            workspace.root_device,
+            workspace.root_inode,
+        )
+        .await
+        .map_err(|error| match error {
+            CreateHeadlessSessionError::Timeout => DeliveryError::SessionTimeout,
+            other => DeliveryError::Session(other.kind()),
+        })?;
+        let run_ctx = RunContext {
+            inputs: serde_json::Value::Null,
+            inputs_secret_derived: false,
+            vars: serde_json::Value::Null,
+            secrets: HashMap::new(),
+            run_id: parent_run.id,
+            previous_report: None,
+            env_allowlist: EnvAllowlist::deny_all(),
+            worktree_provider: Some(Arc::new(SandboxWorktreeProvider::new(root.clone()))),
+        };
+        let result = self
+            .drive_run_to_completion(
                 parent_run.id,
-                &mut sink,
-                &mut host,
+                parent_run.session_id,
+                &session,
+                parent_spec,
+                root,
                 run_ctx,
-                now,
+                self.now(),
                 Some(Resume::Work(vec![done])),
-            );
-            flush_task_events(conn, runner, parent_run.session_id, now, sink).map_err(|error| {
-                roundhouse_flow::exec::run_loop::RunLoopError::from(
-                    roundhouse_flow::exec::run_loop::WorkflowHostError::from(error),
-                )
-            })?;
-            outcome
-        })
-        .await?
-        .map_err(|_| DeliveryError::ChildParentResume)
+            )
+            .await?
+            .map_err(|_| DeliveryError::ChildParentResume)?;
+        if matches!(result, DrivenRun::Outcome(RunOutcome::Terminal { .. })) {
+            session
+                .teardown(&self.sessions, &self.resources.proxy)
+                .await;
+        }
+        Ok(result)
     }
 }
 
@@ -4329,6 +4464,13 @@ mod delivery_tests {
             .to_string()
     }
 
+    fn parent_calling_child_gate_then_read_workflow() -> String {
+        "name: parent-call-gate-then-read\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: child\n    call: child-gate\n    with: {}\n  - id: after\n    \
+         needs: [child]\n    tool: read\n    with: { path: greeting.txt }\n"
+            .to_string()
+    }
+
     fn child_undrivable_workflow() -> String {
         "name: child-undrivable\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
          escalate: fail\nsteps:\n  - id: a\n    needs: [b]\n    emit: { x: 1 }\n  - id: b\n    \
@@ -4419,6 +4561,7 @@ mod delivery_tests {
         stored: StoredBinding,
         delivery: TriggerDelivery,
         workspace_root: PathBuf,
+        policy_rules: crate::session_bootstrap::PolicyRuleSource,
     }
 
     impl Harness {
@@ -4556,6 +4699,46 @@ mod delivery_tests {
                 Arc::clone(&sessions),
                 Arc::clone(&registry),
                 Arc::clone(&self.resources.spawn_tree),
+                Arc::new(FixedClock(instant())),
+            );
+            (executor, registry, sessions)
+        }
+
+        async fn restart_executor_with_reconciled_resources(
+            &self,
+        ) -> (
+            DeliveryExecutor,
+            Arc<InMemoryRunRegistry>,
+            Arc<SessionRegistry>,
+        ) {
+            let registry = Arc::new(InMemoryRunRegistry::new());
+            let sessions = Arc::new(SessionRegistry::new());
+            let workspaces = Arc::new(
+                WorkspaceRegistry::open(
+                    roundhouse_store::open(&self._dir.path().join("events.db"))
+                        .await
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            );
+            let resources = Arc::new(
+                daemon_resources_with_rules(
+                    self._dir.path(),
+                    Some(workspaces),
+                    Arc::clone(&self.policy_rules),
+                )
+                .await,
+            );
+            crate::boot::reconcile_spawn_tree_at_boot(&self.store, &resources.spawn_tree)
+                .await
+                .unwrap();
+            let executor = DeliveryExecutor::new(
+                self.store.clone(),
+                Arc::clone(&resources),
+                Arc::clone(&sessions),
+                Arc::clone(&registry),
+                Arc::clone(&resources.spawn_tree),
                 Arc::new(FixedClock(instant())),
             );
             (executor, registry, sessions)
@@ -4841,8 +5024,12 @@ mod delivery_tests {
 
         let sessions = Arc::new(SessionRegistry::new());
         let resources = Arc::new(
-            daemon_resources_with_rules(dir.path(), Some(Arc::clone(&workspaces)), policy_rules)
-                .await,
+            daemon_resources_with_rules(
+                dir.path(),
+                Some(Arc::clone(&workspaces)),
+                Arc::clone(&policy_rules),
+            )
+            .await,
         );
         let executor = DeliveryExecutor::new(
             store.clone(),
@@ -4863,6 +5050,7 @@ mod delivery_tests {
             stored,
             delivery,
             workspace_root,
+            policy_rules,
         }
     }
 
@@ -4899,14 +5087,15 @@ mod delivery_tests {
     }
 
     async fn answer_child_gate_after_restart(
+        executor: &DeliveryExecutor,
         harness: &Harness,
         child_run_id: RunId,
         child_session_id: SessionId,
         parent_session_id: SessionId,
     ) {
         let root = harness.workspace_root.clone();
-        let tree = Arc::clone(&harness.resources.spawn_tree);
-        let runner = harness.resources.runner;
+        let tree = Arc::clone(&executor.resources.spawn_tree);
+        let runner = executor.resources.runner;
         let workspace = harness.stored.workspace;
         let conn = harness.store.pool.get().await.unwrap();
         conn.interact(move |connection| {
@@ -5881,7 +6070,8 @@ mod delivery_tests {
             .await
             .unwrap();
 
-        let (fresh, _registry, _sessions) = harness.fresh_executor_after_restart();
+        let (fresh, _registry, _sessions) =
+            harness.restart_executor_with_reconciled_resources().await;
         assert!(
             !fresh
                 .continue_after_child_terminal(child_run_id)
@@ -5920,7 +6110,7 @@ mod delivery_tests {
             "the parent task remains unfinished"
         );
         assert_eq!(
-            harness.resources.spawn_tree.direct_children(
+            fresh.resources.spawn_tree.direct_children(
                 harness
                     .delivery_row()
                     .await
@@ -5975,7 +6165,10 @@ mod delivery_tests {
             .await
             .unwrap();
 
+        let (fresh, _registry, _sessions) =
+            harness.restart_executor_with_reconciled_resources().await;
         answer_child_gate_after_restart(
+            &fresh,
             &harness,
             child_run_id,
             child_session_id,
@@ -6003,7 +6196,6 @@ mod delivery_tests {
             "the call hand-off is durable before restart"
         );
 
-        let (fresh, _registry, _sessions) = harness.fresh_executor_after_restart();
         assert!(fresh
             .continue_after_child_terminal(child_run_id)
             .await
@@ -6060,6 +6252,319 @@ mod delivery_tests {
             child_refunds, 1,
             "finish_run retains ownership of one refund"
         );
+    }
+
+    #[tokio::test]
+    async fn a_call_task_creation_rolls_back_with_its_child_association() {
+        let harness = harness(parent_calling_child_gate_workflow()).await;
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_parking_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_call_task_creation
+                     BEFORE INSERT ON events
+                     WHEN NEW.payload LIKE '%TaskCreated%'
+                     BEGIN SELECT RAISE(ABORT, 'task creation refused'); END;",
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let conn = harness.store.pool.get().await.unwrap();
+        let (child_runs, calls, agent_tasks) = conn
+            .interact(move |connection| {
+                let child_runs: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM workflow_run WHERE parent_run_id IS NOT NULL",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let calls: i64 = connection
+                    .query_row("SELECT COUNT(*) FROM workflow_child_call", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                let agent_tasks: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM tasks WHERE kind = 'agent'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                (child_runs, calls, agent_tasks)
+            })
+            .await
+            .unwrap();
+        assert_eq!(child_runs, 0);
+        assert_eq!(calls, 0);
+        assert_eq!(agent_tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_child_continuations_drive_the_following_effect_once() {
+        let harness = harness_with_overlap_and_rules(
+            parent_calling_child_gate_then_read_workflow(),
+            OverlapPolicy::Skip,
+            allow_read_rules(),
+        )
+        .await;
+        std::fs::write(harness.workspace_root.join("greeting.txt"), "once").unwrap();
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_parking_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let parent = harness.delivery_row().await;
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(parent.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let parent_session_id = parent
+            .session_id
+            .expect("reserve stamps a parent session id");
+        let conn = harness.store.pool.get().await.unwrap();
+        let (child_run_id, child_session_id, parent_job_id, child_job_id, parent_spec, child_spec) =
+            conn.interact(move |connection| {
+                let (child_run_id, child_session_id, child_job_id) = connection
+                    .query_row(
+                        "SELECT id, session_id, job_id FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| {
+                            Ok((
+                                RunId::from_uuid(
+                                    Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
+                                ),
+                                SessionId::from_uuid(
+                                    Uuid::parse_str(&row.get::<_, String>(1)?).unwrap(),
+                                ),
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                let parent_job_id: String = connection
+                    .query_row(
+                        "SELECT job_id FROM workflow_run WHERE id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let session_spec = |session_id: SessionId| {
+                    let mut statement = connection
+                        .prepare(
+                            "SELECT payload FROM events WHERE session_id = ?1 ORDER BY seq ASC",
+                        )
+                        .unwrap();
+                    let spec = statement
+                        .query_map([session_id.to_string()], |row| row.get::<_, String>(0))
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .find_map(|payload| match serde_json::from_str(&payload).ok()? {
+                            EventPayload::SessionCreated { spec } => Some(*spec),
+                            _ => None,
+                        })
+                        .expect("session must have a SessionCreated event");
+                    spec
+                };
+                (
+                    child_run_id,
+                    child_session_id,
+                    parent_job_id,
+                    child_job_id,
+                    session_spec(parent_session_id),
+                    session_spec(child_session_id),
+                )
+            })
+            .await
+            .unwrap();
+        assert_ne!(
+            parent_job_id, child_job_id,
+            "parent and child use different jobs"
+        );
+        assert_eq!(parent_spec.parent, None);
+        assert_eq!(child_spec.parent, Some(parent_session_id));
+        let (mut fresh, _registry, _sessions) =
+            harness.restart_executor_with_reconciled_resources().await;
+        answer_child_gate_after_restart(
+            &fresh,
+            &harness,
+            child_run_id,
+            child_session_id,
+            parent_session_id,
+        )
+        .await;
+
+        let gate = Arc::new(SegmentGapGate::new());
+        fresh.segment_gap_gate = Some(Arc::clone(&gate));
+        let first_executor = fresh.clone();
+        let first = tokio::spawn(async move {
+            first_executor
+                .continue_after_child_terminal(child_run_id)
+                .await
+        });
+        for _ in 0..100_000 {
+            if gate.entrants() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            gate.entrants(),
+            1,
+            "the first continuation reaches its following effect"
+        );
+
+        assert!(
+            !fresh
+                .continue_after_child_terminal(child_run_id)
+                .await
+                .unwrap(),
+            "a concurrent continuation must not resume the same parent"
+        );
+        gate.release(1);
+        assert!(first.await.unwrap().unwrap());
+
+        let conn = harness.store.pool.get().await.unwrap();
+        let (state, reads) = conn
+            .interact(move |connection| {
+                let state = recover_run(connection, parent_run_id).unwrap().run.state;
+                let reads: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND payload LIKE '%TaskCreated%' AND payload LIKE '%Read%'",
+                        [parent_session_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                (state, reads)
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, RunState::Completed);
+        assert_eq!(reads, 1, "the following effect is dispatched exactly once");
+    }
+
+    #[tokio::test]
+    async fn an_expired_continuation_claim_retries_after_a_crash_between_join_and_resume() {
+        let harness = harness_with_overlap_and_rules(
+            parent_calling_child_gate_then_read_workflow(),
+            OverlapPolicy::Skip,
+            allow_read_rules(),
+        )
+        .await;
+        std::fs::write(harness.workspace_root.join("greeting.txt"), "retry").unwrap();
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_parking_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let parent = harness.delivery_row().await;
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(parent.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let parent_session_id = parent
+            .session_id
+            .expect("reserve stamps a parent session id");
+        let conn = harness.store.pool.get().await.unwrap();
+        let (child_run_id, child_session_id) = conn
+            .interact(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| {
+                            Ok((
+                                RunId::from_uuid(
+                                    Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
+                                ),
+                                SessionId::from_uuid(
+                                    Uuid::parse_str(&row.get::<_, String>(1)?).unwrap(),
+                                ),
+                            ))
+                        },
+                    )
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+        let (mut fresh, _registry, _sessions) =
+            harness.restart_executor_with_reconciled_resources().await;
+        answer_child_gate_after_restart(
+            &fresh,
+            &harness,
+            child_run_id,
+            child_session_id,
+            parent_session_id,
+        )
+        .await;
+
+        let gate = Arc::new(SegmentGapGate::new());
+        fresh.continuation_gap_gate = Some(Arc::clone(&gate));
+        let stalled_executor = fresh.clone();
+        let stalled = tokio::spawn(async move {
+            stalled_executor
+                .continue_after_child_terminal(child_run_id)
+                .await
+        });
+        for _ in 0..100_000 {
+            if gate.entrants() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            gate.entrants(),
+            1,
+            "the child task was joined before parent resumption"
+        );
+        stalled.abort();
+        assert!(stalled.await.is_err());
+
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            connection
+                .execute(
+                    "UPDATE workflow_child_call SET continuation_lease_expires_at = 0 WHERE child_run_id = ?1",
+                    [child_run_id.to_string()],
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        fresh.continuation_gap_gate = None;
+        assert!(fresh
+            .continue_after_child_terminal(child_run_id)
+            .await
+            .unwrap());
+
+        assert_eq!(harness.run_state(parent_run_id).await, RunState::Completed);
     }
 
     #[tokio::test(flavor = "current_thread")]
