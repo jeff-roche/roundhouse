@@ -81,17 +81,19 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 
-/// Which of §8.11's three sources produced this human wait.
+/// Which of §8.11's sources produced this human wait, or which recovery
+/// path did.
 ///
-/// These line up 1:1 with `roundhouse_core::SuspendReason`'s already-frozen
-/// variants — [`Gate`](Self::Gate) with `WorkflowGate { step_ref }`,
-/// [`PermissionEscalate`](Self::PermissionEscalate) with
+/// These map four-onto-three with `roundhouse_core::SuspendReason`'s
+/// already-frozen variants: [`Gate`](Self::Gate) and
+/// [`CrashRecovery`](Self::CrashRecovery) both map to `WorkflowGate { step_ref }`,
+/// [`PermissionEscalate`](Self::PermissionEscalate) maps to
 /// `AwaitingApproval { rule, params_digest }`, and
-/// [`Elicitation`](Self::Elicitation) with `AwaitingElicitation { schema }`
-/// — so recording one of these waits needs no new suspend reason. Those
-/// core variants carry payloads (the matched rule, the params digest, the
-/// step ref) that only the recording site holds, which is why this enum is
-/// the *source label* and not a conversion.
+/// [`Elicitation`](Self::Elicitation) maps to `AwaitingElicitation { schema }`.
+/// Recording one of these waits needs no new suspend reason. Those core
+/// variants carry payloads (the matched rule, the params digest, the step
+/// ref) that only the recording site holds, which is why this enum is the
+/// *source label* and not a conversion.
 ///
 /// Keeping the source as a field is not a hedge against §8.11's "one
 /// mechanism": the mechanism is [`AwaitingHuman`] and its form schema, both

@@ -2406,7 +2406,7 @@ fn a_cancelling_run_fails_an_indeterminate_step_closed_rather_than_parking_it() 
     let (row_state, error) = step_row(&conn, run_id, "risky");
     assert_eq!(row_state, StepRunState::Failed);
     assert!(
-        error.is_some_and(|e| e.contains("cancel")),
+        error.is_some_and(|e| e.contains("must converge")),
         "the row must say why the step could not park"
     );
 }

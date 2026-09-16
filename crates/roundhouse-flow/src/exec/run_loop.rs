@@ -2119,10 +2119,11 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 Phase::Main => "steps:",
             }));
         }
-        if run_ledger(self.conn, self.run_id)?.state != RunState::Running {
-            return Ok(refuse(
-                "the run is draining a cancel, which must converge rather than wait on a human",
-            ));
+        let run_state = run_ledger(self.conn, self.run_id)?.state;
+        if run_state != RunState::Running {
+            return Ok(refuse(&format!(
+                "the run is not `Running` (currently `{run_state:?}`), and must converge rather than wait on a human"
+            )));
         }
 
         let awaiting = AwaitingHuman::from_crash_recovery(
