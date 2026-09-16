@@ -23,7 +23,14 @@ use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
+
+/// A generous, fixed bound used by every test in this file that is not
+/// itself testing `step_timeout` enforcement — long enough that no ordinary
+/// dispatch here could plausibly hit it, so it behaves as "no timeout" for
+/// every test that doesn't care.
+const AMPLE_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Single-instance pattern — `TaskRunner::bootstrap()` panics on a second call per process.
 static RUNNER: once_cell::sync::Lazy<TaskRunner> =
@@ -232,6 +239,7 @@ async fn write_tool_dispatches_through() {
         TaskKind::Write,
         json!({ "path": &target_str, "contents": "hello" }),
         json!({ "path": &target_str, "contents": "hello" }),
+        AMPLE_STEP_TIMEOUT,
     )
     .await;
 
@@ -279,6 +287,7 @@ async fn edit_tool_dispatches_through() {
         TaskKind::Edit,
         json!({ "path": &target_str, "find": "a", "replace": "b" }),
         json!({ "path": &target_str, "find": "a", "replace": "b" }),
+        AMPLE_STEP_TIMEOUT,
     )
     .await;
 
@@ -324,6 +333,7 @@ async fn find_tool_dispatches_through() {
         TaskKind::Find,
         json!({ "root": &root_str, "pattern": "*.txt" }),
         json!({ "root": &root_str, "pattern": "*.txt" }),
+        AMPLE_STEP_TIMEOUT,
     )
     .await;
 
@@ -386,6 +396,7 @@ async fn shell_tool_dispatches_through() {
         TaskKind::Shell,
         json!({ "program": &program, "argv": [], "cwd": &cwd }),
         json!({ "program": &program, "argv": [], "cwd": &cwd }),
+        AMPLE_STEP_TIMEOUT,
     )
     .await
     .expect("dispatch should succeed");
@@ -436,13 +447,119 @@ async fn shell_tool_dispatches_through() {
     );
 }
 
+/// Phase 8 Task 25.4 Task 3: `dispatch_tool_for_workflow`'s `step_timeout`
+/// parameter — sourced by `DeliveryExecutor::execute_pending` from the
+/// run's real `PendingWork.step_timeout` — actually bounds a dispatched
+/// `tool: shell` step, and an elapsed timeout is a genuine process-group
+/// kill, not merely this call returning early.
+///
+/// The dispatched script records its own pid to a file before sleeping, so
+/// the assertion after the call is a real OS-level liveness check
+/// (`kill -0`, the same mechanism
+/// `shell_task_started_append_failure_cancels_the_pre_spawned_child` above
+/// uses), never just trusting that the returned error names cancellation.
+#[tokio::test]
+async fn shell_tool_step_timeout_elapsing_kills_the_process_and_fails_the_step() {
+    let dir = TempDir::new().unwrap();
+    let workspace_root = dir.path().canonicalize().unwrap();
+    let pid_file = workspace_root.join("shell.pid");
+    let program = workspace_program(
+        &workspace_root,
+        "sleep_and_record_pid.sh",
+        &format!("#!/bin/sh\necho $$ > {}\nsleep 30\n", pid_file.display()),
+    );
+
+    let (actor, actor_root, _db_path, _session_id) = setup_actor(
+        &dir,
+        vec![CompiledRule::test_new(
+            Scope::Builtin,
+            PolicyOutcome::Allow,
+            Predicate::program(&program),
+        )],
+    )
+    .await;
+    assert_eq!(actor_root, workspace_root);
+
+    let cwd = workspace_root.to_string_lossy().to_string();
+    // The dispatch itself is bounded by a short, explicitly authored
+    // `step_timeout` (300ms) — the same value production would source from
+    // `PendingWork.step_timeout`. The outer 10s `tokio::time::timeout` here
+    // is just this test's own "must not hang" guard, not the mechanism
+    // under test.
+    let dispatch = tokio::time::timeout(
+        Duration::from_secs(10),
+        dispatch_tool_for_workflow(
+            &actor,
+            TaskKind::Shell,
+            json!({ "program": &program, "argv": [], "cwd": &cwd }),
+            json!({ "program": &program, "argv": [], "cwd": &cwd }),
+            Duration::from_millis(300),
+        ),
+    )
+    .await
+    .expect("dispatch_tool_for_workflow must honor the threaded step_timeout, not hang")
+    .expect("a timed-out shell dispatch still records its own lifecycle and returns Ok(..)");
+
+    match dispatch.result {
+        Ok(output) => panic!(
+            "a shell step whose command outlives its step_timeout must not report success, got \
+             {output:?}"
+        ),
+        Err(msg) => assert!(!msg.is_empty(), "a failed dispatch must carry a message"),
+    }
+
+    for _ in 0..50 {
+        if pid_file.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .expect("the dispatched shell must have written its own pid before sleeping")
+        .trim()
+        .parse()
+        .expect("pid file must contain a valid pid");
+
+    #[cfg(unix)]
+    {
+        let mut still_alive = true;
+        for _ in 0..100 {
+            still_alive = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if !still_alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !still_alive,
+            "a shell step that exceeded its step_timeout must have its process actually \
+             killed (SIGTERM/SIGKILL), not merely reported as cancelled while still running \
+             (pid {pid})"
+        );
+    }
+}
+
 /// Unsupported tools (Http, Git, Mcp) are rejected with unsupported_workflow_tool.
 #[tokio::test]
 async fn unsupported_tools_rejected() {
     let dir = TempDir::new().unwrap();
     let (actor, _workspace_root, _db_path, _session_id) = setup_actor(&dir, vec![]).await;
 
-    let result = dispatch_tool_for_workflow(&actor, TaskKind::Http, json!({}), json!({})).await;
+    let result = dispatch_tool_for_workflow(
+        &actor,
+        TaskKind::Http,
+        json!({}),
+        json!({}),
+        AMPLE_STEP_TIMEOUT,
+    )
+    .await;
 
     let dispatch = result.expect("dispatch should not error");
     match dispatch.result {
@@ -583,6 +700,7 @@ async fn shell_task_started_append_failure_cancels_the_pre_spawned_child() {
         TaskKind::Shell,
         json!({ "program": &program, "argv": [], "cwd": &cwd }),
         json!({ "program": &program, "argv": [], "cwd": &cwd }),
+        AMPLE_STEP_TIMEOUT,
     )
     .await;
 

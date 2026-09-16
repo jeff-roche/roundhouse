@@ -79,14 +79,21 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::watch;
 
-/// Wall-clock bound on one dispatched `shell` call (fix round A, finding
-/// F6). Not ruled on explicitly — a judgment call, recorded here so it is
-/// easy to find and reconsider: long enough for an ordinary build/test
-/// command, short enough that a hung or runaway process doesn't tie up a
-/// dispatch turn indefinitely. `max_turns`/turn-level timeouts remain the
-/// caller's problem; this is strictly the single-call bound `spawn_cancellable`
-/// needs to be reachable through at all.
-const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Wall-clock bound on one dispatched `shell` call from the chat path
+/// (`agent_loop::dispatch_builtin`) (fix round A, finding F6). Not ruled on
+/// explicitly — a judgment call, recorded here so it is easy to find and
+/// reconsider: long enough for an ordinary build/test command, short enough
+/// that a hung or runaway process doesn't tie up a dispatch turn
+/// indefinitely. `max_turns`/turn-level timeouts remain the caller's
+/// problem; this is strictly the single-call bound `spawn_cancellable` needs
+/// to be reachable through at all.
+///
+/// Phase 8 Task 25.4 Task 3: [`execute_builtin`] no longer hardcodes this —
+/// it now takes a `timeout` parameter, and this constant is only the value
+/// `dispatch_builtin` passes explicitly. The workflow path
+/// (`workflow_dispatch::dispatch_tool_for_workflow`) passes the run's real
+/// `PendingWork.step_timeout` instead, never this constant.
+pub(crate) const SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Grace period between SIGTERM and SIGKILL escalation when a dispatched
 /// shell call is cancelled (timeout or session cancellation) — passed
@@ -840,12 +847,27 @@ fn task_params_for_root(
 /// (`write`'s `contents`, `edit`'s `find`/`replace`, `find`'s `pattern`) —
 /// never for a path/program/cwd.
 ///
-/// `cancel`, when `Some`, is raced against [`SHELL_TIMEOUT`] for the
-/// `Shell` arm (fix round A, finding F6): if the owning session leaves
+/// `cancel`, when `Some`, is raced against `timeout` for the `Shell` arm
+/// (fix round A, finding F6): if the owning session leaves
 /// `Created`/`Running` while the child is in flight, it is cancelled the
 /// same way a timeout is. `None` (used by every non-`Shell` call, and by
 /// tests that don't care about session-cancellation) means the wall-clock
 /// bound is still enforced, just without that extra signal.
+///
+/// `timeout` is the `Shell` arm's real wall-clock bound (Phase 8 Task 25.4
+/// Task 3) — threaded into [`run_isolated_shell_dispatch`], which is what
+/// makes an elapsed timeout a real process-group kill (SIGTERM escalating to
+/// SIGKILL, confirmed) rather than merely dropping this future and orphaning
+/// the child. Every caller passes a real value: `agent_loop::dispatch_builtin`
+/// passes [`SHELL_TIMEOUT`] explicitly (its own behavior is unchanged — only
+/// this function's signature grew a parameter); `dispatch_tool_for_workflow`
+/// passes the run's real `PendingWork.step_timeout`. The four filesystem
+/// arms ignore it entirely — they have no internal bound of their own, and
+/// are instead covered by `DeliveryExecutor::execute_pending`'s outer
+/// `tokio::time::timeout` safety net on the workflow path. `agent_loop`'s
+/// chat path has no equivalent outer wrap for filesystem calls — pre-existing
+/// and out of this task's scope, which is explicitly limited to
+/// `execute_pending`.
 ///
 /// Never call this before `params` has been admitted through
 /// `SessionActor::admit_task` — this function performs no admission check
@@ -857,6 +879,7 @@ pub async fn execute_builtin(
     cancel: Option<watch::Receiver<SessionState>>,
     pre_spawned: Option<Child>,
     isolator: &dyn TaskIsolator,
+    timeout: Duration,
 ) -> Result<Vec<ToolResultPart>, ToolDispatchError> {
     match params {
         TaskParams::Fs {
@@ -940,7 +963,7 @@ pub async fn execute_builtin(
                 &cmd.argv,
                 cwd,
                 &env,
-                SHELL_TIMEOUT,
+                timeout,
                 cancel,
                 pre_spawned,
             )
@@ -1244,6 +1267,15 @@ mod tests {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            // A real process-group leader, matching production spawns — see
+            // `Child::cancel`'s `signal_group` (`roundhouse-sandbox`), which
+            // signals `-pid`. Without this, `pid` is never a real process
+            // group id, `signal_group` is a silent no-op (ESRCH treated as
+            // success), and cancellation falls all the way through to a 5s
+            // wait plus a direct-pid-only `start_kill` — correct eventually,
+            // but not what a timeout test wants to depend on.
+            #[cfg(unix)]
+            process.process_group(0);
             let child = process
                 .spawn()
                 .map_err(|err| IsolationError::Unsupported(err.to_string()))?;
@@ -1689,9 +1721,17 @@ mod tests {
 
         let input = serde_json::json!({ "path": path_str });
         let (params, extras) = task_params_for(TaskKind::Read, &input).unwrap();
-        let parts = execute_builtin(&params, &extras, &input, None, None, &test_isolator())
-            .await
-            .unwrap();
+        let parts = execute_builtin(
+            &params,
+            &extras,
+            &input,
+            None,
+            None,
+            &test_isolator(),
+            SHELL_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].text, "hello world");
     }
@@ -1703,9 +1743,17 @@ mod tests {
 
         let input = serde_json::json!({ "path": path_str, "contents": "hi there" });
         let (params, extras) = task_params_for(TaskKind::Write, &input).unwrap();
-        execute_builtin(&params, &extras, &input, None, None, &test_isolator())
-            .await
-            .unwrap();
+        execute_builtin(
+            &params,
+            &extras,
+            &input,
+            None,
+            None,
+            &test_isolator(),
+            SHELL_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi there");
     }
 
@@ -1717,9 +1765,17 @@ mod tests {
 
         let input = serde_json::json!({ "path": path_str, "find": "world", "replace": "there" });
         let (params, extras) = task_params_for(TaskKind::Edit, &input).unwrap();
-        execute_builtin(&params, &extras, &input, None, None, &test_isolator())
-            .await
-            .unwrap();
+        execute_builtin(
+            &params,
+            &extras,
+            &input,
+            None,
+            None,
+            &test_isolator(),
+            SHELL_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello there");
     }
 
@@ -1731,9 +1787,17 @@ mod tests {
 
         let input = serde_json::json!({ "path": path_str, "find": "a", "replace": "b" });
         let (params, extras) = task_params_for(TaskKind::Edit, &input).unwrap();
-        let err = execute_builtin(&params, &extras, &input, None, None, &test_isolator())
-            .await
-            .unwrap_err();
+        let err = execute_builtin(
+            &params,
+            &extras,
+            &input,
+            None,
+            None,
+            &test_isolator(),
+            SHELL_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             ToolDispatchError::Tool(roundhouse_tools::ToolError::AmbiguousMatch(3))
@@ -1754,9 +1818,17 @@ mod tests {
 
         let input = serde_json::json!({ "root": root_str, "pattern": "*.rs" });
         let (params, extras) = task_params_for(TaskKind::Find, &input).unwrap();
-        let parts = execute_builtin(&params, &extras, &input, None, None, &test_isolator())
-            .await
-            .unwrap();
+        let parts = execute_builtin(
+            &params,
+            &extras,
+            &input,
+            None,
+            None,
+            &test_isolator(),
+            SHELL_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert_eq!(parts.len(), 1);
         assert!(parts[0].text.ends_with("a.rs"));
     }
@@ -1772,9 +1844,17 @@ mod tests {
             "cwd": cwd_str,
         });
         let (params, extras) = task_params_for(TaskKind::Shell, &input).unwrap();
-        let parts = execute_builtin(&params, &extras, &input, None, None, &test_isolator())
-            .await
-            .unwrap();
+        let parts = execute_builtin(
+            &params,
+            &extras,
+            &input,
+            None,
+            None,
+            &test_isolator(),
+            SHELL_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert_eq!(parts.len(), 1);
         assert!(parts[0].text.contains("hello-from-shell"));
         assert!(parts[0].text.contains("exit_code=Some(0)"));
@@ -1791,9 +1871,17 @@ mod tests {
             "shell_command": true,
         });
         let (params, extras) = task_params_for(TaskKind::Shell, &input).unwrap();
-        let parts = execute_builtin(&params, &extras, &input, None, None, &test_isolator())
-            .await
-            .unwrap();
+        let parts = execute_builtin(
+            &params,
+            &extras,
+            &input,
+            None,
+            None,
+            &test_isolator(),
+            SHELL_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert!(parts[0].text.contains("still-cancellable"));
     }
 
@@ -1801,10 +1889,13 @@ mod tests {
     async fn execute_builtin_shell_times_out_a_runaway_process_and_confirms_cancellation() {
         // fix round A, finding F6: a process that never exits on its own
         // must be bounded, not left running forever. Uses a real, short
-        // `SHELL_TIMEOUT` override via the lower-level `run_shell_dispatch`
-        // directly (bypassing the module's 120s production constant, which
-        // this test cannot wait out) — this is the same function
-        // `execute_builtin`'s Shell arm calls.
+        // timeout override via `run_shell_dispatch` directly — a
+        // lower-level analog of `execute_builtin`'s Shell arm that races the
+        // identical `tokio::select!` shape over `spawn_cancellable` instead
+        // of the isolator `execute_builtin` actually dispatches through (see
+        // `execute_builtin_shell_timeout_parameter_is_a_real_process_group_kill`,
+        // below, for the isolator-path version of this same claim, with a
+        // real pid-liveness check).
         let dir = workspace_temp_dir();
         let env = shell_env_allowlist();
 
@@ -1821,6 +1912,82 @@ mod tests {
         assert!(
             matches!(result, Err(ToolDispatchError::ShellCancelled(_))),
             "a runaway process must be cancelled and reported, got {result:?}"
+        );
+    }
+
+    /// Phase 8 Task 25.4 Task 3: `execute_builtin`'s `timeout` parameter —
+    /// not the module's [`SHELL_TIMEOUT`] constant — is what bounds the
+    /// `Shell` arm, and an elapsed timeout is a real process-group kill, not
+    /// merely this future returning. Proven through `execute_builtin` itself
+    /// (via the isolator `TaskIsolator` path, exactly what
+    /// `run_isolated_shell_dispatch` uses in production — unlike the test
+    /// above, which goes through the separate `run_shell_dispatch`/
+    /// `spawn_cancellable` path instead), with a real OS-level liveness
+    /// check on the killed pid (`pid_is_dead_or_zombie`, the same check
+    /// `execute_builtin_shell_is_bounded_even_when_a_backgrounded_grandchild_outlives_the_direct_child`
+    /// uses below) — not merely trusting that the returned error names a
+    /// timeout.
+    #[tokio::test]
+    async fn execute_builtin_shell_timeout_parameter_is_a_real_process_group_kill() {
+        let dir = workspace_temp_dir();
+        let pid_file = dir.path().join("shell.pid");
+        let input = serde_json::json!({
+            "program": "sh",
+            "argv": ["-c", format!("echo $$ > {} ; sleep 30", pid_file.display())],
+            "cwd": dir.path().to_string_lossy(),
+        });
+        let (params, extras) = task_params_for(TaskKind::Shell, &input).unwrap();
+
+        // A tiny, non-zero timeout: `execute_builtin`'s own `timeout`
+        // parameter, deliberately NOT `SHELL_TIMEOUT` (120s) — if the
+        // module still silently used that constant internally instead of
+        // the threaded value, this call would still be sleeping when the
+        // outer 10s bound below elapses.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_builtin(
+                &params,
+                &extras,
+                &input,
+                None,
+                None,
+                &test_isolator(),
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("execute_builtin must honor the threaded 300ms timeout, not SHELL_TIMEOUT's 120s");
+
+        assert!(
+            matches!(result, Err(ToolDispatchError::ShellCancelled(_))),
+            "a shell call exceeding the threaded timeout must be cancelled and reported, got \
+             {result:?}"
+        );
+
+        for _ in 0..50 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the dispatched shell must have written its own pid before sleeping")
+            .trim()
+            .parse()
+            .expect("pid file must contain a valid pid");
+
+        let mut confirmed_dead = false;
+        for _ in 0..100 {
+            if pid_is_dead_or_zombie(pid) {
+                confirmed_dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            confirmed_dead,
+            "the timed-out process (pid {pid}) must actually be killed, not just reported as \
+             cancelled while still running"
         );
     }
 
@@ -2027,6 +2194,7 @@ mod tests {
             None,
             None,
             &test_isolator(),
+            SHELL_TIMEOUT,
         )
         .await
         .unwrap();
@@ -2057,9 +2225,17 @@ mod tests {
             "cwd": "/definitely/does/not/exist",
         });
 
-        let parts = execute_builtin(&params, &extras, &decoy_input, None, None, &test_isolator())
-            .await
-            .unwrap();
+        let parts = execute_builtin(
+            &params,
+            &extras,
+            &decoy_input,
+            None,
+            None,
+            &test_isolator(),
+            SHELL_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert!(
             parts[0].text.contains("exit_code=Some(0)"),
             "must run the admitted `true`, not the decoy input's `false`, got {:?}",
@@ -2081,6 +2257,7 @@ mod tests {
             None,
             None,
             &test_isolator(),
+            SHELL_TIMEOUT,
         )
         .await
         .unwrap_err();

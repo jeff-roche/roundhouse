@@ -54,11 +54,23 @@ pub struct WorkflowToolDispatch {
 /// `logged_input` is what reaches the event log (ruling P33's redacted
 /// half, already computed by `roundhouse-flow`); `dispatch_input` is what
 /// admission and execution actually see — never persisted.
+///
+/// `step_timeout` is the run's real, already-clamped per-step ceiling
+/// (`roundhouse_flow::exec::run_loop::PendingWork::step_timeout`, sourced by
+/// `DeliveryExecutor::execute_pending` from the `PendingWork` it was
+/// handed) — threaded straight into
+/// [`crate::tool_dispatch::execute_builtin`]'s own `timeout` parameter
+/// (Phase 8 Task 25.4 Task 3). For a `Shell` step this is what makes an
+/// elapsed timeout a real process-group kill rather than an abandoned
+/// orphan; the four filesystem kinds ignore it (they have no internal bound
+/// of their own — `execute_pending`'s outer `tokio::time::timeout` is their
+/// safety net, not this parameter).
 pub async fn dispatch_tool_for_workflow(
     actor: &SessionActor,
     task_kind: TaskKind,
     logged_input: serde_json::Value,
     dispatch_input: serde_json::Value,
+    step_timeout: std::time::Duration,
 ) -> Result<WorkflowToolDispatch, String> {
     let writer = actor.writer();
     let runner = actor.runner();
@@ -264,6 +276,7 @@ pub async fn dispatch_tool_for_workflow(
         Some(actor.subscribe()),
         pre_spawned,
         actor,
+        step_timeout,
     )
     .await
     {

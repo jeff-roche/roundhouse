@@ -59,7 +59,7 @@ use roundhouse_core::{
     BindingId, EventPayload, JobId, OnDegrade, SessionId, SessionSpec, TaskId, TaskKind,
     TaskRunner, Tier, Timestamp, WorkspaceId,
 };
-use roundhouse_engine::workflow_dispatch::dispatch_tool_for_workflow;
+use roundhouse_engine::workflow_dispatch::{dispatch_tool_for_workflow, WorkflowToolDispatch};
 use roundhouse_flow::caps::ResourceCaps;
 use roundhouse_flow::durability::{insert_workflow_run, RunState, WorkflowRun};
 use roundhouse_flow::exec::run_loop::{
@@ -973,6 +973,36 @@ impl SegmentGapGate {
 
     fn release(&self, permits: usize) {
         self.releases.add_permits(permits);
+    }
+}
+
+/// Folds a `dispatch_tool_for_workflow` outcome into the [`WorkDone`] shape
+/// [`DeliveryExecutor::execute_pending`] hands back for one `PendingKind::Tool`
+/// item — shared between its `Shell` branch (no outer timeout wrap) and its
+/// filesystem-kinds branch (wrapped in `tokio::time::timeout`), so the two
+/// only differ in how they got a `Result<WorkflowToolDispatch, String>`, not
+/// in how they interpret one.
+fn work_done_from_dispatch(
+    step_id: String,
+    dispatched: Result<WorkflowToolDispatch, String>,
+) -> WorkDone {
+    match dispatched {
+        Ok(dispatched) => {
+            let (status, output) = match dispatched.result {
+                Ok(value) => (WorkStatus::Completed, value),
+                Err(message) => (WorkStatus::Failed { message }, serde_json::Value::Null),
+            };
+            WorkDone {
+                step_id,
+                status,
+                output,
+                output_is_secret_derived: false,
+                task_id: Some(dispatched.task_id),
+                first_task_seq: Some(dispatched.first_task_seq),
+                last_task_seq: dispatched.last_task_seq,
+            }
+        }
+        Err(message) => unanswerable_work(step_id, message),
     }
 }
 
@@ -1925,9 +1955,57 @@ impl DeliveryExecutor {
     /// still gets a [`WorkDone`], just a failed one, so the run is never
     /// left suspended forever waiting on an answer nothing will supply.
     ///
-    /// **Scope: `tool: read` only.** Every other `tool:` kind, every
-    /// `agent:` step, and every `call:` child are refused with a named,
-    /// recorded failure — wiring them is Phase 8 Tasks 25.4/25.5/25.6.
+    /// **Scope: `tool: read|write|edit|find|shell`.** Every `agent:` step
+    /// and every `call:` child are refused with a named, recorded failure —
+    /// wiring them is Phase 8 Tasks 25.5/25.6.
+    ///
+    /// # `step_timeout` enforcement (Phase 8 Task 25.4 Task 3)
+    ///
+    /// Every `Tool` item's own `PendingWork.step_timeout` is passed straight
+    /// through to `dispatch_tool_for_workflow`, which threads it into
+    /// [`roundhouse_engine::tool_dispatch::execute_builtin`]'s `timeout`
+    /// parameter. For `Shell` that parameter is a real, self-contained
+    /// bound: an elapsed timeout is a process-group kill (SIGTERM
+    /// escalating to SIGKILL, confirmed) before `execute_builtin` ever
+    /// returns.
+    ///
+    /// The four filesystem kinds (`Read`/`Write`/`Edit`/`Find`) have no such
+    /// internal mechanism — their futures are simply awaited to completion
+    /// inside `execute_builtin` — so this function additionally wraps
+    /// *their* `dispatch_tool_for_workflow` call in
+    /// `tokio::time::timeout(step_timeout, ..)` as an outer safety net.
+    ///
+    /// **`Shell` deliberately does NOT get that same outer wrap, and this is
+    /// load-bearing, not an oversight.** `dispatch_tool_for_workflow` admits
+    /// the step and appends `TaskCreated`/`TaskStarted` (real store I/O)
+    /// *before* `execute_builtin`'s own `tokio::time::sleep(timeout)` timer
+    /// ever starts — so an outer timeout of the identical duration, started
+    /// at the identical instant this function calls
+    /// `dispatch_tool_for_workflow`, would *always* reach its deadline
+    /// first. `tokio::time::timeout` on the losing side drops the inner
+    /// future outright: the pre-spawned `Child` (and the still-running
+    /// process it wraps) would be dropped out from under
+    /// `run_isolated_shell_dispatch`'s `tokio::select!` before its own
+    /// timeout branch — the one that actually calls `Child::cancel` and
+    /// awaits its confirmation — ever got a chance to run. `roundhouse_sandbox::Child`
+    /// has no `Drop` impl that kills anything, so that is exactly the
+    /// "wrapped only around the outer future... merely drops that future
+    /// and leak[s] the child" failure this task's brief warns against —
+    /// reintroduced by the outer wrap it also asks for, if applied
+    /// unconditionally. So `Shell` is bounded by the inner, real mechanism
+    /// alone; the outer wrap exists only for the four kinds that have
+    /// nothing else.
+    ///
+    /// A `step_timeout` of [`Duration::ZERO`](std::time::Duration::ZERO) is
+    /// refused outright, before any dispatch is attempted (whatever the
+    /// tool kind), with a message naming it as a bug rather than a timeout —
+    /// see `roundhouse_flow::exec::run_loop::PendingWork::step_timeout`'s
+    /// own doc comment for the (today unreachable) `unwrap_or_default()`
+    /// branch that could otherwise produce one. Handing `Duration::ZERO`
+    /// straight to `tokio::time::timeout` (or to `execute_builtin`'s
+    /// `timeout`) would make every dispatch "time out" instantly and
+    /// indistinguishably from a real one, which is a worse failure mode
+    /// than refusing to guess what zero was supposed to mean.
     async fn execute_pending(
         &self,
         session: &HeadlessSession,
@@ -1941,33 +2019,51 @@ impl DeliveryExecutor {
                     logged_input,
                     dispatch_input,
                     ..
-                } => match dispatch_tool_for_workflow(
-                    session.actor(),
-                    task_kind,
-                    logged_input,
-                    dispatch_input,
-                )
-                .await
-                {
-                    Ok(dispatched) => {
-                        let (status, output) = match dispatched.result {
-                            Ok(value) => (WorkStatus::Completed, value),
-                            Err(message) => {
-                                (WorkStatus::Failed { message }, serde_json::Value::Null)
-                            }
-                        };
-                        WorkDone {
-                            step_id: item.step_id,
-                            status,
-                            output,
-                            output_is_secret_derived: false,
-                            task_id: Some(dispatched.task_id),
-                            first_task_seq: Some(dispatched.first_task_seq),
-                            last_task_seq: dispatched.last_task_seq,
+                } => {
+                    let step_timeout = item.step_timeout;
+                    if step_timeout.is_zero() {
+                        unanswerable_work(
+                            item.step_id,
+                            "step_timeout was zero, which should be unreachable — refusing \
+                             rather than treating it as either \"no timeout\" or a legitimate \
+                             instant timeout"
+                                .into(),
+                        )
+                    } else if task_kind == TaskKind::Shell {
+                        // No outer wrap here — see this method's own doc
+                        // comment for why racing an identical-duration
+                        // outer timeout against Shell's inner one would
+                        // orphan the child instead of protecting anything.
+                        let dispatched = dispatch_tool_for_workflow(
+                            session.actor(),
+                            task_kind,
+                            logged_input,
+                            dispatch_input,
+                            step_timeout,
+                        )
+                        .await;
+                        work_done_from_dispatch(item.step_id, dispatched)
+                    } else {
+                        match tokio::time::timeout(
+                            step_timeout,
+                            dispatch_tool_for_workflow(
+                                session.actor(),
+                                task_kind,
+                                logged_input,
+                                dispatch_input,
+                                step_timeout,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(dispatched) => work_done_from_dispatch(item.step_id, dispatched),
+                            Err(_elapsed) => unanswerable_work(
+                                item.step_id,
+                                format!("the tool call exceeded its {step_timeout:?} step_timeout"),
+                            ),
                         }
                     }
-                    Err(message) => unanswerable_work(item.step_id, message),
-                },
+                }
                 PendingKind::Agent { .. } => unanswerable_work(
                     item.step_id,
                     "workflow dispatch of `agent:` steps is not wired yet (Phase 8 Task 25.5)"
@@ -3771,12 +3867,14 @@ mod tests {
 mod delivery_tests {
     use super::*;
     use crate::session_registry::SessionRegistry;
-    use crate::test_support::daemon_resources;
+    use crate::test_support::{daemon_resources, daemon_resources_with_rules};
     use crate::workspace_registry::{WorkspaceRegistration, WorkspaceRegistry};
-    use roundhouse_core::Tier;
-    use roundhouse_flow::durability::recover_run;
+    use roundhouse_core::{Tier, WorkspaceId};
+    use roundhouse_flow::durability::{recover_run, StepDisposition};
     use roundhouse_flow::job::SessionTemplate;
     use roundhouse_flow::job_store::register_workflow_file;
+    use roundhouse_policy::engine::{CompiledRule, Outcome as PolicyOutcome, Predicate, Scope};
+    use roundhouse_policy::FsOp;
     use roundhouse_sched::delivery::DeliveryState;
     use roundhouse_sched::store::fetch_delivery;
     use roundhouse_store::StorePool;
@@ -4861,6 +4959,197 @@ mod delivery_tests {
         assert!(
             harness.workspace_root.is_dir(),
             "the workspace must be untouched by a failed resolution"
+        );
+    }
+
+    /// Phase 8 Task 25.4 Task 3: a [`DeliveryExecutor`]/[`HeadlessSession`]
+    /// pair built directly, bypassing the trigger/binding/run-row machinery
+    /// [`harness`] sets up — `execute_pending` only ever dispatches through
+    /// `session.actor()`, and never touches `DeliveryExecutor`'s own
+    /// `store`/`registry`/`spawn_tree` fields, so none of that machinery is
+    /// needed to call it directly with a hand-built [`PendingWork`].
+    ///
+    /// `rules` governs what the session's own `PolicyEngine` admits —
+    /// `daemon_resources`'s `no_policy_rules()` default makes everything
+    /// `Ask`/`RequiresApproval`, which is fine for tests that never reach
+    /// admission (the `Duration::ZERO` guard) but would wrongly refuse ones
+    /// that need a real dispatch to actually run.
+    async fn executor_and_session(
+        dir: &std::path::Path,
+        rules: Vec<CompiledRule>,
+    ) -> (DeliveryExecutor, HeadlessSession) {
+        let resources =
+            Arc::new(daemon_resources_with_rules(dir, None, Arc::new(move || rules.clone())).await);
+        let sessions = Arc::new(SessionRegistry::new());
+        let store = roundhouse_store::open(&dir.join("events.db"))
+            .await
+            .unwrap();
+        let executor = DeliveryExecutor::new(
+            store,
+            Arc::clone(&resources),
+            Arc::clone(&sessions),
+            Arc::new(InMemoryRunRegistry::new()),
+            Arc::clone(&resources.spawn_tree),
+            Arc::new(FixedClock(instant())),
+        );
+
+        let session_id = SessionId::new();
+        let spec = SessionSpec {
+            workspace: WorkspaceId::new(),
+            name: None,
+            requested_tier: Tier::Sandbox,
+            on_degrade: resources.default_on_degrade,
+            parent: None,
+        };
+        let session = create_headless_session(
+            &resources,
+            &sessions,
+            session_id,
+            spec,
+            dir.to_path_buf(),
+            None,
+            None,
+        )
+        .await
+        .expect("headless session construction must succeed against a working fixture");
+
+        (executor, session)
+    }
+
+    /// A `tool: write` step whose `step_timeout` has already elapsed before
+    /// dispatch even begins is caught by `execute_pending`'s OUTER
+    /// `tokio::time::timeout` — the safety net covering the four filesystem
+    /// kinds, which (unlike `Shell`) have no internal bound of their own.
+    /// `Duration::from_nanos(1)` rather than `Duration::ZERO` deliberately:
+    /// this test is about the outer wrap catching a real elapsed deadline,
+    /// not about the separate zero-guard (covered by
+    /// `a_zero_step_timeout_is_refused_as_a_named_bug_not_dispatched` below).
+    ///
+    /// This does not (and cannot, without a fake/slow filesystem hook this
+    /// codebase does not have) prove the outer wrap fires only once a REAL
+    /// write is genuinely slow — real filesystem writes to a tmpfs-backed
+    /// tempdir are far faster than any timeout this test could use without
+    /// becoming a flaky, real-time-sensitive test. What it proves instead:
+    /// given a deadline that has unambiguously already passed, dispatch
+    /// still completes promptly (bounded by the 10s outer guard below) and
+    /// reports a named timeout failure rather than hanging or silently
+    /// succeeding — exactly the property the outer wrap exists to
+    /// guarantee for a tool with no internal bound.
+    #[tokio::test]
+    async fn a_filesystem_step_exceeding_step_timeout_is_caught_by_the_outer_safety_net() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().canonicalize().unwrap();
+        let target = workspace_root.join("out.txt");
+        let target_str = target.to_string_lossy().to_string();
+
+        let rules = vec![CompiledRule::test_new(
+            Scope::Builtin,
+            PolicyOutcome::Allow,
+            Predicate::FsExact {
+                op: FsOp::Write,
+                path: target.clone(),
+            },
+        )];
+        let (executor, session) = executor_and_session(&workspace_root, rules).await;
+
+        let pending = PendingWork {
+            run_id: RunId::new(),
+            session_id: session.session_id(),
+            step_id: "write_it".to_string(),
+            attempt: 1,
+            item_index: None,
+            disposition: StepDisposition::Effectful,
+            step_timeout: Duration::from_nanos(1),
+            kind: PendingKind::Tool {
+                tool: "write".to_string(),
+                task_kind: TaskKind::Write,
+                logged_input: serde_json::json!({ "path": &target_str, "contents": "hello" }),
+                dispatch_input: serde_json::json!({ "path": &target_str, "contents": "hello" }),
+            },
+        };
+
+        let done = tokio::time::timeout(
+            Duration::from_secs(10),
+            executor.execute_pending(&session, vec![pending]),
+        )
+        .await
+        .expect(
+            "execute_pending must not hang past its own outer safety net — if it did, this \
+             test's own guard would be the thing failing it",
+        );
+
+        assert_eq!(done.len(), 1);
+        match &done[0].status {
+            WorkStatus::Failed { message } => assert!(
+                message.contains("step_timeout"),
+                "the outer safety net's failure must name the timeout, not just say \"failed\", \
+                 got {message:?}"
+            ),
+            other => panic!(
+                "a step whose step_timeout had already elapsed before dispatch began must \
+                 fail, got {other:?}"
+            ),
+        }
+
+        assert!(
+            !target.exists(),
+            "the outer timeout drops the dispatch future — the write must never have landed"
+        );
+    }
+
+    /// The `Duration::ZERO` guard (this task's brief, item 3):
+    /// `PendingWork::step_timeout`'s own doc names its `unwrap_or_default()`
+    /// fallback as unreachable through the normal authoring path today —
+    /// constructed directly here, bypassing that path entirely, to prove
+    /// `execute_pending` refuses it with a named-bug message rather than
+    /// silently treating it as either "no timeout" or a legitimate,
+    /// instantly-elapsed one.
+    ///
+    /// Uses `TaskKind::Read` under `daemon_resources`'s default
+    /// `no_policy_rules()` (fail-closed `Ask`) deliberately: the zero guard
+    /// must fire BEFORE admission is ever attempted, so a rule that would
+    /// admit this call is not needed — and its absence is itself part of
+    /// the proof, since an admission attempt against `no_policy_rules()`
+    /// would refuse for an unrelated reason and could mask a guard that
+    /// never actually ran.
+    #[tokio::test]
+    async fn a_zero_step_timeout_is_refused_as_a_named_bug_not_dispatched() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().canonicalize().unwrap();
+        let (executor, session) = executor_and_session(&workspace_root, vec![]).await;
+
+        let pending = PendingWork {
+            run_id: RunId::new(),
+            session_id: session.session_id(),
+            step_id: "zero_timeout_step".to_string(),
+            attempt: 1,
+            item_index: None,
+            disposition: StepDisposition::Pure,
+            step_timeout: Duration::ZERO,
+            kind: PendingKind::Tool {
+                tool: "read".to_string(),
+                task_kind: TaskKind::Read,
+                logged_input: serde_json::json!({ "path": "irrelevant" }),
+                dispatch_input: serde_json::json!({ "path": "irrelevant" }),
+            },
+        };
+
+        let done = executor.execute_pending(&session, vec![pending]).await;
+
+        assert_eq!(done.len(), 1);
+        match &done[0].status {
+            WorkStatus::Failed { message } => assert!(
+                message.contains("step_timeout was zero"),
+                "must name the zero-step_timeout bug explicitly, not report a generic or \
+                 misleadingly-instant timeout, got {message:?}"
+            ),
+            other => panic!("a zero step_timeout must be refused, not dispatched, got {other:?}"),
+        }
+        assert!(
+            done[0].task_id.is_none(),
+            "the zero guard fires before any dispatch is attempted — no task is ever minted, \
+             unlike the outer-timeout case above where a task may already be in flight when \
+             the deadline is hit"
         );
     }
 

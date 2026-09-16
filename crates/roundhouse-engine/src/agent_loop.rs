@@ -1515,6 +1515,10 @@ async fn dispatch_builtin(
         Some(actor.subscribe()),
         pre_spawned,
         actor,
+        // The chat path's behavior is unchanged by Task 3 — still the fixed
+        // 120s bound `execute_builtin` used to hardcode internally, just
+        // passed explicitly now that the parameter is real.
+        crate::tool_dispatch::SHELL_TIMEOUT,
     )
     .await
     {
