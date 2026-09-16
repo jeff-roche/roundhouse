@@ -15,8 +15,10 @@
 //! [`rusqlite::Connection`](https://docs.rs/rusqlite). `dispatch_step`'s arm
 //! for the two is a refusal naming that, and it is reachable only from a
 //! caller with no run behind it: the in-memory
-//! [`Executor::run_to_completion`], or a `gate:`/`call:` nested inside a
-//! `map`.
+//! [`Executor::run_to_completion`], including the `map` fan-out it drives.
+//! A `gate:`/`call:` nested inside a `map` that **does** have a run behind it
+//! is [`run_loop`]'s, like every other one — Phase 8 Task 25.7's Tasks 6 and 7
+//! gave `run_loop::Loop::advance_map_item` an arm for each.
 //!
 //! The attribution here used to read "Tasks 7/11", was corrected by Task 19
 //! (B11) under ruling P75 §A to "Task 20 (B12)", and is now the module that
@@ -1439,14 +1441,17 @@ impl<'a> Executor<'a> {
             //
             //    `run_loop::Loop::dispatch_map`'s wave-driven loop — the one
             //    that *does* have a `Connection` — used to route both here
-            //    too (Phase 8 Task 25.7 Task 2). It no longer routes a
-            //    `gate:`: Phase 8 Task 25.7 Task 6 gave it an arm of its own
-            //    that parks the run on the item's behalf, cooperatively, once
-            //    its wave has drained. A nested `call:` still arrives here
-            //    from that loop, because it needs the per-item budget pool
-            //    whose ceilings ruling P77 §C defers; Task 7 owns it. (Task
-            //    34 closed `map`'s worktree fan-out and Task 2 closed its
-            //    per-item `tool:`/`agent:` dispatch; see
+            //    too (Phase 8 Task 25.7 Task 2). It now routes **neither**:
+            //    Task 6 gave the `gate:` an arm of its own that parks the run
+            //    on the item's behalf, cooperatively, once its wave has
+            //    drained, and Task 7 gave the `call:` one that funds the
+            //    child run out of that item's own share of the run's budget
+            //    (`run_loop::requested_nested_child_caps`, the per-item pool
+            //    whose ceilings ruling P77 §C had deferred). So the only
+            //    `map` that reaches this arm is case 1's: the in-memory one,
+            //    with no run row to park and no ledger to fund a child from.
+            //    (Task 34 closed `map`'s worktree fan-out and Task 2 closed
+            //    its per-item `tool:`/`agent:` dispatch; see
             //    `run_loop::Loop::dispatch_map`'s own doc comment for what is
             //    left.)
             //
@@ -1463,8 +1468,8 @@ impl<'a> Executor<'a> {
                     &step.id,
                     format!(
                         "step kind `{}` needs a run loop: it is dispatched by \
-                         `run_loop::run_workflow`, never by a bare executor or from inside a \
-                         `map`",
+                         `run_loop::run_workflow`, never by a bare executor — including the \
+                         in-memory `map` fan-out a bare executor drives",
                         step_body_kind_name(other)
                     ),
                 ))

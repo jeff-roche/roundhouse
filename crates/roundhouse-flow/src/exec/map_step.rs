@@ -339,13 +339,16 @@ pub fn split_budget(total: &ResourceCaps, item_count: u32) -> ResourceCaps {
 /// `crate::exec::run_loop::Loop::admit`, which charges a top-level `tool:`
 /// step exactly one.
 ///
-/// **Every real dispatch counts as one call, an `agent:` step included.**
-/// `Loop::admit` bills a top-level `agent:` step against `max_subagents`
-/// instead, but [`split_budget`] deliberately does not divide that field, so
-/// counting an item's agent dispatches there would bound them by the run's
+/// **Every real dispatch counts as one call** — an `agent:` step included, and
+/// (Phase 8 Task 25.7 Task 7) a nested `call:` too. `Loop::admit` bills a
+/// top-level `agent:`/`call:` step against `max_subagents` instead, but
+/// [`split_budget`] deliberately does not divide that field, so counting an
+/// item's agent spawns or child runs there would bound them by the run's
 /// *whole* allowance — which is not a per-item bound at all. The question this
-/// ceiling answers is "how much real work may one item set going", and both
-/// bodies are that.
+/// ceiling answers is "how much real work may one item set going", and all
+/// three bodies are that; see
+/// `crate::exec::run_loop::inner_step_needs_real_dispatch`, which is what
+/// decides membership.
 ///
 /// # Why the item `Failed` rather than `Skipped`
 ///
@@ -883,16 +886,18 @@ pub(crate) fn parse_map_inner_steps(
         })
 }
 
-/// **A `report:` is a property of the run, not of a map item** — the same
-/// argument already written for the nested `call:` refusal in
-/// [`crate::exec::Executor::dispatch_step`]'s catch-all arm, applied to
-/// another step kind with run-wide meaning (B12c fix round, ruling P116 §B).
+/// **A `report:` is a property of the run, not of a map item** — the argument
+/// [`crate::exec::Executor::dispatch_step`]'s catch-all arm used to make for a
+/// nested `call:` too, applied to another step kind with run-wide meaning
+/// (B12c fix round, ruling P116 §B).
 ///
 /// **And it is the one of the three that stays refused.** A nested `gate:`
 /// carried the same "this is run-wide" objection until Phase 8 Task 25.7
 /// Task 6, which resolved it rather than accepting it: a park *is* run-wide,
 /// so one item's gate now parks the whole run and the durable record says
-/// which item. `report:` has no such resolution, and not for want of
+/// which item. A nested `call:` went the same way in Task 7: its child run is
+/// funded out of the item's own share, so what looked run-wide turned out to
+/// be divisible. `report:` has no such resolution, and not for want of
 /// plumbing — a run has exactly one report (ruling P112), so an item cannot
 /// be given one without taking it from the run.
 ///

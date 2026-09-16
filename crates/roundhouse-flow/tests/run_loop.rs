@@ -497,9 +497,12 @@ fn run_to_terminal_failing(
             };
             done.push(roundhouse_flow::exec::run_loop::WorkDone {
                 step_id: p.step_id,
-                // Mirrors what this `PendingWork` itself carries — always
-                // `None` today, since nothing produces a real map item's
-                // pending work yet (Phase 8 Task 25.7 Task 2).
+                // Mirrors what this `PendingWork` itself carries, which
+                // `WorkDone::item_index`'s own doc makes mandatory: an answer
+                // filed under the wrong index answers a different item's step.
+                // `None` for every fixture *this* helper drives, all of which
+                // are top-level; the per-item drivers below are the ones that
+                // see a real index.
                 item_index: p.item_index,
                 status,
                 output: serde_json::json!({}),
@@ -8001,5 +8004,429 @@ fn a_gate_answer_filed_at_the_wrong_nesting_level_is_refused() {
             matches!(result, Err(RunLoopError::UnknownGateStep { .. })),
             "{why}: got {result:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A nested `call:` inside a `map:` — Phase 8 Task 25.7 (#64) Task 7
+//
+// The last of the three bodies `Executor::dispatch_step`'s catch-all refused
+// from inside a `map`. Unlike a nested `gate:`, it needs no new kind of
+// suspension — a child run is answered by the same `Resume::Work` a nested
+// `tool:` is. What it needs is a **budget**: a `call:` draws a real grant out
+// of the run's remaining ledger, so an unclamped nested one lets one item spend
+// what the whole fan-out has left. These tests assert that clamp the only way
+// that distinguishes it from arithmetic — two siblings' actual, durable child
+// grants, read back off the child `workflow_run` rows.
+// ---------------------------------------------------------------------------
+
+/// A `map` whose one inner step is a nested `call:`, plus whatever further
+/// lines `extra` adds (the step's own `caps:` or `when:`, or a second step).
+///
+/// `extra` is already indented to the column it belongs in, so a caller writes
+/// it verbatim rather than counting spaces twice.
+fn map_over_call(extra: &str) -> String {
+    format!(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{{{ inputs.items }}}}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 2\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: sub\n\
+         \x20       call: child-flow\n\
+         {extra}"
+    )
+}
+
+/// [`drive_waves_with_grant`]'s nested-`call:` counterpart: the same wave
+/// recording, against a host that resolves `child-flow`, answering every
+/// pending child run as completed.
+///
+/// A separate driver rather than a flag on that one, because the two differ in
+/// the thing a `call:` test is about: this one collects the `RunId` of every
+/// child the fan-out created, in dispatch order, so a test can read each
+/// child's **durable grant** back rather than trusting what its parent asked
+/// for.
+fn drive_map_calls(
+    body: &str,
+    items: Value,
+    grant: ResourceCaps,
+) -> (
+    Connection,
+    RunId,
+    RecordingSink,
+    Vec<Wave>,
+    Vec<RunId>,
+    Result<RunOutcome, RunLoopError>,
+) {
+    use roundhouse_flow::exec::run_loop::{PendingKind, WorkDone, WorkStatus};
+
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    let mut run = a_run(run_id, SessionId::new());
+    run.caps = Some(grant);
+    insert_workflow_run(&mut conn, &run).expect("seed the run row");
+    let def = parse_workflow(&workflow(body)).expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new().resolving("child-flow");
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": items });
+
+    let mut waves: Vec<Wave> = Vec::new();
+    let mut children: Vec<RunId> = Vec::new();
+    let mut resume: Option<Resume> = None;
+    let mut segments = 0usize;
+    loop {
+        segments += 1;
+        assert!(
+            segments <= MAX_SEGMENTS,
+            "the run has been re-entered {segments} times without reaching a terminal state. \
+             Waves so far: {waves:?}"
+        );
+        let outcome = match run_workflow(
+            &mut conn,
+            &def,
+            run_id,
+            &mut sink,
+            &mut host,
+            run_ctx.clone(),
+            at(10),
+            resume.take(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => return (conn, run_id, sink, waves, children, Err(e)),
+        };
+        let pending = match outcome {
+            RunOutcome::AwaitingWork { pending } => pending,
+            other => return (conn, run_id, sink, waves, children, Ok(other)),
+        };
+        waves.push(
+            pending
+                .iter()
+                .map(|p| (p.step_id.clone(), p.item_index))
+                .collect(),
+        );
+        let mut done = Vec::with_capacity(pending.len());
+        for p in pending {
+            let PendingKind::ChildRun {
+                child_run_id,
+                parent_task_id,
+                ..
+            } = &p.kind
+            else {
+                panic!("every fixture in this section dispatches a `call:`, got {p:?}");
+            };
+            children.push(*child_run_id);
+            done.push(WorkDone {
+                step_id: p.step_id.clone(),
+                item_index: p.item_index,
+                status: WorkStatus::Completed,
+                output: serde_json::json!({ "child": p.item_index }),
+                output_is_secret_derived: false,
+                task_id: Some(*parent_task_id),
+                first_task_seq: None,
+                last_task_seq: None,
+            });
+        }
+        resume = Some(Resume::Work(done));
+    }
+}
+
+/// One child run's durable grant — the figure §8.12's transfer actually moved,
+/// not the one its parent asked for.
+fn child_grant(conn: &Connection, child_run_id: RunId) -> ResourceCaps {
+    run_ledger(conn, child_run_id)
+        .expect("the child run exists")
+        .caps
+        .expect("a child run is always funded")
+}
+
+/// **The task's headline claim.** Two sibling items each nesting a `call:`:
+/// neither child's draw may exceed its own item's share of the run, even
+/// though the run as a whole still has more left.
+///
+/// The numbers are the whole test. The run grants $100 and has spent none of
+/// it, so `split_budget` gives each of the two items $50 and
+/// `bounded_child_share` halves that into a $25 request — **the same $25 for
+/// both, whichever goes first**. Computed against the run's raw remainder
+/// instead, the first item asks for half of $100 and the second for half of
+/// the $50 that left: $50 and $25, a fan-out where going first is worth twice
+/// as much.
+#[test]
+fn two_sibling_nested_calls_each_draw_only_their_own_items_share() {
+    let (conn, run_id, _sink, waves, children, result) =
+        drive_map_calls(&map_over_call(""), map_items(2), a_grant());
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![vec![
+            ("sub".to_string(), Some(0)),
+            ("sub".to_string(), Some(1)),
+        ]],
+        "each item's nested `call:` is real pending work carrying its own index: {waves:?}"
+    );
+    assert_eq!(children.len(), 2, "one child run per item");
+    let grants: Vec<f64> = children
+        .iter()
+        .map(|id| child_grant(&conn, *id).max_cost_usd)
+        .collect();
+    assert_eq!(
+        grants,
+        vec![25.0, 25.0],
+        "half of each item's own $50 share — not half of the run's remainder, which would \
+         have paid the first item $50 and the second $25"
+    );
+    assert_eq!(
+        run_ledger(&conn, run_id).unwrap().spent.cost_usd,
+        50.0,
+        "the run is charged both grants and keeps the other half: §8.9's per-item budget is a \
+         transfer out of the run's remaining budget, drawn from the one durable pool"
+    );
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries.len(), 2);
+    for (index, entry) in entries.iter().enumerate() {
+        assert_eq!(
+            entry["status"], "completed",
+            "item {index} ran its child to completion: {entry:?}"
+        );
+    }
+}
+
+/// **Asking is still not receiving, per item.** A nested `call:` that declares
+/// its own `caps:` is clamped to the item's share, exactly as an undeclared one
+/// is clamped to half of it — otherwise one `caps:` block reopens the whole
+/// hole, since `requested_child_caps` overlays a declared figure *on top of*
+/// the bounded share and `draw_child_budget` would then clamp it only against
+/// the run's remainder.
+///
+/// $500 asked, $50 granted, twice: the first item cannot take the run's whole
+/// $100 and leave its sibling nothing.
+#[test]
+fn a_nested_calls_declared_caps_cannot_exceed_its_items_share_either() {
+    let (conn, _run_id, _sink, _waves, children, result) = drive_map_calls(
+        &map_over_call("\x20       caps: { max_cost_usd: 500.0 }\n"),
+        map_items(2),
+        a_grant(),
+    );
+    result.expect("the run drives");
+
+    let grants: Vec<f64> = children
+        .iter()
+        .map(|id| child_grant(&conn, *id).max_cost_usd)
+        .collect();
+    assert_eq!(
+        grants,
+        vec![50.0, 50.0],
+        "each declared request is clamped to its own item's $50 share, rather than the first \
+         drawing the run's whole $100 remainder and the second drawing $0"
+    );
+}
+
+/// The two fields that were hardcoded `None` on the premise that a `call:`
+/// inside a `map` was refused: the parent step row's `item_index`, and
+/// `WorkflowChildCall::parent_item_index`. Without the first, two items' calls
+/// collide on one row (the primary key is
+/// `run_id, step_id, attempt, item_index`); without the second, nothing durable
+/// says which item a returning child answers.
+#[test]
+fn a_nested_calls_durable_records_say_which_item_it_belongs_to() {
+    let (conn, run_id, _sink, _waves, children, result) =
+        drive_map_calls(&map_over_call(""), map_items(2), a_grant());
+    result.expect("the run drives");
+
+    for index in 0..2u32 {
+        assert_eq!(
+            item_step_row(&conn, run_id, "sub", index).map(|r| r.0),
+            Some(StepRunState::Completed),
+            "item {index}'s `call:` has a row of its own"
+        );
+    }
+    let mut recorded: Vec<i64> = children
+        .iter()
+        .map(|child| {
+            conn.query_row(
+                "SELECT parent_item_index FROM workflow_child_call WHERE child_run_id = ?1",
+                [child.to_string()],
+                |row| row.get(0),
+            )
+            .expect("every child call is recorded")
+        })
+        .collect();
+    recorded.sort_unstable();
+    assert_eq!(
+        recorded,
+        vec![0, 1],
+        "the two children record the two items they belong to, never `-1` for `None`"
+    );
+}
+
+/// A nested `call:` is one real dispatch of the item's share, counted by
+/// `per_item_dispatch_refusal` exactly as a `tool:`/`agent:` dispatch is: a
+/// child workflow is the most real work an item can set going, and
+/// `max_tool_calls` is the field `split_budget` divides that a `map` can
+/// observe at all.
+///
+/// One item with a share of one call and two nested `call:` steps: the first
+/// runs, the second is refused before anything is created for it.
+#[test]
+fn a_nested_call_spends_one_of_its_items_dispatch_share() {
+    let (conn, _run_id, _sink, waves, children, result) = drive_map_calls(
+        &map_over_call("\x20     - id: sub2\n\x20       call: child-flow\n"),
+        map_items(1),
+        a_grant_of_tool_calls(1),
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![vec![("sub".to_string(), Some(0))]],
+        "the item's one call is spent on `sub`, so `sub2` never reaches the caller: {waves:?}"
+    );
+    assert_eq!(
+        children.len(),
+        1,
+        "and the refused `call:` funded no child at all"
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM workflow_child_call", [], |row| row
+            .get::<_, i64>(0))
+            .expect("count child calls"),
+        1,
+        "a refusal must not leave a half-created child behind"
+    );
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    let error = entries[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("sub2") && error.contains("max_tool_calls"),
+        "the refusal names the step it withheld and the field that ran out: {error:?}"
+    );
+}
+
+/// A child run suspends the parent for a whole wave, so an item holding a
+/// worktree is refused at its nested `call:` for exactly the reason it is
+/// refused at a dispatch and at a gate's park — and refused **before** the
+/// child is created, since a refusal afterwards would orphan a funded child
+/// rather than withhold work.
+#[test]
+fn an_items_worktree_cannot_span_a_nested_calls_child_run_either() {
+    let provider = Arc::new(CountingWorktreeProvider::default());
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     on_item_error: continue\n\
+         \x20     isolation: worktree\n\
+         \x20   steps:\n\
+         \x20     - id: sub\n\
+         \x20       call: child-flow\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new().resolving("child-flow");
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": map_items(2) });
+    run_ctx.worktree_provider = Some(provider.clone());
+
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    )
+    .expect("the run drives");
+
+    assert!(
+        host.sessions_created.is_empty(),
+        "no child run is created for an item that could not have survived waiting for one"
+    );
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        assert_eq!(entry["status"], "failed");
+        assert!(
+            entry["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("isolation: worktree") && e.contains("suspend")),
+            "the refusal names exactly what is unsupported: {entry:?}"
+        );
+    }
+    let materialized = provider.materialized.lock().expect("not poisoned").clone();
+    assert_eq!(materialized.len(), 2, "one worktree per item");
+    assert_eq!(
+        provider.released.lock().expect("not poisoned").clone(),
+        materialized,
+        "every worktree the refusal abandoned is still released"
+    );
+}
+
+/// An inner `call:` whose `when:` is false is **skipped, not dispatched** — the
+/// `when:` gate is evaluated before the nested-`call:` arm, exactly as it is
+/// before the nested-`gate:` one. Nothing is resolved, funded or logged for it.
+///
+/// Driven twice, with the dispatching item first and then last (this file's own
+/// fixture convention, ruling P92), so neither a `.take(1)`- nor a
+/// `.skip(1)`-shaped defect in the item walk is invisible here.
+#[test]
+fn a_nested_calls_when_gate_still_skips_it_before_anything_is_funded() {
+    for wanted in [[false, true], [true, false]] {
+        let (conn, _run_id, sink, waves, children, result) = drive_map_calls(
+            &map_over_call("\x20       when: \"${{ item.wanted }}\"\n"),
+            Value::Array(
+                wanted
+                    .iter()
+                    .map(|w| serde_json::json!({ "wanted": w }))
+                    .collect(),
+            ),
+            a_grant(),
+        );
+        let outcome = result.expect("the run drives");
+        let dispatching = wanted.iter().position(|w| *w).expect("one item dispatches");
+
+        assert_eq!(
+            waves,
+            vec![vec![("sub".to_string(), Some(dispatching as u32))]],
+            "only the item whose `when:` held dispatches: {waves:?}"
+        );
+        assert_eq!(children.len(), 1, "one child run, for one item");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM workflow_run WHERE parent_run_id IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .expect("count child runs"),
+            1
+        );
+        assert_eq!(
+            sink.kinds()
+                .iter()
+                .filter(|k| **k == TaskKind::Agent)
+                .count(),
+            1,
+            "and the skipped item logs no `agent`-kind task standing for a call it never made"
+        );
+
+        let output = map_output(&outcome, "fan");
+        let entries = output["items"].as_array().expect("one entry per item");
+        assert_eq!(entries.len(), 2, "§8.9: never drop an item");
+        assert_eq!(entries[dispatching]["status"], "completed", "{entries:?}");
+        assert_eq!(entries[1 - dispatching]["status"], "skipped", "{entries:?}");
     }
 }

@@ -61,8 +61,12 @@
 //!   worktree fan-out is real, via the `flow -> sandbox` edge §5.2's
 //!   `roundhouse-flow` row gained in Task 14 — see
 //!   `Executor::dispatch_map_step`'s own doc comment, "Task 34".) A `gate:`
-//!   or `call:` nested inside a `map` is still refused, for the structural
-//!   reasons [`Executor::dispatch_step`]'s own arm states.
+//!   or `call:` nested inside a `map` is no longer refused either: Task 6 gave
+//!   the gate an arm that parks the whole run on one item's behalf, and Task 7
+//!   gave the call one that funds a child run out of that item's own share
+//!   ([`Loop::advance_map_item`]). What [`Executor::dispatch_step`]'s catch-all
+//!   still refuses is either body reached with **no run behind it**, which is
+//!   what that arm's own doc states.
 //! - **The crash half of report mandatoriness.** A killed daemon writes
 //!   nothing, so the report for a run that died mid-step is the **recovery
 //!   path's** to synthesise on restart (ruling P112 §5), over
@@ -2105,7 +2109,10 @@ impl<H: WorkflowHost> Loop<'_, H> {
                         GateStep::Parked(parked) => return Ok(PhaseEnd::Parked(parked)),
                     },
                     StepBody::Call { workflow, with } => {
-                        match self.dispatch_call(executor, step, workflow, with) {
+                        // `None`: this is the top-level `call:` arm, so there
+                        // is no item and no per-item share — see
+                        // `Self::advance_map_item` for the nested caller.
+                        match self.dispatch_call(executor, step, workflow, with, None) {
                             CallStep::Completed(outcome) => outcome,
                             CallStep::AwaitingWork(kind) => {
                                 return Ok(PhaseEnd::AwaitingWork(vec![
@@ -2475,6 +2482,28 @@ enum CallStep {
     AwaitingWork(PendingKind),
 }
 
+/// What a `call:` dispatched from **inside a `map` item** knows that a
+/// top-level one does not: which item it belongs to, and that item's share of
+/// the run (Phase 8 Task 25.7 Task 7).
+///
+/// Passed as one `Option` rather than two, because the two are the same fact —
+/// there is no nesting without an item, and no item without a share — and
+/// because it makes "is this call nested?" a single `match` in
+/// [`Loop::dispatch_call`] instead of two parameters that could disagree.
+///
+/// Widening that one function is deliberate: [`Loop::dispatch_gate`] is
+/// already the single implementation both [`Loop::run_phase`] and
+/// [`Loop::advance_map_item`] call into, and a second per-item copy of the
+/// `call:` arm would be the place its admission checks, its child-run
+/// creation and its `with:` redaction drifted apart.
+#[derive(Clone, Copy)]
+struct NestedCall<'a> {
+    item_index: u32,
+    /// [`split_budget`]'s even share for this item, as computed by
+    /// [`Loop::dispatch_map`] for the whole fan-out.
+    per_item_caps: &'a ResourceCaps,
+}
+
 /// What [`Loop::crash_recovery_park`] did.
 enum CrashPark {
     Parked(ParkResult),
@@ -2776,12 +2805,33 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// What *is* reachable from here is [`crate::ledger::admit_call_from_run`]
     /// refusing on §7.7's depth or fan-out, or on the run's state — and those
     /// are checked before anything is created.
+    ///
+    /// # `nested`: the same arm, from inside a `map` item (Phase 8 Task 25.7 Task 7)
+    ///
+    /// [`Some`] when this `call:` is one `map` item's inner step. It changes
+    /// exactly three things and nothing else:
+    ///
+    /// - the **requested** caps are computed against the item's own share as
+    ///   well as the run's remainder ([`requested_nested_child_caps`]);
+    /// - the parent step row is written under that item's index, so two items'
+    ///   calls do not collide on one row (migration 0007's primary key is
+    ///   `run_id, step_id, attempt, item_index`); and
+    /// - [`WorkflowChildCall::parent_item_index`] records the same index, which
+    ///   is the only durable statement of *which item* a returning child
+    ///   answers.
+    ///
+    /// The **grant** is unchanged: [`draw_child_budget`] still clamps against
+    /// the run's true remaining, because §8.9 makes an item's budget *"a
+    /// transfer out of the run's remaining budget, not an independent pool"* —
+    /// so the item's share bounds what may be *asked for*, and the run's
+    /// ledger remains the one admission chokepoint.
     fn dispatch_call(
         &mut self,
         executor: &mut Executor<'_>,
         step: &StepDef,
         workflow: &str,
         with: &Value,
+        nested: Option<NestedCall<'_>>,
     ) -> CallStep {
         let called = match self
             .host
@@ -2832,7 +2882,10 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 ));
             }
         };
-        let requested = requested_child_caps(step, &remaining);
+        let requested = match nested {
+            Some(nested) => requested_nested_child_caps(step, &remaining, nested.per_item_caps),
+            None => requested_child_caps(step, &remaining),
+        };
         let grant = draw_child_budget(&mut remaining, &requested);
 
         let child_run_id = RunId::new();
@@ -2887,17 +2940,30 @@ impl<H: WorkflowHost> Loop<'_, H> {
         );
         let inputs_secret_derived = resolved_with.is_secret_derived();
         let dispatch_input = resolved_with.into_unredacted_for_dispatch();
-        // `None`: a `call:` step nested inside a `map` is refused
-        // (`Executor::dispatch_step`'s own doc), so `dispatch_call` only
-        // ever runs for a top-level step.
-        let parent_step = self.step_run(step, StepRunState::Running, None, None, None, None, None);
+        // The item this call belongs to, or `None` for a top-level step. Both
+        // of the rows below used to hardcode `None` on the premise that a
+        // `call:` nested inside a `map` was refused — true until Phase 8 Task
+        // 25.7 Task 7, and load-bearing in both places now that it is not: the
+        // step row's primary key includes `item_index` (so two items' calls
+        // would otherwise overwrite one row), and `parent_item_index` is the
+        // only durable record of which item a returning child answers.
+        let item_index = nested.map(|nested| nested.item_index);
+        let parent_step = self.step_run(
+            step,
+            StepRunState::Running,
+            None,
+            None,
+            None,
+            None,
+            item_index,
+        );
         let task_id = TaskId::new();
         let parent_call = WorkflowChildCall {
             child_run_id,
             parent_run_id: self.run_id,
             parent_step_id: step.id.clone(),
             parent_attempt: 1,
-            parent_item_index: None,
+            parent_item_index: item_index,
             parent_task_id: task_id,
             join: ChildCallJoin::Pending,
         };
@@ -3097,14 +3163,18 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// ([`Self::decided_map_item_step`]) rather than asks again — so each
     /// park settles one inner step of one item for good.
     ///
-    /// # What this task deliberately does not do
+    /// # A nested `call:` needs none of that (Task 7), only a budget
     ///
-    /// - **Nested `call:`.** An inner `call:` still takes
-    ///   [`Executor::dispatch_step`]'s catch-all refusal, unchanged — it comes
-    ///   back `Done(failed)` from the generic arm below rather than needing an
-    ///   arm of its own. Task 7 owns making it real, and the match below is
-    ///   shaped (special cases first, generic dispatch last) so it can be
-    ///   added without restructuring this loop.
+    /// The third body [`Executor::dispatch_step`]'s catch-all used to refuse
+    /// from inside a `map` is now [`Self::advance_map_item`]'s own arm — and it
+    /// needed no new suspension at all, because a child run is answered by the
+    /// same [`Resume::Work`] a nested `tool:` is and so joins the wave above as
+    /// one more [`PendingWork`]. What it needed was the **budget** this loop
+    /// already computes: a `call:` draws a real grant out of the run's
+    /// remaining ledger, so an unclamped nested one would let the first item to
+    /// reach its call spend what the whole fan-out has left. It asks against
+    /// its own item's share instead — see [`requested_nested_child_caps`], and
+    /// [`NestedCall`] for what else the nesting changes.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_map(
         &mut self,
@@ -3578,6 +3648,10 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// A nested `gate:` is the one inner step that can stop the item without
     /// dispatching anything: it returns [`ItemAdvance::WantsPark`], which the
     /// caller may or may not act on this segment (Phase 8 Task 25.7 Task 6).
+    /// A nested `call:` (Task 7) is the opposite — it stops the item by
+    /// dispatching, returning the same [`ItemAdvance::Pending`] a `tool:` does
+    /// — but it is intercepted here for the same reason the gate is: it needs
+    /// the `Connection` and the run's ledger row.
     #[allow(clippy::too_many_arguments)]
     fn advance_map_item(
         &mut self,
@@ -3665,6 +3739,19 @@ impl<H: WorkflowHost> Loop<'_, H> {
                     on_timeout,
                     hold_workspace,
                 } => Some((title, form, timeout, on_timeout, *hold_workspace)),
+                _ => None,
+            };
+            // **A nested `call:` is intercepted here too** (Phase 8 Task 25.7
+            // Task 7), the last of the three bodies
+            // `Executor::dispatch_step`'s catch-all refused from inside a
+            // `map`, and for the same reason the `gate:` above is intercepted:
+            // creating and funding a child run needs the `Connection` and this
+            // run's own ledger row, neither of which `Executor` holds.
+            // Destructured beside `gate_fields`, and before the `when:` gate
+            // below for the same reason — an inner `call:` whose `when:` is
+            // false is skipped rather than dispatched.
+            let call_fields = match &inner.body {
+                StepBody::Call { workflow, with } => Some((workflow.as_str(), with)),
                 _ => None,
             };
             let outcome = match evaluate_when_gate(inner, &executor.ctx) {
@@ -3772,6 +3859,100 @@ impl<H: WorkflowHost> Loop<'_, H> {
                             hold_workspace,
                             gate_condition_was_secret_derived,
                         })));
+                    }
+                }
+                GateDecision::Proceed {
+                    gate_condition_was_secret_derived,
+                } if call_fields.is_some() => {
+                    let (workflow, with) =
+                        call_fields.expect("the guard on this arm is `call_fields.is_some()`");
+                    // **Both refusals are checked *before* the dispatch, which
+                    // is the one way this arm cannot mirror the
+                    // `tool:`/`agent:` branch below.** That branch checks them
+                    // after `Executor::dispatch_step` has answered `Pending`,
+                    // which is safe because nothing has been emitted or spent
+                    // by then. `Self::dispatch_call` is the opposite: by the
+                    // time it answers, the child `workflow_run`, its Session
+                    // and its drawn grant all exist, so a refusal afterwards
+                    // would orphan a funded child rather than withhold work.
+                    //
+                    // The item's share first: **a `call:` is one real dispatch
+                    // of this item's allowance**, counted by
+                    // `inner_step_needs_real_dispatch` exactly as a
+                    // `tool:`/`agent:` step is. `per_item_dispatch_refusal`'s
+                    // own doc settles why that is the right unit — "how much
+                    // real work may one item set going", with an `agent:`
+                    // included because `split_budget` does not divide
+                    // `max_subagents` — and a child workflow is the largest
+                    // answer to that question this crate has.
+                    if let Some(refusal) = per_item_dispatch_refusal(
+                        map_step_id,
+                        &inner.id,
+                        item_index,
+                        self.map_item_dispatches_so_far(inner_steps, item_index),
+                        per_item_caps,
+                    ) {
+                        last = refusal;
+                        break;
+                    }
+                    // **Except when this item holds a worktree** — a child run
+                    // is answered by a later `Resume::Work`, so it spans a
+                    // rebuild of the run loop exactly as any other dispatch
+                    // does. See `worktree_cannot_span_a_suspend`.
+                    if worktree.as_ref().is_some_and(ItemWorktree::holds_worktree) {
+                        let refusal = worktree_cannot_span_a_suspend(
+                            map_step_id,
+                            &inner.id,
+                            "is a `call:`, whose child run must be driven before this item can \
+                             continue, which suspends the run",
+                        );
+                        let held = worktree
+                            .take()
+                            .expect("the branch condition is `worktree.is_some_and(..)`");
+                        last = executor.release_item_isolation(map_step_id, held, refusal);
+                        break;
+                    }
+                    match self.dispatch_call(
+                        executor,
+                        inner,
+                        workflow,
+                        with,
+                        Some(NestedCall {
+                            item_index,
+                            per_item_caps,
+                        }),
+                    ) {
+                        CallStep::Completed(mut outcome) => {
+                            outcome.gate_condition_was_secret_derived =
+                                gate_condition_was_secret_derived;
+                            outcome
+                        }
+                        // The same wave suspension a nested `tool:`/`agent:`
+                        // step takes — one `PendingWork` carrying this item's
+                        // index, answered by a later `Resume::Work` — rather
+                        // than a mechanism of its own. A `call:` needs no park:
+                        // what it waits for is a child run the caller drives,
+                        // not a human.
+                        CallStep::AwaitingWork(kind) => {
+                            // `dispatch_call` already wrote this step's
+                            // `Running` row, inside the child's own transaction
+                            // (the hand-off record a child cannot commit
+                            // without). Written again here for the one thing
+                            // that row cannot carry: this step's `when:` taint,
+                            // which has nowhere else to wait for the answer —
+                            // see `Self::checkpoint_map_item_step_waiting`.
+                            self.checkpoint_map_item_step_waiting(
+                                inner,
+                                item_index,
+                                gate_condition_was_secret_derived,
+                            )?;
+                            return Ok(ItemAdvance::Pending(Box::new(self.pending_work(
+                                executor,
+                                inner,
+                                kind,
+                                Some(item_index),
+                            ))));
+                        }
                     }
                 }
                 GateDecision::Proceed {
@@ -4255,12 +4436,28 @@ fn nested_gate_cannot_park_from(
 /// the unit [`Loop::map_item_dispatches_so_far`] counts against the item's
 /// share.
 ///
-/// These are exactly the two bodies [`Executor::dispatch_step`] answers with
-/// [`super::DispatchDecision::Pending`], which is what makes "a call" the same
-/// event here and at [`Loop::admit`].
+/// These are the bodies that leave this crate as work for its caller to
+/// perform: the two [`Executor::dispatch_step`] answers with
+/// [`super::DispatchDecision::Pending`], and — since Phase 8 Task 25.7 Task 7 —
+/// a nested `call:`, whose child run the caller drives before the item can
+/// continue.
 fn inner_step_needs_real_dispatch(body: &StepBody) -> bool {
     match body {
         StepBody::Tool { .. } | StepBody::Agent { .. } => true,
+        // **A nested `call:` is a dispatch** (Phase 8 Task 25.7 Task 7, which
+        // this arm's previous note asked to decide it). It is the largest
+        // answer this crate has to `per_item_dispatch_refusal`'s question —
+        // "how much real work may one item set going" — and, unlike a park, it
+        // is not free: it draws a grant out of the run's remaining budget and
+        // occupies the caller until the child run ends.
+        //
+        // Counted against `max_tool_calls` rather than `max_subagents`, which
+        // is the field `Loop::admit` bills a *top-level* `call:`, for the
+        // reason `per_item_dispatch_refusal` records for `agent:`: `split_budget`
+        // deliberately does not divide `max_subagents`, so counting there would
+        // bound an item by the whole run's allowance — not a per-item bound at
+        // all.
+        StepBody::Call { .. } => true,
         // Answered inside this crate, dispatching nothing: `emit:`/`report:`,
         // and a nested `map:` (which runs its own items through
         // `Executor::dispatch_map_step`'s in-memory loop).
@@ -4277,16 +4474,13 @@ fn inner_step_needs_real_dispatch(body: &StepBody) -> bool {
         // Counting it would withhold items from a fan-out whose gates cost
         // the run nothing.
         //
-        // `call:` inside a `map` still takes that catch-all refusal and so
-        // dispatches nothing either; Task 7 owns making it real and must
-        // decide this arm again. Written out rather than left to a `_` so
-        // that a new `StepBody` variant is a compile error here instead of a
-        // silent hole in the ceiling.
+        // Written out rather than left to a `_` so that a new `StepBody`
+        // variant is a compile error here instead of a silent hole in the
+        // ceiling.
         StepBody::Emit { .. }
         | StepBody::Report { .. }
         | StepBody::Map { .. }
-        | StepBody::Gate { .. }
-        | StepBody::Call { .. } => false,
+        | StepBody::Gate { .. } => false,
     }
 }
 
@@ -4387,6 +4581,78 @@ fn bounded_child_share(remaining: &ResourceCaps) -> ResourceCaps {
         run_wall_timeout: remaining.run_wall_timeout,
         run_active_timeout: remaining.run_active_timeout,
         step_timeout: remaining.step_timeout,
+    }
+}
+
+/// [`requested_child_caps`] for a `call:` nested inside a `map` item: the same
+/// rule, computed against the item's own share rather than the whole run's
+/// remainder (Phase 8 Task 25.7 Task 7).
+///
+/// # Why the share has to bound the request, and not only the grant
+///
+/// [`draw_child_budget`] already clamps every field to what the run has left,
+/// and that stays the one durable admission chokepoint — §8.9's per-item budget
+/// is *"a transfer out of the run's remaining budget, not an independent
+/// pool"*. But the run's remainder is what the **whole fan-out** shares, so
+/// asking against it makes a nested `call:` a race: the first item to reach its
+/// call asks for half of everything, and its siblings divide what is left. The
+/// item's share is the figure that is already *about* one item, so it is the
+/// one the request is computed from.
+///
+/// # Two clamps, and the second is not redundant
+///
+/// - The **baseline**: the narrower of the run's remainder and the item's
+///   share, in place of the bare remainder [`bounded_child_share`] would
+///   otherwise halve. This is what bounds the default request.
+/// - The **result**, against the same share. A `caps:` block is overlaid by
+///   [`requested_child_caps`] *after* the halving and replaces the field
+///   outright, so without this second clamp `caps: { max_cost_usd: 500 }`
+///   would be bounded only by `draw_child_budget`'s run-level clamp — one
+///   item drawing the fan-out's entire remaining dollars, which is the exact
+///   hole this function exists to close. An author's declared figure can
+///   therefore reach the item's whole share (never half of it), and no more,
+///   which mirrors what a declared figure already does at the top level: it
+///   can reach the parent's whole remainder.
+///
+/// Both clamps are [`narrower_caps`], and for six of the ten fields both are
+/// no-ops by construction: [`split_budget`] divides only `max_cost_usd`,
+/// `max_tokens`, `max_tool_calls` and `max_bytes_written`, and passes the other
+/// six through equal to the run-level figure it was given — deliberately, on
+/// the reasoning in its own doc that the run-level cap *is* the meaningful
+/// per-item ceiling for those. So this narrows exactly the four fields the
+/// split makes per-item, which are also four of the seven
+/// `bounded_child_share` halves.
+fn requested_nested_child_caps(
+    step: &StepDef,
+    parent_remaining: &ResourceCaps,
+    per_item_caps: &ResourceCaps,
+) -> ResourceCaps {
+    let baseline = narrower_caps(parent_remaining, per_item_caps);
+    narrower_caps(&requested_child_caps(step, &baseline), per_item_caps)
+}
+
+/// The tighter of two ceilings, field by field — never a mix of "the lower
+/// number" and "the one that happens to be written second".
+///
+/// Every field is written out rather than left to a `..` fallback, so a new
+/// [`ResourceCaps`] field is a compile error here instead of a ceiling that
+/// silently stops being narrowed.
+fn narrower_caps(a: &ResourceCaps, b: &ResourceCaps) -> ResourceCaps {
+    ResourceCaps {
+        // `f64::min` returns the non-`NaN` operand, which is the safe
+        // direction here: a `NaN` ceiling narrows to the real one rather than
+        // propagating. `draw_child_budget`'s `draw_f64` is what refuses a
+        // request that is still not a usable dollar figure.
+        max_cost_usd: a.max_cost_usd.min(b.max_cost_usd),
+        max_tokens: a.max_tokens.min(b.max_tokens),
+        max_tasks: a.max_tasks.min(b.max_tasks),
+        max_tool_calls: a.max_tool_calls.min(b.max_tool_calls),
+        max_subagents: a.max_subagents.min(b.max_subagents),
+        max_bytes_written: a.max_bytes_written.min(b.max_bytes_written),
+        max_escalations: a.max_escalations.min(b.max_escalations),
+        run_wall_timeout: a.run_wall_timeout.min(b.run_wall_timeout),
+        run_active_timeout: a.run_active_timeout.min(b.run_active_timeout),
+        step_timeout: a.step_timeout.min(b.step_timeout),
     }
 }
 

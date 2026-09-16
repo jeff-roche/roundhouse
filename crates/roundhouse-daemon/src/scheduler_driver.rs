@@ -3417,13 +3417,15 @@ impl DeliveryExecutor {
             call.clone(),
             WorkDone {
                 step_id: call.parent_step_id,
-                // `call:` nested inside a `map` is refused at parse time
-                // (`Executor::dispatch_step`'s own doc), so a joined
-                // child's `WorkflowChildCall::parent_item_index` is always
-                // `None` too — mirrored here rather than read from it,
-                // since this crate's job is answering `PendingWork`, not
-                // re-deriving one of its own fields.
-                item_index: None,
+                // **Read from the row, never assumed.** This used to be a
+                // hardcoded `None`, on the premise that a `call:` nested
+                // inside a `map` was refused; Phase 8 Task 25.7 Task 7 made
+                // that shape real, and `WorkflowChildCall::parent_item_index`
+                // is the durable record of which item the child answers.
+                // `WorkDone::item_index`'s own doc makes echoing it back
+                // mandatory: an answer filed under `None` answers nothing, and
+                // the item would be re-dispatched with the work already done.
+                item_index: call.parent_item_index,
                 status,
                 output,
                 output_is_secret_derived: false,
