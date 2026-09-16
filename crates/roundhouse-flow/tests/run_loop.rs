@@ -6519,3 +6519,234 @@ fn a_re_decided_step_is_refused_at_itself_when_siblings_used_the_room_up() {
          both its calls and is refused at the step after them: {entries:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cooperative run-budget exhaustion — Phase 8 Task 25.7 (#64) Task 5
+//
+// Task 4's per-item ceiling bounds one item against its siblings, and
+// `split_budget` rounds an item's share **up**, so an n-item `map` still issues
+// n real dispatches however little the run has left. These tests assert the
+// aggregate bound that ceiling's own doc comment defers to: the fan-out
+// measured against the run's remainder, with the items it never reached
+// recorded `Skipped { reason: "run_budget_exhausted" }` and the run's
+// synthesised report flagged for a human.
+// ---------------------------------------------------------------------------
+
+/// **The claim: an item the run ran out of budget before reaching is never
+/// dispatched at all** — it produces no `PendingWork`, mints no task, and is
+/// recorded `Skipped` rather than dropped or failed.
+///
+/// Five items over a run with two tool calls left. Task 4's share is
+/// `ceil(2 / 5) = 1`, so nothing about the *per-item* ceiling stops any of the
+/// five making its one call: without the aggregate bound this run dispatches
+/// five times over a budget of two.
+#[test]
+fn a_map_stops_starting_new_items_once_the_runs_own_budget_is_spent() {
+    let (_conn, _run_id, sink, waves, result) = drive_waves_with_grant(
+        &map_over_tool(2, "continue"),
+        &[],
+        a_grant_of_tool_calls(2),
+        |run_ctx| run_ctx.inputs = serde_json::json!({ "items": map_items(5) }),
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![vec![
+            ("build".to_string(), Some(0)),
+            ("build".to_string(), Some(1)),
+        ]],
+        "the run's two calls go to the first wave, and no later item ever reaches the caller \
+         as pending work: {waves:?}"
+    );
+    assert_eq!(
+        shell_tasks(&sink),
+        2,
+        "two real dispatches reached the log, not five"
+    );
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries.len(), 5, "§8.9: never drop an item");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["status"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>(),
+        vec!["completed", "completed", "skipped", "skipped", "skipped"],
+        "the two items already in flight finish; the three the run could not afford are \
+         skipped: {entries:?}"
+    );
+    assert_eq!(
+        entries[2..]
+            .iter()
+            .map(|e| e["reason"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>(),
+        vec![
+            "run_budget_exhausted",
+            "run_budget_exhausted",
+            "run_budget_exhausted"
+        ],
+        "the reason is §8.9's own, not `fail_fast`'s — no item failed: {entries:?}"
+    );
+}
+
+/// **The in-flight half of the same rule, across a suspend/resume boundary.**
+/// Exhaustion is discovered on the *second* segment, by which point items 0
+/// and 1 are already dispatched — §8.9 lets them finish their round-trip, and
+/// nothing retroactively un-dispatches them.
+///
+/// The assertion that makes this more than a restatement of the test above is
+/// the pair of `completed` entries carrying their real answers: a bound applied
+/// to every undecided item rather than to every *unstarted* one would discard
+/// two real, already-computed outputs and backfill them `Skipped`.
+#[test]
+fn an_item_already_in_flight_when_the_budget_runs_out_still_finishes() {
+    let (_conn, _run_id, _sink, waves, result) = drive_waves_with_grant(
+        &map_over_tool(2, "continue"),
+        &[],
+        a_grant_of_tool_calls(2),
+        |run_ctx| run_ctx.inputs = serde_json::json!({ "items": map_items(5) }),
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(waves.len(), 1, "exhaustion is found on the second segment");
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries[..2]
+            .iter()
+            .map(|e| e["output"]["dispatched"].clone())
+            .collect::<Vec<_>>(),
+        vec![serde_json::json!(0), serde_json::json!(1)],
+        "each in-flight item's own answer survives the segment that found the budget spent: \
+         {entries:?}"
+    );
+}
+
+/// **§8.6's flag, on a run that otherwise looks like a success.** The `map`
+/// step's aggregate status is `Completed` (a skipped item is not a failed one)
+/// and no step failed, so the run ends `Completed` — and without this the
+/// synthesised report would read `outcome: nothing, severity: low,
+/// needs_human: false` and sort to the bottom of the inbox, presenting a
+/// partial result as if it were whole.
+#[test]
+fn a_run_whose_map_ran_out_of_budget_flags_its_report_for_a_human() {
+    let (_conn, _run_id, sink, _waves, result) = drive_waves_with_grant(
+        &map_over_tool(2, "continue"),
+        &[],
+        a_grant_of_tool_calls(2),
+        |run_ctx| run_ctx.inputs = serde_json::json!({ "items": map_items(5) }),
+    );
+    let outcome = result.expect("the run drives");
+
+    let RunOutcome::Terminal { state, .. } = &outcome else {
+        panic!("the run must reach a terminal state, got {outcome:?}");
+    };
+    assert_eq!(
+        *state,
+        RunState::Completed,
+        "nothing failed: the flag has to come from the skipped items, not from the run state"
+    );
+
+    let report = sink.the_report();
+    assert_eq!(report["synthesised_by"], "run_loop");
+    assert_eq!(report["needs_human"], true);
+    assert_eq!(
+        report["outcome"], "needs_human",
+        "`outcome: nothing` beside `needs_human: true` would read as a contradiction: {report:?}"
+    );
+    assert_eq!(report["severity"], "med");
+}
+
+/// **The flag survives a `map` that finished on an earlier segment.** A run
+/// whose `map` completes and then suspends on a later step ends on an entry
+/// that never calls `dispatch_map` at all: the map's outcome is inherited from
+/// its durable row and is deliberately absent from the returned `steps`, so a
+/// signal carried only in memory — or read only off this segment's own
+/// outcomes — is lost exactly here.
+#[test]
+fn a_run_budget_skip_still_flags_the_report_when_the_run_ends_on_a_later_segment() {
+    let (_conn, _run_id, sink, waves, result) = drive_waves_with_grant(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 2\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, build] }\n\
+         \x20 - id: after\n\
+         \x20   needs: [fan]\n\
+         \x20   tool: shell\n\
+         \x20   with: { cmd: [echo, after] }\n",
+        &[],
+        a_grant_of_tool_calls(2),
+        |run_ctx| run_ctx.inputs = serde_json::json!({ "items": map_items(5) }),
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![
+            vec![
+                ("build".to_string(), Some(0)),
+                ("build".to_string(), Some(1)),
+            ],
+            vec![("after".to_string(), None)],
+        ],
+        "the map finishes on the second segment and the run suspends again on `after`, so it \
+         ends on a third: {waves:?}"
+    );
+    let RunOutcome::Terminal { state, steps, .. } = &outcome else {
+        panic!("the run must reach a terminal state, got {outcome:?}");
+    };
+    assert_eq!(*state, RunState::Completed);
+    assert!(
+        !steps.iter().any(|s| s.step_id == "fan"),
+        "the map's outcome is inherited on the terminal segment, not re-recorded: {steps:?}"
+    );
+    assert_eq!(sink.the_report()["needs_human"], true);
+}
+
+/// **The reactive half of §8.9's "whichever way it is discovered": the `map`
+/// step's own admission.** A run with no tasks left cannot admit the `map` at
+/// all, so the step fails before any item starts — the existing
+/// "admission refused" path, pinned here for a `map:` body specifically
+/// because that is the one body whose admission `run_phase` re-enters on every
+/// resumed wave.
+///
+/// The proactive check above cannot cover this case and is not asked to: there
+/// are no items to skip when the fan-out never began.
+#[test]
+fn a_map_the_ledger_refuses_to_admit_fails_before_any_item_starts() {
+    let (conn, run_id, sink, waves, result) = drive_waves_with_grant(
+        &map_over_tool(2, "continue"),
+        &[],
+        ResourceCaps {
+            max_tasks: 0,
+            ..a_grant()
+        },
+        |run_ctx| run_ctx.inputs = serde_json::json!({ "items": map_items(5) }),
+    );
+    let outcome = result.expect("the run drives");
+
+    assert!(waves.is_empty(), "no item is ever dispatched: {waves:?}");
+    assert_eq!(shell_tasks(&sink), 0);
+    let RunOutcome::Terminal { state, .. } = &outcome else {
+        panic!("the run must reach a terminal state, got {outcome:?}");
+    };
+    assert_eq!(*state, RunState::Failed);
+    let (fan_state, fan_error) = step_row(&conn, run_id, "fan");
+    assert_eq!(fan_state, StepRunState::Failed);
+    assert!(
+        fan_error
+            .as_deref()
+            .is_some_and(|e| e.contains("admission refused") && e.contains("max_tasks")),
+        "the refusal names the field that ran out: {fan_error:?}"
+    );
+    assert_eq!(sink.the_report()["needs_human"], true);
+}

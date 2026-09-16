@@ -91,9 +91,11 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::map_step::{
-    fold_inner_step_outcome, map_step_outcome, nested_report_refusal, parse_map_inner_steps,
-    per_item_dispatch_refusal, resolve_map_items, restore_map_roots, snapshot_map_roots,
-    split_budget, ItemErrorPolicy, ItemOutcome, ItemWorktree, MapBudget, MapRunResult,
+    fold_inner_step_outcome, map_step_outcome, nested_report_refusal,
+    output_records_a_run_budget_skip, parse_map_inner_steps, per_item_dispatch_refusal,
+    resolve_map_items, restore_map_roots, run_budget_is_exhausted, skipped_by_run_budget_exhausted,
+    snapshot_map_roots, split_budget, ItemErrorPolicy, ItemOutcome, ItemWorktree, MapBudget,
+    MapRunResult,
 };
 use super::{
     evaluate_when_gate, redact_with_needles, steps_context_entry, truncate_diagnostic, Executor,
@@ -1847,9 +1849,12 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 // It is a bound between an item and its siblings, **not** a
                 // bound on the map's total: `split_budget` rounds an item's
                 // share up, so every item keeps at least one call while the
-                // run has any allowance left, and an n-item `map` still
-                // issues n real dispatches. Bounding the aggregate is §8.9's
-                // cooperative run-budget exhaustion, which is Task 5's.
+                // run has any allowance left, and an n-item `map` would still
+                // issue n real dispatches. The aggregate bound is the second
+                // thing `Self::dispatch_map` reads this same figure for —
+                // §8.9's cooperative run-budget exhaustion, through
+                // `run_budget_is_exhausted` (Task 5), which stops the fan-out
+                // *starting* an item the run can no longer afford.
                 //
                 // Nor does it change what reaches §8.4's ledger: an inner
                 // step is still not charged there, only the `map` step itself
@@ -2783,9 +2788,20 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// re-derived from the item's own rows
     /// ([`Self::map_item_dispatches_so_far`]) and enforced at the one seam an
     /// inner step becomes real work (see [`per_item_dispatch_refusal`] for
-    /// which field it bounds and why that one). Cooperative run-budget
-    /// exhaustion — an item the *run* ran out of budget before reaching — is
-    /// the different question Task 5 owns.
+    /// which field it bounds and why that one).
+    ///
+    /// # Cooperative run-budget exhaustion (Task 5), which is the other bound
+    ///
+    /// The per-item ceiling above is a fairness bound between siblings and
+    /// deliberately not a bound on the map's total — `split_budget` rounds an
+    /// item's share up, so n items each keep a call however little the run has
+    /// left. The aggregate bound is the second check in the loop below: the
+    /// fan-out's own dispatch count ([`Self::map_dispatches_so_far`]) against
+    /// what the run has left ([`run_budget_is_exhausted`]), asked at the one
+    /// seam an item is *started*. §8.9's shape falls out of where it is asked:
+    /// an item already in flight is never withheld, so it finishes its
+    /// round-trip, and an item this fan-out has not begun is recorded
+    /// [`skipped_by_run_budget_exhausted`] rather than dropped or failed.
     ///
     /// # What this task deliberately does not do
     ///
@@ -2839,6 +2855,21 @@ impl<H: WorkflowHost> Loop<'_, H> {
             None => MapBudget::unenforced_placeholder().total_remaining,
         };
         let per_item_caps = split_budget(&run_remaining, items.len() as u32);
+        // §8.9's aggregate bound (Task 5), whose two halves are computed here
+        // because neither changes while the items are walked:
+        //
+        // - what this fan-out has already spent, re-derived from the durable
+        //   per-item rows exactly as the per-item tally is; and
+        // - whether the run's remainder can bound it at all. A `map` none of
+        //   whose inner steps ever reaches the dispatch seam (see
+        //   `inner_step_needs_real_dispatch`) spends nothing, so a run with no
+        //   calls left is not a reason to withhold it. Without this, a run that
+        //   had spent its `max_tool_calls` on earlier steps would skip every
+        //   item of a `map` that would have completed for free.
+        let map_dispatches_before = self.map_dispatches_so_far(&inner_steps);
+        let fan_out_can_dispatch = inner_steps
+            .iter()
+            .any(|inner| inner_step_needs_real_dispatch(&inner.body));
 
         let snapshots = snapshot_map_roots(&executor.ctx, as_name, isolation);
         let mut any_item_secret_derived = over_evaluated.secret_derived();
@@ -2874,6 +2905,52 @@ impl<H: WorkflowHost> Loop<'_, H> {
             // rows from an earlier wave, therefore still advances; only an
             // item this fan-out would be **starting** is withheld.
             if stopped && !self.map_item_is_in_flight(&inner_steps, item_index) {
+                continue;
+            }
+            // **§8.9's cooperative run-budget exhaustion, asked at the one seam
+            // an item is *started*** (Task 5). A distinct stop condition from
+            // `fail_fast` above and deliberately not routed through
+            // `ItemErrorPolicy`: that one is driven by `policy.observe`, which
+            // fires only on a real item failure, and nothing here failed.
+            //
+            // Three things follow from asking it *here*:
+            //
+            // - An item already in flight is never withheld, so §8.9's
+            //   "in-flight items finish their current round-trip" needs no
+            //   second mechanism. What that leaves unbounded is stated at
+            //   `run_budget_is_exhausted`'s own doc: an item already part-way
+            //   through may still start its next inner step's round-trip.
+            // - The items this fan-out already pushed into `pending` are
+            //   untouched, because the wave is built in order and nothing
+            //   revisits an entry.
+            // - The decision is recorded on the item now rather than latched
+            //   into a flag and backfilled at the trailing fill below, so the
+            //   reason is attached where it is decided. No latch is needed for
+            //   the condition to stick: `map_dispatches_before` is fixed for
+            //   this segment and `pending` only grows, so once the sum reaches
+            //   the run's remainder it stays there.
+            //
+            // Ordered *after* the `fail_fast` guard so that an item both would
+            // withhold keeps `fail_fast`'s reason: a fan-out stopped because
+            // its items are failing is a different thing to tell an operator
+            // than one stopped because the run ran out, and the failure is the
+            // one with a cause inside the workflow.
+            //
+            // `dispatched_this_segment` is what this segment has added to the
+            // durable tally — `advance_map_item` returns at the first inner
+            // step that dispatches, so one `pending` entry is one dispatch. The
+            // one over-count is a step §8.10 tier 2 re-decides, whose own row
+            // is already in `map_dispatches_before` while its re-dispatch adds
+            // an entry here; it moves the bound earlier, never later.
+            let dispatched_this_segment = u32::try_from(pending.len()).unwrap_or(u32::MAX);
+            if fan_out_can_dispatch
+                && !self.map_item_is_in_flight(&inner_steps, item_index)
+                && run_budget_is_exhausted(
+                    map_dispatches_before.saturating_add(dispatched_this_segment),
+                    &run_remaining,
+                )
+            {
+                outcomes[index] = Some(skipped_by_run_budget_exhausted());
                 continue;
             }
             let item_evaluated = over_evaluated.derive(item.clone());
@@ -2922,9 +2999,11 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 // the fan-out before **starting** — an item that was started
                 // still advanced above, however late its failure was observed
                 // (see the `map_item_is_in_flight` guard). A wave ceiling
-                // always leaves `pending` non-empty, which returned above.
-                // Recorded rather than dropped — §8.9's "every item gets an
-                // entry" — through the same constructor `run_map`'s own
+                // always leaves `pending` non-empty, which returned above, and
+                // the other stop condition (run-budget exhaustion) records its
+                // items where it decides them rather than leaving them to this
+                // fill. Recorded rather than dropped — §8.9's "every item gets
+                // an entry" — through the same constructor `run_map`'s own
                 // trailing fill uses.
                 .map(|outcome| outcome.unwrap_or_else(ItemErrorPolicy::skipped_by_fail_fast))
                 .collect(),
@@ -2959,6 +3038,47 @@ impl<H: WorkflowHost> Loop<'_, H> {
                     .item_steps_before
                     .contains_key(&(inner.id.clone(), item_index))
         })
+    }
+
+    /// How many real dispatches this **whole** `map` has already made — the
+    /// running tally [`run_budget_is_exhausted`] compares against what the run
+    /// has left.
+    ///
+    /// [`Self::map_item_dispatches_so_far`]'s aggregate counterpart, counting
+    /// the same rows by the same rule ([`inner_step_needs_real_dispatch`] and
+    /// [`row_records_a_started_step`]) but walking
+    /// [`Self::item_steps_before`] once rather than asking the per-item form
+    /// once per item: that form allocates a `String` key for every (inner step,
+    /// item) pair it looks up, and a `map` may hold
+    /// [`crate::exec::map_step::MAX_MAP_ITEMS`] items.
+    ///
+    /// **What it counts is every per-item row this load found whose step id
+    /// names one of the inner steps passed in.** Those are this `map`'s inner
+    /// steps, so a second `map` elsewhere in the same workflow contributes
+    /// nothing — unless the two declare an inner step under the same id, which
+    /// `Self::item_steps_before`'s `(step_id, item_index)` key cannot tell
+    /// apart in the first place (`Self::decided_map_item_step` reads it the
+    /// same way).
+    ///
+    /// Everything [`Self::map_item_dispatches_so_far`]'s own doc records about
+    /// the snapshot applies unchanged: it is frozen at entry, so it cannot see
+    /// a dispatch the current segment made, and the caller adds those itself.
+    fn map_dispatches_so_far(&self, inner_steps: &[StepDef]) -> u32 {
+        let dispatchable: std::collections::HashSet<&str> = inner_steps
+            .iter()
+            .filter(|inner| inner_step_needs_real_dispatch(&inner.body))
+            .map(|inner| inner.id.as_str())
+            .collect();
+        self.item_steps_before
+            .iter()
+            .filter(|((step_id, _), row)| {
+                dispatchable.contains(step_id.as_str()) && row_records_a_started_step(row.state)
+            })
+            .count()
+            .try_into()
+            // Saturating for the reason `map_item_dispatches_so_far` gives:
+            // a wrap here would read as "this map has spent nothing".
+            .unwrap_or(u32::MAX)
     }
 
     /// How many real dispatches this `map` item has already made — the running
@@ -3752,10 +3872,30 @@ impl<H: WorkflowHost> Loop<'_, H> {
             .iter()
             .filter(|o| matches!(o.status, StepStatus::Failed { .. }))
             .collect();
+        let run_budget_exhausted = self.a_map_item_was_skipped_for_run_budget();
 
         let (outcome, severity, needs_human) = match state {
             RunState::Failed => ("failed", "high", true),
             RunState::Cancelled => ("failed", "med", true),
+            // §8.9's *"the run's report sets `needs_human: true` so the inbox
+            // visibly flags an incomplete run rather than presenting a partial
+            // result as if it were whole"*. Checked **before** the failure arm
+            // because it is the stronger claim about the run: a `map` item the
+            // run could not afford is not a failure anywhere — the item is
+            // `Skipped`, the `map` step's aggregate status is `Completed`, and
+            // the run reaches `RunState::Completed` — so nothing else in this
+            // function would say anything about it at all.
+            //
+            // `Outcome::NeedsHuman` rather than `nothing`/`findings` for the
+            // reason the `Cancelled` arm above gives for not reporting
+            // `nothing`: §8.6 sorts on
+            // `(needs_human, severity, outcome != nothing)`, so `nothing`
+            // beside `needs_human: true` fights its own flag on the third key
+            // while reading as a contradiction on the first. `med`, matching
+            // the cancel: a run that stopped short of its work, not one that
+            // failed at it. Any failures there were are still listed in
+            // `findings` below.
+            _ if run_budget_exhausted => ("needs_human", "med", true),
             _ if !failures.is_empty() => ("findings", "med", false),
             _ => ("nothing", "low", false),
         };
@@ -3765,6 +3905,13 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 Some(first) => format!("run failed at step `{}`", first.step_id),
                 None => "run failed".to_string(),
             },
+            // Ordered against the two arms below exactly as the `outcome` match
+            // is, so the headline cannot claim a completion the `outcome` does
+            // not.
+            _ if run_budget_exhausted => {
+                "run incomplete: the run's budget ran out before every `map` item was reached"
+                    .to_string()
+            }
             _ if failures.is_empty() => format!("run completed: {} steps", self.outcomes.len()),
             _ => format!(
                 "run completed with {} non-fatal step failures",
@@ -3813,6 +3960,49 @@ impl<H: WorkflowHost> Loop<'_, H> {
         let logged = redact_with_needles(&document, &executor.redaction_needles);
         persist_report(executor, logged, state).map_err(RunLoopError::SynthesisedReportInvalid)?;
         Ok(ReportPersisted(ReportOrigin::Synthesised))
+    }
+
+    /// Whether any `map` step of this run recorded an item §8.9's cooperative
+    /// run-budget exhaustion withheld — [`Self::synthesise_report`]'s
+    /// `needs_human` input (Phase 8 Task 25.7 Task 5).
+    ///
+    /// # Why two sources, neither of which is enough alone
+    ///
+    /// The item's record lives in the `map` step's own aggregate output, and
+    /// where that output can be read from depends on which segment the run
+    /// ends on:
+    ///
+    /// - [`Self::outcomes`] holds it when the run ends on the same segment the
+    ///   `map` finished on. It is the only source there: `finished_before` was
+    ///   built at that segment's entry, before the `map` finished, so the row
+    ///   written a moment ago is not in it.
+    /// - [`Self::finished_before`] holds the row when the `map` finished
+    ///   earlier and a later step suspended: `run_phase` skips a step in
+    ///   `finished_before` outright, and [`RunOutcome::Terminal`]'s `steps`
+    ///   deliberately omits what a re-drive inherited, so the outcome is not in
+    ///   `outcomes` on that segment at all.
+    ///
+    /// Both are read on every call rather than one being chosen, because
+    /// "which segment is this" is not a question this function has to ask to
+    /// get the right answer from the union.
+    ///
+    /// # On the accessor
+    ///
+    /// `value_unredacted_for_resume` because the question is structural —
+    /// whether this crate's own skip reason appears in the aggregate — and its
+    /// answer is a `bool` that reaches the document as `needs_human`, never as
+    /// text. [`StepOutput::value_for_display`] withholds the **whole** output
+    /// of a secret-derived `map`, which would silently drop the signal for
+    /// exactly the runs whose items read secret material.
+    fn a_map_item_was_skipped_for_run_budget(&self) -> bool {
+        self.outcomes
+            .iter()
+            .any(|outcome| output_records_a_run_budget_skip(&outcome.output))
+            || self.finished_before.values().any(|row| {
+                row.output.as_ref().is_some_and(|output| {
+                    output_records_a_run_budget_skip(output.value_unredacted_for_resume())
+                })
+            })
     }
 }
 

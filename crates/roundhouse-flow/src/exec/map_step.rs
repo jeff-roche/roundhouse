@@ -323,7 +323,8 @@ pub fn split_budget(total: &ResourceCaps, item_count: u32) -> ResourceCaps {
 /// returns. What it prevents is one item running away with the whole share,
 /// which is a fairness property rather than an exhaustion one. Bounding the
 /// aggregate — including recording the items a spent *run* never reached — is
-/// §8.9's cooperative run-budget exhaustion, and is a separate task's.
+/// §8.9's cooperative run-budget exhaustion, which is
+/// [`run_budget_is_exhausted`] (Task 5).
 ///
 /// # Why `max_tool_calls`, and why that field alone
 ///
@@ -374,6 +375,72 @@ pub(crate) fn per_item_dispatch_refusal(
     })
 }
 
+/// **§8.9's cooperative run-budget exhaustion, as the one question a `map` can
+/// ask before it starts another item** (Phase 8 Task 25.7, #64, Task 5).
+/// `true` once the fan-out's own real dispatches have used up what the *run*
+/// had left, which is where §8.9 stops new items starting.
+///
+/// # A different bound from [`per_item_dispatch_refusal`], not a second copy of it
+///
+/// That one is a **fairness** bound: one item's tally against
+/// [`split_budget`]'s even share, so no item spends the whole allowance while
+/// its siblings starve. Because the share is rounded *up*, every item keeps at
+/// least one call while the run has any allowance at all — so an n-item `map`
+/// over a run with two calls left still issues n real dispatches, and no
+/// per-item ceiling can stop it. This is the **aggregate** bound that one's
+/// doc comment defers to: the whole fan-out against the run's remainder.
+///
+/// # Why `max_tool_calls`, and why that field alone
+///
+/// The same reason [`per_item_dispatch_refusal`] records, unchanged:
+/// `max_cost_usd`, `max_tokens` and `max_bytes_written` are measured outside
+/// the run and nothing carries them back — `crate::exec::run_loop::WorkDone`,
+/// the only thing a finished dispatch hands this crate, has no field for any
+/// of the three — so a ceiling on them would bound a figure that is always
+/// zero.
+///
+/// The two elapsed-time windows are left out for a different and sharper
+/// reason: [`crate::ledger::admit_spend`] checks both on **every** call
+/// regardless of what is being spent, and the `map` step passes through that
+/// chokepoint on every segment of its fan-out (a real charge on the first,
+/// `Spend::ZERO` on each resumed wave — see
+/// `crate::exec::run_loop::Loop::observe_admission`). A `map` whose wall or
+/// active window has run out is therefore already refused in
+/// `Loop::run_phase`, before this loop is reached at all. `max_tasks` and
+/// `max_subagents` are likewise the run-level admission's to enforce, and it
+/// charges neither for a `map` item's inner step.
+///
+/// # What `>=` means here, given nothing spends the field mid-fan-out
+///
+/// `run_remaining` is re-read from the ledger before every segment, but no
+/// part of a `map`'s fan-out charges `max_tool_calls` against it — only
+/// `Loop::admit` does, and only for a *top-level* `tool:` step — so the figure
+/// is constant for the life of one fan-out. What moves is the left-hand side,
+/// the fan-out's own dispatch count, which is why this becomes true part-way
+/// through a `map` rather than only ever at its start.
+///
+/// # What it bounds, and the one thing it does not
+///
+/// Its caller asks it at the seam an item is **started**, never at the seam an
+/// inner step dispatches, because §8.9's rule is *"no new round-trips or new
+/// items start"* while an in-flight item *"finishes its current round-trip"* —
+/// and an item cut off half-way through its inner steps has no honest outcome
+/// to record (it is not `Skipped`, having run, and `Failed` is the
+/// conflation §8.9 forbids).
+///
+/// The consequence, stated rather than left to be discovered: an item whose
+/// walk is already part-way through may start one further round-trip after
+/// this returns `true`, so a fan-out can overshoot the run's remainder by at
+/// most one dispatch per such item. Those are exactly the items a segment
+/// found mid-walk, which the wave ceiling holds to `map.max_parallel`.
+/// Closing it would need a cut-off outcome §8.9 does not define.
+pub(crate) fn run_budget_is_exhausted(
+    map_dispatches_so_far: u32,
+    run_remaining: &ResourceCaps,
+) -> bool {
+    map_dispatches_so_far >= run_remaining.max_tool_calls
+}
+
 /// The result of a `map` step's fan-out: the per-item outcomes (never
 /// truncated — every item gets an entry, per §8.9), plus, when
 /// `on_item_error: collect`, the gathered error messages for the map step's
@@ -419,7 +486,9 @@ pub struct MapRunResult {
 /// own comment for why binding it *here* would bound nothing but stub work.
 /// The loop that enforces the same share for real is
 /// `crate::exec::run_loop::Loop::dispatch_map`, through
-/// [`per_item_dispatch_refusal`].
+/// [`per_item_dispatch_refusal`] — and it is also where the cooperative
+/// decision described above is actually made, through
+/// [`run_budget_is_exhausted`] and [`skipped_by_run_budget_exhausted`].
 ///
 /// `on_item_error` (finding 10's fix — previously `collect` and `continue`
 /// were indistinguishable):
@@ -521,6 +590,57 @@ impl ItemErrorPolicy {
     pub(crate) fn into_collected_errors(self) -> Vec<String> {
         self.collected_errors
     }
+}
+
+/// The reason §8.9 gives an item the *run* ran out of budget before reaching,
+/// so a reader can tell it from an item `fail_fast` withheld
+/// ([`FAIL_FAST_SKIP_REASON`]) and from one its own `when:` skipped. The
+/// literal §8.9 itself writes.
+pub(crate) const RUN_BUDGET_EXHAUSTED_SKIP_REASON: &str = "run_budget_exhausted";
+
+/// [`ItemErrorPolicy::skipped_by_fail_fast`]'s counterpart for §8.9's
+/// cooperative run-budget exhaustion — the same "never drop an item" record,
+/// for the other of the two reasons a fan-out stops starting items.
+///
+/// **Deliberately a free function rather than a second method on
+/// [`ItemErrorPolicy`], and deliberately not that constructor reused.**
+/// `fail_fast` is an `on_item_error` policy, driven by
+/// [`ItemErrorPolicy::observe`], which fires only on a real item *failure*;
+/// running out of run budget is environmental and no item failed. Sharing the
+/// constructor — or the reason string — would make the two indistinguishable
+/// in a `map`'s own output, which is what §8.9's "never conflated with a real
+/// failure" forbids, and would also make
+/// [`output_records_a_run_budget_skip`] fire on a `fail_fast` cutoff.
+pub(crate) fn skipped_by_run_budget_exhausted() -> ItemOutcome {
+    ItemOutcome::Skipped {
+        reason: RUN_BUDGET_EXHAUSTED_SKIP_REASON.to_string(),
+    }
+}
+
+/// Whether a `map` step's own aggregate output records at least one item
+/// [`skipped_by_run_budget_exhausted`] withheld — the signal
+/// `crate::exec::run_loop::Loop::synthesise_report` turns into §8.9's
+/// `needs_human: true`.
+///
+/// It reads the shape [`map_step_outcome`] writes, through the same
+/// [`item_outcome_to_json`] mapping that wrote it, so the two cannot drift.
+///
+/// **Structural, so it is stated as what it matches rather than as what it
+/// means.** Any output at all can be handed to it, and `false` is simply
+/// "nothing of this shape is in there" — but it does not verify that the
+/// output came from a `map` step, because its callers hold a
+/// [`StepOutcome`]/`workflow_step_run` row rather than the `StepDef` that
+/// would say so. The one way to reach a false positive is a non-`map` step
+/// whose own output contains an `items` array carrying this crate's private
+/// reason constant, and its only effect is to flag a run for an operator that
+/// did not need flagging — the safe direction for a field whose purpose is to
+/// stop an incomplete run being silently buried.
+pub(crate) fn output_records_a_run_budget_skip(output: &Value) -> bool {
+    output["items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["status"] == "skipped" && item["reason"] == RUN_BUDGET_EXHAUSTED_SKIP_REASON
+        })
+    })
 }
 
 fn item_outcome_to_json(o: &ItemOutcome) -> Value {
