@@ -110,7 +110,7 @@
 use crate::caps::ResourceCaps;
 use crate::exec::{RunId, StepOutcome};
 use crate::parse::steps::{StepBody, StepDef};
-use roundhouse_core::{BindingId, JobId, SessionId, Timestamp};
+use roundhouse_core::{BindingId, JobId, SessionId, TaskId, Timestamp};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fmt;
 use thiserror::Error;
@@ -1064,6 +1064,272 @@ pub struct RecoveredRun {
     pub steps: Vec<WorkflowStepRun>,
 }
 
+/// The durable identity of one `call:` invocation that is waiting for its
+/// child. It deliberately records identifiers and join progress only: resolved
+/// `call.with` inputs and their secret provenance remain process-local.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowChildCall {
+    pub child_run_id: RunId,
+    pub parent_run_id: RunId,
+    pub parent_step_id: String,
+    pub parent_attempt: u32,
+    pub parent_item_index: Option<u32>,
+    pub parent_task_id: TaskId,
+    pub join: ChildCallJoin,
+}
+
+/// Whether the child result has been appended to its original parent task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildCallJoin {
+    Pending,
+    Joined {
+        terminal_task_seq: u64,
+        joined_at: Timestamp,
+    },
+}
+
+/// A durable lease token held by the one continuation permitted to resume a
+/// parent call. The token is deliberately opaque to callers; only the writer
+/// that acquired it may release or complete the claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildContinuationClaim {
+    token: Uuid,
+}
+
+impl ChildCallJoin {
+    fn as_sql_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Joined { .. } => "joined",
+        }
+    }
+}
+
+/// Stores the call identity in the transaction that creates the child and
+/// checkpoints its parent step. A child run can therefore never be durable
+/// without the task and step identity its later continuation needs.
+pub fn insert_workflow_child_call_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+    call: &WorkflowChildCall,
+) -> Result<(), DurabilityError> {
+    let (terminal_task_seq, joined_at) = match call.join {
+        ChildCallJoin::Pending => (None, None),
+        ChildCallJoin::Joined {
+            terminal_task_seq,
+            joined_at,
+        } => (
+            Some(seq_to_sql(Some(terminal_task_seq))?),
+            Some(joined_at.as_unix_nanos()),
+        ),
+    };
+    txn.execute(
+        "INSERT INTO workflow_child_call
+            (child_run_id, parent_run_id, parent_step_id, parent_attempt, parent_item_index,
+             parent_task_id, join_state, terminal_task_seq, joined_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            call.child_run_id.to_string(),
+            call.parent_run_id.to_string(),
+            call.parent_step_id,
+            call.parent_attempt,
+            item_index_to_sql(call.parent_item_index),
+            call.parent_task_id.to_string(),
+            call.join.as_sql_str(),
+            terminal_task_seq,
+            joined_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Loads the parent invocation associated with one child run. `None` means the
+/// run was not created by a call recorded by this version of the flow.
+pub fn workflow_child_call_for_child_run(
+    conn: &Connection,
+    child_run_id: RunId,
+) -> Result<Option<WorkflowChildCall>, DurabilityError> {
+    let row = conn
+        .query_row(
+            "SELECT parent_run_id, parent_step_id, parent_attempt, parent_item_index,
+                    parent_task_id, join_state, terminal_task_seq, joined_at
+             FROM workflow_child_call WHERE child_run_id = ?1",
+            params![child_run_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        parent_run_id,
+        parent_step_id,
+        parent_attempt,
+        parent_item_index,
+        parent_task_id,
+        join_state,
+        terminal_task_seq,
+        joined_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let parent_run_id = RunId::from_uuid(parse_uuid(
+        &parent_run_id,
+        "workflow_child_call.parent_run_id",
+    )?);
+    let parent_task_id = TaskId::from_uuid(parse_uuid(
+        &parent_task_id,
+        "workflow_child_call.parent_task_id",
+    )?);
+    let join = match join_state.as_str() {
+        "pending" if terminal_task_seq.is_none() && joined_at.is_none() => ChildCallJoin::Pending,
+        "joined" => ChildCallJoin::Joined {
+            terminal_task_seq: u64::try_from(terminal_task_seq.ok_or(
+                DurabilityError::UnrecognizedDiscriminant {
+                    column: "workflow_child_call.join_state",
+                    value: join_state,
+                },
+            )?)
+            .map_err(|_| DurabilityError::UnrecognizedDiscriminant {
+                column: "workflow_child_call.terminal_task_seq",
+                value: "negative".into(),
+            })?,
+            joined_at: Timestamp::from_unix_nanos(joined_at.ok_or(
+                DurabilityError::UnrecognizedDiscriminant {
+                    column: "workflow_child_call.join_state",
+                    value: "joined without joined_at".into(),
+                },
+            )?),
+        },
+        value => {
+            return Err(DurabilityError::UnrecognizedDiscriminant {
+                column: "workflow_child_call.join_state",
+                value: value.to_string(),
+            })
+        }
+    };
+    Ok(Some(WorkflowChildCall {
+        child_run_id,
+        parent_run_id,
+        parent_step_id,
+        parent_attempt,
+        parent_item_index: item_index_from_sql(parent_item_index)?,
+        parent_task_id,
+        join,
+    }))
+}
+
+/// Marks the association joined after the parent task terminal event has been
+/// appended in the same transaction. `false` means another continuation already
+/// committed that event, so callers must reuse the stored sequence instead of
+/// appending a duplicate terminal.
+pub fn mark_workflow_child_call_joined_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+    child_run_id: RunId,
+    terminal_task_seq: u64,
+    joined_at: Timestamp,
+) -> Result<bool, DurabilityError> {
+    Ok(txn.execute(
+        "UPDATE workflow_child_call
+            SET join_state = 'joined', terminal_task_seq = ?1, joined_at = ?2
+          WHERE child_run_id = ?3 AND join_state = 'pending'",
+        params![
+            seq_to_sql(Some(terminal_task_seq))?,
+            joined_at.as_unix_nanos(),
+            child_run_id.to_string(),
+        ],
+    )? == 1)
+}
+
+/// Atomically elects one continuation for a terminal child call. A claim stays
+/// exclusive until its owner returns an error, completes it, or a later daemon
+/// boot recovers the dead process's incomplete work.
+pub fn claim_workflow_child_continuation_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+    child_run_id: RunId,
+) -> Result<Option<(WorkflowChildCall, ChildContinuationClaim)>, DurabilityError> {
+    let claim = ChildContinuationClaim {
+        token: Uuid::new_v4(),
+    };
+    if txn.execute(
+        "UPDATE workflow_child_call
+            SET continuation_state = 'claimed', continuation_claim_token = ?1
+          WHERE child_run_id = ?2
+            AND continuation_state = 'available'",
+        params![claim.token.to_string(), child_run_id.to_string()],
+    )? == 0
+    {
+        return Ok(None);
+    }
+    let call = workflow_child_call_for_child_run(txn, child_run_id)?.ok_or(
+        DurabilityError::RunNotFound {
+            run_id: child_run_id,
+        },
+    )?;
+    Ok(Some((call, claim)))
+}
+
+/// Releases a claim after an ordinary returned continuation error. A retry may
+/// claim the call immediately; a stale owner cannot release another claim.
+pub fn release_workflow_child_continuation_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+    child_run_id: RunId,
+    claim: &ChildContinuationClaim,
+) -> Result<(), DurabilityError> {
+    txn.execute(
+        "UPDATE workflow_child_call
+            SET continuation_state = 'available', continuation_claim_token = NULL
+          WHERE child_run_id = ?1 AND continuation_state = 'claimed'
+            AND continuation_claim_token = ?2",
+        params![child_run_id.to_string(), claim.token.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Releases claims left by a process that cannot still execute. This is only
+/// called from daemon boot reconciliation, never by a live retry path.
+pub fn release_incomplete_workflow_child_continuations_at_boot_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+) -> Result<usize, DurabilityError> {
+    Ok(txn.execute(
+        "UPDATE workflow_child_call
+            SET continuation_state = 'available', continuation_claim_token = NULL
+          WHERE continuation_state = 'claimed'",
+        [],
+    )?)
+}
+
+/// Makes a successfully resumed call permanently ineligible for another
+/// continuation. The token comparison prevents a stale lease owner from
+/// completing a newer retry's work.
+pub fn complete_workflow_child_continuation_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+    child_run_id: RunId,
+    claim: &ChildContinuationClaim,
+    now: Timestamp,
+) -> Result<bool, DurabilityError> {
+    Ok(txn.execute(
+        "UPDATE workflow_child_call
+            SET continuation_state = 'completed', continuation_claim_token = NULL,
+                continuation_completed_at = ?1
+          WHERE child_run_id = ?2 AND continuation_state = 'claimed'
+            AND continuation_claim_token = ?3",
+        params![
+            now.as_unix_nanos(),
+            child_run_id.to_string(),
+            claim.token.to_string(),
+        ],
+    )? == 1)
+}
+
 /// Inserts a new `workflow_run` row.
 ///
 /// §8.10 tier 1: one SQLite transaction per transition, through
@@ -1715,13 +1981,25 @@ pub fn checkpoint_step(
     step: &WorkflowStepRun,
 ) -> Result<(), DurabilityError> {
     let txn = roundhouse_store::begin_immediate(conn)?;
-    if !run_exists(&txn, step.run_id)? {
+    checkpoint_step_in_transaction(&txn, step)?;
+    txn.commit()?;
+    Ok(())
+}
+
+/// Writes a step checkpoint into a caller-owned transaction.
+///
+/// Child-call admission uses this with the child run insert so a child cannot
+/// commit without the parent step's `Running` hand-off record.
+pub fn checkpoint_step_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+    step: &WorkflowStepRun,
+) -> Result<(), DurabilityError> {
+    if !run_exists(txn, step.run_id)? {
         return Err(DurabilityError::RunNotFound {
             run_id: step.run_id,
         });
     }
-    write_step_row(&txn, step.run_id, step)?;
-    txn.commit()?;
+    write_step_row(txn, step.run_id, step)?;
     Ok(())
 }
 

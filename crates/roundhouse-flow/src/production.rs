@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::durability::{WorkflowChildCall, WorkflowStepRun};
 use crate::exec::run_loop::{
     run_workflow, CalledWorkflow, RunLoopError, RunOutcome, SessionTree, WorkflowHost,
     WorkflowHostError,
@@ -20,7 +21,7 @@ use crate::job::Body;
 use crate::job_store::{resolve_job, resolve_job_version, RegisteredJob};
 use crate::parking::{CheckpointArtifact, CheckpointError, CheckpointRef, Checkpointer};
 use crate::parse::WorkflowDef;
-use roundhouse_core::{BlobRef, SessionId, Timestamp};
+use roundhouse_core::{BlobRef, SessionId, TaskId, TaskInput, Timestamp};
 
 /// A workflow host backed by registered immutable job versions in SQLite.
 ///
@@ -51,6 +52,17 @@ impl SessionTree for UnconfiguredSessionTree {
         _txn: &rusqlite::Transaction<'_>,
         _parent: SessionId,
         _child: &crate::durability::WorkflowRun,
+    ) -> Result<(), WorkflowHostError> {
+        Err(WorkflowHostError::SessionTreeUnavailable)
+    }
+
+    fn persist_parent_call_task(
+        &mut self,
+        _txn: &rusqlite::Transaction<'_>,
+        _parent: SessionId,
+        _created_at: Timestamp,
+        _task_id: TaskId,
+        _input: TaskInput,
     ) -> Result<(), WorkflowHostError> {
         Err(WorkflowHostError::SessionTreeUnavailable)
     }
@@ -188,8 +200,8 @@ pub fn run_workflow_from_storage(
 /// Drives a run using a caller-resolved workflow definition, rather than
 /// re-resolving it from storage on every call.
 ///
-/// The daemon's segmented driving loop (Phase 8 Task 25.2) needs this: it
-/// re-enters [`run_workflow`] once per suspend/resume segment of one run,
+/// The daemon's segmented driving loop, including its recursive `call:` child
+/// drives, needs this: it re-enters [`run_workflow`] once per suspend/resume segment of one run,
 /// and [`run_workflow_from_storage`]'s `host.resolve_run_definition` spawns
 /// `round-yaml-parse-helper` out of process on every call (see
 /// `crate::parse::parse_workflow`'s own module doc) — reasonable once per
@@ -246,6 +258,9 @@ impl WorkflowHost for SqliteWorkflowHost {
         parent: SessionId,
         child: &crate::durability::WorkflowRun,
         called: &CalledWorkflow,
+        parent_step: &WorkflowStepRun,
+        parent_call: &WorkflowChildCall,
+        parent_task_input: TaskInput,
     ) -> Result<(), WorkflowHostError> {
         let txn = roundhouse_store::begin_immediate(conn)?;
         let result = self
@@ -253,6 +268,23 @@ impl WorkflowHost for SqliteWorkflowHost {
             .persist_child_session(&txn, parent, child)
             .and_then(|()| {
                 crate::durability::insert_workflow_run_in_transaction(&txn, child)
+                    .map_err(WorkflowHostError::from)
+            })
+            .and_then(|()| {
+                crate::durability::checkpoint_step_in_transaction(&txn, parent_step)
+                    .map_err(WorkflowHostError::from)
+            })
+            .and_then(|()| {
+                self.session_tree.persist_parent_call_task(
+                    &txn,
+                    parent,
+                    child.started_at,
+                    parent_call.parent_task_id,
+                    parent_task_input,
+                )
+            })
+            .and_then(|()| {
+                crate::durability::insert_workflow_child_call_in_transaction(&txn, parent_call)
                     .map_err(WorkflowHostError::from)
             });
         if let Err(error) = result {

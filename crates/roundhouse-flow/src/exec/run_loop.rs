@@ -30,8 +30,9 @@
 //!
 //! - **Driving a child run.** The `call:` arm creates the child
 //!   `workflow_run` (drawing its grant, §8.12) and emits the parent's
-//!   `agent`-kind task standing for the call. It does **not** execute the
-//!   child. Two independent reasons, both structural: resolving
+//!   `agent`-kind task standing for the call. The daemon's delivery driver
+//!   recursively executes the child and resumes the parent with its report.
+//!   Two independent reasons keep that I/O out of this crate: resolving
 //!   `call: <name>` to a definition needs a jobs table that does not exist in
 //!   the schema (`control::retry_from_step`'s own doc records the radius), and
 //!   [`TaskSink::emit`] carries no `SessionId`, so this crate cannot write
@@ -94,9 +95,9 @@ use super::{
 use crate::caps::ResourceCaps;
 use crate::compose::draw_child_budget;
 use crate::durability::{
-    checkpoint_step, crash_policy, derive_disposition, recover_run, transition_run, CrashPolicy,
-    DurabilityError, RunState, StepDisposition, StepOutput, StepRunState, WorkflowRun,
-    WorkflowStepRun,
+    checkpoint_step, crash_policy, derive_disposition, recover_run, transition_run, ChildCallJoin,
+    CrashPolicy, DurabilityError, RunState, StepDisposition, StepOutput, StepRunState,
+    WorkflowChildCall, WorkflowRun, WorkflowStepRun,
 };
 use crate::hitl::{AwaitingHuman, CrashResolution, HitlError};
 use crate::ledger::{
@@ -177,6 +178,17 @@ pub trait SessionTree: Send {
         child: &WorkflowRun,
     ) -> Result<(), WorkflowHostError>;
 
+    /// Persists the redacted parent task that represents a `call:` in the same
+    /// transaction as its child run and call association.
+    fn persist_parent_call_task(
+        &mut self,
+        txn: &rusqlite::Transaction<'_>,
+        parent: SessionId,
+        created_at: Timestamp,
+        task_id: TaskId,
+        input: TaskInput,
+    ) -> Result<(), WorkflowHostError>;
+
     /// Makes a committed child admission visible to runtime traversal.
     fn register_child(
         &mut self,
@@ -203,17 +215,10 @@ pub trait SessionTree: Send {
     /// before this call can still fail and propagate, exactly as the
     /// `refund_child_run` beside it already can.
     ///
-    /// # Wired and testable, but no production caller yet
-    ///
-    /// Nothing in this workspace drives a workflow `call:` child run to
-    /// completion in production, so [`finish_run`]'s terminal branch — the
-    /// one call site — is reached only from tests today. That is the same
-    /// deliberate state the sub-agent half is in (see
-    /// `SubAgentSessions::retire_child`'s *"No production caller yet, and why
-    /// that is the correct state"* in `roundhouse-daemon`): the bookkeeping is
-    /// wired at the seam that owns it, so whatever eventually drives a `call:`
-    /// child to completion (part of issue #30's scope) inherits a correct slot
-    /// release by construction rather than having to remember one.
+    /// The daemon's scheduled-delivery driver recursively drives a `call:`
+    /// child to this terminal branch. Keeping the release beside the durable
+    /// refund means that driver inherits both halves of child completion rather
+    /// than having to remember either independently.
     ///
     /// Implementors must be idempotent. **Not** because this call site
     /// duplicates — [`run_workflow`] refuses to drive a run that is already
@@ -261,14 +266,18 @@ pub trait WorkflowHost: Checkpointer {
     /// Releases an uncommitted child slot.
     fn release_child_session(&mut self, parent: SessionId, child: &CalledWorkflow);
 
-    /// Persists the child session lifecycle event and workflow row in one
-    /// transaction, then registers the runtime spawn-tree edge after commit.
+    /// Persists the child session lifecycle event, workflow row, and parent
+    /// `Running` checkpoint in one transaction, then registers the runtime
+    /// spawn-tree edge after commit.
     fn create_child_run(
         &mut self,
         conn: &mut Connection,
         parent: SessionId,
         child: &WorkflowRun,
         called: &CalledWorkflow,
+        parent_step: &WorkflowStepRun,
+        parent_call: &WorkflowChildCall,
+        parent_task_input: TaskInput,
     ) -> Result<(), WorkflowHostError>;
 
     /// Drops the runtime edge [`Self::create_child_run`] registered, because
@@ -499,12 +508,16 @@ pub enum PendingKind {
     },
     /// A `call:` child run and Session already exist (created by
     /// [`Loop::dispatch_call`]); the caller drives the child and reports its
-    /// outcome. **Unused until Phase 8 Task 25.6** — the variant exists now
-    /// so [`Resume::Work`]'s shape does not have to change again when that
-    /// task lands.
+    /// outcome.
     ChildRun {
         child_run_id: RunId,
         child_session_id: SessionId,
+        parent_task_id: TaskId,
+        dispatch_input: Value,
+        /// Whether `dispatch_input` was derived from a parent secret. The
+        /// daemon passes this to the child's `RunContext` so the child can
+        /// bind its complete `inputs` root conservatively as secret-derived.
+        inputs_secret_derived: bool,
     },
 }
 
@@ -615,7 +628,9 @@ pub enum RunOutcome {
     /// report and no owner: `crate::report`'s module doc records that
     /// obligation for whoever builds §8.11's reaper.
     Parked(Box<ParkResult>),
-    /// A `tool:`/`agent:` step needs real work this crate cannot perform.
+    /// A `tool:`/`agent:`/`call:` step needs real work this crate cannot
+    /// perform. A pending call already has its funded child run and parent
+    /// agent task; the caller returns its child result as [`WorkDone`].
     /// **Not terminal, so it carries no report** — the run is still
     /// `Running` (unlike `Parked`, which writes `AwaitingHuman`: the run
     /// genuinely is running, its caller is simply not inside
@@ -1226,7 +1241,7 @@ enum PhaseEnd {
     /// and [`Loop::crash_recovery_park`]), because §8.13's cancel must
     /// converge.
     Parked(ParkResult),
-    /// A `tool:`/`agent:` step needs real work. The whole loop unwinds
+    /// A `tool:`/`agent:`/`call:` step needs real work. The whole loop unwinds
     /// exactly as for `Parked` — nothing after this step runs — but the run
     /// stays `Running`, not `AwaitingHuman`.
     AwaitingWork(Box<PendingWork>),
@@ -1671,32 +1686,19 @@ impl<H: WorkflowHost> Loop<'_, H> {
                         GateStep::Parked(parked) => return Ok(PhaseEnd::Parked(parked)),
                     },
                     StepBody::Call { workflow, with } => {
-                        self.dispatch_call(executor, step, workflow, with)
+                        match self.dispatch_call(executor, step, workflow, with) {
+                            CallStep::Completed(outcome) => outcome,
+                            CallStep::AwaitingWork(kind) => {
+                                return Ok(PhaseEnd::AwaitingWork(Box::new(
+                                    self.pending_work(executor, step, kind),
+                                )));
+                            }
+                        }
                     }
                     _ => match executor.dispatch_step(step) {
                         super::DispatchDecision::Done(outcome) => outcome,
                         super::DispatchDecision::Pending(kind) => {
-                            // The row records that the step is waiting, not
-                            // that it finished — the same shape
-                            // `dispatch_gate`'s park uses, and for the same
-                            // reason: a `Running` row is what §8.10 tier 2
-                            // reclassifies `Indeterminate` for an `Effectful`
-                            // step after a crash.
-                            self.checkpoint(step, StepRunState::Running, None, None)?;
-                            return Ok(PhaseEnd::AwaitingWork(Box::new(PendingWork {
-                                run_id: self.run_id,
-                                session_id: self.session_id,
-                                step_id: step.id.clone(),
-                                attempt: 1,
-                                item_index: None,
-                                disposition: derive_disposition(step),
-                                step_timeout: executor
-                                    .map_budget
-                                    .as_ref()
-                                    .map(|b| b.total_remaining.step_timeout)
-                                    .unwrap_or_default(),
-                                kind,
-                            })));
+                            return self.awaiting_work(executor, step, kind);
                         }
                     },
                 }
@@ -1730,6 +1732,40 @@ impl<H: WorkflowHost> Loop<'_, H> {
             }
         }
         Ok(end)
+    }
+
+    fn awaiting_work(
+        &mut self,
+        executor: &Executor<'_>,
+        step: &StepDef,
+        kind: PendingKind,
+    ) -> Result<PhaseEnd, RunLoopError> {
+        self.checkpoint(step, StepRunState::Running, None, None)?;
+        Ok(PhaseEnd::AwaitingWork(Box::new(
+            self.pending_work(executor, step, kind),
+        )))
+    }
+
+    fn pending_work(
+        &self,
+        executor: &Executor<'_>,
+        step: &StepDef,
+        kind: PendingKind,
+    ) -> PendingWork {
+        PendingWork {
+            run_id: self.run_id,
+            session_id: self.session_id,
+            step_id: step.id.clone(),
+            attempt: 1,
+            item_index: None,
+            disposition: derive_disposition(step),
+            step_timeout: executor
+                .map_budget
+                .as_ref()
+                .map(|b| b.total_remaining.step_timeout)
+                .unwrap_or_default(),
+            kind,
+        }
     }
 
     /// §8.4's admission, with §8.13's one exemption applied by phase.
@@ -1845,26 +1881,32 @@ impl<H: WorkflowHost> Loop<'_, H> {
     ) -> Result<(), RunLoopError> {
         checkpoint_step(
             self.conn,
-            &WorkflowStepRun {
-                run_id: self.run_id,
-                step_id: step.id.clone(),
-                // `crate::retry` is built and unwired here — see the module
-                // doc. Writing `1` is the truth about what happened; writing a
-                // counter nothing increments would not be.
-                attempt: 1,
-                item_index: None,
-                disposition: derive_disposition(step),
-                state,
-                // §8.10's ranges join back to a session's task log — see
-                // this method's own doc comment for when a real value is
-                // available to write here.
-                first_task_seq,
-                last_task_seq,
-                output,
-                error,
-            },
+            &self.step_run(step, state, output, error, first_task_seq, last_task_seq),
         )?;
         Ok(())
+    }
+
+    fn step_run(
+        &self,
+        step: &StepDef,
+        state: StepRunState,
+        output: Option<StepOutput>,
+        error: Option<String>,
+        first_task_seq: Option<u64>,
+        last_task_seq: Option<u64>,
+    ) -> WorkflowStepRun {
+        WorkflowStepRun {
+            run_id: self.run_id,
+            step_id: step.id.clone(),
+            attempt: 1,
+            item_index: None,
+            disposition: derive_disposition(step),
+            state,
+            first_task_seq,
+            last_task_seq,
+            output,
+            error,
+        }
     }
 }
 
@@ -1874,6 +1916,11 @@ enum GateStep {
     /// than parks.
     Answered(StepOutcome),
     Parked(ParkResult),
+}
+
+enum CallStep {
+    Completed(StepOutcome),
+    AwaitingWork(PendingKind),
 }
 
 /// What [`Loop::crash_recovery_park`] did.
@@ -2159,12 +2206,9 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// own transaction), and emit the parent's `agent`-kind task standing for
     /// the call.
     ///
-    /// # What the step's output is, and what it is not
-    ///
-    /// `{"run_id": "<child>"}` — the handle, not the result. Driving the child
-    /// to completion is the daemon's for two structural reasons the module doc
-    /// states, and until it has run there is no result to hand back. The
-    /// child's own report is reachable from that id.
+    /// The call remains `Running` until its child driver returns [`WorkDone`].
+    /// That result becomes the call step's output; the child id is carried only
+    /// in [`PendingKind::ChildRun`] while dispatch is outstanding.
     ///
     /// # The in-memory token and the durable draw are not two draws
     ///
@@ -2200,30 +2244,43 @@ impl<H: WorkflowHost> Loop<'_, H> {
         step: &StepDef,
         workflow: &str,
         with: &Value,
-    ) -> StepOutcome {
+    ) -> CallStep {
         let called = match self
             .host
             .resolve_call(&*self.conn, workflow, self.session_id)
         {
             Ok(Some(called)) => called,
             Ok(None) => {
-                return StepOutcome::failed(
+                return CallStep::Completed(StepOutcome::failed(
                     &step.id,
                     format!("`call:` names workflow {workflow:?}, which does not resolve to a job"),
-                )
+                ))
             }
-            Err(e) => return StepOutcome::failed(&step.id, format!("`call:` refused: {e}")),
+            Err(e) => {
+                return CallStep::Completed(StepOutcome::failed(
+                    &step.id,
+                    format!("`call:` refused: {e}"),
+                ))
+            }
         };
         let direct_children = match self.host.reserve_child_session(self.session_id, &called) {
             Ok(count) => count,
-            Err(e) => return StepOutcome::failed(&step.id, format!("`call:` refused: {e}")),
+            Err(e) => {
+                return CallStep::Completed(StepOutcome::failed(
+                    &step.id,
+                    format!("`call:` refused: {e}"),
+                ))
+            }
         };
         let child_depth =
             match crate::ledger::admit_call_from_run(self.conn, self.run_id, direct_children) {
                 Ok(depth) => depth,
                 Err(e) => {
                     self.host.release_child_session(self.session_id, &called);
-                    return StepOutcome::failed(&step.id, format!("`call:` refused: {e}"));
+                    return CallStep::Completed(StepOutcome::failed(
+                        &step.id,
+                        format!("`call:` refused: {e}"),
+                    ));
                 }
             };
 
@@ -2231,7 +2288,10 @@ impl<H: WorkflowHost> Loop<'_, H> {
             Ok(caps) => caps,
             Err(e) => {
                 self.host.release_child_session(self.session_id, &called);
-                return StepOutcome::failed(&step.id, format!("`call:` refused: {e}"));
+                return CallStep::Completed(StepOutcome::failed(
+                    &step.id,
+                    format!("`call:` refused: {e}"),
+                ));
             }
         };
         let requested = requested_child_caps(step, &remaining);
@@ -2270,26 +2330,56 @@ impl<H: WorkflowHost> Loop<'_, H> {
         // call — identical to sub-agent spawning, which is the point."* The
         // `with:` block is interpolated and redacted on the way in, the same
         // as every other dispatch arm.
-        let logged_with = match crate::expr::interpolate_json(
+        let resolved_with = match crate::expr::interpolate_json(
             crate::expr::JsonTemplateSource::from_workflow_file(with),
             &executor.ctx,
         ) {
-            Ok(resolved) => {
-                redact_with_needles(resolved.redacted_for_logging(), &executor.redaction_needles)
-            }
+            Ok(resolved) => resolved,
             Err(e) => {
                 self.host.release_child_session(self.session_id, &called);
-                return StepOutcome::failed(&step.id, format!("interpolating `call.with`: {e}"));
+                return CallStep::Completed(StepOutcome::failed(
+                    &step.id,
+                    format!("interpolating `call.with`: {e}"),
+                ));
             }
         };
-        if let Err(e) = self
-            .host
-            .create_child_run(self.conn, self.session_id, &child, &called)
-        {
-            return StepOutcome::failed(&step.id, format!("`call:` could not be funded: {e}"));
-        }
+        let logged_with = redact_with_needles(
+            resolved_with.redacted_for_logging(),
+            &executor.redaction_needles,
+        );
+        let inputs_secret_derived = resolved_with.is_secret_derived();
+        let dispatch_input = resolved_with.into_unredacted_for_dispatch();
+        let parent_step = self.step_run(step, StepRunState::Running, None, None, None, None);
         let task_id = TaskId::new();
-        executor.sink.emit(
+        let parent_call = WorkflowChildCall {
+            child_run_id,
+            parent_run_id: self.run_id,
+            parent_step_id: step.id.clone(),
+            parent_attempt: 1,
+            parent_item_index: None,
+            parent_task_id: task_id,
+            join: ChildCallJoin::Pending,
+        };
+        let parent_task_input = TaskInput::Json(serde_json::json!({
+            "workflow": workflow,
+            "child_run_id": child_run_id.to_string(),
+            "with": logged_with,
+        }));
+        if let Err(e) = self.host.create_child_run(
+            self.conn,
+            self.session_id,
+            &child,
+            &called,
+            &parent_step,
+            &parent_call,
+            parent_task_input.clone(),
+        ) {
+            return CallStep::Completed(StepOutcome::failed(
+                &step.id,
+                format!("`call:` could not be funded: {e}"),
+            ));
+        }
+        executor.sink.emit_already_persisted(
             task_id,
             None,
             TaskKind::Agent,
@@ -2297,22 +2387,17 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 kind: TaskKind::Agent,
                 parent: None,
                 origin: Origin::System,
-                input: TaskInput::Json(serde_json::json!({
-                    "workflow": workflow,
-                    "child_run_id": child_run_id.to_string(),
-                    "with": logged_with,
-                })),
+                input: parent_task_input,
             },
         );
 
-        StepOutcome {
-            step_id: step.id.clone(),
-            output: serde_json::json!({ "run_id": child_run_id.to_string() }),
-            status: StepStatus::Completed,
-            // A run id is minted here, not derived from anything the run read.
-            output_is_secret_derived: false,
-            gate_condition_was_secret_derived: false,
-        }
+        CallStep::AwaitingWork(PendingKind::ChildRun {
+            child_run_id,
+            child_session_id: called.session_id,
+            parent_task_id: task_id,
+            dispatch_input,
+            inputs_secret_derived,
+        })
     }
 }
 
@@ -2742,6 +2827,9 @@ mod tests {
             _parent: SessionId,
             _child: &WorkflowRun,
             _called: &CalledWorkflow,
+            _parent_step: &WorkflowStepRun,
+            _parent_call: &WorkflowChildCall,
+            _parent_task_input: TaskInput,
         ) -> Result<(), WorkflowHostError> {
             unreachable!("these tests run no `call:` step")
         }

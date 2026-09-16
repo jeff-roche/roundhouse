@@ -100,6 +100,7 @@ fn run_once(yaml: &str) -> (Duration, usize, usize) {
     secrets.insert("TOKEN".to_string(), "sk-measurement-token-0001".to_string());
     let run_ctx = RunContext {
         inputs: serde_json::json!({"repo": "acme/widgets"}),
+        inputs_secret_derived: false,
         vars: serde_json::json!({}),
         secrets,
         run_id: RunId::new(),

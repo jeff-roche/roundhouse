@@ -4,7 +4,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use roundhouse_bus::spawn_tree::SpawnTree;
-use roundhouse_core::{EventPayload, JobId, SessionId, SessionSpec, SessionState, TaskRunner};
+use roundhouse_core::{
+    EventPayload, JobId, Origin, SessionId, SessionSpec, SessionState, TaskId, TaskInput, TaskKind,
+    TaskRunner, Timestamp,
+};
 use roundhouse_flow::compose::MAX_DIRECT_CHILD_CALLS;
 use roundhouse_flow::durability::WorkflowRun;
 use roundhouse_flow::exec::run_loop::{SessionTree, WorkflowHostError};
@@ -81,6 +84,33 @@ impl SessionTree for WorkflowSessionTree {
         Ok(())
     }
 
+    fn persist_parent_call_task(
+        &mut self,
+        txn: &rusqlite::Transaction<'_>,
+        parent: SessionId,
+        created_at: Timestamp,
+        task_id: TaskId,
+        input: TaskInput,
+    ) -> Result<(), WorkflowHostError> {
+        let event = self.runner.record_task_created(
+            parent,
+            0,
+            created_at,
+            task_id,
+            TaskKind::Agent,
+            None,
+            Origin::System,
+            input,
+            1,
+        );
+        roundhouse_store::append_event_in_transaction(
+            txn,
+            &event,
+            &roundhouse_store::redact::Redactor::build(&[]),
+        )?;
+        Ok(())
+    }
+
     fn register_child(
         &mut self,
         parent: SessionId,
@@ -101,12 +131,10 @@ impl SessionTree for WorkflowSessionTree {
     /// into, and the same one the `agent` tool's sub-agent children use, so a
     /// freed slot is freed for both kinds of child.
     ///
-    /// **Wired and testable today, but with no production caller yet:**
-    /// nothing in this workspace drives a workflow `call:` child run to
-    /// completion, so `finish_run`'s terminal branch — and therefore this
-    /// implementation — is reached only from tests. A future run driver (part
-    /// of issue #30's scope) is what will exercise it in a live daemon; see
-    /// the trait method's own doc comment in `roundhouse-flow`.
+    /// The scheduled-delivery driver reaches this through the child's own
+    /// terminal `finish_run` path. Keeping removal here means the runtime edge
+    /// is released beside the durable budget refund, not by a caller that must
+    /// remember both halves.
     ///
     /// Discharges the trait's idempotency requirement outright rather than by
     /// care at the call site: `SpawnTree::remove_child` is documented
@@ -277,9 +305,8 @@ const SESSION_STATE_CHANGED_PAYLOAD_PREFIX: &str = r#"{"SessionStateChanged":"#;
 /// The workflow half has the mirror-image situation and it is *not* a gap in
 /// this function: `finish_run` really does write a terminal `workflow_run`
 /// state (and `child_terminated` beside it), so the row read here is the same
-/// fact the live hook keys off — there is simply no production driver for a
-/// `call:` child run yet (a later task's work), so no such row exists in a
-/// running daemon today either.
+/// fact the live hook keys off, and the scheduled-delivery driver now produces
+/// such terminal child rows in a running daemon.
 ///
 /// # One bad row is skipped, not fatal
 ///
@@ -640,12 +667,11 @@ mod tests {
     /// durable log restores the live children of **both** kinds, and restores
     /// neither ended one.
     ///
-    /// Seeded into the store directly rather than produced by a live driver on
-    /// purpose. Nothing in this workspace drives a `call:` child run to a
-    /// terminal state yet (Task 4's finding — the driver is a later task), so
-    /// a test that waited for one would be untestable today; the rows are the
-    /// contract boot recovery actually reads, and they are seeded through the
-    /// real writers (`insert_workflow_run`, `append_event_in_transaction`).
+    /// Seeded into the store directly to isolate boot recovery from the
+    /// scheduled-delivery driver's separate parent-to-child execution proof.
+    /// The rows are the contract boot recovery actually reads, and they are
+    /// seeded through the real writers (`insert_workflow_run`,
+    /// `append_event_in_transaction`).
     #[test]
     fn boot_recovery_restores_live_children_of_both_kinds_and_skips_the_ended_ones() {
         let mut conn = open_test_db();

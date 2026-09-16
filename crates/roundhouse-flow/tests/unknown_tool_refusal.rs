@@ -50,6 +50,7 @@ steps:
     let mut sink = MockSink { events: Vec::new() };
     let run_context = RunContext {
         inputs: json!({}),
+        inputs_secret_derived: false,
         vars: json!({}),
         secrets: std::collections::HashMap::new(),
         run_id: RunId::new(),
@@ -118,6 +119,7 @@ steps:
     let mut sink = MockSink { events: Vec::new() };
     let run_context = RunContext {
         inputs: json!({}),
+        inputs_secret_derived: false,
         vars: json!({}),
         secrets: std::collections::HashMap::new(),
         run_id: RunId::new(),

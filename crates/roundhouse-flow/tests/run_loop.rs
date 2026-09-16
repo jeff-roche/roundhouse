@@ -222,11 +222,27 @@ impl WorkflowHost for FakeHost {
         _parent: SessionId,
         child: &WorkflowRun,
         called: &CalledWorkflow,
+        parent_step: &roundhouse_flow::durability::WorkflowStepRun,
+        parent_call: &roundhouse_flow::durability::WorkflowChildCall,
+        _parent_task_input: TaskInput,
     ) -> Result<(), WorkflowHostError> {
         let txn = roundhouse_store::begin_immediate(conn)?;
         if let Err(error) =
             roundhouse_flow::durability::insert_workflow_run_in_transaction(&txn, child)
         {
+            self.release_child_session(_parent, called);
+            return Err(error.into());
+        }
+        if let Err(error) =
+            roundhouse_flow::durability::checkpoint_step_in_transaction(&txn, parent_step)
+        {
+            self.release_child_session(_parent, called);
+            return Err(error.into());
+        }
+        if let Err(error) = roundhouse_flow::durability::insert_workflow_child_call_in_transaction(
+            &txn,
+            parent_call,
+        ) {
             self.release_child_session(_parent, called);
             return Err(error.into());
         }
@@ -291,6 +307,7 @@ fn seed_run(conn: &mut Connection) -> (RunId, SessionId) {
 fn ctx(run_id: RunId) -> RunContext {
     RunContext {
         inputs: serde_json::json!({}),
+        inputs_secret_derived: false,
         vars: serde_json::json!({}),
         secrets: HashMap::new(),
         run_id,
@@ -431,13 +448,13 @@ fn run_to_terminal_failing(
         };
         let mut done = Vec::with_capacity(pending.len());
         for p in pending {
-            let task_id = TaskId::new();
-            match p.kind {
+            let task_id = match p.kind {
                 roundhouse_flow::exec::run_loop::PendingKind::Tool {
                     task_kind,
                     logged_input,
                     ..
                 } => {
+                    let task_id = TaskId::new();
                     sink.emit(
                         task_id,
                         None,
@@ -449,8 +466,10 @@ fn run_to_terminal_failing(
                             input: TaskInput::Json(logged_input),
                         },
                     );
+                    task_id
                 }
                 roundhouse_flow::exec::run_loop::PendingKind::Agent { logged_prompt, .. } => {
+                    let task_id = TaskId::new();
                     sink.emit(
                         task_id,
                         None,
@@ -462,11 +481,12 @@ fn run_to_terminal_failing(
                             input: TaskInput::Json(logged_prompt),
                         },
                     );
+                    task_id
                 }
-                roundhouse_flow::exec::run_loop::PendingKind::ChildRun { .. } => {
-                    unreachable!("PendingKind::ChildRun is unused until Phase 8 Task 25.6")
-                }
-            }
+                roundhouse_flow::exec::run_loop::PendingKind::ChildRun {
+                    parent_task_id, ..
+                } => parent_task_id,
+            };
             let status = if failing.contains(&p.step_id.as_str()) {
                 roundhouse_flow::exec::run_loop::WorkStatus::Failed {
                     message: format!("the caller could not dispatch {:?}", p.step_id),
@@ -1238,6 +1258,245 @@ fn a_gate_answer_naming_a_non_gate_step_is_refused() {
 // The `call:` arm — §8.12's child run and its budget transfer
 // ---------------------------------------------------------------------------
 
+#[test]
+fn a_call_step_suspends_until_its_child_result_arrives() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: child\n\
+         \x20   call: child-flow\n\
+         \x20   with: { token: \"${{ secrets.TOKEN }}\" }\n\
+         \x20 - id: after\n\
+         \x20   emit: { ran: true }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new().resolving("child-flow");
+    let mut run_ctx = ctx(run_id);
+    run_ctx
+        .secrets
+        .insert("TOKEN".into(), "child-secret".into());
+
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    )
+    .expect("the parent run drives to its child");
+
+    let RunOutcome::AwaitingWork { pending } = outcome else {
+        panic!("a call waits for its child before continuing");
+    };
+    assert_eq!(pending.len(), 1, "one child run is awaiting completion");
+    let roundhouse_flow::exec::run_loop::PendingKind::ChildRun {
+        child_run_id,
+        child_session_id,
+        parent_task_id,
+        dispatch_input,
+        ..
+    } = &pending[0].kind
+    else {
+        panic!("a call creates pending child work");
+    };
+    assert_eq!(
+        dispatch_input,
+        &serde_json::json!({ "token": "child-secret" }),
+        "the child receives the real resolved input only through pending work"
+    );
+    assert_eq!(*child_session_id, host.sessions_created[0]);
+    assert_eq!(
+        recover_run(&conn, *child_run_id)
+            .expect("recover child")
+            .run
+            .parent_run_id,
+        Some(run_id)
+    );
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM workflow_step_run WHERE run_id = ?1 AND step_id = ?2",
+            [run_id.to_string(), "child".to_string()],
+            |row| row.get(0),
+        )
+        .expect("the pending call is checkpointed");
+    assert_eq!(state, "running");
+    assert!(
+        recover_run(&conn, run_id)
+            .expect("recover parent")
+            .steps
+            .iter()
+            .all(|row| row.step_id != "after"),
+        "the step after a pending child must not execute"
+    );
+    assert_eq!(
+        sink.emitted
+            .iter()
+            .filter(|(kind, payload)| {
+                *kind == TaskKind::Agent && matches!(payload, EventPayload::TaskCreated { .. })
+            })
+            .count(),
+        1,
+        "the parent logs exactly one task for the child call"
+    );
+    assert_eq!(*parent_task_id, sink.task_ids[0]);
+    assert!(
+        !format!("{:?}", sink.emitted).contains("child-secret"),
+        "the real child input is never persisted in the parent log"
+    );
+}
+
+#[test]
+fn a_resumed_call_uses_the_original_parent_agent_task() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: child\n\
+         \x20   call: child-flow\n\
+         \x20 - id: after\n\
+         \x20   needs: [child]\n\
+         \x20   emit: { ran: true }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new().resolving("child-flow");
+
+    let initial = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    )
+    .expect("the parent run drives to its child");
+    let RunOutcome::AwaitingWork { pending } = initial else {
+        panic!("the parent waits for its child");
+    };
+    let roundhouse_flow::exec::run_loop::PendingKind::ChildRun { parent_task_id, .. } =
+        &pending[0].kind
+    else {
+        panic!("the call creates pending child work");
+    };
+    let parent_task_id = *parent_task_id;
+
+    let resumed = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(11),
+        Some(Resume::Work(vec![
+            roundhouse_flow::exec::run_loop::WorkDone {
+                step_id: "child".into(),
+                status: roundhouse_flow::exec::run_loop::WorkStatus::Completed,
+                output: serde_json::json!({ "result": "child complete" }),
+                output_is_secret_derived: false,
+                task_id: Some(parent_task_id),
+                first_task_seq: Some(41),
+                last_task_seq: Some(43),
+            },
+        ])),
+    )
+    .expect("the completed child resumes its parent");
+
+    assert!(matches!(resumed, RunOutcome::Terminal { .. }));
+    let child = recover_run(&conn, run_id)
+        .expect("recover parent")
+        .steps
+        .into_iter()
+        .find(|row| row.step_id == "child")
+        .expect("the call step is checkpointed");
+    assert_eq!(child.state, StepRunState::Completed);
+    assert_eq!(child.first_task_seq, Some(41));
+    assert_eq!(child.last_task_seq, Some(43));
+    assert_eq!(
+        child
+            .output
+            .expect("the child result is persisted")
+            .value_unredacted_for_resume(),
+        &serde_json::json!({ "result": "child complete" })
+    );
+    assert_eq!(
+        host.sessions_created.len(),
+        1,
+        "resume does not create another child"
+    );
+    assert_eq!(
+        sink.task_ids
+            .iter()
+            .zip(&sink.emitted)
+            .filter_map(|(task_id, (kind, payload))| {
+                (*kind == TaskKind::Agent && matches!(payload, EventPayload::TaskCreated { .. }))
+                    .then_some(*task_id)
+            })
+            .collect::<Vec<_>>(),
+        vec![parent_task_id],
+        "the completed child is associated with the original parent task"
+    );
+}
+
+#[test]
+fn a_failed_call_running_checkpoint_rolls_back_its_child() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    conn.execute_batch(
+        "CREATE TRIGGER reject_call_running_checkpoint
+         BEFORE INSERT ON workflow_step_run
+         WHEN NEW.step_id = 'child' AND NEW.state = 'running'
+         BEGIN
+             SELECT RAISE(ABORT, 'test call checkpoint failure');
+         END;",
+    )
+    .expect("install call checkpoint failure");
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: child\n\
+         \x20   call: child-flow\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new().resolving("child-flow");
+
+    let result = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    );
+
+    let RunOutcome::Terminal { state, .. } = result.expect("the failed hand-off is a step failure")
+    else {
+        panic!("a failed child hand-off must not suspend");
+    };
+    assert_eq!(state, RunState::Failed);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM workflow_run WHERE parent_run_id = ?1",
+            [run_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count child runs"),
+        0,
+        "without the running checkpoint, no funded child may survive to be duplicated on re-drive"
+    );
+    assert!(host.sessions_created.is_empty());
+    assert!(host.reservations.is_empty());
+}
+
 /// §8.12: a `call:` creates a child `workflow_run` **and** a child Session,
 /// draws the child's grant from the parent, and puts one `agent`-kind task in
 /// the parent's log standing for the call.
@@ -1267,21 +1526,15 @@ fn a_call_step_creates_a_funded_child_run_and_one_agent_task() {
         None,
     )
     .expect("the run drives");
-    let RunOutcome::Terminal { state, steps, .. } = outcome else {
-        panic!("no gate");
+    let RunOutcome::AwaitingWork { pending } = outcome else {
+        panic!("the call must wait for its child");
     };
-    assert_eq!(state, RunState::Completed);
-
-    let child_id: RunId = steps
-        .iter()
-        .find(|s| s.step_id == "sub")
-        .expect("the call step ran")
-        .output["run_id"]
-        .as_str()
-        .expect("the step's output is the child's handle")
-        .parse()
-        .map(RunId::from_uuid)
-        .expect("a run id");
+    let roundhouse_flow::exec::run_loop::PendingKind::ChildRun { child_run_id, .. } =
+        &pending[0].kind
+    else {
+        panic!("the call creates pending child work");
+    };
+    let child_id = *child_run_id;
 
     let child = run_ledger(&conn, child_id).expect("the child row exists");
     assert_eq!(child.parent_run_id, Some(run_id));
@@ -1441,20 +1694,15 @@ fn a_call_draws_a_bounded_share_of_what_the_parent_has_left_and_leaves_it_some()
     )
     .expect("the run drives");
 
-    let RunOutcome::Terminal { state, steps, .. } = outcome else {
-        panic!("no gate");
+    let RunOutcome::AwaitingWork { pending } = outcome else {
+        panic!("the funded child awaits driving");
     };
-    assert_eq!(
-        state,
-        RunState::Completed,
-        "the call is funded, not refused"
-    );
-    let child_id: RunId = steps[0].output["run_id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .map(RunId::from_uuid)
-        .unwrap();
+    let roundhouse_flow::exec::run_loop::PendingKind::ChildRun { child_run_id, .. } =
+        &pending[0].kind
+    else {
+        panic!("the call creates pending child work");
+    };
+    let child_id = *child_run_id;
     let child = run_ledger(&conn, child_id).unwrap();
     assert_eq!(
         child.caps.unwrap().max_tokens,
@@ -2829,16 +3077,15 @@ fn a_childs_grant_is_a_bounded_share_clamped_and_not_a_default() {
             None,
         )
         .expect("the run drives");
-        let RunOutcome::Terminal { state, steps, .. } = outcome else {
-            panic!("no gate")
+        let RunOutcome::AwaitingWork { pending } = outcome else {
+            panic!("the funded child awaits driving")
         };
-        assert_eq!(state, RunState::Completed, "the call is funded");
-        let id: RunId = steps[0].output["run_id"]
-            .as_str()
-            .expect("the call step's output is the child's handle")
-            .parse()
-            .map(RunId::from_uuid)
-            .unwrap();
+        let roundhouse_flow::exec::run_loop::PendingKind::ChildRun { child_run_id, .. } =
+            &pending[0].kind
+        else {
+            panic!("the call creates pending child work");
+        };
+        let id = *child_run_id;
         run_ledger(&conn, id).unwrap().caps.unwrap()
     }
 
@@ -2895,6 +3142,97 @@ fn a_calls_with_block_is_needle_redacted_on_its_way_into_the_parents_log() {
     let logged = format!("{:?}", sink.emitted);
     assert!(!logged.contains("sk-typed-straight-in"), "got {logged}");
     assert!(logged.contains("***"), "got {logged}");
+}
+
+/// A child must inherit secret provenance from its parent's interpolated
+/// `call.with`, even though the child receives the resolved value as `inputs`.
+/// The daemon uses this bit to bind the child's whole `inputs` root as secret
+/// derived, conservatively redacting any later use rather than leaking it.
+#[test]
+fn a_calls_secret_derived_with_block_marks_the_child_inputs_secret_derived() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: sub\n\
+         \x20   call: child-flow\n\
+         \x20   with: { token: \"${{ secrets.TOKEN }}\" }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new().resolving("child-flow");
+    let mut run_ctx = ctx(run_id);
+    run_ctx
+        .secrets
+        .insert("TOKEN".into(), "sk-child-secret".into());
+
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    )
+    .expect("the parent reaches child dispatch");
+
+    let RunOutcome::AwaitingWork { pending } = outcome else {
+        panic!("the funded child awaits driving");
+    };
+    let roundhouse_flow::exec::run_loop::PendingKind::ChildRun {
+        inputs_secret_derived,
+        ..
+    } = &pending[0].kind
+    else {
+        panic!("the call creates pending child work");
+    };
+
+    assert!(
+        inputs_secret_derived,
+        "the child driver must receive the source interpolation's provenance"
+    );
+}
+
+#[test]
+fn secret_derived_inputs_are_redacted_when_a_child_uses_them() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: expose_input\n\
+         \x20   emit: { token: \"${{ inputs.token }}\" }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "token": "sk-child-secret" });
+    run_ctx.inputs_secret_derived = true;
+
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    )
+    .expect("the child run completes");
+
+    assert!(matches!(outcome, RunOutcome::Terminal { .. }));
+    let logged = format!("{:?}", sink.emitted);
+    assert!(
+        !logged.contains("sk-child-secret"),
+        "a secret-derived child input must not reach the task log: {logged}"
+    );
+    assert!(
+        logged.contains("***"),
+        "the emitted value must be redacted: {logged}"
+    );
 }
 
 /// A gate answer names one gate, not whichever gate the loop reaches first.

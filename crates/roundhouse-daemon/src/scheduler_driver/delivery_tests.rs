@@ -4,7 +4,8 @@ use crate::test_support::{daemon_resources, daemon_resources_with_rules};
 use crate::workspace_registry::{WorkspaceRegistration, WorkspaceRegistry};
 use roundhouse_core::{Tier, WorkspaceId};
 use roundhouse_flow::durability::{
-    checkpoint_step, recover_run, StepDisposition, StepRunState, WorkflowStepRun,
+    checkpoint_step, insert_workflow_run, recover_run, StepDisposition, StepRunState,
+    WorkflowStepRun,
 };
 use roundhouse_flow::exec::run_loop::CrashRecoveryAnswer;
 use roundhouse_flow::exec::StepStatus;
@@ -1958,6 +1959,7 @@ async fn cancelling_mid_shell_dispatch_reports_cancelled_and_still_runs_finally(
     };
     let run_ctx = RunContext {
         inputs: serde_json::Value::Null,
+        inputs_secret_derived: false,
         vars: serde_json::Value::Null,
         secrets: HashMap::new(),
         run_id,
@@ -2009,7 +2011,7 @@ async fn cancelling_mid_shell_dispatch_reports_cancelled_and_still_runs_finally(
     canceller.await.expect("the canceller task must not panic");
 
     let (state, steps) = match outcome {
-        RunOutcome::Terminal { state, steps, .. } => (state, steps),
+        DrivenRun::Outcome(RunOutcome::Terminal { state, steps, .. }) => (state, steps),
         other => panic!("a cancelled run must reach a terminal outcome, got {other:?}"),
     };
     assert_eq!(
@@ -2214,6 +2216,7 @@ async fn a_crash_recovery_park_is_answered_and_the_write_step_really_re_dispatch
     };
     let run_ctx = RunContext {
         inputs: serde_json::Value::Null,
+        inputs_secret_derived: false,
         vars: serde_json::Value::Null,
         secrets: HashMap::new(),
         run_id,
@@ -2240,7 +2243,7 @@ async fn a_crash_recovery_park_is_answered_and_the_write_step_really_re_dispatch
         .expect("drive_run_to_completion's own DeliveryError path must not be reached")
         .expect("run_workflow must not return a RunLoopError for this fixture");
     assert!(
-        matches!(parked, RunOutcome::Parked(_)),
+        matches!(parked, DrivenRun::Outcome(RunOutcome::Parked(_))),
         "a restart mid-`write` must ask a human rather than failing the run, got {parked:?}"
     );
     assert!(
@@ -2248,7 +2251,7 @@ async fn a_crash_recovery_park_is_answered_and_the_write_step_really_re_dispatch
         "nothing may be dispatched while the run is parked"
     );
     assert!(
-        matches!(conclusion_for(Ok(parked)), RunConclusion::Parked),
+        matches!(conclusion_for(&Ok(parked)), RunConclusion::Parked),
         "a crash-recovery park must reach the same delivery conclusion a gate park does — \
              `conclusion_for` is source-agnostic and must stay so"
     );
@@ -2290,7 +2293,7 @@ async fn a_crash_recovery_park_is_answered_and_the_write_step_really_re_dispatch
         .expect("run_workflow must not return a RunLoopError for this fixture");
 
     let (state, steps) = match resumed {
-        RunOutcome::Terminal { state, steps, .. } => (state, steps),
+        DrivenRun::Outcome(RunOutcome::Terminal { state, steps, .. }) => (state, steps),
         other => panic!("an answered park must drive to a terminal outcome, got {other:?}"),
     };
     assert_eq!(state, RunState::Completed);

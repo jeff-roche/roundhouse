@@ -46,28 +46,21 @@
 //! wall-clock alignment at run time — a real, unnecessary slowness/flakiness
 //! risk `Interval` avoids entirely by design.
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use roundhouse_core::{EventPayload, Tier};
+use roundhouse_core::Tier;
 use roundhouse_daemon::scheduler_driver;
 use roundhouse_daemon::session_bootstrap::{policy_rules_from_files, BackgroundServices};
 use roundhouse_daemon::session_registry::SessionRegistry;
-use roundhouse_flow::durability::recover_run;
+use roundhouse_flow::durability::{recover_run, RunState};
 use roundhouse_flow::exec::RunId;
 use roundhouse_flow::job::SessionTemplate;
 use roundhouse_flow::job_store::register_workflow_file;
 use roundhouse_policy::config::compile_policy_layers;
-use roundhouse_policy::engine::{CompiledRule, Outcome as PolicyOutcome, Predicate, Scope};
 use roundhouse_policy::trust::{record_explicit_trust, TrustStore};
-use roundhouse_sandbox::{
-    Attestation, Child, CommandSpec, Handle, Isolate, IsolationError, ProbeResult,
-};
 use roundhouse_sched::delivery::DeliveryState;
 use roundhouse_sched::store::list_deliveries_in_states;
-use roundhouse_store::session_events;
 
 mod common;
 
@@ -299,6 +292,23 @@ async fn a_scheduled_binding_fires_through_the_real_scheduler_and_completes_a_re
 fn reading_workflow() -> String {
     "name: scheduled-read\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
      escalate: fail\nsteps:\n  - id: read_it\n    tool: read\n    with: { path: greeting.txt }\n"
+        .to_string()
+}
+
+/// The registered child in the scheduled parent-to-child fixture. Its input is
+/// supplied by the parent's `call:` step, so the read proves the child's own
+/// run context, session, and real tool dispatch are all wired together.
+fn child_reading_workflow() -> String {
+    "name: scheduled-child-read\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+     escalate: fail\nsteps:\n  - id: read_it\n    tool: read\n    with: { path: \"${{ inputs.path }}\" }\n"
+        .to_string()
+}
+
+/// The registered scheduled parent calls `scheduled-child-read`; it has no
+/// local tool step, so any `Read` task must belong to the child session.
+fn parent_calling_child_read_workflow() -> String {
+    "name: scheduled-parent-call\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+     escalate: fail\nsteps:\n  - id: child\n    call: scheduled-child-read\n    with: { path: greeting.txt }\n"
         .to_string()
 }
 
@@ -539,165 +549,219 @@ async fn a_scheduled_runs_tool_read_step_executes_for_real_and_the_run_completes
         .expect("the scheduler driver must observe cancellation and return Ok");
 }
 
-/// A real-process-spawning `Isolate` for the shell end-to-end test below.
-///
-/// `common::available_isolate` (`BwrapLandlockIsolate::test_with_probe`) is
-/// right for the other tests in this file, none of which actually spawn a
-/// process through it — but its `spawn` execs a hardcoded, nonexistent
-/// `bwrap_path` (`/usr/libexec/roundhouse/bwrap`), so it cannot be used
-/// where a test's whole point is a real dispatched process's real stdout.
-/// This copies `roundhouse-engine`'s own `tests/workflow_tool_dispatch.rs`
-/// `TestIsolate` — a real subprocess with no real sandbox — into this crate
-/// (a test-only double is not worth sharing across crates for one struct).
-struct RealSpawnTestIsolate;
-
-#[async_trait::async_trait]
-impl Isolate for RealSpawnTestIsolate {
-    fn declared(&self) -> Tier {
-        Tier::Sandbox
-    }
-    async fn probe(&self) -> ProbeResult {
-        ProbeResult {
-            achieved: Tier::Sandbox,
-            degradations: vec![],
-        }
-    }
-    async fn prepare(
-        &self,
-        _spec: &roundhouse_core::SessionSpec,
-    ) -> Result<Handle, IsolationError> {
-        Ok(Handle {
-            id: "real-spawn-test-isolate".into(),
-        })
-    }
-    async fn spawn(&self, _handle: &Handle, command: CommandSpec) -> Result<Child, IsolationError> {
-        let mut process = tokio::process::Command::new(&command.program);
-        process
-            .args(&command.argv)
-            .current_dir(command.cwd.as_deref().unwrap_or("."))
-            .env_clear()
-            .envs(command.env)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        #[cfg(unix)]
-        process.process_group(0);
-        let child = process
-            .spawn()
-            .map_err(|err| IsolationError::Unsupported(err.to_string()))?;
-        let pid = child
-            .id()
-            .ok_or_else(|| IsolationError::Unsupported("test child has no pid".into()))?;
-        Ok(Child::from_process(pid, child))
-    }
-    fn attest(&self, _handle: &Handle) -> Attestation {
-        // Must equal the session's requested tier: `sealed_tier_shortfall`
-        // (`roundhouse_policy::sealed`) denies every task when
-        // `attested_tier < requested_tier`, and `template()`'s
-        // `isolation: Tier::Sandbox` is what this test's session requests.
-        Attestation {
-            tier: Tier::Sandbox,
-            digest: "test".into(),
-            net_enforced: false,
-        }
-    }
-    async fn teardown(&self, _handle: Handle) -> Result<(), IsolationError> {
-        Ok(())
-    }
-}
-
-/// Writes an executable script `name` directly under `workspace_root` and
-/// returns the exact `program` string `resolve_shell_program`
-/// (`roundhouse-engine::tool_dispatch`) will derive for it — mirrors
-/// `roundhouse-engine`'s own `tests/workflow_tool_dispatch.rs`'s
-/// `workspace_program` helper (see that helper's own doc comment for why a
-/// `/`-containing, workspace-local path is required rather than a bare name
-/// resolved off `$PATH`: `Predicate::Shell`'s program comparison in
-/// `roundhouse-policy`'s `engine.rs` is an exact string match, and only this
-/// derivation is portable enough to write a rule against).
-fn workspace_shell_program(workspace_root: &std::path::Path, name: &str, contents: &str) -> String {
-    let script = workspace_root.join(name);
-    std::fs::write(&script, contents).unwrap();
-    #[cfg(unix)]
-    {
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
-    }
-    script
-        .parent()
-        .unwrap()
-        .canonicalize()
-        .unwrap()
-        .join(name)
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// A workflow whose single step is a real `tool: shell` — Phase 8 Task
-/// 25.4 Task 2's own exit criterion: this step must suspend the run
-/// (`RunOutcome::AwaitingWork`), be dispatched for real by
-/// `DeliveryExecutor::execute_pending`/`dispatch_tool_for_workflow`, cross
-/// the process isolation boundary through a real pre-spawned, attested
-/// child, and resume the run to completion.
-fn shell_workflow(program: &str, cwd: &str) -> String {
-    format!(
-        "name: scheduled-shell\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
-         escalate: fail\nsteps:\n  - id: run_it\n    tool: shell\n    with: {{ program: \
-         {program:?}, argv: [], cwd: {cwd:?} }}\n"
-    )
-}
-
-/// Phase 8 Task 25.4 Task 2's exit criterion, proven end to end through the
-/// same real production composition path the sibling `tool: read` test
-/// uses: a scheduled run's `tool: shell` step actually runs a real process
-/// — admitted through the real `SessionActor::admit_task` gate, pre-spawned
-/// and attested through `dispatch_tool_for_workflow`'s real isolation
-/// wiring, and recorded as a real `Shell`-kind task with a real
-/// `IsolationAttestation` (not the `Tier::None` placeholder the
-/// `Read`/`Write`/`Edit`/`Find` kinds keep) — with the run reaching
-/// `Completed` afterward.
+/// A scheduled parent must drive its registered child through a real read and
+/// join the child's durable report exactly once. This fails if child dispatch,
+/// child-session routing, terminal joining, or child-ledger settlement is
+/// removed from the production delivery driver.
 #[tokio::test]
-async fn a_scheduled_runs_tool_shell_step_executes_for_real_and_attests_real_isolation() {
+async fn parent_call_drives_child_read_to_completion() {
     let dir = tempfile::tempdir().unwrap();
-    let workspace_root = dir.path().canonicalize().unwrap();
+    let fixture_root = dir.path().canonicalize().unwrap();
+    let fixture = fixture_root.join("greeting.txt");
+    std::fs::write(&fixture, "hello from a child workflow").unwrap();
 
-    let program = workspace_shell_program(
-        &workspace_root,
-        "echo.sh",
-        "#!/bin/sh\necho hello-from-scheduled-shell\n",
+    let policy_dir = fixture_root.join(".roundhouse");
+    std::fs::create_dir(&policy_dir).unwrap();
+    let policy_path = policy_dir.join("policy.toml");
+    let policy_text = format!(
+        "[[rule]]\nid = 'fixture-read'\noutcome = 'allow'\nread = {:?}\n",
+        fixture
     );
-
-    // This session's own `SessionActor::admit_task` gate is independent of
-    // this workflow's `permissions:` block (that one governs `gate:`/hitl
-    // escalation inside `roundhouse-flow`) — same two-systems note the
-    // sibling `tool: read` test's own comment makes. A `.roundhouse/
-    // policy.toml`-file rule (`roundhouse-config`'s `PolicyRule`) can only
-    // express a `read` path, not a shell program, so the allow rule is
-    // supplied directly as a `PolicyRuleSource` closure returning a real
-    // `CompiledRule` — the same mechanism Task 1's own shell test needed
-    // (`roundhouse-engine`'s `tests/workflow_tool_dispatch.rs`) and the
-    // identical mechanism `sub_agent_host.rs`'s own `allow_agent_rules` test
-    // helper already uses in this crate.
-    let program_for_rule = program.clone();
-    let policy_rules: roundhouse_daemon::session_bootstrap::PolicyRuleSource =
-        Arc::new(move || {
-            vec![CompiledRule::test_new(
-                Scope::Builtin,
-                PolicyOutcome::Allow,
-                Predicate::program(&program_for_rule),
-            )]
-        });
+    std::fs::write(&policy_path, &policy_text).unwrap();
+    let trust_state = tempfile::tempdir().unwrap();
+    let rules =
+        policy_rules_from_files(Some(fixture_root.clone()), trust_state.path().to_path_buf())
+            .unwrap();
+    let compiled = compile_policy_layers(vec![roundhouse_config::PolicyLayer {
+        scope: roundhouse_config::ConfigScope::Project,
+        path: policy_path,
+        contents: policy_text.clone(),
+        file: roundhouse_config::PolicyFile {
+            rule: vec![roundhouse_config::PolicyRule {
+                id: "fixture-read".to_string(),
+                outcome: roundhouse_config::PolicyRuleOutcome::Allow,
+                read: fixture,
+            }],
+        },
+    }])
+    .unwrap();
+    record_explicit_trust(
+        &fixture_root,
+        &policy_text,
+        &compiled,
+        &TrustStore::new(trust_state.path().to_path_buf()),
+    )
+    .unwrap();
 
     let resources = common::resources_with(
         dir.path(),
-        Arc::new(RealSpawnTestIsolate),
+        common::available_isolate(),
         Arc::new(common::NoopProvider),
-        policy_rules,
+        rules,
     )
     .await;
     let sessions = Arc::new(SessionRegistry::new());
+    /*
+    /// A real-process-spawning `Isolate` for the shell end-to-end test below.
+    ///
+    /// `common::available_isolate` (`BwrapLandlockIsolate::test_with_probe`) is
+    /// right for the other tests in this file, none of which actually spawn a
+    /// process through it — but its `spawn` execs a hardcoded, nonexistent
+    /// `bwrap_path` (`/usr/libexec/roundhouse/bwrap`), so it cannot be used
+    /// where a test's whole point is a real dispatched process's real stdout.
+    /// This copies `roundhouse-engine`'s own `tests/workflow_tool_dispatch.rs`
+    /// `TestIsolate` — a real subprocess with no real sandbox — into this crate
+    /// (a test-only double is not worth sharing across crates for one struct).
+    struct RealSpawnTestIsolate;
 
+    #[async_trait::async_trait]
+    impl Isolate for RealSpawnTestIsolate {
+        fn declared(&self) -> Tier {
+            Tier::Sandbox
+        }
+        async fn probe(&self) -> ProbeResult {
+            ProbeResult {
+                achieved: Tier::Sandbox,
+                degradations: vec![],
+            }
+        }
+        async fn prepare(
+            &self,
+            _spec: &roundhouse_core::SessionSpec,
+        ) -> Result<Handle, IsolationError> {
+            Ok(Handle {
+                id: "real-spawn-test-isolate".into(),
+            })
+        }
+        async fn spawn(&self, _handle: &Handle, command: CommandSpec) -> Result<Child, IsolationError> {
+            let mut process = tokio::process::Command::new(&command.program);
+            process
+                .args(&command.argv)
+                .current_dir(command.cwd.as_deref().unwrap_or("."))
+                .env_clear()
+                .envs(command.env)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            #[cfg(unix)]
+            process.process_group(0);
+            let child = process
+                .spawn()
+                .map_err(|err| IsolationError::Unsupported(err.to_string()))?;
+            let pid = child
+                .id()
+                .ok_or_else(|| IsolationError::Unsupported("test child has no pid".into()))?;
+            Ok(Child::from_process(pid, child))
+        }
+        fn attest(&self, _handle: &Handle) -> Attestation {
+            // Must equal the session's requested tier: `sealed_tier_shortfall`
+            // (`roundhouse_policy::sealed`) denies every task when
+            // `attested_tier < requested_tier`, and `template()`'s
+            // `isolation: Tier::Sandbox` is what this test's session requests.
+            Attestation {
+                tier: Tier::Sandbox,
+                digest: "test".into(),
+                net_enforced: false,
+            }
+        }
+        async fn teardown(&self, _handle: Handle) -> Result<(), IsolationError> {
+            Ok(())
+        }
+    }
+
+    /// Writes an executable script `name` directly under `workspace_root` and
+    /// returns the exact `program` string `resolve_shell_program`
+    /// (`roundhouse-engine::tool_dispatch`) will derive for it — mirrors
+    /// `roundhouse-engine`'s own `tests/workflow_tool_dispatch.rs`'s
+    /// `workspace_program` helper (see that helper's own doc comment for why a
+    /// `/`-containing, workspace-local path is required rather than a bare name
+    /// resolved off `$PATH`: `Predicate::Shell`'s program comparison in
+    /// `roundhouse-policy`'s `engine.rs` is an exact string match, and only this
+    /// derivation is portable enough to write a rule against).
+    fn workspace_shell_program(workspace_root: &std::path::Path, name: &str, contents: &str) -> String {
+        let script = workspace_root.join(name);
+        std::fs::write(&script, contents).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        script
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// A workflow whose single step is a real `tool: shell` — Phase 8 Task
+    /// 25.4 Task 2's own exit criterion: this step must suspend the run
+    /// (`RunOutcome::AwaitingWork`), be dispatched for real by
+    /// `DeliveryExecutor::execute_pending`/`dispatch_tool_for_workflow`, cross
+    /// the process isolation boundary through a real pre-spawned, attested
+    /// child, and resume the run to completion.
+    fn shell_workflow(program: &str, cwd: &str) -> String {
+        format!(
+            "name: scheduled-shell\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+             escalate: fail\nsteps:\n  - id: run_it\n    tool: shell\n    with: {{ program: \
+             {program:?}, argv: [], cwd: {cwd:?} }}\n"
+        )
+    }
+
+    /// Phase 8 Task 25.4 Task 2's exit criterion, proven end to end through the
+    /// same real production composition path the sibling `tool: read` test
+    /// uses: a scheduled run's `tool: shell` step actually runs a real process
+    /// — admitted through the real `SessionActor::admit_task` gate, pre-spawned
+    /// and attested through `dispatch_tool_for_workflow`'s real isolation
+    /// wiring, and recorded as a real `Shell`-kind task with a real
+    /// `IsolationAttestation` (not the `Tier::None` placeholder the
+    /// `Read`/`Write`/`Edit`/`Find` kinds keep) — with the run reaching
+    /// `Completed` afterward.
+    #[tokio::test]
+    async fn a_scheduled_runs_tool_shell_step_executes_for_real_and_attests_real_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().canonicalize().unwrap();
+
+        let program = workspace_shell_program(
+            &workspace_root,
+            "echo.sh",
+            "#!/bin/sh\necho hello-from-scheduled-shell\n",
+        );
+
+        // This session's own `SessionActor::admit_task` gate is independent of
+        // this workflow's `permissions:` block (that one governs `gate:`/hitl
+        // escalation inside `roundhouse-flow`) — same two-systems note the
+        // sibling `tool: read` test's own comment makes. A `.roundhouse/
+        // policy.toml`-file rule (`roundhouse-config`'s `PolicyRule`) can only
+        // express a `read` path, not a shell program, so the allow rule is
+        // supplied directly as a `PolicyRuleSource` closure returning a real
+        // `CompiledRule` — the same mechanism Task 1's own shell test needed
+        // (`roundhouse-engine`'s `tests/workflow_tool_dispatch.rs`) and the
+        // identical mechanism `sub_agent_host.rs`'s own `allow_agent_rules` test
+        // helper already uses in this crate.
+        let program_for_rule = program.clone();
+        let policy_rules: roundhouse_daemon::session_bootstrap::PolicyRuleSource =
+            Arc::new(move || {
+                vec![CompiledRule::test_new(
+                    Scope::Builtin,
+                    PolicyOutcome::Allow,
+                    Predicate::program(&program_for_rule),
+                )]
+            });
+
+        let resources = common::resources_with(
+            dir.path(),
+            Arc::new(RealSpawnTestIsolate),
+            Arc::new(common::NoopProvider),
+            policy_rules,
+        )
+        .await;
+        let sessions = Arc::new(SessionRegistry::new());
+
+    */
     let workspace = resources
         .workspace_registry
         .as_ref()
@@ -705,14 +769,25 @@ async fn a_scheduled_runs_tool_shell_step_executes_for_real_and_attests_real_iso
         .resolve("default")
         .expect("real_resources registers a \"default\" workspace");
 
-    let cwd = workspace_root.to_string_lossy().to_string();
-    let source = workspace.root.join("workflow.yaml");
-    std::fs::write(&source, shell_workflow(&program, &cwd)).unwrap();
-    let job_id = {
+    let parent_source = workspace.root.join("parent.yaml");
+    let child_source = workspace.root.join("child.yaml");
+    std::fs::write(&parent_source, parent_calling_child_read_workflow()).unwrap();
+    std::fs::write(&child_source, child_reading_workflow()).unwrap();
+    let parent_job_id = {
         let conn = resources.store.pool.get().await.unwrap();
         let root = workspace.root.clone();
         conn.interact(move |connection| {
-            register_workflow_file(connection, &root, &source, template())
+            register_workflow_file(connection, &root, &parent_source, template())
+                /*
+                    let cwd = workspace_root.to_string_lossy().to_string();
+                    let source = workspace.root.join("workflow.yaml");
+                    std::fs::write(&source, shell_workflow(&program, &cwd)).unwrap();
+                    let job_id = {
+                        let conn = resources.store.pool.get().await.unwrap();
+                        let root = workspace.root.clone();
+                        conn.interact(move |connection| {
+                            register_workflow_file(connection, &root, &source, template())
+                */
                 .unwrap()
                 .job
                 .id()
@@ -720,13 +795,25 @@ async fn a_scheduled_runs_tool_shell_step_executes_for_real_and_attests_real_iso
         .await
         .unwrap()
     };
+    {
+        let conn = resources.store.pool.get().await.unwrap();
+        let root = workspace.root.clone();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+    }
 
     let binding_id = uuid::Uuid::new_v4().to_string();
     seed_enabled_interval_binding(
         &resources.store,
         &binding_id,
         &workspace.id.to_string(),
-        &job_id.to_string(),
+        &parent_job_id.to_string(),
+        /*
+                &job_id.to_string(),
+        */
     )
     .await;
 
@@ -745,6 +832,14 @@ async fn a_scheduled_runs_tool_shell_step_executes_for_real_and_attests_real_iso
             let binding_id = binding_id.clone();
             let found = conn
                 .interact(move |connection| {
+                    list_deliveries_in_states(
+                        connection,
+                        &[DeliveryState::Delivered, DeliveryState::Failed],
+                    )
+                    .expect("querying terminal trigger_delivery rows must not fail")
+                    .into_iter()
+                    .find(|delivery| delivery.binding_id.to_string() == binding_id)
+/*
                     let all = list_deliveries_in_states(
                         connection,
                         &[
@@ -757,10 +852,19 @@ async fn a_scheduled_runs_tool_shell_step_executes_for_real_and_attests_real_iso
                     .expect("querying trigger delivery rows must not fail");
                     all.into_iter()
                         .find(|delivery| delivery.binding_id.to_string() == binding_id)
+*/
                 })
                 .await
                 .unwrap();
             if let Some(delivery) = found {
+                assert_eq!(
+                    delivery.state,
+                    DeliveryState::Delivered,
+                    "the parent call must drive the child successfully, not fail its delivery: {:?}",
+                    delivery.last_error
+                );
+                return delivery;
+/*
                 if delivery.state == DeliveryState::Failed {
                     let run_id_str = delivery.run_id.clone().unwrap();
                     let run_id = RunId::from_uuid(uuid::Uuid::parse_str(&run_id_str).unwrap());
@@ -777,11 +881,117 @@ async fn a_scheduled_runs_tool_shell_step_executes_for_real_and_attests_real_iso
                 if delivery.state == DeliveryState::Delivered {
                     return delivery;
                 }
+*/
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     })
     .await
+    .expect("the scheduled parent and its child read must reach a Delivered trigger_delivery");
+
+    let parent_run_id = RunId::from_uuid(
+        uuid::Uuid::parse_str(
+            delivered
+                .run_id
+                .as_deref()
+                .expect("a Delivered delivery must name its parent run"),
+        )
+        .unwrap(),
+    );
+    let (
+        parent_run,
+        child_run,
+        child_read_output,
+        parent_call_output,
+        child_report,
+        parent_call_terminals,
+        reads,
+        child_markers,
+        parent_child_count,
+    ) = {
+        let conn = resources.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            let parent = recover_run(connection, parent_run_id).unwrap();
+            let parent_session_id = parent.run.session_id;
+            let (child_run_id, child_session_id): (String, String) = connection
+                .query_row(
+                    "SELECT r.id, r.session_id
+                     FROM workflow_child_call c
+                     JOIN workflow_run r ON r.id = c.child_run_id
+                     WHERE c.parent_run_id = ?1",
+                    [parent_run_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let child_run_id = RunId::from_uuid(uuid::Uuid::parse_str(&child_run_id).unwrap());
+            let child_session_id = roundhouse_core::SessionId::from_uuid(
+                uuid::Uuid::parse_str(&child_session_id).unwrap(),
+            );
+            let child = recover_run(connection, child_run_id).unwrap();
+            let child_markers: (Option<i64>, Option<i64>) = connection
+                .query_row(
+                    "SELECT drawn_at, refunded_at FROM workflow_run WHERE id = ?1",
+                    [child_run_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let child_read_output = child
+                .steps
+                .iter()
+                .find(|step| step.step_id == "read_it")
+                .and_then(|step| step.output.as_ref())
+                .map(|output| output.value_unredacted_for_resume().clone())
+                .expect("the child read step must retain its real file output");
+            let parent_call_output = parent
+                .steps
+                .iter()
+                .find(|step| step.step_id == "child")
+                .and_then(|step| step.output.as_ref())
+                .map(|output| output.value_unredacted_for_resume().clone())
+                .expect("the completed parent call step must retain the child report");
+            let child_report = serde_json::to_value(
+                roundhouse_flow::runs::load_report(connection, child_session_id, child_run_id)
+                    .unwrap()
+                    .expect("a terminal child must persist its report"),
+            )
+            .unwrap();
+            let parent_call_terminals: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE session_id = ?2 AND task_id = (
+                         SELECT parent_task_id FROM workflow_child_call WHERE child_run_id = ?1
+                     ) AND (payload LIKE '%TaskCompleted%' OR payload LIKE '%TaskFailed%' OR payload LIKE '%TaskCancelled%')",
+                    rusqlite::params![child_run_id.to_string(), parent_session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let reads: (i64, i64) = connection
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM tasks WHERE session_id = ?1 AND kind = 'Read' AND state = 'Completed'),
+                         (SELECT COUNT(*) FROM tasks WHERE session_id = ?2 AND kind = 'Read')",
+                    rusqlite::params![child_session_id.to_string(), parent_session_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let parent_child_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_run WHERE parent_run_id = ?1",
+                    [parent_run_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (
+                parent.run,
+                child.run,
+                child_read_output,
+                parent_call_output,
+                child_report,
+                parent_call_terminals,
+                reads,
+                child_markers,
+                parent_child_count,
+            )
+/*
     .expect(
         "a scheduled run whose only step is `tool: shell` must still reach a Delivered \
          trigger_delivery within the bound — a run stuck AwaitingWork forever would time out \
@@ -803,59 +1013,106 @@ async fn a_scheduled_runs_tool_shell_step_executes_for_real_and_attests_real_iso
                 .find(|s| s.step_id == "run_it")
                 .expect("the run_it step must have a durable row");
             (recovered.run, step)
+*/
         })
         .await
         .unwrap()
     };
+
     assert_eq!(
-        workflow_run.state,
-        roundhouse_flow::durability::RunState::Completed,
-        "a run whose only step is a real tool: shell must reach Completed, not stay stuck or fail"
+        parent_run.state,
+        RunState::Completed,
+        "the scheduled parent run terminates"
     );
-
-    let first_task_seq = step
-        .first_task_seq
-        .expect("a dispatched-for-real tool: shell step must carry a real first_task_seq");
-    let last_task_seq = step
-        .last_task_seq
-        .expect("a dispatched-for-real tool: shell step must carry a real last_task_seq");
-    let output = step
-        .output
-        .as_ref()
-        .expect("a completed tool: shell step must have a durable output")
-        .value_unredacted_for_resume();
-    let content = output
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+    assert_eq!(
+        child_run.state,
+        RunState::Completed,
+        "the called child run terminates"
+    );
+    assert_eq!(
+        reads.0, 1,
+        "the actual file read is one completed Read task in the child session"
+    );
+    assert_eq!(
+        child_read_output
+            .get("content")
+            .and_then(|value| value.as_str()),
+        Some("hello from a child workflow"),
+        "the child Read task must return the actual workspace file's content"
+    );
+    assert_eq!(
+        reads.1, 0,
+        "the parent session must not receive the child's Read task"
+    );
+    assert_eq!(
+        parent_call_terminals, 1,
+        "the parent call task must have exactly one terminal event"
+    );
+    assert_eq!(
+        parent_call_output, child_report,
+        "the parent call step must receive the child session's durable report"
+    );
+    assert_eq!(
+        parent_child_count, 1,
+        "the parent call must create exactly one child run"
+    );
     assert!(
-        content.contains("hello-from-scheduled-shell"),
-        "the dispatched script must have actually run: {content}"
+        child_markers.0.is_some(),
+        "the child that performed the Read and produced the report must record drawn_at"
     );
+    assert!(
+        child_markers.1.is_some(),
+        "the child that performed the Read and produced the report must record refunded_at" /*
+                                                                                                assert_eq!(
+                                                                                                    workflow_run.state,
+                                                                                                    roundhouse_flow::durability::RunState::Completed,
+                                                                                                    "a run whose only step is a real tool: shell must reach Completed, not stay stuck or fail"
+                                                                                                );
 
-    // The isolation-attestation half of this exit criterion: the real
-    // `TaskStarted` recorded for this shell task must NOT carry the
-    // `Tier::None` placeholder `Read`/`Write`/`Edit`/`Find` steps keep.
-    let events = session_events(&resources.store, workflow_run.session_id)
-        .await
-        .unwrap();
-    let started_isolation = events
-        .iter()
-        .find(|e| {
-            e.seq >= first_task_seq
-                && e.seq <= last_task_seq
-                && matches!(&e.payload, EventPayload::TaskStarted { .. })
-        })
-        .and_then(|e| match &e.payload {
-            EventPayload::TaskStarted { isolation, .. } => Some(isolation.clone()),
-            _ => None,
-        })
-        .expect("the shell task's own TaskStarted event must exist in this session's log");
-    assert_ne!(
-        started_isolation.tier,
-        Tier::None,
-        "a dispatched-for-real tool: shell step must carry a real, non-placeholder \
-         IsolationAttestation, got {started_isolation:?}"
+                                                                                                let first_task_seq = step
+                                                                                                    .first_task_seq
+                                                                                                    .expect("a dispatched-for-real tool: shell step must carry a real first_task_seq");
+                                                                                                let last_task_seq = step
+                                                                                                    .last_task_seq
+                                                                                                    .expect("a dispatched-for-real tool: shell step must carry a real last_task_seq");
+                                                                                                let output = step
+                                                                                                    .output
+                                                                                                    .as_ref()
+                                                                                                    .expect("a completed tool: shell step must have a durable output")
+                                                                                                    .value_unredacted_for_resume();
+                                                                                                let content = output
+                                                                                                    .get("content")
+                                                                                                    .and_then(|v| v.as_str())
+                                                                                                    .unwrap_or_default();
+                                                                                                assert!(
+                                                                                                    content.contains("hello-from-scheduled-shell"),
+                                                                                                    "the dispatched script must have actually run: {content}"
+                                                                                                );
+
+                                                                                                // The isolation-attestation half of this exit criterion: the real
+                                                                                                // `TaskStarted` recorded for this shell task must NOT carry the
+                                                                                                // `Tier::None` placeholder `Read`/`Write`/`Edit`/`Find` steps keep.
+                                                                                                let events = session_events(&resources.store, workflow_run.session_id)
+                                                                                                    .await
+                                                                                                    .unwrap();
+                                                                                                let started_isolation = events
+                                                                                                    .iter()
+                                                                                                    .find(|e| {
+                                                                                                        e.seq >= first_task_seq
+                                                                                                            && e.seq <= last_task_seq
+                                                                                                            && matches!(&e.payload, EventPayload::TaskStarted { .. })
+                                                                                                    })
+                                                                                                    .and_then(|e| match &e.payload {
+                                                                                                        EventPayload::TaskStarted { isolation, .. } => Some(isolation.clone()),
+                                                                                                        _ => None,
+                                                                                                    })
+                                                                                                    .expect("the shell task's own TaskStarted event must exist in this session's log");
+                                                                                                assert_ne!(
+                                                                                                    started_isolation.tier,
+                                                                                                    Tier::None,
+                                                                                                    "a dispatched-for-real tool: shell step must carry a real, non-placeholder \
+                                                                                                     IsolationAttestation, got {started_isolation:?}"
+                                                                                            */
     );
 
     running

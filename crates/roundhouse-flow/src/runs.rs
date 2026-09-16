@@ -221,7 +221,7 @@ const LOAD_REPORT_SQL: &str = "SELECT e.payload
 /// an index that serves this `ORDER BY` would make the paragraph above wrong,
 /// and it should be a failing test rather than prose nobody re-measures — which
 /// is exactly what happened to the claim this replaced.
-fn load_report(
+pub fn load_report(
     conn: &Connection,
     session_id: SessionId,
     run_id: RunId,
