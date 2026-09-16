@@ -700,6 +700,8 @@ async fn parent_call_drives_child_read_to_completion() {
         child_report,
         parent_call_terminals,
         reads,
+        child_markers,
+        parent_child_count,
     ) = {
         let conn = resources.store.pool.get().await.unwrap();
         conn.interact(move |connection| {
@@ -707,7 +709,10 @@ async fn parent_call_drives_child_read_to_completion() {
             let parent_session_id = parent.run.session_id;
             let (child_run_id, child_session_id): (String, String) = connection
                 .query_row(
-                    "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
+                    "SELECT r.id, r.session_id
+                     FROM workflow_child_call c
+                     JOIN workflow_run r ON r.id = c.child_run_id
+                     WHERE c.parent_run_id = ?1",
                     [parent_run_id.to_string()],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -717,6 +722,13 @@ async fn parent_call_drives_child_read_to_completion() {
                 uuid::Uuid::parse_str(&child_session_id).unwrap(),
             );
             let child = recover_run(connection, child_run_id).unwrap();
+            let child_markers: (Option<i64>, Option<i64>) = connection
+                .query_row(
+                    "SELECT drawn_at, refunded_at FROM workflow_run WHERE id = ?1",
+                    [child_run_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
             let child_read_output = child
                 .steps
                 .iter()
@@ -755,6 +767,13 @@ async fn parent_call_drives_child_read_to_completion() {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
+            let parent_child_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_run WHERE parent_run_id = ?1",
+                    [parent_run_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
             (
                 parent.run,
                 child.run,
@@ -763,6 +782,8 @@ async fn parent_call_drives_child_read_to_completion() {
                 child_report,
                 parent_call_terminals,
                 reads,
+                child_markers,
+                parent_child_count,
             )
         })
         .await
@@ -802,24 +823,17 @@ async fn parent_call_drives_child_read_to_completion() {
         parent_call_output, child_report,
         "the parent call step must receive the child session's durable report"
     );
-
-    let conn = resources.store.pool.get().await.unwrap();
-    let settled_children: i64 = conn
-        .interact(move |connection| {
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM workflow_run WHERE parent_run_id = ?1
-                     AND drawn_at IS NOT NULL AND refunded_at IS NOT NULL",
-                    [parent_run.id.to_string()],
-                    |row| row.get(0),
-                )
-                .unwrap()
-        })
-        .await
-        .unwrap();
     assert_eq!(
-        settled_children, 1,
-        "the one child run draws and refunds its grant exactly once"
+        parent_child_count, 1,
+        "the parent call must create exactly one child run"
+    );
+    assert!(
+        child_markers.0.is_some(),
+        "the child that performed the Read and produced the report must record drawn_at"
+    );
+    assert!(
+        child_markers.1.is_some(),
+        "the child that performed the Read and produced the report must record refunded_at"
     );
 
     running
