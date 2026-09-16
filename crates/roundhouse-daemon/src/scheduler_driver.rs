@@ -1059,9 +1059,11 @@ fn flush_task_events(
 fn unanswerable_work(step_id: String, message: String) -> WorkDone {
     WorkDone {
         step_id,
-        // Phase 8 Task 25.7 Task 1: nothing dispatches a real map item yet
-        // (Task 2's job), so every `WorkDone` this daemon builds answers a
-        // top-level step.
+        // A placeholder, overwritten by `execute_pending_with_context`'s own
+        // one-place echo of the `PendingWork`'s `item_index` — see the loop
+        // there for why the echo lives at the loop and not at each of this
+        // file's `WorkDone` constructors. This function has no `PendingWork`
+        // to read it from, which is exactly why it cannot be the echo's home.
         item_index: None,
         status: WorkStatus::Failed { message },
         output: serde_json::Value::Null,
@@ -2503,7 +2505,17 @@ impl DeliveryExecutor {
     ) -> PendingExecution {
         let mut done = Vec::with_capacity(pending.len());
         for item in pending {
-            done.push(match item.kind {
+            // **Echoed back on every arm, from one place** (Phase 8 Task 25.7
+            // Task 2). `WorkDone` is keyed by `(step_id, item_index)` in the
+            // run loop, so a `map` item's answer filed under `None` answers
+            // nothing: the loop would find its `PendingWork` unresolved and
+            // re-dispatch the same item on the next wave, forever, until the
+            // run's grant ran out. Captured before `item.kind` moves, and
+            // assigned once after the match rather than at each of the dozen
+            // `WorkDone` constructors below — a dozen chances to forget it is
+            // a dozen ways to reintroduce that livelock.
+            let item_index = item.item_index;
+            let mut answer = match item.kind {
                 PendingKind::Tool {
                     task_kind,
                     logged_input,
@@ -2809,7 +2821,9 @@ impl DeliveryExecutor {
                         Err(_) => return park_child_after_failure(ChildDispatchFailure::Driver),
                     }
                 }
-            });
+            };
+            answer.item_index = item_index;
+            done.push(answer);
         }
         PendingExecution::Done(done)
     }

@@ -34,6 +34,7 @@ use roundhouse_flow::report::{Cost, Outcome, Report, Severity};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
@@ -4757,4 +4758,669 @@ fn a_failed_row_from_a_previous_crashed_run_is_still_re_decided_on_a_cold_entry(
         ),
         other => panic!("the failed step must be re-decided, not inherited: {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// `map:` wave dispatch — Phase 8 Task 25.7 (#64) Task 2
+//
+// Before this, `StepBody::Map` was dispatched entirely inside
+// `Executor::dispatch_step`, whose inner-step loop called
+// `Executor::dispatch_step_or_stub` — so a `tool:`/`agent:` step nested in a
+// `map` fabricated a `{}` `Completed` outcome and never reached the real
+// suspend/resume seam at all. These tests drive a `map` through
+// `run_workflow` and assert on the waves it hands back.
+// ---------------------------------------------------------------------------
+
+/// One wave of a `map:` fan-out, as its caller saw it: the
+/// `(step_id, item_index)` pairs one `RunOutcome::AwaitingWork` asked to have
+/// dispatched.
+type Wave = Vec<(String, Option<u32>)>;
+
+/// Drives a workflow to a terminal state, recording every wave and failing
+/// exactly the `(step_id, item_index)` pairs named in `failing`.
+///
+/// Unlike [`run_to_terminal_failing`], which fails a whole step id across
+/// every item, this fails **one item of one inner step** and leaves its
+/// siblings succeeding — the shape every per-item `on_item_error` assertion
+/// below needs.
+fn drive_waves(
+    body: &str,
+    inputs: Value,
+    failing: &[(&str, u32)],
+) -> (
+    Connection,
+    RunId,
+    RecordingSink,
+    Vec<Wave>,
+    Result<RunOutcome, RunLoopError>,
+) {
+    drive_waves_with_context(body, failing, |run_ctx| run_ctx.inputs = inputs)
+}
+
+fn drive_waves_with_context(
+    body: &str,
+    failing: &[(&str, u32)],
+    configure: impl FnOnce(&mut RunContext),
+) -> (
+    Connection,
+    RunId,
+    RecordingSink,
+    Vec<Wave>,
+    Result<RunOutcome, RunLoopError>,
+) {
+    use roundhouse_flow::exec::run_loop::{PendingKind, WorkDone, WorkStatus};
+
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(body)).expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    configure(&mut run_ctx);
+
+    let mut waves: Vec<Wave> = Vec::new();
+    let mut resume: Option<Resume> = None;
+    let mut segments = 0usize;
+    loop {
+        segments += 1;
+        assert!(
+            segments <= MAX_SEGMENTS,
+            "the run has been re-entered {segments} times without reaching a terminal state: \
+             an item settled by an earlier wave is being re-decided by a later one. Waves so \
+             far: {waves:?}"
+        );
+        let outcome = match run_workflow(
+            &mut conn,
+            &def,
+            run_id,
+            &mut sink,
+            &mut host,
+            run_ctx.clone(),
+            at(10),
+            resume.take(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => return (conn, run_id, sink, waves, Err(e)),
+        };
+        let pending = match outcome {
+            RunOutcome::AwaitingWork { pending } => pending,
+            other => return (conn, run_id, sink, waves, Ok(other)),
+        };
+        waves.push(
+            pending
+                .iter()
+                .map(|p| (p.step_id.clone(), p.item_index))
+                .collect(),
+        );
+        let mut done = Vec::with_capacity(pending.len());
+        for p in pending {
+            let task_id = TaskId::new();
+            match &p.kind {
+                PendingKind::Tool {
+                    task_kind,
+                    logged_input,
+                    ..
+                } => sink.emit(
+                    task_id,
+                    None,
+                    task_kind.clone(),
+                    EventPayload::TaskCreated {
+                        kind: task_kind.clone(),
+                        parent: None,
+                        origin: Origin::System,
+                        input: TaskInput::Json(logged_input.clone()),
+                    },
+                ),
+                PendingKind::Agent { logged_prompt, .. } => sink.emit(
+                    task_id,
+                    None,
+                    TaskKind::Agent,
+                    EventPayload::TaskCreated {
+                        kind: TaskKind::Agent,
+                        parent: None,
+                        origin: Origin::System,
+                        input: TaskInput::Json(logged_prompt.clone()),
+                    },
+                ),
+                PendingKind::ChildRun { .. } => {
+                    panic!("no fixture in this section declares a `call:`")
+                }
+            }
+            let fails = failing
+                .iter()
+                .any(|(id, idx)| *id == p.step_id && p.item_index == Some(*idx));
+            done.push(WorkDone {
+                step_id: p.step_id.clone(),
+                item_index: p.item_index,
+                status: if fails {
+                    WorkStatus::Failed {
+                        message: format!(
+                            "item {:?} of {:?} could not be dispatched",
+                            p.item_index, p.step_id
+                        ),
+                    }
+                } else {
+                    WorkStatus::Completed
+                },
+                output: serde_json::json!({ "dispatched": p.item_index }),
+                output_is_secret_derived: false,
+                task_id: Some(task_id),
+                first_task_seq: None,
+                last_task_seq: None,
+            });
+        }
+        resume = Some(Resume::Work(done));
+    }
+}
+
+/// The `map` step's own aggregate output, read off the terminal outcome.
+fn map_output(outcome: &RunOutcome, step_id: &str) -> Value {
+    let RunOutcome::Terminal { steps, .. } = outcome else {
+        panic!("the run must reach a terminal state, got {outcome:?}");
+    };
+    steps
+        .iter()
+        .find(|s| s.step_id == step_id)
+        .unwrap_or_else(|| panic!("no outcome for map step {step_id:?}"))
+        .output
+        .clone()
+}
+
+fn shell_tasks(sink: &RecordingSink) -> usize {
+    sink.kinds()
+        .iter()
+        .filter(|k| **k == TaskKind::Shell)
+        .count()
+}
+
+/// A `map` whose one inner step is a real `tool:` — the shape that used to be
+/// stubbed out entirely.
+fn map_over_tool(max_parallel: u32, on_item_error: &str) -> String {
+    format!(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{{{ inputs.items }}}}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: {max_parallel}\n\
+         \x20     on_item_error: {on_item_error}\n\
+         \x20   steps:\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: {{ cmd: [echo, \"${{{{ item }}}}\"] }}\n"
+    )
+}
+
+fn map_items(n: usize) -> Value {
+    Value::Array((0..n).map(|i| serde_json::json!(i)).collect())
+}
+
+/// **The whole point of this task.** A `tool:` step nested in a `map` must
+/// reach the same suspend/resume seam a top-level one does, once per item,
+/// carrying its own `item_index` — not be answered by
+/// `dispatch_step_or_stub`'s fabricated `{}`.
+#[test]
+fn a_maps_inner_tool_step_suspends_per_item_instead_of_being_stubbed() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    let def = parse_workflow(&workflow(&map_over_tool(2, "continue"))).expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": map_items(2) });
+
+    let outcome = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        at(10),
+        None,
+    )
+    .expect("the run drives");
+
+    let RunOutcome::AwaitingWork { pending } = outcome else {
+        panic!("a `map`'s inner `tool:` step must reach real dispatch, got {outcome:?}");
+    };
+    assert_eq!(pending.len(), 2, "both items are in the first wave");
+    assert!(
+        pending.iter().all(|p| p.step_id == "build"),
+        "every entry names the inner step, not the map: {pending:?}"
+    );
+    let mut indices: Vec<Option<u32>> = pending.iter().map(|p| p.item_index).collect();
+    indices.sort();
+    assert_eq!(
+        indices,
+        vec![Some(0), Some(1)],
+        "each item's pending work carries its own index — the field `PendingWork::item_index` \
+         was documented as 'always None today' until this task"
+    );
+}
+
+/// `max_parallel` is a real ceiling on one wave, and the fan-out still
+/// finishes: five items at two-at-a-time is `[2, 2, 1]`, never `[5]`.
+#[test]
+fn max_parallel_bounds_one_waves_size_and_the_map_still_finishes() {
+    let (_conn, _run_id, sink, waves, result) = drive_waves(
+        &map_over_tool(2, "continue"),
+        serde_json::json!({ "items": map_items(5) }),
+        &[],
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![2, 2, 1],
+        "`max_parallel: 2` caps each wave at two entries: {waves:?}"
+    );
+    let mut dispatched: Vec<Option<u32>> = waves.iter().flatten().map(|(_, i)| *i).collect();
+    dispatched.sort();
+    assert_eq!(
+        dispatched,
+        vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+        "every item is dispatched exactly once across the waves: {waves:?}"
+    );
+    assert_eq!(
+        shell_tasks(&sink),
+        5,
+        "one real shell task per item — no item is re-dispatched by a later wave"
+    );
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries.len(), 5);
+    assert!(
+        entries.iter().all(|e| e["status"] == "completed"),
+        "every item completed: {entries:?}"
+    );
+}
+
+/// `max_parallel: 1` is the sequential case, and it is where a per-item
+/// cursor that failed to reconstruct from the durable rows would show up as
+/// an item's first inner step being dispatched twice.
+#[test]
+fn a_two_step_item_advances_one_inner_step_per_wave_without_re_dispatching() {
+    let (_conn, _run_id, sink, waves, result) = drive_waves(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 1\n\
+         \x20   steps:\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, build] }\n\
+         \x20     - id: publish\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, publish] }\n",
+        serde_json::json!({ "items": map_items(2) }),
+        &[],
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![
+            vec![("build".to_string(), Some(0))],
+            vec![("publish".to_string(), Some(0))],
+            vec![("build".to_string(), Some(1))],
+            vec![("publish".to_string(), Some(1))],
+        ],
+        "each wave advances the one in-flight item by exactly one inner step"
+    );
+    assert_eq!(
+        shell_tasks(&sink),
+        4,
+        "two items x two inner steps, each dispatched once"
+    );
+    let output = map_output(&outcome, "fan");
+    assert_eq!(output["items"].as_array().expect("items").len(), 2);
+}
+
+/// A `map` step is one step of the run, so §8.4's admission charges it once —
+/// however many waves it takes. Proven by comparing two runs of the same
+/// fixture that differ only in wave count.
+#[test]
+fn a_map_step_is_admitted_once_however_many_waves_it_takes() {
+    let (sequential_conn, sequential_run, _, sequential_waves, sequential) = drive_waves(
+        &map_over_tool(1, "continue"),
+        serde_json::json!({ "items": map_items(4) }),
+        &[],
+    );
+    let (parallel_conn, parallel_run, _, parallel_waves, parallel) = drive_waves(
+        &map_over_tool(4, "continue"),
+        serde_json::json!({ "items": map_items(4) }),
+        &[],
+    );
+    sequential.expect("the sequential run drives");
+    parallel.expect("the parallel run drives");
+
+    assert_eq!(sequential_waves.len(), 4, "one item per wave");
+    assert_eq!(parallel_waves.len(), 1, "all four items in one wave");
+
+    let sequential_ledger = run_ledger(&sequential_conn, sequential_run).expect("ledger");
+    let parallel_ledger = run_ledger(&parallel_conn, parallel_run).expect("ledger");
+    assert_eq!(
+        sequential_ledger.spent.tasks, parallel_ledger.spent.tasks,
+        "a `map` re-admitted once per wave would charge four tasks in the sequential run and \
+         one in the parallel one"
+    );
+}
+
+/// The same invariant for a `map` that declares an `idempotency_key:`, which
+/// makes it `Idempotent` rather than `Effectful` — so `recover_run` leaves its
+/// row `Running` and never reclassifies it `Indeterminate`. A "this map is
+/// mid-flight" test keyed on the reclassification alone would miss exactly
+/// these, and re-admit one per wave.
+#[test]
+fn a_map_with_an_idempotency_key_is_also_admitted_only_once_across_waves() {
+    let fixture = |max_parallel: u32| {
+        format!(
+            "steps:\n\
+             \x20 - id: fan\n\
+             \x20   idempotency_key: \"fan-once\"\n\
+             \x20   map:\n\
+             \x20     over: \"${{{{ inputs.items }}}}\"\n\
+             \x20     as: item\n\
+             \x20     max_parallel: {max_parallel}\n\
+             \x20   steps:\n\
+             \x20     - id: build\n\
+             \x20       tool: shell\n\
+             \x20       with: {{ cmd: [echo, hi] }}\n"
+        )
+    };
+    let (sequential_conn, sequential_run, _, sequential_waves, sequential) = drive_waves(
+        &fixture(1),
+        serde_json::json!({ "items": map_items(4) }),
+        &[],
+    );
+    let (parallel_conn, parallel_run, _, parallel_waves, parallel) = drive_waves(
+        &fixture(4),
+        serde_json::json!({ "items": map_items(4) }),
+        &[],
+    );
+    sequential.expect("the sequential run drives");
+    parallel.expect("the parallel run drives");
+
+    assert_eq!(sequential_waves.len(), 4);
+    assert_eq!(parallel_waves.len(), 1);
+    assert_eq!(
+        run_ledger(&sequential_conn, sequential_run)
+            .expect("ledger")
+            .spent
+            .tasks,
+        run_ledger(&parallel_conn, parallel_run)
+            .expect("ledger")
+            .spent
+            .tasks,
+    );
+}
+
+/// §8.9's `fail_fast` stops the fan-out. Under waves the cutover point is
+/// *starting a new item*: item 0 fails, so items 1 and 2 are never dispatched
+/// at all and are recorded `Skipped` rather than dropped.
+#[test]
+fn fail_fast_stops_pulling_new_items_into_later_waves() {
+    let (_conn, _run_id, sink, waves, result) = drive_waves(
+        &map_over_tool(1, "fail_fast"),
+        serde_json::json!({ "items": map_items(3) }),
+        &[("build", 0)],
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![vec![("build".to_string(), Some(0))]],
+        "only the first item is ever dispatched: {waves:?}"
+    );
+    assert_eq!(shell_tasks(&sink), 1);
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries.len(), 3, "§8.9: never drop an item");
+    assert_eq!(entries[0]["status"], "failed");
+    for entry in &entries[1..] {
+        assert_eq!(entry["status"], "skipped");
+        assert!(
+            entry["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("fail_fast")),
+            "an item the fan-out never started says so: {entry:?}"
+        );
+    }
+}
+
+/// `collect` keeps dispatching every item and gathers each failure's message
+/// onto the map step's own output — across waves, once each, in item order.
+#[test]
+fn on_item_error_collect_gathers_every_failing_items_message_across_waves() {
+    let (_conn, _run_id, sink, waves, result) = drive_waves(
+        &map_over_tool(2, "collect"),
+        serde_json::json!({ "items": map_items(4) }),
+        &[("build", 0), ("build", 3)],
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(waves.iter().map(Vec::len).sum::<usize>(), 4);
+    assert_eq!(shell_tasks(&sink), 4, "`collect` dispatches every item");
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["status"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>(),
+        vec!["failed", "completed", "completed", "failed"],
+        "the failing entry is first in one place and last in another (ruling P92)"
+    );
+    let collected = output["collected_errors"]
+        .as_array()
+        .expect("collected_errors");
+    assert_eq!(
+        collected.len(),
+        2,
+        "each failure is collected exactly once, not once per wave it was replayed in: \
+         {collected:?}"
+    );
+}
+
+/// A `map` whose inner steps are all pure still resolves in one call —
+/// nothing about moving dispatch into the run loop makes a `map` suspend when
+/// it has nothing to suspend on.
+#[test]
+fn a_map_over_pure_inner_steps_still_completes_without_suspending() {
+    let (_conn, _run_id, _sink, waves, result) = drive_waves(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20   steps:\n\
+         \x20     - id: note\n\
+         \x20       emit: { saw: \"${{ item }}\" }\n",
+        serde_json::json!({ "items": map_items(3) }),
+        &[],
+    );
+    let outcome = result.expect("the run drives");
+    assert!(waves.is_empty(), "a pure `map` never suspends: {waves:?}");
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries.len(), 3);
+    assert!(entries.iter().all(|e| e["status"] == "completed"));
+}
+
+/// An inner step's own `when:` gate still decides before dispatch — moving
+/// the inner loop into `Loop` must not reintroduce the fail-open defect Task
+/// 14's fix round 2 closed (`evaluate_when_gate` is still the one evaluator).
+#[test]
+fn an_inner_steps_when_gate_still_skips_the_dispatch_from_inside_the_run_loop() {
+    let (_conn, _run_id, sink, waves, result) = drive_waves(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20   steps:\n\
+         \x20     - id: guarded\n\
+         \x20       when: \"${{ inputs.approved }}\"\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [rm, -rf, /] }\n",
+        serde_json::json!({ "items": map_items(2), "approved": false }),
+        &[],
+    );
+    let outcome = result.expect("the run drives");
+    assert!(
+        waves.is_empty(),
+        "a `when: false` inner step must never reach dispatch: {waves:?}"
+    );
+    assert_eq!(shell_tasks(&sink), 0, "zero sink events, counted");
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|e| e["status"] == "skipped"));
+}
+
+/// **A `when:` gate's taint has to survive the suspension it caused.** An
+/// inner step's `gate_condition_was_secret_derived` is computed on the
+/// segment that dispatches it and folded into the `map`'s one aggregate
+/// (`dispatch_map_step`'s fix round 3, item 1) — but `WorkDone` has no field
+/// for it, so a gate that reads a secret and *then* suspends would have lost
+/// the bit at the wave boundary and let the map's output reach a dependent
+/// unredacted.
+///
+/// Measured against the same gate the top-level case is pinned with:
+/// `${{ secrets.K == '…' }}` guarding a step whose own output is clean, with
+/// the gate true so the step really does dispatch and really does suspend.
+#[test]
+fn an_inner_steps_secret_derived_gate_still_taints_the_map_after_a_suspension() {
+    let body = "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 1\n\
+         \x20   steps:\n\
+         \x20     - id: build\n\
+         \x20       when: \"${{ secrets.K == 'yesyesyesyes' }}\"\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, hi] }\n";
+    let (_conn, _run_id, _sink, waves, result) = drive_waves_with_context(body, &[], |run_ctx| {
+        run_ctx.inputs = serde_json::json!({ "items": map_items(2) });
+        run_ctx
+            .secrets
+            .insert("K".to_string(), "yesyesyesyes".to_string());
+    });
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves.len(),
+        2,
+        "the gate is true, so each item really does dispatch and suspend: {waves:?}"
+    );
+    let RunOutcome::Terminal { steps, .. } = &outcome else {
+        panic!("the run must reach a terminal state, got {outcome:?}");
+    };
+    let map = steps.iter().find(|s| s.step_id == "fan").expect("the map");
+    assert!(
+        map.output_is_secret_derived,
+        "the gate read `secrets.K`, so the map's own output is secret-derived — the bit is \
+         parked on the suspended step's own row and carried back when its answer arrives"
+    );
+}
+
+/// A `WorktreeProvider` that hands out distinct fake paths and counts both
+/// halves of the lifecycle, so a test can prove a worktree is never
+/// materialized twice for one item and never leaked.
+#[derive(Default)]
+struct CountingWorktreeProvider {
+    materialized: std::sync::Mutex<Vec<std::path::PathBuf>>,
+    released: std::sync::Mutex<Vec<std::path::PathBuf>>,
+}
+
+impl roundhouse_flow::worktree::WorktreeProvider for CountingWorktreeProvider {
+    fn materialize(
+        &self,
+        _base_ref: &str,
+    ) -> Result<std::path::PathBuf, roundhouse_flow::worktree::WorktreeProviderError> {
+        let mut made = self.materialized.lock().expect("not poisoned");
+        let path = std::path::PathBuf::from(format!("/fake/worktree/{}", made.len()));
+        made.push(path.clone());
+        Ok(path)
+    }
+
+    fn release(
+        &self,
+        worktree_path: &std::path::Path,
+    ) -> Result<(), roundhouse_flow::worktree::WorktreeProviderError> {
+        self.released
+            .lock()
+            .expect("not poisoned")
+            .push(worktree_path.to_path_buf());
+        Ok(())
+    }
+}
+
+/// **The worktree-across-suspend boundary, failed closed rather than
+/// silently re-materialized.** A worktree guard's lifetime is one synchronous
+/// call, and `Loop`/`Executor` are rebuilt fresh on every re-entry — so an
+/// item that suspended inside its own worktree would come back bound to a
+/// *different* path. Refused per item, with the reason named, and the
+/// worktree that was materialized is still released.
+#[test]
+fn an_items_worktree_cannot_span_a_suspend_and_says_so_rather_than_re_materializing() {
+    let provider = Arc::new(CountingWorktreeProvider::default());
+    let (_conn, _run_id, sink, waves, result) = drive_waves_with_context(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     on_item_error: continue\n\
+         \x20     isolation: worktree\n\
+         \x20   steps:\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, hi] }\n",
+        &[],
+        |run_ctx| {
+            run_ctx.inputs = serde_json::json!({ "items": map_items(2) });
+            run_ctx.worktree_provider = Some(provider.clone());
+        },
+    );
+    let outcome = result.expect("the run drives");
+
+    assert!(
+        waves.is_empty(),
+        "an item that would suspend inside its worktree is refused, never dispatched: {waves:?}"
+    );
+    assert_eq!(shell_tasks(&sink), 0);
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        assert_eq!(entry["status"], "failed");
+        assert!(
+            entry["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("isolation: worktree") && e.contains("suspend")),
+            "the refusal names exactly what is unsupported: {entry:?}"
+        );
+    }
+
+    let materialized = provider.materialized.lock().expect("not poisoned").clone();
+    let released = provider.released.lock().expect("not poisoned").clone();
+    assert_eq!(
+        materialized.len(),
+        2,
+        "one worktree per item, materialized once — never re-materialized on a resume"
+    );
+    assert_eq!(
+        released, materialized,
+        "every worktree the refusal abandoned is still released"
+    );
 }

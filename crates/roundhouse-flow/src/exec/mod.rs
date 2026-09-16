@@ -86,9 +86,11 @@ pub(crate) enum GateDecision {
 /// — the two callers with no `workflow_run` row behind them — never see
 /// `Pending` at all: both go through [`Executor::dispatch_step_or_stub`],
 /// which converts it into the same stub outcome this crate always produced
-/// for `Tool`/`Agent` before this type existed. Only
-/// [`run_loop::Loop::run_phase`] is able to actually suspend a run, so only
-/// it calls [`Executor::dispatch_step`] directly.
+/// for `Tool`/`Agent` before this type existed. Only the two loops that can
+/// actually suspend a run call [`Executor::dispatch_step`] directly:
+/// [`run_loop::Loop::run_phase`] for a top-level step, and
+/// `run_loop::Loop::dispatch_map` for one `map` item's inner step (Phase 8
+/// Task 25.7 Task 2). Both hold the `&mut Connection` `Executor` does not.
 pub(crate) enum DispatchDecision {
     Done(StepOutcome),
     Pending(run_loop::PendingKind),
@@ -961,6 +963,22 @@ impl<'a> Executor<'a> {
     /// callers see no change at all), and the outcome is a fixed empty,
     /// `Completed` object. Real dispatch is [`run_loop::Loop::run_phase`]'s
     /// alone, because only it can suspend and resume a durable run.
+    ///
+    /// # What changed for `map` (Phase 8 Task 25.7 Task 2)
+    ///
+    /// This doc used to say a `map` item's inner `tool:`/`agent:` step was
+    /// stubbed here because *"real per-item concurrency is Phase 8 Task
+    /// 25.7's scope"*. That task landed, and the hand-off it named is done:
+    /// a `map` driven by [`run_loop::run_workflow`] is now dispatched by
+    /// `run_loop::Loop::dispatch_map`, whose per-item loop calls
+    /// [`Self::dispatch_step`] directly and turns each item's `Pending` into
+    /// a real `PendingWork { item_index: Some(i), .. }`.
+    ///
+    /// What still reaches this function from a `map` is
+    /// `dispatch_map_step`'s own loop — the in-memory one, reached only from
+    /// [`Self::run_to_completion`], which has no run to suspend into. So the
+    /// stub is no longer a deferral; it is the honest answer for a sequencer
+    /// that genuinely cannot dispatch.
     fn dispatch_step_or_stub(&mut self, step: &StepDef) -> StepOutcome {
         let kind = match self.dispatch_step(step) {
             DispatchDecision::Done(outcome) => return outcome,
@@ -1357,13 +1375,22 @@ impl<'a> Executor<'a> {
                     gate_condition_was_secret_derived: false,
                 })
             }
-            // Task 14/B6: real `map` dispatch — evaluates `over:`, binds the
-            // `as:` item variable per item, and recursively runs the inner
-            // steps via this same `dispatch_step`. See
+            // Task 14/B6: the **in-memory** `map` dispatch — evaluates
+            // `over:`, binds the `as:` item variable per item, and runs the
+            // inner steps via `dispatch_step_or_stub`. See
             // `map_step::Executor::dispatch_map_step`'s own doc comment for
             // the full provenance/budget reasoning, including Task 34's
             // addition: an explicit `isolation: worktree` materializes a
             // real git worktree per item.
+            //
+            // **A `map` inside a real run does not reach this arm at all**
+            // (Phase 8 Task 25.7 Task 2): `run_loop::Loop::run_phase`
+            // intercepts `StepBody::Map` before it calls this function, the
+            // same way it already intercepts `gate:`/`call:` below, and
+            // drives the fan-out in waves that can suspend per item. This arm
+            // is what `Executor::run_to_completion` — the sequencer with no
+            // run behind it — gets, and `DispatchDecision::Done` is the
+            // honest answer there because nothing in that caller can suspend.
             //
             // (`dispatch_step` matches on `&step.body`, so match ergonomics
             // already bind `over`/`r#as`/`max_parallel`/`on_item_error`/
@@ -1402,20 +1429,23 @@ impl<'a> Executor<'a> {
             //
             // 1. `Executor::run_to_completion`, the in-memory sequencer, which
             //    has no run row at all.
-            // 2. `map_step::dispatch_map_step`'s inner-step loop, for a
-            //    `gate:` or `call:` nested inside a `map`. §8.9's own reference
-            //    workflow nests a `gate:` that way, so this is a real shape
-            //    that is refused rather than an impossible one — and it is
-            //    refused for a structural reason, not an omission: a park is a
-            //    transition of *the run*, and one run cannot be parked
-            //    per-item; a nested `call:` needs the per-item budget pool
-            //    whose ceilings ruling P77 §C defers. (Task 34 closed the
-            //    *other* thing this bullet used to lump in here — `map`'s
-            //    worktree fan-out is no longer deferred; see
-            //    `map_step::Executor::dispatch_map_step`'s own doc comment,
-            //    "Task 34".) The per-item budget pool and the nested
-            //    `gate:`/`call:` refusal both still belong with whoever gives
-            //    `map` real fan-out.
+            // 2. Either `map` inner-step loop, for a `gate:` or `call:`
+            //    nested inside a `map` — `map_step::dispatch_map_step`'s
+            //    in-memory one, and `run_loop::Loop::dispatch_map`'s
+            //    wave-driven one, which deliberately routes a nested
+            //    `gate:`/`call:` through this same generic arm rather than
+            //    growing arms of its own (Phase 8 Task 25.7 Task 2). §8.9's
+            //    own reference workflow nests a `gate:` that way, so this is
+            //    a real shape that is refused rather than an impossible one —
+            //    and it is refused for a structural reason, not an omission:
+            //    a park is a transition of *the run*, and one run cannot be
+            //    parked per-item; a nested `call:` needs the per-item budget
+            //    pool whose ceilings ruling P77 §C defers. (Task 34 closed
+            //    `map`'s worktree fan-out, and Phase 8 Task 25.7 Task 2
+            //    closed its per-item `tool:`/`agent:` dispatch; see
+            //    `run_loop::Loop::dispatch_map`'s own doc comment for what
+            //    that task deliberately left here.) Resolving the two
+            //    refusals above is Phase 8 Task 25.7's Tasks 6 and 7.
             //
             // Fix round 1, item 8: the message used to be
             // `format!("step kind {other:?} handled by a later task")` — a

@@ -1718,6 +1718,55 @@ async fn a_zero_step_timeout_is_refused_as_a_named_bug_not_dispatched() {
     );
 }
 
+/// **A `map` item's answer must come back under that item's index** (Phase 8
+/// Task 25.7 Task 2). `Loop::work_results` is keyed by
+/// `(step_id, item_index)`, so a `WorkDone` filed under `None` for a
+/// `PendingWork` that carried `Some(i)` answers nothing: the run loop finds
+/// the item still unresolved and re-dispatches it on the next wave, forever,
+/// until the run's grant is exhausted and it ends `Failed` reporting
+/// "admission refused" instead of what really happened.
+///
+/// Driven through the zero-`step_timeout` refusal because it is the one arm
+/// that needs no real tool dispatch, no policy rule and no live child — the
+/// echo it exercises is `execute_pending_with_context`'s, which applies to
+/// every arm from one place.
+#[tokio::test]
+async fn a_map_items_answer_carries_its_item_index_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace_root = dir.path().canonicalize().unwrap();
+    let (executor, session) = executor_and_session(&workspace_root, vec![]).await;
+
+    // Two items of the **same** inner step id, which is exactly the shape a
+    // bare-`step_id` answer cannot distinguish, with the interesting index
+    // neither first nor last within the run (ruling P92's fixture rule).
+    let item = |item_index: Option<u32>| PendingWork {
+        run_id: RunId::new(),
+        session_id: session.session_id(),
+        step_id: "build".to_string(),
+        attempt: 1,
+        item_index,
+        disposition: StepDisposition::Pure,
+        step_timeout: Duration::ZERO,
+        kind: PendingKind::Tool {
+            tool: "read".to_string(),
+            task_kind: TaskKind::Read,
+            logged_input: serde_json::json!({ "path": "irrelevant" }),
+            dispatch_input: serde_json::json!({ "path": "irrelevant" }),
+        },
+    };
+
+    let done = executor
+        .execute_pending(&session, vec![item(Some(2)), item(Some(5)), item(None)])
+        .await;
+
+    assert_eq!(
+        done.iter().map(|d| d.item_index).collect::<Vec<_>>(),
+        vec![Some(2), Some(5), None],
+        "each answer echoes exactly the index its own `PendingWork` carried, and a top-level \
+         step's `None` is still `None`"
+    );
+}
+
 /// Phase 8 Task 25.4 Task 4, the non-conflation regression this task's
 /// own restructuring risks: an ordinary `step_timeout` elapsing — no
 /// §8.13 cancel anywhere in this test — must still classify as
