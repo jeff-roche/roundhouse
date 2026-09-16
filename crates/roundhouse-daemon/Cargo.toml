@@ -152,3 +152,14 @@ roundhouse-engine = { path = "../roundhouse-engine", features = ["test-util"] }
 # `async-trait` is no longer listed here: Phase 8 L5 promoted it to a real
 # `[dependencies]` entry (see that entry's comment), which dev targets
 # inherit — this crate's fake `McpTransport` test transport still needs it.
+#
+# Phase 8 Task 25.7 Task 3: `dispatch_wave`'s own concurrency test needs
+# `tokio::time::pause`/`#[tokio::test(start_paused = true)]` — a real
+# injected fake clock, not a real-time `sleep(N); assert!(...)` (the pattern
+# this workspace's own `scheduled_trigger_end_to_end.rs` module doc
+# explicitly bans) — to prove a wave of items is dispatched concurrently
+# rather than sequentially, deterministically and without flakiness. Only
+# `[dev-dependencies]` needs the extra feature; the main `[dependencies]`
+# entry above stays as `["fs", "io-util"]`, unchanged, since production code
+# never pauses time.
+tokio = { workspace = true, features = ["test-util"] }
