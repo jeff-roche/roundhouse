@@ -259,14 +259,16 @@ pub trait WorkflowHost: Checkpointer {
     /// Releases an uncommitted child slot.
     fn release_child_session(&mut self, parent: SessionId, child: &CalledWorkflow);
 
-    /// Persists the child session lifecycle event and workflow row in one
-    /// transaction, then registers the runtime spawn-tree edge after commit.
+    /// Persists the child session lifecycle event, workflow row, and parent
+    /// `Running` checkpoint in one transaction, then registers the runtime
+    /// spawn-tree edge after commit.
     fn create_child_run(
         &mut self,
         conn: &mut Connection,
         parent: SessionId,
         child: &WorkflowRun,
         called: &CalledWorkflow,
+        parent_step: &WorkflowStepRun,
     ) -> Result<(), WorkflowHostError>;
 
     /// Drops the runtime edge [`Self::create_child_run`] registered, because
@@ -559,7 +561,9 @@ pub enum RunOutcome {
     /// report and no owner: `crate::report`'s module doc records that
     /// obligation for whoever builds §8.11's reaper.
     Parked(Box<ParkResult>),
-    /// A `tool:`/`agent:` step needs real work this crate cannot perform.
+    /// A `tool:`/`agent:`/`call:` step needs real work this crate cannot
+    /// perform. A pending call already has its funded child run and parent
+    /// agent task; the caller returns its child result as [`WorkDone`].
     /// **Not terminal, so it carries no report** — the run is still
     /// `Running` (unlike `Parked`, which writes `AwaitingHuman`: the run
     /// genuinely is running, its caller is simply not inside
@@ -1094,7 +1098,7 @@ enum PhaseEnd {
     /// A `gate:` parked the run. The whole loop unwinds; nothing after this
     /// step runs, and no report is written, because the run has not ended.
     Parked(ParkResult),
-    /// A `tool:`/`agent:` step needs real work. The whole loop unwinds
+    /// A `tool:`/`agent:`/`call:` step needs real work. The whole loop unwinds
     /// exactly as for `Parked` — nothing after this step runs — but the run
     /// stays `Running`, not `AwaitingHuman`.
     AwaitingWork(Box<PendingWork>),
@@ -1451,7 +1455,9 @@ impl<H: WorkflowHost> Loop<'_, H> {
                         match self.dispatch_call(executor, step, workflow, with) {
                             CallStep::Completed(outcome) => outcome,
                             CallStep::AwaitingWork(kind) => {
-                                return self.awaiting_work(executor, step, kind);
+                                return Ok(PhaseEnd::AwaitingWork(Box::new(
+                                    self.pending_work(executor, step, kind),
+                                )));
                             }
                         }
                     }
@@ -1501,7 +1507,18 @@ impl<H: WorkflowHost> Loop<'_, H> {
         kind: PendingKind,
     ) -> Result<PhaseEnd, RunLoopError> {
         self.checkpoint(step, StepRunState::Running, None, None)?;
-        Ok(PhaseEnd::AwaitingWork(Box::new(PendingWork {
+        Ok(PhaseEnd::AwaitingWork(Box::new(
+            self.pending_work(executor, step, kind),
+        )))
+    }
+
+    fn pending_work(
+        &self,
+        executor: &Executor<'_>,
+        step: &StepDef,
+        kind: PendingKind,
+    ) -> PendingWork {
+        PendingWork {
             run_id: self.run_id,
             session_id: self.session_id,
             step_id: step.id.clone(),
@@ -1514,7 +1531,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 .map(|b| b.total_remaining.step_timeout)
                 .unwrap_or_default(),
             kind,
-        })))
+        }
     }
 
     /// §8.4's admission, with §8.13's one exemption applied by phase.
@@ -1630,26 +1647,32 @@ impl<H: WorkflowHost> Loop<'_, H> {
     ) -> Result<(), RunLoopError> {
         checkpoint_step(
             self.conn,
-            &WorkflowStepRun {
-                run_id: self.run_id,
-                step_id: step.id.clone(),
-                // `crate::retry` is built and unwired here — see the module
-                // doc. Writing `1` is the truth about what happened; writing a
-                // counter nothing increments would not be.
-                attempt: 1,
-                item_index: None,
-                disposition: derive_disposition(step),
-                state,
-                // §8.10's ranges join back to a session's task log — see
-                // this method's own doc comment for when a real value is
-                // available to write here.
-                first_task_seq,
-                last_task_seq,
-                output,
-                error,
-            },
+            &self.step_run(step, state, output, error, first_task_seq, last_task_seq),
         )?;
         Ok(())
+    }
+
+    fn step_run(
+        &self,
+        step: &StepDef,
+        state: StepRunState,
+        output: Option<StepOutput>,
+        error: Option<String>,
+        first_task_seq: Option<u64>,
+        last_task_seq: Option<u64>,
+    ) -> WorkflowStepRun {
+        WorkflowStepRun {
+            run_id: self.run_id,
+            step_id: step.id.clone(),
+            attempt: 1,
+            item_index: None,
+            disposition: derive_disposition(step),
+            state,
+            first_task_seq,
+            last_task_seq,
+            output,
+            error,
+        }
     }
 }
 
@@ -1829,12 +1852,9 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// own transaction), and emit the parent's `agent`-kind task standing for
     /// the call.
     ///
-    /// # What the step's output is, and what it is not
-    ///
-    /// `{"run_id": "<child>"}` — the handle, not the result. Driving the child
-    /// to completion is the daemon's for two structural reasons the module doc
-    /// states, and until it has run there is no result to hand back. The
-    /// child's own report is reachable from that id.
+    /// The call remains `Running` until its child driver returns [`WorkDone`].
+    /// That result becomes the call step's output; the child id is carried only
+    /// in [`PendingKind::ChildRun`] while dispatch is outstanding.
     ///
     /// # The in-memory token and the durable draw are not two draws
     ///
@@ -1974,9 +1994,10 @@ impl<H: WorkflowHost> Loop<'_, H> {
             &executor.redaction_needles,
         );
         let dispatch_input = resolved_with.into_unredacted_for_dispatch();
-        if let Err(e) = self
-            .host
-            .create_child_run(self.conn, self.session_id, &child, &called)
+        let parent_step = self.step_run(step, StepRunState::Running, None, None, None, None);
+        if let Err(e) =
+            self.host
+                .create_child_run(self.conn, self.session_id, &child, &called, &parent_step)
         {
             return CallStep::Completed(StepOutcome::failed(
                 &step.id,
@@ -2435,6 +2456,7 @@ mod tests {
             _parent: SessionId,
             _child: &WorkflowRun,
             _called: &CalledWorkflow,
+            _parent_step: &WorkflowStepRun,
         ) -> Result<(), WorkflowHostError> {
             unreachable!("these tests run no `call:` step")
         }

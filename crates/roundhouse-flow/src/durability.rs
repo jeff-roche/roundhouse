@@ -1700,13 +1700,25 @@ pub fn checkpoint_step(
     step: &WorkflowStepRun,
 ) -> Result<(), DurabilityError> {
     let txn = roundhouse_store::begin_immediate(conn)?;
-    if !run_exists(&txn, step.run_id)? {
+    checkpoint_step_in_transaction(&txn, step)?;
+    txn.commit()?;
+    Ok(())
+}
+
+/// Writes a step checkpoint into a caller-owned transaction.
+///
+/// Child-call admission uses this with the child run insert so a child cannot
+/// commit without the parent step's `Running` hand-off record.
+pub fn checkpoint_step_in_transaction(
+    txn: &rusqlite::Transaction<'_>,
+    step: &WorkflowStepRun,
+) -> Result<(), DurabilityError> {
+    if !run_exists(txn, step.run_id)? {
         return Err(DurabilityError::RunNotFound {
             run_id: step.run_id,
         });
     }
-    write_step_row(&txn, step.run_id, step)?;
-    txn.commit()?;
+    write_step_row(txn, step.run_id, step)?;
     Ok(())
 }
 

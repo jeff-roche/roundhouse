@@ -221,10 +221,17 @@ impl WorkflowHost for FakeHost {
         _parent: SessionId,
         child: &WorkflowRun,
         called: &CalledWorkflow,
+        parent_step: &roundhouse_flow::durability::WorkflowStepRun,
     ) -> Result<(), WorkflowHostError> {
         let txn = roundhouse_store::begin_immediate(conn)?;
         if let Err(error) =
             roundhouse_flow::durability::insert_workflow_run_in_transaction(&txn, child)
+        {
+            self.release_child_session(_parent, called);
+            return Err(error.into());
+        }
+        if let Err(error) =
+            roundhouse_flow::durability::checkpoint_step_in_transaction(&txn, parent_step)
         {
             self.release_child_session(_parent, called);
             return Err(error.into());
@@ -1424,6 +1431,58 @@ fn a_resumed_call_uses_the_original_parent_agent_task() {
         vec![parent_task_id],
         "the completed child is associated with the original parent task"
     );
+}
+
+#[test]
+fn a_failed_call_running_checkpoint_rolls_back_its_child() {
+    let mut conn = open_test_db();
+    let (run_id, _) = seed_run(&mut conn);
+    conn.execute_batch(
+        "CREATE TRIGGER reject_call_running_checkpoint
+         BEFORE INSERT ON workflow_step_run
+         WHEN NEW.step_id = 'child' AND NEW.state = 'running'
+         BEGIN
+             SELECT RAISE(ABORT, 'test call checkpoint failure');
+         END;",
+    )
+    .expect("install call checkpoint failure");
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: child\n\
+         \x20   call: child-flow\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new().resolving("child-flow");
+
+    let result = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        ctx(run_id),
+        at(10),
+        None,
+    );
+
+    let RunOutcome::Terminal { state, .. } = result.expect("the failed hand-off is a step failure")
+    else {
+        panic!("a failed child hand-off must not suspend");
+    };
+    assert_eq!(state, RunState::Failed);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM workflow_run WHERE parent_run_id = ?1",
+            [run_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("count child runs"),
+        0,
+        "without the running checkpoint, no funded child may survive to be duplicated on re-drive"
+    );
+    assert!(host.sessions_created.is_empty());
+    assert!(host.reservations.is_empty());
 }
 
 /// §8.12: a `call:` creates a child `workflow_run` **and** a child Session,

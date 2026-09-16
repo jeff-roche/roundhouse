@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::durability::WorkflowStepRun;
 use crate::exec::run_loop::{
     run_workflow, CalledWorkflow, RunLoopError, RunOutcome, SessionTree, WorkflowHost,
     WorkflowHostError,
@@ -246,6 +247,7 @@ impl WorkflowHost for SqliteWorkflowHost {
         parent: SessionId,
         child: &crate::durability::WorkflowRun,
         called: &CalledWorkflow,
+        parent_step: &WorkflowStepRun,
     ) -> Result<(), WorkflowHostError> {
         let txn = roundhouse_store::begin_immediate(conn)?;
         let result = self
@@ -253,6 +255,10 @@ impl WorkflowHost for SqliteWorkflowHost {
             .persist_child_session(&txn, parent, child)
             .and_then(|()| {
                 crate::durability::insert_workflow_run_in_transaction(&txn, child)
+                    .map_err(WorkflowHostError::from)
+            })
+            .and_then(|()| {
+                crate::durability::checkpoint_step_in_transaction(&txn, parent_step)
                     .map_err(WorkflowHostError::from)
             });
         if let Err(error) = result {
