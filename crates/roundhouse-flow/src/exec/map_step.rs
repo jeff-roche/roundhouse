@@ -33,8 +33,10 @@
 //! One decision here is deliberately *not* shared, and it is the exception
 //! that proves the rule: [`per_item_dispatch_refusal`] (Task 4) lives beside
 //! [`split_budget`], the division it enforces, but only the run-loop fan-out
-//! calls it. See the closure at [`run_map`]'s call site for why — a ceiling on
-//! stub dispatches, divided out of a placeholder ceiling, would bound nothing.
+//! calls it. See the closure at [`run_map`]'s call site for why — in short,
+//! every `tool:`/`agent:` inner step *this* loop reaches is
+//! [`Executor::dispatch_step_or_stub`]'s stub, so there is no per-item spend
+//! here for a ceiling to bound.
 //!
 //! # Deviations from the plan text (ruling P1)
 //!
@@ -311,10 +313,17 @@ pub fn split_budget(total: &ResourceCaps, item_count: u32) -> ResourceCaps {
 /// and a `map` is still charged there exactly once, when it starts. What this
 /// adds on top is an in-memory ceiling, derived fresh on every segment from
 /// the item's own durable rows, that stops one item consuming the whole run's
-/// allowance while its siblings starve — which is a live risk only since Task
-/// 2 of the same task made a `map` item's inner steps dispatch for real: a
-/// 2,000-item `map` can otherwise issue 2,000 real dispatches against the
-/// admission of one step.
+/// allowance while its siblings starve — a live risk only since Task 2 of the
+/// same task made a `map` item's inner steps dispatch for real.
+///
+/// **It bounds an item against its siblings, not the map's total.**
+/// [`split_budget`] rounds an item's share of `max_tool_calls` *up*, so every
+/// item keeps at least one call for as long as the run has any allowance left
+/// at all: an n-item `map` still issues n real dispatches whatever this
+/// returns. What it prevents is one item running away with the whole share,
+/// which is a fairness property rather than an exhaustion one. Bounding the
+/// aggregate — including recording the items a spent *run* never reached — is
+/// §8.9's cooperative run-budget exhaustion, and is a separate task's.
 ///
 /// # Why `max_tool_calls`, and why that field alone
 ///
@@ -407,8 +416,8 @@ pub struct MapRunResult {
 /// function silently withholding a call. `run_item` is still handed
 /// [`split_budget`]'s even-split allowance for the item, and the closure at
 /// this function's one call site still leaves it unread — see that closure's
-/// own comment for why binding it *here* would bound stub work against a
-/// placeholder ceiling. The loop that enforces the same share for real is
+/// own comment for why binding it *here* would bound nothing but stub work.
+/// The loop that enforces the same share for real is
 /// `crate::exec::run_loop::Loop::dispatch_map`, through
 /// [`per_item_dispatch_refusal`].
 ///
@@ -1907,16 +1916,29 @@ impl<'a> Executor<'a> {
             // item's next dispatch once its running tally would exceed this
             // same `split_budget` share — see `per_item_dispatch_refusal`.
             //
-            // It is not mirrored here because there is nothing here to refuse.
-            // Every `tool:`/`agent:` inner step this loop reaches becomes
-            // `Executor::dispatch_step_or_stub`'s fabricated `{}` (this
-            // function's caller holds no `Connection` and so has nothing to
-            // suspend into), and the budget being divided is
-            // `MapBudget::unenforced_placeholder` — a `ResourceCaps::default`
-            // that explicitly is not sourced from any run. A ceiling on stub
-            // work, derived from a number whose own constructor says it
-            // enforces nothing, would be enforcement theatre; the honest
-            // reading is that this loop has no per-item spend to bound.
+            // It is not mirrored here because there is nothing here to
+            // refuse: every `tool:`/`agent:` inner step this loop reaches
+            // becomes `Executor::dispatch_step_or_stub`'s fabricated `{}`, so
+            // an item of *this* fan-out cannot spend a call in the first
+            // place. A ceiling on stub work would be enforcement theatre.
+            //
+            // **That holds whether or not the budget behind it is real, and
+            // the distinction is worth stating because both cases occur.**
+            // `Executor::run_to_completion`'s in-memory sequencer has no run
+            // behind it and falls back to `MapBudget::unenforced_placeholder`
+            // — but a `map:` nested *inside* another `map`'s inner steps
+            // reaches this same function from a **real** run
+            // (`run_loop::Loop::advance_map_item` →
+            // `Executor::dispatch_step`'s `StepBody::Map` arm, which is not
+            // intercepted the way a top-level `map:` is), and there the
+            // divided ceiling is real and ledger-sourced, exactly as the
+            // `budget` binding above says. What makes the conclusion the same
+            // either way is the stub, not the budget.
+            //
+            // So this is the line to revisit if a future task ever makes a
+            // nested `map`'s own inner steps dispatch for real: at that point
+            // this loop acquires a per-item spend, and the argument above
+            // stops holding.
             //
             // B12c's mutation sweep left two survivors (`M1`/`M2`), both
             // mutations of the split arithmetic, both `EQUIVALENT` because of

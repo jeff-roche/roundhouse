@@ -5937,3 +5937,210 @@ fn an_inner_step_that_never_dispatched_does_not_spend_an_items_share() {
         "item 0's refusal names the step it withheld: {entries:?}"
     );
 }
+
+fn read_tasks(sink: &RecordingSink) -> usize {
+    sink.kinds()
+        .iter()
+        .filter(|k| **k == TaskKind::Read)
+        .count()
+}
+
+/// What the daemon does the instant it takes a `PendingWork` for a `read`
+/// step: mint the task and log it. Separated from *answering* it, because the
+/// gap between the two is exactly where a crash leaves a dispatch that really
+/// happened with no answer to show for it.
+fn mint_read_task(sink: &mut RecordingSink) -> TaskId {
+    let task_id = TaskId::new();
+    sink.emit(
+        task_id,
+        None,
+        TaskKind::Read,
+        EventPayload::TaskCreated {
+            kind: TaskKind::Read,
+            parent: None,
+            origin: Origin::System,
+            input: TaskInput::Json(serde_json::json!({})),
+        },
+    );
+    task_id
+}
+
+/// **A step that is re-decided is charged to the item once, however many
+/// times it actually dispatches — so the ceiling has a bounded soft
+/// overshoot, and this pins its exact size.**
+///
+/// The tally is read out of `item_steps_before`, which is a
+/// `HashMap<(step_id, item_index), _>`: one row per inner step per item, no
+/// attempt dimension. So when §8.10 tier 2 re-decides a step — `on_crash:
+/// rerun` for the `Pure`/`Idempotent` half here, and the same shape for a
+/// `Failed` row re-decided on a cold entry — the second real dispatch of that
+/// step is not seen by the ceiling. The item therefore gets exactly one
+/// dispatch beyond its share **per re-decide**, and is still refused at its
+/// next *fresh* step.
+///
+/// Driven the way it really happens: the wave for item 0's `probe` goes out,
+/// the daemon dies, and the run is re-driven cold. `probe` is `tool: read`
+/// (`Pure`, so its policy is `rerun` and `recover_run` leaves the row
+/// `Running`) and the `map` carries an `idempotency_key:` (`Idempotent`, so
+/// the map's own row is not reclassified and the fan-out re-drives instead of
+/// parking) — between them, the item's own interrupted step is reached
+/// without a human in the loop.
+#[test]
+fn a_re_decided_inner_step_is_charged_to_the_item_once_however_often_it_dispatches() {
+    let mut conn = open_test_db();
+    let run_id = RunId::new();
+    let mut run = a_run(run_id, SessionId::new());
+    // Two items over four calls: a share of two each.
+    run.caps = Some(a_grant_of_tool_calls(4));
+    insert_workflow_run(&mut conn, &run).expect("seed the run row");
+
+    let def = parse_workflow(&workflow(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   idempotency_key: \"fan-once\"\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 1\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: probe\n\
+         \x20       tool: read\n\
+         \x20       with: { path: \"${{ item }}\" }\n\
+         \x20     - id: build\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, build] }\n\
+         \x20     - id: publish\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, publish] }\n",
+    ))
+    .expect("fixture parses");
+    let mut sink = RecordingSink::default();
+    let mut host = FakeHost::new();
+    let mut run_ctx = ctx(run_id);
+    run_ctx.inputs = serde_json::json!({ "items": map_items(2) });
+
+    let first = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx.clone(),
+        at(10),
+        None,
+    )
+    .expect("the run drives");
+    let RunOutcome::AwaitingWork { pending } = first else {
+        panic!("item 0's `probe` is dispatched and the daemon then dies, got {first:?}");
+    };
+    assert_eq!(
+        pending
+            .iter()
+            .map(|p| (p.step_id.clone(), p.item_index))
+            .collect::<Vec<_>>(),
+        vec![("probe".to_string(), Some(0))],
+    );
+    // The daemon mints the task — the dispatch really happens — and *then*
+    // dies, so this attempt is in the log with no answer behind it. That gap
+    // is the whole reason §8.10 tier 2 exists.
+    for p in &pending {
+        assert_eq!(p.item_index, Some(0));
+        mint_read_task(&mut sink);
+    }
+    assert_eq!(read_tasks(&sink), 1, "item 0's first `probe` attempt");
+
+    // The cold re-drive: no `Resume`, exactly as a recovered run is
+    // re-entered, and the answer to the first wave is lost with the process
+    // that was holding it.
+    let recovered = run_workflow(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx.clone(),
+        at(20),
+        None,
+    )
+    .expect("the run drives");
+    let RunOutcome::AwaitingWork { pending } = recovered else {
+        panic!("`probe` is `Pure`, so its `on_crash` policy re-runs it, got {recovered:?}");
+    };
+    assert_eq!(
+        pending
+            .iter()
+            .map(|p| (p.step_id.clone(), p.item_index))
+            .collect::<Vec<_>>(),
+        vec![("probe".to_string(), Some(0))],
+        "the interrupted step really is dispatched a second time — the ceiling did not \
+         withhold it, because its one row is worth one call however many attempts it takes"
+    );
+
+    // Answer this second wave the way the daemon would, then let the run
+    // finish normally.
+    let answer = pending
+        .iter()
+        .map(|p| {
+            let task_id = mint_read_task(&mut sink);
+            roundhouse_flow::exec::run_loop::WorkDone {
+                step_id: p.step_id.clone(),
+                item_index: p.item_index,
+                status: roundhouse_flow::exec::run_loop::WorkStatus::Completed,
+                output: serde_json::json!({}),
+                output_is_secret_derived: false,
+                task_id: Some(task_id),
+                first_task_seq: None,
+                last_task_seq: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let outcome = run_to_terminal(
+        &mut conn,
+        &def,
+        run_id,
+        &mut sink,
+        &mut host,
+        run_ctx,
+        30,
+        Some(Resume::Work(answer)),
+    )
+    .expect("the run drives");
+
+    // Item 0: `probe` twice + `build` once = three real dispatches against a
+    // share of two. Item 1: `probe` + `build` = two, exactly its share.
+    assert_eq!(
+        read_tasks(&sink),
+        3,
+        "item 0's interrupted `probe` dispatched twice and item 1's once — the overshoot is \
+         one call, and it is the re-decided step's own second attempt"
+    );
+    assert_eq!(
+        shell_tasks(&sink),
+        2,
+        "one `build` each; neither item's `publish` is ever dispatched"
+    );
+
+    let RunOutcome::Terminal { steps, .. } = &outcome else {
+        panic!("the run must reach a terminal state, got {outcome:?}");
+    };
+    let map = steps.iter().find(|s| s.step_id == "fan").expect("the map");
+    let entries = map.output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["status"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>(),
+        vec!["failed", "failed"],
+        "the overshoot is bounded, not a hole: both items are still refused at their next \
+         fresh step: {entries:?}"
+    );
+    for entry in entries {
+        assert!(
+            entry["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("publish") && e.contains("max_tool_calls")),
+            "the ceiling still closes on the step after the re-decided one: {entry:?}"
+        );
+    }
+}

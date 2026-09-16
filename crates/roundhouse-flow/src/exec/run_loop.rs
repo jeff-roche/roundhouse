@@ -1840,23 +1840,28 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 // real.** `Self::dispatch_map` divides this figure with
                 // `split_budget` and refuses an item's next dispatch once the
                 // item has spent its share (see `per_item_dispatch_refusal`),
-                // which is what bounds the `MAX_MAP_ITEMS` real dispatches a
-                // `map` could otherwise issue against one step's own
-                // admission — a hole Task 2 opened by making a `map` item's
-                // inner steps dispatch for real. It does not
-                // change what reaches §8.4's ledger: an inner step is still
-                // not charged there, only the `map` step itself is, once —
-                // §8.9's per-item budget is a transfer out of the run's
-                // remaining budget, not a second pool to account for. Task 5
-                // owns §8.9's cooperative run-budget exhaustion, which is the
-                // different question of an item that never got to run at all.
+                // which is what stops one item spending the run's whole
+                // allowance while its siblings starve — a hole Task 2 opened
+                // by making a `map` item's inner steps dispatch for real.
+                //
+                // It is a bound between an item and its siblings, **not** a
+                // bound on the map's total: `split_budget` rounds an item's
+                // share up, so every item keeps at least one call while the
+                // run has any allowance left, and an n-item `map` still
+                // issues n real dispatches. Bounding the aggregate is §8.9's
+                // cooperative run-budget exhaustion, which is Task 5's.
+                //
+                // Nor does it change what reaches §8.4's ledger: an inner
+                // step is still not charged there, only the `map` step itself
+                // is, once — §8.9's per-item budget is a transfer out of the
+                // run's remaining budget, not a second pool to account for.
                 //
                 // `map_step::run_map`'s own closure still binds `_item_caps`
-                // unread, and deliberately: that loop's `tool:`/`agent:` steps
-                // are `dispatch_step_or_stub`'s stubs against a budget that is
-                // `MapBudget::unenforced_placeholder` by construction, so a
-                // refusal there would be a ceiling on nothing, derived from a
-                // number that admits it is not real.
+                // unread, and deliberately: every `tool:`/`agent:` inner step
+                // that loop reaches is `dispatch_step_or_stub`'s stub, so
+                // there is no per-item spend there to bound. See that
+                // closure's own comment, which also records the one case
+                // where the budget it divides is real.
                 //
                 // Re-read on **every** segment of a `map`'s fan-out, not only
                 // the first: `Executor` is rebuilt per entry, so a resuming
@@ -2992,12 +2997,25 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// rather than by tolerance — `fold_inner_step_outcome` ends the item on
     /// any inner-step failure, so no later step of that item ever asks.
     ///
-    /// One deliberate strictness, though: an interrupted step whose
-    /// [`crash_policy`] is `Rerun` counts its **first**, interrupted dispatch
-    /// as well as the re-run, so an item already at its ceiling is refused
-    /// rather than handed a free extra call. That is the fail-closed reading
-    /// and the honest one — an interrupted dispatch is interrupted, not
-    /// un-made, and may well have reached a provider.
+    /// # A re-decided step is charged once, not once per attempt
+    ///
+    /// [`Self::item_steps_before`] is keyed `(step_id, item_index)` and holds
+    /// exactly one row per inner step per item — it has no attempt dimension.
+    /// So a step §8.10 tier 2 re-decides (an interrupted one whose
+    /// [`crash_policy`] is `Rerun`, or a `Failed` row re-decided on a cold
+    /// entry) contributes **one** to this tally however many times it is
+    /// really dispatched, and its re-dispatch is *not* withheld by a ceiling
+    /// its first attempt had already reached.
+    ///
+    /// That is a real gap, and this says so rather than claiming otherwise —
+    /// but a bounded one: **one dispatch beyond the item's share per
+    /// re-decide**, with the ceiling still closing on the item's next *fresh*
+    /// step. Closing it outright would mean counting attempts, which needs
+    /// durable per-attempt state this task deliberately does not add (§8.9's
+    /// per-item budget is a transfer out of the run's remaining budget, not a
+    /// second ledger to keep). Measured rather than asserted away, by
+    /// `a_re_decided_inner_step_is_charged_to_the_item_once_however_often_it_dispatches`
+    /// in `tests/run_loop.rs`.
     fn map_item_dispatches_so_far(&self, inner_steps: &[StepDef], item_index: u32) -> u32 {
         inner_steps
             .iter()
