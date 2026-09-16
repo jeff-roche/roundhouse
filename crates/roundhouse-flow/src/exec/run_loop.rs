@@ -3004,18 +3004,36 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// So a step §8.10 tier 2 re-decides (an interrupted one whose
     /// [`crash_policy`] is `Rerun`, or a `Failed` row re-decided on a cold
     /// entry) contributes **one** to this tally however many times it is
-    /// really dispatched, and its re-dispatch is *not* withheld by a ceiling
-    /// its first attempt had already reached.
+    /// really dispatched.
     ///
-    /// That is a real gap, and this says so rather than claiming otherwise —
-    /// but a bounded one: **one dispatch beyond the item's share per
-    /// re-decide**, with the ceiling still closing on the item's next *fresh*
-    /// step. Closing it outright would mean counting attempts, which needs
-    /// durable per-attempt state this task deliberately does not add (§8.9's
-    /// per-item budget is a transfer out of the run's remaining budget, not a
-    /// second ledger to keep). Measured rather than asserted away, by
+    /// Note which row that is: the step being re-decided already has a
+    /// `Running`/`Indeterminate`/`Failed` row of its own in this segment's
+    /// snapshot, left by the attempt that was interrupted, so its **own** prior
+    /// attempt is part of the tally its re-dispatch is measured against. Which
+    /// of the two things that can happen does depends on how much room the item
+    /// has left once that one row is charged, and both really occur:
+    ///
+    /// - **Room to spare** (the item's share exceeds what its started steps,
+    ///   this one included, already account for): the re-dispatch goes out,
+    ///   and because the step is charged once rather than once per attempt,
+    ///   the item ends up making **one real dispatch more than its share
+    ///   nominally allows**, per re-decide. A bounded gap, stated rather than
+    ///   claimed away, and the ceiling still closes on the item's next step.
+    /// - **No room** — which is *always* the case when the item's share is 1,
+    ///   and whenever the item was already at its ceiling before this step's
+    ///   first attempt: the step's own row alone reaches the ceiling, so the
+    ///   **re-decided step's own re-dispatch** is what gets refused, and there
+    ///   is no overshoot at all.
+    ///
+    /// Closing the first case outright would mean counting attempts, which
+    /// needs durable per-attempt state this task deliberately does not add
+    /// (§8.9's per-item budget is a transfer out of the run's remaining budget,
+    /// not a second ledger to keep). Both cases are measured rather than
+    /// asserted away, by
     /// `a_re_decided_inner_step_is_charged_to_the_item_once_however_often_it_dispatches`
-    /// in `tests/run_loop.rs`.
+    /// (share 2, the overshoot) and
+    /// `a_re_decided_inner_steps_own_re_dispatch_is_refused_when_the_share_is_one`
+    /// (share 1, no overshoot) in `tests/run_loop.rs`.
     fn map_item_dispatches_so_far(&self, inner_steps: &[StepDef], item_index: u32) -> u32 {
         inner_steps
             .iter()
