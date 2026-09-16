@@ -781,10 +781,26 @@ enum RunConclusion {
     /// loop refused to drive it. The `String` is written to
     /// `trigger_delivery.last_error` (a column, never a log field).
     Failed(String),
-    /// A `gate:` parked the run on a human. **Not terminal**, so the delivery
-    /// stays `running` and the registry slot stays held — see
+    /// This run, or a `call:` descendant, parked on a human. **Not terminal**,
+    /// so the delivery stays `running` and the registry slot stays held — see
     /// [`DeliveryExecutor::run_claimed`].
     Parked,
+}
+
+/// What a segmented driver learned about its run.
+///
+/// A child parked on a gate leaves both the child and its waiting parent
+/// nonterminal. It cannot be represented as [`RunOutcome::Parked`], because
+/// that variant describes a gate on the run being driven, not on a descendant.
+enum DrivenRun {
+    Outcome(RunOutcome),
+    ChildParked,
+}
+
+/// The result of dispatching the pending work from one segment.
+enum PendingExecution {
+    Done(Vec<WorkDone>),
+    ChildParked,
 }
 
 /// How [`DeliveryExecutor::handle_run_outcome`] treats a run that reached
@@ -1293,16 +1309,16 @@ impl DeliveryExecutor {
         delivery_id: &str,
         binding_id: BindingId,
         session: Option<HeadlessSession>,
-        outcome: Result<RunOutcome, roundhouse_flow::exec::run_loop::RunLoopError>,
+        outcome: Result<DrivenRun, roundhouse_flow::exec::run_loop::RunLoopError>,
         cancelled_handling: CancelledHandling,
     ) {
         if matches!(cancelled_handling, CancelledHandling::AsCancellation)
             && matches!(
                 outcome,
-                Ok(RunOutcome::Terminal {
+                Ok(DrivenRun::Outcome(RunOutcome::Terminal {
                     state: RunState::Cancelled,
                     ..
-                })
+                }))
             )
         {
             let finished = self.now();
@@ -1462,7 +1478,7 @@ impl DeliveryExecutor {
         stored: &StoredBinding,
         now: Timestamp,
         session: &mut Option<HeadlessSession>,
-    ) -> Result<Result<RunOutcome, roundhouse_flow::exec::run_loop::RunLoopError>, DeliveryError>
+    ) -> Result<Result<DrivenRun, roundhouse_flow::exec::run_loop::RunLoopError>, DeliveryError>
     {
         let session_id = SessionId::new();
         let run_id = RunId::new();
@@ -1747,7 +1763,7 @@ impl DeliveryExecutor {
         session_id: SessionId,
         boot: Timestamp,
         session: &mut Option<HeadlessSession>,
-    ) -> Result<Result<RunOutcome, roundhouse_flow::exec::run_loop::RunLoopError>, DeliveryError>
+    ) -> Result<Result<DrivenRun, roundhouse_flow::exec::run_loop::RunLoopError>, DeliveryError>
     {
         let registry = self
             .resources
@@ -1848,7 +1864,7 @@ impl DeliveryExecutor {
         workspace_root: PathBuf,
         run_ctx: RunContext,
         mut now: Timestamp,
-    ) -> Result<Result<RunOutcome, roundhouse_flow::exec::run_loop::RunLoopError>, DeliveryError>
+    ) -> Result<Result<DrivenRun, roundhouse_flow::exec::run_loop::RunLoopError>, DeliveryError>
     {
         let def = {
             let workspace_root = workspace_root.clone();
@@ -1871,17 +1887,17 @@ impl DeliveryExecutor {
         let mut resume: Option<Resume> = None;
         loop {
             let def = Arc::clone(&def);
-            let run_ctx = run_ctx.clone();
-            let spec = spec.clone();
-            let workspace_root = workspace_root.clone();
+            let segment_run_ctx = run_ctx.clone();
+            let segment_spec = spec.clone();
+            let segment_workspace_root = workspace_root.clone();
             let spawn_tree = Arc::clone(&self.spawn_tree);
             let resume_segment = resume.take();
             let outcome = self
                 .with_connection(move |conn| {
                     let mut sink = BufferedTaskSink::default();
                     let mut host = SqliteWorkflowHost::with_session_tree(
-                        workspace_root,
-                        Box::new(WorkflowSessionTree::new(spawn_tree, runner, spec)),
+                        segment_workspace_root,
+                        Box::new(WorkflowSessionTree::new(spawn_tree, runner, segment_spec)),
                     );
                     let outcome = run_workflow_from_definition(
                         conn,
@@ -1889,7 +1905,7 @@ impl DeliveryExecutor {
                         run_id,
                         &mut sink,
                         &mut host,
-                        run_ctx,
+                        segment_run_ctx,
                         now,
                         resume_segment,
                     );
@@ -1911,10 +1927,23 @@ impl DeliveryExecutor {
                     if let Some(gate) = &self.segment_gap_gate {
                         gate.enter().await;
                     }
-                    resume = Some(Resume::Work(self.execute_pending(session, pending).await));
+                    match self
+                        .execute_pending(
+                            session,
+                            session_id,
+                            &spec,
+                            &workspace_root,
+                            &run_ctx,
+                            pending,
+                        )
+                        .await
+                    {
+                        PendingExecution::Done(done) => resume = Some(Resume::Work(done)),
+                        PendingExecution::ChildParked => return Ok(Ok(DrivenRun::ChildParked)),
+                    }
                     now = self.now();
                 }
-                other => return Ok(other),
+                other => return Ok(other.map(DrivenRun::Outcome)),
             }
         }
     }
@@ -1925,14 +1954,18 @@ impl DeliveryExecutor {
     /// still gets a [`WorkDone`], just a failed one, so the run is never
     /// left suspended forever waiting on an answer nothing will supply.
     ///
-    /// **Scope: `tool: read` only.** Every other `tool:` kind, every
-    /// `agent:` step, and every `call:` child are refused with a named,
-    /// recorded failure — wiring them is Phase 8 Tasks 25.4/25.5/25.6.
+    /// **Scope: `tool: read` and recursively driven `call:` children only.**
+    /// Every other `tool:` kind and every `agent:` step are refused with a
+    /// named, recorded failure — wiring them is Phase 8 Tasks 25.4/25.5.
     async fn execute_pending(
         &self,
         session: &HeadlessSession,
+        session_id: SessionId,
+        session_spec: &SessionSpec,
+        workspace_root: &std::path::Path,
+        parent_run_ctx: &RunContext,
         pending: Vec<PendingWork>,
-    ) -> Vec<WorkDone> {
+    ) -> PendingExecution {
         let mut done = Vec::with_capacity(pending.len());
         for item in pending {
             done.push(match item.kind {
@@ -1973,14 +2006,85 @@ impl DeliveryExecutor {
                     "workflow dispatch of `agent:` steps is not wired yet (Phase 8 Task 25.5)"
                         .into(),
                 ),
-                PendingKind::ChildRun { .. } => unanswerable_work(
-                    item.step_id,
-                    "workflow dispatch of `call:` children is not wired yet (Phase 8 Task 25.6)"
-                        .into(),
-                ),
+                PendingKind::ChildRun {
+                    child_run_id,
+                    child_session_id,
+                    dispatch_input,
+                    ..
+                } => {
+                    let mut child_spec = session_spec.clone();
+                    child_spec.parent = Some(session_id);
+                    let workspace = match self.resources.workspace_registry.as_ref() {
+                        Some(registry) => match registry.resolve_by_id(child_spec.workspace) {
+                            Ok(workspace) => workspace,
+                            Err(_) => return PendingExecution::ChildParked,
+                        },
+                        None => return PendingExecution::ChildParked,
+                    };
+                    let child_session = match create_headless_session(
+                        &self.resources,
+                        &self.sessions,
+                        child_session_id,
+                        child_spec.clone(),
+                        workspace_root.to_path_buf(),
+                        workspace.root_device,
+                        workspace.root_inode,
+                    )
+                    .await
+                    {
+                        Ok(session) => session,
+                        Err(_) => return PendingExecution::ChildParked,
+                    };
+                    let child_ctx = RunContext {
+                        inputs: dispatch_input,
+                        vars: serde_json::Value::Null,
+                        secrets: HashMap::new(),
+                        run_id: child_run_id,
+                        previous_report: None,
+                        env_allowlist: parent_run_ctx.env_allowlist.clone(),
+                        worktree_provider: parent_run_ctx.worktree_provider.clone(),
+                    };
+                    let child_outcome = Box::pin(self.drive_run_to_completion(
+                        child_run_id,
+                        child_session_id,
+                        &child_session,
+                        child_spec,
+                        workspace_root.to_path_buf(),
+                        child_ctx,
+                        self.now(),
+                    ))
+                    .await;
+                    let Ok(Ok(DrivenRun::Outcome(RunOutcome::Terminal { state, .. }))) =
+                        child_outcome
+                    else {
+                        return PendingExecution::ChildParked;
+                    };
+                    child_session
+                        .teardown(&self.sessions, &self.resources.proxy)
+                        .await;
+                    WorkDone {
+                        step_id: item.step_id,
+                        status: match state {
+                            RunState::Completed => WorkStatus::Completed,
+                            other => WorkStatus::Failed {
+                                message: format!(
+                                    "the child workflow run ended in state `{}`",
+                                    other.wire_name()
+                                ),
+                            },
+                        },
+                        // Task 3 owns loading the child's canonical report and
+                        // joining the parent's agent task to it.
+                        output: serde_json::Value::Null,
+                        output_is_secret_derived: false,
+                        task_id: None,
+                        first_task_seq: None,
+                        last_task_seq: None,
+                    }
+                }
             });
         }
-        done
+        PendingExecution::Done(done)
     }
 }
 
@@ -1990,24 +2094,25 @@ impl DeliveryExecutor {
 /// driver error — but it is still a delivery that did not deliver, so it
 /// fails the delivery rather than completing it.
 fn conclusion_for(
-    outcome: Result<RunOutcome, roundhouse_flow::exec::run_loop::RunLoopError>,
+    outcome: Result<DrivenRun, roundhouse_flow::exec::run_loop::RunLoopError>,
 ) -> RunConclusion {
     match outcome {
-        Ok(RunOutcome::Terminal {
+        Ok(DrivenRun::Outcome(RunOutcome::Terminal {
             state: RunState::Completed,
             ..
-        }) => RunConclusion::Completed,
-        Ok(RunOutcome::Terminal { state, .. }) => RunConclusion::Failed(format!(
-            "the workflow run ended in state `{}`",
-            state.wire_name()
-        )),
-        Ok(RunOutcome::Parked(_)) => RunConclusion::Parked,
+        })) => RunConclusion::Completed,
+        Ok(DrivenRun::Outcome(RunOutcome::Terminal { state, .. })) => RunConclusion::Failed(
+            format!("the workflow run ended in state `{}`", state.wire_name()),
+        ),
+        Ok(DrivenRun::Outcome(RunOutcome::Parked(_)) | DrivenRun::ChildParked) => {
+            RunConclusion::Parked
+        }
         // `DeliveryExecutor::drive_run_to_completion` is this function's
         // only production caller, and its own loop never returns
         // `AwaitingWork` — that variant is exactly what makes it loop
         // again, driven by `DeliveryExecutor::execute_pending`. Reachable
         // only if a future caller of `conclusion_for` skips that loop.
-        Ok(RunOutcome::AwaitingWork { .. }) => RunConclusion::Failed(
+        Ok(DrivenRun::Outcome(RunOutcome::AwaitingWork { .. })) => RunConclusion::Failed(
             "the workflow run suspended on real work but was not driven through \
              DeliveryExecutor::drive_run_to_completion's loop"
                 .to_string(),
@@ -3771,12 +3876,14 @@ mod tests {
 mod delivery_tests {
     use super::*;
     use crate::session_registry::SessionRegistry;
-    use crate::test_support::daemon_resources;
+    use crate::test_support::{daemon_resources, daemon_resources_with_rules};
     use crate::workspace_registry::{WorkspaceRegistration, WorkspaceRegistry};
     use roundhouse_core::Tier;
     use roundhouse_flow::durability::recover_run;
     use roundhouse_flow::job::SessionTemplate;
     use roundhouse_flow::job_store::register_workflow_file;
+    use roundhouse_policy::engine::{CompiledRule, Outcome, Predicate, Scope};
+    use roundhouse_policy::FsOp;
     use roundhouse_sched::delivery::DeliveryState;
     use roundhouse_sched::store::fetch_delivery;
     use roundhouse_store::StorePool;
@@ -3810,6 +3917,31 @@ mod delivery_tests {
         "name: scheduled-read\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
          escalate: fail\nsteps:\n  - id: read_it\n    tool: read\n    with: { path: greeting.txt }\n"
             .to_string()
+    }
+
+    fn child_reading_workflow() -> String {
+        "name: child-read\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: read_it\n    tool: read\n    with: { path: \"${{ inputs.path }}\" }\n"
+            .to_string()
+    }
+
+    fn parent_calling_child_workflow() -> String {
+        "name: parent-call\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: child\n    call: child-read\n    with: { path: greeting.txt }\n"
+            .to_string()
+    }
+
+    fn allow_read_rules() -> crate::session_bootstrap::PolicyRuleSource {
+        Arc::new(|| {
+            vec![CompiledRule::test_new(
+                Scope::Project,
+                Outcome::Allow,
+                Predicate::FsPrefix {
+                    op: FsOp::Read,
+                    prefix: PathBuf::from("/"),
+                },
+            )]
+        })
     }
 
     /// A workflow whose step fails: `no_such_fn` is not a function the
@@ -4138,6 +4270,19 @@ mod delivery_tests {
     }
 
     async fn harness_with_overlap(workflow_yaml: String, overlap: OverlapPolicy) -> Harness {
+        harness_with_overlap_and_rules(
+            workflow_yaml,
+            overlap,
+            crate::session_bootstrap::no_policy_rules(),
+        )
+        .await
+    }
+
+    async fn harness_with_overlap_and_rules(
+        workflow_yaml: String,
+        overlap: OverlapPolicy,
+        policy_rules: crate::session_bootstrap::PolicyRuleSource,
+    ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let workspace_root = dir.path().join("workspace");
         std::fs::create_dir(&workspace_root).unwrap();
@@ -4230,7 +4375,10 @@ mod delivery_tests {
         );
 
         let sessions = Arc::new(SessionRegistry::new());
-        let resources = Arc::new(daemon_resources(dir.path(), Some(Arc::clone(&workspaces))).await);
+        let resources = Arc::new(
+            daemon_resources_with_rules(dir.path(), Some(Arc::clone(&workspaces)), policy_rules)
+                .await,
+        );
         let executor = DeliveryExecutor::new(
             store.clone(),
             Arc::clone(&resources),
@@ -4355,6 +4503,140 @@ mod delivery_tests {
             "a terminal delivery must RETIRE its session — spawn_session_reaper waits on a \
              `Closed` nothing produces, so without an explicit teardown a per-delivery \
              session would live for the daemon's whole life and fill max_sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_child_run_drives_using_its_own_session() {
+        let harness = harness_with_overlap_and_rules(
+            parent_calling_child_workflow(),
+            OverlapPolicy::Skip,
+            allow_read_rules(),
+        )
+        .await;
+        std::fs::write(harness.workspace_root.join("greeting.txt"), "hello child").unwrap();
+        let child_source = harness.workspace_root.join("child.yaml");
+        std::fs::write(&child_source, child_reading_workflow()).unwrap();
+        let root = harness.workspace_root.clone();
+        let conn = harness.store.pool.get().await.unwrap();
+        conn.interact(move |connection| {
+            register_workflow_file(connection, &root, &child_source, template()).unwrap();
+        })
+        .await
+        .unwrap();
+
+        harness
+            .executor
+            .claim_and_run(harness.delivery.clone(), harness.stored.clone())
+            .await;
+
+        let row = harness.delivery_row().await;
+        let parent_run_id = RunId::from_uuid(
+            Uuid::parse_str(row.run_id.as_deref().expect("reserve stamps a run id")).unwrap(),
+        );
+        let parent_session_id = row.session_id.expect("reserve stamps a session id");
+        let conn = harness.store.pool.get().await.unwrap();
+        let (
+            parent_call_state,
+            parent_call_error,
+            child_run_id,
+            child_session_id,
+            child_read_error,
+        ) = conn
+            .interact(move |connection| {
+                let parent_call = recover_run(connection, parent_run_id)
+                    .unwrap()
+                    .steps
+                    .into_iter()
+                    .find(|step| step.step_id == "child")
+                    .unwrap();
+                let (child_run_id, child_session_id) = connection
+                    .query_row(
+                        "SELECT id, session_id FROM workflow_run WHERE parent_run_id = ?1",
+                        [parent_run_id.to_string()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .unwrap();
+                let child_run_id = RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap());
+                let child_read_error = recover_run(connection, child_run_id)
+                    .unwrap()
+                    .steps
+                    .into_iter()
+                    .find(|step| step.step_id == "read_it")
+                    .and_then(|step| step.error);
+                (
+                    parent_call.state,
+                    parent_call.error,
+                    child_run_id.to_string(),
+                    child_session_id,
+                    child_read_error,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            row.state,
+            DeliveryState::Delivered,
+            "the parent call must not be failed as an unanswerable `call:`; step error was \
+             {parent_call_error:?}; child read error was {child_read_error:?}"
+        );
+        let child_run_id = RunId::from_uuid(Uuid::parse_str(&child_run_id).unwrap());
+        let child_session_id = SessionId::from_uuid(Uuid::parse_str(&child_session_id).unwrap());
+
+        assert_eq!(
+            harness.run_state(child_run_id).await,
+            RunState::Completed,
+            "the parent may receive a child result only after the child reaches a terminal state"
+        );
+        assert_eq!(
+            parent_call_state,
+            roundhouse_flow::durability::StepRunState::Completed,
+            "the parent call receives the terminal child's result"
+        );
+
+        let conn = harness.store.pool.get().await.unwrap();
+        let (parent_task_kinds, child_task_kinds) = conn
+            .interact(move |connection| {
+                let task_kinds = |session_id: SessionId| {
+                    let mut statement = connection
+                        .prepare("SELECT payload FROM events WHERE session_id = ?1 ORDER BY seq")
+                        .unwrap();
+                    statement
+                        .query_map([session_id.to_string()], |row| row.get::<_, String>(0))
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .filter_map(|payload| {
+                            match serde_json::from_str::<EventPayload>(&payload).unwrap() {
+                                EventPayload::TaskCreated { kind, .. } => Some(kind),
+                                _ => None,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                };
+                (task_kinds(parent_session_id), task_kinds(child_session_id))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            parent_task_kinds
+                .iter()
+                .filter(|kind| **kind == TaskKind::Agent)
+                .count(),
+            1,
+            "the parent has only its agent task for the call"
+        );
+        assert!(
+            !parent_task_kinds.contains(&TaskKind::Read),
+            "the parent session must not receive the child's read task"
+        );
+        assert_eq!(
+            child_task_kinds
+                .into_iter()
+                .filter(|kind| *kind == TaskKind::Read)
+                .count(),
+            1,
+            "the real read task must be filed under the child session"
         );
     }
 

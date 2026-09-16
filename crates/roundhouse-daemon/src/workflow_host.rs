@@ -101,12 +101,10 @@ impl SessionTree for WorkflowSessionTree {
     /// into, and the same one the `agent` tool's sub-agent children use, so a
     /// freed slot is freed for both kinds of child.
     ///
-    /// **Wired and testable today, but with no production caller yet:**
-    /// nothing in this workspace drives a workflow `call:` child run to
-    /// completion, so `finish_run`'s terminal branch — and therefore this
-    /// implementation — is reached only from tests. A future run driver (part
-    /// of issue #30's scope) is what will exercise it in a live daemon; see
-    /// the trait method's own doc comment in `roundhouse-flow`.
+    /// The scheduled-delivery driver reaches this through the child's own
+    /// terminal `finish_run` path. Keeping removal here means the runtime edge
+    /// is released beside the durable budget refund, not by a caller that must
+    /// remember both halves.
     ///
     /// Discharges the trait's idempotency requirement outright rather than by
     /// care at the call site: `SpawnTree::remove_child` is documented
