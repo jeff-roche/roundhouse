@@ -3035,6 +3035,43 @@ enum ItemAdvance {
     /// The item's next inner step needs real work, so the item's cursor stops
     /// here until that answer comes back.
     Pending(Box<PendingWork>),
+    /// The item's next inner step is a nested `call:`, and this wave already
+    /// carries work — so the item dispatches **nothing** and waits for a wave
+    /// of its own (Phase 8 Task 25.7 Task 7, fix round 1).
+    ///
+    /// **A wave carrying a `ChildRun` carries exactly that one entry**, and
+    /// this is one of the two halves that keeps it so (the other is
+    /// [`Loop::dispatch_map`] ending its item walk the moment it pushes one).
+    /// The reason is a real data-loss hazard in the caller, not tidiness:
+    /// `roundhouse-daemon`'s `dispatch_wave` folds a whole wave to
+    /// `PendingExecution::ChildParked` if **any** item's child parks, throwing
+    /// away every other item's already-computed `WorkDone`. That fold was
+    /// written when a `ChildRun` could only ever arrive alone (a top-level
+    /// `call:` is always a one-entry wave), which made the discard a no-op;
+    /// this task is the first thing that can put one in a wave beside
+    /// siblings, and a discarded sibling's answer is **not recovered**: its
+    /// `workflow_step_run` row is left `Running` with no `WorkDone` to match
+    /// it, so the next segment routes it to [`crash_policy`] and
+    /// [`map_item_crash_refusal`] fails an item whose work really did
+    /// complete.
+    ///
+    /// For a `tool:`/`agent:` sibling it is not even recover**able** — nothing
+    /// durable records what the dispatch returned, only the task events the
+    /// caller emitted, which no row points at. A discarded `call:` sibling's
+    /// outcome *is* durable (its [`WorkflowChildCall`] is `Joined`, and
+    /// re-deriving it is what the daemon's own join path already does), so
+    /// teaching [`Loop::decided_map_item_step`] to read it back would close
+    /// that half — and only that half. Keeping the wave one entry wide closes
+    /// both, here, without a second re-derivation of a child's report to keep
+    /// in step with the daemon's.
+    ///
+    /// Deferring costs nothing and loses nothing: the item has dispatched
+    /// nothing, written nothing and emitted nothing at this point, and every
+    /// segment re-walks every item from index 0 anyway (see
+    /// [`Loop::dispatch_map`]'s "Every segment replays every item"). It is the
+    /// same "cost nothing to defer" argument [`Self::WantsPark`] already
+    /// makes.
+    Deferred,
     /// The item's next inner step is a `gate:` with no answer yet: it asks
     /// for the run to be parked on it (Phase 8 Task 25.7 Task 6).
     ///
@@ -3175,6 +3212,24 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// reach its call spend what the whole fan-out has left. It asks against
     /// its own item's share instead — see [`requested_nested_child_caps`], and
     /// [`NestedCall`] for what else the nesting changes.
+    ///
+    /// # A wave carrying a `ChildRun` carries nothing else (Task 7, fix round 1)
+    ///
+    /// So a `map` over items that nest a `call:` dispatches those children
+    /// **one wave at a time**, however large `max_parallel` is. This is a
+    /// deliberate restriction and it is about the *caller*, not this loop:
+    /// `roundhouse-daemon`'s `dispatch_wave` folds a whole wave to
+    /// `PendingExecution::ChildParked` the moment any item's child parks, and
+    /// discards every other item's already-computed answer. That discard was
+    /// harmless for as long as a `ChildRun` could only arrive alone, and this
+    /// task is the first thing that can put one beside siblings — so this loop
+    /// keeps the property that contract was written against rather than
+    /// letting a sibling's real, completed work be thrown away and then
+    /// crash-refused on the next segment. [`ItemAdvance::Deferred`] holds the
+    /// full argument; the two halves are its arm and this loop's `break`.
+    ///
+    /// `tool:`/`agent:` fan-out is untouched and still runs `max_parallel` at
+    /// a time — nothing in that path can park a wave.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_map(
         &mut self,
@@ -3204,13 +3259,35 @@ impl<H: WorkflowHost> Loop<'_, H> {
         // Taken from the [`MapBudget`] [`Self::run_phase`] re-reads before
         // **every** segment of this fan-out, not only the first, so a resuming
         // wave divides what the run has left now rather than what it had when
-        // the `map` began. That re-read is also what makes the figure stable
-        // across one fan-out's segments, which is what a running tally
-        // compared against it needs: nothing a `map`'s waves do spends
-        // `max_tool_calls` at the run level ([`Self::admit`] charges it for a
-        // top-level `tool:` step, and a wave after the first only observes),
-        // so the share an item is measured against does not move underneath
-        // it mid-item.
+        // the `map` began.
+        //
+        // **That figure is not constant for the life of a fan-out, and since
+        // Phase 8 Task 25.7 Task 7 it really can move underneath an item.**
+        // This comment used to claim the opposite — "nothing a `map`'s waves
+        // do spends `max_tool_calls` at the run level" — which was true while
+        // an inner step could only be a `tool:`/`agent:` dispatch ([`Self::admit`]
+        // charges `max_tool_calls` for a *top-level* `tool:` step, and a wave
+        // after the first only observes). A nested `call:` broke it: the
+        // child's grant is drawn from this run's ledger and
+        // [`Spend::for_grant`] charges the parent **every** field of it,
+        // `max_tool_calls` included, so the run's remainder — and with it
+        // `split_budget`'s even share — shrinks after any wave that funded
+        // one.
+        //
+        // The consequence is real and is accepted rather than worked around:
+        // a sibling's nested call in an earlier wave can shrink a later wave's
+        // per-item share below what an item has **already** legitimately
+        // spent, so that item's next dispatch is refused under a smaller
+        // ceiling than the one it was measured against when it started. §8.9
+        // makes an item's budget "a transfer out of the run's remaining
+        // budget, not an independent pool", and a pool that a sibling really
+        // did spend is a pool that legitimately shrank; the alternative is
+        // freezing each item's share at map-start, which needs durable
+        // per-item state this task deliberately does not add (`Loop` and
+        // `Executor` are rebuilt on every segment). It fails closed, through
+        // `per_item_dispatch_refusal`'s ordinary `ItemOutcome::Failed` under
+        // `on_item_error`, never silently. Measured in `tests/run_loop.rs`:
+        // `a_siblings_nested_call_shrinks_a_later_waves_per_item_share`.
         let run_remaining = match &executor.map_budget {
             Some(budget) => budget.total_remaining.clone(),
             // An [`Executor`] with no run behind it at all — see
@@ -3340,6 +3417,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
                 &item_evaluated,
                 isolation,
                 &per_item_caps,
+                pending.is_empty(),
                 &mut any_item_secret_derived,
                 phase,
             ) {
@@ -3350,7 +3428,34 @@ impl<H: WorkflowHost> Loop<'_, H> {
                     stopped |= policy.observe(&outcome);
                     outcomes[index] = Some(outcome);
                 }
-                Ok(ItemAdvance::Pending(work)) => pending.push(*work),
+                Ok(ItemAdvance::Pending(work)) => {
+                    // **A wave that carries a `ChildRun` carries nothing
+                    // else** — the second half of the invariant
+                    // [`ItemAdvance::Deferred`] states and gives the reason
+                    // for. That arm stops a `call:` joining a wave that
+                    // already has entries; this stops entries joining a wave
+                    // that already has a `call:`, which cannot be done there
+                    // because by then the child run exists.
+                    //
+                    // Ending the walk rather than merely withholding further
+                    // *dispatches*: an item that would have finished
+                    // synchronously this segment simply finishes on the next
+                    // one, at the cost of re-walking it, and that is cheaper
+                    // than a second flag threaded through every dispatch seam
+                    // for a distinction nothing observes.
+                    let carries_a_child_run = matches!(work.kind, PendingKind::ChildRun { .. });
+                    pending.push(*work);
+                    if carries_a_child_run {
+                        break;
+                    }
+                }
+                // Nothing was dispatched, written or emitted for this item, so
+                // it is left undecided and re-derived on the next segment.
+                // `pending` is non-empty by construction whenever this is
+                // returned (it is the condition that produces it), so the
+                // early `AwaitingWork` return below is always taken and this
+                // item never reaches the trailing `skipped_by_fail_fast` fill.
+                Ok(ItemAdvance::Deferred) => continue,
                 Ok(ItemAdvance::WantsPark(request)) => park_requests.push(*request),
                 Err(e) => {
                     failure = Some(e);
@@ -3651,7 +3756,16 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// A nested `call:` (Task 7) is the opposite — it stops the item by
     /// dispatching, returning the same [`ItemAdvance::Pending`] a `tool:` does
     /// — but it is intercepted here for the same reason the gate is: it needs
-    /// the `Connection` and the run's ledger row.
+    /// the `Connection` and the run's ledger row. It is also the one inner
+    /// step that can be **deferred** rather than run: see
+    /// `wave_can_take_a_child_run` and [`ItemAdvance::Deferred`].
+    ///
+    /// `wave_can_take_a_child_run` is the caller's "this wave is still empty",
+    /// and it gates exactly one decision — whether a nested `call:` may
+    /// dispatch now. Passed as a `bool` rather than read off a field because
+    /// the wave lives in [`Self::dispatch_map`]'s local state, and asked here
+    /// rather than there because only this function knows which inner step an
+    /// item has actually reached.
     #[allow(clippy::too_many_arguments)]
     fn advance_map_item(
         &mut self,
@@ -3662,6 +3776,7 @@ impl<H: WorkflowHost> Loop<'_, H> {
         item_evaluated: &Evaluated,
         isolation: Option<&MapIsolationDef>,
         per_item_caps: &ResourceCaps,
+        wave_can_take_a_child_run: bool,
         any_item_secret_derived: &mut bool,
         phase: Phase,
     ) -> Result<ItemAdvance, RunLoopError> {
@@ -3911,6 +4026,16 @@ impl<H: WorkflowHost> Loop<'_, H> {
                             .expect("the branch condition is `worktree.is_some_and(..)`");
                         last = executor.release_item_isolation(map_step_id, held, refusal);
                         break;
+                    }
+                    // **And except when this wave already carries work** — the
+                    // last check before the dispatch, because it is the only
+                    // one of the three that is not about this item at all.
+                    // Nothing has been created yet, so the item simply waits
+                    // for a wave of its own; see [`ItemAdvance::Deferred`] for
+                    // the caller-side hazard that makes a `ChildRun` sharing a
+                    // wave unsafe, and why deferring costs nothing.
+                    if !wave_can_take_a_child_run {
+                        return Ok(ItemAdvance::Deferred);
                     }
                     match self.dispatch_call(
                         executor,

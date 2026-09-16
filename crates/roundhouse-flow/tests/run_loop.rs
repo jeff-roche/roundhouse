@@ -8043,7 +8043,9 @@ fn map_over_call(extra: &str) -> String {
 
 /// [`drive_waves_with_grant`]'s nested-`call:` counterpart: the same wave
 /// recording, against a host that resolves `child-flow`, answering every
-/// pending child run as completed.
+/// pending child run as completed — and every pending `tool:` step too, since
+/// a `map` that mixes the two is exactly what several of these tests are
+/// about.
 ///
 /// A separate driver rather than a flag on that one, because the two differ in
 /// the thing a `call:` test is about: this one collects the `RunId` of every
@@ -8111,22 +8113,45 @@ fn drive_map_calls(
         );
         let mut done = Vec::with_capacity(pending.len());
         for p in pending {
-            let PendingKind::ChildRun {
-                child_run_id,
-                parent_task_id,
-                ..
-            } = &p.kind
-            else {
-                panic!("every fixture in this section dispatches a `call:`, got {p:?}");
+            let task_id = match &p.kind {
+                PendingKind::ChildRun {
+                    child_run_id,
+                    parent_task_id,
+                    ..
+                } => {
+                    children.push(*child_run_id);
+                    *parent_task_id
+                }
+                PendingKind::Tool {
+                    task_kind,
+                    logged_input,
+                    ..
+                } => {
+                    let task_id = TaskId::new();
+                    sink.emit(
+                        task_id,
+                        None,
+                        task_kind.clone(),
+                        EventPayload::TaskCreated {
+                            kind: task_kind.clone(),
+                            parent: None,
+                            origin: Origin::System,
+                            input: TaskInput::Json(logged_input.clone()),
+                        },
+                    );
+                    task_id
+                }
+                PendingKind::Agent { .. } => {
+                    panic!("no fixture in this section declares an `agent:` step, got {p:?}")
+                }
             };
-            children.push(*child_run_id);
             done.push(WorkDone {
                 step_id: p.step_id.clone(),
                 item_index: p.item_index,
                 status: WorkStatus::Completed,
-                output: serde_json::json!({ "child": p.item_index }),
+                output: serde_json::json!({ "dispatched": p.item_index }),
                 output_is_secret_derived: false,
-                task_id: Some(*parent_task_id),
+                task_id: Some(task_id),
                 first_task_seq: None,
                 last_task_seq: None,
             });
@@ -8148,13 +8173,22 @@ fn child_grant(conn: &Connection, child_run_id: RunId) -> ResourceCaps {
 /// neither child's draw may exceed its own item's share of the run, even
 /// though the run as a whole still has more left.
 ///
-/// The numbers are the whole test. The run grants $100 and has spent none of
-/// it, so `split_budget` gives each of the two items $50 and
-/// `bounded_child_share` halves that into a $25 request — **the same $25 for
-/// both, whichever goes first**. Computed against the run's raw remainder
-/// instead, the first item asks for half of $100 and the second for half of
-/// the $50 that left: $50 and $25, a fan-out where going first is worth twice
-/// as much.
+/// The numbers are the whole test.
+///
+/// - **Item 0** goes against a run with all $100 left, so `split_budget` gives
+///   it $50 and `bounded_child_share` halves that into a $25 request.
+/// - Funding that child charges the run $25, so **item 1** — in the next wave,
+///   against a run with $75 left — has a share of $37.50 and asks for $18.75.
+///
+/// Computed against the run's raw remainder instead, item 0 would ask for half
+/// of $100 and take **its entire $50 share**, leaving item 1 half of the $50
+/// that left: $50 and $25. The clamp is what turns that into $25 and $18.75.
+///
+/// The two figures differing is the documented drift, not a defect — see
+/// [`a_siblings_nested_call_shrinks_a_later_waves_per_item_share`], which pins
+/// it deliberately. One wave per child is the other Task 7 fix-round-1
+/// property; [`a_wave_that_carries_a_nested_call_carries_nothing_else`] is
+/// where that one is argued.
 #[test]
 fn two_sibling_nested_calls_each_draw_only_their_own_items_share() {
     let (conn, run_id, _sink, waves, children, result) =
@@ -8163,11 +8197,12 @@ fn two_sibling_nested_calls_each_draw_only_their_own_items_share() {
 
     assert_eq!(
         waves,
-        vec![vec![
-            ("sub".to_string(), Some(0)),
-            ("sub".to_string(), Some(1)),
-        ]],
-        "each item's nested `call:` is real pending work carrying its own index: {waves:?}"
+        vec![
+            vec![("sub".to_string(), Some(0))],
+            vec![("sub".to_string(), Some(1))],
+        ],
+        "each item's nested `call:` is real pending work carrying its own index, one child \
+         run per wave: {waves:?}"
     );
     assert_eq!(children.len(), 2, "one child run per item");
     let grants: Vec<f64> = children
@@ -8176,14 +8211,14 @@ fn two_sibling_nested_calls_each_draw_only_their_own_items_share() {
         .collect();
     assert_eq!(
         grants,
-        vec![25.0, 25.0],
-        "half of each item's own $50 share — not half of the run's remainder, which would \
-         have paid the first item $50 and the second $25"
+        vec![25.0, 18.75],
+        "half of each item's own share as of its own wave — never half of the run's \
+         remainder, which would have paid item 0 the whole $50 it was allotted"
     );
     assert_eq!(
         run_ledger(&conn, run_id).unwrap().spent.cost_usd,
-        50.0,
-        "the run is charged both grants and keeps the other half: §8.9's per-item budget is a \
+        43.75,
+        "the run is charged both grants and keeps the rest: §8.9's per-item budget is a \
          transfer out of the run's remaining budget, drawn from the one durable pool"
     );
 
@@ -8205,8 +8240,10 @@ fn two_sibling_nested_calls_each_draw_only_their_own_items_share() {
 /// the bounded share and `draw_child_budget` would then clamp it only against
 /// the run's remainder.
 ///
-/// $500 asked, $50 granted, twice: the first item cannot take the run's whole
-/// $100 and leave its sibling nothing.
+/// $500 asked; item 0 is held to the $50 share it was allotted and item 1 to
+/// the $25 that leaves it. Unclamped, item 0 would draw the run's **whole**
+/// $100 remainder and item 1 would draw $0 — a declared `caps:` block turning
+/// one item into the fan-out's sole spender.
 #[test]
 fn a_nested_calls_declared_caps_cannot_exceed_its_items_share_either() {
     let (conn, _run_id, _sink, _waves, children, result) = drive_map_calls(
@@ -8222,9 +8259,10 @@ fn a_nested_calls_declared_caps_cannot_exceed_its_items_share_either() {
         .collect();
     assert_eq!(
         grants,
-        vec![50.0, 50.0],
-        "each declared request is clamped to its own item's $50 share, rather than the first \
-         drawing the run's whole $100 remainder and the second drawing $0"
+        vec![50.0, 25.0],
+        "each declared request is clamped to its own item's share — the whole share, not half \
+         of it, since the author asked for more — rather than the first drawing the run's \
+         whole $100 remainder and the second drawing $0"
     );
 }
 
@@ -8429,4 +8467,175 @@ fn a_nested_calls_when_gate_still_skips_it_before_anything_is_funded() {
         assert_eq!(entries[dispatching]["status"], "completed", "{entries:?}");
         assert_eq!(entries[1 - dispatching]["status"], "skipped", "{entries:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task 7, fix round 1 — the two properties the review found
+// ---------------------------------------------------------------------------
+
+/// **A wave that carries a `ChildRun` carries nothing else**, so no sibling's
+/// answer can be discarded when a child parks.
+///
+/// This is the regression test for the hazard the review found: `roundhouse-
+/// daemon`'s `dispatch_wave` folds a whole wave to
+/// `PendingExecution::ChildParked` the moment any item's child parks, throwing
+/// away every other item's already-computed `WorkDone`. Nothing recovers a
+/// discarded answer — the sibling's `workflow_step_run` row is left `Running`
+/// with nothing to match it, and a `tool:` sibling's result exists **only** in
+/// that discarded value, so the next segment crash-refuses an item whose work
+/// really did complete. The discard was a no-op while a `ChildRun` could only
+/// arrive alone (a top-level `call:` is always a one-entry wave); this task is
+/// the first thing that could put one beside siblings.
+///
+/// The fixture is exactly that scenario — one item at a nested `call:` and one
+/// at an ordinary `tool:`, which without the fix are dispatched in the same
+/// wave. The assertion is that **the wave never forms**: the run loop gives the
+/// child a wave of its own. Driven with the `call:` item first (where the fix
+/// is `dispatch_map` ending its walk) and last (where it is
+/// `ItemAdvance::Deferred`), because those are two different code paths.
+#[test]
+fn a_wave_that_carries_a_nested_call_carries_nothing_else() {
+    // The exact wave sequence each order produces, spelled out rather than
+    // only checked for the property, because the two orders prove *different*
+    // halves and only the sequence shows which: with the `call:` item first,
+    // `dispatch_map` ends its walk after pushing the child (so the two
+    // `build`s batch together in the next wave); with it last, the item is
+    // `ItemAdvance::Deferred` and takes a wave of its own *after* the sibling
+    // it would otherwise have shared one with.
+    let expected: [Vec<Wave>; 2] = [
+        vec![
+            vec![("sub".to_string(), Some(0))],
+            vec![
+                ("build".to_string(), Some(0)),
+                ("build".to_string(), Some(1)),
+            ],
+        ],
+        vec![
+            vec![("build".to_string(), Some(0))],
+            vec![("sub".to_string(), Some(1))],
+            vec![("build".to_string(), Some(1))],
+        ],
+    ];
+    for (calls, expected) in [[true, false], [false, true]].into_iter().zip(expected) {
+        let (_conn, _run_id, _sink, waves, children, result) = drive_map_calls(
+            // The `when:` is what makes the two items reach *different* inner
+            // steps in one segment, which is the whole shape under test: one
+            // item at the nested `call:`, one at the `tool:` after it.
+            &map_over_call(
+                "\x20       when: \"${{ item.calls }}\"\n\
+                 \x20     - id: build\n\
+                 \x20       tool: shell\n\
+                 \x20       with: { cmd: [echo, hi] }\n",
+            ),
+            Value::Array(
+                calls
+                    .iter()
+                    .map(|c| serde_json::json!({ "calls": c }))
+                    .collect(),
+            ),
+            a_grant(),
+        );
+        let outcome = result.expect("the run drives");
+
+        for wave in &waves {
+            if wave.iter().any(|(step_id, _)| step_id == "sub") {
+                assert_eq!(
+                    wave.len(),
+                    1,
+                    "a wave carrying a nested `call:` must carry nothing else — a parking \
+                     child would discard whatever shares it: {waves:?}"
+                );
+            }
+        }
+        assert_eq!(
+            waves, expected,
+            "the `call:` item takes a wave of its own and the `tool:` sibling still runs, \
+             for items {calls:?}"
+        );
+        assert_eq!(children.len(), 1, "one item nests a `call:`: {calls:?}");
+
+        let output = map_output(&outcome, "fan");
+        let entries = output["items"].as_array().expect("one entry per item");
+        assert_eq!(entries.len(), 2);
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry["status"], "completed",
+                "item {index} finished with nothing lost or crash-refused: {entry:?}"
+            );
+        }
+    }
+}
+
+/// **A sibling's nested `call:` shrinks a later wave's per-item share**, and an
+/// item can be refused against a smaller ceiling than the one its earlier
+/// dispatches were measured against. Pinned deliberately: this is §8.9's model
+/// working, not a defect, and it is the one place the per-item share is *not*
+/// stable for the life of a fan-out.
+///
+/// Funding a child draws the grant from the run's own ledger and
+/// `Spend::for_grant` charges the parent **every** field of it, `max_tool_calls`
+/// included — so a `map` that funds children lowers the very figure
+/// `split_budget` divides. Before a nested `call:` existed, nothing inside a
+/// fan-out could charge that field, which is what two comments in the crate
+/// used to claim outright.
+///
+/// The run starts with six calls and two items, so each item's share is three:
+///
+/// - **Item 0** makes all three of its dispatches (`sub`, `build`, `publish`).
+/// - Its child's grant charges the run, so by the time **item 1** reaches its
+///   third inner step the run has four left, its share is **two**, and its
+///   `publish` is refused — at the same step its sibling ran, under a ceiling a
+///   third smaller.
+///
+/// It fails closed, through the ordinary per-item refusal under
+/// `on_item_error`, with both numbers in the message.
+#[test]
+fn a_siblings_nested_call_shrinks_a_later_waves_per_item_share() {
+    let (conn, run_id, _sink, waves, _children, result) = drive_map_calls(
+        &map_over_call(
+            "\x20     - id: build\n\
+             \x20       tool: shell\n\
+             \x20       with: { cmd: [echo, build] }\n\
+             \x20     - id: publish\n\
+             \x20       tool: shell\n\
+             \x20       with: { cmd: [echo, publish] }\n",
+        ),
+        map_items(2),
+        a_grant_of_tool_calls(6),
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![
+            vec![("sub".to_string(), Some(0))],
+            vec![("build".to_string(), Some(0))],
+            vec![("publish".to_string(), Some(0))],
+            vec![("sub".to_string(), Some(1))],
+            vec![("build".to_string(), Some(1))],
+        ],
+        "item 0 gets three dispatches and item 1 only two, though the fixture gives them the \
+         same inner steps: {waves:?}"
+    );
+    assert_eq!(
+        run_ledger(&conn, run_id).unwrap().spent.tool_calls,
+        2,
+        "the two child grants charged the run's own `max_tool_calls` — the spend that makes \
+         the per-item share move at all, and the thing no inner step could do before a \
+         nested `call:` existed"
+    );
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries[0]["status"], "completed",
+        "item 0 ran all three of its inner steps against a share of three: {entries:?}"
+    );
+    assert_eq!(entries[1]["status"], "failed", "{entries:?}");
+    let error = entries[1]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("publish") && error.contains("2 of the 2"),
+        "item 1 is refused at the step its sibling ran, under the smaller share its \
+         sibling's child left it — with both numbers in the message: {error:?}"
+    );
 }

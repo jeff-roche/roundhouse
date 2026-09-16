@@ -350,6 +350,30 @@ pub fn split_budget(total: &ResourceCaps, item_count: u32) -> ResourceCaps {
 /// `crate::exec::run_loop::inner_step_needs_real_dispatch`, which is what
 /// decides membership.
 ///
+/// # The share can shrink between waves, and an item can be refused under a smaller one
+///
+/// `item_caps` is [`split_budget`]'s output, re-derived on **every** segment
+/// from the run's *current* remainder — so it is not a figure an item can rely
+/// on staying still. Before Phase 8 Task 25.7 Task 7 it did stay still, because
+/// nothing a fan-out did charged `max_tool_calls` at the run level. A nested
+/// `call:` charges it (the child's grant is drawn from the run's ledger, and
+/// `crate::ledger::Spend::for_grant` charges the parent every field of it), so
+/// **one item's child can shrink its siblings' share** — and an item's own
+/// later dispatch can be refused against a ceiling smaller than the one its
+/// earlier dispatches were measured against, with `dispatches_so_far` already
+/// at or past it.
+///
+/// That is §8.9's model working, not a defect in it: an item's budget is *"a
+/// transfer out of the run's remaining budget, not an independent pool"*, and a
+/// pool a sibling really did spend is a pool that legitimately has less in it.
+/// The alternative — freezing each item's share when the `map` starts — needs
+/// durable per-item state that does not exist (`crate::exec::run_loop::Loop` is
+/// rebuilt from scratch on every segment). What matters is that it fails
+/// **closed** and visibly: the item takes the ordinary `ItemOutcome::Failed`
+/// below, with the two numbers in the message, under `on_item_error`. Measured
+/// in `tests/run_loop.rs`:
+/// `a_siblings_nested_call_shrinks_a_later_waves_per_item_share`.
+///
 /// # Why the item `Failed` rather than `Skipped`
 ///
 /// A `Skipped` item is one the fan-out never started — `fail_fast`'s fill, or
@@ -413,14 +437,22 @@ pub(crate) fn per_item_dispatch_refusal(
 /// `max_subagents` are likewise the run-level admission's to enforce, and it
 /// charges neither for a `map` item's inner step.
 ///
-/// # What `>=` means here, given nothing spends the field mid-fan-out
+/// # What `>=` means here, and what moves on each side of it
 ///
-/// `run_remaining` is re-read from the ledger before every segment, but no
-/// part of a `map`'s fan-out charges `max_tool_calls` against it — only
-/// `Loop::admit` does, and only for a *top-level* `tool:` step — so the figure
-/// is constant for the life of one fan-out. What moves is the left-hand side,
-/// the fan-out's own dispatch count, which is why this becomes true part-way
-/// through a `map` rather than only ever at its start.
+/// `run_remaining` is re-read from the ledger before every segment. What
+/// usually moves is the left-hand side — the fan-out's own dispatch count —
+/// which is why this becomes true part-way through a `map` rather than only
+/// ever at its start.
+///
+/// **The right-hand side moves too, since Phase 8 Task 25.7 Task 7.** This
+/// section used to say the figure "is constant for the life of one fan-out",
+/// on the grounds that no part of a fan-out charges `max_tool_calls` at the
+/// run level. A nested `call:` does: its child's grant is drawn from the run's
+/// ledger and `crate::ledger::Spend::for_grant` charges the parent every field
+/// of that grant, `max_tool_calls` included. So a fan-out that funds children
+/// lowers its own aggregate ceiling as it goes, and — through
+/// [`split_budget`], which is re-derived from the same figure every segment —
+/// each item's share with it.
 ///
 /// # What it bounds, and the one thing it does not
 ///

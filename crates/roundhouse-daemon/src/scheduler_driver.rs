@@ -1386,6 +1386,24 @@ fn reclassify_if_interrupted(done: &mut WorkDone, session: &HeadlessSession) {
 /// even attempted the remaining items). Only when nothing in the wave
 /// parked does this return `PendingExecution::Done` with every item's real
 /// [`WorkDone`].
+///
+/// **That discard is only sound because a wave carrying a `ChildRun` carries
+/// exactly one entry**, and only a `ChildRun` item can park — every
+/// `ItemOutcome::ChildParked` in this file comes from
+/// `dispatch_one_pending`'s `PendingKind::ChildRun` arm or from
+/// [`park_child_after_failure`], which that arm alone calls. A discarded
+/// answer is not recoverable: the run loop is left with a `Running`
+/// `workflow_step_run` row and no `WorkDone` to match it, and for a
+/// `tool:`/`agent:` sibling nothing durable records what the dispatch
+/// returned, so the next segment crash-refuses an item whose work really did
+/// complete.
+///
+/// The invariant held for free while a `ChildRun` could only come from a
+/// top-level `call:` (always a one-entry wave). Phase 8 Task 25.7 Task 7 made
+/// a nested `call:` real, so it is now maintained on the **producer** side, by
+/// `roundhouse_flow`'s `Loop::dispatch_map` — see `ItemAdvance::Deferred`,
+/// which holds the whole argument. If that ever changes, this fold has to stop
+/// being all-or-nothing first.
 async fn dispatch_wave<F, Fut>(pending: Vec<PendingWork>, dispatch_one: F) -> PendingExecution
 where
     F: Fn(PendingWork) -> Fut,
