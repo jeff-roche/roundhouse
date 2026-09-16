@@ -662,7 +662,7 @@ fn accept_due_occurrences(
 ///
 /// Rows past this many stay `ready` for the next tick a second later:
 /// backpressure, not loss.
-const MAX_READY_DELIVERIES_SCANNED_PER_TICK: usize = 32;
+const MAX_READY_DELIVERIES_SCANNED_PER_TICK: usize = 128;
 
 /// How many deliveries this daemon may have in flight **at once**.
 ///
@@ -673,23 +673,12 @@ const MAX_READY_DELIVERIES_SCANNED_PER_TICK: usize = 32;
 /// shape `socket_server::construct_real_session_bounded` uses for session
 /// construction.
 ///
-/// **Two, because each in-flight delivery holds a pooled store connection for
-/// the entire run.** `run_workflow_from_storage` takes `&mut Connection` and
-/// drives the whole workflow on it, so the connection cannot be returned
-/// mid-run. `deadpool`'s default pool size is a small multiple of the CPU
-/// count — as low as **four** on a one-core host — and the heartbeat's own
-/// `accept_occurrence`, the event writer, the socket server and the web
-/// server all draw from the same pool, none of them with a checkout timeout.
-/// A cap of four would exactly saturate that floor and starve every other
-/// component; two leaves half of it for the rest of the daemon.
-///
-/// That a long-running workflow pins a pooled connection at all is a real
-/// architectural tension this task inherits rather than creates. The right
-/// fix is to derive this from the pool's actual configured size (or to give a
-/// run its own dedicated connection) rather than to guess against its
-/// documented floor — a change to how `roundhouse-flow` is handed its
-/// connection, not a constant this driver can tune its way out of.
-const MAX_CONCURRENT_DELIVERIES: usize = 2;
+/// Workflow segments hold pooled connections only for their short synchronous
+/// slices; async work between segments holds none. Sixty-four matches the
+/// frozen concurrent-session target and the socket session-construction
+/// bound. Brief SQLite contention may queue a segment, but it cannot
+/// permanently starve the pool while other deliveries await async work.
+const MAX_CONCURRENT_DELIVERIES: usize = 64;
 
 /// One delivery this driver has taken ownership of: leased, and holding
 /// exactly one **active** admission slot (promoted from a queued one if that
@@ -953,6 +942,40 @@ fn unanswerable_work(step_id: String, message: String) -> WorkDone {
     }
 }
 
+#[cfg(test)]
+struct SegmentGapGate {
+    entrants: std::sync::atomic::AtomicUsize,
+    releases: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl SegmentGapGate {
+    fn new() -> Self {
+        Self {
+            entrants: std::sync::atomic::AtomicUsize::new(0),
+            releases: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    async fn enter(&self) {
+        self.entrants
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.releases
+            .acquire()
+            .await
+            .expect("the test-owned segment-gap gate must remain open")
+            .forget();
+    }
+
+    fn entrants(&self) -> usize {
+        self.entrants.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release(&self, permits: usize) {
+        self.releases.add_permits(permits);
+    }
+}
+
 /// Everything one claimed delivery needs to become a real, running workflow.
 ///
 /// Cloned into each spawned per-delivery task, so every field is a handle
@@ -982,6 +1005,8 @@ pub(crate) struct DeliveryExecutor {
     /// every timestamp a delivery writes is chosen by the caller — which is
     /// what makes this path testable without a real clock.
     clock: Arc<dyn ClockSource + Send + Sync>,
+    #[cfg(test)]
+    segment_gap_gate: Option<Arc<SegmentGapGate>>,
 }
 
 impl DeliveryExecutor {
@@ -1001,6 +1026,8 @@ impl DeliveryExecutor {
             spawn_tree,
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
             clock,
+            #[cfg(test)]
+            segment_gap_gate: None,
         }
     }
 
@@ -1880,6 +1907,10 @@ impl DeliveryExecutor {
 
             match outcome {
                 Ok(RunOutcome::AwaitingWork { pending }) => {
+                    #[cfg(test)]
+                    if let Some(gate) = &self.segment_gap_gate {
+                        gate.enter().await;
+                    }
                     resume = Some(Resume::Work(self.execute_pending(session, pending).await));
                     now = self.now();
                 }
@@ -3775,6 +3806,12 @@ mod delivery_tests {
             .to_string()
     }
 
+    fn reading_workflow() -> String {
+        "name: scheduled-read\nversion: 1\npermissions:\n  default: deny\n  unattended:\n    \
+         escalate: fail\nsteps:\n  - id: read_it\n    tool: read\n    with: { path: greeting.txt }\n"
+            .to_string()
+    }
+
     /// A workflow whose step fails: `no_such_fn` is not a function the
     /// expression evaluator knows, so the step (and therefore the run) fails
     /// — the same fixture `roundhouse-flow`'s own run-loop tests use.
@@ -4714,6 +4751,91 @@ mod delivery_tests {
             harness.delivery_row().await.state,
             DeliveryState::Delivered,
             "a freed slot must let the next tick claim the delivery it had to decline"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_deliveries_wait_for_async_work_concurrently_without_holding_store_connections(
+    ) {
+        let mut harness =
+            harness_with_overlap(reading_workflow(), OverlapPolicy::Concurrent { max: 3 }).await;
+        std::fs::write(harness.workspace_root.join("greeting.txt"), "hello").unwrap();
+        let second = harness.accept_another_occurrence(60).await;
+        let third = harness.accept_another_occurrence(120).await;
+        let deliveries = [
+            harness.delivery.delivery_id.clone(),
+            second.delivery_id,
+            third.delivery_id,
+        ];
+        let gate = Arc::new(SegmentGapGate::new());
+        harness.executor.segment_gap_gate = Some(Arc::clone(&gate));
+        let initial_permits = harness.executor.slots.available_permits();
+        let mut bindings = HashMap::new();
+        bindings.insert(harness.stored.binding.id, harness.stored.clone());
+
+        dispatch_ready_deliveries(&harness.executor, &bindings).await;
+        for _ in 0..100_000 {
+            if gate.entrants() == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            gate.entrants(),
+            3,
+            "all three admitted deliveries must overlap in the connection-free async segment gap"
+        );
+        assert_eq!(
+            initial_permits - harness.executor.slots.available_permits(),
+            3,
+            "each overlapping delivery must hold one scheduler permit"
+        );
+        let pool_status = harness.store.pool.status();
+        assert_eq!(
+            pool_status.waiting, 0,
+            "deliveries waiting on async work must not queue for store connections"
+        );
+        assert_eq!(
+            pool_status.available, pool_status.size,
+            "deliveries waiting on async work must return every store connection"
+        );
+
+        gate.release(3);
+        for _ in 0..100_000 {
+            let mut terminal = true;
+            for delivery_id in &deliveries {
+                terminal &= matches!(
+                    harness.state_of(delivery_id).await,
+                    DeliveryState::Delivered | DeliveryState::Failed | DeliveryState::Cancelled
+                );
+            }
+            if terminal {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        for delivery_id in &deliveries {
+            let state = harness.state_of(delivery_id).await;
+            assert!(
+                matches!(
+                    state,
+                    DeliveryState::Delivered | DeliveryState::Failed | DeliveryState::Cancelled
+                ),
+                "released delivery {delivery_id} must reach a terminal state, got {state:?}"
+            );
+        }
+        for _ in 0..100_000 {
+            if harness.executor.slots.available_permits() == initial_permits {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            harness.executor.slots.available_permits(),
+            initial_permits,
+            "terminal deliveries must return all scheduler permits"
         );
     }
 
