@@ -6712,6 +6712,90 @@ fn a_run_budget_skip_still_flags_the_report_when_the_run_ends_on_a_later_segment
     assert_eq!(sink.the_report()["needs_human"], true);
 }
 
+/// **The residual this bound does not close, measured rather than reasoned.**
+/// `map_item_is_in_flight` exempts an item from the exhaustion guard for good
+/// once any of its inner steps holds a row — not for one outstanding
+/// round-trip — so an item already started goes on dispatching the rest of its
+/// inner steps however far past the run's remainder that takes, held by its own
+/// `split_budget` share rather than by this bound.
+///
+/// Three items over three inner steps with seven calls left: the share is
+/// `ceil(7 / 3) = 3`, item 2 starts at a tally of 6 (`6 >= 7` is false) and
+/// then spends all three of its own calls, so the fan-out issues **nine**
+/// dispatches against a remainder of seven. `max_parallel` is 1 here precisely
+/// to show the overshoot is not bounded by it.
+///
+/// The second half of the claim matters as much as the first: every item
+/// completes, so **nothing is `Skipped`** and the run is not flagged.
+/// `needs_human` means "at least one item was withheld", not "this run never
+/// overspent".
+#[test]
+fn an_already_started_item_keeps_dispatching_past_the_runs_remainder_unflagged() {
+    let (_conn, _run_id, sink, waves, result) = drive_waves_with_grant(
+        "steps:\n\
+         \x20 - id: fan\n\
+         \x20   map:\n\
+         \x20     over: \"${{ inputs.items }}\"\n\
+         \x20     as: item\n\
+         \x20     max_parallel: 1\n\
+         \x20     on_item_error: continue\n\
+         \x20   steps:\n\
+         \x20     - id: a\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, a] }\n\
+         \x20     - id: b\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, b] }\n\
+         \x20     - id: c\n\
+         \x20       tool: shell\n\
+         \x20       with: { cmd: [echo, c] }\n",
+        &[],
+        a_grant_of_tool_calls(7),
+        |run_ctx| run_ctx.inputs = serde_json::json!({ "items": map_items(3) }),
+    );
+    let outcome = result.expect("the run drives");
+
+    assert_eq!(
+        waves,
+        vec![
+            vec![("a".to_string(), Some(0))],
+            vec![("b".to_string(), Some(0))],
+            vec![("c".to_string(), Some(0))],
+            vec![("a".to_string(), Some(1))],
+            vec![("b".to_string(), Some(1))],
+            vec![("c".to_string(), Some(1))],
+            vec![("a".to_string(), Some(2))],
+            vec![("b".to_string(), Some(2))],
+            vec![("c".to_string(), Some(2))],
+        ],
+        "item 2's `b` and `c` are dispatched at tallies of 7 and 8, both past the run's \
+         remainder of 7, because the item was already started when the budget ran out: {waves:?}"
+    );
+    assert_eq!(
+        shell_tasks(&sink),
+        9,
+        "nine real dispatches against a remainder of seven: the overshoot is bounded by the \
+         item count (3 x the per-item share of 3), not by `max_parallel: 1`"
+    );
+
+    let output = map_output(&outcome, "fan");
+    let entries = output["items"].as_array().expect("one entry per item");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["status"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>(),
+        vec!["completed", "completed", "completed"],
+        "no item is withheld, so there is no `run_budget_exhausted` skip to record: {entries:?}"
+    );
+    assert_eq!(
+        sink.the_report()["needs_human"],
+        false,
+        "the flag reports withheld items, not overspend — an operator reading it as an \
+         overshoot alarm would miss this run"
+    );
+}
+
 /// **The reactive half of §8.9's "whichever way it is discovered": the `map`
 /// step's own admission.** A run with no tasks left cannot admit the `map` at
 /// all, so the step fails before any item starts — the existing

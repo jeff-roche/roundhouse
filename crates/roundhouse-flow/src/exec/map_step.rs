@@ -428,12 +428,39 @@ pub(crate) fn per_item_dispatch_refusal(
 /// to record (it is not `Skipped`, having run, and `Failed` is the
 /// conflation §8.9 forbids).
 ///
-/// The consequence, stated rather than left to be discovered: an item whose
-/// walk is already part-way through may start one further round-trip after
-/// this returns `true`, so a fan-out can overshoot the run's remainder by at
-/// most one dispatch per such item. Those are exactly the items a segment
-/// found mid-walk, which the wave ceiling holds to `map.max_parallel`.
-/// Closing it would need a cut-off outcome §8.9 does not define.
+/// **The exemption that buys is permanent, not one round-trip long**, and the
+/// overshoot it leaves is correspondingly larger.
+/// `crate::exec::run_loop::Loop::map_item_is_in_flight` is true for an item
+/// from the moment any of its inner steps holds a durable row, and stays true —
+/// so an item already started when this first returns `true` goes on
+/// dispatching its remaining inner steps on every later segment. Nothing in
+/// *this* bound stops it: what does is [`per_item_dispatch_refusal`]'s share,
+/// the item's inner-step list running out, or whatever else ends the item
+/// first (an inner-step failure, a refusal).
+///
+/// The bound is therefore the **item count**, not `map.max_parallel` and not
+/// one dispatch per item in flight. Every item is held to [`split_budget`]'s
+/// share of `ceil(R / N)` — `R` the run's remainder, `N` the item count — so
+/// the fan-out's nominal total is `N * ceil(R / N)`, which exceeds `R` by
+/// `N - (R mod N)` when `N` does not divide `R` and by nothing when it does:
+/// at most `N - 1`, with `N` itself at most [`MAX_MAP_ITEMS`]. (Task 4's own
+/// re-decide overshoot, which
+/// `crate::exec::run_loop::Loop::map_item_dispatches_so_far` documents, sits on
+/// top of that nominal total rather than inside it.)
+///
+/// Measured, not reasoned, in `tests/run_loop.rs`:
+/// `an_already_started_item_keeps_dispatching_past_the_runs_remainder_unflagged`
+/// drives three items of three `tool:` steps with seven calls left and
+/// `max_parallel: 1`, and gets **nine** dispatches — item 2 starts at a tally
+/// of six, which is not yet seven, and then spends its whole share of three.
+///
+/// **And a run that overshoots this way is not flagged.** Every item completes,
+/// so nothing is `Skipped` and [`output_records_a_run_budget_skip`] finds
+/// nothing: §8.9's `needs_human` reports *"at least one item was withheld"*,
+/// never *"this run stayed inside its remainder"*. An operator reading it as an
+/// overspend alarm would miss exactly this case.
+///
+/// Closing either half would need a cut-off outcome §8.9 does not define.
 pub(crate) fn run_budget_is_exhausted(
     map_dispatches_so_far: u32,
     run_remaining: &ResourceCaps,

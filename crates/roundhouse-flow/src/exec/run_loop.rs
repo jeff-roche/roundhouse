@@ -2918,8 +2918,9 @@ impl<H: WorkflowHost> Loop<'_, H> {
             // - An item already in flight is never withheld, so §8.9's
             //   "in-flight items finish their current round-trip" needs no
             //   second mechanism. What that leaves unbounded is stated at
-            //   `run_budget_is_exhausted`'s own doc: an item already part-way
-            //   through may still start its next inner step's round-trip.
+            //   `run_budget_is_exhausted`'s own doc, and it is bigger than one
+            //   round-trip: `map_item_is_in_flight` exempts a started item
+            //   permanently, so it goes on to its remaining inner steps.
             // - The items this fan-out already pushed into `pending` are
             //   untouched, because the wave is built in order and nothing
             //   revisits an entry.
@@ -2942,13 +2943,20 @@ impl<H: WorkflowHost> Loop<'_, H> {
             // one over-count is a step §8.10 tier 2 re-decides, whose own row
             // is already in `map_dispatches_before` while its re-dispatch adds
             // an entry here; it moves the bound earlier, never later.
+            //
+            // `map_item_is_in_flight` is the **last** conjunct, after the flag
+            // and the arithmetic: the three are a pure conjunction of
+            // side-effect-free reads, so the order is a cost decision and not a
+            // behavioural one, and this one keeps the per-item `HashMap`
+            // lookups off every fan-out that does not run the run out. See that
+            // method's own doc, which records the same for `fail_fast`'s guard.
             let dispatched_this_segment = u32::try_from(pending.len()).unwrap_or(u32::MAX);
             if fan_out_can_dispatch
-                && !self.map_item_is_in_flight(&inner_steps, item_index)
                 && run_budget_is_exhausted(
                     map_dispatches_before.saturating_add(dispatched_this_segment),
                     &run_remaining,
                 )
+                && !self.map_item_is_in_flight(&inner_steps, item_index)
             {
                 outcomes[index] = Some(skipped_by_run_budget_exhausted());
                 continue;
@@ -3020,16 +3028,34 @@ impl<H: WorkflowHost> Loop<'_, H> {
     /// answer for one of its inner steps arrived with this entry, or an
     /// earlier wave left one of them a durable row.
     ///
-    /// The one question `fail_fast` turns on under waves. §8.9 stops the
-    /// fan-out from dispatching further *items*, and nothing cancels work
-    /// already dispatched, so an item that is already in flight must still be
-    /// advanced — otherwise its real, already-computed answer is discarded and
-    /// backfilled as `Skipped`, which is both a lie about the item and a
-    /// contradiction of the `TaskCreated` already in the log.
+    /// **The question both of [`Self::dispatch_map`]'s stop conditions turn
+    /// on**, and for the same reason in both: §8.9 stops the fan-out from
+    /// starting further *items*, and nothing cancels work already dispatched,
+    /// so an item that is already in flight must still be advanced — otherwise
+    /// its real, already-computed answer is discarded and backfilled as
+    /// `Skipped`, which is both a lie about the item and a contradiction of the
+    /// `TaskCreated` already in the log.
     ///
-    /// Cheap by construction rather than by care: it is only ever asked once a
-    /// failure has been observed, and `map` inner-step lists are short
-    /// (`MAX_TOP_LEVEL_STEPS`-scale, not item-scale).
+    /// - `fail_fast`'s cutover, once [`ItemErrorPolicy::observe`] has reported
+    ///   an item failure.
+    /// - Run-budget exhaustion (Task 5), once the fan-out's own dispatch count
+    ///   has reached what the run had left.
+    ///
+    /// Cheap by construction rather than by care, and both call sites are
+    /// written to keep it that way: each makes this its **last** conjunct,
+    /// after the flag or the arithmetic that says the question is worth asking
+    /// at all, so a fan-out that neither fails an item nor exhausts the run
+    /// never calls it. When it is called, a `map`'s inner-step list is short
+    /// (`MAX_TOP_LEVEL_STEPS`-scale, not item-scale) — which is what bounds the
+    /// key allocation each lookup makes.
+    ///
+    /// **A started item stays "in flight" for the rest of the fan-out.** There
+    /// is no narrower state here: the predicate is "has any inner step of this
+    /// item a row or an answer", and a row is never removed. Both callers want
+    /// exactly that — but it is also why run-budget exhaustion cannot stop an
+    /// item that has begun, which
+    /// [`crate::exec::map_step::run_budget_is_exhausted`] records as the
+    /// residual it leaves.
     fn map_item_is_in_flight(&self, inner_steps: &[StepDef], item_index: u32) -> bool {
         inner_steps.iter().any(|inner| {
             self.work_results
